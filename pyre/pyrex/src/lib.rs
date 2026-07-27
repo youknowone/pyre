@@ -1187,27 +1187,24 @@ fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecut
     }
 }
 
-/// Keep the object references carried by a pending SystemExit live and
-/// relocatable while interpreter finalization performs collections.  PyPy's
-/// OperationError is GC-visible RPython state; pyre's Rust `PyError` is not, so
-/// its three raw PyObjectRef fields need the same explicit shadow-root
-/// treatment as other host-stack temporaries.
+/// Resolve a pending `SystemExit`'s status, then finalize and exit with it.
+///
+/// The order matters: `app_main.py:114-129 handle_sys_exit` runs at
+/// application level, i.e. *before* `targetpypystandalone.py:88
+/// finally: space.finish()`. Resolving `e.code` is an ordinary attribute
+/// lookup that walks the exception's type and that type's dict, and
+/// `finalize_runtime` collects — pinning the three raw `PyObjectRef` fields
+/// of the Rust `PyError` (which, unlike PyPy's GC-visible `OperationError`,
+/// the collector cannot see) does not keep that type's dict alive. Reading
+/// the code after the collection spun forever inside the type dict's
+/// `IndexMap` probe for a user-defined `SystemExit` subclass.
 fn finalize_system_exit(
-    mut error: pyre_interpreter::PyError,
+    error: pyre_interpreter::PyError,
     canonical: pyre_object::PyObjectRef,
     ec_ptr: *const PyExecutionContext,
 ) -> ! {
-    let roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    for value in [error.exc_object, error.w_name_context, error.w_obj_context] {
-        pyre_object::gc_roots::pin_root(value);
-    }
-    finalize_runtime(canonical, ec_ptr);
-    error.exc_object = pyre_object::gc_roots::shadow_stack_get(base);
-    error.w_name_context = pyre_object::gc_roots::shadow_stack_get(base + 1);
-    error.w_obj_context = pyre_object::gc_roots::shadow_stack_get(base + 2);
     let code = pyre_interpreter::system_exit_code(&error);
-    drop(roots);
+    finalize_runtime(canonical, ec_ptr);
     maybe_print_jit_stats();
     std::process::exit(code);
 }
@@ -1269,7 +1266,41 @@ fn run_module(module: &str, no_site: bool) {
     maybe_print_jit_stats();
 }
 
+/// `os.path.abspath` for the run filename, or `None` for the `-c "<string>"`
+/// command path, which has no script.
+///
+/// A relative path resolves against `sys_path_cwd()` — the seam-provided
+/// virtual cwd under sandbox — before normalizing, so `std::path::absolute`
+/// never consults (and leaks) the trusted process cwd. Off sandbox this is
+/// identical to `absolute(filename)`.
+fn absolute_script_path(filename: &str) -> Option<String> {
+    if filename == "<string>" {
+        return None;
+    }
+    if filename == "<stdin>" {
+        // A stdin run records the literal `<stdin>`: there is no path to
+        // absolutize.
+        return Some(filename.to_string());
+    }
+    let path = Path::new(filename);
+    let to_absolutize = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        sys_path_cwd().join(path)
+    };
+    Some(match std::path::absolute(&to_absolutize) {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(_) => filename.to_string(),
+    })
+}
+
 fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
+    // `config_run_filename_abspath` absolutizes the run filename before the
+    // module is compiled, so `co_filename` — and with it every `File "…"` line
+    // a traceback prints — carries the absolute path, not the literal argv
+    // spelling.  `sys.argv[0]` keeps the spelling and is set elsewhere.
+    let main_file = absolute_script_path(filename);
+    let filename = main_file.as_deref().unwrap_or(filename);
     let code = match compile_source_with_filename(source, mode, filename) {
         Ok(code) => code,
         Err(e) => {
@@ -1342,27 +1373,6 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
     // `sys.argv[0]` keeps the literal command-line path. A stdin run records
     // the literal `<stdin>`: there is no path to absolutize and no file to
     // bind a `SourceFileLoader` to.
-    let main_file: Option<String> = match filename {
-        "<string>" => None,
-        "<stdin>" => Some(filename.to_string()),
-        _ => {
-            // Resolve a relative path against `sys_path_cwd()` — the
-            // seam-provided virtual cwd under sandbox — before normalizing, so
-            // `std::path::absolute` never consults (and leaks) the trusted
-            // process cwd. Off sandbox this is identical to
-            // `absolute(filename)`.
-            let path = Path::new(filename);
-            let to_absolutize = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                sys_path_cwd().join(path)
-            };
-            Some(match std::path::absolute(&to_absolutize) {
-                Ok(p) => p.to_string_lossy().into_owned(),
-                Err(_) => filename.to_string(),
-            })
-        }
-    };
     if let Some(file) = main_file.as_deref() {
         let _ = pyre_interpreter::baseobjspace::setattr_str(
             main_module,
