@@ -33,6 +33,34 @@ impl Drop for ObjectSlotRoot {
     }
 }
 
+/// Roots every element of an owned `Vec<PyObjectRef>` for the vector's
+/// lifetime.  The `Vec` must not be resized while this is alive: the roots are
+/// the element addresses, and a realloc would move them.
+struct ObjectVecRoot {
+    slots: Vec<*mut *mut u8>,
+}
+
+impl ObjectVecRoot {
+    fn new(values: &mut [pyre_object::PyObjectRef]) -> Self {
+        let mut slots = Vec::with_capacity(values.len());
+        for value in values.iter_mut() {
+            let slot = value as *mut pyre_object::PyObjectRef as *mut *mut u8;
+            if unsafe { pyre_object::gc_hook::try_gc_add_root(slot) } {
+                slots.push(slot);
+            }
+        }
+        Self { slots }
+    }
+}
+
+impl Drop for ObjectVecRoot {
+    fn drop(&mut self) {
+        for slot in self.slots.drain(..) {
+            pyre_object::gc_hook::try_gc_remove_root(slot);
+        }
+    }
+}
+
 thread_local! {
     /// pyjitpl.py:3048-3091 `raise_continue_running_normally` seam: set
     /// when the authoritative full-body walk committed its end-of-walk
@@ -718,17 +746,21 @@ fn try_commit_midbody_abort_inner(
         return Err(MidBodyDecline::BeforeRun("null callee code ptr"));
     }
     let code = unsafe { &*raw };
-    // Only portal trace sites currently carry `_exit_frame_with_exception`
-    // out of the walk. Bridge sites keep the former effect-free preflight;
-    // this is checked before running the rebuilt callee, so they never strand
-    // an effectful Err into replay.
-    if !WALK_END_PROPAGATE_ALLOWED.with(|c| c.get())
-        && (!code.exceptiontable.is_empty()
-            || !midbody_post_marker_is_effect_free(code, words.callee_py_pc))
-    {
-        return Err(MidBodyDecline::BeforeRun(
-            "no propagate licence and callee body can raise",
-        ));
+    // Only portal trace sites carry `_exit_frame_with_exception` out of the
+    // walk.  Without that licence a raise from the rebuilt callee has nowhere
+    // to go, and by then the body has already run — `MidBodyDecline::AfterRun`,
+    // from which no rewinding leg is sound (R8).
+    //
+    // The former preflight admitted a licence-less site whose callee had an
+    // empty exception table and an effect-free post-marker region.  Neither
+    // implies the body cannot RAISE: a callee with no handler still
+    // propagates, so that pair could admit a rebuild that then stranded an
+    // effectful Err.  Requiring the licence up front makes the post-run raise
+    // unreachable instead of merely unlikely.  Instrumented over
+    // pyre/bench/synth, the admitting branch was taken 0 times, so this costs
+    // no measured coverage.
+    if !WALK_END_PROPAGATE_ALLOWED.with(|c| c.get()) {
+        return Err(MidBodyDecline::BeforeRun("no propagate licence"));
     }
     if cf_addr == 0 {
         return Err(MidBodyDecline::BeforeRun("no live caller frame"));
@@ -738,7 +770,6 @@ fn try_commit_midbody_abort_inner(
     if ec.is_null() {
         return Err(MidBodyDecline::BeforeRun("null execution context"));
     }
-    let propagate_allowed = WALK_END_PROPAGATE_ALLOWED.with(|c| c.get());
     let outer = unsafe { &mut *(cf_addr as *mut pyre_interpreter::PyFrame) };
     let outer_stack_base = outer.nlocals() + outer.ncells();
     let outer_code = unsafe { &*pyre_interpreter::pyframe_get_pycode(outer) };
@@ -746,7 +777,7 @@ fn try_commit_midbody_abort_inner(
         &outer_code.exceptiontable,
         (words.call_py_pc as u32) * 2,
     );
-    if propagate_allowed {
+    {
         // E-G2: this specialization reconstructs only the exact empty
         // operand-stack level used by statement-position calls. A handler
         // preserving any operand below the call remains on legacy replay.
@@ -853,36 +884,40 @@ fn try_commit_midbody_abort_inner(
     frame.valuestackdepth = stack_base + current.live_stack.len();
     frame.last_instr = words.callee_py_pc as isize - 1;
     let sys_exc_value_pre = unsafe { (*ec).sys_exc_value };
+    // A minor collection inside the callee can move the operands the CALL sat
+    // on, so they have to survive it as roots rather than as a stale borrow.
+    // Re-reading them from the carrier afterwards would work too, but it can
+    // fail — and a failure here is `AfterRun`, from which no leg is sound
+    // (R8).  Rooting an owned copy cannot fail, which is the point.
+    let mut below_owned: Vec<pyre_object::PyObjectRef> = below.to_vec();
+    let _below_root = ObjectVecRoot::new(&mut below_owned);
+    // Everything between the preflight above and here — the callee frame
+    // allocation, the local writes, the Int/Float boxing — can allocate and
+    // therefore collect.  Re-verify immediately before the point of no return
+    // so the only window left is the callee's own execution.
+    if !crate::state::can_flush_walk_end_state_after_outer_call(
+        ctx,
+        cf_addr,
+        words.call_py_pc,
+        words.post_call_py_pc,
+        current.call_stack_len,
+        &below_owned,
+    ) {
+        return Err(MidBodyDecline::BeforeRun(
+            "outer call boundary stopped being flushable during the rebuild",
+        ));
+    }
     let ran = frame.execute_frame(None, None);
-    // `below` came from a clone taken BEFORE the callee ran; a minor collection
-    // inside it can have moved those objects.  Re-read them from the live
-    // carrier, which the abort-resume GC root area keeps forwarded.
-    let fresh = crate::jitcode_dispatch::fbw_abort_carrier_clone();
-    let below_now = match (below.len(), fresh.as_ref()) {
-        (0, _) => &[][..],
-        (n, Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(fresh))) => {
-            match fresh.entry_fallback.as_ref() {
-                Some(fallback) if fallback.call_stack.len() >= n => &fallback.call_stack[..n],
-                _ => {
-                    return Err(MidBodyDecline::AfterRun(
-                        "entry fallback vanished while the callee ran",
-                    ));
-                }
-            }
-        }
-        _ => {
-            return Err(MidBodyDecline::AfterRun(
-                "carrier is no longer a MidBody after the callee ran",
-            ));
-        }
-    };
+    let below_now = &below_owned[..];
     match ran {
         Ok(mut retval) => {
             crate::jitcode_dispatch::fbw_abort_carrier_set_return(retval);
             let _retval_root = ObjectSlotRoot::new(&mut retval);
-            // The callee has already RUN.  A false here is not a plain
-            // decline: it drops to the legacy replay with the callee's
-            // effects applied.
+            // The callee has already RUN, so this is the last `AfterRun` a
+            // caller could still hit.  Its whole precondition was verified
+            // immediately before `execute_frame` and `below` is rooted across
+            // it, so a false here means an invariant broke during the callee —
+            // not an ordinary decline.  Make that loud where it is safe to be.
             if crate::state::flush_walk_end_state_after_outer_call(
                 ctx,
                 cf_addr,
@@ -894,6 +929,11 @@ fn try_commit_midbody_abort_inner(
             ) {
                 Ok(())
             } else {
+                debug_assert!(
+                    false,
+                    "post-call flush declined after the callee ran, though its \
+                     precondition held immediately before `execute_frame`",
+                );
                 Err(MidBodyDecline::AfterRun(
                     "post-call caller flush declined AFTER the callee ran",
                 ))
@@ -905,11 +945,10 @@ fn try_commit_midbody_abort_inner(
             // state first; PUSH_EXC_INFO/POP_EXCEPT will manage it from the
             // selected handler onward.
             unsafe { (*ec).sys_exc_value = sys_exc_value_pre };
-            if !propagate_allowed {
-                return Err(MidBodyDecline::AfterRun(
-                    "callee raised and this site has no propagate licence",
-                ));
-            }
+            // No licence check here any more: the preflight above refuses a
+            // licence-less site outright, so a raise reaching this point always
+            // has somewhere to go.  That is what makes this arm infallible —
+            // it was the one `AfterRun` that a caller could actually provoke.
             let outer = unsafe { &mut *(cf_addr as *mut pyre_interpreter::PyFrame) };
             // The handler unwinds from the operand level the CALL raised at,
             // which for an expression-position call is not the empty one.

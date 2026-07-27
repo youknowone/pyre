@@ -2614,6 +2614,20 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             // carrier's rewind-to-the-CALL has no upstream counterpart, so it
             // is the fallback for a callee this one cannot rebuild, not the
             // preferred leg; `fbw_set_abort_call_resume` keeps that ordering.
+            // This outer gate sits OUTSIDE the reason-producing closure below,
+            // so until it was instrumented its two narrowings were the only
+            // ones that could keep a callee off leg 4 without saying so — the
+            // census could not tell "never fired" from "not measured".
+            if fbw_debug_abort_enabled() && !(is_top_inline && !fbw_has_unjournaled_effect()) {
+                eprintln!(
+                    "[fbw-abort-flush] gh#467 callee-rebuild NOT LATCHED ({})",
+                    if !is_top_inline {
+                        "inline sub-walk (depth>=2)"
+                    } else {
+                        "unjournaled effect pending"
+                    },
+                );
+            }
             if is_top_inline && !fbw_has_unjournaled_effect() {
                 // Each refusal names itself so the debug log can say WHICH
                 // narrowing keeps a callee off this leg — the entry carrier
