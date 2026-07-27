@@ -150,6 +150,21 @@ assert proc.returncode == 0, proc
 
 assert sys._getframemodulename() == "__main__", sys._getframemodulename()
 
+# PyPy's `vm.getsizeof(space, w_object, w_default=None)` accepts one or two
+# positional arguments.  Python 3.14 likewise rejects every excess argument,
+# including when the object has a working `__sizeof__`.
+with assert_raises(TypeError):
+    sys.getsizeof()
+
+with assert_raises(TypeError):
+    sys.getsizeof(object(), 1, 2)
+
+with assert_raises(TypeError):
+    sys.getsizeof("x", 1, 2)
+
+default = object()
+assert sys.getsizeof(object(), default) is default
+
 
 def test_getframemodulename():
     return sys._getframemodulename()

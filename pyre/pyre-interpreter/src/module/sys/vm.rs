@@ -1499,6 +1499,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         make_builtin_function(
             "getsizeof",
             |args| {
+                if args.len() > 2 {
+                    return Err(crate::PyError::type_error(format!(
+                        "getsizeof() takes at most 2 arguments ({} given)",
+                        args.len()
+                    )));
+                }
                 let Some(&w_obj) = args.first() else {
                     return Err(crate::PyError::type_error(
                         "getsizeof() takes at least 1 argument (0 given)",
