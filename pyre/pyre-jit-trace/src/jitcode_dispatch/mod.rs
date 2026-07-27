@@ -2355,7 +2355,7 @@ pub fn walk<Sym: WalkSym>(
                     // when the trace hands it the exception, and it reads the
                     // raise coordinate out of `frame.last_instr`.  Compiled
                     // code never wrote that field, so publish it here.
-                    fbw_publish_raise_last_instr(ctx, recording_opcode_position);
+                    fbw_publish_exit_last_instr(ctx, recording_opcode_position);
                     // RPython parity: framestack exhausted with no handler
                     // match → `compile_exit_frame_with_exception(last_exc_box)`.
                     // Stash the exception the same way the value-return arms

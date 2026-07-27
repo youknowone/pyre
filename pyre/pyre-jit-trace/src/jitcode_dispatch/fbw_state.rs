@@ -1301,8 +1301,10 @@ pub(crate) fn fbw_store_token_in_vable<Sym: WalkSym>(
 
 /// Shared top-level finish path for the three value-returning arms
 /// (`ref_return` / `int_return` / `float_return`).  Re-boxes `result` to
-/// `Type::Ref`, records the vable store-back + `GUARD_NOT_FORCED_2`, and
-/// stashes the finish payload for `full_body_walk_trace`.  Deliberately
+/// `Type::Ref`, publishes the return coordinate into `last_instr`, stores the
+/// virtualizable back into the frame, and stashes the finish payload for
+/// `full_body_walk_trace`.  The store-back is what leaves `vable_token` clear,
+/// so the `GUARD_NOT_FORCED_2` arming below it declines.  Deliberately
 /// does NOT record the `FINISH` op: under the gate the compile consumer
 /// (`finish_and_compile` -> `recorder.finish`, mod.rs) records it from
 /// `finish_args`, so recording it here too would double it.
@@ -1312,15 +1314,41 @@ pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
     op_pc: usize,
 ) -> Result<(), DispatchError> {
     let finish_value = fbw_ensure_boxed_for_ca(ctx, op_pc, result)?;
+    fbw_publish_exit_last_instr(ctx, op_pc);
+    fbw_force_virtualizable_before_return(ctx);
     fbw_store_token_in_vable(ctx, op_pc)?;
     FBW_FINISH_PAYLOAD.with(|c| c.set(Some((finish_value, Type::Ref))));
     Ok(())
 }
 
+/// `jit.hint(frame, force_virtualizable=True)` on the way out of the portal
+/// (`opimpl_hint_force_virtualizable` → `gen_store_back_in_vable`, pyjitpl.py).
+///
+/// `doc/jit/virtualizable.rst` names this as the remedy for exactly this shape:
+/// "If you have something equivalent of a Python generator, where the
+/// virtualizable survives for longer, you want to force it before returning.
+/// It's better to do it that way than by an external call some time later."
+/// A frame the function-entry portal compiled can survive its trace the same
+/// way — a traceback it hands out keeps it alive — and pyre cannot take the
+/// other route: the backend frees the jitframe chain before `execute_token`
+/// returns, so the force marker `store_token_in_vable` leaves behind would name
+/// freed memory rather than the retained deadframe upstream forces through.
+///
+/// Storing back here is what makes the token store unnecessary rather than
+/// merely redundant: `gen_store_back_in_vable` sets `forced_virtualizable`, and
+/// `store_token_in_vable` returns early on that (pyjitpl.py) — the two are
+/// alternatives, not a sequence — and its final store zeroes the token slot.
+fn fbw_force_virtualizable_before_return<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+    let Some(vbox) = ctx.trace_ctx.standard_virtualizable_box() else {
+        return;
+    };
+    ctx.trace_ctx.gen_store_back_in_vable(vbox);
+}
+
 /// Void variant of [`fbw_terminate_with_finish`] for the top-level
 /// `void_return/` portal exit (`compile_done_with_this_frame`'s VOID
-/// branch, pyjitpl.py).  Records the vable store-back +
-/// `GUARD_NOT_FORCED_2`, then stashes a `Type::Void`-marked payload so
+/// branch, pyjitpl.py).  Publishes the return coordinate and stores the
+/// virtualizable back the same way, then stashes a `Type::Void`-marked payload so
 /// [`crate::trace::full_body_walk_trace`] builds a `TraceAction::Finish`
 /// with no args (`done_with_this_frame_descr_from_types(&[])` resolves the
 /// void descr).  Like the value path it does NOT record the `FINISH` op —
@@ -1329,40 +1357,49 @@ pub(crate) fn fbw_terminate_void_with_finish<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
+    fbw_publish_exit_last_instr(ctx, op_pc);
+    fbw_force_virtualizable_before_return(ctx);
     fbw_store_token_in_vable(ctx, op_pc)?;
     FBW_FINISH_PAYLOAD.with(|c| c.set(Some((OpRef::NONE, Type::Void))));
     Ok(())
 }
 
-/// Publish the raising instruction's Python coordinate into the standard
-/// virtualizable's `last_instr` slot before the top-level frame exits with
-/// an exception.
+/// Publish the exiting instruction's Python coordinate into the standard
+/// virtualizable's `last_instr` slot before the top-level frame exits.
 ///
-/// `handle_exception` (pyre-interpreter) stamps this frame's traceback node
-/// with `frame.last_instr` and keys the exception-table lookup on the same
-/// field, so the value has to be the coordinate the raise actually happened
-/// at.  Compiled code never runs the per-opcode interpreter store: a frame
+/// Compiled code never runs the per-opcode interpreter store, so a frame
 /// entered through the function-entry portal still carries the `-1`
-/// initialization sentinel, which `offset2lineno` answers with the code
-/// object's first line — the `def` line — and a loop-entry frame carries the
-/// loop header.  In both shapes the node comes out stamped with a line the
-/// frame was not executing.
+/// initialization sentinel and a loop-entry frame carries the loop header.
+/// `offset2lineno` answers `-1` with the code object's first line — the `def`
+/// line — so whatever reads the field afterwards reports a line the frame was
+/// not executing.
 ///
-/// Upstream never faces this: `handle_operation_error` runs INSIDE the traced
-/// portal, so the node is recorded from the vable's own `last_instr` box
-/// (`pyopcode.py:147-148`), which every opcode writes.  pyre records the
-/// top-level frame's node from the interpreter instead — the exception
-/// surfaces there as `exit_frame_with_exception` — so the field it reads has
-/// to be published before the trace finishes.
+/// Both frame exits publish, because both leave a reader behind.  On the
+/// uncaught raise, `handle_exception` (pyre-interpreter) stamps the traceback
+/// node from `frame.last_instr` and keys the exception-table lookup on the
+/// same field.  On the normal return, a traceback the frame handed out
+/// outlives it, and `tb_frame.f_lineno` resolves through `offset2lineno` on
+/// this field — the return is the last coordinate the frame ever reached.
+///
+/// Upstream never faces either shape: the portal is entered only from a
+/// backward jump (`can_enter_jit`, `interp_jit.py`), so a loop-free function
+/// is never compiled as one, and the frame's `dispatch` loop runs inside the
+/// traced portal where every opcode writes `last_instr` (`pyopcode.py`).
+/// pyre's function-entry portal reaches the field from the interpreter after
+/// the trace has finished, so the coordinate has to be published before it
+/// does.
 ///
 /// The store is the static-field shape `gen_store_back_in_vable` emits for
 /// this slot, so it reaches the frame on a compiled run; the shadow mirror
 /// keeps the walker's own virtualizable view in step with it.
-pub(crate) fn fbw_publish_raise_last_instr<Sym: WalkSym>(
+pub(crate) fn fbw_publish_exit_last_instr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     opcode_position: usize,
 ) {
-    let jitcode_index = ctx.session.borrow().recording_jitcode_index;
+    let (recording_frame_ptr, jitcode_index) = {
+        let session = ctx.session.borrow();
+        (session.recording_frame_ptr, session.recording_jitcode_index)
+    };
     let Some(py_pc) =
         crate::state::python_pc_for_jitcode_pc_public(jitcode_index, opcode_position as i32)
     else {
@@ -1386,6 +1423,24 @@ pub(crate) fn fbw_publish_raise_last_instr<Sym: WalkSym>(
         value,
         Value::Int(i64::from(py_pc)),
     );
+    // The recorded store has to have a concrete counterpart.  Upstream's
+    // tracing IS the interpreter, so its per-opcode `last_instr` write
+    // (`pyopcode.py`) lands in the real frame on the very iteration the trace
+    // is recorded from; the walker only records ops, so without this the
+    // recording iteration is the one iteration that still reports the stale
+    // sentinel — a single wrong answer in the middle of a survey.
+    // `recording_frame_ptr` is the LIVE frame, not `virtualizable_heap_ptr`'s
+    // trace-stepping snapshot: the snapshot's storage is released when tracing
+    // ends, so a store there reaches nothing the interpreter goes on to read.
+    if recording_frame_ptr != 0 {
+        // SAFETY: the recording frame is the live `PyFrame` this walk steps,
+        // and `frame_layout` pins `last_instr` to this offset with a
+        // compile-time assertion against the interpreter's own constant.
+        unsafe {
+            *((recording_frame_ptr + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET)
+                as *mut isize) = py_pc as isize;
+        }
+    }
 }
 
 /// Exception variant of [`fbw_terminate_with_finish`] for the top-level
