@@ -8623,10 +8623,10 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         "exec" => crate::compile::Mode::Exec,
         "eval" => crate::compile::Mode::Eval,
         "single" => crate::compile::Mode::Single,
-        other => {
+        _ => {
             return Err(crate::PyError::new(
                 crate::PyErrorKind::ValueError,
-                format!("compile() mode must be 'exec', 'eval' or 'single', not {other:?}"),
+                "compile() mode must be 'exec', 'eval' or 'single'",
             ));
         }
     };
@@ -9018,10 +9018,11 @@ fn exec_or_eval(
     // locals=globals and pyre's existing same-dict path handles it.
     let mut implicit_caller_locals: pyre_object::PyObjectRef = std::ptr::null_mut();
     if is_none_or_null(globals_arg) && is_none_or_null(locals_arg) && !caller_frame.is_null() {
-        // pyframe.py:540 getdictscope returns the caller's
-        // w_locals (PyObjectRef) — same dict-or-mapping the
-        // interpreter sees inside the calling function body.
-        implicit_caller_locals = unsafe { (*caller_frame).getdictscope()? };
+        // The caller's locals as `locals()` reports them: its real namespace
+        // for a module or class frame, an independent snapshot for an
+        // optimized one.  The snapshot is what keeps `exec("y = 1")` inside a
+        // function from adding `y` to that function's locals.
+        implicit_caller_locals = unsafe { (*caller_frame).frame_locals_snapshot()? };
     }
     let mut locals_object_arg: pyre_object::PyObjectRef = std::ptr::null_mut();
     if !is_none_or_null(locals_arg) {
@@ -9186,14 +9187,12 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // mapping rather than a stale one.  Reading `CURRENT_FRAME` instead
     // skips that force.
     //
-    // `getdictscope` (`pyframe.py:525-530`) always runs `fast2locals()`
-    // before returning `debugdata.w_locals`, so a second `locals()`
-    // re-syncs the mapping with the current fast locals —
-    // `x = 1; locals(); x = 2; locals()["x"]` reads `2`.  `fast2locals`
-    // lazily allocates and caches the mapping on first call, so identity
-    // holds (`locals() is locals()`, and `locals() is globals()` at
-    // module scope where `debugdata.w_locals is w_globals`); for a
-    // non-dict exec/eval mapping it returns that live object and writes
+    // `frame_locals_snapshot` (`_PyEval_GetFrameLocals`) hands an optimized
+    // frame an independent copy, so a snapshot neither tracks later stores nor
+    // writes back — `x = 1; d = locals(); x = 2; d["x"]` still reads `1`, and
+    // `locals() is locals()` is false.  Module and class frames keep returning
+    // their real namespace, so `locals() is globals()` still holds at module
+    // scope and a non-dict exec/eval mapping is still the live object written
     // through its `__setitem__`.
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
     let frame = if ec.is_null() {
@@ -9207,7 +9206,7 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
     let frame_mut = unsafe { &mut *frame };
-    frame_mut.getdictscope()
+    frame_mut.frame_locals_snapshot()
 }
 
 fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

@@ -2326,6 +2326,25 @@ impl PyFrame {
         Ok(self.get_w_locals())
     }
 
+    /// The mapping `locals()` hands back, and the implicit locals `exec` /
+    /// `eval` run against (`_PyEval_GetFrameLocals`).
+    ///
+    /// A frame whose `f_locals` is a `FrameLocalsProxy` — every optimized
+    /// frame — yields an INDEPENDENT dict copy, so `locals() is locals()` is
+    /// false, a snapshot does not track later stores, and writing into one
+    /// reaches neither the fast locals nor the next snapshot (PEP 667).
+    /// Module and class frames keep handing back their real namespace, which
+    /// is what makes a module-level `locals() is globals()` still hold.
+    pub fn frame_locals_snapshot(&mut self) -> Result<PyObjectRef, crate::PyError> {
+        let w_locals = self.getdictscope()?;
+        if w_locals.is_null() || !self.code().flags.contains(crate::CodeFlags::OPTIMIZED) {
+            return Ok(w_locals);
+        }
+        let snapshot = pyre_object::w_dict_new();
+        crate::opcode_ops::dict_update_value(snapshot, w_locals)?;
+        Ok(snapshot)
+    }
+
     /// Test-helper constructor — creates a frame with a fresh execution
     /// context.
     ///
