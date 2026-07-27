@@ -2033,17 +2033,18 @@ fn try_adopt_single_frame_blackhole(
     unsafe {
         majit_gc::shadow_stack::push_resume_ref_roots(locals_undo.as_mut_slice());
     }
-    let locals_published = crate::state::write_back_outer_locals(ctx, vable_frame);
-    if !locals_published {
+    if !crate::state::write_back_outer_locals(ctx, vable_frame) {
         crate::state::restore_frame_locals(vable_frame, &locals_undo);
-    }
-    majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
-    if !locals_published {
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] single-frame locals publish declined — legacy replay kept");
         }
         return false;
     }
+    // The undo image stays rooted across the drive.  The publish overwrote the
+    // slots it was taken from, so these words are the only remaining reference
+    // to the pre-walk locals, and a collection inside the drive would both free
+    // them and leave the withdrawal below writing back pre-move addresses.
     let mut terminal = majit_metainterp::drive_single_frame_blackhole(
         &mut latched.miframe,
         majit_metainterp::blackhole::StateFieldLayout::default(),
@@ -2058,26 +2059,27 @@ fn try_adopt_single_frame_blackhole(
     let adopted = match terminal.outcome {
         majit_metainterp::jitexc::JitException::ContinueRunningNormally {
             ref green_int, ..
-        } => {
-            let Some(&resume_py_pc) = green_int.first() else {
-                return false;
-            };
-            let resume_py_pc = resume_py_pc as usize;
-            if !apply_blackhole_crn(
-                cf_addr,
-                jitcode_index,
-                terminal.position,
-                terminal.last_opcode_position,
-                &terminal.registers_i,
-                terminal.registers_r.as_mut_slice(),
-                &terminal.registers_f,
-                resume_py_pc,
-            ) {
-                return false;
+        } => match green_int.first() {
+            Some(&resume_py_pc) => {
+                let resume_py_pc = resume_py_pc as usize;
+                if apply_blackhole_crn(
+                    cf_addr,
+                    jitcode_index,
+                    terminal.position,
+                    terminal.last_opcode_position,
+                    &terminal.registers_i,
+                    terminal.registers_r.as_mut_slice(),
+                    &terminal.registers_f,
+                    resume_py_pc,
+                ) {
+                    WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
+                    true
+                } else {
+                    false
+                }
             }
-            WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
-            true
-        }
+            None => false,
+        },
         majit_metainterp::jitexc::JitException::DoneWithThisFrameVoid => {
             crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Null);
             true
@@ -2121,7 +2123,15 @@ fn try_adopt_single_frame_blackhole(
                 jitcode_index, terminal.position, terminal.last_opcode_position,
             );
         }
+    } else {
+        // The terminal was not adoptable, so this returns to the legacy
+        // escape/replay path, which resumes the frame from its pre-walk state —
+        // the state `restore_escape_flush_undo` puts back for the flush half.
+        // The publish above and the replay's own vable stores both landed here,
+        // so both have to come off.
+        crate::state::restore_frame_locals(vable_frame, &locals_undo);
     }
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
     adopted
 }
 
@@ -2316,15 +2326,14 @@ fn try_adopt_multi_frame_blackhole(
     unsafe {
         majit_gc::shadow_stack::push_resume_ref_roots(locals_undo.as_mut_slice());
     }
-    let locals_published = crate::state::write_back_outer_locals(ctx, root_addr);
-    if !locals_published {
+    if !crate::state::write_back_outer_locals(ctx, root_addr) {
         crate::state::restore_frame_locals(root_addr, &locals_undo);
-    }
-    majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
-    if !locals_published {
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
         mfdbg!("frame 0: {root_addr:#x} locals publish declined");
         return false;
     }
+    // Rooted across the drive for the same reason as the single-frame arm: the
+    // publish overwrote the slots these words came from.
     let ec = unsafe {
         (*(cf_addr as *mut pyre_interpreter::PyFrame)).execution_context
             as *mut pyre_interpreter::PyExecutionContext
@@ -2387,11 +2396,12 @@ fn try_adopt_multi_frame_blackhole(
     }
     let adopted = match outcome {
         majit_metainterp::jitexc::JitException::ContinueRunningNormally {
-            ref green_int, ..
-        } => {
+            ref green_int,
+            ..
+        } => 'crn: {
             let Some(&resume_py_pc) = green_int.first() else {
                 mfdbg!("ContinueRunningNormally with no green int");
-                return false;
+                break 'crn false;
             };
             let resume_py_pc = resume_py_pc as usize;
             // Only the frame address is checked.  `resume_py_pc` is a
@@ -2403,7 +2413,7 @@ fn try_adopt_multi_frame_blackhole(
             // replay that re-executes what the chain already committed.
             if cf_addr == 0 {
                 mfdbg!("cf_addr {cf_addr:#x} is zero");
-                return false;
+                break 'crn false;
             }
             // The terminal frame's own `setfield_vable` operations committed
             // the frame fields they wrote, but the aborted mid-expression
@@ -2412,14 +2422,14 @@ fn try_adopt_multi_frame_blackhole(
             // performs.
             let Some(terminal) = mf_terminal.as_mut() else {
                 mfdbg!("no terminal image for the ContinueRunningNormally handoff");
-                return false;
+                break 'crn false;
             };
             let Ok(terminal_jitcode_index) = i32::try_from(terminal.jitcode_index) else {
                 mfdbg!(
                     "terminal jitcode index {} out of range",
                     terminal.jitcode_index
                 );
-                return false;
+                break 'crn false;
             };
             // Snapshot, not `root_addr`: with the fold above the match the
             // snapshot is the committed image the epilogue propagates,
@@ -2435,7 +2445,7 @@ fn try_adopt_multi_frame_blackhole(
                 resume_py_pc,
             ) {
                 mfdbg!("apply_blackhole_crn rejected the terminal image");
-                return false;
+                break 'crn false;
             }
             WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
             true
@@ -2478,7 +2488,13 @@ fn try_adopt_multi_frame_blackhole(
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] adopted multi-frame terminal depth={depth}");
         }
+    } else {
+        // Same withdrawal as the single-frame arm: an unadoptable terminal
+        // returns to legacy escape/replay, which resumes the walked frame from
+        // its pre-walk state.
+        crate::state::restore_frame_locals(root_addr, &locals_undo);
     }
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
     adopted
 }
 
