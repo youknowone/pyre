@@ -67,6 +67,7 @@
 pub(crate) mod bigint_binop;
 pub(crate) mod bool_then;
 pub(crate) mod checked_arith;
+pub(crate) mod graph_body;
 pub(crate) mod iter_next;
 pub mod llbc_hints;
 pub mod mir;
