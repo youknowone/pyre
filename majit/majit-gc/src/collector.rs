@@ -2047,11 +2047,11 @@ impl MiniMarkGC {
         }
     }
 
-    /// `inspector.py:get_rpy_roots` / `gc.enumerate_all_roots`: snapshot the
-    /// same complete root set used by major marking. The returned Vec is raw
-    /// (system-allocator) storage, matching inspector.py's preallocated raw
-    /// root list rather than creating a GC-visible side table.
-    fn enumerate_all_root_values(&self) -> Vec<GcRef> {
+    /// Snapshot the root walk shared by inspection and major marking. The
+    /// finalizer lists are appended by the caller because
+    /// `gc.enumerate_all_roots` includes live registered finalizers, whereas
+    /// major marking must leave those objects to the finalization-order pass.
+    fn enumerate_root_walker_values(&self) -> Vec<GcRef> {
         // incminimark.py:2717 collect_roots: root_walker.walk_roots()
         // walks the same root sets as minor collection.
         let mut result = Vec::new();
@@ -2126,6 +2126,29 @@ impl MiniMarkGC {
         crate::shadow_stack::walk_extra_roots(|gcref| {
             result.push(*gcref);
         });
+        result
+    }
+
+    /// `inspector.py:get_rpy_roots` / `gc.enumerate_all_roots`: snapshot all
+    /// inspection roots in the order from `gc/base.py:enumerate_all_roots`.
+    /// The returned Vec is raw system-allocator storage, matching
+    /// inspector.py's preallocated raw root list.
+    fn enumerate_all_root_values(&self) -> Vec<GcRef> {
+        let mut result = self.enumerate_root_walker_values();
+        // incminimark.py:2734-2736 `enum_live_with_finalizers`: registered
+        // finalizer objects remain roots even before they become unreachable
+        // and move to an app-visible death queue. AddressDeque.foreach(..., 2)
+        // visits every object address while skipping each paired queue index.
+        result.extend(
+            self.probably_young_objects_with_finalizers
+                .iter()
+                .map(|&(addr, _)| GcRef(addr)),
+        );
+        result.extend(
+            self.old_objects_with_finalizers
+                .iter()
+                .map(|&(addr, _)| GcRef(addr)),
+        );
 
         // gc/base.py `enum_pending_finalizers`: objects already moved to a
         // death queue remain GC roots until app-level code pops them.
@@ -2145,7 +2168,18 @@ impl MiniMarkGC {
         // seeds stack roots for a major marking cycle. Mirror the same
         // root sets as minor collection, but mark old objects instead of
         // copying nursery objects.
-        for gcref in self.enumerate_all_root_values() {
+        let mut roots = self.enumerate_root_walker_values();
+        // Objects already moved to a death queue remain ordinary roots until
+        // app-level code pops them. Registered live finalizers are deliberately
+        // absent here; incminimark's finalization-order pass decides whether
+        // they survive or move to the death queue.
+        roots.extend(
+            self.finalizer_handlers
+                .iter()
+                .flat_map(|handler| handler.deque.iter().copied())
+                .map(GcRef),
+        );
+        for gcref in roots {
             self.seed_major_root(gcref);
         }
     }
@@ -2188,9 +2222,9 @@ impl MiniMarkGC {
 
     /// `rpython/rlib/rgc.py:1224 do_get_objects`, using MiniMark's
     /// GCFLAG_EXTRA exactly as the translated RPython path does.
-    pub fn do_get_objects(&mut self, generation: i8) -> Vec<GcRef> {
+    pub fn do_get_objects(&mut self, generation: i8, visitor: &mut dyn FnMut(GcRef)) {
         if generation == 1 {
-            return Vec::new();
+            return;
         }
         let _stw = if crate::gc_sync::stw_required() {
             Some(crate::gc_sync::quiesce_mutators())
@@ -2239,7 +2273,9 @@ impl MiniMarkGC {
             unsafe { (*hdr).clear_flag(flags::EXTRA) };
             self.visit_referents(gcref.0, &mut |child| pending.push(child));
         }
-        result
+        for gcref in result {
+            visitor(gcref);
+        }
     }
 
     /// Drive incremental major-collection progress after a minor collection.
@@ -3723,8 +3759,8 @@ impl GcAllocator for MiniMarkGC {
         self.do_collect_full();
     }
 
-    fn get_objects(&mut self, generation: i8) -> Vec<GcRef> {
-        self.do_get_objects(generation)
+    fn get_objects(&mut self, generation: i8, visitor: &mut dyn FnMut(GcRef)) {
+        self.do_get_objects(generation, visitor)
     }
 
     fn collect_oldgen_nonmoving(&mut self) {
@@ -4103,13 +4139,18 @@ mod tests {
             gc.roots.add(&mut holder);
         }
 
-        let all = gc.do_get_objects(-1);
+        let get_objects = |gc: &mut MiniMarkGC, generation| {
+            let mut result = Vec::new();
+            gc.do_get_objects(generation, &mut |gcref| result.push(gcref));
+            result
+        };
+        let all = get_objects(&mut gc, -1);
         assert_eq!(all.len(), 2);
         assert!(all.contains(&holder));
         assert!(all.contains(&leaf));
-        assert_eq!(gc.do_get_objects(0).len(), 2);
-        assert!(gc.do_get_objects(1).is_empty());
-        assert!(gc.do_get_objects(2).is_empty());
+        assert_eq!(get_objects(&mut gc, 0).len(), 2);
+        assert!(get_objects(&mut gc, 1).is_empty());
+        assert!(get_objects(&mut gc, 2).is_empty());
         for object in [holder, raw, leaf] {
             assert!(!unsafe { (*header_of(object.0)).has_flag(flags::EXTRA) });
         }
@@ -4117,8 +4158,8 @@ mod tests {
         gc.do_collect_nursery();
         let raw = unsafe { *(holder.0 as *const GcRef) };
         let leaf = unsafe { *(raw.0 as *const GcRef) };
-        assert!(gc.do_get_objects(0).is_empty());
-        let old = gc.do_get_objects(2);
+        assert!(get_objects(&mut gc, 0).is_empty());
+        let old = get_objects(&mut gc, 2);
         assert_eq!(old.len(), 2);
         assert!(old.contains(&holder));
         assert!(old.contains(&leaf));
@@ -4126,6 +4167,21 @@ mod tests {
             assert!(!unsafe { (*header_of(object.0)).has_flag(flags::EXTRA) });
         }
         gc.roots.clear();
+    }
+
+    #[test]
+    fn get_objects_includes_live_objects_registered_with_finalizers() {
+        fn trigger() {}
+
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let object_tid = gc.register_type(TypeInfo::object(ptr_size));
+        let object = gc.alloc_with_type(object_tid, ptr_size);
+        gc.register_finalizer(0, object, trigger);
+
+        let mut objects = Vec::new();
+        gc.do_get_objects(-1, &mut |gcref| objects.push(gcref));
+        assert!(objects.contains(&object));
     }
 
     #[test]

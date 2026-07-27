@@ -1607,8 +1607,9 @@ fn collect_full_via_active_runtime() {
     with_cranelift_gc(|gc| gc.collect_full());
 }
 
-fn get_objects_via_active_runtime(generation: i8) -> Vec<GcRef> {
-    with_cranelift_gc(|gc| gc.get_objects(generation)).unwrap_or_default()
+fn get_objects_via_active_runtime(generation: i8, visitor: majit_gc::GetObjectsVisitorFn) {
+    let mut visit = visitor;
+    with_cranelift_gc(|gc| gc.get_objects(generation, &mut visit));
 }
 
 /// Non-moving old-gen-only major trampoline — sweeps dead old-gen objects

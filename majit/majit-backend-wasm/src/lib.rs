@@ -468,8 +468,9 @@ fn wasm_collect_oldgen_nonmoving() {
     with_wasm_active_gc_mut(|gc| gc.collect_oldgen_nonmoving());
 }
 
-fn wasm_get_objects(generation: i8) -> Vec<GcRef> {
-    with_wasm_active_gc_mut(|gc| gc.get_objects(generation)).unwrap_or_default()
+fn wasm_get_objects(generation: i8, visitor: majit_gc::GetObjectsVisitorFn) {
+    let mut visit = visitor;
+    with_wasm_active_gc_mut(|gc| gc.get_objects(generation, &mut visit));
 }
 
 fn wasm_register_finalizer(fq_index: usize, obj: GcRef, trigger: majit_gc::FinalizerTriggerFn) {

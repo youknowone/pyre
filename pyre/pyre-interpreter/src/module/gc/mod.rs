@@ -97,8 +97,7 @@ crate::py_module! {
             #[default(w_none())] generation: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
             // CPython 3.14 `gc.get_objects(generation=None)`: -1/None means
-            // every generation, generation 1 is empty after its removal, and
-            // 0/2 select the young/old generations.
+            // every generation; 0 through 2 select a generation.
             let generation = if unsafe { is_none(generation) } {
                 -1
             } else {
@@ -115,13 +114,13 @@ crate::py_module! {
                 ));
             }
             let _roots = pyre_object::gc_roots::push_roots();
-            let objects = majit_gc::get_objects(generation as i8);
-            for &object in &objects {
+            let first = pyre_object::gc_roots::shadow_stack_len();
+            fn pin_object(object: majit_ir::GcRef) {
                 pyre_object::gc_roots::pin_root(object.0 as PyObjectRef);
             }
-            let first = pyre_object::gc_roots::shadow_stack_len() - objects.len();
-            let objects = (0..objects.len())
-                .map(|index| pyre_object::gc_roots::shadow_stack_get(first + index))
+            majit_gc::get_objects(generation as i8, pin_object);
+            let objects = (first..pyre_object::gc_roots::shadow_stack_len())
+                .map(pyre_object::gc_roots::shadow_stack_get)
                 .collect();
             Ok(w_list_new_object(objects))
         }

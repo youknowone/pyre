@@ -11,7 +11,7 @@ assert isinstance(gc.collect(generation=2), int)
 
 
 class Index:
-    def __index__(self):
+    def __index__(self) -> int:
         return 0
 
 
@@ -32,7 +32,7 @@ assert isinstance(gc.get_objects(None), list)
 assert isinstance(gc.get_objects(generation=None), list)
 assert isinstance(gc.get_objects(-1), list)
 assert isinstance(gc.get_objects(0), list)
-assert gc.get_objects(1) == []
+assert isinstance(gc.get_objects(1), list)
 assert isinstance(gc.get_objects(2), list)
 assert isinstance(gc.get_objects(Index()), list)
 
