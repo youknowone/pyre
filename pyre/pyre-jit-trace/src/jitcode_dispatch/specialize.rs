@@ -3924,6 +3924,216 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `math.sqrt(x)` on an exact int/float argument: inline the domain-guarded
+/// pure `CALL_F(sqrt_nonneg_jit)` (ll_math.rs `ll_math_sqrt` → `sqrt_nonneg`,
+/// EF_ELIDABLE_CANNOT_RAISE) instead of the opaque
+/// `bh_call_fn(sqrt_builtin, NULL, x)` residual, so the result `W_FloatObject`
+/// virtualizes.  Two guards pin the branches of `ll_math_sqrt`: `x >= 0` (the
+/// ValueError direction) and `isfinite(x)` (NaN/±inf take the residual).  A
+/// negative argument raises in the concrete pre-exec below and declines to the
+/// generic residual (which records the raise).  Any non-matching shape falls
+/// through to the generic residual (SAFE).
+pub(crate) fn try_walker_specialize_math_sqrt<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // Plain `bh_call_fn(callable, PY_NULL, arg)` shape only.
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(arg_obj),
+    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    else {
+        return Ok(None);
+    };
+    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl` prepends
+    // as arg0 — not a plain `sqrt(x)` call.
+    if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
+        return Ok(None);
+    }
+    if !pyre_interpreter::module::math::interp_math::is_math_sqrt_function(concrete_callable) {
+        return Ok(None);
+    }
+    // Exact int/bool/float argument only — a numeric subclass keeps the builtin
+    // `ob_type` layout but a Python-visible `w_class`, and the `guard_class`
+    // the coercion emits reads `ob_type`, so it would not catch the subclass.
+    let (is_int, val) = unsafe {
+        if !pyre_object::is_exact_builtin_instance(arg_obj) {
+            return Ok(None);
+        }
+        // `bool` shares `W_IntObject`'s `intval`; it coerces through the int arm
+        // via its own `&BOOL_TYPE` guard inside `walker_coerce_operand_to_float`.
+        if pyre_object::is_int(arg_obj) {
+            (true, pyre_object::w_int_get_value(arg_obj) as f64)
+        } else if pyre_object::is_float(arg_obj) {
+            (false, pyre_object::w_float_get_value(arg_obj))
+        } else {
+            return Ok(None);
+        }
+    };
+    // Cold domain: NaN/±inf and negatives take the opaque residual (the
+    // negative direction also raises in the concrete pre-exec below).
+    if !(val.is_finite() && val >= 0.0) {
+        return Ok(None);
+    }
+    // Authentic boxed result, produced on the plain eval loop exactly as the
+    // skipped residual would.  Declines on any raise (defensive; the cold
+    // domain is already excluded above).
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &[arg_obj])
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+
+    // --- emit the specialized IR (walker-native) ---
+    // Pin the callable identity (the module-attr fold usually makes it a
+    // constant already; guard only when it is not).
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx.heap_cache_mut().replace_box(callable_op, expected);
+    }
+    // Coerce the argument to a raw float (int → guard_class + unbox +
+    // CastIntToFloat; float → guard_class + unbox).
+    let x = walker_coerce_operand_to_float(ctx, op.pc, r_args[2], arg_obj, is_int, val, false)?;
+    // `ll_math_sqrt` domain guards: `if x < 0.0` (FloatLt pinned false) and
+    // `if isfinite(x)` (FloatSub(x,x) == 0 pinned true — excludes NaN/±inf).
+    let zero = ctx.trace_ctx.const_float(0.0f64.to_bits() as i64);
+    walker_float_cmp_guard(ctx, op.pc, OpCode::FloatLt, &[x, zero], false)?;
+    let diff = ctx.trace_ctx.record_op(OpCode::FloatSub, &[x, x]);
+    ctx.trace_ctx
+        .set_opref_concrete(diff, majit_ir::Value::Float(0.0));
+    walker_float_cmp_guard(ctx, op.pc, OpCode::FloatEq, &[diff, zero], true)?;
+    // The pure elidable libm sqrt: EF_ELIDABLE_CANNOT_RAISE → CALL_F, no
+    // trailing guard, foldable/hoistable.
+    let raw = ctx.trace_ctx.call_float_typed_with_effect(
+        crate::trace_opcode::sqrt_nonneg_jit as *const (),
+        &[x],
+        &[majit_ir::Type::Float],
+        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+    );
+    let result_val = unsafe { pyre_object::w_float_get_value(boxed_result) };
+    ctx.trace_ctx
+        .set_opref_concrete(raw, majit_ir::Value::Float(result_val));
+    let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+    Ok(Some(()))
+}
+
+/// `float(x)` on an exact int/float argument: inline the conversion
+/// (`W_IntObject.descr_float` → `space.newfloat`, or the identity
+/// `float(f) is f` for an exact float) instead of the opaque
+/// `bh_call_fn(float_type, NULL, x)` residual, so the result virtualizes.  The
+/// callable must be the exact `float` type object; a rebound name or a float
+/// subclass (which reboxes rather than returning the argument) declines.  Any
+/// non-matching shape falls through to the generic residual (SAFE).
+pub(crate) fn try_walker_specialize_float_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(arg_obj),
+    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    else {
+        return Ok(None);
+    };
+    if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
+        return Ok(None);
+    }
+    // The callable must be the canonical `float` type object.
+    let float_type_obj =
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE);
+    if !std::ptr::eq(concrete_callable, float_type_obj) {
+        return Ok(None);
+    }
+    let (is_int, val) = unsafe {
+        if !pyre_object::is_exact_builtin_instance(arg_obj) {
+            return Ok(None);
+        }
+        if pyre_object::is_int(arg_obj) {
+            (true, pyre_object::w_int_get_value(arg_obj) as f64)
+        } else if pyre_object::is_float(arg_obj) {
+            (false, pyre_object::w_float_get_value(arg_obj))
+        } else {
+            return Ok(None);
+        }
+    };
+    // Authentic boxed result (float() is side-effect-free on int/float).
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &[arg_obj])
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+
+    // --- emit the specialized IR (walker-native) ---
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx.heap_cache_mut().replace_box(callable_op, expected);
+    }
+    let arg_op = r_args[2];
+    if is_int {
+        // int/bool → CastIntToFloat + inline wrapfloat (no residual call).
+        let raw = walker_coerce_operand_to_float(ctx, op.pc, arg_op, arg_obj, true, val, false)?;
+        let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
+        ctx.trace_ctx.set_opref_concrete(
+            boxed,
+            majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+        );
+        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+    } else {
+        // exact float → `float(f) is f`: forward the argument unchanged.  Only
+        // sound when the constructor actually returned the same object; a
+        // divergence (should not happen for an exact float) declines.
+        if !std::ptr::eq(boxed_result, arg_obj) {
+            return Ok(None);
+        }
+        let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
+        if !arg_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(arg_op) {
+            let type_const = ctx.trace_ctx.const_int(float_type_addr);
+            ctx.trace_ctx
+                .record_guard(OpCode::GuardClass, &[arg_op, type_const], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        }
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(arg_op, float_type_addr);
+        walker_guard_exact_w_class(ctx, op.pc, arg_op, float_type_obj)?;
+        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', arg_op)?;
+    }
+    Ok(Some(()))
+}
+
 /// #171 ORTHODOX descent of the real `w_list_append` charon body (WIP).
 ///
 /// Instead of hand-rolling the int-storage append IR (the fold below), walk

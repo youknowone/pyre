@@ -89,6 +89,18 @@ pub(crate) extern "C" fn ccall_pow(x: f64, y: f64) -> f64 {
     x.powf(y)
 }
 
+/// `sqrt_nonneg` (ll_math.rs:91) — `@jit.elidable`, `oopspec
+/// "math.sqrt_nonneg(x)"` (ll_math.py:72-75).  The trace records this as a
+/// pure `CALL_F(sqrt_nonneg_jit, x)` (EF_ELIDABLE_CANNOT_RAISE, no trailing
+/// guard) behind the domain-pinning guards emitted by
+/// `try_walker_specialize_math_sqrt`: `x >= 0` (excludes the ValueError
+/// direction) and `isfinite(x)` (excludes NaN/±inf).  Reached only with a
+/// finite, non-negative operand, so `x.sqrt()` cannot raise and matches
+/// `ll_math_sqrt`'s finite-nonneg branch bit-for-bit.
+pub(crate) extern "C" fn sqrt_nonneg_jit(x: f64) -> f64 {
+    x.sqrt()
+}
+
 pub(crate) extern "C" fn float_pow_jit(x: f64, y: f64) -> f64 {
     match pyre_interpreter::float_pow_raw(x, y) {
         Ok(z) => z,

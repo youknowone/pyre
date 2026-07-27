@@ -218,6 +218,26 @@ pm1_edom!(atanh, "expected a number between -1 and 1");
 
 // Exponential / logarithmic
 pm1_edom!(sqrt, "expected a nonnegative input");
+
+/// True iff `callable` is the canonical builtin `math.sqrt` function object.
+/// The JIT walker uses the builtin-code native fn-pointer identity to
+/// distinguish it from a value rebound under the same `math.sqrt` name, so a
+/// monkeypatched `math.sqrt` correctly declines the pure-inline specialization.
+pub fn is_math_sqrt_function(callable: PyObjectRef) -> bool {
+    unsafe {
+        if callable.is_null() || !crate::is_function(callable) {
+            return false;
+        }
+        let code = crate::function_get_code(callable) as PyObjectRef;
+        if code.is_null() || !crate::gateway::is_builtin_code(code) {
+            return false;
+        }
+        std::ptr::fn_addr_eq(
+            crate::gateway::builtin_code_get(code),
+            sqrt as crate::gateway::BuiltinCodeFn,
+        )
+    }
+}
 pm1!(cbrt);
 pm1!(exp);
 pm1!(exp2);
