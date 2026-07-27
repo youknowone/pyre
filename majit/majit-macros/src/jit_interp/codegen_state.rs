@@ -1867,6 +1867,20 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 }
             })
             .collect();
+        // `extract_live` pushes int scalars, then every fixed array's items,
+        // then the one identity slot. With no fixed arrays that position is a
+        // constant — `num_scalars` — so the identity can be DECLARED the way
+        // `warmspot.py:529-538` declares `index_of_virtualizable`, and
+        // `initialize_virtualizable` can look it up instead of searching the
+        // reds for a matching pointer. A fixed `[int]` array alongside a
+        // `[int; virt]` one would make the position depend on that array's
+        // runtime length; no front-end declares both, and the lookup falls
+        // back to the pointer match when it happens.
+        let identity_live_index_stmt: TokenStream = if arrays.is_empty() {
+            quote! { __info.identity_live_index = Some(#num_scalars); }
+        } else {
+            quote! {}
+        };
         quote! {
             #[allow(non_snake_case)]
             fn __build_virtualizable_info()
@@ -1889,6 +1903,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // `num_green_args + index_of_virtualizable` ordinal would
                 // resolve to 0, the slot the green ref occupies).
                 __info.identity_ref_bank_index = Some(1);
+                #identity_live_index_stmt
                 #(#virt_array_field_parts)*
                 Some(__info.finalize_arc(
                     majit_ir::descr::make_size_descr(::std::mem::size_of::<#state_type>()),

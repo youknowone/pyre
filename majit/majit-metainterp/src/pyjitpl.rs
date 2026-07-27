@@ -3059,6 +3059,36 @@ impl<M: Clone> MetaInterp<M> {
     /// `index_of_virtualizable`; the resolved virtualizable pointer and its
     /// ref-bank index are unchanged either way (the gate is a structural-parity
     /// no-op).
+    /// Position of the virtualizable identity inside `live_values`, the
+    /// state-field counterpart of `pyjitpl.py:3295 original_boxes[index]`.
+    ///
+    /// The host declares it (`identity_live_index`); this checks the declared
+    /// position actually holds `vable_ptr` before taking it, because
+    /// `live_values` also arrives from bridge entry, where the reds are rebuilt
+    /// from a deadframe rather than emitted by the state's `extract_live`. A
+    /// host that declares nothing, or whose reds disagree with the declaration,
+    /// falls back to matching the live pointer.
+    ///
+    /// `None` when the pointer is not in the reds at all — the caller then
+    /// mints the box at the declared ref-bank index instead.
+    fn identity_live_position(
+        info: &VirtualizableInfo,
+        live_values: &[Value],
+        vable_ptr: *const u8,
+    ) -> Option<usize> {
+        if vable_ptr.is_null() {
+            return None;
+        }
+        let vable_bits = vable_ptr as usize;
+        let holds_identity = |idx: usize| match live_values.get(idx) {
+            Some(Value::Ref(r)) => r.as_usize() == vable_bits,
+            _ => false,
+        };
+        info.identity_live_index
+            .filter(|idx| holds_identity(*idx))
+            .or_else(|| (0..live_values.len()).find(|idx| holds_identity(*idx)))
+    }
+
     fn initialize_virtualizable(&self, ctx: &mut TraceCtx, live_values: &[Value]) {
         // pyjitpl.py:3291: vinfo = self.jitdriver_sd.virtualizable_info
         // Prefer the trace-bound `active_jitdriver_sd` (RPython
@@ -3227,19 +3257,23 @@ impl<M: Clone> MetaInterp<M> {
         // bridge decoding that section resolves the identity to the wrong
         // deadframe slot.  `pyjitpl.py:3295 virtualizable_box =
         // original_boxes[index]` is a lookup of the red that HOLDS the
-        // virtualizable; recover the same box by matching the live pointer.
+        // virtualizable, so take the same lookup: `identity_live_index` is the
+        // host's declared position for it, the state-field counterpart of
+        // `warmspot.py:529-538 jd.index_of_virtualizable`.
         //
-        // The scan runs over `live_values`, NOT `original_boxes`: the latter is
-        // `[Void; num_green_args] ++ live_values` (the greens are positional
+        // The position indexes `live_values`, NOT `original_boxes`: the latter
+        // is `[Void; num_green_args] ++ live_values` (the greens are positional
         // placeholders so the `num_green_args + index_of_virtualizable` read
         // above lands), while trace inputargs are reds-only.  A position taken
         // in the `original_boxes` space would be `num_green_args` too high.
-        let identity_index = if info.identity_ref_bank_index.is_some() && !self.vable_ptr.is_null()
-        {
-            let vable_bits = self.vable_ptr as usize;
-            live_values
-                .iter()
-                .position(|value| matches!(value, Value::Ref(r) if r.as_usize() == vable_bits))
+        //
+        // The declared position is checked against the live pointer rather than
+        // trusted blind, because `live_values` also arrives from bridge entry,
+        // where the reds are rebuilt from a deadframe rather than emitted by
+        // `extract_live`.  A host that declares no position, or whose reds do
+        // not agree with it, falls back to matching the pointer.
+        let identity_index = if info.identity_ref_bank_index.is_some() {
+            Self::identity_live_position(info, live_values, self.vable_ptr)
         } else {
             None
         };
@@ -19907,6 +19941,69 @@ mod tests {
                 Some(&recovery_layout),
             ),
             vec![Type::Ref, Type::Int, Type::Float, Type::Ref]
+        );
+    }
+
+    /// `pyjitpl.py:3295` reads the virtualizable out of a DECLARED red
+    /// position; it never searches the reds for it. A red that happens to hold
+    /// the same pointer earlier in the vector — another name for the same
+    /// object — must not take the identity's place.
+    #[test]
+    fn test_declared_identity_position_wins_over_an_earlier_alias() {
+        let vable = 0x4000usize;
+        let mut info = VirtualizableInfo::without_vable_token();
+        info.identity_ref_bank_index = Some(1);
+        info.identity_live_index = Some(2);
+        // reds: [alias (Ref), stackpos (Int), &state (Ref)].
+        let live_values = [
+            Value::Ref(majit_ir::GcRef(vable)),
+            Value::Int(7),
+            Value::Ref(majit_ir::GcRef(vable)),
+        ];
+
+        assert_eq!(
+            MetaInterp::<()>::identity_live_position(&info, &live_values, vable as *const u8),
+            Some(2),
+            "the declared position, not the first pointer match",
+        );
+    }
+
+    /// Bridge entry rebuilds the reds from a deadframe instead of the state's
+    /// `extract_live`, and a host with a fixed array alongside a virtualizable
+    /// one declares no position at all. Both fall back to the pointer match.
+    #[test]
+    fn test_identity_position_falls_back_when_the_declaration_does_not_hold() {
+        let vable = 0x4000usize;
+        let live_values = [Value::Int(7), Value::Ref(majit_ir::GcRef(vable))];
+
+        let mut declared_elsewhere = VirtualizableInfo::without_vable_token();
+        declared_elsewhere.identity_ref_bank_index = Some(1);
+        declared_elsewhere.identity_live_index = Some(5);
+        assert_eq!(
+            MetaInterp::<()>::identity_live_position(
+                &declared_elsewhere,
+                &live_values,
+                vable as *const u8,
+            ),
+            Some(1),
+            "a declaration the reds do not honour falls back to the pointer",
+        );
+
+        let mut undeclared = VirtualizableInfo::without_vable_token();
+        undeclared.identity_ref_bank_index = Some(1);
+        assert_eq!(
+            MetaInterp::<()>::identity_live_position(&undeclared, &live_values, vable as *const u8),
+            Some(1),
+        );
+
+        assert_eq!(
+            MetaInterp::<()>::identity_live_position(
+                &undeclared,
+                &live_values,
+                std::ptr::null::<u8>(),
+            ),
+            None,
+            "no live pointer means no red holds the identity",
         );
     }
 

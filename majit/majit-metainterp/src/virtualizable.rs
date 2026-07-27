@@ -230,6 +230,20 @@ pub struct VirtualizableInfo {
     /// box's ref-bank index so it matches the lowering's `vable_input_ref_reg`.
     /// `None` (PyFrame and tests) leaves the flat formula unchanged.
     pub identity_ref_bank_index: Option<usize>,
+    /// Flat position of the virtualizable identity inside the reds the host
+    /// hands `initialize_virtualizable` as `live_values`.
+    ///
+    /// `pyjitpl.py:3295 virtualizable_box = original_boxes[index]` is a lookup
+    /// at a DECLARED position — `warmspot.py:529-538` fixes
+    /// `index_of_virtualizable` when the driver is registered, and nothing at
+    /// snapshot time searches for the box. Hosts whose reds are not the
+    /// jitdriver's `reds` list (the state-field JIT expands its state fields
+    /// into the red vector) publish the identity's position here so pyre can
+    /// take the same lookup instead of matching on the live pointer.
+    ///
+    /// `None` (PyFrame and tests) means the flat `num_green_args +
+    /// index_of_virtualizable` formula already names the box.
+    pub identity_live_index: Option<usize>,
 }
 
 impl Clone for VirtualizableInfo {
@@ -253,6 +267,7 @@ impl Clone for VirtualizableInfo {
             clear_vable_ptr: self.clear_vable_ptr,
             clear_vable_descr: self.clear_vable_descr.clone(),
             identity_ref_bank_index: self.identity_ref_bank_index,
+            identity_live_index: self.identity_live_index,
         }
     }
 }
@@ -315,6 +330,7 @@ impl VirtualizableInfo {
             clear_vable_ptr: None,
             clear_vable_descr: None,
             identity_ref_bank_index: None,
+            identity_live_index: None,
         }
     }
 
