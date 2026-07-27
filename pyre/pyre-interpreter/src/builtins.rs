@@ -7,6 +7,8 @@ use crate::{
 };
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 
 /// `buffer_w` — select the byte-storage `Buffer` variant for a memoryview
 /// backing by concrete kind, so a bytes / bytearray / array *subclass* backing
@@ -11736,22 +11738,24 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
 
-    let path = unsafe {
+    // The OS path is a byte string.  A `str` path may carry surrogateescape
+    // code points, which spell bytes that are not valid UTF-8; folding those
+    // to U+FFFD would open a different file, so the encoded bytes are kept
+    // and handed to the seam verbatim.
+    let path_bytes = unsafe {
         if pyre_object::is_str(path_obj) {
-            crate::baseobjspace::str_utf8_w(path_obj)?.to_string()
+            crate::gateway::fsencode_bytes_w(path_obj)?
         } else if pyre_object::bytesobject::is_bytes_like(path_obj) {
-            let data = pyre_object::bytesobject::bytes_like_data(path_obj);
-            String::from_utf8_lossy(data).into_owned()
+            pyre_object::bytesobject::bytes_like_data(path_obj).to_vec()
         } else if let Some(fspath_fn) = crate::typedef::r#type(path_obj)
             .and_then(|pt| crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__"))
         {
             // `type(path).__fspath__(path)` — unbound descriptor + single arg.
             let result = crate::call::call_function_impl_result(fspath_fn, &[path_obj])?;
             if pyre_object::is_str(result) {
-                crate::baseobjspace::str_utf8_w(result)?.to_string()
+                crate::gateway::fsencode_bytes_w(result)?
             } else if pyre_object::bytesobject::is_bytes_like(result) {
-                let data = pyre_object::bytesobject::bytes_like_data(result);
-                String::from_utf8_lossy(data).into_owned()
+                pyre_object::bytesobject::bytes_like_data(result).to_vec()
             } else {
                 return Err(crate::PyError::type_error(
                     "open(): path should be str, bytes, os.PathLike",
@@ -11763,6 +11767,11 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             ));
         }
     };
+    // `host_env::fs` takes a `Path`; only the seam consumes the raw bytes.
+    #[cfg(unix)]
+    let path = std::ffi::OsString::from_vec(path_bytes.clone());
+    #[cfg(not(unix))]
+    let path = String::from_utf8_lossy(&path_bytes).into_owned();
     let binary = mode.contains('b');
     let writing = mode.contains('w') || mode.contains('a') || mode.contains('x');
     let reading = mode.contains('r') || !writing;
@@ -11815,8 +11824,9 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     {
         let _ = (reading, writing);
         let flags = open_flags_for_mode(&mode);
-        let fd = crate::host_seam::ops::open(path.as_bytes(), flags, 0o666)
-            .map_err(|e| crate::host_seam::seam_os_err(e, &path))?;
+        let path_display = String::from_utf8_lossy(&path_bytes);
+        let fd = crate::host_seam::ops::open(&path_bytes, flags, 0o666)
+            .map_err(|e| crate::host_seam::seam_os_err(e, &path_display))?;
         if let Err(error) = fileio_validate_fd(fd, path_obj) {
             fileio_close_owned_fd(fd);
             return Err(error);
@@ -11843,8 +11853,9 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // close(), which is not the W_FileIO storage shape.
         let _ = (reading, writing);
         let flags = open_flags_for_mode(&mode);
-        let fd = crate::host_seam::ops::open(path.as_bytes(), flags, 0o666)
-            .map_err(|e| crate::host_seam::seam_os_err(e, &path))?;
+        let path_display = String::from_utf8_lossy(&path_bytes);
+        let fd = crate::host_seam::ops::open(&path_bytes, flags, 0o666)
+            .map_err(|e| crate::host_seam::seam_os_err(e, &path_display))?;
         if let Err(error) = fileio_validate_fd(fd, path_obj) {
             fileio_close_owned_fd(fd);
             return Err(error);

@@ -1236,18 +1236,18 @@ mod tests {
 // (gateway.py visit_fsencode line 365) and by posix call sites that
 // previously inlined the same extraction.
 pub fn fsencode_w(obj: pyre_object::PyObjectRef) -> Result<String, crate::PyError> {
+    let data = fsencode_bytes_w(obj)?;
+    Ok(String::from_utf8_lossy(&data).into_owned())
+}
+
+pub fn fsencode_bytes_w(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
     unsafe {
         if pyre_object::is_str(obj) {
-            // A path str may carry lone surrogates (surrogateescape decoding),
-            // so read it through the WTF-8 view and lossily fold surrogates to
-            // U+FFFD rather than panicking in the strict `&str` accessor.
-            return Ok(pyre_object::w_str_get_wtf8(obj)
-                .to_string_lossy()
-                .into_owned());
+            return fsencode_str_bytes(obj);
         }
         if pyre_object::bytesobject::is_bytes_like(obj) {
             let data = pyre_object::bytesobject::bytes_like_data(obj);
-            return Ok(String::from_utf8_lossy(data).into_owned());
+            return Ok(data.to_vec());
         }
     }
     // `type(path).__fspath__(path)` — the descriptor read off the type is
@@ -1258,17 +1258,40 @@ pub fn fsencode_w(obj: pyre_object::PyObjectRef) -> Result<String, crate::PyErro
         let result = crate::call::call_function_impl_result(fspath_fn, &[obj])?;
         unsafe {
             if pyre_object::is_str(result) {
-                return Ok(pyre_object::w_str_get_wtf8(result)
-                    .to_string_lossy()
-                    .into_owned());
+                return fsencode_str_bytes(result);
             }
             if pyre_object::bytesobject::is_bytes_like(result) {
                 let data = pyre_object::bytesobject::bytes_like_data(result);
-                return Ok(String::from_utf8_lossy(data).into_owned());
+                return Ok(data.to_vec());
             }
         }
     }
     Err(crate::PyError::type_error(
         "expected str, bytes or os.PathLike",
     ))
+}
+
+fn fsencode_str_bytes(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+    let wtf8 = unsafe { pyre_object::w_str_get_wtf8(obj) };
+    let mut out = Vec::with_capacity(wtf8.len());
+    for (pos, cp) in wtf8.code_points().enumerate() {
+        if let Some(ch) = cp.to_char() {
+            let mut buf = [0; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        let code = cp.to_u32();
+        if (0xDC80..=0xDCFF).contains(&code) {
+            out.push((code - 0xDC00) as u8);
+        } else {
+            return Err(crate::typedef::unicode_encode_error(
+                "utf-8",
+                obj,
+                pos,
+                pos + 1,
+                "surrogates not allowed",
+            ));
+        }
+    }
+    Ok(out)
 }
