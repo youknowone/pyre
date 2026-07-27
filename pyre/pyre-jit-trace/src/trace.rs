@@ -1532,6 +1532,30 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     cf_addr: usize,
     carrier: &majit_metainterp::BridgeInlineCarrier,
 ) -> TraceAction {
+    let action = drive_bridge_carrier_walk_inner(ctx, sym, w_code, root_pc, cf_addr, carrier);
+    // `pyframe.py:316-358 execute_frame` closes every resumed frame from its
+    // `finally: executioncontext.leave(...)`, including when tracing the
+    // continuation declines.  Successful carrier drives close frames as each
+    // return is threaded below; this finally-shaped epilogue closes any
+    // restored scopes left by setup failures, walk errors, or abort paths.
+    while ctx.virtualref_boxes_len() >= 2 {
+        let before = ctx.virtualref_boxes_len();
+        crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, false);
+        if ctx.virtualref_boxes_len() == before {
+            break;
+        }
+    }
+    action
+}
+
+fn drive_bridge_carrier_walk_inner<Sym: WalkSym>(
+    ctx: &mut TraceCtx,
+    sym: &mut Sym,
+    w_code: *const (),
+    root_pc: usize,
+    cf_addr: usize,
+    carrier: &majit_metainterp::BridgeInlineCarrier,
+) -> TraceAction {
     let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession::default());
     crate::jitcode_dispatch::bool_box_truth_reset();
     crate::jitcode_dispatch::fbw_finish_payload_reset();
@@ -1623,6 +1647,14 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             &[]
         },
     );
+    let deepest_got_exception = matches!(
+        &walk,
+        Some(Ok((
+            crate::jitcode_dispatch::DispatchOutcome::SubRaise { .. },
+            _
+        )))
+    );
+    crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, deepest_got_exception);
     // 2b-ii: on a clean single-recipe `SubReturn`, thread the callee result
     // into the root's operand-stack result slot and walk the ROOT top-level to
     // compile the bridge (the recorded callee continuation + the root
@@ -1646,9 +1678,6 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         let want_compile = n >= 1 && n <= crate::jitcode_dispatch::fbw_max_multiframe_depth();
         let mut middles_ok = true;
         if want_compile {
-            // The deepest carrier frame has returned; close the `virtual_ref`
-            // scope its `enter` opened in the parent trace.
-            crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, false);
             for i in (0..n.saturating_sub(1)).rev() {
                 // recipes[i]'s paused parents are the shallower frames
                 // recipes[..i] (the root sits above them all).
@@ -1668,7 +1697,6 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                         break;
                     }
                 }
-                crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, false);
             }
         }
         if want_compile && middles_ok {
@@ -1711,10 +1739,6 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     if let Some((exc, exc_concrete)) = subwalk_raise {
         if carrier.recipes.len() == 1 {
             if let Some(catch_target) = carrier_root_catch_target(sym, root_pc) {
-                // The carrier frame is unwinding, so this is `leave`'s
-                // `got_exception=True` arm: the caller is marked escaped and
-                // the leaving frame's own vref is forced.
-                crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, true);
                 crate::jitcode_dispatch::set_carrier_raise_seed(
                     crate::jitcode_dispatch::CarrierRaiseSeed {
                         exc,
@@ -1841,6 +1865,14 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         paused_parents,
         child_result,
     );
+    let got_exception = matches!(
+        &middle_walk,
+        Some(Ok((
+            crate::jitcode_dispatch::DispatchOutcome::SubRaise { .. },
+            _
+        )))
+    );
+    crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, got_exception);
     match middle_walk {
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubReturn {

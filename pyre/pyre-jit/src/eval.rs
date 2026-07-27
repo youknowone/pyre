@@ -3825,7 +3825,7 @@ unsafe extern "C" fn force_pyframe_vref(
             // the vref names, then run the guard's async forcing, which is
             // what writes `virtual_token = TOKEN_NONE` and `forced` back.
             let token = (*v).virtual_token as usize as u64;
-            driver.meta_interp_mut().force_virtualizable_token(token);
+            driver.force_virtualizable_token(token);
         })
     };
     // `virtualref.py:174-176` — `token == TOKEN_NONE` with no `forced` means

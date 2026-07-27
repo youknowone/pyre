@@ -11565,6 +11565,23 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
         fail_values: &[i64],
     ) -> Option<(Vec<i64>, Vec<i64>)> {
+        self.handle_async_forcing_with_allocator(
+            green_key,
+            trace_id,
+            fail_index,
+            fail_values,
+            &crate::resume::NullAllocator,
+        )
+    }
+
+    fn handle_async_forcing_with_allocator(
+        &mut self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+        fail_values: &[i64],
+        allocator: &dyn crate::resume::BlackholeAllocator,
+    ) -> Option<(Vec<i64>, Vec<i64>)> {
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit][handle_async_forcing] key={} trace={} fail={} nvals={}",
@@ -11626,7 +11643,6 @@ impl<M: Clone> MetaInterp<M> {
         let deadframe_types = self.get_recovery_slot_types(green_key, norm_tid, fail_index);
         // compile.py:990-991: vinfo = self.jitdriver_sd.virtualizable_info
         let vinfo = self.virtualizable_info();
-        let allocator = crate::resume::NullAllocator;
         let all_liveness = self.staticdata.liveness_info.as_slice();
         let (all_virtuals_ptr, all_virtuals_int) = crate::resume::force_from_resumedata(
             rd_numb,
@@ -11639,7 +11655,7 @@ impl<M: Clone> MetaInterp<M> {
             Some(&self.staticdata.virtualref_info as &dyn crate::resume::VRefInfo),
             vinfo.map(|v| v.as_ref() as &dyn crate::resume::VirtualizableInfo),
             None, // ginfo — pyre has no greenfield mechanism
-            &allocator,
+            allocator,
         );
         drop(_cc_guard);
         // compile.py:999-1000: obj = AllVirtuals(all_virtuals)
@@ -11657,6 +11673,14 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Force a running virtualizable identified by its backend force token.
     pub fn force_virtualizable_token(&mut self, token: u64) {
+        self.force_virtualizable_token_with_allocator(token, &crate::resume::NullAllocator);
+    }
+
+    pub fn force_virtualizable_token_with_allocator(
+        &mut self,
+        token: u64,
+        allocator: &dyn crate::resume::BlackholeAllocator,
+    ) {
         let deadframe = self
             .backend
             .force(GcRef(token as usize))
@@ -11681,7 +11705,13 @@ impl<M: Clone> MetaInterp<M> {
                 Type::Void => 0,
             })
             .collect::<Vec<_>>();
-        let _ = self.handle_async_forcing(green_key, trace_id, fail_index, &fail_values);
+        let _ = self.handle_async_forcing_with_allocator(
+            green_key,
+            trace_id,
+            fail_index,
+            &fail_values,
+            allocator,
+        );
     }
 
     pub fn is_force_token_armed(&self, token: u64) -> bool {

@@ -4535,6 +4535,20 @@ impl<S: JitState> JitDriver<S> {
         &mut self.meta
     }
 
+    /// `compile.py:966-1000 ResumeGuardForcedDescr.force_now` materializes
+    /// virtuals through the same resume allocator used by ordinary guard
+    /// failure.  In particular, a `jit.virtual_ref` frame must not be decoded
+    /// through `NullAllocator`, or its `forced` writeback remains null.
+    pub fn force_virtualizable_token(&mut self, token: u64) {
+        let fallback_alloc = crate::resume::NullAllocator;
+        let allocator: &dyn crate::resume::BlackholeAllocator = self
+            .blackhole_allocator
+            .as_deref()
+            .unwrap_or(&fallback_alloc);
+        self.meta
+            .force_virtualizable_token_with_allocator(token, allocator);
+    }
+
     fn prepare_exit_resume_heap_with_blackhole_allocator(
         &self,
         exit_layout: &CompiledExitLayout,
