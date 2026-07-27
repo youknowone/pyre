@@ -17,7 +17,15 @@
 # `list_extend` residual.  Previously LIST_EXTEND had no walker handler
 # and emitted an abort that, reached on the resume walk, invalidated the
 # live frame and crashed (SIGSEGV) — the residual port fixes that.
-N = 2000000
+#
+# N is sized so PyPy's startup-subtracted user-CPU stays well clear of its own
+# empty-program startup. The gate divides by that difference, so a workload
+# finishing near startup makes the denominator a residue of two similar
+# measurements: at N=2000000 PyPy's whole run is shorter than its startup, the
+# difference clamps to the 5ms floor, and unchanged code reports anywhere from
+# 3x to 18x depending on runner speed. At this N the ratio is 1.8x (dynasm) /
+# 1.9x (cranelift), which is the value the gate is meant to bound.
+N = 20000000
 
 
 def divide_by_zero_const(n):

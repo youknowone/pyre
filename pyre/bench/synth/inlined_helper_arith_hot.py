@@ -20,7 +20,15 @@
 # measures the admitted paths rather than cases that are meant to stay slow.
 # Callees are named directly rather than passed in, so the call site keeps a
 # constant callee. Output verified against CPython/PyPy.
-N = 200000
+#
+# N is sized so PyPy's startup-subtracted user-CPU stays well clear of its own
+# empty-program startup. The gate divides by that difference, so a workload
+# finishing near startup makes the denominator a residue of two similar
+# measurements: at N=200000 it lands on the 5ms floor and unchanged code
+# reports anywhere from 6x to 22x depending on runner speed. At this N the
+# ratio is 2.5x (dynasm) / 3.1x (cranelift), which is the value the gate is
+# meant to bound.
+N = 4000000
 
 
 def add_body(a, i):
