@@ -413,12 +413,28 @@ fn install_panic_hook() {
 #[cfg(any(feature = "web", feature = "wasm-host"))]
 thread_local! {
     static OUTPUT_BUF: RefCell<String> = RefCell::new(String::new());
+    /// fd-2 capture. wasm32 has no descriptors, so everything the interpreter
+    /// writes to stderr — tracebacks, warnings, `sys.stderr.write` — is
+    /// collected here and handed to the embedder separately from stdout.
+    static ERR_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    /// Process status the run ends with: 0, or `SystemExit`'s code, or 1 for
+    /// an uncaught exception. `targetpypystandalone.py:37 entry_point` returns
+    /// the same value; the embedder exits with it.
+    static EXIT_CODE: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    /// Path the source came from, if the embedder named one. The guest is
+    /// handed source text, not a file, so without it every code object
+    /// compiles as `<string>` and a traceback can name neither the file nor
+    /// the offending line.
+    static SCRIPT_PATH: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 #[cfg(any(feature = "web", feature = "wasm-host"))]
 fn install_wasm_print_hook() {
     pyre_interpreter::set_print_hook(|s| {
         OUTPUT_BUF.with(|buf| buf.borrow_mut().push_str(s));
+    });
+    pyre_interpreter::set_stderr_hook(|b| {
+        ERR_BUF.with(|buf| buf.borrow_mut().extend_from_slice(b));
     });
 }
 
@@ -446,13 +462,36 @@ fn run_python_impl(source: &str) -> String {
     #[cfg(feature = "web")]
     pyre_interpreter::importing::mount_embedded_stdlib(std::path::Path::new("/lib-python/3"));
     #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
-    host_fs_provider::install();
+    {
+        // `pymain_sys_path_add_path0`: the script's directory heads
+        // `sys.path`, ahead of the stdlib root `install` appends, so a module
+        // beside the script shadows one of the same name in the stdlib.
+        if let Some(dir) = SCRIPT_PATH
+            .with(|p| p.borrow().clone())
+            .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
+        {
+            pyre_interpreter::importing::add_sys_path(&dir);
+        }
+        host_fs_provider::install();
+    }
     install_wasm_print_hook();
     OUTPUT_BUF.with(|buf| buf.borrow_mut().clear());
+    ERR_BUF.with(|buf| buf.borrow_mut().clear());
+    EXIT_CODE.with(|c| c.set(0));
 
-    let code = match compile_source(source, Mode::Exec) {
+    let filename = SCRIPT_PATH.with(|p| p.borrow().clone());
+    let filename = filename.as_deref().unwrap_or("<string>");
+    let code = match compile_source_with_filename(source, Mode::Exec, filename) {
         Ok(code) => code,
-        Err(e) => return format!("SyntaxError: {e}"),
+        Err(e) => {
+            // `pyrex::run_source` renders the same `File "…", line N` + caret
+            // banner on stderr and exits 1.
+            pyre_interpreter::eprint_syntax_error(&pyre_interpreter::compile_err_to_syntax_error(
+                e, source,
+            ));
+            EXIT_CODE.with(|c| c.set(1));
+            return String::new();
+        }
     };
 
     let execution_context = std::rc::Rc::new(PyExecutionContext::default());
@@ -504,6 +543,7 @@ fn run_python_impl(source: &str) -> String {
     })) {
         Ok(r) => r,
         Err(_) => {
+            EXIT_CODE.with(|c| c.set(1));
             let panic_msg = OUTPUT_BUF.with(|buf| buf.borrow().clone());
             return if panic_msg.is_empty() {
                 "[pyre] unknown panic".to_string()
@@ -525,21 +565,45 @@ fn run_python_impl(source: &str) -> String {
             }
         }
         Err(e) => {
-            if !output.is_empty() && !output.ends_with('\n') {
-                output.push('\n');
+            // `pyrex::real_main`: a `SystemExit` sets the status and prints
+            // nothing; anything else prints its traceback and exits 1.  Both
+            // go to stderr, so the run's stdout stays byte-comparable with the
+            // native binaries instead of gaining an `Error: …` tail.
+            if e.kind == pyre_interpreter::PyErrorKind::SystemExit {
+                EXIT_CODE.with(|c| c.set(pyre_interpreter::system_exit_code(&e)));
+            } else {
+                pyre_interpreter::eprint_exception(&e, true);
+                EXIT_CODE.with(|c| c.set(1));
             }
-            output.push_str(&format!("Error: {e}"));
         }
     }
 
     output
 }
 
+/// Bytes the run wrote to fd 2, draining the buffer.
+#[cfg(any(feature = "web", feature = "wasm-host"))]
+fn take_stderr() -> Vec<u8> {
+    ERR_BUF.with(|buf| std::mem::take(&mut *buf.borrow_mut()))
+}
+
 /// Browser / JS entry point: marshalled by wasm-bindgen.
+///
+/// The browser has one output channel, so the fd-2 text (traceback, warnings)
+/// is appended to the returned string rather than handed over separately the
+/// way the C-ABI surface does it.
 #[cfg(feature = "web")]
 #[wasm_bindgen]
 pub fn run_python(source: &str) -> String {
-    run_python_impl(source)
+    let mut output = run_python_impl(source);
+    let err = take_stderr();
+    if !err.is_empty() {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&String::from_utf8_lossy(&err));
+    }
+    output
 }
 
 /// Native-host (`wasm-host` feature) C-ABI surface.
@@ -549,7 +613,12 @@ pub fn run_python(source: &str) -> String {
 ///   1. `pyre_alloc(len)` → reserve `len` bytes, write the UTF-8 source there;
 ///   2. `pyre_run_python(ptr, len)` → run it, returns a packed `u64`
 ///      (`hi32` = result pointer, `lo32` = result byte length);
-///   3. read the UTF-8 result, then `pyre_dealloc(ptr, len)` both buffers.
+///   3. read the UTF-8 result, then `pyre_dealloc(ptr, len)` both buffers;
+///   4. `pyre_take_stderr()` → the same packed pair for the run's fd-2 bytes,
+///      and `pyre_exit_code()` → the status to exit with.
+///
+/// `pyre_set_script_path(ptr, len)` may precede step 2 to name the file the
+/// source came from.
 #[cfg(feature = "wasm-host")]
 mod host_abi {
     use super::run_python_impl;
@@ -620,29 +689,73 @@ mod host_abi {
     /// the host must free with `pyre_dealloc`.
     #[unsafe(no_mangle)]
     pub extern "C" fn pyre_run_python(ptr: *const u8, len: usize) -> u64 {
-        let result = if ptr.is_null() || len == 0 {
-            run_python_impl("")
-        } else {
-            // Reject a (ptr, len) that escapes linear memory before forming a
-            // slice; the embedder supplies these raw, so an out-of-range pair
-            // would otherwise be undefined behaviour.
-            let mem_bytes = core::arch::wasm32::memory_size(0).saturating_mul(65536);
-            match (ptr as usize).checked_add(len) {
-                Some(end) if end <= mem_bytes => {
-                    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-                    run_python_impl(&String::from_utf8_lossy(bytes))
-                }
-                _ => "Error: input buffer out of wasm memory bounds".to_string(),
-            }
+        let result = match guest_str(ptr, len) {
+            Some(source) => run_python_impl(&source),
+            None => "Error: input buffer out of wasm memory bounds".to_string(),
         };
 
-        let out = result.into_bytes();
-        let out_len = out.len();
-        let out_ptr = pyre_alloc(out_len);
-        if out_len != 0 {
-            unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), out_ptr, out_len) };
+        pack_into_guest(result.into_bytes())
+    }
+
+    /// Name the file the next `pyre_run_python` source came from. It becomes
+    /// the compiled code's filename — hence what a traceback prints and what
+    /// its source-line lookup reads — and its directory heads `sys.path`.
+    /// Without it the guest only has source text, so both fall back to
+    /// `<string>`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_set_script_path(ptr: *const u8, len: usize) {
+        let path = guest_str(ptr, len).filter(|s| !s.is_empty());
+        super::SCRIPT_PATH.with(|p| *p.borrow_mut() = path);
+    }
+
+    /// Copy `[ptr, ptr+len)` out of linear memory as UTF-8. The embedder
+    /// supplies the pair raw, so a range escaping linear memory is rejected
+    /// (`None`) before a slice is formed rather than being undefined
+    /// behaviour; an empty buffer reads as the empty string.
+    fn guest_str(ptr: *const u8, len: usize) -> Option<String> {
+        if ptr.is_null() || len == 0 {
+            return Some(String::new());
         }
-        ((out_ptr as u64) << 32) | (out_len as u64)
+        let mem_bytes = core::arch::wasm32::memory_size(0).saturating_mul(65536);
+        match (ptr as usize).checked_add(len) {
+            Some(end) if end <= mem_bytes => {
+                let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            }
+            _ => None,
+        }
+    }
+
+    /// Take the bytes the run wrote to fd 2 (traceback, warnings,
+    /// `sys.stderr.write`) and hand them over the same way as the stdout
+    /// result: a packed `(ptr << 32) | len` the host frees with
+    /// `pyre_dealloc`. Draining, so a second call returns an empty buffer.
+    ///
+    /// wasm32 has no descriptors, so without this export everything the
+    /// interpreter writes to stderr is discarded.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_take_stderr() -> u64 {
+        pack_into_guest(super::take_stderr())
+    }
+
+    /// Status the last `pyre_run_python` ended with: `SystemExit`'s code, 1 for
+    /// an uncaught exception or a `SyntaxError`, else 0. The host exits with
+    /// it, as `pyrex` does with `targetpypystandalone.py:37 entry_point`'s
+    /// return value.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_exit_code() -> i32 {
+        super::EXIT_CODE.with(|c| c.get())
+    }
+
+    /// Copy `bytes` into a fresh guest buffer and pack its pointer and length
+    /// into the `(hi32, lo32)` pair every result-returning export uses.
+    fn pack_into_guest(bytes: Vec<u8>) -> u64 {
+        let len = bytes.len();
+        let ptr = pyre_alloc(len);
+        if len != 0 {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, len) };
+        }
+        ((ptr as u64) << 32) | (len as u64)
     }
 }
 

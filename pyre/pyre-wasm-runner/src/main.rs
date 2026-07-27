@@ -219,8 +219,8 @@ fn main() {
             let source = std::fs::read_to_string(&script)
                 .map_err(|e| format!("read script {}: {e}", script.display()))?;
             match engine {
-                WasmEngine::Wasmtime => run(&module_path, &source).map_err(fmt_err),
-                WasmEngine::Wasmi => wasmi_host::run(&module_path, &source),
+                WasmEngine::Wasmtime => run(&module_path, &source, &script).map_err(fmt_err),
+                WasmEngine::Wasmi => wasmi_host::run(&module_path, &source, &script),
             }
         })
         .expect("spawn worker thread");
@@ -250,7 +250,7 @@ fn fatal(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
+fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
     let mut config = Config::new();
     // Allow the interpreter's deep recursion before wasmtime raises a stack
     // overflow trap; the interpreter's own recursion limit normally fires
@@ -370,6 +370,23 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
             .get_typed_func::<u64, ()>(&mut store, "pyre_set_force_ca_terminal_decline")
             .context("wasm module lacks terminal-decline regression hook")?;
         set_force.call(&mut store, selector)?;
+    }
+
+    // Name the script so the guest compiles it under its real path: that is
+    // what a traceback prints, what its source-line lookup reads back through
+    // `pyre_host.host_read`, and the directory that heads `sys.path`. Absent
+    // on a module predating the export, leaving the guest on `<string>`.
+    if let Ok(set_path) =
+        instance.get_typed_func::<(u32, u32), ()>(&mut store, "pyre_set_script_path")
+    {
+        let name = script.to_string_lossy();
+        let nlen = name.len() as u32;
+        if nlen != 0 {
+            let p = alloc.call(&mut store, nlen)?;
+            memory.write(&mut store, p as usize, name.as_bytes())?;
+            set_path.call(&mut store, (p, nlen))?;
+            dealloc.call(&mut store, (p, nlen))?;
+        }
     }
 
     let src = source.as_bytes();
@@ -683,6 +700,23 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
         memory.read(&store, out_ptr as usize, &mut out)?;
         dealloc.call(&mut store, (out_ptr, out_len))?;
     }
+    // The guest has no descriptors, so its fd-2 bytes and its exit status come
+    // back through their own exports. Absent on a module predating them, in
+    // which case the run keeps the old stdout-only, always-0 behaviour.
+    let mut err_bytes = Vec::new();
+    if let Ok(take_stderr) = instance.get_typed_func::<(), u64>(&mut store, "pyre_take_stderr") {
+        let packed = take_stderr.call(&mut store, ())?;
+        let (ptr, elen) = ((packed >> 32) as u32, (packed & 0xffff_ffff) as u32);
+        if elen != 0 {
+            err_bytes = vec![0u8; elen as usize];
+            memory.read(&store, ptr as usize, &mut err_bytes)?;
+            dealloc.call(&mut store, (ptr, elen))?;
+        }
+    }
+    let exit_code = instance
+        .get_typed_func::<(), i32>(&mut store, "pyre_exit_code")
+        .and_then(|f| f.call(&mut store, ()))
+        .unwrap_or(0);
     if len != 0 {
         dealloc.call(&mut store, (in_ptr, len))?;
     }
@@ -690,6 +724,9 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     use std::io::Write;
     std::io::stdout().write_all(&out)?;
     std::io::stdout().flush()?;
+    if !err_bytes.is_empty() {
+        std::io::stderr().write_all(&err_bytes)?;
+    }
     startup_lap("dealloc+stdout");
     // Exit without running the wasmtime `Store`/`Module`/`Engine` destructors.
     // Dropping them frees ~40MB of mapped code + linear memory that the OS
@@ -700,9 +737,9 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     // `PYRE_WASM_FULL_TEARDOWN=1` restores the drops for leak diagnostics.
     if std::env::var_os("PYRE_WASM_FULL_TEARDOWN").is_none() {
         std::io::stderr().flush().ok();
-        std::process::exit(0);
+        std::process::exit(exit_code);
     }
-    Ok(0)
+    Ok(exit_code)
 }
 
 /// Load the main module, using a compiled `<module>.cwasm` cache to skip

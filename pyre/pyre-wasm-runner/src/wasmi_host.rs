@@ -73,7 +73,7 @@ fn install_decline_hook() {
     });
 }
 
-pub fn run(module_path: &Path, source: &str) -> Result<i32, String> {
+pub fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32, String> {
     install_decline_hook();
     let mut config = Config::default();
     // Raise the interpreter's value-stack / recursion ceilings so the deep
@@ -121,6 +121,24 @@ pub fn run(module_path: &Path, source: &str) -> Result<i32, String> {
         .get_typed_func::<(u32, u32), ()>(&store, "pyre_dealloc")
         .map_err(estr)?;
 
+    // Name the script so the guest compiles it under its real path: that is
+    // what a traceback prints, what its source-line lookup reads back through
+    // `pyre_host.host_read`, and the directory that heads `sys.path`. Absent
+    // on a module predating the export, leaving the guest on `<string>`.
+    if let Ok(set_path) = instance.get_typed_func::<(u32, u32), ()>(&store, "pyre_set_script_path")
+    {
+        let name = script.to_string_lossy();
+        let nlen = name.len() as u32;
+        if nlen != 0 {
+            let p = alloc.call(&mut store, nlen).map_err(estr)?;
+            memory
+                .write(&mut store, p as usize, name.as_bytes())
+                .map_err(estr)?;
+            set_path.call(&mut store, (p, nlen)).map_err(estr)?;
+            dealloc.call(&mut store, (p, nlen)).map_err(estr)?;
+        }
+    }
+
     let src = source.as_bytes();
     let len = src.len() as u32;
     let in_ptr = if len == 0 {
@@ -160,6 +178,26 @@ pub fn run(module_path: &Path, source: &str) -> Result<i32, String> {
             .map_err(estr)?;
         dealloc.call(&mut store, (out_ptr, out_len)).map_err(estr)?;
     }
+    // The guest has no descriptors, so its fd-2 bytes and its exit status come
+    // back through their own exports. Absent on a module predating them, in
+    // which case the run keeps the old stdout-only, always-0 behaviour.
+    let mut err_bytes = Vec::new();
+    if let Ok(take_stderr) = instance.get_typed_func::<(), u64>(&store, "pyre_take_stderr") {
+        let packed = take_stderr.call(&mut store, ()).map_err(estr)?;
+        let (ptr, elen) = ((packed >> 32) as u32, (packed & 0xffff_ffff) as u32);
+        if elen != 0 {
+            err_bytes = vec![0u8; elen as usize];
+            memory
+                .read(&store, ptr as usize, &mut err_bytes)
+                .map_err(estr)?;
+            dealloc.call(&mut store, (ptr, elen)).map_err(estr)?;
+        }
+    }
+    let exit_code = instance
+        .get_typed_func::<(), i32>(&store, "pyre_exit_code")
+        .map_err(estr)
+        .and_then(|f| f.call(&mut store, ()).map_err(estr))
+        .unwrap_or(0);
     if len != 0 {
         dealloc.call(&mut store, (in_ptr, len)).map_err(estr)?;
     }
@@ -167,7 +205,10 @@ pub fn run(module_path: &Path, source: &str) -> Result<i32, String> {
     use std::io::Write;
     std::io::stdout().write_all(&out).map_err(estr)?;
     std::io::stdout().flush().map_err(estr)?;
-    Ok(0)
+    if !err_bytes.is_empty() {
+        std::io::stderr().write_all(&err_bytes).map_err(estr)?;
+    }
+    Ok(exit_code)
 }
 
 fn build_linker(engine: &Engine) -> Result<Linker<Host>, String> {
