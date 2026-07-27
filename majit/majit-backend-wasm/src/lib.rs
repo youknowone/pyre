@@ -302,6 +302,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         supports_guard_gc_type,
     });
     majit_gc::set_active_alloc_nursery_typed(Some(wasm_alloc_nursery_typed));
+    majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
+        wasm_alloc_nursery_headerless_no_collect,
+    ));
     majit_gc::set_active_alloc_nursery_typed_with_placement(Some(
         wasm_alloc_nursery_typed_with_placement,
     ));
@@ -518,6 +521,15 @@ fn wasm_alloc_nursery_typed(type_id: u32, size: usize) -> GcRef {
     // is not a registered GC root.
     with_wasm_active_gc_mut(|gc| gc.try_alloc_nursery_no_collect_typed(type_id, size))
         .unwrap_or(GcRef(0))
+}
+
+/// `majit_gc::AllocNurseryHeaderlessNoCollectFn`. The metainterp's jitcode
+/// tracer allocates a `NEW` on a `headerless` descr through here so the object
+/// lands in the interpreter's own collected pool rather than the host heap,
+/// where its collector could not see it. Returns `GcRef(0)` when no GC is
+/// bound, leaving the caller on its own path.
+fn wasm_alloc_nursery_headerless_no_collect(size: usize) -> GcRef {
+    with_wasm_active_gc_mut(|gc| gc.alloc_nursery_headerless_no_collect(size)).unwrap_or(GcRef(0))
 }
 
 /// Placement-reporting companion of [`wasm_alloc_nursery_typed`].
