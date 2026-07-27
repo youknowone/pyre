@@ -1455,7 +1455,7 @@ pub fn get_sys_module(name: &str) -> Option<PyObjectRef> {
 pub fn get_interpreter_sys_module() -> Option<PyObjectRef> {
     SYS_MODULES
         .lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get("sys")
         .copied()
         .map(|module| module as PyObjectRef)

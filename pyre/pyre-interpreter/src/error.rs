@@ -1538,7 +1538,13 @@ pub fn write_syntax_error<W: Write>(writer: &mut W, err: &PyError) -> std::io::R
 }
 
 fn write_syntax_error_object<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io::Result<()> {
-    let attr = |name: &str| crate::baseobjspace::syntax_error_attr(exc, name);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(exc);
+    let attr = |name: &str| {
+        let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+        crate::baseobjspace::syntax_error_attr(exc, name)
+    };
     let str_of = |w: PyObjectRef| -> Option<String> {
         (!w.is_null() && unsafe { pyre_object::is_str(w) })
             .then(|| unsafe { pyre_object::w_str_get_value(w) }.to_string())
@@ -1570,6 +1576,7 @@ fn write_syntax_error_object<W: Write>(writer: &mut W, exc: PyObjectRef) -> std:
             writeln!(writer, "{caret}")?;
         }
     }
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     let name = exc_object_class_name(exc).unwrap_or_else(|| "SyntaxError".to_string());
     match str_of(attr("msg")) {
         Some(msg) if !msg.is_empty() => writeln!(writer, "{name}: {msg}"),
@@ -1597,7 +1604,7 @@ struct ExceptionPrintContext {
 impl ExceptionPrintContext {
     fn new(exc: PyObjectRef) -> Self {
         let mut seen = HashSet::new();
-        seen.insert(exc as usize);
+        seen.insert(pyre_object::gc_hook::gc_identity_hash(exc as usize));
         Self {
             seen,
             exception_group_depth: 0,
@@ -1611,82 +1618,136 @@ fn write_exception_object_recursive<W: Write>(
     exc: PyObjectRef,
     context: &mut ExceptionPrintContext,
 ) -> std::io::Result<()> {
-    let cause = unsafe { pyre_object::interp_exceptions::w_exception_get_cause(exc) };
-    let chained = if !cause.is_null()
-        && !unsafe { pyre_object::is_none(cause) }
-        && context.seen.insert(cause as usize)
-    {
-        Some((
-            cause,
-            "\nThe above exception was the direct cause of the following exception:\n\n",
-        ))
-    } else {
-        let previous = unsafe { pyre_object::interp_exceptions::w_exception_get_context(exc) };
-        let suppress =
-            unsafe { pyre_object::interp_exceptions::w_exception_get_suppress_context(exc) };
-        if !suppress
-            && !previous.is_null()
-            && !unsafe { pyre_object::is_none(previous) }
-            && context.seen.insert(previous as usize)
-        {
-            Some((
-                previous,
-                "\nDuring handling of the above exception, another exception occurred:\n\n",
-            ))
+    // `TracebackException.__init__` uses an explicit queue for chain capture.
+    // Keep the same non-recursive shape so an application-created chain cannot
+    // consume the native Rust stack.  Store shadow-stack slot indices, not raw
+    // GC pointers: formatting calls arbitrary `__str__` / attribute code.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let first_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(exc);
+    let mut chain: Vec<(usize, Option<&'static str>)> = Vec::new();
+    let mut current_slot = first_slot;
+    loop {
+        let current = pyre_object::gc_roots::shadow_stack_get(current_slot);
+        let cause = unsafe { pyre_object::interp_exceptions::w_exception_get_cause(current) };
+        let cause_slot = pin_unseen_exception(cause, context);
+        let (older_slot, banner) = if let Some(cause_slot) = cause_slot {
+            (
+                Some(cause_slot),
+                Some("\nThe above exception was the direct cause of the following exception:\n\n"),
+            )
         } else {
-            None
+            let current = pyre_object::gc_roots::shadow_stack_get(current_slot);
+            let suppress = unsafe {
+                pyre_object::interp_exceptions::w_exception_get_suppress_context(current)
+            };
+            let previous =
+                unsafe { pyre_object::interp_exceptions::w_exception_get_context(current) };
+            if !suppress {
+                if let Some(previous_slot) = pin_unseen_exception(previous, context) {
+                    (
+                        Some(previous_slot),
+                        Some(
+                            "\nDuring handling of the above exception, another exception occurred:\n\n",
+                        ),
+                    )
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        };
+        chain.push((current_slot, banner));
+        match older_slot {
+            Some(slot) => current_slot = slot,
+            None => break,
         }
-    };
-    if let Some((older, banner)) = chained {
-        write_exception_object_recursive(writer, older, context)?;
-        emit_exception_text(writer, banner.as_bytes(), context, b'|')?;
     }
 
-    if exception_group_items(exc).is_some() {
-        write_exception_group(writer, exc, context)
-    } else {
-        write_plain_exception_object(writer, exc, context)
+    for (slot, banner) in chain.into_iter().rev() {
+        if let Some(banner) = banner {
+            emit_exception_text(writer, banner.as_bytes(), context, b'|')?;
+        }
+        if let Some(exceptions) = exception_group_item_slots(slot) {
+            write_exception_group(writer, slot, exceptions, context)?;
+        } else {
+            write_plain_exception_object(writer, slot, context)?;
+        }
     }
+    Ok(())
+}
+
+fn pin_unseen_exception(
+    candidate: PyObjectRef,
+    context: &mut ExceptionPrintContext,
+) -> Option<usize> {
+    if candidate.is_null() || unsafe { pyre_object::is_none(candidate) } {
+        return None;
+    }
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(candidate);
+    let candidate = pyre_object::gc_roots::shadow_stack_get(slot);
+    let identity = pyre_object::gc_hook::gc_identity_hash(candidate as usize);
+    context.seen.insert(identity).then_some(slot)
 }
 
 fn write_plain_exception_object<W: Write>(
     writer: &mut W,
-    exc: PyObjectRef,
+    exc_slot: usize,
     context: &ExceptionPrintContext,
 ) -> std::io::Result<()> {
     let mut rendered = Vec::new();
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     let tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
     if !tb.is_null() {
         writeln!(rendered, "Traceback (most recent call last):")?;
         write_traceback_chain_from_tb(&mut rendered, tb)?;
     }
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     if unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) } == ExcKind::SyntaxError
     {
         write_syntax_error_object(&mut rendered, exc)?;
     } else {
-        let header = render_exc_object_wtf8(exc);
+        let header = render_rooted_exc_object_wtf8(exc_slot);
         rendered.write_all(header.as_bytes())?;
         rendered.write_all(b"\n")?;
     }
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     write_exception_notes(&mut rendered, exc)?;
     emit_exception_text(writer, &rendered, context, b'|')
 }
 
-fn exception_group_items(exc: PyObjectRef) -> Option<Vec<PyObjectRef>> {
+fn exception_group_item_slots(exc_slot: usize) -> Option<Vec<usize>> {
     let base_group = crate::builtins::lookup_exc_class("BaseExceptionGroup")?;
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     if !crate::baseobjspace::isinstance(exc, base_group).ok()? {
         return None;
     }
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     let exceptions = crate::baseobjspace::getattr_str(exc, "exceptions").ok()?;
+    let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(exceptions);
+    let exceptions = pyre_object::gc_roots::shadow_stack_get(tuple_slot);
     if !unsafe { pyre_object::is_tuple(exceptions) } {
         return None;
     }
-    Some(unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) })
+    let len = unsafe { pyre_object::w_tuple_len(exceptions) };
+    let mut slots = Vec::with_capacity(len);
+    for index in 0..len {
+        let exceptions = pyre_object::gc_roots::shadow_stack_get(tuple_slot);
+        let child = unsafe { pyre_object::w_tuple_getitem(exceptions, index as i64) }?;
+        let child_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(child);
+        slots.push(child_slot);
+    }
+    Some(slots)
 }
 
 fn write_exception_group<W: Write>(
     writer: &mut W,
-    exc: PyObjectRef,
+    exc_slot: usize,
+    exceptions: Vec<usize>,
     context: &mut ExceptionPrintContext,
 ) -> std::io::Result<()> {
     const MAX_GROUP_WIDTH: usize = 15;
@@ -1695,15 +1756,12 @@ fn write_exception_group<W: Write>(
     if context.exception_group_depth > MAX_GROUP_DEPTH {
         return emit_exception_text(writer, b"... (max_group_depth is 10)\n", context, b'|');
     }
-    let exceptions = match exception_group_items(exc) {
-        Some(exceptions) => exceptions,
-        None => return write_plain_exception_object(writer, exc, context),
-    };
     let is_toplevel = context.exception_group_depth == 0;
     if is_toplevel {
         context.exception_group_depth += 1;
     }
 
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     let tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
     if !tb.is_null() {
         emit_exception_text(
@@ -1718,9 +1776,10 @@ fn write_exception_group<W: Write>(
     }
 
     let mut header = Vec::new();
-    let group_header = render_exc_object_wtf8(exc);
+    let group_header = render_rooted_exc_object_wtf8(exc_slot);
     header.write_all(group_header.as_bytes())?;
     header.write_all(b"\n")?;
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     write_exception_notes(&mut header, exc)?;
     emit_exception_text(writer, &header, context, b'|')?;
 
@@ -1759,8 +1818,10 @@ fn write_exception_group<W: Write>(
                 b'|',
             )?;
         } else {
-            let child = exceptions[index];
-            context.seen.insert(child as usize);
+            let child = pyre_object::gc_roots::shadow_stack_get(exceptions[index]);
+            context
+                .seen
+                .insert(pyre_object::gc_hook::gc_identity_hash(child as usize));
             write_exception_object_recursive(writer, child, context)?;
         }
         if last && context.need_close {
@@ -1869,19 +1930,30 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
         return Ok(());
     }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(exc);
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     let notes = match crate::baseobjspace::getattr_str(exc, "__notes__") {
         Ok(v) if !v.is_null() => v,
         _ => return Ok(()),
     };
+    let notes_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(notes);
+    let notes = pyre_object::gc_roots::shadow_stack_get(notes_slot);
     if !unsafe { pyre_object::is_list(notes) } {
         return Ok(());
     }
     let len = unsafe { pyre_object::w_list_len(notes) } as i64;
     for i in 0..len {
+        let notes = pyre_object::gc_roots::shadow_stack_get(notes_slot);
         let item = unsafe { pyre_object::w_list_getitem(notes, i) }.unwrap_or(pyre_object::PY_NULL);
         if item.is_null() {
             continue;
         }
+        let item_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(item);
+        let item = pyre_object::gc_roots::shadow_stack_get(item_slot);
         let s = unsafe { crate::display::py_str(item) }
             .unwrap_or_else(|_| "<unprintable note>".to_string());
         for line in s.lines() {
@@ -1903,6 +1975,29 @@ fn render_exc_object(exc: PyObjectRef) -> String {
         .ok()
         .and_then(|b| String::from_utf8(b).ok())
         .unwrap_or_else(|| "<exception str() failed>".to_string())
+}
+
+fn render_rooted_exc_object_wtf8(exc_slot: usize) -> Wtf8Buf {
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
+        return Wtf8Buf::from_string("<no exception>".to_string());
+    }
+    let name = exc_object_class_name(exc).unwrap_or_else(|| {
+        let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+        let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) };
+        exc_kind_name(kind).to_string()
+    });
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    let msg = unsafe {
+        crate::display::py_str_wtf8(exc)
+            .unwrap_or_else(|_| Wtf8Buf::from_string("<exception str() failed>".to_string()))
+    };
+    let mut rendered = Wtf8Buf::from_string(name);
+    if !msg.as_bytes().is_empty() {
+        rendered.push_str(": ");
+        rendered.push_wtf8(&msg);
+    }
+    rendered
 }
 
 fn render_exc_object_wtf8(exc: PyObjectRef) -> Wtf8Buf {

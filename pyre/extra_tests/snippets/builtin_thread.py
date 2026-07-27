@@ -104,6 +104,16 @@ class SurrogateStrError(Exception):
         return "bad\ud800value"
 
 
+class CollectingStrError(Exception):
+    def __str__(self):
+        import gc
+
+        garbage = [[index] for index in range(4096)]
+        gc.collect()
+        assert len(garbage) == 4096
+        return "collected safely"
+
+
 def capture_error(exc):
     try:
         raise exc
@@ -153,6 +163,11 @@ assert hook_output(BrokenStrError("raw")).endswith(
 assert hook_output(SurrogateStrError()).endswith(
     "SurrogateStrError: bad\ud800value\n"
 )
+collecting_error = CollectingStrError()
+collecting_error.add_note("note after collection")
+collecting_output = hook_output(collecting_error)
+assert "CollectingStrError: collected safely\n" in collecting_output
+assert collecting_output.endswith("note after collection\n")
 
 # CPython's invalid-value printer intentionally retains its historical
 # `NoneType: None` special case while other non-exceptions use the diagnostic.
@@ -173,13 +188,13 @@ group_output = hook_output(
     ExceptionGroup(
         "outer",
         [
-            ValueError("first leaf"),
+            CollectingStrError(),
             ExceptionGroup("inner", [TypeError("nested leaf")]),
         ],
     )
 )
 assert "ExceptionGroup: outer (2 sub-exceptions)\n" in group_output
-assert "ValueError: first leaf\n" in group_output
+assert "CollectingStrError: collected safely\n" in group_output
 assert "ExceptionGroup: inner (1 sub-exception)\n" in group_output
 assert "TypeError: nested leaf\n" in group_output
 assert "+---------------- 1 ----------------\n" in group_output
@@ -199,6 +214,16 @@ context_cycle_output = hook_output(cycle_first)
 assert context_cycle_output.count("ValueError: cycle first\n") == 1
 assert context_cycle_output.count("TypeError: cycle second\n") == 1
 assert context_cycle_output.count("During handling") == 1
+
+deep_chain = ValueError("chain 0")
+for chain_index in range(1, 1200):
+    next_error = ValueError(f"chain {chain_index}")
+    next_error.__context__ = deep_chain
+    deep_chain = next_error
+deep_chain_output = hook_output(deep_chain)
+assert deep_chain_output.count("During handling") == 1199
+assert "ValueError: chain 0\n" in deep_chain_output
+assert "ValueError: chain 1199\n" in deep_chain_output
 
 
 class BrokenThreadName:
