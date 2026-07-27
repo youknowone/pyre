@@ -1384,6 +1384,8 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // `pyframe.py:49 self.w_globals` — the slot the inline
+            // new-PyFrame helper populates from the function's globals dict.
             (
                 "PyFrame.w_globals",
                 crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET,
@@ -1454,17 +1456,6 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyFrame.w_builtin",
                 crate::frame_layout::PYFRAME_W_BUILTIN_OFFSET,
-                8,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            // `pyframe.py:49 self.w_globals` parity. The inline new-PyFrame
-            // helper populates this slot from the function's globals dict.
-            (
-                "PyFrame.w_globals",
-                crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET,
                 8,
                 Type::Ref,
                 false,
@@ -2720,7 +2711,7 @@ pub fn pyframe_code_descr() -> DescrRef {
 /// PyObjectRef.  `PyFrame.w_globals` is the single globals slot;
 /// the raw dict-storage accessor has been retired.
 pub fn pyframe_w_globals_obj_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 12)
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 4)
 }
 
 /// rewrite.py:665-695 handle_call_assembler scalar field read for the

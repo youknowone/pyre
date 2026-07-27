@@ -907,6 +907,29 @@ impl GcCache {
         // descr.py:220-221: cache[STRUCT][fieldname]
         if let Some(inner) = self._cache_field.get(&struct_key) {
             if let Some(descr) = inner.get(field_name) {
+                debug_assert!(
+                    descr.describes_same_field(
+                        offset,
+                        field_size,
+                        field_type,
+                        is_immutable,
+                        is_quasi_immutable,
+                        virtualizable,
+                        index_in_parent,
+                    ),
+                    "get_field_descr cache hit for {field_name} disagrees with the caller: \
+                     cached (offset {}, size {}, type {:?}, immutable {}, quasi {}, vable {}, \
+                     index_in_parent {}) vs requested (offset {offset}, size {field_size}, \
+                     type {field_type:?}, immutable {is_immutable}, quasi {is_quasi_immutable}, \
+                     vable {virtualizable}, index_in_parent {index_in_parent})",
+                    descr.offset,
+                    descr.field_size,
+                    descr.field_type,
+                    descr.is_immutable,
+                    descr.is_quasi_immutable(),
+                    descr.virtualizable,
+                    descr.index_in_parent,
+                );
                 return descr.clone();
             }
         }
@@ -3688,6 +3711,42 @@ impl Clone for SimpleFieldDescr {
 }
 
 impl SimpleFieldDescr {
+    /// Whether this descr already describes the field a `get_field_descr`
+    /// caller is asking for.
+    ///
+    /// `descr.py:218-239` derives every one of these from `(STRUCT,
+    /// fieldname)` itself — `symbolic.get_field_token`, `get_type_flag`,
+    /// `STRUCT._hints['_immutable_fields_']`,
+    /// `heaptracker.get_fielddescr_index_in` — so a cache hit there cannot
+    /// describe a different field than the caller means. Pyre takes them as
+    /// arguments instead, so two call sites *can* disagree, and the cache
+    /// silently keeps whichever minted first. That is never a legitimate
+    /// state: `heaptracker.py:76-101 get_fielddescr_index_in` is positional
+    /// and `optimizeopt/info.rs force_box` asserts on it, so a disagreeing
+    /// `index_in_parent` alone puts the two halves of the descr universe on
+    /// different slots of the same object.
+    ///
+    /// `index` is deliberately excluded — it is the per-trace codewriter slot
+    /// id, which the analyzer legitimately restamps onto a shared `Arc`.
+    pub fn describes_same_field(
+        &self,
+        offset: usize,
+        field_size: usize,
+        field_type: Type,
+        is_immutable: bool,
+        is_quasi_immutable: bool,
+        virtualizable: bool,
+        index_in_parent: usize,
+    ) -> bool {
+        self.offset == offset
+            && self.field_size == field_size
+            && self.field_type == field_type
+            && self.is_immutable == is_immutable
+            && self.is_quasi_immutable() == is_quasi_immutable
+            && self.virtualizable == virtualizable
+            && self.index_in_parent == index_in_parent
+    }
+
     pub fn new(
         index: u32,
         offset: usize,
