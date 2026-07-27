@@ -279,7 +279,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_datetime": {
-      "dynasm": "CRASH"
+      "dynasm": "PASS"
     },
     "test.test_dbm": {
       "dynasm": "IMPORTERROR"
@@ -1111,7 +1111,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_time": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_timeit": {
       "dynasm": "FAIL"

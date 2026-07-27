@@ -107,6 +107,17 @@ def get_clock_info(name):
             crate::module_ns_store(ns, "CLOCK_THREAD_CPUTIME_ID",
                 pyre_object::w_int_new(libc::CLOCK_THREAD_CPUTIME_ID as i64));
         }
+        #[cfg(unix)]
+        {
+            // PyPy `Module.startup` calls `_init_timezone`, and exposes
+            // `tzset` on every POSIX build.
+            t::init_timezone(ns);
+            crate::module_ns_store(
+                ns,
+                "tzset",
+                crate::make_builtin_function_with_arity("tzset", t::tzset, 0),
+            );
+        }
         // localtime/mktime/ctime/strftime consult $TZ + /etc/localtime (and
         // the LC_TIME locale DB), reading host state outside the controller;
         // gmtime (UTC) and asctime (fixed C format) stay pure.

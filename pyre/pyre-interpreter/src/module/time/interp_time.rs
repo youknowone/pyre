@@ -141,11 +141,9 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 let has_int = crate::baseobjspace::lookup(args[0], "__int__").is_some()
                     || crate::baseobjspace::lookup(args[0], "__index__").is_some();
                 if !has_int {
-                    let name = crate::typedef::r#type(args[0])
-                        .map(|tp| w_type_get_name(tp.as_ptr()).to_string())
-                        .unwrap_or_else(|| "object".to_string());
                     return Err(crate::PyError::type_error(format!(
-                        "'{name}' object cannot be interpreted as an integer"
+                        "'{}' object is not an integer or float",
+                        crate::type_methods::arg_type_name(args[0])
                     )));
                 }
                 let w_int = crate::baseobjspace::space_int(args[0])?;
@@ -539,7 +537,7 @@ type time_t = i64;
 fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     host_time::gmtime_from_timestamp(seconds as host_time::TimeT)
         .map(|tm| libc_tm_to_c_tm(&tm))
-        .ok_or_else(|| crate::PyError::value_error("unconvertible time"))
+        .ok_or_else(|| crate::PyError::os_error("unconvertible time"))
 }
 
 // wasm32 has no libc `struct tm` calendar conversions; the broken-down-time
@@ -560,7 +558,7 @@ fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let p = unsafe { libc::gmtime_r(&t, &mut tm) };
     if p.is_null() {
-        return Err(crate::PyError::value_error("unconvertible time"));
+        return Err(crate::PyError::os_error("unconvertible time"));
     }
     Ok(libc_tm_to_c_tm(&tm))
 }
@@ -583,7 +581,7 @@ fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
 fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     host_time::localtime_from_timestamp(seconds as host_time::TimeT)
         .map(|tm| libc_tm_to_c_tm(&tm))
-        .ok_or_else(|| crate::PyError::value_error("unconvertible time"))
+        .ok_or_else(|| crate::PyError::os_error("unconvertible time"))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -599,7 +597,7 @@ fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let p = unsafe { libc::localtime_r(&t, &mut tm) };
     if p.is_null() {
-        return Err(crate::PyError::value_error("unconvertible time"));
+        return Err(crate::PyError::os_error("unconvertible time"));
     }
     Ok(libc_tm_to_c_tm(&tm))
 }
@@ -666,6 +664,81 @@ fn c_tm_to_libc_tm(tm: &c_tm) -> libc::tm {
         out.tm_isdst = tm.tm_isdst;
         out
     }
+}
+
+/// `interp_time.py:512-611 _init_timezone` — derive the module's four
+/// timezone attributes from libc's January/July broken-down times.  This
+/// preserves the standard-vs-DST ordering in both hemispheres.
+#[cfg(unix)]
+pub(crate) fn init_timezone(ns: PyObjectRef) {
+    const YEAR: i64 = (365 * 24 + 6) * 3600;
+    let start = duration_since_epoch().as_secs() as i64 / YEAR * YEAR;
+    let january = _c_localtime(start);
+    let july = _c_localtime(start + YEAR / 2);
+
+    let (timezone, altzone, daylight, standard_name, daylight_name) = match (january, july) {
+        (Ok(january), Ok(july)) => {
+            let january_offset = -january.tm_gmtoff;
+            let july_offset = -july.tm_gmtoff;
+            let january_name = if january.tm_zone.is_empty() {
+                "   ".to_string()
+            } else {
+                january.tm_zone
+            };
+            let july_name = if july.tm_zone.is_empty() {
+                "   ".to_string()
+            } else {
+                july.tm_zone
+            };
+            if january_offset < july_offset {
+                // DST is reversed in the southern hemisphere.
+                (
+                    july_offset,
+                    january_offset,
+                    i64::from(january_offset != july_offset),
+                    july_name,
+                    january_name,
+                )
+            } else {
+                (
+                    january_offset,
+                    july_offset,
+                    i64::from(january_offset != july_offset),
+                    january_name,
+                    july_name,
+                )
+            }
+        }
+        _ => (0, 0, 0, String::new(), String::new()),
+    };
+
+    crate::module_ns_store(ns, "timezone", w_int_new(timezone));
+    crate::module_ns_store(ns, "altzone", w_int_new(altzone));
+    crate::module_ns_store(ns, "daylight", w_int_new(daylight));
+    crate::module_ns_store(
+        ns,
+        "tzname",
+        w_tuple_new(vec![w_str_new(&standard_name), w_str_new(&daylight_name)]),
+    );
+}
+
+/// `interp_time.py:1106-1122 tzset` — ask libc to reread `TZ`, then refresh
+/// the values installed by `_init_timezone`.
+#[cfg(unix)]
+pub fn tzset(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let _ = args;
+    unsafe extern "C" {
+        #[link_name = "tzset"]
+        fn c_tzset();
+    }
+    unsafe { c_tzset() };
+    if let Some(module) = crate::importing::get_sys_module("time") {
+        let ns = unsafe { pyre_object::w_module_get_w_dict(module) };
+        if !ns.is_null() {
+            init_timezone(ns);
+        }
+    }
+    Ok(w_none())
 }
 
 // ── Windows helpers ─────────────────────────────────────────────────
@@ -773,21 +846,38 @@ fn _tm_to_tuple(tm: &c_tm) -> PyObjectRef {
     }
 }
 
-/// Extract epoch seconds from an optional argument (int, float, or None/absent → now).
-fn _get_seconds(args: &[PyObjectRef]) -> time_t {
+/// `interp_time.py:738-758 _get_inttime` — extract integral epoch seconds
+/// from an optional real argument (None/absent means now), rejecting NaN and
+/// values that lose at least one second when cast to the platform time_t.
+fn _get_seconds(args: &[PyObjectRef]) -> Result<time_t, crate::PyError> {
     if let Some(&arg) = args.first() {
         unsafe {
             if !is_none(arg) {
-                if is_int(arg) {
-                    return w_int_get_value(arg) as time_t;
+                let seconds = crate::baseobjspace::float_w(arg)?;
+                if seconds.is_nan() {
+                    return Err(crate::PyError::value_error(
+                        "Invalid value Nan (not a number)",
+                    ));
                 }
-                if is_float(arg) {
-                    return floatobject::w_float_get_value(arg) as time_t;
+                // Rust's float-to-int cast saturates.  Guard the boundary
+                // explicitly, then retain PyPy's lost-whole-second check.
+                if seconds >= i64::MAX as f64 || seconds < i64::MIN as f64 {
+                    return Err(crate::PyError::overflow_error(
+                        "timestamp out of range for platform time_t",
+                    ));
                 }
+                let result = seconds as time_t;
+                let diff = seconds - result as f64;
+                if !(-1.0..=1.0).contains(&diff) || diff == -1.0 || diff == 1.0 {
+                    return Err(crate::PyError::overflow_error(
+                        "timestamp out of range for platform time_t",
+                    ));
+                }
+                return Ok(result);
             }
         }
     }
-    duration_since_epoch().as_secs() as time_t
+    Ok(duration_since_epoch().as_secs() as time_t)
 }
 
 /// Extract a `c_tm` from a Python time tuple argument.
@@ -796,7 +886,7 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
     let tup = if let Some(&arg) = args.first() {
         if unsafe { is_none(arg) } {
             if default_now {
-                return _c_localtime(_get_seconds(&[]));
+                return _c_localtime(_get_seconds(&[])?);
             }
             return Err(crate::PyError::type_error(
                 "Tuple or struct_time argument required",
@@ -804,7 +894,7 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
         }
         arg
     } else if default_now {
-        return _c_localtime(_get_seconds(&[]));
+        return _c_localtime(_get_seconds(&[])?);
     } else {
         return Err(crate::PyError::type_error(
             "Tuple or struct_time argument required",
@@ -884,14 +974,14 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
 
 /// time.localtime([seconds]) — interp_time.localtime
 pub fn localtime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let seconds = _get_seconds(args);
+    let seconds = _get_seconds(args)?;
     let tm = _c_localtime(seconds)?;
     Ok(_tm_to_tuple(&tm))
 }
 
 /// time.gmtime([seconds]) — interp_time.gmtime
 pub fn gmtime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let seconds = _get_seconds(args);
+    let seconds = _get_seconds(args)?;
     let tm = _c_gmtime(seconds)?;
     Ok(_tm_to_tuple(&tm))
 }
@@ -932,23 +1022,27 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let tm = _gettmarg(&args[1..], true)?;
     _checktm(&tm)?;
 
-    let fmt_str = unsafe {
+    let fmt_wtf8 = unsafe {
         if !is_str(fmt) {
             return Err(crate::PyError::type_error(
                 "strftime() argument 1 must be str",
             ));
         }
-        w_str_get_wtf8(fmt).as_bytes()
+        w_str_get_wtf8(fmt)
     };
 
-    let c_fmt = std::ffi::CString::new(fmt_str)
-        .map_err(|_| crate::PyError::value_error("embedded null in format string"))?;
+    // `interp_time.py:1158-1164` has a byte-preserving passthrough for
+    // formats the locale encoder cannot represent.  Keep pyre's WTF-8
+    // backing bytes intact for every format: valid text is ordinary UTF-8,
+    // while lone surrogates stay distinct (including adjacent DCxx bytes
+    // that would otherwise decode back into one Unicode scalar).
+    let format_len = fmt_wtf8.code_points().count();
 
     // wasm32 has no libc `strftime`; the function raises rather than dropping
     // `time` from the module registry (same policy as `gmtime`/`localtime`).
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = c_fmt;
+        let _ = format_len;
         Err(crate::PyError::not_implemented(
             "time.strftime is unavailable on wasm32",
         ))
@@ -957,39 +1051,55 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // sandbox the registration is stubbed, so the real body is compiled out.
     #[cfg(all(unix, feature = "sandbox"))]
     {
-        let _ = c_fmt;
+        let _ = format_len;
         Err(crate::host_seam::stub("time.strftime"))
     }
     // strftime is available on both Unix and Windows CRT.
     #[cfg(all(unix, not(feature = "sandbox")))]
     {
         let libc_tm = c_tm_to_libc_tm(&tm);
-        let mut buf = vec![0u8; 256];
-        unsafe {
+        let render_segment = |segment: &[u8]| -> Result<Vec<u8>, crate::PyError> {
+            if segment.is_empty() {
+                return Ok(Vec::new());
+            }
+            let c_fmt = std::ffi::CString::new(segment)
+                .expect("a segment split at every NUL contains no NUL");
+            let mut buf = vec![0u8; 256];
             loop {
-                let n = libc::strftime(
-                    buf.as_mut_ptr() as *mut libc::c_char,
-                    buf.len(),
-                    c_fmt.as_ptr(),
-                    &libc_tm,
-                );
+                let n = unsafe {
+                    libc::strftime(
+                        buf.as_mut_ptr() as *mut libc::c_char,
+                        buf.len(),
+                        c_fmt.as_ptr(),
+                        &libc_tm,
+                    )
+                };
                 if n != 0 {
-                    return Ok(w_str_from_wtf8(
-                        rustpython_wtf8::Wtf8Buf::from_bytes(buf[..n].to_vec()).unwrap_or_else(
-                            |b| {
-                                rustpython_wtf8::Wtf8Buf::from_string(
-                                    String::from_utf8_lossy(&b).into_owned(),
-                                )
-                            },
-                        ),
-                    ));
+                    return Ok(buf[..n].to_vec());
                 }
-                if buf.len() > 16384 {
-                    return Ok(w_str_new(""));
+                if buf.len() >= 256 * format_len.max(1) {
+                    return Ok(Vec::new());
                 }
                 buf.resize(buf.len() * 2, 0);
             }
+        };
+
+        // CPython gh-124531, mirrored by the current PyPy-facing suite: an
+        // embedded NUL is literal data, not the end of the format. libc's API
+        // cannot represent it, so render each NUL-free segment and restore
+        // the separators verbatim.
+        let mut rendered = Vec::new();
+        for (index, segment) in fmt_wtf8.as_bytes().split(|&byte| byte == 0).enumerate() {
+            if index != 0 {
+                rendered.push(0);
+            }
+            rendered.extend_from_slice(&render_segment(segment)?);
         }
+        Ok(w_str_from_wtf8(
+            rustpython_wtf8::Wtf8Buf::from_bytes(rendered).unwrap_or_else(|b| {
+                rustpython_wtf8::Wtf8Buf::from_string(String::from_utf8_lossy(&b).into_owned())
+            }),
+        ))
     }
     #[cfg(windows)]
     {
@@ -1001,6 +1111,8 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 timeptr: *const MsvcTm,
             ) -> usize;
         }
+        let c_fmt = std::ffi::CString::new(fmt_wtf8.as_bytes())
+            .map_err(|_| crate::PyError::value_error("embedded null in format string"))?;
         let msvc_tm = c_tm_to_msvc_tm(&tm);
         let mut buf = vec![0u8; 256];
         unsafe {
@@ -1106,7 +1218,7 @@ fn _asctime_from_tm(tm: &c_tm) -> Result<PyObjectRef, crate::PyError> {
 
 /// time.ctime([seconds]) — interp_time.ctime
 pub fn ctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let seconds = _get_seconds(args);
+    let seconds = _get_seconds(args)?;
 
     #[cfg(target_arch = "wasm32")]
     {
