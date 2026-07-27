@@ -8,9 +8,7 @@ use std::cmp::max;
 
 use majit_backend::JitCellToken;
 use majit_ir::OpCode;
-use majit_translate::jitcode::{BhFieldSpec, BhSizeSpec};
-
-const HEADERLESS_SIZE_OWNER_MARKER: &str = "__majit_headerless_size__";
+use majit_translate::jitcode::{BhFieldSpec, BhSizeSpec, HEADERLESS_SIZE_OWNER_MARKER};
 
 use crate::jitcode;
 

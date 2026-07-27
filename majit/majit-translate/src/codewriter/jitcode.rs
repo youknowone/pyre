@@ -1147,6 +1147,10 @@ fn ir_type_to_result_char(result_type: majit_ir::value::Type) -> char {
     }
 }
 
+/// `owner` sentinel marking a [`BhDescr::Size`] as headerless.  See
+/// [`BhDescr::is_headerless`] for why the flag rides in the owner slot.
+pub const HEADERLESS_SIZE_OWNER_MARKER: &str = "__majit_headerless_size__";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BhDescr {
     /// Field descriptor: for getfield/setfield.
@@ -1360,6 +1364,21 @@ impl BhDescr {
             BhDescr::Size { type_id, .. } => *type_id,
             BhDescr::Array { type_id, .. } => *type_id,
             _ => 0,
+        }
+    }
+
+    /// Whether the described struct is headerless — allocated from the
+    /// interpreter's own `headerless_structs` pool with no `type_id` word at
+    /// `ref - 8`.  A headerless struct must never be handed to a header-writing
+    /// allocator (`alloc_oldgen_typed`, `alloc_nursery_typed`): those return
+    /// `base + GcHeader::SIZE`, which shifts every field offset the descr
+    /// carries.  The wire format has no dedicated flag, so the assembler stamps
+    /// [`HEADERLESS_SIZE_OWNER_MARKER`] into the `owner` slot it would
+    /// otherwise leave empty for a transient size descr.
+    pub fn is_headerless(&self) -> bool {
+        match self {
+            BhDescr::Size { owner, .. } => owner == HEADERLESS_SIZE_OWNER_MARKER,
+            _ => false,
         }
     }
 
