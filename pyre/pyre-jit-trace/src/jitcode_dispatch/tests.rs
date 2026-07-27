@@ -10739,7 +10739,7 @@ fn portal_vable_bookkeeping_anchor_accepts_only_same_pc_same_frame_vable_writes(
 /// `getarrayitem_vable_r` is not — it writes a jitcode register the payload
 /// sources live values from.
 #[test]
-fn portal_vable_bookkeeping_anchor_admits_stack_spill_but_not_a_register_write() {
+fn portal_vable_bookkeeping_anchor_admits_this_frames_spills_and_reloads_only() {
     use majit_metainterp::jitcode::RuntimeBhDescr;
     use majit_translate::jitcode::BhDescr;
 
@@ -10808,6 +10808,9 @@ fn portal_vable_bookkeeping_anchor_admits_stack_spill_but_not_a_register_write()
         |_| 29,
     ));
 
+    // A pure vable reload writes no frame state, only a jitcode register, and
+    // the rebuild resumes the plain interpreter without a register bank — so it
+    // is admitted for a weaker reason than the spill stores above.
     let mut reload = vec![getarrayitem];
     let getarrayitem_len =
         super::super::jitcode_runtime::decode_op_at(&[getarrayitem, 1, 2, 0, 0, 0, 0, 3], 0)
@@ -10816,12 +10819,26 @@ fn portal_vable_bookkeeping_anchor_admits_stack_spill_but_not_a_register_write()
     reload.extend(std::iter::repeat_n(1u8, getarrayitem_len - 1));
     let reload_abort_pc = reload.len();
     reload.push(abort);
-    assert!(!super::portal_vable_bookkeeping_anchor(
+    assert!(super::portal_vable_bookkeeping_anchor(
         &pyjit.metadata,
         true,
         1,
         &descrs,
         &reload,
+        29,
+        reload_abort_pc,
+        |_| 29,
+    ));
+    // ...but only for this frame: a reload aimed at another frame register is
+    // not this frame's bookkeeping.
+    let mut foreign_reload = reload.clone();
+    foreign_reload[1] = 2;
+    assert!(!super::portal_vable_bookkeeping_anchor(
+        &pyjit.metadata,
+        true,
+        1,
+        &descrs,
+        &foreign_reload,
         29,
         reload_abort_pc,
         |_| 29,

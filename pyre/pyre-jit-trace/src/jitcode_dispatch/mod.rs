@@ -5222,6 +5222,15 @@ fn portal_vable_bookkeeping_anchor(
                     return false;
                 }
             }
+            // A pure vable read writes no frame state — only a jitcode
+            // register, and the rebuild discards those: it reconstructs a
+            // PyFrame, sets `last_instr = callee_py_pc - 1` and resumes the
+            // PLAIN interpreter (`frame.execute_frame`), which never observes a
+            // jitcode register bank.  So whether this op ran before the abort
+            // makes no difference to the frame the rebuild hands over.  That is
+            // a weaker requirement than the spill stores above, which are
+            // admitted only because the rebuild rewrites the areas they touch.
+            "getarrayitem_vable_r/ridd>r" => {}
             _ => return false,
         }
         pc = op.next_pc;
