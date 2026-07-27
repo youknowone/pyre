@@ -541,6 +541,69 @@ fn exception_delivery_stack_is_sourceable(
     handler_depth == 0 && array_len >= stack_base + 1
 }
 
+/// Flush the OUTER frame at the CALL that entered the aborting callee and let
+/// the interpreter re-execute that whole call.  Returns the committed
+/// `call_py_pc`, or `None` when any step declined and the legacy replay stands.
+///
+/// This resume REWINDS to the CALL, which is sound only while nothing has been
+/// applied since it — the latch was set under that gate, and it is re-checked
+/// here before the flush mutates the live frame.  Reached either as the carrier
+/// in its own right or as the callee-rebuild leg's fallback.
+fn try_commit_entry_carrier_call(
+    ctx: &TraceCtx,
+    cf_addr: usize,
+    abort_jit_pc: usize,
+    outer_jitcode_index: u32,
+    call_jitcode_pc: usize,
+    call_stack: &[pyre_object::PyObjectRef],
+    entry_executed_effects: usize,
+) -> Option<usize> {
+    let resume = WalkEndResume::Rewind {
+        effects_at_resume_point: entry_executed_effects,
+    };
+    if !walk_end_resume_provable(resume) {
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-abort-flush] gh#467 CALL-forward declined at \
+                 abort_jit_pc={abort_jit_pc} (executed-effect delta since the \
+                 outer CALL) — legacy replay kept"
+            );
+        }
+        return None;
+    }
+    let Some(call_py_pc) = resolve_entry_carrier_call_py_pc(outer_jitcode_index, call_jitcode_pc)
+    else {
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-abort-flush] gh#467 CALL-forward declined at \
+                 abort_jit_pc={abort_jit_pc} (unresolved outer \
+                 jitcode_index={outer_jitcode_index} or null code ptr) — legacy replay kept"
+            );
+        }
+        return None;
+    };
+    if !crate::state::flush_walk_end_state_at_outer_call(ctx, cf_addr, call_py_pc, call_stack) {
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-abort-flush] gh#467 CALL-forward declined at \
+                 call_py_pc={call_py_pc} (depth mismatch / unresolved local / \
+                 lastblock) — legacy replay kept"
+            );
+        }
+        return None;
+    }
+    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+        eprintln!(
+            "[fbw-abort-flush] gh#467 CALL-forward COMMIT abort_jit_pc={abort_jit_pc} \
+             call_py_pc={call_py_pc} stack_depth={}",
+            call_stack.len()
+        );
+    }
+    let committed = commit_walk_end(WalkEndCommitLeg::EntryCarrierCall, resume);
+    debug_assert!(committed, "provability re-checked after a pure flush");
+    Some(call_py_pc)
+}
+
 fn try_commit_midbody_abort(
     ctx: &TraceCtx,
     cf_addr: usize,
@@ -2885,54 +2948,15 @@ fn run_perfn_walk<Sym: WalkSym>(
                     call_stack,
                     entry_executed_effects,
                 }) => {
-                    // This resume re-executes the outer CALL from scratch, so
-                    // it is only sound while nothing has been applied since
-                    // that CALL.  The latch was set under the same gate; check
-                    // it again here, before the flush mutates the live frame.
-                    let resume = WalkEndResume::Rewind {
-                        effects_at_resume_point: *entry_executed_effects,
-                    };
-                    if !walk_end_resume_provable(resume) {
-                        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                            eprintln!(
-                                "[fbw-abort-flush] gh#467 CALL-forward declined at \
-                                     abort_jit_pc={abort_jit_pc} (executed-effect delta since the \
-                                     outer CALL) — legacy replay kept"
-                            );
-                        }
-                    } else if let Some(call_py_pc) =
-                        resolve_entry_carrier_call_py_pc(*outer_jitcode_index, *call_jitcode_pc)
-                    {
-                        if crate::state::flush_walk_end_state_at_outer_call(
-                            ctx, cf_addr, call_py_pc, call_stack,
-                        ) {
-                            committed_entry_carrier_call_py_pc = Some(call_py_pc);
-                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                                eprintln!(
-                                    "[fbw-abort-flush] gh#467 CALL-forward COMMIT \
-                                         abort_jit_pc={abort_jit_pc} call_py_pc={call_py_pc} \
-                                         stack_depth={}",
-                                    call_stack.len()
-                                );
-                            }
-                            let committed =
-                                commit_walk_end(WalkEndCommitLeg::EntryCarrierCall, resume);
-                            debug_assert!(committed, "provability re-checked after a pure flush");
-                        } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                            eprintln!(
-                                "[fbw-abort-flush] gh#467 CALL-forward declined at \
-                                     call_py_pc={call_py_pc} (depth mismatch / unresolved local / \
-                                     lastblock) — legacy replay kept"
-                            );
-                        }
-                    } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                        eprintln!(
-                            "[fbw-abort-flush] gh#467 CALL-forward declined at \
-                                 abort_jit_pc={abort_jit_pc} (unresolved outer jitcode_index={} \
-                                 or null code ptr) — legacy replay kept",
-                            outer_jitcode_index,
-                        );
-                    }
+                    committed_entry_carrier_call_py_pc = try_commit_entry_carrier_call(
+                        ctx,
+                        cf_addr,
+                        abort_jit_pc,
+                        *outer_jitcode_index,
+                        *call_jitcode_pc,
+                        call_stack,
+                        *entry_executed_effects,
+                    );
                 }
                 Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(payload))
                     if (is_marker_abort
@@ -2942,36 +2966,62 @@ fn run_perfn_walk<Sym: WalkSym>(
                             && payload.abort_kind
                                 == crate::jitcode_dispatch::MidBodyAbortKind::Structural) =>
                 {
-                    if let Some(words) = resolve_midbody_flush_words(payload) {
-                        if try_commit_midbody_abort(ctx, cf_addr, payload, words) {
+                    let rebuilt = match resolve_midbody_flush_words(payload) {
+                        Some(words) => {
+                            let ok = try_commit_midbody_abort(ctx, cf_addr, payload, words);
                             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                                eprintln!(
-                                    "[fbw-abort-flush] gh#467 callee-rebuild COMMIT \
+                                if ok {
+                                    eprintln!(
+                                        "[fbw-abort-flush] gh#467 callee-rebuild COMMIT \
                                          abort_jit_pc={abort_jit_pc} callee_py_pc={} \
                                          call_py_pc={} post_call_py_pc={}",
-                                    words.callee_py_pc, words.call_py_pc, words.post_call_py_pc,
+                                        words.callee_py_pc,
+                                        words.call_py_pc,
+                                        words.post_call_py_pc,
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "[fbw-abort-flush] gh#467 callee-rebuild declined at \
+                                         callee_py_pc={}",
+                                        words.callee_py_pc,
+                                    );
+                                }
+                            }
+                            ok
+                        }
+                        None => {
+                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                                eprintln!(
+                                    "[fbw-abort-flush] gh#467 callee-rebuild declined at \
+                                     abort_jit_pc={abort_jit_pc} (unresolved carried jitcode \
+                                     identity or null code ptr)",
                                 );
                             }
-                            // This leg resumes INSIDE the rebuilt callee at its
-                            // abort pc — ahead of what the callee applied, not
-                            // behind it.  Nothing re-runs; committing is what
-                            // keeps those effects.
-                            let _ = commit_walk_end(
-                                WalkEndCommitLeg::CalleeRebuild,
-                                WalkEndResume::AfterApplied,
-                            );
-                        } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                            eprintln!(
-                                "[fbw-abort-flush] gh#467 callee-rebuild declined at \
-                                     callee_py_pc={} — legacy replay kept",
-                                words.callee_py_pc,
-                            );
+                            false
                         }
-                    } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                        eprintln!(
-                            "[fbw-abort-flush] gh#467 callee-rebuild declined at \
-                                 abort_jit_pc={abort_jit_pc} (unresolved carried jitcode identity \
-                                 or null code ptr) — legacy replay kept",
+                    };
+                    if rebuilt {
+                        // This leg resumes INSIDE the rebuilt callee at its
+                        // abort pc — ahead of what the callee applied, not
+                        // behind it.  Nothing re-runs; committing is what
+                        // keeps those effects.
+                        let _ = commit_walk_end(
+                            WalkEndCommitLeg::CalleeRebuild,
+                            WalkEndResume::AfterApplied,
+                        );
+                    } else if let Some(fallback) = payload.entry_fallback.as_ref() {
+                        // The rebuild declined but the entry latch's gate had
+                        // held, so rewinding to the outer CALL is still open.
+                        // Falling through to the legacy replay instead would
+                        // re-apply the non-journaled pre-CALL stores.
+                        committed_entry_carrier_call_py_pc = try_commit_entry_carrier_call(
+                            ctx,
+                            cf_addr,
+                            abort_jit_pc,
+                            payload.outer_jitcode_index,
+                            payload.call_jitcode_pc,
+                            &fallback.call_stack,
+                            fallback.entry_executed_effects,
                         );
                     }
                 }

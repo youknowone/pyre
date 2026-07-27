@@ -2625,22 +2625,28 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                         crate::state::pyjitcode_for_code(w_code).ok_or("no callee pyjitcode")?;
                     let metadata = &callee_pjc.metadata;
                     let callee_py_pc = python_pc_for_jitcode_pc(metadata, abort_pc) as usize;
-                    let anchor_ok = match abort_kind {
-                        MidBodyAbortKind::Structural => {
-                            exact_floor_segment_anchor(metadata, callee_py_pc, abort_pc)
-                        }
-                        MidBodyAbortKind::Marker => portal_marker_first_jit_anchor(
-                            metadata,
-                            metadata.built_as_portal,
-                            metadata.portal_frame_reg,
-                            callee_perfn_descrs,
-                            body.code,
-                            callee_py_pc,
-                            abort_pc,
-                            |op_pc| python_pc_for_jitcode_pc(metadata, op_pc) as usize,
-                        ),
-                    };
+                    // Both abort kinds sit at the head of an opcode the walker
+                    // could not take, behind at most that opcode's own vable
+                    // spill; the marker kind is the narrower of the two.
+                    let anchor_ok = portal_vable_bookkeeping_anchor(
+                        metadata,
+                        metadata.built_as_portal,
+                        metadata.portal_frame_reg,
+                        callee_perfn_descrs,
+                        body.code,
+                        callee_py_pc,
+                        abort_pc,
+                        |op_pc| python_pc_for_jitcode_pc(metadata, op_pc) as usize,
+                    );
                     if !anchor_ok {
+                        if fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-abort-flush] gh#467 inexact anchor at abort_pc={abort_pc} \
+                                 callee_py_pc={callee_py_pc} kind={abort_kind:?} \
+                                 would re-run {:?}",
+                                floor_segment_ops_before(metadata, body.code, abort_pc),
+                            );
+                        }
                         return Err("abort pc is not an exact segment anchor");
                     }
                     let raw = unsafe {
@@ -2738,6 +2744,10 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                         live_locals,
                         live_stack,
                         return_value: pyre_object::PY_NULL,
+                        // Attached later by `fbw_set_abort_call_resume`, which
+                        // runs in the Err arm below under the entry latch's own
+                        // zero-delta gate.
+                        entry_fallback: None,
                     })
                 })();
                 match payload {

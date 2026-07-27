@@ -5038,6 +5038,20 @@ pub(crate) struct MidBodyPayload {
     pub live_locals: Vec<Option<ConcreteValue>>,
     pub live_stack: Vec<ConcreteValue>,
     pub return_value: pyre_object::PyObjectRef,
+    /// What [`InlineAbortCarrier::Entry`] would have carried for the same
+    /// abort.  The rebuild is preferred, but it can still decline at the flush
+    /// (an unsourceable outer local, a handler-bearing body); dropping to the
+    /// legacy replay there would re-open the double-apply this carrier family
+    /// exists to close, so the entry rewind stands behind it.  `None` when the
+    /// entry latch's own gate refused.
+    pub entry_fallback: Option<EntryFallback>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EntryFallback {
+    pub call_stack: Vec<pyre_object::PyObjectRef>,
+    /// See [`InlineAbortCarrier::Entry::entry_executed_effects`].
+    pub entry_executed_effects: usize,
 }
 
 struct FbwStoreJournalRootArea {
@@ -5103,14 +5117,57 @@ fn exact_floor_segment_anchor(
         .is_some_and(|(start, py)| start == jit_pc && py as usize == py_pc)
 }
 
-/// Admit a marker at the semantic head of a portal-shaped Python opcode.
-/// `serialize_op` keeps the first op for a Python pc, so the
-/// `setfield_vable_i(last_instr)` emitted immediately before
-/// `abort_permanent` owns the exact anchor slot. The write is entry
-/// bookkeeping: forward interpretation repeats it before executing the
-/// unsupported opcode. Anything except that same-pc write to this portal
-/// frame declines.
-fn portal_marker_first_jit_anchor(
+/// The jitcode ops the callee-rebuild leg would re-run if it resumed at the
+/// Python pc owning `jit_pc` — everything from that pc's floor-segment start up
+/// to `jit_pc`.  Empty exactly when [`exact_floor_segment_anchor`] holds, so a
+/// non-empty list names what makes the anchor inexact.
+pub(crate) fn floor_segment_ops_before(
+    metadata: &crate::PyJitCodeMetadata,
+    code: &[u8],
+    jit_pc: usize,
+) -> Vec<String> {
+    let Some((mut pc, _py)) =
+        crate::pyjitcode::floor_segment_for_jitcode_pc(&metadata.py_floor_by_jit_pc, jit_pc)
+    else {
+        return vec!["<no floor segment>".to_string()];
+    };
+    let mut keys = Vec::new();
+    while pc < jit_pc {
+        let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) else {
+            keys.push("<undecodable>".to_string());
+            break;
+        };
+        keys.push(format!(
+            "{}@f{}",
+            op.key,
+            code.get(op.pc + 1).copied().unwrap_or(u8::MAX)
+        ));
+        pc = op.next_pc;
+    }
+    keys
+}
+
+/// Admit an abort pc at the semantic head of a portal-shaped Python opcode —
+/// that is, one whose whole jitcode prefix inside its own floor segment writes
+/// nothing but THIS frame's own virtualizable: operand-stack slots
+/// (`setarrayitem_vable_r`) and the two int bookkeeping fields,
+/// `last_instr`/`valuestackdepth` (`setfield_vable_i`).
+///
+/// The callee-rebuild leg reconstructs the frame wholesale — a fresh `PyFrame`
+/// whose locals, stack area, `valuestackdepth` and `last_instr` all come from
+/// the carried payload — so every one of those writes is erased before the
+/// rebuilt frame runs, and the resume state at `py_pc` is unaffected by how far
+/// into the opcode's spill the walk got.  `live_stack`'s depth is
+/// `depth_at_py_pc[py_pc]` (`depth_for_jitcode_pc_pred` is keyed per Python pc),
+/// i.e. the depth BEFORE the opcode, which is what resuming at `py_pc` needs.
+///
+/// `getarrayitem_vable_r` is NOT admitted even though it too only reads the
+/// vable: it writes a jitcode REGISTER, and the payload sources `live_stack`
+/// and `live_locals` out of `concrete_registers_r` by color.  A clobbered color
+/// would be read back as a live value.
+///
+/// Anything else, or a write aimed at another frame, declines.
+fn portal_vable_bookkeeping_anchor(
     metadata: &crate::PyJitCodeMetadata,
     built_as_portal: bool,
     portal_frame_reg: u16,
@@ -5140,23 +5197,33 @@ fn portal_marker_first_jit_anchor(
         };
         if op.next_pc > jit_pc
             || python_pc_for_op(op.pc) != py_pc
-            || op.key != "setfield_vable_i/rid"
             || code.get(op.pc + 1).copied() != Some(portal_frame_reg as u8)
         {
             return false;
         }
-        // `rid`: opcode, frame reg, value reg, little-endian descr index.
-        let Some((&lo, &hi)) = code.get(op.pc + 3).zip(code.get(op.pc + 4)) else {
-            return false;
-        };
-        let descr_index = lo as usize | ((hi as usize) << 8);
-        if !matches!(
-            perfn_descrs.get(descr_index),
-            Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(
-                majit_translate::jitcode::BhDescr::VableField { index: 0 }
-            ))
-        ) {
-            return false;
+        match op.key {
+            // Which stack slot a spill addresses does not matter: the whole
+            // stack area is rewritten from `live_stack`.
+            "setarrayitem_vable_r/rirdd" => {}
+            // `rid`: opcode, frame reg, value reg, little-endian descr index.
+            // The int vable fields are `last_instr` (0) and `valuestackdepth`
+            // (2), both reassigned by the rebuild; a non-`VableField` descr is
+            // not frame bookkeeping.
+            "setfield_vable_i/rid" => {
+                let Some((&lo, &hi)) = code.get(op.pc + 3).zip(code.get(op.pc + 4)) else {
+                    return false;
+                };
+                let descr_index = lo as usize | ((hi as usize) << 8);
+                if !matches!(
+                    perfn_descrs.get(descr_index),
+                    Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(
+                        majit_translate::jitcode::BhDescr::VableField { .. }
+                    ))
+                ) {
+                    return false;
+                }
+            }
+            _ => return false,
         }
         pc = op.next_pc;
     }
@@ -5396,6 +5463,11 @@ pub unsafe fn fbw_store_journal_root_walker_area(
                 for slot in &mut payload.live_stack {
                     if let ConcreteValue::Ref(value) = slot {
                         visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
+                    }
+                }
+                if let Some(fallback) = payload.entry_fallback.as_mut() {
+                    for slot in &mut fallback.call_stack {
+                        visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
                     }
                 }
             }

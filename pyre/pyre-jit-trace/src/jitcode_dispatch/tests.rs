@@ -10669,7 +10669,7 @@ fn structural_midbody_anchor_requires_exact_floor_segment_start() {
 }
 
 #[test]
-fn portal_marker_anchor_accepts_only_same_pc_last_instr_bookkeeping() {
+fn portal_vable_bookkeeping_anchor_accepts_only_same_pc_same_frame_vable_writes() {
     use majit_metainterp::jitcode::RuntimeBhDescr;
     use majit_translate::jitcode::BhDescr;
 
@@ -10687,7 +10687,7 @@ fn portal_marker_anchor_accepts_only_same_pc_last_instr_bookkeeping() {
     pyjit.metadata.py_floor_by_jit_pc = vec![(0, 29)];
     let portal_gap = [setfield, 1, 7, 0, 0, abort];
 
-    assert!(super::portal_marker_first_jit_anchor(
+    assert!(super::portal_vable_bookkeeping_anchor(
         &pyjit.metadata,
         true,
         1,
@@ -10697,7 +10697,7 @@ fn portal_marker_anchor_accepts_only_same_pc_last_instr_bookkeeping() {
         5,
         |_| 29,
     ));
-    assert!(!super::portal_marker_first_jit_anchor(
+    assert!(!super::portal_vable_bookkeeping_anchor(
         &pyjit.metadata,
         true,
         1,
@@ -10709,7 +10709,7 @@ fn portal_marker_anchor_accepts_only_same_pc_last_instr_bookkeeping() {
     ));
 
     let computation_gap = [int_copy, 1, 7, abort];
-    assert!(!super::portal_marker_first_jit_anchor(
+    assert!(!super::portal_vable_bookkeeping_anchor(
         &pyjit.metadata,
         true,
         1,
@@ -10721,7 +10721,7 @@ fn portal_marker_anchor_accepts_only_same_pc_last_instr_bookkeeping() {
     ));
 
     pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (5, 29)];
-    assert!(super::portal_marker_first_jit_anchor(
+    assert!(super::portal_vable_bookkeeping_anchor(
         &pyjit.metadata,
         false,
         u16::MAX,
@@ -10729,6 +10729,101 @@ fn portal_marker_anchor_accepts_only_same_pc_last_instr_bookkeeping() {
         &portal_gap,
         29,
         5,
+        |_| 29,
+    ));
+}
+
+/// The operand-stack spill the walker emits ahead of an unwalkable opcode is
+/// `setarrayitem_vable_r` + `setfield_vable_i(valuestackdepth)`, not the
+/// `last_instr` write alone; the rebuild rewrites both, so both are admitted.
+/// `getarrayitem_vable_r` is not — it writes a jitcode register the payload
+/// sources live values from.
+#[test]
+fn portal_vable_bookkeeping_anchor_admits_stack_spill_but_not_a_register_write() {
+    use majit_metainterp::jitcode::RuntimeBhDescr;
+    use majit_translate::jitcode::BhDescr;
+
+    let setarrayitem = *insns_opname_to_byte()
+        .get("setarrayitem_vable_r/rirdd")
+        .expect("setarrayitem_vable_r must exist");
+    let getarrayitem = *insns_opname_to_byte()
+        .get("getarrayitem_vable_r/ridd>r")
+        .expect("getarrayitem_vable_r must exist");
+    let setfield = *insns_opname_to_byte()
+        .get("setfield_vable_i/rid")
+        .expect("setfield_vable_i must exist");
+    let abort = *insns_opname_to_byte()
+        .get("abort_permanent/")
+        .expect("abort_permanent must exist");
+    // `valuestackdepth` is static field index 2, not 0.
+    let descrs = [RuntimeBhDescr::Descr(BhDescr::VableField { index: 2 })];
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.metadata.py_floor_by_jit_pc = vec![(0, 29)];
+
+    let mut spill = vec![setarrayitem];
+    let setarrayitem_len =
+        super::super::jitcode_runtime::decode_op_at(&[setarrayitem, 1, 2, 3, 0, 0, 0, 0], 0)
+            .expect("setarrayitem_vable_r must decode")
+            .next_pc;
+    spill.extend(std::iter::repeat_n(1u8, setarrayitem_len - 1));
+    let spill_end = spill.len();
+    spill.extend_from_slice(&[setfield, 1, 7, 0, 0]);
+    let abort_pc = spill.len();
+    spill.push(abort);
+
+    assert!(super::portal_vable_bookkeeping_anchor(
+        &pyjit.metadata,
+        true,
+        1,
+        &descrs,
+        &spill,
+        29,
+        abort_pc,
+        |_| 29,
+    ));
+    // A `setfield_vable_i` whose descr is not a vable field is not bookkeeping.
+    let mut foreign_descr = spill.clone();
+    foreign_descr[spill_end + 3] = 1;
+    assert!(!super::portal_vable_bookkeeping_anchor(
+        &pyjit.metadata,
+        true,
+        1,
+        &descrs,
+        &foreign_descr,
+        29,
+        abort_pc,
+        |_| 29,
+    ));
+    // A spill aimed at another frame register is not this frame's bookkeeping.
+    let mut foreign_frame = spill.clone();
+    foreign_frame[1] = 2;
+    assert!(!super::portal_vable_bookkeeping_anchor(
+        &pyjit.metadata,
+        true,
+        1,
+        &descrs,
+        &foreign_frame,
+        29,
+        abort_pc,
+        |_| 29,
+    ));
+
+    let mut reload = vec![getarrayitem];
+    let getarrayitem_len =
+        super::super::jitcode_runtime::decode_op_at(&[getarrayitem, 1, 2, 0, 0, 0, 0, 3], 0)
+            .expect("getarrayitem_vable_r must decode")
+            .next_pc;
+    reload.extend(std::iter::repeat_n(1u8, getarrayitem_len - 1));
+    let reload_abort_pc = reload.len();
+    reload.push(abort);
+    assert!(!super::portal_vable_bookkeeping_anchor(
+        &pyjit.metadata,
+        true,
+        1,
+        &descrs,
+        &reload,
+        29,
+        reload_abort_pc,
         |_| 29,
     ));
 }

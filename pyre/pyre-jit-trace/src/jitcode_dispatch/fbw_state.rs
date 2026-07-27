@@ -905,12 +905,14 @@ pub(crate) fn fbw_bump_executed_effect() {
 /// gh#467 latch the inline-abort forward-flush carrier (see
 /// [`FBW_ABORT_CALL_RESUME`]).
 ///
-/// Declines when a `MidBody` carrier is already latched.  Rebuilding the callee
-/// at its own pc and resuming the caller past its call is what upstream does
+/// Does not displace an already-latched `MidBody` carrier — it is stored inside
+/// it as [`MidBodyPayload::entry_fallback`] instead.  Rebuilding the callee at
+/// its own pc and resuming the caller past its call is what upstream does
 /// (`blackhole.py:1799-1821`, `:1653-1662`); rewinding the caller TO the call
 /// has no upstream counterpart, so it stands in only for a callee the rebuild
-/// could not describe.  Both sites are `is_top_inline` on an aborting sub-walk,
-/// which ends the walk, so at most one of each is latched per walk.
+/// could not describe or could not flush.  Both sites are `is_top_inline` on an
+/// aborting sub-walk, which ends the walk, so at most one of each is latched
+/// per walk, and both read the same outer CALL coordinate.
 pub(crate) fn fbw_set_abort_call_resume(
     outer_jitcode_index: u32,
     call_jitcode_pc: usize,
@@ -918,7 +920,15 @@ pub(crate) fn fbw_set_abort_call_resume(
 ) {
     FBW_ABORT_CALL_RESUME.with(|c| {
         let mut slot = c.borrow_mut();
-        if matches!(&*slot, Some(InlineAbortCarrier::MidBody(_))) {
+        if let Some(InlineAbortCarrier::MidBody(payload)) = slot.as_mut() {
+            if payload.outer_jitcode_index == outer_jitcode_index
+                && payload.call_jitcode_pc == call_jitcode_pc
+            {
+                payload.entry_fallback = Some(crate::jitcode_dispatch::EntryFallback {
+                    call_stack: stack,
+                    entry_executed_effects: fbw_executed_effect_count(),
+                });
+            }
             return;
         }
         *slot = Some(InlineAbortCarrier::Entry {

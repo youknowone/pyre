@@ -183,14 +183,58 @@ miscompile (jit / `PYRE_NO_JIT=1` / CPython agree on a `yield`-per-`next` probe)
 ⇒ the honest denominator for R5 is **19**, not 170, and row 7's anchor is the
 dominant real blocker.
 
-#### Next slice: row 7 (the segment anchor)
+#### ✅Slice B landed: row 7 (the segment anchor)
 
-`exact_floor_segment_anchor` (`jitcode_dispatch/mod.rs`) demands the abort
+`exact_floor_segment_anchor` (`jitcode_dispatch/mod.rs`) demanded the abort
 jitcode pc be the exact FIRST jitcode op of its Python pc's floor segment,
 because leg 4 rebuilds a **Python** frame at a **Python** pc. Upstream needs no
 such mapping: `_copy_data_from_miframe` (`blackhole.py:1711-1712`) resumes each
-blackhole at its **jitcode** position. This is the F1 charter deviation
-(py_pc ↔ jitcode), so the slice is scoped by it rather than by frame layout.
+blackhole at its **jitcode** position — the F1 charter deviation (py_pc ↔
+jitcode).
+
+What the 18 refusals actually were, measured: the prefix between the segment
+start and the abort pc is **only** `setarrayitem_vable_r` +
+`setfield_vable_i` + `getarrayitem_vable_r`, every one of them aimed at the
+callee's own `portal_frame_reg`. `portal_marker_first_jit_anchor` already
+admitted a subset of exactly this (the `setfield_vable_i(VableField{index:0})`
+prefix); it was generalized to `portal_vable_bookkeeping_anchor` and now serves
+both abort kinds. Result: anchor refusals 18 → 3, leg 4 commits 1 → **11**,
+leg 3 commits 169 → 159.
+
+⚠️Two traps this slice walked into, both worth remembering:
+
+- **`depth_for_jitcode_pc_pred` is keyed per Python pc**, not per jitcode pc
+  ("Equals `depth_at_py_pc[python_pc_for_jitcode_pc(jit_pc)]`",
+  `pyjitcode.rs`). Comparing it at the segment start and at the abort pc
+  therefore *always* agrees and proves nothing. The real licence is that the
+  rebuild rewrites locals, stack area, `valuestackdepth` and `last_instr`
+  wholesale, so every vable write in the prefix is erased.
+- The `setfield_vable_i` in the prefix writes `VableField{index:2}` =
+  **`valuestackdepth`**, not `last_instr` (static field order is
+  `last_instr, pycode, valuestackdepth, debugdata, lastblock, w_globals` —
+  `virtualizable_gen.rs`). The pattern is `push_and_bump!`: store the slot,
+  then bump the depth.
+
+`getarrayitem_vable_r` is deliberately still refused (the remaining 3): it
+writes a jitcode REGISTER, and the payload sources `live_stack`/`live_locals`
+out of `concrete_registers_r` by color, so a clobbered color would be read back
+as a live value. Lifting it needs a color-liveness argument, not a wider op set.
+
+#### ✅Slice B also: the rebuild's fallback
+
+Newly-latched rebuilds can still decline at the flush (5 of the 15 did), and
+that decline used to land on the legacy replay — the unsound fallback of
+TL;DR §3, and precisely the double-apply the entry carrier was built to close.
+`MidBodyPayload` now carries `entry_fallback`, attached by
+`fbw_set_abort_call_resume` under the entry latch's own zero-delta gate, and
+the walk-end MidBody arm retries through the extracted
+`try_commit_entry_carrier_call`. Commit totals are conserved: 169+1 → 159+11.
+
+#### Next slice
+
+The remaining refusals are 3 `getarrayitem_vable_r` anchors and 1 non-`Ref`
+first argument (row 5). Row 1 (depth-1) and rows 4b/6 still have no corpus
+witness — do not work them without one.
 
 ⚠️Do **not** drop the other conjunct, `!fbw_has_unjournaled_effect()`. Upstream's
 `execute_and_record` executes *then* records (`pyjitpl.py:2647-2662`), so
