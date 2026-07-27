@@ -1860,7 +1860,7 @@ pub(crate) fn bind_kwargs_to_signature(
         }
         if !matched {
             if has_varkw {
-                extra_kwargs.push((pyre_object::w_str_from_wtf8(key.clone()), *value));
+                extra_kwargs.push((pyre_object::w_str_from_wtf8_managed(key.clone()), *value));
             } else {
                 unmatched_kw_names.push(key.clone());
             }
@@ -2058,7 +2058,7 @@ pub fn call_with_kwargs(
                     unsafe {
                         pyre_object::w_dict_store(
                             kwargs_dict,
-                            pyre_object::w_str_from_wtf8(key.clone()),
+                            pyre_object::w_str_from_wtf8_managed(key.clone()),
                             *value,
                         );
                     }
@@ -2323,7 +2323,7 @@ pub fn call_with_kwargs(
                     unsafe {
                         pyre_object::w_dict_store(
                             kw_dict,
-                            pyre_object::w_str_from_wtf8(key.clone()),
+                            pyre_object::w_str_from_wtf8_managed(key.clone()),
                             *value,
                         );
                     }
