@@ -516,8 +516,7 @@ fn build_malloc_slowpath_body(asm: &mut Assembler, slowpath_fn: i64, propagate_p
     // share): non-array write barrier on the reloaded jf so subsequent
     // Ref writes into frame slots are tracked by minor GC.  The barrier
     // body is conditional on the GC exposing a write-barrier descr.
-    let wb_descr =
-        crate::runner::with_dynasm_active_gc(|gc| gc.get_write_barrier_descr()).flatten();
+    let wb_descr = crate::runner::dynasm_write_barrier_descr();
     if let Some(wb) = wb_descr {
         let byteofs = wb.jit_wb_if_flag_byteofs;
         let mask = wb.jit_wb_if_flag_singlebyte as i8;
@@ -2456,10 +2455,7 @@ impl<'a> Assembler386<'a> {
         // (assembler.py:2401 `if array and jit_wb_cards_set` gate); the
         // `helper_num=4` XMM-skip optimization is a perf adaptation not
         // a correctness gap and is not yet implemented.
-        if crate::runner::with_dynasm_active_gc(|gc| gc.get_write_barrier_descr())
-            .flatten()
-            .is_some()
-        {
+        if crate::runner::dynasm_write_barrier_descr().is_some() {
             let rbp_loc = Loc::Reg(crate::regloc::EBP);
             self.emit_write_barrier_fastpath_kind(&[rbp_loc], false);
         }
@@ -7581,9 +7577,7 @@ impl<'a> Assembler386<'a> {
     /// write barrier.
     fn emit_setarrayitem_gc_write_barrier(&mut self, arglocs: &[Loc]) {
         let use_array_barrier =
-            crate::runner::with_dynasm_active_gc(|gc| gc.get_write_barrier_descr())
-                .flatten()
-                .is_some_and(|wb| wb.jit_wb_cards_set != 0);
+            crate::runner::dynasm_write_barrier_descr().is_some_and(|wb| wb.jit_wb_cards_set != 0);
         self.emit_write_barrier_fastpath_kind(arglocs, use_array_barrier);
     }
 
@@ -7594,9 +7588,9 @@ impl<'a> Assembler386<'a> {
     }
 
     fn emit_write_barrier_fastpath_kind(&mut self, arglocs: &[Loc], is_array: bool) {
-        let wb = match crate::runner::with_dynasm_active_gc(|gc| gc.get_write_barrier_descr()) {
-            Some(Some(wb)) => wb,
-            _ => return,
+        let wb = match crate::runner::dynasm_write_barrier_descr() {
+            Some(wb) => wb,
+            None => return,
         };
         let loc_base = match arglocs.first() {
             Some(Loc::Reg(r)) => *r,

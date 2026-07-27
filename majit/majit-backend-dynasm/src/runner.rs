@@ -128,6 +128,20 @@ pub(crate) fn with_dynasm_active_gc<R>(f: impl Fn(&dyn majit_gc::GcAllocator) ->
     None
 }
 
+/// GC write-barrier descriptor for machine-code generation.
+///
+/// Compilation may run outside the mutator thread that owns
+/// `DYNASM_ACTIVE_GC`. PyPy keeps this descriptor on `cpu.gc_ll_descr`; use
+/// the current MiniMark layout in that case instead of silently omitting every
+/// barrier. If an active collector explicitly reports no descriptor, preserve
+/// that choice.
+pub(crate) fn dynasm_write_barrier_descr() -> Option<majit_gc::WriteBarrierDescr> {
+    match with_dynasm_active_gc(|gc| gc.get_write_barrier_descr()) {
+        Some(descr) => descr,
+        None => Some(majit_gc::WriteBarrierDescr::for_current_gc()),
+    }
+}
+
 /// `&mut` counterpart of [`with_dynasm_active_gc`] for GC mutations
 /// (allocation, write barriers). Same three-way routing: test box →
 /// box; production (no box, `gc_sync` initialized) → `gc_sync::gc_op`;

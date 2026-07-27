@@ -5891,9 +5891,9 @@ impl<'a> AssemblerARM64<'a> {
         is_array: bool,
         loc_index: Option<crate::regloc::RegLoc>,
     ) {
-        let wb = match crate::runner::with_dynasm_active_gc(|gc| gc.get_write_barrier_descr()) {
-            Some(Some(wb)) => wb,
-            _ => return,
+        let wb = match crate::runner::dynasm_write_barrier_descr() {
+            Some(wb) => wb,
+            None => return,
         };
         let card_marking = is_array && wb.jit_wb_cards_set != 0;
 

@@ -1707,7 +1707,13 @@ impl MiniMarkGC {
         }
     }
 
-    fn copy_nursery_object(&mut self, obj_addr: usize) -> GcRef {
+    fn copy_nursery_object(
+        &mut self,
+        obj_addr: usize,
+        site: &str,
+        holder_addr: usize,
+        slot_addr: usize,
+    ) -> GcRef {
         // Pinned objects must stay in the nursery.
         if self.pinned_objects.contains(&obj_addr) {
             return GcRef(obj_addr);
@@ -1727,7 +1733,36 @@ impl MiniMarkGC {
         }
 
         let type_id = unsafe { (*hdr_ptr).type_id() };
-        self.validate_type_id(type_id, obj_addr, "copy_nursery_object");
+        if type_id as usize >= self.types.len() {
+            let holder_type_id = if holder_addr == 0 {
+                None
+            } else {
+                Some(unsafe { (*header_of(holder_addr)).type_id() })
+            };
+            let mut holder_words = [0usize; 8];
+            if holder_addr != 0 {
+                for (index, word) in holder_words.iter_mut().enumerate() {
+                    *word = unsafe { *((holder_addr as *const usize).add(index)) };
+                }
+            }
+            panic!(
+                "GC BUG: invalid type_id={} at obj_addr={:#x} \
+                 (header_addr={:#x}, nursery_start={:#x}, site={}, \
+                 nursery_free={:#x}, nursery_top={:#x}, holder_addr={:#x}, \
+                 holder_type_id={:?}, holder_offset={:?}, holder_words={:#x?})",
+                type_id,
+                obj_addr,
+                obj_addr - GcHeader::SIZE,
+                self.nursery.start_ptr() as usize,
+                site,
+                self.nursery.free_ptr() as usize,
+                self.nursery.top_ptr() as usize,
+                holder_addr,
+                holder_type_id,
+                slot_addr.checked_sub(holder_addr),
+                holder_words,
+            );
+        }
         let type_info = self.types.get(type_id);
 
         // Compute the actual payload size (for varsize objects, read the length).
@@ -1854,7 +1889,8 @@ impl MiniMarkGC {
         if !self.is_nursery_object_start(gcref.0) || self.pinned_objects.contains(&gcref.0) {
             return;
         }
-        let new_ref = self.copy_nursery_object(gcref.0);
+        let slot_addr = gcref as *mut GcRef as usize;
+        let new_ref = self.copy_nursery_object(gcref.0, "minor_root_target", 0, slot_addr);
         *gcref = new_ref;
         // incminimark.py:2140-2143: append iff (VISITED | PINNED) == 0. pyre's
         // marking convention sets VISITED at push time (see `seed_major_root`
@@ -1888,7 +1924,12 @@ impl MiniMarkGC {
                         "minor_custom_trace",
                     );
                     if self.is_nursery_object_start(field_ref.0) {
-                        let new_ref = self.copy_nursery_object(field_ref.0);
+                        let new_ref = self.copy_nursery_object(
+                            field_ref.0,
+                            "minor_custom_trace_target",
+                            obj_addr,
+                            slot_ptr as usize,
+                        );
                         *slot_ptr = new_ref;
                     }
                 });
@@ -1914,7 +1955,12 @@ impl MiniMarkGC {
                 "minor_fixed_field",
             );
             if self.is_nursery_object_start(field_ref.0) {
-                let new_ref = self.copy_nursery_object(field_ref.0);
+                let new_ref = self.copy_nursery_object(
+                    field_ref.0,
+                    "minor_fixed_field_target",
+                    obj_addr,
+                    slot as usize,
+                );
                 unsafe {
                     *slot = new_ref;
                 }
@@ -1935,7 +1981,12 @@ impl MiniMarkGC {
                     "minor_varsize_item",
                 );
                 if self.is_nursery_object_start(field_ref.0) {
-                    let new_ref = self.copy_nursery_object(field_ref.0);
+                    let new_ref = self.copy_nursery_object(
+                        field_ref.0,
+                        "minor_varsize_item_target",
+                        obj_addr,
+                        slot as usize,
+                    );
                     unsafe {
                         *slot = new_ref;
                     }
@@ -2500,9 +2551,23 @@ impl MiniMarkGC {
     /// (incminimark.py:2739-2752) does not need this guard because RPython's
     /// type system guarantees every `Ptr(GcStruct)` is GC-managed; it converges
     /// away once every `gc_ptr_offsets` target is a real GC allocation.
-    fn grey_child(&mut self, addr: usize) {
+    fn grey_child(&mut self, addr: usize, holder_addr: usize, slot_addr: usize, site: &str) {
         if self.is_managed_heap_object(addr) {
             let hdr = unsafe { header_of(addr) };
+            let type_id = unsafe { (*hdr).type_id() };
+            if type_id as usize >= self.types.len() {
+                let holder_type_id = unsafe { (*header_of(holder_addr)).type_id() };
+                panic!(
+                    "GC BUG: invalid major child type_id={} at child_addr={:#x} \
+                     holder_addr={:#x} holder_type_id={} holder_offset={:?} site={}",
+                    type_id,
+                    addr,
+                    holder_addr,
+                    holder_type_id,
+                    slot_addr.checked_sub(holder_addr),
+                    site,
+                );
+            }
             if unsafe { !(*hdr).has_flag(flags::VISITED) } {
                 unsafe { (*hdr).set_flag(flags::VISITED) };
                 self.incr_state.gray_stack.push(addr);
@@ -2560,7 +2625,12 @@ impl MiniMarkGC {
                 trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
                     let field_ref = *slot_ptr;
                     if !field_ref.is_null() {
-                        self.grey_child(field_ref.0);
+                        self.grey_child(
+                            field_ref.0,
+                            obj_addr,
+                            slot_ptr as usize,
+                            "major_custom_trace",
+                        );
                     }
                 });
             }
@@ -2569,7 +2639,12 @@ impl MiniMarkGC {
             for &offset in &offsets {
                 let field_ref = unsafe { *((obj_addr + offset) as *const GcRef) };
                 if !field_ref.is_null() {
-                    self.grey_child(field_ref.0);
+                    self.grey_child(
+                        field_ref.0,
+                        obj_addr,
+                        obj_addr + offset,
+                        "major_fixed_field",
+                    );
                 }
             }
             // Variable-part items: streamed one at a time, never buffered, so a
@@ -2581,7 +2656,12 @@ impl MiniMarkGC {
                 for i in 0..length {
                     let field_ref = unsafe { *((items_start + i * item_size) as *const GcRef) };
                     if !field_ref.is_null() {
-                        self.grey_child(field_ref.0);
+                        self.grey_child(
+                            field_ref.0,
+                            obj_addr,
+                            items_start + i * item_size,
+                            "major_varsize_item",
+                        );
                     }
                 }
             }
@@ -3357,7 +3437,12 @@ impl MiniMarkGC {
                                     "minor_dirty_card_item",
                                 );
                                 if self.is_nursery_object_start(field_ref.0) {
-                                    let new_ref = self.copy_nursery_object(field_ref.0);
+                                    let new_ref = self.copy_nursery_object(
+                                        field_ref.0,
+                                        "minor_dirty_card_item_target",
+                                        obj,
+                                        slot as usize,
+                                    );
                                     unsafe {
                                         *slot = new_ref;
                                     }
@@ -3824,6 +3909,19 @@ impl GcAllocator for MiniMarkGC {
 
     fn collection_counts(&self) -> (usize, usize) {
         (self.minor_collections, self.major_collections)
+    }
+
+    fn get_write_barrier_descr(&self) -> Option<crate::WriteBarrierDescr> {
+        let mut descr = crate::WriteBarrierDescr::for_current_gc();
+        if self.card_page_shift == 0 {
+            descr.jit_wb_cards_set = 0;
+            descr.jit_wb_card_page_shift = 0;
+            descr.jit_wb_cards_set_byteofs = 0;
+            descr.jit_wb_cards_set_singlebyte = 0;
+        } else {
+            descr.jit_wb_card_page_shift = self.card_page_shift;
+        }
+        Some(descr)
     }
 
     fn type_alloc_is_plain(&self, type_id: u32) -> bool {
@@ -4381,6 +4479,33 @@ mod tests {
         let mut objects = Vec::new();
         gc.do_get_objects(-1, &mut |gcref| objects.push(gcref));
         assert!(objects.contains(&object));
+    }
+
+    #[test]
+    fn write_barrier_descr_exposes_minimark_card_geometry() {
+        let gc = test_gc(4096);
+        let descr = gc
+            .get_write_barrier_descr()
+            .expect("MiniMark must expose its write-barrier descriptor");
+        assert_eq!(descr.jit_wb_if_flag, flags::TRACK_YOUNG_PTRS);
+        assert_eq!(descr.jit_wb_cards_set, flags::CARDS_SET);
+        assert_eq!(descr.jit_wb_card_page_shift, gc.card_page_shift);
+    }
+
+    #[test]
+    fn write_barrier_descr_disables_cards_with_collector_config() {
+        let gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            card_page_indices: 0,
+            ..GcConfig::default()
+        });
+        let descr = gc
+            .get_write_barrier_descr()
+            .expect("MiniMark must retain its generic write barrier");
+        assert_eq!(descr.jit_wb_if_flag, flags::TRACK_YOUNG_PTRS);
+        assert_eq!(descr.jit_wb_cards_set, 0);
+        assert_eq!(descr.jit_wb_card_page_shift, 0);
     }
 
     #[test]
