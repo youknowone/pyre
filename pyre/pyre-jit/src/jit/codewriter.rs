@@ -5297,6 +5297,21 @@ impl CodeWriter {
     /// and register-allocated, jtransform/regalloc/flatten are identity
     /// transforms. We go directly to assembly.
     pub fn transform_graph_to_jitcode(&self, code: &CodeObject) -> Option<PyJitCode> {
+        // Label-space ceiling.  The pre-passes below claim one label per
+        // instruction index (`flatten.py`'s "pre-create labels for each
+        // block") plus one exception-landing label per covered pc, and a
+        // label id is a `u16` because the assembled jump target is a two-byte
+        // operand (`assembler.py:255 assert 0 <= target <= 0xFFFF`).  Upstream
+        // can assert on that ceiling: its jitcodes come from RPython
+        // functions, so a violation is a translation-time bug.  Pyre compiles
+        // arbitrary user bytecode, so the same ceiling has to DECLINE at
+        // runtime and leave the function to the interpreter — the treatment
+        // `JitCodeBuilder::try_finish` already gives the register-count and
+        // code-length ceilings.  Without this a large enough function aborted
+        // the process on `new_label`'s overflow before reaching either.
+        if code.instructions.len().saturating_mul(2) > u16::MAX as usize {
+            return None;
+        }
         // Recover the live globals-stamped PyCode wrapper for `code` from the
         // `code_ptr → live wrapper` registry. `frame.pycode` is the stable
         // per-code wrapper that every compiled code has stamped (during the

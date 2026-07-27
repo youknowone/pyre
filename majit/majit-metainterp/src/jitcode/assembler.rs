@@ -1980,9 +1980,16 @@ impl JitCodeBuilder {
     }
 
     pub fn new_label(&mut self) -> u16 {
-        let label = self.labels.len() as u16;
+        // A label id addresses `self.labels` and is patched into a two-byte
+        // jump-target slot (`assembler.py:250-257 fix_labels`), so the id
+        // space ends at `u16::MAX`.  Past it the `as u16` truncation would
+        // alias a fresh label onto an earlier one and silently patch the
+        // wrong target; record the overflow so `try_finish` declines the
+        // whole jitcode instead.
+        let label = self.labels.len();
+        self.encoding_overflow |= label > u16::MAX as usize;
         self.labels.push(None);
-        label
+        label as u16
     }
 
     pub fn mark_label(&mut self, label: u16) {
