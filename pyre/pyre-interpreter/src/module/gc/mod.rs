@@ -12,12 +12,15 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 /// call so callers that toggle and re-read the state stay consistent.
 static GC_ENABLED: AtomicBool = AtomicBool::new(true);
 
-/// The three thresholds `gc.set_threshold` writes and `gc.get_threshold`
-/// reads back, seeded with CPython 3.14's defaults. The collector runs off a
-/// nursery size rather than per-generation allocation counters, so the values
-/// round-trip but do not decide when a collection happens.
-static GC_THRESHOLD: [AtomicI64; 3] =
-    [AtomicI64::new(2000), AtomicI64::new(10), AtomicI64::new(10)];
+/// The collection thresholds `gc.get_threshold()` reports.  pyre's collector
+/// has no generational allocation counters to drive, so the values are only
+/// remembered: `set_threshold` stores what it was given and `get_threshold`
+/// hands the same tuple back, which is the part of the pair's behaviour a
+/// caller can observe.  The third threshold is not among them — an incremental
+/// collector has no third generation to size, so it reads back as 0 whatever
+/// it was set to.  The initial values are the ones a fresh interpreter starts
+/// with.
+static GC_THRESHOLD: [AtomicI64; 2] = [AtomicI64::new(2000), AtomicI64::new(10)];
 
 fn pin_object(object: majit_ir::GcRef) {
     pyre_object::gc_roots::pin_root(object.0 as PyObjectRef);
@@ -235,14 +238,19 @@ crate::py_module! {
                     "gc.set_threshold requires 1 to 3 arguments",
                 ));
             }
-            let mut parsed = [0i64; 3];
-            for (i, &arg) in positional.iter().enumerate() {
-                parsed[i] = crate::baseobjspace::int_w(
-                    crate::baseobjspace::space_index(arg)?,
-                )?;
+            // Read every value before storing any, so a non-integer in the
+            // tail leaves the previous thresholds untouched.  An omitted
+            // trailing value keeps the threshold it already had, and a third
+            // value is validated but not kept.  The index protocol, so an
+            // object carrying only `__int__` is a TypeError.
+            let mut given = Vec::with_capacity(positional.len());
+            for &w_value in positional {
+                given.push(crate::baseobjspace::int_w(
+                    crate::baseobjspace::space_index(w_value)?,
+                )?);
             }
-            for (i, &value) in parsed[..positional.len()].iter().enumerate() {
-                GC_THRESHOLD[i].store(value, Ordering::Relaxed);
+            for (slot, value) in GC_THRESHOLD.iter().zip(given) {
+                slot.store(value, Ordering::Relaxed);
             }
             Ok(w_none())
         },
@@ -250,6 +258,7 @@ crate::py_module! {
             GC_THRESHOLD
                 .iter()
                 .map(|slot| w_int_new(slot.load(Ordering::Relaxed)))
+                .chain(std::iter::once(w_int_new(0)))
                 .collect(),
         )),
         "get_count"     / 0 = |_| Ok(w_tuple_new(vec![
