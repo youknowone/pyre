@@ -12601,7 +12601,12 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                 };
                 match found {
                     Some(v) => Ok(v),
-                    None => Err(crate::baseobjspace::raiseattrerror(obj, slot_name, None)),
+                    // A read, so no "and no __dict__ for setting new
+                    // attributes" suffix: `_PyObject_GenericSetAttrWithDict`
+                    // adds that on the store path only.
+                    None => Err(crate::baseobjspace::raiseattrerror(
+                        obj, slot_name, None, false,
+                    )),
                 }
             }),
         )

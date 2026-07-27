@@ -6409,7 +6409,7 @@ pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
     let removed_explicit = crate::type_dict_delete(obj, "__annotations__");
     let removed = removed_cache || removed_explicit;
     if !removed {
-        return Err(raiseattrerror(obj, "__annotations__", None));
+        return Err(raiseattrerror(obj, "__annotations__", None, true));
     }
     crate::type_dict_store(obj, "__annotate_func__", w_none());
     crate::type_dict_delete(obj, "__annotate__");
@@ -9587,19 +9587,28 @@ pub unsafe fn validate_c3_mro(
             .then_some(candidate)
         });
         let Some(next) = next else {
-            let names = (0..n)
-                .filter_map(|i| w_tuple_getitem(bases, i as i64))
-                .map(|base| {
-                    if is_type_like_w(base) {
-                        w_type_get_name(base).to_string()
-                    } else {
-                        "?".to_string()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
+            // The report names the head of every list still waiting to merge,
+            // deduplicated in first-seen order — those are the classes the
+            // linearization could not order, not the full base tuple.  For
+            // `(L, Base, R)` with `L(Base)` and `R(Base)` the remaining heads
+            // are `Base, Base, R, Base`, so the message names `Base, R`.
+            let mut seen: Vec<PyObjectRef> = Vec::with_capacity(lists.len());
+            let mut names: Vec<String> = Vec::with_capacity(lists.len());
+            for list in &lists {
+                let head = list[0];
+                if seen.iter().any(|&s| std::ptr::eq(s, head)) {
+                    continue;
+                }
+                seen.push(head);
+                names.push(if is_type_like_w(head) {
+                    w_type_get_name(head).to_string()
+                } else {
+                    "?".to_string()
+                });
+            }
             return Err(crate::PyError::type_error(format!(
-                "Cannot create a consistent method resolution\norder (MRO) for bases {names}"
+                "Cannot create a consistent method resolution order (MRO) for bases {}",
+                names.join(", ")
             )));
         };
         for list in &mut lists {
@@ -10834,7 +10843,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     if setdictvalue(obj, name, value)? {
         return Ok(w_none());
     }
-    Err(raiseattrerror(obj, name, w_descr))
+    Err(raiseattrerror(obj, name, w_descr, true))
 }
 
 /// A direct `W_BaseException` reference slot whose hard-coded getattr/setattr
@@ -11163,12 +11172,18 @@ pub(crate) fn setdictvalue(
 ///         raise oefmt(space.w_AttributeError,
 ///                     "'%T' object attribute '%s' is read-only", w_obj, name)
 /// ```
+///
+/// `store` marks the `__setattr__` / `__delattr__` terminals.  A store that
+/// misses on a receiver with no instance dict cannot ever succeed, so
+/// `Objects/object.c _PyObject_GenericSetAttrWithDict` names that reason in the
+/// message; a read miss on the same receiver does not.
 // dont_look_inside: attribute-miss / read-only AttributeError construction; slow path.
 #[majit_macros::dont_look_inside]
 pub(crate) fn raiseattrerror(
     obj: PyObjectRef,
     name: &str,
     w_descr: Option<PyObjectRef>,
+    store: bool,
 ) -> PyError {
     // descroperation.py:58-67 — with a descriptor in hand, the attribute
     // exists on the type but has no reachable `__set__`/`__delete__` and the
@@ -11203,8 +11218,19 @@ pub(crate) fn raiseattrerror(
             format!("'{}' object", tp_name)
         }
     };
+    // `object.c _PyObject_GenericSetAttrWithDict` appends the suffix when the
+    // receiver has no dict *slot*, which is a layout question that never runs
+    // Python.  A receiver whose dict lookup can fail — `_thread._local` runs
+    // the subclass initializer on first access (`os_local.py:73
+    // create_new_dict`) — does have somewhere to store, so it keeps the plain
+    // wording.
+    let no_dict_suffix = if store && getdict_backing(obj).is_ok_and(|dict| dict.is_null()) {
+        " and no __dict__ for setting new attributes"
+    } else {
+        ""
+    };
     PyError::attribute_error_with_context(
-        format!("{} has no attribute '{}'", subject, name),
+        format!("{subject} has no attribute '{name}'{no_dict_suffix}"),
         obj,
         name,
     )
@@ -11309,7 +11335,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
                     Err(err) if err.kind == crate::PyErrorKind::KeyError => {
                         // descroperation.py descr__delattr__: deldictvalue
                         // returning False raises AttributeError immediately.
-                        return Err(raiseattrerror(obj, name, None));
+                        return Err(raiseattrerror(obj, name, None, true));
                     }
                     Err(err) => return Err(err),
                 }
@@ -11357,7 +11383,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
                     mutated(obj, Some(name));
                     return Ok(w_none());
                 }
-                return Err(raiseattrerror(obj, name, None));
+                return Err(raiseattrerror(obj, name, None, true));
             }
         }
     }
@@ -11384,7 +11410,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     // `w_descr` carries a found-but-non-data descriptor so the miss is read-only.
     // `raiseattrerror` resolves the type name via the tag-safe `typedef::type`,
     // so a tagged immediate never reaches a raw `ob_type` deref here.
-    Err(raiseattrerror(obj, name, w_descr))
+    Err(raiseattrerror(obj, name, w_descr, true))
 }
 
 /// PyPy: baseobjspace.py `call`.
