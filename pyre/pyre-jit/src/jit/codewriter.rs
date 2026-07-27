@@ -3251,36 +3251,24 @@ fn restore_canraise_exit_order(block: &super::flow::BlockRef) {
     let Some(first_normal) = first_normal else {
         return;
     };
+    if first_normal == 0 {
+        return;
+    }
 
+    // `flatten.rs` lowers a canraise block's `exits[0]` as the normal edge and
+    // `exits[1:]` as seeded exception edges (`flatten.py:220-233 insert_exits`).
+    // Pyre's PC-sequential walker can emit the normal edge past index 0, so
+    // move it back to the front; the exception edges keep their relative order.
+    // A non-seeded exit left in the `exits[1:]` position is a graph-construction
+    // bug that fails loud in `make_exception_link`, not something to drop here.
     let mut ordered = Vec::with_capacity(block_mut.exits.len());
     ordered.push(block_mut.exits[first_normal].clone());
     for (index, link) in block_mut.exits.iter().enumerate() {
-        if index == first_normal {
-            continue;
-        }
-        let is_exception_edge = {
-            let link = link.borrow();
-            link.last_exception.is_some() || link.last_exc_value.is_some()
-        };
-        if is_exception_edge {
+        if index != first_normal {
             ordered.push(link.clone());
         }
     }
-
-    // Structural adaptation for pyre's PC-sequential walker:
-    // RPython `flowcontext.py:130-156 guessexception` closes a
-    // canraise block with exactly one normal edge followed by
-    // exception edges.  Pyre may transiently append an extra normal
-    // fallthrough while forcing the next-PC boundary after
-    // `emit_catch_exception!`.  That duplicate has no
-    // `Link.extravars`, so `flatten.py:223-238` would treat it as an
-    // exception link and trip `make_exception_link`'s
-    // `last_exception` assertion.  Keep the upstream shape at the
-    // graph boundary: first normal edge, then only seeded exception
-    // edges.
-    if ordered.len() >= 2 {
-        block_mut.exits = ordered;
-    }
+    block_mut.exits = ordered;
 }
 
 // `PyJitCode` and `PyJitCodeMetadata` live in `pyre_jit_trace::pyjitcode`
