@@ -1247,7 +1247,7 @@ pub struct MetaInterp<M: Clone> {
     pending_preamble_tokens: indexmap::IndexMap<u64, Vec<crate::history::TargetToken>>,
     // pyjitpl.py:2289 `self.staticdata.all_descrs = self.cpu.setup_descrs()` now
     // lives on MetaInterpStaticData (RPython `metainterp_sd.all_descrs`).
-    // Access via `self.staticdata.all_descrs` / `&mut self.staticdata.all_descrs`.
+    // Access via `self.staticdata.all_descrs()`.
     /// bridgeopt.py:124 frontend_boxes parity: runtime values from the
     /// guard failure DeadFrame. Saved by start_retrace_from_guard, used
     /// by compile_bridge for cls_of_box during deserialize_optimizer_knowledge.
@@ -2954,9 +2954,18 @@ impl<M: Clone> MetaInterp<M> {
 
     /// pyjitpl.py:2289 / descr.py:25-47 parity: take back all_descrs from
     /// optimizer after compilation. Optimizer.ensure_descr_index() assigns
-    /// sequential descr_index during collect_optimizer_knowledge_for_resume().
+    /// sequential descr_index during collect_optimizer_knowledge_for_resume(),
+    /// and may append, so the optimizer's copy is written back wholesale.
+    ///
+    /// The optimizer is handed a **clone**, not `std::mem::take` of the slot:
+    /// `pyjitpl.py:2290` treats `metainterp_sd.all_descrs` as read-only after
+    /// `setup_descrs`, and emptying it for the duration of an optimize left any
+    /// reader that ran inside that window with a zero-length universe.
+    /// `bridgeopt.py:155 descr = metainterp_sd.all_descrs[descr_index]` is one
+    /// such reader (the bridge's `PendingBridgeRd` snapshot), and it indexes
+    /// blind.
     pub(crate) fn take_back_all_descrs(&mut self, all_descrs: Vec<DescrRef>) {
-        *self.staticdata.all_descrs.lock().unwrap() = all_descrs;
+        *self.staticdata.all_descrs().lock().unwrap() = all_descrs;
     }
 
     /// Accessor for `pending_frontend_boxes` without consuming it.
@@ -5619,7 +5628,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
-        unroll_opt.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
+        unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
         unroll_opt.retraced_count = prior_retraced_count_early;
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
@@ -5776,7 +5785,15 @@ impl<M: Clone> MetaInterp<M> {
                         } else {
                             Optimizer::default_pipeline()
                         };
-                        simple_opt.all_descrs = std::mem::take(&mut unroll_opt.all_descrs);
+                        // Clone rather than move: only the success arm below hands
+                        // the list back, so a retry that aborts would otherwise
+                        // leave `unroll_opt.all_descrs` empty, and the
+                        // `take_back_all_descrs` at the end of compile_loop would
+                        // blank `metainterp_sd.all_descrs` for the rest of the
+                        // process.  `pyjitpl.py:2288-2290` treats that list as
+                        // read-only after `setup_descrs`; `bridgeopt.py:155`
+                        // indexes it blind.
+                        simple_opt.all_descrs = unroll_opt.all_descrs.clone();
                         // history.py:220/261/307: `Const.type` /
                         // `InputArg.type` are intrinsic on the box;
                         // no raw-u32 type side-table propagation is
@@ -7029,7 +7046,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
-        unroll_opt.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
+        unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         unroll_opt.target_tokens = prior_front_target_tokens.clone();
         unroll_opt.retraced_count = self
             .compiled_loops
@@ -7580,7 +7597,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             Optimizer::default_pipeline()
         };
-        optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
+        optimizer.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py:_make_op parity: every InputArg carries its type
         // from the recorder. Propagate those raw recorder types to the
@@ -8003,7 +8020,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             Optimizer::default_pipeline()
         };
-        optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
+        optimizer.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py:220/261/307 — `Const.type` / `InputArg.type` are
         // intrinsic on the box itself (recovered via `OpRef::ty()` from
@@ -10263,7 +10280,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes = prepared.runtime_boxes.as_slice();
 
         let mut optimizer = self.make_optimizer();
-        optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
+        optimizer.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map for the optimizer's intrinsic Const
         // class identity.
@@ -10777,7 +10794,7 @@ impl<M: Clone> MetaInterp<M> {
                     frontend_boxes,
                     liveboxes,
                     livebox_types,
-                    all_descrs: self.staticdata.all_descrs.lock().unwrap().clone(),
+                    all_descrs: self.staticdata.all_descrs().lock().unwrap().clone(),
                     cpu: self.cpu.clone(),
                 })
             });
@@ -10861,7 +10878,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes = prepared.runtime_boxes.as_slice();
 
         let mut optimizer = self.make_optimizer();
-        optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
+        optimizer.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         if let Some(prd) = pending_bridge_rd.as_ref() {
             // bridgeopt.py:126 `assert len(frontend_boxes) == len(liveboxes)`.
             // The concrete values belong on the fresh bridge InputArg objects
@@ -15479,26 +15496,6 @@ pub struct MetaInterpStaticData {
     /// default; Rust needs interior mutability for the same
     /// behavior.
     pub globaldata: std::sync::Mutex<MetaInterpGlobalData>,
-    /// pyjitpl.py:2289 `self.staticdata.all_descrs = self.cpu.setup_descrs()`.
-    /// descr.py:25-47: dense list indexed by `descr_index`.
-    ///
-    /// RPython stores this on `metainterp_sd` (the static data object),
-    /// not on the live `MetaInterp` — opencoder / bridgeopt / optimizer
-    /// all read `metainterp_sd.all_descrs`. Pyre mirrors that location
-    /// so `opencoder::Trace` (which lives in this crate now) can read
-    /// the length directly via `self.metainterp_sd.all_descrs.lock().unwrap().len()`
-    /// from `_encode_descr` and the TraceIterator.
-    ///
-    /// TODO: wrapped in `Mutex` because
-    /// `MetaInterp.staticdata` is `Arc<MetaInterpStaticData>` and the
-    /// `TraceRecordBuffer` inside `TraceCtx` holds a clone of this Arc
-    /// (opencoder.py:471 `self.metainterp_sd = metainterp_sd` —
-    /// shared Python reference; lifts to Arc in Rust). With refcount ≥ 2,
-    /// `Arc::get_mut` fails, so `mem::take` at compile time and
-    /// `take_back_all_descrs` at post-optimize both route through a
-    /// Mutex lock. RPython's Python dicts are shared mutable references
-    /// by default; Rust needs interior mutability for the same behavior.
-    pub all_descrs: std::sync::Mutex<Vec<DescrRef>>,
     /// `descr.py:20 GcCache._cache_array` parity for the dispatch JitCode
     /// trace-side `BC_GETARRAYITEM_GC_I` recorder.
     ///
@@ -15659,6 +15656,19 @@ impl crate::compile::DescrContainer for MetaInterpStaticData {
 }
 
 impl MetaInterpStaticData {
+    /// pyjitpl.py:2289 `self.all_descrs = self.cpu.setup_descrs()` —
+    /// descr.py:25-47's dense list, indexed by `descr_index`.  opencoder /
+    /// bridgeopt / optimizer all read `metainterp_sd.all_descrs`; this is
+    /// that slot.
+    ///
+    /// Upstream's is a plain attribute on the one `metainterp_sd`.  Pyre's
+    /// backing store is `descr_registry::all_descrs()` because `descr_index`
+    /// is stamped off the process-wide `GcCache` — see that static's docs for
+    /// why the list cannot be per-instance.
+    pub fn all_descrs(&self) -> &'static std::sync::Mutex<Vec<DescrRef>> {
+        majit_ir::descr_registry::all_descrs()
+    }
+
     pub fn new() -> Self {
         // `pyjitpl.py:2222` `compile.make_and_attach_done_descrs([self, cpu])`.
         // RPython passes `[self, cpu]` — the same `Arc<DoneWithThisFrameDescr*>`
@@ -16066,7 +16076,7 @@ impl MetaInterpStaticData {
 
         // Publish onto staticdata.all_descrs so opencoder / bridgeopt /
         // optimizer reads pick up the same length.
-        *self.all_descrs.lock().unwrap() = all_descrs.clone();
+        *self.all_descrs().lock().unwrap() = all_descrs.clone();
 
         // pyjitpl.py:2290 `effectinfo.compute_bitstrings(self.all_descrs)`.
         // Two-pass mutation: clone each call descr's EI for the algorithm

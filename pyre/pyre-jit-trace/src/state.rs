@@ -229,6 +229,12 @@ impl MetaInterpStaticData {
         // descr's `ei_index` slot via `effectinfo::compute_bitstrings`
         // (`effectinfo.py:526 descr.ei_index = …`); no process-global
         // side table.
+        //
+        // This staticdata is not the one the tracing `MetaInterp` owns —
+        // pyre carries two — so the `all_descrs` list this publishes has to
+        // be the process-wide one `descr_index` is stamped against
+        // (`MetaInterpStaticData::all_descrs`), or `bridgeopt.py:155
+        // metainterp_sd.all_descrs[descr_index]` indexes an empty list.
         if !was_done {
             self.canonical.finish_setup_descrs();
         }
