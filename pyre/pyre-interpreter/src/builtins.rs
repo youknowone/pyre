@@ -3222,25 +3222,25 @@ pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Opt
 /// keyword (any entry other than the `__pyre_kw__` marker).  An empty
 /// `**{}` therefore reports `false`.
 pub(crate) fn has_real_kwargs(kwargs: Option<PyObjectRef>) -> bool {
-    let Some(dict) = kwargs else {
-        return false;
-    };
-    unsafe { pyre_object::w_dict_str_entries(dict) }
-        .iter()
-        .any(|(key, _)| key != "__pyre_kw__")
+    real_kwarg_count(kwargs) > 0
 }
 
 /// Number of real keyword arguments in the kwargs dict from
 /// [`split_builtin_kwargs`] — every entry other than the `__pyre_kw__`
 /// marker.  The clinic-style "takes at most N arguments (M given)" builtins
 /// (`sum`, `round`, `pow`) count positionals plus this against their limit.
+///
+/// Read through the surrogate-preserving iterator, the same one
+/// [`call_forwarding_args`] rebuilds the keywords with: `w_dict_str_entries`
+/// drops a `**{'\udc80': v}` key outright, which would make this report a
+/// keyword-free call and let the keyword be silently discarded.
 pub(crate) fn real_kwarg_count(kwargs: Option<PyObjectRef>) -> usize {
     let Some(dict) = kwargs else {
         return 0;
     };
-    unsafe { pyre_object::w_dict_str_entries(dict) }
+    unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }
         .iter()
-        .filter(|(key, _)| key != "__pyre_kw__")
+        .filter(|(key, _)| key.as_str() != Ok("__pyre_kw__"))
         .count()
 }
 
