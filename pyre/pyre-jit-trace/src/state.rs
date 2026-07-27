@@ -820,6 +820,80 @@ pub fn python_pc_for_jitcode_pc_public(jitcode_index: i32, offset: i32) -> Optio
     )
 }
 
+/// `majit_metainterp::blackhole::LiveMarkerHook` implementation: stamp the
+/// instruction the blackhole is about to replay into the frame's `last_instr`.
+///
+/// `dispatch_bytecode` (pyopcode.py) writes `self.last_instr = intmask(
+/// next_instr)` before every opcode, and the interpreter's own loop
+/// (`eval.rs::eval_loop`) mirrors it, so anything that reads the frame while it
+/// is running — `f_lineno`, `f_lasti`, a traceback node, the exception-table
+/// lookup — sees the instruction actually executing. Upstream gets the same
+/// invariant during blackhole replay for free, because that write is a
+/// source-level store its codewriter lowers into the jitcode. pyre's codewriter
+/// cannot: it unrolls the bytecode per PC, so the store would need one distinct
+/// int pool constant per instruction against `check_result`'s 256-entry cap.
+/// Publishing here costs no jitcode, no recorded operation and no pool entry,
+/// and only the replay pays for it.
+///
+/// The frame is the one the replay itself reads and writes — the portal red the
+/// codewriter threads through every `getarrayitem_vable_r` — falling back to the
+/// virtualizable the interpreter was handed. It is stamped only when its own
+/// code object is the one this JitCode was built for, so a nested level
+/// replaying a different function cannot write its coordinate into the frame the
+/// outer level owns.
+///
+/// This runs once per replayed instruction, so it resolves everything under a
+/// single store borrow and takes no reference count: the `Arc`-cloning
+/// accessors (`pyjitcode_for_jitcode_index`, `pyjitcode_for_code`) each re-run
+/// `ensure_finish_setup`, whose opname-map clone alone costs more than the
+/// replayed instruction, and `compiled_jitcode_lookup` is a linear scan.
+pub fn publish_last_instr_at_live_marker(
+    bh: &majit_metainterp::blackhole::BlackholeInterpreter,
+    marker_pc: usize,
+) {
+    // A JitCode only exists once `finish_setup` has run, so the store is read
+    // directly here rather than through `ensure_finish_setup`. A borrow already
+    // held (a reentrant walker path) skips the publish rather than panicking.
+    METAINTERP_SD.with(|r| {
+        let Ok(sd) = r.try_borrow() else {
+            return;
+        };
+        let Some(jitcode) = sd.jitcodes.get(bh.jitcode.index()) else {
+            return;
+        };
+        let metadata = &jitcode.payload.metadata;
+        let frame = match bh
+            .registers_r
+            .get(metadata.portal_frame_reg as usize)
+            .copied()
+        {
+            Some(value) if value > 0 => value as usize,
+            _ if bh.virtualizable_ptr > 0 => bh.virtualizable_ptr as usize,
+            _ => return,
+        };
+        // SAFETY: the portal red and the virtualizable are both the concrete
+        // `PyFrame` the blackhole runs against, and `frame_layout` pins
+        // `pycode` to this offset with a compile-time assertion against the
+        // interpreter's own constant.
+        let w_code =
+            unsafe { *((frame + crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
+        if w_code.is_null() {
+            return;
+        }
+        let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef) };
+        if raw_code as *const CodeObject != jitcode.payload.code_ptr {
+            return;
+        }
+        let py_pc = crate::jitcode_dispatch::python_pc_for_jitcode_pc(metadata, marker_pc);
+        // SAFETY: same frame, and `last_instr` carries the same compile-time
+        // offset assertion.
+        unsafe {
+            *((frame + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize) =
+                py_pc as isize;
+        }
+    });
+}
+
 /// Whether a JitCode exception exit came from the Python bare-reraise
 /// instruction path. `RAISE_VARARGS 0` and `RERAISE` both use
 /// RaiseWithExplicitTraceback and skip record_application_traceback.

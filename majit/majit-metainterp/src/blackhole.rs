@@ -5190,14 +5190,40 @@ fn bhimpl_jit_leave_portal_frame() {}
 /// blackhole.py:1547-1548 `bhimpl_hint_force_virtualizable(r): pass`.
 fn bhimpl_hint_force_virtualizable(_r: i64) {}
 
+/// Called at every `-live-` marker, i.e. once per source-level instruction the
+/// blackhole replays. Arguments are the interpreter and the marker's own
+/// bytecode position.
+///
+/// RPython's `bhimpl_live` is a plain no-op, and it can be: the frame fields
+/// its interpreter writes per instruction (`dispatch_bytecode`'s
+/// `self.last_instr = intmask(next_instr)`) are ordinary source-level stores,
+/// so they are compiled into the jitcode and the blackhole replays them like
+/// any other operation. A consumer whose jitcode cannot carry such a store —
+/// because the value is a distinct compile-time constant per instruction and
+/// `check_result`'s 256-entry per-kind cap rejects one pool entry per
+/// instruction — registers this hook and writes the field itself.
+pub type LiveMarkerHook = fn(&BlackholeInterpreter, usize);
+
+static LIVE_MARKER_HOOK: std::sync::OnceLock<LiveMarkerHook> = std::sync::OnceLock::new();
+
+/// Install the [`LiveMarkerHook`]. First registration wins; later calls are
+/// ignored, so a consumer may call it from every driver install path.
+pub fn register_live_marker_hook(hook: LiveMarkerHook) {
+    let _ = LIVE_MARKER_HOOK.set(hook);
+}
+
 /// Handler for `live/` — liveness marker. Argcodes: empty, but the assembler
 /// emits a 2-byte offset after the opcode. Skip those 2 bytes.
 /// RPython blackhole.py:146-158 (inside _get_method for `-live-` ops).
 fn handler_live(
-    _bh: &mut BlackholeInterpreter,
+    bh: &mut BlackholeInterpreter,
     _code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
+    if let Some(hook) = LIVE_MARKER_HOOK.get() {
+        // `position` is past the opcode byte; the marker op starts one earlier.
+        hook(bh, position - 1);
+    }
     // Skip the 2-byte liveness offset (RPython: OFFSET_SIZE = 2).
     Ok(position + 2)
 }

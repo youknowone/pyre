@@ -3653,6 +3653,16 @@ fn build_jit_driver_pair() -> JitDriverPair {
     d.set_vtable_offset(Some(pyre_object::pyobject::OB_TYPE_OFFSET));
     // resume.py:1367 — BlackholeAllocator for virtual materialization.
     d.register_blackhole_allocator(PyreBlackholeAllocator);
+    // `dispatch_bytecode` (pyopcode.py) stamps `last_instr` before each
+    // opcode, so a running frame always answers `f_lineno` — and every
+    // traceback taken off it — for the instruction it is on. That store is a
+    // source-level one upstream and rides in the jitcode; this codewriter
+    // unrolls the bytecode, so the same store would need one int pool
+    // constant per instruction. The blackhole publishes it at the `-live-`
+    // marker instead.
+    majit_metainterp::blackhole::register_live_marker_hook(
+        pyre_jit_trace::state::publish_last_instr_at_live_marker,
+    );
     // warmspot.py:1039 handle_jitexception_from_blackhole parity:
     // portal_runner is called when ContinueRunningNormally is raised
     // at a recursive portal level during blackhole execution.
