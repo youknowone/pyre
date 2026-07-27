@@ -6253,13 +6253,19 @@ fn make_exc_type_with_init(
                                 })?;
                                 // `interp_exceptions.py:257-260` — accept
                                 // `str` and any `str` subclass
-                                // (`isinstance_w(w_note, space.w_unicode)`);
-                                // otherwise `oefmt("note must be a str, not %T")`.
+                                // (`isinstance_w(w_note, space.w_unicode)`).
+                                // The rejection wording is the argument-clinic
+                                // one (`_PyArg_BadArgument`), which names the
+                                // method and renders `None` as `None` rather
+                                // than as its type.
                                 if !unsafe { crate::baseobjspace::isinstance_str_w(w_note) } {
-                                    let tp_name =
-                                        crate::baseobjspace::object_functionstr_type_name(w_note);
+                                    let got = if w_note == pyre_object::w_none() {
+                                        "None".to_string()
+                                    } else {
+                                        crate::baseobjspace::object_functionstr_type_name(w_note)
+                                    };
                                     return Err(crate::PyError::type_error(format!(
-                                        "note must be a str, not {tp_name}"
+                                        "add_note() argument must be str, not {got}"
                                     )));
                                 }
                                 // `interp_exceptions.py:240-254` — lazy
