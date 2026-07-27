@@ -151,6 +151,28 @@ pub fn snapshot_all() -> Vec<DescrRef> {
     out
 }
 
+/// `pyjitpl.py:2289 self.all_descrs = self.cpu.setup_descrs()` — the dense
+/// list `descr_index` indexes into (`descr.py:28 v.descr_index =
+/// len(all_descrs)`), and the list `bridgeopt.py:155
+/// metainterp_sd.all_descrs[descr_index]` reads back.
+///
+/// Upstream stores it on `metainterp_sd` because there is exactly one, built
+/// from exactly one `cpu.setup_descrs()`.  Pyre's `GcCache` is instead
+/// process-global and `set_descr_index` therefore stamps process-globally, so
+/// the list those numbers index has to have the same scope: a front-end that
+/// carries more than one `MetaInterpStaticData` (pyre keeps a second one for
+/// the tracing walker) would otherwise number the descrs off one object's
+/// list while `bridgeopt` indexes another object's empty one.
+///
+/// `MetaInterpStaticData::all_descrs()` is the accessor; nothing else should
+/// reach in here directly.
+static ALL_DESCRS: std::sync::Mutex<Vec<DescrRef>> = std::sync::Mutex::new(Vec::new());
+
+/// Handle to the process-wide `all_descrs` list documented on [`ALL_DESCRS`].
+pub fn all_descrs() -> &'static std::sync::Mutex<Vec<DescrRef>> {
+    &ALL_DESCRS
+}
+
 /// `descr.py:28-29 _cache_size` snapshot.
 pub fn snapshot_sizes() -> Vec<DescrRef> {
     gc_cache().lock().unwrap().snapshot_sizes()
