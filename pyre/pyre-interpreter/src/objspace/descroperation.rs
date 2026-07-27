@@ -20,6 +20,14 @@ use crate::baseobjspace::{
 };
 pub use crate::{PyError, PyErrorKind, PyResult};
 
+/// Every zero-divisor `ZeroDivisionError` carries this one message, whatever
+/// the operator and whatever the operand types — int, long, float or complex,
+/// `/`, `//`, `%` or `divmod`. The per-operator and per-type wordings
+/// ("integer division or modulo by zero", "float modulo", …) were unified in
+/// 3.12. `0 ** -1` is the one ZeroDivisionError that keeps its own message
+/// ("zero to a negative power"), because it is not a division.
+const ZERO_DIVISION_MSG: &str = "division by zero";
+
 // ── BigInt helpers ──────────────────────────────────────────────────
 
 /// Box a BigInt result, demoting to W_IntObject if it fits in i64.
@@ -774,7 +782,7 @@ fn bigint_mod(a: BigInt, b: BigInt) -> BigInt {
 fn bigint_truediv(a: &BigInt, b: &BigInt) -> Result<f64, PyError> {
     a.truediv(b).map_err(|error| match error {
         pyre_object::rbigint::RBigIntError::DivisionByZero => {
-            PyError::zero_division("division by zero")
+            PyError::zero_division(ZERO_DIVISION_MSG)
         }
         pyre_object::rbigint::RBigIntError::FloatDivisionOverflow => {
             PyError::overflow_error("integer division result too large for a float")
@@ -827,7 +835,7 @@ unsafe fn int_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
     if vb == 0 {
-        return Err(PyError::zero_division("integer division or modulo by zero"));
+        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
     // intobject.py `_floordiv`: `ovfcheck(x // y)` has exactly one
     // non-zero-divisor overflow on a signed machine word.
@@ -847,9 +855,7 @@ unsafe fn int_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
     if vb == 0 {
-        // `%` alone reports "integer modulo by zero"; only `//`/divmod say
-        // "integer division or modulo by zero".
-        return Err(PyError::zero_division("integer modulo by zero"));
+        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
     // intobject.py `_mod`: the matching machine-word overflow is
     // `MIN % -1`; bounce that one case to rbigint like `ovfcheck`.
@@ -1004,13 +1010,12 @@ unsafe fn long_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // longobject.py:424 `_make_descr_binop(_floordiv, _int_floordiv)`: a
     // machine-int divisor takes the dedicated `rbigint.int_floordiv` leg.
-    // 3.x reports "integer division or modulo by zero" for every int; the
-    // int path raises the same. PyPy's `_floordiv` still carries the 2.x
-    // "long ..." wording (longobject.py:409), which a 3.x runtime does not.
+    // PyPy's `_floordiv` still carries the 2.x "long ..." wording
+    // (longobject.py:409), which a 3.x runtime does not.
     if is_int_like(b) {
         let vb = int_value(b);
         if vb == 0 {
-            return Err(PyError::zero_division("integer division or modulo by zero"));
+            return Err(PyError::zero_division(ZERO_DIVISION_MSG));
         }
         debug_assert!(is_long(a));
         if w_long_get_value(a).get_sign() == 1 && vb == 1 {
@@ -1026,7 +1031,7 @@ unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     debug_assert!(is_long(b));
     let vb = w_long_get_value(b);
     if !vb.tobool() {
-        return Err(PyError::zero_division("integer division or modulo by zero"));
+        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
     let owned_a;
     let va = if is_long(a) {
@@ -1045,12 +1050,10 @@ unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // (machine-int RHS) computes through `rbigint.int_mod_int_result` and
     // returns `space.newint` — the remainder of a long by a machine int always
     // fits — while `_mod` (long RHS) returns `newlong`.
-    // `%` alone reports "integer modulo by zero" (not the floordiv/divmod
-    // "division or modulo" wording).
     if is_int_like(b) {
         let vb = int_value(b);
         if vb == 0 {
-            return Err(PyError::zero_division("integer modulo by zero"));
+            return Err(PyError::zero_division(ZERO_DIVISION_MSG));
         }
         debug_assert!(is_long(a));
         return Ok(w_int_new(bigint_int_modulo_int_result_nonzero(
@@ -1061,7 +1064,7 @@ unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     debug_assert!(is_long(b));
     let vb = w_long_get_value(b);
     if !vb.tobool() {
-        return Err(PyError::zero_division("integer modulo by zero"));
+        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
     let owned_a;
     let va = if is_long(a) {
@@ -1243,7 +1246,7 @@ fn alloc_result_bigint(value: BigInt, collecting: bool) -> i64 {
 fn bigint_floordiv_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
     if pyre_object::longobject::jit_bigint_sign_i64(b) == 0 {
         crate::runtime_ops::jit_publish_exception(
-            PyError::zero_division("integer division or modulo by zero").to_exc_object(),
+            PyError::zero_division(ZERO_DIVISION_MSG).to_exc_object(),
         );
         return 0;
     }
@@ -1256,9 +1259,8 @@ fn bigint_floordiv_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
 
 fn bigint_mod_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
     if pyre_object::longobject::jit_bigint_sign_i64(b) == 0 {
-        // `%` alone reports "integer modulo by zero".
         crate::runtime_ops::jit_publish_exception(
-            PyError::zero_division("integer modulo by zero").to_exc_object(),
+            PyError::zero_division(ZERO_DIVISION_MSG).to_exc_object(),
         );
         return 0;
     }
@@ -1478,7 +1480,7 @@ unsafe fn float_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_float(b);
     reject_float_coercion_overflow(b, vb)?;
     if vb == 0.0 {
-        return Err(PyError::zero_division("float division by zero"));
+        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
     let va = as_float(a);
     reject_float_coercion_overflow(a, va)?;
@@ -1503,7 +1505,7 @@ unsafe fn float_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     reject_float_coercion_overflow(b, y)?;
     if y == 0.0 {
         // floatobject.py:526
-        return Err(PyError::zero_division("float modulo"));
+        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
     let mut m = jit_float_fmod(x, y);
     if m != 0.0 {
@@ -1522,7 +1524,7 @@ unsafe fn float_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 fn float_divmod_w(x: f64, y: f64) -> Result<(f64, f64), PyError> {
     if y == 0.0 {
         // floatobject.py:761
-        return Err(PyError::zero_division("float modulo"));
+        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
     let mut m = jit_float_fmod(x, y);
     // floatobject.py:767: div = (x - mod) / y
@@ -2496,7 +2498,7 @@ unsafe fn complex_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     reject_float_coercion_overflow(a, ar)?;
     reject_float_coercion_overflow(b, br)?;
     if br == 0.0 && bi == 0.0 {
-        return Err(PyError::zero_division("complex division by zero"));
+        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
     if is_complex(a) && is_complex(b) {
         Ok(complex_quot(ar, ai, br, bi))
@@ -2554,7 +2556,9 @@ unsafe fn complex_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         (1.0, 0.0)
     } else if ar == 0.0 && ai == 0.0 {
         if bi != 0.0 || br < 0.0 {
-            return Err(PyError::zero_division("0.0 to a negative or complex power"));
+            return Err(PyError::zero_division(
+                "zero to a negative or complex power",
+            ));
         }
         (0.0, 0.0)
     } else if bi == 0.0 && (-100.0..=100.0).contains(&br) && br == br.trunc() {
@@ -3326,7 +3330,7 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                 return float_truediv(a, b);
             }
             if !is_long(b) && as_float(b) == 0.0 {
-                return Err(PyError::zero_division("division by zero"));
+                return Err(PyError::zero_division(ZERO_DIVISION_MSG));
             }
             // intobject.py:332 `_truediv`: machine ints wider than the
             // binary64 mantissa deliberately overflow into the rbigint path
@@ -3497,7 +3501,7 @@ pub(crate) fn truediv_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                 return float_truediv(a, b);
             }
             if !is_long(b) && as_float(b) == 0.0 {
-                return Err(PyError::zero_division("division by zero"));
+                return Err(PyError::zero_division(ZERO_DIVISION_MSG));
             }
             // Match `_truediv`'s overflow-to-rbigint leg for i64 values that
             // are not exactly representable in a binary64 mantissa.
@@ -3591,7 +3595,7 @@ pub(crate) fn divmod_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             // every numeric zero divisor.  This intentionally differs from
             // PyPy 3.11's int/float-specific divmod and modulo messages.
             if !is_true(b)? {
-                return Err(PyError::zero_division("division by zero"));
+                return Err(PyError::zero_division(ZERO_DIVISION_MSG));
             }
             if is_float_pair(a, b) {
                 let x = as_float(a);
@@ -4063,7 +4067,7 @@ pub fn divmod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             // Python 3.14 target-version spelling; see `divmod_builtin` above
             // for the PyPy 3.11 difference.
             if !is_true(b)? {
-                return Err(PyError::zero_division("division by zero"));
+                return Err(PyError::zero_division(ZERO_DIVISION_MSG));
             }
             if is_float_pair(a, b) {
                 let x = as_float(a);
