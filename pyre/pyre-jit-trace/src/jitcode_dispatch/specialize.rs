@@ -1538,9 +1538,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         if !w_dict.is_null() && !majit_gc::can_move(majit_ir::GcRef(w_dict as usize)) {
             if let Some(slot) = crate::state::module_dict_cell_slot_direct(w_dict, &name) {
                 if let Some(stored) = crate::state::module_dict_cell_value_direct(w_dict, slot) {
-                    if !stored.is_null()
-                        && !majit_gc::can_move(majit_ir::GcRef(stored as usize))
-                    {
+                    if !stored.is_null() && !majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
                         // Pin the receiver to THIS module so the baked dict
                         // address is correct: a constant receiver is already
                         // pinned; a non-constant one gets a `guard_value`.
@@ -4050,7 +4048,9 @@ pub(crate) fn try_walker_specialize_math_sqrt<Sym: WalkSym>(
         ctx.trace_ctx
             .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx.heap_cache_mut().replace_box(callable_op, expected);
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
     }
     // Coerce the argument to a raw float (int → guard_class + unbox +
     // CastIntToFloat; float → guard_class + unbox).
@@ -4113,8 +4113,7 @@ pub(crate) fn try_walker_specialize_float_call<Sym: WalkSym>(
         return Ok(None);
     }
     // The callable must be the canonical `float` type object.
-    let float_type_obj =
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE);
+    let float_type_obj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE);
     if !std::ptr::eq(concrete_callable, float_type_obj) {
         return Ok(None);
     }
@@ -4146,7 +4145,9 @@ pub(crate) fn try_walker_specialize_float_call<Sym: WalkSym>(
         ctx.trace_ctx
             .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx.heap_cache_mut().replace_box(callable_op, expected);
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
     }
     let arg_op = r_args[2];
     if is_int {
