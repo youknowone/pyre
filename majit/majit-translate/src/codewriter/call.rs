@@ -97,26 +97,44 @@ pub struct WriteAnalysis {
     /// `effectinfo.py:294,301-305` `readonly_descrs_fields = []`
     /// populated via `add_struct → cpu.fielddescrof(T, fieldname)` from
     /// `("readstruct", T, fieldname)` tuples.
-    pub field_read_descrs: Vec<majit_ir::descr::DescrRef>,
+    pub field_read_descrs: Vec<(
+        majit_ir::descr::DescrRef,
+        Option<majit_ir::effectinfo::DescrSetMember>,
+    )>,
     /// `effectinfo.py:297,301-305` `write_descrs_fields = []` from
     /// `("struct", T, fieldname)` tuples.
-    pub field_write_descrs: Vec<majit_ir::descr::DescrRef>,
+    pub field_write_descrs: Vec<(
+        majit_ir::descr::DescrRef,
+        Option<majit_ir::effectinfo::DescrSetMember>,
+    )>,
     /// `effectinfo.py:296,313-325` `readonly_descrs_interiorfields = []`
     /// populated via `add_interiorfield → cpu.interiorfielddescrof(T,
     /// fieldname)` from `("readinteriorfield", T, fieldname)` tuples.
-    pub interior_read_descrs: Vec<majit_ir::descr::DescrRef>,
+    pub interior_read_descrs: Vec<(
+        majit_ir::descr::DescrRef,
+        Option<majit_ir::effectinfo::DescrSetMember>,
+    )>,
     /// `effectinfo.py:299,313-325` `write_descrs_interiorfields = []`
     /// from `("interiorfield", T, fieldname)` tuples.
-    pub interior_write_descrs: Vec<majit_ir::descr::DescrRef>,
+    pub interior_write_descrs: Vec<(
+        majit_ir::descr::DescrRef,
+        Option<majit_ir::effectinfo::DescrSetMember>,
+    )>,
     /// `effectinfo.py:295,307-311` `readonly_descrs_arrays = []` populated
     /// via `add_array → cpu.arraydescrof(ARRAY)` from `("readarray", T)`
     /// tuples (plus `("readinteriorfield", T, _)` tuples synthesised into
     /// `("readarray", T)` at `effectinfo.py:327-340`).
-    pub array_read_descrs: Vec<majit_ir::descr::DescrRef>,
+    pub array_read_descrs: Vec<(
+        majit_ir::descr::DescrRef,
+        Option<majit_ir::effectinfo::DescrSetMember>,
+    )>,
     /// `effectinfo.py:298,307-311` `write_descrs_arrays = []` mirror of
     /// the read side, populated from `("array", T)` tuples (plus
     /// `("interiorfield", T, _)` synthesised into `("array", T)`).
-    pub array_write_descrs: Vec<majit_ir::descr::DescrRef>,
+    pub array_write_descrs: Vec<(
+        majit_ir::descr::DescrRef,
+        Option<majit_ir::effectinfo::DescrSetMember>,
+    )>,
     /// RPython: `effects is top_set` — unanalyzable (random effects).
     pub is_top: bool,
 }
@@ -1575,7 +1593,22 @@ impl CallControl {
         len_offset: Option<usize>,
     ) -> majit_ir::descr::DescrRef {
         self.arraydescrof_concrete(idx, array_type_id, ir_type, len_offset, Some(idx))
-            as majit_ir::descr::DescrRef
+            .0 as majit_ir::descr::DescrRef
+    }
+
+    pub fn arraydescrof_keyed(
+        &self,
+        idx: u32,
+        array_type_id: &Option<String>,
+        ir_type: majit_ir::value::Type,
+        len_offset: Option<usize>,
+    ) -> (
+        majit_ir::descr::DescrRef,
+        Option<majit_ir::effectinfo::DescrSetMember>,
+    ) {
+        let (descr, key) =
+            self.arraydescrof_concrete(idx, array_type_id, ir_type, len_offset, Some(idx));
+        (descr as majit_ir::descr::DescrRef, key)
     }
 
     /// Trait-typed sibling of [`Self::arraydescrof`] returning the cached
@@ -1599,7 +1632,10 @@ impl CallControl {
         ir_type: majit_ir::value::Type,
         len_offset: Option<usize>,
         ei_publish: Option<u32>,
-    ) -> std::sync::Arc<dyn majit_ir::descr::ArrayDescr> {
+    ) -> (
+        std::sync::Arc<dyn majit_ir::descr::ArrayDescr>,
+        Option<majit_ir::effectinfo::DescrSetMember>,
+    ) {
         // RPython: ARRAY_INSIDE.OF — extract element type from full ARRAY type.
         let elem_name = array_type_id
             .as_deref()
@@ -1663,8 +1699,10 @@ impl CallControl {
         // parity-correct response is to skip cache publish and mint
         // fresh per call so shape-coincident-but-logically-distinct
         // ARRAYs do not alias.
-        let ad_arc: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> = match array_type_id.as_deref()
-        {
+        let (ad_arc, key): (
+            std::sync::Arc<dyn majit_ir::descr::ArrayDescr>,
+            Option<majit_ir::effectinfo::DescrSetMember>,
+        ) = match array_type_id.as_deref() {
             Some(atid) => {
                 let path_hash_u64 = majit_ir::descr::path_hash(atid);
                 let nolength = len_offset.is_none();
@@ -1730,7 +1768,10 @@ impl CallControl {
                         }
                     }
                 }
-                ad_arc
+                let key = majit_ir::effectinfo::DescrSetMember::Array {
+                    array_id: path_hash_u64,
+                };
+                (ad_arc, Some(key))
             }
             None => {
                 // No identity carrier — local mint, no cache publish.
@@ -1771,7 +1812,7 @@ impl CallControl {
                 let arc: std::sync::Arc<majit_ir::descr::SimpleArrayDescr> =
                     std::sync::Arc::new(ad);
                 majit_ir::descr_registry::register_array(arc.clone() as majit_ir::descr::DescrRef);
-                arc as std::sync::Arc<dyn majit_ir::descr::ArrayDescr>
+                (arc as std::sync::Arc<dyn majit_ir::descr::ArrayDescr>, None)
             }
         };
         // Per-trace codewriter id stamp — analyzer's
@@ -1787,7 +1828,7 @@ impl CallControl {
         if let Some(arr_idx) = ei_publish {
             ad_arc.set_ei_index(arr_idx);
         }
-        ad_arc
+        (ad_arc, key)
     }
 
     /// RPython: `cpu.fielddescrof(STRUCT, fieldname)` — descr.py:215-247.
@@ -1829,6 +1870,20 @@ impl CallControl {
         owner_id: Option<majit_ir::descr::StructId>,
         field_name: &str,
     ) -> Option<majit_ir::descr::DescrRef> {
+        self.fielddescrof_concrete(idx, owner_root, owner_id, field_name)
+            .map(|(descr, _)| descr)
+    }
+
+    pub fn fielddescrof_keyed(
+        &self,
+        idx: u32,
+        owner_root: &str,
+        owner_id: Option<majit_ir::descr::StructId>,
+        field_name: &str,
+    ) -> Option<(
+        majit_ir::descr::DescrRef,
+        majit_ir::effectinfo::DescrSetMember,
+    )> {
         self.fielddescrof_concrete(idx, owner_root, owner_id, field_name)
     }
 
@@ -1895,7 +1950,10 @@ impl CallControl {
         owner_root: &str,
         owner_id: Option<majit_ir::descr::StructId>,
         field_name: &str,
-    ) -> Option<majit_ir::descr::DescrRef> {
+    ) -> Option<(
+        majit_ir::descr::DescrRef,
+        majit_ir::effectinfo::DescrSetMember,
+    )> {
         use majit_ir::descr::{LLType, path_hash};
         let fields = self.struct_fields.fields.get(owner_root)?;
         let mut offset: usize = 0;
@@ -1989,6 +2047,10 @@ impl CallControl {
                         owner_root,
                     ))),
                 };
+                let struct_id = match struct_key {
+                    LLType::Struct(id) => id,
+                    _ => unreachable!("fielddescrof_concrete always builds a Struct key"),
+                };
                 // `descr.py:234-238 get_field_descr` always calls
                 // `get_size_descr(gccache, STRUCT, vtable)` to bind
                 // `fielddescr.parent_descr` before returning. Pyre's
@@ -2002,6 +2064,19 @@ impl CallControl {
                 // vtable on its PyreSizeDescr — cache-hit returns
                 // *that* Arc here unchanged).
                 let struct_size = compute_struct_size(self, owner_root);
+                let field_offset = owner_id
+                    .or_else(|| majit_ir::descr::struct_id_for_name(owner_root))
+                    .and_then(|sid| self.struct_layouts.get(&sid))
+                    .and_then(|l| l.fields.iter().find(|f| f.name.as_str() == field_name))
+                    .map(|f| f.offset)
+                    .unwrap_or(offset);
+                let rank = self.field_immutability(Some(owner_root), field_name);
+                let is_immutable = rank.map(|r| r.is_immutable()).unwrap_or(false);
+                let is_quasi_immutable = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
+                let member = majit_ir::effectinfo::DescrSetMember::Field {
+                    struct_id,
+                    field_name: field_name.to_string(),
+                };
                 use majit_ir::descr::Descr;
                 let size_descr_arc = {
                     let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
@@ -2025,7 +2100,7 @@ impl CallControl {
                         let stored = fd.field_name();
                         if stored == field_name || stored.ends_with(&needle) {
                             fd.set_index(idx);
-                            return Some(fd.clone() as majit_ir::descr::DescrRef);
+                            return Some((fd.clone() as majit_ir::descr::DescrRef, member));
                         }
                     }
                 }
@@ -2045,15 +2120,6 @@ impl CallControl {
                 // divergence that matters for enum variant payloads keyed
                 // by `{enum_leaf}::{variant}`.  Falls back to the
                 // accumulator only for a struct absent from `struct_layouts`.
-                let field_offset = owner_id
-                    .or_else(|| majit_ir::descr::struct_id_for_name(owner_root))
-                    .and_then(|sid| self.struct_layouts.get(&sid))
-                    .and_then(|l| l.fields.iter().find(|f| f.name.as_str() == field_name))
-                    .map(|f| f.offset)
-                    .unwrap_or(offset);
-                let rank = self.field_immutability(Some(owner_root), field_name);
-                let is_immutable = rank.map(|r| r.is_immutable()).unwrap_or(false);
-                let is_quasi_immutable = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
                 let descr = majit_ir::descr::gc_cache().lock().unwrap().get_field_descr(
                     struct_key,
                     field_name,
@@ -2068,7 +2134,7 @@ impl CallControl {
                     field_pos,
                 );
                 descr.set_index(idx);
-                return Some(descr as majit_ir::descr::DescrRef);
+                return Some((descr as majit_ir::descr::DescrRef, member));
             }
             offset = offset.saturating_add(field_size);
             field_pos += 1;
@@ -2100,6 +2166,19 @@ impl CallControl {
         array_type_id: &Option<String>,
         field_name: &str,
     ) -> Option<majit_ir::descr::DescrRef> {
+        self.interiorfielddescrof_keyed(idx, array_type_id, field_name)
+            .map(|(descr, _)| descr)
+    }
+
+    pub fn interiorfielddescrof_keyed(
+        &self,
+        idx: u32,
+        array_type_id: &Option<String>,
+        field_name: &str,
+    ) -> Option<(
+        majit_ir::descr::DescrRef,
+        majit_ir::effectinfo::DescrSetMember,
+    )> {
         use majit_ir::descr::ArrayFlag;
         let array_str = array_type_id.as_deref()?;
         // ARRAY.OF.fieldname — extract the element type from the
@@ -2162,6 +2241,9 @@ impl CallControl {
                 // populated by either the runtime publish or the
                 // analyzer-only mint.
                 let struct_size = compute_struct_size(self, &elem_name);
+                let rank = self.field_immutability(Some(&elem_name), field_name);
+                let is_immutable = rank.map(|r| r.is_immutable()).unwrap_or(false);
+                let is_quasi_immutable = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
                 let size_descr_arc = {
                     let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
                     gc.get_size_descr(struct_key.clone(), struct_size, 0, false)
@@ -2188,9 +2270,6 @@ impl CallControl {
                 if found.is_none() {
                     // No runtime publish for this `(STRUCT, fieldname)` —
                     // analyzer-only mint.
-                    let rank = self.field_immutability(Some(&elem_name), field_name);
-                    let is_immutable = rank.map(|r| r.is_immutable()).unwrap_or(false);
-                    let is_quasi_immutable = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
                     let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
                     let mint = gc.get_field_descr(
                         struct_key,
@@ -2207,74 +2286,49 @@ impl CallControl {
                     );
                     found = Some(mint as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
                 }
-                break;
+                let field_descr = found?;
+                let item_size = compute_struct_size(self, &elem_name);
+                let base_size = self.gc_typed_array_items_base();
+                let array_id = majit_ir::descr::path_hash(array_str);
+                let member = majit_ir::effectinfo::DescrSetMember::InteriorField {
+                    array_id,
+                    name: field_name.to_string(),
+                };
+                let array_key = majit_ir::descr::LLType::Array(array_id);
+                let cached: majit_ir::descr::DescrRef = {
+                    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                    gc.get_array_descr(
+                        array_key.clone(),
+                        base_size,
+                        item_size,
+                        ArrayFlag::Struct,
+                        majit_ir::value::Type::Ref,
+                        false, // !nolength — length word at offset 0
+                        0,     // length_offset
+                        false, // is_pure
+                        '\x00',
+                    )
+                };
+                let array_descr: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
+                    majit_ir::descr::descr_arc_as_array_descr(cached)
+                        .expect("gc_cache._cache_array slot held a non-ArrayDescr Arc");
+                let descr = majit_ir::descr::gc_cache()
+                    .lock()
+                    .unwrap()
+                    .get_interiorfield_descr(
+                        array_key,
+                        field_name.to_string(),
+                        String::new(),
+                        array_descr,
+                        field_descr,
+                    );
+                descr.set_index(idx);
+                return Some((descr as majit_ir::descr::DescrRef, member));
             }
             offset = offset.saturating_add(field_size);
             field_pos += 1;
         }
-        let field_descr = found?;
-        // `descr.py:430 arraydescr = get_array_descr(gc_ll_descr, ARRAY)`:
-        // PyPy `get_interiorfield_descr` reuses the per-ARRAY cached
-        // array descr.  Pyre routes through `gc_cache.get_array_descr`
-        // cache-or-mint so analyzer's `arraydescrof` and
-        // `interiorfielddescrof` share Arc identity for the same
-        // `LLType::Array(path_hash(atid))` cache key.  `try_downcast_arc`
-        // recovers `Arc<SimpleArrayDescr>` from the cache's
-        // `Arc<dyn Descr>` (the `Descr::as_any` override on
-        // `SimpleArrayDescr` makes the cast sound), then cast
-        // `as Arc<dyn ArrayDescr>` matches the trait-object field type
-        // on `SimpleInteriorFieldDescr.array_descr`.
-        let item_size = compute_struct_size(self, &elem_name);
-        // Interior-field struct arrays address `GcTypedArray`, whose items sit
-        // flat at the length word — NOT the element-aligned offset the list
-        // int/float storage (`TypedItemsBlock`) needs in `arraydescrof_concrete`.
-        let base_size = self.gc_typed_array_items_base();
-        let array_key = majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(array_str));
-        let cached: majit_ir::descr::DescrRef = {
-            let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
-            gc.get_array_descr(
-                array_key.clone(),
-                base_size,
-                item_size,
-                ArrayFlag::Struct,
-                majit_ir::value::Type::Ref,
-                false, // !nolength — length word at offset 0
-                0,     // length_offset
-                false, // is_pure
-                '\x00',
-            )
-        };
-        // `descr.py:348-378 get_array_descr` cache hit returns the
-        // existing `Arc<SimpleArrayDescr>` in the slot, upcast to the
-        // `ArrayDescr` trait object, keeping identity across runtime /
-        // analyzer paths per PyPy `cpu.arraydescrof(ARRAY)`.
-        let array_descr: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
-            majit_ir::descr::descr_arc_as_array_descr(cached)
-                .expect("gc_cache._cache_array slot held a non-ArrayDescr Arc");
-        // `descr.py:423-438 get_interiorfield_descr` cache-or-mint:
-        // key is `(ARRAY, name, arrayfieldname=None)` — for the
-        // GcArray-of-Structs case (which is the only case pyre's
-        // analyzer mints) `arrayfieldname` is None per descr.py:431-432.
-        // Pyre encodes `None` as the empty string in the tuple key.
-        // Both arms of `make_simple_descr_group`'s array-of-struct
-        // population (Task D) and this analyzer mint must hit the same
-        // cache slot for `cpu.interiorfielddescrof` per-tuple identity.
-        // `field_descr` is already `Arc<dyn FieldDescr>` (post B-4):
-        // either PyreFieldDescr from the runtime publish walk OR
-        // SimpleFieldDescr from the analyzer-only mint.  Matches
-        // `SimpleInteriorFieldDescr::new` (descr.rs:3521) field type.
-        let descr = majit_ir::descr::gc_cache()
-            .lock()
-            .unwrap()
-            .get_interiorfield_descr(
-                array_key,
-                field_name.to_string(),
-                String::new(),
-                array_descr,
-                field_descr,
-            );
-        descr.set_index(idx);
-        Some(descr as majit_ir::descr::DescrRef)
+        None
     }
 
     /// Insert into `function_graphs` and (if free function) the
@@ -5525,6 +5579,21 @@ impl CallControl {
         }
 
         // RPython call.py:320-324 effectinfo assembly.
+        let effect_callee = match shape {
+            CallShape::Direct(target) => self
+                .target_to_path(target)
+                .map(|p| p.segments.join("::"))
+                .unwrap_or_else(|| format!("{target:?}")),
+            CallShape::Indirect(graphs) => format!(
+                "indirect[{}]",
+                graphs
+                    .into_iter()
+                    .flatten()
+                    .map(|p| p.segments.join("::"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        };
         let effects = match shape {
             CallShape::Direct(target) => {
                 analyze_readwrite(target, &self.function_graphs, self, &self.descr_indices)
@@ -5547,16 +5616,24 @@ impl CallControl {
             can_invalidate,
             can_collect,
             extradescrs,
+            &effect_callee,
         );
 
         // RPython call.py:326-332 post-conditions on elidable / loopinvariant.
         if elidable || loopinvariant {
-            assert!(
-                effectinfo.extraeffect < ExtraEffect::ForcesVirtualOrVirtualizable,
-                "getcalldescr: elidable/loopinvariant call has effect {:?} \
-                 >= ForcesVirtualOrVirtualizable",
-                effectinfo.extraeffect
-            );
+            // S4c degradation converts an unrepresentable concrete raw-set EI
+            // to `EF_RANDOM_EFFECTS`, the same conservative wildcard
+            // `effectinfo.py:285-292` uses when analysis is top.  Preserve the
+            // upstream elidable/loopinvariant postcondition for every
+            // non-degraded EI.
+            if effectinfo.extraeffect != ExtraEffect::RandomEffects {
+                assert!(
+                    effectinfo.extraeffect < ExtraEffect::ForcesVirtualOrVirtualizable,
+                    "getcalldescr: elidable/loopinvariant call has effect {:?} \
+                     >= ForcesVirtualOrVirtualizable",
+                    effectinfo.extraeffect
+                );
+            }
         }
 
         // RPython call.py:334-335:
@@ -5738,6 +5815,30 @@ fn analyze_readwrite_indirect_family(
 ///
 /// Takes pre-analyzed `effects` (from readwrite_analyzer) and `can_collect`
 /// (from collect_analyzer) and constructs an EffectInfo.
+fn canonicalize_keyed_descrs(
+    mut pairs: Vec<(
+        majit_ir::descr::DescrRef,
+        Option<majit_ir::effectinfo::DescrSetMember>,
+    )>,
+    exclude: Option<&std::collections::HashSet<*const ()>>,
+) -> Option<(
+    Vec<majit_ir::descr::DescrRef>,
+    Vec<majit_ir::effectinfo::DescrSetMember>,
+)> {
+    if let Some(exclude) = exclude {
+        pairs.retain(|(descr, _)| !exclude.contains(&std::sync::Arc::as_ptr(descr).cast::<()>()));
+    }
+    pairs.sort_by_key(|(descr, _)| majit_ir::effectinfo::descr_ptr_id(descr));
+    pairs.dedup_by(|(a, _), (b, _)| std::sync::Arc::ptr_eq(a, b));
+    let mut descrs = Vec::with_capacity(pairs.len());
+    let mut keys = Vec::with_capacity(pairs.len());
+    for (descr, key) in pairs {
+        descrs.push(descr);
+        keys.push(key?);
+    }
+    Some((descrs, keys))
+}
+
 pub fn effectinfo_from_writeanalyze(
     effects: WriteAnalysis,
     extraeffect: ExtraEffect,
@@ -5745,6 +5846,7 @@ pub fn effectinfo_from_writeanalyze(
     can_invalidate: bool,
     can_collect: bool,
     extradescrs: Option<Vec<DescrRef>>,
+    callee_path: &str,
 ) -> EffectInfo {
     // effectinfo.py:285: if effects is top_set or extraeffect == EF_RANDOM_EFFECTS:
     if effects.is_top || extraeffect == ExtraEffect::RandomEffects {
@@ -5759,6 +5861,7 @@ pub fn effectinfo_from_writeanalyze(
             _write_descrs_arrays: None,
             _readonly_descrs_interiorfields: None,
             _write_descrs_interiorfields: None,
+            descr_set_keys: None,
             readonly_descrs_fields: None,
             write_descrs_fields: None,
             readonly_descrs_arrays: None,
@@ -5821,11 +5924,11 @@ pub fn effectinfo_from_writeanalyze(
     // Snapshot the Arc-list before consumption — `single_write_descr_array`
     // takes ownership for its `.into_iter().next()` extract, but the EI's
     // `_write_descrs_arrays: Vec<DescrRef>` raw set below also needs it.
-    let array_write_descrs_snapshot: Vec<majit_ir::descr::DescrRef> = array_write_descrs.clone();
+    let array_write_descrs_snapshot = array_write_descrs.clone();
 
     // effectinfo.py:201-206: single_write_descr_array
     let single_write_descr_array = if array_write_descrs.len() == 1 {
-        Some(array_write_descrs.into_iter().next().unwrap())
+        Some(array_write_descrs.iter().next().unwrap().0.clone())
     } else {
         None
     };
@@ -5899,45 +6002,70 @@ pub fn effectinfo_from_writeanalyze(
     // membership test.
     let field_write_ptr_set: std::collections::HashSet<*const ()> = field_write_descrs
         .iter()
-        .map(|d| std::sync::Arc::as_ptr(d).cast::<()>())
+        .map(|d| std::sync::Arc::as_ptr(&d.0).cast::<()>())
         .collect();
-    let mut read_descrs_fields_arcs: Vec<majit_ir::descr::DescrRef> = field_read_descrs_raw
-        .into_iter()
-        .filter(|d| !field_write_ptr_set.contains(&std::sync::Arc::as_ptr(d).cast::<()>()))
-        .collect();
-    read_descrs_fields_arcs.sort_by_key(majit_ir::effectinfo::descr_ptr_id);
-    read_descrs_fields_arcs.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
-    let mut write_descrs_fields_arcs: Vec<majit_ir::descr::DescrRef> = field_write_descrs;
-    write_descrs_fields_arcs.sort_by_key(majit_ir::effectinfo::descr_ptr_id);
-    write_descrs_fields_arcs.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
+    let read_fields_canon =
+        canonicalize_keyed_descrs(field_read_descrs_raw, Some(&field_write_ptr_set));
+    let write_fields_canon = canonicalize_keyed_descrs(field_write_descrs, None);
     // Same `read \ write` subtract for interiorfield + array (PyPy
     // `effectinfo.py:351-360`), again by Arc identity.
     let interior_write_ptr_set: std::collections::HashSet<*const ()> = interior_write_descrs
         .iter()
-        .map(|d| std::sync::Arc::as_ptr(d).cast::<()>())
+        .map(|d| std::sync::Arc::as_ptr(&d.0).cast::<()>())
         .collect();
-    let mut read_descrs_interior_arcs: Vec<majit_ir::descr::DescrRef> = interior_read_descrs_raw
-        .into_iter()
-        .filter(|d| !interior_write_ptr_set.contains(&std::sync::Arc::as_ptr(d).cast::<()>()))
-        .collect();
-    read_descrs_interior_arcs.sort_by_key(majit_ir::effectinfo::descr_ptr_id);
-    read_descrs_interior_arcs.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
-    let mut write_descrs_interior_arcs: Vec<majit_ir::descr::DescrRef> = interior_write_descrs;
-    write_descrs_interior_arcs.sort_by_key(majit_ir::effectinfo::descr_ptr_id);
-    write_descrs_interior_arcs.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
+    let read_interior_canon =
+        canonicalize_keyed_descrs(interior_read_descrs_raw, Some(&interior_write_ptr_set));
+    let write_interior_canon = canonicalize_keyed_descrs(interior_write_descrs, None);
     let array_write_ptr_set: std::collections::HashSet<*const ()> = array_write_descrs_snapshot
         .iter()
-        .map(|d| std::sync::Arc::as_ptr(d).cast::<()>())
+        .map(|d| std::sync::Arc::as_ptr(&d.0).cast::<()>())
         .collect();
-    let mut read_descrs_arrays_arcs: Vec<majit_ir::descr::DescrRef> = array_read_descrs_raw
-        .into_iter()
-        .filter(|d| !array_write_ptr_set.contains(&std::sync::Arc::as_ptr(d).cast::<()>()))
-        .collect();
-    read_descrs_arrays_arcs.sort_by_key(majit_ir::effectinfo::descr_ptr_id);
-    read_descrs_arrays_arcs.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
-    let mut write_descrs_arrays_arcs: Vec<majit_ir::descr::DescrRef> = array_write_descrs_snapshot;
-    write_descrs_arrays_arcs.sort_by_key(majit_ir::effectinfo::descr_ptr_id);
-    write_descrs_arrays_arcs.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
+    let read_arrays_canon =
+        canonicalize_keyed_descrs(array_read_descrs_raw, Some(&array_write_ptr_set));
+    let write_arrays_canon = canonicalize_keyed_descrs(array_write_descrs_snapshot, None);
+    let (
+        Some((read_descrs_fields_arcs, readonly_fields)),
+        Some((write_descrs_fields_arcs, write_fields)),
+        Some((read_descrs_arrays_arcs, readonly_arrays)),
+        Some((write_descrs_arrays_arcs, write_arrays)),
+        Some((read_descrs_interior_arcs, readonly_interiorfields)),
+        Some((write_descrs_interior_arcs, write_interiorfields)),
+    ) = (
+        read_fields_canon,
+        write_fields_canon,
+        read_arrays_canon,
+        write_arrays_canon,
+        read_interior_canon,
+        write_interior_canon,
+    )
+    else {
+        eprintln!(
+            "[s4c-degrade] {callee_path}: unrepresentable EffectInfo descr set member; using EF_RANDOM_EFFECTS"
+        );
+        return EffectInfo {
+            extraeffect: ExtraEffect::RandomEffects,
+            oopspecindex,
+            pyre_helper: majit_ir::PyreHelperKind::None,
+            _readonly_descrs_fields: None,
+            _write_descrs_fields: None,
+            _readonly_descrs_arrays: None,
+            _write_descrs_arrays: None,
+            _readonly_descrs_interiorfields: None,
+            _write_descrs_interiorfields: None,
+            descr_set_keys: None,
+            readonly_descrs_fields: None,
+            write_descrs_fields: None,
+            readonly_descrs_arrays: None,
+            write_descrs_arrays: None,
+            readonly_descrs_interiorfields: None,
+            write_descrs_interiorfields: None,
+            single_write_descr_array: None,
+            extradescrs: extradescrs.clone(),
+            can_invalidate,
+            can_collect: true,
+            call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+        };
+    };
     EffectInfo {
         extraeffect,
         oopspecindex,
@@ -5948,6 +6076,14 @@ pub fn effectinfo_from_writeanalyze(
         _write_descrs_arrays: Some(write_descrs_arrays_arcs),
         _readonly_descrs_interiorfields: Some(read_descrs_interior_arcs),
         _write_descrs_interiorfields: Some(write_descrs_interior_arcs),
+        descr_set_keys: Some(majit_ir::effectinfo::DescrSetKeys {
+            readonly_fields,
+            write_fields,
+            readonly_arrays,
+            write_arrays,
+            readonly_interiorfields,
+            write_interiorfields,
+        }),
         readonly_descrs_fields: Some(majit_ir::bitstring::make_bitstring(&readonly_descrs_fields)),
         write_descrs_fields: Some(majit_ir::bitstring::make_bitstring(&write_descrs_fields)),
         readonly_descrs_arrays: Some(majit_ir::bitstring::make_bitstring(&readonly_descrs_arrays)),
@@ -6150,25 +6286,43 @@ fn collect_readwrite_effects(
     // effectinfo.py:294,301-305: `readonly_descrs_fields = []` populated
     // via `add_struct → cpu.fielddescrof(T, fieldname)` from
     // `("readstruct", T, fieldname)` tuples.
-    field_read_descrs: &mut Vec<majit_ir::descr::DescrRef>,
+    field_read_descrs: &mut Vec<(
+        majit_ir::descr::DescrRef,
+        Option<majit_ir::effectinfo::DescrSetMember>,
+    )>,
     // effectinfo.py:297,301-305: `write_descrs_fields = []` from
     // `("struct", T, fieldname)` tuples.
-    field_write_descrs: &mut Vec<majit_ir::descr::DescrRef>,
+    field_write_descrs: &mut Vec<(
+        majit_ir::descr::DescrRef,
+        Option<majit_ir::effectinfo::DescrSetMember>,
+    )>,
     // effectinfo.py:296,313-325: `readonly_descrs_interiorfields = []`
     // populated via `add_interiorfield → cpu.interiorfielddescrof(T,
     // fieldname)` from `("readinteriorfield", T, fieldname)` tuples.
-    interior_read_descrs: &mut Vec<majit_ir::descr::DescrRef>,
+    interior_read_descrs: &mut Vec<(
+        majit_ir::descr::DescrRef,
+        Option<majit_ir::effectinfo::DescrSetMember>,
+    )>,
     // effectinfo.py:299,313-325: `write_descrs_interiorfields = []`
     // from `("interiorfield", T, fieldname)` tuples.
-    interior_write_descrs: &mut Vec<majit_ir::descr::DescrRef>,
+    interior_write_descrs: &mut Vec<(
+        majit_ir::descr::DescrRef,
+        Option<majit_ir::effectinfo::DescrSetMember>,
+    )>,
     // effectinfo.py:295,307-311: `readonly_descrs_arrays = []` populated
     // via `add_array → cpu.arraydescrof(ARRAY)` from `("readarray", T)`
     // tuples (and `("readinteriorfield", T, _)` synthesised at
     // effectinfo.py:327-340).
-    array_read_descrs: &mut Vec<majit_ir::descr::DescrRef>,
+    array_read_descrs: &mut Vec<(
+        majit_ir::descr::DescrRef,
+        Option<majit_ir::effectinfo::DescrSetMember>,
+    )>,
     // effectinfo.py:201-206,298,355-356: `write_descrs_arrays = []` —
     // also drives single_write_descr_array.
-    array_write_descrs: &mut Vec<majit_ir::descr::DescrRef>,
+    array_write_descrs: &mut Vec<(
+        majit_ir::descr::DescrRef,
+        Option<majit_ir::effectinfo::DescrSetMember>,
+    )>,
     is_top: &mut bool,
 ) {
     if *is_top {
@@ -6244,11 +6398,11 @@ fn collect_readwrite_effects(
                     // (analyzer-unknown owner — matches PyPy's
                     // `consider_struct=False` filter at effectinfo.py:380).
                     if let Some(owner) = field.owner_root.as_deref() {
-                        if !field_read_descrs.iter().any(|d| d.index() == idx) {
+                        if !field_read_descrs.iter().any(|d| d.0.index() == idx) {
                             if let Some(descr) =
-                                cc.fielddescrof(idx, owner, field.owner_id, &field.name)
+                                cc.fielddescrof_keyed(idx, owner, field.owner_id, &field.name)
                             {
-                                field_read_descrs.push(descr);
+                                field_read_descrs.push((descr.0, Some(descr.1)));
                             }
                         }
                     }
@@ -6260,11 +6414,11 @@ fn collect_readwrite_effects(
                     // RPython: effectinfo.py:301-305 — same as FieldRead's
                     // implicit `add_struct` walk, just into `write_descrs_fields`.
                     if let Some(owner) = field.owner_root.as_deref() {
-                        if !field_write_descrs.iter().any(|d| d.index() == idx) {
+                        if !field_write_descrs.iter().any(|d| d.0.index() == idx) {
                             if let Some(descr) =
-                                cc.fielddescrof(idx, owner, field.owner_id, &field.name)
+                                cc.fielddescrof_keyed(idx, owner, field.owner_id, &field.name)
                             {
-                                field_write_descrs.push(descr);
+                                field_write_descrs.push((descr.0, Some(descr.1)));
                             }
                         }
                     }
@@ -6301,7 +6455,7 @@ fn collect_readwrite_effects(
                     // `cpu.arraydescrof(ARRAY)` and appends to
                     // `readonly_descrs_arrays`. Dedup by descriptor index
                     // (frozenset semantics, matching `ArrayWrite` handler).
-                    if !array_read_descrs.iter().any(|d| d.index() == idx) {
+                    if !array_read_descrs.iter().any(|d| d.0.index() == idx) {
                         let ir_type = match item_ty {
                             crate::model::ValueType::Int
                             | crate::model::ValueType::Unsigned
@@ -6319,7 +6473,7 @@ fn collect_readwrite_effects(
                                 )
                             }
                         };
-                        array_read_descrs.push(cc.arraydescrof(
+                        array_read_descrs.push(cc.arraydescrof_keyed(
                             idx,
                             &resolved_id,
                             ir_type,
@@ -6353,7 +6507,7 @@ fn collect_readwrite_effects(
                     write_arrays.push(idx);
                     // RPython: effectinfo.py:307-311 — cpu.arraydescrof(ARRAY).
                     // Dedup by descriptor index (frozenset semantics).
-                    if !array_write_descrs.iter().any(|d| d.index() == idx) {
+                    if !array_write_descrs.iter().any(|d| d.0.index() == idx) {
                         let ir_type = match item_ty {
                             crate::model::ValueType::Int
                             | crate::model::ValueType::Unsigned
@@ -6377,7 +6531,7 @@ fn collect_readwrite_effects(
                         // here so EffectInfo descrs match the same
                         // `lendescr` shape `arraydescrof()` minted at the
                         // emit-bytecode site (assembler.rs).
-                        array_write_descrs.push(cc.arraydescrof(
+                        array_write_descrs.push(cc.arraydescrof_keyed(
                             idx,
                             &resolved_id,
                             ir_type,
@@ -6414,11 +6568,14 @@ fn collect_readwrite_effects(
                     // `cc.struct_fields` or the field is absent
                     // (PyPy `effectinfo.py:316-324 consider_array` /
                     // `Void` / `UnsupportedFieldExc` filters).
-                    if !interior_read_descrs.iter().any(|d| d.index() == ifield_idx) {
+                    if !interior_read_descrs
+                        .iter()
+                        .any(|d| d.0.index() == ifield_idx)
+                    {
                         if let Some(descr) =
-                            cc.interiorfielddescrof(ifield_idx, &resolved_id, &field.name)
+                            cc.interiorfielddescrof_keyed(ifield_idx, &resolved_id, &field.name)
                         {
-                            interior_read_descrs.push(descr);
+                            interior_read_descrs.push((descr.0, Some(descr.1)));
                         }
                     }
                     // effectinfo.py:327-340: synthesizes `("readarray", T)`
@@ -6448,8 +6605,8 @@ fn collect_readwrite_effects(
                     // appended to readonly_descrs_arrays via the synthesized
                     // ("readarray", T) tuple. Dedup by descriptor index
                     // (frozenset semantics).
-                    if !array_read_descrs.iter().any(|d| d.index() == arr_idx) {
-                        array_read_descrs.push(cc.arraydescrof(
+                    if !array_read_descrs.iter().any(|d| d.0.index() == arr_idx) {
+                        array_read_descrs.push(cc.arraydescrof_keyed(
                             arr_idx,
                             &resolved_id,
                             majit_ir::value::Type::Ref,
@@ -6484,12 +6641,12 @@ fn collect_readwrite_effects(
                     // routed into `write_descrs_interiorfields`.
                     if !interior_write_descrs
                         .iter()
-                        .any(|d| d.index() == ifield_idx)
+                        .any(|d| d.0.index() == ifield_idx)
                     {
                         if let Some(descr) =
-                            cc.interiorfielddescrof(ifield_idx, &resolved_id, &field.name)
+                            cc.interiorfielddescrof_keyed(ifield_idx, &resolved_id, &field.name)
                         {
-                            interior_write_descrs.push(descr);
+                            interior_write_descrs.push((descr.0, Some(descr.1)));
                         }
                     }
                     // effectinfo.py:327-340: synthesizes `("array", T)`
@@ -6519,8 +6676,8 @@ fn collect_readwrite_effects(
                     // appended to write_descrs_arrays via the synthesized
                     // ("array", T) tuple. Dedup by descriptor index
                     // (frozenset semantics, matching ArrayWrite handler).
-                    if !array_write_descrs.iter().any(|d| d.index() == arr_idx) {
-                        array_write_descrs.push(cc.arraydescrof(
+                    if !array_write_descrs.iter().any(|d| d.0.index() == arr_idx) {
+                        array_write_descrs.push(cc.arraydescrof_keyed(
                             arr_idx,
                             &resolved_id,
                             majit_ir::value::Type::Ref,

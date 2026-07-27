@@ -290,6 +290,7 @@ pub const CANNOT_RAISE_NO_HEAP_EFFECT_INFO: EffectInfo = EffectInfo {
     _write_descrs_arrays: Some(Vec::new()),
     _readonly_descrs_interiorfields: Some(Vec::new()),
     _write_descrs_interiorfields: Some(Vec::new()),
+    descr_set_keys: Some(majit_ir::effectinfo::DescrSetKeys::const_empty()),
     readonly_descrs_fields: Some(Vec::new()),
     write_descrs_fields: Some(Vec::new()),
     readonly_descrs_arrays: Some(Vec::new()),
@@ -325,6 +326,7 @@ pub const INT_PY_DIV_EFFECT_INFO: EffectInfo = EffectInfo {
     _write_descrs_arrays: Some(Vec::new()),
     _readonly_descrs_interiorfields: Some(Vec::new()),
     _write_descrs_interiorfields: Some(Vec::new()),
+    descr_set_keys: Some(majit_ir::effectinfo::DescrSetKeys::const_empty()),
     readonly_descrs_fields: Some(Vec::new()),
     write_descrs_fields: Some(Vec::new()),
     readonly_descrs_arrays: Some(Vec::new()),
@@ -353,6 +355,7 @@ pub const INT_PY_MOD_EFFECT_INFO: EffectInfo = EffectInfo {
     _write_descrs_arrays: Some(Vec::new()),
     _readonly_descrs_interiorfields: Some(Vec::new()),
     _write_descrs_interiorfields: Some(Vec::new()),
+    descr_set_keys: Some(majit_ir::effectinfo::DescrSetKeys::const_empty()),
     readonly_descrs_fields: Some(Vec::new()),
     write_descrs_fields: Some(Vec::new()),
     readonly_descrs_arrays: Some(Vec::new()),
@@ -389,6 +392,7 @@ pub const UINT_PY_DIV_EFFECT_INFO: EffectInfo = EffectInfo {
     _write_descrs_arrays: Some(Vec::new()),
     _readonly_descrs_interiorfields: Some(Vec::new()),
     _write_descrs_interiorfields: Some(Vec::new()),
+    descr_set_keys: Some(majit_ir::effectinfo::DescrSetKeys::const_empty()),
     readonly_descrs_fields: Some(Vec::new()),
     write_descrs_fields: Some(Vec::new()),
     readonly_descrs_arrays: Some(Vec::new()),
@@ -415,6 +419,7 @@ pub const UINT_PY_MOD_EFFECT_INFO: EffectInfo = EffectInfo {
     _write_descrs_arrays: Some(Vec::new()),
     _readonly_descrs_interiorfields: Some(Vec::new()),
     _write_descrs_interiorfields: Some(Vec::new()),
+    descr_set_keys: Some(majit_ir::effectinfo::DescrSetKeys::const_empty()),
     readonly_descrs_fields: Some(Vec::new()),
     write_descrs_fields: Some(Vec::new()),
     readonly_descrs_arrays: Some(Vec::new()),
@@ -663,6 +668,25 @@ pub fn make_call_descr_with_effect(
 /// with plain void descrs of the same shape.
 pub fn make_call_descr_void_word_abi(arg_types: &[Type], effect_info: EffectInfo) -> DescrRef {
     make_call_descr_sized(arg_types, Type::Void, false, 8, effect_info)
+}
+
+/// Sized variant of [`make_call_descr_with_effect`] for deserialized
+/// `descrs.bin` call descriptors whose result size/sign were fixed by
+/// `descr.py:650-665 getCallDescrClass`.
+pub fn make_call_descr_sized_with_effect(
+    arg_types: &[Type],
+    result_type: Type,
+    result_signed: bool,
+    result_size: usize,
+    effect_info: EffectInfo,
+) -> DescrRef {
+    make_call_descr_sized(
+        arg_types,
+        result_type,
+        result_signed,
+        result_size,
+        effect_info,
+    )
 }
 
 fn make_call_descr_sized(

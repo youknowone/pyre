@@ -25,6 +25,70 @@ impl std::fmt::Display for UnsupportedFieldExc {
 
 impl std::error::Error for UnsupportedFieldExc {}
 
+/// Serializable projection of one member of the six raw EffectInfo descr
+/// sets: the gccache key the analyzer minted the descr through.
+///
+/// `Arc<dyn Descr>` cannot cross the `descrs.bin` process boundary, but the
+/// key can — both halves of the split agree on it by construction, since
+/// `cpu.fielddescrof(STRUCT, fieldname)` / `cpu.arraydescrof(ARRAY)` /
+/// `cpu.interiorfielddescrof(ARRAY, fieldname)` are cache lookups on exactly
+/// these tuples.  The key alone is enough because the member is resolved by
+/// lookup only, never by minting (see `descr_from_set_member` in
+/// `pyre-jit-trace`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DescrSetMember {
+    /// `descr.py:218-239 get_field_descr(gccache, STRUCT, fieldname)` —
+    /// `_cache_field[Struct(struct_id)][field_name]`.
+    Field { struct_id: u64, field_name: String },
+    /// `descr.py:348-378 get_array_descr(gccache, ARRAY)` —
+    /// `_cache_array[Array(array_id)]`.
+    Array { array_id: u64 },
+    /// `descr.py:404-437 get_interiorfield_descr(gccache, ARRAY, fieldname)` —
+    /// `_cache_interiorfield[(Array(array_id), name, "")]`.
+    InteriorField { array_id: u64, name: String },
+}
+
+/// `effectinfo.py:128-145 frozenset_or_none`: serializable projection of
+/// the six raw EffectInfo descr sets. The vectors are kept in the same
+/// canonical order as the raw `DescrRef` sets so deserialization can rebuild
+/// the exact object graph before `compute_bitstrings`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DescrSetKeys {
+    pub readonly_fields: Vec<DescrSetMember>,
+    pub write_fields: Vec<DescrSetMember>,
+    pub readonly_arrays: Vec<DescrSetMember>,
+    pub write_arrays: Vec<DescrSetMember>,
+    pub readonly_interiorfields: Vec<DescrSetMember>,
+    pub write_interiorfields: Vec<DescrSetMember>,
+}
+
+impl DescrSetKeys {
+    /// The `frozenset_or_none(...)` image of six *empty* frozensets — an EI
+    /// the analyzer proved touches no field, array or interiorfield.
+    ///
+    /// Distinct from `descr_set_keys = None`, which is the
+    /// `EF_RANDOM_EFFECTS` wildcard: `effectinfo.py:149-162` makes the raw
+    /// sets `None` **iff** the EI is random-effects, and
+    /// `compute_bitstrings` (`effectinfo.py:484-489`) reads the two shapes
+    /// oppositely — empty sets keep the bitstrings, `None` clears them.  A
+    /// concrete-but-empty EI serialized with `None` would therefore come
+    /// back from `descrs.bin` looking random-effects while its
+    /// `extraeffect` still says otherwise, and `check_readonly_descr_field`
+    /// would panic on the cleared bitstring.
+    ///
+    /// `const` so the `EffectInfo` associated constants can name it.
+    pub const fn const_empty() -> Self {
+        Self {
+            readonly_fields: Vec::new(),
+            write_fields: Vec::new(),
+            readonly_arrays: Vec::new(),
+            write_arrays: Vec::new(),
+            readonly_interiorfields: Vec::new(),
+            write_interiorfields: Vec::new(),
+        }
+    }
+}
+
 /// `EffectInfo` with setup-time interior mutability for the bitstring
 /// fields.
 ///
@@ -267,6 +331,22 @@ pub struct EffectInfo {
     /// effectinfo.py:133 `_write_descrs_interiorfields`.
     #[serde(skip)]
     pub _write_descrs_interiorfields: Option<Vec<DescrRef>>,
+    /// `descr.py:218-239 get_field_descr`, `descr.py:348-378 get_array_descr`,
+    /// `descr.py:404-437 get_interiorfield_descr`: serialized channel for
+    /// the six skipped raw descr sets above.
+    ///
+    /// Tracks the `Option`-ness of those sets exactly: `None` here **iff**
+    /// they are the `EF_RANDOM_EFFECTS` wildcard, `Some` (possibly with
+    /// empty vectors — [`DescrSetKeys::const_empty`]) whenever they are
+    /// concrete.  `effectinfo.py:149-162` states that biconditional and
+    /// `compute_bitstrings` relies on it, so the two must not drift apart.
+    ///
+    /// Pure derivation of the raw sets, so it is deliberately excluded from
+    /// `PartialEq`, `Hash`, `LLType::func_key_with_release_gil_breaker`, and
+    /// `EffectInfoKey::from_effect_info`; including it would split call-descr
+    /// interning buckets on redundant data.
+    #[serde(default)]
+    pub descr_set_keys: Option<DescrSetKeys>,
     /// effectinfo.py:185 bitstring_readonly_descrs_fields. `None` = wildcard
     /// (effectinfo.py:488-489 sets the bitstring to `None` for `EF_RANDOM_EFFECTS`).
     pub readonly_descrs_fields: Option<Vec<u8>>,
@@ -374,6 +454,7 @@ impl Default for EffectInfo {
             _write_descrs_arrays: Some(Vec::new()),
             _readonly_descrs_interiorfields: Some(Vec::new()),
             _write_descrs_interiorfields: Some(Vec::new()),
+            descr_set_keys: Some(DescrSetKeys::const_empty()),
             // effectinfo.py:175-181: empty frozenset for elidable, but `__new__`
             // requires a non-None value for non-RandomEffects EIs. Empty Vec
             // is the bitstring equivalent (no descrs touched).
@@ -794,6 +875,7 @@ impl EffectInfo {
             _write_descrs_arrays: Some(Vec::new()),
             _readonly_descrs_interiorfields: Some(Vec::new()),
             _write_descrs_interiorfields: Some(Vec::new()),
+            descr_set_keys: Some(DescrSetKeys::const_empty()),
             readonly_descrs_fields: Some(Vec::new()),
             write_descrs_fields: Some(Vec::new()),
             readonly_descrs_arrays: Some(Vec::new()),
@@ -856,6 +938,7 @@ impl EffectInfo {
         _write_descrs_arrays: None,
         _readonly_descrs_interiorfields: None,
         _write_descrs_interiorfields: None,
+        descr_set_keys: None,
         readonly_descrs_fields: None,
         write_descrs_fields: None,
         readonly_descrs_arrays: None,

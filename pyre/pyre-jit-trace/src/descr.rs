@@ -4223,6 +4223,197 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
     }
 }
 
+/// Look a serialized raw-set member back up in the process-global gccache.
+///
+/// **Lookup only — never mint.** `descr.py:218-239 get_field_descr` is
+/// cache-or-mint because upstream calls it from `heaptracker.all_fielddescrs
+/// (STRUCT)`, which always has the whole `STRUCT` in hand and therefore mints
+/// the parent `SizeDescr` with its complete `all_fielddescrs` list
+/// (`descr.py:188 init_size_descr`). A serialized member carries only its own
+/// slot, so minting through it would publish a parent with an empty field
+/// list, win `_cache_field` by first-write, and leave
+/// `SizeDescr.all_fielddescrs` and `_cache_field` describing different
+/// objects — breaking the positional invariant `heaptracker.py:76-101
+/// get_fielddescr_index_in` establishes and `optimizeopt/info.rs force_box`
+/// asserts.
+///
+/// Outcome of looking one serialized raw-set member back up.
+enum SetMemberLookup {
+    /// The gccache holds the slot the analyzer minted through.
+    Resolved(majit_ir::DescrRef),
+    /// The *container* (`STRUCT` / `ARRAY`) is absent from this process's
+    /// descr universe entirely, so no operation recorded here can carry a
+    /// descr for it and the member cannot participate in any
+    /// `check_*_descr_*` answer.  Dropping it is the faithful projection of
+    /// the analyzer's frozenset onto the runtime universe — the analyzer
+    /// walks the whole translated program, the runtime only registers what
+    /// it actually traces.  Upstream has no counterpart because
+    /// `cpu.*descrof` and `compute_bitstrings` share one process.
+    AbsentContainer,
+    /// The container IS published but not under this member's key.  A real
+    /// runtime descr for the field may exist under a different spelling, so
+    /// dropping the member would answer "not written" for a field that is;
+    /// the caller must fall back to the wildcard instead.
+    Ambiguous,
+}
+
+/// Look a serialized raw-set member back up in the process-global gccache.
+///
+/// **Lookup only — never mint.** `descr.py:218-239 get_field_descr` is
+/// cache-or-mint because upstream calls it from `heaptracker.all_fielddescrs
+/// (STRUCT)`, which always has the whole `STRUCT` in hand and therefore mints
+/// the parent `SizeDescr` with its complete `all_fielddescrs` list
+/// (`descr.py:188 init_size_descr`). A serialized member carries only its own
+/// slot, so minting through it would publish a parent with an empty field
+/// list, win `_cache_field` by first-write, and leave
+/// `SizeDescr.all_fielddescrs` and `_cache_field` describing different
+/// objects — breaking the positional invariant `heaptracker.py:76-101
+/// get_fielddescr_index_in` establishes and `optimizeopt/info.rs force_box`
+/// asserts.
+fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberLookup {
+    use majit_ir::descr::{LLType, gc_cache};
+
+    match m {
+        majit_ir::effectinfo::DescrSetMember::Field {
+            struct_id,
+            field_name,
+            ..
+        } => {
+            let struct_key = LLType::Struct(*struct_id);
+            let gc = gc_cache().lock().unwrap();
+            match gc._cache_field.get(&struct_key) {
+                Some(inner) => match inner.get(field_name.as_str()) {
+                    Some(fd) => SetMemberLookup::Resolved(fd.clone() as majit_ir::DescrRef),
+                    None => SetMemberLookup::Ambiguous,
+                },
+                // No field map and no size slot: nothing in this process
+                // ever named the struct.
+                None if !gc._cache_size.contains_key(&struct_key) => {
+                    SetMemberLookup::AbsentContainer
+                }
+                None => SetMemberLookup::Ambiguous,
+            }
+        }
+        majit_ir::effectinfo::DescrSetMember::Array { array_id, .. } => {
+            match gc_cache()
+                .lock()
+                .unwrap()
+                ._cache_array
+                .get(&LLType::Array(*array_id))
+            {
+                Some(ad) => SetMemberLookup::Resolved(ad.clone()),
+                None => SetMemberLookup::AbsentContainer,
+            }
+        }
+        majit_ir::effectinfo::DescrSetMember::InteriorField { array_id, name, .. } => {
+            let gc = gc_cache().lock().unwrap();
+            let array_key = LLType::Array(*array_id);
+            match gc
+                ._cache_interiorfield
+                .get(&(array_key.clone(), name.clone(), String::new()))
+            {
+                Some(d) => SetMemberLookup::Resolved(d.clone()),
+                None if !gc._cache_array.contains_key(&array_key) => {
+                    SetMemberLookup::AbsentContainer
+                }
+                None => SetMemberLookup::Ambiguous,
+            }
+        }
+    }
+}
+
+/// Fill the six `_*_descrs_*` raw sets from `descr_set_keys`, canonicalising
+/// exactly as `effectinfo.py:128-145 frozenset_or_none` /
+/// `canonicalize_descr_set`.
+///
+/// All six sets or none of them: `effectinfo.py:149-162` makes them `None`
+/// **iff** the EI is `EF_RANDOM_EFFECTS`, and `compute_bitstrings`
+/// (`effectinfo.py:484-489`) asserts that biconditional before deciding
+/// whether to clear the bitstrings.  A half-populated EI would clear them
+/// while `extraeffect` still claims concrete effects, and the next
+/// `check_readonly_descr_field` would then read a `None` bitstring.
+pub fn rehydrate_effect_info(ei: &mut majit_ir::EffectInfo) {
+    // `effectinfo.py:285-292` wildcard: the shape to fall back to whenever
+    // the concrete sets cannot be rebuilt faithfully.  Conservative in the
+    // sound direction — `has_random_effects()` makes every heap consumer
+    // assume the call touched everything.
+    fn degrade(ei: &mut majit_ir::EffectInfo) {
+        ei.extraeffect = majit_ir::ExtraEffect::RandomEffects;
+        // effectinfo.py:364-365 — the wildcard forces can_collect.
+        ei.can_collect = true;
+        ei._readonly_descrs_fields = None;
+        ei._write_descrs_fields = None;
+        ei._readonly_descrs_arrays = None;
+        ei._write_descrs_arrays = None;
+        ei._readonly_descrs_interiorfields = None;
+        ei._write_descrs_interiorfields = None;
+        ei.readonly_descrs_fields = None;
+        ei.write_descrs_fields = None;
+        ei.readonly_descrs_arrays = None;
+        ei.write_descrs_arrays = None;
+        ei.readonly_descrs_interiorfields = None;
+        ei.write_descrs_interiorfields = None;
+        ei.single_write_descr_array = None;
+    }
+
+    let Some(keys) = ei.descr_set_keys.as_ref() else {
+        // No serialized key channel.  For a build-time EI that means the
+        // codewriter already emitted the `EF_RANDOM_EFFECTS` wildcard, so
+        // the six raw sets are `None` and there is nothing to rebuild.  Any
+        // other shape lost its sets somewhere the invariant above does not
+        // cover; restore the wildcard rather than leave a concrete
+        // `extraeffect` pointing at absent sets.
+        if ei.extraeffect != majit_ir::ExtraEffect::RandomEffects {
+            degrade(ei);
+        }
+        return;
+    };
+    let resolve = |members: &[majit_ir::effectinfo::DescrSetMember]| {
+        let mut out = Vec::with_capacity(members.len());
+        for m in members {
+            match descr_from_set_member(m) {
+                SetMemberLookup::Resolved(d) => out.push(d),
+                SetMemberLookup::AbsentContainer => {}
+                SetMemberLookup::Ambiguous => return None,
+            }
+        }
+        Some(majit_ir::effectinfo::canonicalize_descr_set(out))
+    };
+    let resolved = (
+        resolve(&keys.readonly_fields),
+        resolve(&keys.write_fields),
+        resolve(&keys.readonly_arrays),
+        resolve(&keys.write_arrays),
+        resolve(&keys.readonly_interiorfields),
+        resolve(&keys.write_interiorfields),
+    );
+    let (
+        Some(readonly_fields),
+        Some(write_fields),
+        Some(readonly_arrays),
+        Some(write_arrays),
+        Some(readonly_interiorfields),
+        Some(write_interiorfields),
+    ) = resolved
+    else {
+        degrade(ei);
+        return;
+    };
+    ei._readonly_descrs_fields = Some(readonly_fields);
+    ei._write_descrs_fields = Some(write_fields);
+    ei._readonly_descrs_arrays = Some(readonly_arrays);
+    // effectinfo.py:201-206 single_write_descr_array — also `serde(skip)`,
+    // and read in production by `heap.rs force_from_effectinfo`, so it is
+    // re-derived from the set that just came back rather than left `None`.
+    ei.single_write_descr_array = match write_arrays.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    };
+    ei._write_descrs_arrays = Some(write_arrays);
+    ei._readonly_descrs_interiorfields = Some(readonly_interiorfields);
+    ei._write_descrs_interiorfields = Some(write_interiorfields);
+}
+
 /// `BhCallDescr` -> `CallDescr` adapter. RPython parity: codewriter
 /// `Assembler.descrs` carries the same `CallDescr` instance the
 /// metainterp pulls during op recording. pyre keeps the codewriter-side

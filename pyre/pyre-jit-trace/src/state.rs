@@ -617,6 +617,7 @@ fn ensure_finish_setup() {
     let Some((insns, all_liveness)) = snapshot else {
         return;
     };
+    crate::jitcode_runtime::rehydrate_build_descr_raw_sets();
     METAINTERP_SD.with(|r| {
         r.borrow_mut().finish_setup_if_needed(&insns, all_liveness);
     });
