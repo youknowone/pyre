@@ -112,16 +112,12 @@ pub extern "C" fn jit_load_name_from_namespace(
         return 0;
     };
     // `pyopcode.py:959 _load_global`: `space.finditem_str(w_globals,
-    // varname)`.  Real dict layouts retain the borrowed-string strategy
-    // path; dict subclasses must dispatch through their exact mapping object
-    // so `__missing__` and observable globals identity survive tracing too.
+    // varname)`.  finditem_str takes the borrowed-string fast path for real
+    // dict layouts and dispatches a dict subclass through the general mapping
+    // object, so a raising key `__eq__` propagates through the traced path
+    // instead of being swallowed as a miss.
     if !w_globals.is_null() {
-        let lookup = if unsafe { pyre_object::is_dict(w_globals) } {
-            Ok(unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_globals, name) })
-        } else {
-            crate::baseobjspace::finditem_str(w_globals, name)
-        };
-        let value = match lookup {
+        let value = match crate::baseobjspace::finditem_str(w_globals, name) {
             Ok(value) => value,
             Err(mut error) => {
                 jit_publish_exception(error.to_exc_object());

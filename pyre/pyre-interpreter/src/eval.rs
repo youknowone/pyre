@@ -2063,20 +2063,14 @@ impl NamespaceOpcodeHandler for PyFrame {
     /// because the empty dict is the picked builtin.
     fn load_global_value(&mut self, name: &str, nameindex: usize) -> Result<Self::Value, PyError> {
         // `pyopcode.py:958-960 _load_global_fallback` uses
-        // `space.finditem_str(self.get_w_globals(), varname)`.  Keep the
-        // borrowed-string strategy fast path for real W_DictObject /
-        // W_ModuleDictObject layouts, but dispatch a dict subclass through
-        // the exact mapping object.  In pyre a dict subclass is represented
-        // by an instance plus `__dict_data__`; treating the instance as a
-        // W_DictObject both loses `__missing__` and reads an invalid layout.
+        // `space.finditem_str(self.get_w_globals(), varname)`.  finditem_str
+        // takes a borrowed-string fast path for real W_DictObject /
+        // W_ModuleDictObject layouts and dispatches a dict subclass through
+        // the general mapping object, so a raising key `__eq__` propagates
+        // instead of being swallowed as a miss.
         let w_globals = self.get_w_globals();
         if !w_globals.is_null() {
-            let value = if unsafe { pyre_object::is_dict(w_globals) } {
-                unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_globals, name) }
-            } else {
-                crate::baseobjspace::finditem_str(w_globals, name)?
-            };
-            if let Some(value) = value {
+            if let Some(value) = crate::baseobjspace::finditem_str(w_globals, name)? {
                 return Ok(value);
             }
         }
