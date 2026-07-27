@@ -882,3 +882,24 @@ for i in range(-1, 2, 1):
     assert_raises(
         IndexError, lambda: a[-sys.maxsize - i], _msg="bytearray index out of range"
     )
+
+
+# CPython 3.14 `ByteArrayTest.test_resize` /
+# `ByteArrayTest.test_resize_forbidden`.
+a = bytearray(b"abcdef")
+assert a.resize(3) is None
+assert a == bytearray(b"abc")
+assert a.resize(10) is None
+assert a == bytearray(b"abc\0\0\0\0\0\0\0")
+assert a.resize(0) is None
+assert a == bytearray()
+
+a = bytearray(10)
+view = memoryview(a)
+# The same-size fast path is not a resize and remains legal while exported.
+assert a.resize(10) is None
+assert_raises(BufferError, a.resize, 11)
+assert_raises(BufferError, a.resize, 9)
+assert len(a) == 10
+view.release()
+assert a.resize(9) is None
