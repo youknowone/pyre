@@ -3032,9 +3032,10 @@ pub fn dunder_import(
                     level,
                 );
             }
+            let w_name = pyre_object::w_str_new(name);
             return call_bootstrap_import(
                 shadow_stack_get(import_slot),
-                pyre_object::w_str_new(name),
+                w_name,
                 shadow_stack_get(globals_slot),
                 shadow_stack_get(locals_slot),
                 if fromlist_missing {
