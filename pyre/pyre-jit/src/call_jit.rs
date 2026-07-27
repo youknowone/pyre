@@ -2214,7 +2214,35 @@ pub fn blackhole_resume_via_rd_numb(
             let last_opcode_position = bh.last_opcode_position;
             release_bh_rd(bh);
             match next {
-                Some(caller) => bh = *caller,
+                Some(caller) => {
+                    // `_run_forever` records a node at every frame boundary it
+                    // propagates through, so a frame the chain merely passes
+                    // over still appears in the traceback.  Only the bottommost
+                    // frame was recorded here, which drops the node of every
+                    // level between the raise and the outermost frame — for an
+                    // inlined callee that is the whole of its presence, since
+                    // no interpreter frame ever runs for it.  The helper
+                    // resolves the raise coordinate and honours a bare reraise,
+                    // as it does for the sibling propagation loop.
+                    if !frame_ptr.is_null() {
+                        match jitcode_index {
+                            Some(jitcode_index) => record_caught_blackhole_traceback(
+                                guard_exc,
+                                frame_ptr as i64,
+                                i64::from(jitcode_index),
+                                last_opcode_position as i64,
+                            ),
+                            None => unsafe {
+                                pyre_interpreter::pytraceback::record_application_traceback(
+                                    guard_exc as PyObjectRef,
+                                    frame_ptr,
+                                    (*frame_ptr).last_instr as i64,
+                                )
+                            },
+                        }
+                    }
+                    bh = *caller;
+                }
                 None => {
                     // blackhole.py:1629 bottommost frame, unhandled →
                     // raise ExitFrameWithExceptionRef(exc).
