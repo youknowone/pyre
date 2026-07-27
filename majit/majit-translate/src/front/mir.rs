@@ -11960,6 +11960,21 @@ pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
         if crate::translator::rtyper::cutover::residual_return_shell(token.as_deref()).is_none() {
             continue;
         }
+        // The `ref` token collapses every non-`*mut PyObject` ADT onto one
+        // GC-reference word, so on its own it would also admit a by-value
+        // aggregate — `w_tuple_items_copy_as_vec` returns
+        // `Vec<PyObjectRef>`, three words returned through `sret`.  The
+        // hand-written residuals that do return a `Vec` (`compute_mro`,
+        // `memoryview_gather_bytes`) work because each carries an explicit
+        // `jit_fnaddr` `push_alias_pair` row arranging that ABI; a stub
+        // this collector mints has no such row, so a caller would annotate
+        // the one-word shell against a multiword ABI.  Admit `ref` only
+        // for returns that genuinely are one word.
+        if token.as_deref() == Some("ref")
+            && !ref_return_is_single_word(&tyref_to_ast_string(&fd.signature.output, llbc))
+        {
+            continue;
+        }
         // Both free functions and impl-owned functions are collected,
         // keyed on `name_path()` — the segment vector
         // `call_target_segments` emits for a `CallKind::Fun(Regular)`
@@ -13583,6 +13598,41 @@ fn output_type_is_ref(ty: &TyRef, llbc: &Llbc) -> bool {
 /// `dont_look_inside` residual prefill (`cutover.rs`): without a
 /// `return_type` marker an object-pointer-returning opaque callee maps
 /// `None`→`Void`, residualizing to a void result the caller cannot use.
+/// True when a `ref`-tokened return is genuinely one machine word, so the
+/// token's one-word `SomeInstance` shell matches the callee's return ABI.
+///
+/// Reads the `tyref_to_ast_string` spelling because the `ref` token itself
+/// has already erased the distinction: `tyref_to_value_type` maps every
+/// non-primitive ADT to `ValueType::Ref`, a `Vec<T>` (three words, `sret`)
+/// exactly like a `*mut T`.
+///
+/// Admitted:
+/// - a raw pointer (`*mut T` / `*const T`), one word by construction;
+/// - `Result<T, PyError>` whose `Ok` payload is itself one word.  That is
+///   the shape the exception bridge already gives a one-word ABI — the `Ok`
+///   payload is returned in the result register and the `Err` rides
+///   `BH_LAST_EXC_VALUE` + `jit_publish_exception` — and it is what
+///   `PyResult` spells.
+///
+/// Everything else — `Vec<T>`, `String`, tuples, `Option<T>`, a named ADT by
+/// value — is declined, and its callers keep their "not registered" Skip.
+fn ref_return_is_single_word(ast: &str) -> bool {
+    let ast = ast.trim();
+    if ast.starts_with("*mut ") || ast.starts_with("*const ") {
+        return true;
+    }
+    // `Result<T,PyError>` — `tyref_to_ast_string` comma-joins type args
+    // without spaces, so split the payload off the trailing `,PyError>`.
+    if let Some(args) = ast
+        .strip_prefix("Result<")
+        .and_then(|s| s.strip_suffix(">"))
+        && let Some(ok) = args.strip_suffix(",PyError")
+    {
+        return ok == "()" || ref_return_is_single_word(ok);
+    }
+    false
+}
+
 fn output_type_is_objectptr(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_node(ty, llbc)
         .and_then(|n| strip_ty_wrappers(n, llbc))
