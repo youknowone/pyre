@@ -688,6 +688,56 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         w_dict_new as *const (),
     );
     push_fnaddr(&mut entries, "w_dict_new", w_dict_new as *const ());
+    // `bool_invert_deprecation_text` is `#[dont_look_inside]` (it hides a
+    // `static` prebuilt cell the front-end cannot lift); bind its zero-arg
+    // `fn() -> PyObjectRef` so `invert`'s residual call to it resolves.
+    let bool_invert_deprecation_text: fn() -> pyre_object::PyObjectRef =
+        crate::objspace::descroperation::bool_invert_deprecation_text;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::bool_invert_deprecation_text",
+        "pyre_interpreter::bool_invert_deprecation_text",
+        bool_invert_deprecation_text as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "bool_invert_deprecation_text",
+        bool_invert_deprecation_text as *const (),
+    );
+    // `lookup_exc_class` is `#[dont_look_inside]` (it hides the
+    // `EXC_CLASS_REGISTRY` static); bind it so the residual call from
+    // `warn::warn_category_w` and the `_warnings` category helpers resolves.
+    let lookup_exc_class: fn(&str) -> Option<pyre_object::PyObjectRef> =
+        crate::builtins::lookup_exc_class;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::builtins::lookup_exc_class",
+        "pyre_interpreter::lookup_exc_class",
+        lookup_exc_class as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "lookup_exc_class",
+        lookup_exc_class as *const (),
+    );
+    // `emit_stdout` / `emit_stderr` are `#[dont_look_inside]` (host stdio
+    // handles); bind them so the residual calls resolve.
+    let emit_stdout: fn(&[u8]) = crate::host_seam::emit_stdout;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::host_seam::emit_stdout",
+        "pyre_interpreter::emit_stdout",
+        emit_stdout as *const (),
+    );
+    push_fnaddr(&mut entries, "emit_stdout", emit_stdout as *const ());
+    let emit_stderr: fn(&[u8]) = crate::host_seam::emit_stderr;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::host_seam::emit_stderr",
+        "pyre_interpreter::emit_stderr",
+        emit_stderr as *const (),
+    );
+    push_fnaddr(&mut entries, "emit_stderr", emit_stderr as *const ());
     // `w_set_new` / `w_frozenset_new` are `#[dont_look_inside]` for the same
     // host `IndexMap::new` storage-box reason; bind their zero-arg
     // `fn() -> PyObjectRef` so the residual calls resolve.

@@ -272,6 +272,9 @@ pub(crate) fn current_frames() -> PyObjectRef {
                 unsafe { (*(ec as *const crate::PyExecutionContext)).gettopframe_nohidden() };
             if !frame.is_null() {
                 unsafe { (*frame).mark_as_escaped() };
+                // The frame becomes a user-visible value; materialize the
+                // virtualizable fields the JIT may still be holding.
+                crate::executioncontext::force_frame(frame);
                 pyre_object::gc_roots::pin_root(frame as PyObjectRef);
                 entries.push(ident);
             }

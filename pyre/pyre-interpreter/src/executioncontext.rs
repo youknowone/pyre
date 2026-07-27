@@ -10,8 +10,22 @@ pub fn register_force_frame_hook(f: ForceFrameFn) {
     let _ = FORCE_FRAME_HOOK.set(f);
 }
 
+/// `rvirtualizable.py hook_access_field` → `jit_force_virtualizable`:
+/// materialize a frame's virtualizable fields before something outside the JIT
+/// reads them.
+///
+/// Upstream emits this per redirected FIELD ACCESS, and
+/// `jtransform.rewrite_op_jit_force_virtualizable` deletes it again in every
+/// graph the codewriter looks inside — only the graphs the JIT cannot see keep
+/// the call (`rvirtualizable.replace_force_virtualizable_with_call`).  So the
+/// frame-chain walk itself never forces upstream; the consumer that reads a
+/// field does.  Call sites here are therefore the consumers, not the walkers:
+/// a walk that only follows `f_backref` and tests `hide()` reads nothing the
+/// JIT keeps virtual, and forcing there escapes the traced virtualizable for
+/// every frame-walking helper — `pyjitpl.vable_after_residual_call` then
+/// aborts the whole trace with `ABORT_ESCAPE`.
 #[inline]
-fn force_frame(frame: *mut PyFrame) {
+pub fn force_frame(frame: *mut PyFrame) {
     if let Some(f) = FORCE_FRAME_HOOK.get() {
         unsafe { f(frame) };
     }
@@ -406,10 +420,14 @@ impl ExecutionContext {
         self.topframeref
     }
 
+    /// `executioncontext.py gettopframe_nohidden` — follow `f_backref` past every
+    /// `hidden_applevel` frame.  No force: the walk reads only the vref links
+    /// and `hide()`, and `hide()` goes through `pyframe_get_pycode`, a plain
+    /// field read.  Consumers that hand the frame to app code call
+    /// [`force_frame`] themselves.
     pub fn gettopframe_nohidden(&self) -> *mut PyFrame {
         let mut frame = force_vref(self.topframeref);
         while !frame.is_null() {
-            force_frame(frame);
             // SAFETY: frame pointers are owned by interpreter call stack and can be
             // null-checked before dereference.
             unsafe {
@@ -423,9 +441,11 @@ impl ExecutionContext {
         frame
     }
 
+    /// `executioncontext.py getnextframe_nohidden` — the same walk from an
+    /// arbitrary frame.
+    /// Force-free for the reason given on [`gettopframe_nohidden`].
     pub fn getnextframe_nohidden(mut frame: *mut PyFrame) -> *mut PyFrame {
         while !frame.is_null() {
-            force_frame(frame);
             // SAFETY: caller provides a valid frame chain or null.
             unsafe {
                 let current = &*frame;
@@ -433,7 +453,6 @@ impl ExecutionContext {
                 if next.is_null() {
                     return std::ptr::null_mut();
                 }
-                force_frame(next);
                 if !(&*next).hide() {
                     return next;
                 }

@@ -773,6 +773,8 @@ fn capture_coroutine_origin(ec: *const PyExecutionContext) -> PyObjectRef {
         if frame.is_null() {
             break;
         }
+        // `fget_f_lineno` below reads `last_instr`, a virtualizable field.
+        crate::executioncontext::force_frame(frame);
         let code = unsafe { (*frame).code() };
         let filename_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(w_str_new(&code.source_path));
@@ -2896,9 +2898,18 @@ impl PyFrame {
     /// nohidden walker itself) returns the raw `f_backref` link.
     #[inline]
     pub fn fget_f_back(&self) -> *mut PyFrame {
-        crate::executioncontext::ExecutionContext::getnextframe_nohidden(
-            self as *const PyFrame as *mut PyFrame,
-        )
+        // `f_back` is read from app code, which goes on to read frame fields;
+        // the walk itself no longer forces, so force both ends here.  `self`
+        // matters as much as the result: an inline-published callee frame is
+        // materialised only by a force, and `f_backref` off an unforced one
+        // names the wrong caller.
+        let this = self as *const PyFrame as *mut PyFrame;
+        crate::executioncontext::force_frame(this);
+        let back = crate::executioncontext::ExecutionContext::getnextframe_nohidden(this);
+        if !back.is_null() {
+            crate::executioncontext::force_frame(back);
+        }
+        back
     }
 
     /// pyframe.py:641-642 fget_code → self.getcode().  Returns the `PyCode`

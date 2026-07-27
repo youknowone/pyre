@@ -1757,6 +1757,27 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             last_instr,
             majit_ir::Value::Int(ctx.vstack_cur_pypc as i64),
         );
+        // …and the heap half of the same `_opimpl_setfield_vable` shape
+        // (`virtualizable_boxes[index] = valuebox; synchronize_virtualizable()`
+        // — the mirror above is only the box half, and writes the trace's
+        // shadow, never the frame).  The same constant feeds both so the
+        // shadow and the heap cannot disagree.
+        //
+        // Upstream needs neither at a residual call: its frame readers are
+        // traced in and read `last_instr` off the virtual frame.  pyre
+        // residualizes them and reads the heap, and the frame-chain walk no
+        // longer forces (`ExecutionContext::force_frame`), so without this
+        // store nothing keeps the field current in compiled code: left at the
+        // last resume point, `_warnings::setup_context` keys its registry on
+        // the wrong line and re-issues a warning the interpreted run already
+        // deduplicated.
+        if let Some(vable_ref) = ctx.trace_ctx.standard_virtualizable_box()
+            && let Some(idx) = info.static_field_index_by_name("last_instr")
+        {
+            let descr = info.static_field_descr(idx);
+            ctx.trace_ctx
+                .vable_setfield_descr(vable_ref, last_instr, descr);
+        }
         unsafe {
             majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut **obj));
             info.tracing_before_residual_call(**obj as usize as *mut u8);
@@ -1998,6 +2019,31 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // leg must not assume walk-end shadow state after a cancelled
             // commit.
             ctx.trace_ctx.refresh_virtualizable_shadow_from_heap();
+            if fbw_debug_abort_enabled() {
+                // `vable_after_residual_call`'s
+                // `debug_print('vable escaped during a call in %s')`: name the
+                // callee through `get_name_from_address`, falling back to the
+                // raw address.  Which helper forced the virtualizable is the
+                // only thing that distinguishes one ABORT_ESCAPE from another,
+                // and the trace is gone by the time the abort surfaces.
+                let addr = match ctx.trace_ctx.box_value(allboxes[0]) {
+                    Some(majit_ir::Value::Int(a)) => a,
+                    _ => 0,
+                };
+                match pyre_interpreter::jit_trace_fnaddrs()
+                    .into_iter()
+                    .find(|(_, a)| *a == addr)
+                {
+                    Some((name, _)) => eprintln!(
+                        "[fbw-escape] pc={op_pc} vable escaped during a call in ConstClass({name})"
+                    ),
+                    None => {
+                        eprintln!(
+                            "[fbw-escape] pc={op_pc} vable escaped during a call in {addr:#x}"
+                        )
+                    }
+                }
+            }
             return Err(DispatchError::VableEscapedDuringResidualCall { pc: op_pc });
         }
     }

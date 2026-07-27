@@ -422,6 +422,12 @@ declare_seam! {
 // Best-effort — a failed relay is dropped, matching a closed real stream.
 
 /// Emit bytes to the interpreter's stdout (fd 1).
+///
+/// `dont_look_inside` for the same reason `ll_os_write` is an external: the
+/// non-sandbox arm reaches `std::io::stdout()`, a host handle with no lifted
+/// form, so a caller that can reach it loses its own jitcode and so does every
+/// caller above it.
+#[majit_macros::dont_look_inside]
 pub fn emit_stdout(bytes: &[u8]) {
     #[cfg(not(feature = "sandbox"))]
     {
@@ -435,6 +441,12 @@ pub fn emit_stdout(bytes: &[u8]) {
 }
 
 /// Emit bytes to the interpreter's stderr (fd 2).
+///
+/// `dont_look_inside` — see [`emit_stdout`].  This one is on the warning path:
+/// `warn::warn` is the pre-`_warnings` fallback reachable from
+/// `warn::warn_category_w`, so an opaque body here is what keeps
+/// `warn_category_w` liftable.
+#[majit_macros::dont_look_inside]
 pub fn emit_stderr(bytes: &[u8]) {
     #[cfg(not(feature = "sandbox"))]
     {

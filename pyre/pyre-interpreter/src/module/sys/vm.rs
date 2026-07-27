@@ -737,7 +737,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             let mut current = if ec.is_null() {
                 std::ptr::null_mut()
             } else {
-                unsafe { (*ec).gettopframe_nohidden() }
+                // Force the frame `topframeref` names BEFORE deciding which
+                // frame to hand out.  A JIT-inlined callee has no frame of its
+                // own until that force materialises one, so a walk started on
+                // the unforced chain would skip straight to the caller and
+                // then read `f_back` off a frame that never existed.
+                // `gettopframe` is the forcing accessor; the `_nohidden` walk
+                // is force-free by design (see `force_frame`).
+                unsafe {
+                    (*ec).gettopframe();
+                    (*ec).gettopframe_nohidden()
+                }
             };
             let mut remaining = depth_signed as usize;
             loop {
@@ -754,9 +764,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // Return the live `PyFrame` itself as the user-visible `frame`
             // object (`FRAME_TYPE` typedef); `f_back` chains lazily through
             // the getset.  Mark it escaped so the JIT keeps the frame
-            // materialised for the exposed reference (pyframe.py:176
-            // `mark_as_escaped`).
+            // materialised for the exposed reference (`pyframe.py`
+            // `mark_as_escaped`), and force it now: app code is about to read
+            // `f_lineno` / `f_locals` off a frame whose virtualizable fields
+            // the JIT may still be holding.
             unsafe { (*current).mark_as_escaped() };
+            crate::executioncontext::force_frame(current);
             Ok(current as pyre_object::PyObjectRef)
         }),
     );
