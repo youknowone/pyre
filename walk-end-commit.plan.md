@@ -127,7 +127,7 @@ not being worked:
 | row | state | why not worked |
 |---|---|---|
 | 3 `getarrayitem_vable_r` anchors | still refused | needs a color-liveness argument, not a measurement |
-| depth-1 / N-frame (old assumed R5 blocker) | never fired | **no corpus witness** — refuted by census |
+| depth-1 / N-frame (old assumed R5 blocker) | **unobserved, not refuted** | its gate is outside the named-refusal path, so the census cannot see it — no witness either way |
 | `push_and_bump!` omits `jtransform.py:1898` | real gap | **no corpus witness**; prototyped, costs ~25% more vable stores, fixes nothing observed |
 | legs 3/6 + store journals | keep | deleting them re-opens gh#467 double-apply (TL;DR §3) |
 
@@ -180,7 +180,15 @@ leg 4 preferred; the conversion was **zero**. Census over `pyre/bench/synth`
 
 Every remaining leg-3 commit is one of the 3 `getarrayitem_vable_r` anchors.
 
-Row 1 never fired. Rows 4b and 6 never fired. Print the denominator: 149 of the
+⚠️**Row 1 is NOT instrumented — do not read its silence as "never fired".** The
+`is_top_inline && !fbw_has_unjournaled_effect()` gate (`inline_call.rs:2617`)
+sits *outside* the closure whose `Err(&'static str)` arms are what print under
+`PYRE_FBW_DEBUG_ABORT`, so a depth≥2 inline sub-walk abort (row 1) or an
+unjournaled-effect abort (row 3) emits no line at all. Zero observations is
+indistinguishable from not-measured. The only support is indirect and weaker
+than it looks: the 3 surviving leg-3 commits are accounted for by the 3 anchor
+refusals, which is *consistent* with row 1 not firing but does not establish it.
+Rows 4b and 6 are likewise unobserved. Print the denominator: 149 of the
 151 generator refusals came from one loop in `calls_closures.py`, and the 18
 anchor refusals were spread over 5 files (`foriter_exempt_nested_foriter`,
 `foriter_exempt_shared_generator`, `inline_subwalk_user_iterator`,
