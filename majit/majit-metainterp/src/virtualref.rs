@@ -495,6 +495,10 @@ impl VirtualRefInfo {
             // `virtualref.py:127 assert vref.virtual_token != TOKEN_TRACING_RESCALL`
             debug_assert_ne!(vref.virtual_token, token_tracing_rescall());
             vref.virtual_token = TOKEN_NONE;
+            // The vref is an old-gen allocation and `real_object` can be young,
+            // so the `forced` store needs the generational barrier its creation
+            // counterpart in `alloc_virtual_ref` already carries.
+            majit_gc::gc_write_barrier(majit_ir::GcRef(vref_ptr as usize));
             vref.forced = real_object;
         }
     }

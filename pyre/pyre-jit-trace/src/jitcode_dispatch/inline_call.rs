@@ -1666,6 +1666,11 @@ fn walker_ec_enter(
         &[callee_ec, vref],
         crate::descr::ec_topframeref_descr(),
     );
+    // The recording-time shadow of the `SetfieldGc` above: `PyFrame.f_backref`
+    // is a `Type::Ref` field, so the emitted store carries the generational
+    // barrier and the concrete store has to carry it too.  This frame is an
+    // old-gen `FrameBox` and the caller's vref can be young.
+    pyre_object::gc_hook::try_gc_write_barrier(concrete_frame as *mut u8);
     unsafe {
         (*concrete_frame).f_backref = concrete_caller_topframeref;
         (*concrete_ec).topframeref = concrete_vref as *mut pyre_interpreter::PyFrame;
