@@ -5,6 +5,7 @@
 assert b''.fromhex('aa') == b'\xaa'
 assert b'x'.fromhex('B9 01EF') == b'\xb9\x01\xef'
 assert bytes.fromhex('aabb') == b'\xaa\xbb'
+assert bytes.fromhex(memoryview(b'aabb')) == b'\xaa\xbb'
 assert bytearray().fromhex('aa') == bytearray(b'\xaa')
 assert bytearray.fromhex('aabb') == bytearray(b'\xaa\xbb')
 

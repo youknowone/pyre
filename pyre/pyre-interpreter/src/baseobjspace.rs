@@ -7466,6 +7466,180 @@ pub fn charbuf_w(obj: PyObjectRef) -> Result<&'static [u8], PyError> {
     Ok(unsafe { pyre_object::bytesobject::bytes_like_data(obj) })
 }
 
+/// One copied `PyBUF_SIMPLE` export whose owner remains rooted and acquired
+/// until [`SimpleBufferBytes::release`].
+pub(crate) struct SimpleBufferBytes {
+    _roots: pyre_object::gc_roots::RootScope,
+    data: Vec<u8>,
+    native_owner_slot: Option<usize>,
+    native_export_active: bool,
+    release_exporter_slot: Option<usize>,
+    release_view_slot: Option<usize>,
+}
+
+impl SimpleBufferBytes {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// `PyBuffer_Release`: release errors are unraisable and must not replace
+    /// the operation's success or parsing exception.
+    pub(crate) fn release(mut self) {
+        if self.native_export_active {
+            self.native_export_active = false;
+            let owner = pyre_object::gc_roots::shadow_stack_get(
+                self.native_owner_slot
+                    .expect("active native export has an owner"),
+            );
+            unsafe { crate::builtins::buffer_export_decref(owner) };
+        }
+        let (Some(exporter_slot), Some(view_slot)) = (
+            self.release_exporter_slot.take(),
+            self.release_view_slot.take(),
+        ) else {
+            return;
+        };
+        let exporter = pyre_object::gc_roots::shadow_stack_get(exporter_slot);
+        let view = pyre_object::gc_roots::shadow_stack_get(view_slot);
+        unsafe {
+            if let Some(w_release) = lookup(exporter, "__release_buffer__") {
+                let w_type = crate::typedef::r#type(exporter).map_or(exporter, |p| p.as_ptr());
+                if let Err(mut error) = get_and_call_function(w_release, exporter, w_type, &[view])
+                {
+                    let exporter = pyre_object::gc_roots::shadow_stack_get(exporter_slot);
+                    error.write_unraisable(
+                        pyre_object::w_none(),
+                        &format!(
+                            "Exception ignored in __release_buffer__ of {}:",
+                            object_functionstr_type_name(exporter)
+                        ),
+                        exporter,
+                    );
+                }
+            }
+        }
+        let view = pyre_object::gc_roots::shadow_stack_get(view_slot);
+        if let Err(mut error) = crate::builtins::memoryview_release(&[view]) {
+            error.write_unraisable(
+                pyre_object::w_none(),
+                "Exception ignored in __release_buffer__:",
+                pyre_object::gc_roots::shadow_stack_get(exporter_slot),
+            );
+        }
+    }
+}
+
+/// `ObjSpace.acquire_readbuf`: acquire and copy one `PyBUF_SIMPLE` export.
+///
+/// PyPy: `W_Root.buffer_w` → `__buffer_w`; CPython:
+/// `PyObject_GetBuffer(..., PyBUF_SIMPLE)` / `PyBuffer_Release`.
+/// `Ok(None)` is the `BufferInterfaceNotFound` path, so callers can spell
+/// their own operation-specific TypeError.
+pub(crate) fn simple_buffer_bytes(obj: PyObjectRef) -> Result<Option<SimpleBufferBytes>, PyError> {
+    if let Some(target) = crate::module::__pypy__::interp_buffer::forwarded_exporter(obj) {
+        return simple_buffer_bytes(target?);
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    unsafe {
+        if pyre_object::memoryview::is_w_memoryview(r_obj) {
+            crate::builtins::memoryview_check_released(r_obj)?;
+            if !crate::builtins::memoryview_contiguity(r_obj).0 {
+                return Err(PyError::new(
+                    PyErrorKind::BufferError,
+                    "memoryview: underlying buffer is not C-contiguous",
+                ));
+            }
+            return Ok(Some(SimpleBufferBytes {
+                _roots: roots,
+                data: crate::builtins::memoryview_gather_bytes(r_obj),
+                native_owner_slot: None,
+                native_export_active: false,
+                release_exporter_slot: None,
+                release_view_slot: None,
+            }));
+        }
+    }
+    let native_export_active = unsafe { crate::builtins::buffer_export_incref(r_obj) };
+    match crate::typedef::buffer_as_bytes_like(r_obj) {
+        Ok(Some(w_bytes)) => {
+            return Ok(Some(SimpleBufferBytes {
+                _roots: roots,
+                data: unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes) }.to_vec(),
+                native_owner_slot: native_export_active.then_some(obj_slot),
+                native_export_active,
+                release_exporter_slot: None,
+                release_view_slot: None,
+            }));
+        }
+        Ok(None) => {
+            debug_assert!(!native_export_active);
+        }
+        Err(error) => {
+            if native_export_active {
+                unsafe { crate::builtins::buffer_export_decref(r_obj) };
+            }
+            return Err(error);
+        }
+    }
+
+    // W_Root.__buffer_w: descriptor-bind `__buffer__`, pass PyBUF_SIMPLE,
+    // and require the Python implementation to return a memoryview.
+    unsafe {
+        let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let Some(w_impl) = lookup(r_obj, "__buffer__") else {
+            return Ok(None);
+        };
+        const BUF_SIMPLE: i64 = 0;
+        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(BUF_SIMPLE));
+        let flags_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        pyre_object::gc_roots::pin_root(w_impl);
+        let impl_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let w_type = crate::typedef::r#type(r_obj).map_or(r_obj, |p| p.as_ptr());
+        let w_view = get_and_call_function(
+            pyre_object::gc_roots::shadow_stack_get(impl_slot),
+            r_obj,
+            w_type,
+            &[pyre_object::gc_roots::shadow_stack_get(flags_slot)],
+        )?;
+        if !pyre_object::memoryview::is_w_memoryview(w_view) {
+            return Err(PyError::type_error(
+                "__buffer__ returned non-memoryview object",
+            ));
+        }
+        pyre_object::gc_roots::pin_root(w_view);
+        let view_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let r_view = pyre_object::gc_roots::shadow_stack_get(view_slot);
+        crate::builtins::memoryview_check_released(r_view)?;
+        if !crate::builtins::memoryview_contiguity(r_view).0 {
+            let buffer = SimpleBufferBytes {
+                _roots: roots,
+                data: Vec::new(),
+                native_owner_slot: None,
+                native_export_active: false,
+                release_exporter_slot: Some(obj_slot),
+                release_view_slot: Some(view_slot),
+            };
+            buffer.release();
+            return Err(PyError::new(
+                PyErrorKind::BufferError,
+                "memoryview: underlying buffer is not C-contiguous",
+            ));
+        }
+        Ok(Some(SimpleBufferBytes {
+            _roots: roots,
+            data: crate::builtins::memoryview_gather_bytes(r_view),
+            native_owner_slot: None,
+            native_export_active: false,
+            release_exporter_slot: Some(obj_slot),
+            release_view_slot: Some(view_slot),
+        }))
+    }
+}
+
 /// Look up a descriptor on an object's type.
 ///
 /// PyPy equivalent: `space.lookup(w_obj, name)`.

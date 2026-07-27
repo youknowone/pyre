@@ -17858,25 +17858,24 @@ fn parse_hex_string(args: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
             "fromhex() takes exactly one argument",
         ));
     }
-    let bytes: &[u8] = match args.first() {
-        Some(&a) if unsafe { pyre_object::is_str(a) } => {
-            unsafe { pyre_object::w_str_get_value(a) }.as_bytes()
-        }
-        Some(&a) if unsafe { pyre_object::bytesobject::is_bytes_like(a) } => unsafe {
-            pyre_object::bytesobject::bytes_like_data(a)
-        },
-        Some(&a) => {
-            return Err(crate::PyError::type_error(format!(
-                "fromhex() argument must be str or bytes-like, not {}",
-                unsafe { pyre_object::type_name_of(a) }
-            )));
-        }
-        None => {
-            return Err(crate::PyError::type_error(
-                "fromhex() takes exactly one argument",
-            ));
-        }
+    let a = args[0];
+    if unsafe { pyre_object::is_str(a) } {
+        return parse_hex_bytes(unsafe { pyre_object::w_str_get_value(a) }.as_bytes());
+    }
+    let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(a)? else {
+        return Err(crate::PyError::type_error(format!(
+            "fromhex() argument must be str or bytes-like, not {}",
+            unsafe { pyre_object::type_name_of(a) }
+        )));
     };
+    let result = parse_hex_bytes(buffer.as_bytes());
+    // `_PyBytes_FromHex`'s `release_buffer` label runs on both success and
+    // every parsing/allocation error.
+    buffer.release();
+    result
+}
+
+fn parse_hex_bytes(bytes: &[u8]) -> Result<Vec<u8>, crate::PyError> {
     let nibble = |b: u8| -> Option<u8> {
         match b {
             b'0'..=b'9' => Some(b - b'0'),

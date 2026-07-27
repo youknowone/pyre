@@ -1,3 +1,4 @@
+import array
 import pickle
 import sys
 
@@ -163,8 +164,63 @@ assert bytearray.fromhex(b"B9 01EF") == b"\xb9\x01\xef"
 # fromhex with bytearray (bytes-like object)
 assert bytearray.fromhex(bytearray(b"4142")) == b"AB"
 
+# fromhex with array.array (bytes-like object)
+assert bytearray.fromhex(array.array("B", b"4142")) == b"AB"
+
 # fromhex with memoryview (bytes-like object)
 assert bytearray.fromhex(memoryview(b"4142")) == b"AB"
+
+
+class FromHexExporter:
+    def __init__(self, data):
+        self.data = bytearray(data)
+        self.flags = []
+        self.released = []
+
+    def __buffer__(self, flags):
+        self.flags.append(flags)
+        return memoryview(self.data)
+
+    def __release_buffer__(self, view):
+        self.released.append(view)
+        view.release()
+
+
+# Python 3.14 `_PyBytes_FromHex`: acquire PyBUF_SIMPLE and release the
+# temporary export after both successful and failed parses.
+exporter = FromHexExporter(b"4142")
+assert bytearray.fromhex(exporter) == b"AB"
+assert exporter.flags == [0]
+assert len(exporter.released) == 1
+exporter.data.append(0)
+
+exporter = FromHexExporter(b"4Z")
+assert_raises(ValueError, bytearray.fromhex, exporter)
+assert exporter.flags == [0]
+assert len(exporter.released) == 1
+exporter.data.append(0)
+
+
+class RaisingFromHexExporter(FromHexExporter):
+    def __release_buffer__(self, view):
+        self.released.append(view)
+        raise RuntimeError("release boom")
+
+
+unraisable = []
+old_unraisablehook = sys.unraisablehook
+sys.unraisablehook = unraisable.append
+try:
+    exporter = RaisingFromHexExporter(b"4142")
+    assert bytes.fromhex(exporter) == b"AB"
+    exporter = RaisingFromHexExporter(b"4Z")
+    assert_raises(ValueError, bytes.fromhex, exporter)
+finally:
+    sys.unraisablehook = old_unraisablehook
+assert len(unraisable) == 2
+assert all(isinstance(event.exc_value, RuntimeError) for event in unraisable)
+
+assert_raises(BufferError, bytearray.fromhex, memoryview(b"4142")[::2])
 
 # fromhex error: non-hexadecimal character
 try:
