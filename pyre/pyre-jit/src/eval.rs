@@ -1882,10 +1882,11 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // W_ObjectObject's instance-class edge. A slots-bearing `str` subclass
     // also owns a normal list in `w_slots`; tracing that list edge gives the
     // list's custom tracer ownership of the individual slot values, matching
-    // PyPy's object-resident BaseUserClassMapdict storage. No
-    // `.with_destructor_fn`: the value-box tid's drop glue is the sole
-    // reclaimer (a holder destructor would double-free a box swept before its
-    // owner).
+    // PyPy's object-resident BaseUserClassMapdict storage. The lazily-built
+    // `index_storage` code point table splits the same way as `value` and is
+    // traced on the same terms. No `.with_destructor_fn`: the value-box tid's
+    // drop glue is the sole reclaimer (a holder destructor would double-free a
+    // box swept before its owner).
     let w_str_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
         std::mem::size_of::<pyre_object::unicodeobject::W_UnicodeObject>(),
         object_tid,
@@ -1893,6 +1894,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             pyre_object::pyobject::W_CLASS_OFFSET,
             pyre_object::unicodeobject::UNICODE_VALUE_OFFSET,
             pyre_object::unicodeobject::UNICODE_W_SLOTS_OFFSET,
+            pyre_object::unicodeobject::UNICODE_INDEX_STORAGE_OFFSET,
         ],
     ));
     debug_assert_eq!(w_str_tid, W_UNICODE_GC_TYPE_ID);
@@ -3166,6 +3168,17 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             pyre_object::unicodeobject::UnicodeValueStorage,
         >,
         pyre_object::unicodeobject::set_unicode_value_gc_type_id,
+    );
+    // Mortal `str` `rutf8` code point index table storage box. A leaf
+    // `Vec<Utf8LocElem>` (no inner refs) built on the first non-ASCII index; the
+    // W_UnicodeObject `index_storage` gc-pointer edge greys it and the box tid's
+    // drop glue reclaims it on sweep. Only a GC-owned string boxes its table; an
+    // immortal one keeps a `malloc_raw` table, as it does its value. Keep this id
+    // at the absolute registration tail.
+    register_leaf_storage_box::<pyre_object::rutf8::Utf8IndexStorage>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<pyre_object::rutf8::Utf8IndexStorage>,
+        pyre_object::unicodeobject::set_utf8_index_gc_type_id,
     );
     // Mortal `name` string storage box shared by heap `W_TypeObject` and user
     // `Function` (off-GC storage). A leaf `String` (no inner refs); the

@@ -1626,24 +1626,11 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // indexed without going through `w_str_get_value`.
     //
     // `_index_to_byte` (`unicodeobject.py:1251`) reads an ASCII payload's byte
-    // at the code point index, so only a wide or surrogate-bearing string has
-    // to walk.  Upstream keeps that walk O(1) with a per-string
-    // `rutf8.create_utf8_index_storage` table; without one, walking it once
-    // per call beats walking it once per code point.
-    let ascii = pyre_object::w_str_is_ascii(obj);
-    let cps: Vec<CodePoint> = if ascii {
-        Vec::new()
-    } else {
-        w_str_get_wtf8(obj).code_points().collect()
-    };
+    // at the code point index; a wide or surrogate-bearing one resolves the
+    // position through the string's cached `rutf8` index table, so a read is
+    // O(1) either way and nothing here has to materialise the code points.
     let len = w_str_len(obj);
-    let at = |i: usize| -> Option<CodePoint> {
-        if ascii {
-            pyre_object::w_str_codepoint_at(obj, i)
-        } else {
-            cps.get(i).copied()
-        }
-    };
+    let at = |i: usize| -> Option<CodePoint> { pyre_object::w_str_codepoint_at(obj, i) };
     if is_slice(index) {
         // `pypy/objspace/std/unicodeobject.py W_UnicodeObject._getitem_slice`
         // → `slice.indices(len)` (`pypy/objspace/std/sliceobject.py`).

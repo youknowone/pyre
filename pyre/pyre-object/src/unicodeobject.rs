@@ -41,6 +41,16 @@ pub struct W_UnicodeObject {
     /// `Member.index` from its layout. Keeping this on the object mirrors
     /// PyPy's `_mapdict_*storage` owner and avoids an address-keyed side table.
     pub w_slots: PyObjectRef,
+    /// `W_UnicodeObject._index_storage` (`unicodeobject.py:1196`) — the
+    /// `rutf8` code point index table, built on the first non-ASCII index and
+    /// null until then.  A pure cache: dropping it only costs the next lookup a
+    /// rebuild.
+    ///
+    /// A managed holder boxes it (`utf8_index_gc_type_id`) and is greyed
+    /// through this slot; an immortal holder keeps a `malloc_raw` table the
+    /// walker's `is_managed_heap_object` edge guard skips, the same split its
+    /// `value` buffer already makes.
+    pub index_storage: *mut crate::rutf8::Utf8IndexStorage,
 }
 
 /// Field offset of `value` within `W_UnicodeObject`, for JIT field access.
@@ -51,6 +61,9 @@ pub const UNICODE_BYTE_LEN_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject,
 pub const UNICODE_LEN_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject, len);
 /// Field offset of the subclass slot-storage list.
 pub const UNICODE_W_SLOTS_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject, w_slots);
+/// Field offset of the `rutf8` code point index table.
+pub const UNICODE_INDEX_STORAGE_OFFSET: usize =
+    std::mem::offset_of!(W_UnicodeObject, index_storage);
 
 /// GC type id assigned to `W_UnicodeObject` at JitDriver init time.
 pub const W_UNICODE_GC_TYPE_ID: u32 = 34;
@@ -79,6 +92,22 @@ pub fn set_unicode_value_gc_type_id(id: u32) {
 #[majit_macros::dont_look_inside]
 pub fn unicode_value_gc_type_id() -> u32 {
     UNICODE_VALUE_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Runtime-assigned GC type id for the `rutf8` index table of a *mortal*
+/// string, registered beside [`UnicodeValueStorage`] and published the same
+/// way.  A leaf; its box carries only drop glue.
+static UTF8_INDEX_GC_TYPE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Record the GC type id registered for the `rutf8` index table.
+pub fn set_utf8_index_gc_type_id(id: u32) {
+    UTF8_INDEX_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the runtime-assigned GC type id for the `rutf8` index table.
+#[majit_macros::dont_look_inside]
+pub fn utf8_index_gc_type_id() -> u32 {
+    UTF8_INDEX_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Fixed payload size (`framework.py:811`).
@@ -124,6 +153,7 @@ pub fn w_str_new(s: &str) -> PyObjectRef {
         byte_len,
         len: char_len,
         w_slots: PY_NULL,
+        index_storage: std::ptr::null_mut(),
     }) as PyObjectRef
 }
 
@@ -160,6 +190,7 @@ pub fn w_str_from_wtf8(value: Wtf8Buf) -> PyObjectRef {
         byte_len,
         len: char_len,
         w_slots: PY_NULL,
+        index_storage: std::ptr::null_mut(),
     }) as PyObjectRef
 }
 
@@ -191,6 +222,7 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
         byte_len,
         len: char_len,
         w_slots: PY_NULL,
+        index_storage: std::ptr::null_mut(),
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
     if raw.is_null() {
@@ -229,6 +261,7 @@ pub fn w_str_from_wtf8_immortal(value: Wtf8Buf) -> PyObjectRef {
         byte_len,
         len: char_len,
         w_slots: PY_NULL,
+        index_storage: std::ptr::null_mut(),
     }) as PyObjectRef
 }
 
@@ -253,6 +286,7 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
         byte_len,
         len: char_len,
         w_slots: PY_NULL,
+        index_storage: std::ptr::null_mut(),
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
     let obj = if raw.is_null() {
@@ -424,27 +458,92 @@ pub unsafe fn w_str_is_ascii(obj: PyObjectRef) -> bool {
     }
 }
 
-/// The code point at `index`, or `None` past the end — the read behind
-/// `_getitem_result` (`unicodeobject.py:1205`), which resolves the position
-/// through `_index_to_byte` (:1251).
+/// `W_UnicodeObject._compute_index_storage` (`unicodeobject.py:1200`) — build
+/// the `rutf8` code point index table and cache it in the `index_storage` slot.
 ///
-/// An ASCII payload takes the direct branch and is O(1).  Anything else walks,
-/// because pyre has no counterpart of the `rutf8.create_utf8_index_storage`
-/// table that turns the general case into an O(1) lookup upstream; a
-/// surrogate-bearing or wide string therefore still costs O(index) per read.
+/// The table's holder follows the string's own: a GC-managed string boxes it
+/// so the `index_storage` edge greys it and the sweep reclaims it, while an
+/// immortal one keeps a `malloc_raw` table like its `malloc_raw` value.
+/// `try_gc_owns_object` is the same discriminator every other mixed-allocation
+/// host path uses.
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`) stands in
+/// for the `jit.conditional_call_elidable` that keeps this build off the trace
+/// upstream: [`w_str_get_index_storage`] traces the cached-pointer test and
+/// residualizes the build behind it.
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject`.
+#[majit_macros::dont_look_inside]
+unsafe fn w_str_compute_index_storage(obj: PyObjectRef) -> *mut crate::rutf8::Utf8IndexStorage {
+    unsafe {
+        let str_obj = obj as *mut W_UnicodeObject;
+        let storage =
+            crate::rutf8::create_utf8_index_storage((*(*str_obj).value).as_bytes(), (*str_obj).len);
+        let tid = if crate::gc_hook::try_gc_owns_object(obj as *mut u8) {
+            utf8_index_gc_type_id()
+        } else {
+            0
+        };
+        let storage = crate::gc_storage::gc_alloc_storage_box(storage, tid);
+        (*str_obj).index_storage = storage;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        storage
+    }
+}
+
+/// `W_UnicodeObject._get_index_storage` (`unicodeobject.py:1196`) — the cached
+/// index table, computing it on first use.
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject`.
+#[inline]
+unsafe fn w_str_get_index_storage(obj: PyObjectRef) -> *mut crate::rutf8::Utf8IndexStorage {
+    unsafe {
+        let cached = (*(obj as *const W_UnicodeObject)).index_storage;
+        if cached.is_null() {
+            return w_str_compute_index_storage(obj);
+        }
+        cached
+    }
+}
+
+/// `W_UnicodeObject._index_to_byte` (`unicodeobject.py:1251`) — the byte offset
+/// of code point `index`, which must be below the code point count.
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject` and `index` must be in range.
+pub unsafe fn w_str_index_to_byte(obj: PyObjectRef, index: usize) -> usize {
+    unsafe {
+        if w_str_is_ascii(obj) {
+            return index;
+        }
+        let storage = w_str_get_index_storage(obj);
+        crate::rutf8::codepoint_position_at_index(
+            (*(*(obj as *const W_UnicodeObject)).value).as_bytes(),
+            &*storage,
+            index,
+        )
+    }
+}
+
+/// The code point at `index`, or `None` past the end — the read behind
+/// `_getitem_result` (`unicodeobject.py:1205`): resolve the position through
+/// `_index_to_byte`, then take the one code point that starts there.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_UnicodeObject`.
 pub unsafe fn w_str_codepoint_at(obj: PyObjectRef, index: usize) -> Option<CodePoint> {
     unsafe {
-        let value = &*(*(obj as *const W_UnicodeObject)).value;
-        if w_str_is_ascii(obj) {
-            let end = index.checked_add(1)?;
-            return value
-                .get(index..end)
-                .and_then(|one| one.code_points().next());
+        if index >= w_str_len(obj) {
+            return None;
         }
-        value.code_points().nth(index)
+        let start = w_str_index_to_byte(obj, index);
+        let value = &*(*(obj as *const W_UnicodeObject)).value;
+        let end = crate::rutf8::next_codepoint_pos(value.as_bytes(), start);
+        value
+            .get(start..end)
+            .and_then(|one| one.code_points().next())
     }
 }
 
@@ -554,6 +653,7 @@ mod tests {
         assert_eq!(UNICODE_BYTE_LEN_OFFSET, 24);
         assert_eq!(UNICODE_LEN_OFFSET, 32);
         assert_eq!(UNICODE_W_SLOTS_OFFSET, 40);
+        assert_eq!(UNICODE_INDEX_STORAGE_OFFSET, 48);
     }
 
     #[test]
@@ -613,6 +713,57 @@ mod tests {
             assert_eq!(at(1), Some(0xD800));
             assert_eq!(at(2), Some(u32::from(b'b')));
             assert_eq!(at(3), None);
+        }
+    }
+
+    /// Every index of a multi-group non-ASCII string must answer what a walk
+    /// from the start would, and the table must be built once and reused.
+    #[test]
+    fn test_str_codepoint_at_uses_a_cached_index_table() {
+        let mut buf = Wtf8Buf::new();
+        for i in 0..200 {
+            buf.push_str("a\u{e9}\u{4e00}");
+            buf.push(CodePoint::from_u32(0xD800 + (i % 0x400) as u32).unwrap());
+        }
+        let expected: Vec<u32> = buf.code_points().map(CodePoint::to_u32).collect();
+        let obj = w_str_from_wtf8(buf);
+        unsafe {
+            let str_obj = obj as *const W_UnicodeObject;
+            assert!(!w_str_is_ascii(obj));
+            assert!((*str_obj).index_storage.is_null());
+
+            for (index, &code) in expected.iter().enumerate() {
+                assert_eq!(
+                    w_str_codepoint_at(obj, index).map(CodePoint::to_u32),
+                    Some(code),
+                    "index {index}",
+                );
+            }
+            assert_eq!(w_str_codepoint_at(obj, expected.len()), None);
+
+            let storage = (*str_obj).index_storage;
+            assert!(!storage.is_null());
+            // 800 code points -> ceil-style one entry per 64 plus the tail.
+            assert_eq!((*storage).len(), expected.len() / 64 + 1);
+            // A second pass reuses the table rather than rebuilding it.
+            assert_eq!(
+                w_str_codepoint_at(obj, 0).map(CodePoint::to_u32),
+                Some(expected[0])
+            );
+            assert_eq!((*str_obj).index_storage, storage);
+        }
+    }
+
+    /// An ASCII string never pays for a table: its index is already its byte
+    /// offset (`is_ascii`).
+    #[test]
+    fn test_ascii_str_never_builds_an_index_table() {
+        let obj = w_str_new("abcdefghij");
+        unsafe {
+            for index in 0..10 {
+                assert!(w_str_codepoint_at(obj, index).is_some());
+            }
+            assert!((*(obj as *const W_UnicodeObject)).index_storage.is_null());
         }
     }
 
