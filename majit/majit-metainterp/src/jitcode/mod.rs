@@ -325,8 +325,15 @@ static GLOBAL_BUILD_DESCR_POOL: std::sync::OnceLock<GlobalDescrPool> = std::sync
 /// Install the process-global build-time descr pool.  Idempotent: the first
 /// call wins and later calls are ignored (the pool is a frozen build artifact,
 /// identical across callers).  See [`GLOBAL_BUILD_DESCR_POOL`].
-pub fn set_global_build_descr_pool(pool: Vec<RuntimeBhDescr>) {
-    let _ = GLOBAL_BUILD_DESCR_POOL.set(GlobalDescrPool(pool));
+///
+/// `build` runs only on the call that installs the pool.  It takes a closure
+/// rather than a built `Vec` because the callers sit on hot paths — the jd1
+/// driver installs before every `_unpackiterable_unknown_length` walk — and
+/// building the pool clones every `BhDescr` in the binary (including each call
+/// descr's `EffectInfo` raw descr sets).  Materializing that just to have
+/// `OnceLock::set` drop it is the whole cost of the call.
+pub fn init_global_build_descr_pool(build: impl FnOnce() -> Vec<RuntimeBhDescr>) {
+    GLOBAL_BUILD_DESCR_POOL.get_or_init(|| GlobalDescrPool(build()));
 }
 
 /// The installed global build-time descr pool, or `None` if the embedding
