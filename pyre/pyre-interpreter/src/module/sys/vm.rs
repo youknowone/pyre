@@ -835,14 +835,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 w_int_new(i64::from(crate::importing::ignore_environment_flag())),
                 w_int_new(0), // verbose
                 w_int_new(0), // bytes_warning
-                w_int_new(0), // quiet
+                w_int_new(i64::from(crate::importing::quiet_flag())),
                 w_int_new(0), // hash_randomization
                 w_int_new(i64::from(crate::importing::isolated_flag())),
                 w_bool_from(crate::importing::dev_mode_flag()),
                 w_int_new(crate::importing::utf8_mode_flag()),
                 w_int_new(0), // warn_default_encoding
                 w_bool_from(crate::importing::safe_path_flag()),
-                w_int_new(4300), // int_max_str_digits
+                w_int_new(crate::module::sys::state::int_max_str_digits() as i64),
             ],
             vec![
                 // The interpreter holds a GIL, so `-X gil=0` is not available.

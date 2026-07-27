@@ -1641,6 +1641,7 @@ thread_local! {
 // thread — a codec lookup, `sys.flags`, an embedder calling in — observes
 // the values the launcher recorded instead of the per-thread default.
 static SYS_NO_SITE: AtomicBool = AtomicBool::new(false);
+static SYS_QUIET: AtomicBool = AtomicBool::new(false);
 static SYS_NO_USER_SITE: AtomicBool = AtomicBool::new(false);
 static SYS_IGNORE_ENVIRONMENT: AtomicBool = AtomicBool::new(false);
 static SYS_ISOLATED: AtomicBool = AtomicBool::new(false);
@@ -1667,6 +1668,7 @@ pub fn no_site_flag() -> bool {
 /// `space.sys.get_flag('dev_mode')` in `unicodeobject.py`.
 #[allow(clippy::too_many_arguments)]
 pub fn set_runtime_flags(
+    quiet: bool,
     no_user_site: bool,
     ignore_environment: bool,
     isolated: bool,
@@ -1676,6 +1678,7 @@ pub fn set_runtime_flags(
     optimize: i64,
     dont_write_bytecode: bool,
 ) {
+    SYS_QUIET.store(quiet, Ordering::Relaxed);
     SYS_NO_USER_SITE.store(no_user_site, Ordering::Relaxed);
     SYS_IGNORE_ENVIRONMENT.store(ignore_environment, Ordering::Relaxed);
     SYS_ISOLATED.store(isolated, Ordering::Relaxed);
@@ -1684,6 +1687,10 @@ pub fn set_runtime_flags(
     SYS_SAFE_PATH.store(safe_path, Ordering::Relaxed);
     SYS_OPTIMIZE.store(optimize, Ordering::Relaxed);
     SYS_DONT_WRITE_BYTECODE.store(dont_write_bytecode, Ordering::Relaxed);
+}
+
+pub fn quiet_flag() -> bool {
+    SYS_QUIET.load(Ordering::Relaxed)
 }
 
 pub fn no_user_site_flag() -> bool {

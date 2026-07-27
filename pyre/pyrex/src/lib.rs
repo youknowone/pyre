@@ -605,6 +605,7 @@ fn real_main(binary_name: &str) {
     // reflects whether site initialization was skipped.
     importing::set_no_site(no_site);
     importing::set_runtime_flags(
+        quiet,
         no_user_site,
         ignore_environment,
         isolated,
