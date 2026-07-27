@@ -327,6 +327,13 @@ struct RewriteState {
     /// live-track its producer instead of fabricating position-only
     /// boxes (#9 operand-union grind).
     out: Vec<majit_ir::OpRc>,
+    /// `pos -> emitted op` index over [`Self::out`], maintained by the two
+    /// `emit*` methods.  `emit_pending_zeros` resolves a delayed
+    /// zero-setfield's malloc base by position, and it is flushed at every
+    /// guard (rewrite.py:376-377), so scanning `out` for the producer made
+    /// the GC rewrite quadratic in trace length.  Void results share
+    /// `OpRef::NONE` and are not indexed.
+    out_by_pos: IndexMap<OpRef, majit_ir::OpRc>,
     /// Next position index for emitted result ops that do not have an
     /// explicit source position to preserve.
     next_pos: u32,
@@ -449,6 +456,7 @@ impl RewriteState {
     fn new(hint: usize, next_pos: u32) -> Self {
         RewriteState {
             out: Vec::with_capacity(hint + hint / 4),
+            out_by_pos: IndexMap::default(),
             next_pos,
             constants: ConstMap::new(),
             pending_malloc_idx: None,
@@ -604,6 +612,7 @@ impl RewriteState {
         if pos.is_none() {
             Operand::none()
         } else {
+            self.out_by_pos.insert(pos, rc.clone());
             Operand::from_bound_op(&rc)
         }
     }
@@ -626,6 +635,9 @@ impl RewriteState {
         op.pos.set(pos);
         let rc = std::rc::Rc::new(op);
         self.out.push(rc.clone());
+        if !pos.is_none() {
+            self.out_by_pos.insert(pos, rc.clone());
+        }
         Operand::from_bound_op(&rc)
     }
 
@@ -883,9 +895,8 @@ impl RewriteState {
             // panic, so resolve the producer here. `to_opref()` is unchanged
             // either way.
             let ptr_box = self
-                .out
-                .iter()
-                .find(|o| o.pos.get() == ptr)
+                .out_by_pos
+                .get(&ptr)
                 .map(Operand::from_bound_op)
                 .unwrap_or_else(|| Operand::from_opref(ptr));
             for ofs in entries.iter().copied() {
