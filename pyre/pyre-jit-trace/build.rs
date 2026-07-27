@@ -12,6 +12,11 @@ use walkdir::WalkDir;
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v2";
+/// Retained cache entries. Each is ~6 MB, and a handful covers the
+/// configurations one checkout switches between (native/wasm × release/dev).
+const CODEGEN_CACHE_MAX_ENTRIES: usize = 8;
+/// Rewritten on every cache hit; its mtime is the entry's last-use stamp.
+const CODEGEN_CACHE_USED_MARKER: &str = ".last-used";
 const CODEGEN_OUTPUTS: &[&str] = &[
     "jit_trace_gen.rs",
     "jit_metadata.json",
@@ -464,6 +469,8 @@ fn real_main() {
             "[pyre-jit-trace build.rs] restored generated JIT trace artifacts from cache {}",
             cache_key
         );
+        touch_codegen_cache_entry(&cache_dir);
+        prune_codegen_cache(&repo_root, &cache_dir);
         return;
     }
 
@@ -612,7 +619,10 @@ fn real_main() {
             "[pyre-jit-trace build.rs] warning: could not store generated JIT trace cache {}: {e}",
             cache_key
         );
+        return;
     }
+    touch_codegen_cache_entry(&cache_dir);
+    prune_codegen_cache(&repo_root, &cache_dir);
 }
 
 fn build_call_effect_overrides() -> Vec<majit_translate::CallEffectOverride> {
@@ -692,14 +702,71 @@ fn llbc_layout_sidecars() -> Vec<String> {
         .collect()
 }
 
+/// The cache sits under `build/` rather than the Cargo target directory so
+/// `cargo clean`, a fresh `CARGO_TARGET_DIR`, or a profile switch does not
+/// re-pay the translation prepass — the same reason the prepass's own inputs
+/// (`build/llbc/*.ullbc`) live there. `codegen_cache_key` already folds
+/// HOST/TARGET/PROFILE/OPT_LEVEL, the feature set, the build-script binary's
+/// own bytes and the LLBC content, so an entry is only ever served back to the
+/// configuration that produced it.
+fn codegen_cache_base(repo_root: &str) -> std::path::PathBuf {
+    std::path::Path::new(repo_root).join("build/pyre-jit-trace-cache")
+}
+
 fn codegen_cache_dir(repo_root: &str, cache_key: &str) -> std::path::PathBuf {
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::Path::new(repo_root).join("target"));
-    target_dir
-        .join("pyre-jit-trace-cache")
+    codegen_cache_base(repo_root)
         .join(CODEGEN_CACHE_VERSION)
         .join(cache_key)
+}
+
+/// Record that `cache_dir` was used, so [`prune_codegen_cache`] evicts by last
+/// use rather than by creation: a configuration built daily but keyed long ago
+/// would otherwise be dropped ahead of one-off keys minted by a source edit.
+fn touch_codegen_cache_entry(cache_dir: &std::path::Path) {
+    let _ = std::fs::write(cache_dir.join(CODEGEN_CACHE_USED_MARKER), b"");
+}
+
+/// Drop entries beyond [`CODEGEN_CACHE_MAX_ENTRIES`], least recently used
+/// first, along with any directory left by an earlier `CODEGEN_CACHE_VERSION`.
+/// Every distinct (target, profile, feature set, build-script binary, LLBC
+/// content) combination mints a key and nothing removed them before, so the
+/// directory grew without bound — 110 entries / 682 MB in one worktree.
+///
+/// Best effort throughout: a concurrent build whose entry is removed
+/// mid-restore re-runs the prepass, because `restore_codegen_cache` copies
+/// every output or reports failure — it never serves a partial set.
+fn prune_codegen_cache(repo_root: &str, keep: &std::path::Path) {
+    let base = codegen_cache_base(repo_root);
+    if let Ok(versions) = std::fs::read_dir(&base) {
+        for version in versions.flatten() {
+            if version.file_name() != std::ffi::OsStr::new(CODEGEN_CACHE_VERSION) {
+                let _ = std::fs::remove_dir_all(version.path());
+            }
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(base.join(CODEGEN_CACHE_VERSION)) else {
+        return;
+    };
+    let mut by_last_use: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `store_codegen_cache` stages into a dot-prefixed sibling before its
+        // rename; leaving those alone keeps a concurrent store intact.
+        if path == keep || !path.is_dir() || entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let last_use = std::fs::metadata(path.join(CODEGEN_CACHE_USED_MARKER))
+            .or_else(|_| std::fs::metadata(&path))
+            .and_then(|meta| meta.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        by_last_use.push((last_use, path));
+    }
+    by_last_use.sort_by(|a, b| b.0.cmp(&a.0));
+    // `keep` is excluded above and occupies one of the retained slots.
+    let retained = CODEGEN_CACHE_MAX_ENTRIES.saturating_sub(1);
+    for (_, path) in by_last_use.into_iter().skip(retained) {
+        let _ = std::fs::remove_dir_all(path);
+    }
 }
 
 fn restore_codegen_cache(cache_dir: &std::path::Path, out_dir: &str) -> bool {
@@ -787,18 +854,34 @@ fn codegen_cache_key(manifest_dir: &str, repo_root: &str, source_paths: &[String
     // The codegen output also depends on every crate linked into this
     // build-script binary — `majit-translate`'s own dependencies
     // (`majit-ir`, `majit-charon-reader`, `rustpython-compiler-core`, …)
-    // and their serde wire formats — whose sources are not hashed below
-    // (only `majit-translate/src` and `resoperation.rs` are). Cargo
-    // recompiles and reruns the build script whenever any of them changes,
-    // but the content key would otherwise stay identical and restore a
-    // stale snapshot (e.g. `*.bin` written under an older `majit-ir`
-    // bincode layout). Folding the build-script executable's own bytes into
-    // the key rekeys the cache on any transitive code change.
-    match std::env::current_exe() {
-        Ok(exe) => hash_file_content(&mut h, &exe),
-        Err(e) => {
-            h.write_str("current-exe-error");
-            h.write_str(&e.to_string());
+    // and their serde wire formats — whose sources `majit-translate/src`
+    // below does not cover. Without them the key would stay identical across
+    // such a change and restore a stale snapshot (e.g. `*.bin` written under
+    // an older `majit-ir` bincode layout).
+    //
+    // Hash their *sources* rather than the build-script executable's bytes.
+    // The binary is not reproducible: recompiling it from unchanged sources —
+    // which `cargo clean`, a fresh `CARGO_TARGET_DIR`, or a touched `build.rs`
+    // all force — yields different bytes, so keying on them rekeyed the cache
+    // on almost every build and made it serve only reruns that skipped the
+    // recompile. Workspace sources plus `Cargo.lock` (external crate
+    // versions) and the compiler's version string cover the same change
+    // surface and are stable across recompiles.
+    hash_file_content(&mut h, &std::path::Path::new(repo_root).join("Cargo.lock"));
+    h.write_str(&rustc_version_string());
+    for workspace_dir in ["majit", "pyre"] {
+        let root = std::path::Path::new(repo_root).join(workspace_dir);
+        let Ok(crates) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        let mut src_dirs: Vec<std::path::PathBuf> = crates
+            .flatten()
+            .map(|entry| entry.path().join("src"))
+            .filter(|src| src.is_dir())
+            .collect();
+        src_dirs.sort();
+        for src in src_dirs {
+            hash_rs_dir_content(&mut h, &src);
         }
     }
 
@@ -824,6 +907,21 @@ fn codegen_cache_key(manifest_dir: &str, repo_root: &str, source_paths: &[String
     format!("{:016x}", h.finish())
 }
 
+/// `rustc -vV`, so a toolchain upgrade that changes codegen or a type layout
+/// rekeys the cache. Falls back to a marker when the compiler cannot be run —
+/// a missing string only makes the key coarser, never staler, because every
+/// other input is still hashed.
+fn rustc_version_string() -> String {
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    std::process::Command::new(rustc)
+        .arg("-vV")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_else(|| "rustc-version-unavailable".to_string())
+}
+
 fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &str) {
     // Hash the LLBC by content, not by (len, mtime) signature. The
     // analysis (`analyze_multiple_pipeline_with_modules`) derives every
@@ -831,8 +929,9 @@ fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &str) {
     // happens to preserve size and mtime — `git checkout`, a cache restore
     // that keeps timestamps, an in-place rewrite of equal length — must
     // still rekey the cache. A signature would let `restore_codegen_cache`
-    // serve stale output and skip re-analysis. The `.ullbc` set is a few
-    // MB; the read is negligible next to the analysis it gates.
+    // serve stale output and skip re-analysis. The `.ullbc` set is ~660 MB
+    // (89 % of it `fun_decls`), so the read costs under a second — still
+    // negligible next to the tens of seconds of analysis it gates.
     if let Some(paths) = std::env::var_os("PYRE_MIR_FRONTEND_LLBC") {
         for path in std::env::split_paths(&paths) {
             if !path.as_os_str().is_empty() {
