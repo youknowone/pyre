@@ -440,9 +440,10 @@ unsafe fn pack_int(
             return Err(range_error(fmtchar, size, signed));
         }
     } else {
-        match value.to_u64() {
-            Some(u) => u.to_le_bytes(),
-            None => return Err(range_error(fmtchar, size, signed)),
+        if longobject::jit_bigint_to_u64_fits(&value) != 0 {
+            longobject::jit_bigint_to_u64_value(&value).to_le_bytes()
+        } else {
+            return Err(range_error(fmtchar, size, signed));
         }
     };
 

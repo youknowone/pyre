@@ -260,7 +260,25 @@ fn loadconst_operand_ref<Sym: WalkSym>(
         return OpRef::NONE;
     };
     let idx = usize::from(consti.get(op_arg));
-    let w_const = pyre_interpreter::pyframe::load_const_from_code(code, idx);
+    let w_code = if ctx.is_top_level {
+        let session = ctx.session.borrow();
+        let frame = session.recording_frame_ptr as *const pyre_interpreter::PyFrame;
+        if frame.is_null() {
+            0
+        } else {
+            unsafe { (*frame).pycode as usize }
+        }
+    } else {
+        ctx.inline_callee_consts.map_or(0, |consts| consts.w_code)
+    };
+    let w_const = if w_code == 0 || w_code == usize::MAX {
+        // Malformed/test-only walks have no enclosing PyCode. Keep the
+        // historical materializer fallback; production LOAD_CONST always has
+        // the per-frame red `pycode` owner.
+        pyre_interpreter::pyframe::load_const_from_code(code, idx)
+    } else {
+        unsafe { pyre_interpreter::pycode::w_code_const(w_code as pyre_object::PyObjectRef, idx) }
+    };
     if w_const.is_null() {
         return OpRef::NONE;
     }

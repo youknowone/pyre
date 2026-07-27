@@ -476,21 +476,15 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler {
     /// on call sites that need true immutability to make a copy.
     fn bytes_constant(&mut self, value: &[u8]) -> Result<Self::Value, PyError>;
     fn code_constant(&mut self, code: &CodeObject) -> Result<Self::Value, PyError>;
-    /// `getconstant_w(index) -> co_consts_w[index]` (`pyopcode.py:498-499`) for a
-    /// code constant: return the one wrapper the enclosing code holds at `index`.
-    /// `enclosing` is the running code (whose `constants[index]` is the
-    /// `ConstantData::Code`).  The default realizes a fresh wrapper; `PyFrame`
-    /// overrides it to return `self.pycode.co_consts_w[index]` so repeated loads
-    /// share one `PyCode`.
-    fn code_constant_at(
+    /// `getconstant_w(index) -> co_consts_w[index]` (`pyopcode.py:498-499`).
+    /// The default realizes from the compiler constant; `PyFrame` overrides it
+    /// to return the object owned by `self.pycode.co_consts_w[index]`.
+    fn constant_at(
         &mut self,
-        index: usize,
+        index: crate::bytecode::oparg::ConstIdx,
         enclosing: &CodeObject,
     ) -> Result<Self::Value, PyError> {
-        match &crate::pyframe::code_constants(enclosing)[index] {
-            ConstantData::Code { code } => self.code_constant(code),
-            _ => unreachable!("code_constant_at on a non-code constant at index {index}"),
-        }
+        load_const_value(self, &enclosing.constants[index])
     }
     fn none_constant(&mut self) -> Result<Self::Value, PyError>;
     fn ellipsis_constant(&mut self) -> Result<Self::Value, PyError>;
@@ -515,11 +509,18 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
 ) -> Result<H::Value, PyError> {
     match constant {
         ConstantData::Integer { value } => {
-            if let Some(value) = num_traits::ToPrimitive::to_i64(value) {
-                handler.int_constant(value)
-            } else {
-                let value = crate::compiler_bigint_to_rbigint(value);
-                handler.bigint_constant(&value)
+            // The compiler's Malachite integer is a serialization/API seam,
+            // never the interpreter arithmetic representation.  Convert once
+            // to RPython's rbigint, then make the same machine-int decision
+            // through `rbigint.toint()` that PyPy's integer consumers use.
+            // This also keeps the generated JIT graph entirely on the
+            // sanctioned compiler-bigint conversion residual instead of
+            // pulling a foreign `BigInt::to_i64 -> Option<i64>` method into
+            // translated code.
+            let value = crate::compiler_bigint_to_rbigint(value);
+            match value.toint() {
+                Ok(value) => handler.int_constant(value),
+                Err(_) => handler.bigint_constant(&value),
             }
         }
         ConstantData::Float { value } => handler.float_constant(*value),
@@ -3135,15 +3136,10 @@ where
     };
     let const_idx = consti.get(op_arg);
     // `pyopcode.py:533 LOAD_CONST` reads `getconstant_w(index)`
-    // (`pyopcode.py:498-499 co_consts_w[index]`); a code constant must resolve to
-    // the enclosing code's one shared wrapper, so route it through
-    // `code_constant_at` instead of realizing afresh in `load_const`.
-    if matches!(&code.constants[const_idx], ConstantData::Code { .. }) {
-        let value = executor.code_constant_at(usize::from(const_idx), code)?;
-        executor.push_value(value)?;
-        return Ok(StepResult::Continue);
-    }
-    executor.load_const(&code.constants[const_idx])?;
+    // (`pyopcode.py:498-499 co_consts_w[index]`): every constant, not just a
+    // nested code object, comes from the enclosing PyCode's shared slot.
+    let value = executor.constant_at(const_idx, code)?;
+    executor.push_value(value)?;
     Ok(StepResult::Continue)
 }
 

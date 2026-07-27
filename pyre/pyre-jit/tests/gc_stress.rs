@@ -866,3 +866,110 @@ assert result == 3002, result
         "rbigint formatter cache gc stress program failed",
     );
 }
+
+/// Long consumers keep only the Python wrapper as the GC root while rbigint
+/// arithmetic borrows its immutable digit payload.  Repeatedly move those
+/// wrappers and digit arrays between operations to catch stale borrowed
+/// payloads, missing W_LongObject write barriers, and result digit edges that
+/// were not rooted when the payload was boxed.
+#[test]
+fn rbigint_consumers_survive_moving_collection_between_operations() {
+    const PROGRAM: &str = r#"
+import gc
+
+def run():
+    a = (1 << 300) + 123456789
+    b = (1 << 190) + 98765
+
+    # rbigint.abs returns the original payload for a nonnegative value while
+    # W_LongObject.descr_abs creates a new old-gen wrapper. Drop the original
+    # wrapper so the creation barrier on that shared-payload edge is the only
+    # thing keeping the young rbigint alive.
+    positive = abs((1 << 333) + 13579)
+    gc.collect()
+    assert positive == (1 << 333) + 13579
+    assert +positive is positive
+
+    class HugeInt(int):
+        pass
+    subclassed = HugeInt((1 << 345) + 24680)
+    base = int(subclassed)
+    subclassed = None
+    gc.collect()
+    assert type(base) is int
+    assert base == (1 << 345) + 24680
+
+    i = 0
+    while i < 60:
+        shifted = a << ((i % 31) + 1)
+        gc.collect()
+        assert shifted >> ((i % 31) + 1) == a
+
+        product = a * b
+        gc.collect()
+        q, r = divmod(product, b)
+        assert q == a
+        assert r == 0
+        gc.collect()
+        assert product // b == a
+        assert product % b == 0
+
+        modular = pow(a, 5, b)
+        gc.collect()
+        assert modular == (a * a * a * a * a) % b
+        negative_modular = pow(a, 3, -b)
+        gc.collect()
+        assert -b < negative_modular <= 0
+        assert negative_modular == (a * a * a) % -b
+
+        mixed = (product ^ shifted) + i
+        gc.collect()
+        assert (mixed - i) ^ shifted == product
+
+        # Keep producing fresh long payloads; both operands have survived a
+        # moving collection before the next borrowed rbigint operation.
+        a = a + (1 << (70 + i))
+        b = b | (1 << (80 + i))
+        i = i + 1
+    return a.bit_length() + b.bit_length()
+
+result = run()
+assert result > 490, result
+"#;
+    run_on_worker(
+        PROGRAM,
+        "<rbigint_consumer_gc_stress>",
+        "rbigint consumer survival checks",
+        "rbigint consumer gc stress program failed",
+    );
+}
+
+/// `PyCode.co_consts_w` owns the one wrapped object for each constant index
+/// (`pycode.py:126`, `pyopcode.py:498-499`). A large integer constant is a
+/// managed `W_LongObject`; the Box-immortal PyCode therefore has to expose the
+/// filled slot to the raw-root walker across both interpreter and JIT loads.
+#[test]
+fn rbigint_code_constant_identity_survives_full_collection() {
+    run_on_worker(
+        r#"
+import gc
+
+def load_big():
+    return 123456789012345678901234567890123456789012345678901234567890
+
+i = 0
+first = load_big()
+while i < 80:
+    if i % 7 == 0:
+        gc.collect()
+    assert load_big() is first
+    i += 1
+
+gc.collect()
+assert load_big() is first
+"#,
+        "<rbigint_code_constant_gc_stress>",
+        "rbigint code constant identity and survival checks",
+        "rbigint code constant gc stress program failed",
+    );
+}

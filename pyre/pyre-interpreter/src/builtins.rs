@@ -3166,8 +3166,17 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             });
         }
         if is_long(obj) {
-            let val = w_long_get_value(obj).clone();
-            return Ok(w_long_new(if val < BigInt::from(0) { -val } else { val }));
+            let val = w_long_get_value(obj);
+            // rbigint.py:1303-1308 returns `self` for nonnegative values;
+            // longobject.py:272-277 then allocates a fresh W_LongObject around
+            // that same rbigint. Preserve both wrapper identity and payload
+            // sharing instead of translating `Clone` into another GC payload.
+            if val.get_sign() != -1 {
+                return Ok(pyre_object::longobject::w_long_from_raw(
+                    pyre_object::longobject::w_long_get_raw_value(obj),
+                ));
+            }
+            return Ok(w_long_new(val.neg()));
         }
         if is_float(obj) {
             return Ok(w_float_new(w_float_get_value(obj).abs()));
@@ -3550,10 +3559,16 @@ pub(crate) fn space_index_w(obj: PyObjectRef) -> Result<i64, crate::PyError> {
 /// Convert an int or long object to BigInt for comparison.
 pub(crate) unsafe fn obj_to_bigint(obj: PyObjectRef) -> BigInt {
     unsafe {
-        if is_int(obj) {
+        // PyPy's W_BoolObject subclasses W_IntObject and shares `intval`;
+        // pyre uses a distinct layout, so preserve that upstream semantic arm
+        // with the correct storage projection before testing `is_int`.
+        if is_bool(obj) {
+            BigInt::from(w_bool_get_value(obj) as i64)
+        } else if is_int(obj) {
             BigInt::from(w_int_get_value(obj))
         } else {
-            w_long_get_value(obj).clone()
+            // PyPy's bigint_w/asbigint returns W_LongObject.num itself.
+            w_long_get_value(obj).translated_alias()
         }
     }
 }
@@ -6630,8 +6645,8 @@ fn ensure_baseint_result(
         }
         if pyre_object::pyobject::is_long(obj) {
             // intobject.py:1100-1102: W_AbstractLongObject → newlong
-            return Ok(pyre_object::longobject::w_long_new(
-                pyre_object::longobject::w_long_get_value(obj).clone(),
+            return Ok(pyre_object::longobject::w_long_from_raw(
+                pyre_object::longobject::w_long_get_raw_value(obj),
             ));
         }
     }
@@ -6774,122 +6789,97 @@ fn invalid_int_literal(w_source: PyObjectRef, base: u32) -> crate::PyError {
 }
 
 /// Parse an integer from a string with the given base.
-fn parse_int_from_str(
+pub(crate) fn parse_int_from_str(
     w_source: PyObjectRef,
     s: &str,
     base: u32,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let s = s.trim();
-    let (sign, rest) = if let Some(r) = s.strip_prefix('-') {
-        (-1i64, r)
-    } else if let Some(r) = s.strip_prefix('+') {
-        (1i64, r)
-    } else {
-        (1i64, s)
-    };
-    // intobject.py passes `disallow_whitespace_after_sign=True` to
-    // NumberStringParser.  Its sign branch advances `start` without calling
-    // `_strip_spaces`, so whitespace immediately after either sign remains
-    // part of the digit stream and makes the literal invalid.
-    if rest
-        .as_bytes()
-        .first()
-        .is_some_and(|c| matches!(c, b' ' | b'\x0c' | b'\n' | b'\r' | b'\t' | b'\x0b'))
-    {
-        return Err(invalid_int_literal(w_source, base));
-    }
-    let (radix, digits, had_base_prefix, implicit_zero_only) = if base == 0 {
-        if let Some(r) = rest.strip_prefix("0x").or(rest.strip_prefix("0X")) {
-            (16u32, r, true, false)
-        } else if let Some(r) = rest.strip_prefix("0b").or(rest.strip_prefix("0B")) {
-            (2u32, r, true, false)
-        } else if let Some(r) = rest.strip_prefix("0o").or(rest.strip_prefix("0O")) {
-            (8u32, r, true, false)
-        } else if rest.starts_with('0') {
-            // `NumberStringParser(..., no_implicit_octal=True)`: base 0
-            // plus an unprefixed leading zero selects pseudo-base 1, which
-            // makes only digit zero valid. Keep radix 10 for BigInt parsing
-            // after enforcing that digit rule below.
-            (10u32, rest, false, true)
-        } else {
-            (10u32, rest, false, false)
-        }
-    } else {
-        let (stripped, had_base_prefix) = match base {
-            16 => match rest.strip_prefix("0x").or(rest.strip_prefix("0X")) {
-                Some(r) => (r, true),
-                None => (rest, false),
-            },
-            2 => match rest.strip_prefix("0b").or(rest.strip_prefix("0B")) {
-                Some(r) => (r, true),
-                None => (rest, false),
-            },
-            8 => match rest.strip_prefix("0o").or(rest.strip_prefix("0O")) {
-                Some(r) => (r, true),
-                None => (rest, false),
-            },
-            _ => (rest, false),
+    // rarithmetic.py:936-957 `string_to_int` first handles short, plain
+    // decimal strings without constructing a NumberStringParser.
+    const OVF_DIGITS: usize = 19; // len(str(sys.maxint)) on pyre's i64 target
+    if base == 10 && !s.is_empty() && s.len() < OVF_DIGITS {
+        let bytes = s.as_bytes();
+        let (start, sign) = match bytes[0] {
+            b'-' => (1, -1_i64),
+            b'+' => (1, 1_i64),
+            _ => (0, 1_i64),
         };
-        (base, stripped, had_base_prefix, false)
-    };
-    let is_digit = |c: char| {
-        if implicit_zero_only {
-            c == '0'
-        } else {
-            c.to_digit(radix).is_some()
-        }
-    };
-
-    // RPython `NumberStringParser.__init__` checks the configured digit
-    // limit immediately after whitespace/sign/base-prefix handling and
-    // before it allocates or parses the digit stream.  Preserve that order:
-    // malformed underscore placement is diagnosed later by `next_digit`,
-    // except for an empty input or a leading underscore before a base prefix,
-    // which the parser rejects ahead of the limit check.
-    if digits.is_empty() || (!had_base_prefix && digits.starts_with('_')) {
-        return Err(invalid_int_literal(w_source, base));
-    }
-    if radix & (radix - 1) != 0 {
-        let maxdigits = crate::module::sys::state::int_max_str_digits();
-        if maxdigits != 0 {
-            let digit_count = digits.chars().filter(|&c| c != '_').count();
-            if digit_count > maxdigits as usize {
-                return Err(crate::PyError::new(
-                    crate::PyErrorKind::ValueError,
-                    format!(
-                        "Exceeds the limit ({maxdigits} digits) for integer string conversion: value has {digit_count} digits; use sys.set_int_max_str_digits() to increase the limit"
-                    ),
-                ));
+        if start != bytes.len() {
+            let mut result = 0_i64;
+            let mut all_decimal = true;
+            for &byte in &bytes[start..] {
+                if !byte.is_ascii_digit() {
+                    all_decimal = false;
+                    break;
+                }
+                result = result * 10 + (byte - b'0') as i64;
+            }
+            if all_decimal {
+                return Ok(w_int_new(result * sign));
             }
         }
     }
 
-    let digit_chars: Vec<char> = digits.chars().collect();
-    let mut cleaned = String::with_capacity(digits.len());
-    for (i, &c) in digit_chars.iter().enumerate() {
-        if c == '_' {
-            let after_prefix = had_base_prefix && i == 0;
-            let prev_is_digit = i > 0 && is_digit(digit_chars[i - 1]);
-            let next_is_digit = i + 1 < digit_chars.len() && is_digit(digit_chars[i + 1]);
-            if next_is_digit && (prev_is_digit || after_prefix) {
-                continue;
-            }
-            return Err(invalid_int_literal(w_source, base));
+    // intobject.py:955-982 `_string_to_int_or_long` constructs the one
+    // NumberStringParser used by both the machine-int attempt and the
+    // rbigint overflow retry.  Do not maintain a second parser here: it
+    // diverges on prefix/underscore ordering and erases rbigint allocation
+    // failures into an "invalid literal" error.
+    let maxdigits = if base == 0 || base.is_power_of_two() {
+        0
+    } else {
+        crate::module::sys::state::int_max_str_digits()
+    };
+    let mut parser =
+        pyre_object::rbigint::NumberStringParser::new(s, base as i64, true, true, 0, None, 0, true)
+            .map_err(|error| match error {
+                pyre_object::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
+                _ => invalid_int_literal(w_source, base),
+            })?;
+
+    // NumberStringParser performs this check immediately after its structural
+    // initialization.  Constructing it with a zero limit lets us retain
+    // PyPy's `MaxDigitsError.digits` value in the application-level message.
+    if maxdigits != 0 {
+        let digit_count =
+            parser.end - parser.start - s.bytes().filter(|&c| c == b'_').count() as i64;
+        if digit_count > maxdigits as i64 {
+            return Err(crate::PyError::value_error(format!(
+                "Exceeds the limit ({maxdigits} digits) for integer string conversion: value has {digit_count} digits; use sys.set_int_max_str_digits() to increase the limit"
+            )));
         }
-        if implicit_zero_only && c != '0' {
-            return Err(invalid_int_literal(w_source, base));
+    }
+
+    // rarithmetic.py:962-977 accumulates a signed machine word and hands the
+    // same rewound parser to rbigint only after `ovfcheck` fails.
+    let parsed_base = parser.base;
+    let parsed_sign = parser.sign;
+    let mut machine_value = 0_i64;
+    loop {
+        let digit = parser.next_digit().map_err(|error| match error {
+            pyre_object::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
+            _ => invalid_int_literal(w_source, base),
+        })?;
+        if digit < 0 {
+            return Ok(w_int_new(machine_value));
         }
-        cleaned.push(c);
+        let signed_digit = if parsed_sign < 0 { -digit } else { digit };
+        let Some(value) = machine_value
+            .checked_mul(parsed_base)
+            .and_then(|value| value.checked_add(signed_digit))
+        else {
+            parser.rewind();
+            break;
+        };
+        machine_value = value;
     }
-    if let Ok(v) = i64::from_str_radix(&cleaned, radix) {
-        return Ok(w_int_new(sign * v));
-    }
-    // Values outside the machine-int range parse as arbitrary precision.
-    if let Some(big) = BigInt::parse_bytes(cleaned.as_bytes(), radix) {
-        let signed = if sign < 0 { -big } else { big };
-        return Ok(w_long_new(signed));
-    }
-    Err(invalid_int_literal(w_source, base))
+
+    let value = BigInt::_from_numberstring_parser(&mut parser).map_err(|error| match error {
+        pyre_object::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
+        pyre_object::rbigint::RBigIntError::MaxStrDigits => unreachable!("limit checked above"),
+        _ => invalid_int_literal(w_source, base),
+    })?;
+    Ok(w_long_new(value))
 }
 
 /// PyPy `W_AbstractLongObject.descr_str` / Python 3.14 integer-to-decimal
@@ -6897,7 +6887,17 @@ fn parse_int_from_str(
 /// before the quadratic decimal conversion; the resulting string supplies
 /// the exact boundary check.
 pub(crate) unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, crate::PyError> {
-    let value = obj_to_bigint(obj);
+    let owned;
+    let value = if pyre_object::is_bool(obj) {
+        owned = BigInt::from(pyre_object::w_bool_get_value(obj) as i64);
+        &owned
+    } else if pyre_object::is_int(obj) {
+        owned = BigInt::from(pyre_object::w_int_get_value(obj));
+        &owned
+    } else {
+        debug_assert!(pyre_object::is_long(obj));
+        pyre_object::w_long_get_value(obj)
+    };
     let maxdigits = crate::module::sys::state::int_max_str_digits();
     if maxdigits != 0 {
         let bits = value.bits();
@@ -6912,13 +6912,17 @@ pub(crate) unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, c
             )));
         }
     }
-    let text = value.to_string();
-    if maxdigits != 0 && text.trim_start_matches('-').len() > maxdigits as usize {
-        return Err(crate::PyError::value_error(format!(
+    // longobject.py:109 calls `self.asbigint().str(max_str_digits=...)`.
+    // Going through Rust's Display/ToString adapter erases rbigint's
+    // MaxIntError and MemoryError edges (and can turn either into a formatting
+    // panic), so preserve the direct consumer contract.
+    value.str(maxdigits as i64).map_err(|error| match error {
+        pyre_object::rbigint::RBigIntError::MaxStrDigits => crate::PyError::value_error(format!(
             "Exceeds the limit ({maxdigits}) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit"
-        )));
-    }
-    Ok(text)
+        )),
+        pyre_object::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
+        _ => unreachable!("rbigint.str returned an unrelated error"),
+    })
 }
 
 /// Remove PEP 515 underscore digit separators, rejecting any underscore
@@ -12150,30 +12154,29 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             };
         }
         if is_int(obj) || is_long(obj) {
-            // `intobject.py:144 descr_round` — single-arg round and any
-            // ndigits >= 0 leave an int unchanged; ndigits < 0 rounds to
-            // the nearest multiple of 10**(-ndigits), ties to even.  `ndigits`
-            // is coerced through `space.index`, so a non-index one raises.
+            // intobject.py:144-175 `descr_round`: keep ndigits as an rbigint
+            // obtained through `space.index`, then compute
+            // `10 ** -ndigits` and divmod-near.  Converting ndigits to an
+            // index-sized Rust word or formatting the operand merely to count
+            // decimal digits both diverge from that consumer shape.
             let nd = match ndigits {
-                Some(nd) if !pyre_object::is_none(*nd) => crate::baseobjspace::getindex_w(*nd)?,
+                Some(nd) if !pyre_object::is_none(*nd) => index_to_bigint(*nd)?,
                 _ => return Ok(obj),
             };
-            if nd >= 0 {
+            if nd.get_sign() >= 0 {
                 return Ok(obj);
             }
-            let a = obj_to_bigint(obj);
-            // 10**(-ndigits) beyond the magnitude of `a` rounds every digit
-            // away, giving 0; short-circuit so a clamped huge-negative ndigits
-            // neither overflows `-nd` nor builds an astronomical power of ten.
-            let magnitude_digits = a.to_str_radix(10).trim_start_matches('-').len() as u64;
-            if nd.unsigned_abs() > magnitude_digits {
-                return Ok(w_int_new(0));
-            }
-            let mut b = BigInt::from(1);
-            let ten = BigInt::from(10);
-            for _ in 0..(-nd) {
-                b = &b * &ten;
-            }
+            let owned_a;
+            let a = if is_long(obj) {
+                w_long_get_value(obj)
+            } else {
+                owned_a = BigInt::from(w_int_get_value(obj));
+                &owned_a
+            };
+            let exponent = nd.neg();
+            let b = BigInt::from(10)
+                .pow(&exponent, None)
+                .map_err(|_| crate::PyError::memory_error("exponent too large"))?;
             // `_PyLong_DivmodNear`: q = round(a / b) ties-to-even,
             // result = q * b.  Floor division gives 0 <= r < b.
             let (q, r) = a
@@ -12301,11 +12304,43 @@ fn index_to_bigint(obj: PyObjectRef) -> Result<BigInt, crate::PyError> {
 
 /// Format a `BigInt` in `radix` with the given `0x`/`0o`/`0b` prefix, keeping
 /// the sign ahead of the prefix (`-0xff`).
-fn format_int_radix(value: &BigInt, radix: u32, prefix: &str) -> String {
-    let digits = value.to_str_radix(radix);
-    match digits.strip_prefix('-') {
-        Some(magnitude) => format!("-{prefix}{magnitude}"),
-        None => format!("{prefix}{digits}"),
+fn format_int_radix(value: &BigInt, radix: u32, prefix: &str) -> Result<String, crate::PyError> {
+    let digits = match radix {
+        2 => "01",
+        8 => pyre_object::rbigint::BASE8,
+        16 => pyre_object::rbigint::BASE16,
+        _ => unreachable!("hex/oct/bin use only power-of-two radices"),
+    };
+    value
+        .format(digits, prefix, "", 0)
+        .map_err(|error| match error {
+            pyre_object::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
+            _ => unreachable!("validated radix formatting returned an unrelated error"),
+        })
+}
+
+/// `space.index(obj).asbigint().format(...)` without cloning a W_LongObject's
+/// immutable payload. PyPy's `W_LongObject.asbigint()` returns `self.num`;
+/// only compact int/bool results need a temporary rbigint materialisation.
+fn format_index_radix(
+    obj: PyObjectRef,
+    radix: u32,
+    prefix: &str,
+) -> Result<String, crate::PyError> {
+    let w_index = crate::baseobjspace::space_index(obj)?;
+    unsafe {
+        let owned;
+        let value = if pyre_object::is_bool(w_index) {
+            owned = BigInt::from(pyre_object::w_bool_get_value(w_index) as i64);
+            &owned
+        } else if pyre_object::is_int(w_index) {
+            owned = BigInt::from(pyre_object::w_int_get_value(w_index));
+            &owned
+        } else {
+            debug_assert!(pyre_object::is_long(w_index));
+            pyre_object::w_long_get_value(w_index)
+        };
+        format_int_radix(value, radix, prefix)
     }
 }
 
@@ -12323,7 +12358,7 @@ fn builtin_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    let s = format_int_radix(&index_to_bigint(args[0])?, 16, "0x");
+    let s = format_index_radix(args[0], 16, "0x")?;
     Ok(w_str_new(&s))
 }
 
@@ -12341,7 +12376,7 @@ fn builtin_oct(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    let s = format_int_radix(&index_to_bigint(args[0])?, 8, "0o");
+    let s = format_index_radix(args[0], 8, "0o")?;
     Ok(w_str_new(&s))
 }
 
@@ -12359,7 +12394,7 @@ fn builtin_bin(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    let s = format_int_radix(&index_to_bigint(args[0])?, 2, "0b");
+    let s = format_index_radix(args[0], 2, "0b")?;
     Ok(w_str_new(&s))
 }
 
@@ -12676,6 +12711,50 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 mod tests {
     use super::*;
 
+    #[test]
+    fn long_abs_reuses_nonnegative_rbigint_payload() {
+        let value = BigInt::one().lshift(80).unwrap();
+        let input = w_long_new(value);
+        let result = builtin_abs(&[input]).unwrap();
+
+        assert_ne!(result, input, "int.__abs__ returns a fresh long wrapper");
+        unsafe {
+            assert!(
+                std::ptr::eq(w_long_get_value(result), w_long_get_value(input)),
+                "nonnegative rbigint.abs returns its original payload"
+            );
+        }
+    }
+
+    #[test]
+    fn long_abs_negates_negative_rbigint_payload() {
+        let value = BigInt::one().lshift(80).unwrap().neg();
+        let input = w_long_new(value);
+        let result = builtin_abs(&[input]).unwrap();
+
+        unsafe {
+            assert!(!std::ptr::eq(
+                w_long_get_value(result),
+                w_long_get_value(input)
+            ));
+            assert_eq!(w_long_get_value(result).get_sign(), 1);
+        }
+    }
+
+    #[test]
+    fn ensure_baseint_long_rewraps_without_cloning_payload() {
+        let input = w_long_new(BigInt::one().lshift(80).unwrap());
+        let result = ensure_baseint_result(input, input).unwrap();
+
+        assert_ne!(result, input);
+        unsafe {
+            assert!(std::ptr::eq(
+                w_long_get_value(result),
+                w_long_get_value(input)
+            ));
+        }
+    }
+
     /// RPython rbigint and the small-int path must implement the same
     /// Mersenne reduction across the machine-word range.
     #[test]
@@ -12866,6 +12945,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn int_string_uses_rbigint_number_parser_for_prefixes_and_overflow() {
+        crate::typedef::init_typeobjects();
+        for (text, base, expected) in [
+            ("0x_10", 0, BigInt::from(16)),
+            ("0x_10", 16, BigInt::from(16)),
+            ("00_0", 0, BigInt::from(0)),
+            ("9223372036854775808", 10, BigInt::from(i64::MAX).int_add(1)),
+            (
+                "-9223372036854775809",
+                10,
+                BigInt::from(i64::MIN).int_sub(1),
+            ),
+        ] {
+            let result = parse_int_from_str(w_str_new(text), text, base).unwrap();
+            if let Ok(expected_int) = expected.toint() {
+                assert!(unsafe { is_int(result) });
+                assert_eq!(unsafe { w_int_get_value(result) }, expected_int);
+            } else {
+                assert!(unsafe { is_long(result) });
+                assert!(unsafe { w_long_get_value(result).eq(&expected) });
+            }
+        }
+
+        for text in ["012", "0x__1", "1__0", "1_"] {
+            let error = parse_int_from_str(w_str_new(text), text, 0).unwrap_err();
+            assert_eq!(error.kind, crate::PyErrorKind::ValueError);
+        }
+    }
+
+    #[test]
+    fn integer_round_keeps_rbigint_ndigits_and_ties_to_even() {
+        crate::typedef::init_typeobjects();
+        for (value, expected) in [(2500, 2000), (3500, 4000), (-2500, -2000), (-3500, -4000)] {
+            let rounded = builtin_round(&[w_int_new(value), w_long_new(BigInt::from(-3))]).unwrap();
+            assert_eq!(unsafe { w_int_get_value(rounded) }, expected);
+        }
+
+        let value = BigInt::fromdecimalstr("1234567890123456789012345");
+        let rounded = builtin_round(&[w_long_new(value.clone()), w_int_new(-5)]).unwrap();
+        let divisor = BigInt::from(10).int_pow(5, None).unwrap();
+        let expected = value
+            .divmod(&divisor)
+            .expect("positive divisor")
+            .0
+            .mul(&divisor);
+        assert!(unsafe { w_long_get_value(rounded).eq(&expected) });
+
+        let original = w_long_new(value);
+        assert_eq!(
+            builtin_round(&[original, w_long_new(BigInt::one().lshift(70).unwrap())]).unwrap(),
+            original
+        );
+    }
+
     /// PyPy `interp_io._open` constructs `W_FileIO`, and
     /// `W_FileIO.descr_init` calls `_open_fd` before returning.  A writable
     /// pathname must therefore be created/truncated while the stream is still
@@ -13002,6 +13136,36 @@ mod tests {
         // pow(3, -3, 7) == pow(pow(3, -1, 7), 3, 7) == 5^3 % 7 == 6.
         let cubed = builtin_pow(&[w_int_new(3), w_int_new(-3), w_int_new(7)]).unwrap();
         assert_eq!(unsafe { w_int_get_value(cubed) }, 6);
+
+        let negative_modulus = builtin_pow(&[
+            w_long_new(BigInt::from(5)),
+            w_long_new(BigInt::from(-1)),
+            w_long_new(BigInt::from(-13)),
+        ])
+        .unwrap();
+        assert!(unsafe { is_long(negative_modulus) });
+        assert!(unsafe { w_long_get_value(negative_modulus).int_eq(-5) });
+    }
+
+    #[test]
+    fn test_builtin_pow_three_arg_borrows_long_operands() {
+        crate::typedef::init_typeobjects();
+        let base = BigInt::one().lshift(100).unwrap().int_add(3);
+        let exponent = BigInt::from(5);
+        let modulus = BigInt::one().lshift(70).unwrap().int_add(33);
+        let expected = base.pow(&exponent, Some(&modulus)).unwrap();
+        let result =
+            builtin_pow(&[w_long_new(base), w_long_new(exponent), w_long_new(modulus)]).unwrap();
+        assert!(unsafe { is_long(result) });
+        assert!(unsafe { w_long_get_value(result).eq(&expected) });
+
+        let zero_exp = builtin_pow(&[
+            w_long_new(BigInt::from(2)),
+            w_long_new(BigInt::zero()),
+            w_long_new(BigInt::from(-13)),
+        ])
+        .unwrap();
+        assert!(unsafe { w_long_get_value(zero_exp).int_eq(-12) });
     }
 
     #[test]

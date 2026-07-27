@@ -890,8 +890,9 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// jitcode in `walker_capture_snapshot_for_last_guard`.
     pub inline_subwalk: bool,
     /// The enclosing `w_list_append` fold took the Object strategy's in-place
-    /// arm, so the appended ref lands in a `SetarrayitemGc` the backend GC
-    /// rewrite already covers with `COND_CALL_GC_WB_ARRAY`
+    /// arm on a block that existed before this append, so the appended ref
+    /// lands in a `SetarrayitemGc` the backend GC rewrite already covers with
+    /// `COND_CALL_GC_WB_ARRAY`
     /// (`rewrite.py:936-944` `handle_write_barrier_setarrayitem`). The list's
     /// own `items` pointer is unchanged on that arm, so remembering the
     /// `W_ListObject` adds nothing the array barrier does not already do.
@@ -906,6 +907,10 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// Carries the receiver address rather than a flag so only that list's
     /// barrier is dropped — a barrier reached for any other list inside the
     /// sub-walk is recorded normally.
+    ///
+    /// Never set for Empty->Object promotion: that transition also installs
+    /// the new block in `W_ListObject.items`, so the owner barrier is
+    /// load-bearing even though the subsequent element store is in-place.
     ///
     /// Only set while the items block is GC-managed. With
     /// `PYRE_GC_ITEMSBLOCK=0` the block is `std::alloc` memory with no GC

@@ -2150,11 +2150,26 @@ fn format_rbigint(num: &BigInt, spec: &Wtf8, type_name: &str) -> Result<Wtf8Buf,
     // Keep the parsed value live so syntax validation cannot be optimized
     // away independently from rendering.
     let _ = parsed;
-    let mut magnitude = num.abs().to_str_radix(radix);
+    let digits = match radix {
+        2 => "01",
+        8 => pyre_object::rbigint::BASE8,
+        10 => pyre_object::rbigint::BASE10,
+        16 => pyre_object::rbigint::BASE16,
+        _ => unreachable!("integer format uses radix 2, 8, 10, or 16"),
+    };
+    let negative = num.int_lt(0);
+    let mut magnitude = num.format(digits, "", "", 0).map_err(|error| match error {
+        pyre_object::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
+        _ => unreachable!("validated radix formatting returned an unrelated error"),
+    })?;
+    if negative {
+        debug_assert!(magnitude.starts_with('-'));
+        magnitude.remove(0);
+    }
     if upper {
         magnitude.make_ascii_uppercase();
     }
-    let sign = if num.int_lt(0) {
+    let sign = if negative {
         "-"
     } else {
         match p.sign {
@@ -2447,10 +2462,16 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
         // codes (`e`/`f`/`g`/`%`) format the `f64` conversion of the value.
         if pyre_object::is_int(val) || pyre_object::is_bool(val) || pyre_object::is_long(val) {
             let type_name = arg_type_name(val);
+            let owned;
             let big = if pyre_object::is_bool(val) {
-                BigInt::from(pyre_object::w_bool_get_value(val) as i64)
+                owned = BigInt::from(pyre_object::w_bool_get_value(val) as i64);
+                &owned
+            } else if pyre_object::is_int(val) {
+                owned = BigInt::from(pyre_object::w_int_get_value(val));
+                &owned
             } else {
-                crate::builtins::obj_to_bigint(val)
+                // newformat.py's `w_num.asbigint()` borrows `W_LongObject.num`.
+                pyre_object::w_long_get_value(val)
             };
             let parsed = FormatSpec::parse(spec);
             let p = parse_spec(spec);
@@ -2463,12 +2484,12 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
                 ));
             }
             if spec.ends_with("c") && parsed.is_ok() {
-                return format_char(&big, spec);
+                return format_char(big, spec);
             }
             // A float presentation code formats the `f64` conversion (`n` and
             // the integer bases keep full integer precision instead).
             if matches!(p.ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%') {
-                let f = big.to_f64().unwrap_or(f64::INFINITY);
+                let f = pyre_object::jit_bigint_to_f64_or_inf(big);
                 if f.is_infinite() {
                     return Err(crate::PyError::overflow_error(
                         "int too large to convert to float",
@@ -2477,7 +2498,7 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
                 return format_finite_float(f, spec);
             }
             parsed.map_err(|e| format_spec_err(e, spec, &type_name, true))?;
-            return format_rbigint(&big, spec, &type_name);
+            return format_rbigint(big, spec, &type_name);
         }
         if pyre_object::is_float(val) {
             let v = pyre_object::floatobject::w_float_get_value(val);
@@ -2734,20 +2755,21 @@ fn format_char(num: &BigInt, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
             "Alternate form (#) not allowed with integer format specifier 'c'",
         ));
     }
-    let cp = match num.to_i64() {
+    if pyre_object::jit_bigint_to_i64_fits(num) == 0 {
+        return Err(crate::PyError::overflow_error(
+            "Python int too large to convert to C long",
+        ));
+    }
+    let cp = match u32::try_from(pyre_object::jit_bigint_to_i64_value(num))
+        .ok()
+        .and_then(CodePoint::from_u32)
+    {
+        Some(cp) => cp,
         None => {
             return Err(crate::PyError::overflow_error(
-                "Python int too large to convert to C long",
+                "%c arg not in range(0x110000)",
             ));
         }
-        Some(n) => match u32::try_from(n).ok().and_then(CodePoint::from_u32) {
-            Some(cp) => cp,
-            None => {
-                return Err(crate::PyError::overflow_error(
-                    "%c arg not in range(0x110000)",
-                ));
-            }
-        },
     };
     let mut body = Wtf8Buf::new();
     body.push(cp);

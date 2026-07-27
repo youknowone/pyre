@@ -187,7 +187,7 @@ impl W_Random {
             if is_int_or_long(w_n) {
                 // space.abs(w_n)
                 let v = crate::builtins::obj_to_bigint(w_n);
-                if v.sign() == Sign::Minus { -v } else { v }
+                if v.get_sign() < 0 { -v } else { v }
             } else {
                 // n = space.hash_w(w_n); w_n = space.newint(r_uint(n))
                 BigInt::from(crate::baseobjspace::hash_w_strict(w_n)? as u64)
@@ -223,11 +223,11 @@ impl W_Random {
                     crate::bail_type_error!("state vector must contain ints");
                 }
                 let mut v = crate::builtins::obj_to_bigint(item);
-                if v.sign() == Sign::Minus {
+                if v.get_sign() < 0 {
                     v += BigInt::from(1u64 << 32);
                 }
                 // space.uint_w: every word must fit an unsigned 32-bit int.
-                if v.sign() == Sign::Minus {
+                if v.get_sign() < 0 {
                     crate::bail_overflow_error!("cannot convert negative integer to unsigned int");
                 }
                 if v >= BigInt::from(1u64 << 32) {

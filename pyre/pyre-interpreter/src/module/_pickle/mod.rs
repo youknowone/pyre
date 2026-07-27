@@ -397,10 +397,10 @@ pub(crate) fn int_from_bigint(value: BigInt) -> PyObjectRef {
 
 /// Parse a decimal integer literal (INT / LONG text opcodes) into an int.
 pub(crate) fn parse_int_text(s: &str) -> Result<PyObjectRef, PyError> {
-    match BigInt::parse_bytes(s.trim().as_bytes(), 10) {
-        Some(big) => Ok(int_from_bigint(big)),
-        None => Err(unpickling_error("could not convert string to int")),
-    }
+    // interp_pickle.py:2201 calls the ordinary `int` constructor.  Reuse its
+    // NumberStringParser consumer so the digit limit, MemoryError edge, and
+    // literal diagnostics do not diverge for protocol-0 INT/LONG opcodes.
+    crate::builtins::parse_int_from_str(pyre_object::w_str_new(s), s, 10)
 }
 
 pub(crate) fn read_int_le(data: &[u8]) -> i64 {

@@ -257,8 +257,8 @@ unsafe fn walk_raw_function_roots(
     }
 }
 
-/// Forward a Box-immortal `PyCode`'s cached globals dict object
-/// (`pycode.py:105 "w_globals?"`).  Module globals are `malloc_typed`-immortal,
+/// Forward a Box-immortal `PyCode`'s cached globals dict object and realized
+/// `co_consts_w` entries. Module globals are `malloc_typed`-immortal,
 /// but `exec`/`eval` with a plain dict (or a function built with custom
 /// globals) caches a `try_gc_alloc` movable dict here, which a minor collection
 /// relocates.  The code object itself is Box-immortal, so the standard tracer
@@ -275,6 +275,11 @@ pub unsafe fn walk_raw_code_roots(
         }
         let code = &mut *(value as *mut crate::pycode::PyCode);
         visitor(&mut *(&mut code.w_globals as *mut PyObjectRef as *mut majit_ir::GcRef));
+        if !code.co_consts_w.is_null() {
+            for slot in (&mut *code.co_consts_w).iter_mut() {
+                visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
+            }
+        }
     }
 }
 
@@ -2717,19 +2722,19 @@ impl ConstantOpcodeHandler for PyFrame {
         // Reached only for a code constant nested inside a container constant
         // (e.g. a tuple element), which has no top-level `co_consts_w` slot;
         // realize a wrapper directly.  Top-level `LOAD_CONST` of a code constant
-        // goes through `code_constant_at` below.
+        // goes through `constant_at` below.
         Ok(crate::pycode::box_code_constant(code))
     }
 
-    fn code_constant_at(
+    fn constant_at(
         &mut self,
-        index: usize,
+        index: crate::bytecode::oparg::ConstIdx,
         _enclosing: &crate::bytecode::CodeObject,
     ) -> Result<Self::Value, PyError> {
         // `pyopcode.py:498-499 getconstant_w(index) -> co_consts_w[index]`:
-        // return the one wrapper `self.pycode` holds at `index`.
+        // return the one object `self.pycode` holds at `index`.
         Ok(unsafe {
-            crate::pycode::w_code_co_const(self.pycode as pyre_object::PyObjectRef, index)
+            crate::pycode::w_code_const(self.pycode as pyre_object::PyObjectRef, usize::from(index))
         })
     }
 

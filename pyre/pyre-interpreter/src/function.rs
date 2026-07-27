@@ -1135,7 +1135,7 @@ fn code_getdocstring(obj: PyObjectRef) -> PyObjectRef {
             if code_ref.flags.contains(crate::CodeFlags::HAS_DOCSTRING)
                 && !code_ref.constants.is_empty()
             {
-                let first = crate::pyframe::load_const_from_code(code_ref, 0);
+                let first = unsafe { crate::pycode::w_code_const(code, 0) };
                 if !first.is_null() && unsafe { pyre_object::is_str(first) } {
                     return first;
                 }

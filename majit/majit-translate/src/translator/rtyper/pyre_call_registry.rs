@@ -172,6 +172,8 @@ impl PyreFunctionEntry {
 pub struct TwoPhaseSubject {
     pub graph_key: crate::flowspace::model::GraphKey,
     pub value_to_var: crate::translator::rtyper::flowspace_adapter::LegacyToTyped,
+    pub value_to_var_candidates:
+        crate::translator::rtyper::flowspace_adapter::LegacyToTypedCandidates,
     pub constant_concretetypes: HashMap<
         crate::flowspace::model::Variable,
         crate::translator::rtyper::lltypesystem::lltype::LowLevelType,

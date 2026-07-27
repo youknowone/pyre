@@ -168,6 +168,14 @@ impl W_ListObject {
         // block's live items across that allocation. Callers that hold an
         // incoming `value` across this call root it themselves before grow.
         self.items = grow_list_items_block_gc(self.items, target_cap, self.length);
+        // framework.py's GC transform places the owner write barrier directly
+        // after `_ll_list_resize_really` installs the fresh GcArray pointer.
+        // `object_grow` runs inside the residualized
+        // `w_list_grow_items_block` boundary, so an outer append barrier is
+        // too late to represent this field store in the compiled trace: the
+        // helper itself must leave the old-gen list remembered before it
+        // returns its new nursery-backed `items`.
+        list_write_barrier(self as *mut W_ListObject as PyObjectRef);
     }
 
     /// Upstream list.append equivalent for the object strategy.

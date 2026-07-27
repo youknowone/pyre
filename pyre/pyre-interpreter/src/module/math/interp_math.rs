@@ -4,7 +4,7 @@
 //!
 //! All functions delegate to `pymath::math` for CPython-exact results.
 
-use pyre_object::rbigint::{RBigInt as BigInt, RBigIntError};
+use pyre_object::rbigint::{RBigInt as BigInt, RBigIntError, RBigIntGcRoot};
 use pyre_object::*;
 
 /// Infallible f64 extraction with a `0.0` fallback for a non-convertible
@@ -631,7 +631,7 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
         let (result, _, shift) = fac1(n, gap);
         result.lshift(shift).map_err(map_rbigint_err)?
     };
-    Ok(bigint_to_pyint(result))
+    Ok(bigint_to_pyint(&result))
 }
 
 /// Convert any int/long/bool to a BigInt for math.gcd/lcm/factorial
@@ -642,7 +642,7 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
 fn get_bigint(obj: PyObjectRef) -> Result<BigInt, crate::PyError> {
     unsafe {
         if pyre_object::is_long(obj) {
-            return Ok(pyre_object::w_long_get_value(obj).clone());
+            return Ok(pyre_object::w_long_get_value(obj).translated_alias());
         }
         if pyre_object::is_int(obj) {
             return Ok(BigInt::from(pyre_object::w_int_get_value(obj)));
@@ -671,7 +671,7 @@ fn get_bigint(obj: PyObjectRef) -> Result<BigInt, crate::PyError> {
                     return Ok(BigInt::from(pyre_object::w_int_get_value(result)));
                 }
                 if pyre_object::is_long(result) {
-                    return Ok(pyre_object::w_long_get_value(result).clone());
+                    return Ok(pyre_object::w_long_get_value(result).translated_alias());
                 }
             }
             // descroperation.py:612 — __index__ returned non-int (type %T)
@@ -689,18 +689,22 @@ fn get_bigint(obj: PyObjectRef) -> Result<BigInt, crate::PyError> {
 }
 
 pub fn gcd(args: &[PyObjectRef]) -> PyResult {
-    let mut result = BigInt::zero();
+    // RPython's GC transform roots this running rbigint across the next
+    // argument's potentially user-defined `__index__` call.
+    let mut result = RBigIntGcRoot::new(BigInt::zero());
     for &arg in args {
-        result = result.gcd(&get_bigint(arg)?).map_err(map_rbigint_err)?;
+        *result = result.gcd(&get_bigint(arg)?).map_err(map_rbigint_err)?;
     }
-    Ok(bigint_to_pyint(result))
+    Ok(bigint_to_pyint(&result))
 }
 
 pub fn lcm(args: &[PyObjectRef]) -> PyResult {
     if args.is_empty() {
         return Ok(w_int_new(1));
     }
-    let mut result = get_bigint(args[0])?;
+    // app_math.py keeps `res` live while each later `index()` can execute
+    // arbitrary Python and collect.
+    let mut result = RBigIntGcRoot::new(get_bigint(args[0])?);
     for &arg in &args[1..] {
         // Every argument goes through `__index__` even once the running result
         // is zero: `math_lcm_impl` only short-circuits the arithmetic, so
@@ -711,24 +715,26 @@ pub fn lcm(args: &[PyObjectRef]) -> PyResult {
             continue;
         }
         if value.is_zero() {
-            result = BigInt::zero();
+            *result = BigInt::zero();
             continue;
         }
         let divisor = result.gcd(&value).map_err(map_rbigint_err)?;
-        result = result
+        *result = result
             .floordiv(&divisor)
             .map_err(map_rbigint_err)?
             .mul(&value)
             .abs();
     }
-    Ok(bigint_to_pyint(result.abs()))
+    let result = result.abs();
+    Ok(bigint_to_pyint(&result))
 }
 
 /// `w_int_new` when the value fits an i64, else `w_long_new`.
-fn bigint_to_pyint(b: BigInt) -> PyObjectRef {
-    match b.to_i64() {
-        Some(i) => w_int_new(i),
-        None => w_long_new(b),
+fn bigint_to_pyint(b: &BigInt) -> PyObjectRef {
+    if jit_bigint_to_i64_fits(b) != 0 {
+        w_int_new(jit_bigint_to_i64_value(b))
+    } else {
+        w_long_new(b.translated_alias())
     }
 }
 
@@ -738,7 +744,9 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
             "comb() takes exactly two arguments",
         ));
     }
-    let n_big = get_bigint(args[0])?;
+    // `n` is an unboxed rbigint local across `index(k)`, exactly the kind of
+    // local rooted automatically by RPython's GC transform.
+    let n_big = RBigIntGcRoot::new(get_bigint(args[0])?);
     let k_big = get_bigint(args[1])?;
 
     if n_big.int_lt(0) {
@@ -756,7 +764,7 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
         return Ok(w_int_new(0));
     }
 
-    let n_minus_k = &n_big - &k_big;
+    let n_minus_k = &*n_big - &k_big;
     let k = if n_minus_k.lt(&k_big) {
         n_minus_k
     } else {
@@ -768,7 +776,7 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
 
     // pypy/module/math/app_math.py:comb — preserve its occasional fraction
     // reduction, including a bigint loop index.
-    let mut numerator = n_big.clone();
+    let mut numerator = n_big.translated_alias();
     let mut denominator = BigInt::one();
     let mut i = BigInt::one();
     while i.lt(&k) {
@@ -781,7 +789,7 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
         i = i.int_add(1);
     }
     Ok(bigint_to_pyint(
-        numerator.floordiv(&denominator).map_err(map_rbigint_err)?,
+        &numerator.floordiv(&denominator).map_err(map_rbigint_err)?,
     ))
 }
 
@@ -796,7 +804,8 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
             "perm() takes at most 2 arguments",
         ));
     }
-    let n_big = get_bigint(args[0])?;
+    // Keep `n` rooted while a non-None `k` invokes its `__index__`.
+    let n_big = RBigIntGcRoot::new(get_bigint(args[0])?);
     if n_big.int_lt(0) {
         return Err(crate::PyError::value_error(
             "n must be a non-negative integer",
@@ -818,12 +827,12 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
             return Ok(w_int_new(0));
         }
     }
-    let k = k_big.unwrap_or_else(|| n_big.clone());
+    let k = k_big.unwrap_or_else(|| n_big.translated_alias());
 
     fn product_range(low: &BigInt, high: &BigInt, gap: &BigInt) -> Result<BigInt, RBigIntError> {
         if low.add(gap).ge(high) {
             let mut result = BigInt::one();
-            let mut i = low.clone();
+            let mut i = low.translated_alias();
             while i.lt(high) {
                 result = result.mul(&i);
                 i = i.int_add(1);
@@ -848,7 +857,7 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
         product_range(&low, &high, &gap)
     }
     .map_err(map_rbigint_err)?;
-    Ok(bigint_to_pyint(result))
+    Ok(bigint_to_pyint(&result))
 }
 
 pub fn isqrt(args: &[PyObjectRef]) -> PyResult {
@@ -861,7 +870,7 @@ pub fn isqrt(args: &[PyObjectRef]) -> PyResult {
     let value = n
         .isqrt()
         .map_err(|_| crate::PyError::value_error("isqrt() argument must be nonnegative"))?;
-    Ok(bigint_to_pyint(value))
+    Ok(bigint_to_pyint(&value))
 }
 
 pub fn fsum(args: &[PyObjectRef]) -> PyResult {
@@ -974,7 +983,6 @@ pub fn frexp(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn ldexp(args: &[PyObjectRef]) -> PyResult {
-    use num_traits::ToPrimitive;
     if args.len() < 2 {
         return Err(crate::PyError::type_error(
             "ldexp() takes exactly 2 arguments",
@@ -982,8 +990,11 @@ pub fn ldexp(args: &[PyObjectRef]) -> PyResult {
     }
     // PyPy: pypy/module/math/interp_math.py::ldexp — second argument
     // must be an integer (via `__index__`), not a float.
-    let exp_big = get_bigint(args[1])?;
+    // interp_math.py::ldexp evaluates x before converting the exponent.
+    // Besides preserving callback order, this avoids retaining an unboxed
+    // exponent rbigint across x.__float__.
     let x = try_get_double(args[0])?;
+    let exp_big = get_bigint(args[1])?;
     // Short-circuit special cases so an overflowing exponent doesn't
     // mask inf/nan propagation.
     if x.is_nan() {
@@ -994,16 +1005,18 @@ pub fn ldexp(args: &[PyObjectRef]) -> PyResult {
     }
     // Clamp the exponent to i32 range. Out-of-range exponents either
     // underflow to 0 (negative, finite x) or overflow to OverflowError.
-    let exp = match exp_big.to_i32() {
-        Some(v) => v,
-        None => {
-            // Sign of the exponent decides the result shape.
-            if exp_big.int_lt(0) {
-                let signed = if x.is_sign_positive() { 0.0 } else { -0.0 };
-                return Ok(floatobject::w_float_new(signed));
-            }
-            return Err(crate::PyError::overflow_error("math range error"));
+    let exp = if jit_bigint_to_i64_fits(&exp_big) != 0 {
+        i32::try_from(jit_bigint_to_i64_value(&exp_big)).ok()
+    } else {
+        None
+    };
+    let Some(exp) = exp else {
+        // Sign of the exponent decides the result shape.
+        if exp_big.int_lt(0) {
+            let signed = if x.is_sign_positive() { 0.0 } else { -0.0 };
+            return Ok(floatobject::w_float_new(signed));
         }
+        return Err(crate::PyError::overflow_error("math range error"));
     };
     map_err(pymath::math::ldexp(x, exp))
 }
@@ -1049,7 +1062,11 @@ pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
                     "steps must be a non-negative integer",
                 ));
             }
-            Some(b.to_u64().unwrap_or(u64::MAX))
+            Some(if jit_bigint_to_u64_fits(&b) != 0 {
+                jit_bigint_to_u64_value(&b)
+            } else {
+                u64::MAX
+            })
         }
         None => None,
     };

@@ -1919,6 +1919,19 @@ impl Bookkeeper {
         let canon_root = majit_ir::descr::canonical_struct_name(enum_root);
         let variant_path = format!("{canon_root}::{variant_name}");
         self.project_struct_rows(&variant_path)?;
+        // A variant payload can be the first place a dependency struct is
+        // reached (`ConstantData::Complex.value: Complex<f64>`).  The payload
+        // projector queues that struct to avoid recursively borrowing the
+        // registry, just like an ordinary struct row does.  Drain it before
+        // publishing the variant classdef; otherwise the variant's `value`
+        // attr may be classed while `value.re` / `value.im` still see the
+        // FORCE shell.  This is the variant counterpart of the pending drain
+        // in `getuniqueclassdef_for_struct_root`.
+        loop {
+            let next = self.pending_struct_row_projection.borrow_mut().pop();
+            let Some(n) = next else { break };
+            self.project_struct_rows(&n)?;
+        }
         self.getuniqueclassdef(&variant_host)
     }
 
@@ -2467,7 +2480,28 @@ impl Bookkeeper {
             // meet the same `SomeString` — projecting `s_unicode0` here
             // raised `str ∪ unicode` where a literal merged into a
             // String-typed attr cell.
-            "String" | "str" => return super::model::s_str0(),
+            // RustPython's compiler constants store strings in the
+            // dependency-owned `Wtf8Buf` newtype.  The MIR front already
+            // erases `Wtf8`/`Wtf8Buf` to the same immutable byte-string
+            // value as `String`/`str` (their methods are view adapters over
+            // that value), so a struct payload row must project to that
+            // exact annotation too.  Leaving the dependency-opaque name to
+            // the registered-struct arm below produces `Impossible` and
+            // blocks `ConstantData::Str.value`.
+            "String" | "str" | "Wtf8" | "Wtf8Buf" => return super::model::s_str0(),
+            // `malachite_bigint::BigInt` is deliberately foreign and opaque
+            // to translation.  Its sanctioned conversion seam is a residual
+            // call, but the value occupying `ConstantData::Integer.value`
+            // still has RPython's one-GC-reference shape.  Match the
+            // `BigInt.from` builtin analyzer and foreign-method cutover:
+            // retain a classdef-less `SomeInstance`, never lattice bottom.
+            "BigInt" => {
+                return SomeValue::Instance(super::model::SomeInstance::new(
+                    None,
+                    false,
+                    std::collections::BTreeMap::new(),
+                ));
+            }
             "char" => return SomeValue::Char(super::model::SomeChar::new(false)),
             "()" => return super::model::s_none(),
             _ => {}
@@ -2590,11 +2624,35 @@ impl Bookkeeper {
                 return self.project_pyre_field_type(&items_ty);
             }
         }
+        // Named generic structs in Charon's registry are stored under their
+        // declaration template (`CodeObject`), while a concrete field row can
+        // spell the use-site instantiation (`CodeObject<ConstantData>`).
+        // RPython has no generic class instantiations: both spellings denote
+        // the same classdef.  This is distinct from Option/Result and
+        // container wrappers handled above, and from per-shape tuple/enum
+        // classes whose dedicated paths never reach this arm.
+        let named_root = if strip_generic_one(stripped, "Complex<").is_some()
+            && self
+                .pyre_struct_fields
+                .borrow()
+                .as_ref()
+                .is_some_and(|r| r.fields.contains_key("num_complex::Complex"))
+        {
+            // Charon renders compiler-core's `Complex64` alias payload as
+            // the unqualified `Complex<f64>`, while the opaque dependency
+            // declaration is registered under `num_complex::Complex`.
+            // Resolve that exact generic spelling to its declaration
+            // identity; an unrelated local `Complex` is untouched unless
+            // the real dependency root is present in this program.
+            std::borrow::Cow::Borrowed("num_complex::Complex")
+        } else {
+            majit_ir::descr::strip_generic_args(stripped)
+        };
         let registered = {
             let guard = self.pyre_struct_fields.borrow();
             guard
                 .as_ref()
-                .map(|r| r.fields.contains_key(stripped))
+                .map(|r| r.fields.contains_key(named_root.as_ref()))
                 .unwrap_or(false)
         };
         if !registered {
@@ -2613,14 +2671,14 @@ impl Bookkeeper {
         // pending drain projects its rows before any subject flow can
         // read the class's untyped FORCE shells.
         {
-            let canonical = majit_ir::descr::canonical_struct_name(stripped);
+            let canonical = majit_ir::descr::canonical_struct_name(named_root.as_ref());
             if !self.projected_struct_rows.borrow().contains(&canonical) {
                 self.pending_struct_row_projection
                     .borrow_mut()
-                    .push(stripped.to_string());
+                    .push(named_root.to_string());
             }
         }
-        let host = self.intern_class_by_qualname(stripped);
+        let host = self.intern_class_by_qualname(named_root.as_ref());
         match self.getuniqueclassdef(&host) {
             Ok(classdef) => SomeValue::Instance(super::model::SomeInstance::new(
                 Some(classdef),
@@ -4182,6 +4240,75 @@ mod tests {
                 .as_ref()
                 .is_some_and(|c| Rc::ptr_eq(c, &inner)),
             "PyFrame.pycode inner classdef must be the same Rc as the standalone PyCode lookup"
+        );
+    }
+
+    #[test]
+    fn compiler_constant_payload_types_project_without_lattice_bottom() {
+        use crate::annotator::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "CodeObject".to_string(),
+            vec![("max_stackdepth".to_string(), "u32".to_string())],
+        );
+        reg.fields.insert(
+            "num_complex::Complex".to_string(),
+            vec![
+                ("re".to_string(), "f64".to_string()),
+                ("im".to_string(), "f64".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "Complex".to_string(),
+            reg.fields["num_complex::Complex"].clone(),
+        );
+        bk.set_pyre_struct_fields(Rc::new(reg));
+
+        assert!(
+            matches!(bk.project_pyre_field_type("BigInt"), SomeValue::Instance(ref s) if s.classdef.is_none()),
+            "dependency-opaque compiler BigInt remains one GC reference"
+        );
+        assert!(
+            matches!(bk.project_pyre_field_type("Wtf8Buf"), SomeValue::String(_)),
+            "Wtf8Buf shares the immutable string annotation"
+        );
+
+        let SomeValue::Instance(complex) = bk.project_pyre_field_type("Complex<f64>") else {
+            panic!("Complex<f64> must project to its registered struct class")
+        };
+        let complex_cd = complex.classdef.expect("Complex classdef");
+        let projected_complex = bk
+            .getuniqueclassdef_for_struct_root("num_complex::Complex")
+            .expect("Complex rows project");
+        assert!(Rc::ptr_eq(&complex_cd, &projected_complex));
+        let complex_attrs = &complex_cd.borrow().attrs;
+        assert!(matches!(
+            complex_attrs.get("re").map(|a| &a.s_value),
+            Some(SomeValue::Float(_))
+        ));
+        assert!(matches!(
+            complex_attrs.get("im").map(|a| &a.s_value),
+            Some(SomeValue::Float(_))
+        ));
+
+        let SomeValue::Instance(code) = bk.project_pyre_field_type("Box<CodeObject<ConstantData>>")
+        else {
+            panic!("concrete CodeObject instantiation must use the template class")
+        };
+        let code_cd = code.classdef.expect("CodeObject classdef");
+        let template = bk
+            .getuniqueclassdef_for_struct_root("CodeObject")
+            .expect("CodeObject template classdef");
+        assert!(
+            code_cd.borrow().attrs.contains_key("max_stackdepth"),
+            "template rows must be projected onto the concrete generic use"
+        );
+        assert!(
+            Rc::ptr_eq(&code_cd, &template),
+            "RPython has one CodeObject class, not per-generic classdefs"
         );
     }
 

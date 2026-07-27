@@ -75,6 +75,32 @@ pub(crate) fn clone_residual_for_method(leaf: &str) -> Option<Vec<String>> {
     )
 }
 
+/// Retarget the Rust ownership spelling `w_long_new(RBigInt)` to the pointer
+/// ABI used by translated rbigints.
+///
+/// At source level an `RBigInt` is a by-value two-word Rust handle and
+/// `w_long_new` first allocates its GC payload. After translation that same
+/// value is already the one-GC-reference rbigint object, exactly as in
+/// RPython. Re-boxing it as a by-value Rust argument would both use the wrong
+/// residual ABI and allocate a redundant payload. The caller proves the sole
+/// argument is the exact local RBigInt ADT before applying this target swap.
+pub(crate) fn long_box_residual_path(segments: &[String]) -> Option<Vec<String>> {
+    let leaf = segments.last().map(String::as_str)?;
+    if !matches!(
+        leaf,
+        "w_long_new" | "w_long_new_fresh_rbigint_handle" | "box_bigint_constant"
+    ) || segments.iter().rev().nth(1).map(String::as_str) != Some("longobject")
+    {
+        return None;
+    }
+    Some(
+        ["pyre_object", "longobject", "w_long_from_raw"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
 /// Bare-payload residual for scalar RBigInt queries. The caller has already
 /// proved exact RBigInt receiver identity.
 pub(crate) fn scalar_residual_for_method(leaf: &str) -> Option<(Vec<String>, ScalarResult)> {
@@ -209,23 +235,25 @@ pub(crate) fn pow_nomod_residual_path(segments: &[String]) -> Option<Vec<String>
 /// MemoryError through Rust source. `result_exc` removes that carrier after
 /// this target swap supplies the one-GC-reference residual result.
 pub(crate) fn lshift_count_residual_path(segments: &[String]) -> Option<Vec<String>> {
-    if !segments.ends_with(&[
-        "objspace".to_string(),
-        "descroperation".to_string(),
-        "bigint_lshift_count".to_string(),
-    ]) {
+    let residual = match segments.last().map(String::as_str) {
+        Some("bigint_lshift_count") => "jit_bigint_lshift_count",
+        Some("bigint_lshift_int_int_result") => "jit_bigint_lshift_int_int_result",
+        _ => return None,
+    };
+    if !segments
+        .iter()
+        .rev()
+        .skip(1)
+        .take(2)
+        .eq(["descroperation", "objspace"])
+    {
         return None;
     }
     Some(
-        [
-            "pyre_interpreter",
-            "objspace",
-            "descroperation",
-            "jit_bigint_lshift_count",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect(),
+        ["pyre_interpreter", "objspace", "descroperation", residual]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
     )
 }
 
@@ -317,6 +345,26 @@ mod tests {
             Some(segs(&["pyre_object", "longobject", "jit_bigint_clone"]))
         );
         assert!(clone_residual_for_method("clone_from").is_none());
+    }
+
+    #[test]
+    fn maps_translated_long_boxing_to_pointer_abi() {
+        let expected = segs(&["pyre_object", "longobject", "w_long_from_raw"]);
+        for leaf in [
+            "w_long_new",
+            "w_long_new_fresh_rbigint_handle",
+            "box_bigint_constant",
+        ] {
+            assert_eq!(
+                long_box_residual_path(&segs(&["pyre_object", "longobject", leaf])),
+                Some(expected.clone())
+            );
+        }
+        assert!(
+            long_box_residual_path(&segs(&["other", "longobject", "w_long_new"])).is_some(),
+            "crate prefix is intentionally irrelevant; module/leaf and exact argument type identify the call"
+        );
+        assert!(long_box_residual_path(&segs(&["pyre_object", "other", "w_long_new"])).is_none());
     }
 
     #[test]
@@ -434,6 +482,20 @@ mod tests {
                 "objspace",
                 "descroperation",
                 "jit_bigint_lshift_count",
+            ]))
+        );
+        assert_eq!(
+            lshift_count_residual_path(&segs(&[
+                "pyre_interpreter",
+                "objspace",
+                "descroperation",
+                "bigint_lshift_int_int_result",
+            ])),
+            Some(segs(&[
+                "pyre_interpreter",
+                "objspace",
+                "descroperation",
+                "jit_bigint_lshift_int_int_result",
             ]))
         );
         assert!(

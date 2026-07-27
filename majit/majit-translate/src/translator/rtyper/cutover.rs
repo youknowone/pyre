@@ -62,7 +62,9 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::model::FunctionGraph as LegacyGraph;
 use crate::translator::rtyper::error::TyperError;
-use crate::translator::rtyper::flowspace_adapter::{FlowspaceAdapterOutput, LegacyToTyped};
+use crate::translator::rtyper::flowspace_adapter::{
+    FlowspaceAdapterOutput, LegacyToTyped, LegacyToTypedCandidates,
+};
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::pyre_call_registry::{
     FunctionPathKey, PyreCallRegistry, PyreFunctionEntry,
@@ -308,21 +310,18 @@ pub(crate) fn dual_gate_check_with_registry(
     // stringified error so the env-flag wrapper can decide whether
     // to panic, log, or skip.
     //
-    // Snapshot the session's `fixed_graphs` keys so the failure arms
-    // below can identify the shared callee graphs this subject fixed
-    // (and partially LL-rewrote) before it failed — see
+    // Snapshot the session so the failure arms below can identify both
+    // shared callees this subject newly fixed and previously-annotated
+    // callees whose bindings it evicted while reflowing them — see
     // `unpoison_failed_subject_callees`.
-    let fixed_at_entry: HashSet<crate::flowspace::model::GraphKey> = call_registry
-        .session_if_started()
-        .map(|(ann, _)| ann.fixed_graphs.borrow().keys().cloned().collect())
-        .unwrap_or_default();
+    let session_at_entry = SubjectSessionSnapshot::capture(call_registry);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         specialize_legacy_graph_with_registry_returning_value_to_var(legacy_graph, call_registry)
     }));
     let (real_value_to_var, real_constants) = match result {
         Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
-            unpoison_failed_subject_callees(call_registry, &fixed_at_entry, lift_sources);
+            unpoison_failed_subject_callees(call_registry, &session_at_entry, lift_sources);
             let msg = format!("{e}");
             if is_known_unported(&msg) {
                 return Ok(DualGateOutcome::Skip(msg));
@@ -330,7 +329,7 @@ pub(crate) fn dual_gate_check_with_registry(
             return Err(format!("real path failed: {msg}"));
         }
         Err(payload) => {
-            unpoison_failed_subject_callees(call_registry, &fixed_at_entry, lift_sources);
+            unpoison_failed_subject_callees(call_registry, &session_at_entry, lift_sources);
             let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
                 (*s).to_string()
             } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -403,32 +402,153 @@ pub(crate) fn dual_gate_check_with_registry(
 ///   so `total_calltable_size` and `get_concrete_calltable`'s size
 ///   invariant hold; the family's cached concrete calltable is
 ///   dropped so it rebuilds against the fresh graph)
+#[derive(Default)]
+struct SubjectSessionSnapshot {
+    fixed_graphs: HashSet<crate::flowspace::model::GraphKey>,
+    annotated_blocks: Vec<AnnotatedBlockSnapshot>,
+}
+
+struct AnnotatedBlockSnapshot {
+    key: crate::flowspace::model::BlockKey,
+    block: crate::flowspace::model::BlockRef,
+    graph: crate::flowspace::model::GraphRef,
+    definitions: Vec<(
+        crate::flowspace::model::Variable,
+        Option<Rc<crate::annotator::model::SomeValue>>,
+    )>,
+}
+
+impl SubjectSessionSnapshot {
+    fn capture(call_registry: &PyreCallRegistry) -> Self {
+        Self::capture_inner(call_registry, true)
+    }
+
+    fn capture_fixed_only(call_registry: &PyreCallRegistry) -> Self {
+        Self::capture_inner(call_registry, false)
+    }
+
+    fn capture_inner(call_registry: &PyreCallRegistry, include_annotations: bool) -> Self {
+        let Some((annotator, _)) = call_registry.session_if_started() else {
+            return Self::default();
+        };
+        let fixed_graphs = annotator.fixed_graphs.borrow().keys().cloned().collect();
+        if !include_annotations {
+            return Self {
+                fixed_graphs,
+                annotated_blocks: Vec::new(),
+            };
+        }
+        let annotated = annotator.annotated.borrow();
+        let all_blocks = annotator.all_blocks.borrow();
+        let mut annotated_blocks = Vec::new();
+        for (bkey, graph) in annotated.iter() {
+            let Some(graph) = graph else {
+                continue;
+            };
+            let Some(block) = all_blocks.get(bkey) else {
+                continue;
+            };
+            let definitions = {
+                let block = block.borrow();
+                block
+                    .inputargs
+                    .iter()
+                    .chain(block.operations.iter().map(|op| &op.result))
+                    .filter_map(|value| match value {
+                        Hlvalue::Variable(var) => {
+                            Some((var.clone(), var.annotation.borrow().clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            annotated_blocks.push(AnnotatedBlockSnapshot {
+                key: bkey.clone(),
+                block: block.clone(),
+                graph: graph.clone(),
+                definitions,
+            });
+        }
+        Self {
+            fixed_graphs,
+            annotated_blocks,
+        }
+    }
+}
+
 fn unpoison_failed_subject_callees(
     call_registry: &PyreCallRegistry,
-    fixed_at_entry: &HashSet<crate::flowspace::model::GraphKey>,
+    session_at_entry: &SubjectSessionSnapshot,
     lift_sources: &crate::codewriter::call::GraphStore,
 ) {
     let Some((annotator, rtyper)) = call_registry.session_if_started() else {
         return;
     };
-    let newly_fixed: Vec<(
+    // `AddedBlocksGuard` can remove a block that was already healthy at
+    // subject entry because RPython's `added_blocks` records every
+    // reprocessed block, not only newly discovered ones. Restore the
+    // exact pre-subject annotation cells and ownership rows before
+    // repairing any graph that advanced into LL form. This is the
+    // transaction rollback required only by pyre's continue-after-Skip
+    // driver; upstream aborts the single Translator on the same error.
+    for saved in &session_at_entry.annotated_blocks {
+        annotator
+            .annotated
+            .borrow_mut()
+            .insert(saved.key.clone(), Some(saved.graph.clone()));
+        annotator
+            .all_blocks
+            .borrow_mut()
+            .insert(saved.key.clone(), saved.block.clone());
+        annotator
+            .blocked_blocks
+            .borrow_mut()
+            .shift_remove(&saved.key);
+        for (var, annotation) in &saved.definitions {
+            *var.annotation.borrow_mut() = annotation.clone();
+        }
+    }
+    if !session_at_entry.annotated_blocks.is_empty() {
+        let restored_keys: HashSet<_> = session_at_entry
+            .annotated_blocks
+            .iter()
+            .map(|saved| saved.key.clone())
+            .collect();
+        for generation in annotator.genpendingblocks.borrow_mut().iter_mut() {
+            generation.retain(|bkey, _| !restored_keys.contains(bkey));
+        }
+    }
+
+    let stale_graphs: HashMap<
         crate::flowspace::model::GraphKey,
         crate::flowspace::model::GraphRef,
-    )> = annotator
+    > = annotator
         .fixed_graphs
         .borrow()
         .iter()
-        .filter(|(k, _)| !fixed_at_entry.contains(*k))
+        .filter(|(k, _)| !session_at_entry.fixed_graphs.contains(*k))
         .map(|(k, g)| (k.clone(), g.clone()))
         .collect();
-    for (gkey, stale) in newly_fixed {
+
+    for (gkey, stale) in stale_graphs {
         annotator.fixed_graphs.borrow_mut().shift_remove(&gkey);
-        for block in stale.borrow().iterblocks() {
-            rtyper
-                .already_seen
-                .borrow_mut()
-                .remove(&crate::flowspace::model::BlockKey::of(&block));
+        let stale_blocks = stale.borrow().iterblocks();
+        let stale_block_keys: HashSet<crate::flowspace::model::BlockKey> = stale_blocks
+            .iter()
+            .map(crate::flowspace::model::BlockKey::of)
+            .collect();
+        for block in &stale_blocks {
+            let bkey = crate::flowspace::model::BlockKey::of(block);
+            annotator.annotated.borrow_mut().shift_remove(&bkey);
+            annotator.all_blocks.borrow_mut().shift_remove(&bkey);
+            annotator.blocked_blocks.borrow_mut().shift_remove(&bkey);
+            annotator.failed_blocks.borrow_mut().shift_remove(&bkey);
+            rtyper.already_seen.borrow_mut().remove(&bkey);
         }
+        for generation in annotator.genpendingblocks.borrow_mut().iter_mut() {
+            generation.retain(|bkey, _| !stale_block_keys.contains(bkey));
+        }
+        annotator.blocked_graphs.borrow_mut().shift_remove(&gkey);
         annotator
             .translator
             .graphs
@@ -528,6 +648,51 @@ fn project_value_to_var(
         }
     }
     real_state
+}
+
+/// Select the typed block-local representative of each legacy MIR Variable.
+///
+/// RPython flowspace gives every block inputarg its own Variable definition,
+/// while pyre's pre-adapter MIR can reuse one Variable identity for an op
+/// result and the phi columns of several successor blocks. The adapter
+/// therefore creates several orthodox typed Variables for one legacy key.
+/// Simplification can remove the initially preferred producer while leaving a
+/// successor representative live and rtyped. Repoint the projection map to a
+/// live representative after Phase B; this is identity reconciliation, not a
+/// kind backfill—the rtyper must have positively assigned the lltype.
+fn select_rtyped_representatives(
+    value_to_var: &mut LegacyToTyped,
+    candidates: &LegacyToTypedCandidates,
+) -> Result<(), TyperError> {
+    for (legacy, vars) in candidates {
+        if value_to_var
+            .get(legacy)
+            .is_some_and(|var| var.concretetype.borrow().is_some())
+        {
+            continue;
+        }
+        let mut selected: Option<(Variable, ConcreteType)> = None;
+        for candidate in vars {
+            let Some(lltype) = candidate.concretetype.borrow().clone() else {
+                continue;
+            };
+            let kind = lowleveltype_to_concrete(&lltype)?;
+            if let Some((_, selected_kind)) = &selected {
+                if *selected_kind != kind {
+                    return Err(TyperError::message(format!(
+                        "block-local representatives of one legacy Variable disagree: \
+                         {selected_kind:?} vs {kind:?} for {legacy:?}"
+                    )));
+                }
+            } else {
+                selected = Some((candidate.clone(), kind));
+            }
+        }
+        if let Some((selected, _)) = selected {
+            value_to_var.insert(legacy.clone(), selected);
+        }
+    }
+    Ok(())
 }
 
 /// Variables defined (inputarg or op result) in the reachable block
@@ -720,49 +885,164 @@ fn duplicate_inputarg_vars(graph: &LegacyGraph) -> std::collections::HashSet<Var
 /// excluded here) and the exitswitch (Value / fused compare).  `Link.args`
 /// forwarding is deliberately NOT counted, matching `reachable_defined_vars`.
 fn dead_op_result_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
-    let mut op_read: std::collections::HashSet<Variable> = std::collections::HashSet::new();
-    for block in &graph.blocks {
-        for op in &block.operations {
-            for v in crate::front::result_exc::op_operand_vars(&op.kind) {
-                op_read.insert(v);
-            }
+    use crate::model::{BlockId, ExitSwitch, LinkArg};
+
+    // The legacy MIR can reuse one Variable identity as the producer and as
+    // inputargs in multiple successor blocks. RPython flowspace cannot:
+    // checkgraph requires each block inputarg to be a distinct definition.
+    // Reproduce simplify.py:428-518 over block-local definition nodes rather
+    // than collapsing those definitions into one global Variable key.
+    let by_id: HashMap<BlockId, &crate::model::Block> =
+        graph.blocks.iter().map(|block| (block.id, block)).collect();
+    let mut reachable = HashSet::new();
+    let mut pending = vec![graph.startblock];
+    while let Some(id) = pending.pop() {
+        if !reachable.insert(id) {
+            continue;
         }
-        match &block.exitswitch {
-            Some(crate::model::ExitSwitch::Value(v)) => {
-                op_read.insert(v.clone());
-            }
-            Some(crate::model::ExitSwitch::Fused { args, .. }) => {
-                for v in args {
-                    op_read.insert(v.clone());
-                }
-            }
-            _ => {}
+        if let Some(block) = by_id.get(&id) {
+            pending.extend(block.exits.iter().map(|link| link.target));
         }
     }
-    let mut dead = std::collections::HashSet::new();
-    for block in &graph.blocks {
-        // `canremove(op, block)` (`simplify.py:441`) also excludes the
-        // block's `raising_op` — `block.operations[-1]` whenever the block
-        // raises (`block.canraise()`, exitswitch is `c_last_exception`).  A
-        // `canremove`-classified op parked there as an overflow / bounds /
-        // zero-divide check must keep its result: the raise side effect is
-        // observable, so the real path does NOT drop it either.
+
+    let mut next_node = 0usize;
+    let mut input_nodes: HashMap<(BlockId, usize), usize> = HashMap::new();
+    let mut entry_defs: HashMap<BlockId, HashMap<Variable, usize>> = HashMap::new();
+    for block in graph
+        .blocks
+        .iter()
+        .filter(|block| reachable.contains(&block.id) && !block.dead)
+    {
+        let mut defs = HashMap::new();
+        for (column, var) in block.inputargs.iter().enumerate() {
+            let node = next_node;
+            next_node += 1;
+            input_nodes.insert((block.id, column), node);
+            // remove_identical_vars_SSA runs before the dead-var pass; keeping
+            // the first identity-equivalent column models its representative.
+            defs.entry(var.clone()).or_insert(node);
+        }
+        entry_defs.insert(block.id, defs);
+    }
+
+    let mut dependencies: HashMap<usize, HashSet<usize>> = HashMap::new();
+    let mut read_nodes = HashSet::new();
+    let mut exit_defs: HashMap<BlockId, HashMap<Variable, usize>> = HashMap::new();
+    let mut removable_results: HashMap<Variable, Vec<usize>> = HashMap::new();
+
+    for block in graph
+        .blocks
+        .iter()
+        .filter(|block| reachable.contains(&block.id) && !block.dead)
+    {
+        let mut defs = entry_defs.get(&block.id).cloned().unwrap_or_default();
+        if block.id == graph.startblock
+            || block.id == graph.returnblock
+            || block.id == graph.exceptblock
+        {
+            read_nodes.extend(defs.values().copied());
+        }
         let raising_op_idx = if block.canraise() && !block.operations.is_empty() {
             Some(block.operations.len() - 1)
         } else {
             None
         };
-        for (i, op) in block.operations.iter().enumerate() {
-            if let Some(r) = &op.result
-                && !op_read.contains(r)
-                && op_result_can_remove(&op.kind)
-                && Some(i) != raising_op_idx
-            {
-                dead.insert(r.clone());
+        for (index, op) in block.operations.iter().enumerate() {
+            let operands: Vec<usize> = crate::front::result_exc::op_operand_vars(&op.kind)
+                .into_iter()
+                .filter_map(|var| defs.get(&var).copied())
+                .collect();
+            let removable = op_result_can_remove(&op.kind) && Some(index) != raising_op_idx;
+            if !removable {
+                read_nodes.extend(operands.iter().copied());
+            }
+            if let Some(result) = &op.result {
+                let node = next_node;
+                next_node += 1;
+                if removable {
+                    dependencies
+                        .entry(node)
+                        .or_default()
+                        .extend(operands.iter().copied());
+                    removable_results
+                        .entry(result.clone())
+                        .or_default()
+                        .push(node);
+                }
+                defs.insert(result.clone(), node);
+            }
+        }
+        match &block.exitswitch {
+            Some(ExitSwitch::Value(var)) => {
+                if let Some(node) = defs.get(var) {
+                    read_nodes.insert(*node);
+                }
+            }
+            Some(ExitSwitch::Fused { args, .. }) => {
+                for var in args {
+                    if let Some(node) = defs.get(var) {
+                        read_nodes.insert(*node);
+                    }
+                }
+            }
+            Some(ExitSwitch::LastException) | None => {}
+        }
+        exit_defs.insert(block.id, defs);
+    }
+
+    // simplify.py:461-469: target inputargs depend on corresponding source
+    // link args. Backward liveness through this relation keeps a producer iff
+    // some live successor column ultimately consumes it.
+    for block in graph
+        .blocks
+        .iter()
+        .filter(|block| reachable.contains(&block.id) && !block.dead)
+    {
+        let Some(source_defs) = exit_defs.get(&block.id) else {
+            continue;
+        };
+        for link in &block.exits {
+            for (column, arg) in link.args.iter().enumerate() {
+                let LinkArg::Value(source_var) = arg else {
+                    continue;
+                };
+                let Some(source_node) = source_defs.get(source_var).copied() else {
+                    continue;
+                };
+                if let Some(target_node) = input_nodes.get(&(link.target, column)).copied() {
+                    dependencies
+                        .entry(target_node)
+                        .or_default()
+                        .insert(source_node);
+                } else {
+                    // Link leaves the analyzed closure: upstream marks both
+                    // ends read rather than pruning an externally-used value.
+                    read_nodes.insert(source_node);
+                }
             }
         }
     }
-    dead
+
+    let mut work: Vec<usize> = read_nodes.iter().copied().collect();
+    while let Some(node) = work.pop() {
+        if let Some(previous) = dependencies.get(&node) {
+            for &dependency in previous {
+                if read_nodes.insert(dependency) {
+                    work.push(dependency);
+                }
+            }
+        }
+    }
+
+    removable_results
+        .into_iter()
+        .filter_map(|(var, nodes)| {
+            nodes
+                .iter()
+                .all(|node| !read_nodes.contains(node))
+                .then_some(var)
+        })
+        .collect()
 }
 
 /// Results of a synthetic `FieldRead("__discriminant")` that feed a block
@@ -1021,6 +1301,14 @@ fn collect_divergences(
         // coloring consistent, and the crash does not recur.
         let real_refines_gcref_to_signed =
             legacy_kind == ConcreteType::GcRef && real_kind == ConcreteType::Signed;
+        // Same conservative-legacy refinement for a genuine floating-point
+        // value. `long_pow`'s negative-exponent arm extracts `f64` payloads
+        // from generic Result shells; Charon's erased legacy walk falls back
+        // Unknown→GcRef while the annotator/rtyper positively assigns Float.
+        // Like the Signed case, publish commits the real kind before
+        // jtransform partitions registers, so the float bank is authoritative.
+        let real_refines_gcref_to_float =
+            legacy_kind == ConcreteType::GcRef && real_kind == ConcreteType::Float;
         // A duplicate phi inputarg the real path's `remove_duplicate_inputargs`
         // merged away is untyped in the real graph (its column no longer
         // exists) while the legacy walker types the retained identity.  The
@@ -1068,6 +1356,7 @@ fn collect_divergences(
             real_present.is_none() && repack_payload_reads.contains(var);
         let diverges = if real_refines_gcref_to_void
             || real_refines_gcref_to_signed
+            || real_refines_gcref_to_float
             || real_dropped_duplicate_inputarg
             || real_dropped_dead_op_result
             || real_rebuilt_switch_discriminant
@@ -2370,7 +2659,7 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     legacy: &LegacyGraph,
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
 ) -> Result<(LegacyToTyped, HashMap<Variable, LowLevelType>), TyperError> {
-    let (_graph, value_to_var, constant_concretetypes) =
+    let (_graph, value_to_var, _value_to_var_candidates, constant_concretetypes) =
         drive_subject(legacy, call_registry, true)?;
     Ok((value_to_var, constant_concretetypes))
 }
@@ -2397,6 +2686,7 @@ fn drive_subject(
     (
         crate::flowspace::model::GraphRef,
         LegacyToTyped,
+        LegacyToTypedCandidates,
         HashMap<Variable, LowLevelType>,
     ),
     TyperError,
@@ -2417,7 +2707,8 @@ fn drive_subject(
     // ── Step 1 — adapter ─────────────────────────────────────────────
     let FlowspaceAdapterOutput {
         graph,
-        value_to_var,
+        mut value_to_var,
+        value_to_var_candidates,
         constant_concretetypes,
         ..
     } = crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace(
@@ -2659,7 +2950,15 @@ fn drive_subject(
         crate::codewriter::jtransform_shadow::report_if_enabled(&graph.borrow());
     }
 
-    Ok((graph, value_to_var, constant_concretetypes))
+    if do_rtype {
+        select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates)?;
+    }
+    Ok((
+        graph,
+        value_to_var,
+        value_to_var_candidates,
+        constant_concretetypes,
+    ))
 }
 
 /// Whole-program two-phase rtyper prepass (`PYRE_TWO_PHASE_RTYPE`).
@@ -2882,21 +3181,19 @@ fn run_two_phase_prepass_inner(
         let Some(legacy) = function_graphs.get(path) else {
             continue;
         };
-        let fixed_at_entry: HashSet<crate::flowspace::model::GraphKey> = call_registry
-            .session_if_started()
-            .map(|(ann, _)| ann.fixed_graphs.borrow().keys().cloned().collect())
-            .unwrap_or_default();
+        let session_at_entry = SubjectSessionSnapshot::capture(call_registry);
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drive_subject(legacy, call_registry, /* do_rtype = */ false)
         }));
         match attempt {
-            Ok(Ok((graph, value_to_var, constant_concretetypes))) => {
+            Ok(Ok((graph, value_to_var, value_to_var_candidates, constant_concretetypes))) => {
                 let key = path.canonical_key();
                 call_registry.two_phase().subjects.insert(
                     key,
                     crate::translator::rtyper::pyre_call_registry::TwoPhaseSubject {
                         graph_key: crate::flowspace::model::GraphKey::of(&graph),
                         value_to_var,
+                        value_to_var_candidates,
                         constant_concretetypes,
                     },
                 );
@@ -2929,7 +3226,7 @@ fn run_two_phase_prepass_inner(
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     unpoison_failed_subject_callees(
                         call_registry,
-                        &fixed_at_entry,
+                        &session_at_entry,
                         function_graphs,
                     );
                 }));
@@ -3122,8 +3419,7 @@ fn run_phase_b_rtype_isolated(
                     continue;
                 }
             }
-            let fixed_at_entry: HashSet<GraphKey> =
-                annotator.fixed_graphs.borrow().keys().cloned().collect();
+            let session_at_entry = SubjectSessionSnapshot::capture_fixed_only(call_registry);
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 rtyper.specialize_block(&block)
             }));
@@ -3151,6 +3447,21 @@ fn run_phase_b_rtype_isolated(
                             "[PREPASS phaseB fail] {:?} {gname}: {reason}",
                             gopt.as_ref().map(GraphKey::of)
                         );
+                        // A panic from `bindingrepr` carries only the
+                        // unbound Variable identity, unlike ordinary
+                        // `TyperError::where_info`, which includes the
+                        // current operation.  Emit this block's shallow
+                        // contents in the explicitly verbose census so the
+                        // producer/consumer edge can be located without a
+                        // second instrumented build.
+                        let failed_block = block.borrow();
+                        eprintln!(
+                            "[PREPASS phaseB block] {gname}: inputargs={:?} exitswitch={:?}",
+                            failed_block.inputargs, failed_block.exitswitch
+                        );
+                        for op in &failed_block.operations {
+                            eprintln!("[PREPASS phaseB op] {gname}: {op:?}");
+                        }
                         phase_b_reasons.push(reason);
                     }
                     match &gopt {
@@ -3174,7 +3485,7 @@ fn run_phase_b_rtype_isolated(
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         unpoison_failed_subject_callees(
                             call_registry,
-                            &fixed_at_entry,
+                            &session_at_entry,
                             lift_sources,
                         );
                     }));
@@ -3269,16 +3580,19 @@ pub(crate) fn dual_gate_outcome_from_cache(
         match tp.subjects.get(diag_key) {
             Some(subj) if !tp.rtype_skipped.contains(&subj.graph_key) => Some((
                 subj.value_to_var.clone(),
+                subj.value_to_var_candidates.clone(),
                 subj.constant_concretetypes.clone(),
             )),
             _ => None,
         }
     };
-    let Some((value_to_var, constants)) = cached else {
+    let Some((mut value_to_var, value_to_var_candidates, constants)) = cached else {
         return Ok(DualGateOutcome::Skip(
             "two-phase: subject not annotated/rtyped in prepass".to_string(),
         ));
     };
+    select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates)
+        .map_err(|e| e.to_string())?;
 
     // Validate the cached lltypes project to concrete kinds (the Step-4 check
     // deferred from `drive_subject`, which did not rtype in Phase A).
@@ -3719,10 +4033,13 @@ mod tests {
         collect_divergences(&real_state, &graph)
     }
 
-    /// Build start → mid → return where `mid` defines an `ArrayRead` result
-    /// (`vars[2]`) that no op or exitswitch reads — it is only forwarded on
-    /// the link into the returnblock (a dead phi-thread).  `dead_op_result_vars`
-    /// classifies it; the real path leaves it untyped (`real=None`).
+    /// Build start → mid → sink → return where `mid` defines an `ArrayRead`
+    /// result (`vars[2]`) that no op or exitswitch reads — it is only
+    /// forwarded into an unused `sink` inputarg (a dead phi-thread).
+    /// `dead_op_result_vars` classifies it; the real path leaves it untyped
+    /// (`real=None`). The returnblock itself has no such input: upstream
+    /// `transform_dead_op_vars` treats return/except inputargs as implicit
+    /// reads because they are observable function results.
     fn diff_dead_op_result(legacy_kind: ConcreteType) -> Vec<String> {
         let mut graph = LegacyGraph::new("diff_dead_op_result");
         let vars = mint_vars(&mut graph, 3);
@@ -3730,6 +4047,7 @@ mod tests {
         let index = vars[1].clone();
         let dead = vars[2].clone();
         let mid_id = crate::model::BlockId(7);
+        let sink_id = crate::model::BlockId(8);
         let startblock = Block {
             id: graph.startblock,
             inputargs: block_inputargs(&vars, &[0, 1]),
@@ -3760,23 +4078,33 @@ mod tests {
                 },
             }],
             exitswitch: None,
-            exits: vec![link_to_returnblock(
+            exits: vec![crate::model::Link::new_mixed(
                 vec![LinkArg::Value(dead.clone())],
-                graph.returnblock,
+                sink_id,
+                None,
             )],
+            framestate: None,
+            dead: false,
+        };
+        let sinkblock = Block {
+            id: sink_id,
+            inputargs: block_inputargs(&vars, &[2]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(vec![], graph.returnblock)],
             framestate: None,
             dead: false,
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: block_inputargs(&vars, &[2]),
+            inputargs: vec![],
             operations: vec![],
             exitswitch: None,
             exits: vec![],
             framestate: None,
             dead: false,
         };
-        graph.blocks = vec![startblock, midblock, returnblock];
+        graph.blocks = vec![startblock, midblock, sinkblock, returnblock];
         crate::model::FunctionGraph::set_concretetype_of_inline(&dead, legacy_kind);
         // Real path dropped the dead op result → `dead` untyped.
         let real_state = HashMap::new();
@@ -3795,6 +4123,7 @@ mod tests {
         let index = vars[1].clone();
         let dead = vars[2].clone();
         let mid_id = crate::model::BlockId(7);
+        let sink_id = crate::model::BlockId(8);
         let startblock = Block {
             id: graph.startblock,
             inputargs: block_inputargs(&vars, &[0, 1]),
@@ -3822,23 +4151,33 @@ mod tests {
                 },
             }],
             exitswitch: None,
-            exits: vec![link_to_returnblock(
+            exits: vec![crate::model::Link::new_mixed(
                 vec![LinkArg::Value(dead.clone())],
-                graph.returnblock,
+                sink_id,
+                None,
             )],
+            framestate: None,
+            dead: false,
+        };
+        let sinkblock = Block {
+            id: sink_id,
+            inputargs: block_inputargs(&vars, &[2]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(vec![], graph.returnblock)],
             framestate: None,
             dead: false,
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: block_inputargs(&vars, &[2]),
+            inputargs: vec![],
             operations: vec![],
             exitswitch: None,
             exits: vec![],
             framestate: None,
             dead: false,
         };
-        graph.blocks = vec![startblock, midblock, returnblock];
+        graph.blocks = vec![startblock, midblock, sinkblock, returnblock];
         crate::model::FunctionGraph::set_concretetype_of_inline(&dead, legacy_kind);
         let real_state = HashMap::new();
         collect_divergences(&real_state, &graph)
@@ -4199,6 +4538,87 @@ mod tests {
     }
 
     #[test]
+    fn dead_op_result_vars_propagates_liveness_through_block_local_phi_nodes() {
+        let build = |consume_in_successor: bool| {
+            let mut graph = LegacyGraph::new("phi_liveness_probe");
+            let vars = mint_vars(&mut graph, 4);
+            let input = vars[0].clone();
+            let threaded = vars[1].clone();
+            let call_result = vars[2].clone();
+            let middle_id = BlockId(7);
+            let producer = crate::model::SpaceOperation {
+                result: Some(threaded.clone()),
+                kind: crate::model::OpKind::BinOp {
+                    op: "eq".to_string(),
+                    lhs: input.clone(),
+                    rhs: input.clone(),
+                    result_ty: ValueType::Int,
+                },
+            };
+            let start = Block {
+                id: graph.startblock,
+                inputargs: vec![input],
+                operations: vec![producer],
+                exitswitch: None,
+                exits: vec![crate::model::Link::new_mixed(
+                    vec![LinkArg::Value(threaded.clone())],
+                    middle_id,
+                    None,
+                )],
+                framestate: None,
+                dead: false,
+            };
+            let operations = if consume_in_successor {
+                vec![crate::model::SpaceOperation {
+                    result: Some(call_result),
+                    kind: crate::model::OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath {
+                            segments: vec!["consume".into()],
+                        },
+                        args: vec![threaded.clone()],
+                        result_ty: ValueType::Int,
+                    },
+                }]
+            } else {
+                vec![]
+            };
+            let middle = Block {
+                id: middle_id,
+                // Deliberately reuse the legacy identity. The adapter turns
+                // this into a distinct orthodox flowspace input Variable.
+                inputargs: vec![threaded.clone()],
+                operations,
+                exitswitch: None,
+                exits: vec![link_to_returnblock(vec![], graph.returnblock)],
+                framestate: None,
+                dead: false,
+            };
+            let returnblock = Block {
+                id: graph.returnblock,
+                inputargs: vec![],
+                operations: vec![],
+                exitswitch: None,
+                exits: vec![],
+                framestate: None,
+                dead: false,
+            };
+            graph.blocks = vec![start, middle, returnblock];
+            (graph, threaded)
+        };
+
+        let (dead_graph, dead) = build(false);
+        assert!(
+            dead_op_result_vars(&dead_graph).contains(&dead),
+            "a pure producer forwarded only into an unused phi column is dead"
+        );
+        let (live_graph, live) = build(true);
+        assert!(
+            !dead_op_result_vars(&live_graph).contains(&live),
+            "successor consumption must flow backward across the link and keep the producer live"
+        );
+    }
+
+    #[test]
     fn collect_divergences_accepts_gcref_duplicate_inputarg_dropped() {
         // A `legacy=GcRef` duplicate phi inputarg the real path's
         // `remove_duplicate_inputargs` merged away reads `real=Unknown`, but
@@ -4248,6 +4668,32 @@ mod tests {
         assert!(
             diff_single_var(ConcreteType::GcRef, ConcreteType::Signed).is_empty(),
             "legacy=GcRef, real=Signed is an accepted real refinement"
+        );
+    }
+
+    #[test]
+    fn collect_divergences_accepts_gcref_refined_to_float() {
+        assert!(
+            diff_single_var(ConcreteType::GcRef, ConcreteType::Float).is_empty(),
+            "legacy=GcRef, real=Float is an accepted real refinement"
+        );
+    }
+
+    #[test]
+    fn select_rtyped_representatives_uses_live_block_local_peer() {
+        let legacy = Variable::named("legacy");
+        let removed_producer = Variable::named("producer");
+        let live_phi = Variable::named("phi");
+        live_phi.set_concretetype(Some(LowLevelType::Signed));
+        let mut preferred = HashMap::from([(legacy.clone(), removed_producer.clone())]);
+        let candidates =
+            HashMap::from([(legacy.clone(), vec![removed_producer, live_phi.clone()])]);
+
+        select_rtyped_representatives(&mut preferred, &candidates)
+            .expect("same legacy value's live peer must reconcile");
+        assert_eq!(
+            preferred[&legacy], live_phi,
+            "projection must point at the positively-rtyped block-local representative"
         );
     }
 
@@ -4570,6 +5016,130 @@ mod tests {
              translator.graphs instead of falling to top_result()"
         );
     }
+
+    #[test]
+    fn failed_subject_restores_previously_annotated_callee_that_lost_bindings() {
+        let _lock = anchor_lock();
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::codewriter::call::GraphStore;
+        use crate::flowspace::model::{BlockKey, GraphKey};
+        use crate::parse::CallPath;
+        use crate::translator::rtyper::pyre_call_registry::{FunctionPathKey, PyreCallRegistry};
+
+        let mut source = LegacyGraph::new("shared_int_value");
+        let vars = mint_vars(&mut source, 2);
+        let value = vars[1].clone();
+        source.blocks = vec![
+            Block {
+                id: source.startblock,
+                inputargs: block_inputargs(&vars, &[1]),
+                operations: vec![],
+                exitswitch: None,
+                exits: vec![link_to_returnblock(
+                    vec![LinkArg::Value(value.clone())],
+                    source.returnblock,
+                )],
+                framestate: None,
+                dead: false,
+            },
+            Block {
+                id: source.returnblock,
+                inputargs: block_inputargs(&vars, &[1]),
+                operations: vec![],
+                exitswitch: None,
+                exits: vec![],
+                framestate: None,
+                dead: false,
+            },
+        ];
+        setbinding(&value, ValueType::Int);
+
+        let registry = PyreCallRegistry::new(Rc::new(Bookkeeper::new()));
+        // `mint_vars` allocates unnamed value vars, so the startblock's single
+        // inputarg has no source name and takes the positional `arg0`.
+        let signature =
+            crate::flowspace::argument::Signature::new(vec!["arg0".to_string()], None, None);
+        let lifted = lift_callee_to_pygraph(&source, signature.clone(), &registry)
+            .expect("shared callee must lift");
+        let stale = lifted.graph.clone();
+        let entry_key = FunctionPathKey::from_segments(["shared_int_value"]);
+        registry.register_callee(entry_key.clone(), signature, lifted);
+        let (annotator, _) = registry.ensure_session().expect("session must initialize");
+        let stale_blocks = stale.borrow().iterblocks();
+        for block in &stale_blocks {
+            let bkey = BlockKey::of(block);
+            annotator
+                .annotated
+                .borrow_mut()
+                .insert(bkey.clone(), Some(stale.clone()));
+            annotator
+                .all_blocks
+                .borrow_mut()
+                .insert(bkey, block.clone());
+        }
+        let snapshot = SubjectSessionSnapshot::capture(&registry);
+
+        // Model raise_if_subject_blocked's destructive reflow rollback:
+        // one block that was healthy at subject entry is removed and all
+        // definitions lose their annotations. No graph became fixed, so
+        // the old fixed-only repair could not see this damage.
+        let damaged = stale_blocks
+            .first()
+            .expect("identity graph has a start block")
+            .clone();
+        let damaged_key = BlockKey::of(&damaged);
+        annotator.annotated.borrow_mut().shift_remove(&damaged_key);
+        annotator.all_blocks.borrow_mut().shift_remove(&damaged_key);
+        {
+            let block = damaged.borrow();
+            for value in block
+                .inputargs
+                .iter()
+                .chain(block.operations.iter().map(|op| &op.result))
+            {
+                if let Hlvalue::Variable(var) = value {
+                    *var.annotation.borrow_mut() = None;
+                }
+            }
+        }
+
+        let mut sources = GraphStore::default();
+        sources.insert(CallPath::from_segments(["shared_int_value"]), source);
+        unpoison_failed_subject_callees(&registry, &snapshot, &sources);
+
+        assert!(
+            registry.find_entry_with_cached_graph(&stale).is_some(),
+            "an annotation-only rollback must retain the original FunctionDesc.cache graph"
+        );
+        assert!(
+            stale_blocks.iter().all(|block| {
+                let bkey = BlockKey::of(block);
+                matches!(
+                    annotator.annotated.borrow().get(&bkey),
+                    Some(Some(graph)) if Rc::ptr_eq(graph, &stale)
+                ) && matches!(
+                    annotator.all_blocks.borrow().get(&bkey),
+                    Some(current) if Rc::ptr_eq(current, block)
+                )
+            }),
+            "all pre-existing annotator rows must be restored"
+        );
+        assert!(
+            damaged.borrow().inputargs.iter().all(|value| match value {
+                Hlvalue::Variable(var) => var.annotation.borrow().is_some(),
+                _ => true,
+            }),
+            "the pre-subject Variable annotations must be restored"
+        );
+        assert!(
+            !annotator
+                .blocked_graphs
+                .borrow()
+                .contains_key(&GraphKey::of(&stale)),
+            "discarded graph must not remain in blocked_graphs"
+        );
+    }
+
     // There is no program-wide annotator pre-pass to test: per-session
     // annotator construction inside
     // `specialize_legacy_graph_with_registry_returning_value_to_var`

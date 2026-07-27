@@ -18,7 +18,7 @@ use super::cdata;
 use super::stginfo::{self, StgInfoData};
 use super::type_ns_store;
 use pyre_object::PyObjectRef;
-use pyre_object::rbigint::{RBigInt as BigInt, RBigIntSign};
+use pyre_object::rbigint::RBigInt as BigInt;
 use rustpython_host_env::ctypes as host_ctypes;
 use std::sync::OnceLock;
 
@@ -977,7 +977,7 @@ fn meta_mul(args: &[PyObjectRef]) -> PyResult {
     }
     if unsafe { pyre_object::is_long(count) } {
         let big = unsafe { pyre_object::longobject::w_long_get_value(count) };
-        if big.sign() == RBigIntSign::Minus {
+        if big.get_sign() < 0 {
             return Err(crate::PyError::value_error(
                 "array length must not be negative",
             ));
@@ -1622,7 +1622,7 @@ fn array_init_stginfo(cls: PyObjectRef) -> PyResult {
             }
             let n = if unsafe { pyre_object::is_long(v) } {
                 let big = unsafe { pyre_object::longobject::w_long_get_value(v) };
-                if big.sign() == RBigIntSign::Minus {
+                if big.get_sign() < 0 {
                     return Err(crate::PyError::value_error(
                         "The '_length_' attribute must not be negative",
                     ));

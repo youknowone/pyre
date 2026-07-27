@@ -106,6 +106,7 @@ pub(crate) fn bigint_unop_residual_path(segments: &[String]) -> Option<Vec<Strin
 pub(crate) fn bigint_unop_residual_for_method(leaf: &str) -> Option<Vec<String>> {
     let residual_leaf = match leaf {
         "neg" => "jit_bigint_neg",
+        "invert" | "not" => "jit_bigint_invert",
         _ => return None,
     };
     Some(residual_path(residual_leaf))
@@ -207,10 +208,18 @@ mod tests {
     }
 
     #[test]
-    fn maps_unary_neg_to_its_residual() {
+    fn maps_unary_operations_to_their_residuals() {
         let path = bigint_unop_residual_path(&segs(&["pyre_object", "rbigint", "<Impl>", "neg"]))
             .expect("neg must map");
         assert_eq!(path, desc("jit_bigint_neg"));
+        assert_eq!(
+            bigint_unop_residual_path(&segs(&["rbigint", "RBigInt", "invert"])),
+            Some(desc("jit_bigint_invert"))
+        );
+        assert_eq!(
+            bigint_unop_residual_path(&segs(&["pyre_object", "rbigint", "<Impl>", "not"])),
+            Some(desc("jit_bigint_invert"))
+        );
         // Binary operators / shifts are not in the unary map.
         assert!(
             bigint_unop_residual_path(&segs(&["pyre_object", "rbigint", "<Impl>", "add"]))

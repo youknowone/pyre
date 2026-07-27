@@ -153,6 +153,30 @@ constants_code = constants_sample.__code__
 assert constants_code.replace(co_consts=constants_code.co_consts) == constants_code
 
 
+def huge_constant():
+    return 123456789012345678901234567890123456789012345678901234567890
+
+
+huge_code = huge_constant.__code__
+huge_index = next(
+    index
+    for index, value in enumerate(huge_code.co_consts)
+    if isinstance(value, int) and value.bit_length() > 63
+)
+wrapped_huge = huge_code.co_consts[huge_index]
+assert huge_constant() is wrapped_huge
+assert huge_code.replace().co_consts[huge_index] is wrapped_huge
+
+replacement_huge = int(
+    "987654321098765432109876543210987654321098765432109876543210"
+)
+replacement_consts = list(huge_code.co_consts)
+replacement_consts[huge_index] = replacement_huge
+replaced_huge_code = huge_code.replace(co_consts=tuple(replacement_consts))
+assert replaced_huge_code.co_consts[huge_index] is replacement_huge
+assert types.FunctionType(replaced_huge_code, globals())() is replacement_huge
+
+
 def outer(captured):
     def inner():
         return captured

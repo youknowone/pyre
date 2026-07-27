@@ -193,6 +193,55 @@ pub struct RBigInt {
     _size: i64,
 }
 
+/// Address-stable GC root for a host-side, by-value `RBigInt`.
+///
+/// RPython's GC transform puts an `rbigint` local's `_digits` edge in the
+/// shadow stack whenever that local is live across a call that can collect.
+/// Rust locals have no generated stack map, so interpreter-level consumers
+/// that retain an unboxed `RBigInt` across a Python callback use this exact
+/// analogue.  The `Box` is required: moving this guard must not move the slot
+/// registered with MiniMark.
+pub struct RBigIntGcRoot {
+    value: Box<RBigInt>,
+    slot: *mut *mut u8,
+    registered: bool,
+}
+
+impl RBigIntGcRoot {
+    pub fn new(value: RBigInt) -> Self {
+        let mut value = Box::new(value);
+        let slot = (&mut value._digits as *mut *mut TypedItemsBlock).cast::<*mut u8>();
+        let registered = unsafe { crate::gc_hook::try_gc_add_root(slot) };
+        Self {
+            value,
+            slot,
+            registered,
+        }
+    }
+}
+
+impl std::ops::Deref for RBigIntGcRoot {
+    type Target = RBigInt;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl std::ops::DerefMut for RBigIntGcRoot {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
+}
+
+impl Drop for RBigIntGcRoot {
+    fn drop(&mut self) {
+        if self.registered {
+            crate::gc_hook::try_gc_remove_root(self.slot);
+        }
+    }
+}
+
 /// `rpython.rlib.rstring.NumberStringParser`.
 ///
 /// This deliberately remains an iterator-like parser over the original
@@ -368,7 +417,11 @@ impl<'a> NumberStringParser<'a> {
         }
 
         debug_assert!(self.allow_underscores);
-        let mut builder = String::with_capacity((self.end - self.start) as usize);
+        let capacity = usize::try_from(self.end - self.start).map_err(|_| RBigIntError::Memory)?;
+        let mut builder = String::new();
+        builder
+            .try_reserve_exact(capacity)
+            .map_err(|_| RBigIntError::Memory)?;
         loop {
             let digit = self.next_digit()?;
             if digit < 0 {
@@ -454,7 +507,10 @@ fn prebuilt_payload_pointer(value: &RBigInt) -> Option<*mut RBigInt> {
 }
 
 #[inline]
-fn alloc_rbigint_nursery_impl(value: RBigInt, canonicalize_prebuilt: bool) -> *mut RBigInt {
+pub(crate) fn alloc_rbigint_nursery_impl(
+    value: RBigInt,
+    canonicalize_prebuilt: bool,
+) -> *mut RBigInt {
     if canonicalize_prebuilt && let Some(prebuilt) = prebuilt_payload_pointer(&value) {
         return prebuilt;
     }
@@ -618,6 +674,18 @@ pub enum RBigIntSign {
 }
 
 impl RBigInt {
+    /// Rust ownership spelling for an RPython reference assignment.
+    ///
+    /// The host needs a shallow value clone, but source translation aliases
+    /// this exact method's input and output so upstream fast paths that return
+    /// `self`/`other` do not allocate a new GC payload. Do not use this for
+    /// `rbigint.neg`, which deliberately constructs a fresh handle.
+    #[doc(hidden)]
+    #[inline]
+    pub fn translated_alias(&self) -> Self {
+        self.clone()
+    }
+
     #[inline]
     fn prebuilt(slot: &'static std::sync::OnceLock<usize>, digit: Digit, sign: i64) -> Self {
         let raw = *slot.get_or_init(|| {
@@ -631,10 +699,10 @@ impl RBigInt {
             };
             Box::into_raw(Box::new(value)) as usize
         }) as *const Self;
-        // RPython assignment shares the immutable prebuilt rbigint.  A Rust
-        // RBigInt value is the translated handle, so its shallow clone carries
-        // the same `_digits` GC reference without exposing object identity.
-        unsafe { (&*raw).clone() }
+        // RPython assignment returns the process-global rbigint itself. The
+        // host needs a shallow owned handle; source translation aliases the
+        // exact immortal payload address instead of allocating a clone.
+        unsafe { (&*raw).translated_alias() }
     }
 
     #[inline]
@@ -674,6 +742,38 @@ impl RBigInt {
             _digits: block,
             _size: logical_len * sign,
         }
+    }
+
+    /// Fallible form of [`RBigInt::new`] for upstream paths whose translated
+    /// allocation has an explicit MemoryError edge.
+    fn try_new(digits: &[Digit], sign: i64, size: i64) -> Result<Self, RBigIntError> {
+        debug_assert!(size >= 0);
+        let logical_len = if size == 0 {
+            i64::try_from(digits.len()).map_err(|_| RBigIntError::Memory)?
+        } else {
+            size
+        };
+        let allocation_size = digits.len().max(1);
+        let block = unsafe {
+            try_alloc_typed_items_block_nursery(allocation_size, GC_INT_ARRAY_GC_TYPE_ID)
+        }
+        .ok_or(RBigIntError::Memory)?;
+        unsafe {
+            let base = typed_items_block_items_base(block) as *mut Digit;
+            if digits.is_empty() {
+                *base = NULLDIGIT;
+            } else {
+                let mut i = 0;
+                while i < digits.len() {
+                    *base.add(i) = digits[i];
+                    i += 1;
+                }
+            }
+        }
+        Ok(Self {
+            _digits: block,
+            _size: logical_len.checked_mul(sign).ok_or(RBigIntError::Memory)?,
+        })
     }
 
     /// Allocate the translated equivalent of `[NULLDIGIT] * size`.
@@ -975,8 +1075,14 @@ impl RBigInt {
         // `len(s) * 8 // LONG_BIT + 1`) and then passes `digits[:]` to the
         // rbigint constructor.  Reserve enough fixed-width slots for that
         // append phase here; below we make the same exact-length final copy.
-        let max_digits = (bytes.len() as i64 * 8 + SHIFT - 1) / SHIFT;
-        let mut result = Self::with_size(max_digits, sign);
+        let max_digits = bytes
+            .len()
+            .checked_mul(8)
+            .and_then(|value| value.checked_add(SHIFT as usize - 1))
+            .map(|value| value / SHIFT as usize)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or(RBigIntError::Memory)?;
+        let mut result = Self::try_with_size(max_digits, sign)?;
         let mut accum = 0_u128;
         let mut accumbits = 0_i64;
         let mut out = 0;
@@ -1012,7 +1118,7 @@ impl RBigInt {
         // `digits[:]` in rbigint.py:386 discards the temporary list's spare
         // capacity.  Keeping `max_digits` as the final GcArray capacity makes
         // the translated storage shape depend on a reservation detail.
-        result = Self::new(&result.digits()[..out as usize], sign, out);
+        result = Self::try_new(&result.digits()[..out as usize], sign, out)?;
         result._normalize();
         Ok(result)
     }
@@ -1035,7 +1141,14 @@ impl RBigInt {
         let imax = self.numdigits();
         let mut accum = 0_i128;
         let mut accumbits = 0_i64;
-        let mut result = Vec::with_capacity(nbytes as usize);
+        // StringBuilder(nbytes) in rbigint.py carries the translated
+        // gc_malloc/MemoryError edge.  Preserve it explicitly instead of
+        // truncating i64 to usize on wasm32 or panicking on capacity overflow.
+        let capacity = usize::try_from(nbytes).map_err(|_| RBigIntError::Memory)?;
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(capacity)
+            .map_err(|_| RBigIntError::Memory)?;
         let mut carry = 1_i128;
         let mut i = 0;
         while i < imax {
@@ -1365,10 +1478,10 @@ impl RBigInt {
         let selfsign = self.get_sign();
         let othersign = other.get_sign();
         if selfsign == 0 {
-            return other.clone();
+            return other.translated_alias();
         }
         if othersign == 0 {
-            return self.clone();
+            return self.translated_alias();
         }
         let mut result = if selfsign == othersign {
             _x_add(self, other)
@@ -1386,7 +1499,7 @@ impl RBigInt {
             return Self::fromint(iother);
         }
         if iother == 0 {
-            return self.clone();
+            return self.translated_alias();
         }
         if !int_in_valid_range(iother) {
             return self.add(&Self::fromint(iother));
@@ -1453,7 +1566,7 @@ impl RBigInt {
         let selfsign = self.get_sign();
         let othersign = other.get_sign();
         if othersign == 0 {
-            return self.clone();
+            return self.translated_alias();
         }
         if selfsign == 0 {
             return Self::new(
@@ -1478,7 +1591,7 @@ impl RBigInt {
             return self.sub(&Self::fromint(iother));
         }
         if iother == 0 {
-            return self.clone();
+            return self.translated_alias();
         }
         if selfsign == 0 {
             return Self::fromint(-iother);
@@ -1577,7 +1690,7 @@ impl RBigInt {
         let othersign = intsign(iother);
         if digit == 1 {
             if othersign == 1 {
-                return self.clone();
+                return self.translated_alias();
             }
             return Self::new(
                 &self.digits()[..asize as usize],
@@ -1670,7 +1783,7 @@ impl RBigInt {
         let selfsign = self.get_sign();
         if selfsign == 1 && iother > 0 {
             if digit == 1 {
-                return Ok(self.clone());
+                return Ok(self.translated_alias());
             } else if digit & (digit - 1) == 0 {
                 return Ok(self.rqshift(PTWOTABLE[digit.trailing_zeros() as usize]));
             }
@@ -1894,7 +2007,7 @@ impl RBigInt {
         if modulus.is_none() && size_b == 1 {
             let digit = other.digit(0);
             if digit == ONEDIGIT {
-                return Ok(base.clone());
+                return Ok(base.translated_alias());
             } else if base.numdigits() == 1 {
                 let adigit = base.udigit(0);
                 if adigit == 1 {
@@ -2014,7 +2127,7 @@ impl RBigInt {
         } else if selfsign == 0 {
             return Ok(Self::zero());
         } else if iother == 1 {
-            return Ok(self.clone());
+            return Ok(self.translated_alias());
         } else if self.numdigits() == 1 {
             let adigit = self.udigit(0);
             if adigit == 1 {
@@ -2077,7 +2190,7 @@ impl RBigInt {
     #[majit_macros::jit_elidable]
     pub fn abs(&self) -> Self {
         if self.get_sign() != -1 {
-            self.clone()
+            self.translated_alias()
         } else {
             self.neg()
         }
@@ -2101,7 +2214,7 @@ impl RBigInt {
         if int_other < 0 {
             return Err(RBigIntError::NegativeShift);
         } else if int_other == 0 || selfsign == 0 {
-            return Ok(self.clone());
+            return Ok(self.translated_alias());
         }
         let mut wordshift = int_other / SHIFT as i64;
         let remshift = int_other % SHIFT;
@@ -2213,7 +2326,7 @@ impl RBigInt {
         if int_other < 0 {
             return Err(RBigIntError::NegativeShift);
         } else if int_other == 0 {
-            return Ok(self.clone());
+            return Ok(self.translated_alias());
         }
         let selfsign = self.get_sign();
         if selfsign == -1 && !dont_invert {
@@ -3639,7 +3752,10 @@ pub(crate) fn _x_divrem(v1: &RBigInt, w1: &RBigInt) -> (RBigInt, RBigInt) {
         let carry = _v_rshift(&mut w, &v, size_w, d);
         debug_assert_eq!(carry, 0);
         w._normalize();
-        return (RBigInt::zero(), w);
+        // rbigint.py:2322 deliberately does not return NULLRBIGINT here:
+        // callers of this internal division helper may modify the result.
+        // Keep both the rbigint value and its digit array fresh.
+        return (RBigInt::new(&[NULLDIGIT], 0, 0), w);
     }
     let mut a = RBigInt::with_size(k, 1);
     let wm1 = w.widedigit(size_w - 1);
@@ -3700,7 +3816,7 @@ pub fn _divrem(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBigIntEr
         return Err(RBigIntError::DivisionByZero);
     }
     if size_a < size_b || (size_a == size_b && a.digit(size_a - 1) < b.digit(size_b - 1)) {
-        return Ok((RBigInt::zero(), a.clone()));
+        return Ok((RBigInt::zero(), a.translated_alias()));
     }
     let (mut z, mut rem) = if size_b == 1 {
         let (z, urem) = _divrem1(a, b.digit(0));
@@ -3767,7 +3883,7 @@ fn div2n1n(
         half_n_s,
     )?;
     let (q2, r) = div3n2n(&r1, 0, a_container, a_startindex, b, &b1, &b2, half_n_s)?;
-    Ok((_full_digits_lshift_then_or(&q1, half_n_s, &q2), r))
+    Ok((_full_digits_lshift_then_or(&q1, half_n_s, &q2)?, r))
 }
 
 /// rbigint.py:2497 `div3n2n`.
@@ -3787,7 +3903,8 @@ fn div3n2n(
         r = _extract_digits(a3_container, a3_startindex, n_s);
     } else {
         let r_size = r.numdigits();
-        let mut combined = RBigInt::with_size(n_s + r_size, 1);
+        let combined_size = n_s.checked_add(r_size).ok_or(RBigIntError::Memory)?;
+        let mut combined = RBigInt::try_with_size(combined_size, 1)?;
         let stop = (a3_startindex + n_s).min(a3_container.numdigits());
         let mut source = a3_startindex;
         let mut index = 0;
@@ -3818,13 +3935,14 @@ fn div3n2n(
 }
 
 /// rbigint.py:2525 `_full_digits_lshift_then_or`.
-fn _full_digits_lshift_then_or(a: &RBigInt, n: i64, b: &RBigInt) -> RBigInt {
+fn _full_digits_lshift_then_or(a: &RBigInt, n: i64, b: &RBigInt) -> Result<RBigInt, RBigIntError> {
     if a.get_sign() == 0 {
-        return b.clone();
+        return Ok(b.translated_alias());
     }
     let bdigits = b.numdigits();
     debug_assert!(bdigits <= n);
-    let mut result = RBigInt::with_size(a.numdigits() + n, 1);
+    let result_size = a.numdigits().checked_add(n).ok_or(RBigIntError::Memory)?;
+    let mut result = RBigInt::try_with_size(result_size, 1)?;
     let mut i = 0;
     while i < bdigits {
         result.setdigit(i, b.digit(i));
@@ -3835,7 +3953,7 @@ fn _full_digits_lshift_then_or(a: &RBigInt, n: i64, b: &RBigInt) -> RBigInt {
         result.setdigit(n + i, a.digit(i));
         i += 1;
     }
-    result
+    Ok(result)
 }
 
 /// rbigint.py:2545 `_divmod_fast_pos`.
@@ -3843,7 +3961,7 @@ fn _divmod_fast_pos(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBig
     let n = b.bit_length()?;
     let m = a.bit_length()?;
     if m < n {
-        return Ok((RBigInt::zero(), a.clone()));
+        return Ok((RBigInt::zero(), a.translated_alias()));
     }
     let mut new_n = SHIFT as i64 * holder_limit(&HOLDER.DIV_LIMIT);
     while new_n < n {
@@ -3862,8 +3980,16 @@ fn _divmod_fast_pos(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBig
     };
     let n_s = new_n / SHIFT as i64;
 
-    let chunk_count = (a.numdigits() + n_s - 1) / n_s;
-    let mut a_digits_base_two_pow_n = Vec::with_capacity(chunk_count as usize);
+    let chunk_count = a
+        .numdigits()
+        .checked_add(n_s - 1)
+        .ok_or(RBigIntError::Memory)?
+        / n_s;
+    let chunk_capacity = usize::try_from(chunk_count).map_err(|_| RBigIntError::Memory)?;
+    let mut a_digits_base_two_pow_n = Vec::new();
+    a_digits_base_two_pow_n
+        .try_reserve_exact(chunk_capacity)
+        .map_err(|_| RBigIntError::Memory)?;
     let mut start = 0;
     while start < a.numdigits() {
         // rbigint.py:2570-2577 constructs these chunks directly from
@@ -3873,7 +3999,8 @@ fn _divmod_fast_pos(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBig
         // machine digits) for the recursive Burnikel-Ziegler slice offsets.
         let stop = (start + n_s).min(a.numdigits());
         let digits = &a.digits()[start as usize..stop as usize];
-        a_digits_base_two_pow_n.push(RBigInt::new(digits, 1, digits.len() as i64));
+        let digits_len = i64::try_from(digits.len()).map_err(|_| RBigIntError::Memory)?;
+        a_digits_base_two_pow_n.push(RBigInt::try_new(digits, 1, digits_len)?);
         start = stop;
     }
     let mut a_digits_index = a_digits_base_two_pow_n.len() as i64 - 1;
@@ -3882,20 +4009,25 @@ fn _divmod_fast_pos(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBig
     if a_digits_base_two_pow_n[a_digits_index as usize].ge(b) {
         r = RBigInt::zero();
     } else {
-        r = a_digits_base_two_pow_n[a_digits_index as usize].clone();
+        r = a_digits_base_two_pow_n[a_digits_index as usize].translated_alias();
         a_digits_index -= 1;
     }
 
     let mut q_digits: Option<RBigInt> = None;
     let mut q_index_start = a_digits_index * n_s;
     while a_digits_index >= 0 {
-        let arg1 =
-            _full_digits_lshift_then_or(&r, n_s, &a_digits_base_two_pow_n[a_digits_index as usize]);
+        let arg1 = _full_digits_lshift_then_or(
+            &r,
+            n_s,
+            &a_digits_base_two_pow_n[a_digits_index as usize],
+        )?;
         let (q_digit, next_r) = div2n1n(&arg1, 0, b, n_s)?;
         r = next_r;
         if q_digits.is_none() {
-            let q_size = q_index_start + q_digit.numdigits();
-            q_digits = Some(RBigInt::with_size(q_size, 1));
+            let q_size = q_index_start
+                .checked_add(q_digit.numdigits())
+                .ok_or(RBigIntError::Memory)?;
+            q_digits = Some(RBigInt::try_with_size(q_size, 1)?);
         }
         if let Some(q_digits) = &mut q_digits {
             let mut i = 0;
@@ -4025,7 +4157,7 @@ fn _AsDouble(value: &RBigInt) -> Result<f64, RBigIntError> {
         return Err(RBigIntError::Overflow);
     }
 
-    let mut result = (q as f64) * 2_f64.powi((exp - DBL_MANT_DIG) as i32);
+    let mut result = _float_ldexp(q as f64, exp - DBL_MANT_DIG);
     if sign < 0 {
         result = -result;
     }
@@ -4136,6 +4268,23 @@ fn _truediv_overflow<T>() -> Result<T, RBigIntError> {
     Err(RBigIntError::FloatDivisionOverflow)
 }
 
+/// RPython's `math.ldexp(value, exponent)` spelling used by `_AsDouble` and
+/// `_bigint_true_divide`.  Computing `value * 2.0.powi(exponent)` directly is
+/// not equivalent: for a subnormal result the power-of-two factor can become
+/// zero before it is multiplied by the exactly-representable mantissa.
+#[inline]
+fn _float_ldexp(mut value: f64, mut exponent: i64) -> f64 {
+    while exponent > 1023 {
+        value *= 2.0_f64.powi(1023);
+        exponent -= 1023;
+    }
+    while exponent < -1022 {
+        value *= 2.0_f64.powi(-1022);
+        exponent += 1022;
+    }
+    value * 2.0_f64.powi(exponent as i32)
+}
+
 /// rbigint.py:2844 `_bigint_true_divide`.
 fn _bigint_true_divide(a: &RBigInt, b: &RBigInt) -> Result<f64, RBigIntError> {
     const DBL_MANT_DIG: i64 = 53;
@@ -4220,7 +4369,7 @@ fn _bigint_true_divide(a: &RBigInt, b: &RBigInt) -> Result<f64, RBigIntError> {
     {
         return _truediv_overflow();
     }
-    Ok(_truediv_result(dx * 2_f64.powi(shift as i32), negate))
+    Ok(_truediv_result(_float_ldexp(dx, shift), negate))
 }
 
 pub const BASE8: &str = "01234567";
@@ -4234,7 +4383,7 @@ fn _format_base2_notzero(
     prefix: &str,
     suffix: &str,
     _max_str_digits: i64,
-) -> String {
+) -> Result<String, RBigIntError> {
     let digit_bytes = digits.as_bytes();
     let base = digit_bytes.len() as i64;
     let mut accum = 0_u128;
@@ -4246,11 +4395,25 @@ fn _format_base2_notzero(
         i >>= 1;
     }
     let size_a = a.numdigits();
-    let capacity =
-        (5 + prefix.len() as i64
-            + suffix.len() as i64
-            + (size_a * SHIFT as i64 + basebits as i64 - 1) / basebits as i64) as usize;
-    let mut result = vec![0_u8; capacity];
+    // rbigint.py allocates `[chr(0)] * i`; its translated allocation can
+    // raise MemoryError.  Keep that edge instead of allowing Rust sizing
+    // arithmetic to wrap or an infallible allocation to abort the process.
+    let payload_bits = size_a
+        .checked_mul(SHIFT as i64)
+        .and_then(|value| value.checked_add(basebits as i64 - 1))
+        .ok_or(RBigIntError::Memory)?;
+    let encoded_digits = payload_bits / basebits as i64;
+    let capacity = 5_i64
+        .checked_add(i64::try_from(prefix.len()).map_err(|_| RBigIntError::Memory)?)
+        .and_then(|value| value.checked_add(suffix.len() as i64))
+        .and_then(|value| value.checked_add(encoded_digits))
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(RBigIntError::Memory)?;
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(capacity)
+        .map_err(|_| RBigIntError::Memory)?;
+    result.resize(capacity, 0_u8);
     let mut next_char_index = capacity;
     let mut j = suffix.len();
     while j > 0 {
@@ -4289,8 +4452,9 @@ fn _format_base2_notzero(
         next_char_index -= 1;
         result[next_char_index] = b'-';
     }
-    String::from_utf8(result[next_char_index..].to_vec())
-        .expect("rbigint format digit alphabets are ASCII")
+    result.copy_within(next_char_index.., 0);
+    result.truncate(capacity - next_char_index);
+    Ok(String::from_utf8(result).expect("rbigint format digit alphabets are ASCII"))
 }
 
 struct PartsCacheBase {
@@ -4306,6 +4470,38 @@ struct PartsCacheBase {
     // complete list on every formatting call, and never retain this lock
     // across a bigint allocation/GC safepoint.
     parts_cache: std::sync::Mutex<std::sync::Arc<Vec<std::sync::Arc<RBigInt>>>>,
+}
+
+/// Explicit root for a cached rbigint that has been computed but is not yet
+/// reachable from the translated module-global `_parts_cache` graph.
+///
+/// RPython's GC transform roots this local automatically across publication.
+/// In pyre another mutator may collect while this thread is allocating the
+/// host-side snapshot vector, so the cached value's movable GcArray(Signed)
+/// slot must be registered until either the shared list owns it or it is
+/// discarded after losing a concurrent append race.
+struct PendingPartsCacheDigitRoot {
+    slot: *mut *mut u8,
+    registered: bool,
+}
+
+impl PendingPartsCacheDigitRoot {
+    /// `value`'s Arc allocation keeps the slot address stable for this
+    /// guard's lifetime.
+    unsafe fn new(value: &std::sync::Arc<RBigInt>) -> Self {
+        let value = std::sync::Arc::as_ptr(value) as *mut RBigInt;
+        let slot = unsafe { &mut (*value)._digits as *mut *mut TypedItemsBlock as *mut *mut u8 };
+        let registered = unsafe { crate::gc_hook::try_gc_add_root(slot) };
+        Self { slot, registered }
+    }
+}
+
+impl Drop for PendingPartsCacheDigitRoot {
+    fn drop(&mut self) {
+        if self.registered {
+            crate::gc_hook::try_gc_remove_root(self.slot);
+        }
+    }
 }
 
 impl PartsCacheBase {
@@ -4365,7 +4561,7 @@ impl PartsCacheBase {
     fn parts_snapshot(&self) -> std::sync::Arc<Vec<std::sync::Arc<RBigInt>>> {
         self.parts_cache
             .lock()
-            .expect("rbigint parts list lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
@@ -4381,7 +4577,12 @@ impl PartsCacheBase {
         // Do every bigint/GC allocation outside the list lock.  MiniMark's
         // STW root walker locks this same shared list to forward `_digits`.
         let next = std::sync::Arc::new(last.int_pow(2, None)?);
-        let mut extended = Vec::with_capacity(expected.len() + 1);
+        let _next_root = unsafe { PendingPartsCacheDigitRoot::new(&next) };
+        let extended_len = expected.len().checked_add(1).ok_or(RBigIntError::Memory)?;
+        let mut extended = Vec::new();
+        extended
+            .try_reserve_exact(extended_len)
+            .map_err(|_| RBigIntError::Memory)?;
         extended.extend(expected.iter().cloned());
         extended.push(next);
         let extended = std::sync::Arc::new(extended);
@@ -4389,7 +4590,7 @@ impl PartsCacheBase {
         let mut shared = self
             .parts_cache
             .lock()
-            .expect("rbigint parts list lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if std::sync::Arc::ptr_eq(&shared, expected) {
             *shared = extended;
         }
@@ -4434,12 +4635,12 @@ pub fn walk_rbigint_cache_digit_slots(mut visitor: impl FnMut(&mut *mut u8)) {
 
     let all = PARTS_CACHE
         .lock()
-        .expect("rbigint process-global parts cache lock poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for cache in all.iter().flatten() {
         let parts = cache
             .parts_cache
             .lock()
-            .expect("rbigint parts list lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for value in parts.iter() {
             // Every published snapshot is a monotonic extension and shares
             // these exact Arc<RBigInt> objects with older reader snapshots.
@@ -4464,7 +4665,7 @@ fn get_cached_parts(base: i64) -> PartsCacheRef {
     {
         let all = PARTS_CACHE
             .lock()
-            .expect("rbigint process-global parts cache lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(cache) = &all[index as usize] {
             return cache.clone();
         }
@@ -4473,9 +4674,17 @@ fn get_cached_parts(base: i64) -> PartsCacheRef {
     // Construct outside the owner lock: `fromint` allocates a digit array and
     // the collector walks this same process-global owner.
     let initial = std::sync::Arc::new(PartsCacheBase::new(base));
+    let initial_part = {
+        let parts = initial
+            .parts_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        parts[0].clone()
+    };
+    let _initial_root = unsafe { PendingPartsCacheDigitRoot::new(&initial_part) };
     let mut all = PARTS_CACHE
         .lock()
-        .expect("rbigint process-global parts cache lock poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     all[index as usize].get_or_insert(initial).clone()
 }
 
@@ -4715,20 +4924,26 @@ fn _format(
     max_str_digits: i64,
 ) -> Result<String, RBigIntError> {
     if x.get_sign() == 0 {
-        return Ok(format!("{prefix}0{suffix}"));
+        let capacity = prefix
+            .len()
+            .checked_add(1)
+            .and_then(|value| value.checked_add(suffix.len()))
+            .ok_or(RBigIntError::Memory)?;
+        let mut output = String::new();
+        output
+            .try_reserve_exact(capacity)
+            .map_err(|_| RBigIntError::Memory)?;
+        output.push_str(prefix);
+        output.push('0');
+        output.push_str(suffix);
+        return Ok(output);
     }
     let base = digits.len() as i64;
     if !(2..=36).contains(&base) {
         return Err(RBigIntError::InvalidBase);
     }
     if base & (base - 1) == 0 {
-        return Ok(_format_base2_notzero(
-            x,
-            digits,
-            prefix,
-            suffix,
-            max_str_digits,
-        ));
+        return _format_base2_notzero(x, digits, prefix, suffix, max_str_digits);
     }
     let negative = x.get_sign() < 0;
     let x_owned;
@@ -4758,12 +4973,20 @@ fn _format(
 
     let mut startindex = 0;
     while startindex < pts.len() as i64 && pts[startindex as usize].as_ref().lt(x) {
-        stringsize *= 2;
+        stringsize = stringsize.checked_mul(2).ok_or(RBigIntError::Memory)?;
         startindex += 1;
     }
     startindex -= 1;
-    stringsize += prefix.len() as i64 + suffix.len() as i64 + negative as i64;
-    let mut output = String::with_capacity(stringsize as usize);
+    stringsize = stringsize
+        .checked_add(i64::try_from(prefix.len()).map_err(|_| RBigIntError::Memory)?)
+        .and_then(|value| value.checked_add(suffix.len() as i64))
+        .and_then(|value| value.checked_add(negative as i64))
+        .ok_or(RBigIntError::Memory)?;
+    let capacity = usize::try_from(stringsize).map_err(|_| RBigIntError::Memory)?;
+    let mut output = String::new();
+    output
+        .try_reserve_exact(capacity)
+        .map_err(|_| RBigIntError::Memory)?;
     if negative {
         output.push('-');
     }
@@ -4779,7 +5002,7 @@ fn _format(
         let size_prefix = output.len() as i64;
         if digits == BASE10 {
             _format_recursive_decimal(
-                x.clone(),
+                x.translated_alias(),
                 startindex,
                 &mut output,
                 &pcb,
@@ -4790,7 +5013,7 @@ fn _format(
             )?;
         } else {
             _format_recursive_general(
-                x.clone(),
+                x.translated_alias(),
                 startindex,
                 &mut output,
                 &pcb,
@@ -5331,7 +5554,7 @@ impl FivePowCache {
         self.entries
             .iter()
             .find(|(candidate, _)| *candidate == key)
-            .map(|(_, value)| value.clone())
+            .map(|(_, value)| value.translated_alias())
     }
 
     fn contains(&self, key: i64) -> bool {
@@ -5365,7 +5588,7 @@ fn _str_to_int_big_w5pow(
         let larger = _str_to_int_big_w5pow(w - w2, mem, limit)?;
         smaller.mul(&larger)
     };
-    mem.insert(w, result.clone());
+    mem.insert(w, result.translated_alias());
     Ok(result)
 }
 
@@ -5616,7 +5839,14 @@ pub fn tobytes_int(
     if !signed && intval < 0 {
         return Err(RBigIntError::InvalidSignedness);
     }
-    let mut result = Vec::with_capacity(nbytes as usize);
+    // Keep the same allocation edge as rbigint.py's StringBuilder(nbytes).
+    // In particular, a signed-to-unsigned cast must not turn a negative
+    // length into an enormous allocation request.
+    let capacity = usize::try_from(nbytes).map_err(|_| RBigIntError::Memory)?;
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(capacity)
+        .map_err(|_| RBigIntError::Memory)?;
     let mut currval = intval;
     let mut byte = 0_u8;
     for _ in 0..nbytes {
@@ -5901,6 +6131,11 @@ mod tests {
         assert_eq!(
             tobytes_int(-1, 1, "big", false),
             Err(RBigIntError::InvalidSignedness)
+        );
+        assert_eq!(tobytes_int(0, -1, "big", false), Err(RBigIntError::Memory));
+        assert_eq!(
+            RBigInt::zero().tobytes(-1, "big", false),
+            Err(RBigIntError::Memory)
         );
         assert_eq!(
             frombytes_int(&[0x80, 0, 0, 0, 0, 0, 0, 0], "big", false),
@@ -6432,6 +6667,22 @@ mod tests {
         assert!(q.eq(&expected_q));
         assert!(r.eq(&expected_r));
         assert!(q.mul(&divisor).add(&r).eq(&dividend));
+    }
+
+    #[test]
+    fn test_x_divrem_zero_quotient_is_fresh() {
+        // rbigint.py:2322 cannot return NULLRBIGINT because callers may
+        // modify this internal result.  Equal-sized, two-digit operands with
+        // dividend < divisor take the otherwise uncommon k == 0 branch.
+        let dividend = RBigInt::new(&[1, 1], 1, 2);
+        let divisor = RBigInt::new(&[2, 1], 1, 2);
+        let (mut quotient, remainder) = _x_divrem(&dividend, &divisor);
+        assert_eq!(quotient.get_sign(), 0);
+        assert!(remainder.eq(&dividend));
+        assert_ne!(quotient._digits, RBigInt::zero()._digits);
+
+        quotient.setdigit(0, 1);
+        assert_eq!(RBigInt::zero().digit(0), 0);
     }
 
     #[test]
@@ -6975,6 +7226,26 @@ mod tests {
         assert_eq!(
             twice_just_below.truediv(&RBigInt::fromint(-2)).unwrap(),
             -f64::MAX
+        );
+
+        // `math.ldexp` parity at the subnormal boundary.  A direct
+        // `dx * 2.0.powi(shift)` loses these values when the scale factor
+        // underflows before multiplication.
+        let power_of_two = |exponent| RBigInt::one().lshift(exponent).unwrap();
+        assert_eq!(
+            RBigInt::one().truediv(&power_of_two(1030)).unwrap(),
+            f64::from_bits(0x0000_1000_0000_0000)
+        );
+        assert_eq!(
+            RBigInt::fromint(7).truediv(&power_of_two(1074)).unwrap(),
+            f64::from_bits(0x0000_0000_0000_0007)
+        );
+        assert_eq!(
+            power_of_two(53)
+                .int_add(1)
+                .truediv(&power_of_two(1075).int_add(7))
+                .unwrap(),
+            f64::from_bits(0x0010_0000_0000_0000)
         );
     }
 

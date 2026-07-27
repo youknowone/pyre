@@ -13,7 +13,7 @@
 // additional unsafe block adds noise without safety benefit.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use pyre_object::rbigint::{RBigInt as BigInt, RBigIntSign};
+use pyre_object::rbigint::{RBigInt as BigInt, RBigIntGcRoot};
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -1027,7 +1027,11 @@ pub(crate) fn is_true_slot(obj: PyObjectRef) -> Result<bool, PyError> {
             return Ok(w_int_get_value(obj) != 0);
         }
         if is_long(obj) {
-            return Ok(w_long_get_value(obj).clone() != BigInt::from(0));
+            // longobject.py W_LongObject.descr_bool delegates to the rbigint
+            // sign.  Cloning the Rust handle here becomes a fresh translated
+            // GC payload (`jit_bigint_clone`) and comparing against a newly
+            // materialized zero, neither of which exists in the RPython path.
+            return Ok(w_long_get_value(obj).get_sign() != 0);
         }
         if is_float(obj) {
             return Ok(w_float_get_value(obj) != 0.0);
@@ -1878,8 +1882,10 @@ unsafe fn compute_slice_indices3_big(
     let zero = BigInt::zero();
     let one = BigInt::one();
     let w_step = w_slice_get_step(slice);
-    let step = if is_none(w_step) {
-        one.clone()
+    // RPython's stack map roots each of these unboxed rbigint values while
+    // the following slice component's `space.index()` can call Python.
+    let step = RBigIntGcRoot::new(if is_none(w_step) {
+        one.translated_alias()
     } else {
         let s = pyre_object::range_obj_to_bigint(space_index(w_step)?);
         if s.is_zero() {
@@ -1889,14 +1895,14 @@ unsafe fn compute_slice_indices3_big(
             ));
         }
         s
-    };
-    let negative_step = step < zero;
+    });
+    let negative_step = *step < zero;
     let w_start = w_slice_get_start(slice);
-    let start = if is_none(w_start) {
+    let start = RBigIntGcRoot::new(if is_none(w_start) {
         if negative_step {
             length - &one
         } else {
-            zero.clone()
+            zero.translated_alias()
         }
     } else {
         let st = pyre_object::range_obj_to_bigint(space_index(w_start)?);
@@ -1904,9 +1910,9 @@ unsafe fn compute_slice_indices3_big(
             let st = st + length;
             if st < zero {
                 if negative_step {
-                    -one.clone()
+                    one.neg()
                 } else {
-                    zero.clone()
+                    zero.translated_alias()
                 }
             } else {
                 st
@@ -1915,18 +1921,18 @@ unsafe fn compute_slice_indices3_big(
             if negative_step {
                 length - &one
             } else {
-                length.clone()
+                length.translated_alias()
             }
         } else {
             st
         }
-    };
+    });
     let w_stop = w_slice_get_stop(slice);
-    let stop = if is_none(w_stop) {
+    let stop = RBigIntGcRoot::new(if is_none(w_stop) {
         if negative_step {
-            -one.clone()
+            one.neg()
         } else {
-            length.clone()
+            length.translated_alias()
         }
     } else {
         let sp = pyre_object::range_obj_to_bigint(space_index(w_stop)?);
@@ -1934,9 +1940,9 @@ unsafe fn compute_slice_indices3_big(
             let sp = sp + length;
             if sp < zero {
                 if negative_step {
-                    -one.clone()
+                    one.neg()
                 } else {
-                    zero.clone()
+                    zero.translated_alias()
                 }
             } else {
                 sp
@@ -1945,13 +1951,17 @@ unsafe fn compute_slice_indices3_big(
             if negative_step {
                 length - &one
             } else {
-                length.clone()
+                length.translated_alias()
             }
         } else {
             sp
         }
-    };
-    Ok((start, stop, step))
+    });
+    Ok((
+        start.translated_alias(),
+        stop.translated_alias(),
+        step.translated_alias(),
+    ))
 }
 
 /// `functional.py W_Range._compute_slice` — build the NEW `range`
@@ -1959,22 +1969,27 @@ unsafe fn compute_slice_indices3_big(
 unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult {
     let len_b = pyre_object::range_obj_to_bigint(pyre_object::w_range_length(obj));
     let (sl_start, sl_stop, sl_step) = compute_slice_indices3_big(slice, &len_b)?;
+    let sl_start = RBigIntGcRoot::new(sl_start);
+    let sl_stop = RBigIntGcRoot::new(sl_stop);
+    let sl_step = RBigIntGcRoot::new(sl_step);
     let (rstart, _rstop, rstep) = pyre_object::w_range_fields(obj);
     let rstart_b = pyre_object::range_obj_to_bigint(rstart);
     let rstep_b = pyre_object::range_obj_to_bigint(rstep);
-    let substart = &rstart_b + &sl_start * &rstep_b;
-    let substep = &rstep_b * &sl_step;
+    let substart = RBigIntGcRoot::new(&rstart_b + &*sl_start * &rstep_b);
+    let substep = RBigIntGcRoot::new(&rstep_b * &*sl_step);
+    // Compute and root every unboxed output before the first wrapping
+    // allocation, which may collect.
+    let substop = RBigIntGcRoot::new(&rstart_b + &*sl_stop * &rstep_b);
     let _roots = pyre_object::gc_roots::push_roots();
-    let w_substart = pyre_object::range_bigint_to_obj(substart);
+    let w_substart = pyre_object::range_bigint_to_obj(substart.translated_alias());
     pyre_object::gc_roots::pin_root(w_substart);
-    let w_substep = pyre_object::range_bigint_to_obj(substep);
+    let w_substep = pyre_object::range_bigint_to_obj(substep.translated_alias());
     pyre_object::gc_roots::pin_root(w_substep);
     // functional.py:523-526 tests `if w_stop`, i.e. whether the wrapped
     // pointer exists, not whether its integer payload is zero.  The wrapped
     // result of compute_slice_indices3 is always present, so compute the stop
     // lane even when its value is 0 (notably for `r[-1:-3:-1]`).
-    let substop = &rstart_b + &sl_stop * &rstep_b;
-    let w_substop = pyre_object::range_bigint_to_obj(substop);
+    let w_substop = pyre_object::range_bigint_to_obj(substop.translated_alias());
     pyre_object::gc_roots::pin_root(w_substop);
     Ok(pyre_object::w_range_new(w_substart, w_substop, w_substep))
 }
@@ -2009,19 +2024,21 @@ pub(crate) fn range_count_method(args: &[PyObjectRef]) -> PyResult {
     // merely until the first match.  Keep the counter unbounded like PyPy's
     // wrapped integer accumulator.
     let it = iter(obj)?;
-    let mut count = BigInt::from(0);
+    // The iterator and equality operation can execute Python between
+    // increments; RPython keeps the bigint accumulator in its root map.
+    let mut count = RBigIntGcRoot::new(BigInt::from(0));
     loop {
         match next(it) {
             Ok(item) => {
                 if is_true(compare(item, needle, CompareOp::Eq)?)? {
-                    count = count.int_add(1);
+                    *count = count.int_add(1);
                 }
             }
             Err(e) if e.kind == PyErrorKind::StopIteration => break,
             Err(e) => return Err(e),
         }
     }
-    Ok(pyre_object::range_bigint_to_obj(count))
+    Ok(pyre_object::range_bigint_to_obj(count.translated_alias()))
 }
 
 /// `range.index(value)` — `functional.py W_Range.descr_index`.
@@ -2467,10 +2484,12 @@ pub(crate) fn list_reverse_iter_length_hint_method(args: &[PyObjectRef]) -> PyRe
 pub(crate) fn range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let (current, remaining, step) = pyre_object::w_range_iter_fields(args[0]);
-        let stop = BigInt::from(current) + BigInt::from(remaining) * step;
+        // `w_int_new(current)` may collect before the computed stop is
+        // wrapped, so preserve the RPython stack-map root explicitly.
+        let stop = RBigIntGcRoot::new(BigInt::from(current) + BigInt::from(remaining) * step);
         let w_range = pyre_object::w_range_new(
             w_int_new(current),
-            pyre_object::range_bigint_to_obj(stop),
+            pyre_object::range_bigint_to_obj(stop.translated_alias()),
             w_int_new(step),
         );
         let state = w_tuple_new(vec![w_range]);
@@ -2493,11 +2512,11 @@ pub(crate) fn long_range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
         let step_b = pyre_object::range_obj_to_bigint(step);
         let len_b = pyre_object::range_obj_to_bigint(len);
         let index_b = pyre_object::range_obj_to_bigint(index);
-        let current = &start_b + &index_b * &step_b;
-        let stop = &start_b + &len_b * &step_b;
+        let current = RBigIntGcRoot::new(&start_b + &index_b * &step_b);
+        let stop = RBigIntGcRoot::new(&start_b + &len_b * &step_b);
         let w_range = pyre_object::w_range_new(
-            pyre_object::range_bigint_to_obj(current),
-            pyre_object::range_bigint_to_obj(stop),
+            pyre_object::range_bigint_to_obj(current.translated_alias()),
+            pyre_object::range_bigint_to_obj(stop.translated_alias()),
             pyre_object::range_bigint_to_obj(step_b),
         );
         let state = w_tuple_new(vec![w_range]);
@@ -7340,7 +7359,6 @@ pub fn gateway_nonnegint_w(obj: PyObjectRef) -> Result<i64, PyError> {
 /// apply __int__/__index__ conversion: a non-int object raises TypeError
 /// (W_Root.uint_w → _typed_unwrap_error).
 pub fn uint_w(obj: PyObjectRef) -> Result<u64, PyError> {
-    use num_traits::ToPrimitive;
     if obj.is_null() {
         return Err(PyError::type_error("uint_w: null object"));
     }
@@ -7356,15 +7374,18 @@ pub fn uint_w(obj: PyObjectRef) -> Result<u64, PyError> {
     }
     // W_LongObject.uint_w — num.touint().
     if unsafe { pyre_object::pyobject::is_long(obj) } {
-        let big = unsafe { crate::builtins::obj_to_bigint(obj) };
-        if big.sign() == RBigIntSign::Minus {
+        let big = unsafe { pyre_object::w_long_get_value(obj) };
+        if big.get_sign() < 0 {
             return Err(PyError::value_error(
                 "cannot convert negative integer to unsigned int",
             ));
         }
-        return big
-            .to_u64()
-            .ok_or_else(|| PyError::overflow_error("int too large to convert to unsigned int"));
+        if pyre_object::longobject::jit_bigint_to_u64_fits(big) != 0 {
+            return Ok(pyre_object::longobject::jit_bigint_to_u64_value(big));
+        }
+        return Err(PyError::overflow_error(
+            "int too large to convert to unsigned int",
+        ));
     }
     // W_Root.uint_w → _typed_unwrap_error(space, "integer").
     let tp_name = unsafe { (*(*obj).ob_type).name };
@@ -7482,7 +7503,6 @@ pub fn truncatedint_w(obj: PyObjectRef) -> Result<i64, PyError> {
     match int_w(obj) {
         Ok(value) => Ok(value),
         Err(e) if e.kind == PyErrorKind::OverflowError => {
-            use num_traits::ToPrimitive;
             // intmask(self.bigint_w(w_obj).uintmask()): bigint_w applies
             // __int__/__index__ conversion, so read the bigint from the
             // converted int object rather than the raw argument.
@@ -7491,9 +7511,16 @@ pub fn truncatedint_w(obj: PyObjectRef) -> Result<i64, PyError> {
             } else {
                 space_int(obj)?
             };
-            let big = unsafe { crate::builtins::obj_to_bigint(w_int_obj) };
-            let low = (&big & BigInt::from(u64::MAX)).to_u64().unwrap_or(0);
-            Ok(low as i64)
+            let owned;
+            let big = unsafe {
+                if pyre_object::is_long(w_int_obj) {
+                    pyre_object::w_long_get_value(w_int_obj)
+                } else {
+                    owned = BigInt::from(pyre_object::w_int_get_value(w_int_obj));
+                    &owned
+                }
+            };
+            Ok(big.uintmask() as i64)
         }
         Err(e) => Err(e),
     }
@@ -11426,8 +11453,10 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
                     w_result,
                 )));
             }
-            return Ok(pyre_object::w_long_new(
-                pyre_object::w_long_get_value(w_result).clone(),
+            // W_LongObject.int/newlong strips the strict subclass by creating
+            // a base wrapper around the same immutable rbigint payload.
+            return Ok(pyre_object::longobject::w_long_from_raw(
+                pyre_object::longobject::w_long_get_raw_value(w_result),
             ));
         }
     }
@@ -11499,8 +11528,8 @@ pub fn getindex_w(obj: PyObjectRef) -> Result<i64, PyError> {
     match int_w(w_index) {
         Ok(index) => Ok(index),
         Err(e) if e.kind == PyErrorKind::OverflowError => {
-            let big = unsafe { crate::builtins::obj_to_bigint(w_index) };
-            if big.sign() == RBigIntSign::Minus {
+            let big = unsafe { pyre_object::w_long_get_value(w_index) };
+            if big.get_sign() < 0 {
                 Ok(i64::MIN)
             } else {
                 Ok(i64::MAX)
@@ -11521,8 +11550,8 @@ pub fn index_int_w_preserve_negative(obj: PyObjectRef) -> Result<i64, PyError> {
     match int_w(w_index) {
         Ok(index) => Ok(index),
         Err(error) if error.kind == PyErrorKind::OverflowError => {
-            let big = unsafe { crate::builtins::obj_to_bigint(w_index) };
-            if big.sign() == RBigIntSign::Minus {
+            let big = unsafe { pyre_object::w_long_get_value(w_index) };
+            if big.get_sign() < 0 {
                 Ok(i64::MIN)
             } else {
                 Err(error)
@@ -15035,6 +15064,27 @@ pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uint_and_truncatedint_use_rbigint_word_conversions() {
+        let unsigned_max = pyre_object::longobject::w_long_new(BigInt::from_u128(u64::MAX as u128));
+        assert_eq!(uint_w(unsigned_max).unwrap(), u64::MAX);
+
+        let overflow =
+            pyre_object::longobject::w_long_new(BigInt::one().lshift(130).expect("fixed shift"));
+        assert_eq!(
+            uint_w(overflow).unwrap_err().kind,
+            PyErrorKind::OverflowError
+        );
+
+        let low_word = 0x0123_4567_89ab_cdef_u64;
+        let value = BigInt::one()
+            .lshift(200)
+            .expect("fixed shift")
+            .int_add(low_word as i64);
+        let wrapped = pyre_object::longobject::w_long_new(value);
+        assert_eq!(truncatedint_w(wrapped).unwrap(), low_word as i64);
+    }
 
     #[test]
     fn test_setattr_getattr_and_overwrite() {

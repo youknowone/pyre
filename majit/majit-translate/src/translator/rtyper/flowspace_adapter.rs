@@ -83,6 +83,14 @@ use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 /// lets consumers read `typed_var.concretetype` / `.annotation` back onto
 /// the legacy Variable they already hold, with no slot-index round-trip.
 pub type LegacyToTyped = HashMap<Variable, Variable>;
+/// Every block-local flowspace Variable derived from one legacy MIR
+/// Variable. The legacy MIR can reuse one Variable identity as an op result
+/// and as inputargs of several successor blocks; orthodox RPython flowspace
+/// requires each block inputarg to be a distinct definition. `LegacyToTyped`
+/// retains the preferred projection representative, while this multimap lets
+/// the cutover replace an untyped representative removed by simplify with a
+/// typed block-local peer after rtyping.
+pub type LegacyToTypedCandidates = HashMap<Variable, Vec<Variable>>;
 
 pub use crate::codewriter::annotation_state::valuetype_to_someshell;
 
@@ -607,6 +615,52 @@ fn is_elided_unit_variant_ctor(kind: &OpKind) -> bool {
     false
 }
 
+/// A fixed-size Rust array aggregate emitted by `front::mir`.
+///
+/// The semantic/legacy graph keeps the exact `Array` transparent-ctor plus
+/// `__pos_i` field writes required by legacy code generation and format-array
+/// recognizers.  The RPython annotator has no distinct Rust array class:
+/// arrays, slices, and Vec values are list-shaped.  The block adapter therefore
+/// reconstructs this source aggregate as one `newlist(items...)` operation
+/// while leaving the original model graph untouched.
+fn is_array_aggregate_ctor(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: crate::model::CallTarget::SyntheticTransparentCtor {
+                name,
+                owner_path,
+            },
+            ..
+        } if owner_path.is_empty()
+            && majit_ir::descr::strip_instantiation_suffix(name) == "Array"
+    )
+}
+
+fn array_aggregate_elements(
+    operations: &[SpaceOperation],
+    array: &Variable,
+) -> Option<Vec<Variable>> {
+    let mut by_index = Vec::new();
+    for op in operations {
+        if let OpKind::FieldWrite {
+            base, field, value, ..
+        } = &op.kind
+            && base.id() == array.id()
+        {
+            let index = field.name.strip_prefix("__pos_")?.parse::<usize>().ok()?;
+            by_index.push((index, value.as_variable()?.clone()));
+        }
+    }
+    by_index.sort_by_key(|(index, _)| *index);
+    for (expected, (actual, _)) in by_index.iter().enumerate() {
+        if *actual != expected {
+            return None;
+        }
+    }
+    Some(by_index.into_iter().map(|(_, value)| value).collect())
+}
+
 /// `true` iff `kind` is `front::mir`'s synthetic string-literal
 /// define-op (`Call(["__str_const", <text>])`, `mir.rs:1576`).
 /// Upstream flowspace carries a string literal as a bare
@@ -817,10 +871,10 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // the 0-arg unit-variant ctor, which `translate_op` pre-folds to a
         // `Constant` and emits no op — `op_canraise` is false exactly when
         // that happens.  Matched before the general `Call` arm.
-        OpKind::Call {
+        kind @ OpKind::Call {
             target: crate::model::CallTarget::SyntheticTransparentCtor { .. },
             ..
-        } => !is_elided_unit_variant_ctor(kind),
+        } => !is_elided_unit_variant_ctor(kind) && !is_array_aggregate_ctor(kind),
         // A string-literal define-op pre-folds to `Constant('text')`
         // and emits no op — a Constant raises nothing.  Matched before
         // the general `Call` arm, same as the unit-variant elision.
@@ -2551,6 +2605,9 @@ pub struct FlowspaceAdapterOutput {
     /// Legacy graph `Variable` → typed flowspace `Variable`; each typed
     /// Variable's `concretetype` is read after `specialize` returns.
     pub value_to_var: LegacyToTyped,
+    /// All block-local typed representatives for each legacy Variable.
+    /// See [`LegacyToTypedCandidates`].
+    pub value_to_var_candidates: LegacyToTypedCandidates,
     /// Const-define result `Variable` -> `Constant.concretetype`.
     /// Materialised at lift time from `OpKind::ConstInt` / `ConstFloat`
     /// via `Constant::with_concretetype` (`flowspace_adapter.rs:518-527`),
@@ -3173,6 +3230,7 @@ pub fn function_graph_to_flowspace(
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
 ) -> Result<FlowspaceAdapterOutput, TyperError> {
     let mut value_to_var: LegacyToTyped = HashMap::new();
+    let mut value_to_var_candidates: LegacyToTypedCandidates = HashMap::new();
     let mut constant_hlvalues: HashMap<Variable, Hlvalue> = HashMap::new();
     let mut constant_concretetypes: HashMap<Variable, LowLevelType> = HashMap::new();
 
@@ -3282,6 +3340,10 @@ pub fn function_graph_to_flowspace(
         let mut inputargs: Vec<Hlvalue> = Vec::with_capacity(legacy_block.inputargs.len());
         for legacy_var in legacy_block.inputargs.iter() {
             let var = seed_variable(legacy_var);
+            value_to_var_candidates
+                .entry(legacy_var.clone())
+                .or_default()
+                .push(var.clone());
             value_to_var
                 .entry(legacy_var.clone())
                 .or_insert_with(|| var.clone());
@@ -3323,6 +3385,10 @@ pub fn function_graph_to_flowspace(
         })
         .map(|legacy_var| {
             let var = seed_variable(&legacy_var);
+            value_to_var_candidates
+                .entry(legacy_var.clone())
+                .or_default()
+                .push(var.clone());
             value_to_var
                 .entry(legacy_var)
                 .or_insert_with(|| var.clone());
@@ -3350,6 +3416,10 @@ pub fn function_graph_to_flowspace(
             let mut except_inputargs = Vec::with_capacity(2);
             for legacy_var in legacy_exceptblock.inputargs.iter() {
                 let var = seed_variable(legacy_var);
+                value_to_var_candidates
+                    .entry(legacy_var.clone())
+                    .or_default()
+                    .push(var.clone());
                 value_to_var
                     .entry(legacy_var.clone())
                     .or_insert_with(|| var.clone());
@@ -3418,6 +3488,18 @@ pub fn function_graph_to_flowspace(
 
         // Translate operations.
         let mut translated_ops: Vec<FlowspaceOp> = Vec::new();
+        let array_list_elements: HashMap<Variable, Vec<Variable>> = legacy_block
+            .operations
+            .iter()
+            .filter_map(|op| {
+                if !is_array_aggregate_ctor(&op.kind) {
+                    return None;
+                }
+                let result = op.result.as_ref()?.clone();
+                let elements = array_aggregate_elements(&legacy_block.operations, &result)?;
+                Some((result, elements))
+            })
+            .collect();
         for legacy_op in &legacy_block.operations {
             if let Some(hlvalue) = legacy_const_define_hlvalue(legacy_op, Some(call_registry))? {
                 if let Some(result_var) = legacy_op.result.as_ref() {
@@ -3523,8 +3605,38 @@ pub fn function_graph_to_flowspace(
                 // local to the defining block; only the legacy→typed map is
                 // repointed to the definition.
                 let var = seed_variable(result_var);
+                value_to_var_candidates
+                    .entry(result_var.clone())
+                    .or_default()
+                    .push(var.clone());
                 value_to_var.insert(result_var.clone(), var.clone());
                 value_map.insert(result_var.clone(), Hlvalue::Variable(var));
+            }
+            // RPython has one list model for Rust fixed arrays, slices, and
+            // Vec values.  Rebuild the front-end's exact Array ctor +
+            // positional writes as `newlist(items...)` only in this
+            // flowspace view; the semantic graph stays intact for legacy
+            // fallback/code generation.
+            if let Some(result_var) = legacy_op.result.as_ref()
+                && let Some(elements) = array_list_elements.get(result_var)
+            {
+                let mut args = Vec::with_capacity(elements.len());
+                for (index, element) in elements.iter().enumerate() {
+                    args.push(lookup_operand(
+                        &value_map,
+                        element,
+                        legacy_op,
+                        &format!("array_item_{index}"),
+                    )?);
+                }
+                let result = resolve_result_hlvalue(legacy_op, &value_map)?;
+                translated_ops.push(FlowspaceOp::new("newlist", args, result));
+                continue;
+            }
+            if let OpKind::FieldWrite { base, .. } = &legacy_op.kind
+                && array_list_elements.contains_key(base)
+            {
+                continue;
             }
             translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
             if let Some(result_var) = legacy_op.result.as_ref() {
@@ -3628,6 +3740,7 @@ pub fn function_graph_to_flowspace(
     Ok(FlowspaceAdapterOutput {
         graph: graph_ref,
         value_to_var,
+        value_to_var_candidates,
         constant_concretetypes,
         #[cfg(test)]
         block_map,
@@ -5317,6 +5430,84 @@ mod tests {
             exit.target.as_ref().expect("link must have target"),
             &graph.returnblock,
         ));
+    }
+
+    #[test]
+    fn function_graph_to_flowspace_rebuilds_array_aggregate_as_rpython_list() {
+        let mut graph = LegacyGraph::new("array_to_list");
+        let vars = mint_vars(&mut graph, 6);
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![
+                SpaceOperation {
+                    result: Some(vars[2].clone()),
+                    kind: OpKind::ConstInt(10),
+                },
+                SpaceOperation {
+                    result: Some(vars[3].clone()),
+                    kind: OpKind::ConstInt(20),
+                },
+                SpaceOperation {
+                    result: Some(vars[4].clone()),
+                    kind: OpKind::Call {
+                        target: crate::model::CallTarget::synthetic_transparent_ctor("Array"),
+                        args: vec![],
+                        result_ty: ValueType::Ref(Some("Array".to_string())),
+                    },
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[4].clone(),
+                        field: crate::model::FieldDescriptor::new(
+                            "__pos_0",
+                            Some("Array".to_string()),
+                        ),
+                        value: LinkArg::Value(vars[2].clone()),
+                        ty: ValueType::Int,
+                    },
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[4].clone(),
+                        field: crate::model::FieldDescriptor::new(
+                            "__pos_1",
+                            Some("Array".to_string()),
+                        ),
+                        value: LinkArg::Value(vars[3].clone()),
+                        ty: ValueType::Int,
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(vars[4].clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[5]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("array aggregate must adapt");
+        let graph = output.graph.borrow();
+        let startblock = graph.startblock.borrow();
+        assert_eq!(startblock.operations.len(), 1);
+        let op = &startblock.operations[0];
+        assert_eq!(op.opname, "newlist");
+        assert_eq!(op.args.len(), 2);
     }
 
     #[test]

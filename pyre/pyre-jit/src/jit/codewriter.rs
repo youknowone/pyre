@@ -3025,16 +3025,12 @@ fn frontend_load_const_flow_value(
     idx: usize,
 ) -> super::flow::FlowValue {
     // `flowcontext.py:841-843 LOAD_CONST`: fetch the pre-wrapped constant
-    // and push that value.  A top-level code constant resolves through the
-    // enclosing code's `co_consts_w` (same as `bh_load_const_fn`) so the
-    // graph shadow carries the interpreter's `PyCode` wrapper rather
-    // than a freshly boxed one — keeping `__code__` identity and the nested
-    // function's JIT green key stable. `w_code_co_const` returns null for
-    // non-code constants, which fall through to the `ConstantData`
-    // materializer (the same one the blackhole helper uses).
+    // and push that value. Every top-level constant resolves through the
+    // enclosing code's `co_consts_w`, the same object `bh_load_const_fn`
+    // returns.
     let w_code = w_code as pyre_object::PyObjectRef;
     if !w_code.is_null() {
-        let w_const = unsafe { pyre_interpreter::pycode::w_code_co_const(w_code, idx) };
+        let w_const = unsafe { pyre_interpreter::pycode::w_code_const(w_code, idx) };
         if !w_const.is_null() {
             return pyobject_const_ref_value(w_const);
         }
@@ -3491,14 +3487,12 @@ struct FnPtrIndices {
 /// * `load_global_fn` / `build_slice_fn`: namespace dict lookup +
 ///   slice allocation; can raise (`NameError` / `MemoryError`) but do
 ///   not force virtuals — `EF_CAN_RAISE` → `Plain`.
-/// * `box_int_fn` / `load_const_fn`: kept on `Plain` until the
-///   upstream `@jit.elidable_promote` decorator is wired
-///   (`rpython/rlib/jit.py:180`) and pyre's constant storage shape
-///   matches PyPy's pre-wrapped `co_consts_w`
-///   (`pypy/interpreter/pyopcode.py:516` vs
-///   `pyre-interpreter/src/pyframe.rs:1748-1768`).  Hand-pure
-///   classification without those prerequisites would be a
-///   TODO.
+/// * `box_int_fn`: kept on `Plain` until the upstream
+///   `@jit.elidable_promote` decorator is wired (`rpython/rlib/jit.py:180`).
+/// * `load_const_fn`: reads the shared `co_consts_w` slot, but pyre lazily
+///   realizes the compiler's unwrapped constant on the first read. That first
+///   call allocates and mutates the slot, so it remains `Plain` until the
+///   compiler boundary supplies PyPy-style pre-wrapped constants eagerly.
 fn register_helper_fn_pointers(
     assembler: &mut SSAReprEmitter,
     cpu: &super::cpu::Cpu,
@@ -3566,14 +3560,10 @@ fn register_helper_fn_pointers(
     // Matches `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
     // (`effectinfo.py:23`) → `MayForce` per Slice α-2.
     let truth_fn = bind(assembler, cpu.truth_fn as *const (), CallFlavor::MayForce);
-    // PyPy's `LOAD_CONST` reads pre-wrapped `co_consts_w`
-    // (`pypy/interpreter/pyopcode.py:516`); pyre's
-    // `pyre_interpreter::pyframe::load_const_from_code`
-    // (`pyre-interpreter/src/pyframe.rs:1748-1768`)
-    // re-materializes int / float / str / bool constants on every
-    // call, so the helper is NOT observably idempotent. Stay on
-    // `Plain` until the constant-storage shape converges to the
-    // PyPy pre-wrapped representation.
+    // PyPy's `LOAD_CONST` is a pure pre-wrapped list read. Pyre now preserves
+    // that slot identity, but the first read is still the unwrapped compiler
+    // boundary: it allocates and publishes the object. Stay on `Plain` until
+    // construction itself supplies an eagerly wrapped `co_consts_w`.
     let load_const_fn = bind(assembler, cpu.load_const_fn as *const (), CallFlavor::Plain);
     let store_subscr_fn = bind(
         assembler,
@@ -15294,7 +15284,7 @@ mod tests {
             .position(|constant| matches!(constant, ConstantData::Code { .. }))
             .expect("code constant");
 
-        let expected = unsafe { pyre_interpreter::pycode::w_code_co_const(w_code, idx) };
+        let expected = unsafe { pyre_interpreter::pycode::w_code_const(w_code, idx) };
         assert!(
             !expected.is_null(),
             "co_consts_w must resolve the code wrapper"
@@ -15310,6 +15300,36 @@ mod tests {
                     "graph LOAD_CONST must carry the co_consts_w wrapper, not a fresh box",
                 );
             }
+            other => panic!("expected Ref constant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frontend_load_const_flow_value_shares_co_consts_w_large_integer() {
+        let code =
+            compile_exec("x = 123456789012345678901234567890123456789012345678901234567890\n")
+                .expect("compile failed");
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let idx = code
+            .constants
+            .iter()
+            .position(|constant| {
+                matches!(
+                    constant,
+                    ConstantData::Integer { value }
+                        if num_traits::ToPrimitive::to_i64(value).is_none()
+                )
+            })
+            .expect("large integer constant");
+
+        let expected = unsafe { pyre_interpreter::pycode::w_code_const(w_code, idx) };
+        let value = frontend_load_const_flow_value(w_code as *const (), &code, idx);
+        match value {
+            FlowValue::Constant(c) => assert_eq!(
+                c.value,
+                super::super::flow::ConstantValue::Signed(expected as i64),
+                "graph LOAD_CONST must carry the shared W_LongObject",
+            ),
             other => panic!("expected Ref constant, got {other:?}"),
         }
     }

@@ -537,6 +537,12 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
     )
     .expect("lower rbigint module");
 
+    assert_eq!(
+        program.struct_fields.field_type("RBigInt", "_digits"),
+        Some("[i64]"),
+        "RBigInt._digits must retain rbigint.py's GcArray(Signed) annotation"
+    );
+
     for name in [
         "new",
         "setdigit",
@@ -665,11 +671,227 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
             "RPython digit index must remain Signed for RBigInt::{name}"
         );
     }
+    let digit_graph = program
+        .functions
+        .iter()
+        .find(|function| {
+            function.name == "digit" && function.self_ty_root.as_deref() == Some("rbigint::RBigInt")
+        })
+        .expect("rbigint::RBigInt::digit graph");
+    assert!(
+        digit_graph.graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|operation| {
+                matches!(
+                    &operation.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "_digits"
+                )
+            })
+        }),
+        "RBigInt::digit must project the upstream _digits field directly"
+    );
+    assert!(
+        !digit_graph.graph.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|operation| match &operation.kind {
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } => matches!(name.as_str(), "digits" | "digits_mut"),
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } => matches!(
+                        segments.last().map(String::as_str),
+                        Some("digits" | "digits_mut")
+                    ),
+                    _ => false,
+                })
+        }),
+        "RBigInt::digit must not retain Rust's slice-view adapter"
+    );
     for name in ["lqshift", "rqshift"] {
         assert_eq!(
             input_types(name, Some("rbigint::RBigInt")).last(),
             Some(&ValueType::Int),
             "RPython quick-shift count must remain Signed for RBigInt::{name}"
+        );
+    }
+
+    for name in [
+        "add",
+        "int_add",
+        "sub",
+        "int_sub",
+        "int_mul",
+        "int_floordiv",
+        "pow",
+        "int_pow",
+        "abs",
+        "lshift",
+        "rshift",
+    ] {
+        let function = program
+            .functions
+            .iter()
+            .find(|function| {
+                function.name == name
+                    && function.self_ty_root.as_deref() == Some("rbigint::RBigInt")
+            })
+            .unwrap_or_else(|| panic!("missing rbigint::RBigInt::{name} graph"));
+        assert!(
+            !function
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|operation| matches!(
+                    &operation.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.last().is_some_and(|leaf| leaf == "jit_bigint_clone")
+                )),
+            "RBigInt::{name} must preserve upstream `return self/other` as a GC-reference alias"
+        );
+    }
+    for name in [
+        "prebuilt",
+        "zero",
+        "one",
+        "negative_one",
+        "five",
+        "frombool",
+    ] {
+        let candidates: Vec<_> = program
+            .functions
+            .iter()
+            .filter(|function| {
+                function.name == name
+                    && function.self_ty_root.as_deref() == Some("rbigint::RBigInt")
+            })
+            .collect();
+        assert!(
+            !candidates.is_empty(),
+            "missing rbigint::RBigInt::{name} graph"
+        );
+        assert!(
+            candidates.iter().all(|function| {
+                function
+                    .graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .all(|operation| {
+                        !matches!(
+                            &operation.kind,
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath { segments },
+                                ..
+                            } if segments.last().is_some_and(|leaf| leaf == "jit_bigint_clone")
+                        )
+                    })
+            }),
+            "RBigInt::{name} must return the process-global prebuilt payload, not a clone"
+        );
+    }
+
+    let neg_candidates: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|function| {
+            function.name == "neg" && function.self_ty_root.as_deref() == Some("rbigint::RBigInt")
+        })
+        .collect();
+    let neg = neg_candidates
+        .iter()
+        .copied()
+        .find(|function| {
+            function
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .all(|operation| {
+                    !matches!(
+                        &operation.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments.last().is_some_and(|leaf| leaf == "jit_bigint_neg")
+                    )
+                })
+        })
+        .expect("inherent rbigint::RBigInt::neg graph, distinct from the Neg trait adapter");
+    let neg_calls: Vec<Vec<String>> = neg
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|operation| match &operation.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                ..
+            } => Some(segments.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        neg_calls.iter().any(|segments| segments
+            .last()
+            .is_some_and(|leaf| leaf == "jit_bigint_clone")),
+        "RBigInt::neg must retain the fresh shallow-copy handle upstream constructs: {neg_calls:?}"
+    );
+    let range_obj_to_bigint = program
+        .functions
+        .iter()
+        .find(|function| {
+            function.name == "range_obj_to_bigint" && function.module_path.ends_with("functional")
+        })
+        .expect("functional::range_obj_to_bigint graph");
+    let range_bigint_calls: Vec<_> = range_obj_to_bigint
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|operation| match &operation.kind {
+            OpKind::Call { target, .. } => Some(target),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !range_bigint_calls.iter().any(|target| {
+            matches!(
+                target,
+                CallTarget::FunctionPath { segments }
+                    if segments.last().is_some_and(|leaf| leaf == "jit_bigint_clone")
+            ) || matches!(
+                target,
+                CallTarget::Method { name, .. } if name == "translated_alias"
+            )
+        }),
+        "range_obj_to_bigint must preserve bigint_w's borrowed rbigint payload without a \
+         residual ownership marker: {range_bigint_calls:?}"
+    );
+    for function in &program.functions {
+        assert!(
+            !function
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|operation| matches!(
+                    &operation.kind,
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } if name == "translated_alias"
+                )),
+            "Rust's translated_alias ownership marker must be erased in every translated \
+             RBigInt consumer, but survived in {}::{}",
+            function.module_path,
+            function.name
         );
     }
     let from_list_types = input_types("from_list_n_bits", Some("rbigint::RBigInt"));
@@ -941,6 +1163,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         "objspace::descroperation::jit_bigint_int_xor",
         "objspace::descroperation::jit_bigint_shl",
         "objspace::descroperation::jit_bigint_pow_nomod",
+        "objspace::descroperation::jit_bigint_lshift_int_int_result",
         "objspace::descroperation::jit_bigint_div",
         "objspace::descroperation::jit_bigint_rem",
         "objspace::descroperation::jit_bigint_div_floor",
@@ -957,7 +1180,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         );
     }
     // rbigint.py `_make_int_comparison` only reads existing digits and
-    // returns a bool.  These wrappers are plain @jit.elidable, not the
+    // returns a bool.  These wrappers are elidable and cannot raise, not the
     // allocation-only arithmetic contract above.
     for path in [
         "objspace::descroperation::jit_bigint_int_eq",
@@ -966,11 +1189,16 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         "objspace::descroperation::jit_bigint_int_le",
         "objspace::descroperation::jit_bigint_int_gt",
         "objspace::descroperation::jit_bigint_int_ge",
+        "objspace::descroperation::jit_bigint_divrem_returns_lhs_remainder",
     ] {
         let values = hints
             .get(path)
             .unwrap_or_else(|| panic!("missing pointer-ABI wrapper hints for {path}"));
         assert!(values.iter().any(|hint| hint == "elidable"));
+        assert!(
+            values.iter().any(|hint| hint == "elidable_cannot_raise"),
+            "{path} comparison must not retain an exception edge: {values:?}"
+        );
         assert!(
             !values.iter().any(|hint| hint == "elidable_or_memerror"),
             "{path} comparison must not advertise an allocation edge: {values:?}"
@@ -992,7 +1220,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
         &[llbc],
         HostStaticAddrs::default(),
-        &["objspace::descroperation"],
+        &["objspace::descroperation", "module::math::interp_math"],
     )
     .expect("lower descroperation module");
     let helper = program
@@ -1098,6 +1326,15 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
             }),
             "{caller_name} retained an untranslated RBigInt::int_* call: {calls:?}"
         );
+        assert!(
+            !calls.iter().any(|segments| {
+                segments
+                    .last()
+                    .is_some_and(|leaf| leaf == "jit_bigint_clone")
+            }),
+            "{caller_name} must borrow W_LongObject.num like PyPy's asbigint(), \
+             not allocate cloned rbigint payloads: {calls:?}"
+        );
     }
 
     let mixed_compare = program
@@ -1187,6 +1424,60 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         "the host Result wrapper must not survive in the translated graph: {pow_calls:?}"
     );
 
+    for (module_suffix, caller_name) in [
+        ("objspace::descroperation", "long_pow"),
+        ("objspace::descroperation", "try_int_long_pow_with_modulo"),
+        ("objspace::descroperation", "long_lshift"),
+        ("objspace::descroperation", "long_rshift"),
+        ("objspace::descroperation", "long_floordiv"),
+        ("objspace::descroperation", "long_mod"),
+        ("objspace::descroperation", "integer_divmod_pair"),
+        ("objspace::descroperation", "bigint_mod_inverse"),
+        ("objspace::descroperation", "complex_richcompare"),
+        ("objspace::descroperation", "compare_slot"),
+        ("baseobjspace", "compute_slice_indices3_big"),
+        ("baseobjspace", "uint_w"),
+        ("baseobjspace", "truncatedint_w"),
+        ("baseobjspace", "getindex_w"),
+        ("baseobjspace", "index_int_w_preserve_negative"),
+        ("baseobjspace", "space_index"),
+        ("builtins", "builtin_abs"),
+        ("builtins", "ensure_baseint_result"),
+        ("builtins", "int_to_decimal_string"),
+        ("typedef", "int_descr_new"),
+        ("typedef", "slice_method_indices"),
+        ("builtins", "format_index_radix"),
+        ("type_methods", "format_with_spec"),
+        ("builtins", "obj_to_bigint"),
+        ("objspace::std::formatting", "arg_to_bigint"),
+        ("module::math::interp_math", "comb"),
+        ("module::math::interp_math", "perm"),
+    ] {
+        let caller = program
+            .functions
+            .iter()
+            .find(|function| {
+                function.name == caller_name && function.module_path.ends_with(module_suffix)
+            })
+            .unwrap_or_else(|| panic!("{module_suffix}::{caller_name} graph"));
+        assert!(
+            !caller
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|operation| matches!(
+                    &operation.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.last().is_some_and(|leaf| leaf == "jit_bigint_clone")
+                )),
+            "{caller_name} must borrow long operand payloads rather than allocate \
+             translated rbigint clones"
+        );
+    }
+
     let long_lshift = program
         .functions
         .iter()
@@ -1225,6 +1516,45 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         "the host Result wrapper must not survive in the translated graph: {lshift_calls:?}"
     );
 
+    let int_lshift = program
+        .functions
+        .iter()
+        .find(|function| {
+            function.name == "int_lshift"
+                && function.module_path.ends_with("objspace::descroperation")
+        })
+        .expect("descroperation::int_lshift graph");
+    let int_lshift_calls: Vec<Vec<String>> = int_lshift
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|operation| match &operation.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                ..
+            } => Some(segments.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        int_lshift_calls.iter().any(|segments| segments
+            == &[
+                "pyre_interpreter",
+                "objspace",
+                "descroperation",
+                "jit_bigint_lshift_int_int_result",
+            ]),
+        "int_lshift must retain rbigint's Signed×Signed specialized residual: \
+         {int_lshift_calls:?}"
+    );
+    assert!(
+        !int_lshift_calls.iter().any(|segments| segments
+            .last()
+            .is_some_and(|leaf| leaf == "bigint_lshift_int_int_result")),
+        "the specialized host Result wrapper must not survive: {int_lshift_calls:?}"
+    );
+
     for (caller_name, residual_name) in [
         ("long_floordiv", "jit_bigint_div_floor"),
         ("long_mod", "jit_bigint_mod_floor"),
@@ -1255,6 +1585,45 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
                 .iter()
                 .any(|segments| { segments.last().is_some_and(|leaf| leaf == residual_name) }),
             "{caller_name} must target {residual_name}: {calls:?}"
+        );
+    }
+
+    for (caller_name, residual_name) in [
+        ("bigint_neg", "jit_bigint_neg"),
+        ("bigint_invert", "jit_bigint_invert"),
+    ] {
+        let caller = program
+            .functions
+            .iter()
+            .find(|function| {
+                function.name == caller_name
+                    && function.module_path.ends_with("objspace::descroperation")
+            })
+            .unwrap_or_else(|| panic!("descroperation::{caller_name} graph"));
+        let calls: Vec<Vec<String>> = caller
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|operation| match &operation.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => Some(segments.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            calls
+                .iter()
+                .any(|segments| segments.last().is_some_and(|leaf| leaf == residual_name)),
+            "{caller_name} must target {residual_name}: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|segments| segments
+                .last()
+                .is_some_and(|leaf| leaf == "jit_bigint_clone")),
+            "{caller_name} must borrow its input and allocate only the unary result: {calls:?}"
         );
     }
 }

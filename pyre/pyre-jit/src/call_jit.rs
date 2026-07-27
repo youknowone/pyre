@@ -5380,24 +5380,15 @@ pub extern "C" fn bh_store_global_fn(frame_ptr: i64, w_name: i64, value: i64) ->
 /// Load a constant from the code object.
 /// jtransform.py parity: code comes from getfield_vable_r(frame, pycode).
 pub extern "C" fn bh_load_const_fn(w_code_ptr: i64, consti: i64) -> i64 {
-    // `getconstant_w(index) -> co_consts_w[index]` for a code constant: read the
-    // one wrapper off the virtualizable `pycode` (the same `PyCode` the
-    // interpreter loads), so deopt resume keeps `__code__` identity.  Non-code
-    // constants return `PY_NULL` here and fall through to value realization.
+    // `getconstant_w(index) -> co_consts_w[index]`: read the one shared object
+    // off the virtualizable `pycode`, exactly as the interpreter does.
     let w_code = unsafe {
-        pyre_interpreter::pycode::w_code_co_const(
+        pyre_interpreter::pycode::w_code_const(
             w_code_ptr as pyre_object::PyObjectRef,
             consti as usize,
         )
     };
-    if !w_code.is_null() {
-        return w_code as i64;
-    }
-    let code = unsafe {
-        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject)
-    };
-    pyre_interpreter::pyframe::load_const_from_code(code, consti as usize) as i64
+    w_code as i64
 }
 
 /// Box a raw integer into a PyObject (w_int_new wrapper).

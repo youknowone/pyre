@@ -5,7 +5,7 @@
 //! payloads, calling pure raw-payload helpers, and boxing the resulting payload
 //! with the same `W_LongObject` layout.
 
-use crate::rbigint::{RBigInt as BigInt, RBigIntSign};
+use crate::rbigint::RBigInt as BigInt;
 
 use crate::pyobject::*;
 
@@ -191,6 +191,15 @@ pub fn w_long_new(value: BigInt) -> PyObjectRef {
     w_long_from_raw(alloc_bigint_nursery(value))
 }
 
+/// Wrap a fresh rbigint handle without canonicalizing a shallow copy whose
+/// digit array happens to belong to a prebuilt value.
+#[majit_macros::dont_look_inside]
+pub fn w_long_new_fresh_rbigint_handle(value: BigInt) -> PyObjectRef {
+    // No-collect host counterpart of `jit_bigint_clone`: rbigint.neg always
+    // constructs a new handle, including for the prebuilt zero digit array.
+    w_long_from_raw(crate::rbigint::alloc_rbigint_nursery_impl(value, false))
+}
+
 /// Create a W_LongObject from an i64 value.
 pub fn w_long_from_i64(v: i64) -> PyObjectRef {
     w_long_new(BigInt::from(v))
@@ -293,7 +302,7 @@ pub unsafe fn w_long_fits_int(obj: PyObjectRef) -> bool {
 /// `obj` must point to a valid `W_LongObject`.
 #[inline]
 pub unsafe fn w_long_is_zero(obj: PyObjectRef) -> bool {
-    unsafe { w_long_get_value(obj).sign() == RBigIntSign::NoSign }
+    unsafe { w_long_get_value(obj).get_sign() == 0 }
 }
 
 /// Extract a reference to the BigInt value from a known W_LongObject pointer.
@@ -306,6 +315,17 @@ pub unsafe fn w_long_get_value(obj: PyObjectRef) -> &'static BigInt {
         let long_obj = obj as *const W_LongObject;
         &*(*long_obj).value
     }
+}
+
+/// Return the translated rbigint GC reference stored in a long wrapper.
+///
+/// PyPy's `rbigint.abs` returns `self` for a nonnegative value and
+/// `W_LongObject.descr_abs` then constructs only a new Python wrapper around
+/// that same payload. Consumers implementing that path need the stored
+/// reference itself, not a Rust `Clone` that translates to a fresh GC payload.
+#[inline]
+pub unsafe fn w_long_get_raw_value(obj: PyObjectRef) -> *mut BigInt {
+    unsafe { (*(obj as *const W_LongObject)).value }
 }
 
 /// `rbigint.fits_int()` (`rpython/rlib/rbigint.py:490`) — JIT-callable
@@ -341,7 +361,7 @@ pub extern "C" fn jit_bigint_fits_int(num: i64) -> i64 {
 /// the two-phase rtyper so it never has to model an `Option<i64>` ABI.
 #[majit_macros::dont_look_inside]
 pub fn jit_bigint_to_i64_fits(num: &BigInt) -> i64 {
-    i64::try_from(num).is_ok() as i64
+    num.fits_int() as i64
 }
 
 /// `rbigint.toint()` (`rpython/rlib/rbigint.py:465`, `@jit.elidable`) on a
@@ -349,7 +369,7 @@ pub fn jit_bigint_to_i64_fits(num: &BigInt) -> i64 {
 /// [`jit_bigint_to_i64_fits`]; overflow means that guard was violated.
 #[majit_macros::dont_look_inside]
 pub fn jit_bigint_to_i64_value(num: &BigInt) -> i64 {
-    i64::try_from(num).unwrap_or_else(|_| {
+    num.toint().unwrap_or_else(|_| {
         panic!("jit_bigint_to_i64_value: BigInt out of i64 range - fits guard violated")
     })
 }
@@ -360,22 +380,22 @@ pub fn jit_bigint_to_i64_value(num: &BigInt) -> i64 {
 /// the Err path. Companion of [`jit_bigint_to_i64_fits`].
 #[majit_macros::dont_look_inside]
 pub fn jit_bigint_to_i64_value_or_zero(num: &BigInt) -> i64 {
-    i64::try_from(num).unwrap_or(0)
+    num.toint().unwrap_or(0)
 }
 
-/// `BigInt::to_u64().is_some()` on a borrowed BigInt payload. Scalar half of
-/// the `BigInt::to_u64()` split so the two-phase rtyper never has to model an
-/// `Option<u64>` ABI. Companion of [`jit_bigint_to_u64_value`].
+/// `rbigint.touint()` on a borrowed BigInt payload. Scalar half of the
+/// fallible conversion so the two-phase rtyper never has to model a
+/// `Result<u64, RBigIntError>` ABI. Companion of [`jit_bigint_to_u64_value`].
 #[majit_macros::dont_look_inside]
 pub fn jit_bigint_to_u64_fits(num: &BigInt) -> i64 {
-    num.to_u64().is_some() as i64
+    num.touint().is_ok() as i64
 }
 
-/// `BigInt::to_u64()` on a borrowed BigInt payload. Callers must first check
-/// [`jit_bigint_to_u64_fits`]; a `None` here means that guard was violated.
+/// `rbigint.touint()` on a borrowed BigInt payload. Callers must first check
+/// [`jit_bigint_to_u64_fits`]; an error here means that guard was violated.
 #[majit_macros::dont_look_inside]
 pub fn jit_bigint_to_u64_value(num: &BigInt) -> u64 {
-    num.to_u64().unwrap_or_else(|| {
+    num.touint().unwrap_or_else(|_| {
         panic!("jit_bigint_to_u64_value: BigInt exceeds u64 range - fits guard violated")
     })
 }
@@ -385,11 +405,7 @@ pub fn jit_bigint_to_u64_value(num: &BigInt) -> u64 {
 /// rtyper does not need a synthetic Rust enum ABI at this boundary.
 #[majit_macros::elidable_cannot_raise]
 pub fn jit_bigint_sign_i64(num: &BigInt) -> i64 {
-    match num.sign() {
-        RBigIntSign::Minus => -1,
-        RBigIntSign::NoSign => 0,
-        RBigIntSign::Plus => 1,
-    }
+    num.get_sign()
 }
 
 /// `rbigint.tofloat()` (`rpython/rlib/rbigint.py:503`) on a borrowed BigInt
@@ -397,14 +413,14 @@ pub fn jit_bigint_sign_i64(num: &BigInt) -> i64 {
 /// scalar return.
 #[majit_macros::elidable_cannot_raise]
 pub fn jit_bigint_to_f64_or_inf(num: &BigInt) -> f64 {
-    num.to_f64().unwrap_or(f64::INFINITY)
+    num.tofloat().unwrap_or(f64::INFINITY)
 }
 
 /// `rbigint.tofloat()` (`rpython/rlib/rbigint.py:503`) on a borrowed BigInt
 /// payload, preserving callers that intentionally collapse overflow to NaN.
 #[majit_macros::elidable_cannot_raise]
 pub fn jit_bigint_to_f64_or_nan(num: &BigInt) -> f64 {
-    num.to_f64().unwrap_or(f64::NAN)
+    num.tofloat().unwrap_or(f64::NAN)
 }
 
 /// `W_LongObject.toint()` (`pypy/objspace/std/longobject.py:138`) →
@@ -447,14 +463,28 @@ pub extern "C" fn jit_w_long_toint(obj: i64) -> i64 {
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_add_raw(a: i64, b: i64) -> i64 {
     let (a, b) = (a as PyObjectRef, b as PyObjectRef);
-    unsafe { alloc_bigint_nursery(w_long_get_value(a) + w_long_get_value(b)) as i64 }
+    unsafe {
+        let (av, bv) = (w_long_get_value(a), w_long_get_value(b));
+        if av.get_sign() == 0 {
+            return w_long_get_raw_value(b) as i64;
+        }
+        if bv.get_sign() == 0 {
+            return w_long_get_raw_value(a) as i64;
+        }
+        alloc_bigint_nursery(av + bv) as i64
+    }
 }
 
 /// `rbigint.sub` over `W_LongObject` operands (no-collect). See [`jit_w_long_add_raw`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_w_long_sub_raw(a: i64, b: i64) -> i64 {
     let (a, b) = (a as PyObjectRef, b as PyObjectRef);
-    unsafe { alloc_bigint_nursery(w_long_get_value(a) - w_long_get_value(b)) as i64 }
+    unsafe {
+        if w_long_get_value(b).get_sign() == 0 {
+            return w_long_get_raw_value(a) as i64;
+        }
+        alloc_bigint_nursery(w_long_get_value(a) - w_long_get_value(b)) as i64
+    }
 }
 
 /// `rbigint.mul` over `W_LongObject` operands (no-collect). See [`jit_w_long_add_raw`].
@@ -505,6 +535,12 @@ pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> i64 {
     // Two-limb fast path: when both operands and the sum fit i128 the result
     // is exact without the general limb machinery.
     unsafe {
+        if (&*a).get_sign() == 0 {
+            return b as i64;
+        }
+        if (&*b).get_sign() == 0 {
+            return a as i64;
+        }
         if let (Ok(x), Ok(y)) = (i128::try_from(&*a), i128::try_from(&*b)) {
             if let Some(z) = x.checked_add(y) {
                 return alloc_bigint_nursery_collecting(BigInt::from(z)) as i64;
@@ -530,6 +566,9 @@ pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     // Two-limb fast path mirroring `jit_bigint_add`.
     unsafe {
+        if (&*b).get_sign() == 0 {
+            return a as i64;
+        }
         if let (Ok(x), Ok(y)) = (i128::try_from(&*a), i128::try_from(&*b)) {
             if let Some(z) = x.checked_sub(y) {
                 return alloc_bigint_nursery_collecting(BigInt::from(z)) as i64;

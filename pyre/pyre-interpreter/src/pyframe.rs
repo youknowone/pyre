@@ -3810,14 +3810,13 @@ impl PyFrame {
     /// Load a constant from the code object by raw index.
     /// Used by the blackhole interpreter's bh_load_const_fn.
     pub fn load_const_pyobj(&self, idx: usize) -> PyObjectRef {
-        let code = self.code();
-        // RPython: constants are in JitCode.constants_r. In pyre, we resolve
-        // from the CodeObject's constant table at runtime.
-        let constants = code_constants(code);
-        if idx >= constants.len() {
-            return pyre_object::w_none();
+        let value =
+            unsafe { crate::pycode::w_code_const(self.pycode as pyre_object::PyObjectRef, idx) };
+        if value.is_null() {
+            pyre_object::w_none()
+        } else {
+            value
         }
-        pyobject_from_constant(&constants[idx])
     }
 }
 
@@ -3863,20 +3862,17 @@ pub(crate) fn code_constants(code: &CodeObject) -> &[crate::bytecode::ConstantDa
 /// `&mut PyFrame` to dispatch through the trait, so this free function
 /// mirrors each `*_constant` body directly. Variant order matches
 /// `pyopcode.rs::load_const_value` so future additions stay in sync.
-pub(crate) fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectRef {
+pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectRef {
     use crate::bytecode::ConstantData;
     use num_traits::ToPrimitive;
     match constant {
         // `pyopcode.rs:347-353` — promote bigints to W_LongObject just
         // like `load_const_value` does before invoking the trait.
         ConstantData::Integer { value } => {
-            let value = crate::compiler_bigint_to_rbigint(value);
-            if pyre_object::longobject::jit_bigint_to_i64_fits(&value) != 0 {
-                pyre_object::intobject::w_int_new(pyre_object::longobject::jit_bigint_to_i64_value(
-                    &value,
-                ))
+            if let Some(value) = ToPrimitive::to_i64(value) {
+                pyre_object::intobject::w_int_new(value)
             } else {
-                pyre_object::longobject::w_long_new(value)
+                pyre_object::longobject::w_long_new(crate::compiler_bigint_to_rbigint(value))
             }
         }
         // `eval.rs:1309-1311 float_constant`.

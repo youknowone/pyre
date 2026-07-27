@@ -2006,11 +2006,14 @@ fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // small-int cache so each has its own identity). Set w_class = cls so
     // type()/isinstance() see the subclass while preserving the underlying
     // int/long storage layout for arithmetic. A magnitude that overflows
-    // i64 is a W_LongObject; cloning its BigInt keeps the value intact
-    // (w_int_get_value would truncate it to a garbage machine word).
+    // i64 is a W_LongObject; like PyPy's `W_LongObject(w_value.asbigint())`,
+    // the subtype wrapper shares the immutable rbigint payload.
     let obj = if unsafe { pyre_object::is_long(value) } {
-        let big = unsafe { pyre_object::w_long_get_value(value) }.clone();
-        pyre_object::w_long_new(big)
+        unsafe {
+            pyre_object::longobject::w_long_from_raw(pyre_object::longobject::w_long_get_raw_value(
+                value,
+            ))
+        }
     } else {
         let int_val = unsafe { pyre_object::w_int_get_value(value) };
         pyre_object::intobject::w_int_subclass_new(int_val)
@@ -8097,7 +8100,7 @@ fn slice_method_indices(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         pyre_object::sliceobject::w_slice_get_step(pyre_object::gc_roots::shadow_stack_get(roots))
     };
     let step = if unsafe { pyre_object::is_none(w_step) } {
-        one.clone()
+        one.translated_alias()
     } else {
         let step = slice_eval_index_big(w_step)?;
         if step == zero {
@@ -8107,14 +8110,14 @@ fn slice_method_indices(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     };
     let negative_step = step < zero;
     let lower = if negative_step {
-        -one.clone()
+        one.neg()
     } else {
-        zero.clone()
+        zero.translated_alias()
     };
     let upper = if negative_step {
         &length - &one
     } else {
-        length.clone()
+        length.translated_alias()
     };
 
     let w_start = unsafe {
@@ -8122,19 +8125,19 @@ fn slice_method_indices(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     };
     let start = if unsafe { pyre_object::is_none(w_start) } {
         if negative_step {
-            upper.clone()
+            upper.translated_alias()
         } else {
-            lower.clone()
+            lower.translated_alias()
         }
     } else {
         let mut start = slice_eval_index_big(w_start)?;
         if start < zero {
             start += &length;
             if start < lower {
-                start = lower.clone();
+                start = lower.translated_alias();
             }
         } else if start > upper {
-            start = upper.clone();
+            start = upper.translated_alias();
         }
         start
     };
@@ -13755,7 +13758,20 @@ fn init_int_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__sizeof__",
                 |args| {
-                    let bits = unsafe { crate::builtins::obj_to_bigint(args[0]).bits() } as usize;
+                    let bits = unsafe {
+                        if pyre_object::is_bool(args[0]) {
+                            pyre_object::rbigint::bit_length_int(pyre_object::w_bool_get_value(
+                                args[0],
+                            )
+                                as i64) as usize
+                        } else if pyre_object::is_int(args[0]) {
+                            pyre_object::rbigint::bit_length_int(pyre_object::w_int_get_value(
+                                args[0],
+                            )) as usize
+                        } else {
+                            pyre_object::w_long_get_value(args[0]).bits() as usize
+                        }
+                    };
                     // CPython 3.14's compact PyLong layout: three pointer-sized
                     // header words and at least one 30-bit, four-byte digit.
                     let digits = std::cmp::max(1, (bits + 29) / 30);
@@ -13789,12 +13805,16 @@ fn init_int_type(ns: PyObjectRef) {
                     // absolute value, so long/bigint operands must route
                     // through their magnitude rather than the i64 fast path
                     // (which leaves out-of-range values at 0).
-                    let bits = if !args.is_empty() && unsafe { pyre_object::is_int(args[0]) } {
+                    let bits = if !args.is_empty() && unsafe { pyre_object::is_bool(args[0]) } {
+                        pyre_object::rbigint::bit_length_int(unsafe {
+                            pyre_object::w_bool_get_value(args[0]) as i64
+                        }) as u64
+                    } else if !args.is_empty() && unsafe { pyre_object::is_int(args[0]) } {
                         pyre_object::rbigint::bit_length_int(unsafe {
                             pyre_object::w_int_get_value(args[0])
                         }) as u64
                     } else if !args.is_empty() && unsafe { pyre_object::is_long(args[0]) } {
-                        match unsafe { crate::builtins::obj_to_bigint(args[0]).bit_length() } {
+                        match unsafe { pyre_object::w_long_get_value(args[0]).bit_length() } {
                             Ok(bits) => bits as u64,
                             Err(pyre_object::rbigint::RBigIntError::Overflow) => {
                                 return Err(crate::PyError::overflow_error(
@@ -13828,11 +13848,15 @@ fn init_int_type(ns: PyObjectRef) {
                 |args| {
                     let count = if args.is_empty() {
                         0
+                    } else if unsafe { pyre_object::is_bool(args[0]) } {
+                        pyre_object::int_bit_count(unsafe {
+                            pyre_object::w_bool_get_value(args[0]) as i64
+                        })
                     } else if unsafe { pyre_object::is_int(args[0]) } {
                         // Small-int fast path — `@jit.elidable` `_bit_count`.
                         pyre_object::int_bit_count(unsafe { pyre_object::w_int_get_value(args[0]) })
                     } else if unsafe { pyre_object::pyobject::is_int_or_long(args[0]) } {
-                        match unsafe { crate::builtins::obj_to_bigint(args[0]).bit_count() } {
+                        match unsafe { pyre_object::w_long_get_value(args[0]).bit_count() } {
                             Ok(count) => count,
                             Err(pyre_object::rbigint::RBigIntError::Overflow) => {
                                 return Err(crate::PyError::overflow_error(
@@ -13883,12 +13907,19 @@ fn init_int_type(ns: PyObjectRef) {
                         pos.len() - 1
                     )));
                 }
-                let val = if !pos.is_empty()
-                    && unsafe { pyre_object::pyobject::is_int_or_long(pos[0]) }
-                {
-                    unsafe { crate::builtins::obj_to_bigint(pos[0]) }
+                let owned_val;
+                let val = if !pos.is_empty() && unsafe { pyre_object::is_bool(pos[0]) } {
+                    owned_val =
+                        BigInt::from(unsafe { pyre_object::w_bool_get_value(pos[0]) as i64 });
+                    &owned_val
+                } else if !pos.is_empty() && unsafe { pyre_object::is_int(pos[0]) } {
+                    owned_val = BigInt::from(unsafe { pyre_object::w_int_get_value(pos[0]) });
+                    &owned_val
+                } else if !pos.is_empty() && unsafe { pyre_object::is_long(pos[0]) } {
+                    unsafe { pyre_object::w_long_get_value(pos[0]) }
                 } else {
-                    BigInt::from(0)
+                    owned_val = BigInt::from(0);
+                    &owned_val
                 };
                 let length_obj = pos
                     .get(1)
@@ -13959,6 +13990,9 @@ fn init_int_type(ns: PyObjectRef) {
                             }
                             pyre_object::rbigint::RBigIntError::Overflow => {
                                 crate::PyError::overflow_error("int too big to convert")
+                            }
+                            pyre_object::rbigint::RBigIntError::Memory => {
+                                crate::PyError::memory_error("")
                             }
                             _ => unreachable!("rbigint.tobytes returned an unrelated error"),
                         })?;
@@ -18106,6 +18140,7 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     pyre_object::rbigint::RBigIntError::InvalidEndianness => {
                         crate::PyError::value_error("byteorder must be either 'little' or 'big'")
                     }
+                    pyre_object::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
                     _ => unreachable!("validated rbigint.frombytes returned an unrelated error"),
                 })?;
             pyre_object::w_long_new(value)

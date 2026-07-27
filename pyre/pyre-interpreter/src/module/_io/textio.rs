@@ -29,21 +29,26 @@ impl PositionCookie {
         if value.int_lt(0) {
             return Err(crate::PyError::value_error("negative seek position"));
         }
-        let mask = RBigInt::one()
-            .lshift(Self::BITS as i64)
-            .expect("native-word shift")
-            .int_sub(1);
-        let mut take = || {
-            let field = value.and_(&mask).to_u64().unwrap_or(0);
-            value = value
-                .rshift(Self::BITS as i64, false)
-                .expect("native-word shift");
-            field
-        };
-        let start_pos = take();
-        let dec_flags = take();
-        let bytes_to_feed = take();
-        let chars_to_skip = take();
+        // interp_textio.py:253-269 `PositionCookie.__init__`: extract each
+        // native word with rbigint's mask conversion, then shift the source.
+        // In particular, do not call `to_u64()` on the whole cookie — valid
+        // packed cookies intentionally occupy several machine words.
+        let start_pos = value.ulonglongmask();
+        value = value
+            .rshift(Self::BITS as i64, false)
+            .expect("native-word shift");
+        let dec_flags = value.uintmask();
+        value = value
+            .rshift(Self::BITS as i64, false)
+            .expect("native-word shift");
+        let bytes_to_feed = value.uintmask();
+        value = value
+            .rshift(Self::BITS as i64, false)
+            .expect("native-word shift");
+        let chars_to_skip = value.uintmask();
+        value = value
+            .rshift(Self::BITS as i64, false)
+            .expect("native-word shift");
         let need_eof = value.tobool();
         Ok(Self {
             start_pos,
@@ -1137,21 +1142,11 @@ impl W_TextIOWrapper {
 
         let w_index = crate::baseobjspace::space_index(w_pos)?;
         let raw_pos = unsafe { crate::builtins::obj_to_bigint(w_index) };
-        let Some(raw_pos) = raw_pos.to_u64() else {
-            return Err(crate::PyError::overflow_error(
-                "Python int too large to convert to C unsigned long",
-            ));
-        };
+        let mut cookie = PositionCookie::unpack(raw_pos)?;
         let snapshot = self.snapshot.as_ref().expect("checked above");
-        if snapshot.input.len() as u64 > raw_pos {
-            return Ok(w_int_new(0));
-        }
         let input = snapshot.input.clone();
-        let mut cookie = PositionCookie {
-            start_pos: raw_pos - input.len() as u64,
-            dec_flags: snapshot.flags,
-            ..PositionCookie::default()
-        };
+        cookie.dec_flags = snapshot.flags;
+        cookie.start_pos = cookie.start_pos.wrapping_sub(input.len() as u64);
         if self.decoded.pos == 0 {
             return Ok(cookie.to_object());
         }
@@ -1643,5 +1638,33 @@ impl W_TextIOWrapper {
         fields.push_str(" encoding=");
         fields.push_str(&unsafe { crate::display::py_repr(self.w_encoding)? });
         Ok(format!("<{typename}{fields}>"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn position_cookie_round_trips_all_native_words() {
+        let original = PositionCookie {
+            start_pos: 0xfedc_ba98_7654_3210,
+            dec_flags: 0x0123_4567_89ab_cdef,
+            bytes_to_feed: 0x8877_6655_4433_2211,
+            chars_to_skip: 0x1020_3040_5060_7080,
+            need_eof: true,
+        };
+        let packed = original.pack();
+        assert!(
+            packed.bits() > u64::BITS as u64,
+            "a packed cookie must not be narrowed through to_u64"
+        );
+
+        let decoded = PositionCookie::unpack(packed).expect("packed cookie");
+        assert_eq!(decoded.start_pos, original.start_pos);
+        assert_eq!(decoded.dec_flags, original.dec_flags);
+        assert_eq!(decoded.bytes_to_feed, original.bytes_to_feed);
+        assert_eq!(decoded.chars_to_skip, original.chars_to_skip);
+        assert_eq!(decoded.need_eof, original.need_eof);
     }
 }

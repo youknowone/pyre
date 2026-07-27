@@ -207,7 +207,7 @@ unsafe fn bytes_format_is_mapping(obj: PyObjectRef) -> bool {
 }
 
 /// `CFormatSpec::format_number` over RPython rbigint.
-fn cformat_rbigint(spec: &CFormatSpec, num: &BigInt) -> String {
+fn cformat_rbigint(spec: &CFormatSpec, num: &BigInt) -> Result<String, PyError> {
     let CFormatType::Number(number_type) = spec.format_type else {
         unreachable!()
     };
@@ -241,7 +241,21 @@ fn cformat_rbigint(spec: &CFormatSpec, num: &BigInt) -> String {
             },
         ),
     };
-    let mut magnitude = num.abs().to_str_radix(radix);
+    let digits = match radix {
+        8 => pyre_object::rbigint::BASE8,
+        10 => pyre_object::rbigint::BASE10,
+        16 => pyre_object::rbigint::BASE16,
+        _ => unreachable!("percent integer formats use radix 8, 10, or 16"),
+    };
+    let negative = num.int_lt(0);
+    let mut magnitude = num.format(digits, "", "", 0).map_err(|error| match error {
+        pyre_object::rbigint::RBigIntError::Memory => PyError::memory_error(""),
+        _ => unreachable!("validated radix formatting returned an unrelated error"),
+    })?;
+    if negative {
+        debug_assert!(magnitude.starts_with('-'));
+        magnitude.remove(0);
+    }
     if upper {
         magnitude.make_ascii_uppercase();
     }
@@ -250,7 +264,7 @@ fn cformat_rbigint(spec: &CFormatSpec, num: &BigInt) -> String {
     {
         magnitude = format!("{}{magnitude}", "0".repeat(precision - magnitude.len()));
     }
-    let sign = if num.int_lt(0) {
+    let sign = if negative {
         "-"
     } else {
         spec.flags.sign_string()
@@ -268,23 +282,23 @@ fn cformat_rbigint(spec: &CFormatSpec, num: &BigInt) -> String {
         };
         let needed = width.saturating_sub(signed_prefix.len() + magnitude.len());
         if spec.flags.contains(CConversionFlags::LEFT_ADJUST) {
-            format!(
+            Ok(format!(
                 "{signed_prefix}{magnitude}{}",
                 fill.to_string().repeat(needed)
-            )
+            ))
         } else {
-            format!(
+            Ok(format!(
                 "{signed_prefix}{}{magnitude}",
                 fill.to_string().repeat(needed)
-            )
+            ))
         }
     } else {
         let body = format!("{signed_prefix}{magnitude}");
         let needed = width.saturating_sub(body.len());
         if spec.flags.contains(CConversionFlags::LEFT_ADJUST) {
-            format!("{body}{}", " ".repeat(needed))
+            Ok(format!("{body}{}", " ".repeat(needed)))
         } else {
-            format!("{}{body}", " ".repeat(needed))
+            Ok(format!("{}{body}", " ".repeat(needed)))
         }
     }
 }
@@ -322,7 +336,7 @@ unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<
                 }
                 _ => number_arg_integer(spec, obj)?,
             };
-            Ok(cformat_rbigint(spec, &value).into_bytes())
+            Ok(cformat_rbigint(spec, &value)?.into_bytes())
         }
         CFormatType::Float(_) => {
             let value = crate::baseobjspace::float_w(obj).map_err(|e| {
@@ -370,9 +384,10 @@ unsafe fn bytes_char_arg(obj: PyObjectRef) -> Result<u8, PyError> {
         )));
     };
     let overflow = || PyError::new(PyErrorKind::OverflowError, "%c arg not in range(256)");
-    let Some(n) = value.to_i64() else {
+    if pyre_object::jit_bigint_to_i64_fits(&value) == 0 {
         return Err(overflow());
-    };
+    }
+    let n = pyre_object::jit_bigint_to_i64_value(&value);
     if !(0..=255).contains(&n) {
         return Err(overflow());
     }
@@ -421,7 +436,7 @@ unsafe fn spec_format_string(
                 }
                 _ => number_arg_integer(spec, obj)?,
             };
-            Ok(Wtf8Buf::from_string(cformat_rbigint(spec, &value)))
+            Ok(Wtf8Buf::from_string(cformat_rbigint(spec, &value)?))
         }
         CFormatType::Float(_) => {
             let value = crate::baseobjspace::float_w(obj)?;
@@ -438,7 +453,8 @@ unsafe fn arg_to_bigint(obj: PyObjectRef) -> BigInt {
     } else if is_int(obj) {
         BigInt::from(w_int_get_value(obj))
     } else {
-        w_long_get_value(obj).clone()
+        // bigint_w returns the immutable payload reference, not a copy.
+        w_long_get_value(obj).translated_alias()
     }
 }
 
@@ -606,14 +622,26 @@ unsafe fn star_int(arg: Option<PyObjectRef>, field: StarField) -> Result<i64, Py
         return Err(PyError::type_error("* wants int"));
     }
     let big = crate::builtins::obj_to_bigint(arg);
-    use num_traits::ToPrimitive;
     match field {
-        StarField::Width => big
-            .to_i64()
-            .ok_or_else(|| PyError::overflow_error("Python int too large to convert to C ssize_t")),
-        StarField::Precision => big
-            .to_i32()
-            .map(|v| v as i64)
-            .ok_or_else(|| PyError::overflow_error("Python int too large to convert to C int")),
+        StarField::Width => {
+            if pyre_object::jit_bigint_to_i64_fits(&big) != 0 {
+                Ok(pyre_object::jit_bigint_to_i64_value(&big))
+            } else {
+                Err(PyError::overflow_error(
+                    "Python int too large to convert to C ssize_t",
+                ))
+            }
+        }
+        StarField::Precision => {
+            if pyre_object::jit_bigint_to_i64_fits(&big) != 0 {
+                let value = pyre_object::jit_bigint_to_i64_value(&big);
+                if i32::try_from(value).is_ok() {
+                    return Ok(value);
+                }
+            }
+            Err(PyError::overflow_error(
+                "Python int too large to convert to C int",
+            ))
+        }
     }
 }
