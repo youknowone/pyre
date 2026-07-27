@@ -1371,25 +1371,38 @@ pub fn frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
     jitcode_index: i32,
     carried_jitcode_pc: i32,
 ) -> FrameLivenessRegIndices {
+    try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(jitcode_index, carried_jitcode_pc)
+        .unwrap_or_default()
+}
+
+/// The decline-reporting form of
+/// [`frame_liveness_reg_indices_by_bank_at_with_jitcode_pc`].
+///
+/// The three ways the decode can fail — unknown jitcode index, a coordinate
+/// that is not a `-live-` anchored startpoint, and a liveness offset past the
+/// end of the table — are indistinguishable from a genuinely empty live set in
+/// the `FrameLivenessRegIndices` return. A caller that materializes registers
+/// from the result (rather than merely reading them) needs to tell the two
+/// apart, or it builds a frame whose every register is unset and hands it on as
+/// if it were complete.
+pub fn try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+    jitcode_index: i32,
+    carried_jitcode_pc: i32,
+) -> Option<FrameLivenessRegIndices> {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
         let idx = jitcode_index as usize;
-        let Some(jc) = sd.jitcodes.get(idx) else {
-            return FrameLivenessRegIndices::default();
-        };
+        let jc = sd.jitcodes.get(idx)?;
         let payload = &jc.payload;
         // No Python-pc reconstruction is available here: an absent carried
-        // coordinate returns the empty result to its decline-aware caller.
-        let resolved_jit_pc: Option<usize> =
-            payload.resolve_resume_pc_with_jitcode_pc(carried_jitcode_pc, sd.op_live);
-        let Some(jit_pc) = resolved_jit_pc else {
-            return FrameLivenessRegIndices::default();
-        };
+        // coordinate declines.
+        let jit_pc: usize =
+            payload.resolve_resume_pc_with_jitcode_pc(carried_jitcode_pc, sd.op_live)?;
         let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
         let all_liveness = &sd.liveness_info;
         if off + 2 >= all_liveness.len() {
-            return FrameLivenessRegIndices::default();
+            return None;
         }
         let length_i = all_liveness[off] as u32;
         let length_r = all_liveness[off + 1] as u32;
@@ -1414,7 +1427,7 @@ pub fn frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
         let int = read_bank(&mut cursor, length_i, all_liveness);
         let ref_ = read_bank(&mut cursor, length_r, all_liveness);
         let float = read_bank(&mut cursor, length_f, all_liveness);
-        FrameLivenessRegIndices { int, ref_, float }
+        Some(FrameLivenessRegIndices { int, ref_, float })
     })
 }
 

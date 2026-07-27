@@ -1250,19 +1250,6 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         jitcode_index as i32,
         i32::try_from(call.next_pc).ok()?,
     );
-    let depth = pjc
-        .depth_trivia_for_jitcode_pc(call.next_pc)
-        .or_else(|| pjc.depth_for_jitcode_pc_pred(call.next_pc))
-        .unwrap_or(0) as usize;
-    let nlocals = (!pjc.code_ptr.is_null())
-        .then(|| unsafe { &*pjc.code_ptr }.varnames.len())
-        .unwrap_or(0);
-    let pcdep = pjc
-        .pcdep_trivia_for_jitcode_pc(call.next_pc)
-        .map(ToOwned::to_owned)
-        .or_else(|| pjc.pcdep_for_jitcode_pc(call.next_pc))
-        .unwrap_or_default();
-
     let mut int_values = Vec::with_capacity(live.int.len());
     for &color in &live.int {
         let color = color as usize;
@@ -1281,18 +1268,19 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         if result_bank == 'r' && result_color == Some(color) {
             continue;
         }
-        let semantic_slot =
-            crate::state::semantic_ref_slot_for_reg_color(nlocals, depth, &pcdep, color)
-                .unwrap_or(color);
-        let ConcreteValue::Ref(value) = ctx
-            .concrete_registers_r
-            .get(semantic_slot)
-            .copied()
-            .or_else(|| ctx.concrete_registers_r.get(color).copied())?
-        else {
+        // `concrete_registers_r` is the color-indexed shadow of `registers_r`:
+        // it is allocated to `num_regs_r + constants_r.len()` and every walker
+        // handler writes `concrete_registers_r[dst]` in lock-step with
+        // `registers_r[dst]`.  `semantic_ref_slot_for_reg_color` maps a color
+        // to a `locals_cells_stack_w` slot, which is what
+        // `restore_guard_failure_values` needs to call `set_local_at` /
+        // `set_stack_at` on a concrete PyFrame — a different index space.
+        // Reading the shadow through it stamped whatever register happened to
+        // live at the slot's number.
+        let ConcreteValue::Ref(value) = ctx.concrete_registers_r.get(color).copied()? else {
             return None;
         };
-        ref_values.push((color, semantic_slot, value));
+        ref_values.push((color, value));
     }
 
     let mut float_values = Vec::with_capacity(live.float.len());

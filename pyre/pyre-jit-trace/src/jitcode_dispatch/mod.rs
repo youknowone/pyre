@@ -4638,10 +4638,10 @@ struct InlineParentBlackhole {
     /// return value through `call_result_reg()` before this caller runs.
     resume_pc: usize,
     int_values: Vec<(usize, i64)>,
-    /// `(register color, semantic slot, value)`.  Keeping both indices makes
-    /// the semantic Ref shadow's source explicit while the MIFrame consumer
-    /// restores the color-indexed bank.
-    ref_values: Vec<(usize, usize, pyre_object::PyObjectRef)>,
+    /// `(register color, value)`, read out of the color-indexed
+    /// `concrete_registers_r` shadow and restored into the MIFrame's
+    /// color-indexed Ref bank.
+    ref_values: Vec<(usize, pyre_object::PyObjectRef)>,
     /// Float values have no concrete shadow bank; retain their OpRefs and
     /// resolve them at force time while the trace context is still live.
     float_values: Vec<(usize, OpRef)>,
@@ -5347,7 +5347,7 @@ pub unsafe fn fbw_store_journal_root_walker_area(
                     visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
                 }
                 if let Some(blackhole) = parent.blackhole.as_mut() {
-                    for (_color, _semantic_slot, value) in blackhole.ref_values.iter_mut() {
+                    for (_color, value) in blackhole.ref_values.iter_mut() {
                         visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
                     }
                 }

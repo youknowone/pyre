@@ -171,10 +171,16 @@ fn build_single_frame_miframe<Sym: WalkSym>(
     resume_pc: usize,
     lastop_result: Option<(char, usize, i64)>,
 ) -> Option<majit_metainterp::MIFrame> {
-    let live = crate::state::frame_liveness_reg_indices_by_bank_at(
+    // An MIFrame is only representable at a `-live-` anchored startpoint: the
+    // blackhole reads its registers straight out of the copied banks, so a
+    // coordinate whose live set cannot be decoded must decline here rather
+    // than yield a frame with every register unset.  All callers pass a
+    // post-call `next_pc` today, which always resolves; the precondition is
+    // what keeps that true as the pc domain widens.
+    let live = crate::state::try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
         i32::try_from(jitcode.index()).ok()?,
         i32::try_from(resume_pc).ok()?,
-    );
+    )?;
     let mut miframe = majit_metainterp::MIFrame::new(jitcode.clone(), resume_pc);
 
     // pyjitpl.py make_result_of_lastop: the residual returned before its
@@ -272,7 +278,7 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
         for &(color, value) in &concrete.int_values {
             *miframe.int_values.get_mut(color)? = Some(value);
         }
-        for &(color, _semantic_slot, value) in &concrete.ref_values {
+        for &(color, value) in &concrete.ref_values {
             *miframe.ref_values.get_mut(color)? = Some(value as i64);
         }
         for &(color, opref) in &concrete.float_values {
