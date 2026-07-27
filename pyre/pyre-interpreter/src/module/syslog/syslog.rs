@@ -22,9 +22,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             {
                 let ident = match args.first() {
                     Some(&a) if unsafe { pyre_object::is_str(a) } => {
-                        // openlog(3) keeps the ident pointer, so it has to be a
-                        // C string.
-                        std::ffi::CString::new(crate::baseobjspace::str_utf8_w(a)?)
+                        // openlog(3) keeps a C string, so the ident ends at
+                        // the first NUL.
+                        let ident = crate::baseobjspace::str_utf8_w(a)?;
+                        let ident = ident.split_once('\0').map_or(ident, |(s, _)| s);
+                        std::ffi::CString::new(ident)
                             .ok()
                             .map(|c| c.into_boxed_c_str())
                     }
