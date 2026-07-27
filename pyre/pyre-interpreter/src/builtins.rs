@@ -9061,12 +9061,7 @@ fn _hash_tuple_xx_iter(items: impl Iterator<Item = i64>) -> i64 {
 /// instead of panicking on the `&str` view.
 fn _hash_str(bytes: &[u8]) -> i64 {
     use core::hash::Hasher;
-    // Empty input hashes to 0 (`""` and `b""`), short-circuiting the
-    // siphash digest.
-    if bytes.is_empty() {
-        return 0;
-    }
-    // `rpython/rlib/rsiphash.py:60-62 _build_key_from_seed` — when
+    // `rpython/rlib/rsiphash.py _build_key_from_seed` — when
     // `PYTHONHASHSEED=0` the key is the 16-byte all-zero buffer.
     // Pyre runs with the deterministic seed for reproducibility,
     // matching PyPy's `PYTHONHASHSEED=0` byte-for-byte.  Wiring a
@@ -9083,7 +9078,15 @@ fn _hash_str(bytes: &[u8]) -> i64 {
     let mut hasher = siphasher::sip::SipHasher24::new_with_key(&SECRET);
     hasher.write(bytes);
     let raw = hasher.finish() as i64;
-    raw - ((raw == -1) as i64)
+    let raw = raw - ((raw == -1) as i64);
+    // `rstr.py _ll_strhash` — a string caches its digest in a slot that
+    // `malloc` zeroed, so zero doubles as "not computed yet" and a digest that
+    // lands on it is replaced by this fixed substitute.  Applied here rather
+    // than at the caching str caller so every digest consumer (bytes,
+    // memoryview) agrees with the cached one on the same bytes.  Empty input
+    // is NOT special-cased: `ll_strhash`'s `return 0` arm is a null-pointer
+    // check, and upstream digests `b""` like any other value.
+    if raw == 0 { 29872897 } else { raw }
 }
 
 /// `space.hash_w` digest for a `str` computed directly from its WTF-8 bytes
@@ -9176,20 +9179,17 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             );
         }
         if is_str(obj) {
-            // `unicodeobject.py:339-343 hash_w` digests `self._utf8`, and
+            // `unicodeobject.py hash_w` digests `self._utf8`, and
             // `compute_hash` on an RPython string is `ll_strhash`, which keeps
             // the result in the string and recomputes only while the slot
-            // still reads zero.  Zero doubles as "not computed", so a digest
-            // that lands on it is stored as the same substitute every time
-            // (`rstr.py:409-410`) and stays a consistent hash for the value.
+            // still reads zero.  `_hash_str` already substitutes a zero
+            // digest, so the value cached here is never the "not computed"
+            // sentinel.
             let cached = pyre_object::w_str_get_hash(obj);
             if cached != 0 {
                 return cached;
             }
-            let mut hash = _hash_str(pyre_object::w_str_get_wtf8(obj).as_bytes());
-            if hash == 0 {
-                hash = 29742;
-            }
+            let hash = _hash_str(pyre_object::w_str_get_wtf8(obj).as_bytes());
             pyre_object::w_str_set_hash(obj, hash);
             return hash;
         }
@@ -12749,12 +12749,14 @@ mod tests {
         }
     }
 
-    /// Empty `str`/`bytes` hash to 0; non-empty inputs take the siphash
-    /// digest.
+    /// Empty input is digested like any other: SipHash-2-4 under the all-zero
+    /// key gives `0x1e924b9d737700d7`, which is what PyPy reports for
+    /// `hash("")` under `PYTHONHASHSEED=0`.  A digest never reads back as the
+    /// zero "not computed yet" sentinel.
     #[test]
-    fn empty_str_and_bytes_hash_to_zero() {
-        assert_eq!(_hash_str(b""), 0);
-        assert_eq!(hash_str_bytes(b""), 0);
+    fn empty_str_and_bytes_digest_like_pypy() {
+        assert_eq!(_hash_str(b""), 0x1e92_4b9d_7377_00d7);
+        assert_eq!(hash_str_bytes(b""), 0x1e92_4b9d_7377_00d7);
         assert_ne!(_hash_str(b"a"), 0);
     }
 

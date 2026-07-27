@@ -399,8 +399,7 @@ impl Drop for LiveLastInstrGuard {
         // guard displaced (see [`capture_escape_flush_undo`]), so a later
         // commit withdrawal still restores the resume pc rather than the
         // executing one.
-        let flushed = ESCAPE_FLUSH_UNDO
-            .with(|slot| slot.borrow().as_ref().map(|undo| undo.frame))
+        let flushed = ESCAPE_FLUSH_UNDO.with(|slot| slot.borrow().as_ref().map(|undo| undo.frame))
             == Some(self.frame as usize);
         if !flushed {
             unsafe { (*self.frame).last_instr = self.saved };
