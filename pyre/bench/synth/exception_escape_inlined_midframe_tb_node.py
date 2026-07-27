@@ -12,6 +12,11 @@
 #   before: ('<module>', 'driver', 'leaf')
 #   after:  ('<module>', 'driver', 'mid_pass', 'leaf')
 #
+# Expected output, one line per middle function:
+#   mid_pass    ('<module>', 'driver', 'mid_pass', 'leaf')
+#   mid_outer   ('<module>', 'driver', 'mid_outer', 'mid_pass', 'leaf')
+#   mid_reraise ('<module>', 'driver', 'mid_reraise', 'leaf')
+#
 # Discriminators, each verified against pypy3 and PYRE_JIT=0:
 #   * the walk-time path was already correct - catching the same exception
 #     inside the hot loop keeps every level, because a different arm records it;
@@ -21,7 +26,10 @@
 #   * three call levels hid it for the same reason;
 #   * the middle frame had to be INLINED - a residual one was never affected.
 #
-# Expected output: ('<module>', 'driver', 'mid_pass', 'leaf').
+# The deeper shapes below guard the other direction: the walk now records at
+# every frame it propagates over, so a level that already had a node from
+# somewhere else would show up twice.  Each line is a full chain, so a doubled
+# node is as visible as a missing one.
 N = 4000
 
 
@@ -35,21 +43,33 @@ def mid_pass(i, n):
     return leaf(i, n)
 
 
-def driver(n):
+def mid_outer(i, n):
+    return mid_pass(i, n)
+
+
+def mid_reraise(i, n):
+    try:
+        return leaf(i, n)
+    except ValueError:
+        raise
+
+
+def driver(mid, n):
     acc = 0
     i = 0
     while i < n:
-        acc += mid_pass(i, n)
+        acc += mid(i, n)
         i += 1
     return acc
 
 
-try:
-    driver(N)
-except ValueError as e:
-    names = []
-    tb = e.__traceback__
-    while tb is not None:
-        names.append(tb.tb_frame.f_code.co_name)
-        tb = tb.tb_next
-    print(tuple(names))
+for mid in (mid_pass, mid_outer, mid_reraise):
+    try:
+        driver(mid, N)
+    except ValueError as e:
+        names = []
+        tb = e.__traceback__
+        while tb is not None:
+            names.append(tb.tb_frame.f_code.co_name)
+            tb = tb.tb_next
+        print(mid.__name__, tuple(names))
