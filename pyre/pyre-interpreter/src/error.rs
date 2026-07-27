@@ -1976,25 +1976,43 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
                 crate::baseobjspace::isinstance_w(notes, tuple_type.as_ptr())
             })
     };
-    if is_list || is_tuple {
-        let len = if is_list {
-            unsafe { pyre_object::w_list_len(notes) }
-        } else {
-            unsafe { pyre_object::w_tuple_len(notes) }
-        } as i64;
-        for i in 0..len {
-            let notes = pyre_object::gc_roots::shadow_stack_get(notes_slot);
-            let item = if is_list {
-                unsafe { pyre_object::w_list_getitem(notes, i) }
+    let is_sequence = is_list || is_tuple || notes_is_abc_sequence(notes_slot);
+    if is_sequence
+        && !unsafe { crate::baseobjspace::isinstance_str_w(notes) }
+        && !unsafe { crate::baseobjspace::isinstance_bytes_w(notes) }
+    {
+        let mut item_slots = Vec::new();
+        if is_list || is_tuple {
+            let len = if is_list {
+                unsafe { pyre_object::w_list_len(notes) }
             } else {
-                unsafe { pyre_object::w_tuple_getitem(notes, i) }
+                unsafe { pyre_object::w_tuple_len(notes) }
+            } as i64;
+            for i in 0..len {
+                let notes = pyre_object::gc_roots::shadow_stack_get(notes_slot);
+                let item = if is_list {
+                    unsafe { pyre_object::w_list_getitem(notes, i) }
+                } else {
+                    unsafe { pyre_object::w_tuple_getitem(notes, i) }
+                }
+                .unwrap_or(pyre_object::PY_NULL);
+                if !item.is_null() {
+                    let item_slot = pyre_object::gc_roots::shadow_stack_len();
+                    pyre_object::gc_roots::pin_root(item);
+                    item_slots.push(item_slot);
+                }
             }
-            .unwrap_or(pyre_object::PY_NULL);
-            if item.is_null() {
-                continue;
+        } else {
+            let notes = pyre_object::gc_roots::shadow_stack_get(notes_slot);
+            if let Ok(items) = crate::builtins::collect_iterable(notes) {
+                for item in items {
+                    let item_slot = pyre_object::gc_roots::shadow_stack_len();
+                    pyre_object::gc_roots::pin_root(item);
+                    item_slots.push(item_slot);
+                }
             }
-            let item_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(item);
+        }
+        for item_slot in item_slots {
             let item = pyre_object::gc_roots::shadow_stack_get(item_slot);
             let s = unsafe { crate::display::py_str(item) }
                 .unwrap_or_else(|_| "<unprintable note>".to_string());
@@ -2008,6 +2026,31 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
     let rendered = unsafe { crate::display::py_repr(notes) }
         .unwrap_or_else(|_| "<exception repr() failed>".to_string());
     writeln!(writer, "{rendered}")
+}
+
+fn notes_is_abc_sequence(notes_slot: usize) -> bool {
+    let module = crate::importing::get_sys_module("collections.abc").or_else(|| {
+        crate::importing::importhook(
+            "collections.abc",
+            pyre_object::w_none(),
+            pyre_object::w_none(),
+            0,
+            crate::call::take_last_exec_ctx(),
+        )
+        .ok()?;
+        crate::importing::get_sys_module("collections.abc")
+    });
+    let Some(module) = module else {
+        return false;
+    };
+    let Ok(sequence) = crate::baseobjspace::getattr_str(module, "Sequence") else {
+        return false;
+    };
+    let sequence_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(sequence);
+    let notes = pyre_object::gc_roots::shadow_stack_get(notes_slot);
+    let sequence = pyre_object::gc_roots::shadow_stack_get(sequence_slot);
+    crate::baseobjspace::isinstance(notes, sequence).unwrap_or(false)
 }
 
 /// Compose the `ExcName: msg` header for a W_BaseException —
@@ -2175,6 +2218,29 @@ fn traceback_last_frame(tb: PyObjectRef) -> Option<*mut crate::pyframe::PyFrame>
     (!frame.is_null()).then_some(frame)
 }
 
+fn traceback_self_is(tb: PyObjectRef, obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
+    let Some(frame) = traceback_last_frame(tb) else {
+        return false;
+    };
+    let anchor = crate::eval::FrameAnchor::new(unsafe { &mut *frame });
+    let Ok(locals) = unsafe { &mut *anchor.live() }.getdictscope() else {
+        return false;
+    };
+    let locals_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(locals);
+    let locals = pyre_object::gc_roots::shadow_stack_get(locals_slot);
+    let Some(self_obj) = (unsafe { pyre_object::w_dict_getitem_str(locals, "self") }) else {
+        return false;
+    };
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    std::ptr::eq(self_obj, obj)
+}
+
 fn object_dir_strings(obj: PyObjectRef) -> Option<Vec<String>> {
     if obj.is_null() || unsafe { pyre_object::is_none(obj) } {
         return None;
@@ -2246,8 +2312,12 @@ fn exception_suggestion(exc_slot: usize) -> Option<String> {
         ExcKind::AttributeError => {
             let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
             let obj = unsafe { pyre_object::interp_exceptions::w_exception_get_attr_obj(exc) };
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             object_dir_strings(obj).and_then(|mut names| {
-                if !wrong_name.starts_with('_') {
+                let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                if !wrong_name.starts_with('_') && !traceback_self_is(tb, obj) {
                     names.retain(|name| !name.starts_with('_'));
                 }
                 best_suggestion(&names, &wrong_name)

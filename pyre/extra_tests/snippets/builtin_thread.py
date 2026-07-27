@@ -193,6 +193,11 @@ tuple_notes.__notes__ = ("first detail", 42)
 tuple_notes_output = hook_output(tuple_notes)
 assert tuple_notes_output.endswith("first detail\n42\n")
 
+range_notes = ValueError("range notes")
+range_notes.__notes__ = range(2)
+range_notes_output = hook_output(range_notes)
+assert range_notes_output.endswith("0\n1\n")
+
 scalar_notes = ValueError("scalar notes")
 scalar_notes.__notes__ = "detail"
 scalar_notes_output = hook_output(scalar_notes)
@@ -232,6 +237,23 @@ attribute_suggestion = AttributeError(
 assert hook_output(attribute_suggestion).endswith(
     "AttributeError: 'SuggestionTarget' object has no attribute "
     "'availabl_attribute'. Did you mean: 'available_attribute'?\n"
+)
+
+
+class PrivateSuggestionTarget:
+    _public = 1
+
+    def fail(self):
+        return self.public
+
+
+try:
+    PrivateSuggestionTarget().fail()
+except AttributeError as private_suggestion:
+    private_suggestion_output = hook_output(private_suggestion)
+assert private_suggestion_output.endswith(
+    "AttributeError: 'PrivateSuggestionTarget' object has no attribute "
+    "'public'. Did you mean: '_public'?\n"
 )
 
 import_suggestion = ImportError(
