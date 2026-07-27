@@ -265,6 +265,21 @@ pub struct Cpu {
     /// `bh_list_to_tuple_fn(value)` — CALL_INTRINSIC_1 ListToTuple residual
     /// (`list_to_tuple`, allocates a fresh tuple; non-list → TypeError).
     pub list_to_tuple_fn: extern "C" fn(i64) -> i64,
+    /// `bh_get_len_fn(subject)` — GET_LEN residual; pushes `len(subject)`
+    /// without consuming it (runs `__len__`).
+    pub get_len_fn: extern "C" fn(i64) -> i64,
+    /// `bh_match_sequence_fn(subject)` — MATCH_SEQUENCE residual; reads the
+    /// subject type's PATMA marker (no user code).
+    pub match_sequence_fn: extern "C" fn(i64) -> i64,
+    /// `bh_match_mapping_fn(subject)` — MATCH_MAPPING residual, mirroring
+    /// `match_sequence_fn`.
+    pub match_mapping_fn: extern "C" fn(i64) -> i64,
+    /// `bh_match_keys_fn(subject, keys)` — MATCH_KEYS residual; looks each
+    /// pattern key up via `get` (user code; duplicate key → ValueError).
+    pub match_keys_fn: extern "C" fn(i64, i64) -> i64,
+    /// `bh_match_class_fn(subject, cls, kwd_attrs, count)` — MATCH_CLASS
+    /// residual; runs `isinstance` and attribute lookups.
+    pub match_class_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `bh_unary_not_fn(value)` — UNARY_NOT `not value` residual returning a
     /// bool (a user `__bool__` / `__len__` may run Python; infallible).
     pub unary_not_fn: extern "C" fn(i64) -> i64,
@@ -478,6 +493,11 @@ impl Cpu {
             unary_positive_fn: crate::call_jit::bh_unary_positive_fn,
             load_common_constant_fn: crate::call_jit::bh_load_common_constant_fn,
             list_to_tuple_fn: crate::call_jit::bh_list_to_tuple_fn,
+            get_len_fn: crate::call_jit::bh_get_len_fn,
+            match_sequence_fn: crate::call_jit::bh_match_sequence_fn,
+            match_mapping_fn: crate::call_jit::bh_match_mapping_fn,
+            match_keys_fn: crate::call_jit::bh_match_keys_fn,
+            match_class_fn: crate::call_jit::bh_match_class_fn,
             unary_not_fn: crate::call_jit::bh_unary_not_fn,
             load_fast_check_fn: crate::call_jit::bh_load_fast_check_fn,
             unbound_local_error_fn: crate::call_jit::bh_unbound_local_error_fn,

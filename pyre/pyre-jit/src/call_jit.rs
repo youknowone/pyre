@@ -5916,6 +5916,66 @@ pub extern "C" fn bh_list_to_tuple_fn(value: i64) -> i64 {
     }
 }
 
+/// GET_LEN residual (`get_len` HLOp → `residual_call_r_r`).  Pushes
+/// `len(subject)` without consuming the subject.  Runs the type's
+/// `__len__` (`MayForce`).
+pub extern "C" fn bh_get_len_fn(subject: i64) -> i64 {
+    match pyre_interpreter::baseobjspace::len(subject as pyre_object::PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(mut err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
+}
+
+/// MATCH_SEQUENCE residual (`match_sequence` HLOp → `residual_call_r_r`).
+/// Reads the subject type's PATMA marker; runs no user code and never
+/// raises (`Plain`).
+pub extern "C" fn bh_match_sequence_fn(subject: i64) -> i64 {
+    pyre_interpreter::opcode_ops::match_sequence_value(subject as pyre_object::PyObjectRef) as i64
+}
+
+/// MATCH_MAPPING residual (`match_mapping` HLOp → `residual_call_r_r`).
+/// Mirrors [`bh_match_sequence_fn`].
+pub extern "C" fn bh_match_mapping_fn(subject: i64) -> i64 {
+    pyre_interpreter::opcode_ops::match_mapping_value(subject as pyre_object::PyObjectRef) as i64
+}
+
+/// MATCH_KEYS residual (`match_keys` HLOp → `residual_call_r_r`).  Looks
+/// each pattern key up in the subject via `get`, so it runs user code
+/// (`MayForce`) and can raise on a duplicate key.
+pub extern "C" fn bh_match_keys_fn(subject: i64, keys: i64) -> i64 {
+    match pyre_interpreter::opcode_ops::match_keys_value(
+        subject as pyre_object::PyObjectRef,
+        keys as pyre_object::PyObjectRef,
+    ) {
+        Ok(result) => result as i64,
+        Err(mut err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
+}
+
+/// MATCH_CLASS residual (`match_class` HLOp → `residual_call_ir_r`).
+/// `count` is the number of positional sub-patterns.  Runs `isinstance`
+/// and attribute lookups, so user code (`MayForce`).
+pub extern "C" fn bh_match_class_fn(subject: i64, cls: i64, kwd_attrs: i64, count: i64) -> i64 {
+    match pyre_interpreter::opcode_ops::match_class_value(
+        subject as pyre_object::PyObjectRef,
+        cls as pyre_object::PyObjectRef,
+        kwd_attrs as pyre_object::PyObjectRef,
+        count as usize,
+    ) {
+        Ok(result) => result as i64,
+        Err(mut err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
+}
+
 /// LOAD_COMMON_CONSTANT residual (`load_common_constant` HLOp →
 /// `residual_call_ir_r`).  `disc` is the `CommonConstant` discriminant
 /// (0-6).  Resolves the pushed object through the shared

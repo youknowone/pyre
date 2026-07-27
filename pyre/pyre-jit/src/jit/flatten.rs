@@ -2591,6 +2591,11 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "invert"
             | "pos"
             | "list_to_tuple"
+            | "get_len"
+            | "match_sequence"
+            | "match_mapping"
+            | "match_keys"
+            | "match_class"
             | "not_"
             | "import_name"
             | "import_from"
@@ -3488,6 +3493,30 @@ pub struct LoweringContext {
     /// FORMAT_SIMPLE shape); `bh_list_to_tuple_fn` allocates a fresh tuple
     /// (non-list → TypeError → `MayForce`).
     pub list_to_tuple_fn_idx: u16,
+    /// `get_len_fn` descrs-pool index.  GET_LEN records `get_len(subject)`
+    /// lowered to `residual_call_r_r` by [`lower_get_len_hlop_to_insn`];
+    /// `bh_get_len_fn` runs the type's `__len__` → `MayForce`.
+    pub get_len_fn_idx: u16,
+    /// `match_sequence_fn` descrs-pool index.  MATCH_SEQUENCE records
+    /// `match_sequence(subject)` lowered to `residual_call_r_r` by
+    /// [`lower_match_sequence_hlop_to_insn`]; `bh_match_sequence_fn` reads
+    /// the subject type's PATMA marker, runs no user code → `Plain`.
+    pub match_sequence_fn_idx: u16,
+    /// `match_mapping_fn` descrs-pool index, mirroring
+    /// [`Self::match_sequence_fn_idx`].
+    pub match_mapping_fn_idx: u16,
+    /// `match_keys_fn` descrs-pool index.  MATCH_KEYS records
+    /// `match_keys(subject, keys)` lowered to `residual_call_r_r` (two-Ref)
+    /// by [`lower_match_keys_hlop_to_insn`]; `bh_match_keys_fn` looks each
+    /// key up via `get` → `MayForce`.
+    pub match_keys_fn_idx: u16,
+    /// `match_class_fn` descrs-pool index.  MATCH_CLASS records
+    /// `match_class(subject, cls, kwd_attrs, count)` lowered to
+    /// `residual_call_ir_r(ConstInt(fn_idx), ListI([count]), ListR([subject,
+    /// cls, kwd_attrs]), Descr) → reg` by [`lower_match_class_hlop_to_insn`];
+    /// `bh_match_class_fn` runs `isinstance` and attribute lookups →
+    /// `MayForce`.
+    pub match_class_fn_idx: u16,
     /// `load_from_dict_or_globals_fn` descrs-pool index.
     /// LOAD_FROM_DICT_OR_GLOBALS records `load_from_dict_or_globals(dict,
     /// code, frame, namei)` lowered to `residual_call_ir_r(ConstInt(fn_idx),
@@ -3748,6 +3777,39 @@ fn build_residual_call_ir_r_insn_from_operands(
             Operand::ConstInt(fn_idx as i64),
             Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(op_val)])),
             Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![lhs_operand, rhs_operand])),
+            descr_operand,
+        ],
+        dst_reg,
+    )
+}
+
+/// `build_residual_call_ir_r_insn_from_operands` with a caller-supplied Ref
+/// list instead of the fixed `(lhs, rhs)` pair, for helpers that take more
+/// (or fewer) than two Refs alongside their single Int.  The ABI is Refs
+/// first then Ints, matching the two-Ref form.
+fn build_residual_call_ir_r_insn_from_ref_list(
+    fn_idx: u16,
+    op_val: i64,
+    ref_operands: Vec<Operand>,
+    flavor: CallFlavor,
+    pyre_helper: majit_ir::PyreHelperKind,
+    dst_reg: Register,
+) -> Insn {
+    let mut arg_kinds = vec![Kind::Ref; ref_operands.len()];
+    arg_kinds.push(Kind::Int);
+    let mut effect_info = effect_info_for_call_flavor(flavor);
+    effect_info.pyre_helper = pyre_helper;
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds,
+        result_kind: Some(Kind::Ref),
+    }));
+    Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(op_val)])),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, ref_operands)),
             descr_operand,
         ],
         dst_reg,
@@ -5190,6 +5252,21 @@ where
     if let Some(insn) = lower_list_to_tuple_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_get_len_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_match_sequence_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_match_mapping_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_match_keys_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_match_class_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_load_common_constant_hlop_to_insn(op, ctx, get_register) {
         return Some(insn);
     }
@@ -5985,6 +6062,177 @@ where
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.list_to_tuple_fn_idx,
         vec![value],
+        CallFlavor::MayForce,
+        majit_ir::PyreHelperKind::None,
+        dst_reg,
+    ))
+}
+
+/// Lower a single-Ref pattern-matching HLOp to `residual_call_r_r`.
+/// GET_LEN / MATCH_SEQUENCE / MATCH_MAPPING all have the `op(subject) →
+/// Ref` shape, differing only in helper index and call flavor.
+fn lower_unary_patma_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    opname: &str,
+    fn_idx: u16,
+    flavor: CallFlavor,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != opname || op.args.len() != 1 {
+        return None;
+    }
+    let subject = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_r_r_insn_from_operands(
+        fn_idx,
+        vec![subject],
+        flavor,
+        majit_ir::PyreHelperKind::None,
+        dst_reg,
+    ))
+}
+
+/// Lower the GET_LEN HLOp `get_len(subject)` → `result: Ref`.
+/// `bh_get_len_fn` runs the type's `__len__` → `MayForce`.
+pub fn lower_get_len_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    lower_unary_patma_hlop_to_insn(
+        op,
+        "get_len",
+        ctx.get_len_fn_idx,
+        CallFlavor::MayForce,
+        get_register,
+        lower_constant,
+    )
+}
+
+/// Lower the MATCH_SEQUENCE HLOp `match_sequence(subject)` → `result: Ref`.
+/// `bh_match_sequence_fn` reads the subject type's PATMA marker: no user
+/// code, no allocation beyond the interned bool → `Plain`.
+pub fn lower_match_sequence_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    lower_unary_patma_hlop_to_insn(
+        op,
+        "match_sequence",
+        ctx.match_sequence_fn_idx,
+        CallFlavor::Plain,
+        get_register,
+        lower_constant,
+    )
+}
+
+/// Lower the MATCH_MAPPING HLOp `match_mapping(subject)` → `result: Ref`,
+/// mirroring [`lower_match_sequence_hlop_to_insn`].
+pub fn lower_match_mapping_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    lower_unary_patma_hlop_to_insn(
+        op,
+        "match_mapping",
+        ctx.match_mapping_fn_idx,
+        CallFlavor::Plain,
+        get_register,
+        lower_constant,
+    )
+}
+
+/// Lower the MATCH_KEYS HLOp `match_keys(subject, keys)` → `result: Ref` to
+/// `residual_call_r_r(ConstInt(match_keys_fn_idx), ListR([subject, keys]),
+/// Descr) → reg`.  `bh_match_keys_fn` looks each pattern key up through the
+/// subject's `get` → `MayForce`.
+pub fn lower_match_keys_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "match_keys" || op.args.len() != 2 {
+        return None;
+    }
+    let subject = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let keys = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_r_r_insn_from_operands(
+        ctx.match_keys_fn_idx,
+        vec![subject, keys],
+        CallFlavor::MayForce,
+        majit_ir::PyreHelperKind::None,
+        dst_reg,
+    ))
+}
+
+/// Lower the MATCH_CLASS HLOp `match_class(subject, cls, kwd_attrs, count)`
+/// → `result: Ref` to `residual_call_ir_r(ConstInt(match_class_fn_idx),
+/// ListI([count]), ListR([subject, cls, kwd_attrs]), Descr) → reg` — the
+/// three-Ref-plus-one-Int shape of `lower_load_from_dict_or_globals_hlop_to_insn`.
+/// `bh_match_class_fn` runs `isinstance` and attribute lookups →
+/// `MayForce`.
+pub fn lower_match_class_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "match_class" || op.args.len() != 4 {
+        return None;
+    }
+    let subject = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let cls = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let kwd_attrs = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
+    let count = match flatten_arg_with_lowering(&op.args[3], get_register, lower_constant) {
+        Operand::ConstInt(v) => v,
+        _ => return None,
+    };
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_ir_r_insn_from_ref_list(
+        ctx.match_class_fn_idx,
+        count,
+        vec![subject, cls, kwd_attrs],
         CallFlavor::MayForce,
         majit_ir::PyreHelperKind::None,
         dst_reg,

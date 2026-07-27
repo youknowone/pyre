@@ -3446,6 +3446,11 @@ struct FnPtrIndices {
     unary_positive_fn: HelperHandle,
     load_common_constant_fn: HelperHandle,
     list_to_tuple_fn: HelperHandle,
+    get_len_fn: HelperHandle,
+    match_sequence_fn: HelperHandle,
+    match_mapping_fn: HelperHandle,
+    match_keys_fn: HelperHandle,
+    match_class_fn: HelperHandle,
     load_from_dict_or_globals_fn: HelperHandle,
     call_function_ex_fn: HelperHandle,
     unary_not_fn: HelperHandle,
@@ -4120,6 +4125,32 @@ fn register_helper_fn_pointers(
         cpu.unbound_local_error_fn as *const (),
         CallFlavor::PlainCannotRaise,
     );
+    // Pattern matching (PEP 634).  `bh_get_len_fn` runs `__len__`,
+    // `bh_match_keys_fn` runs the subject's `get`, `bh_match_class_fn` runs
+    // `isinstance` plus attribute lookups → `MayForce`.  MATCH_SEQUENCE /
+    // MATCH_MAPPING only read the subject type's PATMA marker → `Plain`.
+    // Appended last to preserve fn_ptr indices.
+    let get_len_fn = bind(assembler, cpu.get_len_fn as *const (), CallFlavor::MayForce);
+    let match_sequence_fn = bind(
+        assembler,
+        cpu.match_sequence_fn as *const (),
+        CallFlavor::Plain,
+    );
+    let match_mapping_fn = bind(
+        assembler,
+        cpu.match_mapping_fn as *const (),
+        CallFlavor::Plain,
+    );
+    let match_keys_fn = bind(
+        assembler,
+        cpu.match_keys_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    let match_class_fn = bind(
+        assembler,
+        cpu.match_class_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4195,6 +4226,11 @@ fn register_helper_fn_pointers(
         map_add_fn,
         dict_merge_fn,
         list_to_tuple_fn,
+        get_len_fn,
+        match_sequence_fn,
+        match_mapping_fn,
+        match_keys_fn,
+        match_class_fn,
         load_from_dict_or_globals_fn,
         call_function_ex_fn,
         call_kw_fn_0,
@@ -5664,6 +5700,31 @@ impl CodeWriter {
                     idx: list_to_tuple_fn_idx,
                     flavor: _list_to_tuple_fn_flavor,
                 },
+            get_len_fn:
+                HelperHandle {
+                    idx: get_len_fn_idx,
+                    flavor: _get_len_fn_flavor,
+                },
+            match_sequence_fn:
+                HelperHandle {
+                    idx: match_sequence_fn_idx,
+                    flavor: _match_sequence_fn_flavor,
+                },
+            match_mapping_fn:
+                HelperHandle {
+                    idx: match_mapping_fn_idx,
+                    flavor: _match_mapping_fn_flavor,
+                },
+            match_keys_fn:
+                HelperHandle {
+                    idx: match_keys_fn_idx,
+                    flavor: _match_keys_fn_flavor,
+                },
+            match_class_fn:
+                HelperHandle {
+                    idx: match_class_fn_idx,
+                    flavor: _match_class_fn_flavor,
+                },
             load_from_dict_or_globals_fn:
                 HelperHandle {
                     idx: load_from_dict_or_globals_fn_idx,
@@ -5922,6 +5983,11 @@ impl CodeWriter {
                 unary_positive_fn_idx,
                 load_common_constant_fn_idx,
                 list_to_tuple_fn_idx,
+                get_len_fn_idx,
+                match_sequence_fn_idx,
+                match_mapping_fn_idx,
+                match_keys_fn_idx,
+                match_class_fn_idx,
                 load_from_dict_or_globals_fn_idx,
                 call_function_ex_fn_idx,
                 unary_not_fn_idx,
@@ -11276,15 +11342,23 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
-                        // GetLen: peeks obj, pushes len. Net: +1.
+                        // GetLen: peeks obj (does NOT pop), pushes len. Net: +1.
+                        // `get_len(subject)` HLOp → `bh_get_len_fn` residual.
                         Instruction::GetLen => {
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            // Genuine trace boundary: flowspace rejects GET_LEN
-                            // with `unsupported_rpython("GET_LEN is used by match
-                            // statements (not RPython)")` — abort is
-                            // parity-correct.
-                            emit_abort_permanent!(py_pc);
+                            let subject = current_state
+                                .stack
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "get_len",
+                                vec![subject.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // LoadSpecial: pops 1 (obj), pushes 2 (callable, self_or_null). Net: +1.
@@ -12161,47 +12235,78 @@ impl CodeWriter {
                         }
 
                         // MatchSequence: peeks TOS (subject), pushes bool. Net: +1.
-                        // assemble.py:1614, liveness.rs:601.
-                        Instruction::MatchSequence => {
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            // Genuine trace boundary: flowspace rejects
-                            // MATCH_SEQUENCE with `unsupported_rpython("structural
-                            // pattern matching is not RPython")` — abort is
-                            // parity-correct.
-                            emit_abort_permanent!(py_pc);
-                        }
-
-                        // MatchMapping: peeks TOS (subject), pushes bool. Net: +1.
-                        Instruction::MatchMapping => {
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                        // assemble.py:1614, liveness.rs:601.  `match_sequence(
+                        // subject)` HLOp → `bh_match_sequence_fn` residual.
+                        Instruction::MatchSequence | Instruction::MatchMapping => {
+                            let opname = if matches!(instruction, Instruction::MatchSequence) {
+                                "match_sequence"
+                            } else {
+                                "match_mapping"
+                            };
+                            let subject = current_state
+                                .stack
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                opname,
+                                vec![subject.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // MatchKeys: peeks subject + keys tuple (TOS), pushes a
-                        // values tuple or None. Net: +1.
+                        // values tuple or None. Net: +1.  `match_keys(subject,
+                        // keys)` HLOp → `bh_match_keys_fn` residual.
                         Instruction::MatchKeys => {
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                            let depth = current_state.stack.len();
+                            let keys = current_state
+                                .stack
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let subject = depth
+                                .checked_sub(2)
+                                .and_then(|i| current_state.stack.get(i).cloned())
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "match_keys",
+                                vec![subject.into(), keys.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // MatchClass: pops subject, type and the keyword-names
                         // tuple (3), pushes the extracted-attrs tuple or None (1).
-                        // Net: -2. The stack effect MUST be modelled even though
-                        // the trace aborts: an unmodelled MATCH_CLASS (via the
-                        // catch-all below) left the operand-stack depth 2 too high,
-                        // so the enclosing block's return link carried stale pattern
-                        // temporaries and tripped `make_return`'s arity assert in
-                        // the flatten pass.
-                        Instruction::MatchClass { .. } => {
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                        // Net: -2.  `match_class(subject, cls, kwd_attrs, count)`
+                        // HLOp → `bh_match_class_fn` residual.
+                        Instruction::MatchClass { count } => {
+                            let count = count.get(op_arg) as i64;
+                            let _kwd_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let kwd_attrs = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _cls_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let cls = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let _subject_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let subject = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let v_count: super::flow::FlowValue =
+                                super::flow::Constant::signed(count).into();
+                            let result_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "match_class",
+                                vec![subject.into(), cls.into(), kwd_attrs.into(), v_count.into()],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // Catch-all: unknown instruction.
