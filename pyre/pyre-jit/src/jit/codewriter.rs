@@ -10946,10 +10946,11 @@ impl CodeWriter {
                             current_depth = current_depth.saturating_sub(1);
                             current_state.stack.push(result);
                             current_depth += 1;
-                            // Genuine trace boundary: flowspace rejects END_SEND
-                            // with `unsupported_rpython("async iteration is not
-                            // RPython")` — the generated JIT cannot trace it
-                            // either, so abort_permanent is parity-correct.
+                            // Genuine trace boundary: END_SEND terminates a
+                            // `yield from` / `await` delegation, whose partner
+                            // opcode SEND suspends the frame. A trace records one
+                            // continuous execution, so no residual can express the
+                            // resume; abort_permanent is the only correct choice.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -11255,10 +11256,10 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            // Genuine trace boundary: flowspace rejects
-                            // BUILD_INTERPOLATION with `unsupported_rpython(
-                            // "f-strings and template strings are not RPython")`
-                            // — abort is parity-correct.
+                            // Portable in principle (PEP 750 t-strings build an
+                            // Interpolation object — an ordinary call), but no
+                            // residual is written yet: t-strings appear in
+                            // formatting code, not in hot loop bodies.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -11269,10 +11270,8 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            // Genuine trace boundary: flowspace rejects
-                            // BUILD_TEMPLATE with `unsupported_rpython("f-strings
-                            // and template strings are not RPython")` — abort is
-                            // parity-correct.
+                            // Portable in principle, unported for the same
+                            // reason as BUILD_INTERPOLATION above.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -11284,11 +11283,11 @@ impl CodeWriter {
                         Instruction::CallIntrinsic1 { func } => {
                             use pyre_interpreter::bytecode::IntrinsicFunction1;
                             // UnaryPositive→`pos`, ListToTuple→`list_to_tuple`
-                            // are the two portable CALL_INTRINSIC_1 variants
-                            // (flowcontext.rs:2422-2431 record real ops); both
-                            // are single-Ref→Ref residuals.  Every other variant
-                            // is `unsupported_rpython` (flowcontext.rs:2435) —
-                            // abort_permanent is parity-correct there.
+                            // are the two CALL_INTRINSIC_1 variants with a
+                            // residual; both are single-Ref→Ref.  The remaining
+                            // variants (import-star, stopiteration-error, the PEP
+                            // 695 type-param helpers) are def-time or error-path
+                            // only, so no residual has been written for them.
                             let opname = match func.get(op_arg) {
                                 IntrinsicFunction1::UnaryPositive => Some("pos"),
                                 IntrinsicFunction1::ListToTuple => Some("list_to_tuple"),
@@ -11318,12 +11317,9 @@ impl CodeWriter {
                         // Other variants: general pop 2, push 1. Net: -1.
                         // pyopcode.rs:1302-1316.
                         //
-                        // Only SetTypeparamDefault is portable (flowspace
-                        // `set_typeparam_default` pure op); the rest are genuine
-                        // boundaries (`unsupported_rpython`).  The portable one is
-                        // deeply latent — a PEP 695 def-time intrinsic that
+                        // Every variant is a PEP 695 / def-time intrinsic that
                         // imports `_typing` and calls a Python helper, never a hot
-                        // loop body. No residual.
+                        // loop body, so none carries a residual.
                         Instruction::CallIntrinsic2 { func } => {
                             use pyre_interpreter::bytecode::IntrinsicFunction2;
                             match func.get(op_arg) {
@@ -11460,10 +11456,10 @@ impl CodeWriter {
                         Instruction::LoadFromDictOrDeref { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            // Genuine trace boundary: flowspace rejects
-                            // LOAD_FROM_DICT_OR_DEREF with `unsupported_rpython(
-                            // "closure cell mutation is not RPython")` — abort is
-                            // parity-correct.
+                            // No residual is possible while the interpreter
+                            // itself raises here: the trait default
+                            // (pyopcode.rs:1247) never implements the opcode, so
+                            // there is no value-level function to call.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -11653,11 +11649,10 @@ impl CodeWriter {
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
-                        // Genuine trace boundaries: flowspace rejects both —
-                        // LOAD_LOCALS with `unsupported_rpython("locals() is not
-                        // RPython")` and LOAD_BUILD_CLASS with `unsupported_rpython(
-                        // "defining classes inside functions is not RPython")`.
-                        // abort is parity-correct.
+                        // Both are portable (plain value-level reads), but both
+                        // occur only in a class body, which runs once per class
+                        // definition — never a hot loop body — so no residual has
+                        // been written.
                         Instruction::LoadLocals | Instruction::LoadBuildClass => {
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
@@ -11765,10 +11760,9 @@ impl CodeWriter {
                         Instruction::GetYieldFromIter => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            // Genuine trace boundary: flowspace rejects
-                            // GET_YIELD_FROM_ITER with `unsupported_rpython(
-                            // "`yield from` is not supported by flowspace yet")`
-                            // — abort is parity-correct.
+                            // Genuine trace boundary: this only heads a
+                            // `yield from` delegation, whose SEND suspends the
+                            // frame — not expressible as a residual call.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -12138,16 +12132,14 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
-                        // ExitInitCheck: no-op in pyre (pyopcode.rs:2069). Net: 0.
+                        // ExitInitCheck: no-op in pyre. Net: 0.
                         // RustPython pops the __init__ return value, but pyre's
-                        // dispatch is a plain Ok(StepResult::Continue).
-                        // Genuine trace boundary: flowspace rejects
-                        // EXIT_INIT_CHECK with `unsupported_rpython("`__init__`
-                        // return-None check is not RPython")` — abort is
-                        // parity-correct.
-                        Instruction::ExitInitCheck => {
-                            emit_abort_permanent!(py_pc);
-                        }
+                        // dispatch is a plain `Ok(StepResult::Continue)`
+                        // (pyopcode.rs), and liveness.rs:579 models it as pop 0 /
+                        // push 0 to match. An opcode the interpreter executes as a
+                        // no-op has nothing to residualize and nothing to bail for,
+                        // so the trace just carries on.
+                        Instruction::ExitInitCheck => {}
 
                         // StoreName pops 1 value from the stack.
                         // (This is separate from the above because pyopcode.rs pops.)
@@ -12187,9 +12179,10 @@ impl CodeWriter {
                         Instruction::Send { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            // Genuine trace boundary: flowspace rejects SEND with
-                            // `unsupported_rpython("async iteration is not
-                            // RPython")` — abort is parity-correct.
+                            // Genuine trace boundary: SEND suspends the frame
+                            // (StepResult::Yield) and resumes it in a different
+                            // stack context, which a residual call cannot express —
+                            // the same reason YIELD_VALUE aborts above.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -12209,10 +12202,9 @@ impl CodeWriter {
                         // on the StopAsyncIteration path (assemble.py:1578). Structural
                         // adaptation: pyre targets CPython opcode shape here.
                         //
-                        // Genuine trace boundary: flowspace rejects END_ASYNC_FOR
-                        // with `unsupported_rpython` (the async cluster —
-                        // GET_AITER/GET_AWAITABLE/GET_ANEXT/SEND/END_ASYNC_FOR —
-                        // `async for` is not RPython), so abort is parity-correct.
+                        // Genuine trace boundary: END_ASYNC_FOR closes an
+                        // `async for`, whose body suspends the frame through SEND
+                        // on every iteration — not expressible as a residual.
                         Instruction::EndAsyncFor => {
                             for _ in 0..2 {
                                 pop_and_decr_depth(&mut current_state, &mut current_depth);
@@ -12227,10 +12219,9 @@ impl CodeWriter {
                             }
                             push_fresh_ref(&mut current_state, &mut graph);
                             current_depth += 1;
-                            // Genuine trace boundary: flowspace rejects
-                            // CLEANUP_THROW with `unsupported_rpython("async
-                            // iteration is not RPython")` — abort is
-                            // parity-correct.
+                            // Genuine trace boundary: CLEANUP_THROW runs on the
+                            // throw() path of a suspended generator, which a trace
+                            // never records — the resume happens elsewhere.
                             emit_abort_permanent!(py_pc);
                         }
 
