@@ -307,7 +307,7 @@ pub struct SemanticProgram {
     pub unsafe_fn_stubs: Vec<(
         Vec<String>,
         crate::flowspace::argument::Signature,
-        crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+        Option<String>,
     )>,
     /// `(path-segments, Signature, result ValueType)` for every method on
     /// a foreign **opaque** ADT owner (`malachite_bigint::bigint::BigInt`,

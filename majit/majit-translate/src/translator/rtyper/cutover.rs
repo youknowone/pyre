@@ -1477,7 +1477,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
 ///    rtyper's `direct_call`.
 pub(crate) fn populate_call_registry_from_call_graphs(
     function_graphs: &crate::codewriter::call::GraphStore,
-    unsafe_fn_stubs: &[(Vec<String>, Signature, LowLevelType)],
+    unsafe_fn_stubs: &[(Vec<String>, Signature, Option<String>)],
     foreign_opaque_method_externals: &[(Vec<String>, Signature, crate::model::ValueType)],
     registry: &PyreCallRegistry,
 ) -> Result<(), TyperError> {
@@ -1723,61 +1723,15 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // (the `ExtRegistryEntry.compute_result_annotation` shape) so
         // callers annotate the declared result and the codewriter emits
         // the residual call via the fn's registered C ABI address
-        // (`pyre/jit_fnaddr.rs`).  The FUNC.RESULT token is the
-        // canonical spelling `front::mir::dont_look_inside_return_token`
-        // stamps from the callee's return `ValueType`.  Scalar tokens
-        // decode to their primitive lltype (`getkind` equals the legacy
-        // walker's `valuetype_to_concrete(result_ty)`).
-        //
-        // The `ref` token (a non-`*mut PyObject` heap result — e.g. a
-        // `*mut BigInt`) carries a classdef-less `SomeInstance` result
-        // shell (`valuetype_to_someshell(Ref(None))`), NOT a
-        // `SomePtr(GCREF)`.  A residual result is an annotation-stage
-        // value; the annotation-stage projection of every `Ref` is the
-        // classdef-less `SomeInstance` (`annotation_state.rs` doc-table),
-        // with `SomePtr` reserved for a producer writing
-        // `Variable.annotation` at the rtyper stage.  Emitting a
-        // `SomePtr(GCREF)` here made the result collide with the
-        // `SomeInstance(None)` an ordinary `Ref` merge partner carries
-        // (`_ptr ∪ <other>` UnionError in `mergeinputargs`, the union
-        // has no `SomePtr ∪ SomeInstance` arm).  The `SomeInstance(None)`
-        // shell unions cleanly (the classdef-less widen arm) and is the
-        // same shell the sibling `register_foreign_opaque_method_externals`
-        // path already gives a `BigInt`-returning method residual.  Both
-        // spellings rtype to `getkind = GcRef`, so the emitted
-        // `residual_call_*_r` opcode and C ABI are byte-identical.
-        //
-        // The object-pointer marker (`OBJECTPTR_RETURN_TYPE`, stamped by
-        // `merge_hints_from_llbcs` for a `*mut PyObject`-returning opaque
-        // callee the front-end left untokened) keeps the typed `OBJECTPTR`
-        // lltype so a caller reading the returned object's fields rtypes
-        // against the real struct.  An unrecognized token (none currently
-        // emitted) falls through to the normal lift.
+        // (`pyre/jit_fnaddr.rs`).  The FUNC.RESULT token is the canonical
+        // spelling `front::mir::dont_look_inside_return_token` stamps from
+        // the callee's return `ValueType`; [`residual_return_shell`]
+        // decodes it.  A token it declines falls through to the normal
+        // lift.
         let residualize = graph.hints.iter().any(|h| h == "dont_look_inside")
             || graph.hints.iter().any(|h| h == "elidable");
         if residualize {
-            let result_shell = match graph.return_type.as_deref() {
-                Some("ref") => Some(
-                    crate::codewriter::annotation_state::valuetype_to_someshell(
-                        &crate::model::ValueType::Ref(None),
-                    )
-                    .expect("Ref(None) shells to a definite SomeInstance"),
-                ),
-                token => {
-                    let return_lltype = match token {
-                        None | Some("()") => Some(LowLevelType::Void),
-                        Some("bool") => Some(LowLevelType::Bool),
-                        Some("i64") => Some(LowLevelType::Signed),
-                        Some("u64") => Some(LowLevelType::Unsigned),
-                        Some("f64") => Some(LowLevelType::Float),
-                        Some(s) if s == OBJECTPTR_RETURN_TYPE => {
-                            Some(crate::translator::rtyper::rclass::OBJECTPTR.clone())
-                        }
-                        _ => None,
-                    };
-                    return_lltype.and_then(|ll| default_someshell_for_lltype(&ll))
-                }
-            };
+            let result_shell = residual_return_shell(graph.return_type.as_deref());
             if let Some(result_shell) = result_shell {
                 let stub = build_stub_pygraph_with_result_shell(
                     graph.name.clone(),
@@ -1937,12 +1891,12 @@ pub(crate) fn lift_callee_to_pygraph(
 }
 
 /// Synthesize a minimal flowed `PyGraph` for a
-/// callee whose real body cannot be lowered through the adapter
-/// (`unsafe fn` in `pyre-object` / `pyre-interpreter`).  The stub has
-/// a single Link from `startblock` to `returnblock` carrying a
-/// pre-annotated `Variable` so the annotator's `flowin` projects the
-/// callsite result to the declared return type without touching the
-/// (non-modellable) body.
+/// callee declared by a `LowLevelType` result rather than a
+/// `SomeValue` shell — the static [`FOREIGN_STDLIB_EXTERNALS`] table.
+/// The stub has a single Link from `startblock` to `returnblock`
+/// carrying a pre-annotated `Variable` so the annotator's `flowin`
+/// projects the callsite result to the declared return type without
+/// touching the (non-modellable) body.
 ///
 /// `name` becomes the synthetic graph's `FunctionGraph.name`.
 /// `signature.argnames` are turned into named `Variable`s on the
@@ -1974,7 +1928,7 @@ pub(crate) fn lift_callee_to_pygraph(
 /// where `pygraph` is hand-constructed without going through
 /// `build_flow`.  Pure constructor — no annotator / rtyper side
 /// effects.
-pub(crate) fn build_stub_pygraph_for_unsafe_fn(
+pub(crate) fn build_stub_pygraph_for_lltype(
     name: String,
     signature: Signature,
     return_lltype: LowLevelType,
@@ -1989,13 +1943,14 @@ pub(crate) fn build_stub_pygraph_for_unsafe_fn(
 
 /// Build an annotator-only stub PyGraph whose return Variable carries
 /// `return_someval` directly.  Shared core of
-/// [`build_stub_pygraph_for_unsafe_fn`] (which projects an lltype through
-/// [`default_someshell_for_lltype`]) and the foreign-opaque-method
-/// registration (which carries a `SomeValue` shell built from the
-/// method's faithful result `ValueType` — including the classdef-less
-/// `SomeInstance` that an lltype cannot express).  See
-/// [`build_stub_pygraph_for_unsafe_fn`] for the annotator-only carrier
-/// contract.
+/// [`build_stub_pygraph_for_lltype`] (which projects an lltype through
+/// [`default_someshell_for_lltype`]) and the two shell-carrying paths —
+/// the unsafe-fn / `dont_look_inside` residuals via
+/// [`residual_return_shell`], and the foreign-opaque-method
+/// registration built from the method's faithful result `ValueType`.
+/// Both carry the classdef-less `SomeInstance` that an lltype cannot
+/// express.  See [`build_stub_pygraph_for_lltype`] for the
+/// annotator-only carrier contract.
 fn build_stub_pygraph_with_result_shell(
     name: String,
     signature: Signature,
@@ -2033,7 +1988,7 @@ fn build_stub_pygraph_with_result_shell(
 
 /// Project a `LowLevelType` to a `SomeValue` shell suitable for
 /// pre-annotating the stub-graph return Variable
-/// ([`build_stub_pygraph_for_unsafe_fn`]).
+/// ([`build_stub_pygraph_for_lltype`]).
 ///
 /// Delegates to
 /// [`crate::translator::rtyper::llannotation::lltype_to_annotation`]
@@ -2065,9 +2020,70 @@ pub(crate) fn default_someshell_for_lltype(
     }
 }
 
+/// Decode a residual callee's FUNC.RESULT token into the `SomeValue` shell
+/// its stub graph returns, or `None` when the token is one this path cannot
+/// model faithfully.
+///
+/// The token is the canonical spelling
+/// [`crate::front::mir::dont_look_inside_return_token`] stamps from the
+/// callee's return `ValueType`.  Scalar tokens decode to their primitive
+/// lltype (`getkind` equals the legacy walker's
+/// `valuetype_to_concrete(result_ty)`).
+///
+/// The `ref` token (a non-`*mut PyObject` heap result — e.g. a `*mut BigInt`,
+/// or the one-word success payload of a `Result<_, PyError>`) carries a
+/// classdef-less `SomeInstance` shell (`valuetype_to_someshell(Ref(None))`),
+/// NOT a `SomePtr(GCREF)`.  A residual result is an annotation-stage value;
+/// the annotation-stage projection of every `Ref` is the classdef-less
+/// `SomeInstance` (`annotation_state.rs` doc-table), with `SomePtr` reserved
+/// for a producer writing `Variable.annotation` at the rtyper stage.
+/// Emitting a `SomePtr(GCREF)` here made the result collide with the
+/// `SomeInstance(None)` an ordinary `Ref` merge partner carries (`_ptr ∪
+/// <other>` UnionError in `mergeinputargs`, the union has no `SomePtr ∪
+/// SomeInstance` arm).  The `SomeInstance(None)` shell unions cleanly (the
+/// classdef-less widen arm) and is the same shell the sibling
+/// [`register_foreign_opaque_method_externals`] path already gives a
+/// `BigInt`-returning method residual.  Both spellings rtype to `getkind =
+/// GcRef`, so the emitted `residual_call_*_r` opcode and C ABI are
+/// byte-identical.
+///
+/// The object-pointer marker (`OBJECTPTR_RETURN_TYPE`, stamped by
+/// `merge_hints_from_llbcs` for a `*mut PyObject`-returning opaque callee the
+/// front-end left untokened) keeps the typed `OBJECTPTR` lltype so a caller
+/// reading the returned object's fields rtypes against the real struct.
+///
+/// `i128` / `u128` are deliberately declined: they have no `getkind` at the
+/// codewriter boundary (`history.getkind` rejects `SignedLongLongLong`, 16
+/// bytes), so a caller annotating one would only reach a deeper wall.
+pub(crate) fn residual_return_shell(
+    token: Option<&str>,
+) -> Option<crate::annotator::model::SomeValue> {
+    if token == Some("ref") {
+        return Some(
+            crate::codewriter::annotation_state::valuetype_to_someshell(
+                &crate::model::ValueType::Ref(None),
+            )
+            .expect("Ref(None) shells to a definite SomeInstance"),
+        );
+    }
+    let return_lltype = match token {
+        None | Some("()") => Some(LowLevelType::Void),
+        Some("bool") => Some(LowLevelType::Bool),
+        Some("i64") => Some(LowLevelType::Signed),
+        Some("u64") => Some(LowLevelType::Unsigned),
+        Some("f64") => Some(LowLevelType::Float),
+        Some(s) if s == OBJECTPTR_RETURN_TYPE => {
+            Some(crate::translator::rtyper::rclass::OBJECTPTR.clone())
+        }
+        _ => None,
+    };
+    return_lltype.and_then(|ll| default_someshell_for_lltype(&ll))
+}
+
 /// Register a batch of unsafe-fn stub
-/// `(segments, signature, return_lltype)` specs into `registry`.
-/// Each entry is wrapped through [`build_stub_pygraph_for_unsafe_fn`]
+/// `(segments, signature, FUNC.RESULT token)` specs into `registry`.
+/// Each entry is wrapped through [`residual_return_shell`] +
+/// [`build_stub_pygraph_with_result_shell`]
 /// + [`PyreCallRegistry::register_callee`], so subsequent
 /// `flowspace_adapter::translate_op` lookups via
 /// `call_registry.lookup_with_leaf_match` find a registered entry and
@@ -2076,8 +2092,8 @@ pub(crate) fn default_someshell_for_lltype(
 ///
 /// `specs` is typically the output of
 /// `front::mir::collect_unsafe_fn_stubs_from_llbc` (the Charon/LLBC-
-/// sourced stub-spec list).  Per-fn failures (stub-pygraph builder returns
-/// `None` for compound lltypes, or registry already has the same key
+/// sourced stub-spec list).  Per-fn failures ([`residual_return_shell`]
+/// declines the token, or registry already has the same key
 /// at a conflicting signature) propagate as silent skips — the
 /// upstream "not registered" Skip path then absorbs that specific fn
 /// while the rest of the batch lands.
@@ -2090,8 +2106,8 @@ pub(crate) fn default_someshell_for_lltype(
 /// unsafe fns by validate_signature rejection).
 ///
 /// **Annotator-only carrier — never reaches the codewriter.**
-/// The stub graph carries a single default-Constant return link
-/// suitable for `RPythonAnnotator` return-type inference via
+/// The stub graph carries a single return link holding a pre-annotated
+/// Variable, suitable for `RPythonAnnotator` return-type inference via
 /// `cachedgraph` (see `pyre_call_registry::prefill_default_cache`).
 /// Because `CallControl::function_graphs` is populated exclusively
 /// by lowered safe-fn bodies (unsafe fns never produce a flow graph —
@@ -2106,21 +2122,22 @@ pub(crate) fn default_someshell_for_lltype(
 /// into executable JITCode.  The actual unsafe-fn body executes
 /// through the residual-call / direct-call fnaddr lowering that
 /// the codewriter emits for the call op whose target resolves
-/// to the host-evaluator entry point.  The default-Constant return is
+/// to the host-evaluator entry point.  The synthetic return shell is
 /// safe by virtue of the `function_graphs` gate, not by any
 /// `look_inside_graph` policy on the stub itself.
 pub(crate) fn register_unsafe_fn_stubs(
     registry: &PyreCallRegistry,
-    specs: &[(Vec<String>, Signature, LowLevelType)],
+    specs: &[(Vec<String>, Signature, Option<String>)],
 ) {
-    for (segments, signature, return_lltype) in specs {
-        let Some(stub_pygraph) = build_stub_pygraph_for_unsafe_fn(
-            segments.last().cloned().unwrap_or_default(),
-            signature.clone(),
-            return_lltype.clone(),
-        ) else {
+    for (segments, signature, return_token) in specs {
+        let Some(result_shell) = residual_return_shell(return_token.as_deref()) else {
             continue;
         };
+        let stub_pygraph = build_stub_pygraph_with_result_shell(
+            segments.last().cloned().unwrap_or_default(),
+            signature.clone(),
+            result_shell,
+        );
         let key = FunctionPathKey::from_segments(segments.iter().cloned());
         if registry.lookup(&key).is_some() {
             // Already registered via the function_graphs pass (e.g. a
@@ -2247,7 +2264,7 @@ pub(crate) fn register_foreign_stdlib_externals(registry: &PyreCallRegistry) {
             None,
             None,
         );
-        let Some(stub_pygraph) = build_stub_pygraph_for_unsafe_fn(
+        let Some(stub_pygraph) = build_stub_pygraph_for_lltype(
             segments.last().copied().unwrap_or_default().to_string(),
             signature.clone(),
             return_lltype.clone(),
@@ -4632,12 +4649,9 @@ mod tests {
     fn build_stub_pygraph_carries_signature_and_links_to_returnblock() {
         use crate::annotator::model::SomeValue;
         let sig = Signature::new(vec!["obj".to_string()], None, None);
-        let pygraph = build_stub_pygraph_for_unsafe_fn(
-            "is_none".to_string(),
-            sig.clone(),
-            LowLevelType::Bool,
-        )
-        .expect("Bool return must produce a stub pygraph");
+        let pygraph =
+            build_stub_pygraph_for_lltype("is_none".to_string(), sig.clone(), LowLevelType::Bool)
+                .expect("Bool return must produce a stub pygraph");
         assert_eq!(*pygraph.signature.borrow(), sig);
         let graph = pygraph.graph.borrow();
         assert_eq!(graph.name, "is_none");
@@ -4695,28 +4709,27 @@ mod tests {
             (
                 vec!["pyobject".to_string(), "is_none".to_string()],
                 Signature::new(vec!["obj".to_string()], None, None),
-                LowLevelType::Bool,
+                Some("bool".to_string()),
             ),
             (
                 vec!["pyobject".to_string(), "is_int".to_string()],
                 Signature::new(vec!["obj".to_string()], None, None),
-                LowLevelType::Bool,
+                Some("bool".to_string()),
             ),
-            // Compound lltype — the stub-pygraph builder returns None
-            // and register_unsafe_fn_stubs must skip.
+            // A token `residual_return_shell` declines — 128-bit has no
+            // `getkind` at the codewriter boundary — so
+            // register_unsafe_fn_stubs must skip.
             (
                 vec!["pyobject".to_string(), "unsupported".to_string()],
                 Signature::new(vec!["x".to_string()], None, None),
-                LowLevelType::Struct(Box::new(
-                    crate::translator::rtyper::lltypesystem::lltype::Struct::new("S", vec![]),
-                )),
+                Some("i128".to_string()),
             ),
         ];
         register_unsafe_fn_stubs(&registry, &specs);
         assert_eq!(
             registry.len(),
             2,
-            "compound-return spec must be skipped, others registered"
+            "undecodable-return spec must be skipped, others registered"
         );
         assert!(
             registry
@@ -4756,7 +4769,7 @@ mod tests {
         callcontrol.unsafe_fn_stubs = vec![(
             vec!["pyobject".to_string(), "is_none".to_string()],
             Signature::new(vec!["obj".to_string()], None, None),
-            LowLevelType::Bool,
+            Some("bool".to_string()),
         )];
         let bk = std::rc::Rc::new(Bookkeeper::new());
         let registry = PyreCallRegistry::new(bk);
@@ -4797,7 +4810,7 @@ mod tests {
         let specs = vec![(
             vec!["pyobject".to_string(), "shared".to_string()],
             signature,
-            LowLevelType::Bool,
+            Some("bool".to_string()),
         )];
         register_unsafe_fn_stubs(&registry, &specs);
         assert_eq!(registry.len(), 1, "no new entry expected");
@@ -4820,7 +4833,7 @@ mod tests {
                 result: LowLevelType::Void,
             },
         ));
-        let result = build_stub_pygraph_for_unsafe_fn("synth".to_string(), sig, func_ll);
+        let result = build_stub_pygraph_for_lltype("synth".to_string(), sig, func_ll);
         assert!(result.is_none(), "Func lltype must surface as None");
     }
 }
