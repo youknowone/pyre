@@ -114,6 +114,11 @@ class CollectingStrError(Exception):
         return "collected safely"
 
 
+class ErrorNamespace:
+    class NestedError(Exception):
+        pass
+
+
 def capture_error(exc):
     try:
         raise exc
@@ -168,6 +173,24 @@ collecting_error.add_note("note after collection")
 collecting_output = hook_output(collecting_error)
 assert "CollectingStrError: collected safely\n" in collecting_output
 assert collecting_output.endswith("note after collection\n")
+
+nested_output = hook_output(ErrorNamespace.NestedError("nested"))
+assert nested_output.endswith("ErrorNamespace.NestedError: nested\n")
+ErrorNamespace.NestedError.__module__ = "pkg.mod"
+qualified_output = hook_output(ErrorNamespace.NestedError("qualified"))
+assert qualified_output.endswith(
+    "pkg.mod.ErrorNamespace.NestedError: qualified\n"
+)
+
+tuple_notes = ValueError("tuple notes")
+tuple_notes.__notes__ = ("first detail", 42)
+tuple_notes_output = hook_output(tuple_notes)
+assert tuple_notes_output.endswith("first detail\n42\n")
+
+scalar_notes = ValueError("scalar notes")
+scalar_notes.__notes__ = "detail"
+scalar_notes_output = hook_output(scalar_notes)
+assert scalar_notes_output.endswith("'detail'\n")
 
 # CPython's invalid-value printer intentionally retains its historical
 # `NoneType: None` special case while other non-exceptions use the diagnostic.

@@ -1439,8 +1439,22 @@ fn exc_object_class_name(exc: PyObjectRef) -> Option<String> {
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
         return None;
     }
-    crate::typedef::r#type(exc)
-        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()).to_string() })
+    crate::typedef::r#type(exc).map(|tp| unsafe {
+        let w_type = tp.as_ptr();
+        if !pyre_object::w_type_is_heaptype(w_type) {
+            return pyre_object::w_type_get_name(w_type).to_string();
+        }
+        let qualname = pyre_object::w_type_get_qualname(w_type).to_string();
+        let module = crate::baseobjspace::lookup_in_type(w_type, "__module__")
+            .filter(|value| pyre_object::is_str(*value))
+            .map(|value| pyre_object::w_str_get_value(value).to_string());
+        match module.as_deref() {
+            Some(module) if module != "builtins" && module != "__main__" => {
+                format!("{module}.{qualname}")
+            }
+            _ => qualname,
+        }
+    })
 }
 
 impl std::fmt::Display for PyError {
@@ -1941,26 +1955,45 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
     let notes_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(notes);
     let notes = pyre_object::gc_roots::shadow_stack_get(notes_slot);
-    if !unsafe { pyre_object::is_list(notes) } {
+    let is_list = unsafe { crate::baseobjspace::isinstance_list_w(notes) };
+    let is_tuple = unsafe {
+        pyre_object::is_tuple(notes)
+            || crate::typedef::gettypefor(&pyre_object::TUPLE_TYPE).is_some_and(|tuple_type| {
+                crate::baseobjspace::isinstance_w(notes, tuple_type.as_ptr())
+            })
+    };
+    if is_list || is_tuple {
+        let len = if is_list {
+            unsafe { pyre_object::w_list_len(notes) }
+        } else {
+            unsafe { pyre_object::w_tuple_len(notes) }
+        } as i64;
+        for i in 0..len {
+            let notes = pyre_object::gc_roots::shadow_stack_get(notes_slot);
+            let item = if is_list {
+                unsafe { pyre_object::w_list_getitem(notes, i) }
+            } else {
+                unsafe { pyre_object::w_tuple_getitem(notes, i) }
+            }
+            .unwrap_or(pyre_object::PY_NULL);
+            if item.is_null() {
+                continue;
+            }
+            let item_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(item);
+            let item = pyre_object::gc_roots::shadow_stack_get(item_slot);
+            let s = unsafe { crate::display::py_str(item) }
+                .unwrap_or_else(|_| "<unprintable note>".to_string());
+            for line in s.split('\n') {
+                writeln!(writer, "{}", line)?;
+            }
+        }
         return Ok(());
     }
-    let len = unsafe { pyre_object::w_list_len(notes) } as i64;
-    for i in 0..len {
-        let notes = pyre_object::gc_roots::shadow_stack_get(notes_slot);
-        let item = unsafe { pyre_object::w_list_getitem(notes, i) }.unwrap_or(pyre_object::PY_NULL);
-        if item.is_null() {
-            continue;
-        }
-        let item_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(item);
-        let item = pyre_object::gc_roots::shadow_stack_get(item_slot);
-        let s = unsafe { crate::display::py_str(item) }
-            .unwrap_or_else(|_| "<unprintable note>".to_string());
-        for line in s.lines() {
-            writeln!(writer, "{}", line)?;
-        }
-    }
-    Ok(())
+    let notes = pyre_object::gc_roots::shadow_stack_get(notes_slot);
+    let rendered = unsafe { crate::display::py_repr(notes) }
+        .unwrap_or_else(|_| "<exception repr() failed>".to_string());
+    writeln!(writer, "{rendered}")
 }
 
 /// Compose the `ExcName: msg` header for a W_BaseException —
