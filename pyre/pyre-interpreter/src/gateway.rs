@@ -816,88 +816,133 @@ pub unsafe fn builtin_code_call(
     // fixed-count bodies reject a trailing keyword marker before it can be read
     // as an ordinary argument.
     let arity = unsafe { (*code).fast_natural_arity } as usize;
-    if arity <= 4 {
+    if arity <= 4 && args.len() != arity {
         let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-        if crate::builtins::has_real_kwargs(kwargs) {
-            return Err(no_keyword_arguments(unsafe { &*code }));
-        }
+        let receiver = positional.first().copied();
         if positional.len() != arity {
-            return Err(arity_mismatch(unsafe { &*code }, arity, positional.len()));
+            return Err(arity_mismatch(
+                unsafe { &*code },
+                receiver,
+                arity,
+                positional.len(),
+            ));
+        }
+        // A builtin registered by arity alone declares no parameter names
+        // (`sig` is null), so it is positional-only and a keyword cannot name
+        // anything it accepts.  The positional count already matched, so the
+        // keyword is purely extra and the body would silently ignore it.
+        if unsafe { (*code).sig.is_null() } && crate::builtins::has_real_kwargs(kwargs) {
+            return Err(no_keyword_arguments(unsafe { &*code }, receiver));
         }
     }
     unsafe { ((*code).func)(args) }
 }
 
-/// The TypeError raised for a call whose positional count does not match the
-/// implementation's.  Python 3.14 words this from the entry point's calling
-/// convention rather than from a signature, so a builtin registered by arity
-/// alone can reproduce it exactly:
-///
-/// - one argument (`METH_O`) — `range.count() takes exactly one argument (0 given)`
-/// - no arguments (`METH_NOARGS`) — `object.__dir__() takes no arguments (1 given)`
-/// - a fixed count — `insert expected 2 arguments, got 1`
-/// - a slot wrapper — `expected 1 argument, got 0`, with no qualified name,
-///   except the two-argument wrappers (`__setitem__`, `__setattr__`, `__set__`)
-///   which keep the bare method name.
-///
-/// A descriptor's receiver is not part of the reported count, so the declared
-/// arity and the supplied count both drop it.  The qualified name follows
-/// `func.__qualname__`: a method descriptor reports `type.name`, a
-/// module-level builtin its bare name.
+/// Wording for a keyword passed to a positional-only builtin.  A slot wrapper
+/// reports itself as `wrapper NAME()`; everything else uses its qualified
+/// name, the same split [`arity_mismatch`] draws.
 #[cold]
 #[inline(never)]
-fn arity_mismatch(code: &BuiltinCode, expected: usize, given: usize) -> crate::PyError {
+fn no_keyword_arguments(code: &BuiltinCode, receiver: Option<PyObjectRef>) -> crate::PyError {
+    let (owner, qualname) = builtin_names(code, receiver);
     let name = code.name;
+    let subject = match owner {
+        Some(owner) if is_slot_wrapper(owner.type_name, name) => format!("wrapper {name}"),
+        _ => qualname,
+    };
+    crate::PyError::type_error(format!("{subject}() takes no keyword arguments"))
+}
+
+/// The name a builtin reports itself under (`methodobject.c
+/// meth_get__qualname__`): a module-level builtin its bare name, a descriptor
+/// `TYPE.name` — where TYPE is the receiver itself when the receiver IS a type
+/// (`int.__subclasses__`), otherwise the receiver's type (`ValueError.add_note`
+/// for a `ValueError` instance, even though the method is declared on
+/// `BaseException`).  With no receiver to read, fall back to the type the
+/// method was stamped onto.
+fn builtin_names(
+    code: &BuiltinCode,
+    receiver: Option<PyObjectRef>,
+) -> (Option<&'static MethodOwner>, String) {
     let owner = unsafe { code.owner.as_ref() };
-    let qualname = builtin_code_qualname(code);
-    // A descriptor's receiver is not part of the reported count.
-    let (wanted, got) = match owner {
+    let qualname = match owner {
+        None => code.name.to_string(),
+        Some(owner) => {
+            let ty = match receiver {
+                Some(r) if unsafe { pyre_object::typeobject::is_type(r) } => {
+                    unsafe { pyre_object::w_type_get_name(r) }.to_string()
+                }
+                Some(r) => crate::baseobjspace::object_functionstr_type_name(r),
+                None => owner.type_name.to_string(),
+            };
+            format!("{ty}.{}", code.name)
+        }
+    };
+    (owner, qualname)
+}
+
+/// Wording for a call whose positional count does not match the
+/// implementation's.  A builtin is reported under the convention its C
+/// counterpart is written in, which for a fixed-arity implementation follows
+/// from the argument count alone once the receiver is discounted:
+///
+/// - two or more arguments is argument-clinic's `_PyArg_CheckPositional`:
+///   `NAME expected N arguments, got M`, under the BARE name — this is the
+///   form for slot wrappers too (`__setitem__ expected 2 arguments, got 0`);
+/// - one argument on a slot wrapper drops the name entirely
+///   (`expected 1 argument, got 2`), because the wrapper stands in front of
+///   every type's slot;
+/// - otherwise no arguments is `METH_NOARGS`
+///   (`NAME() takes no arguments (M given)`) and exactly one is `METH_O`
+///   (`NAME() takes exactly one argument (M given)`).
+///
+/// The `at least` / `at most` variants belong to builtins with optional
+/// arguments; those carry no fixed arity, so they check their own counts and
+/// never reach here.
+#[cold]
+#[inline(never)]
+fn arity_mismatch(
+    code: &BuiltinCode,
+    receiver: Option<PyObjectRef>,
+    expected: usize,
+    given: usize,
+) -> crate::PyError {
+    let (owner, qualname) = builtin_names(code, receiver);
+    // A descriptor's slice leads with the receiver; every wording below counts
+    // the arguments after it.
+    let (declared, supplied) = match owner {
         Some(_) => (expected.saturating_sub(1), given.saturating_sub(1)),
         None => (expected, given),
     };
-    let message = if owner.is_some_and(|owner| is_slot_wrapper(owner.type_name, name)) {
-        if wanted == 2 {
-            format!("{name} expected 2 arguments, got {got}")
-        } else {
-            format!(
-                "expected {wanted} argument{}, got {got}",
-                if wanted == 1 { "" } else { "s" },
-            )
-        }
+    let name = code.name;
+    let slot = owner.is_some_and(|owner| is_slot_wrapper(owner.type_name, name));
+    let message = if declared >= 2 {
+        format!("{name} expected {declared} arguments, got {supplied}")
+    } else if slot {
+        format!(
+            "expected {declared} argument{}, got {supplied}",
+            if declared == 1 { "" } else { "s" }
+        )
+    } else if declared == 0 {
+        format!("{qualname}() takes no arguments ({supplied} given)")
     } else {
-        match wanted {
-            0 => format!("{qualname}() takes no arguments ({got} given)"),
-            1 => format!("{qualname}() takes exactly one argument ({got} given)"),
-            _ => format!("{name} expected {wanted} arguments, got {got}"),
-        }
+        format!("{qualname}() takes exactly one argument ({supplied} given)")
     };
     crate::PyError::type_error(message)
 }
 
-fn builtin_code_qualname(code: &BuiltinCode) -> String {
-    match unsafe { code.owner.as_ref() } {
-        Some(owner) => format!("{}.{}", owner.type_name, code.name),
-        None => code.name.to_string(),
-    }
-}
-
-fn no_keyword_arguments(code: &BuiltinCode) -> crate::PyError {
-    // A method carries its owning type, so it names itself `list.append`.
-    // A module-level builtin has no owner to qualify it with and reports the
-    // bare name.
-    crate::PyError::type_error(format!(
-        "{}() takes no keyword arguments",
-        builtin_code_qualname(code)
-    ))
-}
-
-/// Build the keyword-rejection error for a fixed-count BuiltinCode.
+/// Build the keyword-rejection error for a fixed-count BuiltinCode, for a
+/// caller that rejects the keyword before it reaches [`builtin_code_call`].
+/// `receiver` is the call's first positional argument, if any.
 ///
 /// # Safety
 /// `obj` must point to a valid `BuiltinCode`.
 #[inline]
-pub unsafe fn builtin_code_no_keyword_arguments(obj: PyObjectRef) -> crate::PyError {
-    unsafe { no_keyword_arguments(&*(obj as *const BuiltinCode)) }
+pub unsafe fn builtin_code_no_keyword_arguments(
+    obj: PyObjectRef,
+    receiver: Option<PyObjectRef>,
+) -> crate::PyError {
+    unsafe { no_keyword_arguments(&*(obj as *const BuiltinCode), receiver) }
 }
 
 /// Python 3.14 fills a type's slots with `wrapper_descriptor`s and its

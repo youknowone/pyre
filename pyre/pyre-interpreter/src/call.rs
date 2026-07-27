@@ -2195,7 +2195,10 @@ pub fn call_with_kwargs(
             };
             if arity <= 4 && !kwargs.is_empty() {
                 return Err(unsafe {
-                    crate::builtin_code_no_keyword_arguments(code as pyre_object::PyObjectRef)
+                    crate::builtin_code_no_keyword_arguments(
+                        code as pyre_object::PyObjectRef,
+                        pos_args.first().copied(),
+                    )
                 });
             }
             let mut full_args = pos_args.to_vec();

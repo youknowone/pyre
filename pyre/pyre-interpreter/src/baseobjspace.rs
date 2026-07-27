@@ -11219,11 +11219,9 @@ pub(crate) fn raiseattrerror(
         }
     };
     // `object.c _PyObject_GenericSetAttrWithDict` appends the suffix when the
-    // receiver has no dict *slot*, which is a layout question that never runs
-    // Python.  A receiver whose dict lookup can fail — `_thread._local` runs
-    // the subclass initializer on first access (`os_local.py:73
-    // create_new_dict`) — does have somewhere to store, so it keeps the plain
-    // wording.
+    // receiver has no dict *slot*.  A raising `getdict` says nothing about
+    // whether the object could hold a dict, so the suffix is only added on a
+    // plainly absent one.
     let no_dict_suffix = if store && getdict_backing(obj).is_ok_and(|dict| dict.is_null()) {
         " and no __dict__ for setting new attributes"
     } else {
