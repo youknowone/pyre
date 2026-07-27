@@ -2146,7 +2146,7 @@ fn best_suggestion(candidates: &[String], wrong_name: &str) -> Option<String> {
         }
         let candidate_len = candidate.chars().count();
         let mut max_distance = (candidate_len + wrong_len + 3) * SUGGESTION_MOVE_COST / 6;
-        max_distance = max_distance.min(best_distance.saturating_sub(1));
+        max_distance = max_distance.min(best_distance);
         let distance = suggestion_distance(wrong_name, candidate, max_distance);
         if distance <= max_distance && (suggestion.is_none() || distance < best_distance) {
             suggestion = Some(candidate.clone());
@@ -2160,17 +2160,18 @@ fn traceback_last_frame(tb: PyObjectRef) -> Option<*mut crate::pyframe::PyFrame>
     if tb.is_null() {
         return None;
     }
-    let mut current = tb;
-    let mut last_slot = None;
+    let tb_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(tb);
+    let mut current = pyre_object::gc_roots::shadow_stack_get(tb_slot);
+    let mut last = pyre_object::PY_NULL;
     while !current.is_null() && unsafe { crate::pytraceback::is_pytraceback(current) } {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(current);
-        last_slot = Some(slot);
-        let rooted_current = pyre_object::gc_roots::shadow_stack_get(slot);
-        current = unsafe { crate::pytraceback::w_pytraceback_get_w_next(rooted_current) };
+        last = current;
+        current = unsafe { crate::pytraceback::w_pytraceback_get_w_next(current) };
     }
-    let tb = pyre_object::gc_roots::shadow_stack_get(last_slot?);
-    let frame = unsafe { crate::pytraceback::w_pytraceback_get_frame(tb) };
+    if last.is_null() {
+        return None;
+    }
+    let frame = unsafe { crate::pytraceback::w_pytraceback_get_frame(last) };
     (!frame.is_null()).then_some(frame)
 }
 
@@ -2281,17 +2282,25 @@ fn exception_suggestion(exc_slot: usize) -> Option<String> {
         }
         ExcKind::NameError => {
             let frame = traceback_last_frame(tb)?;
-            let frame = unsafe { &mut *frame };
+            let anchor = crate::eval::FrameAnchor::new(unsafe { &mut *frame });
             let mut names = Vec::new();
-            if let Ok(locals) = frame.getdictscope() {
+            if let Ok(locals) = unsafe { &mut *anchor.live() }.getdictscope() {
+                let locals_slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(locals);
+                let locals = pyre_object::gc_roots::shadow_stack_get(locals_slot);
                 dict_string_keys(locals, &mut names);
                 if let Some(self_obj) = unsafe { pyre_object::w_dict_getitem_str(locals, "self") } {
+                    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+                    pyre_object::gc_roots::pin_root(self_obj);
+                    let self_obj = pyre_object::gc_roots::shadow_stack_get(self_slot);
                     if crate::baseobjspace::getattr_str(self_obj, &wrong_name).is_ok() {
                         return Some(format!(". Did you mean: 'self.{wrong_name}'?"));
                     }
                 }
             }
+            let frame = unsafe { &*anchor.live() };
             dict_string_keys(frame.get_w_globals(), &mut names);
+            let frame = unsafe { &*anchor.live() };
             dict_string_keys(frame.fget_f_builtins(), &mut names);
             best_suggestion(&names, &wrong_name)
         }
