@@ -2920,6 +2920,11 @@ fn value_type_to_itemsize(ty: &crate::model::ValueType) -> usize {
         // (`symbolic.py:12 WORD = sizeof(lltype.Signed)`).  The sibling
         // fallback in `arraydescrof` already reads it this way.
         ValueType::Ref(_) => crate::layout::target_word_size(),
+        // `lltype.Bool` is one byte (`descr.py:223` takes the field's real
+        // size from `symbolic.get_field_token`), and so is a Rust `bool` —
+        // the spelling-keyed twin already answers 1 for it
+        // (`type_flag_from_str` `"u8" | "bool"`).
+        ValueType::Bool => 1,
         // `Int`/`Unsigned` deliberately keep 8.  They are `lltype.Signed` /
         // `lltype.Unsigned` on paper, but the MIR front-end folds narrower
         // *and* 64-bit Rust integers into them (see `model.rs ValueType`),
@@ -2927,9 +2932,30 @@ fn value_type_to_itemsize(ty: &crate::model::ValueType) -> usize {
         // struct is recoverable; narrowing an `i64`/`u64` field to the
         // wasm32 word would truncate it.  Resolving this needs the
         // front-end to carry the source width, not a guess at this seam.
-        ValueType::Int => 8,
+        ValueType::Int | ValueType::Unsigned => 8,
         ValueType::Float => 8,
         _ => 8,
+    }
+}
+
+/// `descr.py:241-254 get_type_flag` over a `ValueType`, for the no-layout
+/// fallback.
+///
+/// Cannot go through `ArrayFlag::from_field_type`: that reads the descriptor
+/// IR type, which collapses `Bool` / `Unsigned` onto `Type::Int` to track the
+/// register class (`value_type_to_ir_type_for_descr`), and would then report
+/// every unsigned field as `Signed`.  The signedness has to come from the
+/// `ValueType` itself, the way the spelling-keyed `type_flag_from_str` reads
+/// it off `u*` vs `i*`.
+fn value_type_to_field_flag(ty: &crate::model::ValueType) -> majit_ir::descr::ArrayFlag {
+    use crate::model::ValueType;
+    use majit_ir::descr::ArrayFlag;
+    match ty {
+        ValueType::Ref(_) => ArrayFlag::Pointer,
+        ValueType::Float => ArrayFlag::Float,
+        ValueType::Bool | ValueType::Unsigned | ValueType::UInt128 => ArrayFlag::Unsigned,
+        ValueType::Void => ArrayFlag::Void,
+        _ => ArrayFlag::Signed,
     }
 }
 
@@ -3009,7 +3035,7 @@ fn fallback_field_layout(
 ) {
     let field_type = value_type_to_ir_type_for_descr(ty);
     let field_size = value_type_to_itemsize(ty);
-    let field_flag = majit_ir::descr::ArrayFlag::from_field_type(field_type);
+    let field_flag = value_type_to_field_flag(ty);
     let is_signed = field_flag == majit_ir::descr::ArrayFlag::Signed;
     (field_size, field_type, field_flag, is_signed)
 }
