@@ -727,32 +727,50 @@ pub unsafe fn builtin_code_call(
     unsafe { ((*code).func)(args) }
 }
 
-/// The `_match_signature` wording (argument.py:283-297) for a call whose
-/// positional count does not match the implementation's.  The qualified name
-/// follows `func.qualname`: a method descriptor reports `type.name`, a
-/// module-level builtin its bare name.
+/// The TypeError raised for a call whose positional count does not match the
+/// implementation's.  Python 3.14 words this from the entry point's calling
+/// convention rather than from a signature, so a builtin registered by arity
+/// alone can reproduce it exactly:
 ///
-/// The too-few form omits the `: 'name'` tail upstream appends, because a
-/// builtin registered by arity alone carries no parameter names.
+/// - one argument (`METH_O`) — `range.count() takes exactly one argument (0 given)`
+/// - no arguments (`METH_NOARGS`) — `object.__dir__() takes no arguments (1 given)`
+/// - a fixed count — `insert expected 2 arguments, got 1`
+/// - a slot wrapper — `expected 1 argument, got 0`, with no qualified name,
+///   except the two-argument wrappers (`__setitem__`, `__setattr__`, `__set__`)
+///   which keep the bare method name.
+///
+/// A descriptor's receiver is not part of the reported count, so the declared
+/// arity and the supplied count both drop it.  The qualified name follows
+/// `func.__qualname__`: a method descriptor reports `type.name`, a
+/// module-level builtin its bare name.
 #[cold]
 #[inline(never)]
 fn arity_mismatch(code: &BuiltinCode, expected: usize, given: usize) -> crate::PyError {
-    let qualname = match unsafe { code.owner.as_ref() } {
-        Some(owner) => format!("{}.{}", owner.type_name, code.name),
-        None => code.name.to_string(),
+    let name = code.name;
+    let owner = unsafe { code.owner.as_ref() };
+    let (qualname, wanted, got) = match owner {
+        Some(owner) => (
+            format!("{}.{}", owner.type_name, name),
+            expected.saturating_sub(1),
+            given.saturating_sub(1),
+        ),
+        None => (name.to_string(), expected, given),
     };
-    let message = if given > expected {
-        format!(
-            "{qualname}() takes {expected} positional argument{} but {given} {} given",
-            if expected == 1 { "" } else { "s" },
-            if given == 1 { "was" } else { "were" },
-        )
+    let message = if owner.is_some_and(|owner| is_slot_wrapper(owner.type_name, name)) {
+        if wanted == 2 {
+            format!("{name} expected 2 arguments, got {got}")
+        } else {
+            format!(
+                "expected {wanted} argument{}, got {got}",
+                if wanted == 1 { "" } else { "s" },
+            )
+        }
     } else {
-        let missing = expected - given;
-        format!(
-            "{qualname}() missing {missing} required positional argument{}",
-            if missing == 1 { "" } else { "s" },
-        )
+        match wanted {
+            0 => format!("{qualname}() takes no arguments ({got} given)"),
+            1 => format!("{qualname}() takes exactly one argument ({got} given)"),
+            _ => format!("{name} expected {wanted} arguments, got {got}"),
+        }
     };
     crate::PyError::type_error(message)
 }
