@@ -366,6 +366,7 @@ thread_local! {
 struct LiveLastInstrGuard {
     frame: *mut pyre_interpreter::PyFrame,
     saved: isize,
+    prev: Option<(usize, isize)>,
 }
 
 impl LiveLastInstrGuard {
@@ -386,14 +387,21 @@ impl LiveLastInstrGuard {
         }
         let saved = unsafe { (*frame).last_instr };
         unsafe { (*frame).last_instr = py_pc as isize };
-        PUBLISHED_LAST_INSTR.with(|slot| slot.set(Some((frame as usize, saved))));
-        Some(Self { frame, saved })
+        // Save/restore rather than set/clear: a residual can run user code that
+        // records a nested walk whose own residual enters a second guard, and
+        // clearing on the inner drop would leave the still-live outer
+        // publication invisible — `capture_escape_flush_undo` would then snapshot
+        // the executing pc as if it were the outer frame's resume coordinate.
+        // Same discipline as [`InlineConcreteFrameGuard`] and
+        // [`ResidualFrameChainGuard`].
+        let prev = PUBLISHED_LAST_INSTR.with(|slot| slot.replace(Some((frame as usize, saved))));
+        Some(Self { frame, saved, prev })
     }
 }
 
 impl Drop for LiveLastInstrGuard {
     fn drop(&mut self) {
-        PUBLISHED_LAST_INSTR.with(|slot| slot.set(None));
+        PUBLISHED_LAST_INSTR.with(|slot| slot.set(self.prev));
         // A flush that committed onto this frame wrote the resume coordinate
         // itself and is authoritative.  Its undo capture holds the value this
         // guard displaced (see [`capture_escape_flush_undo`]), so a later
