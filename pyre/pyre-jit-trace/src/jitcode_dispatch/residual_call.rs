@@ -342,6 +342,70 @@ thread_local! {
     /// [`INLINE_CONCRETE_FRAME`], which stays set across the whole sub-walk.
     static PUBLISHED_INLINE_FRAME: std::cell::Cell<*mut pyre_interpreter::PyFrame> =
         const { std::cell::Cell::new(std::ptr::null_mut()) };
+
+    /// The frame a live [`LiveLastInstrGuard`] published the executing pc onto,
+    /// with the resume coordinate it displaced.
+    static PUBLISHED_LAST_INSTR: std::cell::Cell<Option<(usize, isize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `_opimpl_setfield_vable`'s heap half for the recording walk.  While a
+/// residual runs concretely the live frame must name the EXECUTING opcode, so
+/// that a frame reader inside the callee reports the line the opcode is on —
+/// what `eval.rs` `frame.last_instr = pc` gives an interpreted opcode.  The
+/// walk dispatches opcodes itself instead of through `execute_opcode_step`, so
+/// nothing else advances the field and the frame still carries the pc of the
+/// last resume point; `_warnings::setup_context` then keys its registry on
+/// that line and re-issues a warning the interpreted run already deduplicated.
+///
+/// Restored on the way out, because `last_instr` doubles as the resume
+/// coordinate: `flush_walk_end_state_to_frame_inner` writes `resume_py_pc - 1`
+/// and the escape guard's resume pc is this same pc, so the two meanings
+/// differ by exactly one and may only coexist for the residual's duration.
+/// Leaving the executing value behind makes an abort replay one opcode late.
+struct LiveLastInstrGuard {
+    frame: *mut pyre_interpreter::PyFrame,
+    saved: isize,
+}
+
+impl LiveLastInstrGuard {
+    /// Publishes onto the frame `py_pc` indexes.  Inside an inline sub-walk
+    /// that is the callee's concrete frame, NOT the walk's virtualizable: a
+    /// sub-walk's pc is in the callee's code (the same reason `escape_stack`
+    /// declines to latch a sub-walk's mirror), and writing it onto the outer
+    /// frame strands that frame's replay on a stack depth it never had.
+    fn enter(live_frame: usize, py_pc: u32) -> Option<Self> {
+        let inline = INLINE_CONCRETE_FRAME.with(|slot| slot.get());
+        let frame = if inline.is_null() {
+            live_frame as *mut pyre_interpreter::PyFrame
+        } else {
+            inline
+        };
+        if frame.is_null() {
+            return None;
+        }
+        let saved = unsafe { (*frame).last_instr };
+        unsafe { (*frame).last_instr = py_pc as isize };
+        PUBLISHED_LAST_INSTR.with(|slot| slot.set(Some((frame as usize, saved))));
+        Some(Self { frame, saved })
+    }
+}
+
+impl Drop for LiveLastInstrGuard {
+    fn drop(&mut self) {
+        PUBLISHED_LAST_INSTR.with(|slot| slot.set(None));
+        // A flush that committed onto this frame wrote the resume coordinate
+        // itself and is authoritative.  Its undo capture holds the value this
+        // guard displaced (see [`capture_escape_flush_undo`]), so a later
+        // commit withdrawal still restores the resume pc rather than the
+        // executing one.
+        let flushed = ESCAPE_FLUSH_UNDO
+            .with(|slot| slot.borrow().as_ref().map(|undo| undo.frame))
+            == Some(self.frame as usize);
+        if !flushed {
+            unsafe { (*self.frame).last_instr = self.saved };
+        }
+    }
 }
 
 /// Names the frame an inline sub-walk executes concretely for the duration of
@@ -559,9 +623,17 @@ fn capture_escape_flush_undo(frame: usize) {
             None => {}
         }
         let pf = unsafe { &*(frame as *const pyre_interpreter::PyFrame) };
+        // With a [`LiveLastInstrGuard`] live on this frame the field holds the
+        // EXECUTING pc, not the resume coordinate.  The undo exists to hand a
+        // legacy replay a pristine pre-flush frame, and a replay needs the
+        // resume pc — so capture the value the guard displaced.
+        let last_instr = PUBLISHED_LAST_INSTR
+            .with(|slot| slot.get())
+            .filter(|(published, _)| *published == frame)
+            .map_or(pf.last_instr, |(_, saved)| saved);
         *slot = Some(EscapeFlushUndo {
             frame,
-            last_instr: pf.last_instr,
+            last_instr,
             valuestackdepth: pf.valuestackdepth,
             slots: pf.locals_w().as_slice().to_vec(),
         });
@@ -1887,6 +1959,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // `executioncontext.py:85 enter` for the inlined callee this residual
         // runs inside of.
         let _frame_chain = ResidualFrameChainGuard::enter();
+        let _last_instr = LiveLastInstrGuard::enter(live_frame, ctx.vstack_cur_pypc);
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
