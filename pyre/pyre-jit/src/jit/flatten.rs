@@ -1874,37 +1874,13 @@ impl<'a> GraphFlattener<'a> {
             self.emitline(normal_label);
             let mut captured_all = false;
             for link in &catch_links {
-                let payload_shape = {
-                    let link_borrow = link.borrow();
-                    (
-                        link_borrow.last_exception.is_some(),
-                        link_borrow.last_exc_value.is_some(),
-                    )
-                };
-                match payload_shape {
-                    (false, false) => {
-                        // Structural adaptation for pyre's bytecode-level
-                        // graph builder.  RPython `flowcontext.py:130-156
-                        // guessexception` closes a canraise block with
-                        // `exits[0]` as the sole normal link and all
-                        // following links seeded via `Link.extravars`.
-                        // Pyre's PC-sequential walker can leave an
-                        // additional normal/explicit-raise edge after
-                        // the first slot.  Such a link is not an
-                        // exception match arm; flatten it with ordinary
-                        // `make_link` so final exceptblock targets still
-                        // lower through `make_return`, and keep
-                        // `make_exception_link` reserved for seeded
-                        // exception links as upstream expects.
-                        self.make_link(link, false);
-                        continue;
-                    }
-                    (true, true) => {}
-                    (last_exception, last_exc_value) => panic!(
-                        "canraise catch link payload partially seeded: \
-                         last_exception={last_exception}, last_exc_value={last_exc_value}",
-                    ),
-                }
+                // `flatten.py:223-233 insert_exits` lowers every catch link
+                // (`block.exits[1:]`) through `make_exception_link`, which
+                // asserts both `last_exception` and `last_exc_value` are seeded
+                // (`flatten.py:161-162`).  There is no ordinary-`make_link` arm
+                // for a catch link: one that is not a fully seeded exception
+                // link is a graph-construction bug and fails loud inside
+                // `make_exception_link`.
                 let llexitcase = link.borrow().llexitcase.clone();
                 if let Some(case) = llexitcase {
                     let case_operand = self.getcolor(&case);
