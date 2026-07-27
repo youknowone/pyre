@@ -1613,6 +1613,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     let live_value_types_override: TokenStream =
         if num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0 {
             quote! {
+                // A bank with no scalars emits `0..0`, which is data, not the
+                // `for i in 10..0` typo `reversed_empty_ranges` is aimed at —
+                // and that lint is deny-by-default in every consumer of this
+                // macro, so a state of arrays only would not compile there.
+                #[allow(clippy::reversed_empty_ranges)]
                 fn live_value_types(&self, _meta: &__JitMeta) -> Vec<majit_ir::Type> {
                     // Value-routing types in `extract_live` order: int scalars,
                     // int array elements, then the ONE virtualizable identity
@@ -2527,6 +2532,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             // fields like `selected` to `Const`, so only the identity register
             // reliably names the field).  Box → `input_arg(n)` + `fail_values[n]`;
             // Const → a folded pool constant.  MAJIT_BRIDGE_DEBUG dumps it.
+            #[allow(clippy::reversed_empty_ranges)]
             fn setup_bridge_sym(
                 sym: &mut __JitSym,
                 ctx: &mut majit_metainterp::TraceCtx,
