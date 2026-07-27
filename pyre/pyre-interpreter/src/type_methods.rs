@@ -2856,6 +2856,23 @@ fn format_finite_float(v: f64, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
     } else {
         v
     };
+    if p.fill.to_char().is_none() {
+        // A fill with no `char` cannot come back out of the `String`-typed
+        // engine, so render the value unpadded and pad it by code point.
+        let unpadded_spec = float_engine_spec_with_width(&p, None);
+        let body = rustpython_common::format::FormatSpec::parse(&unpadded_spec)
+            .map_err(|e| format_spec_err(e, spec, "float", false))?
+            .format_float(v)
+            .map_err(|e| format_spec_err(e, spec, "float", false))?;
+        let body = match p.fractional_grouping {
+            Some(separator) => {
+                let digits = fractional_digit_count(&body);
+                group_fractional_digits(body, separator, digits)
+            }
+            None => body,
+        };
+        return Ok(pad_to_width(body, p.fill, p.align.unwrap_or('>'), p.width));
+    }
     if let Some(separator) = p.fractional_grouping {
         let unpadded_spec = float_engine_spec_with_width(&p, None);
         let unpadded = rustpython_common::format::FormatSpec::parse(&unpadded_spec)
@@ -2873,16 +2890,6 @@ fn format_finite_float(v: f64, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
         return Ok(Wtf8Buf::from_string(group_fractional_digits(
             rendered, separator, digits,
         )));
-    }
-    if p.fill.to_char().is_none() {
-        // A fill with no `char` cannot come back out of the `String`-typed
-        // engine, so render the value unpadded and pad it by code point.
-        let unpadded_spec = float_engine_spec_with_width(&p, None);
-        let body = rustpython_common::format::FormatSpec::parse(&unpadded_spec)
-            .map_err(|e| format_spec_err(e, spec, "float", false))?
-            .format_float(v)
-            .map_err(|e| format_spec_err(e, spec, "float", false))?;
-        return Ok(pad_to_width(body, p.fill, p.align.unwrap_or('>'), p.width));
     }
     let parsed = rustpython_common::format::FormatSpec::parse(&p.engine_spec)
         .map_err(|e| format_spec_err(e, spec, "float", false))?;
