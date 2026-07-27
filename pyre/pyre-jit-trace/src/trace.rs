@@ -163,10 +163,13 @@ pub(crate) enum WalkEndResume {
     /// the PREVIOUS opcode), and the flush sets `last_instr = pc - 1`
     /// (`state.rs`), so `next_instr()` re-executes that opcode.
     ///
-    /// Re-founding it on a commit-time sample would flip which walks commit
-    /// (the forcing residual bumps the odometer after the window is sampled),
-    /// so that is a measured change of its own and not part of introducing
-    /// this contract.
+    /// The proof is DECLARED, not measured: the window records each residual's
+    /// `EffectInfo` re-runnability class (`EF_ELIDABLE_*` / `EF_LOOPINVARIANT`),
+    /// the same axis upstream licenses `resumepc=orgpc` on
+    /// (`jtransform.py:620-630`).  A commit-time counter sample would answer a
+    /// different question — the forcing residual itself moves the odometer
+    /// after the window is read — and upstream's op counters gate nothing
+    /// (`jitprof.py:43-44`).
     RewindProvenAtLatch,
     /// The resume pc is AHEAD of what the walk applied — a rebuilt callee
     /// resumed at its own abort pc.  Nothing re-runs; committing is what

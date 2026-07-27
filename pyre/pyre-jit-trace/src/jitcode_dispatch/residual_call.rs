@@ -46,16 +46,29 @@ thread_local! {
     /// adopt the committed resume pc must restore this first.
     static ESCAPE_FLUSH_UNDO: std::cell::RefCell<Option<EscapeFlushUndo>> =
         const { std::cell::RefCell::new(None) };
-    /// Opcode-scoped effect window: `(py_pc, frame_entry_count,
-    /// executed_effect_count)` sampled at the FIRST residual of the Python
-    /// opcode currently being walked.  Re-executing a committed escape re-runs
-    /// the WHOLE opcode, so the latch gate must know whether any EARLIER
-    /// residual of the same opcode ran user bytecode or committed an effect —
-    /// not just the escaping one (rich-compare fallback chains run two
-    /// residuals in one opcode).  Reset at walk start; concrete effects only
-    /// happen through residuals, so anchoring the window at the first residual
-    /// loses nothing.
-    static ESCAPE_OPCODE_WINDOW: std::cell::Cell<Option<(usize, u64, usize)>> =
+    /// Opcode-scoped purity window: `(py_pc, every_prior_residual_reentrant)`
+    /// for the Python opcode currently being walked.  Re-executing a committed
+    /// escape re-runs the WHOLE opcode, so the latch gate must know whether any
+    /// EARLIER residual of the same opcode could have done something — not just
+    /// the escaping one (rich-compare fallback chains run two residuals in one
+    /// opcode).
+    ///
+    /// The verdict comes from each residual's DECLARED effect class
+    /// ([`escape_opcode_window_note`], `EffectInfo::check_is_elidable` or
+    /// `LoopInvariant`), not from counting what happened.  That is the axis
+    /// upstream decides on: the licence to place a resume pc behind an executed
+    /// residual is the codewriter-time `EF_ELIDABLE_CANNOT_RAISE` registration
+    /// (`jtransform.py:620-630`), and upstream's only op counters are
+    /// profiling-only and gate nothing (`jitprof.py:43-44`, `count_ops` is
+    /// `pass`).
+    ///
+    /// Reset at walk start.  Residuals are the only executor that can put
+    /// something irreversible between two points of ONE opcode: the eager
+    /// journaled folds (`fbw_store_journal_push` / `fbw_append_journal_push` /
+    /// `fbw_cell_store_journal_push`) each terminate their own opcode
+    /// (STORE_SUBSCR, the `append` CALL, STORE_NAME/STORE_GLOBAL), so no
+    /// residual of the same opcode instance can follow one.
+    static ESCAPE_OPCODE_WINDOW: std::cell::Cell<Option<(usize, bool)>> =
         const { std::cell::Cell::new(None) };
     /// C3 S1 force-time image of the single live tracing frame.  The
     /// color-indexed concrete banks cease to exist when dispatch unwinds, so
@@ -578,23 +591,41 @@ pub(crate) fn discard_escape_flush_undo() {
 }
 
 /// Opcode-scoped effect window check (see [`ESCAPE_OPCODE_WINDOW`]): true iff
-/// no earlier residual of the CURRENT Python opcode entered a user frame or
-/// committed a concrete effect.  Opens the window on the first residual of
-/// each opcode.  Keyed on `py_pc` alone: an opcode revisited across walked
-/// inner-loop iterations compares against the FIRST visit's snapshot, so
-/// every revisit after any effect declines the latch — conservative (decline
-/// → legacy).  An unexplained latch-decline spike on nested-loop shapes is
-/// this; the refinement would reset the window on back-edge re-entry.
+/// every earlier residual of the CURRENT Python opcode is declared re-runnable.
+/// A pure query — the window is written only by [`escape_opcode_window_note`],
+/// so the residual asking the question never disqualifies itself.
+///
+/// Keyed on `py_pc` alone: an opcode revisited across walked inner-loop
+/// iterations still sees the FIRST visit's verdict, so every revisit after any
+/// non-re-runnable residual declines the latch — conservative (decline →
+/// legacy).  An unexplained latch-decline spike on nested-loop shapes is this;
+/// the refinement would reset the window on back-edge re-entry.
 fn escape_opcode_window_clean(py_pc: usize) -> bool {
-    let frames = pyre_interpreter::call::frame_entry_count();
-    let effects = fbw_executed_effect_count();
     ESCAPE_OPCODE_WINDOW.with(|slot| match slot.get() {
-        Some((pc, f, e)) if pc == py_pc => f == frames && e == effects,
-        _ => {
-            slot.set(Some((py_pc, frames, effects)));
-            true
-        }
+        Some((pc, clean)) if pc == py_pc => clean,
+        _ => true,
     })
+}
+
+/// Declare this residual's re-runnability into the opcode window (see
+/// [`ESCAPE_OPCODE_WINDOW`]).  Called for every residual that reaches
+/// execution, AFTER the latch gate has read the window.
+///
+/// `reentrant` is the declared effect class, `EF_ELIDABLE_*`
+/// (`check_is_elidable`) or `EF_LOOPINVARIANT`.  It is deliberately STRICTER
+/// than `provably_side_effect_free`, which additionally exempts
+/// [`majit_ir::PyreHelperKind::ForIterNext`]: that exemption answers a
+/// different question (the consume is the SOURCE of an in-flight item, not a
+/// body effect for it), and a user-defined `__next__` runs user bytecode that
+/// re-executing the opcode would re-run.
+fn escape_opcode_window_note(py_pc: usize, reentrant: bool) {
+    ESCAPE_OPCODE_WINDOW.with(|slot| {
+        let clean = match slot.get() {
+            Some((pc, clean)) if pc == py_pc => clean,
+            _ => true,
+        };
+        slot.set(Some((py_pc, clean && reentrant)));
+    });
 }
 
 /// Reset the opcode window at walk start so a prior trace's sample cannot
@@ -1627,9 +1658,14 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // consume.
     let ei = call_descr.get_extra_info();
     let helper = ei.pyre_helper;
-    let provably_side_effect_free = ei.check_is_elidable()
-        || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant
-        || helper == majit_ir::PyreHelperKind::ForIterNext;
+    // The declared re-runnability class, the axis `EffectInfo` is decided on at
+    // codewriter time (`jtransform.py:620-630`): re-executing the opcode that
+    // contains this residual re-executes the residual, which is harmless only
+    // for an elidable or loop-hoisted one.  Feeds [`ESCAPE_OPCODE_WINDOW`].
+    let reentrant_residual =
+        ei.check_is_elidable() || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant;
+    let provably_side_effect_free =
+        reentrant_residual || helper == majit_ir::PyreHelperKind::ForIterNext;
     let writes_live_heap = call_descr.result_type() == majit_ir::Type::Void
         || matches!(
             helper,
@@ -1786,6 +1822,11 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
+    // Declared only now, so this residual constrains the residuals that FOLLOW
+    // it inside the same opcode and never itself: the gate above read the
+    // window, and a force inside the callee reads it again from
+    // `flush_active_frame_escape` while it is still the gate's view.
+    escape_opcode_window_note(ctx.vstack_cur_pypc as usize, reentrant_residual);
     if !provably_side_effect_free && !is_idempotent_gc_barrier {
         fbw_mark_executed_nonpure_residual();
         // Count only a FOREIGN non-pure residual: a self-recursive call is the
