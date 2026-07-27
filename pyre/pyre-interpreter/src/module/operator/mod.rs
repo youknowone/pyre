@@ -191,10 +191,6 @@ crate::py_module! {
         "getitem"  / 2 = |args| getitem(args[0], args[1]),
         "setitem"  / 3 = |args| { setitem(args[0], args[1], args[2])?; Ok(w_none()) },
         "delitem"  / 2 = |args| { delitem(args[0], args[1])?; Ok(w_none()) },
-        // Underscore aliases (__add__ / __sub__ / __mul__ via operator).
-        "__add__"  / 2 = |args| Ok(add(args[0], args[1]).unwrap_or(w_none())),
-        "__sub__"  / 2 = |args| Ok(sub(args[0], args[1]).unwrap_or(w_none())),
-        "__mul__"  / 2 = |args| Ok(mul(args[0], args[1]).unwrap_or(w_none())),
         "eq" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Eq),
         "lt" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Lt),
         "gt" / 2 = |args| baseobjspace::compare(args[0], args[1], CompareOp::Gt),
@@ -204,36 +200,7 @@ crate::py_module! {
         "length_hint"  / * = op_length_hint,
         "_compare_digest" / 2 = op_compare_digest,
     },
-    extra_init: |ns| {
-        // `operator.py` tail — bind each dunder name to its operator
-        // function (`__lt__ = lt`, `__add__ = add`, …) so `operator.__lt__`
-        // resolves like CPython's pure-Python wrapper does.
-        const ALIASES: &[(&str, &str)] = &[
-            ("__lt__", "lt"), ("__le__", "le"), ("__eq__", "eq"),
-            ("__ne__", "ne"), ("__ge__", "ge"), ("__gt__", "gt"),
-            ("__not__", "not_"), ("__abs__", "abs"), ("__add__", "add"),
-            ("__and__", "and_"), ("__call__", "call"),
-            ("__floordiv__", "floordiv"), ("__index__", "index"),
-            ("__inv__", "inv"), ("__invert__", "invert"),
-            ("__lshift__", "lshift"), ("__mod__", "mod"), ("__mul__", "mul"),
-            ("__matmul__", "matmul"), ("__neg__", "neg"), ("__or__", "or_"),
-            ("__pos__", "pos"), ("__pow__", "pow"), ("__rshift__", "rshift"),
-            ("__sub__", "sub"), ("__truediv__", "truediv"), ("__xor__", "xor"),
-            ("__concat__", "concat"), ("__contains__", "contains"),
-            ("__delitem__", "delitem"), ("__getitem__", "getitem"),
-            ("__setitem__", "setitem"), ("__iadd__", "iadd"),
-            ("__iand__", "iand"), ("__iconcat__", "iconcat"),
-            ("__ifloordiv__", "ifloordiv"), ("__ilshift__", "ilshift"),
-            ("__imod__", "imod"), ("__imul__", "imul"),
-            ("__imatmul__", "imatmul"), ("__ior__", "ior"),
-            ("__ipow__", "ipow"), ("__irshift__", "irshift"),
-            ("__isub__", "isub"), ("__itruediv__", "itruediv"),
-            ("__ixor__", "ixor"),
-        ];
-        for (dunder, src) in ALIASES {
-            if let Some(f) = crate::module_ns_get(ns, src) {
-                crate::module_ns_store(ns, dunder, f);
-            }
-        }
-    },
+    // The `__lt__ = lt` / `__add__ = add` dunder aliases belong to
+    // `operator.py`, which binds them after its `from _operator import *`;
+    // this module carries only the names that tail imports.
 }
