@@ -533,12 +533,19 @@ fn resolve_midbody_flush_words(
     })
 }
 
+/// Whether the caller's handler for the aborting CALL can be entered from the
+/// operand stack this leg can reconstruct.
+///
+/// `handle_exception` only ever POPS down to the handler's recorded depth
+/// (`eval.rs`, `pyopcode.py:151-173`), so restoring the `below` operands the
+/// CALL sat on is enough for any handler that wants at most that many.
 fn exception_delivery_stack_is_sourceable(
     handler_depth: u32,
+    below_len: usize,
     array_len: usize,
     stack_base: usize,
 ) -> bool {
-    handler_depth == 0 && array_len >= stack_base + 1
+    handler_depth as usize <= below_len && array_len >= stack_base + below_len + 1
 }
 
 /// Flush the OUTER frame at the CALL that entered the aborting callee and let
@@ -708,10 +715,11 @@ fn try_commit_midbody_abort_inner(
         if let Some((_target, depth, _lasti)) = outer_handler {
             if !exception_delivery_stack_is_sourceable(
                 depth,
+                below.len(),
                 outer.locals_w().as_slice().len(),
                 outer_stack_base,
             ) {
-                return Err("caller handler keeps an operand below the call");
+                return Err("caller handler wants more operands than the call sat on");
             }
         }
         // G7: materialize every outer local before the rebuilt callee can run.
@@ -723,13 +731,14 @@ fn try_commit_midbody_abort_inner(
     }
     let mut w_code = payload.w_code;
     let mut w_globals = payload.w_globals;
-    let mut x_arg = payload.x_arg;
     let _w_code_root = ObjectSlotRoot::new(&mut w_code);
     let _w_globals_root = ObjectSlotRoot::new(&mut w_globals);
-    let _x_arg_root = ObjectSlotRoot::new(&mut x_arg);
+    // No positional seed: `finish_for_call_with_globals_obj` only binds
+    // `args` into the first `varnames` slots, and every one of them is
+    // cleared to PY_NULL and rewritten from `live_locals` just below.
     let frame = match pyre_interpreter::PyFrame::try_new_for_call_with_closure_and_globals_obj(
         w_code as *const (),
-        &[x_arg],
+        &[],
         w_globals,
         ec,
         pyre_object::PY_NULL,
@@ -800,26 +809,25 @@ fn try_commit_midbody_abort_inner(
     frame.valuestackdepth = stack_base + current.live_stack.len();
     frame.last_instr = words.callee_py_pc as isize - 1;
     let sys_exc_value_pre = unsafe { (*ec).sys_exc_value };
-    match frame.execute_frame(None, None) {
+    let ran = frame.execute_frame(None, None);
+    // `below` came from a clone taken BEFORE the callee ran; a minor collection
+    // inside it can have moved those objects.  Re-read them from the live
+    // carrier, which the abort-resume GC root area keeps forwarded.
+    let fresh = crate::jitcode_dispatch::fbw_abort_carrier_clone();
+    let below_now = match (below.len(), fresh.as_ref()) {
+        (0, _) => &[][..],
+        (n, Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(fresh))) => {
+            match fresh.entry_fallback.as_ref() {
+                Some(fallback) if fallback.call_stack.len() >= n => &fallback.call_stack[..n],
+                _ => return Err("entry fallback vanished while the callee ran"),
+            }
+        }
+        _ => return Err("carrier is no longer a MidBody after the callee ran"),
+    };
+    match ran {
         Ok(mut retval) => {
             crate::jitcode_dispatch::fbw_abort_carrier_set_return(retval);
             let _retval_root = ObjectSlotRoot::new(&mut retval);
-            // `below` came from a clone taken BEFORE the callee ran; a minor
-            // collection inside it can have moved those objects.  Re-read them
-            // from the live carrier, which the abort-resume GC root area keeps
-            // forwarded.
-            let fresh = crate::jitcode_dispatch::fbw_abort_carrier_clone();
-            let below_now = match (below.len(), fresh.as_ref()) {
-                (0, _) => &[][..],
-                (
-                    n,
-                    Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(fresh)),
-                ) => match fresh.entry_fallback.as_ref() {
-                    Some(fallback) if fallback.call_stack.len() >= n => &fallback.call_stack[..n],
-                    _ => return Err("entry fallback vanished while the callee ran"),
-                },
-                _ => return Err("carrier is no longer a MidBody after the callee ran"),
-            };
             // The callee has already RUN.  A false here is not a plain
             // decline: it drops to the legacy replay with the callee's
             // effects applied.
@@ -847,8 +855,15 @@ fn try_commit_midbody_abort_inner(
                 return Err("callee raised and this site has no propagate licence");
             }
             let outer = unsafe { &mut *(cf_addr as *mut pyre_interpreter::PyFrame) };
+            // The handler unwinds from the operand level the CALL raised at,
+            // which for an expression-position call is not the empty one.
+            let arr_ptr = outer.locals_w_mut() as *mut _;
+            outer.locals_w_mut().as_mut_slice()
+                [outer_stack_base..outer_stack_base + below_now.len()]
+                .copy_from_slice(below_now);
+            crate::state::frame_array_write_barrier(cf_addr as *mut u8, arr_ptr);
             outer.last_instr = words.call_py_pc as isize;
-            outer.valuestackdepth = outer_stack_base;
+            outer.valuestackdepth = outer_stack_base + below_now.len();
             let mut next_instr = words.call_py_pc;
             if pyre_interpreter::eval::handle_exception(outer, &mut operr, &mut next_instr) {
                 outer.last_instr = next_instr as isize - 1;
@@ -4591,10 +4606,17 @@ mod tests {
     }
 
     #[test]
-    fn forward_exception_delivery_requires_exact_empty_handler_stack() {
-        assert!(super::exception_delivery_stack_is_sourceable(0, 8, 7));
-        assert!(!super::exception_delivery_stack_is_sourceable(1, 9, 7));
-        assert!(!super::exception_delivery_stack_is_sourceable(0, 7, 7));
+    fn forward_exception_delivery_needs_a_handler_the_call_operands_can_fill() {
+        // Statement position: nothing below the call, empty-stack handler.
+        assert!(super::exception_delivery_stack_is_sourceable(0, 0, 8, 7));
+        assert!(!super::exception_delivery_stack_is_sourceable(1, 0, 9, 7));
+        // Expression position: one operand below, handler wanting 0 or 1.
+        assert!(super::exception_delivery_stack_is_sourceable(1, 1, 9, 7));
+        assert!(super::exception_delivery_stack_is_sourceable(0, 1, 9, 7));
+        assert!(!super::exception_delivery_stack_is_sourceable(2, 1, 9, 7));
+        // The array must hold the restored operands plus the pushed exception.
+        assert!(!super::exception_delivery_stack_is_sourceable(0, 0, 7, 7));
+        assert!(!super::exception_delivery_stack_is_sourceable(1, 1, 8, 7));
     }
 }
 

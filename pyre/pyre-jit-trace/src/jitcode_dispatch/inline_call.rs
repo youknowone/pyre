@@ -2726,10 +2726,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                         }
                         *dst = Some(value);
                     }
-                    let Some(ConcreteValue::Ref(x_arg)) = callee_arg_concretes.first().copied()
-                    else {
-                        return Err("first callee argument is not a Ref");
-                    };
                     Ok(MidBodyPayload {
                         abort_kind,
                         outer_jitcode_index,
@@ -2740,7 +2736,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                         callee_py_pc,
                         w_code: w_code as pyre_object::PyObjectRef,
                         w_globals: unsafe { pyre_interpreter::function_get_globals_obj(callable) },
-                        x_arg,
                         live_locals,
                         live_stack,
                         return_value: pyre_object::PY_NULL,

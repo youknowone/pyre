@@ -156,14 +156,16 @@ i.e. rows 1/4/5 — **is refuted by measurement**. Slice A dropped row 2 and mad
 leg 4 preferred; the conversion was **zero**. Census over `pyre/bench/synth`
 (315 files, `PYRE_FBW_DEBUG_ABORT=1`):
 
-| | base | after slices A–D |
+| | base | after slices A–E |
 |---|---|---|
-| leg 3 `EntryCarrierCall` commits | 169 | **4** |
-| leg 4 `CalleeRebuild` commits | 1 | **16** |
+| leg 3 `EntryCarrierCall` commits | 169 | **3** |
+| leg 4 `CalleeRebuild` commits | 1 | **17** |
 | refusal: callee is a generator | 151 | 0 |
 | refusal: abort pc is not an exact segment anchor | 18 | 3 |
-| refusal: first callee argument is not a `Ref` | 1 | 1 |
+| refusal: first callee argument is not a `Ref` | 1 | 0 |
 | rebuild latched but declined at the flush | 0 | 0 |
+
+Every remaining leg-3 commit is one of the 3 `getarrayitem_vable_r` anchors.
 
 Row 1 never fired. Rows 4b and 6 never fired. Print the denominator: 149 of the
 151 generator refusals came from one loop in `calls_closures.py`, and the 18
@@ -254,12 +256,32 @@ pc, slot-ordered from the stack base, so its prefix is exactly the residue.
 Python, so they are re-read from the live carrier (kept forwarded by the
 abort-resume root area), never from the pre-execute clone.
 
+#### ✅Slice E landed: the single-argument residue and the raising caller
+
+Row 5 (`callee_arg_concretes.first()` must be a `Ref`) was **dead weight**.
+`finish_for_call_with_globals_obj` binds `args` into the first `varnames` slots
+and validates no arity; `try_commit_midbody_abort` then clears every one of
+those slots to `PY_NULL` and rewrites them from `live_locals`. The seed never
+survived, so `x_arg` is gone from `MidBodyPayload`, from its GC root visit, and
+from the refusal list.
+
+Removing it exposed the next one: `exception_delivery_stack_is_sourceable`
+required `handler_depth == 0` — the same statement-position assumption slice D
+removed from the return path, now on the raise path. `handle_exception` only
+ever POPS down to the handler's recorded depth (`eval.rs`,
+`pyopcode.py:151-173`), so restoring the `below` operands and setting
+`valuestackdepth` from them serves any handler wanting at most that many. The
+re-read of `below` from the live carrier is hoisted above the `execute_frame`
+match so both arms use it.
+
 #### Next slice
 
-Leg 3 is down to 4 commits, each of them a rebuild that could not latch:
-3 `getarrayitem_vable_r` anchors and 1 non-`Ref` first argument (row 5).
-No rebuild declines at the flush any more. Row 1 (depth-1) and rows 4b/6 still
-have no corpus witness — do not work them without one.
+Leg 3 is down to 3 commits, all of them the `getarrayitem_vable_r` anchor.
+Lifting it needs a color-liveness argument: the op writes a jitcode register and
+the payload sources `live_stack`/`live_locals` out of `concrete_registers_r` by
+color, so the case to prove is that the clobbered color is not one the payload
+reads — not that the op is harmless. Row 1 (depth-1) and rows 4b/6 still have no
+corpus witness; do not work them without one.
 
 ⚠️Do **not** drop the other conjunct, `!fbw_has_unjournaled_effect()`. Upstream's
 `execute_and_record` executes *then* records (`pyjitpl.py:2647-2662`), so

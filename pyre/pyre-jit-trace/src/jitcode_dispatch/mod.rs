@@ -5034,7 +5034,6 @@ pub(crate) struct MidBodyPayload {
     pub callee_py_pc: usize,
     pub w_code: pyre_object::PyObjectRef,
     pub w_globals: pyre_object::PyObjectRef,
-    pub x_arg: pyre_object::PyObjectRef,
     pub live_locals: Vec<Option<ConcreteValue>>,
     pub live_stack: Vec<ConcreteValue>,
     pub return_value: pyre_object::PyObjectRef,
@@ -5446,9 +5445,6 @@ pub unsafe fn fbw_store_journal_root_walker_area(
                 });
                 visitor(unsafe {
                     &mut *(&mut payload.w_globals as *mut pyre_object::PyObjectRef).cast()
-                });
-                visitor(unsafe {
-                    &mut *(&mut payload.x_arg as *mut pyre_object::PyObjectRef).cast()
                 });
                 if !payload.return_value.is_null() {
                     visitor(unsafe {
