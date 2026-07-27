@@ -1516,6 +1516,53 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
+    // Module attribute (`math.sqrt`): the receiver is an exact module and the
+    // name is present in its dict.  Fold the module-dict read to a
+    // `QUASIIMMUT_FIELD(dict, slot)` version guard + elidable cell lookup —
+    // celldict.py `_getdictvalue_no_unwrapping_pure` (`@jit.elidable_promote`) —
+    // so a hot `math.sqrt(x)` loop drops its per-iteration LOAD_ATTR may-force
+    // residual and the `math.sqrt` callable becomes a trace constant.  A rebind
+    // of the attribute bumps the module dict `version` and fails the guard.
+    // All resolution below is read-only; a missing / movable / non-canonical
+    // shape falls through to the residual with no IR emitted.  An exact
+    // `module` `w_class` excludes a module subclass with a custom
+    // `__getattribute__`; a module-level PEP 562 `__getattr__` is irrelevant
+    // because the name is present (the dict lookup wins before `__getattr__`).
+    if unsafe { pyre_object::is_module(concrete_obj) }
+        && std::ptr::eq(
+            unsafe { (*concrete_obj).w_class },
+            pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::MODULE_TYPE),
+        )
+    {
+        let w_dict = unsafe { pyre_object::w_module_get_w_dict(concrete_obj) };
+        if !w_dict.is_null() && !majit_gc::can_move(majit_ir::GcRef(w_dict as usize)) {
+            if let Some(slot) = crate::state::module_dict_cell_slot_direct(w_dict, &name) {
+                if let Some(stored) = crate::state::module_dict_cell_value_direct(w_dict, slot) {
+                    if !stored.is_null()
+                        && !majit_gc::can_move(majit_ir::GcRef(stored as usize))
+                    {
+                        // Pin the receiver to THIS module so the baked dict
+                        // address is correct: a constant receiver is already
+                        // pinned; a non-constant one gets a `guard_value`.
+                        if !obj.is_constant() {
+                            let expected = ctx.trace_ctx.const_ref(concrete_obj as i64);
+                            ctx.trace_ctx
+                                .record_guard(OpCode::GuardValue, &[obj, expected], 0);
+                            walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+                            ctx.trace_ctx.heap_cache_mut().replace_box(obj, expected);
+                        }
+                        // `guard_frame_globals=false`: the receiver pin above
+                        // (not a frame-globals-identity guard) proves the dict.
+                        emit_namespace_cell_fold(
+                            ctx, op_pc, dst, dst_bank, w_dict, slot, stored, false,
+                        )?;
+                        return Ok(Some(()));
+                    }
+                }
+            }
+        }
+    }
+
     let Some((w_type, version_tag, map, storageindex, listindex, unbox_type)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(concrete_obj, &name)
     }) else {
