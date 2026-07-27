@@ -98,6 +98,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
@@ -696,15 +697,7 @@ pub struct GcCache {
     _cache_interiorfield_order: Vec<DescrRef>,
 
     /// Superseded SizeDescr Arcs retired by `register_keyed_size`'s
-    /// fuller-layout upgrade.  PyPy's `_cache_size[STRUCT]` holds a single
-    /// canonical SizeDescr that is never freed, so field descrs' Weak parent
-    /// back-references stay valid for the process lifetime.  pyre registers
-    /// struct layouts incrementally and replaces the cached SizeDescr with a
-    /// fuller one; without this vec the replaced Arc would drop while field
-    /// descrs already baked into recorded ops still hold Weak refs to it,
-    /// dangling their `get_parent_descr()`.  Kept OUT of `_cache_size_order`
-    /// so `setup_descrs` descr_index assignment is unchanged — these are
-    /// retired, not re-registered; they exist only to keep the Weak alive.
+    /// fuller-layout upgrade. Kept out of `_cache_size_order`.
     _size_keepalive: Vec<DescrRef>,
 
     /// `gctypelayout.py:301-357 TypeLayoutBuilder.get_type_id` analog —
@@ -907,6 +900,8 @@ impl GcCache {
         is_immutable: bool,
         is_quasi_immutable: bool,
         flag: ArrayFlag,
+        index: u32,
+        virtualizable: bool,
         index_in_parent: usize,
     ) -> Arc<SimpleFieldDescr> {
         // descr.py:220-221: cache[STRUCT][fieldname]
@@ -925,14 +920,16 @@ impl GcCache {
         let parent = self._cache_size.get(&struct_key).cloned();
         // descr.py:230-231: FieldDescr(name, offset, size, flag, index_in_parent, is_pure)
         let mut fd = SimpleFieldDescr::new_with_name(
-            u32::MAX,
+            index,
             offset,
             field_size,
             field_type,
             is_immutable,
             flag,
             name,
+            field_name.to_string(),
         );
+        fd.virtualizable = virtualizable;
         // descr.py:228: index_in_parent (from heaptracker)
         fd.index_in_parent = index_in_parent;
         // descr.py:229 `is_quasi_immutable = '%s?' in STRUCT._hints.get(
@@ -945,7 +942,7 @@ impl GcCache {
         fd = fd.with_quasi_immutable(is_quasi_immutable);
         // descr.py:238: fielddescr.parent_descr = get_size_descr(gccache, STRUCT, vtable)
         if let Some(ref p) = parent {
-            fd.parent_descr = Some(Arc::downgrade(p));
+            fd.parent_descr = RwLock::new(Some(Arc::downgrade(p)));
         }
         let descr = Arc::new(fd);
         // descr.py:232-233: cachedict = cache.setdefault(STRUCT, {})
@@ -974,6 +971,7 @@ impl GcCache {
             Type::Int,
             false,
             ArrayFlag::Signed, // descr.py:264: get_type_flag(lltype.Signed)
+            "len".to_string(),
             "len".to_string(),
         ));
         // descr.py:265: result.parent_descr = None (no parent)
@@ -1189,20 +1187,11 @@ impl GcCache {
     /// `descr.py:108-118 get_size_descr` cache-miss branch writes both
     /// the keyed map and the order Vec; this method mirrors that for
     /// mint sites that bypass `get_size_descr` (`make_simple_descr_group`,
-    /// runtime macro `__majit_register_descrs`).  First-write wins —
-    /// subsequent calls with the same key keep the original Arc, matching
-    /// PyPy `cache[STRUCT] = sizedescr` semantics.
+    /// runtime macro `__majit_register_descrs`).
     pub fn register_keyed_size(&mut self, key: LLType, descr: DescrRef) {
-        // descr.py:108-118 `get_size_descr` populates `all_fielddescrs`
-        // from `heaptracker.all_fielddescrs(STRUCT)` — the COMPLETE field
-        // set — before caching.  pyre's incremental `register_struct_layout`
-        // may produce multiple `make_simple_descr_group_keyed` calls for
-        // the same struct with progressively more fields.  To match PyPy's
-        // invariant that the cached SizeDescr always carries the full known
-        // layout, replace an existing entry when the new descr has MORE
-        // fields.  This prevents `StructPtrInfo.init_fields` from under-
-        // allocating slots, which causes cross-type forwards when different-
-        // typed fields map to the same slot.
+        // descr.py:108-118 caches the SizeDescr. Multiple pyre producers may
+        // report partial layouts, so the cached owner is upgraded when the
+        // incoming frozen list has more fields.
         let should_insert = match self._cache_size.get(&key) {
             None => true,
             Some(existing) => {
@@ -1218,9 +1207,6 @@ impl GcCache {
             }
         };
         if should_insert {
-            // PyPy never frees a cached SizeDescr; retire the superseded one
-            // into an immortal keepalive so any field descr already baked into
-            // a recorded op keeps a live Weak parent (get_parent_descr()).
             if let Some(old) = self._cache_size.get(&key) {
                 if !arc_in_vec(&self._size_keepalive, old) {
                     self._size_keepalive.push(old.clone());
@@ -1228,8 +1214,6 @@ impl GcCache {
             }
             self._cache_size.insert(key.clone(), descr.clone());
             self._cache_size_order.retain(|d| {
-                // Remove the old entry for this key (if any) from the
-                // ordered vec so a stale orphan never appears.
                 d.as_size_descr()
                     .map(|sd| {
                         sd.cache_key() != descr.as_size_descr().map(|s| s.cache_key()).unwrap_or(0)
@@ -1237,7 +1221,12 @@ impl GcCache {
                     .unwrap_or(true)
             });
             if !arc_in_vec(&self._cache_size_order, &descr) {
-                self._cache_size_order.push(descr);
+                self._cache_size_order.push(descr.clone());
+            }
+            if let Some(fields) = self._cache_field.get(&key) {
+                for field in fields.values() {
+                    field.set_parent_descr(&descr);
+                }
             }
         }
     }
@@ -1261,41 +1250,8 @@ impl GcCache {
         field_name: String,
         descr: Arc<SimpleFieldDescr>,
     ) {
-        // descr.py:218-239 `get_field_descr`: `cachedict[fieldname] =
-        // fielddescr` with `fielddescr.parent_descr = get_size_descr(STRUCT)`.
-        // In PyPy the parent SizeDescr is always the single canonical one
-        // (populated with ALL fields) so the Weak is always valid.
-        //
-        // pyre's incremental path may replace the cached SizeDescr with a
-        // fuller one (register_keyed_size upgrade).  When that happens,
-        // existing field descrs' Weak parent back-references point to the
-        // OLD (now-dropped) SizeDescr → get_parent_descr() returns None.
-        // Detect this by checking whether the existing entry's parent_descr
-        // Weak can still upgrade; if not, replace it with the new descr
-        // whose parent Weak points to the current (upgraded) SizeDescr.
         let inner = self._cache_field.entry(struct_key).or_default();
-        // PyPy's cached field descr always parents the single canonical (fullest)
-        // SizeDescr.  pyre registers incrementally, so replace the cached field
-        // descr when the incoming one's parent carries MORE fields — this keeps
-        // future getfield recordings baking the fullest-layout parent.  (The old
-        // Weak-liveness check is now inert: register_keyed_size retires superseded
-        // SizeDescrs into _size_keepalive instead of freeing them.)
-        let parent_field_count = |fd: &SimpleFieldDescr| -> usize {
-            fd.get_parent_descr()
-                .and_then(|p| p.as_size_descr().map(|sd| sd.all_fielddescrs().len()))
-                .unwrap_or(0)
-        };
-        let should_replace = match inner.get(&field_name) {
-            None => true, // no entry yet -> insert
-            Some(existing) => parent_field_count(&descr) > parent_field_count(existing),
-        };
-        if should_replace {
-            // Remove stale entry from _order if present.
-            if let Some(old) = inner.get(&field_name) {
-                let old_ref: DescrRef = old.clone() as DescrRef;
-                self._cache_field_order
-                    .retain(|d| !Arc::ptr_eq(d, &old_ref));
-            }
+        if !inner.contains_key(&field_name) {
             inner.insert(field_name, descr.clone());
             let as_ref: DescrRef = descr as DescrRef;
             if !arc_in_vec(&self._cache_field_order, &as_ref) {
@@ -2987,6 +2943,12 @@ pub trait FieldDescr: Descr {
         ""
     }
 
+    /// descr.py:220-233 cache key (`fieldname`). Defaults to the
+    /// display name for descriptor implementations without a separate key.
+    fn field_key(&self) -> &str {
+        self.field_name()
+    }
+
     /// heaptracker.py:66: `if name == 'typeptr': continue`
     ///
     /// RPython filters typeptr by raw field name BEFORE creating
@@ -3666,6 +3628,9 @@ pub struct SimpleFieldDescr {
     ei_index: AtomicU32,
     /// RPython: FieldDescr.name — e.g. "MyStruct.field_name"
     name: String,
+    /// descr.py:220-233 cache key (`fieldname`), distinct from display
+    /// `name` built at descr.py:227.
+    field_key: String,
     offset: usize,
     field_size: usize,
     field_type: Type,
@@ -3687,8 +3652,10 @@ pub struct SimpleFieldDescr {
     /// `OptContext::ensure_ptr_info_arg0` to dispatch Instance vs Struct
     /// PtrInfo per `optimizer.py:478-484`. Stored as `Weak` to break the
     /// SizeDescr → FieldDescr → SizeDescr Arc cycle introduced by
-    /// `make_simple_descr_group`.
-    pub parent_descr: Option<Weak<dyn Descr>>,
+    /// `make_simple_descr_group`. Interior-mutable because
+    /// `descr.py:238` updates the single parent backreference while the
+    /// field Arc is shared by `(STRUCT, fieldname)`.
+    pub parent_descr: RwLock<Option<Weak<dyn Descr>>>,
     /// pyjitpl.py:1148-1149 `vinfo = fielddescr.get_vinfo()` — backref to
     /// the owning `VirtualizableInfo`. Stored as `Weak<dyn VinfoMarker>`
     /// because the vinfo Arc keeps the descriptor alive (via its
@@ -3705,6 +3672,7 @@ impl Clone for SimpleFieldDescr {
             descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
             ei_index: AtomicU32::new(self.ei_index.load(Ordering::Relaxed)),
             name: self.name.clone(),
+            field_key: self.field_key.clone(),
             offset: self.offset,
             field_size: self.field_size,
             field_type: self.field_type,
@@ -3713,7 +3681,7 @@ impl Clone for SimpleFieldDescr {
             flag: self.flag,
             virtualizable: self.virtualizable,
             index_in_parent: self.index_in_parent,
-            parent_descr: self.parent_descr.clone(),
+            parent_descr: RwLock::new(self.parent_descr.read().unwrap().clone()),
             vinfo: self.vinfo.clone(),
         }
     }
@@ -3735,6 +3703,7 @@ impl SimpleFieldDescr {
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
             name: String::new(),
+            field_key: String::new(),
             offset,
             field_size,
             field_type,
@@ -3743,7 +3712,7 @@ impl SimpleFieldDescr {
             flag,
             virtualizable: false,
             index_in_parent: 0,
-            parent_descr: None,
+            parent_descr: RwLock::new(None),
             vinfo: None,
         }
     }
@@ -3759,12 +3728,14 @@ impl SimpleFieldDescr {
         is_immutable: bool,
         flag: ArrayFlag,
         name: String,
+        field_key: String,
     ) -> Self {
         SimpleFieldDescr {
             index: AtomicU32::new(index),
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
             name,
+            field_key,
             offset,
             field_size,
             field_type,
@@ -3773,7 +3744,7 @@ impl SimpleFieldDescr {
             flag,
             virtualizable: false,
             index_in_parent: 0,
-            parent_descr: None,
+            parent_descr: RwLock::new(None),
             vinfo: None,
         }
     }
@@ -3821,9 +3792,14 @@ impl SimpleFieldDescr {
     /// GETFIELD/SETFIELD/QUASIIMMUT_FIELD that flows through
     /// `ensure_ptr_info_arg0` (optimizer.py:478-484).
     pub fn with_parent_descr(mut self, parent: DescrRef, index_in_parent: usize) -> Self {
-        self.parent_descr = Some(Arc::downgrade(&parent));
+        self.parent_descr = RwLock::new(Some(Arc::downgrade(&parent)));
         self.index_in_parent = index_in_parent;
         self
+    }
+
+    /// descr.py:238 — update this field's single parent backreference.
+    pub fn set_parent_descr(&self, parent: &DescrRef) {
+        *self.parent_descr.write().unwrap() = Some(Arc::downgrade(parent));
     }
 
     /// Builder: attach the owning `VirtualizableInfo` backreference that
@@ -3904,11 +3880,18 @@ impl FieldDescr for SimpleFieldDescr {
     fn field_name(&self) -> &str {
         &self.name
     }
+    fn field_key(&self) -> &str {
+        &self.field_key
+    }
     fn index_in_parent(&self) -> usize {
         self.index_in_parent
     }
     fn get_parent_descr(&self) -> Option<DescrRef> {
-        self.parent_descr.as_ref().and_then(|p| p.upgrade())
+        self.parent_descr
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|p| p.upgrade())
     }
     fn get_vinfo(&self) -> Option<Arc<dyn VinfoMarker>> {
         self.vinfo.as_ref().and_then(|w| w.upgrade())
@@ -4046,6 +4029,24 @@ impl SimpleSizeDescr {
         self
     }
 
+    /// Add a GC edge that the positional `all_fielddescrs` list does not
+    /// name.  `heaptracker.py:50-73 all_fielddescrs` recurses into the
+    /// inherited header so upstream's `gc_fielddescrs` covers it; pyre's
+    /// runtime object groups declare only the concrete payload, and the
+    /// allocation-clear census still has to see the embedded `PyObject`
+    /// pointer edge.  Kept out of `all_fielddescrs` so the positional
+    /// indexing above is unaffected.
+    pub fn with_extra_gc_fielddescr(mut self, fd: Arc<dyn FieldDescr>) -> Self {
+        if !self
+            .gc_fielddescrs
+            .iter()
+            .any(|old| old.offset() == fd.offset())
+        {
+            self.gc_fielddescrs.push(fd);
+        }
+        self
+    }
+
     /// gc.py:541: descr.tid = llop.combine_ushort(lltype.Signed, type_id, 0)
     /// Called by init_size_descr hook before Arc wrapping.
     pub fn set_type_id(&mut self, type_id: u32) {
@@ -4107,6 +4108,9 @@ impl SizeDescr for SimpleSizeDescr {
 #[derive(Debug, Clone)]
 pub struct SimpleFieldDescrSpec {
     pub index: u32,
+    /// descr.py:220-233 cache key (`fieldname`).
+    pub field_key: String,
+    /// descr.py:227 display name.
     pub name: String,
     pub offset: usize,
     pub field_size: usize,
@@ -4159,6 +4163,7 @@ pub fn make_simple_descr_group_keyed(
         is_gc_managed,
         false,
         field_specs,
+        &[],
     )
 }
 
@@ -4171,48 +4176,59 @@ pub fn make_simple_descr_group_keyed_with_headerless(
     is_gc_managed: bool,
     headerless: bool,
     field_specs: &[SimpleFieldDescrSpec],
+    extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
 ) -> SimpleDescrGroup {
-    let group = make_simple_descr_group_inner(
-        index,
-        size,
-        type_id,
-        cache_key,
-        vtable,
-        is_gc_managed,
-        headerless,
-        field_specs,
-    );
     let struct_key = LLType::struct_key(cache_key);
-    // `descr.py:108-118 get_size_descr` cache-miss `cache[STRUCT] =
-    // sizedescr` — for mint sites that bypass `get_size_descr` proper
-    // and call this factory, publish into the keyed map so
-    // analyzer-side `cc.fielddescrof` lookups via the same cache_key
-    // resolve to the same Arc.
-    crate::descr_registry::register_keyed_size(
-        struct_key.clone(),
-        group.size_descr.clone() as DescrRef,
-    );
-    // `descr.py:225-235 get_field_descr` cache-miss
-    // `cachedict[fieldname] = fielddescr` — the inner-dict key at
-    // `descr.py:221 cache[STRUCT][fieldname]` is **bare** `fieldname`.
-    // `fd.name` carries the dotted display form
-    // (`'%s.%s' % (STRUCT._name, fieldname)`, `descr.py:227`); strip
-    // the `STRUCT._name` prefix to recover the bare `fieldname` key,
-    // matching the analyzer's bare-name `cc.fielddescrof_concrete`
-    // lookup (`call.rs` analyzer) and the runtime macro's bare-name
-    // `gc_cache.get_field_descr(__majit_key, fname_str, ...)` at
-    // `jit_struct.rs`.  Both arms must publish at the same key so
-    // `cpu.fielddescrof(STRUCT, fieldname)` per-tuple Arc identity
-    // holds across analyzer / runtime / BhSize round-trip.
-    for fd in &group.field_descrs {
-        let bare_name = fd
-            .name
-            .rsplit_once('.')
-            .map(|(_, n)| n.to_string())
-            .unwrap_or_else(|| fd.name.clone());
-        crate::descr_registry::register_keyed_field(struct_key.clone(), bare_name, fd.clone());
+    let mut gc = gc_cache().lock().unwrap();
+    // descr.py:218-239 — cache-or-mint each FieldDescr by
+    // `(STRUCT, fieldname)` before freezing this producer's positional list.
+    let field_descrs: Vec<Arc<SimpleFieldDescr>> = field_specs
+        .iter()
+        .map(|spec| {
+            gc.get_field_descr(
+                struct_key.clone(),
+                &spec.field_key,
+                spec.offset,
+                spec.field_size,
+                spec.field_type,
+                spec.is_immutable,
+                spec.is_quasi_immutable,
+                spec.flag,
+                spec.index,
+                spec.virtualizable,
+                spec.index_in_parent,
+            )
+        })
+        .collect();
+    let all_fielddescrs: Vec<Arc<dyn FieldDescr>> = field_descrs
+        .iter()
+        .cloned()
+        .map(|field_descr| field_descr as Arc<dyn FieldDescr>)
+        .collect();
+    let mut sd = SimpleSizeDescr::with_vtable(index, size, type_id, vtable);
+    sd.set_cache_key(cache_key);
+    sd.set_gc_managed(is_gc_managed);
+    sd.set_headerless(headerless);
+    let mut sd = sd.with_all_fielddescrs(all_fielddescrs);
+    for fd in extra_gc_fielddescrs {
+        sd = sd.with_extra_gc_fielddescr(fd.clone());
     }
-    group
+    let size_descr = Arc::new(sd);
+    let size_ref = size_descr.clone() as DescrRef;
+    gc.register_keyed_size(struct_key.clone(), size_ref);
+    let parent = gc
+        ._cache_size
+        .get(&struct_key)
+        .cloned()
+        .unwrap_or_else(|| size_descr.clone() as DescrRef);
+    // descr.py:238 — each shared field reports the current cached SizeDescr.
+    for fd in &field_descrs {
+        fd.set_parent_descr(&parent);
+    }
+    SimpleDescrGroup {
+        size_descr,
+        field_descrs,
+    }
 }
 
 /// Inner factory shared between [`make_simple_descr_group`] (no
@@ -4241,6 +4257,7 @@ fn make_simple_descr_group_inner(
                     descr_index: AtomicI32::new(-1),
                     ei_index: AtomicU32::new(u32::MAX),
                     name: spec.name.clone(),
+                    field_key: spec.field_key.clone(),
                     offset: spec.offset,
                     field_size: spec.field_size,
                     field_type: spec.field_type,
@@ -4249,7 +4266,7 @@ fn make_simple_descr_group_inner(
                     flag: spec.flag,
                     virtualizable: spec.virtualizable,
                     index_in_parent: spec.index_in_parent,
-                    parent_descr: Some(parent_descr.clone()),
+                    parent_descr: RwLock::new(Some(parent_descr.clone())),
                     vinfo: None,
                 })
             })
@@ -4901,6 +4918,7 @@ pub fn make_vtable_field_descr() -> DescrRef {
                     descr_index: AtomicI32::new(-1),
                     ei_index: AtomicU32::new(u32::MAX),
                     name: "object.typeptr".to_string(),
+                    field_key: "typeptr".to_string(),
                     offset: 0,
                     field_size: std::mem::size_of::<usize>(),
                     field_type: crate::Type::Int,
@@ -4909,7 +4927,7 @@ pub fn make_vtable_field_descr() -> DescrRef {
                     flag: ArrayFlag::Signed,
                     virtualizable: false,
                     index_in_parent: 0,
-                    parent_descr: Some(parent_descr),
+                    parent_descr: RwLock::new(Some(parent_descr)),
                     vinfo: None,
                 });
                 *field_descr_cell.borrow_mut() = Some(field_descr.clone());
@@ -5742,10 +5760,11 @@ pub fn make_field_descr_with_parent(
         field_type,
         false,
         flag,
+        name.clone(),
         name,
     );
     fd.index_in_parent = index_in_parent;
-    fd.parent_descr = Some(parent_weak);
+    fd.parent_descr = RwLock::new(Some(parent_weak));
     Arc::new(fd)
 }
 

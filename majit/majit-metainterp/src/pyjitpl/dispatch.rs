@@ -54,6 +54,7 @@ fn field_spec_from_bh(
 ) -> majit_ir::descr::SimpleFieldDescrSpec {
     majit_ir::descr::SimpleFieldDescrSpec {
         index: f.index,
+        field_key: f.field_key().to_string(),
         name: f.name.clone(),
         offset: f.offset,
         field_size: f.field_size,
@@ -98,6 +99,7 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
                 *is_gc_managed,
                 owner == HEADERLESS_SIZE_OWNER_MARKER,
                 &specs,
+                &[],
             );
             let sd: majit_ir::DescrRef = group.size_descr;
             return sd;
@@ -141,6 +143,8 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
             index_in_parent,
             parent,
             name,
+            is_immutable,
+            is_quasi_immutable,
             ..
         } => {
             if let Some(p) = parent {
@@ -163,6 +167,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         p.is_gc_managed,
                         p.headerless,
                         &specs,
+                        &[],
                     );
                     let struct_key = majit_ir::descr::LLType::Struct(p.type_id);
                     let cached = majit_ir::descr::gc_cache()
@@ -176,35 +181,36 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         let fd: majit_ir::DescrRef = fd;
                         return (*offset, fd);
                     }
-                    // Name-miss: the getfield names a Rust field (e.g.
-                    // `strategy`) that the flattened layout represents under a
-                    // different name — an inline enum's `__discriminant` at its
-                    // sub-struct-relative offset — so the by-name lookup finds
-                    // nothing.  The getfield's own baked offset is the
-                    // authoritative absolute offset; wire it to the containing
-                    // struct's cache-owned SizeDescr so the FieldDescr satisfies
-                    // `descr.py:238 get_parent_descr()` for
-                    // `ensure_ptr_info_arg0` (`optimizer.py:478`) instead of
-                    // falling to the parentless placeholder.
-                    let parent_size = majit_ir::descr::gc_cache()
-                        .lock()
-                        .unwrap()
-                        ._cache_size
-                        .get(&struct_key)
-                        .cloned();
-                    if let Some(parent_size) = parent_size {
-                        return (
+                    // Name-miss: the getfield names an inline aggregate
+                    // (`ob_header`, `int_items`, an enum's `__pos_0`) that the
+                    // flattened layout only represents through its leaves, so
+                    // the by-name lookup finds nothing.  `heaptracker.py:68-69`
+                    // recurses into a nested `lltype.Struct` without minting a
+                    // descr for the container at all — `jtransform.py:942
+                    // rewrite_op_getsubstruct` lowers that access to
+                    // `int_add(ptr, offset)`, no descr — so this whole branch
+                    // exists only because pyre still emits a `getfield_gc` here.
+                    // Until that lowering is ported, the container descr must at
+                    // least obey the single-mint rule: go through
+                    // `descr.py:218-239 get_field_descr` so the pool-side and
+                    // walker-side resolutions land on one Arc instead of each
+                    // minting a fresh one per resolution.
+                    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                    if gc._cache_size.contains_key(&struct_key) {
+                        let fd = gc.get_field_descr(
+                            struct_key,
+                            name,
                             *offset,
-                            majit_ir::descr::make_field_descr_with_parent(
-                                *offset,
-                                *field_size,
-                                *field_type,
-                                *field_flag,
-                                *index_in_parent,
-                                name.clone(),
-                                &parent_size,
-                            ),
+                            *field_size,
+                            *field_type,
+                            *is_immutable,
+                            *is_quasi_immutable,
+                            *field_flag,
+                            *index_in_parent as u32,
+                            false,
+                            *index_in_parent,
                         );
+                        return (*offset, fd as majit_ir::DescrRef);
                     }
                 }
             }
@@ -263,6 +269,7 @@ pub fn struct_fields_write_effect_info(
                 };
                 majit_ir::descr::SimpleFieldDescrSpec {
                     index: u32::MAX,
+                    field_key: name.to_string(),
                     name: name.to_string(),
                     offset,
                     field_size: 8,
@@ -1525,6 +1532,7 @@ where
                 majit_ir::value::Type::Int,
                 false,
                 majit_ir::descr::ArrayFlag::Signed,
+                "len".to_string(),
                 "len".to_string(),
             ));
             d

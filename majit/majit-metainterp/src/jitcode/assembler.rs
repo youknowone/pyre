@@ -629,6 +629,7 @@ impl JitCodeBuilder {
                     // runtime DescrCache mints one; index_in_parent carries
                     // the structural slot the optimizer indexes by.
                     index: u32::MAX,
+                    field_key: name.to_string(),
                     name: name.to_string(),
                     offset,
                     field_size: 8,
