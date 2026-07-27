@@ -11683,36 +11683,164 @@ impl CraneliftBackend {
                         &known_values,
                         op.arg(0).to_opref(),
                     );
-                    let result = emit_collecting_gc_call(
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        jf_ptr,
-                        &ref_root_slots,
-                        &defined_ref_vars,
-                        &stale_ref_vars,
-                        &demoted_failarg_slots,
-                        ref_root_base_ofs,
-                        per_call_gcmap,
-                        gc_alloc_nursery_headerless_shim as *const () as usize,
-                        &[size],
-                        Some(cl_types::I64),
-                    )
-                    .expect("headerless nursery allocation helper must return a value");
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    builder.ins().set_pinned_reg(jf_ptr);
-                    builder.def_var(var(vi), result);
-                    // malloc_cond parity: the headerless slow path
-                    // (gc_alloc_nursery_headerless_shim) returns NULL on
-                    // host/bounded out-of-memory; propagate before the
-                    // following stores dereference it.
-                    emit_memory_error_check(
-                        &mut builder,
-                        ptr_type,
-                        result,
-                        propagate_exception_descr_ptr,
-                        preamble_phase,
-                    );
+                    // x86/assembler.py:2556-2565 malloc_cond parity, headerless
+                    // variant — the same inline bump the `CallMallocNursery`
+                    // arm below emits and the dynasm backends already emit for
+                    // this opcode (`genop_call_malloc_nursery_headerless`).
+                    // Three differences from the headered shape: the bump is by
+                    // `size` alone (no `GcHeader::SIZE` reservation), no header
+                    // word is zeroed, and the result is the old nursery base
+                    // rather than `base + GcHeader::SIZE`.
+                    //
+                    // The raw bump is correct only while the active GC is
+                    // headerless-aware, which is the same invariant
+                    // `alloc_nursery_headerless`'s panicking default enforces on
+                    // the overflow path — whoever declares `headerless_structs`
+                    // upholds it. Without a bump surface (`nursery_free` /
+                    // `nursery_top` reported as 0) the op stays on the helper.
+                    let inline_bump = gc_nursery_addrs.filter(|&(nf, nt)| nf != 0 && nt != 0);
+                    if let Some((nf_addr, nt_addr)) = inline_bump {
+                        let flags = MemFlags::trusted();
+                        let nf_ptr = builder.ins().iconst(ptr_type, nf_addr as i64);
+                        let nt_ptr = builder.ins().iconst(ptr_type, nt_addr as i64);
+                        let free = builder.ins().load(ptr_type, flags, nf_ptr, 0);
+                        let new_free = builder.ins().iadd(free, size);
+                        let top = builder.ins().load(ptr_type, flags, nt_ptr, 0);
+                        // `nursery_top` is one-past-last, so the region is exhausted
+                        // exactly when the bumped free pointer runs past it — the
+                        // dynasm emitters' `b.hi` / `ja` slow-path edge.
+                        let fits =
+                            builder
+                                .ins()
+                                .icmp(IntCC::UnsignedLessThanOrEqual, new_free, top);
+
+                        // Same block-param carry as the headered arm: only the slow
+                        // path spills and reloads the ref roots, so the merge takes
+                        // every live ref as a parameter instead of letting the two
+                        // paths disagree on the variable's definition.
+                        let live_refs: Vec<(u32, usize)> = ref_root_slots
+                            .iter()
+                            .filter(|(var_idx, _)| defined_ref_vars.contains(var_idx))
+                            .copied()
+                            .collect();
+
+                        let fast_block = builder.create_block();
+                        let slow_block = builder.create_block();
+                        let merge_block = builder.create_block();
+                        builder.append_block_param(merge_block, ptr_type); // result
+                        builder.append_block_param(merge_block, ptr_type); // jf_ptr
+                        for _ in &live_refs {
+                            builder.append_block_param(merge_block, cl_types::I64);
+                        }
+                        builder.ins().brif(fits, fast_block, &[], slow_block, &[]);
+
+                        // fast: publish the bumped free pointer and hand back the
+                        // old base. Nothing here can collect, so no gcmap is pushed
+                        // and no ref root is spilled.
+                        builder.switch_to_block(fast_block);
+                        builder.seal_block(fast_block);
+                        builder.ins().store(flags, new_free, nf_ptr, 0);
+                        let mut fast_args: Vec<BlockArg> =
+                            vec![BlockArg::from(free), BlockArg::from(jf_ptr)];
+                        for &(var_idx, _) in &live_refs {
+                            fast_args.push(BlockArg::from(builder.use_var(var(var_idx))));
+                        }
+                        builder.ins().jump(merge_block, &fast_args);
+
+                        // slow: aarch64 `_build_malloc_slowpath` parity — spill the
+                        // ref roots and install the gcmap, then let the helper
+                        // collect and re-bump.
+                        builder.switch_to_block(slow_block);
+                        builder.seal_block(slow_block);
+                        builder.set_cold_block(slow_block);
+                        spill_ref_roots(
+                            &mut builder,
+                            jf_ptr,
+                            &ref_root_slots,
+                            &defined_ref_vars,
+                            &stale_ref_vars,
+                            &demoted_failarg_slots,
+                            ref_root_base_ofs,
+                        );
+                        emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
+                        let slow_r = emit_host_call(
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                            gc_alloc_nursery_headerless_shim as *const () as usize,
+                            &[size],
+                            Some(cl_types::I64),
+                        )
+                        .expect("headerless nursery allocation helper must return a value");
+                        let jf_ptr_slow =
+                            emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        emit_pop_gcmap(&mut builder, jf_ptr_slow, per_call_gcmap);
+                        reload_ref_roots(
+                            &mut builder,
+                            jf_ptr_slow,
+                            &ref_root_slots,
+                            &defined_ref_vars,
+                            &demoted_failarg_slots,
+                            ref_root_base_ofs,
+                        );
+                        let mut slow_args: Vec<BlockArg> =
+                            vec![BlockArg::from(slow_r), BlockArg::from(jf_ptr_slow)];
+                        for &(var_idx, _) in &live_refs {
+                            slow_args.push(BlockArg::from(builder.use_var(var(var_idx))));
+                        }
+                        builder.ins().jump(merge_block, &slow_args);
+
+                        builder.switch_to_block(merge_block);
+                        builder.seal_block(merge_block);
+                        let params = builder.block_params(merge_block).to_vec();
+                        let result = params[0];
+                        jf_ptr = params[1];
+                        builder.ins().set_pinned_reg(jf_ptr);
+                        for (i, &(var_idx, _)) in live_refs.iter().enumerate() {
+                            builder.def_var(var(var_idx), params[2 + i]);
+                        }
+                        builder.def_var(var(vi), result);
+                        // malloc_cond parity: the headerless slow path
+                        // (gc_alloc_nursery_headerless_shim) returns NULL on
+                        // host/bounded out-of-memory; propagate before the
+                        // following stores dereference it. The fast path cannot
+                        // produce NULL, but the check is on the merged value so a
+                        // slow-path NULL is caught on either edge.
+                        emit_memory_error_check(
+                            &mut builder,
+                            ptr_type,
+                            result,
+                            propagate_exception_descr_ptr,
+                            preamble_phase,
+                        );
+                    } else {
+                        let result = emit_collecting_gc_call(
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                            jf_ptr,
+                            &ref_root_slots,
+                            &defined_ref_vars,
+                            &stale_ref_vars,
+                            &demoted_failarg_slots,
+                            ref_root_base_ofs,
+                            per_call_gcmap,
+                            gc_alloc_nursery_headerless_shim as *const () as usize,
+                            &[size],
+                            Some(cl_types::I64),
+                        )
+                        .expect("headerless nursery allocation helper must return a value");
+                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        builder.ins().set_pinned_reg(jf_ptr);
+                        builder.def_var(var(vi), result);
+                        emit_memory_error_check(
+                            &mut builder,
+                            ptr_type,
+                            result,
+                            propagate_exception_descr_ptr,
+                            preamble_phase,
+                        );
+                    }
                 }
                 OpCode::CallMallocNursery => {
                     // x86/assembler.py:2556-2565 malloc_cond parity.
