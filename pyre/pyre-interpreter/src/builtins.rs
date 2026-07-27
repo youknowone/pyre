@@ -9173,20 +9173,28 @@ fn builtin_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     })
 }
 
+/// The frame whose locals `locals()` / `vars()` / `dir()` report on
+/// (`interp_inspect.py:7-11 locals` — `ec.gettopframe_nohidden()`).
+///
+/// Going through `gettopframe_nohidden` is what makes the frame's fastlocals
+/// readable: it runs `force_frame` on every frame it walks
+/// (`executioncontext.rs:409-421`), and `fast2locals` reads
+/// `locals_cells_stack_w` directly, so an unforced virtualizable hands back an
+/// array of nulls — which `fast2locals` renders as an EMPTY mapping rather
+/// than a stale one.  Reading `CURRENT_FRAME` instead skips that force, and
+/// under the JIT the caller then sees no locals at all.
+fn topframe_for_locals() -> *mut crate::PyFrame {
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    if ec.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { (*ec).gettopframe_nohidden() }
+}
+
 fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if !args.is_empty() {
         return Err(crate::PyError::type_error("locals() takes no arguments"));
     }
-    // `interp_inspect.py:7-11 locals` returns
-    // `ec.gettopframe_nohidden().getdictscope()` unconditionally.  Going
-    // through `gettopframe_nohidden` is what makes the frame's fastlocals
-    // readable: it runs `force_frame` on every frame it walks
-    // (`executioncontext.rs:409-421`), and `fast2locals` reads
-    // `locals_cells_stack_w` directly, so an unforced virtualizable hands
-    // back an array of nulls — which `fast2locals` renders as an EMPTY
-    // mapping rather than a stale one.  Reading `CURRENT_FRAME` instead
-    // skips that force.
-    //
     // `frame_locals_snapshot` (`_PyEval_GetFrameLocals`) hands an optimized
     // frame an independent copy, so a snapshot neither tracks later stores nor
     // writes back — `x = 1; d = locals(); x = 2; d["x"]` still reads `1`, and
@@ -9194,12 +9202,7 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // their real namespace, so `locals() is globals()` still holds at module
     // scope and a non-dict exec/eval mapping is still the live object written
     // through its `__setitem__`.
-    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
-    let frame = if ec.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe { (*ec).gettopframe_nohidden() }
-    };
+    let frame = topframe_for_locals();
     if frame.is_null() {
         return Err(crate::PyError::runtime_error(
             "locals() requires an active frame",
@@ -9337,27 +9340,26 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if args.is_empty() {
         // `bltinmodule.c builtin_dir` — with no argument, list the names in
         // the caller's local scope: `sorted(frame.f_locals)`.  Resolve the
-        // locals mapping exactly as `locals()` does (module scope returns
-        // the globals dict), then return its sorted keys.
-        return crate::eval::CURRENT_FRAME.with(|current| {
-            let frame = current.get();
-            if frame.is_null() {
-                return Ok(w_list_new(vec![]));
-            }
-            let frame_mut = unsafe { &mut *frame };
-            let w_locals_dict = frame_mut.getdictscope()?;
-            if w_locals_dict.is_null() {
-                return Ok(w_list_new(vec![]));
-            }
-            // PyPy app_inspect.py:50 calls
-            // `sorted(_caller_locals().keys())`, not `sorted(locals)`.
-            // This distinction is observable for a general eval locals
-            // mapping which implements `keys()` and sequence-style
-            // `__getitem__` but no `__iter__`.
-            let keys_method = crate::baseobjspace::getattr_str(w_locals_dict, "keys")?;
-            let keys = crate::call_and_check(keys_method, &[])?;
-            builtin_sorted(&[keys])
-        });
+        // frame exactly as `locals()` does (module scope returns the globals
+        // dict), then return the mapping's sorted keys.  `getdictscope` rather
+        // than `frame_locals_snapshot`: only the key set is read, and the two
+        // agree on it, so the snapshot copy would be a pure allocation.
+        let frame = topframe_for_locals();
+        if frame.is_null() {
+            return Ok(w_list_new(vec![]));
+        }
+        let frame_mut = unsafe { &mut *frame };
+        let w_locals_dict = frame_mut.getdictscope()?;
+        if w_locals_dict.is_null() {
+            return Ok(w_list_new(vec![]));
+        }
+        // app_inspect.py:50 calls `sorted(_caller_locals().keys())`, not
+        // `sorted(locals)`.  This distinction is observable for a general
+        // eval locals mapping which implements `keys()` and sequence-style
+        // `__getitem__` but no `__iter__`.
+        let keys_method = crate::baseobjspace::getattr_str(w_locals_dict, "keys")?;
+        let keys = crate::call_and_check(keys_method, &[])?;
+        return builtin_sorted(&[keys]);
     }
     if args.len() > 1 {
         return Err(crate::PyError::type_error(format!(
