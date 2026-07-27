@@ -745,9 +745,13 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     let mut functions = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     for fd in llbc.iter_local_fns() {
-        if fd.unstructured().is_none() {
+        // `FunDecl::body` is raw JSON and `unstructured()` re-parses it on
+        // every call, so hold the one projection this iteration needs: it
+        // is both the "has a lowerable body" gate and the input the
+        // lowering below reads.
+        let Some(body) = fd.unstructured() else {
             continue;
-        }
+        };
         // Charon emits static / const initialiser bodies (e.g. the
         // body that builds `static NONE_SINGLETON`) as ordinary
         // `FunDecl` entries with `is_global_initializer` set to the
@@ -789,9 +793,10 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // production keeps going with a degraded SemanticProgram —
         // failing-loud on the single broken function rather than
         // erroring out at program-build time.
-        let graph = match lower_fun_decl_with_static_addrs_and_attrs(
+        let graph = match lower_unstructured_with_static_addrs_and_attrs(
             llbc,
             fd,
+            &body,
             static_addrs,
             &struct_field_attrs,
         ) {
@@ -1585,6 +1590,23 @@ fn lower_fun_decl_with_static_addrs_and_attrs(
             fd.item_meta.name_path()
         ))
     })?;
+    lower_unstructured_with_static_addrs_and_attrs(llbc, fd, &u, static_addrs, struct_field_attrs)
+}
+
+/// Lower `fd` from an already-projected `Unstructured` body.
+///
+/// `FunDecl::body` is retained as raw JSON and `FunDecl::unstructured`
+/// re-parses it on every call, so a caller that has already projected the
+/// body — the whole-program loop, which needs the projection to decide
+/// whether the decl has one at all — passes it in here rather than paying
+/// the parse a second time.
+fn lower_unstructured_with_static_addrs_and_attrs(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    u: &Unstructured,
+    static_addrs: crate::HostStaticAddrs<'_>,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> Result<FunctionGraph, LowerError> {
     let name = fd.item_meta.name_path();
     // The Result-of-PyError exception-link lowering's callee rule
     // applies when this body is a scoped callee (see
@@ -1883,7 +1905,7 @@ fn lower_fun_decl_with_static_addrs_and_attrs(
     // the monotonic one — unless `PYRE_MIR_FRAMESTATE_STRICT` is set,
     // which propagates the error for debugging.
     if framestate_enabled() {
-        let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs, fd.generics.as_ref())?;
+        let mut lo = Lowering::new(llbc, name.clone(), u, static_addrs, fd.generics.as_ref())?;
         // Back-edge targets (loop headers); empty for an acyclic body, in
         // which case `lower_framestate` reduces exactly to the two-pass
         // RPO walk.  Treat the threaded lowering and its shared
@@ -1915,7 +1937,7 @@ fn lower_fun_decl_with_static_addrs_and_attrs(
             }
         }
     }
-    let mut lo = Lowering::new(llbc, name.clone(), &u, static_addrs, fd.generics.as_ref())?;
+    let mut lo = Lowering::new(llbc, name.clone(), u, static_addrs, fd.generics.as_ref())?;
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => {
             finish(&mut lo)?;
@@ -1933,7 +1955,7 @@ fn lower_fun_decl_with_static_addrs_and_attrs(
         // inputargs), which is order-independent.  RPO only resolves the
         // acyclic forward-reference case above.
         Err(LowerError::Unsupported(msg)) if is_known_lowering_gap(&msg) => {
-            let mut lo = Lowering::new(llbc, name, &u, static_addrs, fd.generics.as_ref())?;
+            let mut lo = Lowering::new(llbc, name, u, static_addrs, fd.generics.as_ref())?;
             lo.lower(BlockOrder::ReversePostorder)?;
             finish(&mut lo)?;
             Ok(lo.graph)
