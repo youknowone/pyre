@@ -5406,16 +5406,16 @@ impl FunctionGraph {
     /// formal parameters the recovery is exact 1:1 — the param-binding
     /// loop (`lower_expr_into_graph_with_signature` / `build_function_
     /// graph`) emits a named `Input` op for every inputarg — so the
-    /// `arg{N}` fallback in `signature_for_graph` is unreachable for
-    /// well-formed graphs. `pygraph.py:16` instead names the initial-
-    /// block locals straight from `code.co_varnames` and stores
-    /// `code.signature` on the `PyGraph` wrapper; pyre's lifted callee
-    /// graphs carry no such wrapper, so the raw name is recovered from
-    /// the `Input` op until a `PyGraph`-equivalent signature store
-    /// lands. Orthodox reader for callers that already hold the
-    /// `Variable` (e.g. `signature_for_graph` walking
-    /// `startblock.inputargs`); RPython reads the source name off the
-    /// Variable / `co_varnames`, never via an integer value index.
+    /// `arg{N}` fallback in `GraphStore::signature_from_graph` is
+    /// unreachable for well-formed graphs. `pygraph.py:16` instead names
+    /// the initial-block locals straight from `code.co_varnames` and
+    /// stores `code.signature` on the `PyGraph` wrapper; pyre's lifted
+    /// callee graphs carry no such wrapper, so the raw name is recovered
+    /// from the `Input` op once at registration and kept on the
+    /// `GraphStore` slot thereafter. Orthodox reader for callers that
+    /// already hold the `Variable` (e.g. `GraphStore::signature_from_graph`
+    /// walking `startblock.inputargs`); RPython reads the source name off
+    /// the Variable / `co_varnames`, never via an integer value index.
     pub fn value_name_for(&self, var: &crate::flowspace::model::Variable) -> Option<String> {
         // Unnamed values (arithmetic temporaries, constants) carry no
         // source name; `Variable.renamed` is the O(1) gate that keeps

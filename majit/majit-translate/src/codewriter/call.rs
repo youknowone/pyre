@@ -12,6 +12,7 @@ use majit_ir::descr::{DescrRef, EffectInfo, ExtraEffect, OopSpecIndex};
 use majit_ir::value::Type;
 use serde::{Deserialize, Serialize};
 
+use crate::flowspace::argument::Signature;
 use crate::front::semantic::SemanticFunction;
 use crate::jitcode::{BhCallDescr, CallResultErasedKey};
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation};
@@ -500,7 +501,23 @@ type GraphKey = (Option<String>, String);
 #[derive(Default)]
 pub(crate) struct GraphStore {
     path_to_key: HashMap<CallPath, GraphKey>,
-    graphs: HashMap<GraphKey, FunctionGraph>,
+    graphs: HashMap<GraphKey, GraphSlot>,
+}
+
+/// One source funcobj's stored graph plus the metadata derived from it at
+/// registration time.
+///
+/// `signature` is the funcobj's formal parameter list.  `pygraph.py:16`
+/// names the initial-block locals straight from `code.co_varnames` and
+/// stores `code.signature` on the `PyGraph` wrapper, so upstream reads a
+/// callee's signature off the *code object* and never walks the built
+/// graph.  Pyre's lifted callees carry no `PyGraph` wrapper, so the
+/// signature is recovered from the startblock's `Input` ops
+/// ([`crate::model::FunctionGraph::value_name_for`]) — but once, here,
+/// while the body is in hand, rather than on every registry consumer.
+struct GraphSlot {
+    graph: FunctionGraph,
+    signature: Signature,
 }
 
 impl GraphStore {
@@ -508,38 +525,70 @@ impl GraphStore {
         Self::default()
     }
 
+    /// Derive a funcobj's parameter [`Signature`] from its startblock
+    /// inputargs.  `varargname` / `kwargname` are `None`: a Rust-source
+    /// funcobj has no `*args` / `**kwargs` formal.
+    fn signature_from_graph(graph: &FunctionGraph) -> Signature {
+        let startblock = graph.block(graph.startblock);
+        let argnames: Vec<String> = startblock
+            .inputargs
+            .iter()
+            .enumerate()
+            .map(|(idx, var)| {
+                graph
+                    .value_name_for(var)
+                    .unwrap_or_else(|| format!("arg{idx}"))
+            })
+            .collect();
+        Signature::new(argnames, None, None)
+    }
+
     /// Register `graph` under `path`.  When another alias of the same
     /// source funcobj (same `GraphKey`) is already stored, keep the one
     /// shared graph object and fold this registration's attributes onto it
     /// monotonically — accumulate effects, adopt hints / return type if the
     /// stored graph lacks them — so neither registration order nor a
-    /// hint-less first insert drops metadata a later alias carried.
+    /// hint-less first insert drops metadata a later alias carried.  The
+    /// signature stays that of the shared graph, which the aliases resolve
+    /// to anyway.
     pub(crate) fn insert(&mut self, path: CallPath, graph: FunctionGraph) {
         let key = (graph.owner_root.clone(), graph.name.clone());
         match self.graphs.get_mut(&key) {
             Some(existing) => {
-                existing.func.merge_from(&graph.func);
+                existing.graph.func.merge_from(&graph.func);
                 if !graph.hints.is_empty() {
-                    existing.hints = graph.hints;
+                    existing.graph.hints = graph.hints;
                 }
-                if existing.return_type.is_none() {
-                    existing.return_type = graph.return_type;
+                if existing.graph.return_type.is_none() {
+                    existing.graph.return_type = graph.return_type;
                 }
             }
             None => {
-                self.graphs.insert(key.clone(), graph);
+                let signature = Self::signature_from_graph(&graph);
+                self.graphs
+                    .insert(key.clone(), GraphSlot { graph, signature });
             }
         }
         self.path_to_key.insert(path, key);
     }
 
     pub(crate) fn get(&self, path: &CallPath) -> Option<&FunctionGraph> {
-        self.graphs.get(self.path_to_key.get(path)?)
+        self.graphs
+            .get(self.path_to_key.get(path)?)
+            .map(|s| &s.graph)
     }
 
     pub(crate) fn get_mut(&mut self, path: &CallPath) -> Option<&mut FunctionGraph> {
         let key = self.path_to_key.get(path)?.clone();
-        self.graphs.get_mut(&key)
+        self.graphs.get_mut(&key).map(|s| &mut s.graph)
+    }
+
+    /// The formal parameter [`Signature`] of the funcobj `path` names —
+    /// the `FunctionDesc` signature upstream takes from `code.signature`.
+    pub(crate) fn signature(&self, path: &CallPath) -> Option<&Signature> {
+        self.graphs
+            .get(self.path_to_key.get(path)?)
+            .map(|s| &s.signature)
     }
 
     pub(crate) fn contains_key(&self, path: &CallPath) -> bool {
@@ -558,7 +607,7 @@ impl GraphStore {
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&CallPath, &FunctionGraph)> {
         self.path_to_key
             .iter()
-            .filter_map(move |(p, k)| self.graphs.get(k).map(|g| (p, g)))
+            .filter_map(move |(p, k)| self.graphs.get(k).map(|s| (p, &s.graph)))
     }
 
     /// Number of registered alias spellings (path count), matching the old

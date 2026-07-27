@@ -444,12 +444,13 @@ fn unpoison_failed_subject_callees(
             .keys_for_entry(&key)
             .iter()
             .find_map(|k| {
-                lift_sources.get(&crate::parse::CallPath::from_segments(
-                    k.segments().iter().cloned(),
-                ))
+                let path = crate::parse::CallPath::from_segments(k.segments().iter().cloned());
+                let source = lift_sources.get(&path)?;
+                let signature = lift_sources.signature(&path)?;
+                Some((source, signature))
             })
-            .and_then(|source| {
-                lift_callee_to_pygraph(source, signature_for_graph(source), call_registry).ok()
+            .and_then(|(source, signature)| {
+                lift_callee_to_pygraph(source, signature.clone(), call_registry).ok()
             });
         match fresh {
             Some(fresh) => {
@@ -1521,8 +1522,12 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         }
         segs
     }
-    let mut pending: Vec<(FunctionPathKey, &LegacyGraph, Rc<PyreFunctionEntry>)> =
-        Vec::with_capacity(function_graphs.len());
+    let mut pending: Vec<(
+        FunctionPathKey,
+        &LegacyGraph,
+        Rc<PyreFunctionEntry>,
+        &Signature,
+    )> = Vec::with_capacity(function_graphs.len());
     // `by_canonical_path` tracks the canonical `FunctionPathKey` of
     // the first-encountered alias for each canonical-stripped key.
     // Subsequent aliases of the same callable register an alias row
@@ -1601,6 +1606,9 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         {
             continue;
         }
+        let signature = function_graphs
+            .signature(path)
+            .expect("iter() path resolves to a stored slot");
         let entry = if let Some(canonical_key) = by_canonical_path.get(&canonical_strip) {
             if canonical_key != &key {
                 registry.alias(key.clone(), canonical_key);
@@ -1609,12 +1617,11 @@ pub(crate) fn populate_call_registry_from_call_graphs(
                 .lookup(canonical_key)
                 .expect("canonical entry registered")
         } else {
-            let signature = signature_for_graph(graph);
-            let entry = registry.get_or_register(key.clone(), signature);
+            let entry = registry.get_or_register(key.clone(), signature.clone());
             by_canonical_path.insert(canonical_strip, key.clone());
             entry
         };
-        pending.push((key, graph, entry));
+        pending.push((key, graph, entry, signature));
     }
     // Lift `pending` in a deterministic order.  `function_graphs.iter()`
     // (`GraphStore` over `path_to_key: HashMap<CallPath, _>`) yields entries
@@ -1698,7 +1705,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // `RPythonAnnotator` (`bookkeeper.annotator()` panics with
     // "backlink absent or dropped") only pay the lookup on the
     // failure path; success paths remain unaffected.
-    for (_key, graph, entry) in &pending {
+    for (_key, graph, entry, signature) in &pending {
         let entry_ptr = Rc::as_ptr(entry);
         if !lifted.insert(entry_ptr) {
             continue;
@@ -1774,14 +1781,14 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             if let Some(result_shell) = result_shell {
                 let stub = build_stub_pygraph_with_result_shell(
                     graph.name.clone(),
-                    signature_for_graph(graph),
+                    (*signature).clone(),
                     result_shell,
                 );
                 entry.prefill_default_cache(stub);
                 continue;
             }
         }
-        match lift_callee_to_pygraph(graph, signature_for_graph(graph), registry) {
+        match lift_callee_to_pygraph(graph, (*signature).clone(), registry) {
             Ok(pygraph) => entry.prefill_default_cache(pygraph),
             Err(e) => {
                 let message = format!("{e}");
@@ -1815,7 +1822,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // same-named instance field wins — a function source for a field
     // attribute would union-conflict in `generalize_attr`.
     let bk = registry.bookkeeper();
-    for (key, _graph, entry) in &pending {
+    for (key, _graph, entry, _signature) in &pending {
         // `CallPath::for_impl_method` splits the module-qualified owner
         // ("pyframe::PyFrame" → [pyframe, PyFrame, method]), so the
         // owner is the second-to-last segment.  Free-function paths
@@ -1847,26 +1854,6 @@ pub(crate) fn populate_call_registry_from_call_graphs(
 // orthodox flow directly: lift subject graph -> seed subject blocks
 // -> compute_at_fixpoint (drives pycall->recursivecall to discover
 // callees) -> RPythonTyper::specialize.
-
-/// Derive a parameter `Signature` directly from a `FunctionGraph`'s
-/// startblock inputargs.  Same shape as
-/// [`signature_for`] but takes a graph rather than a
-/// `SemanticFunction`, since `CallControl::function_graphs()`
-/// carries graphs without their lowered SemanticFunction wrapper.
-fn signature_for_graph(graph: &LegacyGraph) -> Signature {
-    let startblock = graph.block(graph.startblock);
-    let argnames: Vec<String> = startblock
-        .inputargs
-        .iter()
-        .enumerate()
-        .map(|(idx, var)| {
-            graph
-                .value_name_for(var)
-                .unwrap_or_else(|| format!("arg{idx}"))
-        })
-        .collect();
-    Signature::new(argnames, None, None)
-}
 
 /// Lift a pyre `model::FunctionGraph` (a callee that may appear on a
 /// `OpKind::Call::FunctionPath` callsite of some other graph) into a
