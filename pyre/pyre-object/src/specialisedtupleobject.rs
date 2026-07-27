@@ -176,6 +176,7 @@ pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> P
     // potential collection inside `try_gc_alloc_stable`. The ii/ff
     // variants take unboxed i64/f64 and need no bracket here.
     let _roots = crate::gc_roots::push_roots();
+    let save_point = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(value0);
     crate::gc_roots::pin_root(value1);
 
@@ -187,6 +188,11 @@ pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> P
         SPECIALISED_TUPLE_OO_GC_TYPE_ID,
         SPECIALISED_TUPLE_OO_OBJECT_SIZE,
     );
+    // pop_roots: the parameters still name the pre-collection addresses, so
+    // the values stored into the tuple are read back out of the shadow stack,
+    // as `w_tuple_new_array_backed` does before filling its items block.
+    let value0 = crate::gc_roots::shadow_stack_get(save_point);
+    let value1 = crate::gc_roots::shadow_stack_get(save_point + 1);
     if !raw.is_null() {
         unsafe {
             std::ptr::write(
