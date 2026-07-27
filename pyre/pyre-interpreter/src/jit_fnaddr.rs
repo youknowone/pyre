@@ -711,6 +711,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "w_frozenset_new",
         w_frozenset_new as *const (),
     );
+    // `w_set_copy_storage_from` is `#[dont_look_inside]` (its body clones the
+    // host `SetItemsStorage` `IndexMap` and boxes it into `d.items`); bind its
+    // `unsafe fn(PyObjectRef, PyObjectRef)` so the residual call resolves. The
+    // void 2-arg fn registers exactly like the void `w_type_set_abstract`
+    // sibling below.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::setobject::w_set_copy_storage_from",
+        "pyre_object::w_set_copy_storage_from",
+        pyre_object::setobject::w_set_copy_storage_from as *const (),
+    );
     push_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_len",

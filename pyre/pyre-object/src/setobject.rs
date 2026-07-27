@@ -575,8 +575,17 @@ pub unsafe fn w_set_popitem(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// non-collecting stable old-generation allocator, so there is no collection
 /// point between reading `src`'s table and installing the new field value.
 ///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`), the
+/// `w_set_new` twin: cloning `src`'s `SetItemsStorage` (`IndexMap<ObjectKey,
+/// ()>`) and boxing it into `d.items` is a foreign `IndexMap::clone` +
+/// storage-box write. Tracing into it carries that host container op into the
+/// caller and unifies the `items` field as `Instance(IndexMap)`; residualising
+/// the whole assignment keeps the box off the trace, modelling it as a void
+/// effect on two GCREFs.
+///
 /// # Safety
 /// `dst` and `src` must point to valid `W_SetObject`s.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_set_copy_storage_from(dst: PyObjectRef, src: PyObjectRef) {
     let d = &mut *(dst as *mut W_SetObject);
     let copied = (*(*(src as *const W_SetObject)).items).clone();
