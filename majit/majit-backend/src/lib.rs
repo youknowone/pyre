@@ -893,8 +893,6 @@ pub struct CompiledLoopToken {
     pub loop_token_wref: parking_lot::Mutex<std::sync::Weak<JitCellToken>>,
     /// `model.py:300` `self.bridges_count = 0`.
     pub bridges_count: parking_lot::Mutex<usize>,
-    /// `model.py:301` `self.invalidate_positions = []`.
-    pub invalidate_positions: parking_lot::Mutex<Vec<usize>>,
     /// `model.py:302-304` `self.looptokens_redirected_to = []` — weak
     /// references to `CompiledLoopToken` instances previously redirected
     /// to this one via `redirect_call_assembler`.
@@ -982,7 +980,6 @@ impl CompiledLoopToken {
             number,
             loop_token_wref: parking_lot::Mutex::new(std::sync::Weak::new()),
             bridges_count: parking_lot::Mutex::new(0),
-            invalidate_positions: parking_lot::Mutex::new(Vec::new()),
             looptokens_redirected_to: parking_lot::Mutex::new(Vec::new()),
             asmmemmgr_blocks: parking_lot::Mutex::new(Vec::new()),
             asmmemmgr_gcreftracers: parking_lot::Mutex::new(Vec::new()),
@@ -1202,7 +1199,7 @@ pub struct JitCellToken {
     /// Carries per-compilation metadata: `asmmemmgr_blocks` (owned bridge
     /// memory blocks — `model.py:293`), `asmmemmgr_gcreftracers`
     /// (`model.py:294`), `frame_info` (JIT frame layout —
-    /// `x86/assembler.py:514`), `bridges_count`, `invalidate_positions`,
+    /// `x86/assembler.py:514`), `bridges_count`,
     /// `looptokens_redirected_to`. Populated eagerly by `JitCellToken::new`
     /// so backends can update fields through `&JitCellToken`.
     ///
