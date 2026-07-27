@@ -4058,18 +4058,12 @@ impl<'a> AssemblerARM64<'a> {
         let fail_label = self.mc.new_dynamic_label();
         if self.invalidated_flag_addr != 0 {
             self.emit_mov_imm64(16, self.invalidated_flag_addr as i64);
-            // `CBNZ` reaches +-32KB, but this guard sits at the head of the
-            // peeled loop body while its recovery stub is emitted after the
-            // whole trace, so a long body puts the stub out of range and
-            // dynasm rejects the relocation at commit. Branch over an
-            // unconditional `B` (+-128MB) instead, the standard veneer.
-            let continue_label = self.mc.new_dynamic_label();
-            dynasm!(self.mc ; .arch aarch64
-                ; ldrb w17, [x16]
-                ; cbz w17, =>continue_label
-                ; b =>fail_label
-                ; =>continue_label
-            );
+            dynasm!(self.mc ; .arch aarch64 ; ldrb w17, [x16]);
+            // The recovery stub is emitted after the whole trace body, so a
+            // bare `cbnz` (19-bit, ±1MB) cannot reach it once the body passes
+            // 1MB — the same reach the other guards route around via
+            // `emit_bcond_to_label`.
+            self.emit_cbnz_w_to_label(17, fail_label);
         }
         self.append_guard_token_with_faillocs(op, op_index, fail_index, fail_label, faillocs);
     }
@@ -4829,6 +4823,18 @@ impl<'a> AssemblerARM64<'a> {
 
     fn emit_jcc_to_label(&mut self, fail_cc: u8, fail_label: DynamicLabel) {
         self.emit_bcond_to_label(fail_cc, fail_label);
+    }
+
+    /// `cbnz W(reg), =>label` for a `label` that may sit past the 19-bit /
+    /// ±1MB reach of `cbnz`, using the same inversion as
+    /// [`Self::emit_bcond_to_label`]: `cbz skip; b =>label; skip:`.
+    fn emit_cbnz_w_to_label(&mut self, reg: u8, label: DynamicLabel) {
+        let skip = self.mc.new_dynamic_label();
+        dynasm!(self.mc ; .arch aarch64
+            ; cbz W(reg), =>skip
+            ; b =>label
+            ; =>skip
+        );
     }
 
     /// Infer fail_arg_types from `op.type_` (via `opref_type`) or
