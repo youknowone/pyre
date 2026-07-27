@@ -1399,7 +1399,7 @@ pub(crate) fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
     // writing `sys.modules['foo'] = mod` is immediately visible to imports.
     // PyPy: importing.py check_sys_modules reads space.sys.get('modules').
     let key = pyre_object::w_str_new(name);
-    let dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
+    let dict = sys_modules_dict();
     if !dict.is_null() {
         if let Some(m) = unsafe { pyre_object::w_dict_lookup(dict, key) } {
             if !m.is_null() && !unsafe { pyre_object::is_none(m) } {
@@ -1428,7 +1428,7 @@ fn sys_modules_blocks(name: &str) -> bool {
     // uses: reading the thread-local last keeps the borrow off the stack
     // across the allocation.
     let key = pyre_object::w_str_new(name);
-    let dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
+    let dict = sys_modules_dict();
     if dict.is_null() {
         return false;
     }
@@ -1446,7 +1446,14 @@ pub fn get_sys_module(name: &str) -> Option<PyObjectRef> {
 
 /// The Python-visible `sys.modules` dict, or `PY_NULL` before it is
 /// installed. Used by callers that need to iterate every loaded module
-/// (e.g. pickle's `whichmodule` scan).
+/// (e.g. pickle's `whichmodule` scan), and the single read seam every
+/// traced reader of `SYS_MODULES_DICT` goes through.
+///
+/// The pointer is stamped at runtime by `set_sys_modules_dict`, so it is not
+/// a build-time constant and the JIT residualizes the read instead of
+/// tracing into it (`@dont_look_inside`, the `gc_interp::enabled` shape).
+/// The `-> PyObjectRef` return fits a single word and it cannot raise.
+#[majit_macros::dont_look_inside]
 pub fn sys_modules_dict() -> PyObjectRef {
     SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef
 }
@@ -1460,7 +1467,7 @@ pub fn set_sys_module(name: &str, module: PyObjectRef) {
         .unwrap()
         .insert(name.to_string(), module as usize);
     // Keep the Python-visible sys.modules dict in sync.
-    let dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
+    let dict = sys_modules_dict();
     if !dict.is_null() {
         unsafe {
             pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), module);
@@ -1477,7 +1484,7 @@ pub fn set_sys_module(name: &str, module: PyObjectRef) {
 /// the next `import ssl` succeeds with no `SSLWantReadError`, etc.
 pub fn remove_sys_module(name: &str) {
     SYS_MODULES.lock().unwrap().remove(name);
-    let dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
+    let dict = sys_modules_dict();
     if !dict.is_null() {
         unsafe {
             pyre_object::w_dict_delitem_str(dict, name);

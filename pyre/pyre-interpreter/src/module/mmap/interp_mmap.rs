@@ -88,8 +88,13 @@ fn mmap_io_err(e: std::io::Error, ctx: &str) -> crate::PyError {
 #[cfg(unix)]
 static MMAP_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+/// Reads (and lazily installs) the runtime-assigned `mmap` type object, not a
+/// build-time constant, so the JIT residualizes the call instead of tracing
+/// into it (`@dont_look_inside`, the `gc_interp::enabled` shape). The
+/// `-> PyObjectRef` return fits a single word and it cannot raise.
 #[cfg(unix)]
-fn mmap_type() -> pyre_object::PyObjectRef {
+#[majit_macros::dont_look_inside]
+pub(crate) fn mmap_type() -> pyre_object::PyObjectRef {
     *MMAP_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("mmap", init_mmap_type);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };

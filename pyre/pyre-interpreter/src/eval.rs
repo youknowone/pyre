@@ -929,6 +929,12 @@ thread_local! {
 /// keeps it (and its traceback chain) alive across a collection. Called from
 /// `record_application_traceback`, the single chokepoint every raising frame
 /// passes through.
+///
+/// Writes the runtime-mutable `IN_FLIGHT_EXCEPTION` thread-local, not a
+/// build-time constant, so the JIT residualizes the call instead of tracing
+/// into it (`@dont_look_inside`, the `gc_interp::at_outermost_activation`
+/// shape). One single-word argument, `()` result, and it cannot raise.
+#[majit_macros::dont_look_inside]
 pub fn set_in_flight_exception(exc: PyObjectRef) {
     IN_FLIGHT_EXCEPTION.with(|c| c.set(exc));
 }

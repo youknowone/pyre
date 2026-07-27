@@ -902,6 +902,62 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::dict_view_iterator_gc_type_id",
         pyre_object::dictmultiobject::dict_view_iterator_gc_type_id as *const (),
     );
+    // The same shape over the object space's remaining runtime-mutable
+    // globals: `sys_modules_dict` reads the `SYS_MODULES_DICT` pointer
+    // `set_sys_modules_dict` stamps, `set_in_flight_exception` writes the
+    // `IN_FLIGHT_EXCEPTION` thread-local, `lookup_exc_class` reads the
+    // `EXC_CLASS_REGISTRY` `OnceLock`, `mmap_type` the lazily-installed
+    // `mmap` type object, and the two `note_eval_activation_*` twins move the
+    // `EVAL_NESTING` thread-local `at_outermost_activation` already reads.
+    // None is a build-time constant, so each carries `#[dont_look_inside]`
+    // and binds its Rust `fn` directly by qualified path rather than taking a
+    // `jit_static_*_addrs` address row.
+    let sys_modules_dict: fn() -> pyre_object::PyObjectRef = crate::importing::sys_modules_dict;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::importing::sys_modules_dict",
+        "pyre_interpreter::sys_modules_dict",
+        sys_modules_dict as *const (),
+    );
+    let set_in_flight_exception: fn(pyre_object::PyObjectRef) =
+        crate::eval::set_in_flight_exception;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::eval::set_in_flight_exception",
+        "pyre_interpreter::set_in_flight_exception",
+        set_in_flight_exception as *const (),
+    );
+    let lookup_exc_class: fn(&str) -> Option<pyre_object::PyObjectRef> =
+        crate::builtins::lookup_exc_class;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::builtins::lookup_exc_class",
+        "pyre_interpreter::lookup_exc_class",
+        lookup_exc_class as *const (),
+    );
+    #[cfg(unix)]
+    {
+        let mmap_type: fn() -> pyre_object::PyObjectRef =
+            crate::module::mmap::interp_mmap::mmap_type;
+        push_alias_pair(
+            &mut entries,
+            "pyre_interpreter::module::mmap::interp_mmap::mmap_type",
+            "pyre_interpreter::mmap_type",
+            mmap_type as *const (),
+        );
+    }
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_interp::note_eval_activation_enter",
+        "pyre_object::note_eval_activation_enter",
+        pyre_object::gc_interp::note_eval_activation_enter as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_interp::note_eval_activation_exit",
+        "pyre_object::note_eval_activation_exit",
+        pyre_object::gc_interp::note_eval_activation_exit as *const (),
+    );
     // The dispatch-loop safepoint's four toucher residuals plus the frame-entry
     // odometer bump and the items-block strategy gate: each reads a
     // runtime-mutable global (`COLLECT_STATE` / `EVAL_NESTING` atomics, the two

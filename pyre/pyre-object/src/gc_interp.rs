@@ -53,12 +53,30 @@ pub struct EvalActivationGuard {
     armed: bool,
 }
 
+/// Count one eval-loop activation on this thread.
+///
+/// Writes the runtime-mutable `EVAL_NESTING` thread-local, not a build-time
+/// constant, so the JIT residualizes the call instead of tracing into it
+/// (`@dont_look_inside`, the [`at_outermost_activation`] sibling). No
+/// arguments, `()` result, and it cannot raise.
+#[majit_macros::dont_look_inside]
+pub fn note_eval_activation_enter() {
+    EVAL_NESTING.with(|d| d.set(d.get() + 1));
+}
+
+/// Rewind one eval-loop activation. The [`note_eval_activation_enter`] twin;
+/// same residual contract.
+#[majit_macros::dont_look_inside]
+pub fn note_eval_activation_exit() {
+    EVAL_NESTING.with(|d| d.set(d.get().saturating_sub(1)));
+}
+
 impl EvalActivationGuard {
     #[inline]
     pub fn enter() -> Self {
         let armed = enabled();
         if armed {
-            EVAL_NESTING.with(|d| d.set(d.get() + 1));
+            note_eval_activation_enter();
         }
         Self { armed }
     }
@@ -68,7 +86,7 @@ impl Drop for EvalActivationGuard {
     #[inline]
     fn drop(&mut self) {
         if self.armed {
-            EVAL_NESTING.with(|d| d.set(d.get().saturating_sub(1)));
+            note_eval_activation_exit();
         }
     }
 }

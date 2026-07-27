@@ -6203,6 +6203,12 @@ fn register_exc_class(name: &'static str, cls: PyObjectRef) -> PyObjectRef {
 /// Look up a builtin exception class by its `ExcKind` name. Returns
 /// `None` if the registry hasn't been populated yet (e.g. before
 /// install_default_builtins).
+/// Reads the runtime-populated `EXC_CLASS_REGISTRY` `OnceLock`, not a
+/// build-time constant, so the JIT residualizes the call instead of tracing
+/// into it (`@dont_look_inside`). The scalar-`Option<PyObjectRef>` result is
+/// the same residual boundary shape as
+/// `baseobjspace::lookup_in_type_where_uncached`.
+#[majit_macros::dont_look_inside]
 pub fn lookup_exc_class(name: &str) -> Option<PyObjectRef> {
     let registry = EXC_CLASS_REGISTRY.get()?;
     let registry = registry
