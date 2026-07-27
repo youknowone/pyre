@@ -1408,10 +1408,9 @@ pub(crate) fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
     // Consult the Python-visible sys.modules dict first so that user code
     // writing `sys.modules['foo'] = mod` is immediately visible to imports.
     // PyPy: importing.py check_sys_modules reads space.sys.get('modules').
-    let key = pyre_object::w_str_new(name);
     let dict = sys_modules_dict();
     if !dict.is_null() {
-        if let Some(m) = unsafe { pyre_object::w_dict_lookup(dict, key) } {
+        if let Some(m) = unsafe { pyre_object::w_dict_getitem_str(dict, name) } {
             if !m.is_null() && !unsafe { pyre_object::is_none(m) } {
                 return Some(m);
             }
