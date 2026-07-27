@@ -662,36 +662,43 @@ fn flush_escape_state_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: us
                 _ => return false,
             }
         }
-        // Why this latch exists, checkable at runtime.  `vable_setfield` and
-        // `vable_setarrayitem_indexed` both end in `synchronize_virtualizable`
-        // (`pyjitpl.py:1194`, `:1246`), so any slot a push actually stored IS
-        // current in the shadow.  Measured over pyre/bench/synth the only slot
-        // that ever disagrees is the in-progress opcode's TOS, and it always
-        // reads back NULL rather than a stale value — the store never happened.
+        // Why this latch exists, checkable at runtime.  Measured over
+        // pyre/bench/synth, the only slot that ever disagrees with the vable
+        // shadow is the in-progress opcode's TOS, and it holds a compile-time
+        // NULL *constant* rather than a stale or absent value: exactly what
+        // `popvalue_maybe_none` writes (`pyframe.py:411-417` →
+        // `setarrayitem_vable_r(locals_cells_stack_w, depth, ConstPtr.NULL)`
+        // via `jtransform.py:1898`).  The opcode had already popped the slot
+        // before its residual forced.
         //
-        // `pyframe.pushvalue` is two writes: `locals_cells_stack_w[depth] =
-        // w_object` and `valuestackdepth = depth + 1`, lowered by
-        // `jtransform.py:1898` `do_fixed_list_setitem` and `:844` respectively.
-        // `emit_load_fast_ref` emits both; the generic `push_and_bump!` that
-        // every residual-call and HLOp result goes through emits only the
-        // depth bump, so a value produced mid-opcode never reaches the array.
-        // That missing store is what this latch stands in for.
+        // So the array is correct and upstream agrees — RPython's `popvalue`
+        // NULLs the slot the same way.  What this latch holds is the operand
+        // the in-flight opcode already consumed, which is what upstream keeps
+        // in `MIFrame.registers_r` and what `convert_and_run_from_pyjitpl`
+        // resumes a blackhole from.  Emitting more vable stores does not
+        // remove the need for it: `LOAD_ATTR` already emits the push mirror
+        // via `emit_pushvalue_ref!` and its slot still reads NULL, because the
+        // pop follows the push.
         if fbw_debug_abort_enabled() {
             let base = ctx
                 .virtualizable_info()
                 .map_or(usize::MAX, |info| info.num_static_extra_boxes);
             let nlocals = crate::state::concrete_nlocals(frame).unwrap_or(usize::MAX);
             for (rel, &obj) in stack.iter().enumerate() {
-                let shadow = ctx
-                    .virtualizable_entry_at(base.saturating_add(nlocals).saturating_add(rel))
-                    .map(|(_opref, value)| value);
+                let entry =
+                    ctx.virtualizable_entry_at(base.saturating_add(nlocals).saturating_add(rel));
+                let shadow = entry.map(|(_opref, value)| value);
                 let agrees =
                     matches!(shadow, Some(majit_ir::Value::Ref(r)) if r.as_usize() == obj as usize);
                 if !agrees {
+                    // Report the OpRef too: a live box with a NULL value means
+                    // the symbolic write landed and only the concrete mirror is
+                    // absent, which is a different defect from no write at all.
                     eprintln!(
-                        "[r6-latch] slot {rel}/{} latched=0x{:x} shadow={shadow:?} (DISAGREES)",
+                        "[r6-latch] slot {rel}/{} latched=0x{:x} shadow={shadow:?} box={:?} (DISAGREES)",
                         stack.len(),
                         obj as usize,
+                        entry.map(|(opref, _)| opref),
                     );
                 }
             }

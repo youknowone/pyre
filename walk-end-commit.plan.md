@@ -296,33 +296,21 @@ row 1 *in principle* — upstream avoids it only because
 (`pyjitpl.py:1120-1146`) — but no corpus case reaches it yet, so it is not what
 gates progress today.
 
-### R6 — vable write-through parity
+### R6 — CLOSED: the latch is orthodox; nothing is missing on this path
 
-⛔**The premise recorded here before was wrong, and this section is now the
-scoping note rather than a work item.** It said "pyre's shadow is explicitly
-lazy … that laziness is the entire reason a mid-expression operand-stack latch
-had to be invented". Verified false:
+⛔**R6 is not a work item. Two successive premises were recorded here and both
+are refuted by measurement.** Keep this section so the theory is not re-derived.
 
-- `TraceCtx::vable_setfield` ends in `self.synchronize_virtualizable()`
-  (`majit-metainterp/src/trace_ctx.rs`), and so does
-  `vable_setarrayitem_indexed`. Both mirror `pyjitpl.py:1194` / `:1246`.
-- `synchronize_virtualizable` → `write_boxes` parity is already implemented
-  (`trace_ctx.rs`).
-- The strict fresh-frame fold that writes nothing through
-  (`vable_ops.rs`, `setfield_vable_via_metainterp` / `setarrayitem_vable_via_metainterp`)
-  is gated on `fbw_strict_fold_frame_reg`, which reads
-  `callee_shadow.fold_frame_reg` — set only for an inline **callee** sub-walk.
-  The escape latch is gated on `!inline_subwalk`, so it is not that path.
+**Premise 1 (refuted): "pyre's shadow is lazy where upstream writes through."**
+`TraceCtx::vable_setfield` and `vable_setarrayitem_indexed` both end in
+`self.synchronize_virtualizable()` (`trace_ctx.rs`), mirroring `pyjitpl.py:1194`
+/ `:1246`, and `write_boxes` parity exists. The fold path that writes nothing
+(`vable_ops.rs`) is gated on `fbw_strict_fold_frame_reg` =
+`callee_shadow.fold_frame_reg`, set only for an inline **callee** sub-walk,
+while the escape latch is gated on `!inline_subwalk` — a different path.
 
-So write-through is present on exactly the path the latch serves. What is
-actually incomplete is *which* pushes reach a vable store at all: `state.rs`
-(the "only generally valid at a merge point" comment) names the shape — "a
-MAKE_FUNCTION whose LOAD_CONST'd code object the walk tracked symbolically,
-never writing it to the shadow". A slot no `setarrayitem_vable_r` ever wrote is
-not made current by synchronizing.
-
-✅**Verified — R6 is a frontend task, and the missing write is named.** The
-latch was instrumented to compare every resolved slot against the vable shadow
+**Premise 2 (refuted): "the missing write is the `pushvalue` array store."**
+The latch was instrumented to compare every resolved slot against the shadow
 (`residual_call.rs`, `[r6-latch]`, gated on `PYRE_FBW_DEBUG_ABORT`) and censused
 over `pyre/bench/synth`:
 
@@ -331,47 +319,48 @@ over `pyre/bench/synth`:
 | disagreements | **10**, in 2 files (`getframe_stored_fback_walk.py` 5, `getframe_force_cancel_journal.py` 5) |
 | slot index | **`rel == len-1` in 10/10** — always the in-progress opcode's TOS |
 | shadow value | **`Ref(GcRef(0))` (NULL) in 10/10** — never a stale non-null |
+| shadow **box** | **`ConstPtr(GcRef(0))` in 10/10** — a compile-time NULL *constant* |
 
-Two things follow. The shadow is never *wrong*, only *absent*, so this is a
-missing store and not a synchronization race. And every slot **below** the TOS
-agrees, so the completed pushes did write through — it is specifically the value
-produced mid-opcode that never lands.
+That last row is what settles it. The slot does not hold *no* write; it holds a
+**deliberate NULL constant**, which is exactly what `emit_popvalue_ref!` emits:
+`pyframe.py:411-417 popvalue_maybe_none` → `setarrayitem_vable_r(
+locals_cells_stack_w, depth, ConstPtr.NULL)` via `jtransform.py:1898`. The
+in-flight opcode had already **popped** that slot before its residual forced.
 
-The store that is missing: `pyframe.pushvalue` is two writes —
-`locals_cells_stack_w[depth] = w_object` and `valuestackdepth = depth + 1` —
-lowered by `jtransform.py:1898` `do_fixed_list_setitem` and `:844`. In
-`codewriter.rs`:
+So the vable array is *correct*, and upstream agrees with it — RPython's
+`popvalue` NULLs `locals_cells_stack_w[depth]` the same way. What the latch
+holds is the operand the in-flight opcode already consumed, which is precisely
+what upstream keeps in `MIFrame.registers_r` and what
+`convert_and_run_from_pyjitpl` resumes a blackhole from. **The latch is the
+orthodox register-level mirror, not a workaround.** It does not retire, and
+neither do `ESCAPE_OPCODE_WINDOW`, `EscapeFlushUndo`, `EscapeResumeKind`,
+`RewindProvenAtLatch` or `RewindUnproven` on this argument.
 
-- `emit_load_fast_ref` emits **both** (and cites `:1898`), as do the ad-hoc
-  mirrors at `STORE_FAST` and `SWAP` — the `SWAP` arm even states the invariant:
-  "a guard-failure resume walk reconstructs the live frame from those slots, so
-  emit the `setarrayitem_vable_r` writes that keep the mirror consistent".
-- the generic `push_and_bump!` — the single path taken by **every** residual-call
-  and HLOp result, 38 call sites — emits only `emit_vsd!`, the depth bump.
+Directly disproving premise 2: `LOAD_ATTR` — the escaping opcode in both witness
+files — *already* emits the push mirror via `emit_pushvalue_ref!`
+(`codewriter.rs`), and the slot still reads NULL. Emitting the store is
+demonstrably not sufficient, because the pop follows it.
 
-So the TOS at an escaping residual is a value pushed with the depth bumped and
-the array never written, which is exactly the NULL the census reports. In both
-witness files the disagreeing TOS is a residual result awaiting its next
-attribute read (`box[0].f_back` before `.f_locals`; `sys._getframe(1)` before
-`.f_locals`).
+#### Witness-less residue: `push_and_bump!` omits the `:1898` half
 
-⚠️The earlier framing in this section — that the latch is the orthodox
-register-level mirror, upstream's `MIFrame.registers_r` — is **also wrong**.
-Upstream emits both halves of `pushvalue` and can afford to because
-`OptVirtualize` removes them from the compiled trace while the tracer still sees
-them. The latch is standing in for a store pyre never made.
+Genuine and separate from the above. `pyframe.pushvalue` is two writes —
+`locals_cells_stack_w[depth] = w_object` (`jtransform.py:1898`
+`do_fixed_list_setitem`) and `valuestackdepth = depth + 1` (`:844`).
+`emit_pushvalue_ref!` and `emit_load_fast_ref` emit both; the generic
+`push_and_bump!`, taken by every residual-call and HLOp result (38 sites),
+emits only `emit_vsd!`. A guard-failure resume at an opcode **boundary** just
+after such a push would therefore read a NULL stack slot.
 
-**R6 = make `push_and_bump!` emit the `jtransform.py:1898` half.** Only then do
-`flush_escape_state_with_latched_stack`, `ESCAPE_OPCODE_WINDOW`,
-`EscapeFlushUndo`, `EscapeResumeKind`, `RewindProvenAtLatch` and
-`RewindUnproven` retire. Two things to settle while implementing:
+Measured cost of closing it (prototyped, then reverted): adding the store to
+`push_and_bump!` under a `Kind::Ref` gate takes
+`getframe_stored_fback_walk.py` from **140 to 175** emitted
+`setarrayitem_vable_r`, ~25% more vable stores, and **changes none of the 10
+disagreements** — it is not a fix for anything observed.
 
-- **Kind.** The vable array holds `W_Root`, so the mirror is `setarrayitem_vable_r`
-  and only a Ref-kind push may take it. Audit the 38 sites for Int/Float pushes
-  before emitting unconditionally.
-- **Perf.** This adds a vable store to every pushing opcode and leans on the
-  optimizer to remove them, so it needs the A/B discipline for this repo: size
-  ladder, min-of-rounds, base measured from a worktree at committed `HEAD`.
+⛔**Do not land it without a corpus witness.** Per this file's own evidence
+rules, a row with no witness is not worked. To get one, look for a guard that
+fails at an opcode boundary immediately after a residual-call push and observe
+whether the resumed frame sees NULL at that slot.
 
 ### R7 — REJECTED: do not delete legs 3/6 or the journals now
 
