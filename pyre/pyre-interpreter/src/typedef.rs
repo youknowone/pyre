@@ -13122,11 +13122,11 @@ fn init_property_type(ns: PyObjectRef) {
         ),
         (
             "__set_name__",
-            make_builtin_function_with_arity(
-                "__set_name__",
-                crate::baseobjspace::property_set_name_impl,
-                3,
-            ),
+            // CPython 3.14's positional-only clinic wrapper reports the
+            // user-visible count without the bound receiver.  Let the
+            // implementation parse the call so its exact 3.14 diagnostics
+            // are not pre-empted by gateway's generic fixed-arity wording.
+            make_builtin_function("__set_name__", crate::baseobjspace::property_set_name_impl),
         ),
     ];
     for (name, value) in entries {

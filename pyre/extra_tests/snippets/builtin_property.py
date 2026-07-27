@@ -110,5 +110,12 @@ assert SlottedProperty(doc="slot doc").__doc__ == "slot doc"
 assert SlottedProperty(documented_getter_2).__doc__ == "doc 2"
 
 for count in (0, 1, 3):
-    with assert_raises(TypeError):
+    with assert_raises(TypeError) as caught:
         property().__set_name__(*([0] * count))
+    assert str(caught.exception) == (
+        "__set_name__() takes 2 positional arguments but {} were given".format(count)
+    )
+
+with assert_raises(TypeError) as caught:
+    property().__set_name__(owner=object, name="value")
+assert str(caught.exception) == "property.__set_name__() takes no keyword arguments"
