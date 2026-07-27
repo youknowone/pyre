@@ -19,11 +19,14 @@
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, Once};
 
 use majit_ir::DescrRef;
 use majit_translate::CompiledJitDriver;
 use majit_translate::jitcode::{BhDescr, JitCode};
+
+static REHYDRATED_CALL_DESCR_REFS: LazyLock<Mutex<Vec<Option<DescrRef>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 
 thread_local! {
     /// Per-thread cached `&'static` to the build-time `pipeline.jitcodes`
@@ -410,6 +413,73 @@ pub fn all_liveness() -> &'static [u8] {
     &ALL_LIVENESS
 }
 
+fn call_descr_arg_types(arg_classes: &str) -> Vec<majit_ir::Type> {
+    arg_classes
+        .chars()
+        .filter_map(|c| match c {
+            'i' | 'S' => Some(majit_ir::Type::Int),
+            'r' => Some(majit_ir::Type::Ref),
+            'f' | 'L' => Some(majit_ir::Type::Float),
+            _ => None,
+        })
+        .collect()
+}
+
+fn call_descr_result_type(result_type: char) -> majit_ir::Type {
+    match result_type {
+        'i' | 'S' => majit_ir::Type::Int,
+        'r' => majit_ir::Type::Ref,
+        'f' | 'L' => majit_ir::Type::Float,
+        _ => majit_ir::Type::Void,
+    }
+}
+
+fn rehydrated_call_descr_ref(bh: &majit_translate::jitcode::BhCallDescr) -> majit_ir::DescrRef {
+    let arg_types = call_descr_arg_types(&bh.arg_classes);
+    let result_type = call_descr_result_type(bh.result_type);
+    let mut effect_info = bh.extra_info.clone();
+    crate::descr::rehydrate_effect_info(&mut effect_info);
+    majit_metainterp::make_call_descr_sized_with_effect(
+        &arg_types,
+        result_type,
+        bh.result_signed,
+        bh.result_size,
+        effect_info,
+    )
+}
+
+/// Rehydrate build-time EffectInfo raw descr sets before
+/// `finish_setup_descrs`. `finish_setup_done` is per-thread, but the
+/// rehydrated raw sets live in the process-global `GcCache`, so this guard is
+/// process-global.
+pub fn rehydrate_build_descr_raw_sets() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let all = all_descrs();
+        // `descr.py:25-47 setup_descrs` group order — every non-call slot
+        // first.  Each `Size` / `Field` entry publishes its parent's FULL
+        // `heaptracker.all_fielddescrs(STRUCT)` list into the gccache, and
+        // `descr_from_set_member` is lookup-only, so the raw-set members
+        // below can only land on slots that already carry their complete
+        // layout.  Resolving in the other order would leave every member
+        // whose struct has not been published yet unresolvable.
+        for bh in all.iter() {
+            if !matches!(bh, BhDescr::Call { .. } | BhDescr::JitCode { .. }) {
+                crate::descr::make_descr_from_bh(bh);
+            }
+        }
+        let mut refs = vec![None; all.len()];
+        for (i, bh) in all.iter().enumerate() {
+            let calldescr = match bh {
+                BhDescr::Call { calldescr } | BhDescr::JitCode { calldescr, .. } => calldescr,
+                _ => continue,
+            };
+            refs[i] = Some(rehydrated_call_descr_ref(calldescr));
+        }
+        *REHYDRATED_CALL_DESCR_REFS.lock().unwrap() = refs;
+    });
+}
+
 /// Pool of `DescrRef`s indexed alongside [`all_descrs`] so the
 /// trace-side jitcode walker
 /// ([`crate::jitcode_dispatch::dispatch_via_miframe`]) can resolve each
@@ -445,7 +515,16 @@ pub fn all_liveness() -> &'static [u8] {
 static ALL_DESCR_REFS: LazyLock<Vec<DescrRef>> = LazyLock::new(|| {
     let refs: Vec<DescrRef> = all_descrs()
         .iter()
-        .map(crate::descr::make_descr_from_bh)
+        .enumerate()
+        .map(|(i, bh)| match bh {
+            BhDescr::Call { .. } => REHYDRATED_CALL_DESCR_REFS
+                .lock()
+                .unwrap()
+                .get(i)
+                .and_then(Clone::clone)
+                .unwrap_or_else(|| crate::descr::make_descr_from_bh(bh)),
+            _ => crate::descr::make_descr_from_bh(bh),
+        })
         .collect();
     if std::env::var_os("PYRE_FIELD_IDENTITY_CENSUS").is_some() {
         field_descr_identity_census(&refs);
