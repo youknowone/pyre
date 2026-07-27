@@ -2901,11 +2901,33 @@ fn kind_char_to_name(c: char) -> &'static str {
     }
 }
 
+/// Alignment of a scalar of `field_size` bytes, for the textual struct-layout
+/// walkers below.
+///
+/// The cap is the target's *maximum scalar alignment*, not its word:
+/// `u64`/`f64` align to 8 on wasm32 even though a pointer there is 4 bytes,
+/// so this must NOT be rewritten to `layout::target_word_size()` — that would
+/// under-align every 8-byte field on a 32-bit target and shift the offsets
+/// this walker derives.
+fn scalar_align(field_size: usize) -> usize {
+    field_size.min(8)
+}
+
 fn value_type_to_itemsize(ty: &crate::model::ValueType) -> usize {
     use crate::model::ValueType;
     match ty {
+        // A pointer strides by the target word, not the build host's
+        // (`symbolic.py:12 WORD = sizeof(lltype.Signed)`).  The sibling
+        // fallback in `arraydescrof` already reads it this way.
+        ValueType::Ref(_) => crate::layout::target_word_size(),
+        // `Int`/`Unsigned` deliberately keep 8.  They are `lltype.Signed` /
+        // `lltype.Unsigned` on paper, but the MIR front-end folds narrower
+        // *and* 64-bit Rust integers into them (see `model.rs ValueType`),
+        // so the width is genuinely unknown here.  Over-reading inside the
+        // struct is recoverable; narrowing an `i64`/`u64` field to the
+        // wasm32 word would truncate it.  Resolving this needs the
+        // front-end to carry the source width, not a guess at this seam.
         ValueType::Int => 8,
-        ValueType::Ref(_) => 8,
         ValueType::Float => 8,
         _ => 8,
     }
@@ -2926,10 +2948,27 @@ fn value_type_to_ir_type_for_descr(ty: &crate::model::ValueType) -> majit_ir::va
     }
 }
 
+/// `descr.py:241-254 get_type_flag`, over a Rust type spelling.
+///
+/// The authoritative copy is [`super::call::get_type_flag`]; this one serves
+/// the layout walkers below.  Word-sized spellings must resolve through
+/// `layout::target_word_size()` in both: this crate is the build-time host
+/// prepass, so `size_of::<usize>()` here would bake the *host's* 8 into a
+/// wasm32 descr.
+///
+/// The two deliberately still differ on `f32`.  `get_type_flag` follows
+/// `descr.py:254` and lands SingleFloat int-banked
+/// (`ArrayFlag::Unsigned` / `Type::Int`), then restores the `'f'` width
+/// marker via `concrete_type` on the ArrayDescr it builds
+/// (`call.rs` `elem_ref == Some("f32")`).  `BhDescr::Array` carries no
+/// `concrete_type` field to restore it with, so adopting the int-banked
+/// answer here would lose the f32-ness outright.  Merging the two is
+/// blocked on `BhDescr::Array` gaining that marker.
 fn type_flag_from_str(
     type_str: &str,
 ) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
     use majit_ir::descr::ArrayFlag;
+    let word = crate::layout::target_word_size();
     match type_str {
         s if s.starts_with('&')
             || s.starts_with("Box<")
@@ -2939,20 +2978,24 @@ fn type_flag_from_str(
             || s.starts_with("Option<")
             || s == "String" =>
         {
-            (ArrayFlag::Pointer, majit_ir::value::Type::Ref, 8)
+            (ArrayFlag::Pointer, majit_ir::value::Type::Ref, word)
         }
         "f64" => (ArrayFlag::Float, majit_ir::value::Type::Float, 8),
         "f32" => (ArrayFlag::Float, majit_ir::value::Type::Float, 4),
-        "i64" | "isize" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 8),
+        "i64" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 8),
+        "isize" => (ArrayFlag::Signed, majit_ir::value::Type::Int, word),
         "i32" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 4),
         "i16" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 2),
         "i8" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 1),
-        "u64" | "usize" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 8),
+        "u64" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 8),
+        "usize" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, word),
         "u32" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
         "u16" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 2),
         "u8" | "bool" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
         "()" => (ArrayFlag::Void, majit_ir::value::Type::Void, 0),
-        _ => (ArrayFlag::Pointer, majit_ir::value::Type::Ref, 8),
+        // Unknown type — treat as GC pointer (conservative), matching
+        // `get_type_flag`'s wildcard.
+        _ => (ArrayFlag::Pointer, majit_ir::value::Type::Ref, word),
     }
 }
 
@@ -3145,7 +3188,7 @@ fn bh_all_field_specs_for_struct_into(
         if field_type == majit_ir::value::Type::Void || field_size == 0 {
             continue;
         }
-        let align = field_size.min(std::mem::size_of::<usize>());
+        let align = scalar_align(field_size);
         offset = (offset + align - 1) & !(align - 1);
         let is_skipped_field = field_name == "typeptr" || field_name.starts_with("c__pad");
         if !is_skipped_field {
@@ -3198,7 +3241,7 @@ fn heuristic_struct_size_for_bh(cc: &CallControl, owner: &str) -> Option<usize> 
         if field_size == 0 {
             continue;
         }
-        let align = field_size.min(std::mem::size_of::<usize>());
+        let align = scalar_align(field_size);
         max_align = max_align.max(align);
         offset = (offset + align - 1) & !(align - 1);
         offset += field_size;
@@ -3318,7 +3361,7 @@ fn heuristic_field_layout(
         if field_type == majit_ir::value::Type::Void || field_size == 0 {
             continue;
         }
-        let align = field_size.min(std::mem::size_of::<usize>());
+        let align = scalar_align(field_size);
         offset = (offset + align - 1) & !(align - 1);
         if name == field_name {
             return Some((

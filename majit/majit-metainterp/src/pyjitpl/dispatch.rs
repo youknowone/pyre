@@ -265,7 +265,10 @@ pub fn struct_fields_write_effect_info(
                     index: u32::MAX,
                     name: name.to_string(),
                     offset,
-                    field_size: 8,
+                    // One target word (`symbolic.py:12 WORD =
+                    // sizeof(lltype.Signed)`), matching the Ref/Int split
+                    // above; 4 on wasm32.
+                    field_size: std::mem::size_of::<usize>(),
                     field_type,
                     is_immutable: false,
                     is_quasi_immutable: false,
