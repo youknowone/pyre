@@ -4743,10 +4743,27 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // trace).  The descr-pool wiring above (strategy/header field descrs) is
     // exercised on the way in.
 
-    // Tracing is execution: apply the append + journal the rewind (the walker
-    // recorded the IR but did not mutate the concrete list).
+    // Tracing is execution: apply the append + journal the rewind.  The
+    // journal entry is unconditional — it rewinds the receiver to
+    // `len_before` on an aborted walk, whichever side actually grew it.
+    //
+    // The sub-walk normally records the store as IR without touching the
+    // concrete list, so the append below is what applies it.  It is not
+    // guaranteed to: the per-strategy store the descended arm reaches
+    // (`W_ListObject::object_push`, `IntArray::push`, `FloatArray::push`) is a
+    // `residual_call`, and a residual whose funcptr resolves to a real address
+    // is EXECUTED by `try_execute_residual_call_via_executor` rather than only
+    // recorded.  Those three carry runtime bindings, so on a target where the
+    // arm keeps them as residuals the sub-walk has already appended, and
+    // appending again puts the value in twice — one extra element per compiled
+    // append, which is how it surfaces (`len(keep)` 20048 for 20000
+    // iterations, a traceback name list with its last frame doubled).
+    // Re-read the length instead of assuming which side ran: it is the
+    // receiver's own state, so it answers for both.
     fbw_append_journal_push(inner_self, len_before);
-    unsafe { pyre_object::w_list_append(inner_self, value) };
+    if unsafe { pyre_object::w_list_len(inner_self) } == len_before {
+        unsafe { pyre_object::w_list_append(inner_self, value) };
+    }
     Ok(())
 }
 
