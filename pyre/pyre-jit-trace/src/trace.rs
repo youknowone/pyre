@@ -3063,9 +3063,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                                         "[fbw-abort-flush] gh#467 callee-rebuild COMMIT \
                                          abort_jit_pc={abort_jit_pc} callee_py_pc={} \
                                          call_py_pc={} post_call_py_pc={}",
-                                        words.callee_py_pc,
-                                        words.call_py_pc,
-                                        words.post_call_py_pc,
+                                        words.callee_py_pc, words.call_py_pc, words.post_call_py_pc,
                                     );
                                 } else {
                                     eprintln!(

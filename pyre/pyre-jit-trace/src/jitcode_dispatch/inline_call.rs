@@ -2680,18 +2680,19 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                         let register_value =
                             crate::state::semantic_slot_color_for_ref_slot(&entries, semantic_slot)
                                 .and_then(|color| sub_wc.concrete_registers_r.get(color).copied());
-                        let value = register_value.or_else(|| {
-                            (metadata.built_as_portal && abort_kind == MidBodyAbortKind::Marker)
-                                .then(|| {
-                                    callee_vable_ref_at(
-                                        sub_wc.callee_shadow.as_ref(),
-                                        metadata.portal_frame_reg,
-                                        semantic_slot,
-                                    )
-                                })
-                                .flatten()
-                        })
-                        .ok_or("live stack slot has no concrete value")?;
+                        let value = register_value
+                            .or_else(|| {
+                                (metadata.built_as_portal && abort_kind == MidBodyAbortKind::Marker)
+                                    .then(|| {
+                                        callee_vable_ref_at(
+                                            sub_wc.callee_shadow.as_ref(),
+                                            metadata.portal_frame_reg,
+                                            semantic_slot,
+                                        )
+                                    })
+                                    .flatten()
+                            })
+                            .ok_or("live stack slot has no concrete value")?;
                         if !matches!(value, ConcreteValue::Ref(r) if !r.is_null()) {
                             return Err("live stack slot is not a non-null Ref");
                         }
