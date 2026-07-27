@@ -16845,6 +16845,14 @@ fn empty_bytes_like(recv: PyObjectRef) -> PyObjectRef {
 ///
 /// Restricted to cuts — a transform that preserves the length has no upstream
 /// identity shortcut, so routing one through here would create a divergence.
+///
+/// Restricted further to cuts upstream spells with **both** bounds.  Only
+/// `ll_stringslice_startstop` carries the shortcut; a one-bound `s[start:]`
+/// resolves to `ll_stringslice_startonly` (rstr.py:857-858), which always
+/// builds a fresh string.  `descr_removeprefix`'s `selfval[len(prefix):]`
+/// (stringmethods.py:879) is one of those, so it allocates even for an empty
+/// prefix and does not come here.  Check which helper the upstream arm
+/// resolves to before routing a new call site through this function.
 fn cut_bytes_like(recv: PyObjectRef, piece: &[u8]) -> PyObjectRef {
     if piece.len() == unsafe { pyre_object::bytesobject::bytes_like_data(recv) }.len()
         && unsafe {
@@ -17634,12 +17642,15 @@ fn bytes_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     let args = pos;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let prefix = require_bytes_like(args[1])?;
-    let out = if data.starts_with(prefix) {
-        &data[prefix.len()..]
-    } else {
-        data
-    };
-    Ok(cut_bytes_like(args[0], out))
+    // `descr_removeprefix` (stringmethods.py:875-880) slices on a match and
+    // rewraps the receiver's own storage otherwise.  `ll_stringslice_startonly`
+    // (rstr.py:857-858) goes straight to `_ll_stringslice` with no whole-span
+    // shortcut of its own, so even an empty prefix takes the slice arm and
+    // builds a fresh object — only the no-match arm can come back identical.
+    match data.strip_prefix(prefix) {
+        Some(rest) => Ok(new_bytes_like(args[0], rest)),
+        None => Ok(cut_bytes_like(args[0], data)),
+    }
 }
 
 /// `bytes.removesuffix` — drop a trailing bytes-like suffix if present.
@@ -17655,12 +17666,13 @@ fn bytes_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     let args = pos;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let suffix = require_bytes_like(args[1])?;
-    let out = if !suffix.is_empty() && data.ends_with(suffix) {
-        &data[..data.len() - suffix.len()]
-    } else {
-        data
-    };
-    Ok(cut_bytes_like(args[0], out))
+    // `descr_removesuffix` (stringmethods.py:882-889) guards the slice arm with
+    // `if suffix and ...`, so an empty suffix falls through to the arm that
+    // rewraps the receiver's own storage rather than cutting a whole span.
+    if !suffix.is_empty() && data.ends_with(suffix) {
+        return Ok(new_bytes_like(args[0], &data[..data.len() - suffix.len()]));
+    }
+    Ok(cut_bytes_like(args[0], data))
 }
 
 /// `bytesobject.py:descr_translate` — map each byte through a 256-entry

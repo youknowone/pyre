@@ -260,6 +260,16 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
 /// those has an upstream identity shortcut, so routing one through here would
 /// manufacture a divergence rather than close one.
 ///
+/// Restricted further to cuts upstream spells with **both** bounds.  Only
+/// `ll_stringslice_startstop` carries the shortcut; a one-bound `s[start:]`
+/// goes through `ll_stringslice_startonly` (rstr.py:857-858), which calls
+/// `_ll_stringslice` directly and always builds a fresh string.  So a method
+/// whose match arm slices with a single bound — `descr_removeprefix`'s
+/// `selfval[len(prefix):]` (stringmethods.py:879) — must allocate even when an
+/// empty argument makes the cut span the receiver whole, and must not come
+/// here.  Check which helper the upstream arm resolves to before routing a new
+/// call site through this function.
+///
 /// # Safety
 /// `recv` must point to a valid `W_UnicodeObject`, and `piece` must be a
 /// contiguous cut of its WTF-8 storage.

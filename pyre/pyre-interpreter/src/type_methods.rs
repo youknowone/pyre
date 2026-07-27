@@ -5267,10 +5267,18 @@ pub fn str_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     }
     let s = unsafe { w_str_get_wtf8(pos[0]) };
     let suffix = unsafe { w_str_get_wtf8(pos[1]) };
-    match s.strip_suffix(suffix) {
-        Some(rest) => Ok(w_str_from_wtf8_managed(rest.to_wtf8_buf())),
-        None => Ok(str_result_unchanged(pos[0])),
+    // `descr_removesuffix` (unicodeobject.py:1511-1517) guards the slice arm
+    // with `if suffix and ...`, so an empty suffix falls through to the arm
+    // that rewraps the receiver's own storage — `s.removesuffix("") is s` for
+    // an exact `str`.  `removeprefix` has no such guard: its slice arm goes
+    // through `ll_stringslice_startonly` (rstr.py:857-858), which has no
+    // whole-span shortcut, so an empty prefix still builds a fresh object.
+    if !suffix.is_empty()
+        && let Some(rest) = s.strip_suffix(suffix)
+    {
+        return Ok(w_str_from_wtf8_managed(rest.to_wtf8_buf()));
     }
+    Ok(str_result_unchanged(pos[0]))
 }
 
 /// PyPy: unicodeobject.py descr_expandtabs
