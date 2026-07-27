@@ -2765,6 +2765,35 @@ fn flatten_vector_info(head: Option<&AccumInfo>) -> Vec<AccumInfo> {
     result
 }
 
+/// Frontend decoder from a [`SizeDescr::vtable`] pointer to the canonical
+/// `PyObject.w_class` object its instances carry (`get_instantiate(vtable)`).
+///
+/// Pluggable for the same reason as [`crate::value::set_str_resolver`]: the
+/// object model is the frontend's, and the IR layer holds no `PyType` layout.
+/// Consulted live rather than cached on the descr — the type objects are
+/// installed after the descrs are built, so a value snapshotted at
+/// construction time would be null for every descr.
+pub type WClassObjFn = fn(vtable: usize) -> Option<i64>;
+
+static W_CLASS_OBJ_RESOLVER: std::sync::OnceLock<WClassObjFn> = std::sync::OnceLock::new();
+
+/// Register the frontend's [`WClassObjFn`].  First call wins, mirroring
+/// `OnceLock::set`.  The resolver only ever receives a `vtable` a
+/// `SizeDescr` of this frontend reported, so it may assume its own type
+/// layout.
+pub fn set_w_class_obj_resolver(resolve: WClassObjFn) {
+    let _ = W_CLASS_OBJ_RESOLVER.set(resolve);
+}
+
+/// Resolve `vtable` through the registered [`WClassObjFn`], or `None` when
+/// the vtable is null or no frontend registered one.
+pub fn resolve_w_class_obj(vtable: usize) -> Option<i64> {
+    if vtable == 0 {
+        return None;
+    }
+    W_CLASS_OBJ_RESOLVER.get().and_then(|resolve| resolve(vtable))
+}
+
 /// Descriptor for a fixed-size struct/object allocation.
 ///
 /// Mirrors rpython/jit/backend/llsupport/descr.py SizeDescr.
@@ -2833,7 +2862,9 @@ pub trait SizeDescr: Descr {
     /// builtin type inherits this value unless the trace stores an
     /// explicit `w_class` field. OptVirtualize folds `w_class` header
     /// reads to this constant. `None`/`0` for non-pyre size descrs or
-    /// before the type objects are initialised.
+    /// before the type objects are initialised.  A frontend whose size
+    /// descrs are the generic [`SimpleSizeDescr`] supplies the answer
+    /// through [`set_w_class_obj_resolver`] instead of overriding this.
     fn w_class_obj(&self) -> Option<i64> {
         None
     }
@@ -4161,6 +4192,15 @@ impl SizeDescr for SimpleSizeDescr {
     }
     fn vtable(&self) -> usize {
         self.vtable
+    }
+    /// The generic size descr has no object model of its own, so the
+    /// `w_class` identity comes from the frontend's registered
+    /// [`WClassObjFn`].  Without it `OptVirtualize` cannot fold a `w_class`
+    /// header read off a `new_with_vtable` virtual and forces the virtual
+    /// instead, which turns the read into a load of freshly allocated,
+    /// uninitialised memory and the guard on it into a per-iteration failure.
+    fn w_class_obj(&self) -> Option<i64> {
+        resolve_w_class_obj(self.vtable)
     }
 }
 

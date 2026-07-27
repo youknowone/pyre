@@ -1505,21 +1505,8 @@ impl SizeDescr for PyreSizeDescr {
         self.vtable
     }
 
-    /// The canonical `w_class` (Python class object) for instances of
-    /// this type — `get_instantiate(vtable_type)`. Read live (not cached
-    /// at construction) since the type objects are installed after the
-    /// descrs are built. `None` before `init_typeobjects()` runs.
     fn w_class_obj(&self) -> Option<i64> {
-        if self.vtable == 0 {
-            return None;
-        }
-        let tp = self.vtable as *const pyre_object::pyobject::PyType;
-        let w_class = unsafe { pyre_object::pyobject::get_instantiate(&*tp) };
-        if w_class.is_null() {
-            None
-        } else {
-            Some(w_class as i64)
-        }
+        w_class_obj_for_vtable(self.vtable)
     }
 
     fn is_immutable(&self) -> bool {
@@ -1757,6 +1744,30 @@ static W_CLASS_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(new_w_
 
 pub fn w_class_descr() -> DescrRef {
     W_CLASS_FIELD_DESCR.clone() as DescrRef
+}
+
+/// The canonical `w_class` (Python class object) for instances of the type
+/// `vtable` names — `get_instantiate(vtable_type)`. Read live (not cached at
+/// construction) since the type objects are installed after the descrs are
+/// built. `None` before `init_typeobjects()` runs.
+///
+/// Registered as majit's [`majit_ir::descr::WClassObjFn`] so the generic
+/// `SimpleSizeDescr` — which every runtime PyObject group and every
+/// blackhole-dispatch size descr is built as — answers `w_class_obj` the same
+/// way `PyreSizeDescr` does. Without it `OptVirtualize` cannot fold the
+/// `w_class` header read off a `new_with_vtable` virtual and forces the
+/// virtual instead.
+pub fn w_class_obj_for_vtable(vtable: usize) -> Option<i64> {
+    if vtable == 0 {
+        return None;
+    }
+    let tp = vtable as *const pyre_object::pyobject::PyType;
+    let w_class = unsafe { pyre_object::pyobject::get_instantiate(&*tp) };
+    if w_class.is_null() {
+        None
+    } else {
+        Some(w_class as i64)
+    }
 }
 
 /// Alias for backward compatibility — same as w_class_descr().
