@@ -835,12 +835,14 @@ pub fn python_pc_for_jitcode_pc_public(jitcode_index: i32, offset: i32) -> Optio
 /// Publishing here costs no jitcode, no recorded operation and no pool entry,
 /// and only the replay pays for it.
 ///
-/// The frame is the one the replay itself reads and writes — the portal red the
-/// codewriter threads through every `getarrayitem_vable_r` — falling back to the
-/// virtualizable the interpreter was handed. It is stamped only when its own
-/// code object is the one this JitCode was built for, so a nested level
-/// replaying a different function cannot write its coordinate into the frame the
-/// outer level owns.
+/// The frame is the one THIS level reads and writes — the portal red the
+/// codewriter threads through every `getarrayitem_vable_r`, taken from this
+/// level's own register bank. `virtualizable_ptr` is deliberately not a
+/// fallback: a nested level that carries no frame of its own would resolve it
+/// to the level ABOVE, and direct recursion would then get the callee's
+/// coordinate written into the caller's frame, past the code-object check.
+/// That check stays as the second half of the same argument — the frame must
+/// also be running the function this JitCode was built for.
 ///
 /// This runs once per replayed instruction, so it resolves everything under a
 /// single store borrow and takes no reference count: the `Arc`-cloning
@@ -868,13 +870,11 @@ pub fn publish_last_instr_at_live_marker(
             .copied()
         {
             Some(value) if value > 0 => value as usize,
-            _ if bh.virtualizable_ptr > 0 => bh.virtualizable_ptr as usize,
             _ => return,
         };
-        // SAFETY: the portal red and the virtualizable are both the concrete
-        // `PyFrame` the blackhole runs against, and `frame_layout` pins
-        // `pycode` to this offset with a compile-time assertion against the
-        // interpreter's own constant.
+        // SAFETY: the portal red holds the concrete `PyFrame` the blackhole
+        // runs against, and `frame_layout` pins `pycode` to this offset with a
+        // compile-time assertion against the interpreter's own constant.
         let w_code =
             unsafe { *((frame + crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
         if w_code.is_null() {
