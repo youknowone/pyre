@@ -20,19 +20,30 @@ use super::{
 };
 
 /// Byte width of one scalar of `ty` in memory — a struct field or an array
-/// item.  Integers and pointers are one target word (`symbolic.py:12 WORD =
-/// sizeof(lltype.Signed)`) — 4 on wasm32, where an 8 would make the backend
-/// pick its load width (`majit-backend-wasm codegen.rs emit_sized_int_load`)
-/// wide enough to fold in the following field's bytes.  A float is its own
-/// 8-byte storage on every target, so it does not follow the word.
+/// item.
+///
+/// Only `Ref` follows the target word: its storage IS a pointer, so on
+/// wasm32 it is 4 and a literal 8 would make the backend pick a load width
+/// (`majit-backend-wasm codegen.rs emit_sized_int_load`) wide enough to fold
+/// in the following slot's bytes.
+///
+/// `Int` does NOT follow the word.  It names the interpreter's integer
+/// *bank*, whose values are `i64` (`majit_ir::value::Type` doc), and the
+/// storage a descr describes is the source declaration, not the bank: a
+/// `jit_interp` `[int; virt]` array is backed by the caller's `Vec<i64>`
+/// (`majit/examples/spcount/src/main.rs:96`) and an `int` struct field by an
+/// `i64` (`majit-metainterp/tests/jit_interp_inline_helper_typed_return.rs:57`).
+/// Narrowing those to 4 on wasm32 strides past half of every item and
+/// truncates the value.  `Float` is `f64` on every target for the same
+/// reason.
 ///
 /// This crate is compiled into the wasm guest, so `size_of::<usize>()` is
 /// the target word here; build-time host code in `majit-translate` must use
 /// `layout::target_word_size()` instead.
-fn scalar_size(ty: majit_ir::value::Type) -> usize {
+pub(crate) fn scalar_size(ty: majit_ir::value::Type) -> usize {
     match ty {
-        majit_ir::value::Type::Float => std::mem::size_of::<f64>(),
-        _ => std::mem::size_of::<usize>(),
+        majit_ir::value::Type::Ref => std::mem::size_of::<usize>(),
+        _ => std::mem::size_of::<i64>(),
     }
 }
 
@@ -4680,11 +4691,12 @@ impl JitCodeBuilder {
     ) -> u16 {
         self.add_bh_descr(CanonicalBhDescr::Array {
             base_size: std::mem::size_of::<usize>(),
-            // The runtime twin of this descr reads its item size from
+            // A `[ref; virt]` array's runtime twin reads its item size from
             // `pyre_object::ITEMS_BLOCK_TOKEN`
             // (`pyre-jit-trace virtualizable_gen.rs`), which is
             // `size_of::<PyObjectRef>()`; a literal 8 makes the two descr
-            // universes disagree on wasm32.
+            // universes disagree on wasm32.  A `[int; virt]` array keeps 8 —
+            // it is backed by the caller's `Vec<i64>`, not by words.
             itemsize: scalar_size(item_type),
             len_offset: Some(0),
             type_id: 0,

@@ -265,10 +265,10 @@ pub fn struct_fields_write_effect_info(
                     index: u32::MAX,
                     name: name.to_string(),
                     offset,
-                    // One target word (`symbolic.py:12 WORD =
-                    // sizeof(lltype.Signed)`), matching the Ref/Int split
-                    // above; 4 on wasm32.
-                    field_size: std::mem::size_of::<usize>(),
+                    // Same width rule as the `field_specs_from_layout` twin
+                    // this mirrors: a `Ref` field is one target word (4 on
+                    // wasm32), an `Int` field is its `i64` storage.
+                    field_size: jitcode::scalar_size(field_type),
                     field_type,
                     is_immutable: false,
                     is_quasi_immutable: false,

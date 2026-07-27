@@ -1,5 +1,6 @@
 mod assembler;
 
+pub(crate) use assembler::scalar_size;
 pub use assembler::{JitCodeBuilder, live_slots_for_state_field_jit};
 pub use majit_translate::jitcode::{
     BhCallDescr as CanonicalBhCallDescr, BhDescr as CanonicalBhDescr, BhInteriorFieldSpec,

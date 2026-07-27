@@ -1368,12 +1368,12 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
                     index: descr.index(),
                     offset: fd.map(|f| f.offset()).unwrap_or(0),
                     field_type: fd.map(|f| f.field_type()).unwrap_or(majit_ir::Type::Int),
-                    // The fallback pairs with the `Type::Int` above: one
-                    // target word (`symbolic.py:12 WORD =
-                    // sizeof(lltype.Signed)`), 4 on wasm32.
+                    // The fallback pairs with the `Type::Int` above, whose
+                    // storage is `i64` on every target — only a `Ref` field
+                    // follows the target word.
                     field_size: fd
                         .map(|f| f.field_size())
-                        .unwrap_or(std::mem::size_of::<usize>()),
+                        .unwrap_or_else(|| crate::jitcode::scalar_size(majit_ir::Type::Int)),
                 }
             })
             .collect();
@@ -1408,12 +1408,12 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
                     index: descr.index(),
                     offset: fd.map(|f| f.offset()).unwrap_or(0),
                     field_type: fd.map(|f| f.field_type()).unwrap_or(majit_ir::Type::Int),
-                    // The fallback pairs with the `Type::Int` above: one
-                    // target word (`symbolic.py:12 WORD =
-                    // sizeof(lltype.Signed)`), 4 on wasm32.
+                    // The fallback pairs with the `Type::Int` above, whose
+                    // storage is `i64` on every target — only a `Ref` field
+                    // follows the target word.
                     field_size: fd
                         .map(|f| f.field_size())
-                        .unwrap_or(std::mem::size_of::<usize>()),
+                        .unwrap_or_else(|| crate::jitcode::scalar_size(majit_ir::Type::Int)),
                 }
             })
             .collect();
