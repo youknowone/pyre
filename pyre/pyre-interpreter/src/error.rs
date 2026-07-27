@@ -1950,7 +1950,21 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
     let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     let notes = match crate::baseobjspace::getattr_str(exc, "__notes__") {
         Ok(v) if !v.is_null() => v,
-        _ => return Ok(()),
+        Ok(_) => return Ok(()),
+        Err(err) if err.kind == PyErrorKind::AttributeError => return Ok(()),
+        Err(mut err) => {
+            // `traceback.py:1068-1072 TracebackException.__init__` preserves
+            // failures raised by a custom `__notes__` descriptor as a
+            // synthetic note instead of silently discarding the diagnostic.
+            let err_obj = err.to_exc_object();
+            pyre_object::gc_roots::pin_root(err_obj);
+            let err_obj = pyre_object::gc_roots::shadow_stack_get(
+                pyre_object::gc_roots::shadow_stack_len() - 1,
+            );
+            let rendered = unsafe { crate::display::py_repr(err_obj) }
+                .unwrap_or_else(|_| "<exception repr() failed>".to_string());
+            return writeln!(writer, "Ignored error getting __notes__: {rendered}");
+        }
     };
     let notes_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(notes);
@@ -2030,6 +2044,9 @@ fn render_rooted_exc_object_wtf8(exc_slot: usize) -> Wtf8Buf {
         rendered.push_str(": ");
         rendered.push_wtf8(&msg);
     }
+    if let Some(suffix) = exception_suggestion(exc_slot) {
+        rendered.push_str(&suffix);
+    }
     rendered
 }
 
@@ -2037,25 +2054,258 @@ fn render_exc_object_wtf8(exc: PyObjectRef) -> Wtf8Buf {
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
         return Wtf8Buf::from_string("<no exception>".to_string());
     }
-    let name = exc_object_class_name(exc).unwrap_or_else(|| {
-        let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) };
-        exc_kind_name(kind).to_string()
-    });
-    // `Python/pythonrun.c:print_exception_message` calls
-    // `PyObject_Str(value)`, so specialized builtin formatting
-    // (KeyError/OSError/Unicode errors) and a user `__str__` override all win
-    // over reconstructing a message from `args`.  A raising `__str__` is
-    // cleared and rendered with CPython's diagnostic placeholder.
-    let msg = unsafe {
-        crate::display::py_str_wtf8(exc)
-            .unwrap_or_else(|_| Wtf8Buf::from_string("<exception str() failed>".to_string()))
-    };
-    let mut rendered = Wtf8Buf::from_string(name);
-    if !msg.as_bytes().is_empty() {
-        rendered.push_str(": ");
-        rendered.push_wtf8(&msg);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(exc);
+    render_rooted_exc_object_wtf8(exc_slot)
+}
+
+const MAX_SUGGESTION_CANDIDATES: usize = 750;
+const MAX_SUGGESTION_STRING_SIZE: usize = 40;
+const SUGGESTION_MOVE_COST: usize = 2;
+
+fn dict_string_keys(dict: PyObjectRef, names: &mut Vec<String>) {
+    if dict.is_null() || !unsafe { pyre_object::is_dict(dict) } {
+        return;
     }
-    rendered
+    for (key, _) in unsafe { pyre_object::w_dict_items(dict) } {
+        if unsafe { pyre_object::is_str(key) } {
+            names.push(unsafe { pyre_object::w_str_get_value(key) }.to_string());
+        }
+    }
+}
+
+fn suggestion_distance(a: &str, b: &str, max_cost: usize) -> usize {
+    let mut a: Vec<char> = a.chars().collect();
+    let mut b: Vec<char> = b.chars().collect();
+    if a == b {
+        return 0;
+    }
+    while a.first() == b.first() && !a.is_empty() {
+        a.remove(0);
+        b.remove(0);
+    }
+    while a.last() == b.last() && !a.is_empty() {
+        a.pop();
+        b.pop();
+    }
+    if a.is_empty() || b.is_empty() {
+        return SUGGESTION_MOVE_COST * (a.len() + b.len());
+    }
+    if a.len() > MAX_SUGGESTION_STRING_SIZE || b.len() > MAX_SUGGESTION_STRING_SIZE {
+        return max_cost + 1;
+    }
+    if b.len() < a.len() {
+        std::mem::swap(&mut a, &mut b);
+    }
+    if (b.len() - a.len()) * SUGGESTION_MOVE_COST > max_cost {
+        return max_cost + 1;
+    }
+    let mut row: Vec<usize> = (1..=a.len())
+        .map(|index| index * SUGGESTION_MOVE_COST)
+        .collect();
+    let mut result = 0;
+    for (bindex, bchar) in b.iter().enumerate() {
+        let mut distance = bindex * SUGGESTION_MOVE_COST;
+        result = distance;
+        let mut minimum = usize::MAX;
+        for (index, achar) in a.iter().enumerate() {
+            let case_equal = achar.to_lowercase().eq(bchar.to_lowercase());
+            let substitute = distance
+                + if achar == bchar {
+                    0
+                } else if case_equal {
+                    1
+                } else {
+                    SUGGESTION_MOVE_COST
+                };
+            distance = row[index];
+            result = (result.min(distance) + SUGGESTION_MOVE_COST).min(substitute);
+            row[index] = result;
+            minimum = minimum.min(result);
+        }
+        if minimum > max_cost {
+            return max_cost + 1;
+        }
+    }
+    result
+}
+
+fn best_suggestion(candidates: &[String], wrong_name: &str) -> Option<String> {
+    if candidates.len() > MAX_SUGGESTION_CANDIDATES
+        || wrong_name.chars().count() > MAX_SUGGESTION_STRING_SIZE
+    {
+        return None;
+    }
+    let wrong_len = wrong_name.chars().count();
+    let mut best_distance = wrong_len;
+    let mut suggestion = None;
+    for candidate in candidates {
+        if candidate == wrong_name {
+            continue;
+        }
+        let candidate_len = candidate.chars().count();
+        let mut max_distance = (candidate_len + wrong_len + 3) * SUGGESTION_MOVE_COST / 6;
+        max_distance = max_distance.min(best_distance.saturating_sub(1));
+        let distance = suggestion_distance(wrong_name, candidate, max_distance);
+        if distance <= max_distance && (suggestion.is_none() || distance < best_distance) {
+            suggestion = Some(candidate.clone());
+            best_distance = distance;
+        }
+    }
+    suggestion
+}
+
+fn traceback_last_frame(tb: PyObjectRef) -> Option<*mut crate::pyframe::PyFrame> {
+    if tb.is_null() {
+        return None;
+    }
+    let mut current = tb;
+    let mut last_slot = None;
+    while !current.is_null() && unsafe { crate::pytraceback::is_pytraceback(current) } {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(current);
+        last_slot = Some(slot);
+        let rooted_current = pyre_object::gc_roots::shadow_stack_get(slot);
+        current = unsafe { crate::pytraceback::w_pytraceback_get_w_next(rooted_current) };
+    }
+    let tb = pyre_object::gc_roots::shadow_stack_get(last_slot?);
+    let frame = unsafe { crate::pytraceback::w_pytraceback_get_frame(tb) };
+    (!frame.is_null()).then_some(frame)
+}
+
+fn object_dir_strings(obj: PyObjectRef) -> Option<Vec<String>> {
+    if obj.is_null() || unsafe { pyre_object::is_none(obj) } {
+        return None;
+    }
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
+    let obj = pyre_object::gc_roots::shadow_stack_get(slot);
+    let names = crate::builtins::builtin_dir(&[obj]).ok()?;
+    let names_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(names);
+    let names = pyre_object::gc_roots::shadow_stack_get(names_slot);
+    let items = crate::builtins::collect_iterable(names).ok()?;
+    Some(
+        items
+            .into_iter()
+            .filter(|item| unsafe { pyre_object::is_str(*item) })
+            .filter_map(|item| {
+                unsafe { pyre_object::w_str_get_wtf8(item).as_str() }
+                    .ok()
+                    .map(str::to_owned)
+            })
+            .collect(),
+    )
+}
+
+fn stdlib_module_name(name: &str) -> bool {
+    let Some(sys) = crate::importing::get_interpreter_sys_module() else {
+        return false;
+    };
+    let Ok(names) = crate::baseobjspace::getattr_str(sys, "stdlib_module_names") else {
+        return false;
+    };
+    if !unsafe { pyre_object::is_set_or_frozenset(names) } {
+        return false;
+    }
+    let names_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(names);
+    let name = pyre_object::w_str_new(name);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(name);
+    let names = pyre_object::gc_roots::shadow_stack_get(names_slot);
+    let name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+    crate::baseobjspace::contains(names, name).unwrap_or(false)
+}
+
+/// `traceback.py:1096-1114,1601-1684` enhanced error messages.
+fn exception_suggestion(exc_slot: usize) -> Option<String> {
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) };
+    let wrong = match kind {
+        ExcKind::ImportError => unsafe {
+            pyre_object::interp_exceptions::w_exception_get_import_name_from(exc)
+        },
+        ExcKind::NameError | ExcKind::AttributeError => unsafe {
+            pyre_object::interp_exceptions::w_exception_get_name(exc)
+        },
+        _ => return None,
+    };
+    if wrong.is_null()
+        || unsafe { pyre_object::is_none(wrong) }
+        || !unsafe { pyre_object::is_str(wrong) }
+    {
+        return None;
+    }
+    let wrong_name = unsafe { pyre_object::w_str_get_value(wrong) }.to_string();
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    let tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
+    let suggestion = match kind {
+        ExcKind::AttributeError => {
+            let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+            let obj = unsafe { pyre_object::interp_exceptions::w_exception_get_attr_obj(exc) };
+            object_dir_strings(obj).and_then(|mut names| {
+                if !wrong_name.starts_with('_') {
+                    names.retain(|name| !name.starts_with('_'));
+                }
+                best_suggestion(&names, &wrong_name)
+            })
+        }
+        ExcKind::ImportError => {
+            let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+            let module_name = unsafe { pyre_object::interp_exceptions::w_exception_get_name(exc) };
+            if module_name.is_null() || !unsafe { pyre_object::is_str(module_name) } {
+                None
+            } else {
+                let module_name = unsafe { pyre_object::w_str_get_value(module_name) }.to_string();
+                crate::importing::get_sys_module(&module_name)
+                    .or_else(|| {
+                        crate::importing::importhook(
+                            &module_name,
+                            pyre_object::w_none(),
+                            pyre_object::w_none(),
+                            0,
+                            crate::call::take_last_exec_ctx(),
+                        )
+                        .ok()
+                    })
+                    .and_then(object_dir_strings)
+                    .and_then(|mut names| {
+                        if !wrong_name.starts_with('_') {
+                            names.retain(|name| !name.starts_with('_'));
+                        }
+                        best_suggestion(&names, &wrong_name)
+                    })
+            }
+        }
+        ExcKind::NameError => {
+            let frame = traceback_last_frame(tb)?;
+            let frame = unsafe { &mut *frame };
+            let mut names = Vec::new();
+            if let Ok(locals) = frame.getdictscope() {
+                dict_string_keys(locals, &mut names);
+                if let Some(self_obj) = unsafe { pyre_object::w_dict_getitem_str(locals, "self") } {
+                    if crate::baseobjspace::getattr_str(self_obj, &wrong_name).is_ok() {
+                        return Some(format!(". Did you mean: 'self.{wrong_name}'?"));
+                    }
+                }
+            }
+            dict_string_keys(frame.get_w_globals(), &mut names);
+            dict_string_keys(frame.fget_f_builtins(), &mut names);
+            best_suggestion(&names, &wrong_name)
+        }
+        _ => None,
+    };
+    let mut suffix = suggestion.map(|value| format!(". Did you mean: '{value}'?"));
+    if kind == ExcKind::NameError && stdlib_module_name(&wrong_name) {
+        let import = format!("Did you forget to import '{wrong_name}'?");
+        match suffix.as_mut() {
+            Some(text) => text.push_str(&format!(" Or {import}")),
+            None => suffix = Some(format!(". {import}")),
+        }
+    }
+    suffix
 }
 
 /// `pypy/interpreter/error.py:125-158 print_app_tb_only` parity —
@@ -2085,13 +2335,17 @@ fn write_traceback_chain_from_tb<W: Write>(
     writer: &mut W,
     mut tb: PyObjectRef,
 ) -> std::io::Result<()> {
+    let _roots = pyre_object::gc_roots::push_roots();
     while !tb.is_null() {
-        if !unsafe { crate::pytraceback::is_pytraceback(tb) } {
+        let tb_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(tb);
+        let current_tb = pyre_object::gc_roots::shadow_stack_get(tb_slot);
+        if !unsafe { crate::pytraceback::is_pytraceback(current_tb) } {
             break;
         }
-        let w_code = unsafe { crate::pytraceback::w_pytraceback_get_w_code(tb) };
-        let lineno = unsafe { crate::pytraceback::w_pytraceback_get_lineno(tb) };
-        let lasti = unsafe { crate::pytraceback::w_pytraceback_get_lasti(tb) };
+        let w_code = unsafe { crate::pytraceback::w_pytraceback_get_w_code(current_tb) };
+        let lineno = unsafe { crate::pytraceback::w_pytraceback_get_lineno(current_tb) };
+        let lasti = unsafe { crate::pytraceback::w_pytraceback_get_lasti(current_tb) };
         let (filename, funcname, location) = if w_code.is_null() {
             (String::from("<unknown>"), String::from("<unknown>"), None)
         } else {
@@ -2174,7 +2428,8 @@ fn write_traceback_chain_from_tb<W: Write>(
                 }
             }
         }
-        tb = unsafe { crate::pytraceback::w_pytraceback_get_w_next(tb) };
+        let current_tb = pyre_object::gc_roots::shadow_stack_get(tb_slot);
+        tb = unsafe { crate::pytraceback::w_pytraceback_get_w_next(current_tb) };
     }
     Ok(())
 }

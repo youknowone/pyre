@@ -114,6 +114,12 @@ class CollectingStrError(Exception):
         return "collected safely"
 
 
+class BrokenNotesError(Exception):
+    @property
+    def __notes__(self):
+        raise RuntimeError("notes failed")
+
+
 class ErrorNamespace:
     class NestedError(Exception):
         pass
@@ -191,6 +197,52 @@ scalar_notes = ValueError("scalar notes")
 scalar_notes.__notes__ = "detail"
 scalar_notes_output = hook_output(scalar_notes)
 assert scalar_notes_output.endswith("'detail'\n")
+
+broken_notes_output = hook_output(BrokenNotesError("broken notes"))
+assert broken_notes_output.endswith(
+    "BrokenNotesError: broken notes\n"
+    "Ignored error getting __notes__: RuntimeError('notes failed')\n"
+)
+
+
+def raise_name_suggestion():
+    available_name = 1
+    return availabl_name
+
+
+try:
+    raise_name_suggestion()
+except NameError as suggested_name_error:
+    name_suggestion_output = hook_output(suggested_name_error)
+assert name_suggestion_output.endswith(
+    "NameError: name 'availabl_name' is not defined. "
+    "Did you mean: 'available_name'?\n"
+)
+
+
+class SuggestionTarget:
+    available_attribute = 1
+
+
+attribute_suggestion = AttributeError(
+    "'SuggestionTarget' object has no attribute 'availabl_attribute'",
+    name="availabl_attribute",
+    obj=SuggestionTarget(),
+)
+assert hook_output(attribute_suggestion).endswith(
+    "AttributeError: 'SuggestionTarget' object has no attribute "
+    "'availabl_attribute'. Did you mean: 'available_attribute'?\n"
+)
+
+import_suggestion = ImportError(
+    "cannot import name 'sqr' from 'math'",
+    name="math",
+    name_from="sqr",
+)
+import_suggestion_output = hook_output(import_suggestion)
+assert import_suggestion_output.endswith(
+    "ImportError: cannot import name 'sqr' from 'math'. Did you mean: 'sqrt'?\n"
+), repr(import_suggestion_output)
 
 # CPython's invalid-value printer intentionally retains its historical
 # `NoneType: None` special case while other non-exceptions use the diagnostic.
