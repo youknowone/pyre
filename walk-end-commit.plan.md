@@ -1,6 +1,6 @@
 # Walk-end commit contract — convergence roadmap
 
-Status: **R1–R3 landed; R4–R6 open.** This is the authoritative plan for
+Status: **R1–R4 landed; R5–R6 open.** This is the authoritative plan for
 retiring the walk-end commit gates in `run_perfn_walk`'s epilogue. It supersedes
 the reasoning in the comments those gates carry, and it records two claims that
 were in the tree and are **false**.
@@ -92,25 +92,31 @@ way. They differ in operand-stack sourcing and in whether any gate ran.
   (`residual_call.rs`, `flush_active_frame_escape`).
 - Naming the one journal-keeping path that sat outside the contract
   (`TerminateNoReplay`), so no commit path is anonymous in the census.
+- **R4** — the escape gate is now founded on a declared effect class.
+  `ESCAPE_OPCODE_WINDOW` holds `(py_pc, every_prior_residual_reentrant)`;
+  `escape_opcode_window_clean` is a pure query; `escape_opcode_window_note`
+  records each residual's `EffectInfo` class (`check_is_elidable` /
+  `LoopInvariant`) after the call returns, so the gate and a force inside the
+  callee both see the window as it stood *before* that residual. The ordering
+  hazard below was respected — this is a reclassification, not a resample, and
+  the CA-bench census is unchanged.
+
+  `reentrant_residual` is deliberately stricter than `provably_side_effect_free`
+  (it drops the `ForIterNext` exemption, which answers the in-flight FOR_ITER
+  question, not the opcode-re-execution one), so it covers both runtime signals
+  it replaced: advancing `frame_entry_count` or bumping the odometer both
+  require a non-elidable, non-loop-invariant residual. The three journaled folds
+  that also bump the odometer each terminate their own opcode, so no residual of
+  the same opcode instance can follow one.
+
+  Not addressed, and unchanged from before: the window is still keyed on `py_pc`
+  alone, so an opcode revisited across walked inner-loop iterations still sees
+  the first visit's verdict. That is conservative (decline → legacy); the
+  refinement is a back-edge reset, and it belongs with R6.
 
 ---
 
 ## Open
-
-### R4 — re-found the escape gate on a static effect class
-
-Replace the runtime window comparison in `escape_opcode_window_clean`
-(`residual_call.rs`; compares `frame_entry_count` and
-`fbw_executed_effect_count` sampled at the first residual of the opcode) with a
-per-callee effect classification decided once, the way `EffectInfo` is decided
-at codewriter time (`jtransform.py:620-630`).
-
-This is the item that makes `RewindProvenAtLatch` collapse into a real proof
-rather than a named gap. Note the ordering hazard: re-founding the *existing*
-gate on a commit-time sample instead (the obvious-looking move) would flip which
-walks commit — the forcing residual bumps the odometer *after* the window is
-sampled — and per TL;DR §3 the branch it would flip into is not safe either. So
-this must be a static reclassification, not a resampling.
 
 ### R5 — generalize leg 4, then let legs 3 and 6 become unreachable
 
@@ -128,6 +134,22 @@ drop the `fbw_executed_effect_count() != executed_effects_before` conjunct,
 which is a routing filter rather than a safety gate and currently makes the
 orthodox path the exception. Legs 3 and 6 then retire by becoming
 **unreachable**, not by deletion.
+
+The eligibility set to lift is `inline_call.rs`, the `midbody_abort` payload
+builder — in the order they refuse:
+
+| # | refusal | upstream counterpart |
+|---|---|---|
+| 1 | `is_top_inline` (depth-1 only) | none — upstream loops over the whole `framestack` (`blackhole.py:1799-1821`) |
+| 2 | `fbw_executed_effect_count() != executed_effects_before` | none — routing filter, drop it |
+| 3 | `!fbw_has_unjournaled_effect()` | ⚠️KEEP — see below |
+| 4 | generator / `cellvars` / `freevars` / non-null closure | none — upstream rebuilds any frame |
+| 5 | `callee_arg_concretes.first()` must be a `Ref` (`x_arg`) | none — single-argument residue |
+| 6 | every live stack slot a non-null `Ref`; every live local resolvable and not `Null`/`Bool` | partial — upstream reads typed registers per frame |
+| 7 | `anchor_ok` / `abort_flush_call_jitcode_coord` / `depth`+`pcdep` resolvable | pyre's jitcode↔py_pc mapping, orthogonal |
+
+Rows 1, 4 and 5 are the ones the per-level `PyFrame` materialization blocks;
+rows 2 and 6 are independent of it and can move first.
 
 ⚠️Do **not** drop the other conjunct, `!fbw_has_unjournaled_effect()`. Upstream's
 `execute_and_record` executes *then* records (`pyjitpl.py:2647-2662`), so
