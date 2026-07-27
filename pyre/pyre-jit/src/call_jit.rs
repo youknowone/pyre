@@ -1902,6 +1902,12 @@ pub fn blackhole_resume_via_rd_numb(
     // `None` for both the vinfo and the per-frame virtualizable handle.
     novable: bool,
 ) -> BlackholeResult {
+    // Same window as `handle_fail`, for every blackhole resume including the
+    // CALL_ASSEMBLER caller: the decode below rebuilds virtuals through the
+    // blackhole allocator while the grabbed exception is still only a bare
+    // pointer with no deadframe root behind it.
+    let _guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
+
     let nbody_debug = pyre_nbody_debug_enabled();
     use majit_metainterp::resume;
 

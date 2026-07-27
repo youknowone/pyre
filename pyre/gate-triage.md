@@ -83,9 +83,83 @@ parity pass read `direct_assembler_call` and found its ON design is what
 upstream's `num_red_args` assert forbids. Retired.
 Still kept: `PYRE_CARRIER_EXC_RESUME` (default-off; threads the guard-failure exception
 into the bridge sym for the depth-2 carrier exception-resume slice #343/#126 —
-inert until validated; the seed's `bridge_guard_exc` GC-rooting and the
-unconditional `execute_ll_raised` exception assign are parity gaps to close
-before it is enabled by default).
+inert until validated).  Two parity gaps were listed here as pre-flip work; the
+`execute_ll_raised` exception assign is still open, and the seed's
+`bridge_guard_exc` GC-rooting is closed by §1e — which also measures the seed
+site as **reachable** (170 bridge-route guard failures carry a live exception),
+so this gate is a live adoption target rather than an inert one.
+
+## §1e — The grabbed guard exception is rooted for the whole handoff (2026-07-27)
+
+`bridge_guard_exc` was booked as a pre-flip gap for `PYRE_CARRIER_EXC_RESUME`.
+It is **not gate-specific**: the same grabbed pointer drives the default
+blackhole resume, so the gate never bounded the exposure.
+
+`grab_exc_value` (`llmodel.py:240`) reads `jf_guard_exc` off the deadframe and
+drops the jitframe, which was the collector's only handle on the exception
+(`jitframe_trace`).  The handoff then decodes resume data and rebuilds virtuals
+through the blackhole allocator before anything re-roots the value, so in that
+window the exception — and the young `args` / `__traceback__` reachable only
+through it — live behind a bare `i64` that a precise collector cannot see.
+RPython's `grab_exc_value` result is a shadowstack-rooted local across the same
+span.  Closed the same way as the six sibling raw-exception carriers
+(`walk_jit_exc_value`, `walk_bh_last_exc_value`, …): `GuardExcRoot` parks the
+value and a `GUARD_EXC_VALUE` root walker marks the carrier and forwards its
+young children.  Parked at the three handoff owners — `handle_fail`,
+`blackhole_resume_via_rd_numb` (which also covers the CALL_ASSEMBLER caller),
+and `back_edge_internal`.
+
+### Coverage census (339 files, `bench/` + `bench/synth/`)
+
+Instrumenting `handle_fail` counted **732,660** guard failures:
+
+| `guard_exc` | `is_guard_exc` | `should_bridge` | count |
+|---|---|---|---|
+| NULL | false | false | 648,725 |
+| NULL | **true** | false | 48,327 |
+| **NON-NULL** | **true** | false | **34,620** |
+| NULL | false | **true** | 579 |
+| NULL | **true** | **true** | 239 |
+| **NON-NULL** | **true** | **true** | **170** |
+
+So the window is entered with a live exception **34,790** times, and the 170 in
+the last row are exactly the `bridge_guard_exc` read this section is about — the
+`PYRE_CARRIER_EXC_RESUME` seed site is **reachable**, not inert.  Seven benches
+produce them: `inline_subwalk_property_mutates` and
+`inline_subwalk_mutating_residual_abort` (11,482 each),
+`type_name_surrogate_reject` (9,462), `named_reraise_sibling_hot` (1,418),
+`exc_mixed_classes_bridge_flavor` (410), `handler_reraise_second_exc` (400),
+`sre_pattern_methods` (136).
+
+★ **TRAP** — an earlier revision of this section reported "zero coverage" from a
+sweep whose every invocation had silently failed: `timeout` does not exist on
+macOS, so each run died with `command not found` and produced no lines.  The
+control used to validate that sweep did not go through `timeout`, so it did not
+catch it.  Use `perl -e 'alarm N; exec @ARGV' --` instead.
+
+### The walker is not load-bearing on any measured workload
+
+A `gc_stress` build under `MAJIT_GC_STRESS` (full collection at the start of
+every allocation, so the window's blackhole-allocator calls all collect) was run
+over the producers above with the walker registered and with it suppressed:
+`handler_reraise_second_exc`, `exc_mixed_classes_bridge_flavor`,
+`named_reraise_sibling_hot`, `sre_pattern_methods` and
+`type_name_surrogate_reject` all **pass identically both ways**.
+
+So this stays a **parity fix at a reachable site**, not a demonstrated bug fix.
+The likely reason it cannot be discriminated: on the residual-raise path the
+same exception is still parked in `BH_LAST_EXC_VALUE`, which `walk_bh_last_exc_value`
+already roots, and nothing drains that cell before the handoff completes.  What
+the new walker covers is the case where it *is* drained first — untested,
+because no workload produces it.
+
+★ **TRAP** — the first attempt at this A/B forced `try_gc_collect()` at
+`handle_fail` entry instead of using `MAJIT_GC_STRESS`.  That aborts with
+`GC BUG: invalid type_id … site=object_total_size` on ~8/12 runs **with the
+walker on as well**, which reads like a second defect but is not: an arbitrary
+program point is not a safepoint, and the same bench is clean under the real
+allocation-driven stress.  Force collections through the GC's own stress hook,
+never at a hand-picked instruction.
 
 ## §1c — Retired since the 2026-07-05 audit (10): reader already deleted by a closed epic
 

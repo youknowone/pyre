@@ -3316,6 +3316,26 @@ fn walk_bh_last_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     };
 }
 
+/// Root the exception grabbed off a failing guard's deadframe
+/// (`GUARD_EXC_VALUE`): the grab drops `jf_guard_exc`, the collector's only
+/// handle on it, and the bridge / blackhole handoff reconstructs resume state
+/// through the blackhole allocator before re-rooting the value. Same
+/// carrier/children split as [`walk_jit_exc_value`].
+fn walk_guard_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    let exc = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get());
+    if exc == 0 {
+        return;
+    }
+    let mut gcref = majit_ir::GcRef(exc as usize);
+    visitor(&mut gcref);
+    unsafe {
+        pyre_interpreter::eval::walk_raw_exception_roots(
+            gcref.0 as pyre_object::PyObjectRef,
+            visitor,
+        )
+    };
+}
+
 /// Root PyPy's process-global `rbigint._parts_cache`. The object crate exposes
 /// its raw `_digits` slots without depending on majit-ir; this adapter performs
 /// the `GcRef` conversion and writes back a forwarded address.
@@ -3334,6 +3354,7 @@ fn install_gc_root_walkers() {
     pyre_interpreter::eval::register_pyframe_root_walker();
     majit_gc::shadow_stack::register_extra_root_walker(walk_jit_exc_value);
     majit_gc::shadow_stack::register_extra_root_walker(walk_bh_last_exc_value);
+    majit_gc::shadow_stack::register_extra_root_walker(walk_guard_exc_value);
     majit_gc::shadow_stack::register_extra_root_walker(walk_rbigint_parts_cache);
     // Stored `PyError` carriers whose GC refs the precise collector cannot
     // reach through their raw TLS cells: the call-assembler FFI stash and the
@@ -7106,6 +7127,11 @@ fn handle_fail(
     guard_exc: i64,
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> HandleFailOutcome {
+    // The guard exception arrives as a bare pointer whose deadframe root is
+    // already gone, and bridge setup decodes resume data (allocating) before
+    // `setup_bridge_sym` copies it onto the sym. Park it for the walker first.
+    let _guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
+
     // A failure reported through a retired/inlined source descr can belong to
     // an invalidated JitCellToken even while the outer entry token is still
     // installed.  PyPy cannot make that namespace mistake: the live

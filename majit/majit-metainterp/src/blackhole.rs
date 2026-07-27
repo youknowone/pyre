@@ -307,6 +307,44 @@ pub struct BlackholeInterpreter {
 // Read by handler dispatch to populate exception_last_value.
 thread_local! {
     pub static BH_LAST_EXC_VALUE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+
+    /// llmodel.py:240 `grab_exc_value(deadframe)`: the exception a failing
+    /// guard carried, parked for the bridge / blackhole handoff.
+    ///
+    /// Grabbing the value reads `jf_guard_exc` off the deadframe and drops the
+    /// jitframe, which was the collector's only handle on the exception
+    /// (`jitframe_trace`). The handoff then reconstructs the resume state
+    /// through the blackhole allocator before anything re-roots the value, so
+    /// in that window the exception — and the young `args` / `__traceback__`
+    /// reachable only through it — live behind a bare `i64`. RPython's
+    /// `grab_exc_value` result is a shadowstack-rooted local across the same
+    /// span; pyre has no GC transform, so the frontend registers a root walker
+    /// over this cell instead.
+    pub static GUARD_EXC_VALUE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// Park a grabbed guard exception in [`GUARD_EXC_VALUE`] for the duration of
+/// one handoff.
+///
+/// Restores the previous value on drop rather than clearing, so a nested
+/// handoff (a bridge trace that itself deopts) unwinds to the exception its
+/// caller is still carrying.
+pub struct GuardExcRoot {
+    prev: i64,
+}
+
+impl GuardExcRoot {
+    pub fn park(exc: i64) -> Self {
+        Self {
+            prev: GUARD_EXC_VALUE.with(|cell| cell.replace(exc)),
+        }
+    }
+}
+
+impl Drop for GuardExcRoot {
+    fn drop(&mut self) {
+        GUARD_EXC_VALUE.with(|cell| cell.set(self.prev));
+    }
 }
 
 // rvmprof integration lives in the `rpython.rlib.rvmprof.cintf` analog.

@@ -3477,6 +3477,11 @@ impl<S: JitState> JitDriver<S> {
             // the no-exception continuation.
             let guard_exc = result.exception.exc_value;
             drop(result);
+            // The deadframe root died with the grab and the reconstruction
+            // below allocates through the blackhole allocator, so hold the
+            // exception where the frontend's root walker can reach it until
+            // `prepare_resume_from_failure` hands it to the blackhole.
+            let _guard_exc_root = crate::blackhole::GuardExcRoot::park(guard_exc);
 
             // must_compile tick for bridge threshold counting.
             if crate::majit_log_enabled() {
