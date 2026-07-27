@@ -1747,17 +1747,26 @@ def main():
         # we run them so the wasm leak/perf work can be driven down one bench
         # at a time, accepting the timeout state until each is fixed.
 
+        # Gate values are set from the gate's OWN metric — user-CPU minus the
+        # measured empty-program startup, min-of-5 interleaved — at ~2.5x the
+        # measured ratio, so a runner 2.5x slower than an idle local box still
+        # passes. A gate is only tightened when its baseline is healthy
+        # (baseline exec >= ~5x that runtime's startup); where it is not, the
+        # workload is sized up instead (see spectral_norm.py). Benches with
+        # under ~3x headroom are deliberately left alone: nested_loop,
+        # raise_catch, int_loop and fib_recursive-vs-cpython are the known
+        # slow-runner flakes.
         #             name              script                          timeout  d_vs_cp  d_vs_py  c_vs_cp  c_vs_py
         chk.run_bench("int_loop",       f"{B}/int_loop.py",             5,       None,    2,       None,    2)
         chk.run_bench("float_loop",     f"{B}/float_loop.py",           5,       None,    1.5,     None,    1.5)
         chk.run_bench("fib_loop",       f"{B}/fib_loop.py",             5,       2,       3,       2,       3)
         chk.run_bench("inline_helper",  f"{B}/inline_helper.py",        5,       None,    1.5,     None,    1.5)
-        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       13,      2,       13)
+        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       6,       2,       8)
         chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    3)
         chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     5,       None,    1.5,     None,    2.5)
-        chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",        5,       2,       7,       2,       7)
-        chk.run_bench("nbody",          f"{B}/nbody.py",               10,       1,       5,       1,       5,    wasm_float_tol=True)
-        chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       None)
+        chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       15,       1,       5,       1,       5)
+        chk.run_bench("nbody",          f"{B}/nbody.py",               10,       0.5,     5,       1,       5,    wasm_float_tol=True)
+        chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       15)
         # Skipped on wasm: the guard times calls with `time.perf_counter()`, and
         # the wasm guest has no `time` module (import fails before any output),
         # so the guard is native-JIT-backend only.

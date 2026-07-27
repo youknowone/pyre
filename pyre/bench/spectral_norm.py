@@ -36,7 +36,12 @@ v = [0.0] * n
 tmp = [0.0] * n
 
 i = 0
-while i < 10:
+# 30 rather than the reference 10: check.py gates on execution-only time
+# (run minus the measured empty-program startup), and at 10 the pypy run is
+# 0.026s against a 0.011s startup, so the denominator is the residue of two
+# similar measurements and the ratio stops tracking pyre. 30 puts pypy at
+# 0.077s, ~7x its startup.
+while i < 30:
     multiply_AtAv(n, u, v, tmp)
     multiply_AtAv(n, v, u, tmp)
     i = i + 1

@@ -428,6 +428,16 @@ nested inside `single_frame_blackhole_resume_enabled()`, so it also requires
 `_BLACKHOLE_RESUME` to stay ON.  The pre-existing `[s2-gate]` eprintln (under
 `PYRE_FBW_DEBUG_ABORT`) already reports `inline_subwalk` at that site.
 
+**A second coverage benchmark, 2026-07-27.**
+`synth/getframe_inline_subwalk_multiframe` (#798) reaches the latch with
+`inline_subwalk=true` and drives `build_multi_frame_miframe` — under
+`PYRE_FBW_MULTIFRAME=1 PYRE_FBW_DEBUG_ABORT=1` it prints 5 `[s2-gate]
+inline_subwalk` lines each followed by `[s2-build-decline] BUILT multi-frame
+depth=2`.  One `sys._getframe(1)` level does not get there; the chain needs a
+residual level under the walked frame and an inlined level under that, so the
+force has to reach two frames up.  Per-frame vable binding, outer-locals
+materialization, and the `jit.virtual_ref` emit are therefore validatable now.
+
 ## §2 — Not gates (11): Rust identifiers, not env vars
 
 The audit regex matched non-env identifiers. These are real code; **do not
