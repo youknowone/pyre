@@ -518,9 +518,12 @@ mod tests {
 
     /// #184 recursive CALL_ASSEMBLER portal entry: the macro-generated
     /// `JitCodeSym::recursive_fresh_entry_reds` yields fresh-frame reds in
-    /// `extract_live` order — stackpos zeroed, a fresh vable identity Ref
-    /// distinct from the caller, and the stack re-allocated at the caller's
-    /// captured capacity (read from the sym's `stack_len_value` cache).
+    /// `extract_live` order — stackpos zeroed, then a fresh vable identity Ref
+    /// distinct from the caller's. The stack is re-allocated at the caller's
+    /// captured capacity (read from the sym's `stack_len_value` cache), but
+    /// that capacity is NOT a red: a virtualizable is named once, and its array
+    /// lengths are read off the live object (`virtualizable.py:150-153`). It is
+    /// checked here on the returned owner instead.
     #[test]
     fn recursive_fresh_entry_reds_layout() {
         use majit_metainterp::{JitCodeSym as _, JitState as _};
@@ -533,11 +536,11 @@ mod tests {
         let mut sym = <TlState as majit_metainterp::JitState>::create_sym(&meta, 0);
         // Seeds `sym.stack_len_value` from the caller's live capacity.
         caller.initialize_sym(&mut sym, &meta);
-        let (values, _owner) = sym
+        let (values, owner) = sym
             .recursive_fresh_entry_reds()
             .expect("ref-scalar-free state-field interp must support portal entry");
-        // tl extract_live order: [stackpos (Int), &state (Ref), stack.len() (Int)].
-        assert_eq!(values.len(), 3, "stackpos + vable ptr + stack len");
+        // tl extract_live order: [stackpos (Int), &state (Ref)].
+        assert_eq!(values.len(), 2, "stackpos + the one vable identity");
         assert_eq!(values[0], majit_ir::Value::Int(0), "fresh stackpos zeroed");
         match values[1] {
             majit_ir::Value::Ref(majit_ir::GcRef(p)) => {
@@ -549,11 +552,15 @@ mod tests {
             }
             ref other => panic!("slot 1 must be the vable identity Ref, got {other:?}"),
         }
+        let fresh = owner
+            .downcast_ref::<TlState>()
+            .expect("the owner is the fresh state the reds name");
         assert_eq!(
-            values[2],
-            majit_ir::Value::Int(caller.stack.len() as i64),
+            fresh.stack.len(),
+            caller.stack.len(),
             "fresh stack re-allocated at the caller's captured capacity",
         );
+        assert_eq!(fresh.stackpos, 0, "fresh frame starts empty");
     }
 
     /// #184 S3f-1: the host alloc/free targets the recursive dispatcher records
