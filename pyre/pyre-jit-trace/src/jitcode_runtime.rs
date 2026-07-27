@@ -746,22 +746,30 @@ pub fn build_time_field_offset(owner: &str, name: &str) -> Option<usize> {
 /// `as_bh_descr()`.
 ///
 /// Idempotent: the metainterp `OnceLock` keeps the first pool, so repeated
-/// calls (harness + production init) are safe.
+/// calls (harness + production init) are safe.  The pool is built inside the
+/// `OnceLock` initializer, so a repeat call costs a load and nothing else —
+/// `drive_unpack_iterable_trace` reaches here once per
+/// `_unpackiterable_unknown_length`, and cloning every `BhDescr` (each call
+/// descr carrying its `EffectInfo` raw descr sets) only to drop it is the
+/// dominant cost of an unpack-heavy program.
 pub fn install_global_build_descr_pool() {
     use majit_metainterp::RuntimeBhDescr;
-    let pool: Vec<RuntimeBhDescr> = all_descrs()
-        .iter()
-        .map(|bh| match bh {
-            BhDescr::JitCode { jitcode_index, .. } => match get_jitcode_by_index(*jitcode_index) {
-                Some(canonical) => RuntimeBhDescr::JitCode(Arc::new(
-                    majit_metainterp::JitCode::from_canonical((*canonical).clone()),
-                )),
-                None => RuntimeBhDescr::Descr(bh.clone()),
-            },
-            other => RuntimeBhDescr::Descr(other.clone()),
-        })
-        .collect();
-    majit_metainterp::set_global_build_descr_pool(pool);
+    majit_metainterp::init_global_build_descr_pool(|| {
+        all_descrs()
+            .iter()
+            .map(|bh| match bh {
+                BhDescr::JitCode { jitcode_index, .. } => {
+                    match get_jitcode_by_index(*jitcode_index) {
+                        Some(canonical) => RuntimeBhDescr::JitCode(Arc::new(
+                            majit_metainterp::JitCode::from_canonical((*canonical).clone()),
+                        )),
+                        None => RuntimeBhDescr::Descr(bh.clone()),
+                    }
+                }
+                other => RuntimeBhDescr::Descr(other.clone()),
+            })
+            .collect()
+    });
 }
 
 /// Build a `BlackholeInterpBuilder` pre-configured for this binary's

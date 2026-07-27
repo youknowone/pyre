@@ -125,7 +125,7 @@ pub use jit_state::{
 };
 pub use jitcode::{
     BC_GOTO, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, LivenessInfo, RuntimeBhDescr, insns,
-    live_slots_for_state_field_jit, set_global_build_descr_pool,
+    init_global_build_descr_pool, live_slots_for_state_field_jit,
 };
 pub use jitdriver::{
     DeclarativeJitDriver, JitDriver, JitDriverStaticData, MultiFrameBlackholeResult,
