@@ -99,6 +99,12 @@ struct MetaInterpStaticData {
     /// cached opcode ids and liveness bytes in place.
     finish_setup_done: bool,
 
+    /// `Assembler.insns` length the cached `op_*` ids above were read off.
+    /// Paired with `liveness_info.len()` it decides whether a refresh would
+    /// observe anything new — both writer-side buffers are append-only
+    /// (`assembler.py:29-31`), so equal lengths mean equal contents.
+    insns_len: usize,
+
     // pyjitpl.py:2236-2243 opcode number cache filled by `setup_insns`.
     // RPython stores every field even when the runtime currently does
     // not read them, so the structural parity is preserved. Sentinel
@@ -139,6 +145,7 @@ impl MetaInterpStaticData {
             jitcodes: Vec::new(),
             liveness_info: std::sync::Arc::<[u8]>::from(Vec::<u8>::new().into_boxed_slice()),
             finish_setup_done: false,
+            insns_len: 0,
             op_live: u8::MAX,
             op_goto: u8::MAX,
             op_catch_exception: u8::MAX,
@@ -186,6 +193,19 @@ impl MetaInterpStaticData {
         self.op_ref_return = insns.get("ref_return/r").copied().unwrap_or(u8::MAX);
         self.op_float_return = insns.get("float_return/f").copied().unwrap_or(u8::MAX);
         self.op_void_return = insns.get("void_return/").copied().unwrap_or(u8::MAX);
+        self.insns_len = insns.len();
+    }
+
+    /// Whether a `finish_setup_if_needed` call with these writer-side buffer
+    /// lengths would republish anything. `ensure_finish_setup` runs on every
+    /// `jitcode_for`, and building its arguments copies both buffers whole;
+    /// `assembler.py:29-31` seeds them from the build-time tables, so that
+    /// copy is proportional to the whole opcode and liveness universe rather
+    /// than to what the call would change.
+    fn finish_setup_would_republish(&self, insns_len: usize, all_liveness_len: usize) -> bool {
+        !self.finish_setup_done
+            || insns_len != self.insns_len
+            || all_liveness_len != self.liveness_info.len()
     }
 
     /// pyjitpl.py:2255-2264 `finish_setup`: wire the assembler's opcode table
@@ -580,10 +600,17 @@ fn ensure_finish_setup() {
     FRAME_VALUE_COUNT_INIT.call_once(|| {
         majit_ir::resumedata::set_frame_value_count_fn(frame_value_count_at);
     });
-    let (insns, all_liveness) = ASSEMBLER_STATE.with(|a| {
+    let snapshot = ASSEMBLER_STATE.with(|a| {
         let asm = a.borrow();
-        (asm.insns.clone(), asm.all_liveness.clone())
+        let republishes = METAINTERP_SD.with(|r| {
+            r.borrow()
+                .finish_setup_would_republish(asm.insns.len(), asm.all_liveness.len())
+        });
+        republishes.then(|| (asm.insns.clone(), asm.all_liveness.clone()))
     });
+    let Some((insns, all_liveness)) = snapshot else {
+        return;
+    };
     METAINTERP_SD.with(|r| {
         r.borrow_mut().finish_setup_if_needed(&insns, all_liveness);
     });
