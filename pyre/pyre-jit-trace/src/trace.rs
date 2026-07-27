@@ -92,6 +92,14 @@ pub(crate) enum WalkEndCommitLeg {
     NestedInlineOuterCall = 6,
     /// Kept-stack branch guard flush at the abort pc.
     BranchGuard = 7,
+    /// Not a flush leg: the portal/CALL_ASSEMBLER `Terminate` no-replay
+    /// shortcut.  It keeps the journal like the legs above, but by a different
+    /// caller protocol — the caller consumes the walk's concrete result
+    /// instead of adopting a resume pc — so it must NOT set
+    /// [`WALK_END_FLUSH_COMMITTED`].  Tagged anyway because the census
+    /// otherwise reports these walks as `committed=true leg=0`, which reads as
+    /// "no leg" when it means "a commit path outside the leg contract".
+    TerminateNoReplay = 8,
 }
 
 /// Where a committing leg puts the interpreter, relative to the effects the
@@ -191,13 +199,26 @@ pub(crate) fn walk_end_resume_provable(resume: WalkEndResume) -> bool {
     }
 }
 
+/// Name the path that kept this walk's journal, for the census only.  Every
+/// journal-keeping path goes through here so none stays anonymous; the flush
+/// legs additionally set [`WALK_END_FLUSH_COMMITTED`] via [`commit_walk_end`],
+/// which is what tells the portal the returned `FrameBox` carries adoptable end
+/// state.  A path with a different caller protocol must tag WITHOUT that flag.
 #[must_use]
-pub(crate) fn commit_walk_end(leg: WalkEndCommitLeg, resume: WalkEndResume) -> bool {
+pub(crate) fn record_walk_end_leg(leg: WalkEndCommitLeg, resume: WalkEndResume) -> bool {
     if !walk_end_resume_provable(resume) {
         return false;
     }
-    WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
     WALK_END_COMMIT_LEG.with(|c| c.set(leg as u8));
+    true
+}
+
+#[must_use]
+pub(crate) fn commit_walk_end(leg: WalkEndCommitLeg, resume: WalkEndResume) -> bool {
+    if !record_walk_end_leg(leg, resume) {
+        return false;
+    }
+    WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
     true
 }
 
@@ -3264,6 +3285,14 @@ fn run_perfn_walk<Sym: WalkSym>(
         && crate::jitcode_dispatch::fbw_finish_concrete_peek().is_some();
     if !terminate_no_replay && !blackhole_terminal_no_replay {
         crate::jitcode_dispatch::fbw_finish_concrete_reset();
+    }
+    // The one journal-keeping path outside the flush legs: it sets no flush
+    // flag (the caller consumes the concrete result instead of adopting a
+    // resume pc), so tag it here or the census reports it as `leg=0`.
+    // `blackhole_terminal_no_replay` needs no tag — it only refines a walk
+    // whose VableEscape leg already committed, and retagging would erase it.
+    if terminate_no_replay {
+        let _ = record_walk_end_leg(WalkEndCommitLeg::TerminateNoReplay, WalkEndResume::Terminal);
     }
 
     // Store-journal epilogue, on EVERY walk exit (commit, declined
