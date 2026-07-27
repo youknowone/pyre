@@ -2712,11 +2712,12 @@ pub unsafe fn w_dict_adopt_regular_copy_for_empty_update(dst: PyObjectRef, w_cop
 
     dst_dict.dstrategy = copy_dict.dstrategy;
     dst_dict.dstorage = copy_dict.dstorage;
-    // `w_copy` is a consumed temporary.  Move, rather than alias, its storage:
-    // leaving both dicts pointing at the same box would let the temporary's
-    // GC-box sweep reclaim the destination's live backing.  Null the copy's
-    // slot so only `dst` roots the moved box.
-    copy_dict.dstorage = std::ptr::null_mut();
+    // PyPy aliases the GC storage pointer here:
+    // `w_dict.dstorage = w_copy.dstorage`.  The storage box is an independent
+    // GC object, not memory owned by `w_copy`, so both dicts must keep tracing
+    // it until the consumed temporary is swept.  Clearing the temporary's
+    // field would leave a live W_DictObject whose strategy cannot trace its
+    // null storage during that same collection.
     dict_write_barrier(dst);
 
     // The destination previously held a placeholder Object-shape box; now
