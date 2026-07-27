@@ -8832,6 +8832,16 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
         return Ok(false);
     }
     let w_globals = ns_ptr as pyre_object::PyObjectRef;
+    // The namespace operand is the fold's authority: both legs end at
+    // `guard_current_frame_globals_identity`, which bakes it as the expected
+    // `ConstPtr` and declines outright on a null one.  An inlined callee whose
+    // namespace register is unseeded presents it as a null `Ref`, so decline
+    // here instead of walking the builtins leg, which reads `__builtins__`
+    // straight out of it.  The residual re-resolves the globals from the frame
+    // it runs on, so declining stays correct.
+    if w_globals.is_null() {
+        return Ok(false);
+    }
     // `namei` is the raw `LOAD_GLOBAL` oparg; bit 0 is the push-NULL flag,
     // so the `co_names` index is `namei >> 1` (mirror `bh_load_global_fn`).
     let name_idx = (namei as usize) >> 1;
