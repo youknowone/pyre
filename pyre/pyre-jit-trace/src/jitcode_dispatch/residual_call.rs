@@ -985,10 +985,15 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                     EscapeResumeKind::RerunsOpcode
                 };
                 COMMITTED_FRAME_ESCAPE_PC.with(|committed| committed.set(Some((py_pc, kind))));
-            } else {
+            } else if !crate::state::flush_locals_region_to_frame(ctx, expected) {
                 // All-or-nothing decline: nothing was written, nothing to undo.
                 discard_escape_flush_undo();
             }
+            // A declined full flush still escaped the virtualizable, so the
+            // locals region is written anyway (`virtualizable.py:101-138
+            // write_boxes` has no decline) — otherwise the callee reads an
+            // array of nulls.  That write claims no resume pc, and the undo
+            // stays armed so the legacy replay re-enters the pre-flush frame.
             // A directly matched frame escaped whether or not the flush
             // committed, so the two signals stay decoupled.  A redirected one
             // is reported only once the resume pc is committed: forcing

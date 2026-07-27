@@ -4749,6 +4749,67 @@ fn flush_walk_end_state_to_frame_inner(
     true
 }
 
+/// Write back ONLY the locals/cells region (absolute slots `0..nlocals`) from
+/// the virtualizable shadow, leaving the operand-stack region,
+/// `valuestackdepth` and `last_instr` untouched.
+///
+/// `virtualizable.py:101-138 write_boxes` writes the whole array on every
+/// force, with no way to decline: a callee handed the frame reads its
+/// fastlocals straight out of the array (`pyframe.py:548-552 fast2locals`), and
+/// an unforced array of nulls renders as an EMPTY `f_locals` mapping — a wrong
+/// answer, not a stale one.  The merge-point flush cannot carry that on its
+/// own because it is all-or-nothing across the operand stack too, and a
+/// mid-expression stack slot reads NULL from the shadow, declining the whole
+/// write.  The locals region has no such hazard: a NULL local is a legitimate
+/// unbound local.
+///
+/// Resume-pc authority stays with the full flush — this writes state only, so
+/// the caller keeps the escape-flush undo armed and a legacy replay from the
+/// trace entry still re-enters the pre-flush frame.
+pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -> bool {
+    if frame == 0 {
+        return false;
+    }
+    let Some(nlocals) = concrete_nlocals(frame) else {
+        return false;
+    };
+    let Some(info) = ctx.virtualizable_info() else {
+        return false;
+    };
+    let base = info.num_static_extra_boxes;
+    // Validation pass first: it allocates nothing, so a missing entry leaves
+    // the frame untouched (same all-or-nothing discipline as the full flush).
+    for abs in 0..nlocals {
+        if ctx.virtualizable_entry_at(base + abs).is_none() {
+            return false;
+        }
+    }
+    let frame_ptr = frame as *const u8;
+    let arr_ptr = unsafe {
+        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < nlocals {
+        return false;
+    }
+    for abs in 0..nlocals {
+        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
+            return false;
+        };
+        let boxed = boxed_slot_value_for_type(Type::Ref, &value);
+        unsafe {
+            (*arr_ptr).as_mut_slice()[abs] = boxed;
+        }
+        // Boxing an Int/Float slot allocates, and each minor collection
+        // consumes the array's remembered-set entry, so re-arm per store.
+        frame_array_write_barrier(frame as *mut u8, arr_ptr);
+    }
+    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+        eprintln!("[fbw-flush] locals-region written: nlocals={nlocals}");
+    }
+    true
+}
+
 /// gh#467 forward-flush AT an inlined-callee CALL boundary.  When an
 /// supported abort fires inside an inline sub-walk whose callee executed no
 /// concrete effect, the outer frame is flushed as of the CALL that

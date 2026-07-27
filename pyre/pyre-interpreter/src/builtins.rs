@@ -9170,27 +9170,38 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if !args.is_empty() {
         return Err(crate::PyError::type_error("locals() takes no arguments"));
     }
-    crate::eval::CURRENT_FRAME.with(|current| {
-        let frame = current.get();
-        if frame.is_null() {
-            return Err(crate::PyError::runtime_error(
-                "locals() requires an active frame",
-            ));
-        }
-        // `interp_inspect.py:7-11 locals` returns
-        // `ec.gettopframe_nohidden().getdictscope()` unconditionally.
-        // `getdictscope` (`pyframe.py:525-530`) always runs `fast2locals()`
-        // before returning `debugdata.w_locals`, so a second `locals()`
-        // re-syncs the mapping with the current fast locals —
-        // `x = 1; locals(); x = 2; locals()["x"]` reads `2`.  `fast2locals`
-        // lazily allocates and caches the mapping on first call, so identity
-        // holds (`locals() is locals()`, and `locals() is globals()` at
-        // module scope where `debugdata.w_locals is w_globals`); for a
-        // non-dict exec/eval mapping it returns that live object and writes
-        // through its `__setitem__`.
-        let frame_mut = unsafe { &mut *frame };
-        frame_mut.getdictscope()
-    })
+    // `interp_inspect.py:7-11 locals` returns
+    // `ec.gettopframe_nohidden().getdictscope()` unconditionally.  Going
+    // through `gettopframe_nohidden` is what makes the frame's fastlocals
+    // readable: it runs `force_frame` on every frame it walks
+    // (`executioncontext.rs:409-421`), and `fast2locals` reads
+    // `locals_cells_stack_w` directly, so an unforced virtualizable hands
+    // back an array of nulls — which `fast2locals` renders as an EMPTY
+    // mapping rather than a stale one.  Reading `CURRENT_FRAME` instead
+    // skips that force.
+    //
+    // `getdictscope` (`pyframe.py:525-530`) always runs `fast2locals()`
+    // before returning `debugdata.w_locals`, so a second `locals()`
+    // re-syncs the mapping with the current fast locals —
+    // `x = 1; locals(); x = 2; locals()["x"]` reads `2`.  `fast2locals`
+    // lazily allocates and caches the mapping on first call, so identity
+    // holds (`locals() is locals()`, and `locals() is globals()` at
+    // module scope where `debugdata.w_locals is w_globals`); for a
+    // non-dict exec/eval mapping it returns that live object and writes
+    // through its `__setitem__`.
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    let frame = if ec.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { (*ec).gettopframe_nohidden() }
+    };
+    if frame.is_null() {
+        return Err(crate::PyError::runtime_error(
+            "locals() requires an active frame",
+        ));
+    }
+    let frame_mut = unsafe { &mut *frame };
+    frame_mut.getdictscope()
 }
 
 fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
