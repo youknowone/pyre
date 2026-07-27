@@ -478,8 +478,7 @@ pub unsafe fn w_str_is_ascii(obj: PyObjectRef) -> bool {
 unsafe fn w_str_compute_index_storage(obj: PyObjectRef) -> *mut crate::rutf8::Utf8IndexStorage {
     unsafe {
         let str_obj = obj as *mut W_UnicodeObject;
-        let storage =
-            crate::rutf8::create_utf8_index_storage((*(*str_obj).value).as_bytes(), (*str_obj).len);
+        let storage = crate::rutf8::create_utf8_index_storage(&*(*str_obj).value, (*str_obj).len);
         let tid = if crate::gc_hook::try_gc_owns_object(obj as *mut u8) {
             utf8_index_gc_type_id()
         } else {
@@ -509,7 +508,9 @@ unsafe fn w_str_get_index_storage(obj: PyObjectRef) -> *mut crate::rutf8::Utf8In
 }
 
 /// `W_UnicodeObject._index_to_byte` (`unicodeobject.py:1251`) — the byte offset
-/// of code point `index`, which must be below the code point count.
+/// of code point `index`, which must not exceed the code point count.  The
+/// count itself resolves to the end of the buffer, which is what a `start` or
+/// `end` bound equal to the length asks for.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_UnicodeObject` and `index` must be in range.
@@ -520,16 +521,57 @@ pub unsafe fn w_str_index_to_byte(obj: PyObjectRef, index: usize) -> usize {
         }
         let storage = w_str_get_index_storage(obj);
         crate::rutf8::codepoint_position_at_index(
-            (*(*(obj as *const W_UnicodeObject)).value).as_bytes(),
+            &*(*(obj as *const W_UnicodeObject)).value,
             &*storage,
             index,
         )
     }
 }
 
-/// The code point at `index`, or `None` past the end — the read behind
-/// `_getitem_result` (`unicodeobject.py:1205`): resolve the position through
-/// `_index_to_byte`, then take the one code point that starts there.
+/// `W_UnicodeObject._byte_to_index` (`unicodeobject.py:1263`) — the code point
+/// index whose [`w_str_index_to_byte`] is `bytepos`.
+///
+/// Logarithmic in the string length, with a constant that is not tiny either,
+/// so callers resolve a byte offset once rather than per code point.
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject` and `bytepos` must be a code
+/// point boundary within it.
+pub unsafe fn w_str_byte_to_index(obj: PyObjectRef, bytepos: usize) -> usize {
+    unsafe {
+        if w_str_is_ascii(obj) {
+            return bytepos;
+        }
+        let storage = w_str_get_index_storage(obj);
+        crate::rutf8::codepoint_index_at_byte_position(
+            &*(*(obj as *const W_UnicodeObject)).value,
+            &*storage,
+            bytepos,
+            w_str_len(obj),
+        )
+    }
+}
+
+/// `W_UnicodeObject._codepoints_in_utf8` (`unicodeobject.py:1257`) — the number
+/// of code points in the byte window `start..end`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject` and `start <= end` must hold.
+pub unsafe fn w_str_codepoints_in_utf8(obj: PyObjectRef, start: usize, end: usize) -> usize {
+    unsafe {
+        if w_str_is_ascii(obj) {
+            return end - start;
+        }
+        crate::rutf8::codepoints_in_utf8(&*(*(obj as *const W_UnicodeObject)).value, start, end)
+    }
+}
+
+/// The code point at `index`, or `None` past the end.
+///
+/// `rutf8.codepoint_at_index` (`rutf8.py:576`) is the read for a non-ASCII
+/// payload; an ASCII one takes `_index_to_byte`'s direct branch
+/// (`unicodeobject.py:1251`), where the code point index is already the byte
+/// offset, and never builds a table.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_UnicodeObject`.
@@ -538,12 +580,14 @@ pub unsafe fn w_str_codepoint_at(obj: PyObjectRef, index: usize) -> Option<CodeP
         if index >= w_str_len(obj) {
             return None;
         }
-        let start = w_str_index_to_byte(obj, index);
         let value = &*(*(obj as *const W_UnicodeObject)).value;
-        let end = crate::rutf8::next_codepoint_pos(value.as_bytes(), start);
-        value
-            .get(start..end)
-            .and_then(|one| one.code_points().next())
+        if w_str_is_ascii(obj) {
+            return value
+                .get(index..index + 1)
+                .and_then(|one| one.code_points().next());
+        }
+        let storage = w_str_get_index_storage(obj);
+        Some(crate::rutf8::codepoint_at_index(value, &*storage, index))
     }
 }
 

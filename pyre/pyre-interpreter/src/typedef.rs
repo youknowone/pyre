@@ -5356,7 +5356,8 @@ fn init_str_type(ns: PyObjectRef) {
 
                     let x = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
                     let y = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
-                    if x.code_points().count() != y.code_points().count() {
+                    if unsafe { pyre_object::w_str_len(args[0]) != pyre_object::w_str_len(args[1]) }
+                    {
                         return Err(crate::PyError::value_error(
                             "the first two maketrans arguments must have equal length",
                         ));

@@ -1097,8 +1097,7 @@ pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "startswith", 1)?;
     arity_at_most(args, "startswith", 3)?;
-    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-    let Some(slice) = str_slice_args(s, args)? else {
+    let Some(slice) = str_slice_args(args[0], args)? else {
         return validate_prefix_arg(args[1], "startswith").map(|()| w_bool_from(false));
     };
     str_prefix_match(slice, args[1], "startswith", true).map(w_bool_from)
@@ -1107,8 +1106,7 @@ pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "endswith", 1)?;
     arity_at_most(args, "endswith", 3)?;
-    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-    let Some(slice) = str_slice_args(s, args)? else {
+    let Some(slice) = str_slice_args(args[0], args)? else {
         return validate_prefix_arg(args[1], "endswith").map(|()| w_bool_from(false));
     };
     str_prefix_match(slice, args[1], "endswith", false).map(w_bool_from)
@@ -1126,11 +1124,12 @@ pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// it is short of the end. `None` signals the resulting window is inverted,
 /// for which the match is always `False` — even for an empty needle, which is
 /// why `'abc'.startswith('', 5, 10)` and `''.endswith('', 1, 0)` are `False`.
-fn str_slice_args<'a>(
-    s: &'a Wtf8,
+fn str_slice_args(
+    obj: pyre_object::PyObjectRef,
     args: &[pyre_object::PyObjectRef],
-) -> Result<Option<&'a Wtf8>, crate::PyError> {
-    let char_len = s.code_points().count() as i64;
+) -> Result<Option<&'static Wtf8>, crate::PyError> {
+    let s = unsafe { pyre_object::w_str_get_wtf8(obj) };
+    let char_len = unsafe { pyre_object::w_str_len(obj) } as i64;
     // `None` bounds mean "not provided" (start -> 0, end -> len).
     let start = if args.len() >= 3 && !unsafe { pyre_object::is_none(args[2]) } {
         crate::sliceobject::adapt_lower_bound(char_len, args[2])?
@@ -1143,21 +1142,16 @@ fn str_slice_args<'a>(
         char_len
     };
     let bytes = s.as_bytes();
-    let index_to_byte = |cp: i64| {
-        s.code_point_indices()
-            .nth(cp as usize)
-            .map_or(bytes.len(), |(i, _)| i)
-    };
     let mut end_index = bytes.len();
     if end < char_len {
-        end_index = index_to_byte(end);
+        end_index = unsafe { pyre_object::w_str_index_to_byte(obj, end as usize) };
     }
     let mut start_index = 0usize;
     if start > 0 {
         start_index = if start > char_len {
             end_index + 1
         } else {
-            index_to_byte(start)
+            unsafe { pyre_object::w_str_index_to_byte(obj, start as usize) }
         };
     }
     if start_index > end_index {
@@ -1290,10 +1284,10 @@ pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// `None` when the codepoint window is empty because `start` is past the end
 /// or past `end` (the search-miss case shared by count).
 fn wtf8_idx_window(
-    s: &Wtf8,
+    obj: PyObjectRef,
     args: &[PyObjectRef],
 ) -> Result<Option<(usize, usize)>, crate::PyError> {
-    let cp_len = s.code_points().count() as i64;
+    let cp_len = unsafe { pyre_object::w_str_len(obj) } as i64;
     let w_start = if args.len() >= 3 { args[2] } else { w_none() };
     let w_end = if args.len() >= 4 { args[3] } else { w_none() };
     let (start, end) = crate::sliceobject::unwrap_start_stop(cp_len, w_start, w_end)?;
@@ -1304,14 +1298,8 @@ fn wtf8_idx_window(
     if start > end {
         return Ok(None);
     }
-    let byte_start = s
-        .code_point_indices()
-        .nth(start as usize)
-        .map_or(s.len(), |(i, _)| i);
-    let byte_end = s
-        .code_point_indices()
-        .nth(end as usize)
-        .map_or(s.len(), |(i, _)| i);
+    let byte_start = unsafe { pyre_object::w_str_index_to_byte(obj, start as usize) };
+    let byte_end = unsafe { pyre_object::w_str_index_to_byte(obj, end as usize) };
     Ok(Some((byte_start, byte_end)))
 }
 
@@ -4104,7 +4092,7 @@ pub fn str_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     arity_exact(args, "str.zfill", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?.max(0) as usize;
-    let len = s.code_points().count();
+    let len = unsafe { pyre_object::w_str_len(args[0]) };
     if len >= width {
         return Ok(str_result_unchanged(args[0]));
     }
@@ -4674,9 +4662,21 @@ fn rstring_search_normal(
 /// scanning over the WTF-8 bytes. PyPy's `unicodeobject.py:1116` delegates
 /// to `_utf8.count`; the RPython translation path for non-host strings is
 /// `rstring.py:_search_normal(..., SEARCH_COUNT)`.
+///
+/// The empty needle is answered here rather than through that path. Any
+/// other needle is a whole encoded sequence, so counting matches over bytes
+/// and counting them over code points give the same number; the empty
+/// needle alone degenerates to `end - start + 1` (`rstring.py:836`), which
+/// is a length, and the bounds `descr_count` hands down are byte offsets
+/// (`unicodeobject.py:1322` says so). PyPy therefore reports the byte
+/// length plus one for a non-ASCII receiver: `"\xe9\xe8\xe9\xe8\xe9"
+/// .count("")` is 11 there against 6 in 3.14. `descr_find` and its
+/// siblings escape this because `_unwrap_and_search` maps the byte result
+/// back with `_byte_to_index`, a step a count has nowhere to put. 3.14
+/// counts code points, so that is what this counts.
 fn wtf8_count(haystack: &Wtf8, needle: &Wtf8) -> usize {
     if needle.is_empty() {
-        return haystack.code_points().count() + 1;
+        return pyre_object::rutf8::codepoints_in_utf8(haystack, 0, haystack.len()) + 1;
     }
     rstring_search_normal(
         haystack.as_bytes(),
@@ -4719,31 +4719,30 @@ fn str_unwrap_and_search(
     args: &[PyObjectRef],
     forward: bool,
 ) -> Result<Option<i64>, crate::PyError> {
-    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
+    let obj = args[0];
+    let s = unsafe { pyre_object::w_str_get_wtf8(obj) };
     let sub = unsafe { pyre_object::w_str_get_wtf8(args[1]) }.as_bytes();
     let h = s.as_bytes();
-    // Byte offset of each codepoint, with the trailing length appended,
-    // so `cp_offsets[i]` is `_index_to_byte(i)` and a byte offset maps
-    // back via its position.
-    let mut cp_offsets: Vec<usize> = s.code_point_indices().map(|(i, _)| i).collect();
-    cp_offsets.push(h.len());
-    let length = (cp_offsets.len() - 1) as i64;
+    let length = unsafe { pyre_object::w_str_len(obj) } as i64;
 
     let w_start = if args.len() >= 3 { args[2] } else { w_none() };
     let w_end = if args.len() >= 4 { args[3] } else { w_none() };
     let (start, end) = crate::sliceobject::unwrap_start_stop(length, w_start, w_end)?;
 
+    // `_search` (`unicodeobject.py:1290`): the two code point bounds become
+    // byte offsets through `_index_to_byte`, and the byte offset the search
+    // lands on comes back through `_byte_to_index`.
     let start_index = if start == 0 {
         0
     } else if start > length {
         return Ok(None);
     } else {
-        cp_offsets[start as usize]
+        unsafe { pyre_object::w_str_index_to_byte(obj, start as usize) }
     };
     let end_index = if end >= length {
         h.len()
     } else {
-        cp_offsets[end as usize]
+        unsafe { pyre_object::w_str_index_to_byte(obj, end as usize) }
     };
     if start_index > end_index {
         return Ok(None);
@@ -4754,7 +4753,7 @@ fn str_unwrap_and_search(
     } else {
         wtf8_rfind_bounded(h, sub, start_index, end_index)
     };
-    Ok(res_index.and_then(|ri| cp_offsets.iter().position(|&o| o == ri).map(|i| i as i64)))
+    Ok(res_index.map(|ri| unsafe { pyre_object::w_str_byte_to_index(obj, ri) } as i64))
 }
 
 /// PyPy: unicodeobject.py descr_count
@@ -4766,7 +4765,7 @@ pub fn str_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // start / end arguments bound the count window over the code points.
     let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
     let sub = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
-    let Some((byte_start, byte_end)) = wtf8_idx_window(s, args)? else {
+    let Some((byte_start, byte_end)) = wtf8_idx_window(args[0], args)? else {
         return Ok(w_int_new(0));
     };
     let window = rustpython_wtf8::Wtf8::from_bytes(&s.as_bytes()[byte_start..byte_end])
@@ -4870,7 +4869,7 @@ pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?.max(0) as usize;
     let fillchar = pad_fillchar(args, "center")?;
-    let s_len = s.code_points().count();
+    let s_len = unsafe { pyre_object::w_str_len(args[0]) };
     if s_len >= width {
         return Ok(str_result_unchanged(args[0]));
     }
@@ -4891,7 +4890,7 @@ pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?.max(0) as usize;
     let fillchar = pad_fillchar(args, "ljust")?;
-    let s_len = s.code_points().count();
+    let s_len = unsafe { pyre_object::w_str_len(args[0]) };
     if s_len >= width {
         return Ok(str_result_unchanged(args[0]));
     }
@@ -4907,7 +4906,7 @@ pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?.max(0) as usize;
     let fillchar = pad_fillchar(args, "rjust")?;
-    let s_len = s.code_points().count();
+    let s_len = unsafe { pyre_object::w_str_len(args[0]) };
     if s_len >= width {
         return Ok(str_result_unchanged(args[0]));
     }
