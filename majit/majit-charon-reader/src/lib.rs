@@ -49,7 +49,7 @@ pub struct Llbc {
     /// and any `.field` projection on it panics in the annotator
     /// (`annotator/unaryop.rs:3587`).
     dedup_adt: Vec<(u64, u64)>,
-    /// `dedup_id → body Value` index built from every inline
+    /// `dedup_id → body` index built from every inline
     /// `HashConsedValue: [id, body]` occurrence in the raw LLBC JSON.
     /// Sorted by `dedup_id` for binary search.  Populated once at
     /// parse time.
@@ -63,7 +63,35 @@ pub struct Llbc {
     /// fall back to `Ref` and downstream callers cannot distinguish
     /// `i64`-returning helpers from pointer-returning ones, defeating
     /// `fn_return_types`-based type checks.
-    dedup_body: Vec<(u64, serde_json::Value)>,
+    dedup_body: Vec<(u64, DedupBody)>,
+}
+
+/// One hash-consed type body, kept as its raw JSON text and exploded to a
+/// [`serde_json::Value`] only on first access.
+///
+/// The corpus holds ~208 k of these across the three pyre artefacts —
+/// 66 MB of JSON that costs 1.60 GB as `Value` trees (21.4× measured),
+/// while the consumers (`front::mir`, `front::result_exc`,
+/// `front::option_try`) reach only the ids their lowered functions
+/// mention.  Parsing on demand keeps the untouched majority at raw size.
+#[derive(Debug)]
+struct DedupBody {
+    raw: Box<serde_json::value::RawValue>,
+    parsed: std::sync::OnceLock<serde_json::Value>,
+}
+
+impl DedupBody {
+    fn get(&self) -> Option<&serde_json::Value> {
+        // A body that fails to re-parse cannot be projected by any
+        // consumer, and every one of them already treats a missing id as
+        // "not resolvable" — so a parse failure degrades to the same
+        // `None` rather than aborting the load.
+        if self.parsed.get().is_none() {
+            let value = serde_json::from_str::<serde_json::Value>(self.raw.get()).ok()?;
+            let _ = self.parsed.set(value);
+        }
+        self.parsed.get()
+    }
 }
 
 impl Llbc {
@@ -79,14 +107,14 @@ impl Llbc {
         // `serde_json::Value` of the whole document (which costs
         // ~26× the input bytes as an exploded node tree):
         //   1. `collect_dedup_bodies` scans the raw bytes for inline
-        //      `"HashConsedValue":[id, body]` occurrences, parsing only
-        //      each small `body` and discarding the rest.
+        //      `"HashConsedValue":[id, body]` occurrences, keeping only
+        //      each small `body`'s raw text and discarding the rest.
         //   2. `from_slice` streams the bytes straight into the typed
         //      `LlbcFile` without the intermediate Value.
         // Peak settles at the larger of {bytes + dedup bodies} and
         // {bytes + LlbcFile}.
         let mut dedup_adt: Vec<(u64, u64)> = Vec::new();
-        let mut dedup_body: Vec<(u64, serde_json::Value)> = Vec::new();
+        let mut dedup_body: Vec<(u64, DedupBody)> = Vec::new();
         collect_dedup_bodies(bytes, &mut dedup_adt, &mut dedup_body);
         dedup_adt.sort_by_key(|&(id, _)| id);
         dedup_adt.dedup_by_key(|p| p.0);
@@ -119,10 +147,8 @@ impl Llbc {
     /// this LLBC.  See the [`Self::dedup_body`] field doc for
     /// context.
     pub fn dedup_body(&self, id: u64) -> Option<&serde_json::Value> {
-        self.dedup_body
-            .binary_search_by_key(&id, |p| p.0)
-            .ok()
-            .map(|i| &self.dedup_body[i].1)
+        let i = self.dedup_body.binary_search_by_key(&id, |p| p.0).ok()?;
+        self.dedup_body[i].1.get()
     }
 
     /// Look up a local-crate function whose name ends with `::<name>`.
@@ -248,7 +274,7 @@ impl Llbc {
 fn collect_dedup_bodies(
     bytes: &[u8],
     adt: &mut Vec<(u64, u64)>,
-    bodies: &mut Vec<(u64, serde_json::Value)>,
+    bodies: &mut Vec<(u64, DedupBody)>,
 ) {
     // The artefact is UTF-8 JSON; on the off chance it is not, there are
     // no HashConsedValue entries to find and the typed parse will fail
@@ -264,12 +290,18 @@ fn collect_dedup_bodies(
         // exactly that one value (the deserializer stops at the array's
         // close, ignoring the trailing document).
         let mut de = serde_json::Deserializer::from_slice(&bytes[val_start..]);
-        if let Ok((id, body)) = <(u64, serde_json::Value)>::deserialize(&mut de) {
+        if let Ok((id, raw)) = <(u64, Box<serde_json::value::RawValue>)>::deserialize(&mut de) {
             if seen.insert(id) {
-                if let Some(def_id) = adt_def_id_from_ty_body(&body) {
+                if let Some(def_id) = adt_def_id_from_ty_body(&raw) {
                     adt.push((id, def_id));
                 }
-                bodies.push((id, body));
+                bodies.push((
+                    id,
+                    DedupBody {
+                        raw,
+                        parsed: std::sync::OnceLock::new(),
+                    },
+                ));
             }
         }
     }
@@ -278,14 +310,28 @@ fn collect_dedup_bodies(
 /// Project a type-expression body to its underlying ADT `def_id`,
 /// when the body has shape `{"Adt": {"id": {"Adt": <def_id>}}}`.
 /// Returns `None` for non-ADT bodies (`Literal`, `Ref`, `Tuple`, …).
-fn adt_def_id_from_ty_body(body: &serde_json::Value) -> Option<u64> {
-    body.as_object()?
-        .get("Adt")?
-        .as_object()?
-        .get("id")?
-        .as_object()?
-        .get("Adt")?
-        .as_u64()
+///
+/// Reads the raw text through a narrow typed projection rather than a
+/// `Value` tree: this runs once per hash-consed id at load time, and
+/// materialising all of them is what the [`DedupBody`] laziness avoids.
+fn adt_def_id_from_ty_body(raw: &serde_json::value::RawValue) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Body {
+        #[serde(rename = "Adt")]
+        adt: Adt,
+    }
+    #[derive(Deserialize)]
+    struct Adt {
+        id: AdtId,
+    }
+    #[derive(Deserialize)]
+    struct AdtId {
+        #[serde(rename = "Adt")]
+        def_id: u64,
+    }
+    serde_json::from_str::<Body>(raw.get())
+        .ok()
+        .map(|b| b.adt.id.def_id)
 }
 
 /// Errors produced when loading / parsing a `.llbc` artefact.
