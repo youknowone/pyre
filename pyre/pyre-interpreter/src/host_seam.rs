@@ -465,6 +465,9 @@ pub fn getenv(name: &[u8]) -> SeamResult<Option<Vec<u8>>> {
 /// caller above it.
 #[majit_macros::dont_look_inside]
 pub fn emit_stdout(bytes: &[u8]) {
+    if crate::print_hook_emit_bytes(bytes) {
+        return;
+    }
     #[cfg(not(feature = "sandbox"))]
     {
         use std::io::Write;
@@ -484,6 +487,9 @@ pub fn emit_stdout(bytes: &[u8]) {
 /// `warn_category_w` liftable.
 #[majit_macros::dont_look_inside]
 pub fn emit_stderr(bytes: &[u8]) {
+    if crate::stderr_hook_emit(bytes) {
+        return;
+    }
     #[cfg(not(feature = "sandbox"))]
     {
         use std::io::Write;

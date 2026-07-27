@@ -2404,17 +2404,21 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
                 let (encoding, _) = live_stdio_encoding_errors("stderr", "backslashreplace");
                 let bytes =
                     crate::type_methods::encode_object(s_obj, &encoding, "backslashreplace")?;
-                // Under sandbox fd 1 is the marshalling pipe, so a raw write
-                // would corrupt the protocol: route through ll_os_write(2,…)
-                // and let the controller relay it to its own stderr.
-                #[cfg(not(feature = "sandbox"))]
-                {
-                    use std::io::Write;
-                    let _ = std::io::stderr().write_all(&bytes);
+                // An embedder with no fd 2 (wasm32) takes the bytes through
+                // its hook; otherwise fall through to the descriptor.
+                if !crate::stderr_hook_emit(&bytes) {
+                    // Under sandbox fd 1 is the marshalling pipe, so a raw write
+                    // would corrupt the protocol: route through ll_os_write(2,…)
+                    // and let the controller relay it to its own stderr.
+                    #[cfg(not(feature = "sandbox"))]
+                    {
+                        use std::io::Write;
+                        let _ = std::io::stderr().write_all(&bytes);
+                    }
+                    #[cfg(feature = "sandbox")]
+                    crate::host_seam::ops::write(2, &bytes)
+                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 }
-                #[cfg(feature = "sandbox")]
-                crate::host_seam::ops::write(2, &bytes)
-                    .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));
             }
             Ok(w_int_new(0))
@@ -2424,14 +2428,19 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
             if let Some(s_obj) = pick_str(args) {
                 let (encoding, errors) = live_stdio_encoding_errors("stdout", "strict");
                 let bytes = crate::type_methods::encode_object(s_obj, &encoding, &errors)?;
-                #[cfg(not(feature = "sandbox"))]
-                {
-                    use std::io::Write;
-                    let _ = std::io::stdout().write_all(&bytes);
+                // Same seam `print` rides, so an embedder that captures stdout
+                // (wasm32, which has no fd 1) sees `sys.stdout.write` too and
+                // the two stay in order.
+                if !crate::print_hook_emit(&String::from_utf8_lossy(&bytes)) {
+                    #[cfg(not(feature = "sandbox"))]
+                    {
+                        use std::io::Write;
+                        let _ = std::io::stdout().write_all(&bytes);
+                    }
+                    #[cfg(feature = "sandbox")]
+                    crate::host_seam::ops::write(1, &bytes)
+                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 }
-                #[cfg(feature = "sandbox")]
-                crate::host_seam::ops::write(1, &bytes)
-                    .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));
             }
             Ok(w_int_new(0))

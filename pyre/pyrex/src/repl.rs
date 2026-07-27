@@ -182,7 +182,7 @@ pub fn run_repl(quiet: bool, no_site: bool) {
                 if err.kind == pyre_interpreter::PyErrorKind::SystemExit {
                     // exit()/quit() raise SystemExit; terminate the REPL with
                     // its code instead of printing a traceback and continuing.
-                    pending_exit = Some(crate::system_exit_code(&err));
+                    pending_exit = Some(pyre_interpreter::system_exit_code(&err));
                     break;
                 }
                 pyre_interpreter::eprint_exception(&err, true);

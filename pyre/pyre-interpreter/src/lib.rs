@@ -66,6 +66,9 @@ pub mod host_seam {
     /// only this one.
     #[majit_macros::dont_look_inside]
     pub fn emit_stdout(bytes: &[u8]) {
+        if super::print_hook_emit_bytes(bytes) {
+            return;
+        }
         use std::io::Write;
         let _ = std::io::stdout().write_all(bytes);
     }
@@ -73,6 +76,9 @@ pub mod host_seam {
     /// Emit bytes to the interpreter's stderr (fd 2).
     #[majit_macros::dont_look_inside]
     pub fn emit_stderr(bytes: &[u8]) {
+        if super::stderr_hook_emit(bytes) {
+            return;
+        }
         use std::io::Write;
         let _ = std::io::stderr().write_all(bytes);
     }
@@ -1019,21 +1025,68 @@ pub fn set_print_hook(hook: fn(&str)) {
     PRINT_HOOK.with(|h| *h.borrow_mut() = Some(hook));
 }
 
+/// Offer `s` to the print hook. Returns whether a hook consumed it;
+/// `false` leaves the caller on its own descriptor path.
+pub fn print_hook_emit(s: &str) -> bool {
+    PRINT_HOOK.with(|h| match *h.borrow() {
+        Some(hook) => {
+            hook(s);
+            true
+        }
+        None => false,
+    })
+}
+
+/// [`print_hook_emit`] for callers holding already-encoded bytes.
+pub fn print_hook_emit_bytes(bytes: &[u8]) -> bool {
+    PRINT_HOOK.with(|h| match *h.borrow() {
+        Some(hook) => {
+            hook(&String::from_utf8_lossy(bytes));
+            true
+        }
+        None => false,
+    })
+}
+
 /// Write a string through the print hook (if set) or stdout.
 pub fn print_output(s: &str) {
-    PRINT_HOOK.with(|h| {
-        if let Some(hook) = *h.borrow() {
-            hook(s);
-        } else {
-            // Under sandbox fd 1 is the marshalling pipe, so route program
-            // output through ll_os_write(1,…) for the controller to relay; a
-            // raw `print!` would corrupt the protocol stream.
-            #[cfg(all(unix, feature = "sandbox"))]
-            let _ = crate::host_seam::ops::write(1, s.as_bytes());
-            #[cfg(not(all(unix, feature = "sandbox")))]
-            print!("{s}");
+    if print_hook_emit(s) {
+        return;
+    }
+    // Under sandbox fd 1 is the marshalling pipe, so route program
+    // output through ll_os_write(1,…) for the controller to relay; a
+    // raw `print!` would corrupt the protocol stream.
+    #[cfg(all(unix, feature = "sandbox"))]
+    let _ = crate::host_seam::ops::write(1, s.as_bytes());
+    #[cfg(not(all(unix, feature = "sandbox")))]
+    print!("{s}");
+}
+
+// ── Stderr hook for wasm (fd-2 capture) ──
+thread_local! {
+    static STDERR_HOOK: RefCell<Option<fn(&[u8])>> = RefCell::new(None);
+}
+
+/// Set a hook that receives everything the interpreter writes to fd 2 —
+/// `sys.stderr.write`, tracebacks, warnings — instead of the real descriptor.
+///
+/// The wasm32 target has no descriptors: `std::io::stderr().write_all` there
+/// discards the bytes, so without a hook a traceback simply vanishes. The
+/// stdout twin is [`set_print_hook`].
+pub fn set_stderr_hook(hook: fn(&[u8])) {
+    STDERR_HOOK.with(|h| *h.borrow_mut() = Some(hook));
+}
+
+/// Offer `bytes` to the stderr hook. Returns whether a hook consumed them;
+/// `false` leaves the caller on its own descriptor path.
+pub fn stderr_hook_emit(bytes: &[u8]) -> bool {
+    STDERR_HOOK.with(|h| match *h.borrow() {
+        Some(hook) => {
+            hook(bytes);
+            true
         }
-    });
+        None => false,
+    })
 }
 
 // baseobjspace call helpers are re-exported from `baseobjspace`.

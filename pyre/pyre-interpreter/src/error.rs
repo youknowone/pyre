@@ -2660,11 +2660,14 @@ fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
     if lineno <= 0 || filename.is_empty() || filename.starts_with('<') {
         return None;
     }
-    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+    #[cfg(feature = "host_env")]
     {
         // Read through the import machinery's source provider, not std::fs:
         // under sandbox that routes the read through the seam to the controller
         // VFS, so a guest-controlled traceback path cannot leak a host file.
+        // On wasm32 the provider is the embedder's — the host-FS bridge for the
+        // native-host build, `NullSourceProvider` in a browser — so the same
+        // call renders the offending line wherever one is actually reachable.
         let content =
             crate::importing::read_source_to_string(std::path::Path::new(filename)).ok()?;
         content
@@ -2672,7 +2675,7 @@ fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
             .nth((lineno - 1) as usize)
             .map(|s| s.to_string())
     }
-    #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+    #[cfg(not(feature = "host_env"))]
     {
         // Sandbox-intentional: PyPy's `error.py:150 linecache.getline`
         // also returns silently when the source can't be read; with
@@ -2691,6 +2694,39 @@ pub fn eprint_exception(err: &PyError, include_traceback: bool) {
     let mut buf: Vec<u8> = Vec::new();
     let _ = write_exception(&mut buf, err, include_traceback);
     crate::host_seam::emit_stderr(&buf);
+}
+
+/// `app_main.py:114-129 handle_sys_exit` — `exitcode = e.code`; `None` exits
+/// 0; otherwise `int(exitcode)`, and a value `int()` rejects is printed to
+/// stderr with exit status 1. `e.code` itself is `args[0]` for a 1-arg raise
+/// and the whole args tuple otherwise (`interp_exceptions.py:993-998
+/// W_SystemExit.descr_init`). A `SystemExit` with no object behind it has no
+/// `code` attribute beyond the class default `None`, i.e. a success exit.
+///
+/// Lives here rather than in a launcher because pyre has two of them —
+/// `pyrex` and the wasm `run_python` entry — and both terminate on the same
+/// rule.
+pub fn system_exit_code(err: &PyError) -> i32 {
+    let exc = err.exc_object;
+    if exc.is_null() {
+        return 0;
+    }
+    let code = match crate::getattr(exc, pyre_object::w_str_new("code")) {
+        Ok(c) => c,
+        Err(_) => return 1,
+    };
+    if unsafe { pyre_object::is_none(code) } {
+        return 0;
+    }
+    match crate::builtins::builtin_int(&[code]) {
+        Ok(w_int) => unsafe { pyre_object::w_int_get_value(w_int) as i32 },
+        Err(_) => {
+            let text = unsafe { crate::display::py_str(code) }
+                .unwrap_or_else(|_| "<unprintable>".to_string());
+            crate::host_seam::emit_stderr(format!("{text}\n").as_bytes());
+            1
+        }
+    }
 }
 
 pub fn get_cleared_operation_error(_space: PyObjectRef) -> OperationError {
