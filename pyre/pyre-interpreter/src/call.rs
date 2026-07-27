@@ -624,6 +624,18 @@ fn format_unknown_kwds_err(fname: &str, unmatched: &[Wtf8Buf]) -> String {
     }
 }
 
+#[cold]
+fn raise_if_posonly_kwds(posonly_kwds: &[String], fname: &str) -> Result<(), PyError> {
+    if posonly_kwds.is_empty() {
+        return Ok(());
+    }
+    Err(crate::PyError::type_error(format!(
+        "{}() got some positional-only arguments passed as keyword arguments: '{}'",
+        fname,
+        posonly_kwds.join(", ")
+    )))
+}
+
 fn call_user_function_with_eval(
     frame: &PyFrame,
     callable: PyObjectRef,
@@ -1594,13 +1606,7 @@ pub(crate) fn resolve_kwargs(
     // argument.py:499-500 — ArgErrPosonlyAsKwds, raised after the full
     // keyword scan (and before ArgErrUnknownKwds, since `_match_keywords`
     // raises this before its caller ever checks unmatched kwds).
-    if !posonly_kwds.is_empty() {
-        return Err(crate::PyError::type_error(format!(
-            "{}() got some positional-only arguments passed as keyword arguments: '{}'",
-            fname,
-            posonly_kwds.join(", ")
-        )));
-    }
+    raise_if_posonly_kwds(&posonly_kwds, &fname)?;
 
     // `argument.py:270-271` ArgErrUnknownKwds — unmatched kwargs and no
     // **kwarg to absorb them.
@@ -1863,13 +1869,7 @@ pub(crate) fn bind_kwargs_to_signature(
 
     // argument.py:499-500 — ArgErrPosonlyAsKwds, raised after the full
     // keyword scan and before ArgErrUnknownKwds.
-    if !posonly_kwds.is_empty() {
-        return Err(crate::PyError::type_error(format!(
-            "{}() got some positional-only arguments passed as keyword arguments: '{}'",
-            fname,
-            posonly_kwds.join(", ")
-        )));
-    }
+    raise_if_posonly_kwds(&posonly_kwds, fname)?;
 
     if !unmatched_kw_names.is_empty() {
         // parse_obj (argument.py:377-380) rewrites the unknown-keyword message
@@ -2043,6 +2043,14 @@ pub fn call_with_kwargs(
                     crate::builtin_code_call(code as pyre_object::PyObjectRef, &bound)
                 };
             }
+            let arity = unsafe {
+                crate::builtin_code_get_fast_natural_arity(code as pyre_object::PyObjectRef)
+            };
+            if arity <= 4 && !kwargs.is_empty() {
+                return Err(unsafe {
+                    crate::builtin_code_no_keyword_arguments(code as pyre_object::PyObjectRef)
+                });
+            }
             let mut full_args = pos_args.to_vec();
             if !kwargs.is_empty() {
                 let kwargs_dict = pyre_object::w_dict_new();
@@ -2184,13 +2192,7 @@ pub fn call_with_kwargs(
 
             // argument.py:499-500 — ArgErrPosonlyAsKwds, raised after the
             // full keyword scan and before ArgErrUnknownKwds.
-            if !posonly_kwds.is_empty() {
-                return Err(crate::PyError::type_error(format!(
-                    "{}() got some positional-only arguments passed as keyword arguments: '{}'",
-                    fname,
-                    posonly_kwds.join(", ")
-                )));
-            }
+            raise_if_posonly_kwds(&posonly_kwds, &fname)?;
 
             // `argument.py:270-271` ArgErrUnknownKwds.
             if !unmatched_kw_names.is_empty() {

@@ -3,7 +3,10 @@
 //! PyPy equivalent: `pypy/module/sys/vm.py`.
 
 use crate::executioncontext::ActionFlagOps;
-use crate::{make_builtin_function, make_builtin_function_with_arity, module_ns_store};
+use crate::{
+    make_builtin_function, make_builtin_function_with_arity,
+    make_builtin_function_with_arity_and_maybe_sig, module_ns_store,
+};
 use pyre_object::*;
 use std::sync::OnceLock;
 
@@ -997,7 +1000,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(
         ns,
         "set_int_max_str_digits",
-        make_builtin_function_with_arity(
+        make_builtin_function_with_arity_and_maybe_sig(
             "set_int_max_str_digits",
             |args| {
                 if args.len() != 1 {
@@ -1018,6 +1021,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 Ok(w_none())
             },
             1,
+            Some(crate::gateway::Signature::new(
+                vec!["maxdigits"],
+                None,
+                None,
+                0,
+                0,
+            )),
         ),
     );
     // sys.intern
