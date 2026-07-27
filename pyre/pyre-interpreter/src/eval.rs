@@ -2440,17 +2440,12 @@ impl IterOpcodeHandler for PyFrame {
                 self.locals_w_mut()[tos] = seq_iter;
                 return Ok(());
             }
-            // bytes/bytearray → list of int → seq_iter
+            // bytes/bytearray → seq_iter cursor over the bytes themselves, so
+            // GET_ITER stays O(1) and a bytearray mutated mid-loop is observed
+            // (baseobjspace::iter takes the same shape).
             if pyre_object::bytesobject::is_bytes_like(iter) {
                 let len = pyre_object::bytesobject::bytes_like_len(iter);
-                let mut items = Vec::with_capacity(len);
-                for i in 0..len {
-                    items.push(pyre_object::w_int_new(
-                        pyre_object::bytesobject::bytes_like_getitem(iter, i) as i64,
-                    ));
-                }
-                let list = pyre_object::w_list_new(items);
-                let seq_iter = pyre_object::w_seq_iter_new(list, len);
+                let seq_iter = pyre_object::w_seq_iter_new(iter, len);
                 let tos = self.valuestackdepth - 1;
                 self.locals_w_mut()[tos] = seq_iter;
                 return Ok(());

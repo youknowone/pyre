@@ -1367,6 +1367,8 @@ unsafe fn seq_iter_current_len(seq: PyObjectRef) -> Option<i64> {
             // Code-point count, not byte count (matches the str seq-iter
             // seed in baseobjspace::iter).
             Some(w_str_len(seq) as i64)
+        } else if pyre_object::bytesobject::is_bytes_like(seq) {
+            Some(pyre_object::bytesobject::bytes_like_len(seq) as i64)
         } else if pyre_object::interp_array::is_array(seq) {
             Some(pyre_object::interp_array::w_array_len(seq) as i64)
         } else {
@@ -1450,6 +1452,17 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
                     one.push(cp);
                     w_str_from_wtf8(one)
                 })
+            } else if pyre_object::bytesobject::is_bytes_like(si.seq) {
+                // Each item is the byte's ordinal, read from the live buffer so
+                // a bytearray resized mid-iteration is observed.
+                if (idx as usize) < pyre_object::bytesobject::bytes_like_len(si.seq) {
+                    Some(w_int_new(pyre_object::bytesobject::bytes_like_getitem(
+                        si.seq,
+                        idx as usize,
+                    ) as i64))
+                } else {
+                    None
+                }
             } else if pyre_object::interp_array::is_array(si.seq) {
                 if (idx as usize) < pyre_object::interp_array::w_array_len(si.seq) {
                     Some(pyre_object::interp_array::w_array_unpack_item(

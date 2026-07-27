@@ -11947,15 +11947,15 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
         if pyre_object::bytesobject::is_bytes_like(obj) {
+            // The cursor holds the bytes object itself, as the str arm above
+            // does: `space.iter` builds a sequence iterator over the sequence
+            // (`iterobject.py W_SeqIterObject`), it does not unpack it.  A
+            // materialised int list would make `iter(b)` cost O(len) before a
+            // single item is consumed, freeze a bytearray against
+            // mid-iteration mutation, and report the list rather than the
+            // bytes in `__reduce__`.
             let len = pyre_object::bytesobject::bytes_like_len(obj);
-            let mut items = Vec::with_capacity(len);
-            for i in 0..len {
-                items.push(w_int_new(
-                    pyre_object::bytesobject::bytes_like_getitem(obj, i) as i64,
-                ));
-            }
-            let list = pyre_object::w_list_new(items);
-            return Ok(pyre_object::w_seq_iter_new(list, len));
+            return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
         // dict → iterate over keys (`pypy/objspace/std/dictmultiobject.py
         // W_DictMultiObject.descr_iter` → `W_DictMultiIterKeysObject`).
@@ -12273,6 +12273,15 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     one.push(cp);
                     w_str_from_wtf8(one)
                 })
+            } else if pyre_object::bytesobject::is_bytes_like(seq) {
+                // Each item is the byte's ordinal, read from the live buffer.
+                if (idx as usize) < pyre_object::bytesobject::bytes_like_len(seq) {
+                    Some(w_int_new(
+                        pyre_object::bytesobject::bytes_like_getitem(seq, idx as usize) as i64,
+                    ))
+                } else {
+                    None
+                }
             } else if pyre_object::interp_array::is_array(seq) {
                 if (idx as usize) < pyre_object::interp_array::w_array_len(seq) {
                     Some(pyre_object::interp_array::w_array_unpack_item(
