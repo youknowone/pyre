@@ -130,6 +130,51 @@ not being worked:
 | depth-1 / N-frame (old assumed R5 blocker) | **unobserved, not refuted** | its gate is outside the named-refusal path, so the census cannot see it — no witness either way |
 | `push_and_bump!` omits `jtransform.py:1898` | real gap | **no corpus witness**; prototyped, costs ~25% more vable stores, fixes nothing observed |
 | legs 3/6 + store journals | keep | deleting them re-opens gh#467 double-apply (TL;DR §3) |
+| post-run rebuild decline is still unsound | **narrowed, not closed** | see R8 |
+| the escaping residual does not constrain itself | open question | see R9 |
+
+### R8 — a rebuild that fails AFTER the callee ran (found by Codex parity review, PR #837)
+
+⚠️**This was a live double-apply introduced by R5 and is now narrowed.** The
+call site took `EntryCarrierCall` — which rewinds the outer frame to its CALL —
+whenever `try_commit_midbody_abort` returned false, and "false" included the
+failures that happen *after* `frame.execute_frame` has already run the callee.
+Rewinding then runs the callee body a **second** time.
+`try_commit_entry_carrier_call`'s `walk_end_resume_provable` re-check cannot
+catch it: it samples `FBW_EXECUTED_EFFECT_COUNT`, which is walker-side, and the
+plain interpretation inside `execute_frame` never bumps it.
+
+Fixed by making the decline say which side of `execute_frame` it came from
+(`MidBodyDecline::{BeforeRun, AfterRun}`) and taking the rewinding leg only on
+`BeforeRun`.
+
+⛔**Still open.** `AfterRun` now takes no leg, which drops through to the legacy
+replay — and that re-enters the outer frame at its entry and re-runs the CALL as
+well. The callee's effects are user code, which the store journal does not
+cover, so **neither branch can undo them**. The real close is to make the
+post-run path infallible: each `AfterRun` decline already has a pre-run
+counterpart (`can_flush_walk_end_state_after_outer_call`, the propagate
+licence), so reaching one means a pre-check is too weak, not that another
+fallback is needed. Upstream has no post-execution decline at all —
+`convert_and_run_from_pyjitpl` copies every frame and continues
+(`blackhole.py:1799-1820`). No corpus witness: the census row "rebuild latched
+but declined at the flush" measured 0.
+
+### R9 — the escaping residual is not in its own purity window
+
+Raised as pre-existing by the same review (`residual_call.rs` ↔
+`pyjitpl.py:3373-3390`). `escape_opcode_window_note` is called *after*
+`execute_residual_call` returns, so a residual constrains only the ones that
+FOLLOW it inside the opcode, never itself. The escape resume pc is the escaping
+opcode, so that residual re-runs. Upstream's licence for `resumepc=orgpc` is
+`EF_ELIDABLE_CANNOT_RAISE` on the residual being rewound over
+(`jtransform.py:620-630`) — which is the residual itself, not its predecessors.
+
+Unresolved, deliberately: folding the current residual into its own window would
+turn latches into declines on a path with no measured decline today, and R6
+established the latch itself is orthodox. Needs a witness first — a forcing
+residual that is neither elidable nor loop-invariant and whose re-execution is
+observable.
 
 ### R5 — generalize leg 4, then let legs 3 and 6 become unreachable
 

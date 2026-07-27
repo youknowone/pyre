@@ -611,6 +611,32 @@ fn try_commit_entry_carrier_call(
     Some(call_py_pc)
 }
 
+/// Why a callee rebuild did not commit — and whether the callee body had
+/// already executed when that was decided.
+///
+/// The distinction is load-bearing, not diagnostic.  The caller's fallback is
+/// `EntryCarrierCall`, which rewinds the outer frame to its CALL; taking that
+/// after `frame.execute_frame` has run the callee runs the callee a SECOND
+/// time.  `walk_end_resume_provable` cannot catch it, because the odometer it
+/// samples (`FBW_EXECUTED_EFFECT_COUNT`) is walker-side and the plain
+/// interpretation inside `execute_frame` never bumps it.
+enum MidBodyDecline {
+    /// Refused before the callee ran; none of its effects are applied, so
+    /// rewinding the caller to its CALL is still sound.
+    BeforeRun(&'static str),
+    /// The callee body already ran.  Its effects are applied and there is no
+    /// journal undo for them, so no rewinding leg may be selected.
+    AfterRun(&'static str),
+}
+
+impl MidBodyDecline {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::BeforeRun(reason) | Self::AfterRun(reason) => reason,
+        }
+    }
+}
+
 /// Wrapper that names which narrowing kept a rebuild off leg 4; the reason
 /// otherwise vanishes into the entry-carrier fallback.
 fn try_commit_midbody_abort(
@@ -618,20 +644,22 @@ fn try_commit_midbody_abort(
     cf_addr: usize,
     payload: &crate::jitcode_dispatch::MidBodyPayload,
     words: MidBodyFlushWords,
-) -> bool {
-    match try_commit_midbody_abort_inner(ctx, cf_addr, payload, words) {
-        Ok(()) => true,
-        Err(reason) => {
-            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                eprintln!(
-                    "[fbw-abort-flush] gh#467 callee-rebuild NOT COMMITTED at \
-                     callee_py_pc={} ({reason})",
-                    words.callee_py_pc,
-                );
-            }
-            false
-        }
+) -> Result<(), MidBodyDecline> {
+    let outcome = try_commit_midbody_abort_inner(ctx, cf_addr, payload, words);
+    if let Err(decline) = &outcome
+        && crate::jitcode_dispatch::fbw_debug_abort_enabled()
+    {
+        eprintln!(
+            "[fbw-abort-flush] gh#467 callee-rebuild NOT COMMITTED at callee_py_pc={} ({}){}",
+            words.callee_py_pc,
+            decline.reason(),
+            match decline {
+                MidBodyDecline::AfterRun(_) => " — callee already ran, no rewinding leg eligible",
+                MidBodyDecline::BeforeRun(_) => "",
+            },
+        );
     }
+    outcome
 }
 
 fn try_commit_midbody_abort_inner(
@@ -639,7 +667,7 @@ fn try_commit_midbody_abort_inner(
     cf_addr: usize,
     payload: &crate::jitcode_dispatch::MidBodyPayload,
     words: MidBodyFlushWords,
-) -> Result<(), &'static str> {
+) -> Result<(), MidBodyDecline> {
     // An expression-position call sits on top of operands the payload does not
     // record — it counts only the call's own `[callable, null_or_self, args…]`.
     // The entry fallback's `reconstructed_all_ref_call_stack` is the caller's
@@ -659,11 +687,17 @@ fn try_commit_midbody_abort_inner(
                 .map(|fallback| fallback.call_stack.as_slice())
                 .filter(|full| full.len() == n + payload.call_stack_len)
             else {
-                return Err("expression-position call with no reconstructed stack below it");
+                return Err(MidBodyDecline::BeforeRun(
+                    "expression-position call with no reconstructed stack below it",
+                ));
             };
             &full[..n]
         }
-        None => return Err("caller stack depth does not model this call shape"),
+        None => {
+            return Err(MidBodyDecline::BeforeRun(
+                "caller stack depth does not model this call shape",
+            ));
+        }
     };
     if !crate::state::can_flush_walk_end_state_after_outer_call(
         ctx,
@@ -673,13 +707,15 @@ fn try_commit_midbody_abort_inner(
         payload.call_stack_len,
         below,
     ) {
-        return Err("outer call boundary not flushable");
+        return Err(MidBodyDecline::BeforeRun(
+            "outer call boundary not flushable",
+        ));
     }
     let raw = unsafe {
         pyre_interpreter::w_code_get_ptr(payload.w_code) as *const pyre_interpreter::CodeObject
     };
     if raw.is_null() {
-        return Err("null callee code ptr");
+        return Err(MidBodyDecline::BeforeRun("null callee code ptr"));
     }
     let code = unsafe { &*raw };
     // Only portal trace sites currently carry `_exit_frame_with_exception`
@@ -690,15 +726,17 @@ fn try_commit_midbody_abort_inner(
         && (!code.exceptiontable.is_empty()
             || !midbody_post_marker_is_effect_free(code, words.callee_py_pc))
     {
-        return Err("no propagate licence and callee body can raise");
+        return Err(MidBodyDecline::BeforeRun(
+            "no propagate licence and callee body can raise",
+        ));
     }
     if cf_addr == 0 {
-        return Err("no live caller frame");
+        return Err(MidBodyDecline::BeforeRun("no live caller frame"));
     }
     let ec = unsafe { (*(cf_addr as *const pyre_interpreter::PyFrame)).execution_context }
         as *mut pyre_interpreter::PyExecutionContext;
     if ec.is_null() {
-        return Err("null execution context");
+        return Err(MidBodyDecline::BeforeRun("null execution context"));
     }
     let propagate_allowed = WALK_END_PROPAGATE_ALLOWED.with(|c| c.get());
     let outer = unsafe { &mut *(cf_addr as *mut pyre_interpreter::PyFrame) };
@@ -719,14 +757,18 @@ fn try_commit_midbody_abort_inner(
                 outer.locals_w().as_slice().len(),
                 outer_stack_base,
             ) {
-                return Err("caller handler wants more operands than the call sat on");
+                return Err(MidBodyDecline::BeforeRun(
+                    "caller handler wants more operands than the call sat on",
+                ));
             }
         }
         // G7: materialize every outer local before the rebuilt callee can run.
         // `can_flush_walk_end_state_after_outer_call` already proved all
         // shadow entries sourceable, so no post-effect decline remains.
         if !crate::state::write_back_outer_locals(ctx, cf_addr) {
-            return Err("an outer local is not sourceable");
+            return Err(MidBodyDecline::BeforeRun(
+                "an outer local is not sourceable",
+            ));
         }
     }
     let mut w_code = payload.w_code;
@@ -745,7 +787,7 @@ fn try_commit_midbody_abort_inner(
         pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
     ) {
         Ok(frame) => frame,
-        Err(_) => return Err("callee frame allocation failed"),
+        Err(_) => return Err(MidBodyDecline::BeforeRun("callee frame allocation failed")),
     };
     let mut frame = pyre_interpreter::pyframe::FrameBox::new(frame);
     frame.fix_array_ptrs();
@@ -754,10 +796,12 @@ fn try_commit_midbody_abort_inner(
     let Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(current)) =
         crate::jitcode_dispatch::fbw_abort_carrier_clone()
     else {
-        return Err("carrier is no longer a MidBody");
+        return Err(MidBodyDecline::BeforeRun("carrier is no longer a MidBody"));
     };
     if current.live_locals.len() != code.varnames.len() {
-        return Err("live_locals length does not match varnames");
+        return Err(MidBodyDecline::BeforeRun(
+            "live_locals length does not match varnames",
+        ));
     }
     for slot in &mut frame.locals_w_mut().as_mut_slice()[..code.varnames.len()] {
         *slot = pyre_object::PY_NULL;
@@ -772,7 +816,7 @@ fn try_commit_midbody_abort_inner(
     let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
     for (rel, value) in current.live_stack.iter().enumerate() {
         let crate::state::ConcreteValue::Ref(value) = value else {
-            return Err("live stack slot is not a Ref");
+            return Err(MidBodyDecline::BeforeRun("live stack slot is not a Ref"));
         };
         frame.locals_w_mut().as_mut_slice()[stack_base + rel] = *value;
     }
@@ -798,7 +842,7 @@ fn try_commit_midbody_abort_inner(
                 pyre_object::floatobject::w_float_new(*value)
             }
             Some(crate::state::ConcreteValue::Null | crate::state::ConcreteValue::Bool(_)) => {
-                return Err("live local is Null/Bool");
+                return Err(MidBodyDecline::BeforeRun("live local is Null/Bool"));
             }
         };
     }
@@ -819,10 +863,18 @@ fn try_commit_midbody_abort_inner(
         (n, Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(fresh))) => {
             match fresh.entry_fallback.as_ref() {
                 Some(fallback) if fallback.call_stack.len() >= n => &fallback.call_stack[..n],
-                _ => return Err("entry fallback vanished while the callee ran"),
+                _ => {
+                    return Err(MidBodyDecline::AfterRun(
+                        "entry fallback vanished while the callee ran",
+                    ));
+                }
             }
         }
-        _ => return Err("carrier is no longer a MidBody after the callee ran"),
+        _ => {
+            return Err(MidBodyDecline::AfterRun(
+                "carrier is no longer a MidBody after the callee ran",
+            ));
+        }
     };
     match ran {
         Ok(mut retval) => {
@@ -842,7 +894,9 @@ fn try_commit_midbody_abort_inner(
             ) {
                 Ok(())
             } else {
-                Err("post-call caller flush declined AFTER the callee ran")
+                Err(MidBodyDecline::AfterRun(
+                    "post-call caller flush declined AFTER the callee ran",
+                ))
             }
         }
         Err(mut operr) => {
@@ -852,7 +906,9 @@ fn try_commit_midbody_abort_inner(
             // selected handler onward.
             unsafe { (*ec).sys_exc_value = sys_exc_value_pre };
             if !propagate_allowed {
-                return Err("callee raised and this site has no propagate licence");
+                return Err(MidBodyDecline::AfterRun(
+                    "callee raised and this site has no propagate licence",
+                ));
             }
             let outer = unsafe { &mut *(cf_addr as *mut pyre_interpreter::PyFrame) };
             // The handler unwinds from the operand level the CALL raised at,
@@ -3056,24 +3112,17 @@ fn run_perfn_walk<Sym: WalkSym>(
                 {
                     let rebuilt = match resolve_midbody_flush_words(payload) {
                         Some(words) => {
-                            let ok = try_commit_midbody_abort(ctx, cf_addr, payload, words);
-                            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                                if ok {
-                                    eprintln!(
-                                        "[fbw-abort-flush] gh#467 callee-rebuild COMMIT \
-                                         abort_jit_pc={abort_jit_pc} callee_py_pc={} \
-                                         call_py_pc={} post_call_py_pc={}",
-                                        words.callee_py_pc, words.call_py_pc, words.post_call_py_pc,
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "[fbw-abort-flush] gh#467 callee-rebuild declined at \
-                                         callee_py_pc={}",
-                                        words.callee_py_pc,
-                                    );
-                                }
+                            let outcome = try_commit_midbody_abort(ctx, cf_addr, payload, words);
+                            if outcome.is_ok() && crate::jitcode_dispatch::fbw_debug_abort_enabled()
+                            {
+                                eprintln!(
+                                    "[fbw-abort-flush] gh#467 callee-rebuild COMMIT \
+                                     abort_jit_pc={abort_jit_pc} callee_py_pc={} \
+                                     call_py_pc={} post_call_py_pc={}",
+                                    words.callee_py_pc, words.call_py_pc, words.post_call_py_pc,
+                                );
                             }
-                            ok
+                            outcome
                         }
                         None => {
                             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -3083,32 +3132,61 @@ fn run_perfn_walk<Sym: WalkSym>(
                                      identity or null code ptr)",
                                 );
                             }
-                            false
+                            // Nothing was rebuilt, so nothing of the callee ran.
+                            Err(MidBodyDecline::BeforeRun("unresolved jitcode identity"))
                         }
                     };
-                    if rebuilt {
-                        // This leg resumes INSIDE the rebuilt callee at its
-                        // abort pc — ahead of what the callee applied, not
-                        // behind it.  Nothing re-runs; committing is what
-                        // keeps those effects.
-                        let _ = commit_walk_end(
-                            WalkEndCommitLeg::CalleeRebuild,
-                            WalkEndResume::AfterApplied,
-                        );
-                    } else if let Some(fallback) = payload.entry_fallback.as_ref() {
-                        // The rebuild declined but the entry latch's gate had
-                        // held, so rewinding to the outer CALL is still open.
-                        // Falling through to the legacy replay instead would
-                        // re-apply the non-journaled pre-CALL stores.
-                        committed_entry_carrier_call_py_pc = try_commit_entry_carrier_call(
-                            ctx,
-                            cf_addr,
-                            abort_jit_pc,
-                            payload.outer_jitcode_index,
-                            payload.call_jitcode_pc,
-                            &fallback.call_stack,
-                            fallback.entry_executed_effects,
-                        );
+                    match rebuilt {
+                        Ok(()) => {
+                            // This leg resumes INSIDE the rebuilt callee at its
+                            // abort pc — ahead of what the callee applied, not
+                            // behind it.  Nothing re-runs; committing is what
+                            // keeps those effects.
+                            let _ = commit_walk_end(
+                                WalkEndCommitLeg::CalleeRebuild,
+                                WalkEndResume::AfterApplied,
+                            );
+                        }
+                        Err(MidBodyDecline::BeforeRun(_)) => {
+                            if let Some(fallback) = payload.entry_fallback.as_ref() {
+                                // The rebuild declined before running anything
+                                // and the entry latch's gate had held, so
+                                // rewinding to the outer CALL is still open.
+                                // Falling through to the legacy replay instead
+                                // would re-apply the non-journaled pre-CALL
+                                // stores.
+                                committed_entry_carrier_call_py_pc = try_commit_entry_carrier_call(
+                                    ctx,
+                                    cf_addr,
+                                    abort_jit_pc,
+                                    payload.outer_jitcode_index,
+                                    payload.call_jitcode_pc,
+                                    &fallback.call_stack,
+                                    fallback.entry_executed_effects,
+                                );
+                            }
+                        }
+                        Err(MidBodyDecline::AfterRun(_)) => {
+                            // The callee body already executed.  `EntryCarrierCall`
+                            // rewinds the outer frame to its CALL, which would run
+                            // that body a SECOND time — the gh#467 double-apply.
+                            // Its `walk_end_resume_provable` re-check does not stop
+                            // it: that samples `FBW_EXECUTED_EFFECT_COUNT`, which is
+                            // walker-side, and the plain interpretation inside
+                            // `execute_frame` never bumps it.  So take no leg.
+                            //
+                            // ⚠️This NARROWS the hazard, it does not close it: the
+                            // legacy replay this falls through to re-enters the
+                            // outer frame at its entry and re-runs the CALL too.
+                            // The callee's effects are user code and the store
+                            // journal does not cover them, so neither branch can
+                            // undo them.  Closing it means making the post-run path
+                            // infallible — every one of these declines already has a
+                            // pre-run counterpart (`can_flush_walk_end_state_after_
+                            // outer_call`, the propagate licence), so reaching here
+                            // means a pre-check was too weak, not that a new
+                            // fallback is needed.
+                        }
                     }
                 }
                 None if is_marker_abort => {
