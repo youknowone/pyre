@@ -24,6 +24,15 @@ fn sort_descr_entries_untranslated<T>(entries: &mut [(u32, DescrRef, T)]) {
     }
 }
 
+/// [`sort_descr_entries_untranslated`] for a caller that permutes an index
+/// list instead of the entries themselves.
+#[inline]
+fn sort_descr_entry_indices_untranslated<T>(entries: &[(u32, DescrRef, T)], order: &mut [usize]) {
+    if use_untranslated_heap_ordering() {
+        order.sort_by(|&a, &b| entries[b].1.repr().cmp(&entries[a].1.repr()));
+    }
+}
+
 #[inline]
 fn sort_descr_item_refs_untranslated<T>(entries: &mut [(&DescrRef, T)]) {
     if use_untranslated_heap_ordering() {
@@ -1434,17 +1443,19 @@ impl OptHeap {
     /// PtrInfo cleanup through `invalidate_with_ctx` so the per-pass
     /// "single source of truth" stays in sync after a clean.
     fn clean_caches(&mut self, ctx: &mut OptContext) {
-        let mut field_entries: Vec<_> = self
-            .cached_fields
-            .iter_mut()
-            .map(|(field_idx, descr, cf)| (*field_idx, descr.clone(), cf))
-            .collect();
-        sort_descr_entries_untranslated(&mut field_entries);
-        for (_field_idx, descr, cf) in field_entries {
+        // heap.py:380-381 `if not we_are_translated(): items.sort(key=str,
+        // reverse=True)` — the ordering exists only untranslated, so walk the
+        // cache in place through a permuted index list. Materializing the
+        // entries instead cost a `DescrRef` clone per cached field on every
+        // residual call, which is where clean_caches runs.
+        let mut order: Vec<usize> = (0..self.cached_fields.len()).collect();
+        sort_descr_entry_indices_untranslated(&self.cached_fields, &mut order);
+        for i in order {
+            let (_field_idx, descr, cf) = &mut self.cached_fields[i];
             // heap.py:384: `cf.invalidate(descr)` — purity self-gate
             // inside the method (heap.py:189-194). `_field_idx` unused
             // post-purity-lift; index now recomputed from `descr`.
-            cf.invalidate(&descr, ctx);
+            cf.invalidate(descr, ctx);
         }
         // heap.py:386-389:
         //   for descr, submap in self.cached_arrayitems.iteritems():
