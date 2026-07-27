@@ -1,6 +1,8 @@
 # Walk-end commit contract — convergence roadmap
 
-Status: **R1–R4 landed; R5–R6 open.** This is the authoritative plan for
+Status: **R1–R5 landed; R6 closed as refuted; R7 rejected.** The only
+remaining rows carry named, measured causes and no corpus witness — see
+"Residue" below. This is the authoritative plan for
 retiring the walk-end commit gates in `run_perfn_walk`'s epilogue. It supersedes
 the reasoning in the comments those gates carry, and it records two claims that
 were in the tree and are **false**.
@@ -116,7 +118,18 @@ way. They differ in operand-stack sourcing and in whether any gate ran.
 
 ---
 
-## Open
+## Residue
+
+Nothing here is blocking. R5 landed, R6 is closed as refuted, R7 is rejected.
+What is left is recorded so it is not re-derived, and each row states why it is
+not being worked:
+
+| row | state | why not worked |
+|---|---|---|
+| 3 `getarrayitem_vable_r` anchors | still refused | needs a color-liveness argument, not a measurement |
+| depth-1 / N-frame (old assumed R5 blocker) | never fired | **no corpus witness** — refuted by census |
+| `push_and_bump!` omits `jtransform.py:1898` | real gap | **no corpus witness**; prototyped, costs ~25% more vable stores, fixes nothing observed |
+| legs 3/6 + store journals | keep | deleting them re-opens gh#467 double-apply (TL;DR §3) |
 
 ### R5 — generalize leg 4, then let legs 3 and 6 become unreachable
 
