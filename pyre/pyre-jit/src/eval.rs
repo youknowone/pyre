@@ -5225,12 +5225,12 @@ fn init_callbacks() {
     });
 }
 
-/// Read the call depth from pyre-interpreter's CALL_DEPTH TLS.
-/// Replaces the separate JIT_CALL_DEPTH — single source of truth.
-// dont_look_inside: reads CALL_DEPTH TLS; no registry-resolvable accessor.
+/// Read the Python recursion depth from pyre-interpreter's
+/// PY_RECURSION_DEPTH TLS — the single source of truth for both crates.
+// dont_look_inside: reads a TLS; no registry-resolvable accessor.
 #[majit_macros::dont_look_inside]
 pub(crate) fn call_depth() -> u32 {
-    pyre_interpreter::call::call_depth()
+    pyre_interpreter::call::py_recursion_depth()
 }
 
 /// RPython green_key = (pycode, next_instr).
@@ -5246,8 +5246,8 @@ pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
     majit_ir::pypyjit_greenkey_uhash(pc, false, code_ptr as u64)
 }
 
-// JIT_CALL_DEPTH removed — pyre-interpreter::call::CALL_DEPTH is the single
-// source of truth. call_depth() reads it. No more Box<dyn Any> allocation.
+// JIT_CALL_DEPTH removed — pyre-interpreter::call::PY_RECURSION_DEPTH is the
+// single source of truth. call_depth() reads it.
 
 /// RPython compile.py:204-207 (record_loop_or_bridge) parity:
 /// Register the compiled artifact's invalidation flag with all quasi-immutable
@@ -6706,6 +6706,12 @@ fn unsupported_jit_shape_uncached(code: &pyre_interpreter::CodeObject) -> Unsupp
 }
 
 fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
+    // The JIT-side frame-activation seam: a frame that runs entirely as
+    // compiled code returns from `try_function_entry_jit` without reaching an
+    // eval loop, so the recursion budget is spent here, where every JIT route
+    // through the frame — compiled, JIT eval loop, or declined to the plain
+    // evaluator — passes exactly once.
+    let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame);
     // Phase B of GC init: register root walkers that reference
     // interpreter state.  Safe here — the interpreter is initialized.
     // Phase A (GC build + backend install) ran at boot in init_jit_hooks.
@@ -7076,6 +7082,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // FBW FOR_ITER Option-C guard snapshots this around a residual call to
     // detect a body effect that ran through user code.
     pyre_interpreter::call::bump_frame_entry_count();
+    // Spend one unit of the recursion budget on this frame's activation, in
+    // case this loop was reached without going through `eval_with_jit_inner`.
+    // A frame the wrapper already accounted spends nothing here.
+    let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame_root.frame());
     // Count this eval-loop activation for the GC safepoint's
     // at_outermost_activation gate (gh#393). The gate allows collection
     // at depth ≤ 2 (module + one called function) where the CALL opcode

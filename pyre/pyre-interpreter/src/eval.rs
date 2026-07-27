@@ -1824,6 +1824,11 @@ pub(crate) fn eval_frame_plain_with_resume(
     operr: Option<PyError>,
     throw_args: Option<([PyObjectRef; 3], usize)>,
 ) -> PyResult {
+    // Spend one unit of the recursion budget on this frame's activation and
+    // give it back when it returns.  Every Python frame costs the same unit —
+    // module body, called function, `exec`ed code, resumed generator — so the
+    // depth `stack_check()` reads is the number of live Python frames.
+    let _recursion_depth = crate::call::enter_recursive_frame(frame);
     frame.fix_array_ptrs();
     if frame.execution_context.is_null() {
         match prepare_frame_resume(frame, w_inputvalue, operr, throw_args)? {

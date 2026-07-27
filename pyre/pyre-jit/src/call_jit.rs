@@ -417,7 +417,7 @@ extern "C" fn jit_call_user_function_from_frame(
     let frame = unsafe { &*(frame_ptr as *const PyFrame) };
     let args =
         unsafe { std::slice::from_raw_parts(args_ptr as *const PyObjectRef, nargs as usize) };
-    // Depth tracked by pyre_interpreter::call::CALL_DEPTH (call_user_function path).
+    // Depth tracked by pyre_interpreter::call::PY_RECURSION_DEPTH (eval-loop entry).
     match pyre_interpreter::call::call_user_function(frame, callable as PyObjectRef, args) {
         Ok(result) => result as i64,
         Err(mut err) => {

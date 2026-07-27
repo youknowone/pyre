@@ -35,7 +35,7 @@
 //! `rpython/jit/backend/x86/assembler.py:1080
 //! _call_header_with_stack_check`).
 
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering};
 
 use pyre_object::interp_exceptions::{ExcKind, w_exception_new};
 
@@ -492,33 +492,43 @@ pub extern "C" fn pyre_stack_criticalcode_stop() {
     TL_REPORT_ERROR.with(|c| c.set(1));
 }
 
+/// Largest recursion limit ever requested on this process.  The native byte
+/// budget is reserved from it, never from a lowered limit.
+static NATIVE_STACK_RESERVE: AtomicI32 = AtomicI32::new(DEFAULT_RECURSION_LIMIT);
+
 /// pypy/module/sys/vm.py:63 `setrecursionlimit`, with Python 3.14's
 /// logical-depth rejection before PyPy's byte-budget update.  The check must
-/// use Python call depth: native Rust frame size is unrelated to CPython's
-/// `py_recursion_remaining` and cannot decide whether a Python limit is below
-/// the current interpreter depth.
+/// use Python frame depth: native Rust frame size is unrelated to the Python
+/// recursion budget and cannot decide whether a limit is below the current
+/// interpreter depth.
 pub fn set_recursion_limit(new_limit: i32) -> Result<(), PyError> {
     if new_limit <= 0 {
         return Err(PyError::value_error("recursion limit must be positive"));
     }
     // pypy/module/sys/vm.py:86-87 silent upper bound.
     let limit = new_limit.min(MAX_RECURSION_LIMIT);
-    let old_limit = get_recursion_limit();
-    // CPython 3.14 Python/sysmodule.c `sys_setrecursionlimit_impl`: reject
+    // Python/sysmodule.c `sys_setrecursionlimit_impl`: reject
     // when the current Python recursion depth has already reached the limit.
-    let depth = crate::call::call_depth();
+    let depth = crate::call::py_recursion_depth();
     if depth >= limit as u32 {
         return Err(PyError::recursion_error(format!(
             "cannot set the recursion limit to {limit} at the recursion depth {depth}: the limit is too low"
         )));
     }
 
-    // CPython 3.14 keeps Python recursion accounting separate from native
-    // stack protection.  Preserve PyPy's native byte guard as a high-water
-    // allocation: lowering the Python limit must not shrink it underneath
-    // the already-running Rust interpreter stack.  Logical depth below is
-    // what enforces the newly lowered Python limit.
-    pyre_stack_set_length_fraction(old_limit.max(limit) as f64 * 0.001);
+    // Python 3.14 keeps Python recursion accounting separate from native stack
+    // protection.  Preserve PyPy's native byte guard as a high-water
+    // allocation: lowering the Python limit must not shrink it underneath the
+    // already-running Rust interpreter stack.  Logical depth below is what
+    // enforces the newly lowered Python limit.  The mark is the largest limit
+    // ever requested, not the previous one — `setrecursionlimit(n)` called
+    // twice would otherwise collapse the reservation from the startup 5000 to
+    // `n` on the second call, and the native guard would then cut a recursion
+    // short far above the Python limit.
+    let reserved = NATIVE_STACK_RESERVE
+        .fetch_max(limit, Ordering::Relaxed)
+        .max(limit);
+    pyre_stack_set_length_fraction(reserved as f64 * 0.001);
     crate::module::sys::state::set_recursion_limit(limit);
     majit_gc::shadow_stack::increase_root_stack_depth((limit as f64 * 0.001 * 163840.0) as usize);
     Ok(())
@@ -548,7 +558,7 @@ pub fn stack_check() -> Result<(), PyError> {
     // CPython 3.14 checks `py_recursion_remaining`, i.e. Python interpreter
     // depth, independently of native stack protection.  pyre's matching
     // counter is bumped around every user-function call.
-    if crate::call::call_depth() >= get_recursion_limit() as u32 {
+    if crate::call::py_recursion_depth() >= get_recursion_limit() as u32 {
         return Err(PyError::recursion_error("maximum recursion depth exceeded"));
     }
     let current = current_sp();
@@ -629,6 +639,7 @@ mod tests {
         PYRE_STACKTOOBIG.report_error.store(1, Ordering::Relaxed);
         TL_REPORT_ERROR.with(|c| c.set(1));
         crate::module::sys::state::reset_recursion_limit_for_tests();
+        NATIVE_STACK_RESERVE.store(DEFAULT_RECURSION_LIMIT, Ordering::Relaxed);
         clear_jit_pending_exception();
     }
 

@@ -3067,7 +3067,7 @@ fn classify_unported_reason(reason: &str) -> &'static str {
             || reason.contains("TL_")
             || reason.contains("TYPEOBJECT_CACHE")
             || reason.contains("W_TYPE_TYPEOBJECT")
-            || reason.contains("CALL_DEPTH")
+            || reason.contains("PY_RECURSION_DEPTH")
             || reason.contains("PENDING_EXCEPTION")
         {
             "FRONTEND-THREADLOCAL/ONCELOCK (threadlocalref_get)"
