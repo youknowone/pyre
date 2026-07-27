@@ -15,9 +15,6 @@ import sys
 import tempfile
 import types
 
-import_helper.import_module("_testmultiphase")
-
-
 BUILTINS = types.SimpleNamespace()
 BUILTINS.good_name = None
 BUILTINS.bad_name = None
