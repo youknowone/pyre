@@ -3605,22 +3605,22 @@ fn run_perfn_walk<Sym: WalkSym>(
                 &walk_result,
                 Err(crate::jitcode_dispatch::DispatchError::TraceTooLong { .. })
             ) && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::TraceTooLong);
-        let force_blackhole_adopted =
-            matches!(
-                &walk_result,
-                Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
-            ) && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::VableEscape);
+        let vable_escaped = matches!(
+            &walk_result,
+            Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
+        );
+        let force_blackhole_adopted = vable_escaped
+            && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::VableEscape);
+        let mut escape_pc_adopted = false;
         if trace_too_long_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] adopted ABORT_TOO_LONG forward resume");
         }
         if !force_blackhole_adopted
-            && matches!(
-                &walk_result,
-                Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
-            )
+            && vable_escaped
             && let Some((resume_py_pc, escape_kind)) =
                 crate::jitcode_dispatch::take_committed_frame_escape_pc()
         {
+            escape_pc_adopted = true;
             // BOTH flushes inside `flush_active_frame_escape` rewind: they take
             // the same `py_pc` and the same `last_instr = pc - 1`, so the
             // escaping opcode re-runs either way.  They differ in whether the
@@ -3670,6 +3670,21 @@ fn run_perfn_walk<Sym: WalkSym>(
                     );
                 }
             }
+        }
+        // The force arm withdrew its commit and DEFERRED the frame restore to
+        // here.  Neither continuation that keeps the flushed frame ran, so the
+        // walk falls back to replaying the traced region from its entry: put
+        // the pre-flush locals / operand stack / resume coordinate back so the
+        // replay re-derives them instead of compounding onto the walk's
+        // mid-region values.  When a blackhole terminal or a committed escape
+        // pc DID take over, the flush stands — `virtualizable.py:101-138
+        // write_boxes` has no undo once the vable is forced, and the resumed
+        // interpreter reads its fastlocals straight out of that array.
+        if crate::jitcode_dispatch::take_escape_flush_undo_pending()
+            && !force_blackhole_adopted
+            && !escape_pc_adopted
+        {
+            crate::jitcode_dispatch::restore_escape_flush_undo();
         }
         let call_forward_abort = match &walk_result {
             Err(crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { pc }) => {

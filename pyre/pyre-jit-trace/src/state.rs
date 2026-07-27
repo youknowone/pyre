@@ -4779,9 +4779,13 @@ pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -> bool
     let base = info.num_static_extra_boxes;
     // Validation pass first: it allocates nothing, so a missing entry leaves
     // the frame untouched (same all-or-nothing discipline as the full flush).
+    // `Value::Void` is the shadow's "no concrete half" sentinel, not a NULL
+    // local: writing it back would box to `PY_NULL` and DESTROY the slot the
+    // walk is holding in a register.  Decline instead.
     for abs in 0..nlocals {
-        if ctx.virtualizable_entry_at(base + abs).is_none() {
-            return false;
+        match ctx.virtualizable_entry_at(base + abs) {
+            Some((_, Value::Void)) | None => return false,
+            Some(_) => {}
         }
     }
     let frame_ptr = frame as *const u8;

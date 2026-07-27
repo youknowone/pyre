@@ -42,10 +42,16 @@ thread_local! {
     /// Pre-flush frame state captured by [`flush_active_frame_escape`] so a
     /// post-call commit withdrawal can put the live frame back.  The legacy
     /// replay's correctness contract is "the live frame still holds pre-walk
-    /// state"; a committed force-flush breaks it, so every path that does NOT
-    /// adopt the committed resume pc must restore this first.
+    /// state"; a committed force-flush breaks it, so the replay leg restores
+    /// this before re-entering.  Which leg runs is only known at walk end, so
+    /// the withdrawal arms `ESCAPE_FLUSH_UNDO_PENDING` and the epilogue
+    /// decides.
     static ESCAPE_FLUSH_UNDO: std::cell::RefCell<Option<EscapeFlushUndo>> =
         const { std::cell::RefCell::new(None) };
+    /// Set when the force arm withdrew its commit: the pre-flush frame has to
+    /// come back, but only on the legacy-replay leg (see
+    /// `mark_escape_flush_undo_pending`).
+    static ESCAPE_FLUSH_UNDO_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Opcode-scoped purity window: `(py_pc, every_prior_residual_reentrant)`
     /// for the Python opcode currently being walked.  Re-executing a committed
     /// escape re-runs the WHOLE opcode, so the latch gate must know whether any
@@ -1040,10 +1046,11 @@ fn capture_escape_flush_undo(frame: usize) {
     });
 }
 
-/// Put the pre-flush frame state back.  Called on every path that does not
-/// adopt the committed escape pc (commit withdrawal, an unforced or
-/// rootless continuation) so the
-/// legacy replay re-enters a pristine frame.
+/// Put the pre-flush frame state back so the legacy replay re-enters a
+/// pristine frame.  Called from the unforced / rootless continuation (where
+/// the walk goes on and must not see the moved frame) and, for a withdrawn
+/// commit, from the walk-end epilogue once no resume-PAST continuation has
+/// claimed the flushed frame.
 pub(crate) fn restore_escape_flush_undo() {
     ESCAPE_FLUSH_UNDO.with(|slot| {
         let Some(undo) = slot.borrow_mut().take() else {
@@ -1066,6 +1073,22 @@ pub(crate) fn discard_escape_flush_undo() {
     ESCAPE_FLUSH_UNDO.with(|slot| {
         *slot.borrow_mut() = None;
     });
+    ESCAPE_FLUSH_UNDO_PENDING.with(|slot| slot.set(false));
+}
+
+/// Note that the forced residual's commit was withdrawn, so the pre-flush
+/// frame has to come back IF the walk ends up on the legacy replay.  The
+/// restore itself waits for [`take_escape_flush_undo_pending`] at walk end:
+/// the resume-PAST continuation keeps the flushed frame (upstream's
+/// `virtualizable.py:101-138 write_boxes` has no undo once the vable is
+/// forced), and only the replay-from-entry leg needs the pre-walk state back.
+fn mark_escape_flush_undo_pending() {
+    ESCAPE_FLUSH_UNDO_PENDING.with(|slot| slot.set(true));
+}
+
+/// Consume the deferred-restore request armed by the force arm.
+pub(crate) fn take_escape_flush_undo_pending() -> bool {
+    ESCAPE_FLUSH_UNDO_PENDING.with(|slot| slot.replace(false))
 }
 
 /// Opcode-scoped effect window check (see [`ESCAPE_OPCODE_WINDOW`]): true iff
@@ -2538,7 +2561,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before)
             {
                 cancel_committed_frame_escape_pc();
-                restore_escape_flush_undo();
+                // The restore is DEFERRED to the walk-end epilogue, which is
+                // where the legacy replay is actually chosen.  Undoing it here
+                // also undid `write_boxes`' locals materialization on the
+                // resume-PAST path below — the blackhole then continued into a
+                // frame whose fastlocals were back to their unwritten nulls
+                // (`x = 1; a = sys._getframe(0); return x` returned NULL).
+                // The capture stays armed; `run_perfn_walk` restores it only
+                // when neither the force blackhole nor a committed escape pc
+                // takes over the continuation.
+                mark_escape_flush_undo_pending();
             }
             // C3 S1: the writes-live-heap force shape cannot safely resume AT
             // this opcode, but a top-level one-frame walk can resume PAST it
