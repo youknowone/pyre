@@ -2790,11 +2790,21 @@ pub fn import_name(
 // ── __import__ ───────────────────────────────────────────────────────
 // PyPy equivalent: _frozen_importlib/interp_import.py `interp___import__`
 
-/// `_gcd_import` fast path: the already-imported, fully-initialised module
-/// for `name`, or `None` when the slow path must run — a missing
-/// `sys.modules` entry, a missing `__spec__`, or a module whose
-/// `__spec__._initializing` is still true.  A `__spec__` without
-/// `_initializing` counts as initialised (a builtin module).
+/// `_gcd_import` fast path: the already-imported module for `name`, after
+/// waiting for another thread to finish initialising it.
+///
+/// PyPy's `interp_import.py:_gcd_import` performs the same `sys.modules` /
+/// `__spec__._initializing` inspection.  CPython 3.14's
+/// `import_ensure_initialized` supplies the missing concurrent-import tail:
+/// call `_lock_unlock_module`, whose deadlock handler deliberately accepts a
+/// partially initialised module for a concurrent circular import.  Re-read
+/// `sys.modules` afterwards, as `PyImport_ImportModuleLevelObject` does, so an
+/// import that failed and removed or replaced its module is retried by the
+/// slow path instead of returning a stale object.
+///
+/// `None` means the slow path must run — a missing `sys.modules` entry, a
+/// missing `__spec__`, or an entry removed/replaced while we waited.  A
+/// `__spec__` without `_initializing` counts as initialised (a builtin module).
 fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
@@ -2822,7 +2832,33 @@ fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
         crate::baseobjspace::findattr_result(shadow_stack_get(spec_slot), "_initializing")?
     {
         if crate::baseobjspace::is_true(w_initializing)? {
-            return Ok(None);
+            let Some(w_bootstrap) = get_sys_module("importlib._bootstrap") else {
+                return Ok(None);
+            };
+            let bootstrap_slot = shadow_stack_len();
+            pin_root(w_bootstrap);
+            let Some(w_lock_unlock) = crate::baseobjspace::findattr_result(
+                shadow_stack_get(bootstrap_slot),
+                "_lock_unlock_module",
+            )?
+            else {
+                return Ok(None);
+            };
+            let lock_unlock_slot = shadow_stack_len();
+            pin_root(w_lock_unlock);
+            let name_slot = shadow_stack_len();
+            pin_root(pyre_object::w_str_new(name));
+            crate::call::call_function_impl_result(
+                shadow_stack_get(lock_unlock_slot),
+                &[shadow_stack_get(name_slot)],
+            )?;
+
+            let Some(w_current) = check_sys_modules(name) else {
+                return Ok(None);
+            };
+            if w_current != shadow_stack_get(mod_slot) {
+                return Ok(None);
+            }
         }
     }
     Ok(Some(shadow_stack_get(mod_slot)))
