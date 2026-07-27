@@ -107,9 +107,9 @@ effect is to write `guard_exc` into `current_exc_value` beforehand so the ungate
 code picks it up.  Hence the `is_null` conjunct — it exists to avoid clobbering a
 live `sys.exc_info` value, which also means the injection is suppressed exactly
 when the EC already holds an exception.  That is why forcing the gate on measures
-as a no-op: **dynasm 334/334, byte-identical to the default**, and the seven
-live-exception producers of §1e individually identical, despite the seed site
-being entered 170 times.
+as a no-op: **dynasm 336/336 with the gate forced on**, correctness results
+matching the default run, and the seven live-exception producers of §1e among
+them, despite the seed site being entered 170 times.
 
 So "inert until validated" should read **inert because the guard's exception
 reaches `last_exc_value` only through a slot it does not belong in**.  A green
@@ -417,9 +417,9 @@ side effect ~5.2k extra times (the recorded trace-abort double-run class) while
 the adopt gives the exact count.
 
 Everything else that was thought to block the flip has been measured and does
-not: the full corpus is **326/326 on dynasm and cranelift with the gate both off
-and on**, the blast radius is exactly `inline_subwalk = true` at a vable escape
-(the latch is an `if`/`else if` whose single-frame arm requires
+not: the full corpus is **336/336 with the gate on (dynasm) and 336/336 with it
+off (cranelift)**, the blast radius is exactly `inline_subwalk = true` at a
+vable escape (the latch is an `if`/`else if` whose single-frame arm requires
 `!inline_subwalk`, so with the gate off that condition latches nothing and falls
 to legacy escape/replay), and the two build-side declines above are correct.
 
