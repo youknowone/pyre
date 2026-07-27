@@ -3341,6 +3341,12 @@ fn walk_bh_last_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// handle on it, and the bridge / blackhole handoff reconstructs resume state
 /// through the blackhole allocator before re-rooting the value. Same
 /// carrier/children split as [`walk_jit_exc_value`].
+///
+/// This slot reaches only the *collecting* thread's cell; every other mutator's
+/// cell is reached through the per-mutator `PyFrameRootArea`, which carries the
+/// same TLS address alongside `BH_LAST_EXC_VALUE`. `rthread.py:429-437
+/// _trace_tlref` enumerates every thread's block rather than resolving the
+/// thread local on whichever thread started the collection.
 fn walk_guard_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     let exc = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get());
     if exc == 0 {

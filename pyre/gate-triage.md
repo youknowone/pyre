@@ -478,7 +478,7 @@ OFF path is a needed safety net. Retire at the listed trigger (A7).
 
 | var | subsystem | retire when |
 |---|---|---|
-| PYRE_FBW_BLACKHOLE_RESUME | single-frame resume-past-escape (#754) | flipped default-ON 2026-07-25; retirement was conditioned on the multi-frame twin (`_MULTIFRAME`) landing, but §1 now measures that twin as having zero corpus coverage, so the condition is unevaluable — keep the gate and re-open the question once the multi-frame adopt's root-mismatch decline (§1d) is resolved |
+| PYRE_FBW_BLACKHOLE_RESUME | single-frame resume-past-escape (#754) | flipped default-ON 2026-07-25; retirement is conditioned on the multi-frame twin (`_MULTIFRAME`) flipping, and the multi-frame latch is nested inside `single_frame_blackhole_resume_enabled()`, so this gate has to stay ON while that one is in play. Both earlier premises are spent: the root-mismatch decline is resolved (§1d) and the twin's corpus coverage is no longer zero (20 adopts, 10 pinned declines). What blocks the twin now is the escaping `sys._getframe` identity answer, not this gate |
 | PYRE_TWO_PHASE_RTYPE, PYRE_TUPLE_PER_SHAPE_CLASSDEF | rtyper prepass / per-shape tuple classdef | WS2 / #346 rtyper epic |
 | PYRE_ORIGINAL_BOXES | greens++reds original_boxes index shape | box-identity #202 / resume F1 |
 | PYRE_MIR_FRAMESTATE | framestate-threaded MIR lowering | MIR front-end #176/#181/#346 |

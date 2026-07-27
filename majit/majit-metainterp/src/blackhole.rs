@@ -319,7 +319,10 @@ thread_local! {
     /// reachable only through it — live behind a bare `i64`. RPython's
     /// `grab_exc_value` result is a shadowstack-rooted local across the same
     /// span; pyre has no GC transform, so the frontend registers a root walker
-    /// over this cell instead.
+    /// over this cell instead, and carries the cell's address in the
+    /// per-mutator root area next to `BH_LAST_EXC_VALUE` so a collection
+    /// started by another thread still reaches a stopped mutator's parked
+    /// exception.
     pub static GUARD_EXC_VALUE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
