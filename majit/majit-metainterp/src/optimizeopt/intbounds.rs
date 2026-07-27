@@ -854,25 +854,25 @@ impl OptIntBounds {
     /// `new_operations` / `emitted_operations` to operand identity, at which
     /// point this positional scan collapses to the `_emittedoperations`
     /// membership test on the box.
-    fn find_producing_op<'a>(&self, box_: &Operand, ctx: &'a OptContext) -> Option<&'a Op> {
+    ///
+    /// The lookup goes through `new_operations_index`, the O(1) mirror of
+    /// `new_operations` keyed by result position. `op in
+    /// self._emittedoperations` (optimizer.py:375) is a dict membership test,
+    /// so a hash lookup is the shape upstream has; scanning instead put an
+    /// O(len(new_operations)) walk on `propagate_bounds_backward`, which runs
+    /// once per emitted int op and recurses, making bound propagation
+    /// quadratic in trace length. Insert-overwrites gives the index
+    /// last-occurrence semantics, matching the `rfind` it replaces (a later
+    /// replacement at the same position wins).
+    fn find_producing_op(&self, box_: &Operand, ctx: &OptContext) -> Option<majit_ir::OpRc> {
         // optimizer.py:372 `isinstance(op, AbstractResOp)` — a `Const` is not
         // an AbstractResOp, so `as_operation` returns None for it. A constant
-        // operand has no producing op; bail before `raw()`, which panics on
-        // the inline-`Const` OpRef variants.
+        // operand has no producing op; bail before `to_opref()`, whose
+        // inline-`Const` variants have no producer.
         if box_.is_constant() {
             return None;
         }
-        let cond_ref = box_.to_opref();
-        // First try direct index (when OpRef matches new_operations index)
-        let idx = cond_ref.raw() as usize;
-        if idx < ctx.new_operations.len() && ctx.new_operations[idx].pos.get() == cond_ref {
-            return Some(ctx.new_operations[idx].as_ref());
-        }
-        // Otherwise search by pos field
-        ctx.new_operations
-            .iter()
-            .rfind(|op| op.pos.get() == cond_ref)
-            .map(|rc| rc.as_ref())
+        ctx.producer_in_new_operations(box_.to_opref())
     }
 
     // ── Bound narrowing helpers ──
@@ -1063,9 +1063,9 @@ impl OptIntBounds {
     /// to tighten its other arguments.
     /// Reads the operand bound box-native through `getintbound_arg`
     /// (→ `resolve_box_box`); the `as_operation` producer lookup
-    /// (`find_producing_op`) now takes the box directly, keeping only an
-    /// internal flat-OpRef positional scan over `new_operations` (the
-    /// legitimate `_emittedoperations` residual, #188-gated). The const-fold
+    /// (`find_producing_op`) now takes the box directly, resolving it through
+    /// the `new_operations` position index (the legitimate
+    /// `_emittedoperations` residual, #188-gated). The const-fold
     /// (`make_constant_int_ref`) stays OpRef-keyed pending #186.
     fn propagate_bounds_backward(&mut self, box_: &Operand, ctx: &mut OptContext) {
         let b = self.getintbound_arg(box_, ctx);
@@ -1073,7 +1073,7 @@ impl OptIntBounds {
             self.make_constant_int_ref(box_.to_opref(), b.get_constant_int(), ctx);
         }
         if let Some(producing_op) = self.find_producing_op(box_, ctx) {
-            let producing_op = producing_op.clone();
+            let producing_op = (*producing_op).clone();
             self.propagate_bounds_backward_op(&producing_op, ctx);
         }
     }

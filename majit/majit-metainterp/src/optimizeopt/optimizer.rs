@@ -4698,7 +4698,7 @@ impl Optimizer {
                              replacement guard has no descr",
                         );
                         crate::compile::copy_all_attributes_from(&new_descr, &old_descr);
-                        ctx.new_operations[target_pos] = std::rc::Rc::new(op.clone());
+                        ctx.replace_new_operation(target_pos, std::rc::Rc::new(op.clone()));
                         ctx.in_final_emission = saved_in_final_emission;
                         return Ok(());
                     }
