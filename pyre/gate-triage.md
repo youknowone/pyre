@@ -83,11 +83,41 @@ parity pass read `direct_assembler_call` and found its ON design is what
 upstream's `num_red_args` assert forbids. Retired.
 Still kept: `PYRE_CARRIER_EXC_RESUME` (default-off; threads the guard-failure exception
 into the bridge sym for the depth-2 carrier exception-resume slice #343/#126 —
-inert until validated).  Two parity gaps were listed here as pre-flip work; the
-`execute_ll_raised` exception assign is still open, and the seed's
+inert until validated).  Two parity gaps were listed here as pre-flip work.  The
 `bridge_guard_exc` GC-rooting is closed by §1e — which also measures the seed
 site as **reachable** (170 bridge-route guard failures carry a live exception),
 so this gate is a live adoption target rather than an inert one.
+
+The second is still open, and the row described it as "the unconditional
+`execute_ll_raised` exception assign", which is not what the divergence is.
+
+pyre's standing-exception maintenance for an exception-guard bridge lives in
+`seed_bridge_standing_exception_from_current` (`state.rs`), which is **not
+gated** and already mirrors upstream's branch: it assigns `last_exc_value` /
+`last_exc_box` when it finds an exception, and clears all four exception slots
+when it does not (`_prepare_exception_resumption`'s
+`else: clear_exception()`).  The divergence is the **source**.  Upstream takes it
+from `cpu.grab_exc_value(deadframe)` — the exception the failing guard carried.
+pyre takes it from `sym.current_exc_value`, falling back to
+`get_current_exception()` — the *execution context's* current exception, which is
+the `sys.exc_info()` mirror, a different slot with different lifetime rules.
+
+`PYRE_CARRIER_EXC_RESUME` is a **back-channel into that function**: its only
+effect is to write `guard_exc` into `current_exc_value` beforehand so the ungated
+code picks it up.  Hence the `is_null` conjunct — it exists to avoid clobbering a
+live `sys.exc_info` value, which also means the injection is suppressed exactly
+when the EC already holds an exception.  That is why forcing the gate on measures
+as a no-op: **dynasm 334/334, byte-identical to the default**, and the seven
+live-exception producers of §1e individually identical, despite the seed site
+being entered 170 times.
+
+So "inert until validated" should read **inert because the guard's exception
+reaches `last_exc_value` only through a slot it does not belong in**.  A green
+corpus under the gate is not evidence about the gate.  Two further deltas to
+settle before any flip, both in that function: it early-returns when
+`last_exc_box` is already set, and it sets `class_of_last_exc_is_const = true`,
+whereas the `_prepare_exception_resumption` path reaches `execute_ll_raised` with
+the default `constant=False`.
 
 ## §1e — The grabbed guard exception is rooted for the whole handoff (2026-07-27)
 
