@@ -1765,6 +1765,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::identitydict::w_dict_delete_identity_strategy",
+        "pyre_object::w_dict_delete_identity_strategy",
+        pyre_object::identitydict::w_dict_delete_identity_strategy as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_float_abs",
         "pyre_interpreter::jit_float_abs",
         crate::objspace::descroperation::jit_float_abs as *const (),

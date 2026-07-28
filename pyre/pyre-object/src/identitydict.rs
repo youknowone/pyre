@@ -96,6 +96,26 @@ pub unsafe fn w_dict_lookup_identity_strategy(
     identity_storage(obj).get(&IdentityKey(key)).copied()
 }
 
+/// `dictmultiobject.py:1081-1087 delitem`'s identity-keyed remove — drop the
+/// entry for `key` and report whether one was there.
+///
+/// Residualise the storage remove alone (`@dont_look_inside`,
+/// `rlib/jit.py:139`), the delete twin of [`w_dict_lookup_identity_strategy`]:
+/// upstream's `_ll_dict_del` (`rordereddict.py:884`) carries
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(i))`, and an
+/// `IndexMap` can never be virtual to this front end, so the predicate is
+/// permanently false and the residual arm is the only one reachable.  The
+/// keys-version bump stays traced.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject` on [`IDENTITY_DICT_STRATEGY`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_delete_identity_strategy(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    identity_storage_mut(obj)
+        .shift_remove(&IdentityKey(key))
+        .is_some()
+}
+
 /// `dictmultiobject.py:1143-1150 AbstractTypedStrategy.switch_to_object_strategy`
 /// instantiation for IdentityDictStrategy — `wrap` is identity (`:26-27`), so
 /// the migration ports each `IdentityKey(obj)` into
@@ -255,8 +275,7 @@ impl DictStrategy for IdentityDictStrategy {
     /// on mismatch, promote to Object.
     unsafe fn delitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> bool {
         if Self::is_correct_type(w_key) {
-            let entries = identity_storage_mut(w_dict);
-            let removed = entries.shift_remove(&IdentityKey(w_key)).is_some();
+            let removed = w_dict_delete_identity_strategy(w_dict, w_key);
             if removed {
                 crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
             }

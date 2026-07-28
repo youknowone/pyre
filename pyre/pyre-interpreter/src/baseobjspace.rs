@@ -3503,7 +3503,13 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
             ),
         ));
     }
-    for (k, &idx) in indices.iter().enumerate() {
+    // Walked by index rather than `.iter().enumerate()`: `Enumerate::next` is
+    // an unregistered foreign leaf that stops this graph, and the position is
+    // already needed as `k`.  `listobject.py setitem__List_ANY_ANY`'s extended
+    // arm spells the same walk as a plain `range` loop.
+    let mut k = 0usize;
+    while k < indices.len() {
+        let idx = indices[k];
         let item =
             pyre_object::w_list_getitem(w_other, k as i64).expect("k < other_len by construction");
         if !pyre_object::w_list_setitem(obj, idx, item) {
@@ -3512,6 +3518,7 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
                 "list assignment index out of range",
             ));
         }
+        k += 1;
     }
     Ok(w_none())
 }
@@ -3775,10 +3782,17 @@ unsafe fn setitem_bytearray_slice(
             ),
         ));
     }
-    for (k, &idx) in indices.iter().enumerate() {
-        if let Some(slot) = vec.get_mut(idx) {
-            *slot = sequence2[k];
+    // Index walk rather than `.iter().enumerate()` / `slice::get_mut`, both of
+    // which are unregistered foreign leaves that stop this graph;
+    // `bytearrayobject.py setitem__Bytearray_ANY_ANY`'s extended arm is the
+    // same plain `range` loop.
+    let mut k = 0usize;
+    while k < indices.len() {
+        let idx = indices[k];
+        if idx < vec.len() {
+            vec[idx] = sequence2[k];
         }
+        k += 1;
     }
     Ok(w_none())
 }
