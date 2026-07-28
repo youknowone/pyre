@@ -1349,7 +1349,7 @@ pub struct MetaInterp<M: Clone> {
     /// reads it to fire the trace-too-long hook.
     pub aborted_tracing_jitdriver: Option<usize>,
 
-    /// pyjitpl.py:3291 `self.jitdriver_sd` parity — index into
+    /// pyjitpl.py:2411 `self.jitdriver_sd` parity — index into
     /// `staticdata.jitdrivers_sd` of the driver that owns the
     /// in-flight trace.
     ///
@@ -1769,7 +1769,7 @@ impl<M: Clone> MetaInterp<M> {
                 ia.set_value(Value::Ref(r));
             }
         }
-        // pyjitpl.py:3290-3306 — `initialize_virtualizable` /
+        // pyjitpl.py:3314-3330 — `initialize_virtualizable` /
         // `force_start_tracing` / `setup_tracing` snapshot inputarg
         // constants into `initial_inputarg_consts`. Each is an inline-const
         // `OpRef`; a `ConstPtr` entry's inline gcref is forwarded in place —
@@ -3006,7 +3006,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     fn trace_entry_vable_lengths(&self, info: &VirtualizableInfo) -> Vec<usize> {
-        // pyjitpl.py:3302 `vinfo.read_boxes(self.cpu, virtualizable, startindex)`
+        // pyjitpl.py:3326 `vinfo.read_boxes(self.cpu, virtualizable, startindex)`
         // reads field/array values directly from the concrete virtualizable
         // heap object; RPython does not consult any interpreter-supplied
         // "trace-entry cache" for lengths. Match that here when the layout
@@ -3026,7 +3026,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Position of the virtualizable identity inside `live_values`, the
-    /// state-field counterpart of `pyjitpl.py:3295 original_boxes[index]`.
+    /// state-field counterpart of `pyjitpl.py:3319 original_boxes[index]`.
     ///
     /// The host declares it (`identity_live_index`); this checks the declared
     /// position actually holds `vable_ptr` before taking it, because
@@ -3055,7 +3055,7 @@ impl<M: Clone> MetaInterp<M> {
             .or_else(|| (0..live_values.len()).find(|idx| holds_identity(*idx)))
     }
 
-    /// pyjitpl.py:3290 `initialize_virtualizable(self, original_boxes)`.
+    /// pyjitpl.py:3314 `initialize_virtualizable(self, original_boxes)`.
     ///
     /// RPython:
     ///     vinfo = self.jitdriver_sd.virtualizable_info
@@ -3078,7 +3078,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `TraceCtx::init_virtualizable_boxes` helper which performs the
     /// actual `virtualizable_boxes = [..., vable_ref]` push (matching
     /// the `read_boxes(...) ; append(virtualizable_box)` shape from
-    /// pyjitpl.py:3302-3306).
+    /// pyjitpl.py:3326-3330).
     ///
     /// `live_values` is reds-only (greens fold to consts in the `green_key`
     /// side channel, matching the compiled loop's reds-only entry contract).
@@ -3090,7 +3090,7 @@ impl<M: Clone> MetaInterp<M> {
     /// ref-bank index are unchanged either way (the gate is a structural-parity
     /// no-op).
     fn initialize_virtualizable(&self, ctx: &mut TraceCtx, live_values: &[Value]) {
-        // pyjitpl.py:3291: vinfo = self.jitdriver_sd.virtualizable_info
+        // pyjitpl.py:3315: vinfo = self.jitdriver_sd.virtualizable_info
         // Prefer the trace-bound `active_jitdriver_sd` (RPython
         // `self.jitdriver_sd`); fall back to scanning when an
         // init-time / test caller has not yet elected one.
@@ -3102,7 +3102,7 @@ impl<M: Clone> MetaInterp<M> {
             .virtualizable_info
             .as_ref()
             .expect("resolve_active_jitdriver_sd_with_vinfo returned a slot without vinfo");
-        // pyjitpl.py:3293-3295:
+        // pyjitpl.py:3317-3319:
         //     index = (self.jitdriver_sd.num_green_args +
         //              self.jitdriver_sd.index_of_virtualizable)
         //     virtualizable_box = original_boxes[index]
@@ -3114,7 +3114,7 @@ impl<M: Clone> MetaInterp<M> {
         // driver (empty reds + named virtualizable), matching the
         // portal convention, so the strict RPython read works for
         // every driver.
-        // pyjitpl.py:3293 reads `original_boxes[num_green_args +
+        // pyjitpl.py:3317 reads `original_boxes[num_green_args +
         // index_of_virtualizable]`. pyre keeps `live_values` reds-only — the
         // compiled loop's reds-only entry contract (`live_values_match_descriptor`,
         // warmstate.py:387 execute_assembler). By default this restores RPython's
@@ -3138,11 +3138,11 @@ impl<M: Clone> MetaInterp<M> {
         };
         debug_assert!(
             use_original_boxes || num_green_args == 0,
-            "pyre green args live in green_key, not in live_values (pyjitpl.py:3293)"
+            "pyre green args live in green_key, not in live_values (pyjitpl.py:3317)"
         );
         assert!(
             jd_sd.index_of_virtualizable >= 0,
-            "pyjitpl.py:3293: jitdriver with virtualizable_info must have \
+            "pyjitpl.py:3317: jitdriver with virtualizable_info must have \
              index_of_virtualizable set (got {})",
             jd_sd.index_of_virtualizable,
         );
@@ -3189,7 +3189,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         let num_array_elems: usize = array_lengths.iter().sum();
         let total_vable = num_static + num_array_elems;
-        // pyjitpl.py:3293-3302 parity:
+        // pyjitpl.py:3317-3326 parity:
         //     index = num_green_args + index_of_virtualizable
         //     virtualizable_box = original_boxes[index]
         //     startindex = len(original_boxes) - num_green_args  # == num_red_args
@@ -3209,7 +3209,7 @@ impl<M: Clone> MetaInterp<M> {
             .driver_descriptor()
             .map(|driver| driver.num_reds())
             .unwrap_or(1);
-        // pyjitpl.py:3290-3307 `initialize_virtualizable` only gates on
+        // pyjitpl.py:3314-3331 `initialize_virtualizable` only gates on
         // `vinfo is not None` and unconditionally calls
         // `vinfo.read_boxes(cpu, virtualizable, startindex)`. Callers
         // without a driver descriptor supply `live_values` already in the
@@ -3231,7 +3231,7 @@ impl<M: Clone> MetaInterp<M> {
         if !_has_expanded_tail_outer && self.vable_ptr.is_null() {
             return;
         }
-        // pyjitpl.py:3293-3295: index = num_green_args + index_of_virtualizable.
+        // pyjitpl.py:3317-3319: index = num_green_args + index_of_virtualizable.
         // The caller derives `index` above from jitdriver_sd so the bootstrap
         // path and the regular JitDriver registry agree. The virtualizable
         // is a Ref-typed inputarg (resoperation.py:739 InputArgRef).
@@ -3255,7 +3255,7 @@ impl<M: Clone> MetaInterp<M> {
         // only read through `virtualizable_values[-1]`, but it is what
         // `capture_resumedata` writes into every guard's vable section, so a
         // bridge decoding that section resolves the identity to the wrong
-        // deadframe slot.  `pyjitpl.py:3295 virtualizable_box =
+        // deadframe slot.  `pyjitpl.py:3319 virtualizable_box =
         // original_boxes[index]` is a lookup of the red that HOLDS the
         // virtualizable, so take the same lookup: `identity_live_index` is the
         // host's declared position for it, the state-field counterpart of
@@ -3303,7 +3303,7 @@ impl<M: Clone> MetaInterp<M> {
         // inputargs from the live heap values.
         let has_expanded_tail =
             info.identity_ref_bank_index.is_none() && live_values.len() >= num_reds + total_vable;
-        // pyjitpl.py:3302: virtualizable_boxes = vinfo.read_boxes(...)
+        // pyjitpl.py:3326: virtualizable_boxes = vinfo.read_boxes(...)
         // pyjitpl.py appends these boxes to `original_boxes` before
         // create_empty_history() snapshots the trace inputargs. When the
         // caller already supplied an expanded tail we reuse those inputarg
@@ -3347,7 +3347,7 @@ impl<M: Clone> MetaInterp<M> {
                 })
                 .collect()
         };
-        // pyjitpl.py:3306: virtualizable_boxes.append(virtualizable_box)
+        // pyjitpl.py:3330: virtualizable_boxes.append(virtualizable_box)
         // is folded inside init_virtualizable_boxes (it pushes vable_ref
         // at the end of the list).
         ctx.init_virtualizable_boxes(
@@ -3375,7 +3375,7 @@ impl<M: Clone> MetaInterp<M> {
         // MetaInterp `vable_ptr` was cached before `tracing` existed, so
         // `set_vable_ptr` could not plumb it through.
         ctx.set_virtualizable_heap_ptr(self.vable_ptr);
-        // pyjitpl.py:3307: check_synchronized_virtualizable() — debug-only
+        // pyjitpl.py:3331: check_synchronized_virtualizable() — debug-only
         // assertion. pyre's analog is `check_synchronized_virtualizable`
         // on MetaInterp, but it requires &self which we don't have here.
         // Callers in setup_tracing / bound_reached perform the check
@@ -3510,7 +3510,7 @@ impl<M: Clone> MetaInterp<M> {
             // slot 0; encode that here so `initialize_virtualizable`
             // can use `jd.index_of_virtualizable` unconditionally,
             // matching RPython's `index = num_green_args +
-            // index_of_virtualizable` (pyjitpl.py:3293-3295) without a
+            // index_of_virtualizable` (pyjitpl.py:3317-3319) without a
             // `< 0` fallback at the read site.
             if jd.index_of_virtualizable < 0 && jd.reds().is_empty() {
                 jd.index_of_virtualizable = 0;
@@ -3527,7 +3527,7 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Get the active virtualizable info.
     ///
-    /// pyjitpl.py:3291 `vinfo = self.jitdriver_sd.virtualizable_info`.
+    /// pyjitpl.py:3315 `vinfo = self.jitdriver_sd.virtualizable_info`.
     /// Prefers the trace-bound `active_jitdriver_sd`; falls back to
     /// scanning `jitdrivers_sd` for callers that read this before any
     /// trace has started (warmspot init, host-side queries).
@@ -3545,7 +3545,7 @@ impl<M: Clone> MetaInterp<M> {
             .find_map(|jd| jd.virtualizable_info.as_ref())
     }
 
-    /// pyjitpl.py:3291 `self.jitdriver_sd = jitdriver_sd` parity —
+    /// pyjitpl.py:2411 `self.jitdriver_sd = jitdriver_sd` parity —
     /// pick the slot inside `staticdata.jitdrivers_sd` that owns the
     /// next trace.
     ///
@@ -3585,10 +3585,10 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Resolve the slot index of the JitDriver that should be treated
-    /// as `self.jitdriver_sd` (pyjitpl.py:3291) for callers that need
+    /// as `self.jitdriver_sd` (pyjitpl.py:2411) for callers that need
     /// `virtualizable_info` and the related metadata together.
     ///
-    /// pyjitpl.py:3291 `vinfo = self.jitdriver_sd.virtualizable_info` — the
+    /// pyjitpl.py:3315 `vinfo = self.jitdriver_sd.virtualizable_info` — the
     /// vinfo is STRICTLY that of the elected active driver, so a novable
     /// active driver (jd1 `unpackiterable_driver`, `virtualizable_info=None`)
     /// never borrows a sibling driver's vinfo; borrowing would capture a
@@ -3959,12 +3959,12 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref descriptor) = driver_descriptor {
                     ctx.set_driver_descriptor(descriptor.clone());
                 }
-                // pyjitpl.py:3291 `self.jitdriver_sd = jitdriver_sd`: see
+                // pyjitpl.py:2411 `self.jitdriver_sd = jitdriver_sd`: see
                 // `setup_tracing` for the rationale; `force_start_tracing`
                 // is the parallel trace-start entry point and must keep the
                 // same invariant.
                 self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
-                // pyjitpl.py:3290 initialize_virtualizable parity.
+                // pyjitpl.py:3314 initialize_virtualizable parity.
                 self.initialize_virtualizable(&mut ctx, live_values);
                 // warmstate.py:439 `force_finish_trace=bool(cell.flags &
                 // JC_FORCE_FINISH)`.  Read-only — JC_FORCE_FINISH is sticky
@@ -4239,13 +4239,13 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(ref descriptor) = driver_descriptor {
             ctx.set_driver_descriptor(descriptor.clone());
         }
-        // pyjitpl.py:3291 `self.jitdriver_sd = jitdriver_sd`: bind the
+        // pyjitpl.py:2411 `self.jitdriver_sd = jitdriver_sd`: bind the
         // active driver before reads (`initialize_virtualizable`) consult
         // it. `elect_active_jitdriver_sd` mirrors RPython by picking the
         // driver matching the descriptor; with the single-portal pyre
         // shell driver this collapses to slot 0.
         self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
-        // pyjitpl.py:3290 initialize_virtualizable parity.
+        // pyjitpl.py:3314 initialize_virtualizable parity.
         self.initialize_virtualizable(&mut ctx, live_values);
 
         // warmstate.py:439 `force_finish_trace=bool(cell.flags &
@@ -11462,7 +11462,7 @@ impl<M: Clone> MetaInterp<M> {
         ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
         ctx.callinfocollection = self.callinfocollection.clone();
         self.tracing = Some(ctx);
-        // pyjitpl.py:3291 `self.jitdriver_sd = jitdriver_sd`: bridges
+        // pyjitpl.py:2411 `self.jitdriver_sd = jitdriver_sd`: bridges
         // inherit the parent's driver. The bridge entry path does not
         // thread `driver_descriptor`, so fall back to scanning for the
         // vinfo-bearing slot — a no-op for single-portal pyre and the
@@ -19944,7 +19944,7 @@ mod tests {
         );
     }
 
-    /// `pyjitpl.py:3295` reads the virtualizable out of a DECLARED red
+    /// `pyjitpl.py:3319` reads the virtualizable out of a DECLARED red
     /// position; it never searches the reds for it. A red that happens to hold
     /// the same pointer earlier in the vector — another name for the same
     /// object — must not take the identity's place.
@@ -20956,7 +20956,7 @@ mod tests {
 
     #[test]
     fn trace_entry_vable_lengths_reads_from_heap_first() {
-        // pyjitpl.py:3302 `vinfo.read_boxes(...)` always reads from the
+        // pyjitpl.py:3326 `vinfo.read_boxes(...)` always reads from the
         // concrete heap object. The interpreter-supplied cache is a pyre
         // fallback used only when `info.can_read_all_array_lengths_from_heap`
         // is false; otherwise the heap-read wins.

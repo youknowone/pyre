@@ -3911,7 +3911,7 @@ impl ResumeDataLoopMemo {
         //
         // `metainterp.virtualizable_boxes` is payload-first, identity-last
         // (`read_boxes(...)` then `append(virtualizable_box)`,
-        // pyjitpl.py:3302-3306) — but that is NOT the order arriving here. The
+        // pyjitpl.py:3326-3330) — but that is NOT the order arriving here. The
         // snapshot writer already reordered it: `_list_of_boxes_virtualizable`
         // (opencoder.py:718-726, `build_vable_snapshot_boxes` for the
         // state-field path) moves `boxes[-1]` to slot 0, so `vable_array` is
@@ -5071,7 +5071,7 @@ mod tests {
         env.types.insert(1, majit_ir::Type::Int);
 
         let snapshot = Snapshot {
-            // pyjitpl.py:3302-3306 parity: payload slots first,
+            // pyjitpl.py:3326-3330 parity: payload slots first,
             // virtualizable identity (`virtualizable_boxes[-1]`) last.
             vable_array: vec![OpRef::int_op(1).into(), OpRef::ref_op(7).into()],
             vref_array: vec![],

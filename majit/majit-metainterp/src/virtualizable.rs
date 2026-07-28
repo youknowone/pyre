@@ -233,7 +233,7 @@ pub struct VirtualizableInfo {
     /// Flat position of the virtualizable identity inside the reds the host
     /// hands `initialize_virtualizable` as `live_values`.
     ///
-    /// `pyjitpl.py:3295 virtualizable_box = original_boxes[index]` is a lookup
+    /// `pyjitpl.py:3319 virtualizable_box = original_boxes[index]` is a lookup
     /// at a DECLARED position — `warmspot.py:529-538` fixes
     /// `index_of_virtualizable` when the driver is registered, and nothing at
     /// snapshot time searches for the box. Hosts whose reds are not the

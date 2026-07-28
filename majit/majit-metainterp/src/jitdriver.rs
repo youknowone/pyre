@@ -4303,7 +4303,7 @@ impl<S: JitState> JitDriver<S> {
 
         // Refresh the trace-entry vable heap pointer so `initialize_virtualizable`
         // reads array lengths directly from the concrete virtualizable object
-        // (pyjitpl.py:3302 `vinfo.read_boxes(cpu, virtualizable, startindex)`).
+        // (pyjitpl.py:3326 `vinfo.read_boxes(cpu, virtualizable, startindex)`).
         // `VirtualizableInfo.name` is the canonical identifier declared via
         // `virtualizable!(name = "...")`, so we can feed it straight to the
         // interpreter hooks without going through the descriptor.
