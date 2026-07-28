@@ -6149,7 +6149,11 @@ fn read_descr_vable_array(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
     (
         BhDescr::Field {
             offset,
-            field_size: 8,
+            // The array field is a pointer, so its width is the target word
+            // like the scalars above.  Latent rather than live: the `_gc_r`
+            // accessors this descr reaches take `as_offset()` and store at
+            // pointer width without consulting the size.
+            field_size: std::mem::size_of::<usize>(),
             field_type: majit_ir::value::Type::Ref,
             field_flag: majit_ir::descr::ArrayFlag::Pointer,
             is_field_signed: false,
