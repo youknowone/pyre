@@ -2191,6 +2191,21 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // below), so returning costs nothing but the inline.  The
     // POP_JUMP_IF_NONE scan is the one exception and still aborts — see the
     // note at that site.
+    //
+    // The caller-frame catch-marker decline belongs to the same set and is
+    // hoisted here for the same reason.  Its own site further down runs after
+    // the seed block has recorded ops and stamped a concrete `FrameBox`, where
+    // `Ok(None)` would strand dead IR; the predicate reads only the caller's
+    // jitcode and the CALL coordinate, so asking it here is equivalent and
+    // lets a CALL inside a `try` block residualize instead of discarding the
+    // enclosing loop trace.
+    if try_multiframe
+        && crate::jitcode_dispatch::resume_snapshot::inline_caller_frame_declines_for_catch_marker(
+            ctx, op.pc,
+        )
+    {
+        return Ok(None);
+    }
     if try_multiframe || strict_seed {
         'seed: {
             // Branch-A frame shape only (mirror REC_CA): no cells.
@@ -2400,6 +2415,12 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         match compute_inline_caller_frame(ctx, op.pc) {
             Ok(pf) => Some(pf),
             Err(InlineCallerFrameDecline::TryBlockCatchMarker) => {
+                // Unreachable under `try_multiframe`: the pre-seed hoist above
+                // already answered this and returned `Ok(None)`.  Kept as the
+                // defensive arm rather than an `unreachable!` — the predicate
+                // reads the caller's jitcode, and a shape that changed between
+                // the two points should degrade to the old abort, not panic.
+                //
                 // An un-entered multiframe-inline CALL declined at its
                 // try-block catch marker is re-run whole and forward, exactly
                 // as if it had never been inlined (`pyjitpl.py`).  The
@@ -2454,14 +2475,12 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // the call stays residual, where the post-call catch resume
         // (`GuardCaptureScope::residual_call_catch_resume`) routes the raise.
         //
-        // FIXME: this `Err` discards the whole enclosing loop trace, where the
-        // comment above describes only declining the inline.  It cannot become
-        // `Ok(None)` in place like the seed preconditions below: by here the
-        // seed block has already recorded `GETFIELD_GC_R` +
-        // `emit_new_pyframe_inline_with_params` and stamped a concrete
-        // `FrameBox` onto that op, so returning would leave dead IR behind.
-        // Closing it means hoisting `decline_inline_caller_frame_for_catch_marker`
-        // ahead of the seed block.
+        // The `try_multiframe` path reaches this decline at the pre-seed hoist
+        // above and residualizes there.  This arm serves the strict-seed path,
+        // which cannot return `Ok(None)` here: by this point the seed block has
+        // recorded `GETFIELD_GC_R` + `emit_new_pyframe_inline_with_params` and
+        // stamped a concrete `FrameBox` onto that op, so returning would strand
+        // dead IR.
         match compute_inline_caller_frame(ctx, op.pc) {
             Ok(pf) => Some(pf),
             Err(InlineCallerFrameDecline::TryBlockCatchMarker) => {

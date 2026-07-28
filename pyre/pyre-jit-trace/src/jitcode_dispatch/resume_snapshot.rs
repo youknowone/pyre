@@ -1504,6 +1504,74 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
 /// [`compute_inline_caller_frame`] body but keyed on `caller_code`'s own
 /// `PyJitCode` instead of `fbw_mode.snapshot_sym`, and reading boxes via the
 /// sym-less [`collect_callee_active_boxes`] (no portal-vable shadow to fold).
+/// The `TryBlockCatchMarker` half of [`compute_inline_caller_frame`], answered
+/// without building anything.
+///
+/// [`decline_inline_caller_frame_for_catch_marker`] is a pure function of the
+/// caller's `after_residual_call_resume` coordinate and its jitcode, and both
+/// caller paths reach it from data that exists at the CALL — the nested path
+/// from `pyjitcode_for_jitcode_index`, the top-level one from
+/// `fbw_mode.snapshot_sym`.  Neither reads anything the multiframe seed block
+/// produces, so the answer can be had *before* that block records its first op.
+/// That matters because the decline it feeds must return `Ok(None)`
+/// (residualize the call, keep tracing) rather than abort the enclosing loop,
+/// and `Ok(None)` is only free while nothing has been recorded.
+///
+/// Reports only the catch-marker decline.  `Unavailable` stays with
+/// [`compute_inline_caller_frame`]: it depends on the live register banks, and
+/// its fallback is the single-frame collapse, not a residual call.
+pub(crate) fn inline_caller_frame_declines_for_catch_marker<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    call_jit_pc: usize,
+) -> bool {
+    let caller_code = ctx
+        .session
+        .borrow()
+        .framestack
+        .last()
+        .map(|frame| frame.w_code);
+    if let Some(caller_code) = caller_code {
+        let Some(jitcode_index) = crate::state::ensure_jitcode_index(caller_code as *const ())
+        else {
+            return false;
+        };
+        let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
+            return false;
+        };
+        if !pjc.is_populated() || pjc.code_ptr.is_null() {
+            return false;
+        }
+        return decline_inline_caller_frame_for_catch_marker(
+            pjc.after_residual_call_resume_for_jitcode_pc(call_jit_pc),
+            &[],
+        )
+        .is_err();
+    }
+    let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if caller_sym_ptr.is_null() {
+        return false;
+    }
+    // SAFETY: same contract as `compute_inline_caller_frame` — the sym is set
+    // for the lifetime of the top-level `dispatch_via_miframe`, and this reads
+    // only immutable layout fields.
+    unsafe {
+        let caller_sym = &*caller_sym_ptr;
+        if caller_sym.jitcode().is_null() {
+            return false;
+        }
+        let jc = &*caller_sym.jitcode();
+        if jc.payload.code_ptr.is_null() || !jc.payload.is_populated() {
+            return false;
+        }
+        decline_inline_caller_frame_for_catch_marker(
+            jc.payload
+                .after_residual_call_resume_for_jitcode_pc(call_jit_pc),
+            jc.payload.jitcode.code.as_slice(),
+        )
+        .is_err()
+    }
+}
+
 pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
