@@ -29,6 +29,18 @@ use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 // argument count and raise instead of asserting. `args[0]` is the bound
 // receiver, so the counts in these messages exclude it.
 
+/// The argument count `args` carries once its receiver slot is discounted —
+/// `len() - 1`, floored at zero for the malformed empty slice.
+///
+/// Spelled as an explicit branch rather than `saturating_sub`: the front end
+/// lowers a plain subtraction (`Sub` plus an overflow `Assert` it strips), but
+/// `core::num::<Impl>::saturating_sub` is an unregistered foreign leaf that
+/// stops the enclosing graph before it can be lifted.
+#[inline]
+pub(crate) fn args_given(args: &[PyObjectRef]) -> usize {
+    if args.is_empty() { 0 } else { args.len() - 1 }
+}
+
 /// TypeError for a method requiring exactly `n` positional arguments after
 /// the receiver, called with a different count.
 pub(crate) fn arity_exact(
@@ -44,7 +56,7 @@ pub(crate) fn arity_exact(
         };
         return Err(crate::PyError::type_error(format!(
             "{name}() takes {expected} ({} given)",
-            args.len().saturating_sub(1),
+            args_given(args),
         )));
     }
     Ok(())
@@ -62,7 +74,7 @@ pub(crate) fn arity_at_least(
         return Err(crate::PyError::type_error(format!(
             "{name} expected at least {min} argument{}, got {}",
             if min == 1 { "" } else { "s" },
-            args.len().saturating_sub(1),
+            args_given(args),
         )));
     }
     Ok(())
@@ -81,7 +93,7 @@ pub(crate) fn arity_at_least_positional(
         return Err(crate::PyError::type_error(format!(
             "{name}() takes at least {min} positional argument{} ({} given)",
             if min == 1 { "" } else { "s" },
-            args.len().saturating_sub(1),
+            args_given(args),
         )));
     }
     Ok(())
@@ -114,7 +126,7 @@ pub(crate) fn arity_at_most(
         return Err(crate::PyError::type_error(format!(
             "{name} expected at most {max} argument{}, got {}",
             if max == 1 { "" } else { "s" },
-            args.len().saturating_sub(1),
+            args_given(args),
         )));
     }
     Ok(())
@@ -135,7 +147,7 @@ pub(crate) fn arity_exact_unpack(
         return Err(crate::PyError::type_error(format!(
             "{name} expected {n} argument{}, got {}",
             if n == 1 { "" } else { "s" },
-            args.len().saturating_sub(1),
+            args_given(args),
         )));
     }
     Ok(())
@@ -150,7 +162,7 @@ pub(crate) fn arity_slot(args: &[PyObjectRef], n: usize) -> Result<(), crate::Py
         return Err(crate::PyError::type_error(format!(
             "expected {n} argument{}, got {}",
             if n == 1 { "" } else { "s" },
-            args.len().saturating_sub(1),
+            args_given(args),
         )));
     }
     Ok(())
@@ -162,7 +174,7 @@ pub(crate) fn arity_no_args(args: &[PyObjectRef], name: &str) -> Result<(), crat
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "{name}() takes no arguments ({} given)",
-            args.len().saturating_sub(1),
+            args_given(args),
         )));
     }
     Ok(())
@@ -172,7 +184,7 @@ pub(crate) fn arity_no_args(args: &[PyObjectRef], name: &str) -> Result<(), crat
 /// accepts one or two positional arguments after the receiver — the
 /// "expected 1 or 2 arguments, got M" form with no method name.
 pub(crate) fn arity_pow(args: &[PyObjectRef]) -> Result<(), crate::PyError> {
-    let extra = args.len().saturating_sub(1);
+    let extra = args_given(args);
     if !(1..=2).contains(&extra) {
         return Err(crate::PyError::type_error(format!(
             "expected 1 or 2 arguments, got {extra}"
@@ -1238,7 +1250,7 @@ pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if pos.len() < 3 {
         return Err(crate::PyError::type_error(format!(
             "replace() takes at least 2 positional arguments ({} given)",
-            pos.len().saturating_sub(1)
+            args_given(pos)
         )));
     }
     crate::builtins::kwarg_reject_unknown(kwargs, &["count"], "replace")?;
@@ -5230,7 +5242,7 @@ pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     if pos.len() > 2 {
         return Err(crate::PyError::type_error(format!(
             "splitlines() takes at most 1 argument ({} given)",
-            pos.len().saturating_sub(1)
+            args_given(pos)
         )));
     }
     crate::builtins::kwarg_reject_unknown(kwargs, &["keepends"], "splitlines")?;
@@ -5279,7 +5291,7 @@ pub fn str_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     if pos.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "str.removeprefix() takes exactly one argument ({} given)",
-            pos.len().saturating_sub(1)
+            args_given(pos)
         )));
     }
     if !unsafe { pyre_object::is_str(pos[1]) } {
@@ -5302,7 +5314,7 @@ pub fn str_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     if pos.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "str.removesuffix() takes exactly one argument ({} given)",
-            pos.len().saturating_sub(1)
+            args_given(pos)
         )));
     }
     if !unsafe { pyre_object::is_str(pos[1]) } {
@@ -5334,7 +5346,7 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     if pos.len() > 2 {
         return Err(crate::PyError::type_error(format!(
             "expandtabs() takes at most 1 argument ({} given)",
-            pos.len().saturating_sub(1)
+            args_given(pos)
         )));
     }
     crate::builtins::kwarg_reject_unknown(kwargs, &["tabsize"], "expandtabs")?;
@@ -5493,9 +5505,12 @@ pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
                 let mut layout = pyre_object::w_type_get_layout_ptr(w_type);
                 while !layout.is_null() {
                     let current = &*layout;
-                    let first_slot = current
-                        .nslots
-                        .saturating_sub(current.newslotnames.len() as u32);
+                    let newslots = current.newslotnames.len() as u32;
+                    let first_slot = if current.nslots > newslots {
+                        current.nslots - newslots
+                    } else {
+                        0
+                    };
                     if let Some(offset) = current
                         .newslotnames
                         .iter()
@@ -6197,7 +6212,7 @@ pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if args.len() < 2 {
         return Err(crate::PyError::type_error(format!(
             "index expected at least 1 argument, got {}",
-            args.len().saturating_sub(1)
+            args_given(args)
         )));
     }
     if args.len() > 4 {
@@ -6255,7 +6270,7 @@ pub fn tuple_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if args.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "tuple.count() takes exactly one argument ({} given)",
-            args.len().saturating_sub(1)
+            args_given(args)
         )));
     }
     let tup = args[0];

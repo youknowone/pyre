@@ -2018,7 +2018,7 @@ pub(crate) fn range_count_method(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 2 {
         return Err(PyError::type_error(format!(
             "range.count() takes exactly one argument ({} given)",
-            args.len().saturating_sub(1)
+            crate::type_methods::args_given(args)
         )));
     }
     let obj = args[0];
@@ -2057,7 +2057,7 @@ pub(crate) fn range_index_method(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 2 {
         return Err(PyError::type_error(format!(
             "range.index() takes exactly one argument ({} given)",
-            args.len().saturating_sub(1)
+            crate::type_methods::args_given(args)
         )));
     }
     let obj = args[0];
@@ -13874,7 +13874,7 @@ pub(crate) fn property_set_name_impl(args: &[PyObjectRef]) -> PyResult {
     if positional.len() != 3 {
         return Err(crate::PyError::type_error(format!(
             "__set_name__() takes 2 positional arguments but {} were given",
-            positional.len().saturating_sub(1),
+            crate::type_methods::args_given(positional),
         )));
     }
     let prop = property_require_obj(
@@ -14495,7 +14495,7 @@ pub(crate) fn generator_throw_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> PyResult {
-    let given = args.len().saturating_sub(1);
+    let given = crate::type_methods::args_given(args);
     if given == 0 {
         return Err(PyError::type_error(
             "throw expected at least 1 argument, got 0",
@@ -14695,7 +14695,7 @@ pub(crate) fn async_generator_asend_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub(crate) fn async_generator_athrow_method(args: &[PyObjectRef]) -> PyResult {
-    let given = args.len().saturating_sub(1);
+    let given = crate::type_methods::args_given(args);
     if given == 0 {
         return Err(PyError::type_error(
             "athrow expected at least 1 argument, got 0",
