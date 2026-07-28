@@ -411,10 +411,13 @@ fn is_source_constant_variable(
                 | OpKind::ConstRef(_)
                 | OpKind::ConstRefNull
                 | OpKind::ConstRefAddr(_) => true,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
-                    ..
-                } => segments.first().is_some_and(|s| s == "__str_const"),
+                OpKind::Call { target, .. } => match target {
+                    CallTarget::FunctionPath { segments } => {
+                        segments.first().is_some_and(|s| s == "__str_const")
+                            || crate::model::fn_const_segments(target).is_some()
+                    }
+                    _ => false,
+                },
                 _ => false,
             }
         })
@@ -850,6 +853,15 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::ConstInt(fnaddr),
             },
         )
+    }
+
+    fn materialize_fn_const_funcptr_value(
+        &mut self,
+        graph: &mut FunctionGraph,
+        funcptr: &crate::flowspace::model::Variable,
+    ) -> Option<(crate::flowspace::model::Variable, SpaceOperation)> {
+        let target = fn_const_target_for_var(graph, funcptr, 0)?;
+        Some(self.direct_funcptr_value(graph, &target))
     }
 
     /// RPython: Transformer.rewrite_operation() — dispatch to rewrite_op_*.
@@ -4741,6 +4753,12 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
         graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
+        let materialized_funcptr = self.materialize_fn_const_funcptr_value(graph, funcptr);
+        let funcptr_value = materialized_funcptr
+            .as_ref()
+            .map(|(var, _)| var)
+            .unwrap_or(funcptr)
+            .clone();
         let (args_i, args_r, args_f) = self.make_three_lists_from_vars(args);
         let resolved_result = self.resolve_call_result(op.result.as_ref(), result_ty);
         let result_kind = resolved_result.kind;
@@ -4775,7 +4793,10 @@ impl<'a> Transformer<'a> {
                 //   op1 = SpaceOperation('int_guard_value', [op.args[0]], None)
                 //   op2 = self.handle_residual_call(op, [IndirectCallTargets(lst)], True)
                 // then [op0, op1] + op2 (op2 is itself [residual_call, '-live-'])
-                let mut ops = Vec::<SpaceOperation>::with_capacity(4);
+                let mut ops = Vec::<SpaceOperation>::with_capacity(5);
+                if let Some((_, funcptr_op)) = materialized_funcptr.clone() {
+                    ops.push(funcptr_op);
+                }
                 ops.push(SpaceOperation {
                     result: None,
                     kind: OpKind::Live,
@@ -4783,14 +4804,14 @@ impl<'a> Transformer<'a> {
                 ops.push(SpaceOperation {
                     result: None,
                     kind: OpKind::GuardValue {
-                        value: funcptr.clone(),
+                        value: funcptr_value.clone(),
                         kind_char: 'i',
                     },
                 });
                 ops.push(SpaceOperation {
                     result: op.result.clone(),
                     kind: OpKind::CallResidual {
-                        funcptr: CallFuncPtr::Value(funcptr.clone()),
+                        funcptr: CallFuncPtr::Value(funcptr_value.clone()),
                         descriptor,
                         args_i,
                         args_r,
@@ -4825,10 +4846,14 @@ impl<'a> Transformer<'a> {
                         None => "call <indirect> → residual unknown family".to_string(),
                     },
                 });
-                let mut ops = vec![SpaceOperation {
+                let mut ops = Vec::new();
+                if let Some((_, funcptr_op)) = materialized_funcptr {
+                    ops.push(funcptr_op);
+                }
+                ops.push(SpaceOperation {
                     result: op.result.clone(),
                     kind: OpKind::CallResidual {
-                        funcptr: CallFuncPtr::Value(funcptr.clone()),
+                        funcptr: CallFuncPtr::Value(funcptr_value),
                         descriptor,
                         args_i,
                         args_r,
@@ -4836,7 +4861,7 @@ impl<'a> Transformer<'a> {
                         result_kind,
                         indirect_targets: None,
                     },
-                }];
+                });
                 if can_raise {
                     ops.push(SpaceOperation {
                         result: None,
@@ -5317,10 +5342,92 @@ fn value_type_to_ir_type(ty: &ValueType) -> majit_ir::value::Type {
     }
 }
 
+fn fn_const_target_for_var(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+    depth: usize,
+) -> Option<CallTarget> {
+    if depth > 8 {
+        return None;
+    }
+    let (block_id, index) = crate::front::mir::resolve_to_producer_op(graph, var)?;
+    let block = graph.blocks.iter().find(|block| block.id == block_id)?;
+    let op = block.operations.get(index)?;
+    fn_const_target_from_op(graph, op, depth + 1)
+}
+
+fn fn_const_target_from_op(
+    graph: &FunctionGraph,
+    op: &SpaceOperation,
+    depth: usize,
+) -> Option<CallTarget> {
+    match &op.kind {
+        OpKind::Call { target, args, .. }
+            if args.is_empty() && crate::model::fn_const_segments(target).is_some() =>
+        {
+            Some(target.clone())
+        }
+        OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+            fn_const_target_for_var(graph, operand, depth)
+        }
+        OpKind::Hint { value, .. } => fn_const_target_for_var(graph, value, depth),
+        OpKind::FieldRead { base, field, .. } => {
+            let index = tuple_pos_field_index(&field.name)?;
+            if let Some(target) = fn_const_target_from_tuple_arg(graph, base, index, depth) {
+                return Some(target);
+            }
+            fn_const_target_from_field_write(graph, base, field, depth)
+        }
+        _ => None,
+    }
+}
+
+fn fn_const_target_from_tuple_arg(
+    graph: &FunctionGraph,
+    base: &crate::flowspace::model::Variable,
+    index: usize,
+    depth: usize,
+) -> Option<CallTarget> {
+    let (block_id, op_index) = crate::front::mir::resolve_to_producer_op(graph, base)?;
+    let block = graph.blocks.iter().find(|block| block.id == block_id)?;
+    let op = block.operations.get(op_index)?;
+    let OpKind::NewTuple { args } = &op.kind else {
+        return None;
+    };
+    let arg = args.get(index)?;
+    fn_const_target_for_var(graph, arg, depth)
+}
+
+fn fn_const_target_from_field_write(
+    graph: &FunctionGraph,
+    base: &crate::flowspace::model::Variable,
+    field: &crate::model::FieldDescriptor,
+    depth: usize,
+) -> Option<CallTarget> {
+    graph.blocks.iter().find_map(|block| {
+        block.operations.iter().find_map(|op| match &op.kind {
+            OpKind::FieldWrite {
+                base: write_base,
+                field: write_field,
+                value,
+                ..
+            } if write_base == base && write_field == field => value
+                .as_variable()
+                .and_then(|value| fn_const_target_for_var(graph, value, depth)),
+            _ => None,
+        })
+    })
+}
+
+fn tuple_pos_field_index(name: &str) -> Option<usize> {
+    name.strip_prefix("__pos_")?.parse().ok()
+}
+
 /// Convert a CallTarget to a CallPath for jitcode lookup.
 fn target_to_call_path(target: &CallTarget) -> crate::parse::CallPath {
     match target {
         CallTarget::FunctionPath { segments } => {
+            let segments = crate::model::fn_const_segments(target).unwrap_or(segments.as_slice());
             crate::parse::CallPath::from_segments(segments.iter().map(String::as_str))
         }
         CallTarget::Method { name, .. } => crate::parse::CallPath::from_segments([name.as_str()]),

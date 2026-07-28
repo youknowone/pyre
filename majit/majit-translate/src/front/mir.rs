@@ -4523,23 +4523,40 @@ impl<'a> Lowering<'a> {
                 // shape (`flowspace_adapter.rs::is_str_const_define`).
                 result_ty: ValueType::Ref(None),
             },
-            // A function item's value is its address.  Upstream materialises
-            // it as `Constant(funcptr)` of lltype `Ptr(FuncType)`
-            // (`rtyper.getcallable`, and `sub_helper_funcptr_constant` for the
-            // sub-helper twins), whose `getkind` is `r` — the same reason the
-            // `Str` arm above declares a Ref.  The synthetic define reuses the
-            // callee's real path so a value threaded into a call site still
-            // resolves, which also puts it in front of `getcalldescr`'s
-            // `RESULT == FUNC.RESULT` check (`call.py`): an `Int` here read as
-            // a 0-arg call to that function and hard-failed against any callee
-            // whose graph carries a `FUNC.RESULT` token — `w_dict_new`
-            // (`dont_look_inside`) threaded through `Option::unwrap_or_else` is
-            // the shape that surfaces it.
-            DecodedConst::FnPath(segments) => OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
-                args: vec![],
-                result_ty: ValueType::Ref(None),
-            },
+            // A function item used as a *value* rather than called; its value
+            // is the function's address.  The define takes a synthetic head
+            // for the same reason the `Str` arm above does: the path never
+            // matches a registered graph, so the define is not mistaken for a
+            // real 0-arg call to the function it names.  Both of
+            // `getcalldescr`'s checks (`call.py`) run off the resolved callee
+            // graph, and both reject this shape without the head — the
+            // argument-kind comparison against the define's empty list
+            // (`cycle_reduce_method`, one `Ref` parameter), and
+            // `RESULT == FUNC.RESULT` for a 0-parameter callee carrying a
+            // result token (`w_dict_new`, `dont_look_inside`, threaded through
+            // `Option::unwrap_or_else`).  The callee's own segments stay in
+            // the tail so the referenced function is still recoverable.
+            //
+            // Upstream materialises the address as `Constant(funcptr)` of
+            // lltype `Ptr(FuncType)` (`rtyper.getcallable`, and
+            // `sub_helper_funcptr_constant` for the sub-helper twins), whose
+            // `getkind` is `r`.  The slot here stays `Int` because majit
+            // materialises a funcptr as its integer address everywhere else
+            // (`jtransform.rs direct_funcptr_value` emits `ConstInt(fnaddr)`,
+            // which the assembler encodes through the `'i'` argcode), and the
+            // flowspace fold gives the define a `Signed` legacy slot to match.
+            DecodedConst::FnPath(segments) => {
+                let mut synthetic = Vec::with_capacity(segments.len() + 1);
+                synthetic.push(crate::model::FN_CONST_HEAD.to_string());
+                synthetic.extend(segments);
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: synthetic,
+                    },
+                    args: vec![],
+                    result_ty: ValueType::Int,
+                }
+            }
         };
         let var = self
             .graph
@@ -15401,7 +15418,7 @@ fn scalar_value_to_i64(v: &serde_json::Value) -> Option<i64> {
 /// `None` when `var` traces to a `Const`, a function input (no producing
 /// op), a phi merge (a block with more than one incoming `Link`, so no
 /// single producer), or a producer not yet emitted into `graph`.
-fn resolve_to_producer_op(
+pub(crate) fn resolve_to_producer_op(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
 ) -> Option<(BlockId, usize)> {

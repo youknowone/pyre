@@ -289,6 +289,20 @@ pub enum CallTarget {
     UnsupportedExpr,
 }
 
+pub const FN_CONST_HEAD: &str = "__fn_const";
+
+pub fn fn_const_segments(target: &CallTarget) -> Option<&[String]> {
+    match target {
+        CallTarget::FunctionPath { segments }
+            if segments.first().map(String::as_str) == Some(FN_CONST_HEAD)
+                && segments.len() > 1 =>
+        {
+            Some(&segments[1..])
+        }
+        _ => None,
+    }
+}
+
 impl CallTarget {
     pub fn method(name: impl Into<String>, receiver_root: Option<String>) -> Self {
         Self::Method {

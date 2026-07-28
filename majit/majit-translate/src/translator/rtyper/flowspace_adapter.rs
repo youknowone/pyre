@@ -626,6 +626,19 @@ fn is_str_const_define(kind: &OpKind) -> bool {
     )
 }
 
+/// `true` iff `kind` is `front::mir`'s synthetic function-item constant
+/// define-op (`Call(["__fn_const", <real path>...])`).  Like
+/// [`is_str_const_define`], this is a constant carrier rather than a
+/// flowspace call operation.
+fn is_fn_const_define(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::Call { target, args, .. } if args.is_empty() => {
+            crate::model::fn_const_segments(target).is_some()
+        }
+        _ => false,
+    }
+}
+
 /// `true` iff `kind` is `front::mir`'s synthetic prebuilt-constant-array
 /// define-op (`Call(["__const_int_array", <i0>, <i1>, …])`,
 /// `fold_named_const_int_array_global`).  A module-level constant array
@@ -812,6 +825,9 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // and emits no op — a Constant raises nothing.  Matched before
         // the general `Call` arm, same as the unit-variant elision.
         kind if is_str_const_define(kind) => false,
+        // A function-item constant define-op is a bare constant carrier,
+        // not a callee invocation, so it raises nothing.
+        kind if is_fn_const_define(kind) => false,
         // A prebuilt-constant-array define-op pre-folds to `Constant(list)`
         // and emits no op — a Constant raises nothing.  Matched before the
         // general `Call` arm, same as the string-literal elision.
@@ -946,6 +962,12 @@ pub fn translate_op(
     // way (see `is_str_const_define`); the pre-pass owns the slot's
     // `Hlvalue::Constant`, translate_op emits no FlowspaceOp.
     if is_str_const_define(&op.kind) {
+        return Ok(Vec::new());
+    }
+    // Function-item define-ops pre-fold to a constant carrier the same
+    // way (see `is_fn_const_define`); consumers that need the address
+    // recover the real path by stripping the synthetic head.
+    if is_fn_const_define(&op.kind) {
         return Ok(Vec::new());
     }
     // Prebuilt-constant-array define-ops pre-fold to `Constant(list)` the
@@ -2576,36 +2598,41 @@ fn constant_from_constvalue(value: ConstValue) -> Constant {
     }
 }
 
-fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
+fn legacy_const_define_hlvalue(
+    op: &SpaceOperation,
+    call_registry: Option<&crate::translator::rtyper::pyre_call_registry::PyreCallRegistry>,
+) -> Result<Option<Hlvalue>, TyperError> {
     // Const-define ops always carry a result Variable; bail on the
     // (malformed) result-less op so the caller can key the const
     // concretetype by `op.result` identity.
-    op.result.as_ref()?;
+    if op.result.is_none() {
+        return Ok(None);
+    }
     match &op.kind {
-        OpKind::ConstInt(n) => Some(Hlvalue::Constant(Constant::with_concretetype(
+        OpKind::ConstInt(n) => Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
             ConstValue::Int(*n),
             LowLevelType::Signed,
-        ))),
-        OpKind::ConstInt128(n) => Some(Hlvalue::Constant(Constant::with_concretetype(
+        )))),
+        OpKind::ConstInt128(n) => Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
             ConstValue::Int128(*n),
             LowLevelType::SignedLongLongLong,
-        ))),
-        OpKind::ConstUInt128(n) => Some(Hlvalue::Constant(Constant::with_concretetype(
+        )))),
+        OpKind::ConstUInt128(n) => Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
             ConstValue::UInt128(*n),
             LowLevelType::UnsignedLongLongLong,
-        ))),
-        OpKind::ConstBool(b) => Some(Hlvalue::Constant(Constant::with_concretetype(
+        )))),
+        OpKind::ConstBool(b) => Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
             ConstValue::Bool(*b),
             LowLevelType::Bool,
-        ))),
-        OpKind::ConstFloat(bits) => Some(Hlvalue::Constant(Constant::with_concretetype(
+        )))),
+        OpKind::ConstFloat(bits) => Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
             ConstValue::Float(*bits),
             LowLevelType::Float,
-        ))),
-        OpKind::ConstRefNull => Some(Hlvalue::Constant(const_ref_gcref_constant(None))),
-        OpKind::ConstRefAddr(addr) => {
-            Some(Hlvalue::Constant(const_ref_gcref_constant(Some(*addr))))
-        }
+        )))),
+        OpKind::ConstRefNull => Ok(Some(Hlvalue::Constant(const_ref_gcref_constant(None)))),
+        OpKind::ConstRefAddr(addr) => Ok(Some(Hlvalue::Constant(const_ref_gcref_constant(Some(
+            *addr,
+        ))))),
         // Prebuilt-constant-array define-op.  A module-level constant
         // array (`OP_STACKDEL: [i32; N]`) is carried as a bare immutable
         // `Constant(list)`; `immutableconstant` annotates it `SomeList`
@@ -2615,8 +2642,8 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
         // (`fold_named_const_int_array_global`); re-fold that define-op to
         // the upstream Constant shape here, the same way the
         // `__str_const` arm below re-folds a string literal.
-        kind if is_const_int_array_define(kind) => const_int_array_items(kind)
-            .map(|items| Hlvalue::Constant(Constant::new(ConstValue::List(items)))),
+        kind if is_const_int_array_define(kind) => Ok(const_int_array_items(kind)
+            .map(|items| Hlvalue::Constant(Constant::new(ConstValue::List(items))))),
         // String-literal constant.  Upstream flowspace carries a string
         // literal as a bare `Constant('text')` SSA value (annotated
         // `SomeString` by `immutablevalue`); `front::mir` has no
@@ -2637,10 +2664,53 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
             args,
             ..
         } if args.is_empty() && segments.len() == 2 && segments[0] == "__str_const" => {
-            Some(Hlvalue::Constant(Constant::with_concretetype(
+            Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
                 ConstValue::ByteStr(segments[1].clone().into_bytes()),
                 crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone(),
-            )))
+            ))))
+        }
+        OpKind::Call { target, args, .. }
+            if args.is_empty() && crate::model::fn_const_segments(target).is_some() =>
+        {
+            let segments = crate::model::fn_const_segments(target).expect("guard checked");
+            let call_registry = call_registry.ok_or_else(|| {
+                TyperError::message(format!(
+                    "fn const {:?} requires a PyreCallRegistry to materialise getfunctionptr",
+                    segments
+                ))
+            })?;
+            let key =
+                crate::translator::rtyper::pyre_call_registry::FunctionPathKey(segments.to_vec());
+            let entry = call_registry.lookup_with_leaf_match(&key).ok_or_else(|| {
+                TyperError::message(format!(
+                    "fn const {:?} did not resolve to a registered callee",
+                    key.segments()
+                ))
+            })?;
+            if let Some(err) = entry.pyre_lift_error() {
+                return Err(TyperError::message(format!(
+                    "fn const {:?} resolved to an unbuildable callee: {err}",
+                    key.segments()
+                )));
+            }
+            let graphs = entry.function_desc.borrow().getgraphs();
+            let graph = graphs.into_iter().next().ok_or_else(|| {
+                TyperError::message(format!(
+                    "fn const {:?} resolved to a registry entry without a cached graph",
+                    key.segments()
+                ))
+            })?;
+            let func_ptr = crate::translator::rtyper::lltypesystem::lltype::getfunctionptr(
+                &graph.graph,
+                crate::translator::rtyper::lltypesystem::lltype::_getconcretetype,
+            )?;
+            let func_ptr_type = crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(
+                Box::new(func_ptr._TYPE.clone()),
+            );
+            Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::LLPtr(Box::new(func_ptr)),
+                func_ptr_type,
+            ))))
         }
         // RPython parity: unit-variant ctors (`StepResult::Continue`,
         // `LoopResult::Done`, …) are pre-built singleton instances at
@@ -2671,7 +2741,7 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
             if !crate::translator::rtyper::unit_variant_fold::is_synthetic_unit_variant_path(
                 &segments,
             ) {
-                return None;
+                return Ok(None);
             }
             // PyPy rtyper folds unit-variant PBC constructors into a
             // singleton instance pointer before jtransform sees them
@@ -2699,15 +2769,19 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<Hlvalue> {
             // (`rpython/rtyper/rclass.py:804`).  Without this, two
             // graphs that reach the same unit variant via different
             // gate arms would resolve to distinct singletons.
-            let instance = crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
-                &qualname,
-            )?;
-            Some(Hlvalue::Constant(Constant::with_concretetype(
+            let instance =
+                crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
+                    &qualname,
+                );
+            let Some(instance) = instance else {
+                return Ok(None);
+            };
+            Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
                 ConstValue::HostObject(instance),
                 crate::translator::rtyper::rclass::OBJECTPTR.clone(),
-            )))
+            ))))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -3116,7 +3190,7 @@ pub fn function_graph_to_flowspace(
             continue;
         }
         for legacy_op in &legacy_block.operations {
-            if let Some(hlvalue) = legacy_const_define_hlvalue(legacy_op) {
+            if let Some(hlvalue) = legacy_const_define_hlvalue(legacy_op, Some(call_registry))? {
                 // `legacy_const_define_hlvalue` only returns `Some` for ops
                 // with a result Variable, so this is always present here.
                 let Some(result_var) = legacy_op.result.as_ref() else {
@@ -3124,7 +3198,20 @@ pub fn function_graph_to_flowspace(
                 };
                 if let Hlvalue::Constant(c) = &hlvalue {
                     if let Some(ct) = &c.concretetype {
-                        constant_concretetypes.insert(result_var.clone(), ct.clone());
+                        let legacy_ct = if is_fn_const_define(&legacy_op.kind) {
+                            // The rtyper-side carrier is a real LLPtr so
+                            // direct-call resolution can materialise
+                            // `getfunctionptr` from the function graph.  The
+                            // legacy/codewriter side must still see the
+                            // synthetic define's declared Int slot: later
+                            // jtransform materialises funcptr values as
+                            // `ConstInt(fnaddr)` and the assembler encodes
+                            // them through the `i` argcode.
+                            LowLevelType::Signed
+                        } else {
+                            ct.clone()
+                        };
+                        constant_concretetypes.insert(result_var.clone(), legacy_ct.clone());
                         // Also stamp the lltype onto the legacy graph's
                         // orphan Variable cell for this const-define
                         // result.  The rtyper consumes `Hlvalue::Constant`
@@ -3138,7 +3225,7 @@ pub fn function_graph_to_flowspace(
                         // depending on the post-rtyper
                         // `apply_to_graph(constant_concretetypes, …)`
                         // bridge.
-                        result_var.set_concretetype(Some(ct.clone()));
+                        result_var.set_concretetype(Some(legacy_ct));
                     }
                 }
                 constant_hlvalues.insert(result_var.clone(), hlvalue);
@@ -3332,7 +3419,7 @@ pub fn function_graph_to_flowspace(
         // Translate operations.
         let mut translated_ops: Vec<FlowspaceOp> = Vec::new();
         for legacy_op in &legacy_block.operations {
-            if let Some(hlvalue) = legacy_const_define_hlvalue(legacy_op) {
+            if let Some(hlvalue) = legacy_const_define_hlvalue(legacy_op, Some(call_registry))? {
                 if let Some(result_var) = legacy_op.result.as_ref() {
                     value_map.insert(result_var.clone(), hlvalue.clone());
                     if let Some(name) = legacy.value_name_for(result_var) {
@@ -5611,7 +5698,7 @@ mod tests {
                 .is_empty()
         );
         // The pre-pass folds the define to the prebuilt list constant.
-        match legacy_const_define_hlvalue(&op) {
+        match legacy_const_define_hlvalue(&op, None).expect("const-array define folds") {
             Some(Hlvalue::Constant(c)) => assert_eq!(
                 c.value,
                 ConstValue::List(vec![
@@ -5632,5 +5719,125 @@ mod tests {
             result_ty: ValueType::Ref(None),
         };
         assert!(!is_const_int_array_define(&str_const));
+    }
+
+    #[test]
+    fn fn_const_define_is_constant_carrier() {
+        use crate::model::CallTarget;
+
+        let registry = empty_call_registry();
+        let key = crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments([
+            "module", "function",
+        ]);
+        let func = crate::flowspace::model::GraphFunc::new(
+            "function",
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        let ret = Variable::new();
+        ret.annotation.replace(Some(Rc::new(
+            crate::annotator::model::SomeValue::Impossible,
+        )));
+        ret.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+        ));
+        let startblock = crate::flowspace::model::Block::shared(vec![]);
+        let pygraph = Rc::new(crate::flowspace::pygraph::PyGraph {
+            graph: Rc::new(RefCell::new(
+                crate::flowspace::model::FunctionGraph::with_return_var(
+                    "function",
+                    startblock,
+                    Hlvalue::Variable(ret),
+                ),
+            )),
+            func,
+            signature: RefCell::new(crate::flowspace::argument::Signature::new(
+                Vec::<String>::new(),
+                None,
+                None,
+            )),
+            defaults: RefCell::new(Some(Vec::new())),
+            access_directly: std::cell::Cell::new(false),
+        });
+        registry.register_callee(
+            key,
+            crate::flowspace::argument::Signature::new(Vec::<String>::new(), None, None),
+            pygraph,
+        );
+
+        let define = OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec![
+                    crate::model::FN_CONST_HEAD.to_string(),
+                    "module".to_string(),
+                    "function".to_string(),
+                ],
+            },
+            args: Vec::new(),
+            result_ty: ValueType::Int,
+        };
+        assert!(is_fn_const_define(&define));
+        assert!(!is_str_const_define(&define));
+        assert!(!is_const_int_array_define(&define));
+
+        let op = SpaceOperation {
+            result: Some(Variable::new()),
+            kind: define.clone(),
+        };
+        assert!(
+            translate_op(&op, &HashMap::new(), &empty_call_registry())
+                .expect("fn const define translates")
+                .is_empty()
+        );
+        match legacy_const_define_hlvalue(&op, Some(&registry)).expect("fn const define folds") {
+            Some(Hlvalue::Constant(c)) => {
+                assert!(matches!(c.value, ConstValue::LLPtr(_)));
+                assert!(matches!(
+                    c.concretetype,
+                    Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(_))
+                ));
+            }
+            other => panic!("expected LLPtr funcptr Constant carrier, got {other:?}"),
+        }
+
+        let mut legacy = LegacyGraph::new("fn_const_carrier");
+        let carrier = legacy.alloc_value_var();
+        let startblock = Block {
+            id: legacy.startblock,
+            inputargs: vec![],
+            operations: vec![SpaceOperation {
+                result: Some(carrier.clone()),
+                kind: define,
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(carrier.clone())],
+                legacy.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: legacy.returnblock,
+            inputargs: vec![carrier.clone()],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        legacy.blocks = vec![startblock, returnblock];
+
+        let output = function_graph_to_flowspace(&legacy, &registry)
+            .expect("fn const carrier graph converts");
+        assert_eq!(
+            output.constant_concretetypes.get(&carrier),
+            Some(&crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed),
+            "legacy/codewriter carrier type must stay Int/Signed"
+        );
+        assert_eq!(
+            carrier.concretetype(),
+            Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed),
+            "legacy Variable cell must stay Int/Signed"
+        );
     }
 }

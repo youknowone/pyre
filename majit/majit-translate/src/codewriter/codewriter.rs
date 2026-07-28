@@ -606,20 +606,6 @@ impl CodeWriter {
         // `Variable.concretetype` (see `Transformer::transform` →
         // `apply_to_graph`), so the legacy `resolve_rewritten_types`
         // walk is structurally dead in the production path.
-        // Commit jtransform-induced op-result kinds (`result_ty` /
-        // `result_kind` declarations) to each backing
-        // `Variable.concretetype` cell.  Pre-jtransform kinds are
-        // already on the graph cells (rtyper boundary via
-        // `apply_to_graph` / `resolve_types`); this overlay handles
-        // the post-jtransform op-result deltas.  Precedence stack
-        // `post_result > pre-jtransform` falls out of
-        // `set_concretetype_of_inline`'s "preserve richer existing
-        // iff getkind matches" semantic.
-        for (var, kind) in &post_result_types {
-            if !matches!(kind, crate::model::ConcreteType::Unknown) {
-                crate::model::FunctionGraph::set_concretetype_of_inline(var, kind.clone());
-            }
-        }
         // Long-term parity hydration: when the dual-gate Match arm
         // surfaced a `LegacyToTyped` map, copy each upstream-typed
         // Variable's lltype onto the matching legacy Variable so
@@ -630,6 +616,24 @@ impl CodeWriter {
         // line-for-line equivalent.
         if let Some(value_to_var) = real_value_to_var.as_ref() {
             crate::codewriter::type_state::apply_from_flowspace_variables(value_to_var);
+        }
+        // Commit jtransform-induced op-result kinds (`result_ty` /
+        // `result_kind` declarations) to each backing
+        // `Variable.concretetype` cell.  Pre-jtransform kinds are
+        // already on the graph cells (rtyper boundary via
+        // `apply_to_graph` / `resolve_types`); this overlay handles the
+        // post-jtransform op-result deltas.  It runs after the hydration
+        // above because a rewritten declaration outranks the
+        // pre-jtransform cell: an inlined `Result<bool, PyError>` call is
+        // the post-exception `Bool` value even though the Rust aggregate
+        // typed it as a `Ref` shell.  Precedence stack
+        // `post_result > pre-jtransform` falls out of
+        // `set_concretetype_of_inline`'s "preserve richer existing
+        // iff getkind matches" semantic.
+        for (var, kind) in &post_result_types {
+            if !matches!(kind, crate::model::ConcreteType::Unknown) {
+                crate::model::FunctionGraph::set_concretetype_of_inline(var, kind.clone());
+            }
         }
 
         // Steps 2-4 (regalloc → flatten → liveness/assemble → calldescr →

@@ -17,6 +17,90 @@ use vecset::VecSet;
 use crate::call::CallControl;
 use crate::flatten::{FlatOp, IntOvfOp, Label, RegKind, SSARepr};
 
+fn reg_label(reg: crate::flatten::Register) -> String {
+    reg.repr()
+}
+
+fn reg_or_const_label(value: &crate::flatten::RegOrConst) -> String {
+    match value {
+        crate::flatten::RegOrConst::Reg(reg) => reg_label(*reg),
+        crate::flatten::RegOrConst::Const(c) => {
+            let kind = crate::flatten::constant_kind(c);
+            format!("Const({kind})")
+        }
+    }
+}
+
+fn flatop_debug_label(op: &FlatOp) -> String {
+    match op {
+        FlatOp::Label(label) => format!("Label({})", label.0),
+        FlatOp::Op(op) => {
+            let has_result = op.result.is_some();
+            format!("Op(has_result={has_result})")
+        }
+        FlatOp::Jump(label) => format!("Jump({})", label.0),
+        FlatOp::GotoIfNot { cond, target } => {
+            format!("GotoIfNot(cond={}, target={})", reg_label(*cond), target.0)
+        }
+        FlatOp::GotoIfNotOp {
+            opname,
+            args,
+            target,
+        } => {
+            let args = args
+                .iter()
+                .map(|reg| reg_label(*reg))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("GotoIfNotOp({opname}, args=[{args}], target={})", target.0)
+        }
+        FlatOp::Switch { value, targets } => {
+            format!(
+                "Switch(value={}, targets={})",
+                reg_label(*value),
+                targets.len()
+            )
+        }
+        FlatOp::IntBinOpJumpIfOvf {
+            op,
+            target,
+            lhs,
+            rhs,
+            dst,
+        } => format!(
+            "IntBinOpJumpIfOvf({op:?}, lhs={}, rhs={}, dst={}, target={})",
+            reg_label(*lhs),
+            reg_label(*rhs),
+            reg_label(*dst),
+            target.0
+        ),
+        FlatOp::CatchException { target } => format!("CatchException(target={})", target.0),
+        FlatOp::GotoIfExceptionMismatch { target, .. } => {
+            format!("GotoIfExceptionMismatch(target={})", target.0)
+        }
+        FlatOp::Move { dst, src } => {
+            format!(
+                "Move(dst={}, src={})",
+                reg_label(*dst),
+                reg_or_const_label(src)
+            )
+        }
+        FlatOp::Push(reg) => format!("Push({})", reg_label(*reg)),
+        FlatOp::Pop(reg) => format!("Pop({})", reg_label(*reg)),
+        FlatOp::LastException { dst } => format!("LastException(dst={})", reg_label(*dst)),
+        FlatOp::LastExcValue { dst } => format!("LastExcValue(dst={})", reg_label(*dst)),
+        FlatOp::Live { live_values } => format!("Live(count={})", live_values.len()),
+        FlatOp::Reraise => "Reraise".to_string(),
+        FlatOp::IntReturn(value) => format!("IntReturn({})", reg_or_const_label(value)),
+        FlatOp::RefReturn(value) => format!("RefReturn({})", reg_or_const_label(value)),
+        FlatOp::FloatReturn(value) => format!("FloatReturn({})", reg_or_const_label(value)),
+        FlatOp::VoidReturn => "VoidReturn".to_string(),
+        FlatOp::Raise(value) => format!("Raise({})", reg_or_const_label(value)),
+        FlatOp::EndOfBlock => "EndOfBlock".to_string(),
+        FlatOp::Unreachable => "Unreachable".to_string(),
+    }
+}
+
 /// `flatten.py:30` `Register.kind[0]` — single-char prefix for opname keys.
 fn kind_char_of(kind: RegKind) -> char {
     match kind {
@@ -397,7 +481,7 @@ impl Assembler {
         for op in &ops {
             insns_pos.push(state.code.len());
             if debug_enabled {
-                self.current_flatop_debug = Some(format!("{op:?}"));
+                self.current_flatop_debug = Some(flatop_debug_label(op));
             }
             self.write_insn(op, regallocs, &mut state, callcontrol);
         }
