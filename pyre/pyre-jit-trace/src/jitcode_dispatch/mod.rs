@@ -5932,10 +5932,18 @@ pub(crate) unsafe fn resolve_inlinable_callee(
         if raw.is_null() {
             return None;
         }
-        // Calling a generator / coroutine / async-generator function does NOT
-        // run its body — it builds the iterator and returns.  Inlining the
-        // body at the call site walks code the call never reaches, so the
-        // attempt can only end in an abort that discards the whole trace.
+        // Calling a generator / coroutine / async-generator function does not
+        // run its body — it builds a suspended frame object and returns it.
+        // Its jitcode therefore starts at `RETURN_GENERATOR`, which the
+        // codewriter lowers to an `abort_permanent` marker: inlining the body
+        // at the call site walks code the call never reaches, so the attempt
+        // can only end in an abort that discards the whole trace.  Decline to
+        // the residual call instead — the creation is an ordinary allocating
+        // call the walk steps over, and the body's suspension never enters the
+        // trace.  `generator.py:614-634` `should_not_inline` (consumed at
+        // `:63`) is upstream's decision point for the same boundary; it governs
+        // the *body* at `send_ex`, which is a separate question from the
+        // creation call.
         if pyre_interpreter::pyframe::code_flags_make_generator((*raw).flags) {
             return None;
         }
