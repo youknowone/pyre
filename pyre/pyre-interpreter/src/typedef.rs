@@ -1214,11 +1214,21 @@ pub fn init_typeobjects() {
         );
         reg.insert(
             &pyre_object::interp_itertools::PAIRWISE_TYPE as *const PyType as usize,
-            new_typeobject_with_base("itertools.pairwise", |_| {}, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.pairwise",
+                init_pairwise_type,
+                object_type,
+                &pyre_object::interp_itertools::PAIRWISE_TYPE as *const PyType,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::interp_itertools::CYCLE_TYPE as *const PyType as usize,
-            new_typeobject_with_base("itertools.cycle", |_| {}, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.cycle",
+                init_cycle_type,
+                object_type,
+                &pyre_object::interp_itertools::CYCLE_TYPE as *const PyType,
+            ) as usize,
         );
         reg.insert(
             &pyre_object::interp_itertools::CHAIN_TYPE as *const PyType as usize,
@@ -23965,6 +23975,121 @@ fn init_zip_longest_type(ns: PyObjectRef) {
             "__doc__",
             w_str_new(
                 "Return a zip_longest object whose next method returns a tuple from each iterable.",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+// ── itertools pairwise / cycle TypeDefs ─────────────────────────────
+// PyPy W_Pairwise / W_Cycle. Python 3.14 no longer exposes the old PyPy
+// pickle entries on cycle, so both public TypeDefs contain only the native
+// constructor and iterator protocol.
+
+fn itertools_posonly_iter_new(
+    args: &[PyObjectRef],
+    name: &str,
+    exact: PyObjectRef,
+    alloc: fn(PyObjectRef) -> PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = positional.first().copied().unwrap_or(PY_NULL);
+    let values = positional.get(1..).unwrap_or(&[]);
+    if values.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "{name} expected 1 argument, got {}",
+            values.len()
+        )));
+    }
+    // CPython 3.14 keeps the single input positional-only. It permits
+    // keywords to flow to an overridden subtype __init__, while the base
+    // initializer rejects them. This is the 3.14 delta from Pairwise's
+    // fixed PyPy gateway signature.
+    builtinclass_new_args_check(
+        name,
+        exact,
+        cls,
+        0,
+        crate::builtins::has_real_kwargs(kwargs),
+    )?;
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(values[0]);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let iterator =
+        crate::baseobjspace::iter(unsafe { pyre_object::gc_roots::shadow_stack_get(value_slot) })?;
+    let obj = alloc(iterator);
+    itertools_alloc_for_class(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        exact,
+        obj,
+    )
+}
+
+fn pairwise_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exact =
+        gettypefor(&pyre_object::interp_itertools::PAIRWISE_TYPE).map_or(PY_NULL, |p| p.as_ptr());
+    itertools_posonly_iter_new(
+        args,
+        "pairwise",
+        exact,
+        pyre_object::interp_itertools::w_pairwise_new,
+    )
+}
+
+fn cycle_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exact =
+        gettypefor(&pyre_object::interp_itertools::CYCLE_TYPE).map_or(PY_NULL, |p| p.as_ptr());
+    itertools_posonly_iter_new(
+        args,
+        "cycle",
+        exact,
+        pyre_object::interp_itertools::w_cycle_new,
+    )
+}
+
+fn init_pairwise_type(ns: PyObjectRef) {
+    let entries = [
+        ("__new__", make_new_descr(pairwise_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Return an iterator of overlapping pairs taken from the input iterator.\n\n    s -> (s0,s1), (s1,s2), (s2, s3), ...\n",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn init_cycle_type(ns: PyObjectRef) {
+    let entries = [
+        ("__new__", make_new_descr(cycle_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Return elements from the iterable until it is exhausted. Then repeat the sequence indefinitely.",
             ),
         ),
     ];

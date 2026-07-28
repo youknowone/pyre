@@ -493,35 +493,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "filterfalse",
         crate::typedef::gettypefor(&pyre_object::interp_itertools::FILTERFALSE_TYPE).expect("itertools.filterfalse TypeDef initialized").as_ptr(),
     );
-    // pairwise(iterable) — W_Pairwise__new__: store `space.iter(w_iterable)`;
-    // pairs are produced lazily by W_Pairwise.next_w (baseobjspace::next).
+    // PyPy exports the native W_Pairwise / W_Cycle TypeDefs. Their __new__
+    // slots allocate the requested subtype and retain a live source iterator.
     crate::module_ns_store(
         ns,
         "pairwise",
-        crate::make_builtin_function_with_arity(
-            "pairwise",
-            |args| {
-                let iterator = crate::baseobjspace::iter(args[0])?;
-                Ok(pyre_object::interp_itertools::w_pairwise_new(iterator))
-            },
-            1,
-        ),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::PAIRWISE_TYPE)
+            .expect("itertools.pairwise TypeDef initialized")
+            .as_ptr(),
     );
-    // cycle(iterable) — W_Cycle___new__: store `space.iter(w_iterable)` and an
-    // empty `saved` list.  W_Cycle.next_w (baseobjspace::next) pulls from the
-    // source on the first pass, saving each element, then replays `saved`
-    // forever.
     crate::module_ns_store(
         ns,
         "cycle",
-        crate::make_builtin_function_with_arity(
-            "cycle",
-            |args| {
-                let iterator = crate::baseobjspace::iter(args[0])?;
-                Ok(pyre_object::interp_itertools::w_cycle_new(iterator))
-            },
-            1,
-        ),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::CYCLE_TYPE)
+            .expect("itertools.cycle TypeDef initialized")
+            .as_ptr(),
     );
     // batched(iterable, n, *, strict=False) — CPython 3.13 itertools.batched.
     // Batches the input into tuples of length `n`; the last tuple may be
