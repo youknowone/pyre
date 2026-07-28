@@ -1124,6 +1124,16 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
             std::process::exit(1);
         }
     };
+    // The frame is a GC object, and the only root that reaches one is the
+    // `CURRENT_FRAME` / `f_backref` chain the frame walker follows — which it
+    // joins when `eval_with_jit` below installs it.  Everything between here
+    // and that call runs Python (`sys`, the importlib bootstrap, `site`) and
+    // can therefore drive a collection that would reclaim the frame and hand
+    // its storage to the next frame allocation.  RPython keeps a local holding
+    // a GC object alive through the translated shadow stack; publish it
+    // explicitly for the same span.
+    let _main_frame_root = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(&*frame as *const PyFrame as pyre_object::PyObjectRef);
 
     // Register __main__ module in sys.modules — PyPy: app_main sets
     // sys.modules['__main__'] before executing user code so that

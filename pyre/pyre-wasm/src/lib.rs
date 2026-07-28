@@ -433,6 +433,14 @@ fn run_python_impl(source: &str) -> String {
             Ok(frame) => frame,
             Err(e) => return format!("Error: {e}"),
         };
+    // Nothing reaches a GC frame but the `CURRENT_FRAME` / `f_backref` chain,
+    // which this one joins only when `eval_with_jit` installs it; the module
+    // registration below allocates and can collect in between. Publish it for
+    // that span (pyrex `run_source` does the same).
+    let _main_frame_root = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(
+        &*frame as *const pyre_interpreter::pyframe::PyFrame as pyre_object::PyObjectRef,
+    );
 
     // Register the `__main__` module in sys.modules (pyrex real_main does the
     // same), reusing the canonical globals dict so `__main__.__dict__`,
