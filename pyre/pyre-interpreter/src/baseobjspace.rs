@@ -4861,6 +4861,8 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::interp_itertools::is_combinations(obj)
             || pyre_object::interp_itertools::is_combinations_with_replacement(obj)
             || pyre_object::interp_itertools::is_permutations(obj)
+            || pyre_object::interp_itertools::is_groupby(obj)
+            || pyre_object::interp_itertools::is_groupby_iterator(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = match name {
                 "__next__" => Some((iter_next_method, "__next__", 1)),
@@ -12548,6 +12550,8 @@ pub fn is_iterable(obj: PyObjectRef) -> bool {
             || pyre_object::interp_itertools::is_combinations(obj)
             || pyre_object::interp_itertools::is_combinations_with_replacement(obj)
             || pyre_object::interp_itertools::is_permutations(obj)
+            || pyre_object::interp_itertools::is_groupby(obj)
+            || pyre_object::interp_itertools::is_groupby_iterator(obj)
         {
             return true;
         }
@@ -12929,6 +12933,24 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             }
             return Ok(obj);
         }
+        if pyre_object::interp_itertools::is_groupby(obj) {
+            let exact = get_instantiate(&pyre_object::interp_itertools::GROUPBY_TYPE);
+            if !std::ptr::eq((*obj).w_class, exact) {
+                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
+                    if !std::ptr::eq(src, exact) {
+                        if is_none(method) {
+                            return Err(PyError::type_error(format!(
+                                "'{}' object is not iterable",
+                                obj_type_name(obj)
+                            )));
+                        }
+                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                        return iter_check_is_iterator(w_iter);
+                    }
+                }
+            }
+            return Ok(obj);
+        }
         // itertools native iterators — iter_w returns self.
         // PyPy: W_Count.iter_w / W_Repeat.iter_w / W_TakeWhile.iter_w /
         // W_DropWhile.iter_w / W_Filter.iter_w / W_Pairwise.iter_w
@@ -12942,6 +12964,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             || pyre_object::interp_itertools::is_pairwise(obj)
             || pyre_object::interp_itertools::is_cycle(obj)
             || pyre_object::interp_itertools::is_chain(obj)
+            || pyre_object::interp_itertools::is_groupby_iterator(obj)
         {
             return Ok(obj);
         }
@@ -13110,6 +13133,43 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         "'{}' object is not iterable",
         unsafe { not_iterable_type_name(obj) }
     )))
+}
+
+/// PyPy `W_GroupBy._skip_to_next_iteration_group` /
+/// CPython `groupby_step`: draw one value, compute its key, and publish both
+/// back onto the rooted parent after arbitrary iterator/key-function calls.
+fn groupby_step(obj: PyObjectRef) -> Result<(), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_self = unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) };
+    let state = unsafe { &*(w_self as *const pyre_object::interp_itertools::W_GroupBy) };
+    let w_newvalue = next(state.w_iterator)?;
+    pyre_object::gc_roots::pin_root(w_newvalue);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    let w_self = unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) };
+    let w_keyfunc =
+        unsafe { (*(w_self as *const pyre_object::interp_itertools::W_GroupBy)).w_keyfunc };
+    let w_newkey = if unsafe { pyre_object::is_none(w_keyfunc) } {
+        unsafe { pyre_object::gc_roots::shadow_stack_get(value_slot) }
+    } else {
+        pyre_object::gc_roots::pin_root(w_keyfunc);
+        let keyfunc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        crate::call::call_function_impl_result(
+            unsafe { pyre_object::gc_roots::shadow_stack_get(keyfunc_slot) },
+            &[unsafe { pyre_object::gc_roots::shadow_stack_get(value_slot) }],
+        )?
+    };
+    pyre_object::gc_roots::pin_root(w_newkey);
+    let key_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    let w_self = unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) };
+    let state = unsafe { &mut *(w_self as *mut pyre_object::interp_itertools::W_GroupBy) };
+    state.w_currkey = unsafe { pyre_object::gc_roots::shadow_stack_get(key_slot) };
+    state.w_currvalue = unsafe { pyre_object::gc_roots::shadow_stack_get(value_slot) };
+    pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
+    Ok(())
 }
 
 /// `next(iterator)` — PyPy: space.next(w_iter)
@@ -14056,6 +14116,130 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 return Err(PyError::stop_iteration());
             }
             state.started = true;
+            return Ok(pyre_object::gc_roots::shadow_stack_get(result_slot));
+        }
+        // itertools.groupby — PyPy W_GroupBy.next_w.
+        if pyre_object::interp_itertools::is_groupby(obj) {
+            let exact = get_instantiate(&pyre_object::interp_itertools::GROUPBY_TYPE);
+            if !std::ptr::eq((*obj).w_class, exact) {
+                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__next__") {
+                    if !std::ptr::eq(src, exact) {
+                        return crate::call::call_function_impl_result(method, &[obj]);
+                    }
+                }
+            }
+
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            (*(w_self as *mut pyre_object::interp_itertools::W_GroupBy)).w_currgrouper = PY_NULL;
+
+            // _skip_to_next_iteration_group.  Snapshot keys around equality
+            // so a re-entrant __eq__ cannot leave stale moving-GC pointers.
+            loop {
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let state = &*(w_self as *const pyre_object::interp_itertools::W_GroupBy);
+                let should_step = if state.w_currkey.is_null() {
+                    true
+                } else if state.w_tgtkey.is_null() {
+                    false
+                } else {
+                    let equal = {
+                        let _compare_roots = pyre_object::gc_roots::push_roots();
+                        pyre_object::gc_roots::pin_root(state.w_tgtkey);
+                        let tgt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                        pyre_object::gc_roots::pin_root(state.w_currkey);
+                        let curr_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                        eq_w(
+                            pyre_object::gc_roots::shadow_stack_get(tgt_slot),
+                            pyre_object::gc_roots::shadow_stack_get(curr_slot),
+                        )?
+                    };
+                    equal
+                };
+                if !should_step {
+                    break;
+                }
+                groupby_step(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
+            }
+
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let w_key = (*(w_self as *const pyre_object::interp_itertools::W_GroupBy)).w_currkey;
+            pyre_object::gc_roots::pin_root(w_key);
+            let key_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            (*(w_self as *mut pyre_object::interp_itertools::W_GroupBy)).w_tgtkey =
+                pyre_object::gc_roots::shadow_stack_get(key_slot);
+            pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
+
+            let grouper = pyre_object::interp_itertools::w_groupby_iterator_new(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
+            );
+            pyre_object::gc_roots::pin_root(grouper);
+            let grouper_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            return Ok(pyre_object::w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
+                pyre_object::gc_roots::shadow_stack_get(grouper_slot),
+            ]));
+        }
+        // itertools._grouper — PyPy W_GroupByIterator.next_w.
+        if pyre_object::interp_itertools::is_groupby_iterator(obj) {
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let parent =
+                (*(w_self as *const pyre_object::interp_itertools::W_GroupByIterator)).groupby;
+            pyre_object::gc_roots::pin_root(parent);
+            let parent_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+            let parent = pyre_object::gc_roots::shadow_stack_get(parent_slot);
+            let parent_state = &*(parent as *const pyre_object::interp_itertools::W_GroupBy);
+            if !std::ptr::eq(
+                parent_state.w_currgrouper,
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            ) {
+                return Err(PyError::stop_iteration());
+            }
+            if parent_state.w_currvalue.is_null() {
+                groupby_step(parent)?;
+            }
+
+            let equal = {
+                let _compare_roots = pyre_object::gc_roots::push_roots();
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let w_tgtkey =
+                    (*(w_self as *const pyre_object::interp_itertools::W_GroupByIterator)).w_tgtkey;
+                pyre_object::gc_roots::pin_root(w_tgtkey);
+                let tgt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let parent = pyre_object::gc_roots::shadow_stack_get(parent_slot);
+                let w_currkey =
+                    (*(parent as *const pyre_object::interp_itertools::W_GroupBy)).w_currkey;
+                pyre_object::gc_roots::pin_root(w_currkey);
+                let curr_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                eq_w(
+                    pyre_object::gc_roots::shadow_stack_get(tgt_slot),
+                    pyre_object::gc_roots::shadow_stack_get(curr_slot),
+                )?
+            };
+            if !equal {
+                return Err(PyError::stop_iteration());
+            }
+
+            let parent = pyre_object::gc_roots::shadow_stack_get(parent_slot);
+            let parent_state = &mut *(parent as *mut pyre_object::interp_itertools::W_GroupBy);
+            if parent_state.w_currvalue.is_null() {
+                return Err(PyError::stop_iteration());
+            }
+            let w_result = parent_state.w_currvalue;
+            pyre_object::gc_roots::pin_root(w_result);
+            let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let parent = pyre_object::gc_roots::shadow_stack_get(parent_slot);
+            let parent_state = &mut *(parent as *mut pyre_object::interp_itertools::W_GroupBy);
+            parent_state.w_currvalue = PY_NULL;
+            parent_state.w_currkey = PY_NULL;
             return Ok(pyre_object::gc_roots::shadow_stack_get(result_slot));
         }
         // itertools.compress — interp_itertools.py W_Compress.next_w.

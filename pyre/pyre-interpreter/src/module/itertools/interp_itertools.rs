@@ -2,36 +2,6 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-
-/// groupby(iterable, key=None) — itertools-docs pure-Python equivalent.
-const GROUPBY_SRC: &str = r#"
-class groupby:
-    __module__ = 'itertools'
-    def __init__(self, iterable, key=None):
-        if key is None:
-            key = lambda x: x
-        self.keyfunc = key
-        self.it = iter(iterable)
-        self.tgtkey = self.currkey = self.currvalue = object()
-    def __iter__(self):
-        return self
-    def __next__(self):
-        self.id = object()
-        while self.currkey == self.tgtkey:
-            self.currvalue = next(self.it)
-            self.currkey = self.keyfunc(self.currvalue)
-        self.tgtkey = self.currkey
-        return (self.currkey, self._grouper(self.tgtkey, self.id))
-    def _grouper(self, tgtkey, id):
-        while self.id is id and self.currkey == tgtkey:
-            yield self.currvalue
-            try:
-                self.currvalue = next(self.it)
-            except StopIteration:
-                return
-            self.currkey = self.keyfunc(self.currvalue)
-"#;
-
 /// tee(iterable, n=2) — itertools-docs pure-Python equivalent.  Each `_tee`
 /// keeps its own deque; when a deque runs dry the shared source iterator is
 /// advanced once and the new value is fanned out to every deque, so the copies
@@ -112,12 +82,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             .expect("itertools.islice TypeDef initialized")
             .as_ptr(),
     );
-    // groupby(iterable, key=None) — the itertools-docs pure-Python
-    // equivalent.  The parent and each group share the `currkey/currvalue`
-    // cursor plus an `id` token that invalidates a group once the parent
-    // advances; expressing that shared state directly in Python avoids a
-    // second native iterator type.
-    crate::importing::appleveldef_install(ns, GROUPBY_SRC, "<inline>", &["groupby"]);
+    // PyPy W_GroupBy and W_GroupByIterator share the live source cursor.
+    crate::module_ns_store(
+        ns,
+        "groupby",
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::GROUPBY_TYPE)
+            .expect("itertools.groupby TypeDef initialized")
+            .as_ptr(),
+    );
+    crate::module_ns_store(
+        ns,
+        "_grouper",
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::GROUPBY_ITERATOR_TYPE)
+            .expect("itertools._grouper TypeDef initialized")
+            .as_ptr(),
+    );
     // tee(iterable, n=2) — the itertools-docs pure-Python equivalent.  A native
     // dataobject type would only save buffer copies; the deque-per-copy recipe
     // keeps the copies lazy and independent, which is what callers observe.

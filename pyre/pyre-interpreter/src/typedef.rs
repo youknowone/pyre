@@ -1232,6 +1232,26 @@ pub fn init_typeobjects() {
             ) as usize,
         );
         reg.insert(
+            &pyre_object::interp_itertools::GROUPBY_TYPE as *const PyType as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.groupby",
+                init_groupby_type,
+                object_type,
+                &pyre_object::interp_itertools::GROUPBY_TYPE as *const PyType,
+            ) as usize,
+        );
+        let groupby_iterator_type = new_typeobject_with_base_and_layout(
+            "itertools._grouper",
+            init_groupby_iterator_type,
+            object_type,
+            &pyre_object::interp_itertools::GROUPBY_ITERATOR_TYPE as *const PyType,
+        );
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(groupby_iterator_type, false) };
+        reg.insert(
+            &pyre_object::interp_itertools::GROUPBY_ITERATOR_TYPE as *const PyType as usize,
+            groupby_iterator_type as usize,
+        );
+        reg.insert(
             &pyre_object::interp_itertools::COMPRESS_TYPE as *const PyType as usize,
             new_typeobject_with_base_and_layout(
                 "itertools.compress",
@@ -24644,6 +24664,116 @@ fn init_permutations_type(ns: PyObjectRef) {
             w_str_new(
                 "Return successive r-length permutations of elements in the iterable.\n\npermutations(range(3), 2) --> (0,1), (0,2), (1,0), (1,2), (2,0), (2,1)",
             ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+// ── itertools.groupby / itertools._grouper TypeDefs ────────────────
+// PyPy W_GroupBy and W_GroupByIterator.  Python 3.14 exposes the child as
+// `_grouper`, removes both pickle surfaces, and keeps the child final.
+
+fn groupby_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exact =
+        gettypefor(&pyre_object::interp_itertools::GROUPBY_TYPE).map_or(PY_NULL, |p| p.as_ptr());
+    let (cls, scope) =
+        itertools_constructor_scope(args, "groupby", vec!["iterable", "key"], &[w_none()])?;
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    for &value in &scope {
+        pyre_object::gc_roots::pin_root(value);
+    }
+    let values_base = pyre_object::gc_roots::shadow_stack_len() - scope.len();
+    let w_iterator =
+        crate::baseobjspace::iter(unsafe { pyre_object::gc_roots::shadow_stack_get(values_base) })?;
+    let obj = pyre_object::interp_itertools::w_groupby_new(w_iterator, unsafe {
+        pyre_object::gc_roots::shadow_stack_get(values_base + 1)
+    });
+    itertools_alloc_for_class(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        exact,
+        obj,
+    )
+}
+
+fn groupby_iterator_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exact = gettypefor(&pyre_object::interp_itertools::GROUPBY_ITERATOR_TYPE)
+        .map_or(PY_NULL, |p| p.as_ptr());
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = positional.first().copied().unwrap_or(PY_NULL);
+    let values = positional.get(1..).unwrap_or(&[]);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "_grouper() takes no keyword arguments",
+        ));
+    }
+    if values.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "_grouper() takes exactly 2 arguments ({} given)",
+            values.len()
+        )));
+    }
+    if !unsafe { pyre_object::interp_itertools::is_groupby(values[0]) } {
+        return Err(crate::PyError::type_error(
+            "argument 1 must be itertools.groupby",
+        ));
+    }
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(values[0]);
+    let parent_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(values[1]);
+    let key_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let obj = pyre_object::interp_itertools::w_groupby_iterator_new(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(parent_slot) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(key_slot) },
+    );
+    itertools_alloc_for_class(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        exact,
+        obj,
+    )
+}
+
+fn init_groupby_type(ns: PyObjectRef) {
+    let entries = [
+        ("__new__", make_new_descr(groupby_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "make an iterator that returns consecutive keys and groups from the iterable\n\n  iterable\n    Elements to divide into groups according to the key function.\n  key\n    A function for computing the group category for each element.\n    If the key function is not specified or is None, the element itself\n    is used for grouping.",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn init_groupby_iterator_type(ns: PyObjectRef) {
+    let entries = [
+        ("__new__", make_new_descr(groupby_iterator_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
         ),
     ];
     for (name, value) in entries {

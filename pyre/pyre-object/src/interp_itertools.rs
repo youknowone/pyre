@@ -636,6 +636,74 @@ pub unsafe fn is_permutations(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &PERMUTATIONS_TYPE) }
 }
 
+// ── W_GroupBy / W_GroupByIterator — PyPy interp_itertools.py ───────
+//
+// The parent owns the live iterator and shared key/value cursor.  A strong
+// `w_currgrouper` edge mirrors PyPy's attribute and invalidates an older group
+// by identity whenever the parent advances.
+#[pyre_class("itertools.groupby", static_name = "GROUPBY")]
+pub struct W_GroupBy {
+    pub w_iterator: PyObjectRef,
+    pub w_keyfunc: PyObjectRef,
+    pub w_tgtkey: PyObjectRef,
+    pub w_currkey: PyObjectRef,
+    pub w_currvalue: PyObjectRef,
+    pub w_currgrouper: PyObjectRef,
+}
+
+pub fn w_groupby_new(w_iterator: PyObjectRef, w_keyfunc: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(w_iterator);
+    crate::gc_roots::pin_root(w_keyfunc);
+    W_GroupBy::allocate_stable(W_GroupBy {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_iterator,
+        w_keyfunc,
+        w_tgtkey: std::ptr::null_mut(),
+        w_currkey: std::ptr::null_mut(),
+        w_currvalue: std::ptr::null_mut(),
+        w_currgrouper: std::ptr::null_mut(),
+    })
+}
+
+#[inline]
+pub unsafe fn is_groupby(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &GROUPBY_TYPE) }
+}
+
+#[pyre_class("itertools._grouper", static_name = "GROUPBY_ITERATOR")]
+pub struct W_GroupByIterator {
+    pub groupby: PyObjectRef,
+    pub w_tgtkey: PyObjectRef,
+}
+
+pub fn w_groupby_iterator_new(groupby: PyObjectRef, w_tgtkey: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(groupby);
+    crate::gc_roots::pin_root(w_tgtkey);
+    let grouper = W_GroupByIterator::allocate_stable(W_GroupByIterator {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        groupby,
+        w_tgtkey,
+    });
+    unsafe {
+        (*(groupby as *mut W_GroupBy)).w_currgrouper = grouper;
+        crate::gc_hook::try_gc_write_barrier(groupby as *mut u8);
+    }
+    grouper
+}
+
+#[inline]
+pub unsafe fn is_groupby_iterator(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &GROUPBY_ITERATOR_TYPE) }
+}
+
 // ── W_Compress — pypy/module/itertools/interp_itertools.py:W_Compress ──
 //
 // ```python
@@ -1164,6 +1232,40 @@ mod tests {
         assert_eq!(
             <W_Permutations as crate::lltype::GcType>::SIZE,
             W_PERMUTATIONS_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_groupby_gc_descriptor_traces_shared_cursor() {
+        assert_eq!(
+            W_GROUPBY_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_GroupBy, w_iterator),
+                std::mem::offset_of!(W_GroupBy, w_keyfunc),
+                std::mem::offset_of!(W_GroupBy, w_tgtkey),
+                std::mem::offset_of!(W_GroupBy, w_currkey),
+                std::mem::offset_of!(W_GroupBy, w_currvalue),
+                std::mem::offset_of!(W_GroupBy, w_currgrouper),
+            ]
+        );
+        assert_eq!(
+            <W_GroupBy as crate::lltype::GcType>::SIZE,
+            W_GROUPBY_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_groupby_iterator_gc_descriptor_traces_parent_and_key() {
+        assert_eq!(
+            W_GROUPBY_ITERATOR_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_GroupByIterator, groupby),
+                std::mem::offset_of!(W_GroupByIterator, w_tgtkey),
+            ]
+        );
+        assert_eq!(
+            <W_GroupByIterator as crate::lltype::GcType>::SIZE,
+            W_GROUPBY_ITERATOR_OBJECT_SIZE
         );
     }
 
