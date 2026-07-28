@@ -3077,11 +3077,14 @@ fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Ok(pyre_object::w_dict_new());
     }
 
-    // A dict subclass keeps its items in an instance attribute, so the
-    // allocation carries an empty backing dict for `__init__` to fill.
+    // PyPy `W_DictMultiObject.allocate_and_init_instance` initializes the
+    // mapping payload directly, before any Python-level `__setattr__` can
+    // run.  `__dict_data__` is pyre's reserved layout-slot equivalent, so
+    // write it through object.__setattr__'s terminal path rather than
+    // dispatching a subclass override.
     let instance = pyre_object::w_instance_new(cls);
     let backing = pyre_object::w_dict_new();
-    let _ = crate::baseobjspace::setattr_str(instance, "__dict_data__", backing);
+    crate::baseobjspace::object_setattr(instance, "__dict_data__", backing)?;
     Ok(instance)
 }
 /// boolobject.py descr_new — bool.__new__(cls, obj=False)
