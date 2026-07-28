@@ -2360,7 +2360,9 @@ pub(crate) fn try_walker_specialize_load_classmethod_attr<Sym: WalkSym>(
     // classmethod lookup walks; the version tag below covers method reassignment.
     let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
     walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
-    ctx.trace_ctx.heap_cache_mut().replace_box(obj, w_type_const);
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(obj, w_type_const);
 
     // typeobject.py `promote(self.version_tag())`: class mutation or classmethod
     // reassignment in the class or any base bumps `_version_tag`, so the pinned
@@ -5495,16 +5497,6 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     let value_concrete = ConcreteValue::Ref(value);
     let saved_fbw_mode = ctx.fbw_mode;
     ctx.fbw_mode.inline_subwalk = true;
-    // Read the arm AFTER any empty-strategy promotion above, so the predicate
-    // sees the storage the sub-walk will actually append into.  An
-    // Empty->Object promotion is not the pre-existing-block in-place case:
-    // it has just installed a young `items` block into the (possibly old)
-    // list wrapper.  Keep the body's `list_write_barrier` for that transition;
-    // only an append whose Object block predated this append is covered solely
-    // by the SetarrayitemGc array barrier.
-    ctx.fbw_mode.append_inplace_wb_covered_receiver = (!promote_empty
-        && unsafe { pyre_object::w_list_append_stores_into_gc_block_in_place(inner_self) })
-    .then_some(inner_self as usize);
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,
