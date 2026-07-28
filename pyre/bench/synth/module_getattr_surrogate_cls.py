@@ -29,11 +29,34 @@ def main():
     print("ident2", getattr(m, "again") == ("dict", "again"))
     print("surr2", getattr(m, SUR) == ("dict", SUR))
 
+    # a module-dict hook that itself raises AttributeError also falls through
+    # to the class-level __getattr__
+    def raising(name):
+        raise AttributeError("hook raised")
+
+    m2 = M("m2")
+    m2.__getattr__ = raising
+    print("ident3", getattr(m2, "x") == ("cls", "x"))
+    print("surr3", getattr(m2, SUR) == ("cls", SUR))
+
     # no hook anywhere: AttributeError for both name kinds
     bare = types.ModuleType("bare")
-    for label, nm in (("ident3", "gone"), ("surr3", SUR)):
+    for label, nm in (("ident4", "gone"), ("surr4", SUR)):
         try:
             getattr(bare, nm)
+            print(label, "NO-RAISE")
+        except AttributeError:
+            print(label, "AttributeError")
+
+    # a raising module-dict hook with NO class-level fallback propagates
+    class Plain(types.ModuleType):
+        pass
+
+    p = Plain("p")
+    p.__getattr__ = raising
+    for label, nm in (("ident5", "gone"), ("surr5", SUR)):
+        try:
+            getattr(p, nm)
             print(label, "NO-RAISE")
         except AttributeError:
             print(label, "AttributeError")
