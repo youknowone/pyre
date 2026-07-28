@@ -646,6 +646,51 @@ fn register_dispatch_jitcode_stores_singleton() {
     let _arc: &Arc<JitCode> = stored.unwrap();
 }
 
+/// A thread that keeps two drivers alive holds ONE state-field store, and it
+/// belongs to whichever driver published last. Every compile is reached through
+/// a trace entry, so `force_start_tracing` re-aims the store: the guard metadata
+/// that trace produces decodes frame value counts against its OWN jitcodes.
+///
+/// Without that re-aim the second registration owned the slot for good, and
+/// `JitDriverStaticData::frame_value_count_fn` records that the wrong store
+/// frequently *succeeds* — it decodes an unrelated jitcode at the same pc and
+/// returns a mistyped frame count rather than failing.
+#[test]
+fn a_trace_entry_takes_the_state_field_store_back_from_a_second_driver() {
+    let mut first: JitDriver<DispatchTestState> = JitDriver::new(100);
+    __declare_jit_schema_dispatch_minimal(&mut first);
+    first.register_dispatch_jitcode(build_dispatch_minimal());
+    assert_eq!(
+        majit_metainterp::current_state_field_fvc_epoch(),
+        first.state_field_fvc_epoch(),
+        "registering a dispatch jitcode publishes the registering driver's store",
+    );
+
+    let mut second: JitDriver<DispatchTestState> = JitDriver::new(100);
+    __declare_jit_schema_dispatch_minimal(&mut second);
+    second.register_dispatch_jitcode(build_dispatch_minimal());
+    assert_ne!(
+        first.state_field_fvc_epoch(),
+        second.state_field_fvc_epoch(),
+        "each driver's registry is published under its own identity",
+    );
+    assert_eq!(
+        majit_metainterp::current_state_field_fvc_epoch(),
+        second.state_field_fvc_epoch(),
+        "the later registration takes the single slot",
+    );
+
+    let program = [OP_INC_A, OP_END];
+    let mut state = DispatchTestState { a: 0 };
+    first.meta_interp_mut().finish_setup_descrs_for_jitdrivers();
+    first.force_start_tracing(0, 0, &mut state, &program[..]);
+    assert_eq!(
+        majit_metainterp::current_state_field_fvc_epoch(),
+        first.state_field_fvc_epoch(),
+        "force_start_tracing must aim the store at the driver about to trace",
+    );
+}
+
 /// A.2.1 fixture: minimal `#[jit_interp]` dispatch loop carrying both the
 /// `state.last_instr = pc as i64` store (`pyopcode.py:172`) AND the two-byte
 /// `[opcode][oparg]` fetch with `pc += 2` (`pyopcode.py:179-181`).

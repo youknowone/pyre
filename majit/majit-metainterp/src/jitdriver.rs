@@ -1195,6 +1195,9 @@ pub struct JitDriver<S: JitState> {
     /// JitCode itself, so this driver stores only the slot; `None` until
     /// `register_dispatch_jitcode` runs.
     portal_jd_index: Option<usize>,
+    /// This driver's payload for the per-thread `frame_value_count` store,
+    /// built once by `register_dispatch_jitcode`. `None` until then.
+    state_field_fvc: Option<StateFieldFvcData>,
 }
 
 thread_local! {
@@ -1206,9 +1209,20 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Identity stamped on each driver's publication so a thread can tell whose
+/// store it is currently holding. Non-zero; `0` is never handed out.
+static STATE_FIELD_FVC_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// One driver's contribution to the per-thread store, assembled once at
+/// `register_dispatch_jitcode` so re-publishing costs three refcount bumps
+/// rather than cloning the registry and the liveness buffer.
+#[derive(Clone)]
 struct StateFieldFvcData {
-    jitcodes: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
-    all_liveness: Vec<u8>,
+    /// Which driver built this. Compared against the thread's current store to
+    /// skip a redundant install.
+    epoch: u64,
+    jitcodes: std::sync::Arc<Vec<std::sync::Arc<crate::jitcode::JitCode>>>,
+    all_liveness: std::sync::Arc<Vec<u8>>,
     op_live: u8,
 }
 
@@ -1240,27 +1254,33 @@ fn state_field_frame_value_count(jitcode_index: i32, pc: i32) -> usize {
     })
 }
 
+/// Epoch of the state-field store this thread is currently holding, or `0`
+/// when no driver has published on it yet. Diagnostic for the single-slot
+/// store described on [`JitDriver::republish_state_field_fvc`].
+#[doc(hidden)]
+pub fn current_state_field_fvc_epoch() -> u64 {
+    STATE_FIELD_FVC.with(|cell| cell.borrow().as_ref().map_or(0, |data| data.epoch))
+}
+
 /// Publish the driver's flat jitcode registry + packed liveness for the
 /// stateless global `frame_value_count` decode. Both compile-time decoders
 /// (`compile.rs` build_guard_metadata and the cranelift backend) read the
 /// callback via `get_frame_value_count_fn`, so this single registration
 /// serves both. Registers the callback once (process-global slot), then
-/// refreshes the thread-local payload for the installing driver.
-fn install_state_field_fvc(
-    jitcodes: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
-    all_liveness: Vec<u8>,
-    op_live: u8,
-) {
+/// refreshes the thread-local payload for the installing driver — but only
+/// when the thread is not already holding that driver's store, so the
+/// trace-entry calls that keep it honest cost one `u64` compare.
+fn install_state_field_fvc(data: &StateFieldFvcData) {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         majit_ir::resumedata::set_frame_value_count_fn(state_field_frame_value_count);
     });
     STATE_FIELD_FVC.with(|cell| {
-        *cell.borrow_mut() = Some(StateFieldFvcData {
-            jitcodes,
-            all_liveness,
-            op_live,
-        });
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().is_some_and(|held| held.epoch == data.epoch) {
+            return;
+        }
+        *slot = Some(data.clone());
     });
 }
 
@@ -1325,6 +1345,7 @@ impl<S: JitState> JitDriver<S> {
             blackhole_allocator: None,
             portal_runner: None,
             portal_jd_index: None,
+            state_field_fvc: None,
             shared_asm: std::sync::Arc::new(std::sync::Mutex::new(
                 majit_translate::codewriter::assembler::Assembler::new(),
             )),
@@ -1462,7 +1483,14 @@ impl<S: JitState> JitDriver<S> {
         // before this call, so staticdata carries the final liveness buffer.
         let all_liveness = self.meta_interp().staticdata.liveness_info.clone();
         let op_live = self.meta_interp().staticdata.op_live as u8;
-        install_state_field_fvc(registry, all_liveness, op_live);
+        let data = StateFieldFvcData {
+            epoch: STATE_FIELD_FVC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            jitcodes: std::sync::Arc::new(registry),
+            all_liveness: std::sync::Arc::new(all_liveness),
+            op_live,
+        };
+        install_state_field_fvc(&data);
+        self.state_field_fvc = Some(data);
     }
 
     /// pyjitpl.py:3294 `self.jitdriver_sd.mainjitcode` — this driver's portal
@@ -1477,26 +1505,38 @@ impl<S: JitState> JitDriver<S> {
     /// [`Self::register_dispatch_jitcode`] already built.
     ///
     /// That store is a SINGLE slot per thread and is written only when a driver
-    /// registers its dispatch jitcode, so a consumer holding more than one
-    /// driver alive on a thread must call this for the driver it is about to
-    /// run. Leaving another driver's store in place is not a benign miss:
+    /// publishes, so a thread holding more than one driver alive can otherwise
+    /// decode against whichever published last. That is not a benign miss:
     /// [`JitDriverStaticData::frame_value_count_fn`] records that the wrong
     /// store frequently *succeeds*, decoding an unrelated jitcode at the same pc
     /// and silently returning a mistyped frame count.
     ///
+    /// The store is now re-aimed automatically at both trace entries
+    /// ([`Self::force_start_tracing`] and [`Self::start_bridge_tracing`]), which
+    /// is what every compile is reached through, so calling this by hand is no
+    /// longer required — it stays for consumers that already do, and to let a
+    /// pool aim the store at checkout rather than at trace start.
+    ///
     /// A driver that has not registered a dispatch jitcode has nothing to
     /// publish and is left alone.
     ///
-    /// The upstream arrangement is one process-wide `metainterp_sd.jitcodes`
-    /// table rather than a registry per driver; until majit has that, the store
-    /// has to be aimed at the right driver by hand.
+    /// `warmspot.py:281-282 metainterp_sd.jitcodes` now owns the table
+    /// (`MetaInterp::install_jitcodes`), but one `MetaInterpStaticData` per
+    /// driver is still not upstream's ONE table, and this store is a separate
+    /// per-thread copy of it besides. Re-aiming on entry only removes the
+    /// window in which the wrong one is read.
     pub fn republish_state_field_fvc(&self) {
-        if self.dispatch_jitcode.is_none() {
-            return;
+        if let Some(data) = self.state_field_fvc.as_ref() {
+            install_state_field_fvc(data);
         }
-        let all_liveness = self.meta_interp().staticdata.liveness_info.clone();
-        let op_live = self.meta_interp().staticdata.op_live as u8;
-        install_state_field_fvc(self.jitcode_registry.clone(), all_liveness, op_live);
+    }
+
+    /// This driver's store epoch, or `0` before it registered a dispatch
+    /// jitcode. Compare against [`current_state_field_fvc_epoch`] to see whose
+    /// store the thread is holding.
+    #[doc(hidden)]
+    pub fn state_field_fvc_epoch(&self) -> u64 {
+        self.state_field_fvc.as_ref().map_or(0, |data| data.epoch)
     }
 
     /// Register a BlackholeAllocator for virtual materialization during
@@ -4032,6 +4072,11 @@ impl<S: JitState> JitDriver<S> {
     ) {
         // Note: no is_hot_or_tracing check here — the caller (try_function_entry_jit)
         // already verified the threshold. force_start_tracing must unconditionally start.
+        //
+        // Every compile this trace can reach decodes frame value counts through
+        // the per-thread store, so aim it at this driver before recording a
+        // single op. Free when it already points here (one `u64` compare).
+        self.republish_state_field_fvc();
         let meta = state.build_meta(target_pc, env);
         let descriptor = self.driver_descriptor_for(state, &meta);
         if !self.sync_before(state, &meta, descriptor.as_ref()) {
@@ -5361,6 +5406,9 @@ impl<S: JitState> JitDriver<S> {
         guard_exc: i64,
     ) -> bool {
         majit_metainterp::mc_diag_bump(12); // start_bridge_tracing entered
+        // Same reason as the primary trace entry: the bridge compile decodes
+        // frame value counts through the per-thread store, so aim it here.
+        self.republish_state_field_fvc();
         self.bridge_body_start_op_count = None;
         // compile.py:725-729 `_trace_and_compile_from_bridge` raises
         // `compile.giveup()` when the descr's owning JitCellToken weakref
