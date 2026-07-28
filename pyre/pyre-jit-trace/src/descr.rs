@@ -4279,8 +4279,14 @@ enum SetMemberLookup {
     /// runtime universe keeps growing after that.  A container registered
     /// later — under the same `path_hash` key — leaves this EI permanently
     /// claiming "not written" for a field the callee does write, so the
-    /// heapcache would not invalidate a read across the call.  No corpus
-    /// fixture reproduces it today.
+    /// heapcache would not invalidate a read across the call.
+    ///
+    /// `publish_runtime_descr_groups` closes the gap for the module-scope
+    /// groups by forcing all of them before the first lookup;
+    /// `W_IntObject.intval` was landing here until it did.  What is still
+    /// published on demand, and so can still fall into this arm: the
+    /// per-exception-class groups behind `W_BASE_EXCEPTION_DESCR_CACHE`, and
+    /// the `ARRAY_DESCR_REGISTRY` entries minted per element layout.
     ///
     /// The conservative repair (treat this like [`Self::Ambiguous`] and
     /// degrade the EI to `EF_RANDOM_EFFECTS`) is not taken here: a probe over
@@ -4314,6 +4320,128 @@ enum SetMemberLookup {
 /// objects — breaking the positional invariant `heaptracker.py:76-101
 /// get_fielddescr_index_in` establishes and `optimizeopt/info.rs force_box`
 /// asserts.
+/// Ledger of every serialized raw-set member that came back
+/// [`SetMemberLookup::Ambiguous`] — its container *is* published in this
+/// process's descr universe, just not under the key the analyzer minted
+/// through.
+///
+/// `Ambiguous` is the two-spellings defect by construction, and it is the only
+/// one of the three outcomes that is never a legitimate projection:
+/// `Resolved` joined, `AbsentContainer` means the runtime never named the
+/// container at all (the analyzer walks the whole translated program, the
+/// runtime only registers what it actually traces), but `Ambiguous` means both
+/// sides named the same container and disagreed on how to spell it.  Its
+/// consumer degrades the whole `EffectInfo` to `EF_RANDOM_EFFECTS`, so every
+/// entry below is a residual call that stopped invalidating precisely and
+/// became a whole-heap barrier.
+///
+/// This is the gate for struct-identity work; a converged-field-descr count is
+/// not.  A field-descr census only counts the descrs a particular run happens
+/// to mint, so deleting a call site greens it without joining anything,
+/// whereas the members here are fixed by `descrs.bin` and stay `Ambiguous`
+/// until the two spellings actually collapse onto one key.
+/// Force every module-scope runtime descr group into the gccache.
+///
+/// `descr.py:25-47 setup_descrs` publishes the whole descr universe before
+/// anything consumes it, and upstream gets that for free: `cpu.*descrof` runs
+/// during codewriting, so by the time `compute_bitstrings`
+/// (`effectinfo.py:484-489`) walks the raw sets, every `STRUCT` the program
+/// mentions already has its slot.  Pyre splits those two phases across a
+/// build-time analyzer and a runtime process, and the runtime groups are
+/// `LazyLock`s that publish only when a trace first touches the type — so the
+/// raw-set members were being resolved against a universe that was still
+/// mostly empty, and answered [`SetMemberLookup::AbsentContainer`] for
+/// containers this process does register, just later.
+///
+/// Publishing here restores the upstream order.  It must run *before* the
+/// build-time `make_descr_from_bh` loop: those specs carry `vtable: 0` and the
+/// inherited header fields, so on a shared key they would otherwise displace
+/// the runtime publish that owns the only copy of the vtable (see the
+/// authority rule in `majit-ir` `register_keyed_size`).
+pub(crate) fn publish_runtime_descr_groups() {
+    // `PyreObjectDescrGroup`'s constructor is what registers into the
+    // gccache, so dereferencing the `LazyLock` is the publish.
+    let _published = [
+        &*W_INT_DESCR_GROUP,
+        &*W_FLOAT_DESCR_GROUP,
+        &*W_LONG_DESCR_GROUP,
+        &*W_BOOL_DESCR_GROUP,
+        &*RANGE_ITER_DESCR_GROUP,
+        &*RANGE_DESCR_GROUP,
+        &*W_METHOD_DESCR_GROUP,
+        &*W_OBJECT_MUTABLE_CELL_DESCR_GROUP,
+        &*W_LIST_DESCR_GROUP,
+        &*W_TUPLE_DESCR_GROUP,
+        &*SPECIALISED_TUPLE_II_DESCR_GROUP,
+        &*SPECIALISED_TUPLE_FF_DESCR_GROUP,
+        &*SPECIALISED_TUPLE_OO_DESCR_GROUP,
+        &*ITEMS_BLOCK_DESCR_GROUP,
+        &*W_SLICE_DESCR_GROUP,
+        &*PYFRAME_DESCR_GROUP,
+        &*W_OBJECT_OBJECT_DESCR_GROUP,
+        &*PYTRACEBACK_DESCR_GROUP,
+    ];
+}
+
+/// `ambiguous` empty alone is not enough to call the gate green: a member
+/// whose container is not registered *yet* answers `AbsentContainer`, which
+/// looks identical to the legitimate projection.  So the ledger carries all
+/// three outcomes — a run where `absent` dwarfs `resolved` has an empty
+/// `ambiguous` set vacuously, because nothing was ever joined.
+#[derive(Default)]
+pub struct SetMemberLedger {
+    pub resolved: usize,
+    /// Container keys no lookup could reach, by name.  Kept as a set rather
+    /// than a count because a spelling miss hides here too: a container the
+    /// runtime *did* publish, under a different key, is absent from both
+    /// `_cache_field` and `_cache_size` at the analyzer's key and so reads
+    /// exactly like a container this process never traced.
+    pub absent: std::collections::BTreeSet<String>,
+    pub ambiguous: std::collections::BTreeSet<String>,
+}
+
+static SET_MEMBER_LEDGER: LazyLock<Mutex<SetMemberLedger>> =
+    LazyLock::new(|| Mutex::new(SetMemberLedger::default()));
+
+fn set_member_label(m: &majit_ir::effectinfo::DescrSetMember) -> String {
+    use majit_ir::effectinfo::DescrSetMember;
+    match m {
+        DescrSetMember::Field {
+            struct_id,
+            field_name,
+        } => format!("Struct({struct_id:#018x}).{field_name}"),
+        DescrSetMember::Array { array_id } => format!("Array({array_id:#018x})"),
+        DescrSetMember::InteriorField { array_id, name } => {
+            format!("Array({array_id:#018x}).{name}")
+        }
+    }
+}
+
+fn record_set_member_lookup(m: &majit_ir::effectinfo::DescrSetMember, out: &SetMemberLookup) {
+    let mut ledger = SET_MEMBER_LEDGER.lock().unwrap();
+    match out {
+        SetMemberLookup::Resolved(_) => ledger.resolved += 1,
+        SetMemberLookup::AbsentContainer => {
+            let label = set_member_label(m);
+            ledger.absent.insert(label);
+        }
+        SetMemberLookup::Ambiguous => {
+            let label = set_member_label(m);
+            ledger.ambiguous.insert(label);
+        }
+    }
+}
+
+/// Snapshot of the [`SET_MEMBER_LEDGER`].
+pub fn set_member_ledger() -> SetMemberLedger {
+    let ledger = SET_MEMBER_LEDGER.lock().unwrap();
+    SetMemberLedger {
+        resolved: ledger.resolved,
+        absent: ledger.absent.clone(),
+        ambiguous: ledger.ambiguous.clone(),
+    }
+}
+
 fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberLookup {
     use majit_ir::descr::{LLType, gc_cache};
 
@@ -4415,7 +4543,9 @@ pub fn rehydrate_effect_info(ei: &mut majit_ir::EffectInfo) {
     let resolve = |members: &[majit_ir::effectinfo::DescrSetMember]| {
         let mut out = Vec::with_capacity(members.len());
         for m in members {
-            match descr_from_set_member(m) {
+            let looked_up = descr_from_set_member(m);
+            record_set_member_lookup(m, &looked_up);
+            match looked_up {
                 SetMemberLookup::Resolved(d) => out.push(d),
                 SetMemberLookup::AbsentContainer => {}
                 SetMemberLookup::Ambiguous => return None,

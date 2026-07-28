@@ -474,6 +474,11 @@ fn rehydrated_call_descr_ref(bh: &majit_translate::jitcode::BhCallDescr) -> maji
 pub fn rehydrate_build_descr_raw_sets() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
+        // The runtime's own groups first: `descr_from_set_member` is
+        // lookup-only, so a container that has not been published yet reads
+        // as `AbsentContainer` and its member is dropped from the raw set for
+        // the life of the process.
+        crate::descr::publish_runtime_descr_groups();
         let all = all_descrs();
         // `descr.py:25-47 setup_descrs` group order — every non-call slot
         // first.  Each `Size` / `Field` entry publishes its parent's FULL
@@ -496,7 +501,34 @@ pub fn rehydrate_build_descr_raw_sets() {
             refs[i] = Some(rehydrated_call_descr_ref(calldescr));
         }
         *REHYDRATED_CALL_DESCR_REFS.lock().unwrap() = refs;
+        report_descr_spelling_gate();
     });
+}
+
+/// Print the [`crate::descr::set_member_ledger`] under
+/// `PYRE_DESCR_SPELLING_GATE=1`.
+///
+/// The whole serialized raw-set universe is resolved inside the `Once` above
+/// and nowhere else, so this runs exactly once with the ledger complete.
+/// Green is `ambiguous=0` **with** a `resolved` count that shows the join
+/// actually happened; `ambiguous=0, resolved=0` is vacuous.
+fn report_descr_spelling_gate() {
+    if std::env::var_os("PYRE_DESCR_SPELLING_GATE").is_none() {
+        return;
+    }
+    let ledger = crate::descr::set_member_ledger();
+    eprintln!(
+        "[descr-spelling-gate] resolved={} absent={} ambiguous={}",
+        ledger.resolved,
+        ledger.absent.len(),
+        ledger.ambiguous.len()
+    );
+    for label in &ledger.ambiguous {
+        eprintln!("[descr-spelling-gate] ambiguous {label}");
+    }
+    for label in &ledger.absent {
+        eprintln!("[descr-spelling-gate] absent {label}");
+    }
 }
 
 /// Pool of `DescrRef`s indexed alongside [`all_descrs`] so the
