@@ -877,7 +877,16 @@ pub fn publish_last_instr_at_live_marker(
         // compile-time assertion against the interpreter's own constant.
         let w_code =
             unsafe { *((frame + crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
-        if w_code.is_null() {
+        // A non-standard virtualizable frame from a bridge sub-walk carries the
+        // `GcRef(usize::MAX)` sentinel (or null) here instead of a real
+        // `PyCode`. `w_code_get_ptr` requires a valid code object, so the null
+        // and sentinel tests run first, and `is_code` before the deref for the
+        // same reason its other callers order them that way — `py_type_check`
+        // would itself dereference a raw sentinel.
+        if w_code.is_null() || w_code as usize == usize::MAX {
+            return;
+        }
+        if !unsafe { pyre_interpreter::pycode::is_code(w_code as PyObjectRef) } {
             return;
         }
         let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef) };
