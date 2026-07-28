@@ -4675,11 +4675,13 @@ unsafe fn create_weakref_slot(w_type: pyre_object::PyObjectRef) {
     }
 }
 
-/// typeobject.py:1089-1105 find_best_base.
-unsafe fn find_best_base(w_bases: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+/// typeobject.py:1335-1353 find_best_base.
+unsafe fn find_best_base(
+    w_bases: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     unsafe {
         if w_bases.is_null() || !pyre_object::is_tuple(w_bases) {
-            return std::ptr::null_mut();
+            return Ok(std::ptr::null_mut());
         }
         let len = pyre_object::w_tuple_len(w_bases);
         let mut w_bestbase: pyre_object::PyObjectRef = std::ptr::null_mut();
@@ -4687,6 +4689,15 @@ unsafe fn find_best_base(w_bases: pyre_object::PyObjectRef) -> pyre_object::PyOb
             if let Some(w_candidate) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
                 if !pyre_object::is_type(w_candidate) {
                     continue;
+                }
+                // typeobject.py:1343-1345 — a custom metaclass mro() may
+                // expose the nascent type before its MRO is installed, but
+                // that incomplete type cannot itself be extended.
+                if pyre_object::w_type_get_mro(w_candidate).is_null() {
+                    return Err(crate::PyError::type_error(format!(
+                        "Cannot extend an incomplete type '{}'",
+                        pyre_object::w_type_get_name(w_candidate),
+                    )));
                 }
                 if w_bestbase.is_null() {
                     w_bestbase = w_candidate;
@@ -4702,7 +4713,7 @@ unsafe fn find_best_base(w_bases: pyre_object::PyObjectRef) -> pyre_object::PyOb
                 }
             }
         }
-        w_bestbase
+        Ok(w_bestbase)
     }
 }
 
@@ -4715,36 +4726,7 @@ pub(crate) unsafe fn check_and_find_best_base(
     w_bases: pyre_object::PyObjectRef,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     unsafe {
-        let len = if w_bases.is_null() || !pyre_object::is_tuple(w_bases) {
-            0
-        } else {
-            pyre_object::w_tuple_len(w_bases)
-        };
-        for i in 0..len {
-            let Some(w_base) = pyre_object::w_tuple_getitem(w_bases, i as i64) else {
-                continue;
-            };
-            if !pyre_object::is_type(w_base) {
-                return Err(crate::PyError::type_error(format!(
-                    "{}() argument 2 must be tuple of types, not {}",
-                    "type",
-                    pyre_object::type_name_of(w_base),
-                )));
-            }
-            if pyre_object::w_type_get_mro(w_base).is_null() {
-                return Err(crate::PyError::type_error(format!(
-                    "cannot extend incomplete type '{}'",
-                    pyre_object::w_type_get_name(w_base),
-                )));
-            }
-            if !is_acceptable_base_class(w_base) {
-                return Err(crate::PyError::type_error(format!(
-                    "type '{}' is not an acceptable base type",
-                    pyre_object::w_type_get_name(w_base),
-                )));
-            }
-        }
-        let w_bestbase = find_best_base(w_bases);
+        let w_bestbase = find_best_base(w_bases)?;
         // typeobject.py:1113-1115
         if w_bestbase.is_null() {
             return Err(crate::PyError::type_error(

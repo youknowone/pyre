@@ -7219,6 +7219,34 @@ restored = C.__bases__ == old_bases and C.__mro__ == old_mro";
     }
 
     #[test]
+    fn test_custom_mro_observes_incomplete_mro_as_none() {
+        let source = "\
+observed_none = False
+extension_rejected = False
+class Meta(type):
+    def mro(cls):
+        global observed_none, extension_rejected
+        observed_none = cls.__mro__ is None
+        if observed_none and cls.__name__ == 'C':
+            try:
+                class Derived(cls):
+                    pass
+            except TypeError:
+                extension_rejected = True
+        return type.mro(cls)
+class C(metaclass=Meta):
+    pass";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("incomplete MRO regression");
+        unsafe {
+            for name in ["observed_none", "extension_rejected"] {
+                let value = w_dict_getitem_str(frame.w_globals, name).unwrap();
+                assert!(is_true(value).unwrap(), "{name} should be true");
+            }
+        }
+    }
+
+    #[test]
     fn test_function_dunder_globals_and_code_are_materialized() {
         crate::test_hooks::install_hash_hook();
         let source = "\

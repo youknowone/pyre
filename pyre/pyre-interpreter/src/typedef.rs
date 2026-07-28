@@ -9684,7 +9684,10 @@ fn init_type_type(ns: PyObjectRef) {
             unsafe {
                 let mro_ptr = pyre_object::w_type_get_mro(cls);
                 if mro_ptr.is_null() {
-                    return Ok(pyre_object::w_tuple_new(vec![]));
+                    // typeobject.py:1080-1084 descr_get__mro__: an
+                    // incompletely initialized type exposes None, not an
+                    // empty tuple, while its metaclass mro() is running.
+                    return Ok(pyre_object::w_none());
                 }
                 Ok(pyre_object::w_tuple_new((*mro_ptr).to_vec()))
             }
