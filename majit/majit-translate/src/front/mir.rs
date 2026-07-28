@@ -8466,6 +8466,25 @@ impl<'a> Lowering<'a> {
                 if !first_is_self {
                     return None;
                 }
+                // The first input being the owner ADT is necessary but not
+                // sufficient: an associated constructor
+                // (`W_Range::allocate(payload: Self)` /
+                // `allocate_stable(payload: Self)`) also presents the owner as
+                // its first input, yet routing it as `Method` threads the
+                // payload as the getattr receiver and blocks on
+                // `getattr(payload, "allocate")`.  Only a genuine `self`
+                // receiver may route as `Method`.  Rust forbids naming a
+                // parameter `self`, so a receiver's local is the `self` keyword
+                // (Charon names it `"self"`, or leaves it unnamed for a
+                // monomorphised trait method), whereas a constructor's
+                // `Self`-typed parameter keeps its source name (`payload`).
+                // Decline the Method hint for an explicitly-named non-`self`
+                // first input so the call routes as `FunctionPath` and the
+                // call registry resolves the constructor (its residual stub via
+                // `collect_pyre_class_ctor_stubs_from_llbc`).
+                if fd.first_arg_local_name().is_some_and(|n| n != "self") {
+                    return None;
+                }
                 owner
             }
             // Non-ADT `Self` (primitive / raw pointer / slice): Charon leaves
@@ -12808,6 +12827,78 @@ pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
             })
             .collect();
         out.push((segments, Signature::new(argnames, None, None), token));
+    }
+    out
+}
+
+/// Collect residual stubs for the `#[pyre_class]`-generated allocation
+/// constructors `<Owner>::allocate(payload: Self) -> PyObjectRef` and
+/// `allocate_stable(payload: Self)`.
+///
+/// Each builds `Self { ob: <header>, ..payload }` then calls
+/// `lltype::malloc_typed[_stable]` — a non-numeric boxing allocation with no
+/// ported general `malloc->new` lowering (`fuse_boxing_alloc` rewrites only
+/// the numeric boxes `W_Float`/`W_Int`/`W_Complex`/`W_Long`; every other
+/// mallocable struct hits the fail-closed `flowspace_adapter` guard).  So the
+/// constructor body cannot be traced; the faithful treatment is the
+/// `register_external` analog — residualize the whole `allocate` call.
+/// [`Lowering::impl_method_owner`] declines the `CallTarget::Method` hint for
+/// the `payload`-named `Self` argument (routing through
+/// `CallTarget::FunctionPath`); this collection feeds the matching registry
+/// entries, keyed by the SAME [`impl_method_owner_for_fundecl`] the
+/// declined-Method `call_target_segments` arm uses, so the `FunctionPath`
+/// lookup resolves to the `*mut PyObject` return shell instead of the failing
+/// looked-inside body.  The companion skip in
+/// `populate_call_registry_from_call_graphs` keeps the constructor's own
+/// (unliftable) body out of the registry so this stub key wins.
+///
+/// Reuses the [`CallControl::unsafe_fn_stubs`] carrier + `register_unsafe_fn_stubs`
+/// registration path (both feed `(segments, Signature, return-token)` specs
+/// through the same annotator-only `residual_return_shell`).
+pub(crate) fn collect_pyre_class_ctor_stubs_from_llbc(
+    llbc: &Llbc,
+) -> Vec<(
+    Vec<String>,
+    crate::flowspace::argument::Signature,
+    Option<String>,
+)> {
+    use crate::flowspace::argument::Signature;
+    let mut out = Vec::new();
+    for fd in llbc.iter_local_fns() {
+        if fd.is_global_initializer.is_some() {
+            continue;
+        }
+        let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(llbc, fd) else {
+            continue;
+        };
+        if leaf != "allocate" && leaf != "allocate_stable" {
+            continue;
+        }
+        // The macro constructor is exactly `(payload: Self) -> *mut PyObject`:
+        // one argument returning the object pointer.  A `self`-named receiver
+        // (`fn allocate(&self) -> …`) is a real method, not the constructor.
+        if fd.signature.inputs.len() != 1 {
+            continue;
+        }
+        if !output_type_is_objectptr(&fd.signature.output, llbc) {
+            continue;
+        }
+        if fd.first_arg_local_name().as_deref() == Some("self") {
+            continue;
+        }
+        let mut segments: Vec<String> = owner_qualified.split("::").map(String::from).collect();
+        segments.push(leaf);
+        let argname = fd
+            .unstructured()
+            .as_ref()
+            .and_then(|u| u.locals.locals.get(1))
+            .and_then(|l| l.name.clone())
+            .unwrap_or_else(|| "payload".to_string());
+        out.push((
+            segments,
+            Signature::new(vec![argname], None, None),
+            Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE.to_string()),
+        ));
     }
     out
 }

@@ -1783,6 +1783,26 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         {
             continue;
         }
+        // `#[pyre_class]`'s generated allocation constructors
+        // (`<Owner>::allocate(payload: Self)` / `allocate_stable(payload:
+        // Self)`) build the object then call the non-numeric
+        // `lltype::malloc_typed[_stable]`, which has no ported general
+        // `malloc->new` lowering — lifting the body records a poison lift-error
+        // that surfaces on the first constructing caller (`w_range_new`,
+        // the iterator/`GenericAlias` `*_new` heads).  Skip registering the
+        // constructor as a user function so its key is instead served by the
+        // residual stub from `collect_pyre_class_ctor_stubs_from_llbc` (seeded
+        // through the `unsafe_fn_stubs` carrier), whose `*mut PyObject` return
+        // shell lets the caller annotate.  The numeric boxes never reach here —
+        // they call `malloc_typed` inline (`w_float_new`/`w_int_new`), not the
+        // macro `allocate` wrapper — so this does not disturb
+        // `fuse_boxing_alloc`.
+        if matches!(
+            canonical_strip.last().map(String::as_str),
+            Some("allocate") | Some("allocate_stable")
+        ) {
+            continue;
+        }
         // `pyre_object::lltype::malloc_raw` is the raw (non-GC) allocation
         // intrinsic (`lltype.malloc(T, flavor='raw')` parity), recognised as
         // a host builtin (annotator `malloc_raw_alloc`, HOST_ENV

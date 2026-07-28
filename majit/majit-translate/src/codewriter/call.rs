@@ -3437,6 +3437,24 @@ impl CallControl {
                             {
                                 continue;
                             }
+                            // `#[pyre_class]`'s `allocate`/`allocate_stable`
+                            // constructors build the object then call the
+                            // non-numeric `lltype::malloc_typed[_stable]`, which
+                            // has no ported general `malloc->new` lowering.  The
+                            // caller resolves them to the
+                            // `collect_pyre_class_ctor_stubs_from_llbc` residual
+                            // stub, so — like a builtin — the BFS must not follow
+                            // the constructor body: otherwise the two-phase census
+                            // annotates its unliftable body (and its transitive
+                            // `malloc_typed_stable`) standalone and reports a
+                            // spurious Phase-A failure for a graph no caller ever
+                            // traces into.
+                            if matches!(
+                                callee_path.last_segment(),
+                                Some("allocate") | Some("allocate_stable")
+                            ) {
+                                continue;
+                            }
                             vec![callee_path]
                         }
                         _ => continue,

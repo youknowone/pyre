@@ -194,9 +194,18 @@ fn build_semantic_program_via_active_frontend(
             // full LLBC set for every local `unsafe fn` / unsafe
             // impl-method projecting to a unit/bool return.  The consumer
             // at `call_control.unsafe_fn_stubs` (lib.rs) reads this carrier.
+            // Same carrier also feeds the `#[pyre_class]` allocation
+            // constructors (`<Owner>::allocate[_stable](payload: Self)`): the
+            // non-numeric boxing ctors have no ported `malloc->new` lowering,
+            // so they residualize through the same annotator-only stub path.
             program.unsafe_fn_stubs = llbcs
                 .iter()
                 .flat_map(front::mir::collect_unsafe_fn_stubs_from_llbc)
+                .chain(
+                    llbcs
+                        .iter()
+                        .flat_map(front::mir::collect_pyre_class_ctor_stubs_from_llbc),
+                )
                 .collect();
             // Foreign opaque-ADT methods (`<BigInt as Add>::add`, …) that
             // `impl_method_owner` routes through `CallTarget::FunctionPath`

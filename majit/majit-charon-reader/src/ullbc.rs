@@ -72,6 +72,45 @@ impl FunDecl {
             .map(|p| p.unstructured)
     }
 
+    /// Source name of the first argument local (local index 1; index 0 is the
+    /// return slot).  `None` when the body is absent, the function has no
+    /// arguments, or Charon dropped the name.
+    ///
+    /// Projects only the `locals` table — the basic-block CFG is skipped — so a
+    /// caller can distinguish a `self` receiver from an associated
+    /// constructor's `Self`-typed parameter without paying for a full body
+    /// parse.  Rust forbids naming a parameter `self`, so a genuine receiver's
+    /// local is the `self` keyword (named `"self"`, or unnamed for a
+    /// monomorphised trait method), whereas `W_Range::allocate(payload: Self)`
+    /// keeps its source name (`"payload"`).
+    pub fn first_arg_local_name(&self) -> Option<String> {
+        #[derive(Deserialize)]
+        struct Proj {
+            #[serde(rename = "Unstructured")]
+            u: BodyProj,
+        }
+        #[derive(Deserialize)]
+        struct BodyProj {
+            locals: LocalsProj,
+        }
+        #[derive(Deserialize)]
+        struct LocalsProj {
+            arg_count: u64,
+            locals: Vec<LocalNameProj>,
+        }
+        #[derive(Deserialize)]
+        struct LocalNameProj {
+            #[serde(default)]
+            name: Option<String>,
+        }
+        let body = self.body.as_ref()?;
+        let proj = serde_json::from_str::<Proj>(body.get()).ok()?;
+        if proj.u.locals.arg_count < 1 {
+            return None;
+        }
+        proj.u.locals.locals.get(1).and_then(|l| l.name.clone())
+    }
+
     /// Returns `Some(msg)` if Charon recorded a translation error
     /// (e.g. `"charon does not support thread local references"`).
     pub fn error_message(&self) -> Option<String> {
