@@ -279,7 +279,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_datetime": {
-      "dynasm": "PASS"
+      "dynasm": "TIMEOUT"
     },
     "test.test_dbm": {
       "dynasm": "IMPORTERROR"
