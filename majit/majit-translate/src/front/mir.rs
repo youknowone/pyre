@@ -12821,10 +12821,20 @@ fn dont_look_inside_return_token(output: &TyRef, llbc: &Llbc) -> Option<String> 
     // `RESULT == FUNC.RESULT` check).  `Result<(), PyError>` reaches the
     // unit arm the same way its callee reaches `widen_unit_return_to_void`.
     //
+    // Only a `PyError` carrier is lowered that way.  Any other `Result`
+    // stays a real ADT the callee returns whole and the caller matches on
+    // (`rbigint::_AsDouble -> Result<f64, RBigIntError>`), so projecting it
+    // would name the payload's bank for a value that arrives as a
+    // reference — the same disagreement in the other direction.
+    //
     // The `OBJECTPTR` carve-out below deliberately keeps reading the
     // declared `output`: it decides the pointer's lowering, not its bank,
     // and a `Result`-typed output has never taken it.
-    let payload = crate::front::result_exc::tyref_result_ok(output, llbc);
+    let payload = if crate::front::result_exc::tyref_is_result_of_pyerror(output, llbc) {
+        crate::front::result_exc::tyref_result_ok(output, llbc)
+    } else {
+        None
+    };
     let kind_src = payload.as_ref().unwrap_or(output);
     if is_unit_type(kind_src, llbc) {
         return None;
