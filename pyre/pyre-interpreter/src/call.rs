@@ -3397,29 +3397,31 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         None
     };
 
-    // If no explicit metaclass, infer from bases (PyPy: calculate_metaclass)
+    // compiling.py:169-183 — choose the initial metaclass from the first
+    // resolved base (or `type` for an empty base list), then run
+    // `_calculate_metaclass` across *every* base.  In particular a non-type
+    // base without `__mro_entries__` still contributes `space.type(base)`:
+    // `(object, None)` therefore raises the metaclass conflict instead of
+    // slipping through the default-type fast path.
+    //
+    // `None` remains pyre's internal spelling for the exact builtin `type`
+    // winner, so `build_class_inner` can retain its raw default construction
+    // path without changing the app-level algorithm.
+    let w_type_type = crate::typedef::w_type();
     let w_metaclass = match metaclass {
-        Some(meta) if unsafe { !pyre_object::is_type(meta) } => Some(meta),
-        explicit => {
-            let initial = if let Some(explicit) = explicit {
-                explicit
-            } else if unsafe { pyre_object::w_tuple_len(bases_tuple) } > 0 {
-                unsafe {
-                    pyre_object::w_tuple_getitem(bases_tuple, 0)
-                        .and_then(|base| {
-                            if pyre_object::is_type(base) && !(*base).w_class.is_null() {
-                                Some((*base).w_class)
-                            } else {
-                                crate::typedef::r#type(base).map(|ty| ty.as_ptr())
-                            }
-                        })
-                        .unwrap_or_else(crate::typedef::w_type)
-                }
-            } else {
-                crate::typedef::w_type()
+        Some(w_meta) if unsafe { pyre_object::is_type(w_meta) } => {
+            Some(calculate_metaclass(w_meta, bases_tuple)?)
+        }
+        Some(w_meta) => Some(w_meta),
+        None => {
+            let initial = unsafe {
+                pyre_object::w_tuple_getitem(bases_tuple, 0)
+                    .and_then(crate::typedef::r#type)
+                    .map(|w_type| w_type.as_ptr())
+                    .unwrap_or(w_type_type)
             };
             let winner = calculate_metaclass(initial, bases_tuple)?;
-            if std::ptr::eq(winner, crate::typedef::w_type()) {
+            if std::ptr::eq(winner, w_type_type) {
                 None
             } else {
                 Some(winner)

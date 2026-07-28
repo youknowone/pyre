@@ -7151,6 +7151,23 @@ except (TypeError, AttributeError):
     }
 
     #[test]
+    fn test_build_class_rejects_non_type_base_in_metaclass_calculation() {
+        let source = "\
+rejected = False
+try:
+    class C(object, None):
+        pass
+except TypeError:
+    rejected = True";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("non-type base regression");
+        unsafe {
+            let value = w_dict_getitem_str(frame.w_globals, "rejected").unwrap();
+            assert!(is_true(value).unwrap());
+        }
+    }
+
+    #[test]
     fn test_function_dunder_globals_and_code_are_materialized() {
         crate::test_hooks::install_hash_hook();
         let source = "\
