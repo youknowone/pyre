@@ -7336,6 +7336,19 @@ except TypeError:
     }
 
     #[test]
+    fn test_type_preserves_and_warns_for_non_string_namespace_keys() {
+        let source = "\
+C = type('C', (), {1: 2})
+result = C.__dict__[1] == 2";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("non-string type namespace regression");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(is_true(result).unwrap());
+        }
+    }
+
+    #[test]
     fn test_function_dunder_globals_and_code_are_materialized() {
         crate::test_hooks::install_hash_hook();
         let source = "\
