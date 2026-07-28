@@ -3976,9 +3976,27 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── load_build_class ──
-    // PyPy: BUILD_CLASS; CPython: LOAD_BUILD_CLASS
+    // PyPy pyopcode.py:866-870 LOAD_BUILD_CLASS reads
+    // `self.get_builtin().getdictvalue('__build_class__')`.  Python 3.14
+    // reports a NameError when the selected builtin mapping has no entry.
     fn load_build_class(&mut self) -> Result<(), PyError> {
-        let bc = crate::get_build_class_func();
+        let w_builtin = self.get_builtin();
+        let bc = if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
+            let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+            if w_dict.is_null() {
+                None
+            } else {
+                crate::baseobjspace::finditem_str(w_dict, "__build_class__")?
+            }
+        } else {
+            None
+        };
+        let Some(bc) = bc else {
+            return Err(PyError::name_error_with_name(
+                "__build_class__ not found",
+                "__build_class__",
+            ));
+        };
         self.push(bc);
         Ok(())
     }

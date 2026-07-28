@@ -8576,6 +8576,33 @@ fn exec_or_eval(
                 return Err(err);
             }
         };
+    // Python 3.14 always selects the builtin namespace supplied through an
+    // explicit exec/eval globals dict.  PyPy expresses the same selection as
+    // `space.builtin.pick_builtin(w_globals)` when
+    // `objspace.honor__builtins__` is enabled.  Keep Pyre's global PyPy
+    // configuration unchanged, but apply that exact selection to the frame
+    // constructed by this exec/eval path.
+    //
+    // `moduledef.py:95-100` has a common-case identity exit when the globals
+    // entry is already `space.builtin`.  Preserve that shape as an
+    // allocation-free exact-dict probe: imported modules overwhelmingly carry
+    // this entry, and must not enter the general mapping dispatch again.
+    let current_globals = frame.get_w_globals();
+    let keeps_existing_builtin = unsafe {
+        pyre_object::is_dict(current_globals)
+            && pyre_object::w_dict_getitem_str(current_globals, "__builtins__")
+                .is_some_and(|w_builtin| std::ptr::eq(w_builtin, frame.w_builtin))
+    };
+    if !keeps_existing_builtin {
+        // `pick_builtin_obj_checked` can invoke a dict-subclass `__getitem__`
+        // and therefore allocate or collect.  The new frame is not current
+        // yet, so expose it as a temporary GC root while selecting and storing
+        // its builtin Module.
+        let _frame_roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(frame.as_mut_ptr() as pyre_object::PyObjectRef);
+        let current_globals = frame.get_w_globals();
+        frame.w_builtin = crate::baseobjspace::pick_builtin_obj_checked(current_globals, exec_ctx)?;
+    }
     frame.fix_array_ptrs();
     // eval.py:32 frame.setdictscope(w_locals, ...) — only when locals
     // were separately supplied.  Without this call, initialize_frame_scopes'
@@ -8811,9 +8838,14 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             if w_locals_dict.is_null() {
                 return Ok(w_list_new(vec![]));
             }
-            let keys_iter = crate::baseobjspace::iter(w_locals_dict)?;
-            let keys = collect_iterable(keys_iter)?;
-            builtin_sorted(&[w_list_new(keys)])
+            // PyPy app_inspect.py:50 calls
+            // `sorted(_caller_locals().keys())`, not `sorted(locals)`.
+            // This distinction is observable for a general eval locals
+            // mapping which implements `keys()` and sequence-style
+            // `__getitem__` but no `__iter__`.
+            let keys_method = crate::baseobjspace::getattr_str(w_locals_dict, "keys")?;
+            let keys = crate::call_and_check(keys_method, &[])?;
+            builtin_sorted(&[keys])
         });
     }
     if args.len() > 1 {

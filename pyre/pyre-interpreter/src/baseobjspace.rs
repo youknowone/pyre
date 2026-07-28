@@ -2147,6 +2147,35 @@ pub(crate) fn builtin_callable(name: &str) -> PyObjectRef {
     unsafe { (*ctx).lookup_builtin(name).unwrap_or(PY_NULL) }
 }
 
+/// Python 3.14 `_PyEval_GetBuiltin(name)` for operations whose result is
+/// observably resolved in the current frame (notably iterator `__reduce__`).
+/// The frame's selected builtin mapping may be a dict subclass or
+/// `MappingProxyType`; propagate its lookup error and report a missing entry
+/// as AttributeError, matching `_PyEval_GetBuiltin`.
+fn frame_builtin_callable(name: &str) -> PyResult {
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if !frame.is_null() {
+            let w_builtin = unsafe { (*frame).get_builtin() };
+            if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
+                let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+                if !w_dict.is_null()
+                    && let Some(callable) = finditem_str(w_dict, name)?
+                {
+                    return Ok(callable);
+                }
+            }
+            return Err(PyError::attribute_error(name));
+        }
+        let callable = builtin_callable(name);
+        if callable.is_null() {
+            Err(PyError::attribute_error(name))
+        } else {
+            Ok(callable)
+        }
+    })
+}
+
 /// Build the common iterator pickle tuple after the reconstructor lookup and
 /// the subsequent state read.  Keep every component rooted while tuple
 /// allocation runs: these methods are deliberately exercised with a hostile
@@ -2314,7 +2343,7 @@ pub(crate) fn list_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(args[0]);
-    let callable = builtin_callable("iter");
+    let callable = frame_builtin_callable("iter")?;
     pyre_object::gc_roots::pin_root(callable);
     unsafe {
         let receiver = pyre_object::gc_roots::shadow_stack_get(sp);
@@ -12035,6 +12064,12 @@ pub fn pick_builtin_obj_checked(
                 if !backing.is_null() {
                     return Ok(pyre_object::w_module_new_aliasing_dict("", w_builtin));
                 }
+                // Python 3.14 keeps any other supplied object as the frame's
+                // builtin mapping too.  A later LOAD_GLOBAL dispatches
+                // `obj[name]`, so a non-mapping value raises its native
+                // TypeError instead of silently becoming PyPy's default
+                // empty builtin Module.
+                return Ok(pyre_object::w_module_new_aliasing_dict("", w_builtin));
             }
             // `__builtins__` absent — moduledef.py:106-108 default Module.
             Ok(_) => {}
