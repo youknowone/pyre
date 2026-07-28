@@ -5780,15 +5780,11 @@ fn init_dict_type(ns: PyObjectRef) {
                         if pyre_object::is_dict(args[0]) {
                             crate::type_methods::dict_store_checked(args[0], args[1], args[2])?;
                         } else if pyre_object::is_instance(args[0]) {
-                            // dict subclass — store in __dict_data__ backing dict
-                            if let Ok(backing) =
-                                crate::baseobjspace::getattr_str(args[0], "__dict_data__")
-                            {
-                                if pyre_object::is_dict(backing) {
-                                    crate::type_methods::dict_store_checked(
-                                        backing, args[1], args[2],
-                                    )?;
-                                }
+                            // dict subclass — read its reserved payload slot
+                            // directly, bypassing Python __getattribute__.
+                            let backing = crate::type_methods::resolve_dict_backing(args[0]);
+                            if pyre_object::is_dict(backing) {
+                                crate::type_methods::dict_store_checked(backing, args[1], args[2])?;
                             }
                         }
                     }
@@ -5811,28 +5807,23 @@ fn init_dict_type(ns: PyObjectRef) {
                             return crate::baseobjspace::getitem(args[0], args[1]);
                         }
                         if pyre_object::is_instance(args[0]) {
-                            if let Ok(backing) =
-                                crate::baseobjspace::getattr_str(args[0], "__dict_data__")
-                            {
-                                if pyre_object::is_dict(backing) {
-                                    // `dictmultiobject.py:166-170` — on a miss,
-                                    // dispatch `__missing__` against the SUBCLASS
-                                    // instance's type, not the plain-`dict` backing
-                                    // (so e.g. `defaultdict.__missing__` fires).
-                                    return match pyre_object::dictmultiobject::w_dict_lookup_checked(
-                                        backing, args[1],
-                                    ) {
-                                        Ok(Some(val)) => Ok(val),
-                                        Ok(None) => crate::baseobjspace::dict_missing_or_key_error(
-                                            args[0], args[1],
-                                        ),
-                                        Err(_) => {
-                                            Err(crate::baseobjspace::take_pending_dict_key_error(
-                                                args[1],
-                                            ))
-                                        }
-                                    };
-                                }
+                            let backing = crate::type_methods::resolve_dict_backing(args[0]);
+                            if pyre_object::is_dict(backing) {
+                                // `dictmultiobject.py:166-170` — on a miss,
+                                // dispatch `__missing__` against the SUBCLASS
+                                // instance's type, not the plain-`dict` backing
+                                // (so e.g. `defaultdict.__missing__` fires).
+                                return match pyre_object::dictmultiobject::w_dict_lookup_checked(
+                                    backing, args[1],
+                                ) {
+                                    Ok(Some(val)) => Ok(val),
+                                    Ok(None) => crate::baseobjspace::dict_missing_or_key_error(
+                                        args[0], args[1],
+                                    ),
+                                    Err(_) => Err(
+                                        crate::baseobjspace::take_pending_dict_key_error(args[1]),
+                                    ),
+                                };
                             }
                         }
                     }
@@ -5961,13 +5952,11 @@ fn init_dict_type(ns: PyObjectRef) {
                         if pyre_object::is_dict(args[0]) {
                             crate::baseobjspace::delitem_slot(args[0], args[1])?;
                         } else if pyre_object::is_instance(args[0]) {
-                            // dict subclass — delete from __dict_data__ backing dict
-                            if let Ok(backing) =
-                                crate::baseobjspace::getattr_str(args[0], "__dict_data__")
-                            {
-                                if pyre_object::is_dict(backing) {
-                                    crate::baseobjspace::delitem(backing, args[1])?;
-                                }
+                            // dict subclass — delete through the reserved
+                            // payload slot without Python attribute lookup.
+                            let backing = crate::type_methods::resolve_dict_backing(args[0]);
+                            if pyre_object::is_dict(backing) {
+                                crate::baseobjspace::delitem(backing, args[1])?;
                             }
                         }
                     }
@@ -19775,7 +19764,8 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         // exact object identity is preserved.  (bytearray does NOT honour
         // __bytes__.)
         if let Some(method) = crate::baseobjspace::lookup(arg, "__bytes__") {
-            let w_bytes = crate::builtins::call_and_check(method, &[arg])?;
+            let w_type = crate::typedef::r#type(arg).map_or(pyre_object::PY_NULL, |t| t.as_ptr());
+            let w_bytes = crate::baseobjspace::get_and_call_function(method, arg, w_type, &[])?;
             if !pyre_object::bytesobject::is_bytes(w_bytes) {
                 return Err(crate::PyError::type_error(format!(
                     "__bytes__ returned non-bytes (type {})",

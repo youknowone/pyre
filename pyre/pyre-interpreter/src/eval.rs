@@ -2051,6 +2051,23 @@ impl SharedOpcodeHandler for PyFrame {
         getattr_str(obj, name)
     }
 
+    fn load_special_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
+        let w_type = crate::typedef::r#type(obj).ok_or_else(|| {
+            PyError::type_error(format!(
+                "'{}' object does not support the context manager protocol",
+                crate::baseobjspace::object_functionstr_type_name(obj)
+            ))
+        })?;
+        let descr = unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), name) }
+            .ok_or_else(|| {
+                PyError::type_error(format!(
+                    "'{}' object does not support the context manager protocol",
+                    crate::baseobjspace::object_functionstr_type_name(obj)
+                ))
+            })?;
+        Ok(unsafe { crate::baseobjspace::get(descr, obj, w_type.as_ptr()) }?.unwrap_or(descr))
+    }
+
     fn store_attr(
         &mut self,
         obj: Self::Value,
@@ -7053,6 +7070,43 @@ result = C.value";
         unsafe {
             let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
             assert_eq!(w_int_get_value(result), 42);
+        }
+    }
+
+    #[test]
+    fn test_hot_context_manager_special_lookup_bypasses_getattribute() {
+        let _jit_guard = jit_compile_test_guard();
+        let source = "\
+seen = [0, 0]
+def enter(self):
+    return self
+def exit(self, typ, value, traceback):
+    return False
+class SpecialDescr:
+    def __init__(self, impl, index):
+        self.impl = impl
+        self.index = index
+    def __get__(self, obj, owner):
+        seen[self.index] += 1
+        return self.impl.__get__(obj, owner)
+class Manager:
+    __enter__ = SpecialDescr(enter, 0)
+    __exit__ = SpecialDescr(exit, 1)
+    def __getattribute__(self, name):
+        raise AssertionError(name)
+i = 0
+while i < 3000:
+    with Manager():
+        pass
+    i += 1";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("context-manager special lookup failed");
+        unsafe {
+            let i = w_dict_getitem_str(frame.w_globals, "i").unwrap();
+            assert_eq!(w_int_get_value(i), 3000);
+            let seen = w_dict_getitem_str(frame.w_globals, "seen").unwrap();
+            assert_eq!(w_int_get_value(w_list_getitem(seen, 0).unwrap()), 3000);
+            assert_eq!(w_int_get_value(w_list_getitem(seen, 1).unwrap()), 3000);
         }
     }
 

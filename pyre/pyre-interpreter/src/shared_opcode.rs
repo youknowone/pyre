@@ -39,6 +39,7 @@ pub trait SharedOpcodeHandler {
     fn unpack_sequence(&mut self, seq: Self::Value, count: usize)
     -> OpcodeResult<Vec<Self::Value>>;
     fn load_attr(&mut self, obj: Self::Value, name: &str) -> OpcodeResult<Self::Value>;
+    fn load_special_attr(&mut self, obj: Self::Value, name: &str) -> OpcodeResult<Self::Value>;
     fn store_attr(&mut self, obj: Self::Value, name: &str, value: Self::Value) -> OpcodeResult<()>;
 }
 
