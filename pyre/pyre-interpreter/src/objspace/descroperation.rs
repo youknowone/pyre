@@ -3747,6 +3747,71 @@ pub(crate) fn try_dispatch_binary_special(
     }
 }
 
+/// CPython 3.14 `typeobject.c:slot_nb_power` — the three-argument copy of
+/// `SLOT1BINFULL`.  Unlike PyPy 3.11's `space.pow`, Python 3.14 also offers
+/// the exponent's reflected method the modulus argument.  A proper subtype's
+/// distinct `__rpow__` is tried first, then the base's `__pow__`, then the
+/// reflected method when it has not already been tried.
+fn try_dispatch_ternary_pow_special(
+    base: PyObjectRef,
+    exp: PyObjectRef,
+    modulus: PyObjectRef,
+) -> Result<Option<PyObjectRef>, PyError> {
+    unsafe {
+        let Some(w_base_type) = crate::typedef::r#type(base) else {
+            return Ok(None);
+        };
+        let Some(w_exp_type) = crate::typedef::r#type(exp) else {
+            return Ok(None);
+        };
+        let (w_base_src, w_base_impl) =
+            match lookup_where_with_method_cache(w_base_type.as_ptr(), "__pow__") {
+                Some((src, imp)) => (Some(src), Some(imp)),
+                None => (None, None),
+            };
+        let (w_exp_src, mut w_exp_impl) = if w_base_type != w_exp_type {
+            match lookup_where_with_method_cache(w_exp_type.as_ptr(), "__rpow__") {
+                Some((src, imp)) => (Some(src), Some(imp)),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
+        // slot_nb_power: a proper exponent subtype whose reflected method is
+        // distinct from the base type's definition gets the first chance.
+        if issubtype_w(w_exp_type.as_ptr(), w_base_type.as_ptr()) {
+            if let (Some(exp_src), Some(base_src), Some(exp_impl)) =
+                (w_exp_src, w_base_src, w_exp_impl)
+            {
+                if !std::ptr::eq(base_src, exp_src)
+                    && !p_abstract_issubclass_w(base_src, exp_src)?
+                    && !p_abstract_issubclass_w(w_base_type.as_ptr(), exp_src)?
+                {
+                    if let Some(result) = try_call_special(exp_impl, &[exp, base, modulus])? {
+                        return Ok(Some(result));
+                    }
+                    // CPython clears `do_other` after the subtype-first call,
+                    // including when it returns NotImplemented.
+                    w_exp_impl = None;
+                }
+            }
+        }
+
+        if let Some(method) = w_base_impl {
+            if let Some(result) = try_call_special(method, &[base, exp, modulus])? {
+                return Ok(Some(result));
+            }
+        }
+        if let Some(method) = w_exp_impl {
+            if let Some(result) = try_call_special(method, &[exp, base, modulus])? {
+                return Ok(Some(result));
+            }
+        }
+        Ok(None)
+    }
+}
+
 /// descroperation.py:825 `inplace_impl` — try the in-place special
 /// (`__iadd__` etc.) on the lhs.  Returns `None` when the type has no
 /// such method or the call yields `NotImplemented`, so the caller falls
@@ -3943,45 +4008,16 @@ pub(crate) fn ternary_builtin_type_error(
     ))
 }
 
-/// 3-arg `pow(a, b, c)` dispatch — pypy/objspace/descroperation.py:441
-/// `def pow(space, w_obj1, w_obj2, w_obj3)`. Tries the int/long modulus
-/// fast path, then only the forward `__pow__` on the base; the reflected
-/// `__rpow__` is not consulted for three-arg power (unlike two-arg), so a
-/// forward `NotImplemented` raises the three-operand type error rather than
-/// falling through to the right operand.
+/// 3-arg `pow(a, b, c)` dispatch. PyPy 3.11's
+/// `pypy/objspace/descroperation.py:441` tries only the base's `__pow__`;
+/// Python 3.14 changed this to offer the exponent's `__rpow__` the modulus
+/// too (`Objects/typeobject.c:slot_nb_power`).
 pub fn pow3(base: PyObjectRef, exp: PyObjectRef, modulus: PyObjectRef) -> PyResult {
     if unsafe { is_none(modulus) } {
         return pow(base, exp);
     }
-    // Python 3.14 extends reflected-power dispatch to the ternary form.  A
-    // strict RHS subtype gets the first opportunity, exactly as for binary
-    // power, and receives `(base, modulus)` after its bound receiver.
-    let base_type = crate::typedef::r#type(base).map(|t| t.as_ptr());
-    let exp_type = crate::typedef::r#type(exp).map(|t| t.as_ptr());
-    let rhs_first = match (base_type, exp_type) {
-        (Some(lhs), Some(rhs)) if !std::ptr::eq(lhs, rhs) => unsafe {
-            crate::baseobjspace::issubtype_w(rhs, lhs)
-        },
-        _ => false,
-    };
-    if rhs_first {
-        if let Some(method) = unsafe { lookup_type_special(exp, "__rpow__") } {
-            if let Some(result) = try_call_special(method, &[exp, base, modulus])? {
-                return Ok(result);
-            }
-        }
-    }
-    if let Some(method) = unsafe { lookup_type_special(base, "__pow__") } {
-        if let Some(result) = try_call_special(method, &[base, exp, modulus])? {
-            return Ok(result);
-        }
-    }
-    if !rhs_first {
-        if let Some(method) = unsafe { lookup_type_special(exp, "__rpow__") } {
-            if let Some(result) = try_call_special(method, &[exp, base, modulus])? {
-                return Ok(result);
-            }
-        }
+    if let Some(result) = try_dispatch_ternary_pow_special(base, exp, modulus)? {
+        return Ok(result);
     }
     Err(ternary_builtin_type_error("pow()", base, exp, modulus))
 }

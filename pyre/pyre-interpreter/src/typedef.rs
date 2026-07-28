@@ -13777,11 +13777,21 @@ int_binop_rev!(
 /// optional modulus argument, so it validates arity as one-or-two.
 fn int_dunder_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_pow(args)?;
-    if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
-        crate::objspace::descroperation::pow_builtin(args[1], args[0])
-    } else {
-        Ok(pyre_object::w_not_implemented())
+    if !unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
+        return Ok(pyre_object::w_not_implemented());
     }
+    if args.len() >= 3 && !unsafe { pyre_object::pyobject::is_none(args[2]) } {
+        if !unsafe { pyre_object::pyobject::is_int_or_long(args[2]) } {
+            return Ok(pyre_object::w_not_implemented());
+        }
+        return match crate::objspace::descroperation::try_int_long_pow_with_modulo(
+            args[1], args[0], args[2],
+        )? {
+            Some(result) => Ok(result),
+            None => Ok(pyre_object::w_not_implemented()),
+        };
+    }
+    crate::objspace::descroperation::pow_builtin(args[1], args[0])
 }
 int_binop_fwd!(
     int_dunder_lshift,
@@ -13823,9 +13833,9 @@ fn int_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     if args.len() >= 3 && !unsafe { pyre_object::pyobject::is_none(args[2]) } {
         // Only an integer modulus routes through the modular-power path.
-        // The object protocol has no ternary reflected slot, so an int base
-        // with a non-int modulus yields NotImplemented and the caller raises
-        // the three-operand type error.
+        // Python 3.14's ternary reflected dispatch can still offer the
+        // exponent's `__rpow__` a non-int modulus after this method returns
+        // NotImplemented.
         if !unsafe { pyre_object::pyobject::is_int_or_long(args[2]) } {
             return Ok(pyre_object::w_not_implemented());
         }
