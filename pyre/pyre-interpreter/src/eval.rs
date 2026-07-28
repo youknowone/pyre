@@ -7247,6 +7247,29 @@ class C(metaclass=Meta):
     }
 
     #[test]
+    fn test_custom_mro_that_drops_the_new_type_is_rejected() {
+        let source = "\
+class B:
+    pass
+class Meta(type):
+    def mro(cls):
+        del Meta.mro
+        return (B,)
+rejected = False
+try:
+    class A(metaclass=Meta):
+        pass
+except TypeError:
+    rejected = True";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("disappearing custom MRO regression");
+        unsafe {
+            let value = w_dict_getitem_str(frame.w_globals, "rejected").unwrap();
+            assert!(is_true(value).unwrap());
+        }
+    }
+
+    #[test]
     fn test_function_dunder_globals_and_code_are_materialized() {
         crate::test_hooks::install_hash_hook();
         let source = "\

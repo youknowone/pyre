@@ -4178,6 +4178,12 @@ pub(crate) fn call_init_subclass_on_bases(
     _w_effective_bases: PyObjectRef,
     init_subclass_kwargs: &[(PyObjectRef, PyObjectRef)],
 ) -> Result<(), crate::PyError> {
+    // typeobject.py:1022 `space.call_function(w_super, w_type, w_type)`
+    // goes through `super.__new__` / `_super_check` before constructing the
+    // proxy.  This matters for a custom metaclass mro() that omits the
+    // nascent class: `super(w_type, w_type)` must reject that incomplete
+    // hierarchy instead of manufacturing an invalid proxy.
+    crate::builtins::super_check(w_type, w_type)?;
     let w_super = pyre_object::descriptor::w_super_new(w_type, w_type);
     let w_func = crate::baseobjspace::getattr_str(w_super, "__init_subclass__")?;
     // `__args__.replace_arguments([])` — keywords only, no positionals.
