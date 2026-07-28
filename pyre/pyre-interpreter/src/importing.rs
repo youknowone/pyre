@@ -1793,6 +1793,10 @@ pub fn utf8_mode_flag() -> i64 {
     SYS_UTF8_MODE.load(Ordering::Relaxed)
 }
 
+/// `#[dont_look_inside]`: reads the runtime-mutable `SYS_SAFE_PATH` global
+/// (`-P` / `PYTHONSAFEPATH`), so the tracer residualises the read rather than
+/// folding a build-time constant — the runtime-mutable-global accessor pattern.
+#[majit_macros::dont_look_inside]
 pub fn safe_path_flag() -> bool {
     SYS_SAFE_PATH.load(Ordering::Relaxed)
 }
