@@ -1662,7 +1662,18 @@ impl CallControl {
         } else {
             (
                 majit_ir::descr::ArrayFlag::from_item_type(ir_type, false),
-                8,
+                // Same rule as the named-element path (`get_type_flag`) and
+                // the codewriter-less fallback in `assembler.rs`: a pointer
+                // element strides by the TARGET word, an int/float bank by 8.
+                // The list/tuple items-block ops the #171 append fold emits
+                // carry no `array_type_id`, so a flat 8 here would stride a
+                // `GcArray(OBJECTPTR)` at 8 bytes on a 32-bit target while
+                // the runtime block holds 4-byte items.
+                if ir_type == majit_ir::value::Type::Ref {
+                    crate::layout::target_word_size()
+                } else {
+                    8
+                },
                 ir_type,
             )
         };
