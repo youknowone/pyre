@@ -241,13 +241,12 @@ crate::py_module! {
             // Read every value before storing any, so a non-integer in the
             // tail leaves the previous thresholds untouched.  An omitted
             // trailing value keeps the threshold it already had, and a third
-            // value is validated but not kept.  The index protocol, so an
-            // object carrying only `__int__` is a TypeError.
+            // value is validated but not kept.
             let mut given = Vec::with_capacity(positional.len());
             for &w_value in positional {
-                given.push(crate::baseobjspace::int_w(
-                    crate::baseobjspace::space_index(w_value)?,
-                )?);
+                // The index protocol, so an object carrying only `__int__` is
+                // a TypeError rather than a silent conversion.
+                given.push(crate::builtins::space_index_w(w_value)?);
             }
             for (slot, value) in GC_THRESHOLD.iter().zip(given) {
                 slot.store(value, Ordering::Relaxed);
