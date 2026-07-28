@@ -2170,6 +2170,9 @@ fn module_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             tag_subclass_instance(w_module, cls);
         }
     }
+    // module.py:Module.descr_module__new__ allocates through
+    // `space.allocate_instance(Module, w_subtype)`.
+    pyre_object::gc_hook::maybe_register_finalizer(w_module);
     Ok(w_module)
 }
 
@@ -12571,6 +12574,7 @@ fn staticmethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
     if !std::ptr::eq(cls, staticmethod_type) {
         tag_subclass_instance(sm, cls);
     }
+    pyre_object::gc_hook::maybe_register_finalizer(sm);
     Ok(sm)
 }
 
@@ -12857,6 +12861,7 @@ fn classmethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
     if !std::ptr::eq(cls, classmethod_type) {
         tag_subclass_instance(cm, cls);
     }
+    pyre_object::gc_hook::maybe_register_finalizer(cm);
     Ok(cm)
 }
 
@@ -13185,6 +13190,7 @@ fn property_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
     if !std::ptr::eq(cls, property_type) {
         tag_subclass_instance(prop, cls);
     }
+    pyre_object::gc_hook::maybe_register_finalizer(prop);
     Ok(prop)
 }
 
