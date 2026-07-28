@@ -23377,6 +23377,10 @@ fn itertools_alloc_for_class(
     if !std::ptr::eq(cls, exact_type) {
         tag_subclass_instance(obj, cls);
     }
+    // objspace.py:allocate_instance registers `hasuserdel` after the concrete
+    // subtype is installed.  Every PyPy constructor routed through this
+    // helper uses that allocation path.
+    pyre_object::gc_hook::maybe_register_finalizer(obj);
     Ok(obj)
 }
 

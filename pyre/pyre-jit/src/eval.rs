@@ -1238,11 +1238,16 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // other `PyObject`-layout class chains its `parent` field to
     // this id so `assign_inheritance_ids` (normalizecalls.py:373-389)
     // produces a `subclassrange_{min,max}` covering every
-    // descendant. The size is `sizeof(PyObject)` because instances
-    // tagged with `&INSTANCE_TYPE` (i.e. user `object()` calls)
-    // carry only the `ob_type` header.
-    let object_tid = gc.register_type(TypeInfo::object(
+    // descendant. The size is `sizeof(PyObject)` because instances tagged
+    // with `&INSTANCE_TYPE` (i.e. user `object()` calls) carry only this
+    // header. RPython's OBJECT has only `typeptr`; pyre's augmented header
+    // also keeps the app-level class in `w_class`. Register that managed edge
+    // on the root so every ordinary offset-traced subclass inherits it
+    // through its embedded PyObject header, matching GcStruct `super` field
+    // tracing.
+    let object_tid = gc.register_type(TypeInfo::object_with_gc_ptrs(
         std::mem::size_of::<pyre_object::PyObject>(),
+        vec![std::mem::offset_of!(pyre_object::PyObject, w_class)],
     ));
     debug_assert_eq!(object_tid, OBJECT_GC_TYPE_ID);
     // W_IntObject / W_FloatObject carry `PyObject.ob_type` at offset 0,

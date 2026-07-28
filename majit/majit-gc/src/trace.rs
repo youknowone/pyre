@@ -512,6 +512,33 @@ impl TypeInfo {
         }
     }
 
+    /// Create an `rclass.OBJECT`-layout root whose fixed payload also
+    /// contains GC pointer fields.
+    ///
+    /// RPython's `rclass.OBJECT` itself contains only `typeptr`, but a
+    /// frontend may extend that common root header with managed fields. The
+    /// concrete subclass layout then inherits these offsets just as an
+    /// RPython `GcStruct(..., ('super', OBJECT), ...)` inherits the GC fields
+    /// of its embedded `super`.
+    pub fn object_with_gc_ptrs(size: usize, offsets: Vec<usize>) -> Self {
+        let has_gc_ptrs = !offsets.is_empty();
+        TypeInfo {
+            size,
+            has_gc_ptrs,
+            gc_ptr_offsets: offsets,
+            item_size: 0,
+            length_offset: 0,
+            items_have_gc_ptrs: false,
+            custom_trace: None,
+            is_object: true,
+            parent: None,
+            subclassrange_min: 0,
+            subclassrange_max: 0,
+            is_weakref: false,
+            destructor: None,
+        }
+    }
+
     /// Create a type info for an `rclass.OBJECT`-layout instance
     /// that inherits from a previously-registered class.
     ///
@@ -755,7 +782,7 @@ impl TypeRegistry {
     /// assigns preorder bounds via `assign_inheritance_ids`
     /// (normalizecalls.py:373-389), then refreshes the materialized
     /// `TypeEntry` rows.
-    pub fn register(&mut self, info: TypeInfo) -> u32 {
+    pub fn register(&mut self, mut info: TypeInfo) -> u32 {
         assert!(
             self.can_add_new_types,
             "TypeRegistry::register called after freeze_types \
@@ -767,6 +794,26 @@ impl TypeRegistry {
             "TypeRegistry exceeded MAX_TYPES = {} — bump trace.rs",
             Self::MAX_TYPES
         );
+        if info.custom_trace.is_none()
+            && let Some(parent_id) = info.parent
+        {
+            let parent = self
+                .entries
+                .get(parent_id as usize)
+                .expect("object parent must be registered before its subclass");
+            assert!(
+                parent.custom_trace.is_none(),
+                "offset-traced object subclass cannot inherit a custom-traced parent"
+            );
+            let mut offsets = parent.gc_ptr_offsets.clone();
+            for offset in std::mem::take(&mut info.gc_ptr_offsets) {
+                if !offsets.contains(&offset) {
+                    offsets.push(offset);
+                }
+            }
+            info.gc_ptr_offsets = offsets;
+            info.has_gc_ptrs = !info.gc_ptr_offsets.is_empty() || info.items_have_gc_ptrs;
+        }
         let entry = TypeEntry::from_type_info(&info, id as u32);
         self.entries.push(info);
         self.layout_table.push(entry);
@@ -967,6 +1014,22 @@ mod tests {
         let id = reg.register(TypeInfo::with_gc_ptrs(24, vec![0, 8, 16]));
         assert!(reg.get(id).has_gc_ptrs);
         assert_eq!(reg.get(id).gc_ptr_offsets.len(), 3);
+    }
+
+    #[test]
+    fn test_object_subclass_inherits_fixed_gc_ptrs() {
+        // rclass.py embeds the complete parent GcStruct as `super`; GC fields
+        // from that fixed prefix therefore remain part of every concrete
+        // subclass's trace shape.
+        let mut reg = TypeRegistry::new();
+        let root = reg.register(TypeInfo::object_with_gc_ptrs(16, vec![8]));
+        let child = reg.register(TypeInfo::object_subclass_with_gc_ptrs(32, root, vec![24]));
+        let grandchild = reg.register(TypeInfo::object_subclass(40, child));
+
+        assert_eq!(reg.get(child).gc_ptr_offsets, vec![8, 24]);
+        assert_eq!(reg.get(grandchild).gc_ptr_offsets, vec![8, 24]);
+        assert!(reg.get(child).has_gc_ptrs);
+        assert!(reg.get(grandchild).has_gc_ptrs);
     }
 
     #[test]
