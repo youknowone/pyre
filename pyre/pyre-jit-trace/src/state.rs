@@ -4854,6 +4854,43 @@ pub(crate) fn restore_frame_locals(frame: usize, saved: &[i64]) {
     frame_array_write_barrier(frame as *mut u8, arr_ptr);
 }
 
+/// The scalar half of the frame image [`capture_frame_locals`] covers.
+#[derive(Clone, Copy)]
+pub(crate) struct FrameScalars {
+    last_instr: isize,
+    valuestackdepth: usize,
+}
+
+/// Take the two frame words a blackhole drive moves as it replays.  It reaches
+/// them through `setfield_vable_i` against the frame register, which is the
+/// live frame, so a caller that may still hand that frame back to the
+/// interpreter has to take these beside the slots: the interpreter derives its
+/// next opcode from `last_instr + 1`, and reads the operand stack at
+/// `valuestackdepth`.  Restoring only the locals leaves the two disagreeing.
+pub(crate) fn capture_frame_scalars(frame: usize) -> Option<FrameScalars> {
+    if frame == 0 {
+        return None;
+    }
+    Some(FrameScalars {
+        last_instr: unsafe {
+            *((frame + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *const isize)
+        },
+        valuestackdepth: concrete_stack_depth(frame)?,
+    })
+}
+
+/// Put back what [`capture_frame_scalars`] took.
+pub(crate) fn restore_frame_scalars(frame: usize, saved: FrameScalars) {
+    if frame == 0 {
+        return;
+    }
+    unsafe {
+        *((frame + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize) =
+            saved.last_instr;
+    }
+    set_concrete_stack_depth(frame, saved.valuestackdepth);
+}
+
 /// Materialize the outer frame's locals from the virtualizable shadow.
 /// Callers must run their complete preflight before executing a rebuilt
 /// callee; after that point a failure would make replay unsafe.

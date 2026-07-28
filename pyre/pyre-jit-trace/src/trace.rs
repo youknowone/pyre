@@ -2029,6 +2029,7 @@ fn try_adopt_single_frame_blackhole(
     let Some(mut locals_undo) = crate::state::capture_frame_locals(vable_frame) else {
         return false;
     };
+    let scalars_undo = crate::state::capture_frame_scalars(vable_frame);
     let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
     unsafe {
         majit_gc::shadow_stack::push_resume_ref_roots(locals_undo.as_mut_slice());
@@ -2128,8 +2129,15 @@ fn try_adopt_single_frame_blackhole(
         // escape/replay path, which resumes the frame from its pre-walk state —
         // the state `restore_escape_flush_undo` puts back for the flush half.
         // The publish above and the replay's own vable stores both landed here,
-        // so both have to come off.
+        // so both have to come off.  The drive reached the frame's scalars
+        // through `setfield_vable_i`, for which no undo image exists anywhere
+        // else: the store journal covers heap effects and
+        // `fbw_exit_last_instr_rollback` only arms on a return or void-return
+        // exit, which an unadoptable terminal is not.
         crate::state::restore_frame_locals(vable_frame, &locals_undo);
+        if let Some(scalars) = scalars_undo {
+            crate::state::restore_frame_scalars(vable_frame, scalars);
+        }
     }
     majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
     adopted
@@ -2349,6 +2357,7 @@ fn try_adopt_multi_frame_blackhole(
         restore_links(&saved_links);
         return false;
     };
+    let scalars_undo = crate::state::capture_frame_scalars(root_addr);
     let undo_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
     unsafe {
         majit_gc::shadow_stack::push_resume_ref_roots(locals_undo.as_mut_slice());
@@ -2519,8 +2528,12 @@ fn try_adopt_multi_frame_blackhole(
     } else {
         // Same withdrawal as the single-frame arm: an unadoptable terminal
         // returns to legacy escape/replay, which resumes the walked frame from
-        // its pre-walk state.  The chain the drive was given comes down with it.
+        // its pre-walk state.  The chain the drive was given comes down with it,
+        // and so do the frame scalars the drive moved.
         crate::state::restore_frame_locals(root_addr, &locals_undo);
+        if let Some(scalars) = scalars_undo {
+            crate::state::restore_frame_scalars(root_addr, scalars);
+        }
         restore_links(&saved_links);
     }
     majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
