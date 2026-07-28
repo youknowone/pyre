@@ -40,6 +40,8 @@ SOURCES = (
     ("match", "def f(v):\n    match v:\n        case 0:\n            return 'zero'\n        case [1, 2]:\n            return 'onetwo'\n        case [1, *tail]:\n            return 'head1 ' + str(tail)\n        case {'k': val, **extra}:\n            return 'map ' + str(val) + str(sorted(extra))\n        case str() as s if len(s) > 1:\n            return 'str ' + s\n        case (int() | float()) as n:\n            return 'num ' + str(n)\n        case None:\n            return 'none'\n        case _:\n            return 'other'\nfor v in (0, [1, 2], [1, 5, 6], {'k': 9, 'z': 1}, 'hi', 4.5, None, object):\n    print(f(v))"),
     ("matchclass", "class P:\n    __match_args__ = ('x', 'y')\n    def __init__(self, x, y):\n        self.x, self.y = x, y\ndef f(p):\n    match p:\n        case P(0, y=b):\n            return 'originx ' + str(b)\n        case P(a, b):\n            return 'point ' + str(a + b)\nprint(f(P(0, 5)), f(P(2, 3)))"),
     ("constants", "print(1, 1.5, 'a', b'b', True, False, None, ..., 3 + 4j, -0.0, 10 ** 30)"),
+    ("fstrings", "x, w = 5, 8\nprint(f'', f'plain', f'a{x}b', f'{x}{x}')\nprint(f'{x!r} {x!s} {x!a}')\nprint(f'{x:05d}|{x:>8}|{x:+.3f}|{x:>{w}}|{x:0{w}d}')\nprint(f'{x!r:>10}', f'{{literal}} {x}')"),
+    ("fstring_nesting", "x = 3\nd = {'k': [1, 2]}\nprint(f'{f\"{x}\"}', f'{d[\"k\"][1] + 1}', f'{len(\"abc\")}')\nprint(f'a' 'b' f'{x}' 'c')\nprint(f'{x=}', f'{x = }', f'{x=:04d}', f'{x=!r}')\ndef g(v):\n    return f'<{v!r}>'\nprint(g(1), g('s'), [f'{i}:{i * i}' for i in range(3)])"),
 )
 
 
@@ -100,6 +102,59 @@ def handbuilt():
         got = ns["x"]
         shown = sorted(got) if isinstance(got, frozenset) else got
         out.append("const " + type(got).__name__ + " " + str(shown) + " " + str(got == value))
+    # An f-string reaches the tree path as the values it joins, not as the
+    # literal and interpolated parts the parser split it into, so the shapes
+    # below only exist here: no values at all, a lone `FormattedValue`, a
+    # nested `JoinedStr`, and a spec that is itself formatted.
+    name = ast.Name("x", ast.Load())
+    for label, node in (
+        ("empty", ast.JoinedStr(values=[])),
+        ("const", ast.JoinedStr(values=[ast.Constant("ab")])),
+        ("lone-fv", ast.FormattedValue(value=name, conversion=-1)),
+        ("fv-repr", ast.FormattedValue(value=name, conversion=114)),
+        ("fv-str", ast.FormattedValue(value=name, conversion=115)),
+        ("fv-ascii", ast.FormattedValue(value=ast.Constant("\xe9"), conversion=97)),
+        ("mixed", ast.JoinedStr(values=[
+            ast.Constant("a"), ast.FormattedValue(value=name, conversion=-1), ast.Constant("b")])),
+        ("spec", ast.JoinedStr(values=[ast.FormattedValue(
+            value=name, conversion=-1,
+            format_spec=ast.JoinedStr(values=[ast.Constant("07.2f")]))])),
+        ("spec-formatted", ast.JoinedStr(values=[ast.FormattedValue(
+            value=name, conversion=-1,
+            format_spec=ast.JoinedStr(values=[
+                ast.Constant(">"),
+                ast.FormattedValue(value=ast.Name("w", ast.Load()), conversion=-1)]))])),
+        ("nested", ast.JoinedStr(values=[
+            ast.JoinedStr(values=[ast.FormattedValue(value=name, conversion=-1)]),
+            ast.Constant("!")])),
+        ("non-str-const", ast.JoinedStr(values=[ast.Constant(1)])),
+    ):
+        tree = ast.Expression(body=node)
+        ast.fix_missing_locations(tree)
+        out.append("fstring " + label + " " + repr(eval(compile(tree, "<s>", "eval"),
+                                                       {"x": 42.5, "w": 9})))
+    # Only the class is compared: the wording differs between runtimes.
+    def without(node, field):
+        # Dropped after construction rather than left off it, which warns.
+        delattr(node, field)
+        return node
+
+    for label, node in (
+        ("missing-conversion", ast.JoinedStr(values=[
+            without(ast.FormattedValue(value=name, conversion=-1), "conversion")])),
+        ("missing-value", ast.JoinedStr(values=[
+            without(ast.FormattedValue(value=name, conversion=-1), "value")])),
+        ("values-not-a-list", ast.JoinedStr(values=ast.Constant("a"))),
+        ("none-in-values", ast.JoinedStr(values=[None])),
+        ("none-in-body", ast.Module(body=[None], type_ignores=[])),
+    ):
+        tree = node if isinstance(node, ast.Module) else ast.Expression(body=node)
+        try:
+            ast.fix_missing_locations(tree)
+            compile(tree, "<s>", "exec" if isinstance(node, ast.Module) else "eval")
+            out.append("reject " + label + " none")
+        except BaseException as e:
+            out.append("reject " + label + " " + type(e).__name__)
     return out
 
 

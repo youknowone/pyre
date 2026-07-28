@@ -80,8 +80,8 @@ impl ObjectConverter {
         let value = self.field(object, field, node)?;
         if !unsafe { pyre_object::is_list(value) } {
             return Err(crate::PyError::type_error(format!(
-                "AST list field must be a list, not {}",
-                unsafe { pyre_object::type_name_of(value) }
+                "{node} field {field:?} must be a list, not a {}",
+                class_name(value)
             )));
         }
         Ok(unsafe { pyre_object::w_list_items_copy_as_vec(value) })
@@ -98,43 +98,29 @@ impl ObjectConverter {
     }
 
     fn module(&mut self, object: PyObjectRef) -> AstResult<ast::Mod> {
-        if self.is_node(object, "Module")? {
-            let values = self.list(object, "body", "Module")?;
-            let body = values
-                .into_iter()
-                .map(|value| self.recurse(|this| this.stmt(value)))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(ast::Mod::Module(ast::ModModule {
-                node_index: Default::default(),
-                range: Default::default(),
-                body,
-                runtime_body: None,
-            }))
+        let node = if self.is_node(object, "Module")? {
+            "Module"
         } else if self.is_node(object, "Interactive")? {
-            let values = self.list(object, "body", "Interactive")?;
-            let body = values
-                .into_iter()
-                .map(|value| self.recurse(|this| this.stmt(value)))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(ast::Mod::Module(ast::ModModule {
-                node_index: Default::default(),
-                range: Default::default(),
-                body,
-                runtime_body: None,
-            }))
+            "Interactive"
         } else if self.is_node(object, "Expression")? {
             let body = self.field(object, "body", "Expression")?;
-            Ok(ast::Mod::Expression(ast::ModExpression {
+            return Ok(ast::Mod::Expression(ast::ModExpression {
                 node_index: Default::default(),
                 range: Default::default(),
                 body: Box::new(self.recurse(|this| this.expr(body))?),
-            }))
+            }));
         } else {
-            Err(crate::PyError::type_error(format!(
+            return Err(crate::PyError::type_error(format!(
                 "expected some sort of mod, but got {}",
                 unsafe { pyre_object::type_name_of(object) }
-            )))
-        }
+            )));
+        };
+        Ok(ast::Mod::Module(ast::ModModule {
+            node_index: Default::default(),
+            range: Default::default(),
+            body: self.body(object, "body", node)?,
+            runtime_body: None,
+        }))
     }
 
     fn stmt(&mut self, object: PyObjectRef) -> AstResult<ast::Stmt> {
@@ -877,17 +863,35 @@ impl ObjectConverter {
         }
     }
 
+    /// A missing element of a statement or expression list is rejected before
+    /// the node conversion, which would only report the type it did not
+    /// recognise.  Lists of the other ASDL nodes carry no such check.
+    fn require_node(&self, value: PyObjectRef, kind: &str) -> AstResult<()> {
+        if unsafe { pyre_object::is_none(value) } {
+            return Err(crate::PyError::value_error(format!(
+                "None disallowed in {kind} list"
+            )));
+        }
+        Ok(())
+    }
+
     fn body(&mut self, object: PyObjectRef, field: &str, node: &str) -> AstResult<Vec<ast::Stmt>> {
         self.list(object, field, node)?
             .into_iter()
-            .map(|value| self.recurse(|this| this.stmt(value)))
+            .map(|value| {
+                self.require_node(value, "statement")?;
+                self.recurse(|this| this.stmt(value))
+            })
             .collect()
     }
 
     fn exprs(&mut self, object: PyObjectRef, field: &str, node: &str) -> AstResult<Vec<ast::Expr>> {
         self.list(object, field, node)?
             .into_iter()
-            .map(|value| self.recurse(|this| this.expr(value)))
+            .map(|value| {
+                self.require_node(value, "expression")?;
+                self.recurse(|this| this.expr(value))
+            })
             .collect()
     }
 
@@ -1249,18 +1253,52 @@ impl ObjectConverter {
                 upper: self.opt_expr(object, "upper")?,
                 step: self.opt_expr(object, "step")?,
             }))
-        } else if self.is_node(object, "JoinedStr")? || self.is_node(object, "FormattedValue")? {
-            // The compiler AST keeps an f-string as its literal parts rather than
-            // as a concatenation node, so rebuilding one needs the part split
-            // that `JoinedStr` has already discarded.
-            Err(crate::PyError::not_implemented(
-                "compiling a JoinedStr AST node is not implemented",
-            ))
+        } else if self.is_node(object, "JoinedStr")? {
+            let values = self.exprs(object, "values", "JoinedStr")?;
+            Ok(fstring(Vec::new(), Some(values)))
+        } else if self.is_node(object, "FormattedValue")? {
+            let element = self.interpolation(object)?;
+            Ok(fstring(vec![element], None))
         } else {
             Err(crate::PyError::type_error(format!(
                 "expected some sort of expr, but got {}",
                 unsafe { pyre_object::type_name_of(object) }
             )))
+        }
+    }
+
+    fn interpolation(&mut self, object: PyObjectRef) -> AstResult<ast::InterpolatedStringElement> {
+        let expression = self.req_expr(object, "value", "FormattedValue")?;
+        let conversion = self.conversion(object)?;
+        let format_spec = self.opt_expr(object, "format_spec")?;
+        Ok(ast::InterpolatedStringElement::Interpolation(
+            ast::InterpolatedElement {
+                node_index: Default::default(),
+                range: Default::default(),
+                expression,
+                debug_text: None,
+                conversion,
+                // A parsed spec is the element list standing between the
+                // braces, while the object carries a `JoinedStr`; codegen
+                // formats with that expression whenever the field below is
+                // set, so the parsed shape has nothing to hold.
+                format_spec: None,
+                runtime_str: None,
+                runtime_interpolation_format_spec: None,
+                runtime_formatted_value_format_spec: format_spec,
+            },
+        ))
+    }
+
+    fn conversion(&self, object: PyObjectRef) -> AstResult<ast::ConversionFlag> {
+        match self.int_field(object, "conversion", "FormattedValue")? {
+            -1 => Ok(ast::ConversionFlag::None),
+            value if value == i64::from(b's') => Ok(ast::ConversionFlag::Str),
+            value if value == i64::from(b'r') => Ok(ast::ConversionFlag::Repr),
+            value if value == i64::from(b'a') => Ok(ast::ConversionFlag::Ascii),
+            value => Err(crate::PyError::system_error(format!(
+                "Unrecognized conversion character {value}"
+            ))),
         }
     }
 
@@ -1437,6 +1475,30 @@ impl ObjectConverter {
         }
         Err(crate::PyError::type_error("expected some sort of operator"))
     }
+}
+
+/// An f-string expression built from `_ast` objects.  The parser splits an
+/// f-string into the literal and interpolated parts the compiler AST holds,
+/// but a `JoinedStr` object carries only the values to join, so those go to
+/// codegen as the joined values and the part list stays empty.  A
+/// `FormattedValue` on its own is a single interpolated part, which does fit
+/// the part list.
+fn fstring(
+    elements: Vec<ast::InterpolatedStringElement>,
+    runtime_joined_str: Option<Vec<ast::Expr>>,
+) -> ast::Expr {
+    ast::Expr::FString(ast::ExprFString {
+        node_index: Default::default(),
+        range: Default::default(),
+        value: ast::FStringValue::single(ast::FString {
+            node_index: Default::default(),
+            range: Default::default(),
+            elements: elements.into(),
+            flags: ast::FStringFlags::empty(),
+        }),
+        runtime_joined_str,
+        runtime_values: None,
+    })
 }
 
 pub fn parse_to_object(source: &str, mode: crate::compile::Mode) -> crate::PyResult {
@@ -2175,19 +2237,18 @@ impl Converter<'_> {
             );
         }
 
-        let mut values = Vec::new();
+        let mut parts = Vec::new();
         for part in node.value.iter() {
             match part {
-                ast::FStringPart::Literal(literal) => values.push(self.constant(
-                    range(literal.range),
-                    self.string(&literal.value),
-                    pyre_object::w_none(),
-                )?),
+                ast::FStringPart::Literal(literal) => {
+                    push_literal(&mut parts, range(literal.range), &literal.value)
+                }
                 ast::FStringPart::FString(fstring) => {
-                    values.extend(self.interpolated_elements(&fstring.elements)?);
+                    self.interpolated_elements(&fstring.elements, &mut parts)?
                 }
             }
         }
+        let values = self.joined_values(parts)?;
         self.node(
             "JoinedStr",
             Some(range(node.range)),
@@ -2195,24 +2256,49 @@ impl Converter<'_> {
         )
     }
 
+    fn joined_values(&self, parts: Vec<JoinedPart>) -> Result<Vec<PyObjectRef>, crate::PyError> {
+        parts
+            .into_iter()
+            .map(|part| match part {
+                JoinedPart::Literal { start, end, value } => {
+                    self.constant((start, end), self.string(&value), pyre_object::w_none())
+                }
+                JoinedPart::Value(value) => Ok(value),
+            })
+            .collect()
+    }
+
     fn interpolated_elements(
         &self,
         elements: &[ast::InterpolatedStringElement],
-    ) -> Result<Vec<PyObjectRef>, crate::PyError> {
-        let mut values = Vec::new();
+        parts: &mut Vec<JoinedPart>,
+    ) -> Result<(), crate::PyError> {
         for element in elements {
             match element {
-                ast::InterpolatedStringElement::Literal(literal) => values.push(self.constant(
-                    range(literal.range),
-                    self.string(&literal.value),
-                    pyre_object::w_none(),
-                )?),
+                ast::InterpolatedStringElement::Literal(literal) => {
+                    push_literal(parts, range(literal.range), &literal.value)
+                }
                 ast::InterpolatedStringElement::Interpolation(interpolation) => {
+                    let mut conversion = interpolation.conversion;
+                    if let Some(debug_text) = interpolation.debug_text.as_ref() {
+                        self.push_debug_text(parts, interpolation, debug_text);
+                        // `=` echoes the expression text and then reprs the
+                        // value, unless a conversion or a format spec already
+                        // says how to render it.
+                        if matches!(
+                            (conversion, &interpolation.format_spec),
+                            (ast::ConversionFlag::None, None)
+                        ) {
+                            conversion = ast::ConversionFlag::Repr;
+                        }
+                    }
                     let format_spec = interpolation
                         .format_spec
                         .as_deref()
                         .map(|spec| {
-                            let values = self.interpolated_elements(&spec.elements)?;
+                            let mut spec_parts = Vec::new();
+                            self.interpolated_elements(&spec.elements, &mut spec_parts)?;
+                            let values = self.joined_values(spec_parts)?;
                             self.node(
                                 "JoinedStr",
                                 Some(range(spec.range)),
@@ -2220,22 +2306,46 @@ impl Converter<'_> {
                             )
                         })
                         .transpose()?;
-                    values.push(self.node(
+                    parts.push(JoinedPart::Value(self.node(
                         "FormattedValue",
                         Some(range(interpolation.range)),
                         &[
                             ("value", self.expr(&interpolation.expression)?),
                             (
                                 "conversion",
-                                pyre_object::w_int_new(interpolation.conversion as i8 as i64),
+                                pyre_object::w_int_new(conversion as i8 as i64),
                             ),
                             ("format_spec", self.optional(format_spec)),
                         ],
-                    )?);
+                    )?));
                 }
             }
         }
-        Ok(values)
+        Ok(())
+    }
+
+    /// The literal an `=` conversion echoes: the source text of the
+    /// expression, framed by whatever stood between the brace and the
+    /// expression and between the expression and the `!`, `:` or `}`.
+    fn push_debug_text(
+        &self,
+        parts: &mut Vec<JoinedPart>,
+        interpolation: &ast::InterpolatedElement,
+        debug_text: &ast::DebugText,
+    ) {
+        use ruff_text_size::Ranged;
+        let (start, end) = range(interpolation.expression.range());
+        let leading = strip_debug_comments(&debug_text.leading);
+        let trailing = strip_debug_comments(&debug_text.trailing);
+        let expression = &self.source[start as usize..end as usize];
+        push_literal(
+            parts,
+            (
+                start.saturating_sub(leading.len() as u32),
+                end + trailing.len() as u32,
+            ),
+            &[leading.as_str(), expression, trailing.as_str()].concat(),
+        );
     }
 
     fn match_case(&self, case: &ast::MatchCase) -> crate::PyResult {
@@ -2708,6 +2818,66 @@ impl Converter<'_> {
             .collect::<Result<Vec<_>, _>>()
             .map(|items| self.list(items))
     }
+}
+
+/// `%T`-style class name of an AST object.  The `_ast` node types are heap
+/// types, so the name sits on the class the instance points at rather than on
+/// the layout its `ob_type` names.
+fn class_name(object: PyObjectRef) -> &'static str {
+    match crate::typedef::r#type(object) {
+        Some(w_type) => unsafe { pyre_object::w_type_get_name(w_type.as_ptr()) },
+        None => unsafe { pyre_object::type_name_of(object) },
+    }
+}
+
+/// A value of a `JoinedStr` under construction.  Consecutive literal pieces
+/// are one `Constant`, so what the parser kept apart -- an implicit
+/// concatenation, the text an `=` conversion echoes -- is joined as it
+/// arrives instead of reaching the tree one node per piece.
+enum JoinedPart {
+    Literal { start: u32, end: u32, value: String },
+    Value(PyObjectRef),
+}
+
+fn push_literal(parts: &mut Vec<JoinedPart>, (start, end): (u32, u32), value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    if let Some(JoinedPart::Literal {
+        end: last_end,
+        value: last,
+        ..
+    }) = parts.last_mut()
+    {
+        *last_end = end;
+        last.push_str(value);
+        return;
+    }
+    parts.push(JoinedPart::Literal {
+        start,
+        end,
+        value: value.to_string(),
+    });
+}
+
+/// A comment inside the braces runs to the end of the line and is no part of
+/// the text an `=` conversion echoes.
+fn strip_debug_comments(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut in_comment = false;
+    for ch in text.chars() {
+        if in_comment {
+            if ch == '\n' {
+                in_comment = false;
+                result.push(ch);
+            }
+        } else if ch == '#' {
+            in_comment = true;
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }
 
 fn range(range: impl RangeParts) -> (u32, u32) {

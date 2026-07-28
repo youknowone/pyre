@@ -659,6 +659,10 @@ impl PyError {
         Self::new(PyErrorKind::NotImplementedError, msg)
     }
 
+    pub fn system_error(msg: impl Into<String>) -> Self {
+        Self::new(PyErrorKind::SystemError, msg)
+    }
+
     /// `_PyEval_FormatExcCheckArg` parity — a NameError carrying the
     /// undefined `name` so `e.name` reads back once the instance is
     /// materialised (Python 3.10+).
