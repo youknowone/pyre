@@ -2197,30 +2197,27 @@ impl MIFrame {
         // LABEL when unrolled, root TreeLoop.inputargs otherwise — see
         // `MetaInterp::front_target_inputarg_types` doc).
         //
-        // For a main trace the target label is the merge point being closed at
-        // (`original_boxes`, pyjitpl.py:3039-3041), which is the trace's own
-        // inputargs only when the trace closes at its own head. Resolving it
-        // through the merge point keeps the JUMP typed against the label it
-        // actually targets, the same correction `front_target_inputarg_types`
-        // makes on the bridge arm. A head close resolves to the trace-start
-        // seed, whose boxes were registered from `inputarg_types` — so that
-        // case stays byte-identical.
-        let inputarg_types = {
-            let (driver, _) = crate::driver::driver_pair();
-            if driver.is_bridge_tracing() {
-                if let Some(gk) = driver.current_trace_green_key() {
-                    driver
-                        .front_target_inputarg_types(gk)
-                        .unwrap_or_else(|| ctx.inputarg_types())
-                } else {
-                    ctx.inputarg_types()
-                }
-            } else {
-                target_pc
-                    .and_then(|pc| ctx.merge_point_arg_types_at_header(pc))
-                    .unwrap_or_else(|| ctx.inputarg_types())
-            }
-        };
+        // A close reached through the walk targets the merge point that matched
+        // (`original_boxes`, pyjitpl.py:3039-3041), whichever kind of trace is
+        // recording: `reached_loop_header` scans `current_merge_points` first
+        // and only falls through to the previously compiled loop when nothing
+        // matched. So the merge point recorded at the closing header answers
+        // ahead of the bridge's front target; a bridge that walked into a loop
+        // header it had itself passed closes at THAT label, not at the loop its
+        // guard came from. With no such merge point the close targets the root
+        // loop's LABEL/inputargs, which `front_target_inputarg_types` resolves
+        // (a bridge's own `inputarg_types()` are its guard fail_arg types).
+        let inputarg_types = target_pc
+            .and_then(|pc| ctx.merge_point_arg_types_at_header(pc))
+            .or_else(|| {
+                let (driver, _) = crate::driver::driver_pair();
+                driver
+                    .is_bridge_tracing()
+                    .then(|| driver.current_trace_green_key())
+                    .flatten()
+                    .and_then(|gk| driver.front_target_inputarg_types(gk))
+            })
+            .unwrap_or_else(|| ctx.inputarg_types());
         let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         // `extra_reds` reflects the canonical ec/red layout (NUM_EXTRA_REDS).
         // Drives the conditional ec push at args[1] and the dedup-side

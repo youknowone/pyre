@@ -5282,11 +5282,17 @@ impl TraceCtx {
     /// `header_pc` identifies the header on its own here: a merge point's
     /// `green_key` is derived from `(code, header_pc)`, so the reverse scan's
     /// first hit is the same entry [`get_merge_point_at`] would return.
+    /// Only entries recorded during the walk (`position > 0`) answer here.
+    /// The entry at position 0 is the synthetic trace-start seed, whose boxes
+    /// were built from the trace's own `inputarg_types()`; leaving it out lets
+    /// callers keep their existing fallback for a head close and reserves this
+    /// lookup for the case it is meant to fix — closing at a header the walk
+    /// reached later.
     pub fn merge_point_arg_types_at_header(&self, header_pc: usize) -> Option<Vec<majit_ir::Type>> {
         self.current_merge_points
             .iter()
             .rev()
-            .find(|mp| mp.header_pc == header_pc)
+            .find(|mp| mp.header_pc == header_pc && mp.position._pos > 0)
             .map(|mp| mp.green_boxes.iter().map(|green| green.ty).collect())
     }
 
