@@ -825,8 +825,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             flags_type,
             vec![
                 w_int_new(0), // debug
-                w_int_new(0), // inspect
-                w_int_new(0), // interactive
+                // `-i` sets both.
+                w_int_new(i64::from(crate::importing::inspect_flag())),
+                w_int_new(i64::from(crate::importing::inspect_flag())),
                 w_int_new(crate::importing::optimize_level()),
                 w_int_new(i64::from(crate::importing::dont_write_bytecode_flag())),
                 w_int_new(i64::from(crate::importing::no_user_site_flag())),

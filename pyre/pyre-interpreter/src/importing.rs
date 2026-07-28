@@ -1642,6 +1642,7 @@ thread_local! {
 // the values the launcher recorded instead of the per-thread default.
 static SYS_NO_SITE: AtomicBool = AtomicBool::new(false);
 static SYS_QUIET: AtomicBool = AtomicBool::new(false);
+static SYS_INSPECT: AtomicBool = AtomicBool::new(false);
 static SYS_NO_USER_SITE: AtomicBool = AtomicBool::new(false);
 static SYS_IGNORE_ENVIRONMENT: AtomicBool = AtomicBool::new(false);
 static SYS_ISOLATED: AtomicBool = AtomicBool::new(false);
@@ -1669,6 +1670,7 @@ pub fn no_site_flag() -> bool {
 #[allow(clippy::too_many_arguments)]
 pub fn set_runtime_flags(
     quiet: bool,
+    inspect: bool,
     no_user_site: bool,
     ignore_environment: bool,
     isolated: bool,
@@ -1679,6 +1681,7 @@ pub fn set_runtime_flags(
     dont_write_bytecode: bool,
 ) {
     SYS_QUIET.store(quiet, Ordering::Relaxed);
+    SYS_INSPECT.store(inspect, Ordering::Relaxed);
     SYS_NO_USER_SITE.store(no_user_site, Ordering::Relaxed);
     SYS_IGNORE_ENVIRONMENT.store(ignore_environment, Ordering::Relaxed);
     SYS_ISOLATED.store(isolated, Ordering::Relaxed);
@@ -1691,6 +1694,13 @@ pub fn set_runtime_flags(
 
 pub fn quiet_flag() -> bool {
     SYS_QUIET.load(Ordering::Relaxed)
+}
+
+/// `-i`, which `make_flags` reports as both `inspect` and `interactive`.
+/// `PYTHONINSPECT` would set only the former, but the launcher does not
+/// read it, so `-i` is the whole of this flag's input.
+pub fn inspect_flag() -> bool {
+    SYS_INSPECT.load(Ordering::Relaxed)
 }
 
 pub fn no_user_site_flag() -> bool {
