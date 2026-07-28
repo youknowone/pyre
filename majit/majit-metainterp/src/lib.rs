@@ -597,17 +597,19 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 /// compile_and_run_once early-out: tracing did not start, 23 =
 /// should_trace_function_entry declined (cell compiled or tracing), 24 =
 /// should_trace_function_entry declined (dead procedure token cleanup), 25 =
-/// should_trace_function_entry answered from the counter tick.
-pub static MC_DIAG: [std::sync::atomic::AtomicU64; 26] = {
+/// should_trace_function_entry answered from the counter tick, 26 = walk steps
+/// recorded past `trace_limit` whose abort was suppressed because the walk had
+/// already executed an unrollbackable effect.
+pub static MC_DIAG: [std::sync::atomic::AtomicU64; 27] = {
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     [
-        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
+        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
     ]
 };
 
 /// Short label per [`MC_DIAG`] slot, in index order, so a tally cannot be added
 /// without naming it. Readers join these with the counter values.
-pub const MC_DIAG_LABELS: [&str; 26] = [
+pub const MC_DIAG_LABELS: [&str; 27] = [
     "mc_entered",
     "decl_shortcircuit",
     "descr0_skip",
@@ -634,6 +636,7 @@ pub const MC_DIAG_LABELS: [&str; 26] = [
     "stfe_cell_busy",
     "stfe_dead_token",
     "stfe_tick",
+    "toolong_suppressed",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.

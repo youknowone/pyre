@@ -2223,17 +2223,23 @@ pub fn walk<Sym: WalkSym>(
         // the odometer itself. `fbw_executed_effect_count` is reset per walk, so
         // zero means nothing the replay would redo has run yet. A walk that is
         // already past that point keeps recording — the pre-existing unbounded
-        // behaviour — rather than corrupt the heap.
-        if ctx.trace_ctx.is_too_long() && fbw_executed_effect_count() == 0 {
-            let ops = ctx.trace_ctx.num_recorded_ops();
-            crate::state::note_root_trace_too_long(
-                ctx.trace_ctx.current_merge_points_first_greenkey(),
-                ctx.trace_ctx.resumekey_original_loop_token().cloned(),
-            );
-            return Err(DispatchError::TraceTooLong {
-                pc: opcode_position,
-                ops,
-            });
+        // behaviour — rather than corrupt the heap. That overshoot is otherwise
+        // silent, so it is tallied: it is what turns a walk which never reaches
+        // a close into unbounded recording.
+        if ctx.trace_ctx.is_too_long() {
+            if fbw_executed_effect_count() != 0 {
+                majit_metainterp::mc_diag_bump(26);
+            } else {
+                let ops = ctx.trace_ctx.num_recorded_ops();
+                crate::state::note_root_trace_too_long(
+                    ctx.trace_ctx.current_merge_points_first_greenkey(),
+                    ctx.trace_ctx.resumekey_original_loop_token().cloned(),
+                );
+                return Err(DispatchError::TraceTooLong {
+                    pc: opcode_position,
+                    ops,
+                });
+            }
         }
         match outcome {
             DispatchOutcome::Continue => {}

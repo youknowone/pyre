@@ -562,6 +562,7 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
                 "stfe_cell_busy",
                 "stfe_dead_token",
                 "stfe_tick",
+                "toolong_suppressed",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
