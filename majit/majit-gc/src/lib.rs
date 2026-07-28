@@ -299,6 +299,17 @@ pub trait GcAllocator: Send {
     /// `alloc_nursery_no_collect_typed` so backends without a
     /// distinct old-gen still compile; backends with a real old-gen
     /// override to force placement there.
+    ///
+    /// Non-collecting, unlike its structural counterpart
+    /// `external_malloc` (incminimark.py:987-994), which tests
+    /// `threshold_reached(raw_malloc_usage(totalsize))` before allocating and
+    /// drives `minor_collection_with_major_progress` when it holds. That check
+    /// cannot be made here: an RPython caller's locals are shadow-stack roots,
+    /// so upstream may collect mid-allocation, while the callers this entry
+    /// exists for are holding the raw pointer on the Rust stack precisely
+    /// because it is not a root. Old-gen growth is instead answered by the
+    /// interpreter safepoint's `threshold_reached` poll, which runs where the
+    /// root set is known (`pyre-object`'s `gc_interp::safepoint`).
     fn alloc_oldgen_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         self.alloc_nursery_no_collect_typed(type_id, size)
     }
