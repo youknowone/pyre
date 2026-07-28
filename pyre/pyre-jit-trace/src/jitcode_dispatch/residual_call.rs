@@ -452,7 +452,15 @@ impl Drop for InlineConcreteFrameGuard {
 struct ResidualFrameChainGuard {
     ec: *mut pyre_interpreter::PyExecutionContext,
     frame: *mut pyre_interpreter::PyFrame,
-    saved_topframeref: *mut pyre_interpreter::PyFrame,
+    /// Shadow-stack index of the caller `topframeref` this guard displaced,
+    /// held there rather than in the struct because the residual runs
+    /// arbitrary user code.  Frames themselves never move — `FrameBox::new`
+    /// allocates old-gen — but once the tracer stores a `JitVirtualRef` in the
+    /// chain the displaced value is a nursery object, and a minor collection
+    /// inside the residual would leave `Drop` writing back a pre-move pointer.
+    /// Rooting lets the collector forward it in place, as `CurrentFrameGuard`
+    /// already does for the same field.
+    saved_root: usize,
     previous_published: *mut pyre_interpreter::PyFrame,
     /// Whether this guard performed the chain write, so `Drop` restores only
     /// what it changed.  False when the chain already named `frame`.
@@ -485,6 +493,7 @@ impl ResidualFrameChainGuard {
                 (*ec).topframeref = frame;
             }
         }
+        let saved_root = majit_gc::shadow_stack::push(majit_ir::GcRef(saved_topframeref as usize));
         // Published whether or not this guard wrote the chain: `frame` is the
         // one a force inside the residual must redirect its escape onto
         // (`flush_active_frame_escape`), and the chain already naming it makes
@@ -493,7 +502,7 @@ impl ResidualFrameChainGuard {
         Some(Self {
             ec,
             frame,
-            saved_topframeref,
+            saved_root,
             previous_published,
             entered,
         })
@@ -509,9 +518,14 @@ impl Drop for ResidualFrameChainGuard {
             // reference to its caller, so the caller must stay materialised;
             // dropping that propagation would leave the escape recorded only on
             // a frame the walk owns privately.
+            // Read the root back before popping: a collection during the
+            // residual forwards it in place.
+            let saved_topframeref =
+                majit_gc::shadow_stack::get(self.saved_root).0 as *mut pyre_interpreter::PyFrame;
+            majit_gc::shadow_stack::pop_to(self.saved_root);
             PUBLISHED_INLINE_FRAME.with(|slot| slot.set(self.previous_published));
             if self.entered {
-                (*self.ec).topframeref = self.saved_topframeref;
+                (*self.ec).topframeref = saved_topframeref;
             }
             if (*self.frame).escaped() {
                 let f_back = (*self.frame).get_f_back();

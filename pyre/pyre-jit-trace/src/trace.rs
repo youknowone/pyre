@@ -2375,7 +2375,12 @@ fn try_adopt_multi_frame_blackhole(
         (*(cf_addr as *mut pyre_interpreter::PyFrame)).execution_context
             as *mut pyre_interpreter::PyExecutionContext
     };
-    let saved_topframeref = unsafe { (*ec).topframeref };
+    // Rooted for the whole drive: frames themselves never move, but once the
+    // tracer stores a `JitVirtualRef` in the chain the displaced value is a
+    // nursery object, and a collection inside the drive would leave the
+    // restore below writing back a pre-move pointer.
+    let saved_root =
+        majit_gc::shadow_stack::push(majit_ir::GcRef(unsafe { (*ec).topframeref } as usize));
     // `enter`: publish `ec.topframeref = <this level's frame>` before it runs.
     let set_topframeref = |frame_ptr: i64| unsafe {
         (*ec).topframeref = frame_ptr as *mut pyre_interpreter::PyFrame;
@@ -2407,7 +2412,11 @@ fn try_adopt_multi_frame_blackhole(
         Some(per_frame.as_slice()),
         Some(&set_topframeref as &dyn Fn(i64)),
     );
-    // `leave`: restore `ec.topframeref` to the portal after the inline chain.
+    // `leave`: restore `ec.topframeref` to the portal after the inline chain,
+    // reading the root back so an in-place forward during the drive is kept.
+    let saved_topframeref =
+        majit_gc::shadow_stack::get(saved_root).0 as *mut pyre_interpreter::PyFrame;
+    majit_gc::shadow_stack::pop_to(saved_root);
     unsafe {
         (*ec).topframeref = saved_topframeref;
     }

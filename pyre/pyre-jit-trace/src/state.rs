@@ -10047,15 +10047,25 @@ fn materialize_virtual_object(
         return None;
     }
 
-    unsafe {
-        let ptr = raw as *mut PyObject;
-        (*ptr).ob_type = vtable as *const PyType;
-        // rclass.py:739-743 set `w_class` from the cached instantiate
-        // pointer on the PyType. Tracing may later overwrite this via
-        // an explicit `SetfieldGc(w_class)`; the field replay below
-        // takes precedence for that case (heaptracker.py:66-style
-        // "typeptr" filter does NOT apply to w_class in pyre).
-        (*ptr).w_class = get_instantiate(&*(vtable as *const PyType));
+    if vtable as u64 == majit_metainterp::virtualref::JIT_VIRTUAL_REF_VTABLE {
+        // `JitVirtualRef` is a `GcStruct` whose `('super', rclass.OBJECT)` slot
+        // holds the type-id constant itself, not a `PyType *`.  It has no
+        // `w_class`, and running the arm below would dereference the
+        // `JIT_VIRTUAL_REF_VTABLE` magic as a type object.  The field replay
+        // then fills `virtual_token` and `forced` from the traced values, the
+        // same two the optimizer seeds when it lowers `VIRTUAL_REF`.
+        unsafe { (raw as *mut u64).write(vtable as u64) };
+    } else {
+        unsafe {
+            let ptr = raw as *mut PyObject;
+            (*ptr).ob_type = vtable as *const PyType;
+            // rclass.py:739-743 set `w_class` from the cached instantiate
+            // pointer on the PyType. Tracing may later overwrite this via
+            // an explicit `SetfieldGc(w_class)`; the field replay below
+            // takes precedence for that case (heaptracker.py:66-style
+            // "typeptr" filter does NOT apply to w_class in pyre).
+            (*ptr).w_class = get_instantiate(&*(vtable as *const PyType));
+        }
     }
 
     // resume.py:597-603 setfields parity: for each traced field,
