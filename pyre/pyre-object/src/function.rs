@@ -14,6 +14,13 @@ pub struct Method {
     pub w_function: PyObjectRef,
     pub w_self: PyObjectRef,
     pub w_class: PyObjectRef,
+    /// CPython 3.14 `PyCFunctionObject.m_module` for builtin-bound methods.
+    ///
+    /// PyPy's `_Method` has no public `__module__` storage of its own; pyre
+    /// keeps this version-selected field on the same bound object rather than
+    /// in a side table. `PY_NULL` for ordinary Python methods, `None` initially
+    /// for a bound builtin method.
+    pub w_module: PyObjectRef,
 }
 
 /// Field offsets of inline `PyObjectRef` slots within `Method`.
@@ -23,6 +30,7 @@ pub struct Method {
 pub const METHOD_W_FUNCTION_OFFSET: usize = std::mem::offset_of!(Method, w_function);
 pub const METHOD_W_SELF_OFFSET: usize = std::mem::offset_of!(Method, w_self);
 pub const METHOD_W_CLASS_OFFSET: usize = std::mem::offset_of!(Method, w_class);
+pub const METHOD_W_MODULE_OFFSET: usize = std::mem::offset_of!(Method, w_module);
 
 pub fn w_method_new(
     w_function: PyObjectRef,
@@ -53,6 +61,7 @@ pub fn w_method_new(
     let w_function = crate::gc_roots::shadow_stack_get(save_point);
     let w_self = crate::gc_roots::shadow_stack_get(save_point + 1);
     let w_class = crate::gc_roots::shadow_stack_get(save_point + 2);
+    let w_module = PY_NULL;
     if !raw.is_null() {
         unsafe {
             std::ptr::write(
@@ -62,6 +71,7 @@ pub fn w_method_new(
                     w_function,
                     w_self,
                     w_class,
+                    w_module,
                 },
             );
         }
@@ -76,7 +86,26 @@ pub fn w_method_new(
         w_function,
         w_self,
         w_class,
+        w_module,
     })
+}
+
+/// Select a CPython-compatible public type for a Method-layout object while
+/// preserving PyPy's raw `METHOD_TYPE` payload and GC descriptor.
+#[inline]
+pub unsafe fn w_method_set_public_class(obj: PyObjectRef, w_class: PyObjectRef) {
+    (*obj).w_class = w_class;
+}
+
+#[inline]
+pub unsafe fn w_method_get_module(obj: PyObjectRef) -> PyObjectRef {
+    (*(obj as *const Method)).w_module
+}
+
+#[inline]
+pub unsafe fn w_method_set_module(obj: PyObjectRef, w_module: PyObjectRef) {
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    (*(obj as *mut Method)).w_module = w_module;
 }
 
 #[inline]

@@ -740,6 +740,19 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             // Raw BuiltinCode objects (Code-level, not normally user-visible)
             let name = builtin_code_name(obj);
             format!("<code {name}>")
+        } else if std::ptr::eq(tp, &crate::function::SLOT_WRAPPER_TYPE as *const PyType) {
+            let name = function_get_name(obj);
+            let owner = crate::function::fget_func_objclass(obj)?;
+            let owner_name = pyre_object::w_type_get_name(owner);
+            format!("<slot wrapper '{name}' of '{owner_name}' objects>")
+        } else if std::ptr::eq(
+            tp,
+            &crate::function::METHOD_DESCRIPTOR_TYPE as *const PyType,
+        ) {
+            let name = function_get_name(obj);
+            let owner = crate::function::fget_func_objclass(obj)?;
+            let owner_name = pyre_object::w_type_get_name(owner);
+            format!("<method '{name}' of '{owner_name}' objects>")
         } else if std::ptr::eq(tp, &BUILTIN_FUNCTION_TYPE as *const PyType) {
             // function.py:721 BuiltinFunction.descr_function_repr
             let name = function_get_name(obj);

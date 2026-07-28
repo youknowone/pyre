@@ -599,10 +599,30 @@ pub fn init_typeobjects() {
             pyre_object::w_type_set_acceptable_as_base_class(slot_wrapper_type, false);
             pyre_object::w_type_set_disallow_instantiation(slot_wrapper_type);
             pyre_object::typeobject::w_type_set_flag_method_descriptor(slot_wrapper_type, true);
+            pyre_object::set_instantiate(&crate::SLOT_WRAPPER_TYPE, slot_wrapper_type);
         }
         reg.insert(
             &crate::SLOT_WRAPPER_TYPE as *const PyType as usize,
             slot_wrapper_type as usize,
+        );
+
+        let method_descriptor_type = new_typeobject_with_base(
+            "method_descriptor",
+            init_method_descriptor_type,
+            object_type,
+        );
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(method_descriptor_type, false);
+            pyre_object::w_type_set_disallow_instantiation(method_descriptor_type);
+            pyre_object::typeobject::w_type_set_flag_method_descriptor(
+                method_descriptor_type,
+                true,
+            );
+            pyre_object::set_instantiate(&crate::METHOD_DESCRIPTOR_TYPE, method_descriptor_type);
+        }
+        reg.insert(
+            &crate::METHOD_DESCRIPTOR_TYPE as *const PyType as usize,
+            method_descriptor_type as usize,
         );
 
         // builtin-code — PyPy: BuiltinCode.typedef = TypeDef('builtin-code', ...)
@@ -1875,6 +1895,9 @@ unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef) {
                     pyre_object::w_str_new(&format!("{owner}.{key}")),
                 );
             }
+        }
+        if !descr.is_null() && crate::function::is_method_descriptor(descr) {
+            crate::function::function_set_objclass(descr, type_obj);
         }
         if !descr.is_null() && pyre_object::typedef::is_getset_property(descr) {
             // `method_descriptor` and `wrapper_descriptor` reuse PyPy's
@@ -4467,7 +4490,11 @@ fn init_list_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "append",
-            make_builtin_function_with_arity("append", crate::type_methods::list_method_append, 2),
+            crate::make_method_descriptor_with_arity(
+                "append",
+                crate::type_methods::list_method_append,
+                2,
+            ),
         )
     };
     unsafe {
@@ -10956,7 +10983,18 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
                 value
             })
         }
-        pyre_object::MEMBER_FUNCTION_MODULE => Ok(unsafe { crate::function::fget___module__(obj) }),
+        pyre_object::MEMBER_FUNCTION_MODULE => {
+            if unsafe { pyre_object::function::is_method(obj) } {
+                let value = unsafe { pyre_object::function::w_method_get_module(obj) };
+                Ok(if value.is_null() {
+                    pyre_object::w_none()
+                } else {
+                    value
+                })
+            } else {
+                Ok(unsafe { crate::function::fget___module__(obj) })
+            }
+        }
         pyre_object::MEMBER_FUNCTION_BUILTINS => {
             let builtins = unsafe { crate::function::function_get_builtins(obj) };
             Ok(if builtins.is_null() {
@@ -10989,7 +11027,11 @@ pub(crate) unsafe fn direct_member_set(
             Ok(pyre_object::w_none())
         }
         pyre_object::MEMBER_FUNCTION_MODULE => {
-            if unsafe { pyre_object::py_type_check(obj, &crate::function::BUILTIN_FUNCTION_TYPE) } {
+            if unsafe { pyre_object::function::is_method(obj) } {
+                unsafe { pyre_object::function::w_method_set_module(obj, value) };
+            } else if unsafe {
+                pyre_object::py_type_check(obj, &crate::function::BUILTIN_FUNCTION_TYPE)
+            } {
                 unsafe { crate::function::builtin_function_set_module_attr(obj, value) };
             } else {
                 unsafe { crate::function::fset___module__(obj, value)? };
@@ -11010,7 +11052,11 @@ pub(crate) unsafe fn direct_member_delete(
             Ok(pyre_object::w_none())
         }
         pyre_object::MEMBER_FUNCTION_MODULE => {
-            if unsafe { pyre_object::py_type_check(obj, &crate::function::BUILTIN_FUNCTION_TYPE) } {
+            if unsafe { pyre_object::function::is_method(obj) } {
+                unsafe { pyre_object::function::w_method_set_module(obj, pyre_object::w_none()) };
+            } else if unsafe {
+                pyre_object::py_type_check(obj, &crate::function::BUILTIN_FUNCTION_TYPE)
+            } {
                 unsafe {
                     crate::function::builtin_function_set_module_attr(obj, pyre_object::w_none())
                 };
@@ -11210,9 +11256,17 @@ fn init_function_type(ns: PyObjectRef) {
 /// missing `dict_storage_store(ns, "__get__", ...)` call after it expresses the
 /// `del rawdict['__get__']` step. The `update({...})` overrides go below as
 /// pyre starts modeling them.
+#[inline]
+fn is_bound_builtin_method(obj: PyObjectRef) -> bool {
+    !obj.is_null()
+        && unsafe { pyre_object::function::is_method(obj) }
+        && unsafe { crate::function::is_method_descriptor(pyre_object::w_method_get_func(obj)) }
+}
+
 fn builtin_function_receiver(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
     if obj.is_null()
-        || !unsafe { pyre_object::py_type_check(obj, &crate::function::BUILTIN_FUNCTION_TYPE) }
+        || !(unsafe { pyre_object::py_type_check(obj, &crate::function::BUILTIN_FUNCTION_TYPE) }
+            || is_bound_builtin_method(obj))
     {
         let received = if obj.is_null() {
             "object"
@@ -11226,6 +11280,52 @@ fn builtin_function_receiver(obj: PyObjectRef, name: &str) -> Result<PyObjectRef
         )));
     }
     Ok(obj)
+}
+
+#[inline]
+unsafe fn builtin_function_carrier(obj: PyObjectRef) -> PyObjectRef {
+    if is_bound_builtin_method(obj) {
+        unsafe { pyre_object::w_method_get_func(obj) }
+    } else {
+        obj
+    }
+}
+
+fn bound_builtin_functions_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
+    let a_descr = unsafe { pyre_object::w_method_get_func(a) };
+    let b_descr = unsafe { pyre_object::w_method_get_func(b) };
+    let a_code = unsafe { crate::function::getcode(a_descr) } as PyObjectRef;
+    let b_code = unsafe { crate::function::getcode(b_descr) } as PyObjectRef;
+    !a_code.is_null()
+        && !b_code.is_null()
+        && unsafe {
+            std::ptr::fn_addr_eq(
+                crate::gateway::builtin_code_get(a_code),
+                crate::gateway::builtin_code_get(b_code),
+            )
+        }
+}
+
+fn builtin_function_qualname(obj: PyObjectRef) -> crate::PyResult {
+    if is_bound_builtin_method(obj) {
+        let descr = unsafe { pyre_object::w_method_get_func(obj) };
+        let instance = unsafe { pyre_object::w_method_get_self(obj) };
+        let actual_type =
+            crate::typedef::r#type(instance).map_or(pyre_object::PY_NULL, |tp| tp.as_ptr());
+        let type_qualname = crate::baseobjspace::getattr_str(actual_type, "__qualname__")?;
+        let Some(type_qualname) = (unsafe { pyre_object::w_str_get_value_opt(type_qualname) })
+        else {
+            return Err(crate::PyError::type_error(
+                "<method>.__class__.__qualname__ is not a unicode object",
+            ));
+        };
+        let name = unsafe { crate::function::function_get_name(descr) };
+        Ok(pyre_object::w_str_new(&format!("{type_qualname}.{name}")))
+    } else {
+        Ok(pyre_object::w_str_new(&unsafe {
+            crate::function::function_get_qualname(obj)
+        }))
+    }
 }
 
 fn init_builtin_function_type(ns: PyObjectRef) {
@@ -11269,22 +11369,30 @@ fn init_builtin_function_type(ns: PyObjectRef) {
     for (name, getter) in [
         (
             "__doc__",
-            (|args: &[PyObjectRef]| Ok(unsafe { crate::function::fget_func_doc(args[1]) }))
-                as fn(&[PyObjectRef]) -> crate::PyResult,
+            (|args: &[PyObjectRef]| {
+                let obj = builtin_function_receiver(args[1], "__doc__")?;
+                Ok(unsafe { crate::function::fget_func_doc(builtin_function_carrier(obj)) })
+            }) as fn(&[PyObjectRef]) -> crate::PyResult,
         ),
         ("__name__", |args: &[PyObjectRef]| {
-            Ok(unsafe { crate::function::fget_func_name(args[1]) })
+            let obj = builtin_function_receiver(args[1], "__name__")?;
+            Ok(unsafe { crate::function::fget_func_name(builtin_function_carrier(obj)) })
         }),
         ("__qualname__", |args: &[PyObjectRef]| {
-            Ok(pyre_object::w_str_new(&unsafe {
-                crate::function::function_get_qualname(args[1])
-            }))
+            let obj = builtin_function_receiver(args[1], "__qualname__")?;
+            builtin_function_qualname(obj)
         }),
         ("__self__", |args: &[PyObjectRef]| {
-            Ok(unsafe { crate::function::function_get_self_or_none(args[1]) })
+            let obj = builtin_function_receiver(args[1], "__self__")?;
+            if is_bound_builtin_method(obj) {
+                Ok(unsafe { pyre_object::w_method_get_self(obj) })
+            } else {
+                Ok(unsafe { crate::function::function_get_self_or_none(obj) })
+            }
         }),
         ("__text_signature__", |args: &[PyObjectRef]| unsafe {
-            crate::function::fget_func_text_signature(args[1])
+            let obj = builtin_function_receiver(args[1], "__text_signature__")?;
+            crate::function::fget_func_text_signature(builtin_function_carrier(obj))
         }),
     ] {
         let get = make_builtin_function_with_arity(name, getter, 2);
@@ -11307,7 +11415,11 @@ fn init_builtin_function_type(ns: PyObjectRef) {
                     positional.first().copied().unwrap_or(pyre_object::PY_NULL),
                     "__call__",
                 )?;
-                function_descr_call_impl(positional, kwargs, function)
+                if is_bound_builtin_method(function) {
+                    crate::function::descr_method_call(args)
+                } else {
+                    function_descr_call_impl(positional, kwargs, function)
+                }
             }),
         )
     };
@@ -11323,10 +11435,21 @@ fn init_builtin_function_type(ns: PyObjectRef) {
                         args.first().copied().unwrap_or(pyre_object::PY_NULL),
                         "__repr__",
                     )?;
-                    let name = unsafe { crate::function_get_name(func) };
-                    Ok(pyre_object::w_str_new(&format!(
-                        "<built-in function {name}>"
-                    )))
+                    let carrier = unsafe { builtin_function_carrier(func) };
+                    let name = unsafe { crate::function_get_name(carrier) };
+                    if is_bound_builtin_method(func) {
+                        let instance = unsafe { pyre_object::w_method_get_self(func) };
+                        let type_name = crate::typedef::r#type(instance)
+                            .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
+                            .unwrap_or("object");
+                        Ok(pyre_object::w_str_new(&format!(
+                            "<built-in method {name} of {type_name} object at {instance:p}>"
+                        )))
+                    } else {
+                        Ok(pyre_object::w_str_new(&format!(
+                            "<built-in function {name}>"
+                        )))
+                    }
                 },
                 1,
             ),
@@ -11345,7 +11468,11 @@ fn init_builtin_function_type(ns: PyObjectRef) {
                         args.first().copied().unwrap_or(pyre_object::PY_NULL),
                         "__reduce__",
                     )?;
-                    crate::function::descr_builtin_function_reduce(function)
+                    if is_bound_builtin_method(function) {
+                        crate::function::descr_method__reduce__(function)
+                    } else {
+                        crate::function::descr_builtin_function_reduce(function)
+                    }
                 },
                 1,
             ),
@@ -11362,7 +11489,19 @@ fn init_builtin_function_type(ns: PyObjectRef) {
                     args.first().copied().unwrap_or(pyre_object::PY_NULL),
                     "__eq__",
                 )?;
-                Ok(pyre_object::w_bool_from(std::ptr::eq(function, args[1])))
+                if is_bound_builtin_method(function) {
+                    if !is_bound_builtin_method(args[1]) {
+                        return Ok(pyre_object::w_not_implemented());
+                    }
+                    let same = unsafe {
+                        pyre_object::w_method_get_self(function)
+                            == pyre_object::w_method_get_self(args[1])
+                            && bound_builtin_functions_equal(function, args[1])
+                    };
+                    Ok(pyre_object::w_bool_from(same))
+                } else {
+                    Ok(pyre_object::w_bool_from(std::ptr::eq(function, args[1])))
+                }
             }) as fn(&[PyObjectRef]) -> crate::PyResult,
         ),
         ("__ne__", |args: &[PyObjectRef]| {
@@ -11370,7 +11509,19 @@ fn init_builtin_function_type(ns: PyObjectRef) {
                 args.first().copied().unwrap_or(pyre_object::PY_NULL),
                 "__ne__",
             )?;
-            Ok(pyre_object::w_bool_from(!std::ptr::eq(function, args[1])))
+            if is_bound_builtin_method(function) {
+                if !is_bound_builtin_method(args[1]) {
+                    return Ok(pyre_object::w_not_implemented());
+                }
+                let same = unsafe {
+                    pyre_object::w_method_get_self(function)
+                        == pyre_object::w_method_get_self(args[1])
+                        && bound_builtin_functions_equal(function, args[1])
+                };
+                Ok(pyre_object::w_bool_from(!same))
+            } else {
+                Ok(pyre_object::w_bool_from(!std::ptr::eq(function, args[1])))
+            }
         }),
     ] {
         unsafe {
@@ -11423,7 +11574,22 @@ fn init_builtin_function_type(ns: PyObjectRef) {
                         args.first().copied().unwrap_or(pyre_object::PY_NULL),
                         "__hash__",
                     )?;
-                    Ok(pyre_object::w_int_new(function as i64))
+                    if is_bound_builtin_method(function) {
+                        let descr = unsafe { pyre_object::w_method_get_func(function) };
+                        let code = unsafe { crate::function::getcode(descr) } as PyObjectRef;
+                        let function_address =
+                            unsafe { crate::gateway::builtin_code_get(code) } as *const () as usize;
+                        let instance = unsafe { pyre_object::w_method_get_self(function) };
+                        let mut value = (pyre_object::gc_hook::gc_identity_hash(instance as usize)
+                            ^ pyre_object::gc_hook::gc_identity_hash(function_address))
+                            as i64;
+                        if value == -1 {
+                            value = -2;
+                        }
+                        Ok(pyre_object::w_int_new(value))
+                    } else {
+                        Ok(pyre_object::w_int_new(function as i64))
+                    }
                 },
                 1,
             ),
@@ -11782,6 +11948,163 @@ fn init_slot_wrapper_type(ns: PyObjectRef) {
                 make_getset_descriptor(make_builtin_function_with_arity(name, getter, 2)),
             )
         };
+    }
+}
+
+fn method_descriptor_receiver(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    if obj.is_null() || !unsafe { crate::function::is_method_descriptor(obj) } {
+        let received = crate::typedef::r#type(obj)
+            .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
+            .unwrap_or("object");
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' for 'method_descriptor' objects doesn't apply to a '{received}' object"
+        )));
+    }
+    Ok(obj)
+}
+
+fn bind_method_descriptor(
+    descr: PyObjectRef,
+    obj: PyObjectRef,
+    w_type: PyObjectRef,
+) -> crate::PyResult {
+    let descr = method_descriptor_receiver(descr, "__get__")?;
+    if obj.is_null() {
+        if w_type.is_null() {
+            return Err(crate::PyError::type_error("__get__(None, None) is invalid"));
+        }
+        return Ok(descr);
+    }
+    let owner = unsafe { crate::function::fget_func_objclass(descr)? };
+    let applies = crate::typedef::r#type(obj)
+        .map(|actual| unsafe { crate::baseobjspace::issubtype_w(actual.as_ptr(), owner) })
+        .unwrap_or(false);
+    if !applies {
+        let name = unsafe { crate::function::function_get_name(descr) };
+        let owner_name = unsafe { pyre_object::w_type_get_name(owner) };
+        let received = crate::typedef::r#type(obj)
+            .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
+            .unwrap_or("object");
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' for '{owner_name}' objects doesn't apply to a '{received}' object"
+        )));
+    }
+    let actual_type = crate::typedef::r#type(obj).map_or(pyre_object::PY_NULL, |tp| tp.as_ptr());
+    Ok(crate::function::builtin_bound_method_new(
+        descr,
+        obj,
+        actual_type,
+    ))
+}
+
+fn init_method_descriptor_type(ns: PyObjectRef) {
+    // CPython 3.14 Objects/descrobject.c `PyMethodDescr_Type`; PyPy keeps
+    // the corresponding immutable BuiltinCode carrier in Function fields.
+    for (name, getter) in [
+        (
+            "__name__",
+            (|args: &[PyObjectRef]| {
+                let descr = method_descriptor_receiver(args[1], "__name__")?;
+                Ok(pyre_object::w_str_new(unsafe {
+                    crate::function::function_get_name(descr)
+                }))
+            }) as crate::gateway::BuiltinCodeFn,
+        ),
+        ("__objclass__", |args: &[PyObjectRef]| {
+            let descr = method_descriptor_receiver(args[1], "__objclass__")?;
+            unsafe { crate::function::fget_func_objclass(descr) }
+        }),
+        ("__qualname__", |args: &[PyObjectRef]| {
+            let descr = method_descriptor_receiver(args[1], "__qualname__")?;
+            let owner = unsafe { crate::function::fget_func_objclass(descr)? };
+            let owner_qualname = crate::baseobjspace::getattr_str(owner, "__qualname__")?;
+            let Some(owner_qualname) =
+                (unsafe { pyre_object::w_str_get_value_opt(owner_qualname) })
+            else {
+                return Err(crate::PyError::type_error(
+                    "descriptor owner __qualname__ is not a string",
+                ));
+            };
+            let method_name = unsafe { crate::function::function_get_name(descr) };
+            Ok(pyre_object::w_str_new(&format!(
+                "{owner_qualname}.{method_name}"
+            )))
+        }),
+        ("__doc__", |args: &[PyObjectRef]| {
+            let descr = method_descriptor_receiver(args[1], "__doc__")?;
+            Ok(unsafe { crate::function::fget_func_doc(descr) })
+        }),
+        ("__text_signature__", |args: &[PyObjectRef]| {
+            let descr = method_descriptor_receiver(args[1], "__text_signature__")?;
+            match unsafe { crate::function::fget_func_text_signature(descr) } {
+                Ok(value) => Ok(value),
+                Err(err) if err.kind == crate::PyErrorKind::AttributeError => {
+                    Ok(pyre_object::w_none())
+                }
+                Err(err) => Err(err),
+            }
+        }),
+    ] {
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_descriptor(make_builtin_function_with_arity(name, getter, 2)),
+            )
+        };
+    }
+
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__get__",
+            make_builtin_function_with_arity(
+                "__get__",
+                |args| {
+                    let obj = if pyre_object::is_none(args[1]) {
+                        pyre_object::PY_NULL
+                    } else {
+                        args[1]
+                    };
+                    let w_type = if pyre_object::is_none(args[2]) {
+                        pyre_object::PY_NULL
+                    } else {
+                        args[2]
+                    };
+                    bind_method_descriptor(args[0], obj, w_type)
+                },
+                3,
+            ),
+        );
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__call__",
+            make_builtin_function("__call__", |args| {
+                let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+                let descr = method_descriptor_receiver(
+                    positional.first().copied().unwrap_or(pyre_object::PY_NULL),
+                    "__call__",
+                )?;
+                function_descr_call_impl(positional, kwargs, descr)
+            }),
+        );
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| {
+                    let descr = method_descriptor_receiver(args[0], "__repr__")?;
+                    let name = crate::function::function_get_name(descr);
+                    let owner = crate::function::fget_func_objclass(descr)?;
+                    let owner_name = pyre_object::w_type_get_name(owner);
+                    Ok(pyre_object::w_str_new(&format!(
+                        "<method '{name}' of '{owner_name}' objects>"
+                    )))
+                },
+                1,
+            ),
+        );
     }
 }
 
