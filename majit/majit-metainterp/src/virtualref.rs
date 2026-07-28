@@ -39,16 +39,14 @@ pub(crate) fn vref_gc_type_id() -> u32 {
 /// `rpython/rtyper/rclass.py:OBJECT` — RPython's GC
 /// object header.  Every `rclass.OBJECT` subclass starts with a
 /// `typeptr` field (a vtable pointer) used for runtime type identity
-/// checks (`inst.typeptr == some_vtable`).  Pyre's analogue: a u64
-/// `typeptr` slot at offset 0 carrying the type-id constant for
-/// each registered GC type.
+/// checks (`inst.typeptr == some_vtable`).  Pyre's analogue is the
+/// pointer-sized identity word at offset 0.
 #[repr(C)]
 pub struct ObjectHeader {
     /// `rclass.OBJECT.typeptr` — runtime type identity.  RPython
     /// stores a pointer to the per-class `OBJECT_VTABLE` instance;
-    /// pyre stores the type-id constant directly (e.g.
-    /// `JIT_VIRTUAL_REF_VTABLE` for `JitVirtualRef`).
-    pub typeptr: u64,
+    /// pyre stores a pointer-sized identity constant directly.
+    pub typeptr: usize,
 }
 
 /// `rpython/rlib/jit.py JitVirtualRef`: heap-allocated virtual
@@ -105,7 +103,9 @@ pub struct JitVirtualRef {
 /// real OBJECT_VTABLE pointer; the comparison `header.typeptr ==
 /// JIT_VIRTUAL_REF_VTABLE` is the structural equivalent of
 /// upstream's `inst.typeptr == self.jit_virtual_ref_vtable`.
-pub const JIT_VIRTUAL_REF_VTABLE: u64 = 0x4A49_5456_5245_4621; // "JITVREF!"
+// `virtualref.py:21-23` allocates an OBJECT_VTABLE pointer, so its translated
+// identity occupies one target word rather than an unconditional u64.
+pub const JIT_VIRTUAL_REF_VTABLE: usize = 0x4A56_5221; // "JVR!"
 
 /// Free-function form of [`VirtualRefInfo::is_virtual_ref`] for callers that
 /// don't hold a `VirtualRefInfo` — e.g. the interpreter's frame-chain force
@@ -203,10 +203,9 @@ pub const TOKEN_NONE: *mut u8 = std::ptr::null_mut();
 /// ```python
 /// _DUMMY = lltype.GcStruct('JITFRAME_DUMMY')
 /// ```
-/// Pyre stores the corresponding type-id as a u64 magic constant —
-/// the typeptr written into the `super_.typeptr` slot of the
-/// allocated `_dummy` instance below.
-pub const JITFRAME_DUMMY_VTABLE: u64 = 0x4A46_4D44_554D_4D59; // "JFMDUMMY"
+/// `virtualizable.py:326-330` uses a real pointer to the `_dummy` object, so
+/// the translated identity word is pointer-sized too.
+pub const JITFRAME_DUMMY_VTABLE: usize = 0x4A46_444D; // "JFDM"
 
 /// Lazy initialisation of the `_dummy` address.  `OnceLock<usize>`
 /// (instead of `OnceLock<*mut u8>`) so the cell is `Sync` —

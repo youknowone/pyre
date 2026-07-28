@@ -2422,24 +2422,31 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // the recorded OpRef with the executed concrete so downstream
             // `concrete_of_opref` / `box_value` consumers see the folded
             // value. An executed void helper has nothing to stamp.
-            match call_descr.result_type() {
-                majit_ir::Type::Int => {
-                    ctx.trace_ctx
-                        .set_opref_concrete(recorded, majit_ir::Value::Int(result_i64));
+            // `pyjitpl.py:2049-2068` checks forced virtual refs before
+            // recording the selected CALL operation.  The assembler-call
+            // walker uses `OpRef::NONE` while concrete-executing so
+            // `vrefs_after_residual_call` can emit VIRTUAL_REF_FINISH before
+            // CALL_ASSEMBLER, then stamps the newly recorded call itself.
+            if !recorded.is_none() {
+                match call_descr.result_type() {
+                    majit_ir::Type::Int => {
+                        ctx.trace_ctx
+                            .set_opref_concrete(recorded, majit_ir::Value::Int(result_i64));
+                    }
+                    majit_ir::Type::Ref => {
+                        ctx.trace_ctx.set_opref_concrete(
+                            recorded,
+                            majit_ir::Value::Ref(majit_ir::GcRef(result_i64 as usize)),
+                        );
+                    }
+                    majit_ir::Type::Float => {
+                        ctx.trace_ctx.set_opref_concrete(
+                            recorded,
+                            majit_ir::Value::Float(f64::from_bits(result_i64 as u64)),
+                        );
+                    }
+                    majit_ir::Type::Void => {}
                 }
-                majit_ir::Type::Ref => {
-                    ctx.trace_ctx.set_opref_concrete(
-                        recorded,
-                        majit_ir::Value::Ref(majit_ir::GcRef(result_i64 as usize)),
-                    );
-                }
-                majit_ir::Type::Float => {
-                    ctx.trace_ctx.set_opref_concrete(
-                        recorded,
-                        majit_ir::Value::Float(f64::from_bits(result_i64 as u64)),
-                    );
-                }
-                majit_ir::Type::Void => {}
             }
             // #57 Option C (capture): this residual is the FOR_ITER advance
             // (`for_iter_next`) — it just advanced the real shared heap

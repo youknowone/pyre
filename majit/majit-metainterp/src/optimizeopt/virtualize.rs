@@ -2370,7 +2370,9 @@ impl FieldDescr for VRefFieldDescr {
     }
 
     fn field_size(&self) -> usize {
-        8
+        // `virtualref.py:17-20` declares both fields as pointer types, so
+        // source translation gives them the target pointer width.
+        std::mem::size_of::<*mut u8>()
     }
 
     fn field_type(&self) -> majit_ir::Type {
@@ -2445,18 +2447,17 @@ fn build_vref_field_descr(index: u32) -> Arc<VRefFieldDescr> {
         // and `optimize_jit_force_virtual`'s constant-null read agree
         // on the value tag.
         //
-        // TODO (GC trace divergence).  The optimizer
-        // descriptor is `Type::Ref` for parity with the rtyper's
-        // setfield_gc_r emit, but the actual GC tracer at
-        // `pyre/pyre-jit/src/eval.rs:241-247` registers JIT_VIRTUAL_REF
-        // with `gc_ptr_offsets = [16]` (forced only).  See
-        // `JitVirtualRef` doc-comment in `majit-metainterp/src/virtualref.rs`
-        // for why `virtual_token` is intentionally outside the GC's
-        // view: every value it holds at runtime (TOKEN_NONE,
-        // `token_tracing_rescall()` static address, libc::calloc'd
-        // JITFRAME address) lives outside any GC heap.
-        VREF_VIRTUAL_TOKEN_FIELD_INDEX => (8, Type::Ref),
-        VREF_FORCED_FIELD_INDEX => (16, Type::Ref),
+        // `virtualref.py:17-20` makes these fields part of the translated
+        // JitVirtualRef structure; use that structure's target layout rather
+        // than assuming native 64-bit pointer offsets.
+        VREF_VIRTUAL_TOKEN_FIELD_INDEX => (
+            std::mem::offset_of!(crate::virtualref::JitVirtualRef, virtual_token),
+            Type::Ref,
+        ),
+        VREF_FORCED_FIELD_INDEX => (
+            std::mem::offset_of!(crate::virtualref::JitVirtualRef, forced),
+            Type::Ref,
+        ),
         _ => panic!("invalid JitVirtualRef field slot {index}"),
     };
     Arc::new(VRefFieldDescr {
@@ -2466,7 +2467,7 @@ fn build_vref_field_descr(index: u32) -> Arc<VRefFieldDescr> {
     })
 }
 
-/// Size descriptor for JitVirtualRef (24 bytes = super_.typeptr + virtual_token + forced).
+/// `virtualref.py:17-20` target-layout size descriptor for JitVirtualRef.
 #[derive(Debug)]
 struct VRefSizeDescr;
 

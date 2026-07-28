@@ -3903,12 +3903,22 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
                 majit_metainterp::virtualizable::VableToken::TracingRescall
             )
         });
-        let live_frame_armed = match info.read_token(frame.cast()) {
-            majit_metainterp::virtualizable::VableToken::Active(token) => {
-                driver.meta_interp_mut().is_force_token_armed(token)
-            }
-            _ => false,
-        };
+        // `pyjitpl.py:3326-3334` reads the token only from
+        // `virtualizable_boxes[-1]`.  An inlined callee materialized through
+        // a virtual reference is an ordinary frame, not that one standard
+        // virtualizable, and its token slot is not part of its resume image.
+        let standard_frame = driver
+            .meta_interp()
+            .standard_virtualizable_heap_ptr()
+            .cast_mut()
+            .cast::<pyre_interpreter::PyFrame>();
+        let live_frame_armed = std::ptr::eq(frame, standard_frame)
+            && match info.read_token(frame.cast()) {
+                majit_metainterp::virtualizable::VableToken::Active(token) => {
+                    driver.meta_interp_mut().is_force_token_armed(token)
+                }
+                _ => false,
+            };
         let mut force = |ptr: *mut u8| {
             info.force_virtualizable_if_necessary(ptr, |token| {
                 driver.meta_interp_mut().force_virtualizable_token(token);

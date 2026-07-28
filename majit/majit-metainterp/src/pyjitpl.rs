@@ -3027,6 +3027,13 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// `pyjitpl.py:3326-3334` keeps exactly one standard virtualizable
+    /// identity in `virtualizable_boxes[-1]`; `vable_ptr` is its concrete
+    /// heap counterpart.
+    pub fn standard_virtualizable_heap_ptr(&self) -> *const u8 {
+        self.vable_ptr
+    }
+
     /// Cache fallback virtualizable array lengths for trace-entry box setup.
     pub(crate) fn set_vable_array_lengths(&mut self, lengths: Vec<usize>) {
         self.vable_array_lengths = lengths;

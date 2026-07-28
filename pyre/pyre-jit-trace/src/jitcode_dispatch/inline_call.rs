@@ -852,15 +852,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // SETFIELD_GC(vable_token) before the assembler call.
     maybe_walker_vable_and_vrefs_before_residual_call(ctx);
 
-    let ca_result = ctx.trace_ctx.call_assembler_red_only_ref_arc(
-        token,
-        &[callee_frame, ec],
-        &[Type::Ref, Type::Ref],
-    );
-    // pyjitpl.py: KEEPALIVE on the callee virtualizable so it
-    // survives until the result is consumed.
-    ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
-
     // pyjitpl.py `execute_and_record_varargs(CALL_MAY_FORCE_R)`:
     // the forces branch EXECUTES the call during tracing —
     // `direct_assembler_call` (pyjitpl.py) only rewrites the
@@ -886,11 +877,26 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             OpCode::CallMayForceR,
             &allboxes,
             call_descr,
-            ca_result,
+            OpRef::NONE,
             op.pc,
             None,
         )?
     };
+    // `pyjitpl.py:2049-2079` checks vrefs after concrete execution, records
+    // CALL_ASSEMBLER, then emits GUARD_NOT_FORCED.  In particular,
+    // VIRTUAL_REF_FINISH must precede the call so the call and guard remain
+    // adjacent and the backend can arm the JIT frame's force descriptor.
+    let ca_result = ctx.trace_ctx.call_assembler_red_only_ref_arc(
+        token,
+        &[callee_frame, ec],
+        &[Type::Ref, Type::Ref],
+    );
+    if let ResidualExecOutcome::Executed(Ok(result)) = exec {
+        ctx.trace_ctx.set_opref_concrete(
+            ca_result,
+            majit_ir::Value::Ref(majit_ir::GcRef(result as usize)),
+        );
+    }
     // A decline leaves the CALL_ASSEMBLER recorded symbolically WITHOUT
     // running it — a side effect only the legacy replay applies, so the
     // walk-end no-replay commit must stay off for this trace (see
@@ -1006,6 +1012,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // the call (`capture_resumedata(after_residual_call=True)`).
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    // `pyjitpl.py:2080-2081` keeps the assembler virtualizable alive after
+    // the force guard has captured its resume data.
+    ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
     // pyjitpl.py `handle_possible_exception`.
     if exec_raised {
         // Raising branch (pyjitpl.py): `GUARD_EXCEPTION` with
@@ -1098,13 +1107,6 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     // is why forcing the still-virtual frame here — allocation plus one
     // SETARRAYITEM_GC per known element — is the upstream op sequence rather
     // than a decline.
-    let ca_result = ctx.trace_ctx.call_assembler_red_only_ref_arc(
-        token,
-        &[callee_frame, callee_ec],
-        &[Type::Ref, Type::Ref],
-    );
-    ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
-
     // Run the call concretely to stamp `ca_result` (same rationale as the
     // self-recursive arm: the downstream consumer needs the real concrete to
     // take its int specialization). ⚠️ The inlined prologue already ran the
@@ -1133,10 +1135,23 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
         OpCode::CallMayForceR,
         &allboxes,
         call_descr,
-        ca_result,
+        OpRef::NONE,
         op.pc,
         None,
     )?;
+    // `pyjitpl.py:2049-2079` records a forced VIRTUAL_REF_FINISH before the
+    // selected CALL_ASSEMBLER, followed immediately by GUARD_NOT_FORCED.
+    let ca_result = ctx.trace_ctx.call_assembler_red_only_ref_arc(
+        token,
+        &[callee_frame, callee_ec],
+        &[Type::Ref, Type::Ref],
+    );
+    if let ResidualExecOutcome::Executed(Ok(result)) = exec {
+        ctx.trace_ctx.set_opref_concrete(
+            ca_result,
+            majit_ir::Value::Ref(majit_ir::GcRef(result as usize)),
+        );
+    }
     let exec_raised = match exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
         ResidualExecOutcome::Declined(cause) => {
@@ -1152,6 +1167,8 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
 
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    // `pyjitpl.py:2080-2081` places KEEPALIVE after GUARD_NOT_FORCED.
+    ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
     if exec_raised {
         walker_record_guard_exception(ctx, op.pc);
         let exc = ctx

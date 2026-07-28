@@ -1157,19 +1157,22 @@ impl OptHeap {
         if ctx.is_virtualizable(&target) {
             return true;
         }
-        // Indirect: SETARRAYITEM_GC on the frame's array-pointer field. The
-        // array operand is produced by reading that field off the frame.
+        // `virtualizable.py:81-84` permits indirection only through an array
+        // field: SETARRAYITEM_GC on an array read from the standard frame.
+        // A SETFIELD_GC target merely read from the frame is a different
+        // object and must never inherit virtualizable ownership.
         match ctx.get_producing_op(&target) {
             Some(producer)
-                if matches!(
-                    producer.opcode,
-                    OpCode::GetfieldGcI
-                        | OpCode::GetfieldGcR
-                        | OpCode::GetfieldGcF
-                        | OpCode::GetfieldRawI
-                        | OpCode::GetfieldRawR
-                        | OpCode::GetfieldRawF
-                ) =>
+                if op.opcode == OpCode::SetarrayitemGc
+                    && matches!(
+                        producer.opcode,
+                        OpCode::GetfieldGcI
+                            | OpCode::GetfieldGcR
+                            | OpCode::GetfieldGcF
+                            | OpCode::GetfieldRawI
+                            | OpCode::GetfieldRawR
+                            | OpCode::GetfieldRawF
+                    ) =>
             {
                 ctx.resolve_operand_operand_opt(&producer.arg(0))
                     .map_or(false, |frame| ctx.is_virtualizable(&frame))
