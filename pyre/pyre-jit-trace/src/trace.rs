@@ -4676,6 +4676,20 @@ fn full_body_walk_trace<Sym: WalkSym>(
                     fbw_decline(crate::driver::make_green_key(w_code, start_pc));
                     TraceAction::Abort
                 }
+                // The exc-edge routing decision is `find_catch_for_exc_resume`
+                // + `exc_handler_rejoins_loop` over `(jitcode_code, position)`
+                // alone, so the same guard reaches it on every retrace — the
+                // premise the `AbortPermanent` decline below is written for.
+                // It cannot take that mapping: the abort is raised before any
+                // recording precisely so the guard resumes via the blackhole,
+                // which is the correct handling, not a location to retire.
+                // Record only the bridge-guard decline, so the guard stops
+                // re-walking the whole body (executing its residual calls
+                // concretely) to re-derive a static answer.
+                DE::ExcEdgeCrossFrameReturnUnsupported { .. } => {
+                    fbw_bridge_decline(ctx);
+                    TraceAction::Abort
+                }
                 _ => TraceAction::Abort,
             }
         }
