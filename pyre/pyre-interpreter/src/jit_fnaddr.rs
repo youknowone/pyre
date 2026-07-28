@@ -1737,6 +1737,25 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::dict_entries_remove_object",
         pyre_object::dictmultiobject::dict_entries_remove_object as *const (),
     );
+    // The checked probe / store pair, keyed on an already-hashed key.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_probe_hashed",
+        "pyre_object::dict_entries_probe_hashed",
+        pyre_object::dictmultiobject::dict_entries_probe_hashed as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_insert_hashed",
+        "pyre_object::dict_entries_insert_hashed",
+        pyre_object::dictmultiobject::dict_entries_insert_hashed as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_pop_last",
+        "pyre_object::dict_entries_pop_last",
+        pyre_object::dictmultiobject::dict_entries_pop_last as *const (),
+    );
     // A runtime-mutable global counter, not a build-time constant: bind the
     // read seam by address so the JIT calls it instead of folding whatever
     // serial the build process saw.

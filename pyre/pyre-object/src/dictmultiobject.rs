@@ -250,6 +250,63 @@ pub unsafe fn dict_entries_remove_object(
     entries.shift_remove(&object_key_for(key)).is_some()
 }
 
+/// [`dict_entries_probe_object`] for a caller that already ran
+/// [`object_key_for_checked`] — the checked paths, which must hash before the
+/// probe so a raising `__hash__` is reported without touching the table.
+///
+/// The key arrives DECOMPOSED into its two words rather than as an
+/// [`ObjectKey`]: a struct by value is not a residual-ABI argument shape, and
+/// `hash` + `obj` are exactly what the caller holds anyway (the same split
+/// [`dict_entries_probe_str`] takes).
+///
+/// # Safety
+/// Same as [`dict_entries_probe_object`]; `hash` must be the digest
+/// [`object_key_for_checked`] produced for `obj`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn dict_entries_probe_hashed(
+    entries: &indexmap::IndexMap<ObjectKey, PyObjectRef>,
+    hash: i64,
+    obj: PyObjectRef,
+) -> Option<PyObjectRef> {
+    entries.get(&ObjectKey { hash, obj }).copied()
+}
+
+/// The store side of [`dict_entries_probe_hashed`] —
+/// `dictmultiobject.py:1067 setitem`'s
+/// `self.unerase(w_dict.dstorage)[self.unwrap(w_key)] = w_value`, returning
+/// the displaced value so the caller can tell an overwrite from an insert.
+///
+/// Residualised for [`dict_entries_probe_object`]'s reason: `IndexMap` has no
+/// lowering, so the call is the last modellable point.  Upstream's
+/// `_ll_dict_setitem_lookup_done` (`rordereddict.py:674`) is likewise
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))`, and
+/// neither conjunct can hold for an `IndexMap` here.
+///
+/// # Safety
+/// Same as [`dict_entries_probe_hashed`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn dict_entries_insert_hashed(
+    entries: &mut indexmap::IndexMap<ObjectKey, PyObjectRef>,
+    hash: i64,
+    obj: PyObjectRef,
+    value: PyObjectRef,
+) -> Option<PyObjectRef> {
+    entries.insert(ObjectKey { hash, obj }, value)
+}
+
+/// Drop the last entry — the undo the checked store runs when a user `__eq__`
+/// raised mid-probe and `insert` therefore appended a spurious entry.
+///
+/// Residual for the same reason its `insert` twin is; separating it keeps the
+/// error test itself traced.
+///
+/// # Safety
+/// Same as [`dict_entries_probe_hashed`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn dict_entries_pop_last(entries: &mut indexmap::IndexMap<ObjectKey, PyObjectRef>) {
+    entries.pop();
+}
+
 /// Borrow-key str dict GET: hash `key`'s WTF-8 bytes via the str hook and
 /// probe `entries` without building a `W_UnicodeObject`.  Falls back to the
 /// allocating `object_key_for(w_str_new(key))` path when no str hash hook is
@@ -2268,7 +2325,7 @@ pub unsafe fn w_module_dict_lookup_inner_checked(
     let _module_guard = w_dict_lock(obj);
     if let Some(entries) = w_module_dict_object_storage(obj) {
         let object_key = object_key_for_checked(key)?;
-        let hit = entries.get(&object_key).copied();
+        let hit = dict_entries_probe_hashed(entries, object_key.hash, object_key.obj);
         if take_dict_key_error() {
             return Err(DictKeyError);
         }
@@ -2283,7 +2340,7 @@ pub unsafe fn w_module_dict_lookup_inner_checked(
     w_module_dict_switch_to_object_strategy(obj);
     let entries = w_module_dict_object_storage(obj).ok_or(DictKeyError)?;
     let object_key = object_key_for_checked(key)?;
-    let hit = entries.get(&object_key).copied();
+    let hit = dict_entries_probe_hashed(entries, object_key.hash, object_key.obj);
     if take_dict_key_error() {
         return Err(DictKeyError);
     }
@@ -2761,9 +2818,9 @@ pub unsafe fn w_module_dict_store_inner_checked(
     // Single setitem probe; on an `__eq__` raise mid-probe `insert` appends
     // a spurious entry, so drop it with `pop` and leave the dict unchanged
     // (see `w_dict_store_object_strategy_checked`).
-    let previous = entries.insert(object_key, value);
+    let previous = dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value);
     if take_dict_key_error() {
-        entries.pop();
+        dict_entries_pop_last(entries);
         return Err(DictKeyError);
     }
     let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
