@@ -5012,10 +5012,22 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             } else {
                 lookup_in_type_where(w_type, name)
             };
+            // module.py descr_getattribute runs the normal lookup, then catches
+            // an AttributeError from it (objspace.py:694-699) and routes it to
+            // the PEP 562 module `__getattr__`.  This inlined default slot must
+            // do the same rather than propagate a descriptor `__get__`'s
+            // AttributeError; the bare `object.__getattribute__` slot
+            // (`!call_getattr`) still propagates so `module_getattribute`'s own
+            // `try`/`except` performs the routing.
             if let Some(descr) = w_descr {
                 if is_data_descr(descr) {
-                    if let Some(value) = get(descr, obj, w_type)? {
-                        return Ok(value);
+                    match get(descr, obj, w_type) {
+                        Ok(Some(value)) => return Ok(value),
+                        Ok(None) => {}
+                        Err(e) if call_getattr && e.kind == PyErrorKind::AttributeError => {
+                            return module_getattr_fallback(obj, name, e);
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
             }
@@ -5028,7 +5040,13 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                 }
             }
             if let Some(descr) = w_descr {
-                return Ok(get(descr, obj, w_type)?.unwrap_or(descr));
+                match get(descr, obj, w_type) {
+                    Ok(value) => return Ok(value.unwrap_or(descr)),
+                    Err(e) if call_getattr && e.kind == PyErrorKind::AttributeError => {
+                        return module_getattr_fallback(obj, name, e);
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
     }
@@ -5247,13 +5265,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         if err.kind != PyErrorKind::AttributeError {
             return Err(err);
         }
-        let err = match unsafe { module_getattr_hook_or_err(obj, name, err, true) } {
-            Ok(value) => return Ok(value),
-            Err(e) if e.kind == PyErrorKind::AttributeError => e,
-            Err(e) => return Err(e),
-        };
-        let w_type = crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr());
-        return unsafe { instance_getattr_hook_or_err(w_type, obj, name, err) };
+        return unsafe { module_getattr_fallback(obj, name, err) };
     }
 
     let err = match object_getattr_miss(obj, name, call_getattr) {
@@ -5843,6 +5855,23 @@ unsafe fn module_getattr_hook_or_err(
         format!("module '{nm}' has no attribute '{name}'")
     };
     Err(PyError::new(PyErrorKind::AttributeError, msg))
+}
+
+/// module.py `Module.descr_getattribute` AttributeError tail for the inlined
+/// default slot: consult the module dict's PEP 562 `__getattr__`, then the
+/// receiver type's class-level `__getattr__` (descroperation.py:242-245),
+/// before propagating `err`.  Mirrors the `module_getattribute` slot's own
+/// `try`/`except` so a directly-served `getattr(module, name)` routes a
+/// descriptor `__get__`'s AttributeError the same way an explicit
+/// `ModuleType.__getattribute__` call would.
+unsafe fn module_getattr_fallback(obj: PyObjectRef, name: &str, err: PyError) -> PyResult {
+    let err = match module_getattr_hook_or_err(obj, name, err, true) {
+        Ok(value) => return Ok(value),
+        Err(e) if e.kind == PyErrorKind::AttributeError => e,
+        Err(e) => return Err(e),
+    };
+    let w_type = crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr());
+    instance_getattr_hook_or_err(w_type, obj, name, err)
 }
 
 /// `descroperation.py:242-245` `_handle_getattribute` tail: on an
