@@ -4711,7 +4711,7 @@ unsafe fn find_best_base(w_bases: pyre_object::PyObjectRef) -> pyre_object::PyOb
 ///   if w_bestbase is None: raise TypeError
 ///   if not w_bestbase.layout.typedef.acceptable_as_base_class: raise TypeError
 ///   for w_base in bases_w: check layout conflicts
-unsafe fn check_and_find_best_base(
+pub(crate) unsafe fn check_and_find_best_base(
     w_bases: pyre_object::PyObjectRef,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     unsafe {

@@ -7168,6 +7168,26 @@ except TypeError:
     }
 
     #[test]
+    fn test_set_bases_checks_secondary_base_layout_and_acceptability() {
+        let source = "\
+class O:
+    pass
+class X:
+    pass
+rejected = False
+try:
+    X.__bases__ = (O, type(None))
+except TypeError:
+    rejected = True";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("secondary base validation regression");
+        unsafe {
+            let value = w_dict_getitem_str(frame.w_globals, "rejected").unwrap();
+            assert!(is_true(value).unwrap());
+        }
+    }
+
+    #[test]
     fn test_function_dunder_globals_and_code_are_materialized() {
         crate::test_hooks::install_hash_hook();
         let source = "\

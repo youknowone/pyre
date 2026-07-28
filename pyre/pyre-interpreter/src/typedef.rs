@@ -10086,9 +10086,8 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 "can only assign non-empty tuple to {type_name}.__bases__, not ()"
             )));
         }
-        // find_best_base: pick the base with the most-derived instance layout.
-        let mut w_bestbase = pyre_object::PY_NULL;
-        let mut best_layout: *const pyre_object::typeobject::Layout = std::ptr::null();
+        // typeobject.py:1108-1115 — reject cycles and non-class entries
+        // before asking check_and_find_best_base to validate the layouts.
         for i in 0..n {
             let Some(w_base) = pyre_object::w_tuple_getitem(w_value, i as i64) else {
                 continue;
@@ -10108,27 +10107,28 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     pyre_object::type_name_of(w_base)
                 )));
             }
-            let cand_layout = pyre_object::w_type_get_layout_ptr(w_base);
-            if best_layout.is_null()
-                || (cand_layout != best_layout
-                    && !cand_layout.is_null()
-                    && (*cand_layout).issublayout(best_layout))
-            {
-                w_bestbase = w_base;
-                best_layout = cand_layout;
-            }
         }
-        // Instances keep their current layout, so the new best base must share
-        // it (no instance-size change).  Adding layout-neutral mixin bases such
-        // as Generic is fine; switching to an incompatible solid base is not.
-        let cur_layout = pyre_object::w_type_get_layout_ptr(w_type);
-        if best_layout != cur_layout {
-            // The clash names the new best base and the type's *current* best
-            // base (`__base__`), not the type being reassigned.
+
+        // typeobject.py:1117-1127 — both sides go through the same best-base
+        // validation used by initial type construction.  This preserves the
+        // acceptable-as-base check and checks every secondary base for a
+        // conflicting layout before comparing the two complete layouts.
+        let saved_bases = pyre_object::typeobject::w_type_get_bases(w_type);
+        let w_oldbestbase = crate::call::check_and_find_best_base(saved_bases)?;
+        let w_newbestbase = crate::call::check_and_find_best_base(w_value)?;
+        let layouts_match = pyre_object::typeobject::Layout::expands_equal(
+            pyre_object::w_type_get_layout_ptr(w_oldbestbase),
+            pyre_object::w_type_get_hasdict(w_oldbestbase),
+            pyre_object::w_type_get_weakrefable(w_oldbestbase),
+            pyre_object::w_type_get_layout_ptr(w_newbestbase),
+            pyre_object::w_type_get_hasdict(w_newbestbase),
+            pyre_object::w_type_get_weakrefable(w_newbestbase),
+        );
+        if !layouts_match {
             return Err(crate::PyError::type_error(format!(
                 "__bases__ assignment: '{}' object layout differs from '{}'",
-                pyre_object::w_type_get_name(w_bestbase),
-                pyre_object::w_type_get_name(pyre_object::typeobject::w_type_get_best_base(w_type))
+                pyre_object::w_type_get_name(w_newbestbase),
+                pyre_object::w_type_get_name(w_oldbestbase),
             )));
         }
         // The linearization has to hold for the new bases before anything is
@@ -10143,7 +10143,6 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // the new bases (typeobject.py:1136-1138 `remove_subclass`); the new
         // bases are relinked by `w_type_ready` below (typeobject.py:1140-1142
         // `add_subclass`).
-        let saved_bases = pyre_object::typeobject::w_type_get_bases(w_type);
         if !saved_bases.is_null() {
             let old_n = pyre_object::w_tuple_len(saved_bases);
             for i in 0..old_n as i64 {
