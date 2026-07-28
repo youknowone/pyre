@@ -1268,7 +1268,13 @@ pub fn init_typeobjects() {
             object_type,
             &pyre_object::interp_itertools::TEE_ITERABLE_TYPE as *const PyType,
         );
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(tee_iterable_type, false) };
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(tee_iterable_type, false);
+            // PyPy declares make_weakref_descr(W_TeeIterable).  CPython 3.14
+            // keeps the capability while omitting "__weakref__" from the
+            // concrete type dictionary.
+            pyre_object::w_type_set_weakrefable(tee_iterable_type, true);
+        };
         reg.insert(
             &pyre_object::interp_itertools::TEE_ITERABLE_TYPE as *const PyType as usize,
             tee_iterable_type as usize,
@@ -23446,6 +23452,16 @@ fn itertools_constructor_scope(
     names: Vec<&'static str>,
     defaults: &[PyObjectRef],
 ) -> Result<(PyObjectRef, Vec<PyObjectRef>), crate::PyError> {
+    itertools_constructor_scope_kwonly(args, fn_name, names, defaults, 0)
+}
+
+fn itertools_constructor_scope_kwonly(
+    args: &[PyObjectRef],
+    fn_name: &str,
+    names: Vec<&'static str>,
+    defaults: &[PyObjectRef],
+    kwonlyargcount: usize,
+) -> Result<(PyObjectRef, Vec<PyObjectRef>), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let cls = positional.first().copied().unwrap_or(PY_NULL);
@@ -23463,7 +23479,26 @@ fn itertools_constructor_scope(
             keywords_w.push(value);
         }
     }
-    let signature = crate::gateway::Signature::new(names, None, None, 0, 0);
+    let positional_default_count = defaults.len().saturating_sub(kwonlyargcount);
+    let w_kw_defs = if kwonlyargcount == 0 {
+        PY_NULL
+    } else {
+        let w_kw_defs = pyre_object::w_dict_new();
+        pyre_object::gc_roots::pin_root(w_kw_defs);
+        let kw_defs_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let kw_names_start = names.len() - kwonlyargcount;
+        for index in 0..kwonlyargcount {
+            unsafe {
+                pyre_object::w_dict_setitem_str_no_proxy(
+                    pyre_object::gc_roots::shadow_stack_get(kw_defs_slot),
+                    names[kw_names_start + index],
+                    defaults[positional_default_count + index],
+                )
+            };
+        }
+        unsafe { pyre_object::gc_roots::shadow_stack_get(kw_defs_slot) }
+    };
+    let signature = crate::gateway::Signature::new(names, None, None, kwonlyargcount, 0);
     let arguments = crate::argument::Arguments::with_kw(positional, &keyword_names_w, &keywords_w);
     let mut scope_w = vec![PY_NULL; signature.scope_length()];
     arguments.parse_into_scope(
@@ -23471,8 +23506,8 @@ fn itertools_constructor_scope(
         &mut scope_w,
         fn_name,
         &signature,
-        Some(defaults),
-        PY_NULL,
+        Some(&defaults[..positional_default_count]),
+        w_kw_defs,
     )?;
     Ok((cls, scope_w))
 }
@@ -23838,11 +23873,12 @@ fn accumulate_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let exact =
         gettypefor(&pyre_object::interp_itertools::ACCUMULATE_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     let w_none = pyre_object::w_none();
-    let (cls, scope_w) = itertools_constructor_scope(
+    let (cls, scope_w) = itertools_constructor_scope_kwonly(
         args,
         "accumulate",
         vec!["iterable", "func", "initial"],
         &[w_none, w_none],
+        1,
     )?;
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(cls);

@@ -1,6 +1,7 @@
 import copy
 import gc
 import itertools
+import weakref
 
 
 assert isinstance(itertools._tee, type)
@@ -17,6 +18,18 @@ assert next(b) == 1
 assert next(a) == 3
 assert next(b) == 2
 assert next(b) == 3
+
+weak_target, _ = itertools.tee(range(1))
+weak_proxy = weakref.proxy(weak_target)
+assert weak_proxy.__class__ is itertools._tee
+del weak_target
+gc.collect()
+try:
+    weak_proxy.__class__
+except ReferenceError:
+    pass
+else:
+    raise AssertionError("_tee weak reference remained live")
 
 # Python 3.14 returns without even requesting an iterator when n == 0.
 class ExplodingIter:
