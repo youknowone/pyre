@@ -85,6 +85,37 @@ fn validate_constant(value: &ast::ConstantValue) -> ValidateResult {
     }
 }
 
+/// The operand a literal pattern is allowed to negate.
+fn is_number(expr: &ast::Expr) -> bool {
+    matches!(expr, ast::Expr::Constant(constant) if matches!(
+        constant.value,
+        ast::ConstantValue::Integer(_)
+            | ast::ConstantValue::Float(_)
+            | ast::ConstantValue::Complex { .. }
+    ))
+}
+
+/// The real half of the complex literal a pattern may spell out, which is
+/// written either on its own or negated.
+fn is_signed_real(expr: &ast::Expr) -> bool {
+    let expr = match expr {
+        ast::Expr::UnaryOp(unary) if unary.op == ast::UnaryOp::USub => &unary.operand,
+        _ => expr,
+    };
+    matches!(expr, ast::Expr::Constant(constant) if matches!(
+        constant.value,
+        ast::ConstantValue::Integer(_) | ast::ConstantValue::Float(_)
+    ))
+}
+
+/// The imaginary half of that literal, which carries its own sign.
+fn is_imaginary(expr: &ast::Expr) -> bool {
+    matches!(
+        expr,
+        ast::Expr::Constant(constant) if matches!(constant.value, ast::ConstantValue::Complex { .. })
+    )
+}
+
 struct AstValidator;
 
 impl AstValidator {
@@ -433,10 +464,24 @@ impl AstValidator {
                             ))
                         }
                     }
-                    // An attribute lookup is always permitted, and a complex
-                    // literal reaches here as the operation that builds it,
-                    // whose shape the code generator checks.
-                    ast::Expr::Attribute(_) | ast::Expr::BinOp(_) | ast::Expr::UnaryOp(_) => Ok(()),
+                    // An attribute lookup is always permitted.
+                    ast::Expr::Attribute(_) => Ok(()),
+                    // A negated number and a complex literal reach here as the
+                    // operations that build them, and only in those shapes.
+                    ast::Expr::UnaryOp(unary)
+                        if unary.op == ast::UnaryOp::USub && is_number(&unary.operand) =>
+                    {
+                        Ok(())
+                    }
+                    ast::Expr::BinOp(binop)
+                        if matches!(binop.op, ast::Operator::Add | ast::Operator::Sub)
+                            && is_signed_real(&binop.left)
+                            && is_imaginary(&binop.right) =>
+                    {
+                        Ok(())
+                    }
+                    // An f-string is left for the code generator to report.
+                    ast::Expr::FString(_) => Ok(()),
                     // Upstream stops at the constant check and lets everything
                     // else through; 3.14 rejects it here, before the code
                     // generator reports the same thing as a SyntaxError.
@@ -740,6 +785,43 @@ mod tests {
         })
     }
 
+    fn literal(value: ast::ConstantValue) -> ast::Expr {
+        ast::Expr::Constant(ast::ExprConstant {
+            node_index: Default::default(),
+            range: Default::default(),
+            value,
+            kind: None,
+            invalid_type: None,
+        })
+    }
+
+    fn unary(op: ast::UnaryOp, operand: ast::Expr) -> ast::Expr {
+        ast::Expr::UnaryOp(ast::ExprUnaryOp {
+            node_index: Default::default(),
+            range: Default::default(),
+            op,
+            operand: Box::new(operand),
+        })
+    }
+
+    fn binop(left: ast::Expr, op: ast::Operator, right: ast::Expr) -> ast::Expr {
+        ast::Expr::BinOp(ast::ExprBinOp {
+            node_index: Default::default(),
+            range: Default::default(),
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        })
+    }
+
+    fn value(expr: ast::Expr) -> ast::Pattern {
+        ast::Pattern::MatchValue(ast::PatternMatchValue {
+            node_index: Default::default(),
+            range: Default::default(),
+            value: Box::new(expr),
+        })
+    }
+
     fn message(result: ValidateResult) -> String {
         result.unwrap_err().message
     }
@@ -768,6 +850,57 @@ mod tests {
             })),
         });
         assert!(validate(matched(value)).is_ok());
+    }
+
+    #[test]
+    fn match_value_takes_a_negated_number_and_a_complex_literal() {
+        let float = || literal(ast::ConstantValue::Float(1.5));
+        let imaginary = || {
+            literal(ast::ConstantValue::Complex {
+                real: 0.0,
+                imag: 2.0,
+            })
+        };
+        let text = || literal(ast::ConstantValue::Str("a".into()));
+        let accepted = [
+            unary(ast::UnaryOp::USub, constant(1)),
+            unary(ast::UnaryOp::USub, float()),
+            unary(ast::UnaryOp::USub, imaginary()),
+            binop(constant(1), ast::Operator::Add, imaginary()),
+            binop(float(), ast::Operator::Sub, imaginary()),
+            binop(
+                unary(ast::UnaryOp::USub, constant(1)),
+                ast::Operator::Add,
+                imaginary(),
+            ),
+        ];
+        for expr in accepted {
+            assert!(validate(matched(value(expr))).is_ok());
+        }
+
+        let rejected = [
+            // Only a negation, and only over a number.
+            unary(ast::UnaryOp::USub, text()),
+            unary(ast::UnaryOp::UAdd, constant(1)),
+            unary(ast::UnaryOp::Invert, constant(1)),
+            unary(ast::UnaryOp::USub, unary(ast::UnaryOp::USub, constant(1))),
+            // A real half and then an imaginary one, added or subtracted.
+            binop(imaginary(), ast::Operator::Add, constant(1)),
+            binop(constant(1), ast::Operator::Add, constant(2)),
+            binop(text(), ast::Operator::Add, imaginary()),
+            binop(constant(1), ast::Operator::Mult, imaginary()),
+            binop(
+                constant(1),
+                ast::Operator::Add,
+                unary(ast::UnaryOp::USub, imaginary()),
+            ),
+        ];
+        for expr in rejected {
+            assert_eq!(
+                message(validate(matched(value(expr)))),
+                "patterns may only match literals and attribute lookups"
+            );
+        }
     }
 
     #[test]
