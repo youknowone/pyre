@@ -2297,8 +2297,16 @@ pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<String, crate::P
 /// entry point into that same implementation.
 fn module_descr_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__getattribute__")?;
-    let name = crate::baseobjspace::text_w(args[1])?;
-    crate::baseobjspace::module_getattribute(module, name)
+    // The descriptor is reachable with any name `getattr` accepts, so it
+    // takes the same WTF-8 split rather than demanding a `&str` view a
+    // lone-surrogate name cannot give.
+    let name = crate::baseobjspace::text_wtf8_w(args[1])?;
+    match name.as_str() {
+        Ok(s) => crate::baseobjspace::module_getattribute(module, s),
+        Err(_) => unsafe {
+            crate::baseobjspace::module_getattribute_wtf8(module, args[1], name)
+        },
+    }
 }
 
 /// module.py:164-173 `Module.descr_module__dir__`.

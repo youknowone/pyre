@@ -5781,6 +5781,46 @@ pub(crate) fn module_getattribute(obj: PyObjectRef, name: &str) -> PyResult {
     }
 }
 
+/// `Module.descr_getattribute` for a name with no `&str` view.  The `&str`
+/// chain cannot spell a lone surrogate, so the terminal `__dict__` read and
+/// the PEP 562 hook are reached through their WTF-8 twins.
+pub(crate) unsafe fn module_getattribute_wtf8(
+    obj: PyObjectRef,
+    w_name: PyObjectRef,
+    name: &Wtf8,
+) -> PyResult {
+    unsafe {
+        match object_getattribute_surrogate(obj, w_name, name) {
+            Ok(value) => Ok(value),
+            Err(err) if err.kind == PyErrorKind::AttributeError => {
+                module_getattr_hook_wtf8(obj, w_name, err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+/// module.py:139-142 PEP 562 tail on the raw name object: a module-level
+/// `__getattr__` in the module's own dict is called unbound with just the
+/// name.  `err` is the miss the caller is about to report.
+unsafe fn module_getattr_hook_wtf8(
+    obj: PyObjectRef,
+    w_name: PyObjectRef,
+    err: PyError,
+) -> PyResult {
+    unsafe {
+        let w_dict = pyre_object::w_module_get_w_dict(obj);
+        if !w_dict.is_null() {
+            if let Some(mod_getattr) = finditem_str(w_dict, "__getattr__")? {
+                if !mod_getattr.is_null() {
+                    return crate::call::call_function_impl_result(mod_getattr, &[w_name]);
+                }
+            }
+        }
+        Err(err)
+    }
+}
+
 /// module.py `Module.descr_getattribute` tail.  A module-level `__getattr__`
 /// is a namespace value called with the name alone, not a type descriptor.
 unsafe fn module_getattr_hook_or_err(
