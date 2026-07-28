@@ -14508,8 +14508,8 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
     }
     let gen_obj = args[0];
     let w_type = args[1];
-    let w_val = args.get(2).copied().unwrap_or_else(w_none);
-    let w_tb = args.get(3).copied().unwrap_or_else(w_none);
+    let w_val = crate::type_methods::arg_or_none(args, 2);
+    let w_tb = crate::type_methods::arg_or_none(args, 3);
     let argc = given;
 
     // Python 3.14 deprecates only the legacy three-argument spelling; the
@@ -14632,7 +14632,7 @@ pub(crate) fn coroutine_wrapper_next_method(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn coroutine_wrapper_send_method(args: &[PyObjectRef]) -> PyResult {
     let wrapper = args.first().copied().unwrap_or(PY_NULL);
     let coroutine = unsafe { pyre_object::generator::w_coroutine_wrapper_get_coroutine(wrapper) };
-    let value = args.get(1).copied().unwrap_or_else(w_none);
+    let value = crate::type_methods::arg_or_none(args, 1);
     generator_send_ex(coroutine, value, None, None)
 }
 
@@ -14687,7 +14687,7 @@ pub(crate) fn async_generator_anext_method(args: &[PyObjectRef]) -> PyResult {
 
 pub(crate) fn async_generator_asend_method(args: &[PyObjectRef]) -> PyResult {
     let async_gen = args.first().copied().unwrap_or(PY_NULL);
-    let value = args.get(1).copied().unwrap_or_else(w_none);
+    let value = crate::type_methods::arg_or_none(args, 1);
     async_generator_init_hooks(async_gen)?;
     Ok(pyre_object::generator::w_async_gen_asend_new(
         async_gen, value,
@@ -14720,8 +14720,8 @@ pub(crate) fn async_generator_athrow_method(args: &[PyObjectRef]) -> PyResult {
     Ok(pyre_object::generator::w_async_gen_athrow_new(
         async_gen,
         args[1],
-        args.get(2).copied().unwrap_or_else(w_none),
-        args.get(3).copied().unwrap_or_else(w_none),
+        crate::type_methods::arg_or_none(args, 2),
+        crate::type_methods::arg_or_none(args, 3),
     ))
 }
 
@@ -14795,7 +14795,7 @@ pub(crate) fn async_gen_asend_next_method(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn async_gen_asend_send_method(args: &[PyObjectRef]) -> PyResult {
     async_gen_asend_do_send(
         args.first().copied().unwrap_or(PY_NULL),
-        args.get(1).copied().unwrap_or_else(w_none),
+        crate::type_methods::arg_or_none(args, 1),
     )
 }
 
@@ -14974,7 +14974,7 @@ pub(crate) fn async_gen_athrow_next_method(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn async_gen_athrow_send_method(args: &[PyObjectRef]) -> PyResult {
     async_gen_athrow_do_send(
         args.first().copied().unwrap_or(PY_NULL),
-        args.get(1).copied().unwrap_or_else(w_none),
+        crate::type_methods::arg_or_none(args, 1),
     )
 }
 

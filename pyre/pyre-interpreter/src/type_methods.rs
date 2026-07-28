@@ -41,6 +41,21 @@ pub(crate) fn args_given(args: &[PyObjectRef]) -> usize {
     if args.is_empty() { 0 } else { args.len() - 1 }
 }
 
+/// The `i`th entry of a gateway argument slice, or `None` when the caller did
+/// not pass it — the optional-positional-argument default.
+///
+/// Spelled as an explicit bounds test rather than `args.get(i)`: `slice::get`
+/// yields an `Option<&T>` whose payload is valid on only one arm, and the front
+/// end has no lowering that can build one.  Its single `Option`-synthesizing
+/// path, `emit_tagged_pair_aggregate`, writes the payload unconditionally
+/// before the consumer's discriminant switch runs (`front/mir.rs:9936`), so an
+/// out-of-bounds read would execute on the absent arm.  A plain index lowers to
+/// a native read plus an overflow `Assert` the front end strips.
+#[inline]
+pub(crate) fn arg_or_none(args: &[PyObjectRef], i: usize) -> PyObjectRef {
+    if i < args.len() { args[i] } else { w_none() }
+}
+
 /// TypeError for a method requiring exactly `n` positional arguments after
 /// the receiver, called with a different count.
 pub(crate) fn arity_exact(
