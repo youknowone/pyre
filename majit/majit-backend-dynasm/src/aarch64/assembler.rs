@@ -277,6 +277,19 @@ pub struct AssemblerARM64<'a> {
     /// consumed by a following GUARD_TRUE/GUARD_FALSE.
     /// Stores an abstract condition code (CC_* constants).
     guard_success_cc: Option<u8>,
+    /// `(result location, condition code)` of the comparison emitted by the
+    /// immediately preceding `RegAllocOp`, so a `GUARD_TRUE`/`GUARD_FALSE`
+    /// that consumes exactly that result can branch on the live NZCV flags
+    /// instead of re-testing the materialized boolean.
+    /// `assembler.py:1186-1198 _walk_operations` folds the pair by handing
+    /// `prevop` to `guard_operations[...]`, which reaches
+    /// `regalloc.py:780 guard_impl` -> `dispatch_comparison(prevop)` and
+    /// returns the comparison's own `fcond`; the guard then emits only the
+    /// conditional branch.  pyre's regalloc emits the two ops separately,
+    /// so the pairing is recognised here at emit time instead.
+    /// Cleared by every non-guard `RegAllocOp`, so only an ADJACENT pair
+    /// folds — the same `operations[i + 1]` window upstream uses.
+    pending_cmp_cc: Option<(RegLoc, u8)>,
     /// x86/assembler.py:93 target_tokens_currently_compiling parity.
     /// Keyed by descriptor pointer identity (PyPy uses Python `is`).
     target_tokens_currently_compiling: IndexMap<usize, DynamicLabel>,
@@ -473,6 +486,7 @@ impl<'a> AssemblerARM64<'a> {
             constants,
             next_slot: 0,
             guard_success_cc: None,
+            pending_cmp_cc: None,
             target_tokens_currently_compiling: IndexMap::new(),
             compiled_target_tokens: Vec::new(),
             vtable_offset,
@@ -2076,6 +2090,10 @@ impl<'a> AssemblerARM64<'a> {
                         );
                     }
                     self.regalloc_mov(src, dst);
+                    // A reload/spill/register move sits between the
+                    // comparison and its guard, so they are no longer the
+                    // adjacent pair `_walk_operations` folds.
+                    self.pending_cmp_cc = None;
                     continue;
                 }
                 RegAllocOp::Perform {
@@ -2186,6 +2204,10 @@ impl<'a> AssemblerARM64<'a> {
         fail_index: u32,
         ops: &[Op],
     ) {
+        // Only an ADJACENT comparison/guard pair may share NZCV; anything
+        // emitted in between invalidates the record (the comparison arms
+        // below re-arm it).
+        self.pending_cmp_cc = None;
         match op.opcode {
             OpCode::IntAddOvf => {
                 // RPython aarch64/opassembler.py int_add_impl parity —
@@ -2314,18 +2336,21 @@ impl<'a> AssemblerARM64<'a> {
                 if let Some(Loc::Reg(r)) = result_loc {
                     let cc = Self::opcode_to_cc(op.opcode);
                     self.emit_setcc(cc, r.value);
+                    self.pending_cmp_cc = Some((*r, cc));
                 }
             }
             OpCode::IntIsTrue => {
                 if let (Some(src), Some(Loc::Reg(r))) = (arglocs.first(), result_loc) {
                     self.emit_test_loc(src);
                     self.emit_setcc(CC_NE, r.value);
+                    self.pending_cmp_cc = Some((*r, CC_NE));
                 }
             }
             OpCode::IntIsZero => {
                 if let (Some(src), Some(Loc::Reg(r))) = (arglocs.first(), result_loc) {
                     self.emit_test_loc(src);
                     self.emit_setcc(CC_E, r.value);
+                    self.pending_cmp_cc = Some((*r, CC_E));
                 }
             }
             OpCode::UintMulHigh => {
@@ -3424,15 +3449,25 @@ impl<'a> AssemblerARM64<'a> {
             OpCode::GuardTrue | OpCode::VecGuardTrue | OpCode::GuardNonnull => {
                 // arglocs[0] = condition location
                 if let Some(loc) = arglocs.first() {
-                    self.emit_test_loc(loc);
-                    self.guard_success_cc = Some(CC_NE);
+                    match self.take_pending_cmp_cc(loc) {
+                        Some(cc) => self.guard_success_cc = Some(cc),
+                        None => {
+                            self.emit_test_loc(loc);
+                            self.guard_success_cc = Some(CC_NE);
+                        }
+                    }
                 }
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
             OpCode::GuardFalse | OpCode::VecGuardFalse | OpCode::GuardIsnull => {
                 if let Some(loc) = arglocs.first() {
-                    self.emit_test_loc(loc);
-                    self.guard_success_cc = Some(CC_E);
+                    match self.take_pending_cmp_cc(loc) {
+                        Some(cc) => self.guard_success_cc = Some(invert_cc(cc)),
+                        None => {
+                            self.emit_test_loc(loc);
+                            self.guard_success_cc = Some(CC_E);
+                        }
+                    }
                 }
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
@@ -3801,6 +3836,21 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// Guard with faillocs — emit conditional jump and store faillocs on descr.
+    /// The comparison NZCV flags are still live iff the immediately
+    /// preceding `RegAllocOp` was a comparison writing exactly `loc` — the
+    /// `operations[i + 1]` adjacency `assembler.py:1186 _walk_operations`
+    /// requires before folding a comparison into its guard.  Every other
+    /// `RegAllocOp` clears the record, so nothing in between can have
+    /// clobbered the flags.  Returns the condition under which the
+    /// comparison was TRUE.
+    fn take_pending_cmp_cc(&mut self, loc: &Loc) -> Option<u8> {
+        let (cmp_reg, cc) = self.pending_cmp_cc.take()?;
+        let Loc::Reg(guard_reg) = loc else {
+            return None;
+        };
+        (cmp_reg.value == guard_reg.value && cmp_reg.is_xmm == guard_reg.is_xmm).then_some(cc)
+    }
+
     fn implement_guard_with_faillocs(
         &mut self,
         op: &Op,
