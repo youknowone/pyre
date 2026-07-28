@@ -4277,8 +4277,16 @@ pub fn getdict(obj: PyObjectRef) -> PyResult {
             if !existing.is_null() {
                 return Ok(existing);
             }
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(obj);
             let w_dict = pyre_object::w_dict_new();
-            unsafe { pyre_object::floatobject::w_float_setdict(obj, w_dict) };
+            unsafe {
+                pyre_object::floatobject::w_float_setdict(
+                    pyre_object::gc_roots::shadow_stack_get(root_base),
+                    w_dict,
+                )
+            };
             return Ok(w_dict);
         }
     }
@@ -4291,8 +4299,16 @@ pub fn getdict(obj: PyObjectRef) -> PyResult {
             if !existing.is_null() {
                 return Ok(existing);
             }
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(obj);
             let w_dict = pyre_object::w_dict_new();
-            unsafe { pyre_object::complexobject::w_complex_setdict(obj, w_dict) };
+            unsafe {
+                pyre_object::complexobject::w_complex_setdict(
+                    pyre_object::gc_roots::shadow_stack_get(root_base),
+                    w_dict,
+                )
+            };
             return Ok(w_dict);
         }
     }

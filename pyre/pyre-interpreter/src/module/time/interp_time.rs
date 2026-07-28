@@ -1095,11 +1095,11 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             }
             rendered.extend_from_slice(&render_segment(segment)?);
         }
-        Ok(w_str_from_wtf8(
-            rustpython_wtf8::Wtf8Buf::from_bytes(rendered).unwrap_or_else(|b| {
-                rustpython_wtf8::Wtf8Buf::from_string(String::from_utf8_lossy(&b).into_owned())
-            }),
-        ))
+        // Directives such as %Z/%a render in the LC_TIME locale, so the
+        // bytes need not be UTF-8.  Decode with surrogateescape to preserve
+        // each byte as a lone surrogate rather than raising, mirroring
+        // str_decode_locale_surrogateescape.
+        Ok(crate::typedef::charp2uni(&rendered))
     }
     #[cfg(windows)]
     {

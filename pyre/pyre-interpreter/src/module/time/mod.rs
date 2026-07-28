@@ -107,10 +107,13 @@ def get_clock_info(name):
             crate::module_ns_store(ns, "CLOCK_THREAD_CPUTIME_ID",
                 pyre_object::w_int_new(libc::CLOCK_THREAD_CPUTIME_ID as i64));
         }
-        #[cfg(unix)]
+        // `Module.startup` calls `_init_timezone`, and exposes `tzset` on
+        // every POSIX build.  Both read host timezone state ($TZ,
+        // /etc/localtime) outside the controller, so under sandbox the four
+        // timezone attributes stay at the UTC interplevel defaults and tzset
+        // is not exposed — matching the tz-dependent stubs installed below.
+        #[cfg(all(unix, not(feature = "sandbox")))]
         {
-            // PyPy `Module.startup` calls `_init_timezone`, and exposes
-            // `tzset` on every POSIX build.
             t::init_timezone(ns);
             crate::module_ns_store(
                 ns,

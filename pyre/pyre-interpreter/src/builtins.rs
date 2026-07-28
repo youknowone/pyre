@@ -3941,28 +3941,6 @@ pub(crate) fn type_new_take_qualname(w_type: PyObjectRef, ns: PyObjectRef) -> cr
     Ok(pyre_object::w_none())
 }
 
-/// Copy a real dict without narrowing its key strategy to strings.  Type
-/// namespaces deliberately retain non-string keys (while warning); lookups
-/// may later compare such a key and execute user code.
-fn copy_type_namespace_entries(src: PyObjectRef, dst: PyObjectRef) -> bool {
-    unsafe {
-        let items = pyre_object::w_dict_items(src);
-        let has_non_string = items.iter().any(|(key, _)| !pyre_object::is_str(*key));
-        let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = pyre_object::gc_roots::shadow_stack_len();
-        for &(key, value) in &items {
-            pyre_object::gc_roots::pin_root(key);
-            pyre_object::gc_roots::pin_root(value);
-        }
-        for index in 0..items.len() {
-            let key = pyre_object::gc_roots::shadow_stack_get(root_base + index * 2);
-            let value = pyre_object::gc_roots::shadow_stack_get(root_base + index * 2 + 1);
-            pyre_object::w_dict_store(dst, key, value);
-        }
-        has_non_string
-    }
-}
-
 fn type_descr_new_with_metaclass(
     args: &[PyObjectRef],
     w_metaclass: PyObjectRef,
@@ -4241,11 +4219,14 @@ fn type_descr_new_with_metaclass(
 
         let _dict_root = pyre_object::gc_roots::push_roots();
         let dict_root = pyre_object::gc_roots::shadow_stack_len();
-        let dict_obj = pyre_object::w_dict_new();
-        pyre_object::gc_roots::pin_root(dict_obj);
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
-        copy_type_namespace_entries(class_ns, dict_obj);
+        // Clone the assembled namespace preserving its cached key hashes,
+        // mirroring the final `PyDict_Copy` for the type's `__dict__`.  A
+        // per-key reinsert would hash every non-string key again, running a
+        // side-effecting `__hash__` an extra time (and dropping any error it
+        // raised, since the store cannot propagate one).
+        let dict_obj = unsafe { pyre_object::w_dict_copy(class_ns) };
+        pyre_object::gc_roots::pin_root(dict_obj);
         let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
         let w_type = pyre_object::w_type_new(name, w_effective_bases, dict_obj as *mut u8);
         type_new_take_qualname(w_type, dict_obj)?;

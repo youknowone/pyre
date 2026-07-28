@@ -1211,7 +1211,10 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // gc.py:642). They are NewWithVtable allocation targets so the
     // payload size must be the actual struct size, and they sit one
     // level below the OBJECT root (`int.__bases__ == (object,)`,
-    // `float.__bases__ == (object,)`).
+    // `float.__bases__ == (object,)`). W_IntObject is a pure leaf;
+    // W_FloatObject additionally traces `w_class`/`w_dict`/`w_slots`, the
+    // last handing slot-value ownership to the list's custom tracer, so it
+    // registers with the gc-pointer offsets below.
     let w_int_tid = gc.register_type(TypeInfo::object_subclass(
         std::mem::size_of::<W_IntObject>(),
         object_tid,
@@ -2356,13 +2359,14 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         w_object_object_tid,
         pyre_object::objectobject::W_OBJECT_OBJECT_GC_TYPE_ID,
     );
-    // W_ComplexObject carries two f64s after the `PyObject` header and
-    // no managed pointers — a GC leaf like W_FloatObject.  Registered
-    // immediately after the last hardcoded-constant tid (W_ObjectObject = 53)
-    // so its fixed id 54 precedes the auto-numbered `#[pyre_class]` /
-    // per-ExcKind tids registered below.  Bound to `COMPLEX_TYPE` so the
-    // collector reads the correct size + leaf trace when a managed
-    // container holds a complex.
+    // W_ComplexObject carries two f64s after the `PyObject` header plus
+    // three traced edges — `w_class`, `w_dict`, and the `w_slots` list
+    // whose custom tracer owns the slot values — mirroring W_FloatObject.
+    // Registered immediately after the last hardcoded-constant tid
+    // (W_ObjectObject = 53) so its fixed id 54 precedes the auto-numbered
+    // `#[pyre_class]` / per-ExcKind tids registered below.  Bound to
+    // `COMPLEX_TYPE` so the collector reads the correct size + trace when a
+    // managed container holds a complex.
     let w_complex_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
         std::mem::size_of::<pyre_object::complexobject::W_ComplexObject>(),
         object_tid,

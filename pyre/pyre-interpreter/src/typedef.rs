@@ -2945,11 +2945,13 @@ fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // allocation carries an empty backing dict for `__init__` to fill.
     let instance = pyre_object::w_instance_new(cls);
     let backing = pyre_object::w_dict_new();
-    let installed = crate::type_methods::set_dict_backing(instance, backing);
-    debug_assert!(
-        installed,
-        "dict subclass layout has no mapping payload slot"
-    );
+    if !crate::type_methods::set_dict_backing(instance, backing) {
+        // Surface the layout invariant violation at construction rather than
+        // letting every later mapping operation raise a confusing TypeError.
+        return Err(crate::PyError::runtime_error(
+            "dict subclass layout has no mapping payload slot",
+        ));
+    }
     Ok(instance)
 }
 /// boolobject.py descr_new — bool.__new__(cls, obj=False)
@@ -12098,18 +12100,9 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
         )
     };
     // CPython 3.14 `PyMemberDescr_Type` metadata.  PyPy's Member typedef
-    // stops at __name__/__objclass__; these four entries are the selected
+    // stops at __name__/__objclass__; __doc__ is registered above (reporting
+    // the real `member_get_doc`) and these remaining entries are the selected
     // 3.14 surface.
-    let doc_getter =
-        make_builtin_function_with_arity("__doc__", |_args| Ok(pyre_object::w_none()), 2);
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__doc__",
-            make_getset_descriptor_named(doc_getter, "__doc__"),
-        )
-    };
-
     let qualname_getter = make_builtin_function_with_arity(
         "__qualname__",
         |args| {

@@ -1720,14 +1720,37 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if let Some(w_sizeof) = unsafe {
                         crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__sizeof__")
                     } {
-                        return unsafe {
+                        let w_size = unsafe {
                             crate::baseobjspace::get_and_call_function(
                                 w_sizeof,
                                 w_obj,
                                 w_type.as_ptr(),
                                 &[],
                             )
-                        };
+                        }?;
+                        // getsizeof must yield a non-negative integer: a
+                        // non-int result is rejected like a failed index
+                        // coercion, and a negative one (including a bignum)
+                        // raises ValueError.
+                        if unsafe { !pyre_object::is_int(w_size) } {
+                            return Err(crate::PyError::type_error(format!(
+                                "'{}' object cannot be interpreted as an integer",
+                                crate::type_methods::arg_type_name(w_size)
+                            )));
+                        }
+                        let negative = crate::baseobjspace::is_true(
+                            crate::objspace::descroperation::compare(
+                                w_size,
+                                pyre_object::w_int_new(0),
+                                crate::objspace::descroperation::CompareOp::Lt,
+                            )?,
+                        )?;
+                        if negative {
+                            return Err(crate::PyError::value_error(
+                                "__sizeof__() should return >= 0",
+                            ));
+                        }
+                        return Ok(w_size);
                     }
                 }
                 match args.get(1).copied() {
