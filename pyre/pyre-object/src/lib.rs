@@ -54,6 +54,7 @@ pub mod rbigint;
 pub mod rutf8;
 pub mod setobject;
 pub mod sliceobject;
+pub mod slots;
 pub mod special;
 pub mod specialisedtupleobject;
 pub mod tagged_int;

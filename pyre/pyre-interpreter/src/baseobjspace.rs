@@ -4421,6 +4421,20 @@ pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str, index: u32) -> Resul
     Ok(unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(w_dict, name) })
 }
 
+/// `space.isinstance_w(w_dict, space.w_dict)` — the dict-or-dict-subclass
+/// gate every typed-field `setdict` arm shares, raising the standard
+/// `__dict__` TypeError otherwise.
+fn require_dict_for_setdict(w_dict: PyObjectRef) -> Result<(), PyError> {
+    let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+    if unsafe { isinstance_w(w_dict, w_dict_type) } {
+        return Ok(());
+    }
+    Err(PyError::type_error(format!(
+        "__dict__ must be set to a dictionary, not a '{}'",
+        object_functionstr_type_name(w_dict),
+    )))
+}
+
 /// interpreter/baseobjspace.py:70-73 W_Root.setdict(space, w_dict).
 ///
 /// ```python
@@ -4441,25 +4455,13 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
     }
     // function.py:683-688 StaticMethod.setdict.
     if unsafe { pyre_object::function::is_staticmethod(obj) } {
-        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-        if !unsafe { isinstance_w(w_dict, w_dict_type) } {
-            return Err(PyError::type_error(format!(
-                "__dict__ must be set to a dictionary, not a '{}'",
-                object_functionstr_type_name(w_dict),
-            )));
-        }
+        require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::function::w_staticmethod_setdict(obj, w_dict) };
         return Ok(());
     }
     // function.py:731-736 ClassMethod.setdict.
     if unsafe { pyre_object::function::is_classmethod(obj) } {
-        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-        if !unsafe { isinstance_w(w_dict, w_dict_type) } {
-            return Err(PyError::type_error(format!(
-                "__dict__ must be set to a dictionary, not a '{}'",
-                object_functionstr_type_name(w_dict),
-            )));
-        }
+        require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::function::w_classmethod_setdict(obj, w_dict) };
         return Ok(());
     }
@@ -4477,46 +4479,22 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
         return Ok(());
     }
     if unsafe { pyre_object::bytesobject::is_bytes(obj) } {
-        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-        if !unsafe { isinstance_w(w_dict, w_dict_type) } {
-            return Err(PyError::type_error(format!(
-                "__dict__ must be set to a dictionary, not a '{}'",
-                object_functionstr_type_name(w_dict),
-            )));
-        }
+        require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::bytesobject::w_bytes_setdict(obj, w_dict) };
         return Ok(());
     }
     if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
-        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-        if !unsafe { isinstance_w(w_dict, w_dict_type) } {
-            return Err(PyError::type_error(format!(
-                "__dict__ must be set to a dictionary, not a '{}'",
-                object_functionstr_type_name(w_dict),
-            )));
-        }
+        require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::bytearrayobject::w_bytearray_setdict(obj, w_dict) };
         return Ok(());
     }
     if unsafe { pyre_object::is_float(obj) } {
-        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-        if !unsafe { isinstance_w(w_dict, w_dict_type) } {
-            return Err(PyError::type_error(format!(
-                "__dict__ must be set to a dictionary, not a '{}'",
-                object_functionstr_type_name(w_dict),
-            )));
-        }
+        require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::floatobject::w_float_setdict(obj, w_dict) };
         return Ok(());
     }
     if unsafe { pyre_object::is_complex(obj) } {
-        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-        if !unsafe { isinstance_w(w_dict, w_dict_type) } {
-            return Err(PyError::type_error(format!(
-                "__dict__ must be set to a dictionary, not a '{}'",
-                object_functionstr_type_name(w_dict),
-            )));
-        }
+        require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::complexobject::w_complex_setdict(obj, w_dict) };
         return Ok(());
     }
@@ -6324,9 +6302,63 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // but that descriptor's mapdict layout does not apply to the
             // class object and must not shadow `type.__dict__`.
             if name == "__dict__" {
+                // typeobject.py:811-819 — the metatype MRO is consulted first,
+                // so a metaclass that overrides `__dict__`
+                // (`Meta.__dict__ = property(...)`) supersedes the class's
+                // canonical namespace.  The canonical entry is `type`'s own
+                // `__dict__` getset (owner `type`), whose getter already returns
+                // the class proxy handled by the fallback below; every other
+                // metatype defining `__dict__` is a genuine override to invoke.
+                // (Owner layout typedef cannot narrow this: every class,
+                // including `type` and user metaclasses, chains its layout
+                // typedef to `object`'s `INSTANCE_TYPE`, so `type`'s canonical
+                // getset is told apart by owner identity, not by layout.)
+                for w_metaclass in w_metaclasses.iter().flatten() {
+                    let w_metaclass = *w_metaclass;
+                    if !is_type(w_metaclass) {
+                        continue;
+                    }
+                    if let Some((owner, descr)) = lookup_where(w_metaclass, name) {
+                        // A `__dict__` descriptor is a genuine metatype override
+                        // only when its owner is a proper metaclass (a subclass
+                        // of `type`).  A plain base mixed into the metaclass MRO
+                        // ahead of `type` (`class Meta(Base, type)`) contributes
+                        // an *instance* `__dict__` getset that does not apply to
+                        // a class object; fall through to the canonical proxy for
+                        // it, as for `type`'s own getset (owner `type`).
+                        if !std::ptr::eq(owner, w_type_type)
+                            && issubtype_w(owner, w_type_type)
+                            && is_data_descr(descr)
+                        {
+                            match get(descr, obj, w_metaclass) {
+                                Ok(Some(result)) => return Ok(result),
+                                Ok(None) => {}
+                                Err(e) => {
+                                    return type_getattr_hook_or_err(
+                                        obj,
+                                        &w_metaclasses,
+                                        name,
+                                        e,
+                                        call_getattr,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                // No metatype descriptor overrides `__dict__`; a real type
+                // always exposes its canonical namespace, so a null pointer is
+                // an unfinished bootstrap layout rather than a user-visible
+                // mapping — surface it instead of a throwaway writable proxy.
                 let dict_ptr = w_type_get_dict_ptr(obj);
+                debug_assert!(
+                    !dict_ptr.is_null(),
+                    "type object is missing its canonical __dict__"
+                );
                 if dict_ptr.is_null() {
-                    return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
+                    return Err(PyError::runtime_error(
+                        "type object has no canonical __dict__",
+                    ));
                 }
                 return Ok(pyre_object::w_dict_proxy_new(dict_ptr as PyObjectRef));
             }
@@ -9858,6 +9890,14 @@ pub fn type_immutable_attr_raise_is_stable(obj: PyObjectRef, name: &str, is_dele
 /// `object.__setattr__` and as the default path in `setattr`.
 pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
+    // `W_BaseException` carries its instance dict on the typed `w_dict` slot but
+    // installs no `__dict__` getset in its namespace, so the descriptor walk
+    // below finds no exception `__dict__` setter.  A plain base mixed into an
+    // exception (`class E(Exception, Base)`) does contribute an *instance*
+    // `__dict__` getset (`Base`'s), whose mapdict layout is incompatible with
+    // the exception layout and rejects the receiver — so the walk must not reach
+    // it.  Route exception `__dict__` assignment straight to `setdict`, ahead of
+    // that walk (`interp_exceptions.py:227-231 W_BaseException.setdict`).
     if name == "__dict__" && unsafe { pyre_object::is_exception(obj) } {
         setdict(obj, value)?;
         return Ok(w_none());

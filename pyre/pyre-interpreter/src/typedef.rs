@@ -573,7 +573,7 @@ pub fn init_typeobjects() {
         // CPython `method_descriptor`, backed by PyPy's immutable
         // FunctionWithFixedCode payload.
         let method_descriptor_type =
-            new_typeobject_with_base("method_descriptor", init_function_type_common, object_type);
+            new_typeobject_with_base("method_descriptor", init_descriptor_type_common, object_type);
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(method_descriptor_type, false);
             pyre_object::w_type_set_disallow_instantiation(method_descriptor_type);
@@ -591,7 +591,7 @@ pub fn init_typeobjects() {
         // are callable, but are not Python functions. Their Rust payload is
         // the immutable BuiltinCode-backed Function carrier.
         let slot_wrapper_type =
-            new_typeobject_with_base("wrapper_descriptor", init_function_type_common, object_type);
+            new_typeobject_with_base("wrapper_descriptor", init_descriptor_type_common, object_type);
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(slot_wrapper_type, false);
             pyre_object::w_type_set_disallow_instantiation(slot_wrapper_type);
@@ -10167,6 +10167,58 @@ fn function_receiver(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate:
     Ok(obj)
 }
 
+/// `function.py:464-470 descr_function_get` — the descriptor bind shared by
+/// the `function`, `method_descriptor`, and `wrapper_descriptor` carriers.
+/// Class access (`obj` is None) returns the bare carrier; instance access
+/// binds it into a `method`.
+fn descr_carrier_get(args: &[PyObjectRef]) -> crate::PyResult {
+    let w_function = function_receiver(
+        args.first().copied().unwrap_or(pyre_object::PY_NULL),
+        "__get__",
+    )?;
+    let w_obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    let w_cls = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+    // The class-access case (`w_obj == None and w_cls is some type`) returns
+    // the bare carrier — that keeps `cls.func` callable as a plain function
+    // rather than a bound method.
+    let cls_is_none = unsafe { w_cls.is_null() || pyre_object::is_none(w_cls) };
+    let obj_is_none = unsafe { w_obj.is_null() || pyre_object::is_none(w_obj) };
+    // Python 3.14 `func_descr_get`: omitting `type` is equivalent to passing
+    // None, but `__get__(None, None)` is invalid.
+    if obj_is_none && cls_is_none {
+        return Err(crate::PyError::type_error("__get__(None, None) is invalid"));
+    }
+    if obj_is_none {
+        Ok(w_function)
+    } else {
+        // function.py:470 Method(space, w_function, w_obj, w_cls), with the
+        // inferred owner when `type` is omitted.
+        let owner = if cls_is_none {
+            r#type(w_obj).map_or(pyre_object::PY_NULL, |p| p.as_ptr())
+        } else {
+            w_cls
+        };
+        Ok(pyre_object::w_method_new(w_function, w_obj, owner))
+    }
+}
+
+/// `init_function_type_common` plus the descriptor `__get__` that
+/// `method_descriptor`/`wrapper_descriptor` expose. Unlike `builtin_function`
+/// (already bound, so PyPy deletes its `__get__`), these carriers are
+/// descriptors: `Type.method.__get__` must bind, and exposing `__get__` keeps
+/// `inspect.ismethoddescriptor` / `getattr_static` from mistaking them for
+/// plain callables and recursing on `type(obj).__call__`.
+fn init_descriptor_type_common(ns: PyObjectRef) {
+    init_function_type_common(ns);
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__get__",
+            make_builtin_function("__get__", descr_carrier_get),
+        )
+    };
+}
+
 fn init_function_type_common(ns: PyObjectRef) {
     // `pypy/interpreter/typedef.py:802 __doc__ = getset_func_doc` —
     // `getset_func_doc = GetSetProperty(Function.fget_func_doc,
@@ -10898,46 +10950,7 @@ fn init_function_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__get__",
-            make_builtin_function("__get__", |args| {
-                let w_function = function_receiver(
-                    args.first().copied().unwrap_or(pyre_object::PY_NULL),
-                    "__get__",
-                )?;
-                let w_obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                let w_cls = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
-                // function.py:464-470 descr_function_get
-                //
-                //   asking_for_function = (
-                //       space.is_w(w_cls, space.w_None)
-                //       or (
-                //           space.is_w(w_obj, space.w_None)
-                //           and not space.is_w(w_cls, space.type(space.w_None))
-                //       )
-                //   )
-                //
-                // The class-access case (`w_obj == None and w_cls is some type`)
-                // returns the bare function — that's how `cls.func` stays callable
-                // as a plain function rather than a bound method.
-                let cls_is_none = unsafe { w_cls.is_null() || pyre_object::is_none(w_cls) };
-                let obj_is_none = unsafe { w_obj.is_null() || pyre_object::is_none(w_obj) };
-                // Python 3.14 `func_descr_get`: omitting `type` is equivalent
-                // to passing None, but `__get__(None, None)` is invalid.
-                if obj_is_none && cls_is_none {
-                    return Err(crate::PyError::type_error("__get__(None, None) is invalid"));
-                }
-                if obj_is_none {
-                    Ok(w_function)
-                } else {
-                    // function.py:470 Method(space, w_function, w_obj, w_cls),
-                    // with CPython's inferred owner when `type` is omitted.
-                    let owner = if cls_is_none {
-                        r#type(w_obj).map_or(pyre_object::PY_NULL, |p| p.as_ptr())
-                    } else {
-                        w_cls
-                    };
-                    Ok(pyre_object::w_method_new(w_function, w_obj, owner))
-                }
-            }),
+            make_builtin_function("__get__", descr_carrier_get),
         )
     };
 }

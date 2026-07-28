@@ -2394,13 +2394,12 @@ mod tests {
         assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 7777);
     }
 
-    /// 3-arg `pow(proxy, b, c)` reaches `space.pow3`, which consults only the
-    /// forward `__pow__` on the base — the reflected `__rpow__` is not tried
-    /// for ternary power (descroperation.py:450). A forward `NotImplemented`
-    /// therefore raises the three-operand type error rather than falling
-    /// through to the right operand's `__rpow__`.
+    /// 3-arg `pow(proxy, b, c)` reaches `space.pow3`. Python 3.14 extends
+    /// reflected-power dispatch to the ternary form: when the forward
+    /// `__pow__` returns `NotImplemented`, the right operand's `__rpow__` is
+    /// tried with `(base, modulus)` after its receiver rather than raising.
     #[test]
-    fn test_proxy_pow_three_arg_does_not_use_rpow() {
+    fn test_proxy_pow_three_arg_uses_rpow() {
         let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let lhs_type = crate::typedef::make_builtin_type("Pow3Lhs", |ns| {
@@ -2419,6 +2418,8 @@ mod tests {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "__rpow__",
+                    // __rpow__(self, base, modulus) — return the modulus so the
+                    // assertion proves the ternary argument reached the slot.
                     crate::make_builtin_function("__rpow__", |args| Ok(args[2])),
                 )
             };
@@ -2426,12 +2427,8 @@ mod tests {
         let lhs = pyre_object::objectobject::w_instance_new(lhs_type);
         let rhs = pyre_object::objectobject::w_instance_new(rhs_type);
         let proxy_lhs = W_Proxy_new(lhs, PY_NULL);
-        let err = proxy_pow(&[proxy_lhs, rhs, pyre_object::w_int_new(99)]).unwrap_err();
-        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
-        assert_eq!(
-            err.message,
-            "unsupported operand type(s) for pow(): 'Pow3Lhs', 'Pow3Rhs', 'int'"
-        );
+        let result = proxy_pow(&[proxy_lhs, rhs, pyre_object::w_int_new(7)]).unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 7);
     }
 
     /// `divmod(proxy, rhs)` where `lhs.__divmod__` returns NotImplemented

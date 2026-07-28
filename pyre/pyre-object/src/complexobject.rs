@@ -69,6 +69,8 @@ pub fn w_complex_subclass_new(real: f64, imag: f64) -> PyObjectRef {
         },
         real,
         imag,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_COMPLEX_GC_TYPE_ID, W_COMPLEX_OBJECT_SIZE);
     if raw.is_null() {
@@ -110,40 +112,24 @@ pub unsafe fn w_complex_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
+/// Address of `W_ComplexObject::w_slots` for the shared slot helpers.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ComplexObject`.
+unsafe fn complex_slots_field(obj: PyObjectRef) -> *mut PyObjectRef {
+    unsafe { &mut (*(obj as *mut W_ComplexObject)).w_slots }
+}
+
 pub unsafe fn w_complex_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-    let slots = unsafe { (*(obj as *const W_ComplexObject)).w_slots };
-    if slots.is_null() {
-        return None;
-    }
-    unsafe { crate::listobject::w_list_getitem(slots, index as i64) }
-        .filter(|value| !value.is_null())
+    unsafe { crate::slots::slot_get(obj, index, complex_slots_field) }
 }
 
 pub unsafe fn w_complex_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
-    let mut slots = unsafe { (*(obj as *const W_ComplexObject)).w_slots };
-    if slots.is_null() {
-        slots = crate::listobject::w_list_new(vec![PY_NULL; index + 1]);
-        unsafe { (*(obj as *mut W_ComplexObject)).w_slots = slots };
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
-    } else {
-        while unsafe { crate::listobject::w_list_len(slots) } <= index {
-            unsafe { crate::listobject::w_list_append(slots, PY_NULL) };
-        }
-    }
-    unsafe { crate::listobject::w_list_setitem(slots, index as i64, value) };
+    unsafe { crate::slots::slot_set(obj, index, value, complex_slots_field) }
 }
 
 pub unsafe fn w_complex_slot_del(obj: PyObjectRef, index: usize) -> bool {
-    let slots = unsafe { (*(obj as *const W_ComplexObject)).w_slots };
-    if slots.is_null() || unsafe { crate::listobject::w_list_len(slots) } <= index {
-        return false;
-    }
-    let present = unsafe { crate::listobject::w_list_getitem(slots, index as i64) }
-        .is_some_and(|value| !value.is_null());
-    if present {
-        unsafe { crate::listobject::w_list_setitem(slots, index as i64, PY_NULL) };
-    }
-    present
+    unsafe { crate::slots::slot_del(obj, index, complex_slots_field) }
 }
 
 #[cfg(test)]
