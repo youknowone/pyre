@@ -21287,7 +21287,10 @@ fn set_method_symmetric_difference_update(
 /// Walked one index at a time through `w_set_key_at` and probed with
 /// `w_set_contains_key_checked`, the same shape as `set_intersect_update`, so
 /// the merge loop stays traced and only the per-key table probe/insert cross a
-/// residual boundary. The two sets are old-gen allocations that keep their
+/// residual boundary. The two operands are reached from the frame and stay
+/// rooted, but `d_new` is only reachable from this frame's Rust locals; a probe
+/// `eq_w` that triggers a collection would sweep the unrooted body, so it is
+/// pinned for the whole merge. The set bodies are old-gen and keep their
 /// addresses across a collection, but their elements are young and move, so
 /// each key is re-read from the table the collector rewrites rather than
 /// carried across the `eq_w` a bucket probe can run.
@@ -21296,7 +21299,9 @@ fn set_symmetric_difference_storage(
     w_other: pyre_object::PyObjectRef,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
         let d_new = pyre_object::w_set_new();
+        pyre_object::gc_roots::pin_root(d_new);
         for (walk, probe) in [(w_other, w_set), (w_set, w_other)] {
             let mut i = 0;
             while let Some(key) = pyre_object::w_set_key_at(walk, i) {
