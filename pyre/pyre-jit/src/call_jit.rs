@@ -5382,13 +5382,13 @@ pub extern "C" fn bh_store_global_fn(frame_ptr: i64, w_name: i64, value: i64) ->
 pub extern "C" fn bh_load_const_fn(w_code_ptr: i64, consti: i64) -> i64 {
     // `getconstant_w(index) -> co_consts_w[index]`: read the one shared object
     // off the virtualizable `pycode`, exactly as the interpreter does.
-    let w_code = unsafe {
+    let w_const = unsafe {
         pyre_interpreter::pycode::w_code_const(
             w_code_ptr as pyre_object::PyObjectRef,
             consti as usize,
         )
     };
-    w_code as i64
+    w_const as i64
 }
 
 /// Box a raw integer into a PyObject (w_int_new wrapper).

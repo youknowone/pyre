@@ -874,7 +874,7 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         kind @ OpKind::Call {
             target: crate::model::CallTarget::SyntheticTransparentCtor { .. },
             ..
-        } => !is_elided_unit_variant_ctor(kind) && !is_array_aggregate_ctor(kind),
+        } => !is_elided_unit_variant_ctor(kind),
         // A string-literal define-op pre-folds to `Constant('text')`
         // and emits no op — a Constant raises nothing.  Matched before
         // the general `Call` arm, same as the unit-variant elision.

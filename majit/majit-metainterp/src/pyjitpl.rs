@@ -1666,15 +1666,21 @@ impl<M: Clone> MetaInterp<M> {
     /// `terminal_exit_layouts` storage slots once updates the pool for
     /// every observer.
     pub fn walk_rd_consts_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
-        fn visit_storage(
-            storage: Option<&Arc<ResumeStorage>>,
+        fn visit_pool(
+            pool: Option<&Arc<majit_ir::SharedConstPool>>,
+            visited: &mut Vec<usize>,
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
-            let Some(s) = storage else { return };
+            let Some(pool) = pool else { return };
+            let identity = Arc::as_ptr(pool) as usize;
+            if visited.contains(&identity) {
+                return;
+            }
+            visited.push(identity);
             // SAFETY: pyre is single-threaded and the minor-collection
             // walker is the only writer; concurrent readers run outside
             // GC cycles.
-            let consts = unsafe { s.rd_consts_mut_for_gc() };
+            let consts = unsafe { pool.as_mut_vec_for_gc() };
             for c in consts.iter_mut() {
                 if let Const::Ref(slot) = c {
                     visitor(slot);
@@ -1682,13 +1688,34 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
+        let mut visited = Vec::new();
         for entry in self.compiled_loops.values_mut() {
             for trace in entry.traces.values_mut() {
                 for layout in trace.exit_layouts.values_mut() {
-                    visit_storage(layout.storage.as_ref(), &mut visitor);
+                    visit_pool(
+                        layout.storage.as_ref().map(|storage| &storage.rd_consts),
+                        &mut visited,
+                        &mut visitor,
+                    );
+                    let descr_pool = layout
+                        .descr
+                        .as_ref()
+                        .and_then(|descr| descr.as_fail_descr())
+                        .and_then(|fd| fd.rd_consts_arc());
+                    visit_pool(descr_pool.as_ref(), &mut visited, &mut visitor);
                 }
                 for layout in trace.terminal_exit_layouts.values_mut() {
-                    visit_storage(layout.storage.as_ref(), &mut visitor);
+                    visit_pool(
+                        layout.storage.as_ref().map(|storage| &storage.rd_consts),
+                        &mut visited,
+                        &mut visitor,
+                    );
+                    let descr_pool = layout
+                        .descr
+                        .as_ref()
+                        .and_then(|descr| descr.as_fail_descr())
+                        .and_then(|fd| fd.rd_consts_arc());
+                    visit_pool(descr_pool.as_ref(), &mut visited, &mut visitor);
                 }
             }
             for tt in entry.front_target_tokens.iter_mut() {
@@ -20183,10 +20210,7 @@ mod tests {
             .get_resume_storage(green_key, trace_id, fail_index)
             .expect("storage should be present");
         assert_eq!(storage.rd_numb, vec![7, 8, 9]);
-        assert_eq!(
-            unsafe { (*storage.rd_consts.get()).clone() },
-            vec![majit_ir::Const::Int(11)]
-        );
+        assert_eq!(storage.rd_consts_snapshot(), vec![majit_ir::Const::Int(11)]);
         assert_eq!(
             meta.get_recovery_slot_types(green_key, trace_id, fail_index),
             Some(vec![Type::Ref])
@@ -20859,7 +20883,7 @@ mod tests {
             .as_ref()
             .expect("retrace storage should be present");
         assert_eq!(storage.rd_numb, expected_rd_numb);
-        assert!(unsafe { (*storage.rd_consts.get()).is_empty() });
+        assert!(storage.rd_consts().is_empty());
         assert!(storage.rd_virtuals.is_empty());
     }
 

@@ -740,6 +740,12 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
         (Some(lhs), Some(rhs)) => (lhs, rhs),
         _ => return Ok(None),
     };
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(lhs_obj)
+            || pyre_object::tagged_int::is_tagged_int(rhs_obj))
+    {
+        return Ok(None);
+    }
     let (long, int, long_obj, int_obj) = unsafe {
         if pyre_object::is_long(lhs_obj) && pyre_object::is_int(rhs_obj) {
             (r_args[0], r_args[1], lhs_obj, rhs_obj)
@@ -749,12 +755,14 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
             return Ok(None);
         }
     };
-    if unsafe {
-        !pyre_object::is_exact_builtin_instance(long_obj)
-            || !pyre_object::is_exact_builtin_instance(int_obj)
-    } {
+    let (Some(long_class), Some(int_class)) = (unsafe {
+        (
+            walker_exact_builtin_class(long_obj),
+            walker_exact_builtin_class(int_obj),
+        )
+    }) else {
         return Ok(None);
-    }
+    };
     let int_value = unsafe { pyre_object::w_int_get_value(int_obj) };
 
     let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
@@ -779,8 +787,10 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
 
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, long, long_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, long, long_class)?;
     let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
     let int_raw = walker_unbox_int_typed(ctx, op_pc, int, int_type, int_descr)?;
+    walker_guard_exact_w_class(ctx, op_pc, int, int_class)?;
     let off = pyre_object::longobject::LONG_VALUE_OFFSET;
     let long_payload = unsafe { *((long_obj as *const u8).add(off) as *const i64) };
     let long_pl = ctx.trace_ctx.record_op_with_descr(
@@ -895,15 +905,23 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_div<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
-    let int_value = unsafe {
-        if !pyre_object::is_long(long_obj)
-            || !pyre_object::is_int(int_obj)
-            || !pyre_object::is_exact_builtin_instance(long_obj)
-            || !pyre_object::is_exact_builtin_instance(int_obj)
-        {
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(long_obj)
+            || pyre_object::tagged_int::is_tagged_int(int_obj))
+    {
+        return Ok(None);
+    }
+    let (long_class, int_class, int_value) = unsafe {
+        if !pyre_object::is_long(long_obj) || !pyre_object::is_int(int_obj) {
             return Ok(None);
         }
-        pyre_object::w_int_get_value(int_obj)
+        let (Some(long_class), Some(int_class)) = (
+            walker_exact_builtin_class(long_obj),
+            walker_exact_builtin_class(int_obj),
+        ) else {
+            return Ok(None);
+        };
+        (long_class, int_class, pyre_object::w_int_get_value(int_obj))
     };
     // The zero-divisor arm raises before calling rbigint. Record it through the
     // generic helper so no partial specialization is emitted.
@@ -947,8 +965,10 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_div<Sym: WalkSym>(
 
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, long, long_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, long, long_class)?;
     let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
     let int_raw = walker_unbox_int_typed(ctx, op_pc, int, int_type, int_descr)?;
+    walker_guard_exact_w_class(ctx, op_pc, int, int_class)?;
     let zero = ctx.trace_ctx.const_int(0);
     let nonzero = ctx.trace_ctx.record_op(OpCode::IntNe, &[int_raw, zero]);
     ctx.trace_ctx
@@ -1107,15 +1127,23 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_pow<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
-    let exp_value = unsafe {
-        if !pyre_object::is_long(long_obj)
-            || !pyre_object::is_int(int_obj)
-            || !pyre_object::is_exact_builtin_instance(long_obj)
-            || !pyre_object::is_exact_builtin_instance(int_obj)
-        {
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(long_obj)
+            || pyre_object::tagged_int::is_tagged_int(int_obj))
+    {
+        return Ok(None);
+    }
+    let (long_class, int_class, exp_value) = unsafe {
+        if !pyre_object::is_long(long_obj) || !pyre_object::is_int(int_obj) {
             return Ok(None);
         }
-        pyre_object::w_int_get_value(int_obj)
+        let (Some(long_class), Some(int_class)) = (
+            walker_exact_builtin_class(long_obj),
+            walker_exact_builtin_class(int_obj),
+        ) else {
+            return Ok(None);
+        };
+        (long_class, int_class, pyre_object::w_int_get_value(int_obj))
     };
     // A non-positive exponent leaves through one of the short-circuits above
     // the `rbigint.int_pow` call; record those through the generic helper.
@@ -1146,8 +1174,10 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_pow<Sym: WalkSym>(
 
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, long, long_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, long, long_class)?;
     let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
     let exp_raw = walker_unbox_int_typed(ctx, op_pc, int, int_type, int_descr)?;
+    walker_guard_exact_w_class(ctx, op_pc, int, int_class)?;
     let zero = ctx.trace_ctx.const_int(0);
     let positive = ctx.trace_ctx.record_op(OpCode::IntGt, &[exp_raw, zero]);
     ctx.trace_ctx
@@ -3171,9 +3201,7 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
         )?
     };
 
-    let Some(tuple) = walker_emit_specialised_tuple_ii(ctx, raw0, raw1, v0, v1) else {
-        return Ok(None);
-    };
+    let tuple = walker_emit_specialised_tuple_ii(ctx, op_pc, raw0, raw1, v0, v1)?;
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, tuple)?;
     Ok(Some(()))
 }
@@ -3186,15 +3214,17 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
 /// partner unpack fold reads back (`walker_concrete_ref_object` +
 /// `unpack_item_fn`).  The shadow is constructed LAST so the construct→root
 /// window holds no intervening runtime allocation: stamping `tuple`'s concrete
-/// roots the fresh spec_ii via the trace's concrete-shadow set.  Returns
-/// `None` only when that allocation fails.
+/// roots the fresh spec_ii via the trace's concrete-shadow set. A concrete
+/// allocation failure aborts the whole walk because the virtual allocation
+/// and stores have already been recorded.
 fn walker_emit_specialised_tuple_ii<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
     raw0: OpRef,
     raw1: OpRef,
     v0: i64,
     v1: i64,
-) -> Option<OpRef> {
+) -> Result<OpRef, DispatchError> {
     let tuple = ctx.trace_ctx.record_op_with_descr(
         OpCode::NewWithVtable,
         &[],
@@ -3230,13 +3260,13 @@ fn walker_emit_specialised_tuple_ii<Sym: WalkSym>(
     }
     let tuple_ptr = pyre_object::specialisedtupleobject::w_specialised_tuple_ii_new(v0, v1);
     if tuple_ptr.is_null() {
-        return None;
+        return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op_pc });
     }
     ctx.trace_ctx.set_opref_concrete(
         tuple,
         majit_ir::Value::Ref(majit_ir::GcRef(tuple_ptr as usize)),
     );
-    Some(tuple)
+    Ok(tuple)
 }
 
 /// #57 SLICE 3b: walker-native speculative int specialization for the
@@ -4835,10 +4865,8 @@ pub(crate) fn try_walker_specialize_builtin_divmod<Sym: WalkSym>(
     walker_emit_int_div_domain_guards(ctx, op.pc, lhs_raw, rhs_raw, la, rb)?;
     let (div_raw, div_value) = walker_emit_int_py_div_or_mod(ctx, lhs_raw, rhs_raw, la, rb, true);
     let (mod_raw, mod_value) = walker_emit_int_py_div_or_mod(ctx, lhs_raw, rhs_raw, la, rb, false);
-    let Some(tuple) = walker_emit_specialised_tuple_ii(ctx, div_raw, mod_raw, div_value, mod_value)
-    else {
-        return Ok(None);
-    };
+    let tuple =
+        walker_emit_specialised_tuple_ii(ctx, op.pc, div_raw, mod_raw, div_value, mod_value)?;
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', tuple)?;
     Ok(Some(()))
 }

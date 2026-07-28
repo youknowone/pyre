@@ -44,6 +44,6 @@ pub use resoperation::{
 };
 pub use value::{
     Const, FAILARGS_LIMIT, GcRef, GreenAsI64, GreenKey, GreenType, InputArg, InputArgRc,
-    JitDriverVar, StrEqFn, StrHashFn, Type, Value, VarKind, green_type_to_ir, make_str_slot,
-    pypyjit_greenkey_uhash, set_str_resolver, set_unicode_resolver,
+    JitDriverVar, SharedConstPool, StrEqFn, StrHashFn, Type, Value, VarKind, green_type_to_ir,
+    make_str_slot, pypyjit_greenkey_uhash, set_str_resolver, set_unicode_resolver,
 };

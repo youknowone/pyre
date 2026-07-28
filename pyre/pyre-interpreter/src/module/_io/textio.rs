@@ -1146,7 +1146,12 @@ impl W_TextIOWrapper {
         let snapshot = self.snapshot.as_ref().expect("checked above");
         let input = snapshot.input.clone();
         cookie.dec_flags = snapshot.flags;
-        cookie.start_pos = cookie.start_pos.wrapping_sub(input.len() as u64);
+        if input.len() as u64 > cookie.start_pos {
+            // interp_textio.py:tell_w, CPython GH-95782: devices may report
+            // zero even though the decoder snapshot still contains input.
+            return Ok(pyre_object::w_int_new(0));
+        }
+        cookie.start_pos -= input.len() as u64;
         if self.decoded.pos == 0 {
             return Ok(cookie.to_object());
         }

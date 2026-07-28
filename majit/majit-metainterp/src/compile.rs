@@ -625,12 +625,10 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
             // byte stream the donor was built from (RPython compile.py:832
             // ResumeGuardCopiedDescr).
             let storage_for_guard = if let Some(numb) = op.resolved_rd_numb() {
-                Some(crate::resume::ResumeStorage::new(
+                Some(crate::resume::ResumeStorage::with_shared_consts(
                     numb.to_vec(),
                     op.resolved_rd_consts()
-                        .as_deref()
-                        .map(<[Const]>::to_vec)
-                        .unwrap_or_default(),
+                        .unwrap_or_else(|| majit_ir::SharedConstPool::new(Vec::new())),
                     op.resolved_rd_virtuals()
                         .as_deref()
                         .map(<[std::rc::Rc<majit_ir::RdVirtualInfo>]>::to_vec)
@@ -723,7 +721,8 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
             // Follow `descr.prev` so sharing-path guards see the donor's
             // const pool (compile.py:849 get_resumestorage).
             let rd_consts_arc = op.resolved_rd_consts();
-            let rd_consts_ref: &[Const] = rd_consts_arc.as_deref().unwrap_or(&[]);
+            let rd_consts_ref: &[Const] =
+                rd_consts_arc.as_deref().map_or(&[], |pool| pool.as_slice());
             let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len()) as i32;
             let resolve_tagged_source = |tagged: i16| -> ExitValueSourceLayout {
                 let (val, tagbits) = majit_ir::resumedata::untag(tagged);
@@ -3212,13 +3211,13 @@ impl FailDescr for ResumeAtPositionDescr {
     fn rd_consts(&self) -> Option<&[Const]> {
         self.inner.payload.rd_consts()
     }
-    fn rd_consts_arc(&self) -> Option<Arc<[Const]>> {
+    fn rd_consts_arc(&self) -> Option<Arc<majit_ir::SharedConstPool>> {
         self.inner.payload.rd_consts_arc()
     }
     fn set_rd_consts(&self, value: Option<Vec<Const>>) {
         self.inner.payload.set_rd_consts(value)
     }
-    fn set_rd_consts_arc(&self, value: Option<Arc<[Const]>>) {
+    fn set_rd_consts_arc(&self, value: Option<Arc<majit_ir::SharedConstPool>>) {
         self.inner.payload.set_rd_consts_arc(value)
     }
     fn rd_virtuals(&self) -> Option<&[Rc<RdVirtualInfo>]> {
@@ -3479,13 +3478,13 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn rd_consts(&self) -> Option<&[Const]> {
         self.inner.payload.rd_consts()
     }
-    fn rd_consts_arc(&self) -> Option<Arc<[Const]>> {
+    fn rd_consts_arc(&self) -> Option<Arc<majit_ir::SharedConstPool>> {
         self.inner.payload.rd_consts_arc()
     }
     fn set_rd_consts(&self, value: Option<Vec<Const>>) {
         self.inner.payload.set_rd_consts(value)
     }
-    fn set_rd_consts_arc(&self, value: Option<Arc<[Const]>>) {
+    fn set_rd_consts_arc(&self, value: Option<Arc<majit_ir::SharedConstPool>>) {
         self.inner.payload.set_rd_consts_arc(value)
     }
     fn rd_virtuals(&self) -> Option<&[Rc<RdVirtualInfo>]> {
@@ -3730,13 +3729,13 @@ impl FailDescr for ResumeGuardExcDescr {
     fn rd_consts(&self) -> Option<&[Const]> {
         self.inner.payload.rd_consts()
     }
-    fn rd_consts_arc(&self) -> Option<Arc<[Const]>> {
+    fn rd_consts_arc(&self) -> Option<Arc<majit_ir::SharedConstPool>> {
         self.inner.payload.rd_consts_arc()
     }
     fn set_rd_consts(&self, value: Option<Vec<Const>>) {
         self.inner.payload.set_rd_consts(value)
     }
-    fn set_rd_consts_arc(&self, value: Option<Arc<[Const]>>) {
+    fn set_rd_consts_arc(&self, value: Option<Arc<majit_ir::SharedConstPool>>) {
         self.inner.payload.set_rd_consts_arc(value)
     }
     fn rd_virtuals(&self) -> Option<&[Rc<RdVirtualInfo>]> {
@@ -4204,7 +4203,7 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn rd_consts(&self) -> Option<&[Const]> {
         self.prev().as_fail_descr().and_then(|fd| fd.rd_consts())
     }
-    fn rd_consts_arc(&self) -> Option<Arc<[Const]>> {
+    fn rd_consts_arc(&self) -> Option<Arc<majit_ir::SharedConstPool>> {
         self.prev()
             .as_fail_descr()
             .and_then(|fd| fd.rd_consts_arc())
@@ -4491,7 +4490,7 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn rd_consts(&self) -> Option<&[Const]> {
         self.inner.rd_consts()
     }
-    fn rd_consts_arc(&self) -> Option<Arc<[Const]>> {
+    fn rd_consts_arc(&self) -> Option<Arc<majit_ir::SharedConstPool>> {
         self.inner.rd_consts_arc()
     }
     fn set_rd_consts(&self, value: Option<Vec<Const>>) {
@@ -4912,13 +4911,13 @@ impl FailDescr for CompileLoopVersionDescr {
     fn rd_consts(&self) -> Option<&[Const]> {
         self.inner.payload.rd_consts()
     }
-    fn rd_consts_arc(&self) -> Option<Arc<[Const]>> {
+    fn rd_consts_arc(&self) -> Option<Arc<majit_ir::SharedConstPool>> {
         self.inner.payload.rd_consts_arc()
     }
     fn set_rd_consts(&self, value: Option<Vec<Const>>) {
         self.inner.payload.set_rd_consts(value)
     }
-    fn set_rd_consts_arc(&self, value: Option<Arc<[Const]>>) {
+    fn set_rd_consts_arc(&self, value: Option<Arc<majit_ir::SharedConstPool>>) {
         self.inner.payload.set_rd_consts_arc(value)
     }
     fn rd_virtuals(&self) -> Option<&[Rc<RdVirtualInfo>]> {

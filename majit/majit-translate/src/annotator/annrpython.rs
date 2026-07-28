@@ -81,6 +81,13 @@ pub struct RPythonAnnotator {
     /// identity-keyed blocks; the value side is `()` (we only use it
     /// as a set).
     pub added_blocks: RefCell<Option<IndexMap<BlockKey, BlockRef>>>,
+    /// Pyre's per-subject dual-gate continues after annotation failures,
+    /// unlike upstream's single fatal Translator run. While an
+    /// `added_blocks` scope is active, this transaction log captures only
+    /// previously-seen blocks before their input bindings are widened or
+    /// reflowed, so an uncommitted scope can restore them without cloning the
+    /// entire monotonically-growing annotator session for every subject.
+    subject_annotation_snapshots: RefCell<Option<IndexMap<BlockKey, BlockAnnotationSnapshot>>>,
     /// RPython `self.links_followed = {}` (annrpython.py:39).
     pub links_followed: RefCell<HashSet<LinkKey>>,
     /// RPython `self.notify = {}` (annrpython.py:40).
@@ -314,6 +321,12 @@ fn clear_block_bindings(block: &BlockRef) {
     }
 }
 
+struct BlockAnnotationSnapshot {
+    block: BlockRef,
+    graph: Option<GraphRef>,
+    definitions: Vec<(Variable, Option<Rc<SomeValue>>)>,
+}
+
 /// RAII guard for `self.added_blocks = {}; ...; finally:
 /// self.added_blocks = saved` in `complete_helpers()`.
 ///
@@ -334,6 +347,7 @@ fn clear_block_bindings(block: &BlockRef) {
 pub(crate) struct AddedBlocksGuard<'a> {
     ann: &'a RPythonAnnotator,
     saved: Option<Option<IndexMap<BlockKey, BlockRef>>>,
+    saved_annotation_snapshots: Option<Option<IndexMap<BlockKey, BlockAnnotationSnapshot>>>,
     annotated_at_entry: std::collections::HashSet<BlockKey>,
     committed: std::cell::Cell<bool>,
 }
@@ -352,6 +366,30 @@ impl<'a> AddedBlocksGuard<'a> {
 impl<'a> Drop for AddedBlocksGuard<'a> {
     fn drop(&mut self) {
         if !self.committed.get() {
+            // Restore only previously-seen blocks that this subject actually
+            // touched. `snapshot_block_if_tracking` records the cells before
+            // mergeinputargs/reflow mutates them.
+            if let Some(snapshots) = self.ann.subject_annotation_snapshots.borrow().as_ref() {
+                for (bkey, saved) in snapshots {
+                    self.ann
+                        .annotated
+                        .borrow_mut()
+                        .insert(bkey.clone(), saved.graph.clone());
+                    self.ann
+                        .all_blocks
+                        .borrow_mut()
+                        .insert(bkey.clone(), saved.block.clone());
+                    self.ann.blocked_blocks.borrow_mut().shift_remove(bkey);
+                    for (var, annotation) in &saved.definitions {
+                        *var.annotation.borrow_mut() = annotation.clone();
+                    }
+                }
+                if !snapshots.is_empty() {
+                    for generation in self.ann.genpendingblocks.borrow_mut().iter_mut() {
+                        generation.retain(|bkey, _| !snapshots.contains_key(bkey));
+                    }
+                }
+            }
             // Best-effort eviction under `try_borrow_mut`: a panic that
             // unwinds while one of these maps is borrowed degrades to a
             // leak rather than an abort-during-unwind double-borrow.
@@ -414,6 +452,9 @@ impl<'a> Drop for AddedBlocksGuard<'a> {
         }
         if let Some(saved) = self.saved.take() {
             *self.ann.added_blocks.borrow_mut() = saved;
+        }
+        if let Some(saved) = self.saved_annotation_snapshots.take() {
+            *self.ann.subject_annotation_snapshots.borrow_mut() = saved;
         }
     }
 }
@@ -480,6 +521,7 @@ impl RPythonAnnotator {
                 annotated: RefCell::new(IndexMap::new()),
                 all_blocks: RefCell::new(IndexMap::new()),
                 added_blocks: RefCell::new(None),
+                subject_annotation_snapshots: RefCell::new(None),
                 links_followed: RefCell::new(HashSet::new()),
                 notify: RefCell::new(IndexMap::new()),
                 fixed_graphs: RefCell::new(IndexMap::new()),
@@ -835,6 +877,10 @@ impl RPythonAnnotator {
     /// ```
     pub fn complete_helpers(&self) -> Result<(), crate::annotator::model::AnnotatorError> {
         let saved = self.added_blocks.borrow_mut().replace(IndexMap::new());
+        let saved_annotation_snapshots = self
+            .subject_annotation_snapshots
+            .borrow_mut()
+            .replace(IndexMap::new());
         // `complete_helpers` is the RPython helper-graph drive: its
         // `finally` only restores `added_blocks` (annrpython.py:113-119),
         // never evicting blocks.  Pre-commit so the guard's
@@ -843,6 +889,7 @@ impl RPythonAnnotator {
         let _guard = AddedBlocksGuard {
             ann: self,
             saved: Some(saved),
+            saved_annotation_snapshots: Some(saved_annotation_snapshots),
             annotated_at_entry: std::collections::HashSet::new(),
             committed: std::cell::Cell::new(true),
         };
@@ -1405,13 +1452,59 @@ impl RPythonAnnotator {
     /// (annrpython.py:113-114) for callers — e.g. the dual-gate
     /// per-subject driver — that drain via `complete_pending_blocks`
     /// directly rather than through `complete()`.
+    fn snapshot_block_if_tracking(&self, bkey: &BlockKey, block: &BlockRef) {
+        {
+            let snapshots = self.subject_annotation_snapshots.borrow();
+            let Some(snapshots) = snapshots.as_ref() else {
+                return;
+            };
+            if snapshots.contains_key(bkey) {
+                return;
+            }
+        }
+        let Some(graph) = self.annotated.borrow().get(bkey).cloned() else {
+            // A block first discovered in this scope is evicted by the
+            // ordinary added-block rollback and has no prior state to save.
+            return;
+        };
+        let definitions = {
+            let block = block.borrow();
+            block
+                .inputargs
+                .iter()
+                .chain(block.operations.iter().map(|op| &op.result))
+                .filter_map(|value| match value {
+                    Hlvalue::Variable(var) => Some((var.clone(), var.annotation.borrow().clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        self.subject_annotation_snapshots
+            .borrow_mut()
+            .as_mut()
+            .expect("annotation snapshot scope disappeared")
+            .insert(
+                bkey.clone(),
+                BlockAnnotationSnapshot {
+                    block: block.clone(),
+                    graph,
+                    definitions,
+                },
+            );
+    }
+
     pub(crate) fn enter_added_blocks_scope(&self) -> AddedBlocksGuard<'_> {
         let saved = self.added_blocks.borrow_mut().replace(IndexMap::new());
+        let saved_annotation_snapshots = self
+            .subject_annotation_snapshots
+            .borrow_mut()
+            .replace(IndexMap::new());
         let annotated_at_entry: std::collections::HashSet<BlockKey> =
             self.annotated.borrow().keys().cloned().collect();
         AddedBlocksGuard {
             ann: self,
             saved: Some(saved),
+            saved_annotation_snapshots: Some(saved_annotation_snapshots),
             annotated_at_entry,
             committed: std::cell::Cell::new(false),
         }
@@ -1583,6 +1676,9 @@ impl RPythonAnnotator {
 
         let bkey = BlockKey::of(block);
         let seen_before = self.annotated.borrow().contains_key(&bkey);
+        if seen_before {
+            self.snapshot_block_if_tracking(&bkey, block);
+        }
         if !seen_before {
             self.bindinputargs(graph, block, cells);
         } else {
@@ -1679,8 +1775,9 @@ impl RPythonAnnotator {
                 .contains_key(&GraphKey::of(graph)),
             "reflowpendingblock: graph is fixed"
         );
-        self.schedulependingblock(graph, block);
         let bkey = BlockKey::of(block);
+        self.snapshot_block_if_tracking(&bkey, block);
+        self.schedulependingblock(graph, block);
         assert!(
             self.annotated.borrow().contains_key(&bkey),
             "reflowpendingblock: block not yet annotated"

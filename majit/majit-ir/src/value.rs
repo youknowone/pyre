@@ -193,6 +193,59 @@ impl PartialEq for Const {
 
 impl Eq for Const {}
 
+/// Shared, GC-forwardable `ResumeGuardDescr.rd_consts` list.
+///
+/// RPython stores one mutable list object on the guard and reference-shares it
+/// with copied descriptors and every resume-data reader.  Rust needs interior
+/// mutability because the stop-the-world GC root walker forwards `Const::Ref`
+/// entries after the pool has been shared.  The JIT and collector run under
+/// the same single-threaded/GIL contract; mutator access resumes only after
+/// collection has finished.
+pub struct SharedConstPool {
+    values: std::cell::UnsafeCell<Vec<Const>>,
+}
+
+unsafe impl Send for SharedConstPool {}
+unsafe impl Sync for SharedConstPool {}
+
+impl SharedConstPool {
+    pub fn new(values: Vec<Const>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            values: std::cell::UnsafeCell::new(values),
+        })
+    }
+
+    pub fn as_slice(&self) -> &[Const] {
+        unsafe { &*self.values.get() }
+    }
+
+    pub fn snapshot(&self) -> Vec<Const> {
+        self.as_slice().to_vec()
+    }
+
+    /// # Safety
+    ///
+    /// The caller must be the exclusive GC root walker; no resume-data reader
+    /// may run concurrently.
+    pub unsafe fn as_mut_vec_for_gc(&self) -> &mut Vec<Const> {
+        unsafe { &mut *self.values.get() }
+    }
+}
+
+impl std::ops::Deref for SharedConstPool {
+    type Target = [Const];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl std::fmt::Debug for SharedConstPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.as_slice()).finish()
+    }
+}
+
 impl Const {
     pub fn get_type(&self) -> Type {
         match self {

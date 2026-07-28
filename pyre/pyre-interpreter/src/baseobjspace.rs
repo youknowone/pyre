@@ -1879,9 +1879,16 @@ unsafe fn compute_slice_indices3_big(
     length: &BigInt,
 ) -> Result<(BigInt, BigInt, BigInt), PyError> {
     use num_traits::{One, Zero};
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(slice);
+    let slice_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    // `space.index` below can invoke arbitrary Python. RPython's GC transform
+    // keeps both the slice object and incoming rbigint live across every
+    // callback.
+    let length = RBigIntGcRoot::new(length.translated_alias());
     let zero = BigInt::zero();
     let one = BigInt::one();
-    let w_step = w_slice_get_step(slice);
+    let w_step = w_slice_get_step(pyre_object::gc_roots::shadow_stack_get(slice_slot));
     // RPython's stack map roots each of these unboxed rbigint values while
     // the following slice component's `space.index()` can call Python.
     let step = RBigIntGcRoot::new(if is_none(w_step) {
@@ -1897,17 +1904,17 @@ unsafe fn compute_slice_indices3_big(
         s
     });
     let negative_step = *step < zero;
-    let w_start = w_slice_get_start(slice);
+    let w_start = w_slice_get_start(pyre_object::gc_roots::shadow_stack_get(slice_slot));
     let start = RBigIntGcRoot::new(if is_none(w_start) {
         if negative_step {
-            length - &one
+            &*length - &one
         } else {
             zero.translated_alias()
         }
     } else {
         let st = pyre_object::range_obj_to_bigint(space_index(w_start)?);
         if st < zero {
-            let st = st + length;
+            let st = st + &*length;
             if st < zero {
                 if negative_step {
                     one.neg()
@@ -1919,7 +1926,7 @@ unsafe fn compute_slice_indices3_big(
             }
         } else if st >= *length {
             if negative_step {
-                length - &one
+                &*length - &one
             } else {
                 length.translated_alias()
             }
@@ -1927,7 +1934,7 @@ unsafe fn compute_slice_indices3_big(
             st
         }
     });
-    let w_stop = w_slice_get_stop(slice);
+    let w_stop = w_slice_get_stop(pyre_object::gc_roots::shadow_stack_get(slice_slot));
     let stop = RBigIntGcRoot::new(if is_none(w_stop) {
         if negative_step {
             one.neg()
@@ -1937,7 +1944,7 @@ unsafe fn compute_slice_indices3_big(
     } else {
         let sp = pyre_object::range_obj_to_bigint(space_index(w_stop)?);
         if sp < zero {
-            let sp = sp + length;
+            let sp = sp + &*length;
             if sp < zero {
                 if negative_step {
                     one.neg()
@@ -1949,7 +1956,7 @@ unsafe fn compute_slice_indices3_big(
             }
         } else if sp >= *length {
             if negative_step {
-                length - &one
+                &*length - &one
             } else {
                 length.translated_alias()
             }
@@ -1967,19 +1974,23 @@ unsafe fn compute_slice_indices3_big(
 /// `functional.py W_Range._compute_slice` — build the NEW `range`
 /// a slice of `obj` denotes.
 unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let len_b = pyre_object::range_obj_to_bigint(pyre_object::w_range_length(obj));
     let (sl_start, sl_stop, sl_step) = compute_slice_indices3_big(slice, &len_b)?;
     let sl_start = RBigIntGcRoot::new(sl_start);
     let sl_stop = RBigIntGcRoot::new(sl_stop);
     let sl_step = RBigIntGcRoot::new(sl_step);
-    let (rstart, _rstop, rstep) = pyre_object::w_range_fields(obj);
-    let rstart_b = pyre_object::range_obj_to_bigint(rstart);
-    let rstep_b = pyre_object::range_obj_to_bigint(rstep);
-    let substart = RBigIntGcRoot::new(&rstart_b + &*sl_start * &rstep_b);
-    let substep = RBigIntGcRoot::new(&rstep_b * &*sl_step);
+    let (rstart, _rstop, rstep) =
+        pyre_object::w_range_fields(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+    let rstart_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(rstart));
+    let rstep_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(rstep));
+    let substart = RBigIntGcRoot::new(&*rstart_b + &*sl_start * &*rstep_b);
+    let substep = RBigIntGcRoot::new(&*rstep_b * &*sl_step);
     // Compute and root every unboxed output before the first wrapping
     // allocation, which may collect.
-    let substop = RBigIntGcRoot::new(&rstart_b + &*sl_stop * &rstep_b);
+    let substop = RBigIntGcRoot::new(&*rstart_b + &*sl_stop * &*rstep_b);
     let _roots = pyre_object::gc_roots::push_roots();
     let w_substart = pyre_object::range_bigint_to_obj(substart.translated_alias());
     pyre_object::gc_roots::pin_root(w_substart);
@@ -2484,15 +2495,28 @@ pub(crate) fn list_reverse_iter_length_hint_method(args: &[PyObjectRef]) -> PyRe
 pub(crate) fn range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let (current, remaining, step) = pyre_object::w_range_iter_fields(args[0]);
-        // `w_int_new(current)` may collect before the computed stop is
-        // wrapped, so preserve the RPython stack-map root explicitly.
         let stop = RBigIntGcRoot::new(BigInt::from(current) + BigInt::from(remaining) * step);
+        // Python evaluates and keeps all three wrapped arguments before
+        // W_Range construction. Mirror the GC transform's root slots between
+        // those allocating expressions.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let w_current = w_int_new(current);
+        pyre_object::gc_roots::pin_root(w_current);
+        let current_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_stop = pyre_object::range_bigint_to_obj(stop.translated_alias());
+        pyre_object::gc_roots::pin_root(w_stop);
+        let stop_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_step = w_int_new(step);
+        pyre_object::gc_roots::pin_root(w_step);
+        let step_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let w_range = pyre_object::w_range_new(
-            w_int_new(current),
-            pyre_object::range_bigint_to_obj(stop.translated_alias()),
-            w_int_new(step),
+            pyre_object::gc_roots::shadow_stack_get(current_slot),
+            pyre_object::gc_roots::shadow_stack_get(stop_slot),
+            pyre_object::gc_roots::shadow_stack_get(step_slot),
         );
+        pyre_object::gc_roots::pin_root(w_range);
         let state = w_tuple_new(vec![w_range]);
+        pyre_object::gc_roots::pin_root(state);
         Ok(w_tuple_new(vec![builtin_callable("iter"), state, w_none()]))
     }
 }
@@ -2508,18 +2532,30 @@ pub(crate) fn range_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn long_range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let (start, step, len, index) = pyre_object::w_long_range_iter_fields(args[0]);
-        let start_b = pyre_object::range_obj_to_bigint(start);
-        let step_b = pyre_object::range_obj_to_bigint(step);
-        let len_b = pyre_object::range_obj_to_bigint(len);
-        let index_b = pyre_object::range_obj_to_bigint(index);
-        let current = RBigIntGcRoot::new(&start_b + &index_b * &step_b);
-        let stop = RBigIntGcRoot::new(&start_b + &len_b * &step_b);
+        let start_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(start));
+        let step_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(step));
+        let len_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(len));
+        let index_b = RBigIntGcRoot::new(pyre_object::range_obj_to_bigint(index));
+        let current = RBigIntGcRoot::new(&*start_b + &*index_b * &*step_b);
+        let stop = RBigIntGcRoot::new(&*start_b + &*len_b * &*step_b);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let w_current = pyre_object::range_bigint_to_obj(current.translated_alias());
+        pyre_object::gc_roots::pin_root(w_current);
+        let current_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_stop = pyre_object::range_bigint_to_obj(stop.translated_alias());
+        pyre_object::gc_roots::pin_root(w_stop);
+        let stop_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_step = pyre_object::range_bigint_to_obj(step_b.translated_alias());
+        pyre_object::gc_roots::pin_root(w_step);
+        let step_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let w_range = pyre_object::w_range_new(
-            pyre_object::range_bigint_to_obj(current.translated_alias()),
-            pyre_object::range_bigint_to_obj(stop.translated_alias()),
-            pyre_object::range_bigint_to_obj(step_b),
+            pyre_object::gc_roots::shadow_stack_get(current_slot),
+            pyre_object::gc_roots::shadow_stack_get(stop_slot),
+            pyre_object::gc_roots::shadow_stack_get(step_slot),
         );
+        pyre_object::gc_roots::pin_root(w_range);
         let state = w_tuple_new(vec![w_range]);
+        pyre_object::gc_roots::pin_root(state);
         Ok(w_tuple_new(vec![builtin_callable("iter"), state, w_none()]))
     }
 }

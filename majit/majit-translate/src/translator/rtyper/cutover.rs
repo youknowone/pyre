@@ -310,10 +310,9 @@ pub(crate) fn dual_gate_check_with_registry(
     // stringified error so the env-flag wrapper can decide whether
     // to panic, log, or skip.
     //
-    // Snapshot the session so the failure arms below can identify both
-    // shared callees this subject newly fixed and previously-annotated
-    // callees whose bindings it evicted while reflowing them — see
-    // `unpoison_failed_subject_callees`.
+    // Snapshot the fixed-graph keyset so failure repair can identify shared
+    // callees newly fixed by this subject. Previously-annotated block cells
+    // are journaled lazily by AddedBlocksGuard only when actually touched.
     let session_at_entry = SubjectSessionSnapshot::capture(call_registry);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         specialize_legacy_graph_with_registry_returning_value_to_var(legacy_graph, call_registry)
@@ -405,74 +404,19 @@ pub(crate) fn dual_gate_check_with_registry(
 #[derive(Default)]
 struct SubjectSessionSnapshot {
     fixed_graphs: HashSet<crate::flowspace::model::GraphKey>,
-    annotated_blocks: Vec<AnnotatedBlockSnapshot>,
-}
-
-struct AnnotatedBlockSnapshot {
-    key: crate::flowspace::model::BlockKey,
-    block: crate::flowspace::model::BlockRef,
-    graph: crate::flowspace::model::GraphRef,
-    definitions: Vec<(
-        crate::flowspace::model::Variable,
-        Option<Rc<crate::annotator::model::SomeValue>>,
-    )>,
 }
 
 impl SubjectSessionSnapshot {
     fn capture(call_registry: &PyreCallRegistry) -> Self {
-        Self::capture_inner(call_registry, true)
+        Self::capture_fixed_only(call_registry)
     }
 
     fn capture_fixed_only(call_registry: &PyreCallRegistry) -> Self {
-        Self::capture_inner(call_registry, false)
-    }
-
-    fn capture_inner(call_registry: &PyreCallRegistry, include_annotations: bool) -> Self {
         let Some((annotator, _)) = call_registry.session_if_started() else {
             return Self::default();
         };
         let fixed_graphs = annotator.fixed_graphs.borrow().keys().cloned().collect();
-        if !include_annotations {
-            return Self {
-                fixed_graphs,
-                annotated_blocks: Vec::new(),
-            };
-        }
-        let annotated = annotator.annotated.borrow();
-        let all_blocks = annotator.all_blocks.borrow();
-        let mut annotated_blocks = Vec::new();
-        for (bkey, graph) in annotated.iter() {
-            let Some(graph) = graph else {
-                continue;
-            };
-            let Some(block) = all_blocks.get(bkey) else {
-                continue;
-            };
-            let definitions = {
-                let block = block.borrow();
-                block
-                    .inputargs
-                    .iter()
-                    .chain(block.operations.iter().map(|op| &op.result))
-                    .filter_map(|value| match value {
-                        Hlvalue::Variable(var) => {
-                            Some((var.clone(), var.annotation.borrow().clone()))
-                        }
-                        _ => None,
-                    })
-                    .collect()
-            };
-            annotated_blocks.push(AnnotatedBlockSnapshot {
-                key: bkey.clone(),
-                block: block.clone(),
-                graph: graph.clone(),
-                definitions,
-            });
-        }
-        Self {
-            fixed_graphs,
-            annotated_blocks,
-        }
+        Self { fixed_graphs }
     }
 }
 
@@ -484,41 +428,6 @@ fn unpoison_failed_subject_callees(
     let Some((annotator, rtyper)) = call_registry.session_if_started() else {
         return;
     };
-    // `AddedBlocksGuard` can remove a block that was already healthy at
-    // subject entry because RPython's `added_blocks` records every
-    // reprocessed block, not only newly discovered ones. Restore the
-    // exact pre-subject annotation cells and ownership rows before
-    // repairing any graph that advanced into LL form. This is the
-    // transaction rollback required only by pyre's continue-after-Skip
-    // driver; upstream aborts the single Translator on the same error.
-    for saved in &session_at_entry.annotated_blocks {
-        annotator
-            .annotated
-            .borrow_mut()
-            .insert(saved.key.clone(), Some(saved.graph.clone()));
-        annotator
-            .all_blocks
-            .borrow_mut()
-            .insert(saved.key.clone(), saved.block.clone());
-        annotator
-            .blocked_blocks
-            .borrow_mut()
-            .shift_remove(&saved.key);
-        for (var, annotation) in &saved.definitions {
-            *var.annotation.borrow_mut() = annotation.clone();
-        }
-    }
-    if !session_at_entry.annotated_blocks.is_empty() {
-        let restored_keys: HashSet<_> = session_at_entry
-            .annotated_blocks
-            .iter()
-            .map(|saved| saved.key.clone())
-            .collect();
-        for generation in annotator.genpendingblocks.borrow_mut().iter_mut() {
-            generation.retain(|bkey, _| !restored_keys.contains(bkey));
-        }
-    }
-
     let stale_graphs: HashMap<
         crate::flowspace::model::GraphKey,
         crate::flowspace::model::GraphRef,
@@ -940,7 +849,17 @@ fn dead_op_result_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variabl
             || block.id == graph.returnblock
             || block.id == graph.exceptblock
         {
-            read_nodes.extend(defs.values().copied());
+            // Every terminal input column is observable. The legacy graph can
+            // repeat one Variable identity in multiple columns (notably the
+            // exceptblock's etype/evalue pair), while RPython SSA gives each
+            // column its own definition node.
+            read_nodes.extend(
+                block
+                    .inputargs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(column, _)| input_nodes.get(&(block.id, column)).copied()),
+            );
         }
         let raising_op_idx = if block.canraise() && !block.operations.is_empty() {
             Some(block.operations.len() - 1)
@@ -5021,9 +4940,7 @@ mod tests {
     fn failed_subject_restores_previously_annotated_callee_that_lost_bindings() {
         let _lock = anchor_lock();
         use crate::annotator::bookkeeper::Bookkeeper;
-        use crate::codewriter::call::GraphStore;
         use crate::flowspace::model::{BlockKey, GraphKey};
-        use crate::parse::CallPath;
         use crate::translator::rtyper::pyre_call_registry::{FunctionPathKey, PyreCallRegistry};
 
         let mut source = LegacyGraph::new("shared_int_value");
@@ -5077,17 +4994,31 @@ mod tests {
                 .borrow_mut()
                 .insert(bkey, block.clone());
         }
-        let snapshot = SubjectSessionSnapshot::capture(&registry);
-
         // Model raise_if_subject_blocked's destructive reflow rollback:
         // one block that was healthy at subject entry is removed and all
         // definitions lose their annotations. No graph became fixed, so
-        // the old fixed-only repair could not see this damage.
+        // the transaction log must restore the touched block without scanning
+        // every annotated block in the session.
         let damaged = stale_blocks
             .first()
             .expect("identity graph has a start block")
             .clone();
         let damaged_key = BlockKey::of(&damaged);
+        let inputcells: Vec<Option<crate::annotator::model::SomeValue>> = damaged
+            .borrow()
+            .inputargs
+            .iter()
+            .map(|value| match value {
+                Hlvalue::Variable(var) => var
+                    .annotation
+                    .borrow()
+                    .as_ref()
+                    .map(|annotation| (**annotation).clone()),
+                _ => None,
+            })
+            .collect();
+        let scope = annotator.enter_added_blocks_scope();
+        annotator.addpendingblock(&stale, &damaged, &inputcells);
         annotator.annotated.borrow_mut().shift_remove(&damaged_key);
         annotator.all_blocks.borrow_mut().shift_remove(&damaged_key);
         {
@@ -5102,10 +5033,7 @@ mod tests {
                 }
             }
         }
-
-        let mut sources = GraphStore::default();
-        sources.insert(CallPath::from_segments(["shared_int_value"]), source);
-        unpoison_failed_subject_callees(&registry, &snapshot, &sources);
+        drop(scope);
 
         assert!(
             registry.find_entry_with_cached_graph(&stale).is_some(),

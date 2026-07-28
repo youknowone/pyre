@@ -32,6 +32,14 @@ pub enum ResumeValueSource {
     Constant(Const),
     /// Value is a virtual object that must be materialized on resume.
     Virtual(usize),
+    /// Raw resume.py field number, retained until the direct reader decodes
+    /// it. RPython stores `AbstractVirtualInfo.fieldnums` in this form and
+    /// resolves TAGCONST through the live `rd_consts` list only after any
+    /// allocation-triggered collection has forwarded that list.
+    ///
+    /// This variant is runtime-only: layout/export paths construct the
+    /// structured variants above.
+    Tagged(i16),
     /// Value exists conceptually but is still uninitialized.
     ///
     /// Mirrors RPython's `UNINITIALIZED` tag used for string/unicode content.
@@ -46,6 +54,9 @@ impl ResumeValueSource {
             ResumeValueSource::FailArg(_) => ResumeValueKind::FailArg,
             ResumeValueSource::Constant(_) => ResumeValueKind::Constant,
             ResumeValueSource::Virtual(_) => ResumeValueKind::Virtual,
+            ResumeValueSource::Tagged(_) => {
+                panic!("runtime tagged resume source has no exported ResumeValueKind")
+            }
             ResumeValueSource::Uninitialized => ResumeValueKind::Uninitialized,
             ResumeValueSource::Unavailable => ResumeValueKind::Unavailable,
         }
@@ -77,6 +88,9 @@ impl ResumeValueSource {
                 constant_type: None,
                 virtual_index: Some(*index),
             },
+            ResumeValueSource::Tagged(_) => {
+                panic!("runtime tagged resume source cannot be exported as a layout summary")
+            }
             ResumeValueSource::Uninitialized => ResumeValueLayoutSummary {
                 kind: ResumeValueKind::Uninitialized,
                 fail_arg_index: 0,

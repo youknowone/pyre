@@ -75,6 +75,11 @@ impl ArenaCollection {
         assert_eq!(small_request_threshold % WORD, 0);
         let length = small_request_threshold / WORD + 1;
         let hdrsize = std::mem::size_of::<PageHeader>();
+        assert_eq!(
+            hdrsize % ARENA_ALIGN,
+            0,
+            "PageHeader must preserve the GC object alignment"
+        );
         assert!(page_size > hdrsize);
         let mut nblocks_for_size = vec![0; length];
         for (i, nblocks) in nblocks_for_size.iter_mut().enumerate().skip(1) {

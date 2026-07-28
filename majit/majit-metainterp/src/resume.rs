@@ -537,7 +537,7 @@ pub struct ResumeStorage {
     /// must remain mutable after the `Arc` is shared. `UnsafeCell`
     /// is sound here because pyre is single-threaded and the walker
     /// holds exclusive access for the duration of each GC cycle.
-    pub rd_consts: UnsafeCell<Vec<Const>>,
+    pub rd_consts: Arc<majit_ir::SharedConstPool>,
     /// compile.py:858 `storage.rd_virtuals` — live `RdVirtualInfo`
     /// entries describing virtual objects to materialize on resume.
     pub rd_virtuals: Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
@@ -554,7 +554,7 @@ unsafe impl Sync for ResumeStorage {}
 
 impl std::fmt::Debug for ResumeStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let consts_len = unsafe { (*self.rd_consts.get()).len() };
+        let consts_len = self.rd_consts.len();
         f.debug_struct("ResumeStorage")
             .field("rd_numb_len", &self.rd_numb.len())
             .field("rd_consts_len", &consts_len)
@@ -573,7 +573,7 @@ impl ResumeStorage {
     ) -> Arc<Self> {
         Arc::new(ResumeStorage {
             rd_numb,
-            rd_consts: UnsafeCell::new(rd_consts),
+            rd_consts: majit_ir::SharedConstPool::new(rd_consts),
             rd_virtuals,
             rd_pendingfields,
         })
@@ -588,20 +588,34 @@ impl ResumeStorage {
     /// copy — e.g. legacy `Vec<Const>`-typed APIs before their
     /// migration to the shared storage handle).
     pub fn rd_consts_snapshot(&self) -> Vec<Const> {
-        unsafe { (*self.rd_consts.get()).clone() }
+        self.rd_consts.snapshot()
     }
 
     /// Borrow `rd_consts` for reading. Safety: the root walker holds
     /// the only writer and runs during GC, outside of reader scope.
     pub fn rd_consts(&self) -> &[Const] {
-        unsafe { &*self.rd_consts.get() }
+        self.rd_consts.as_slice()
     }
 
     /// Internal accessor for the GC root walker. SAFETY: caller must
     /// ensure exclusive access — only the minor-collection walker in
     /// `MetaInterp::walk_rd_consts_refs` uses this.
     pub(crate) unsafe fn rd_consts_mut_for_gc(&self) -> &mut Vec<Const> {
-        unsafe { &mut *self.rd_consts.get() }
+        unsafe { self.rd_consts.as_mut_vec_for_gc() }
+    }
+
+    pub fn with_shared_consts(
+        rd_numb: Vec<u8>,
+        rd_consts: Arc<majit_ir::SharedConstPool>,
+        rd_virtuals: Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
+        rd_pendingfields: Vec<majit_ir::GuardPendingFieldEntry>,
+    ) -> Arc<Self> {
+        Arc::new(ResumeStorage {
+            rd_numb,
+            rd_consts,
+            rd_virtuals,
+            rd_pendingfields,
+        })
     }
 }
 
@@ -1371,13 +1385,29 @@ pub fn tagged_to_source(
 /// Convert an `RdVirtualInfo` (IR-level, from compile.rs/pyjitpl.rs)
 /// to a `VirtualInfo` (resume-level, used by ResumeDataDirectReader).
 ///
-/// `consts`, `count` and `num_virtuals` are needed to decode tagged
-/// fieldnums (see [`tagged_to_source`]).
+/// Keep `fieldnums` tagged until `ResumeDataDirectReader` consumes them.
+/// RPython's `AbstractVirtualInfo.fieldnums` has exactly this shape: a
+/// TAGCONST is resolved through the live `rd_consts` list only after any
+/// allocation-triggered collection has forwarded that list.
+///
+/// The numbering sentinels are not values and must remain semantic markers:
+/// RPython tests `UNINITIALIZED` before decoding string fields, while pyre's
+/// `VirtualInfo` also uses `Unavailable` for an unassigned field.
+fn rd_virtual_field_source(tagged: i16) -> VirtualFieldSource {
+    if tagged_eq(tagged, UNINITIALIZED_TAG) {
+        ResumeValueSource::Uninitialized
+    } else if tagged_eq(tagged, UNASSIGNED) || tagged_eq(tagged, UNASSIGNEDVIRTUAL) {
+        ResumeValueSource::Unavailable
+    } else {
+        ResumeValueSource::Tagged(tagged)
+    }
+}
+
 pub fn rd_virtual_to_virtual_info(
     rd: &majit_ir::RdVirtualInfo,
-    consts: &[majit_ir::Const],
-    count: i32,
-    num_virtuals: usize,
+    _consts: &[majit_ir::Const],
+    _count: i32,
+    _num_virtuals: usize,
 ) -> VirtualInfo {
     match rd {
         majit_ir::RdVirtualInfo::VirtualInfo {
@@ -1391,12 +1421,7 @@ pub fn rd_virtual_to_virtual_info(
             let fields = fielddescrs
                 .iter()
                 .zip(fieldnums.iter())
-                .map(|(fd, &tagged)| {
-                    (
-                        fd.index,
-                        tagged_to_source(tagged, consts, count, num_virtuals),
-                    )
-                })
+                .map(|(fd, &tagged)| (fd.index, rd_virtual_field_source(tagged)))
                 .collect();
             VirtualInfo::VirtualObj {
                 descr: descr.clone(),
@@ -1417,12 +1442,7 @@ pub fn rd_virtual_to_virtual_info(
             let fields = fielddescrs
                 .iter()
                 .zip(fieldnums.iter())
-                .map(|(fd, &tagged)| {
-                    (
-                        fd.index,
-                        tagged_to_source(tagged, consts, count, num_virtuals),
-                    )
-                })
+                .map(|(fd, &tagged)| (fd.index, rd_virtual_field_source(tagged)))
                 .collect();
             VirtualInfo::VStruct {
                 typedescr: typedescr.clone(),
@@ -1439,7 +1459,7 @@ pub fn rd_virtual_to_virtual_info(
         } => {
             let items = fieldnums
                 .iter()
-                .map(|&tagged| tagged_to_source(tagged, consts, count, num_virtuals))
+                .map(|&tagged| rd_virtual_field_source(tagged))
                 .collect();
             VirtualInfo::VArray {
                 arraydescr: arraydescr.clone(),
@@ -1454,7 +1474,7 @@ pub fn rd_virtual_to_virtual_info(
         } => {
             let items = fieldnums
                 .iter()
-                .map(|&tagged| tagged_to_source(tagged, consts, count, num_virtuals))
+                .map(|&tagged| rd_virtual_field_source(tagged))
                 .collect();
             VirtualInfo::VArray {
                 arraydescr: arraydescr.clone(),
@@ -1478,12 +1498,7 @@ pub fn rd_virtual_to_virtual_info(
                 let elem: Vec<(u32, VirtualFieldSource)> = chunk
                     .iter()
                     .enumerate()
-                    .map(|(j, &tagged)| {
-                        (
-                            j as u32,
-                            tagged_to_source(tagged, consts, count, num_virtuals),
-                        )
-                    })
+                    .map(|(j, &tagged)| (j as u32, rd_virtual_field_source(tagged)))
                     .collect();
                 element_fields.push(elem);
             }
@@ -1507,7 +1522,7 @@ pub fn rd_virtual_to_virtual_info(
             assert_eq!(offsets.len(), fieldnums.len());
             let values = fieldnums
                 .iter()
-                .map(|&tagged| tagged_to_source(tagged, consts, count, num_virtuals))
+                .map(|&tagged| rd_virtual_field_source(tagged))
                 .collect();
             VirtualInfo::VRawBuffer {
                 func: *func,
@@ -1520,7 +1535,7 @@ pub fn rd_virtual_to_virtual_info(
         majit_ir::RdVirtualInfo::VRawSliceInfo { offset, fieldnums } => {
             let parent = fieldnums
                 .first()
-                .map(|&tagged| tagged_to_source(tagged, consts, count, num_virtuals))
+                .map(|&tagged| rd_virtual_field_source(tagged))
                 .unwrap_or(ResumeValueSource::Unavailable);
             VirtualInfo::VRawSlice {
                 offset: *offset as i64,
@@ -1530,19 +1545,19 @@ pub fn rd_virtual_to_virtual_info(
         majit_ir::RdVirtualInfo::VStrPlainInfo { fieldnums } => {
             let chars = fieldnums
                 .iter()
-                .map(|&tagged| tagged_to_source(tagged, consts, count, num_virtuals))
+                .map(|&tagged| rd_virtual_field_source(tagged))
                 .collect();
             VirtualInfo::VStrPlain { chars }
         }
         majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums } => {
-            let left = Box::new(tagged_to_source(fieldnums[0], consts, count, num_virtuals));
-            let right = Box::new(tagged_to_source(fieldnums[1], consts, count, num_virtuals));
+            let left = Box::new(rd_virtual_field_source(fieldnums[0]));
+            let right = Box::new(rd_virtual_field_source(fieldnums[1]));
             VirtualInfo::VStrConcat { left, right }
         }
         majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums } => {
-            let source = Box::new(tagged_to_source(fieldnums[0], consts, count, num_virtuals));
-            let start = Box::new(tagged_to_source(fieldnums[1], consts, count, num_virtuals));
-            let length = Box::new(tagged_to_source(fieldnums[2], consts, count, num_virtuals));
+            let source = Box::new(rd_virtual_field_source(fieldnums[0]));
+            let start = Box::new(rd_virtual_field_source(fieldnums[1]));
+            let length = Box::new(rd_virtual_field_source(fieldnums[2]));
             VirtualInfo::VStrSlice {
                 source,
                 start,
@@ -1552,19 +1567,19 @@ pub fn rd_virtual_to_virtual_info(
         majit_ir::RdVirtualInfo::VUniPlainInfo { fieldnums } => {
             let chars = fieldnums
                 .iter()
-                .map(|&tagged| tagged_to_source(tagged, consts, count, num_virtuals))
+                .map(|&tagged| rd_virtual_field_source(tagged))
                 .collect();
             VirtualInfo::VUniPlain { chars }
         }
         majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
-            let left = Box::new(tagged_to_source(fieldnums[0], consts, count, num_virtuals));
-            let right = Box::new(tagged_to_source(fieldnums[1], consts, count, num_virtuals));
+            let left = Box::new(rd_virtual_field_source(fieldnums[0]));
+            let right = Box::new(rd_virtual_field_source(fieldnums[1]));
             VirtualInfo::VUniConcat { left, right }
         }
         majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
-            let source = Box::new(tagged_to_source(fieldnums[0], consts, count, num_virtuals));
-            let start = Box::new(tagged_to_source(fieldnums[1], consts, count, num_virtuals));
-            let length = Box::new(tagged_to_source(fieldnums[2], consts, count, num_virtuals));
+            let source = Box::new(rd_virtual_field_source(fieldnums[0]));
+            let start = Box::new(rd_virtual_field_source(fieldnums[1]));
+            let length = Box::new(rd_virtual_field_source(fieldnums[2]));
             VirtualInfo::VUniSlice {
                 source,
                 start,
@@ -1698,6 +1713,7 @@ impl EncodedResumeData {
                 ResumeValueSource::Virtual(index) => {
                     tag(*index as i32, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL)
                 }
+                ResumeValueSource::Tagged(tagged) => *tagged,
                 ResumeValueSource::Uninitialized => UNINITIALIZED_TAG,
                 ResumeValueSource::Unavailable => UNASSIGNED,
             }
@@ -2479,6 +2495,9 @@ impl ResumeDataExt for ResumeData {
             }
             ResumeValueSource::Constant(c) => MaterializedValue::Value(c.as_raw_i64()),
             ResumeValueSource::Virtual(idx) => MaterializedValue::VirtualRef(*idx),
+            ResumeValueSource::Tagged(_) => {
+                panic!("runtime tagged source requires ResumeDataDirectReader")
+            }
             ResumeValueSource::Uninitialized | ResumeValueSource::Unavailable => {
                 MaterializedValue::Value(0)
             }
@@ -2495,6 +2514,9 @@ impl ResumeDataExt for ResumeData {
             }
             ResumeValueSource::Constant(c) => ReconstructedValue::Value(c.as_raw_i64()),
             ResumeValueSource::Virtual(idx) => ReconstructedValue::Virtual(*idx),
+            ResumeValueSource::Tagged(_) => {
+                panic!("runtime tagged source requires ResumeDataDirectReader")
+            }
             ResumeValueSource::Uninitialized => ReconstructedValue::Uninitialized,
             ResumeValueSource::Unavailable => ReconstructedValue::Unavailable,
         }
@@ -3194,6 +3216,9 @@ impl ResumeDataLoopMemo {
             ResumeValueSource::Constant(c) => self.getconst_i64(c),
             // resume.py:219-221: virtual → tag(num_virtuals, TAGVIRTUAL)
             ResumeValueSource::Virtual(index) => tag_i64(encode_len(*index), TAGVIRTUAL),
+            ResumeValueSource::Tagged(_) => {
+                panic!("runtime tagged source cannot be encoded into a new resume stream")
+            }
             ResumeValueSource::Uninitialized => tag_i64(ENCODED_UNINITIALIZED, TAGCONST),
             ResumeValueSource::Unavailable => tag_i64(ENCODED_UNAVAILABLE, TAGCONST),
         }
@@ -4380,6 +4405,9 @@ impl<'a> ResumeDataReader<'a> {
             ResumeValueSource::Virtual(vidx) => {
                 self.virtuals.get(*vidx).copied().flatten().unwrap_or(0)
             }
+            ResumeValueSource::Tagged(_) => {
+                panic!("runtime tagged source requires ResumeDataDirectReader")
+            }
             ResumeValueSource::Uninitialized | ResumeValueSource::Unavailable => 0,
         }
     }
@@ -5210,6 +5238,48 @@ mod tests {
             ResumeDataDirectReader::new(&[0, 0], &[], &[], &[], None, None, &NullAllocator);
         let _ = reader.next_value_of_type(majit_ir::Type::Void);
     }
+
+    #[test]
+    fn rd_virtual_keeps_const_tag_until_direct_reader_decode() {
+        // resume.py:596-602 keeps AbstractVirtualInfo.fieldnums tagged and
+        // calls decoder.setfield(..., num, ...). In particular it does not
+        // copy ConstPtr.value out of rd_consts before allocate(), because that
+        // allocation may collect and forward rd_consts.
+        let tagged = tag(TAG_CONST_OFFSET, TAGCONST).unwrap();
+        let rd = majit_ir::RdVirtualInfo::VRawSliceInfo {
+            offset: 0,
+            fieldnums: vec![tagged],
+        };
+        let mut consts = vec![majit_ir::Const::Ref(majit_ir::GcRef(0x1000))];
+        let virtual_info = rd_virtual_to_virtual_info(&rd, &consts, 0, 1);
+        let VirtualInfo::VRawSlice { parent, .. } = virtual_info else {
+            panic!("expected VRawSlice");
+        };
+        assert_eq!(parent, ResumeValueSource::Tagged(tagged));
+
+        // Model the root walker forwarding rd_consts during the allocation
+        // window. The later field decode must observe the new pointer.
+        consts[0] = majit_ir::Const::Ref(majit_ir::GcRef(0x2000));
+        let mut reader =
+            ResumeDataDirectReader::new(&[0, 0], &consts, &[], &[], None, None, &NullAllocator);
+        assert_eq!(reader.decode_field_source(&parent), 0x2000);
+    }
+
+    #[test]
+    fn rd_virtual_normalizes_numbering_sentinels_before_decode() {
+        assert_eq!(
+            rd_virtual_field_source(UNINITIALIZED_TAG),
+            ResumeValueSource::Uninitialized
+        );
+        assert_eq!(
+            rd_virtual_field_source(UNASSIGNED),
+            ResumeValueSource::Unavailable
+        );
+        assert_eq!(
+            rd_virtual_field_source(UNASSIGNEDVIRTUAL),
+            ResumeValueSource::Unavailable
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -5654,6 +5724,15 @@ pub trait VirtualInfoBlackholeExt {
     ) -> i64;
 }
 
+#[inline]
+fn virtual_source_is_uninitialized(source: &VirtualFieldSource) -> bool {
+    match source {
+        ResumeValueSource::Uninitialized => true,
+        ResumeValueSource::Tagged(tagged) => tagged_eq(*tagged, UNINITIALIZED_TAG),
+        _ => false,
+    }
+}
+
 /// `resume.py:766-775 VStrPlainInfo.allocate` and `resume.py:821-830
 /// VUniPlainInfo.allocate` share the same loop body — the only
 /// difference is `decoder.allocate_string` vs `allocate_unicode` and
@@ -5680,7 +5759,7 @@ fn vstr_plain_info_allocate(
     decoder.virtuals_cache.set_ptr(index, string);
     for (i, char_source) in chars.iter().enumerate() {
         // resume.py:773 / 828 if not tagged_eq(charnum, UNINITIALIZED)
-        if matches!(char_source, VirtualFieldSource::Uninitialized) {
+        if virtual_source_is_uninitialized(char_source) {
             continue;
         }
         // resume.py:774 / 829 decoder.{string,unicode}_setitem(string, i, charnum)
@@ -5713,7 +5792,7 @@ fn abstract_virtual_struct_info_setfields(
             continue;
         };
         // resume.py:601 if not tagged_eq(num, UNINITIALIZED)
-        if matches!(source, VirtualFieldSource::Uninitialized) {
+        if virtual_source_is_uninitialized(source) {
             continue;
         }
         // resume.py:602 decoder.setfield(struct, num, descr)
@@ -5912,7 +5991,7 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                         fielddescrs.len()
                     );
                     for (j, &(_, ref source)) in fields.iter().enumerate() {
-                        if matches!(source, VirtualFieldSource::Uninitialized) {
+                        if virtual_source_is_uninitialized(source) {
                             continue;
                         }
                         // resume.py:757: decoder.setinteriorfield(i, array, num, self.fielddescrs[j])
@@ -6001,7 +6080,7 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 for i in 0..offsets.len() {
                     let descr = &descrs[i];
                     let source = &values[i];
-                    if matches!(source, VirtualFieldSource::Uninitialized) {
+                    if virtual_source_is_uninitialized(source) {
                         continue;
                     }
                     // pyre extracts the per-entry value from the virtual
@@ -7020,6 +7099,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             // resume.py:1568 ConstPtr.getref_base() — the Const carries its type.
             ResumeValueSource::Constant(c) => c.getref_base().as_usize() as i64,
             ResumeValueSource::Virtual(index) => self.getvirtual_ptr(*index),
+            ResumeValueSource::Tagged(tagged) => self.decode_ref(*tagged),
             ResumeValueSource::Uninitialized => 0,
             ResumeValueSource::Unavailable => 0,
         }
@@ -7034,6 +7114,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             // resume.py:1555 ConstInt.getint().
             ResumeValueSource::Constant(c) => c.getint(),
             ResumeValueSource::Virtual(index) => self.getvirtual_int(*index),
+            ResumeValueSource::Tagged(tagged) => self.decode_int(*tagged),
             ResumeValueSource::Uninitialized => 0,
             ResumeValueSource::Unavailable => 0,
         }
@@ -7052,6 +7133,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             ResumeValueSource::Virtual(_) => {
                 panic!("decode_field_source_float: TAGVIRTUAL not valid for float field")
             }
+            ResumeValueSource::Tagged(tagged) => self.decode_float(*tagged),
             ResumeValueSource::Uninitialized => 0,
             ResumeValueSource::Unavailable => 0,
         }

@@ -1477,15 +1477,22 @@ fn derive_program_metadata(
         .any(|td| td.item_meta.name_path() == compiler_constants_path)
     {
         let rows = vec![("__pos_0".to_string(), "Box<[ConstantData]>".to_string())];
-        for key in [compiler_constants_path, "bytecode::Constants", "Constants"] {
+        for key in [compiler_constants_path, "bytecode::Constants"] {
             struct_fields.fields.insert(key.to_string(), rows.clone());
             known_struct_names.insert(key.to_string());
         }
+        struct_fields
+            .fields
+            .entry("Constants".to_string())
+            .or_insert_with(|| rows.clone());
+        known_struct_names.insert("Constants".to_string());
         let sid = majit_ir::descr::StructId::from_canonical("bytecode::Constants");
         for key in [compiler_constants_path, "bytecode::Constants", "Constants"] {
             record_struct_id(&mut struct_ids, key.to_string(), sid);
         }
-        struct_origins.insert("Constants".to_string(), "bytecode".to_string());
+        struct_origins
+            .entry("Constants".to_string())
+            .or_insert_with(|| "bytecode".to_string());
         struct_field_attrs.insert(
             "bytecode::Constants".to_string(),
             vec![("__pos_0".to_string(), ValueType::Ref(None))],
@@ -1502,6 +1509,7 @@ fn derive_program_metadata(
     // declaration so an unrelated same-named local type cannot acquire this
     // shape.
     let num_complex_path = "num_complex::Complex";
+    let num_complex_canon = strip_crate_prefix(num_complex_path);
     if llbc
         .iter_type_decls()
         .any(|td| td.item_meta.name_path() == num_complex_path)
@@ -1514,13 +1522,13 @@ fn derive_program_metadata(
             struct_fields.fields.insert(key.to_string(), rows.clone());
             known_struct_names.insert(key.to_string());
         }
-        let sid = majit_ir::descr::StructId::from_canonical(num_complex_path);
+        let sid = majit_ir::descr::StructId::from_canonical(&num_complex_canon);
         for key in [num_complex_path, "Complex"] {
             record_struct_id(&mut struct_ids, key.to_string(), sid);
         }
         struct_origins.insert("Complex".to_string(), "num_complex".to_string());
         struct_field_attrs.insert(
-            num_complex_path.to_string(),
+            num_complex_canon,
             vec![
                 ("re".to_string(), ValueType::Float),
                 ("im".to_string(), ValueType::Float),
@@ -7747,6 +7755,25 @@ impl<'a> Lowering<'a> {
             ..
         } = &op_kind
             && args.len() == 2
+            && match segments.last().map(String::as_str) {
+                Some("bigint_lshift_count") => {
+                    first_arg_ty
+                        .as_ref()
+                        .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+                        && second_arg_ty
+                            .as_ref()
+                            .is_some_and(|ty| tyref_to_value_type(ty, self.llbc) == ValueType::Int)
+                }
+                Some("bigint_lshift_int_int_result") => {
+                    first_arg_ty
+                        .as_ref()
+                        .is_some_and(|ty| tyref_to_value_type(ty, self.llbc) == ValueType::Int)
+                        && second_arg_ty
+                            .as_ref()
+                            .is_some_and(|ty| tyref_to_value_type(ty, self.llbc) == ValueType::Int)
+                }
+                _ => false,
+            }
             && let Some(residual) = crate::front::rbigint_call::lshift_count_residual_path(segments)
         {
             OpKind::Call {

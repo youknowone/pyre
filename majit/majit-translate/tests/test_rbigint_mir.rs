@@ -1220,7 +1220,15 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
         &[llbc],
         HostStaticAddrs::default(),
-        &["objspace::descroperation", "module::math::interp_math"],
+        &[
+            "objspace::descroperation",
+            "module::math::interp_math",
+            "baseobjspace",
+            "builtins",
+            "typedef",
+            "type_methods",
+            "objspace::std::formatting",
+        ],
     )
     .expect("lower descroperation module");
     let helper = program

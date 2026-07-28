@@ -165,7 +165,12 @@ fn divrem_returns_input_as_remainder(a: &BigInt, b: &BigInt) -> bool {
 /// callers.
 #[majit_macros::dont_look_inside]
 fn bigint_pow_nomod(a: &BigInt, b: &BigInt) -> Result<BigInt, PyError> {
-    a.pow(b, None)
+    // `rbigint.pow` performs several collecting digit-array allocations while
+    // both operands remain live. RPython's GC transform roots those incoming
+    // handles for the whole call.
+    let a = RBigIntGcRoot::new(a.translated_alias());
+    let b = RBigIntGcRoot::new(b.translated_alias());
+    a.pow(&b, None)
         .map_err(|_| PyError::memory_error("exponent too large"))
 }
 
@@ -174,6 +179,8 @@ fn bigint_pow_nomod(a: &BigInt, b: &BigInt) -> Result<BigInt, PyError> {
 /// (`longobject.py:230`); only a long exponent reaches `rbigint.pow`.
 #[majit_macros::dont_look_inside]
 fn bigint_int_pow_nomod(a: &BigInt, b: i64) -> Result<BigInt, PyError> {
+    // `int_pow` also keeps the base live across its intermediate allocations.
+    let a = RBigIntGcRoot::new(a.translated_alias());
     a.int_pow(b, None)
         .map_err(|_| PyError::memory_error("exponent too large"))
 }
@@ -550,7 +557,12 @@ pub extern "C" fn jit_bigint_pow_nomod(a: i64, b: i64) -> pyre_object::longobjec
     if unsafe { (&*a).get_sign() != 0 && (&*b).int_eq(1) } {
         return pyre_object::longobject::encode_jit_bigint_result(a as *mut BigInt);
     }
-    match unsafe { (&*a).pow(&*b, None) } {
+    // The residual call can collect inside `rbigint.pow`; mirror the roots
+    // inserted for both arguments by RPython's GC transform instead of
+    // depending on a backend-specific native call map.
+    let a = RBigIntGcRoot::new(unsafe { (&*a).translated_alias() });
+    let b = RBigIntGcRoot::new(unsafe { (&*b).translated_alias() });
+    match a.pow(&b, None) {
         Ok(value) => pyre_object::longobject::encode_jit_bigint_result(
             pyre_object::longobject::alloc_bigint_nursery_collecting(value),
         ),
@@ -575,7 +587,9 @@ pub extern "C" fn jit_bigint_int_pow_nomod(
     if b == 1 && unsafe { (&*a).get_sign() != 0 } {
         return pyre_object::longobject::encode_jit_bigint_result(a as *mut BigInt);
     }
-    match unsafe { (&*a).int_pow(b, None) } {
+    // `int_pow` retains the base across intermediate collecting allocations.
+    let a = RBigIntGcRoot::new(unsafe { (&*a).translated_alias() });
+    match a.int_pow(b, None) {
         Ok(value) => pyre_object::longobject::encode_jit_bigint_result(
             pyre_object::longobject::alloc_bigint_nursery_collecting(value),
         ),
@@ -660,13 +674,11 @@ pub extern "C" fn jit_bigint_divrem_returns_lhs_remainder(a: i64, b: i64) -> i64
     unsafe {
         let a = &*a;
         let b = &*b;
-        let a_size = a.numdigits();
         let b_size = b.numdigits();
         (a.get_sign() != 0
             && a.get_sign() == b.get_sign()
             && b_size != 1
-            && (a_size < b_size || (a_size == b_size && a.digit(a_size - 1) < b.digit(b_size - 1))))
-            as i64
+            && divrem_returns_input_as_remainder(a, b)) as i64
     }
 }
 
@@ -1928,10 +1940,9 @@ unsafe fn repeat_count(n: PyObjectRef) -> Result<usize, PyError> {
         // The count coerces to a signed machine word (an index-sized integer):
         // a non-negative value exceeding `isize::MAX` overflows rather than
         // wrapping to a huge `usize` count, matching `getindex_w`. Negative
-        // counts clamp to 0.
+        // counts clamp to 0 only after they fit the index-sized word.
         match big.to_isize() {
             Some(v) => Ok(if v < 0 { 0 } else { v as usize }),
-            None if big.get_sign() < 0 => Ok(0),
             None => Err(PyError::new(
                 PyErrorKind::OverflowError,
                 "cannot fit 'int' into an index-sized integer",
@@ -5668,7 +5679,8 @@ mod tests {
     fn test_long_repeat_count_bounds() {
         unsafe {
             let huge = BigInt::one().lshift(100).unwrap();
-            assert_eq!(repeat_count(w_long_new(huge.neg())).unwrap(), 0);
+            let negative_error = repeat_count(w_long_new(huge.neg())).unwrap_err();
+            assert_eq!(negative_error.kind, PyErrorKind::OverflowError);
             let error = repeat_count(w_long_new(huge)).unwrap_err();
             assert_eq!(error.kind, PyErrorKind::OverflowError);
         }

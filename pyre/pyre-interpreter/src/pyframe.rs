@@ -3864,15 +3864,14 @@ pub(crate) fn code_constants(code: &CodeObject) -> &[crate::bytecode::ConstantDa
 /// `pyopcode.rs::load_const_value` so future additions stay in sync.
 pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectRef {
     use crate::bytecode::ConstantData;
-    use num_traits::ToPrimitive;
     match constant {
         // `pyopcode.rs:347-353` — promote bigints to W_LongObject just
         // like `load_const_value` does before invoking the trait.
         ConstantData::Integer { value } => {
-            if let Some(value) = ToPrimitive::to_i64(value) {
-                pyre_object::intobject::w_int_new(value)
-            } else {
-                pyre_object::longobject::w_long_new(crate::compiler_bigint_to_rbigint(value))
+            let value = crate::compiler_bigint_to_rbigint(value);
+            match value.toint() {
+                Ok(value) => pyre_object::intobject::w_int_new(value),
+                Err(_) => pyre_object::longobject::w_long_new(value),
             }
         }
         // `eval.rs:1309-1311 float_constant`.

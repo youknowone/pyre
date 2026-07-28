@@ -18,7 +18,6 @@ use crate::descr::{
     LoopTargetDescr, LoopTokenDescr, SizeDescr,
 };
 use crate::resoperation::{GuardPendingFieldEntry, Op, RdVirtualInfo};
-use crate::value::Const;
 
 impl Op {
     /// `resoperation.py:244 AbstractResOpOrInputArg.getdescr` + `:462
@@ -140,7 +139,7 @@ impl Op {
     }
 
     /// Same as `resolved_rd_numb` but for the `rd_consts` const pool.
-    pub fn resolved_rd_consts(&self) -> Option<Arc<[Const]>> {
+    pub fn resolved_rd_consts(&self) -> Option<Arc<crate::SharedConstPool>> {
         self.descr
             .borrow()
             .as_ref()?

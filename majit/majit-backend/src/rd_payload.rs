@@ -9,7 +9,7 @@ use std::cell::UnsafeCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use majit_ir::{Const, GuardPendingFieldEntry, RdVirtualInfo};
+use majit_ir::{Const, GuardPendingFieldEntry, RdVirtualInfo, SharedConstPool};
 
 /// Resume-payload backing store for ResumeGuardDescr (`compile.py:855`).
 ///
@@ -29,7 +29,7 @@ use majit_ir::{Const, GuardPendingFieldEntry, RdVirtualInfo};
 #[derive(Debug)]
 pub struct RdPayload {
     rd_numb: UnsafeCell<Option<Arc<[u8]>>>,
-    rd_consts: UnsafeCell<Option<Arc<[Const]>>>,
+    rd_consts: UnsafeCell<Option<Arc<SharedConstPool>>>,
     rd_virtuals: UnsafeCell<Option<Arc<[Rc<RdVirtualInfo>]>>>,
     rd_pendingfields: UnsafeCell<Option<Arc<[GuardPendingFieldEntry]>>>,
 }
@@ -56,7 +56,7 @@ impl RdPayload {
     /// donor descr, matching RPython's reference-share semantics.
     pub fn from_arcs(
         rd_numb: Option<Arc<[u8]>>,
-        rd_consts: Option<Arc<[Const]>>,
+        rd_consts: Option<Arc<SharedConstPool>>,
         rd_virtuals: Option<Arc<[Rc<RdVirtualInfo>]>>,
         rd_pendingfields: Option<Arc<[GuardPendingFieldEntry]>>,
     ) -> Self {
@@ -100,15 +100,19 @@ impl RdPayload {
     }
 
     pub fn rd_consts(&self) -> Option<&[Const]> {
-        unsafe { (*self.rd_consts.get()).as_deref() }
+        unsafe {
+            (*self.rd_consts.get())
+                .as_deref()
+                .map(SharedConstPool::as_slice)
+        }
     }
-    pub fn rd_consts_arc(&self) -> Option<Arc<[Const]>> {
+    pub fn rd_consts_arc(&self) -> Option<Arc<SharedConstPool>> {
         unsafe { (*self.rd_consts.get()).clone() }
     }
     pub fn set_rd_consts(&self, value: Option<Vec<Const>>) {
-        unsafe { *self.rd_consts.get() = value.map(Arc::from) }
+        unsafe { *self.rd_consts.get() = value.map(SharedConstPool::new) }
     }
-    pub fn set_rd_consts_arc(&self, value: Option<Arc<[Const]>>) {
+    pub fn set_rd_consts_arc(&self, value: Option<Arc<SharedConstPool>>) {
         unsafe { *self.rd_consts.get() = value }
     }
 

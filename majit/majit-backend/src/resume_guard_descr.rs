@@ -369,13 +369,13 @@ impl FailDescr for ResumeGuardDescr {
     fn rd_consts(&self) -> Option<&[Const]> {
         self.payload.rd_consts()
     }
-    fn rd_consts_arc(&self) -> Option<Arc<[Const]>> {
+    fn rd_consts_arc(&self) -> Option<Arc<majit_ir::SharedConstPool>> {
         self.payload.rd_consts_arc()
     }
     fn set_rd_consts(&self, value: Option<Vec<Const>>) {
         self.payload.set_rd_consts(value)
     }
-    fn set_rd_consts_arc(&self, value: Option<Arc<[Const]>>) {
+    fn set_rd_consts_arc(&self, value: Option<Arc<majit_ir::SharedConstPool>>) {
         self.payload.set_rd_consts_arc(value)
     }
     fn rd_virtuals(&self) -> Option<&[Rc<RdVirtualInfo>]> {

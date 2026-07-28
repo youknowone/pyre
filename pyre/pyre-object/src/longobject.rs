@@ -769,6 +769,38 @@ mod tests {
     }
 
     #[test]
+    fn test_bigint_add_zero_shortcuts_preserve_payload_identity() {
+        let zero_obj = w_long_new(BigInt::from(0));
+        let value_obj = w_long_new(BigInt::from(i64::MAX) + BigInt::from(17));
+        let zero_payload = unsafe { w_long_get_raw_value(zero_obj) };
+        let value_payload = unsafe { w_long_get_raw_value(value_obj) };
+
+        assert_eq!(
+            jit_w_long_add_raw(zero_obj as i64, value_obj as i64) as *mut BigInt,
+            value_payload
+        );
+        assert_eq!(
+            jit_w_long_add_raw(value_obj as i64, zero_obj as i64) as *mut BigInt,
+            value_payload
+        );
+        assert_eq!(
+            jit_bigint_add(zero_payload as i64, value_payload as i64) as *mut BigInt,
+            value_payload
+        );
+        assert_eq!(
+            jit_bigint_add(value_payload as i64, zero_payload as i64) as *mut BigInt,
+            value_payload
+        );
+        unsafe {
+            assert_eq!(&*zero_payload, &BigInt::from(0));
+            assert_eq!(
+                &*value_payload,
+                &(BigInt::from(i64::MAX) + BigInt::from(17))
+            );
+        }
+    }
+
+    #[test]
     fn test_bare_bigint_constructor_comparison_and_scalar_residuals() {
         let a = jit_bigint_from_i64(-42);
         let b = jit_bigint_from_u64(42);

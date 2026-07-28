@@ -2168,7 +2168,7 @@ pub trait FailDescr: Descr {
         None
     }
 
-    fn rd_consts_arc(&self) -> Option<std::sync::Arc<[Const]>> {
+    fn rd_consts_arc(&self) -> Option<std::sync::Arc<crate::SharedConstPool>> {
         None
     }
 
@@ -2180,7 +2180,7 @@ pub trait FailDescr: Descr {
         );
     }
 
-    fn set_rd_consts_arc(&self, _value: Option<std::sync::Arc<[Const]>>) {
+    fn set_rd_consts_arc(&self, _value: Option<std::sync::Arc<crate::SharedConstPool>>) {
         panic!(
             "set_rd_consts_arc invoked on a FailDescr that does not \
              carry rd_consts (compile.py:855 `_attrs_` only on \

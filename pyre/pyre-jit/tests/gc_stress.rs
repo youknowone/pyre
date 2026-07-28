@@ -944,6 +944,49 @@ assert result > 490, result
     );
 }
 
+/// RPython's GC transform roots a by-value `rbigint` local when a later
+/// `space.index`, comparison, or wrapping allocation can collect. The Rust
+/// interpreter needs the equivalent explicit stable slot: these callbacks
+/// force a collection while an earlier machine-int conversion exists only as
+/// an unboxed `RBigInt`.
+#[test]
+fn unboxed_rbigint_consumers_survive_python_callbacks() {
+    run_on_worker(
+        r#"
+import gc
+import math
+
+class Index:
+    def __init__(self, value):
+        self.value = value
+
+    def __index__(self):
+        gc.collect()
+        return self.value
+
+class Even:
+    def __eq__(self, other):
+        gc.collect()
+        return other % 2 == 0
+
+i = 0
+while i < 40:
+    assert math.gcd(123456789, Index(3)) == 3
+    assert math.lcm(123456789, Index(3)) == 123456789
+    assert math.comb(50, Index(3)) == 19600
+    assert math.perm(20, Index(3)) == 6840
+
+    sliced = range(20)[slice(Index(1), Index(12), Index(2))]
+    assert list(sliced) == [1, 3, 5, 7, 9, 11]
+    assert range(20).count(Even()) == 10
+    i += 1
+"#,
+        "<unboxed_rbigint_callback_gc_stress>",
+        "unboxed rbigint callback-root checks",
+        "unboxed rbigint callback GC stress program failed",
+    );
+}
+
 /// `PyCode.co_consts_w` owns the one wrapped object for each constant index
 /// (`pycode.py:126`, `pyopcode.py:498-499`). A large integer constant is a
 /// managed `W_LongObject`; the Box-immortal PyCode therefore has to expose the
