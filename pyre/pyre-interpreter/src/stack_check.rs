@@ -526,6 +526,12 @@ pub fn set_recursion_limit(new_limit: i32) -> Result<(), PyError> {
 
 /// pypy/module/sys/vm.py:72 `getrecursionlimit` parity. Reads
 /// `space.sys.recursionlimit` via `module::sys::state`.
+///
+/// `#[dont_look_inside]`: reads the runtime-mutable `recursion_limit` global
+/// (`sys.setrecursionlimit` mutates it), so the tracer residualises the read
+/// rather than folding a build-time constant — the runtime-mutable-global
+/// accessor pattern.
+#[majit_macros::dont_look_inside]
 pub fn get_recursion_limit() -> i32 {
     crate::module::sys::state::recursion_limit()
 }
