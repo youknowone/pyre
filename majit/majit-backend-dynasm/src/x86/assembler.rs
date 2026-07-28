@@ -7711,49 +7711,57 @@ impl<'a> Assembler386<'a> {
             ; push rax ; push rcx ; push rdx ; push rsi ; push rdi
             ; push r8 ; push r9 ; push r10 ; push r11
         );
-        // Save XMM caller-saved (xmm0-xmm15, 16 × 16 bytes = 256 bytes)
+        // Save XMM caller-saved (xmm0-xmm15, 16 × 16 bytes = 256 bytes).
+        //
+        // The nine GPR pushes above leave `rsp` at 8-mod-16 (the body is
+        // 0-mod-16), and `SUB rsp, 256` preserves that, so these stores land
+        // on an odd 8-byte boundary.  They must therefore be the unaligned
+        // form: `MOVAPS` faults with #GP on a non-16-byte-aligned address.
+        // `_build_wb_slowpath` saves the XMM registers with `MOVSD_bx`, which
+        // has no alignment requirement either; only the save area differs
+        // (jitframe there, stack here).
         dynasm!(self.mc ; .arch x64
             ; sub rsp, 256
-            ; movaps [rsp], xmm0
-            ; movaps [rsp + 16], xmm1
-            ; movaps [rsp + 32], xmm2
-            ; movaps [rsp + 48], xmm3
-            ; movaps [rsp + 64], xmm4
-            ; movaps [rsp + 80], xmm5
-            ; movaps [rsp + 96], xmm6
-            ; movaps [rsp + 112], xmm7
-            ; movaps [rsp + 128], xmm8
-            ; movaps [rsp + 144], xmm9
-            ; movaps [rsp + 160], xmm10
-            ; movaps [rsp + 176], xmm11
-            ; movaps [rsp + 192], xmm12
-            ; movaps [rsp + 208], xmm13
-            ; movaps [rsp + 224], xmm14
-            ; movaps [rsp + 240], xmm15
+            ; movups [rsp], xmm0
+            ; movups [rsp + 16], xmm1
+            ; movups [rsp + 32], xmm2
+            ; movups [rsp + 48], xmm3
+            ; movups [rsp + 64], xmm4
+            ; movups [rsp + 80], xmm5
+            ; movups [rsp + 96], xmm6
+            ; movups [rsp + 112], xmm7
+            ; movups [rsp + 128], xmm8
+            ; movups [rsp + 144], xmm9
+            ; movups [rsp + 160], xmm10
+            ; movups [rsp + 176], xmm11
+            ; movups [rsp + 192], xmm12
+            ; movups [rsp + 208], xmm13
+            ; movups [rsp + 224], xmm14
+            ; movups [rsp + 240], xmm15
         );
         self.emit_abi_int_arg_from_reg(0, loc_base.value as u8);
         dynasm!(self.mc ; .arch x64
             ; mov rax, QWORD helper
         );
         self.emit_abi_call_rax_after_one_push();
-        // Restore XMM
+        // Restore XMM (same 8-mod-16 `rsp` as the save side above).
         dynasm!(self.mc ; .arch x64
-            ; movaps xmm0, [rsp]
-            ; movaps xmm1, [rsp + 16]
-            ; movaps xmm2, [rsp + 32]
-            ; movaps xmm3, [rsp + 48]
-            ; movaps xmm4, [rsp + 64]
-            ; movaps xmm5, [rsp + 80]
-            ; movaps xmm6, [rsp + 96]
-            ; movaps xmm7, [rsp + 112]
-            ; movaps xmm8, [rsp + 128]
-            ; movaps xmm9, [rsp + 144]
-            ; movaps xmm10, [rsp + 160]
-            ; movaps xmm11, [rsp + 176]
-            ; movaps xmm12, [rsp + 192]
-            ; movaps xmm13, [rsp + 208]
-            ; movaps xmm14, [rsp + 224]
-            ; movaps xmm15, [rsp + 240]
+            ; movups xmm0, [rsp]
+            ; movups xmm1, [rsp + 16]
+            ; movups xmm2, [rsp + 32]
+            ; movups xmm3, [rsp + 48]
+            ; movups xmm4, [rsp + 64]
+            ; movups xmm5, [rsp + 80]
+            ; movups xmm6, [rsp + 96]
+            ; movups xmm7, [rsp + 112]
+            ; movups xmm8, [rsp + 128]
+            ; movups xmm9, [rsp + 144]
+            ; movups xmm10, [rsp + 160]
+            ; movups xmm11, [rsp + 176]
+            ; movups xmm12, [rsp + 192]
+            ; movups xmm13, [rsp + 208]
+            ; movups xmm14, [rsp + 224]
+            ; movups xmm15, [rsp + 240]
             ; add rsp, 256
         );
         // Restore GPRs
