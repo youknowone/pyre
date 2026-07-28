@@ -10,10 +10,16 @@ use crate::pyobject::*;
 pub struct W_FloatObject {
     pub ob_header: PyObject,
     pub floatval: f64,
+    /// Native-subclass mapdict owner. Exact floats keep this null.
+    pub w_dict: PyObjectRef,
+    /// Native-subclass `__slots__` storage indexed by `Member.index`.
+    pub w_slots: PyObjectRef,
 }
 
 /// Field offset of `floatval` within `W_FloatObject`, for JIT field access.
 pub const FLOAT_FLOATVAL_OFFSET: usize = std::mem::offset_of!(W_FloatObject, floatval);
+pub const FLOAT_W_DICT_OFFSET: usize = std::mem::offset_of!(W_FloatObject, w_dict);
+pub const FLOAT_W_SLOTS_OFFSET: usize = std::mem::offset_of!(W_FloatObject, w_slots);
 
 /// GC type id assigned to `W_FloatObject` at JitDriver init time.
 /// Held as a constant here (rather than runtime-queried) so the
@@ -57,6 +63,8 @@ pub fn w_float_new(value: f64) -> PyObjectRef {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: value,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
     };
     if crate::gc_interp::enabled() {
         let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE);
@@ -110,6 +118,53 @@ pub fn box_float_constant(value: f64) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_float_get_value(obj: PyObjectRef) -> f64 {
     unsafe { (*(obj as *const W_FloatObject)).floatval }
+}
+
+#[inline]
+pub unsafe fn w_float_getdict(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_FloatObject)).w_dict }
+}
+
+#[inline]
+pub unsafe fn w_float_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
+    unsafe { (*(obj as *mut W_FloatObject)).w_dict = w_dict };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+pub unsafe fn w_float_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+    let slots = unsafe { (*(obj as *const W_FloatObject)).w_slots };
+    if slots.is_null() {
+        return None;
+    }
+    unsafe { crate::listobject::w_list_getitem(slots, index as i64) }
+        .filter(|value| !value.is_null())
+}
+
+pub unsafe fn w_float_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
+    let mut slots = unsafe { (*(obj as *const W_FloatObject)).w_slots };
+    if slots.is_null() {
+        slots = crate::listobject::w_list_new(vec![PY_NULL; index + 1]);
+        unsafe { (*(obj as *mut W_FloatObject)).w_slots = slots };
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    } else {
+        while unsafe { crate::listobject::w_list_len(slots) } <= index {
+            unsafe { crate::listobject::w_list_append(slots, PY_NULL) };
+        }
+    }
+    unsafe { crate::listobject::w_list_setitem(slots, index as i64, value) };
+}
+
+pub unsafe fn w_float_slot_del(obj: PyObjectRef, index: usize) -> bool {
+    let slots = unsafe { (*(obj as *const W_FloatObject)).w_slots };
+    if slots.is_null() || unsafe { crate::listobject::w_list_len(slots) } <= index {
+        return false;
+    }
+    let present = unsafe { crate::listobject::w_list_getitem(slots, index as i64) }
+        .is_some_and(|value| !value.is_null());
+    if present {
+        unsafe { crate::listobject::w_list_setitem(slots, index as i64, PY_NULL) };
+    }
+    present
 }
 
 #[majit_macros::dont_look_inside]

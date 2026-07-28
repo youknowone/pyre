@@ -61,7 +61,22 @@ pub fn binary_value(
         BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => floordiv(a, b),
         BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => mod_(a, b),
         BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => truediv(a, b),
-        BinaryOperator::Power | BinaryOperator::InplacePower => pow(a, b),
+        BinaryOperator::Power => pow(a, b),
+        BinaryOperator::InplacePower => match pow(a, b) {
+            Err(err)
+                if err.kind == crate::PyErrorKind::TypeError
+                    && err
+                        .message
+                        .starts_with("unsupported operand type(s) for ** or pow():") =>
+            {
+                Err(crate::PyError::type_error(format!(
+                    "unsupported operand type(s) for **=: '{}' and '{}'",
+                    crate::baseobjspace::object_functionstr_type_name(a),
+                    crate::baseobjspace::object_functionstr_type_name(b),
+                )))
+            }
+            result => result,
+        },
         BinaryOperator::Lshift | BinaryOperator::InplaceLshift => lshift(a, b),
         BinaryOperator::MatrixMultiply | BinaryOperator::InplaceMatrixMultiply => matmul(a, b),
         BinaryOperator::Rshift | BinaryOperator::InplaceRshift => rshift(a, b),

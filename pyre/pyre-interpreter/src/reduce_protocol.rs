@@ -157,7 +157,12 @@ pub fn getnewargs(w_obj: PyObjectRef) -> Result<(bool, PyObjectRef, PyObjectRef)
     let w_args;
     let w_kwargs;
     if let Some(w_descr) = w_descr {
-        let w_result = crate::call::call_function_impl_result(w_descr, &[w_obj])?;
+        // objectobject.py:204:
+        // `space.get_and_call_function(w_descr, w_obj)`.
+        let w_type =
+            crate::typedef::r#type(w_obj).map_or(pyre_object::PY_NULL, |w_type| w_type.as_ptr());
+        let w_result =
+            unsafe { crate::baseobjspace::get_and_call_function(w_descr, w_obj, w_type, &[]) }?;
         if !unsafe { pyre_object::is_tuple(w_result) } {
             return Err(PyError::type_error(format!(
                 "__getnewargs_ex__ should return a tuple, not '{}'",
@@ -191,7 +196,12 @@ pub fn getnewargs(w_obj: PyObjectRef) -> Result<(bool, PyObjectRef, PyObjectRef)
     } else {
         let w_descr = unsafe { crate::baseobjspace::lookup(w_obj, "__getnewargs__") };
         if let Some(w_descr) = w_descr {
-            let wa = crate::call::call_function_impl_result(w_descr, &[w_obj])?;
+            // objectobject.py:212:
+            // `space.get_and_call_function(w_descr, w_obj)`.
+            let w_type = crate::typedef::r#type(w_obj)
+                .map_or(pyre_object::PY_NULL, |w_type| w_type.as_ptr());
+            let wa =
+                unsafe { crate::baseobjspace::get_and_call_function(w_descr, w_obj, w_type, &[]) }?;
             if !unsafe { pyre_object::is_tuple(wa) } {
                 return Err(PyError::type_error(format!(
                     "__getnewargs__ should return a tuple, not '{}'",

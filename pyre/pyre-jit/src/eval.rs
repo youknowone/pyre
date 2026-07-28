@@ -1217,9 +1217,14 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         object_tid,
     ));
     debug_assert_eq!(w_int_tid, W_INT_GC_TYPE_ID);
-    let w_float_tid = gc.register_type(TypeInfo::object_subclass(
+    let w_float_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
         std::mem::size_of::<W_FloatObject>(),
         object_tid,
+        vec![
+            pyre_object::pyobject::W_CLASS_OFFSET,
+            pyre_object::floatobject::FLOAT_W_DICT_OFFSET,
+            pyre_object::floatobject::FLOAT_W_SLOTS_OFFSET,
+        ],
     ));
     debug_assert_eq!(w_float_tid, W_FLOAT_GC_TYPE_ID);
     // jitframe.py:49 — rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
@@ -1562,6 +1567,15 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     );
     pytype_to_tid.insert(
         &pyre_interpreter::function::BUILTIN_FUNCTION_TYPE as *const _ as usize,
+        function_tid,
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_interpreter::function::METHOD_DESCRIPTOR_TYPE as *const _ as usize,
+        function_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_interpreter::function::METHOD_DESCRIPTOR_TYPE as *const _ as usize,
         function_tid,
     );
     majit_gc::GcAllocator::register_vtable_for_type(
@@ -2349,9 +2363,14 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // per-ExcKind tids registered below.  Bound to `COMPLEX_TYPE` so the
     // collector reads the correct size + leaf trace when a managed
     // container holds a complex.
-    let w_complex_tid = gc.register_type(TypeInfo::object_subclass(
+    let w_complex_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
         std::mem::size_of::<pyre_object::complexobject::W_ComplexObject>(),
         object_tid,
+        vec![
+            pyre_object::pyobject::W_CLASS_OFFSET,
+            pyre_object::complexobject::COMPLEX_W_DICT_OFFSET,
+            pyre_object::complexobject::COMPLEX_W_SLOTS_OFFSET,
+        ],
     ));
     debug_assert_eq!(
         w_complex_tid,
@@ -9204,6 +9223,8 @@ fn materialize_virtual_from_rd(
                         w_class: pyre_object::pyobject::get_instantiate(tp),
                     },
                     floatval: 0.0,
+                    w_dict: std::ptr::null_mut(),
+                    w_slots: std::ptr::null_mut(),
                 });
                 Box::into_raw(obj) as usize
             } else if ob_type != 0 {
@@ -10662,6 +10683,8 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                         ),
                     },
                     floatval: 0.0,
+                    w_dict: std::ptr::null_mut(),
+                    w_slots: std::ptr::null_mut(),
                 });
                 Box::into_raw(obj) as i64
             }

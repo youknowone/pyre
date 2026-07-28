@@ -472,7 +472,6 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             // hint before `_do_extend_from_iterable` obtains and consumes the
             // iterator.  Hint failures other than TypeError/AttributeError are
             // observable and propagate without appending a prefix.
-            let _ = crate::baseobjspace::length_hint(other, 0)?;
             // Append each yielded value before asking for the next one.  An
             // exception from a later `next()` does not roll back the prefix.
             let _roots = pyre_object::gc_roots::push_roots();
@@ -5483,6 +5482,43 @@ pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 pub unsafe fn has_dict_backing(obj: PyObjectRef) -> bool {
     !resolve_dict_backing(obj).is_null()
+}
+
+/// Write pyre's object-resident stand-in for a dict subclass's intrinsic
+/// `W_DictMultiObject` payload.  This is a layout-slot operation, not Python
+/// attribute assignment: a subclass may override `__setattr__` with a dict
+/// method before its mapping payload exists.
+pub fn set_dict_backing(obj: PyObjectRef, backing: PyObjectRef) -> bool {
+    unsafe {
+        if !is_instance(obj) || !is_dict(backing) {
+            return false;
+        }
+        let w_type = crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr());
+        if w_type.is_null() {
+            return false;
+        }
+        let mut layout = pyre_object::w_type_get_layout_ptr(w_type);
+        while !layout.is_null() {
+            let current = &*layout;
+            let first_slot = current
+                .nslots
+                .saturating_sub(current.newslotnames.len() as u32);
+            if let Some(offset) = current
+                .newslotnames
+                .iter()
+                .position(|name| name == "__dict_data__")
+            {
+                crate::objspace::std::mapdict::setslotvalue(
+                    obj,
+                    first_slot + offset as u32,
+                    backing,
+                );
+                return true;
+            }
+            layout = current.base_layout;
+        }
+    }
+    false
 }
 
 pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {

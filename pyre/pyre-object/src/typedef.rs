@@ -241,6 +241,10 @@ pub struct W_MemberDescr {
     pub name: *const String,
     /// Owning type object (for typecheck).
     pub w_cls: PyObjectRef,
+    /// `PyMemberDef.doc` for native member descriptors.  Like CPython's
+    /// static C string, this is non-GC metadata; Python `__slots__` members
+    /// leave it null.
+    pub doc: *const String,
 }
 
 /// Python 3.14's function type exposes five direct `PyMemberDef` entries.
@@ -256,13 +260,32 @@ pub const MEMBER_FUNCTION_MODULE: u32 = MEMBER_DIRECT_FLAG | 3;
 pub const MEMBER_FUNCTION_BUILTINS: u32 = MEMBER_DIRECT_FLAG | 4;
 /// CPython 3.14 `module_members`: the authoritative Module.w_dict field.
 pub const MEMBER_MODULE_DICT: u32 = MEMBER_DIRECT_FLAG | 5;
+/// CPython `PyComplex_Type` exposes `real`/`imag` as read-only T_DOUBLE
+/// member descriptors.
+pub const MEMBER_COMPLEX_REAL: u32 = MEMBER_DIRECT_FLAG | 6;
+pub const MEMBER_COMPLEX_IMAG: u32 = MEMBER_DIRECT_FLAG | 7;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {
+    w_member_new_with_doc(index, name, w_cls, None)
+}
+
+/// Create a member descriptor carrying the native member definition's doc.
+pub fn w_member_new_with_doc(
+    index: u32,
+    name: String,
+    w_cls: PyObjectRef,
+    doc: Option<String>,
+) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
     let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(w_cls);
     let name = crate::lltype::malloc_raw(name);
+    let doc = doc.map_or(std::ptr::null(), |value| {
+        crate::lltype::malloc_raw(value) as *const String
+    });
+    let w_cls = crate::gc_roots::shadow_stack_get(root_base);
     W_MemberDescr::allocate(W_MemberDescr {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -271,6 +294,7 @@ pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef
         index,
         name,
         w_cls,
+        doc,
     })
 }
 
@@ -300,6 +324,22 @@ pub unsafe fn w_member_get_cls(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_member_set_cls(obj: PyObjectRef, w_cls: PyObjectRef) {
     crate::gc_roots::mark_prebuilt_roots_dirty();
     unsafe { (*(obj as *mut W_MemberDescr)).w_cls = w_cls }
+}
+
+pub unsafe fn w_member_get_doc(obj: PyObjectRef) -> Option<&'static str> {
+    if unsafe { w_member_is_direct(obj) } {
+        match unsafe { w_member_get_name(obj) } {
+            "real" => return Some("the real part of a complex number"),
+            "imag" => return Some("the imaginary part of a complex number"),
+            _ => {}
+        }
+    }
+    let doc = unsafe { (*(obj as *const W_MemberDescr)).doc };
+    if !doc.is_null() {
+        Some(unsafe { &*doc })
+    } else {
+        None
+    }
 }
 
 /// `typedef.py:446 Member.index` — the slot index (`base_nslots + position`),

@@ -323,7 +323,11 @@ unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<
                         crate::baseobjspace::object_functionstr_type_name(obj)
                     )));
                 };
-                let bytes = crate::builtins::call_and_check(method, &[obj])?;
+                // bytesobject.py `invoke_bytes_method`:
+                // `space.get_and_call_function(w_bytes_method, w_source)`.
+                let w_type = crate::typedef::r#type(obj)
+                    .map_or(pyre_object::PY_NULL, |w_type| w_type.as_ptr());
+                let bytes = crate::baseobjspace::get_and_call_function(method, obj, w_type, &[])?;
                 if !pyre_object::is_bytes(bytes) {
                     return Err(PyError::type_error(format!(
                         "__bytes__ returned non-bytes (type {})",

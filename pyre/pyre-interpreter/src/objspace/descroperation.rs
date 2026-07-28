@@ -3953,15 +3953,34 @@ pub fn pow3(base: PyObjectRef, exp: PyObjectRef, modulus: PyObjectRef) -> PyResu
     if unsafe { is_none(modulus) } {
         return pow(base, exp);
     }
-    // descroperation.py:454-459 — three-arg power looks up only the forward
-    // `__pow__` on the base (so a subclass override is honoured) and never
-    // the reflected `__rpow__`. The `is_cpytype()` `pow3_bug_compat_cpyext`
-    // branch has no equivalent: with no cpyext type model every base takes
-    // the `else` branch. The integer modular-power computation lives in
-    // `int.__pow__`, reached through this lookup.
+    // Python 3.14 extends reflected-power dispatch to the ternary form.  A
+    // strict RHS subtype gets the first opportunity, exactly as for binary
+    // power, and receives `(base, modulus)` after its bound receiver.
+    let base_type = crate::typedef::r#type(base).map(|t| t.as_ptr());
+    let exp_type = crate::typedef::r#type(exp).map(|t| t.as_ptr());
+    let rhs_first = match (base_type, exp_type) {
+        (Some(lhs), Some(rhs)) if !std::ptr::eq(lhs, rhs) => unsafe {
+            crate::baseobjspace::issubtype_w(rhs, lhs)
+        },
+        _ => false,
+    };
+    if rhs_first {
+        if let Some(method) = unsafe { lookup_type_special(exp, "__rpow__") } {
+            if let Some(result) = try_call_special(method, &[exp, base, modulus])? {
+                return Ok(result);
+            }
+        }
+    }
     if let Some(method) = unsafe { lookup_type_special(base, "__pow__") } {
         if let Some(result) = try_call_special(method, &[base, exp, modulus])? {
             return Ok(result);
+        }
+    }
+    if !rhs_first {
+        if let Some(method) = unsafe { lookup_type_special(exp, "__rpow__") } {
+            if let Some(result) = try_call_special(method, &[exp, base, modulus])? {
+                return Ok(result);
+            }
         }
     }
     Err(ternary_builtin_type_error("pow()", base, exp, modulus))

@@ -3657,15 +3657,12 @@ pub unsafe fn walk_mapdict_roots_area(_data: *const (), mut visitor: impl FnMut(
 /// tracer cannot model; the JIT residualises the call (`@dont_look_inside`).
 #[majit_macros::dont_look_inside]
 pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
-    // Upstream `space.isinstance_w(w_dict, space.w_dict)` also accepts
-    // dict subclasses (their instances are dict-layout
-    // W_DictMultiObject).  Pyre dict-subclass instances are
-    // `__dict_data__`-composed W_ObjectObject (typedef.rs
-    // dict_descr_new), and the devolved/cache readers below this slot
-    // (node SPECIAL reads, classify_attr) do raw layout dict ops, so
-    // only layout dicts are accepted until the subclass layout
-    // converges.
-    if !unsafe { pyre_object::is_dict(w_dict) } {
+    // mapdict.py:848 `space.isinstance_w(w_dict, space.w_dict)` accepts
+    // dict subclasses. Pyre's composed dict-subclass representation is
+    // resolved by the getdict backing helpers at each raw dict operation,
+    // while the SPECIAL slot retains the supplied object's identity.
+    let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+    if !unsafe { crate::baseobjspace::isinstance_w(w_dict, w_dict_type) } {
         return Err(PyError::type_error(
             "setting dictionary to a non-dict".to_string(),
         ));

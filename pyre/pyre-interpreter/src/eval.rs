@@ -4156,6 +4156,28 @@ impl OpcodeStepExecutor for PyFrame {
         Ok(())
     }
 
+    fn load_special(&mut self, name: &str) -> Result<(), PyError> {
+        let obj = self.pop();
+        let w_type =
+            crate::typedef::r#type(obj).map_or(pyre_object::PY_NULL, |w_type| w_type.as_ptr());
+        let descr = if w_type.is_null() {
+            None
+        } else {
+            unsafe { crate::baseobjspace::lookup_in_type(w_type, name) }
+        }
+        .ok_or_else(|| {
+            PyError::attribute_error(format!(
+                "'{}' object has no attribute '{}'",
+                crate::baseobjspace::object_functionstr_type_name(obj),
+                name,
+            ))
+        })?;
+        let bound = unsafe { crate::baseobjspace::get(descr, obj, w_type) }?.unwrap_or(descr);
+        self.push(bound);
+        self.push(PY_NULL);
+        Ok(())
+    }
+
     /// pyopcode.py:1024-1027 `LOAD_ATTR` — the interpreter consults the mapdict
     /// attribute cache only off-trace; under the JIT it does the plain
     /// `space.getattr`, which the trace folds via the type's `version_tag`.

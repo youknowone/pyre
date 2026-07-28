@@ -1702,29 +1702,42 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(
         ns,
         "getsizeof",
-        make_builtin_function("getsizeof", |args| {
-            if args.len() > 2 {
-                return Err(crate::PyError::type_error(format!(
-                    "getsizeof() takes at most 2 arguments ({} given)",
-                    args.len()
-                )));
-            }
-            let Some(&w_obj) = args.first() else {
-                return Err(crate::PyError::type_error(
-                    "getsizeof() takes at least 1 argument (0 given)",
-                ));
-            };
-            if unsafe { pyre_object::is_str(w_obj) } {
-                let method = crate::baseobjspace::getattr_str(w_obj, "__sizeof__")?;
-                return crate::call::call_function_impl_result(method, &[]);
-            }
-            match args.get(1).copied() {
-                Some(w_default) => Ok(w_default),
-                None => Err(crate::PyError::type_error(
-                    "getsizeof(object, default) -> int: object size is not tracked; supply a default",
-                )),
-            }
-        }),
+        make_builtin_function(
+            "getsizeof",
+            |args| {
+                if args.len() > 2 {
+                    return Err(crate::PyError::type_error(format!(
+                        "getsizeof() takes at most 2 arguments ({} given)",
+                        args.len()
+                    )));
+                }
+                let Some(&w_obj) = args.first() else {
+                    return Err(crate::PyError::type_error(
+                        "getsizeof() takes at least 1 argument (0 given)",
+                    ));
+                };
+                if let Some(w_type) = crate::typedef::r#type(w_obj) {
+                    if let Some(w_sizeof) = unsafe {
+                        crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__sizeof__")
+                    } {
+                        return unsafe {
+                            crate::baseobjspace::get_and_call_function(
+                                w_sizeof,
+                                w_obj,
+                                w_type.as_ptr(),
+                                &[],
+                            )
+                        };
+                    }
+                }
+                match args.get(1).copied() {
+                    Some(w_default) => Ok(w_default),
+                    None => Err(crate::PyError::type_error(
+                        "getsizeof(object, default) -> int: object size is not tracked; supply a default",
+                    )),
+                }
+            },
+        ),
     );
     // PyPy normally omits CPython's raw refcount API.  The shared ctypes
     // tests only require the strong-reference delta created by a c_char_p

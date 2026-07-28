@@ -309,7 +309,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_descr": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_descrtut": {
       "dynasm": "IMPORTERROR"

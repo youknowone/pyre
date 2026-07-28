@@ -2695,16 +2695,21 @@ pub(crate) fn calculate_metaclass(
         let Some(base) = (unsafe { pyre_object::w_tuple_getitem(bases, i as i64) }) else {
             continue;
         };
-        let Some(w_base_type) = crate::typedef::r#type(base) else {
+        let w_base_type = unsafe {
+            if pyre_object::is_type(base) && !(*base).w_class.is_null() {
+                Some((*base).w_class)
+            } else {
+                crate::typedef::r#type(base).map(|ty| ty.as_ptr())
+            }
+        };
+        let Some(w_base_type) = w_base_type else {
             continue;
         };
-        if std::ptr::eq(w_winner, w_base_type.as_ptr())
-            || issubtype_ptr(w_winner, w_base_type.as_ptr())
-        {
+        if std::ptr::eq(w_winner, w_base_type) || issubtype_ptr(w_winner, w_base_type) {
             continue;
         }
-        if issubtype_ptr(w_base_type.as_ptr(), w_winner) {
-            w_winner = w_base_type.as_ptr();
+        if issubtype_ptr(w_base_type, w_winner) {
+            w_winner = w_base_type;
             continue;
         }
         return Err(PyError::type_error(
@@ -3324,27 +3329,34 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     };
 
     // If no explicit metaclass, infer from bases (PyPy: calculate_metaclass)
-    let w_metaclass = metaclass.or_else(|| {
-        unsafe {
-            if !pyre_object::is_tuple(bases_tuple) {
-                return None;
-            }
-            let n = pyre_object::w_tuple_len(bases_tuple);
-            for i in 0..n {
-                if let Some(base) = pyre_object::w_tuple_getitem(bases_tuple, i as i64) {
-                    if pyre_object::is_type(base) {
-                        // baseobjspace.py:76 — metaclass from w_class
-                        let w_class = (*base).w_class;
-                        let w_type_type = crate::typedef::w_type();
-                        if !w_class.is_null() && !std::ptr::eq(w_class, w_type_type) {
-                            return Some(w_class);
-                        }
-                    }
+    let w_metaclass = match metaclass {
+        Some(meta) if unsafe { !pyre_object::is_type(meta) } => Some(meta),
+        explicit => {
+            let initial = if let Some(explicit) = explicit {
+                explicit
+            } else if unsafe { pyre_object::w_tuple_len(bases_tuple) } > 0 {
+                unsafe {
+                    pyre_object::w_tuple_getitem(bases_tuple, 0)
+                        .and_then(|base| {
+                            if pyre_object::is_type(base) && !(*base).w_class.is_null() {
+                                Some((*base).w_class)
+                            } else {
+                                crate::typedef::r#type(base).map(|ty| ty.as_ptr())
+                            }
+                        })
+                        .unwrap_or_else(crate::typedef::w_type)
                 }
+            } else {
+                crate::typedef::w_type()
+            };
+            let winner = calculate_metaclass(initial, bases_tuple)?;
+            if std::ptr::eq(winner, crate::typedef::w_type()) {
+                None
+            } else {
+                Some(winner)
             }
         }
-        None
-    });
+    };
 
     build_class_inner(
         body_fn,
@@ -3725,6 +3737,15 @@ fn build_class_inner(
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         unsafe { pyre_object::w_dict_getitem_str(class_ns, "__classcell__") }
     };
+    if w_metaclass.is_none()
+        && classcell.is_some_and(|value| unsafe { !pyre_object::is_cell(value) })
+    {
+        let value = classcell.unwrap();
+        return Err(PyError::type_error(format!(
+            "__classcell__ must be a nonlocal cell, not {}",
+            unsafe { pyre_object::type_name_of(value) },
+        )));
+    }
     // CPython 3.14 type_new_set_classdict: compiler-generated annotation
     // functions and comprehensions capture `__classdict__` through this
     // separate cell.  type.__new__ consumes the namespace entry and replaces
@@ -4623,6 +4644,35 @@ unsafe fn check_and_find_best_base(
     w_bases: pyre_object::PyObjectRef,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     unsafe {
+        let len = if w_bases.is_null() || !pyre_object::is_tuple(w_bases) {
+            0
+        } else {
+            pyre_object::w_tuple_len(w_bases)
+        };
+        for i in 0..len {
+            let Some(w_base) = pyre_object::w_tuple_getitem(w_bases, i as i64) else {
+                continue;
+            };
+            if !pyre_object::is_type(w_base) {
+                return Err(crate::PyError::type_error(format!(
+                    "{}() argument 2 must be tuple of types, not {}",
+                    "type",
+                    pyre_object::type_name_of(w_base),
+                )));
+            }
+            if pyre_object::w_type_get_mro(w_base).is_null() {
+                return Err(crate::PyError::type_error(format!(
+                    "cannot extend incomplete type '{}'",
+                    pyre_object::w_type_get_name(w_base),
+                )));
+            }
+            if !is_acceptable_base_class(w_base) {
+                return Err(crate::PyError::type_error(format!(
+                    "type '{}' is not an acceptable base type",
+                    pyre_object::w_type_get_name(w_base),
+                )));
+            }
+        }
         let w_bestbase = find_best_base(w_bases);
         // typeobject.py:1113-1115
         if w_bestbase.is_null() {
@@ -4642,14 +4692,22 @@ unsafe fn check_and_find_best_base(
         // typeobject.py:1122-1128: check layout conflicts
         let best_layout = pyre_object::w_type_get_layout_ptr(w_bestbase);
         if !best_layout.is_null() && !w_bases.is_null() && pyre_object::is_tuple(w_bases) {
-            let len = pyre_object::w_tuple_len(w_bases);
             for i in 0..len {
                 if let Some(w_base) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
                     if !pyre_object::is_type(w_base) {
                         continue;
                     }
                     let layout = pyre_object::w_type_get_layout_ptr(w_base);
-                    if !layout.is_null() && !(*best_layout).issublayout(layout) {
+                    let native_layout_conflict = !layout.is_null()
+                        && !std::ptr::eq((*best_layout).typedef, (*layout).typedef)
+                        && !std::ptr::eq(
+                            (*best_layout).typedef,
+                            &pyre_object::pyobject::INSTANCE_TYPE,
+                        )
+                        && !std::ptr::eq((*layout).typedef, &pyre_object::pyobject::INSTANCE_TYPE);
+                    if !layout.is_null()
+                        && (!(*best_layout).issublayout(layout) || native_layout_conflict)
+                    {
                         return Err(crate::PyError::type_error(
                             "instance layout conflicts in multiple inheritance".to_string(),
                         ));

@@ -1143,6 +1143,17 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         self.push_value(null)
     }
 
+    /// LOAD_SPECIAL bypasses instance `__getattribute__` and resolves the
+    /// descriptor on the type. Concrete frames override this with the direct
+    /// special-method lookup; symbolic executors retain the method-shaped
+    /// stack contract.
+    fn load_special(&mut self, name: &str) -> Result<(), PyError>
+    where
+        Self: SharedOpcodeHandler + NamespaceOpcodeHandler,
+    {
+        self.load_method(name)
+    }
+
     fn store_attr(&mut self, name: &str) -> Result<(), PyError>
     where
         Self: SharedOpcodeHandler,
@@ -2352,7 +2363,7 @@ where
         SpecialMethod::AEnter => "__aenter__",
         _ => "__aexit__",
     };
-    executor.load_method(name)?;
+    executor.load_special(name)?;
     Ok(StepResult::Continue)
 }
 

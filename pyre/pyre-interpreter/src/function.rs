@@ -13,6 +13,12 @@ pub static FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype("function")
 /// Type descriptor for module-level builtins.
 pub static BUILTIN_FUNCTION_TYPE: PyType =
     pyre_object::pyobject::new_pytype("builtin_function_or_method");
+/// CPython-compatible interp-level method descriptor.
+///
+/// PyPy represents these as `FunctionWithFixedCode`; the separate public
+/// type preserves that payload and call ABI while exposing CPython's
+/// `method_descriptor` surface.
+pub static METHOD_DESCRIPTOR_TYPE: PyType = pyre_object::pyobject::new_pytype("method_descriptor");
 /// CPython-compatible slot wrapper descriptor.
 ///
 /// The public type is distinct from PyPy's `FunctionWithFixedCode`, while the
@@ -529,6 +535,16 @@ pub fn function_new_slot_wrapper(code: *const (), name: String) -> PyObjectRef {
     function_new_impl(&SLOT_WRAPPER_TYPE, code, name, PY_NULL, PY_NULL, false)
 }
 
+/// Retag a freshly materialised `FunctionWithFixedCode` as the public
+/// method-descriptor carrier. TypeDef builds its namespace before the owner
+/// type exists, so this is deliberately performed during materialisation.
+pub unsafe fn function_retag_method_descriptor(obj: PyObjectRef) {
+    unsafe {
+        (*obj).ob_type = &METHOD_DESCRIPTOR_TYPE as *const PyType;
+        (*obj).w_class = get_instantiate(&METHOD_DESCRIPTOR_TYPE);
+    }
+}
+
 /// function.py:385-388 — `_check_code_mutable(attr)`:
 ///
 /// ```python
@@ -569,7 +585,11 @@ pub unsafe fn _get_immutable_code(func: PyObjectRef) -> *const () {
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_function(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &FUNCTION_TYPE) || py_type_check(obj, &BUILTIN_FUNCTION_TYPE) }
+    unsafe {
+        py_type_check(obj, &FUNCTION_TYPE)
+            || py_type_check(obj, &BUILTIN_FUNCTION_TYPE)
+            || py_type_check(obj, &METHOD_DESCRIPTOR_TYPE)
+    }
 }
 
 /// Whether `obj` is a CPython-compatible slot-wrapper descriptor.

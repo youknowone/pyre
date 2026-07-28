@@ -348,6 +348,7 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
         let is_leaf = std::ptr::eq(tp, &INT_TYPE as *const PyType)
             || std::ptr::eq(tp, &LONG_TYPE as *const PyType)
             || std::ptr::eq(tp, &FLOAT_TYPE as *const PyType)
+            || std::ptr::eq(tp, &pyre_object::COMPLEX_TYPE as *const PyType)
             || std::ptr::eq(tp, &BOOL_TYPE as *const PyType)
             || std::ptr::eq(tp, &STR_TYPE as *const PyType)
             || std::ptr::eq(tp, &pyre_object::LIST_TYPE as *const PyType)
