@@ -4266,6 +4266,26 @@ enum SetMemberLookup {
     /// walks the whole translated program, the runtime only registers what
     /// it actually traces.  Upstream has no counterpart because
     /// `cpu.*descrof` and `compute_bitstrings` share one process.
+    ///
+    /// KNOWN GAP: "absent" is evaluated once, when the `BhCallDescr` is
+    /// materialised (`jitcode_runtime.rs rehydrated_call_descr_ref`), but the
+    /// runtime universe keeps growing after that.  A container registered
+    /// later — under the same `path_hash` key — leaves this EI permanently
+    /// claiming "not written" for a field the callee does write, so the
+    /// heapcache would not invalidate a read across the call.  No corpus
+    /// fixture reproduces it today.
+    ///
+    /// The conservative repair (treat this like [`Self::Ambiguous`] and
+    /// degrade the EI to `EF_RANDOM_EFFECTS`) is not taken here: a probe over
+    /// `bench/synth/comprehension_object_append_hot` counts 211 drops across
+    /// ~40 distinct containers (`W_TupleObject.wrappeditems`,
+    /// `PyFrame.w_globals`, `intval`, rbigint `_digits`/`_size`, …), so it
+    /// would turn most residual calls into whole-heap barriers.  The
+    /// convergence path is to stop freezing the sets at materialisation and
+    /// re-resolve from the retained `ei.descr_set_keys` as the universe grows
+    /// (i.e. inside `compute_bitstrings`, which already re-runs); that is
+    /// blocked on the descr-universe work and on `compute_bitstrings`' own
+    /// per-`jitcode_for` cost.
     AbsentContainer,
     /// The container IS published but not under this member's key.  A real
     /// runtime descr for the field may exist under a different spelling, so
