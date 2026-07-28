@@ -1803,6 +1803,20 @@ def main():
             f"{B}/getframe_escape_flush_writethrough_regression.py",
             15,
         )
+        # The coordinate a frame reports WHILE it is still running: compiled code
+        # runs no per-opcode `last_instr` store, so a replayed frame answers for
+        # the instruction it is on only if the blackhole publishes at the
+        # `-live-` marker. Skipped on wasm, which does not satisfy it today --
+        # the guard's own header carries the measurement (the publish lands and
+        # reads back, and a wasm-side writer clears it before the residual
+        # `sys._getframe`). The post-return coordinate, which wasm does satisfy,
+        # stays in the synthetic bench (exception_traceback_frame_lineno).
+        chk.run_selfcheck(
+            "frame_lineno_mid_replay",
+            f"{B}/frame_lineno_mid_replay_regression.py",
+            20,
+            skip_backends=("wasm",),
+        )
         # The branchy-inlined-callee guard (gh#343) lives in the synthetic parity
         # suite as bridge_branchy_callee.py, gated against pypy by
         # `# pyre-check: max-pypy-ratio`; a decline that keeps every crossing

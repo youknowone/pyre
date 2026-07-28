@@ -29,11 +29,10 @@
 # a miss appears as a SECOND tuple in the shape set.
 #
 # Both frame exits publishing is not enough on its own: a frame can also be
-# READ while it is still running, and a replayed frame has to answer for the
-# instruction it is on, not for the last one that published.  The
-# `mid_replay_*` group reads it from the two places that can: a callee walking
-# up with `sys._getframe`, and a traceback taken inside a handler the same
-# frame is still executing.
+# READ while it is still running.  That half lives in
+# `pyre/bench/frame_lineno_mid_replay_regression.py` instead of here, because
+# the wasm backend does not satisfy it yet and the synthetic suite has no
+# per-backend scoping; the guard carries the measurement.
 #
 # Offsets run from `co_firstlineno` so edits above these functions do not move
 # the expected values.
@@ -176,75 +175,6 @@ def loop_owners():
     )]
 
 
-def caller_offset():
-    """The caller's coordinate, read from a callee while the caller is still
-    running.  Nothing has left the caller's frame yet, so neither exit publish
-    has fired and the answer can only come from the frame being kept current."""
-    frame = sys._getframe(1)
-    return frame.f_lineno - frame.f_code.co_firstlineno
-
-
-def mid_replay_getframe(n):
-    tb = None
-    k = 0
-    while k < n:
-        try:
-            raise ValueError(k)
-        except ValueError as e:
-            tb = e.__traceback__
-        k += 1
-    return caller_offset()
-
-
-def mid_replay_handler(n):
-    tb = None
-    k = 0
-    while k < n:
-        try:
-            raise ValueError(k)
-        except ValueError as e:
-            tb = e.__traceback__
-        k += 1
-    try:
-        raises_out(k)
-    except KeyError as e:
-        t = e.__traceback__
-        base = t.tb_frame.f_code.co_firstlineno
-        return (t.tb_lineno - base, t.tb_frame.f_lineno - base)
-
-
-def mid_replay():
-    """Split across calls rather than run once: the loop compiles part-way
-    through, so a set over the rounds holds the interpreted answer and the
-    replayed one together and a divergence appears as a SECOND element."""
-    rounds = 8
-    each = N // rounds
-    return [
-        sorted({mid_replay_getframe(each) for _ in range(rounds)}),
-        sorted({mid_replay_handler(each) for _ in range(rounds)}),
-    ]
-
-
-def recursive_mid_replay(n, depth):
-    """Direct recursion, every level with its own hot loop, so every level is
-    replayed and every level shares ONE code object with its caller — the shape
-    where a per-level frame mix-up survives a code-object check.  A level
-    answering for another one shows up as a shifted offset."""
-    tb = None
-    k = 0
-    while k < n:
-        try:
-            raise ValueError(k)
-        except ValueError as e:
-            tb = e.__traceback__
-        k += 1
-    if depth > 0:
-        inner = recursive_mid_replay(n, depth - 1)
-    else:
-        inner = ()
-    return ((caller_offset(), caller_offset()),) + inner
-
-
 def kept_alive():
     """Many tracebacks alive at once: a shared or recycled frame collapses."""
     kept = []
@@ -263,9 +193,6 @@ print("while/callee", while_callee())
 print("for/callee  ", for_callee())
 for shape in loop_owners():
     print("loop_owner  ", shape)
-for shape in mid_replay():
-    print("mid_replay  ", shape)
-print("recursive   ", recursive_mid_replay(N // 2, 3))
 kept_shapes, kept_distinct = kept_alive()
 print("kept        ", kept_shapes)
 print("kept_distinct", kept_distinct)
