@@ -1779,6 +1779,21 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 !raw.is_null() && pyre_interpreter::code_is_self_recursive(&*raw)
             };
     }
+    // A callee `fbw_abort_nested_unjournaled_residual` already named on its
+    // hazard arm residualizes from here on.  The hazard is a static property of
+    // the callee's `CodeObject` (loop-bearing / self-recursive), so re-inlining
+    // it rebuilds the identical framestack and reaches the identical abort —
+    // the enclosing loop is retired for a decline that belongs to the callee.
+    // `warmstate.py:331` `disable_noninlinable_function` is the same answer:
+    // the flag it sets means "do not inline calls to this function", and the
+    // enclosing loop is left free to retrace.
+    //
+    // `bridge_rec_root_selfrec` is exempt: that admission carries its own
+    // `SELFREC_CA_FOLD_ACTIVE` exemption from the hazard arm (:2696), so its
+    // recursive residual is not what named the callee here.
+    if !bridge_rec_root_selfrec && fbw_hazardous_inline_denied(callee_code_key) {
+        return Ok(None);
+    }
     // An inline sub-walk inside a FOR_ITER body resumes a guard at the
     // caller's CALL boundary, so deopt re-executes the whole callee.  Replaying
     // a live-heap mutation would double it; the nested-residual decline catches

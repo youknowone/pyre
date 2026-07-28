@@ -1043,6 +1043,19 @@ thread_local! {
     /// backstop abort costs one attempt per callee instead of storming.
     static FBW_FORITER_DEFERRED_DENY: std::cell::RefCell<std::collections::HashSet<usize>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
+    /// Code keys of the callees [`fbw_inline_callee_hazardous`] named when the
+    /// hazard arm of [`fbw_abort_nested_unjournaled_residual`] fired.  The
+    /// inline callsite declines them from then on, so the call residualizes
+    /// and the enclosing trace never re-enters the identical abort.
+    ///
+    /// This is `disable_noninlinable_function` (`warmstate.py:331`, which sets
+    /// `JC_DONT_TRACE_HERE` = "do not inline calls to this function"): upstream
+    /// answers an abort attributable to one inlined callee by denying THAT
+    /// callee and retracing the enclosing loop, not by penalising the loop
+    /// (`pyjitpl.py:2818-2828`).  Like the upstream flag the set has no removal
+    /// path — the hazard is a static property of the callee's `CodeObject`.
+    static FBW_HAZARDOUS_INLINE_DENY: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 /// Marks the sub-walk of a callee admitted into a FOR_ITER body under
@@ -1088,6 +1101,16 @@ fn fbw_foriter_deny_deferred_call(callee_code_key: usize) {
     });
 }
 
+pub(crate) fn fbw_hazardous_inline_denied(callee_code_key: usize) -> bool {
+    FBW_HAZARDOUS_INLINE_DENY.with(|c| c.borrow().contains(&callee_code_key))
+}
+
+fn fbw_deny_hazardous_inline(callee_code_key: usize) {
+    FBW_HAZARDOUS_INLINE_DENY.with(|c| {
+        c.borrow_mut().insert(callee_code_key);
+    });
+}
+
 /// Whether the active inline sub-walk is one of the hazard classes the blanket
 /// nested-residual decline was masking, as opposed to a straight-line mutating
 /// callee (the #73 depth-≥2 payoff, which inlines).  Two classes decline:
@@ -1112,12 +1135,19 @@ fn fbw_foriter_deny_deferred_call(callee_code_key: usize) {
 /// The `w_code` field is the `jitcode_for` code key, resolved to the raw
 /// `CodeObject` via the jitcode index (the `current`-frame pattern,
 /// mod.rs:4664).
-fn fbw_inline_callee_hazardous<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> bool {
+///
+/// Returns the code key of the offending callee, which is the entity the
+/// decline is a property of and therefore the one to deny — the same
+/// attribution `find_biggest_function` (`pyjitpl.py:3538`) performs before
+/// `disable_noninlinable_function`.  Declining it at its own callsite makes
+/// the next attempt residualize that call, so the surviving nest is
+/// hazard-free and the enclosing loop can compile.
+fn fbw_inline_callee_hazardous<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<usize> {
     let session = ctx.session.borrow();
     let mut seen: Vec<usize> = Vec::with_capacity(session.framestack.len());
     for frame in session.framestack.iter() {
         if seen.contains(&frame.w_code) {
-            return true;
+            return Some(frame.w_code);
         }
         seen.push(frame.w_code);
         if let Some(idx) = crate::state::ensure_jitcode_index(frame.w_code as *const ()) {
@@ -1127,13 +1157,13 @@ fn fbw_inline_callee_hazardous<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> 
                     if pyre_interpreter::code_has_for_iter(code)
                         || pyre_interpreter::code_is_self_recursive(code)
                     {
-                        return true;
+                        return Some(frame.w_code);
                     }
                 }
             }
         }
     }
-    false
+    None
 }
 
 pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
@@ -1168,13 +1198,27 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     // aborts before the hazardous body is committed.  Every other nested
     // residual inlines.  The hazard scan is last so the cheap checks
     // short-circuit it.
-    if !in_selfrec_fold
+    let nested = !in_selfrec_fold
         && !in_exception_string_inline
-        && !ctx.session.borrow().framestack.is_empty()
-        && (foriter_deferred_inline.is_some() || fbw_inline_callee_hazardous(ctx))
-    {
+        && !ctx.session.borrow().framestack.is_empty();
+    let hazardous_callee = if nested && foriter_deferred_inline.is_none() {
+        fbw_inline_callee_hazardous(ctx)
+    } else {
+        None
+    };
+    if nested && (foriter_deferred_inline.is_some() || hazardous_callee.is_some()) {
         if let Some(callee_code_key) = foriter_deferred_inline {
             fbw_foriter_deny_deferred_call(callee_code_key);
+        }
+        // Deny the named callee so the enclosing loop's next attempt
+        // residualizes that call instead of re-entering this abort.  Without
+        // it the decline is a property of the framestack, which the next
+        // attempt rebuilds identically: the abort recurs byte-for-byte until
+        // the enclosing location is retired, so the loop never compiles at
+        // all.  Upstream answers the same situation by denying the callee and
+        // letting the enclosing loop retrace (`pyjitpl.py:2818-2828`).
+        if let Some(callee_code_key) = hazardous_callee {
+            fbw_deny_hazardous_inline(callee_code_key);
         }
         // The flush this latch feeds resumes the OUTERMOST caller at the CALL
         // that entered the inline region, re-executing that call from scratch,
