@@ -3486,7 +3486,7 @@ fn range_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// proxy; `__init__` fills it from zero, one, or two user arguments.
 fn super_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(PY_NULL);
-    let value = pyre_object::descriptor::w_super_new(PY_NULL, PY_NULL);
+    let value = pyre_object::descriptor::w_super_new(PY_NULL, PY_NULL, PY_NULL);
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::descriptor::SUPER_TYPE)? {
         unsafe { (*value).w_class = sub };
     }
@@ -3499,6 +3499,7 @@ fn super_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         pyre_object::descriptor::w_super_set_fields(
             args[0],
             pyre_object::descriptor::w_super_get_type(fresh),
+            pyre_object::descriptor::w_super_get_obj_type(fresh),
             pyre_object::descriptor::w_super_get_obj(fresh),
         )
     };
@@ -3516,7 +3517,7 @@ fn super_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let bound_name = if bound.is_null() {
         "NULL".to_string()
     } else {
-        let bound_type = crate::builtins::super_check(start, bound)?;
+        let bound_type = unsafe { pyre_object::descriptor::w_super_get_obj_type(args[0]) };
         format!("<{} object>", unsafe {
             pyre_object::w_type_get_name(bound_type)
         })
@@ -3564,6 +3565,7 @@ fn super_getter(args: &[PyObjectRef], field: usize) -> Result<PyObjectRef, crate
     }
     let start = unsafe { pyre_object::descriptor::w_super_get_type(self_) };
     let bound = unsafe { pyre_object::descriptor::w_super_get_obj(self_) };
+    let bound_type = unsafe { pyre_object::descriptor::w_super_get_obj_type(self_) };
     Ok(match field {
         0 => {
             if start.is_null() {
@@ -3580,10 +3582,10 @@ fn super_getter(args: &[PyObjectRef], field: usize) -> Result<PyObjectRef, crate
             }
         }
         _ => {
-            if bound.is_null() {
+            if bound_type.is_null() {
                 w_none()
             } else {
-                crate::builtins::super_check(start, bound)?
+                bound_type
             }
         }
     })

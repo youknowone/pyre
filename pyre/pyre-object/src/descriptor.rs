@@ -9,22 +9,28 @@ use pyre_macros::pyre_class;
 //
 // PyPy equivalent: pypy/module/__builtin__/descriptor.py W_Super
 //
-// Stores (super_type, obj) and resolves attribute lookups
+// Stores (super_type, obj_type, obj) and resolves attribute lookups
 // starting from the next class after super_type in obj's MRO.
 
-/// super proxy: [ob_type | super_type (cls) | obj (self)]
+/// super proxy: [ob_type | super_type (cls) | obj_type | obj (self)]
 #[pyre_class("super", type_id = 18, static_name = "SUPER")]
 pub struct W_Super {
     /// The class passed to super() — lookup starts after this in MRO.
     pub super_type: PyObjectRef,
+    /// PyPy `W_Super.w_objtype` — the type returned by `_super_check`.
+    pub obj_type: PyObjectRef,
     /// The instance (self) or class for classmethod.
     pub obj: PyObjectRef,
 }
 
 /// Create a new super proxy.
-pub fn w_super_new(super_type: PyObjectRef, obj: PyObjectRef) -> PyObjectRef {
+pub fn w_super_new(
+    super_type: PyObjectRef,
+    obj_type: PyObjectRef,
+    obj: PyObjectRef,
+) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
-    // `super_type`/`obj` pair across the GC malloc and re-read their
+    // `super_type`/`obj_type`/`obj` fields across the GC malloc and re-read their
     // relocated addresses afterwards (a minor collection inside the malloc
     // may move them). A super proxy whose members are reachable only
     // through it must be GC-traced; a `malloc_typed` proxy is invisible to
@@ -35,6 +41,7 @@ pub fn w_super_new(super_type: PyObjectRef, obj: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(super_type);
+    crate::gc_roots::pin_root(obj_type);
     crate::gc_roots::pin_root(obj);
 
     let header = PyObject {
@@ -43,7 +50,8 @@ pub fn w_super_new(super_type: PyObjectRef, obj: PyObjectRef) -> PyObjectRef {
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_SUPER_GC_TYPE_ID, W_SUPER_OBJECT_SIZE);
     let super_type = crate::gc_roots::shadow_stack_get(save_point);
-    let obj = crate::gc_roots::shadow_stack_get(save_point + 1);
+    let obj_type = crate::gc_roots::shadow_stack_get(save_point + 1);
+    let obj = crate::gc_roots::shadow_stack_get(save_point + 2);
     if !raw.is_null() {
         unsafe {
             std::ptr::write(
@@ -51,6 +59,7 @@ pub fn w_super_new(super_type: PyObjectRef, obj: PyObjectRef) -> PyObjectRef {
                 W_Super {
                     ob: header,
                     super_type,
+                    obj_type,
                     obj,
                 },
             );
@@ -61,6 +70,7 @@ pub fn w_super_new(super_type: PyObjectRef, obj: PyObjectRef) -> PyObjectRef {
     W_Super::allocate(W_Super {
         ob: header,
         super_type,
+        obj_type,
         obj,
     })
 }
@@ -76,14 +86,20 @@ pub unsafe fn w_super_get_type(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_Super)).super_type }
 }
 
+/// Get the type selected by `_super_check`.
+#[inline]
+pub unsafe fn w_super_get_obj_type(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_Super)).obj_type }
+}
+
 /// Get the bound object (self) from a super proxy.
 #[inline]
 pub unsafe fn w_super_get_obj(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_Super)).obj }
 }
 
-/// Replace the two field-resident pieces of an existing `W_Super`, matching
-/// `W_Super.descr_init` assigning `w_starttype` and `w_self` in place.
+/// Replace the three field-resident pieces of an existing `W_Super`, matching
+/// `W_Super.descr_init` assigning `w_starttype`, `w_objtype`, and `w_self`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_Super`.
@@ -91,11 +107,13 @@ pub unsafe fn w_super_get_obj(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_super_set_fields(
     obj: PyObjectRef,
     super_type: PyObjectRef,
+    obj_type: PyObjectRef,
     bound_obj: PyObjectRef,
 ) {
     unsafe {
         let super_obj = obj as *mut W_Super;
         (*super_obj).super_type = super_type;
+        (*super_obj).obj_type = obj_type;
         (*super_obj).obj = bound_obj;
     }
 }

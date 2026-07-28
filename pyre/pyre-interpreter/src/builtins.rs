@@ -7807,6 +7807,7 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         return Ok(pyre_object::descriptor::w_super_new(
             cls,
             pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
         ));
     }
     if args.len() == 2 {
@@ -7818,8 +7819,8 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 crate::baseobjspace::object_functionstr_type_name(cls)
             )));
         }
-        super_check(cls, obj)?;
-        return Ok(pyre_object::descriptor::w_super_new(cls, obj));
+        let obj_type = super_check(cls, obj)?;
+        return Ok(pyre_object::descriptor::w_super_new(cls, obj_type, obj));
     }
     // descriptor.py `_super_from_frame`: zero-arg super() finds the first
     // argument and the `__class__` free variable in the live caller frame.
@@ -7879,8 +7880,10 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             ));
         }
 
-        super_check(w_class, w_self)?;
-        Ok(pyre_object::descriptor::w_super_new(w_class, w_self))
+        let obj_type = super_check(w_class, w_self)?;
+        Ok(pyre_object::descriptor::w_super_new(
+            w_class, obj_type, w_self,
+        ))
     })
 }
 
