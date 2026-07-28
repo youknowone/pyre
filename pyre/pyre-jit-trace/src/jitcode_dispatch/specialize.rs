@@ -1287,15 +1287,17 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_shift<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
-    let rhs_value = unsafe {
-        if !pyre_object::is_long(lhs_obj)
-            || !pyre_object::is_int(rhs_obj)
-            || !pyre_object::is_exact_builtin_instance(lhs_obj)
-            || !pyre_object::is_exact_builtin_instance(rhs_obj)
-        {
+    let (lhs_class, rhs_class, rhs_value) = unsafe {
+        if !pyre_object::is_long(lhs_obj) || !pyre_object::is_int(rhs_obj) {
             return Ok(None);
         }
-        pyre_object::w_int_get_value(rhs_obj)
+        let (Some(lhs_class), Some(rhs_class)) = (
+            walker_exact_builtin_class(lhs_obj),
+            walker_exact_builtin_class(rhs_obj),
+        ) else {
+            return Ok(None);
+        };
+        (lhs_class, rhs_class, pyre_object::w_int_get_value(rhs_obj))
     };
     // The negative-count arm raises before calling rbigint.  Record it through
     // the generic helper so no partial specialization is emitted.
@@ -1328,8 +1330,10 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_shift<Sym: WalkSym>(
 
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, lhs, lhs_class)?;
     let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
     let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
+    walker_guard_exact_w_class(ctx, op_pc, rhs, rhs_class)?;
     let zero = ctx.trace_ctx.const_int(0);
     let nonnegative = ctx.trace_ctx.record_op(OpCode::IntGe, &[rhs_raw, zero]);
     ctx.trace_ctx
@@ -1452,6 +1456,14 @@ pub(crate) fn try_walker_specialize_binary_op_long<Sym: WalkSym>(
     if !unsafe { pyre_object::is_long(lhs_obj) && pyre_object::is_long(rhs_obj) } {
         return Ok(None);
     }
+    let (Some(lhs_class), Some(rhs_class)) = (unsafe {
+        (
+            walker_exact_builtin_class(lhs_obj),
+            walker_exact_builtin_class(rhs_obj),
+        )
+    }) else {
+        return Ok(None);
+    };
     // Authentic boxed result via the same execute path the int leg uses; a
     // NULL / raised result defers to the generic record.
     let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
@@ -1480,6 +1492,8 @@ pub(crate) fn try_walker_specialize_binary_op_long<Sym: WalkSym>(
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
     walker_guard_class(ctx, op_pc, rhs, long_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, lhs, lhs_class)?;
+    walker_guard_exact_w_class(ctx, op_pc, rhs, rhs_class)?;
     // Read each operand's immutable `value` payload, then call the
     // elidable `rbigint` op on the bare `*const BigInt` payloads. Passing
     // the payloads (not the wrappers) keeps the call pure on the immutable
@@ -1620,6 +1634,14 @@ pub(crate) fn try_walker_specialize_truediv_op_long<Sym: WalkSym>(
     if !unsafe { pyre_object::is_long(lhs_obj) && pyre_object::is_long(rhs_obj) } {
         return Ok(None);
     }
+    let (Some(lhs_class), Some(rhs_class)) = (unsafe {
+        (
+            walker_exact_builtin_class(lhs_obj),
+            walker_exact_builtin_class(rhs_obj),
+        )
+    }) else {
+        return Ok(None);
+    };
     // Authentic boxed float via the generic execute path; a NULL / raised result
     // (zero divisor, float overflow) defers to the generic record.
     let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
@@ -1628,6 +1650,8 @@ pub(crate) fn try_walker_specialize_truediv_op_long<Sym: WalkSym>(
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
     walker_guard_class(ctx, op_pc, rhs, long_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, lhs, lhs_class)?;
+    walker_guard_exact_w_class(ctx, op_pc, rhs, rhs_class)?;
     // Pure `rbigint.truediv` → correctly-rounded f64 (CallPureF). The op already
     // ran authentically above, so the divisor is nonzero / non-overflowing here;
     // the trailing GuardNoException covers a divide-by-zero / overflow on replay.
@@ -3631,12 +3655,14 @@ pub(crate) fn try_walker_specialize_compare_op_long_int<Sym: WalkSym>(
     } else {
         return Ok(None);
     };
-    if unsafe {
-        !pyre_object::is_exact_builtin_instance(long_obj)
-            || !pyre_object::is_exact_builtin_instance(int_obj)
-    } {
+    let (Some(long_class), Some(int_class)) = (unsafe {
+        (
+            walker_exact_builtin_class(long_obj),
+            walker_exact_builtin_class(int_obj),
+        )
+    }) else {
         return Ok(None);
-    }
+    };
     let effective_cmp = if reflected {
         match cmp_op {
             ComparisonOperator::Less => ComparisonOperator::Greater,
@@ -3672,8 +3698,10 @@ pub(crate) fn try_walker_specialize_compare_op_long_int<Sym: WalkSym>(
 
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, long, long_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, long, long_class)?;
     let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
     let int_raw = walker_unbox_int_typed(ctx, op_pc, int, int_type, int_descr)?;
+    walker_guard_exact_w_class(ctx, op_pc, int, int_class)?;
     let off = pyre_object::longobject::LONG_VALUE_OFFSET;
     let long_payload = unsafe { *((long_obj as *const u8).add(off) as *const i64) };
     let long_pl = ctx.trace_ctx.record_op_with_descr(
@@ -3763,6 +3791,14 @@ pub(crate) fn try_walker_specialize_compare_op_long<Sym: WalkSym>(
     if !unsafe { pyre_object::is_long(lhs_obj) && pyre_object::is_long(rhs_obj) } {
         return Ok(None);
     }
+    let (Some(lhs_class), Some(rhs_class)) = (unsafe {
+        (
+            walker_exact_builtin_class(lhs_obj),
+            walker_exact_builtin_class(rhs_obj),
+        )
+    }) else {
+        return Ok(None);
+    };
     // Authentic boxed W_Bool via the same execute path the int leg uses; also
     // advances the concrete VM state the downstream ops read.
     let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
@@ -3771,6 +3807,8 @@ pub(crate) fn try_walker_specialize_compare_op_long<Sym: WalkSym>(
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
     walker_guard_class(ctx, op_pc, rhs, long_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, lhs, lhs_class)?;
+    walker_guard_exact_w_class(ctx, op_pc, rhs, rhs_class)?;
     // Pure `rbigint` comparison → sign in {-1,0,1}. Dead after the `int_<cmp>`
     // below and never spans a guard, so it needs no blackhole reconstruction.
     let cmp_fn = pyre_object::longobject::jit_w_long_cmp as *const ();
