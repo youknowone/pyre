@@ -1708,6 +1708,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::dict_eq_hook::hash_str_hooked_bytes",
+        "pyre_object::hash_str_hooked_bytes",
+        pyre_object::dict_eq_hook::hash_str_hooked_bytes as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_float_abs",
         "pyre_interpreter::jit_float_abs",
         crate::objspace::descroperation::jit_float_abs as *const (),

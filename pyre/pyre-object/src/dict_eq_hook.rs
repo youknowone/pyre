@@ -322,6 +322,19 @@ pub extern "C" fn hash_str_hooked(ptr: *const u8, len: usize) -> i64 {
     HASH_STR_HOOK.with(|cell| cell.get().map(|f| unsafe { f(ptr, len) }).unwrap_or(0))
 }
 
+/// [`hash_str_hooked`] over a byte slice.
+///
+/// Marked so the `as_ptr` decomposition runs *inside* the boundary that is
+/// already opaque (`rlib/jit.py:139`): `core::slice::<Impl>::as_ptr` is an
+/// unregistered foreign leaf, and spelling it in [`try_hash_str`]'s traced body
+/// stopped that graph and every caller above it.  A `&[u8]` argument crosses a
+/// residual call unchanged — the same shape `host_seam::emit_stdout` uses — and
+/// the `i64` result is a single word, so nothing here widens the residual ABI.
+#[majit_macros::dont_look_inside]
+pub fn hash_str_hooked_bytes(bytes: &[u8]) -> i64 {
+    hash_str_hooked(bytes.as_ptr(), bytes.len())
+}
+
 /// Invoke the installed `hash_str` hook over `bytes`.  Returns `None` when no
 /// hook is installed (pyre-object lib tests without the str hook, pre-init
 /// snapshot tools); the str-keyed GET helpers then fall back to the
@@ -329,7 +342,7 @@ pub extern "C" fn hash_str_hooked(ptr: *const u8, len: usize) -> i64 {
 #[inline]
 pub fn try_hash_str(bytes: &[u8]) -> Option<i64> {
     if has_hash_str_hook() {
-        Some(hash_str_hooked(bytes.as_ptr(), bytes.len()))
+        Some(hash_str_hooked_bytes(bytes))
     } else {
         None
     }
