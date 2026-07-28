@@ -9658,6 +9658,7 @@ pub(crate) unsafe fn get(
         if obj.is_null() {
             return Ok(Some(descr));
         }
+        crate::typedef::slot_wrapper_check_instance(descr, obj)?;
         return Ok(Some(pyre_object::w_method_new(descr, obj, w_type)));
     }
 

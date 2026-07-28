@@ -11942,6 +11942,27 @@ fn slot_wrapper_receiver(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, cr
     Ok(obj)
 }
 
+pub(crate) fn slot_wrapper_check_instance(
+    descr: PyObjectRef,
+    obj: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    let owner = unsafe { crate::function::fget_func_objclass(descr)? };
+    let applies = crate::typedef::r#type(obj)
+        .map(|actual| unsafe { crate::baseobjspace::issubtype_w(actual.as_ptr(), owner) })
+        .unwrap_or(false);
+    if applies {
+        return Ok(());
+    }
+    let name = unsafe { crate::function::function_get_name(descr) };
+    let owner_name = unsafe { pyre_object::w_type_get_name(owner) };
+    let received = crate::typedef::r#type(obj)
+        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
+        .unwrap_or("object");
+    Err(crate::PyError::type_error(format!(
+        "descriptor '{name}' requires a '{owner_name}' object but received a '{received}'"
+    )))
+}
+
 fn init_slot_wrapper_type(ns: PyObjectRef) {
     // CPython 3.14 Objects/descrobject.c `PyWrapperDescr_Type` metadata.
     // The descriptor payload remains PyPy's FunctionWithFixedCode and keeps
@@ -15189,7 +15210,7 @@ fn init_int_type(ns: PyObjectRef) {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function(name, func),
+                crate::make_slot_wrapper(name, func),
             )
         };
     }
@@ -15205,7 +15226,7 @@ fn init_int_type(ns: PyObjectRef) {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(name, func, 2),
+                crate::make_slot_wrapper_with_arity(name, func, 2),
             )
         };
     }

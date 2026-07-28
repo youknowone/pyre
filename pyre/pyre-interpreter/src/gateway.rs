@@ -1159,6 +1159,12 @@ pub fn make_slot_wrapper_with_arity(
     crate::function_new_slot_wrapper(code as *const (), name.to_string())
 }
 
+/// Build a CPython-compatible variadic slot-wrapper descriptor.
+pub fn make_slot_wrapper(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
+    let code = builtin_code_new(name, func);
+    crate::function_new_slot_wrapper(code as *const (), name.to_string())
+}
+
 /// Build a CPython-compatible ordinary method descriptor with fixed arity.
 pub fn make_method_descriptor_with_arity(
     name: &'static str,

@@ -2037,6 +2037,11 @@ pub fn call_with_kwargs(
     }
 
     if unsafe { crate::is_function_carrier(callable) } {
+        if unsafe { crate::is_slot_wrapper(callable) }
+            && let Some(&receiver) = pos_args.first()
+        {
+            crate::typedef::slot_wrapper_check_instance(callable, receiver)?;
+        }
         let code = unsafe { crate::getcode(callable) };
         // For builtins: pack kwargs into a dict as last arg.
         //
@@ -2661,6 +2666,11 @@ pub fn call_function_impl_result(
         }
         // All callables are Function objects.
         if crate::is_function_carrier(callable) {
+            if crate::is_slot_wrapper(callable)
+                && let Some(&receiver) = args.first()
+            {
+                crate::typedef::slot_wrapper_check_instance(callable, receiver)?;
+            }
             let code = crate::getcode(callable);
             if crate::is_builtin_code(code as pyre_object::PyObjectRef) {
                 // Builtin function: direct Rust call. Errors propagate
