@@ -1414,6 +1414,33 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     Some((args, concretes))
 }
 
+thread_local! {
+    /// Memo for [`callee_body_has_abort_permanent`], keyed by the stable
+    /// `CodeObject` pointer.  The answer is a static property of the callee's
+    /// assembled body, so it is computed once per code object instead of once
+    /// per inline attempt — the scan is O(body) and the callsite is reached on
+    /// every retrace of every caller.
+    static CALLEE_ABORT_PERMANENT_SEEN: std::cell::RefCell<std::collections::BTreeMap<usize, bool>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// Whether the callee's assembled body contains an `abort_permanent` marker.
+///
+/// Same scan `loop_inlines_abort_permanent_callee` runs over a `SubJitCodeBody`
+/// (`trace.rs`), memoized here because this is the per-callsite path.
+fn callee_body_has_abort_permanent(w_code: *const (), body: &SubJitCodeBody) -> bool {
+    let key = w_code as usize;
+    if let Some(hit) = CALLEE_ABORT_PERMANENT_SEEN.with(|m| m.borrow().get(&key).copied()) {
+        return hit;
+    }
+    let hit =
+        crate::jitcode_runtime::decoded_ops(body.code).any(|op| op.opname == "abort_permanent");
+    CALLEE_ABORT_PERMANENT_SEEN.with(|m| {
+        m.borrow_mut().insert(key, hit);
+    });
+    hit
+}
+
 pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -1617,6 +1644,28 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         return Ok(None);
     };
     if nparams > body.num_regs_r {
+        return Ok(None);
+    }
+    // Inlining a callee whose body carries an `abort_permanent` marker walks
+    // the sub-walk straight into it.  That surfaces as
+    // `TraceAction::AbortPermanent`, which stamps `DONT_TRACE_HERE` on the
+    // CALLER loop's green key — so one unported opcode anywhere in a callee
+    // permanently un-JITs the loop that calls it.  Upstream keeps this
+    // decision static and on the callee: `codewriter/policy.py:48-84`
+    // `look_inside_graph` reads whole-graph properties before tracing, and its
+    // own comment (:78-79) spells out the consequence of a "no" — "the call
+    // will be turned into a residual call".  Answer the same way.
+    //
+    // `loop_inlines_abort_permanent_callee` (`trace.rs`) already screens this
+    // up front, but only for callees it can resolve statically out of globals
+    // and frame slots; a bound method, a container element or a call result
+    // reaches here unscreened.  At this point the callee is concrete, so the
+    // screen is exact.
+    //
+    // Whole-body, like upstream's whole-graph test: a marker on a path this
+    // trace happens not to take still costs only the inline if we decline,
+    // where walking into it costs the whole loop, permanently.
+    if callee_body_has_abort_permanent(w_code, &body) {
         return Ok(None);
     }
     // The callee body resolves its `d`/`j` descr operands through its OWN
