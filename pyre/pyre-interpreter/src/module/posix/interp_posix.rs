@@ -1741,7 +1741,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if n < 0 {
                     return Err(crate::PyError::value_error("negative argument not allowed"));
                 }
-                let n = n as usize;
+                // A 32-bit target's `usize` is narrower than the `__index__`
+                // result, so a size it cannot hold is reported rather than
+                // wrapped to a smaller request.
+                let n = usize::try_from(n)
+                    .map_err(|_| crate::PyError::overflow_error("argument out of range"))?;
                 #[cfg(not(feature = "sandbox"))]
                 let buf = host_os::urandom(n).unwrap_or_else(|_| vec![0u8; n]);
                 // Route host entropy through the trusted controller instead of

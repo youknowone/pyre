@@ -2303,9 +2303,7 @@ fn module_descr_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     let name = crate::baseobjspace::text_wtf8_w(args[1])?;
     match name.as_str() {
         Ok(s) => crate::baseobjspace::module_getattribute(module, s),
-        Err(_) => unsafe {
-            crate::baseobjspace::module_getattribute_wtf8(module, args[1], name)
-        },
+        Err(_) => unsafe { crate::baseobjspace::module_getattribute_wtf8(module, args[1], name) },
     }
 }
 

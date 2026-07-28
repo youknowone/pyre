@@ -103,6 +103,12 @@ fn write_object(
     version: i32,
     depth: usize,
 ) -> Result<(), PyError> {
+    // `obj` is held as a raw local across the whole traversal, which is sound
+    // only because writing allocates nothing the GC manages: the output is a
+    // Rust `Vec<u8>`, and the one conversion here (`obj_to_bigint`) reads the
+    // int or clones a Rust `BigInt`.  A minor collection therefore cannot run
+    // between the branch test and the read, so no reload from the shadow slot
+    // is needed.  Anything added here that allocates breaks that.
     if depth == 0 {
         return Err(PyError::value_error("object too deeply nested to marshal"));
     }
