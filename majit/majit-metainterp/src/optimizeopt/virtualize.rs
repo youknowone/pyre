@@ -2099,44 +2099,23 @@ impl Optimization for OptVirtualize {
             //           assert i >= 0
             //           self.optimizer._newoperations.insert(i, guard_op)
             //
-            // majit ordering: upstream INSERTS because its postprocess runs
-            // after the FINISH is already appended.  This pass runs BEFORE the
-            // FINISH reaches the terminal emit, so `emit_extra` queues the
-            // stashed guard for the passes after virtualize and
-            // `drain_extra_operations_from` (called right after this method
-            // returns) flushes it through the pipeline first.  The guard lands
-            // in `new_operations` first, the FINISH second — the same final
-            // op order.
+            // The stash here is only half the port: the guard has to be
+            // finalized and inserted AFTER the FINISH is emitted, because
+            // `emit(op)` force_box's the FINISH args and
+            // `store_final_boxes_in_guard` has to see a return box that was
+            // virtual as already materialized.  Finalizing it on the way
+            // through the pipeline instead would encode that same box as still
+            // virtual — a consistent image, but not upstream's image.
             //
-            // The RESUME DATA is where the two diverge.  Upstream finalizes the
-            // guard in `postprocess_FINISH`, i.e. after `emit(op)` forced the
-            // FINISH args, so `store_final_boxes_in_guard` sees a return box
-            // that was virtual as already materialized.  Here the guard is
-            // finalized on the way through the pipeline, before that forcing,
-            // and encodes the same box as still virtual.  Both are consistent
-            // images, but they are not the same image.
-            //
-            // BLOCKER for the faithful order.  `propagate_postprocess` (the
-            // port of optimizer.py's postprocess dispatch) is a method on a
-            // PASS, and the finalization a guard needs is
-            // `Optimizer::store_final_boxes_in_guard` with the knowledge
-            // `collect_optimizer_knowledge_for_resume(&self)` gathers — which
-            // needs the Optimizer, not a pass.  Running it from here with no
-            // knowledge would drop the bridgeopt sections that
-            // `serialize_optimizer_knowledge` puts in every other guard, buying
-            // one ordering divergence with a worse one.  Reaching upstream's
-            // shape needs an Optimizer-side FINISH postprocess that can insert
-            // at `new_operations.len() - 1` after its own emit.
-            //
-            // Nothing arms the token today — the portal-return
-            // `gen_store_back_in_vable` sets `forced_virtualizable`, so
-            // `store_token_in_vable` early-returns and no `GUARD_NOT_FORCED_2`
-            // reaches a FINISH — so neither image is currently observable.
+            // `propagate_postprocess` below runs at the right moment but is a
+            // method on a PASS, and both the finalization and the
+            // `collect_optimizer_knowledge_for_resume` that feeds it are
+            // Optimizer-side.  So it hands the guard to the Optimizer through
+            // `ctx.pending_finish_guard_postprocess`, the same shape
+            // `pending_guard_class_postprocess` uses, and
+            // `drain_pending_finish_guard_postprocess` does the insert.
             OpCode::Finish => {
                 self.finish_guard_op = self.last_guard_not_forced_2.take();
-                if let Some(guard_op) = self.finish_guard_op.clone() {
-                    ctx.emit_extra(ctx.current_pass_idx, guard_op);
-                }
                 OptimizationResult::PassOn
             }
 
@@ -2289,6 +2268,36 @@ impl Optimization for OptVirtualize {
             vt.setup();
         }
         self.finish_guard_op = None;
+    }
+
+    // virtualize.py:84-90 postprocess_FINISH
+    //
+    //   def postprocess_FINISH(self, op):
+    //       guard_op = self._finish_guard_op
+    //       if guard_op is not None:
+    //           guard_op = self.optimizer.store_final_boxes_in_guard(guard_op, [])
+    //           i = len(self.optimizer._newoperations) - 1
+    //           assert i >= 0
+    //           self.optimizer._newoperations.insert(i, guard_op)
+    //
+    // The two Optimizer-side halves are in
+    // `Optimizer::drain_pending_finish_guard_postprocess`, which this hands
+    // the guard to.
+    fn have_postprocess_op(&self, opcode: OpCode) -> bool {
+        matches!(opcode, OpCode::Finish)
+    }
+
+    fn propagate_postprocess(&mut self, op: &Op, ctx: &mut OptContext) {
+        if op.opcode != OpCode::Finish {
+            return;
+        }
+        if let Some(guard_op) = self.finish_guard_op.take() {
+            debug_assert!(
+                ctx.pending_finish_guard_postprocess.is_none(),
+                "postprocess_FINISH queued multiple guards"
+            );
+            ctx.pending_finish_guard_postprocess = Some(guard_op);
+        }
     }
 
     fn name(&self) -> &'static str {

@@ -4493,6 +4493,7 @@ impl Optimizer {
                     for &pp_idx in postprocess_passes.iter().rev() {
                         self.passes[pp_idx].propagate_postprocess(&op, ctx);
                     }
+                    self.drain_pending_finish_guard_postprocess(ctx);
                     return Ok(());
                 }
                 OptimizationResult::Replace(op) => {
@@ -4551,6 +4552,7 @@ impl Optimizer {
                     for &pp_idx in postprocess_passes.iter().rev() {
                         self.passes[pp_idx].propagate_postprocess(&current_op, ctx);
                     }
+                    self.drain_pending_finish_guard_postprocess(ctx);
                     return Ok(());
                 }
                 OptimizationResult::Remove => {
@@ -4588,6 +4590,10 @@ impl Optimizer {
         for &pp_idx in postprocess_passes.iter().rev() {
             self.passes[pp_idx].propagate_postprocess(&current_op, ctx);
         }
+        // The FINISH reaches its emit down this path — `optimize_FINISH`
+        // returns PassOn — so this is the drain that postprocess_FINISH
+        // actually goes through.
+        self.drain_pending_finish_guard_postprocess(ctx);
         Ok(())
     }
 
@@ -5203,6 +5209,45 @@ impl Optimizer {
             self.all_descrs.len()
         );
         new_idx
+    }
+
+    /// virtualize.py:84-90 postprocess_FINISH, Optimizer half.
+    ///
+    /// `OptVirtualize::propagate_postprocess` stashed the GUARD_NOT_FORCED_2 it
+    /// took off the FINISH; the finalization needs `store_final_boxes_in_guard`
+    /// and the knowledge `collect_optimizer_knowledge_for_resume` gathers, both
+    /// of which live here.  Running after the FINISH's own emit is the point:
+    /// that emit force_box'd the FINISH args, so a return box that was virtual
+    /// is materialized by the time it is numbered.
+    ///
+    /// The guard goes straight into `new_operations` rather than back through
+    /// the pass chain, matching `_newoperations.insert` — it has already been
+    /// through every pass once, on its way to being stashed.
+    fn drain_pending_finish_guard_postprocess(&mut self, ctx: &mut OptContext) {
+        let Some(guard_op) = ctx.pending_finish_guard_postprocess.take() else {
+            return;
+        };
+        // virtualize.py:87 store_final_boxes_in_guard(guard_op, []) — the
+        // pendingfields argument is the empty list.
+        let knowledge_for_resume = self.collect_optimizer_knowledge_for_resume(ctx);
+        let knowledge = if knowledge_for_resume.is_empty() {
+            None
+        } else {
+            Some(knowledge_for_resume)
+        };
+        let guard_op = Self::store_final_boxes_in_guard(guard_op, ctx, knowledge, Vec::new());
+        // virtualize.py:88-90 `i = len(_newoperations) - 1; assert i >= 0;
+        // insert(i, guard_op)` — the FINISH this postprocess belongs to is the
+        // last element, so the guard lands immediately in front of it.
+        let Some(i) = ctx.new_operations.len().checked_sub(1) else {
+            debug_assert!(false, "virtualize.py:89 assert i >= 0");
+            return;
+        };
+        ctx.new_operations.insert(i, std::rc::Rc::new(guard_op));
+        // `new_operations_index` maps position -> op with last-occurrence-wins
+        // semantics, which an insert in the middle cannot maintain
+        // incrementally.
+        ctx.rebuild_new_operations_index();
     }
 
     fn collect_optimizer_knowledge_for_resume(

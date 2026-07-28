@@ -578,6 +578,12 @@ pub struct OptContext {
     /// Set by rewrite pass, executed by emit_operation after the guard
     /// is added to new_operations (matching RPython's callback pattern).
     pub(crate) pending_guard_class_postprocess: Option<PendingGuardClassPostprocess>,
+    /// virtualize.py:84-90 postprocess_FINISH queues the stashed
+    /// GUARD_NOT_FORCED_2 here so the outer optimizer can insert it at
+    /// `new_operations.len() - 1` with full `store_final_boxes_in_guard`
+    /// semantics — the pass that stashes it holds no Optimizer, and both the
+    /// finalization and the knowledge collection are Optimizer-side.
+    pub(crate) pending_finish_guard_postprocess: Option<Op>,
     /// rewrite.py:282: postprocess_GUARD_NONNULL → mark_last_guard.
     /// Deferred until emit adds the guard to new_operations.
     pub(crate) pending_mark_last_guard: Option<OpRef>,
@@ -1659,6 +1665,7 @@ impl OptContext {
             extra_operations_after: VecDeque::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
+            pending_finish_guard_postprocess: None,
             imported_short_pure_ops: Vec::new(),
             imported_virtual_args: None,
             imported_loop_invariant_results: Vec::new(),
@@ -2264,6 +2271,7 @@ impl OptContext {
             extra_operations_after: VecDeque::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
+            pending_finish_guard_postprocess: None,
             imported_short_pure_ops: Vec::new(),
             imported_virtual_args: None,
             imported_loop_invariant_results: Vec::new(),
