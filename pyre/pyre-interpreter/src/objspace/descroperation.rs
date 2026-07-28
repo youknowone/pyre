@@ -3364,40 +3364,57 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
-/// Power operation dispatch (`**` operator).
-
-pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+/// `descroperation.py:425 pow_binary` — return `None` when neither numeric
+/// fast paths nor `__pow__` / `__rpow__` produce a result.
+fn pow_binary(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
     unsafe {
         if needs_numeric_binop_dispatch(a, b, "__pow__", "__rpow__") {
             if let Some(result) = try_dispatch_binary_special(a, b, "__pow__", "__rpow__")? {
-                return Ok(result);
+                return Ok(Some(result));
             }
         }
         if is_int_like(a) && is_int_like(b) {
-            return int_pow(a, b);
+            return int_pow(a, b).map(Some);
         }
         if is_int_or_long(a) && is_int_or_long(b) {
-            return long_pow(a, b);
+            return long_pow(a, b).map(Some);
         }
         if is_float_pair(a, b) {
             reject_pow_operand_overflow(a)?;
             reject_pow_operand_overflow(b)?;
-            return float_pow_impl(as_float(a), as_float(b));
+            return float_pow_impl(as_float(a), as_float(b)).map(Some);
         }
         if is_complex_pair(a, b) {
             reject_pow_operand_overflow(a)?;
             reject_pow_operand_overflow(b)?;
-            return complex_pow(a, b);
+            return complex_pow(a, b).map(Some);
         }
-        if let Some(result) = try_dispatch_binary_special(a, b, "__pow__", "__rpow__")? {
-            return Ok(result);
-        }
-        let a_name = crate::baseobjspace::object_functionstr_type_name(a);
-        let b_name = crate::baseobjspace::object_functionstr_type_name(b);
-        Err(PyError::type_error(format!(
-            "unsupported operand type(s) for ** or pow(): '{a_name}' and '{b_name}'"
-        )))
+        try_dispatch_binary_special(a, b, "__pow__", "__rpow__")
     }
+}
+
+/// Power operation dispatch (`**` operator).
+pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    if let Some(result) = pow_binary(a, b)? {
+        return Ok(result);
+    }
+    let a_name = crate::baseobjspace::object_functionstr_type_name(a);
+    let b_name = crate::baseobjspace::object_functionstr_type_name(b);
+    Err(PyError::type_error(format!(
+        "unsupported operand type(s) for ** or pow(): '{a_name}' and '{b_name}'"
+    )))
+}
+
+/// `descroperation.py:486-499 inplace_pow` — unlike the generated in-place
+/// binary operations, power has its own fallback error spelling.
+pub fn inplace_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    if let Some(result) = try_inplace_special(a, b, "__ipow__", None, false)? {
+        return Ok(result);
+    }
+    if let Some(result) = pow_binary(a, b)? {
+        return Ok(result);
+    }
+    Err(binary_builtin_type_error("**=", a, b))
 }
 
 // ── Numeric type-slot builtins ────────────────────────────────────────

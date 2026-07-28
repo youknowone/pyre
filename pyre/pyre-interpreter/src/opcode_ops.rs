@@ -33,6 +33,9 @@ pub fn binary_value(
     b: PyObjectRef,
     op: BinaryOperator,
 ) -> Result<PyObjectRef, PyError> {
+    if op == BinaryOperator::InplacePower {
+        return crate::objspace::descroperation::inplace_pow(a, b);
+    }
     // descroperation.py:825 `inplace_impl` — consult the in-place
     // special first; fall through to the binary op below when absent or
     // `NotImplemented`.
