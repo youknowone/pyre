@@ -6832,6 +6832,7 @@ impl<M: Clone> MetaInterp<M> {
                     .expect("bridge source op.descr must implement FailDescr");
                 let success = self.compile_bridge(
                     origin_key,
+                    green_key,
                     fail_index,
                     fail_descr,
                     &bridge_ops,
@@ -10683,9 +10684,35 @@ impl<M: Clone> MetaInterp<M> {
     /// `fail_descr` is the FailDescr from the guard that failed.
     /// `bridge_ops` are the recorded bridge trace operations.
     /// `bridge_inputargs` are the input arguments for the bridge.
+    /// `unroll.py:196-197 cell_token = jump_op.getdescr()` and
+    /// `unroll.py:321-322 jitcelltoken = jump_op.getdescr()`: the jitcell whose
+    /// `target_tokens` `optimize_bridge` scans, and whose `retraced_count` it
+    /// reads and charges, is the one the closing JUMP *enters* — never the loop
+    /// the bridge hangs from.  A JUMP target with no compiled loop has no
+    /// `target_tokens` to scan, so it degrades to the origin.
+    pub(crate) fn bridge_cell_token_key(&self, origin_key: u64, jump_target_key: u64) -> u64 {
+        if jump_target_key != origin_key && self.compiled_loops.contains_key(&jump_target_key) {
+            jump_target_key
+        } else {
+            origin_key
+        }
+    }
+
     pub fn compile_bridge(
         &mut self,
         green_key: u64,
+        // The jitcell the closing JUMP enters (`bridge_cell_token_key`).
+        // `green_key` stays the origin — it selects the guard's trace, its
+        // OpRef namespace base and the loop the bridge is attached to.
+        //
+        // Measured over `pyre/bench` (336 scripts, dynasm): 50 of 403 bridge
+        // closes cross loops, but 44 of those enter a jitcell holding a single
+        // target token, where `optimize_bridge` takes the `len() <= 1`
+        // jump_to_preamble path off the JUMP's own descr either way.  Only 6
+        // reach the target-token scan, and they converge — outputs and all
+        // five jit-stats counters are byte-identical across the corpus with
+        // and without this parameter.  It is a parity correction, not a lever.
+        jump_target_key: u64,
         fail_index: u32,
         fail_descr: &dyn majit_ir::FailDescr,
         bridge_ops: &[majit_ir::Op],
@@ -10703,6 +10730,7 @@ impl<M: Clone> MetaInterp<M> {
         if !self.compiled_loops.contains_key(&green_key) {
             return false;
         }
+        let cell_token_key = self.bridge_cell_token_key(green_key, jump_target_key);
 
         // `pyjitpl.py:2897-2899` parity:
         //   self.resumekey_original_loop_token =
@@ -10748,8 +10776,16 @@ impl<M: Clone> MetaInterp<M> {
         // bridgeopt.py:124-185 deserialize_optimizer_knowledge:
         // Retrieve guard's rd_numb + frontend_boxes for deserialization.
         use crate::optimizeopt::optimizer::PendingBridgeRd;
-        let (retraced_count, loop_num_inputs, parent_next_global_opref, pending_bridge_rd): (
-            u32,
+        // `unroll.py:213-215 if cell_token.retraced_count < limit:
+        // cell_token.retraced_count += 1` — the retrace budget is charged to
+        // the jitcell being entered, so a cross-loop close reads (and below,
+        // bumps) the target's counter rather than the origin's.
+        let retraced_count = self
+            .compiled_loops
+            .get(&cell_token_key)
+            .and_then(|compiled| compiled.live_token())
+            .map_or(0, |tok| tok.get_retraced_count());
+        let (loop_num_inputs, parent_next_global_opref, pending_bridge_rd): (
             usize,
             u32,
             Option<PendingBridgeRd>,
@@ -10831,7 +10867,6 @@ impl<M: Clone> MetaInterp<M> {
                 return false;
             };
             (
-                tok.get_retraced_count(),
                 tok.inputarg_types().len(),
                 compiled.next_global_opref,
                 pending,
@@ -10966,18 +11001,39 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(bridge_ops, &constants));
         }
         let _compiled = self.compiled_loops.get_mut(&green_key).unwrap();
+        // `unroll.py:325 for target_token in jitcelltoken.target_tokens` scans
+        // the tokens of the loop the JUMP enters.  `compiled_loops` cannot
+        // hand out a second `&mut` alongside the origin entry, so a cross-loop
+        // close runs against a clone of the target's vector and stores it back
+        // below; a same-loop close keeps borrowing the entry in place.
+        let mut crossed_target_tokens = if cell_token_key != green_key {
+            self.compiled_loops
+                .get(&cell_token_key)
+                .map(|compiled| compiled.front_target_tokens.clone())
+        } else {
+            None
+        };
         // compile.py:1077-1078 parity: optimize_bridge may raise InvalidLoop
         // (e.g. rewrite.py:404-407 GUARD_CLASS proven to always fail).
         // RPython catches it via the abstract jitexc handler and discards
         // the bridge. Mirror that here so the trace abort doesn't unwind
         // past compile_bridge.
         let bridge_optimize_result = {
-            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
+            let front_target_tokens = match crossed_target_tokens.as_mut() {
+                Some(tokens) => tokens,
+                None => {
+                    &mut self
+                        .compiled_loops
+                        .get_mut(&green_key)
+                        .unwrap()
+                        .front_target_tokens
+                }
+            };
             optimizer.optimize_bridge(
                 bridge_ops,
                 &mut constants,
                 bridge_inputargs.len(),
-                &mut compiled.front_target_tokens,
+                front_target_tokens,
                 bridge_runtime_boxes,
                 bridge_inline_short_preamble,
                 retraced_count,
@@ -10987,6 +11043,11 @@ impl<M: Clone> MetaInterp<M> {
                 bridge_inputarg_base,
             )
         };
+        if let Some(tokens) = crossed_target_tokens {
+            if let Some(compiled) = self.compiled_loops.get_mut(&cell_token_key) {
+                compiled.front_target_tokens = tokens;
+            }
+        }
         let (optimized_ops, retrace_requested) = match bridge_optimize_result {
             Ok(result) => result,
             // compile.py:1077-1078 + unroll.py:119-123 `except (InvalidLoop,
@@ -11015,9 +11076,11 @@ impl<M: Clone> MetaInterp<M> {
             // compile.py:1079: metainterp.retrace_needed(new_trace, info)
             // Save partial trace + exported state so the next loop-header's
             // compile_loop → compile_retrace can produce a new specialization.
+            // unroll.py:214 `cell_token.retraced_count += 1` — charged to the
+            // jitcell the JUMP enters, which is where the count was read from.
             if let Some(tok) = self
                 .compiled_loops
-                .get(&green_key)
+                .get(&cell_token_key)
                 .and_then(|compiled| compiled.live_token())
             {
                 tok.set_retraced_count(tok.get_retraced_count() + 1);
@@ -22051,6 +22114,60 @@ mod tests {
         assert!(hooks.on_trace_start.is_none());
         assert!(hooks.on_trace_abort.is_none());
         assert!(hooks.on_compile_error.is_none());
+    }
+}
+
+/// `unroll.py:196-197` / `:321-322` route every target-token decision in
+/// `optimize_bridge` through `jump_op.getdescr()`, the jitcell the closing JUMP
+/// enters.  These pin which loop `compile_bridge` resolves that to.
+#[cfg(test)]
+mod bridge_cell_token_tests {
+    use super::*;
+
+    fn record_loop(meta: &mut MetaInterp<()>, green_key: u64) {
+        meta.compiled_loops.insert(
+            green_key,
+            CompiledEntry {
+                token: std::sync::Weak::new(),
+                meta: (),
+                front_target_tokens: Vec::new(),
+                front_target_source_positions: None,
+                root_trace_id: green_key,
+                traces: indexmap::IndexMap::new(),
+                previous_tokens: Vec::new(),
+                next_global_opref: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn a_same_loop_close_keeps_the_origin() {
+        let mut meta = MetaInterp::<()>::new(1);
+        record_loop(&mut meta, 7);
+        assert_eq!(meta.bridge_cell_token_key(7, 7), 7);
+    }
+
+    #[test]
+    fn a_cross_loop_close_reaches_the_jump_target() {
+        let mut meta = MetaInterp::<()>::new(1);
+        record_loop(&mut meta, 7);
+        record_loop(&mut meta, 9);
+        assert_eq!(
+            meta.bridge_cell_token_key(7, 9),
+            9,
+            "unroll.py:321-322 scans the target_tokens of the jitcell the JUMP enters"
+        );
+    }
+
+    #[test]
+    fn an_uncompiled_jump_target_degrades_to_the_origin() {
+        let mut meta = MetaInterp::<()>::new(1);
+        record_loop(&mut meta, 7);
+        assert_eq!(
+            meta.bridge_cell_token_key(7, 9),
+            7,
+            "a target with no compiled loop has no target_tokens to scan"
+        );
     }
 }
 
