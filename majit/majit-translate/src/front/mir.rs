@@ -4863,6 +4863,14 @@ impl<'a> Lowering<'a> {
                         ))
                     })?;
                     let bb_id = self.block_id[mir_bb];
+                    // Element type, not `Ref(None)`: `place_ty` is the
+                    // post-projection type, the same source the genuine-Ref
+                    // tuple read below uses.  A `(FieldlessEnum, bool)`
+                    // scrutinee is built as a positional aggregate and its
+                    // `.0` read back to feed the `match` switch, so a blanket
+                    // `Ref` here types that switch value as a pointer and
+                    // `flatten.py:280 assert kind == 'int'` rejects the graph.
+                    let ty = tyref_to_value_type(&place_ty, self.llbc);
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -4871,7 +4879,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::FieldRead {
                             base,
                             field: FieldDescriptor::new(format!("__pos_{idx}"), Some(owner_root)),
-                            ty: ValueType::Ref(None),
+                            ty,
                             pure: false,
                         },
                     });

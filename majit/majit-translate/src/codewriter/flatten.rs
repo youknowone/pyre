@@ -1229,7 +1229,15 @@ impl<'a> GraphFlattener<'a> {
                 _ => unreachable!(),
             };
             let kind = value_kind(&cond, self.regallocs);
-            assert_eq!(kind, 'i', "switch exitswitch must be int");
+            // Name the graph and block: the switch value is produced far from
+            // here (a `__pos_N` read of a match scrutinee aggregate, an enum
+            // `__discriminant` read, …), so a bare kind mismatch gives the
+            // reader nothing to search for.
+            assert_eq!(
+                kind, 'i',
+                "switch exitswitch must be int (graph {}, block {:?})",
+                self.graph.name, bid
+            );
             // `switches = [link for link in block.exits if link.exitcase != 'default']`.
             // `switches.sort(key=lambda link: link.llexitcase)`.
             let default_link = exits
