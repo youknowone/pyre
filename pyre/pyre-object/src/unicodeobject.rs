@@ -485,13 +485,40 @@ pub unsafe fn w_str_slot_del(obj: PyObjectRef, index: usize) -> bool {
     unsafe { crate::listobject::w_list_setitem(slots, index as i64, PY_NULL) }
 }
 
+/// FNV-1a over the key bytes, the digest the type-lookup method cache already
+/// uses. The interning table is thread-local, holds only internal identifier
+/// strings, and its entries are immortal, so the default SipHash buys nothing
+/// here while charging every attribute-name lookup a full siphash24 of the
+/// name — 10 of the top-of-stack samples in a profile of
+/// `exception_subclass_attrs`, reached through
+/// `type_descr_call_impl` -> `lookup_in_type_where` -> `box_str_constant`.
+#[derive(Default)]
+pub struct Fnv1aHasher(u64);
+
+impl std::hash::Hasher for Fnv1aHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = if self.0 == 0 { 0xcbf2_9ce4_8422_2325 } else { self.0 };
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.0 = h;
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type Fnv1aBuild = std::hash::BuildHasherDefault<Fnv1aHasher>;
+
 thread_local! {
     /// String constant interning cache — single-threaded, no lock needed.
     /// RPython has no equivalent lock; string interning is handled by the
     /// translator at compile time, not at runtime.  Keyed by WTF-8 so a
     /// surrogate-bearing constant (a `'\udcff'` literal) interns too.
-    static STRING_CONSTANT_CACHE: RefCell<HashMap<Wtf8Buf, usize>> =
-        RefCell::new(HashMap::new());
+    static STRING_CONSTANT_CACHE: RefCell<HashMap<Wtf8Buf, usize, Fnv1aBuild>> =
+        RefCell::new(HashMap::default());
 }
 
 /// Box a string constant into a heap Python str object.
