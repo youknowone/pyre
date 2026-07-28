@@ -4628,12 +4628,15 @@ impl<'a> Lowering<'a> {
             //
             // Upstream materialises the address as `Constant(funcptr)` of
             // lltype `Ptr(FuncType)` (`rtyper.getcallable`, and
-            // `sub_helper_funcptr_constant` for the sub-helper twins), whose
-            // `getkind` is `r`.  The slot here stays `Int` because majit
-            // materialises a funcptr as its integer address everywhere else
-            // (`jtransform.rs direct_funcptr_value` emits `ConstInt(fnaddr)`,
-            // which the assembler encodes through the `'i'` argcode), and the
-            // flowspace fold gives the define a `Signed` legacy slot to match.
+            // `sub_helper_funcptr_constant` for the sub-helper twins).
+            // `FuncType._gckind` is `raw`, so `getkind` maps that pointer to
+            // `int`, not to `ref` — the `Int` slot here IS that mapping rather
+            // than a departure from it, and re-stamping it `Ref` would be the
+            // deviation.  majit materialises a funcptr as its integer address
+            // everywhere else as well (`jtransform.rs direct_funcptr_value`
+            // emits `ConstInt(fnaddr)`, which the assembler encodes through the
+            // `'i'` argcode), and the flowspace fold gives the define a
+            // `Signed` legacy slot to match.
             DecodedConst::FnPath(segments) => {
                 let mut synthetic = Vec::with_capacity(segments.len() + 1);
                 synthetic.push(crate::model::FN_CONST_HEAD.to_string());
