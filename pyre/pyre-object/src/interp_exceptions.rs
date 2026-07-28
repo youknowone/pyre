@@ -530,6 +530,14 @@ pub fn w_exception_new_empty_immortal(kind: ExcKind) -> PyObjectRef {
     w_exception_new_empty_impl(kind, true)
 }
 
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`), the
+/// `w_dict_new` / `w_dict_view_iterator_new_direction` twin: the body builds a
+/// `W_BaseException` and boxes it through the non-numeric `malloc_typed`
+/// (`fuse_boxing_alloc` fuses only the numeric boxes), so tracing into it
+/// carries the unported `malloc->new` lowering into the caller. Residualise
+/// the whole constructor — the JIT models it by signature as a plain
+/// `PyObjectRef` GCREF and emits a residual call.
+#[majit_macros::dont_look_inside]
 fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
     let w_class = lookup_exc_class_for_kind(kind);
     let w_class = if w_class != PY_NULL {
