@@ -7318,6 +7318,24 @@ except AttributeError as exc:
     }
 
     #[test]
+    fn test_default_metaclass_rejects_non_cell_classcell() {
+        let source = "\
+rejected = False
+try:
+    class C:
+        __classcell__ = 42
+        __slots__ = ['__classcell__']
+except TypeError:
+    rejected = True";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("default-metaclass classcell regression");
+        unsafe {
+            let value = w_dict_getitem_str(frame.w_globals, "rejected").unwrap();
+            assert!(is_true(value).unwrap());
+        }
+    }
+
+    #[test]
     fn test_function_dunder_globals_and_code_are_materialized() {
         crate::test_hooks::install_hash_hook();
         let source = "\

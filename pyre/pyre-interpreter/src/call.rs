@@ -3977,6 +3977,17 @@ fn build_class_inner(
         // consume the explicit class cells here (type_new_classcell leaves
         // them out of the class `__dict__`); the captured `classcell` is
         // bound to the new type below.
+        // typeobject.py `_store_type_in_classcell` validates the value before
+        // deleting it.  The default-metaclass shortcut bypasses
+        // `type.__new__`, so it must preserve that check here too.
+        if let Some(w_classcell) = classcell {
+            if !unsafe { pyre_object::is_cell(w_classcell) } {
+                return Err(PyError::type_error(format!(
+                    "__classcell__ must be a nonlocal cell, not {}",
+                    crate::baseobjspace::object_functionstr_type_name(w_classcell),
+                )));
+            }
+        }
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_ns, "__classcell__") };
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
