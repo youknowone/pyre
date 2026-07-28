@@ -2307,10 +2307,24 @@ fn new_descr_class(args: &[PyObjectRef], type_name: &str) -> Result<PyObjectRef,
 /// `str.maketrans` / `bytes.maketrans` / `bytearray.maketrans` are static
 /// methods: an instance call such as `b''.maketrans(a, b)` must read `a`/`b`
 /// as the two arguments, not bind the receiver as the first one.
-fn make_maketrans_descr(
-    func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
-) -> PyObjectRef {
-    pyre_object::w_staticmethod_new(make_builtin_function("maketrans", func))
+/// `$owner` names the type the static method is reached through, which is
+/// what its keyword rejection reports (`str.maketrans() takes no keyword
+/// arguments`); the body itself is variadic, so the trailing marker dict
+/// would otherwise arrive as one more translation-table argument.
+macro_rules! make_maketrans_descr {
+    ($owner:literal, $func:expr) => {{
+        fn maketrans(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            if crate::builtins::has_real_kwargs(kwargs) {
+                return Err(crate::PyError::type_error(concat!(
+                    $owner,
+                    ".maketrans() takes no keyword arguments"
+                )));
+            }
+            ($func)(args)
+        }
+        pyre_object::w_staticmethod_new(make_builtin_function("maketrans", maketrans))
+    }};
 }
 
 /// `moduleobject.c module_new` — allocate an anonymous `Module`
@@ -3395,12 +3409,6 @@ fn filter_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let cls = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
     let args_w = positional.get(1..).unwrap_or(&[]);
-    if args_w.len() != 2 {
-        return Err(crate::PyError::type_error(format!(
-            "filter expected 2 arguments, got {}",
-            args_w.len()
-        )));
-    }
 
     // `space.getattr` and keyword-name inspection are allowed to allocate in
     // the source gateway. Keep the subtype and both positional arguments live
@@ -3408,10 +3416,13 @@ fn filter_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(cls);
     let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_object::gc_roots::pin_root(args_w[0]);
-    let predicate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_object::gc_roots::pin_root(args_w[1]);
-    let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    // Pin whatever operands the call supplied — the argument-count check
+    // itself comes after the keyword inspection, which may collect.
+    let mut arg_slots = [usize::MAX; 2];
+    for (slot, &arg) in arg_slots.iter_mut().zip(args_w) {
+        pyre_object::gc_roots::pin_root(arg);
+        *slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    }
     let kwargs_slot = kwargs.map(|dict| {
         pyre_object::gc_roots::pin_root(dict);
         pyre_object::gc_roots::shadow_stack_len() - 1
@@ -3432,14 +3443,22 @@ fn filter_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         };
     let rooted_kwargs =
         kwargs_slot.map(|slot| unsafe { pyre_object::gc_roots::shadow_stack_get(slot) });
+    // `filter_new` runs `_PyArg_NoKeywords` before `PyArg_UnpackTuple`, so a
+    // keyword call is a keyword error whatever its positional count is.
     if init_matches && crate::builtins::has_real_kwargs(rooted_kwargs) {
         return Err(crate::PyError::type_error(
             "filter() takes no keyword arguments",
         ));
     }
+    if args_w.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "filter expected 2 arguments, got {}",
+            args_w.len()
+        )));
+    }
     let value = crate::builtins::builtin_filter(&[
-        unsafe { pyre_object::gc_roots::shadow_stack_get(predicate_slot) },
-        unsafe { pyre_object::gc_roots::shadow_stack_get(iterable_slot) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(arg_slots[0]) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(arg_slots[1]) },
     ])?;
     pyre_object::gc_roots::pin_root(value);
     let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -4770,12 +4789,12 @@ fn init_list_type(ns: PyObjectRef) {
                 "__imul__",
                 |args| {
                     crate::type_methods::require_list_receiver(args, "__imul__", false)?;
-                    // listobject.py descr_inplace_mul: the count goes through
-                    // `__index__`; a non-index operand becomes NotImplemented.
+                    // listobject.py descr_inplace_mul: `wrap_indexargfunc`
+                    // reduces the count through `__index__` before the slot
+                    // runs, so a non-index operand raises here rather than
+                    // reporting NotImplemented.
                     crate::type_methods::arity_slot(args, 1)?;
-                    let Some(w_count) = list_repeat_index(args[1])? else {
-                        return Ok(pyre_object::w_not_implemented());
-                    };
+                    let w_count = crate::baseobjspace::getindex_repeat(args[1])?;
                     unsafe {
                         crate::objspace::descroperation::list_inplace_repeat(args[0], w_count)?
                     };
@@ -4803,40 +4822,12 @@ fn init_list_type(ns: PyObjectRef) {
     }
 }
 
-/// `space.getindex_w(w_obj, space.w_OverflowError)`: run `w_obj.__index__()`
-/// and return the resulting int/long object, converting an out-of-index-range
-/// value to an `OverflowError` that names the ORIGINAL operand (not the
-/// `__index__` result). A non-`__index__` operand raises the `TypeError` from
-/// `space.index`. Callers that repeat a sequence share this so `str`/`tuple`
-/// honour a custom `__index__` exactly like `list`/`bytes`.
-fn getindex_repeat(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let w_count = crate::baseobjspace::space_index(w_obj)?;
-    match crate::baseobjspace::int_w(w_count) {
-        Ok(_) => Ok(w_count),
-        Err(e) if e.kind == crate::PyErrorKind::OverflowError => Err(crate::PyError::new(
-            crate::PyErrorKind::OverflowError,
-            format!(
-                "cannot fit '{}' into an index-sized integer",
-                crate::baseobjspace::object_functionstr_type_name(w_obj)
-            ),
-        )),
-        Err(e) => Err(e),
-    }
-}
-
 /// Coerce a `list`/`tuple` `* n` / `*= n` repeat count through `getindex_repeat`
 /// (`getindex_w`). An operand without `__index__` yields `None`, which the
 /// caller maps to NotImplemented so the `*`/`*=` operator can try a reflected
 /// `__rmul__` and otherwise emit the "can't multiply sequence by non-int"
 /// message; any other coercion error propagates. This is `descr_mul`'s
 /// `try/except TypeError -> NotImplemented` wrapper (`listobject.py`).
-fn list_repeat_index(w_obj: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
-    match getindex_repeat(w_obj) {
-        Ok(w_count) => Ok(Some(w_count)),
-        Err(e) if e.kind == crate::PyErrorKind::TypeError => Ok(None),
-        Err(e) => Err(e),
-    }
-}
 
 /// `listobject.c:list_repeat` — `list * n` / `n * list`.  The count goes
 /// through `__index__`, so any object implementing it repeats the list.
@@ -4851,9 +4842,9 @@ fn list_descr_rmul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 fn list_descr_mul_impl(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_list_receiver(args, name, false)?;
     crate::type_methods::arity_slot(args, 1)?;
-    let Some(w_count) = list_repeat_index(args[1])? else {
-        return Ok(pyre_object::w_not_implemented());
-    };
+    // `wrap_indexargfunc` reduces the count through `__index__` before
+    // `sq_repeat` runs, so a non-index operand raises here.
+    let w_count = crate::baseobjspace::getindex_repeat(args[1])?;
     unsafe { crate::objspace::descroperation::list_repeat(args[0], w_count) }
 }
 
@@ -4867,7 +4858,7 @@ fn str_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_count = if unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
         args[1]
     } else {
-        getindex_repeat(args[1])?
+        crate::baseobjspace::getindex_repeat(args[1])?
     };
     unsafe { crate::objspace::descroperation::str_repeat(args[0], w_count) }
 }
@@ -5548,7 +5539,7 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "maketrans",
-            make_maketrans_descr(|args| {
+            make_maketrans_descr!("str", |args: &[PyObjectRef]| {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error(
                         "maketrans expected at least 1 argument, got 0",
@@ -8265,13 +8256,8 @@ fn tuple_descr_mul_impl(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef,
     crate::type_methods::arity_slot(args, 1)?;
     // tupleobject descr_mul routes the count through getindex_w, so a custom
     // __index__ repeats the tuple (and an out-of-range one overflows).
-    // A non-__index__ operand yields NotImplemented, letting the `*` operator
-    // try a reflected `__rmul__` and otherwise emit "can't multiply sequence by
-    // non-int", instead of this method's own slot error.
-    let Some(w_count) = list_repeat_index(args[1])? else {
-        return Ok(pyre_object::w_not_implemented());
-    };
-    crate::objspace::descroperation::mul(args[0], w_count)
+    let w_count = crate::baseobjspace::getindex_repeat(args[1])?;
+    unsafe { crate::objspace::descroperation::tuple_repeat(args[0], w_count) }
 }
 
 // ── Int/Float/Bool TypeDef (minimal) ─────────────────────────────────
@@ -16325,7 +16311,7 @@ fn init_bool_type(ns: PyObjectRef) {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 and_name,
-                make_builtin_function(and_name, f),
+                make_builtin_function_with_arity(and_name, f, 2),
             )
         };
         unsafe {
@@ -16830,19 +16816,18 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__sizeof__",
-            make_builtin_function_with_arity(
-                "__sizeof__",
-                |args| {
-                    if args.is_empty() {
-                        return Err(crate::PyError::type_error(
-                            "unbound method object.__sizeof__() needs an argument",
-                        ));
-                    }
-                    crate::type_methods::arity_no_args(args, "__sizeof__")?;
-                    object_descr_sizeof(args)
-                },
-                1,
-            ),
+            // No declared arity: the body reports the mismatch itself, under
+            // the class that declares the descriptor rather than under the
+            // receiver's class the gateway would read.
+            make_builtin_function("__sizeof__", |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error(
+                        "unbound method object.__sizeof__() needs an argument",
+                    ));
+                }
+                crate::type_methods::arity_no_args_of(Some("object"), args, "__sizeof__")?;
+                object_descr_sizeof(args)
+            }),
         )
     };
     // typeobject.py descr___init_subclass__ — the default accepts no
@@ -17559,7 +17544,7 @@ fn init_bytes_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "maketrans",
-            make_maketrans_descr(bytes_maketrans),
+            make_maketrans_descr!("bytes", bytes_maketrans),
         )
     };
     unsafe {
@@ -17742,9 +17727,7 @@ fn init_bytes_type(ns: PyObjectRef) {
 
 fn bytes_descr_repeat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_slot(args, 1)?;
-    let Some(count) = list_repeat_index(args[1])? else {
-        return Ok(pyre_object::w_not_implemented());
-    };
+    let count = crate::baseobjspace::getindex_repeat(args[1])?;
     unsafe { crate::objspace::descroperation::bytes_repeat(args[0], count) }
 }
 
@@ -18398,6 +18381,14 @@ fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate
     // (including `None`) raises rather than silently defaulting.
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let fn_name = if forward { "split" } else { "rsplit" };
+    crate::builtins::clinic_arity(
+        fn_name,
+        pos.len() - 1,
+        crate::builtins::real_kwarg_count(kwargs),
+        0,
+        2,
+        0,
+    )?;
     crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "maxsplit"], fn_name)?;
     crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "sep", pos.get(1).is_some())?;
     crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "maxsplit", pos.get(2).is_some())?;
@@ -18541,7 +18532,9 @@ fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                     .filter_map(|i| pyre_object::w_tuple_getitem(iterable, i as i64))
                     .collect()
             } else {
-                crate::builtins::collect_iterable(iterable)?
+                // `PySequence_Fast(seq, "can only join an iterable")` — the
+                // separator's own error, not the iteration protocol's.
+                crate::builtins::sequence_fast(iterable, "can only join an iterable")?
             }
         };
         let mut out: Vec<u8> = Vec::new();
@@ -19226,63 +19219,30 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             pos.len() - 1
         )));
     }
-    // `byteorder` and `signed` are the only keywords the gateway signature
-    // accepts; anything else is an unexpected-keyword TypeError.
-    crate::builtins::kwarg_reject_unknown(kwargs, &["byteorder", "signed"], "from_bytes")?;
-    let data_obj = pos.get(1).copied().ok_or_else(|| {
-        crate::PyError::type_error("from_bytes() missing required argument 'bytes' (pos 1)")
-    })?;
-    // bytesobject.py `makebytesdata_w`: `__bytes__` takes precedence over the
-    // buffer/iterable conversion and must itself return a bytes instance.
-    let bytes_method = unsafe { crate::baseobjspace::lookup(data_obj, "__bytes__") };
-    let bytes: Vec<u8> = if let Some(method) = bytes_method {
-        let w_type = crate::typedef::r#type(data_obj).map_or(pyre_object::PY_NULL, |t| t.as_ptr());
-        let w_bytes =
-            unsafe { crate::baseobjspace::get_and_call_function(method, data_obj, w_type, &[])? };
-        if !unsafe { pyre_object::bytesobject::is_bytes(w_bytes) } {
-            return Err(crate::PyError::type_error(format!(
-                "__bytes__ returned non-bytes (type '{}')",
-                unsafe { pyre_object::type_name_of(w_bytes) }
-            )));
-        }
-        unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes).to_vec() }
-    } else if unsafe { pyre_object::bytesobject::is_bytes_like(data_obj) } {
-        unsafe { pyre_object::bytesobject::bytes_like_data(data_obj).to_vec() }
-    } else {
-        // `_convert_from_buffer_or_iterable`: unicode is rejected before the
-        // generic iterable-of-bytes path.  In particular, an empty string is
-        // not accepted as an empty byte sequence.
-        let str_type = crate::typedef::gettypeobject(&pyre_object::STR_TYPE);
-        if unsafe { crate::baseobjspace::isinstance_w(data_obj, str_type) } {
-            return Err(crate::PyError::type_error(
-                "cannot convert 'str' object to bytes",
-            ));
-        }
-        let items = crate::builtins::collect_iterable(data_obj)?;
-        let mut v = Vec::with_capacity(items.len());
-        for it in items {
-            let n = crate::baseobjspace::int_w(it)?;
-            if !(0..=255).contains(&n) {
-                return Err(crate::PyError::value_error(
-                    "bytes must be in range(0, 256)",
-                ));
-            }
-            v.push(n as u8);
-        }
-        v
-    };
-    // byteorder is positional-or-keyword; supplying both is an error rather
-    // than the keyword silently winning.
+    // `bytes` and `byteorder` are positional-or-keyword; supplying one both
+    // ways is an error rather than the keyword silently winning.
+    let bytes_kw = crate::builtins::kwarg_get(kwargs, "bytes");
     let byteorder_kw = crate::builtins::kwarg_get(kwargs, "byteorder");
-    let byteorder_pos = pos.get(2).copied();
-    if byteorder_kw.is_some() && byteorder_pos.is_some() {
+    if bytes_kw.is_some() && pos.len() > 1 {
         return Err(crate::PyError::type_error(
-            "got multiple values for argument 'byteorder'",
+            "argument for from_bytes() given by name ('bytes') and position (1)",
         ));
     }
-    // `byteorder='text'` unwraps through `space.text_w`; a non-str value is a
-    // TypeError, and only a str that is neither 'little'/'big' is a ValueError.
-    let byteorder = match byteorder_pos.or(byteorder_kw) {
+    if byteorder_kw.is_some() && pos.len() > 2 {
+        return Err(crate::PyError::type_error(
+            "argument for from_bytes() given by name ('byteorder') and position (2)",
+        ));
+    }
+    // Every declared slot is filled before the unrecognized keywords are
+    // reported, so a call missing `bytes` is reported against `bytes`.
+    let data_obj = pos.get(1).copied().or(bytes_kw).ok_or_else(|| {
+        crate::PyError::type_error("from_bytes() missing required argument 'bytes' (pos 1)")
+    })?;
+    crate::builtins::kwarg_reject_unknown(kwargs, &["bytes", "byteorder", "signed"], "from_bytes")?;
+    // The clinic `str byteorder` converter runs before `PyBytes_FromObject`
+    // touches the payload, so a bad byte order is reported even when the
+    // payload could not have been converted either.
+    let byteorder = match pos.get(2).copied().or(byteorder_kw) {
         None => "big",
         Some(b) if unsafe { pyre_object::is_str(b) } => {
             match unsafe { pyre_object::w_str_get_value(b) } {
@@ -19298,9 +19258,57 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         Some(b) => {
             let tname = unsafe { pyre_object::type_name_of(b) };
             return Err(crate::PyError::type_error(format!(
-                "expected str, got {tname} object"
+                "from_bytes() argument 'byteorder' must be str, not {tname}"
             )));
         }
+    };
+    // `makebytesdata_w` — `__bytes__` takes precedence over the buffer /
+    // iterable conversion and must itself return a bytes instance.
+    let bytes_method = unsafe { crate::baseobjspace::lookup(data_obj, "__bytes__") };
+    // `_convert_from_buffer_or_iterable` — the buffer protocol, else an
+    // iterable of ints.  A str is iterable but never a byte source, and
+    // neither is an object with no iterator at all.
+    let bytes: Vec<u8> = if let Some(method) = bytes_method {
+        let w_type = crate::typedef::r#type(data_obj).map_or(pyre_object::PY_NULL, |t| t.as_ptr());
+        let w_bytes =
+            unsafe { crate::baseobjspace::get_and_call_function(method, data_obj, w_type, &[])? };
+        if !unsafe { pyre_object::bytesobject::is_bytes(w_bytes) } {
+            return Err(crate::PyError::type_error(format!(
+                "__bytes__ returned non-bytes (type '{}')",
+                unsafe { pyre_object::type_name_of(w_bytes) }
+            )));
+        }
+        unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes).to_vec() }
+    } else if unsafe { pyre_object::bytesobject::is_bytes_like(data_obj) } {
+        unsafe { pyre_object::bytesobject::bytes_like_data(data_obj).to_vec() }
+    } else {
+        let not_bytes = || {
+            crate::PyError::type_error(format!(
+                "cannot convert '{}' object to bytes",
+                crate::baseobjspace::object_functionstr_type_name(data_obj)
+            ))
+        };
+        if unsafe { pyre_object::is_str(data_obj) } {
+            return Err(not_bytes());
+        }
+        let items = crate::builtins::collect_iterable(data_obj).map_err(|e| {
+            if e.kind == crate::PyErrorKind::TypeError {
+                not_bytes()
+            } else {
+                e
+            }
+        })?;
+        let mut v = Vec::with_capacity(items.len());
+        for it in items {
+            let n = crate::baseobjspace::int_w(it)?;
+            if !(0..=255).contains(&n) {
+                return Err(crate::PyError::value_error(
+                    "bytes must be in range(0, 256)",
+                ));
+            }
+            v.push(n as u8);
+        }
+        v
     };
     let signed = crate::builtins::kwarg_get(kwargs, "signed")
         .map(crate::baseobjspace::is_true)
@@ -19380,6 +19388,14 @@ fn bytearray_fromhex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "hex")?;
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::clinic_arity(
+        "hex",
+        pos.len() - 1,
+        crate::builtins::real_kwarg_count(kwargs),
+        0,
+        2,
+        0,
+    )?;
     crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "bytes_per_sep"], "hex")?;
     crate::builtins::kwarg_reject_duplicate(kwargs, "hex", "sep", pos.get(1).is_some())?;
     crate::builtins::kwarg_reject_duplicate(kwargs, "hex", "bytes_per_sep", pos.get(2).is_some())?;
@@ -19396,7 +19412,9 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         .copied()
         .or_else(|| crate::builtins::kwarg_get(kwargs, "bytes_per_sep"))
     {
-        Some(o) => crate::baseobjspace::int_w(o)?,
+        // `_Py_strhex_impl`'s clinic `int bytes_per_sep` converter reads
+        // `__index__`, so a non-index argument is named in the error.
+        Some(o) => crate::builtins::space_index_w(o)?,
         None => 1,
     };
 
@@ -19930,6 +19948,14 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
     // `bytes.decode(encoding='utf-8', errors='strict')` — both parameters
     // are positional-or-keyword, so accept them from either side.
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::clinic_arity(
+        "decode",
+        pos.len() - 1,
+        crate::builtins::real_kwarg_count(kwargs),
+        0,
+        2,
+        0,
+    )?;
     crate::builtins::kwarg_reject_unknown(kwargs, &["encoding", "errors"], "decode")?;
     // `encoding` is positional-or-keyword at position 1; giving it both ways is
     // a TypeError (the rarer 3-positional `errors` over-count is not modelled).
@@ -20381,7 +20407,7 @@ fn bytearray_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `bytearrayobject.py:descr_extend` — append a bytes-like object's
 /// bytes, or each integer yielded by an iterable.
 fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_at_least(args, "extend", 1)?;
+    crate::type_methods::arity_exact(args, "extend", 1)?;
     unsafe { crate::builtins::bytearray_check_exports(args[0])? };
     let other = args[1];
     // Materialize the new bytes before mutating so `x.extend(x)` is safe.
@@ -20437,7 +20463,7 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `bytearrayobject.py:descr_insert` — insert one byte before `index`,
 /// clamping out-of-range indices (negative counts from the end).
 fn bytearray_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_at_least(args, "insert", 2)?;
+    crate::type_methods::arity_exact_unpack(args, "insert", 2)?;
     unsafe { crate::builtins::bytearray_check_exports(args[0])? };
     let index = crate::builtins::space_index_w(args[1])?;
     let b = bytearray_byte_arg(args[2])?;
@@ -20472,6 +20498,7 @@ fn bytearray_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `index` (default last); IndexError when empty or out of range.
 fn bytearray_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "pop")?;
+    crate::type_methods::arity_at_most(args, "pop", 1)?;
     unsafe {
         crate::builtins::bytearray_check_exports(args[0])?;
         let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
@@ -21123,7 +21150,7 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "maketrans",
-            make_maketrans_descr(bytes_maketrans),
+            make_maketrans_descr!("bytearray", bytes_maketrans),
         )
     };
     unsafe {
@@ -21263,12 +21290,10 @@ fn init_bytearray_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__imul__",
                 |args| {
-                    // descr_inplace_mul: the count goes through `__index__`; a
-                    // non-index operand becomes NotImplemented.
+                    // descr_inplace_mul: `wrap_indexargfunc` reduces the
+                    // count through `__index__` before the slot runs.
                     crate::type_methods::arity_slot(args, 1)?;
-                    let Some(w_count) = list_repeat_index(args[1])? else {
-                        return Ok(pyre_object::w_not_implemented());
-                    };
+                    let w_count = crate::baseobjspace::getindex_repeat(args[1])?;
                     unsafe {
                         crate::objspace::descroperation::bytearray_inplace_repeat(args[0], w_count)?
                     };
@@ -21501,11 +21526,15 @@ macro_rules! setlike_method_gateways {
     ($set_fn:ident, $frozenset_fn:ident, $name:literal, $implementation:ident) => {
         fn $set_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             crate::type_methods::require_set_receiver(args, $name, true)?;
+            // Every set method takes its operands as a bare `*others`, so a
+            // keyword would otherwise reach the body as one more operand.
+            crate::type_methods::reject_kwargs(args, $name)?;
             $implementation(args)
         }
 
         fn $frozenset_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             crate::type_methods::require_frozenset_receiver(args, $name, true)?;
+            crate::type_methods::reject_kwargs(args, $name)?;
             $implementation(args)
         }
     };
@@ -22800,6 +22829,7 @@ fn init_set_type(ns: PyObjectRef) {
             "update",
             make_builtin_function("update", |args| {
                 crate::type_methods::require_set_receiver(args, "update", true)?;
+                crate::type_methods::reject_kwargs(args, "update")?;
                 set_method_update(args)
             }),
         )
@@ -22814,6 +22844,7 @@ fn init_set_type(ns: PyObjectRef) {
             "difference_update",
             make_builtin_function("difference_update", |args| {
                 crate::type_methods::require_set_receiver(args, "difference_update", true)?;
+                crate::type_methods::reject_kwargs(args, "difference_update")?;
                 set_method_difference_update(args)
             }),
         )
@@ -22824,6 +22855,7 @@ fn init_set_type(ns: PyObjectRef) {
             "intersection_update",
             make_builtin_function("intersection_update", |args| {
                 crate::type_methods::require_set_receiver(args, "intersection_update", true)?;
+                crate::type_methods::reject_kwargs(args, "intersection_update")?;
                 set_method_intersection_update(args)
             }),
         )
@@ -22838,6 +22870,7 @@ fn init_set_type(ns: PyObjectRef) {
                     "symmetric_difference_update",
                     true,
                 )?;
+                crate::type_methods::reject_kwargs(args, "symmetric_difference_update")?;
                 set_method_symmetric_difference_update(args)
             }),
         )

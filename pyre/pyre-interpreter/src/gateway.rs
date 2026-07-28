@@ -897,11 +897,15 @@ fn no_keyword_arguments(code: &BuiltinCode, receiver: Option<PyObjectRef>) -> cr
 /// The name a builtin reports itself under (`_PyObject_FunctionStr` of the
 /// `__module__` and `__qualname__` a `builtin_function_or_method` carries): a
 /// module-level builtin `module.name` — bare for `builtins`, whose module
-/// prefix is left off — and a descriptor `TYPE.name`, where TYPE is the
-/// receiver itself when the receiver IS a type (`int.__subclasses__`) and
-/// otherwise the receiver's type (`ValueError.add_note` for a `ValueError`
-/// instance, even though the method is declared on `BaseException`).  With no
-/// receiver to read, fall back to the type the method was stamped onto.
+/// prefix is left off — and a descriptor `TYPE.name`.
+///
+/// TYPE is the receiver itself when the receiver IS a type
+/// (`int.__subclasses__`) and otherwise the receiver's type — the rule a
+/// bound `builtin_function_or_method` follows (`type(__self__).__qualname__`),
+/// which is the callable kind pyre hands out for every builtin method.  A
+/// `method_descriptor` reports the class that declares it instead, a
+/// distinction pyre cannot draw with one callable kind; the descriptors whose
+/// declaring class is fixed (`object.__sizeof__`) name it themselves.
 fn builtin_names(
     code: &BuiltinCode,
     receiver: Option<PyObjectRef>,

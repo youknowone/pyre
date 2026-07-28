@@ -1462,10 +1462,14 @@ crate::py_module! {
         // through the args slice (typed varargs are not supported by
         // inline_functions arity inference).
         "pack" / * = |args| {
-            if args.is_empty() {
+            let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            if crate::builtins::has_real_kwargs(kwargs) {
                 return Err(crate::PyError::type_error(
-                    "pack() missing 1 required positional argument: 'fmt'",
+                    "_struct.pack() takes no keyword arguments",
                 ));
+            }
+            if args.is_empty() {
+                return Err(crate::PyError::type_error("missing format argument"));
             }
             let fmt = format_to_string(args[0])?;
             do_pack(&fmt, &args[1..])

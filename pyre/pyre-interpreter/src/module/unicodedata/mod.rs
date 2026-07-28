@@ -67,6 +67,12 @@ fn extract_char(func: &str, argno: Option<u32>, obj: PyObjectRef) -> Result<Code
 
 /// Single required character argument (`category`, `bidirectional`, …).
 fn one_char(func: &str, args: &[PyObjectRef]) -> Result<CodePoint, PyError> {
+    let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(PyError::type_error(format!(
+            "unicodedata.{func}() takes no keyword arguments"
+        )));
+    }
     if args.len() != 1 {
         return Err(PyError::type_error(format!(
             "unicodedata.{func}() takes exactly one argument ({} given)",

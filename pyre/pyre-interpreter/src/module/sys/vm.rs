@@ -1177,7 +1177,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "setrecursionlimit() takes exactly one argument",
                     ));
                 }
-                let new_limit = crate::baseobjspace::c_int_w(args[0])?;
+                // `sys_setrecursionlimit_impl`'s clinic `int new_limit`
+                // converter reads `__index__`, so a non-index argument is
+                // named in the error rather than reported as a bare
+                // "expected integer".
+                let new_limit = crate::builtins::space_index_w(args[0])?;
+                if !(i32::MIN as i64..=i32::MAX as i64).contains(&new_limit) {
+                    return Err(crate::PyError::overflow_error(
+                        "expected a 32-bit integer",
+                    ));
+                }
+                let new_limit = new_limit as i32;
                 crate::stack_check::set_recursion_limit(new_limit)?;
                 Ok(w_none())
             },
@@ -1967,17 +1977,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         make_builtin_function(
             "getsizeof",
             |args| {
-                if args.len() > 2 {
-                    return Err(crate::PyError::type_error(format!(
-                        "getsizeof() takes at most 2 arguments ({} given)",
-                        args.len()
-                    )));
-                }
-                let Some(&w_obj) = args.first() else {
-                    return Err(crate::PyError::type_error(
-                        "getsizeof() takes at least 1 argument (0 given)",
-                    ));
-                };
+                // `vm.py:355 getsizeof(space, w_object, w_default=None)` — both
+                // parameters are positional-or-keyword.
+                let scope = crate::builtins::bind_builtin_kwargs(
+                    args,
+                    &["object", "default"],
+                    &[true, false],
+                    "getsizeof",
+                )?;
+                let w_obj = scope[0];
                 if let Some(w_type) = crate::typedef::r#type(w_obj) {
                     if let Some(w_sizeof) = unsafe {
                         crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__sizeof__")
@@ -2015,7 +2023,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         return Ok(w_size);
                     }
                 }
-                match args.get(1).copied() {
+                match Some(scope[1]).filter(|d| !d.is_null()) {
                     Some(w_default) => Ok(w_default),
                     None => Err(crate::PyError::type_error(
                         "getsizeof(object, default) -> int: object size is not tracked; supply a default",

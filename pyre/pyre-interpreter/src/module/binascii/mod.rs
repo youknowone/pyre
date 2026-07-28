@@ -13,6 +13,23 @@ mod transforms;
 
 use pyre_object::*;
 
+/// The required first parameter of the hex entry points, which is
+/// positional-or-keyword and reported by name when absent.
+fn arg_data(
+    pos: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+    fn_name: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    pos.first()
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "data"))
+        .ok_or_else(|| {
+            crate::PyError::type_error(format!(
+                "{fn_name}() missing required argument 'data' (pos 1)"
+            ))
+        })
+}
+
 /// `ascii_buffer_converter` — accept a str (ASCII) or any bytes-like and
 /// surface the raw bytes.  Only the `a2b_*` decoders take a str source.
 fn as_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
@@ -142,7 +159,7 @@ fn arg_sep(
     };
     let bytes_per_sep =
         match crate::builtins::kwarg_get(kwargs, "bytes_per_sep").or_else(|| pos.get(2).copied()) {
-            Some(o) if !unsafe { is_none(o) } => crate::baseobjspace::int_w(o)? as isize,
+            Some(o) if !unsafe { is_none(o) } => crate::builtins::space_index_w(o)? as isize,
             _ => 1,
         };
     Ok((sep, bytes_per_sep))
@@ -172,13 +189,13 @@ crate::py_module! {
     functions: {
         "b2a_hex" / * = |args| {
             let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_buffer_bytes(pos.first().copied().unwrap_or(w_none()))?;
+            let data = as_buffer_bytes(arg_data(pos, kwargs, "b2a_hex")?)?;
             let (sep, bytes_per_sep) = arg_sep(pos, kwargs)?;
             Ok(w_bytes_from_bytes(&transforms::hexlify(&data, sep, bytes_per_sep)))
         },
         "hexlify" / * = |args| {
             let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_buffer_bytes(pos.first().copied().unwrap_or(w_none()))?;
+            let data = as_buffer_bytes(arg_data(pos, kwargs, "hexlify")?)?;
             let (sep, bytes_per_sep) = arg_sep(pos, kwargs)?;
             Ok(w_bytes_from_bytes(&transforms::hexlify(&data, sep, bytes_per_sep)))
         },

@@ -108,7 +108,17 @@ fn declaring_builtin_type_name(receiver: PyObjectRef) -> String {
 /// slice length.  Without this the marker would be counted as a positional
 /// value and reach the implementation as one.  A slot wrapper reports itself
 /// as `wrapper NAME()`, everything else under its qualified name.
-fn reject_kwargs(args: &[PyObjectRef], name: &str) -> Result<(), crate::PyError> {
+pub(crate) fn reject_kwargs(args: &[PyObjectRef], name: &str) -> Result<(), crate::PyError> {
+    reject_kwargs_of(None, args, name)
+}
+
+/// [`reject_kwargs`] for a method whose declaring class is fixed rather than
+/// read off the receiver — see [`arity_no_args_of`].
+fn reject_kwargs_of(
+    owner: Option<&str>,
+    args: &[PyObjectRef],
+    name: &str,
+) -> Result<(), crate::PyError> {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     if !crate::builtins::has_real_kwargs(kwargs) {
         return Ok(());
@@ -116,10 +126,10 @@ fn reject_kwargs(args: &[PyObjectRef], name: &str) -> Result<(), crate::PyError>
     let slot = positional.first().is_some_and(|&receiver| {
         crate::gateway::is_slot_wrapper(&declaring_builtin_type_name(receiver), name)
     });
-    let subject = if slot {
-        format!("wrapper {name}")
-    } else {
-        method_qualname(positional, name)
+    let subject = match (slot, owner) {
+        (true, _) => format!("wrapper {name}"),
+        (false, Some(owner)) => format!("{owner}.{name}"),
+        (false, None) => method_qualname(positional, name),
     };
     Err(crate::PyError::type_error(format!(
         "{subject}() takes no keyword arguments"
@@ -264,11 +274,26 @@ pub(crate) fn arity_slot(args: &[PyObjectRef], n: usize) -> Result<(), crate::Py
 /// the "X() takes no arguments (M given)" form (`list.__reversed__`).  `name`
 /// is the bare method name; the message qualifies it with the receiver's type.
 pub(crate) fn arity_no_args(args: &[PyObjectRef], name: &str) -> Result<(), crate::PyError> {
-    reject_kwargs(args, name)?;
+    arity_no_args_of(None, args, name)
+}
+
+/// [`arity_no_args`] for a method whose declaring class cannot be recovered
+/// from the receiver: `object.__sizeof__` is shadowed on the MRO of every
+/// receiver whose own type declares one, yet the descriptor reached through
+/// `object` still reports `object`.
+pub(crate) fn arity_no_args_of(
+    owner: Option<&str>,
+    args: &[PyObjectRef],
+    name: &str,
+) -> Result<(), crate::PyError> {
+    reject_kwargs_of(owner, args, name)?;
     if args.len() != 1 {
+        let qualname = match owner {
+            Some(owner) => format!("{owner}.{name}"),
+            None => method_qualname(args, name),
+        };
         return Err(crate::PyError::type_error(format!(
-            "{}() takes no arguments ({} given)",
-            method_qualname(args, name),
+            "{qualname}() takes no arguments ({} given)",
             args_given(args),
         )));
     }
@@ -703,13 +728,17 @@ pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // Keep the argument decoding shared with `sorted()` before changing the
     // receiver's visible storage.
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if positional.len() > 1 {
-        return Err(crate::PyError::type_error(format!(
-            "sorted() takes at most 1 positional argument ({} given)",
-            positional.len()
-        )));
-    }
-    crate::builtins::kwarg_reject_unknown(kwargs, &["key", "reverse"], "sorted")?;
+    // `sort($self, /, *, key=None, reverse=False)` — the receiver is the only
+    // positional slot, so everything after it has to arrive by keyword.
+    crate::builtins::clinic_arity(
+        "sort",
+        positional.len() - 1,
+        crate::builtins::real_kwarg_count(kwargs),
+        0,
+        0,
+        2,
+    )?;
+    crate::builtins::kwarg_reject_unknown(kwargs, &["key", "reverse"], "sort")?;
     let key_fn = crate::builtins::kwarg_get(kwargs, "key")
         .filter(|key| unsafe { !pyre_object::is_none(*key) });
     let reverse = crate::builtins::kwarg_get(kwargs, "reverse")
@@ -807,7 +836,9 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
                 .filter_map(|i| w_tuple_getitem(iterable, i as i64))
                 .collect()
         } else {
-            crate::builtins::collect_iterable(iterable)?
+            // `PySequence_Fast(seq, "can only join an iterable")` — the
+            // separator's own error, not the iteration protocol's.
+            crate::builtins::sequence_fast(iterable, "can only join an iterable")?
         }
     };
     // pypy/objspace/std/unicodeobject.py:856-872 descr_join — each
@@ -853,6 +884,14 @@ fn resolve_split_args(
     fn_name: &str,
 ) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::clinic_arity(
+        fn_name,
+        pos.len() - 1,
+        crate::builtins::real_kwarg_count(kwargs),
+        0,
+        2,
+        0,
+    )?;
     crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "maxsplit"], fn_name)?;
     crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "sep", pos.get(1).is_some())?;
     crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "maxsplit", pos.get(2).is_some())?;
@@ -3224,6 +3263,14 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     };
     // `encode(encoding=None, errors=None)` — both positional-or-keyword;
     // the gateway rejects unknown keywords and a value given both ways.
+    crate::builtins::clinic_arity(
+        "encode",
+        pos.len() - 1,
+        crate::builtins::real_kwarg_count(kwargs),
+        0,
+        2,
+        0,
+    )?;
     crate::builtins::kwarg_reject_unknown(kwargs, &["encoding", "errors"], "encode")?;
     let dual =
         |name: &str, p: Option<PyObjectRef>| -> Result<Option<PyObjectRef>, crate::PyError> {
@@ -5082,6 +5129,7 @@ pub(crate) fn str_result_unchanged(obj: PyObjectRef) -> PyObjectRef {
 
 pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "center", 1)?;
+    arity_at_most(args, "center", 2)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?.max(0) as usize;
     let fillchar = pad_fillchar(args, "center")?;
@@ -5103,6 +5151,7 @@ pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// PyPy: unicodeobject.py descr_ljust
 pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "ljust", 1)?;
+    arity_at_most(args, "ljust", 2)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?.max(0) as usize;
     let fillchar = pad_fillchar(args, "ljust")?;
@@ -5120,6 +5169,7 @@ pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// PyPy: unicodeobject.py descr_rjust
 pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "rjust", 1)?;
+    arity_at_most(args, "rjust", 2)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?.max(0) as usize;
     let fillchar = pad_fillchar(args, "rjust")?;
@@ -5548,7 +5598,24 @@ pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     unsafe {
         for cp in s.code_points() {
             let key = w_int_new(cp.to_u32() as i64);
-            match crate::baseobjspace::finditem(table, key)? {
+            // `unicode_translate` clears any LookupError the lookup raises
+            // and keeps the character, so a table that indexes rather than
+            // maps (a str, a list) leaves unmapped code points alone.
+            let found = match crate::baseobjspace::finditem(table, key) {
+                Ok(found) => found,
+                Err(e)
+                    if matches!(
+                        e.kind,
+                        crate::PyErrorKind::LookupError
+                            | crate::PyErrorKind::KeyError
+                            | crate::PyErrorKind::IndexError
+                    ) =>
+                {
+                    None
+                }
+                Err(e) => return Err(e),
+            };
+            match found {
                 None => result.push(cp),
                 Some(val) if is_none(val) => {}
                 Some(val) if is_int(val) => {

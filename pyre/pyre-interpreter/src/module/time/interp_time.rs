@@ -141,8 +141,10 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 let has_int = crate::baseobjspace::lookup(args[0], "__int__").is_some()
                     || crate::baseobjspace::lookup(args[0], "__index__").is_some();
                 if !has_int {
+                    // `_PyTime_FromSecondsObject` accepts either domain, so
+                    // an argument that is neither names both.
                     return Err(crate::PyError::type_error(format!(
-                        "'{}' object is not an integer or float",
+                        "'{}' object cannot be interpreted as an integer or float",
                         crate::type_methods::arg_type_name(args[0])
                     )));
                 }
