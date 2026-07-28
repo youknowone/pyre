@@ -5134,14 +5134,22 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "upper",
-            make_builtin_function_with_arity("upper", crate::type_methods::str_method_upper, 1),
+            crate::make_method_descriptor_with_arity(
+                "upper",
+                crate::type_methods::str_method_upper,
+                1,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "lower",
-            make_builtin_function_with_arity("lower", crate::type_methods::str_method_lower, 1),
+            crate::make_method_descriptor_with_arity(
+                "lower",
+                crate::type_methods::str_method_lower,
+                1,
+            ),
         )
     };
     unsafe {
@@ -11963,6 +11971,27 @@ fn method_descriptor_receiver(obj: PyObjectRef, name: &str) -> Result<PyObjectRe
     Ok(obj)
 }
 
+fn method_descriptor_check_instance(
+    descr: PyObjectRef,
+    obj: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    let owner = unsafe { crate::function::fget_func_objclass(descr)? };
+    let applies = crate::typedef::r#type(obj)
+        .map(|actual| unsafe { crate::baseobjspace::issubtype_w(actual.as_ptr(), owner) })
+        .unwrap_or(false);
+    if applies {
+        return Ok(());
+    }
+    let name = unsafe { crate::function::function_get_name(descr) };
+    let owner_name = unsafe { pyre_object::w_type_get_name(owner) };
+    let received = crate::typedef::r#type(obj)
+        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
+        .unwrap_or("object");
+    Err(crate::PyError::type_error(format!(
+        "descriptor '{name}' for '{owner_name}' objects doesn't apply to a '{received}' object"
+    )))
+}
+
 fn bind_method_descriptor(
     descr: PyObjectRef,
     obj: PyObjectRef,
@@ -11975,20 +12004,7 @@ fn bind_method_descriptor(
         }
         return Ok(descr);
     }
-    let owner = unsafe { crate::function::fget_func_objclass(descr)? };
-    let applies = crate::typedef::r#type(obj)
-        .map(|actual| unsafe { crate::baseobjspace::issubtype_w(actual.as_ptr(), owner) })
-        .unwrap_or(false);
-    if !applies {
-        let name = unsafe { crate::function::function_get_name(descr) };
-        let owner_name = unsafe { pyre_object::w_type_get_name(owner) };
-        let received = crate::typedef::r#type(obj)
-            .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
-            .unwrap_or("object");
-        return Err(crate::PyError::type_error(format!(
-            "descriptor '{name}' for '{owner_name}' objects doesn't apply to a '{received}' object"
-        )));
-    }
+    method_descriptor_check_instance(descr, obj)?;
     let actual_type = crate::typedef::r#type(obj).map_or(pyre_object::PY_NULL, |tp| tp.as_ptr());
     Ok(crate::function::builtin_bound_method_new(
         descr,
@@ -12085,6 +12101,9 @@ fn init_method_descriptor_type(ns: PyObjectRef) {
                     positional.first().copied().unwrap_or(pyre_object::PY_NULL),
                     "__call__",
                 )?;
+                if let Some(&obj) = positional.get(1) {
+                    method_descriptor_check_instance(descr, obj)?;
+                }
                 function_descr_call_impl(positional, kwargs, descr)
             }),
         );
