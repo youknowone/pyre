@@ -2862,7 +2862,12 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "SystemExit",
-        make_exc_type("SystemExit", exc_system_exit_new, base_exc),
+        make_exc_type_with_init(
+            "SystemExit",
+            exc_system_exit_new,
+            Some(exc_system_exit_init),
+            base_exc,
+        ),
     );
     crate::module_ns_store(
         ns,
@@ -6209,6 +6214,82 @@ exc_new_wrapper!(exc_reference_error_new, exc_reference_error);
 exc_new_wrapper!(exc_system_error_new, exc_system_error);
 exc_new_wrapper!(exc_syntax_error_new, exc_syntax_error);
 
+/// True when `method` is one of the `descr_str` / `descr_repr` builtins that
+/// `make_exc_type_with_init` installs.  `py_str` / `py_repr` already run those
+/// rules natively, so the native path must not dispatch back into them —
+/// unlike, say, `BaseExceptionGroup.__str__`, which has no native arm and
+/// whose builtin the native path does have to call.
+pub(crate) unsafe fn is_native_exception_dunder(method: PyObjectRef) -> bool {
+    if method.is_null() || !crate::function::is_function(method) {
+        return false;
+    }
+    let code = crate::function::getcode(method) as PyObjectRef;
+    if code.is_null() || !unsafe { crate::gateway::is_builtin_code(code) } {
+        return false;
+    }
+    let f = unsafe { crate::gateway::builtin_code_get(code) };
+    [
+        base_exception_str_method as crate::gateway::BuiltinCodeFn,
+        exception_str_method as crate::gateway::BuiltinCodeFn,
+        exception_repr_method as crate::gateway::BuiltinCodeFn,
+    ]
+    .iter()
+    .any(|&target| std::ptr::fn_addr_eq(f, target))
+}
+
+/// `interp_exceptions.py:993-998 W_SystemExit.descr_init` — a lone argument
+/// becomes `code` verbatim, several become the args tuple, and none leaves
+/// the `None` class default; `W_BaseException.descr_init` then stamps `args`.
+/// It runs first here so its keyword rejection precedes the `code` write.
+fn exc_system_exit_init(args: &[PyObjectRef]) -> crate::PyResult {
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
+    })?;
+    exc_base_exception_init(args)?;
+    let (positional, _) = split_builtin_kwargs(&args[1..]);
+    let code = match positional.len() {
+        0 => return Ok(pyre_object::w_none()),
+        1 => positional[0],
+        _ => pyre_object::w_tuple_new(positional.to_vec()),
+    };
+    unsafe { pyre_object::interp_exceptions::w_exception_set_code(w_self, code) };
+    Ok(pyre_object::w_none())
+}
+
+/// `interp_exceptions.py:126-133 W_BaseException.descr_str` — the base rule,
+/// which reports the args alone.  It is what `BaseException.__str__(exc)`
+/// runs even when `exc`'s own class registers a `descr_str` override.
+fn base_exception_str_method(args: &[PyObjectRef]) -> crate::PyResult {
+    let obj = args[0];
+    Ok(pyre_object::w_str_new(&unsafe {
+        crate::display::base_exception_str(obj)?
+    }))
+}
+
+/// The `descr_str` of the class that registers one, falling back to
+/// `W_BaseException.descr_str` for an arg shape it does not special-case
+/// (`KeyError('a', 'b')`, an `OSError` with neither errno nor strerror).
+fn exception_str_method(args: &[PyObjectRef]) -> crate::PyResult {
+    let obj = args[0];
+    let text = unsafe {
+        match crate::display::exception_kind_str(obj)? {
+            Some(s) => s,
+            None => crate::display::base_exception_str(obj)?,
+        }
+    };
+    Ok(pyre_object::w_str_new(&text))
+}
+
+/// `interp_exceptions.py:135-151 W_BaseException.descr_repr` — every builtin
+/// exception class inherits this one, so it is registered on `BaseException`
+/// alone and reads the receiver's own class name.
+fn exception_repr_method(args: &[PyObjectRef]) -> crate::PyResult {
+    let obj = args[0];
+    Ok(pyre_object::w_str_new(&unsafe {
+        crate::display::py_repr(obj)?
+    }))
+}
+
 /// Build a builtin exception type with the given name, base, and __new__ wrapper.
 pub(crate) fn make_exc_type(
     name: &'static str,
@@ -6256,6 +6337,43 @@ fn make_exc_type_with_init(
                         ns,
                         "__init__",
                         make_builtin_function("__init__", init_fn),
+                    )
+                };
+            }
+            // `interp_exceptions.py:291-292` registers `__str__` /
+            // `__repr__` on `BaseException`'s typedef, and each of the
+            // classes below registers a `descr_str` of its own on top.  A
+            // class that inherits both stays out of this list, so
+            // `LookupError.__str__` resolves up the MRO to
+            // `BaseException`'s the way `KeyError.__str__` does not.
+            if name == "BaseException" {
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__repr__",
+                        make_builtin_function_with_arity("__repr__", exception_repr_method, 1),
+                    );
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__str__",
+                        make_builtin_function_with_arity("__str__", base_exception_str_method, 1),
+                    );
+                };
+            } else if matches!(
+                name,
+                "KeyError"
+                    | "OSError"
+                    | "ImportError"
+                    | "SyntaxError"
+                    | "UnicodeDecodeError"
+                    | "UnicodeEncodeError"
+                    | "UnicodeTranslateError"
+            ) {
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__str__",
+                        make_builtin_function_with_arity("__str__", exception_str_method, 1),
                     )
                 };
             }

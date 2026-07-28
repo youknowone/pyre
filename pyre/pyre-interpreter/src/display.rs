@@ -524,7 +524,16 @@ pub(crate) unsafe fn exc_user_dunder_obj(
         let Some((src, method)) = crate::baseobjspace::lookup_where_pair(w_class, name) else {
             return Ok(None);
         };
+        // `object`'s and `BaseException`'s registrations are the two the
+        // native formatting stands in for, and so are the `descr_str`
+        // builtins the exception classes install on top of them — calling
+        // any of those back from here would recurse.  A builtin that the
+        // native path does *not* implement, such as
+        // `BaseExceptionGroup.__str__`, still has to be dispatched.
         if method.is_null() || std::ptr::eq(src, crate::typedef::w_object()) {
+            return Ok(None);
+        }
+        if crate::builtins::is_native_exception_dunder(method) {
             return Ok(None);
         }
         if let Some(base) = crate::builtins::lookup_exc_class("BaseException") {
@@ -1010,135 +1019,9 @@ pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
                 return Ok(s);
             }
         }
-        // `pypy/module/exceptions/interp_exceptions.py:126-133
-        // W_BaseException.descr_str`:
-        //
-        // ```python
-        // def descr_str(self, space):
-        //     lgt = len(self.args_w)
-        //     if lgt == 0:
-        //         return space.newtext('')
-        //     elif lgt == 1:
-        //         return space.str(self.args_w[0])
-        //     else:
-        //         return space.str(space.newtuple(self.args_w))
-        // ```
-        //
-        // PyPy reads `self.args_w` on every call so `e.args = (...)`
-        // mutations are reflected by subsequent `str(e)` reads.  Pyre
-        // previously returned the constructor-time `message` snapshot,
-        // which split repr/str apart after the user mutated args.
         if unsafe { pyre_object::is_exception(obj) } {
-            // `pypy/module/exceptions/interp_exceptions.py:447-459`
-            // `W_UnicodeTranslateError.descr_str`,
-            // `:1061-1071` `W_UnicodeDecodeError.descr_str`,
-            // `:1175-1191` `W_UnicodeEncodeError.descr_str` — each
-            // typedef registers `__str__ = interp2app(descr_str)`,
-            // overriding the inherited `W_BaseException.descr_str`.
-            // Dispatched on `ExcKind` because Pyre flattens the three
-            // PyPy subclasses into the single `W_BaseException`
-            // struct.
-            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-            match kind {
-                pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError => {
-                    return Ok(unicode_translate_error_str(obj));
-                }
-                pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError => {
-                    return Ok(unicode_decode_error_str(obj));
-                }
-                pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError => {
-                    return Ok(unicode_encode_error_str(obj));
-                }
-                // `interp_exceptions.py:540-548 W_KeyError.descr_str` —
-                // a single-argument KeyError stringifies as `repr(args[0])`
-                // so `str(KeyError('k'))` is `"'k'"`; with any other arg
-                // count it falls back to `W_BaseException.descr_str` below.
-                pyre_object::interp_exceptions::ExcKind::KeyError => {
-                    let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
-                    if !args.is_null()
-                        && pyre_object::is_tuple(args)
-                        && pyre_object::w_tuple_len(args) == 1
-                    {
-                        let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
-                        return py_repr(first);
-                    }
-                }
-                // `interp_exceptions.py:667-703 W_OSError.descr_str` reads
-                // the `errno`/`strerror`/`filename`/`filename2` slots:
-                // the 2-argument form renders as `"[Errno N] strerror"`,
-                // extended with `": 'filename'"` and `" -> 'filename2'"`
-                // when those are present.  `_init_error` drops filename
-                // from `args`, so prefer the slot and fall back to the
-                // positional arg (same 2..=5 gate as the getters) for the
-                // internal-constructor path that leaves the slots `PY_NULL`.
-                // Both errno and strerror absent falls back to
-                // `W_BaseException.descr_str` below.
-                pyre_object::interp_exceptions::ExcKind::OSError
-                | pyre_object::interp_exceptions::ExcKind::FileNotFoundError => {
-                    let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
-                    let n = if !args.is_null() && pyre_object::is_tuple(args) {
-                        pyre_object::w_tuple_len(args)
-                    } else {
-                        0
-                    };
-                    let slot_or_arg = |slot: pyre_object::PyObjectRef,
-                                       idx: usize|
-                     -> Option<pyre_object::PyObjectRef> {
-                        if !slot.is_null() {
-                            return Some(slot);
-                        }
-                        if (2..=5).contains(&n) && idx < n {
-                            unsafe { pyre_object::w_tuple_getitem(args, idx as i64) }
-                        } else {
-                            None
-                        }
-                    };
-                    let w_errno = slot_or_arg(
-                        pyre_object::interp_exceptions::w_exception_get_errno(obj),
-                        0,
-                    );
-                    let w_strerror = slot_or_arg(
-                        pyre_object::interp_exceptions::w_exception_get_strerror(obj),
-                        1,
-                    );
-                    if let (Some(w_errno), Some(w_strerror)) = (w_errno, w_strerror) {
-                        let errno = py_str(w_errno)?;
-                        let strerror = py_str(w_strerror)?;
-                        let w_filename = slot_or_arg(
-                            pyre_object::interp_exceptions::w_exception_get_filename(obj),
-                            2,
-                        )
-                        .filter(|&f| !pyre_object::is_none(f));
-                        if let Some(fname) = w_filename {
-                            let w_filename2 = slot_or_arg(
-                                pyre_object::interp_exceptions::w_exception_get_filename2(obj),
-                                4,
-                            )
-                            .filter(|&f| !pyre_object::is_none(f));
-                            if let Some(fname2) = w_filename2 {
-                                return Ok(format!(
-                                    "[Errno {errno}] {strerror}: {} -> {}",
-                                    py_repr(fname)?,
-                                    py_repr(fname2)?
-                                ));
-                            }
-                            return Ok(format!("[Errno {errno}] {strerror}: {}", py_repr(fname)?));
-                        }
-                        return Ok(format!("[Errno {errno}] {strerror}"));
-                    }
-                }
-                // `interp_exceptions.py:859-883 W_SyntaxError.descr_str` —
-                // a non-str `msg` stringifies plainly; otherwise the message
-                // is suffixed with the `basename(filename)` and `line N` /
-                // `lines N-M` derived from the location attributes.  The
-                // WTF-8 path already implements this; reuse it and drop any
-                // lone surrogates for the plain-`String` caller.
-                pyre_object::interp_exceptions::ExcKind::SyntaxError => {
-                    if let Some(w) = exception_descr_str_wtf8(obj)? {
-                        return Ok(w.to_string_lossy().into_owned());
-                    }
-                }
-                _ => {}
+            if let Some(s) = exception_kind_str(obj)? {
+                return Ok(s);
             }
             // A user subclass that overrides `__str__` shadows the builtin
             // `W_BaseException.descr_str`; dispatch it before the generic
@@ -1149,22 +1032,7 @@ pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
             if let Some(s) = exc_user_dunder(obj, "__str__")? {
                 return Ok(s);
             }
-            let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
-            if args.is_null() {
-                return Ok(String::new());
-            }
-            if !pyre_object::is_tuple(args) {
-                return py_str(args);
-            }
-            let n: usize = pyre_object::w_tuple_len(args);
-            if n == 0 {
-                return Ok(String::new());
-            }
-            if n == 1 {
-                let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
-                return py_str(first);
-            }
-            return py_str(args);
+            return base_exception_str(obj);
         }
         // `int`/`float`/... define no `tp_str`, so `str()` falls back to
         // `repr()` (a `__str__` override wins, otherwise the `__repr__`
@@ -1182,6 +1050,175 @@ pub unsafe fn py_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
             }
         }
         py_repr(obj)
+    }
+}
+
+/// `pypy/module/exceptions/interp_exceptions.py:126-133
+/// W_BaseException.descr_str`:
+///
+/// ```python
+/// def descr_str(self, space):
+///     lgt = len(self.args_w)
+///     if lgt == 0:
+///         return space.newtext('')
+///     elif lgt == 1:
+///         return space.str(self.args_w[0])
+///     else:
+///         return space.str(space.newtuple(self.args_w))
+/// ```
+///
+/// PyPy reads `self.args_w` on every call so `e.args = (...)` mutations are
+/// reflected by subsequent `str(e)` reads.
+///
+/// # Safety
+/// `obj` must be a live `W_BaseException`.
+pub(crate) unsafe fn base_exception_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
+    unsafe {
+        let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
+        if args.is_null() {
+            return Ok(String::new());
+        }
+        if !pyre_object::is_tuple(args) {
+            return py_str(args);
+        }
+        let n: usize = pyre_object::w_tuple_len(args);
+        if n == 0 {
+            return Ok(String::new());
+        }
+        if n == 1 {
+            let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
+            return py_str(first);
+        }
+        py_str(args)
+    }
+}
+
+/// The `descr_str` overrides the builtin exception classes register on top of
+/// `W_BaseException.descr_str`, dispatched on the instance's `ExcKind` because
+/// pyre flattens PyPy's subclasses into the single `W_BaseException` struct.
+/// `None` means the instance's class inherits the base `descr_str`.
+///
+/// # Safety
+/// `obj` must be a live `W_BaseException`.
+pub(crate) unsafe fn exception_kind_str(
+    obj: PyObjectRef,
+) -> Result<Option<String>, crate::PyError> {
+    unsafe {
+        // `pypy/module/exceptions/interp_exceptions.py:447-459`
+        // `W_UnicodeTranslateError.descr_str`,
+        // `:1061-1071` `W_UnicodeDecodeError.descr_str`,
+        // `:1175-1191` `W_UnicodeEncodeError.descr_str` — each
+        // typedef registers `__str__ = interp2app(descr_str)`,
+        // overriding the inherited `W_BaseException.descr_str`.
+        // Dispatched on `ExcKind` because Pyre flattens the three
+        // PyPy subclasses into the single `W_BaseException`
+        // struct.
+        let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+        match kind {
+            pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError => {
+                return Ok(Some(unicode_translate_error_str(obj)));
+            }
+            pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError => {
+                return Ok(Some(unicode_decode_error_str(obj)));
+            }
+            pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError => {
+                return Ok(Some(unicode_encode_error_str(obj)));
+            }
+            // `interp_exceptions.py:540-548 W_KeyError.descr_str` —
+            // a single-argument KeyError stringifies as `repr(args[0])`
+            // so `str(KeyError('k'))` is `"'k'"`; with any other arg
+            // count it falls back to `W_BaseException.descr_str` below.
+            pyre_object::interp_exceptions::ExcKind::KeyError => {
+                let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
+                if !args.is_null()
+                    && pyre_object::is_tuple(args)
+                    && pyre_object::w_tuple_len(args) == 1
+                {
+                    let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
+                    return Ok(Some(py_repr(first)?));
+                }
+            }
+            // `interp_exceptions.py:667-703 W_OSError.descr_str` reads
+            // the `errno`/`strerror`/`filename`/`filename2` slots:
+            // the 2-argument form renders as `"[Errno N] strerror"`,
+            // extended with `": 'filename'"` and `" -> 'filename2'"`
+            // when those are present.  `_init_error` drops filename
+            // from `args`, so prefer the slot and fall back to the
+            // positional arg (same 2..=5 gate as the getters) for the
+            // internal-constructor path that leaves the slots `PY_NULL`.
+            // Both errno and strerror absent falls back to
+            // `W_BaseException.descr_str` below.
+            pyre_object::interp_exceptions::ExcKind::OSError
+            | pyre_object::interp_exceptions::ExcKind::FileNotFoundError => {
+                let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
+                let n = if !args.is_null() && pyre_object::is_tuple(args) {
+                    pyre_object::w_tuple_len(args)
+                } else {
+                    0
+                };
+                let slot_or_arg = |slot: pyre_object::PyObjectRef,
+                                   idx: usize|
+                 -> Option<pyre_object::PyObjectRef> {
+                    if !slot.is_null() {
+                        return Some(slot);
+                    }
+                    if (2..=5).contains(&n) && idx < n {
+                        unsafe { pyre_object::w_tuple_getitem(args, idx as i64) }
+                    } else {
+                        None
+                    }
+                };
+                let w_errno = slot_or_arg(
+                    pyre_object::interp_exceptions::w_exception_get_errno(obj),
+                    0,
+                );
+                let w_strerror = slot_or_arg(
+                    pyre_object::interp_exceptions::w_exception_get_strerror(obj),
+                    1,
+                );
+                if let (Some(w_errno), Some(w_strerror)) = (w_errno, w_strerror) {
+                    let errno = py_str(w_errno)?;
+                    let strerror = py_str(w_strerror)?;
+                    let w_filename = slot_or_arg(
+                        pyre_object::interp_exceptions::w_exception_get_filename(obj),
+                        2,
+                    )
+                    .filter(|&f| !pyre_object::is_none(f));
+                    if let Some(fname) = w_filename {
+                        let w_filename2 = slot_or_arg(
+                            pyre_object::interp_exceptions::w_exception_get_filename2(obj),
+                            4,
+                        )
+                        .filter(|&f| !pyre_object::is_none(f));
+                        if let Some(fname2) = w_filename2 {
+                            return Ok(Some(format!(
+                                "[Errno {errno}] {strerror}: {} -> {}",
+                                py_repr(fname)?,
+                                py_repr(fname2)?
+                            )));
+                        }
+                        return Ok(Some(format!(
+                            "[Errno {errno}] {strerror}: {}",
+                            py_repr(fname)?
+                        )));
+                    }
+                    return Ok(Some(format!("[Errno {errno}] {strerror}")));
+                }
+            }
+            // `interp_exceptions.py:859-883 W_SyntaxError.descr_str` —
+            // a non-str `msg` stringifies plainly; otherwise the message
+            // is suffixed with the `basename(filename)` and `line N` /
+            // `lines N-M` derived from the location attributes.  The
+            // WTF-8 path already implements this; reuse it and drop any
+            // lone surrogates for the plain-`String` caller.
+            pyre_object::interp_exceptions::ExcKind::SyntaxError => {
+                if let Some(w) = exception_descr_str_wtf8(obj)? {
+                    return Ok(Some(w.to_string_lossy().into_owned()));
+                }
+            }
+            _ => {}
+        }
+        Ok(None)
     }
 }
 

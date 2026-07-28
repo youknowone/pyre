@@ -5116,13 +5116,22 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             }
             // Per-iterator-type pickle protocol: `__reduce__` /
             // `__setstate__` / `__length_hint__` recreate the iterator's
-            // CPython 3.14 pickle shape.  `arity` includes `self`.
-            // `memory_iterator` is the one seq-iter flavour with no pickle
-            // surface at all, so it takes none of these.
-            let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = if is_seq_iter(obj)
-                && !pyre_object::iterobject::is_memory_iter(obj)
-            {
+            // Python 3.14 pickle shape.  `arity` includes `self`.  The
+            // producer-specific seq-iter identities do not all declare the
+            // full trio: `memory_iterator` declares none of it and
+            // `arrayiterator` omits `__length_hint__`, so the shared payload's
+            // accessors stay hidden for those.
+            let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = if is_seq_iter(obj) {
+                let undeclared: &[&str] = if unsafe { pyre_object::iterobject::is_memory_iter(obj) }
+                {
+                    &["__reduce__", "__setstate__", "__length_hint__"]
+                } else if unsafe { pyre_object::iterobject::is_array_iter(obj) } {
+                    &["__length_hint__"]
+                } else {
+                    &[]
+                };
                 match name {
+                    _ if undeclared.contains(&name) => None,
                     "__reduce__" => Some((seq_iter_reduce_method, "__reduce__", 1)),
                     "__setstate__" => Some((seq_iter_setstate_method, "__setstate__", 2)),
                     "__length_hint__" => Some((seq_iter_length_hint_method, "__length_hint__", 1)),
@@ -7202,6 +7211,19 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 // attribute lookup fall-through.
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if kind == pyre_object::interp_exceptions::ExcKind::StopIteration {
+                    // `readwrite_attrproperty_w('w_value')` is a slot of its
+                    // own, so an explicit `e.value = x` wins over the
+                    // constructor-time `args_w[0]`.  Pyre keeps no dedicated
+                    // slot and lands that write in the hasdict instance dict,
+                    // so read it first — the same shape as
+                    // `syntax_error_attr`.
+                    let w_dict = getdict_backing_native(obj);
+                    if !w_dict.is_null() {
+                        if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, "value") }
+                        {
+                            return Ok(v);
+                        }
+                    }
                     let args_tuple =
                         unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
                     // `w_exception_get_args` always returns a real
@@ -7475,18 +7497,17 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             }
             "encoding" => {
                 // `interp_exceptions.py:1080 W_UnicodeDecodeError.encoding`
-                // / `:1200 W_UnicodeEncodeError.encoding`.
-                // `W_UnicodeTranslateError` has no encoding property per
-                // PyPy; the kind check here excludes Translate so
-                // attribute lookup on `UnicodeTranslateError().encoding`
-                // falls through to the generic AttributeError, matching
-                // `interp_exceptions.py:461-471 typedef` (no `encoding`
-                // attrproperty).
+                // / `:1200 W_UnicodeEncodeError.encoding`.  Python 3.14
+                // declares `encoding` on `UnicodeError` itself, so a
+                // `UnicodeTranslateError` — which never stamps the slot —
+                // reports `None` rather than raising; PyPy's typedef
+                // (`:461-471`) omits the attrproperty there.
                 let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
                 if matches!(
                     kind,
                     pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
                         | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
                 ) {
                     let stored =
                         unsafe { pyre_object::interp_exceptions::w_exception_get_encoding(obj) };
@@ -10724,6 +10745,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                     kind,
                     pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
                         | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
                 ) {
                     unsafe { pyre_object::interp_exceptions::w_exception_set_encoding(obj, value) };
                     return Ok(w_none());
@@ -11004,13 +11026,14 @@ pub unsafe fn exception_attr_slot_fold(
         {
             ExceptionAttrSlot::UnicodeReason
         }
-        // `encoding` is absent on `UnicodeTranslateError`, so its getattr arm
-        // excludes that kind.
+        // 3.14 declares `encoding` on `UnicodeError`, so the Translate kind
+        // takes the slot too even though it never stamps one.
         "encoding"
             if matches!(
                 kind,
                 pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
                     | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
             ) =>
         {
             ExceptionAttrSlot::UnicodeEncoding
@@ -11266,6 +11289,47 @@ pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     object_delattr(obj, name)
 }
 
+/// True for an exception attribute whose class registers a `GetSetProperty`
+/// with a reset-to-`None` deleter.  Each name is gated on the kinds whose
+/// typedef installs the descriptor, the same gate the setattr arms apply, so
+/// `del ValueError("v").name` still reports a plain missing attribute.
+unsafe fn exception_deletable_slot(obj: PyObjectRef, name: &str) -> bool {
+    use pyre_object::interp_exceptions::ExcKind as K;
+    let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+    match name {
+        "errno" | "strerror" | "filename2" => matches!(kind, K::OSError | K::FileNotFoundError),
+        "filename" => matches!(kind, K::OSError | K::FileNotFoundError | K::SyntaxError),
+        "code" => kind == K::SystemExit,
+        "value" => kind == K::StopIteration,
+        "msg" => matches!(
+            kind,
+            K::ImportError | K::ModuleNotFoundError | K::SyntaxError
+        ),
+        "path" | "name_from" => matches!(kind, K::ImportError | K::ModuleNotFoundError),
+        "name" => matches!(
+            kind,
+            K::ImportError
+                | K::ModuleNotFoundError
+                | K::NameError
+                | K::UnboundLocalError
+                | K::AttributeError
+        ),
+        "obj" => kind == K::AttributeError,
+        "object" | "reason" => matches!(
+            kind,
+            K::UnicodeTranslateError | K::UnicodeDecodeError | K::UnicodeEncodeError
+        ),
+        "encoding" => matches!(
+            kind,
+            K::UnicodeDecodeError | K::UnicodeEncodeError | K::UnicodeTranslateError
+        ),
+        "lineno" | "offset" | "text" | "end_lineno" | "end_offset" | "print_file_and_line" => {
+            kind == K::SyntaxError
+        }
+        _ => false,
+    }
+}
+
 /// Terminal `object.__delattr__` — bypasses user override.
 pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
@@ -11381,13 +11445,39 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
             }
         }
     }
-    // `pypy/module/exceptions/interp_exceptions.py:159-161
-    // W_BaseException.descr_delargs` → unconditional TypeError
-    // ("args may not be deleted").  Reject `del e.args` before the
-    // generic instance-dict removal path, which would otherwise
-    // succeed silently when an entry existed there.
-    if unsafe { pyre_object::is_exception(obj) } && name == "args" {
-        return Err(PyError::type_error("args may not be deleted"));
+    // `pypy/module/exceptions/interp_exceptions.py` registers a deleter beside
+    // every exception `GetSetProperty`.  The `W_BaseException` slots refuse
+    // deletion (`:159-161 descr_delargs` and the `descr_delcause` /
+    // `descr_delcontext` / `descr_deltraceback` siblings raise, and
+    // `__suppress_context__` and the Unicode `start` / `end` offsets are
+    // plain non-reference fields), while every per-class slot resets to
+    // `None` — exactly what the matching setattr arm does for an explicit
+    // `None` store.  All of this runs before the generic instance-dict
+    // removal below, which would otherwise silently succeed on a name that
+    // happens to have an entry there.
+    if unsafe { pyre_object::is_exception(obj) } {
+        match name {
+            "args" | "__cause__" | "__context__" | "__traceback__" => {
+                return Err(PyError::type_error(format!("{name} may not be deleted")));
+            }
+            "__suppress_context__" => {
+                return Err(PyError::type_error("can't delete numeric/char attribute"));
+            }
+            "start" | "end"
+                if matches!(
+                    unsafe { pyre_object::w_exception_get_kind(obj) },
+                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+                ) =>
+            {
+                return Err(PyError::type_error("can't delete numeric/char attribute"));
+            }
+            _ if unsafe { exception_deletable_slot(obj, name) } => {
+                return object_setattr(obj, name, w_none());
+            }
+            _ => {}
+        }
     }
     // Instance/general: remove from the instance dict.
     let w_dict = getdict_backing(obj)?;
