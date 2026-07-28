@@ -2151,8 +2151,8 @@ pub unsafe fn w_module_dict_lookup_inner(
     key: PyObjectRef,
 ) -> Option<PyObjectRef> {
     let _module_guard = w_dict_lock(obj);
-    if let Some(entries) = w_module_dict_object_storage(obj) {
-        return entries.get(&object_key_for(key)).copied();
+    if w_module_dict_object_storage(obj).is_some() {
+        return w_module_dict_lookup_object_entries(obj, key);
     }
     if let Some(ks) = key_as_utf8(key) {
         return w_module_dict_getitem_str(obj, ks);
@@ -2161,6 +2161,31 @@ pub unsafe fn w_module_dict_lookup_inner(
         return None;
     }
     w_module_dict_switch_to_object_strategy(obj);
+    w_module_dict_lookup_object_entries(obj, key)
+}
+
+/// The unified-entries probe both arms of [`w_module_dict_lookup_inner`]
+/// perform — `celldict.py:139 self.unerase(w_dict.dstorage).get(w_key)` once
+/// the module dict has been promoted to object storage.
+///
+/// Residualise the probe alone (`@dont_look_inside`, `rlib/jit.py:139`), the
+/// twin of [`w_dict_lookup_int_strategy`]: the `IndexMap::get` it wraps is an
+/// external-crate heap-lookup the tracer cannot model — the oopspec'd residual
+/// arm of `rordereddict.ll_dict_getitem` (traced only for a virtual dict).
+/// The enclosing router keeps its str fast path, its never-equal shortcut and
+/// its strategy promotion visible, because `celldict.py:131-141` carries no
+/// residual marker of its own.
+///
+/// Returns `None` when the dict is not on object storage, matching the `?` the
+/// second call site used to spell.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_module_dict_lookup_object_entries(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+) -> Option<PyObjectRef> {
     let entries = w_module_dict_object_storage(obj)?;
     entries.get(&object_key_for(key)).copied()
 }

@@ -807,6 +807,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::identitydict::w_dict_lookup_identity_strategy",
+        "pyre_object::w_dict_lookup_identity_strategy",
+        pyre_object::identitydict::w_dict_lookup_identity_strategy as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_module_dict_lookup_object_entries",
+        "pyre_object::w_module_dict_lookup_object_entries",
+        pyre_object::dictmultiobject::w_module_dict_lookup_object_entries as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_object::dictmultiobject::w_dict_store_bytes_strategy",
         "pyre_object::w_dict_store_bytes_strategy",
         pyre_object::dictmultiobject::w_dict_store_bytes_strategy as *const (),
