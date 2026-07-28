@@ -377,3 +377,149 @@ mod scalar_float_slot_reserve {
         );
     }
 }
+
+// The virtualizable's element boxes are a strict SUFFIX of the loop-carried
+// list upstream: `live_arg_boxes = greenboxes + redboxes` and then
+// `live_arg_boxes += self.virtualizable_boxes; live_arg_boxes.pop()`
+// (pyjitpl.py:2981-2989). `+=` appends, so no element can precede a red.
+//
+// The entry contract is built the same way — `JitDriver::extend_compiled_live_values`
+// does `live_values.extend(extra_values)` after every red. The closing JUMP
+// spliced the elements between the vable identity and the ref/float scalars, so
+// for a state declaring BOTH a `[.. ; virt]` array and a ref or float scalar the
+// two sides carried the same arity with different slot meanings —
+// `jump.numargs() == label.numargs()` (compile.py:334) passes and nothing
+// downstream catches it. Pin the suffix relation directly.
+mod virt_array_with_float_scalar {
+    use super::Bytecode;
+    use majit_metainterp::{JitDriver, JitState};
+
+    struct MixedState {
+        sp: i64,
+        cells: Vec<i64>,
+        acc: f64,
+        stack: Vec<i64>,
+    }
+
+    const OP_NOP: u8 = 0;
+    const OP_STEP: u8 = 1;
+
+    #[majit_macros::jit_interp(
+        state = MixedState,
+        env = Bytecode,
+        // The fixed `[int]` array is what makes this shape reachable: a state
+        // that is exactly one virt array plus a float scalar is already refused
+        // by the recursive-portal fresh-allocation gate, so the ordering bug
+        // could only be hit alongside a fixed array or a ref scalar.
+        state_fields = { sp: int, cells: [int], acc: float, stack: [int; virt] },
+    )]
+    #[allow(unused_assignments, unused_variables)]
+    fn mixed_virt_and_float(program: &Bytecode, threshold: u32) -> i64 {
+        let mut driver: JitDriver<MixedState> = JitDriver::new(threshold);
+        let mut pc: usize = 0;
+        let mut state = MixedState {
+            sp: 0,
+            cells: vec![0; 2],
+            acc: 0.0,
+            stack: vec![0; 2],
+        };
+        {
+            use majit_metainterp::JitState as _;
+            state
+                .build_meta(0, program)
+                .install_canonical_liveness(&mut driver);
+        }
+        while pc < program.len() {
+            jit_merge_point!();
+            let opcode = program[pc];
+            pc += 1;
+            match opcode {
+                OP_NOP => {}
+                OP_STEP => {
+                    state.stack[0] = state.stack[0] + 1;
+                    state.acc = state.acc + 1.5;
+                    // Read-only: a MUTATED plain `[int]` is refused outright
+                    // (it is not restored on deopt), so the fixed array is
+                    // loop-carried but never written.
+                    state.sp = state.sp + 1 + state.cells[0];
+                }
+                _ => break,
+            }
+        }
+        state.sp
+    }
+
+    #[test]
+    fn element_boxes_are_a_strict_suffix_of_the_reds() {
+        let state = MixedState {
+            sp: 0,
+            cells: vec![0; 2],
+            acc: 0.0,
+            stack: vec![0; 2],
+        };
+        let program: &Bytecode = &[OP_NOP, OP_STEP];
+        let meta = state.build_meta(0, program);
+        let sym = <MixedState as JitState>::create_sym(&meta, 0);
+
+        // `TraceCtx::collect_virtualizable_typed_boxes()` shape: the element
+        // block in per-array order, identity LAST.
+        let e0 = majit_ir::OpRef::input_arg_typed(90, majit_ir::Type::Int);
+        let e1 = majit_ir::OpRef::input_arg_typed(91, majit_ir::Type::Int);
+        let identity = majit_ir::OpRef::input_arg_typed(92, majit_ir::Type::Ref);
+        let boxes = [
+            (e0, majit_ir::Type::Int),
+            (e1, majit_ir::Type::Int),
+            (identity, majit_ir::Type::Ref),
+        ];
+
+        let reds = <MixedState as JitState>::collect_jump_args(&sym);
+        let close = <MixedState as JitState>::collect_jump_args_with_boxes(&sym, &boxes);
+
+        assert_eq!(
+            close.len(),
+            reds.len() + 2,
+            "the close carries every red plus one box per element, minus the \
+             trailing identity (pyjitpl.py:2988-2989)"
+        );
+        assert_eq!(
+            &close[..reds.len()],
+            &reds[..],
+            "the reds must lead, in `collect_jump_args` order and unshifted — a \
+             float scalar displaced by an element box binds the JUMP to the wrong \
+             LABEL slot at equal arity"
+        );
+        assert_eq!(
+            &close[reds.len()..],
+            &[e0, e1],
+            "the element block must be the strict suffix `live_arg_boxes += \
+             virtualizable_boxes; live_arg_boxes.pop()` produces"
+        );
+    }
+
+    /// The entry contract this suffix has to match: `live_value_types` is the
+    /// reds only, and `JitDriver::extend_compiled_live_values` appends the
+    /// elements after all of them.
+    #[test]
+    fn the_entry_contract_carries_no_element_in_its_red_block() {
+        let state = MixedState {
+            sp: 0,
+            cells: vec![0; 2],
+            acc: 0.0,
+            stack: vec![0; 2],
+        };
+        let program: &Bytecode = &[OP_NOP, OP_STEP];
+        let meta = state.build_meta(0, program);
+        assert_eq!(
+            state.live_value_types(&meta),
+            vec![
+                majit_ir::Type::Int,   // sp
+                majit_ir::Type::Int,   // cells[0]
+                majit_ir::Type::Int,   // cells[1]
+                majit_ir::Type::Ref,   // __vable_identity
+                majit_ir::Type::Float, // acc
+            ],
+            "no `stack` element belongs in the red block",
+        );
+        assert_eq!(state.extract_live(&meta).len(), 5);
+    }
+}

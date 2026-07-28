@@ -144,38 +144,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     let num_vable_identity_slots = usize::from(has_vable_identity);
     let num_ref_scalars = ref_scalars.len();
     let num_float_scalars = float_scalars.len();
-    // The virtualizable's element boxes are a strict SUFFIX of the loop-carried
-    // list upstream — `live_arg_boxes = greenboxes + redboxes` then
-    // `live_arg_boxes += self.virtualizable_boxes; live_arg_boxes.pop()`
-    // (pyjitpl.py:2981-2989), and `+=` cannot put an element before a red.
-    //
-    // Pyre's two sides disagree once a state has BOTH a `[.. ; virt]` array and
-    // a ref or float scalar:
-    //   entry (`JitDriver::extend_compiled_live_values`, jitdriver.rs)
-    //     `live_values.extend(extra_values)`
-    //     -> [ints, fixed arrays, identity, refs, floats] ++ [elements]
-    //   close (`__jit_loop_carried_boxes` below)
-    //     -> [ints, fixed arrays, identity, elements, refs, floats]
-    // Same arity, so `jump.numargs() == label.numargs()` (compile.py:334) still
-    // holds and nothing catches it — the JUMP just binds the ref/float scalars
-    // and the trailing elements to each other's LABEL slots.
-    //
-    // No interpreter in tree declares that combination (cel's `VmStateF` is
-    // arrays only; `tl` is one int scalar plus one virt array), so this refuses
-    // the shape rather than miscompiling it silently. Lifting the refusal means
-    // moving the element splice to the end of every vector that enumerates the
-    // reds, not relaxing this check.
-    if num_virt_arrays > 0 && (num_ref_scalars > 0 || num_float_scalars > 0) {
-        return quote! {
-            compile_error!(
-                "state_fields cannot yet combine a `[.. ; virt]` array with a ref or \
-                 float scalar: the closing JUMP splices the virtualizable's element \
-                 boxes ahead of those scalars while the entry contract appends them \
-                 after every red (pyjitpl.py:2981-2989 makes the elements a strict \
-                 suffix), so the two orders disagree at equal arity"
-            );
-        };
-    }
     // First ref-bank register available for ref-scalar identity slots.
     // `MIFrame::setup_call` packs the dispatch JitCode's ref args densely
     // from r0 (`program` at r0, the virtualizable identity at r1 when
@@ -1286,22 +1254,27 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     //
     // The list must be slot-for-slot identical to the trace-entry Label, whose
     // inputargs are minted by `create_sym` advancing `__offset` in declaration
-    // order — int scalars (Int), each fixed `[int]` array's cells (Int), then
-    // per virt array the `<arr>_ptr` (Ref, `input_arg_ref`) + `<arr>_len`
-    // (Int) header, then ref scalars (Ref), then float scalars (Float) — with
-    // the element boxes minted by `initialize_virtualizable` at
-    // `num_reds..num_reds+total`. `__boxes` =
-    // `TraceCtx::collect_virtualizable_typed_boxes()` =
+    // order — int scalars (Int), each fixed `[int]` array's cells (Int), the
+    // one `__vable_identity` (Ref), then ref scalars (Ref), then float scalars
+    // (Float) — after which `JitDriver::extend_compiled_live_values` appends
+    // the element block with `live_values.extend(extra_values)`.
+    //
+    // So the element block is a strict SUFFIX of the reds, exactly as upstream
+    // builds it: `live_arg_boxes = greenboxes + redboxes` and then
+    // `live_arg_boxes += self.virtualizable_boxes; live_arg_boxes.pop()`
+    // (pyjitpl.py:2981-2989) — `+=` appends, so no element can precede a red.
+    // ⚠️Splicing the elements before the ref/float scalars (as this did until
+    // the order was unified) leaves the JUMP and the Label at the SAME arity
+    // with different slot meanings, so `jump.numargs() == label.numargs()`
+    // (compile.py:334) still passes and nothing downstream catches it.
+    //
+    // `__boxes` = `TraceCtx::collect_virtualizable_typed_boxes()` =
     // `[arr0_elem0.., arr1_elem0.., .., identity]` (`num_static_extra_boxes==0`
     // for state-field; `initialize_virtualizable` concatenates the arrays in
-    // declaration order; identity LAST). So push every header first (loop-
-    // invariant identity bases + lengths), then the whole element shadow once,
-    // dropping the trailing identity (pyjitpl.py:2988-2989 `live_arg_boxes +=
-    // virtualizable_boxes; live_arg_boxes.pop()`). The element block is already
-    // in per-array order, so a single contiguous splice reproduces the Label
-    // for any number of arrays; pushing it once-per-array (or putting elements
-    // before a later array's header) would shift every later slot and break the
-    // unroll's Label↔Jump virtual-state match.
+    // declaration order; identity LAST), so one contiguous splice of
+    // `__boxes[..len-1]` reproduces the Label's element tail for any number of
+    // arrays. Pushing it once-per-array would interleave the arrays and shift
+    // every later slot.
     //
     // With 0 virt arrays (tlr/tinyframe) there is no element shadow to splice,
     // so the body degenerates to `collect_jump_args` and `__boxes` is unused —
@@ -1362,12 +1335,18 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             __boxes: &[(majit_ir::OpRef, majit_ir::Type)],
         ) -> Vec<(majit_ir::OpRef, majit_ir::Type)> {
             let mut args: Vec<(majit_ir::OpRef, majit_ir::Type)> = Vec::new();
+            // The reds, in `extract_live` / `live_value_types` order …
             #(#typed_scalar_parts)*
             #(#typed_array_parts)*
             #typed_vable_identity_part
-            #typed_element_splice
             #(#typed_ref_scalar_parts)*
             #(#typed_float_scalar_parts)*
+            // … then the element block as a strict SUFFIX, which is what
+            // `live_arg_boxes += self.virtualizable_boxes; live_arg_boxes.pop()`
+            // (pyjitpl.py:2988-2989) makes it, and what the entry contract
+            // builds with `live_values.extend(extra_values)`
+            // (`JitDriver::extend_compiled_live_values`).
+            #typed_element_splice
             args
         }
     };
