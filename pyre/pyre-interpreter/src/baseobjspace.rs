@@ -1465,6 +1465,13 @@ pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 /// operand names the key's own class).  The reference `pypy3` quotes the type
 /// name here; 3.14 emits it unquoted, and only the `str` wording
 /// ([`string_index_type_error`]) keeps the quotes.
+///
+/// `getindex_w` also catches a `TypeError` raised *while* coercing the key
+/// through `__index__` and rewrites it to this message.  3.14 does not: a key
+/// that has an `__index__` at all surfaces whatever that `__index__` raised
+/// ("__index__ returned non-int (type float)"), and this wording is reserved
+/// for a key with no `__index__` to try.  Every subscript path therefore
+/// tests for the slot up front and lets `space_index`'s error propagate.
 fn index_type_error(descr: &str, index: PyObjectRef) -> PyError {
     let tp = if index.is_null() {
         "NULL".to_string()
@@ -1478,7 +1485,7 @@ fn index_type_error(descr: &str, index: PyObjectRef) -> PyError {
 
 /// Python 3.14 string-subscript wording.  Unlike this PyPy source's generic
 /// `getindex_w(..., "string")` remap, 3.14 omits "or slices" after the slice
-/// case has already been handled and preserves errors raised by `__index__`.
+/// case has already been handled, and keeps the type name quoted.
 fn string_index_type_error(index: PyObjectRef) -> PyError {
     let tp = if index.is_null() {
         "NULL".to_string()
@@ -1486,21 +1493,6 @@ fn string_index_type_error(index: PyObjectRef) -> PyError {
         object_functionstr_type_name(index)
     };
     PyError::type_error(format!("string indices must be integers, not '{tp}'"))
-}
-
-/// `getindex_w` remaps a `TypeError` raised while coercing a subscript key
-/// through `__index__` — a non-int `__index__` return, or a `TypeError` from
-/// `__index__` itself — to the sequence-specific "indices must be integers or
-/// slices" message (`baseobjspace.py:1574` catches `space.index`'s error when
-/// `objdescr` is set).  Any other error (e.g. a `ValueError` from `__index__`)
-/// propagates unchanged.  Only the subscript paths pass an `objdescr`;
-/// `list.insert` / `list.pop` do not, and surface `space.index`'s error verbatim.
-fn remap_getindex_type_error(err: PyError, descr: &str, index: PyObjectRef) -> PyError {
-    if err.kind == PyErrorKind::TypeError {
-        index_type_error(descr, index)
-    } else {
-        err
-    }
 }
 
 #[inline(never)]
@@ -1535,10 +1527,7 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = match space_index(index) {
-            Ok(w) => w,
-            Err(e) => return Err(remap_getindex_type_error(e, "list", index)),
-        };
+        let indexed = space_index(index)?;
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -1597,10 +1586,7 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = match space_index(index) {
-            Ok(w) => w,
-            Err(e) => return Err(remap_getindex_type_error(e, "tuple", index)),
-        };
+        let indexed = space_index(index)?;
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -1770,13 +1756,7 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = match space_index(index) {
-            Ok(w) => w,
-            Err(e) => {
-                let descr = if is_bytes { "byte" } else { "bytearray" };
-                return Err(remap_getindex_type_error(e, descr, index));
-            }
-        };
+        let indexed = space_index(index)?;
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -3470,10 +3450,7 @@ unsafe fn setitem_list(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef)
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = match space_index(index) {
-            Ok(w) => w,
-            Err(e) => return Err(remap_getindex_type_error(e, "list", index)),
-        };
+        let indexed = space_index(index)?;
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -3597,10 +3574,7 @@ unsafe fn subscript_index_w(descr: &str, index: PyObjectRef) -> Result<i64, PyEr
     if !pyre_object::pyobject::is_int_or_long(index) && lookup(index, "__index__").is_none() {
         return Err(index_type_error(descr, index));
     }
-    let indexed = match space_index(index) {
-        Ok(w) => w,
-        Err(e) => return Err(remap_getindex_type_error(e, descr, index)),
-    };
+    let indexed = space_index(index)?;
     match int_w(indexed) {
         Ok(i) => Ok(i),
         // `baseobjspace.py getindex_w` — an index that overflows a machine
@@ -3612,6 +3586,26 @@ unsafe fn subscript_index_w(descr: &str, index: PyObjectRef) -> Result<i64, PyEr
                 "cannot fit '{}' into an index-sized integer",
                 object_functionstr_type_name(index)
             ),
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+/// `space.getindex_w(w_obj, space.w_OverflowError)`: run `w_obj.__index__()`
+/// and return the resulting int/long object, converting an out-of-index-range
+/// value to an `OverflowError` that names the ORIGINAL operand (not the
+/// `__index__` result). A non-`__index__` operand raises the `TypeError` from
+/// `space.index`. Callers that repeat a sequence share this so `str`/`tuple`
+/// honour a custom `__index__` exactly like `list`/`bytes`.
+pub(crate) fn getindex_repeat(w_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let w_count = space_index(w_obj)?;
+    match int_w(w_count) {
+        Ok(_) => Ok(w_count),
+        Err(e) if e.kind == PyErrorKind::OverflowError => Err(PyError::new(
+            PyErrorKind::OverflowError,
+            format!("cannot fit '{}' into an index-sized integer", unsafe {
+                object_functionstr_type_name(w_obj)
+            }),
         )),
         Err(e) => Err(e),
     }
@@ -3654,10 +3648,7 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = match space_index(index) {
-            Ok(w) => w,
-            Err(e) => return Err(remap_getindex_type_error(e, "bytearray", index)),
-        };
+        let indexed = space_index(index)?;
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -13002,12 +12993,14 @@ unsafe fn obj_type_name(obj: PyObjectRef) -> &'static str {
 /// Type name for the "not iterable" TypeError. A tagged immediate is an
 /// exact `int`; name it without derefing its (non-pointer) tagged bits as
 /// `ob_type`. Gated on `CAN_BE_TAGGED`; folds to the raw deref at flag-false.
-unsafe fn not_iterable_type_name(obj: PyObjectRef) -> &'static str {
+unsafe fn not_iterable_type_name(obj: PyObjectRef) -> String {
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
-        "int"
-    } else {
-        (*(*obj).ob_type).name
+        return "int".to_string();
     }
+    // `%T` resolves `space.type(w_obj)`, so a user instance is named by its
+    // class and not by the shared `object` instance layout its `ob_type`
+    // vtable carries.
+    object_functionstr_type_name(obj)
 }
 
 unsafe fn iter_check_is_iterator(w_iterator: PyObjectRef) -> PyResult {
@@ -13422,7 +13415,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                 if is_none(method) {
                     return Err(PyError::type_error(format!(
                         "'{}' object is not iterable",
-                        (*(*obj).ob_type).name
+                        not_iterable_type_name(obj)
                     )));
                 }
                 let w_iter = crate::call::call_function_impl_result(method, &[obj])?;

@@ -1692,12 +1692,10 @@ pub(crate) fn resolve_kwargs(
         let Some(kw_name_obj) = kw_name else { continue };
         let kw_value = args[n_pos + ki];
 
-        // argument.py:630 — keywords must be strings (check before access)
+        // argument.py:630 — keywords must be strings (check before access).
+        // `_PyStack_UnpackDict` names neither the callable nor the key's type.
         if !unsafe { pyre_object::is_str(kw_name_obj) } {
-            return Err(crate::PyError::type_error(format!(
-                "{}() keywords must be strings",
-                fname
-            )));
+            return Err(crate::PyError::type_error("keywords must be strings"));
         }
         // A lone-surrogate keyword name (not valid UTF-8) never equals a
         // source-level parameter name, so it falls straight to **kwargs or

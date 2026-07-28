@@ -233,15 +233,13 @@ pub fn do_combine_starstarargs_wrapped(
         std::collections::HashMap::new();
     for (i, &w_key) in keys_w.iter().enumerate() {
         // argument.py:431 — `key = space.text_w(w_key)`; raise TypeError
-        // if w_key is not a string.  argument.py:434-436 message:
-        // `"keywords must be strings, not '%T'"`.
+        // if w_key is not a string.  `_PyStack_UnpackDict` reports this
+        // without the callable's qualname or the offending key's type, where
+        // argument.py:434-436 formats `"keywords must be strings, not '%T'"`
+        // through `raise_type_error`.
         let key = unsafe {
             if !pyre_object::is_str(w_key) {
-                let tp = type_name_of(w_key);
-                return Err(raise_type_error(
-                    w_function,
-                    format!("keywords must be strings, not '{tp}'"),
-                ));
+                return Err(crate::PyError::type_error("keywords must be strings"));
             }
             // `space.text_w` preserves lone surrogates as WTF-8 bytes; keep the
             // key in WTF-8 so a surrogate keyword name survives the seen-set and

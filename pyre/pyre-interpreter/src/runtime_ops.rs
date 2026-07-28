@@ -1262,9 +1262,10 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
     // UNPACK_SEQUENCE wraps the whole `fixedview_unroll` (iter + known-length
     // loop) in a TypeError → "cannot unpack non-iterable %T object" remap.
     let non_iterable = || {
-        PyError::type_error(format!("cannot unpack non-iterable {} object", unsafe {
-            pyre_object::type_name_of(seq)
-        }))
+        PyError::type_error(format!(
+            "cannot unpack non-iterable {} object",
+            crate::baseobjspace::object_functionstr_type_name(seq)
+        ))
     };
     let iter = match crate::baseobjspace::iter(seq) {
         Ok(it) => it,
@@ -1323,7 +1324,7 @@ pub fn unpack_ex_slots(
                 Err(e) if e.kind == PyErrorKind::TypeError => {
                     return Err(PyError::type_error(format!(
                         "cannot unpack non-iterable {} object",
-                        pyre_object::type_name_of(value)
+                        crate::baseobjspace::object_functionstr_type_name(value)
                     )));
                 }
                 Err(e) => return Err(e),
@@ -1369,7 +1370,7 @@ pub fn ensure_range_iter(iter: PyObjectRef) -> Result<(), PyError> {
     }
     Err(PyError::type_error(format!(
         "'{}' object is not iterable",
-        unsafe { pyre_object::type_name_of(iter) }
+        crate::baseobjspace::object_functionstr_type_name(iter)
     )))
 }
 
