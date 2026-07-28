@@ -531,6 +531,23 @@ fn report_descr_spelling_gate() {
     }
 }
 
+/// Re-ask the `AbsentContainer` question once the run is over, and report
+/// every member whose container has since been registered.
+///
+/// Called from the same post-`real_main` hook as
+/// [`field_descr_identity_census_now`], so it sees the fully grown universe
+/// rather than the one the `Once` above resolved against. Each entry is a live
+/// instance of the gap documented on `SetMemberLookup::AbsentContainer`: an
+/// `EffectInfo` frozen while its container was unregistered still claims the
+/// callee does not touch it.
+pub fn descr_spelling_gate_recheck_now() {
+    let stale = crate::descr::stale_absent_containers();
+    eprintln!("[descr-spelling-gate] stale_absent={}", stale.len());
+    for label in &stale {
+        eprintln!("[descr-spelling-gate] stale_absent {label}");
+    }
+}
+
 /// Pool of `DescrRef`s indexed alongside [`all_descrs`] so the
 /// trace-side jitcode walker
 /// ([`crate::jitcode_dispatch::dispatch_via_miframe`]) can resolve each

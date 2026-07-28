@@ -4398,6 +4398,9 @@ pub struct SetMemberLedger {
     /// exactly like a container this process never traced.
     pub absent: std::collections::BTreeSet<String>,
     pub ambiguous: std::collections::BTreeSet<String>,
+    /// The dropped members themselves, so
+    /// [`stale_absent_containers`] can ask the question again later.
+    absent_members: Vec<majit_ir::effectinfo::DescrSetMember>,
 }
 
 static SET_MEMBER_LEDGER: LazyLock<Mutex<SetMemberLedger>> =
@@ -4423,7 +4426,9 @@ fn record_set_member_lookup(m: &majit_ir::effectinfo::DescrSetMember, out: &SetM
         SetMemberLookup::Resolved(_) => ledger.resolved += 1,
         SetMemberLookup::AbsentContainer => {
             let label = set_member_label(m);
-            ledger.absent.insert(label);
+            if ledger.absent.insert(label) {
+                ledger.absent_members.push(m.clone());
+            }
         }
         SetMemberLookup::Ambiguous => {
             let label = set_member_label(m);
@@ -4439,7 +4444,31 @@ pub fn set_member_ledger() -> SetMemberLedger {
         resolved: ledger.resolved,
         absent: ledger.absent.clone(),
         ambiguous: ledger.ambiguous.clone(),
+        absent_members: Vec::new(),
     }
+}
+
+/// Re-ask the [`SetMemberLookup::AbsentContainer`] question against the
+/// universe as it stands *now*, and return the members that have since become
+/// reachable.
+///
+/// Every entry is a live instance of the gap documented on that variant: the
+/// member was dropped from its raw set when the `BhCallDescr` was
+/// materialised, the container was registered afterwards, and the frozen
+/// `EffectInfo` still claims the callee does not touch it. Upstream cannot
+/// reach this state — `effectinfo.py` builds its sets through
+/// `cpu.fielddescrof` / `cpu.arraydescrof` in the same process that owns the
+/// descr cache, so the container is always registered by construction.
+///
+/// An empty result is the evidence that the gap is not being hit; a non-empty
+/// one names exactly which containers to publish eagerly next.
+pub fn stale_absent_containers() -> Vec<String> {
+    let members = SET_MEMBER_LEDGER.lock().unwrap().absent_members.clone();
+    members
+        .iter()
+        .filter(|m| !matches!(descr_from_set_member(m), SetMemberLookup::AbsentContainer))
+        .map(set_member_label)
+        .collect()
 }
 
 fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberLookup {

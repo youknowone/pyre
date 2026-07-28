@@ -519,6 +519,9 @@ pub fn main_entry(binary_name: &'static str) {
                 if std::env::var_os("PYRE_FIELD_IDENTITY_CENSUS").is_some() {
                     pyre_jit::field_descr_identity_census_now();
                 }
+                if std::env::var_os("PYRE_DESCR_SPELLING_GATE").is_some() {
+                    pyre_jit::descr_spelling_gate_recheck_now();
+                }
             })
             .expect("spawn main thread")
             .join()
