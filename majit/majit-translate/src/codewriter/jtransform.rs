@@ -5404,19 +5404,37 @@ fn fn_const_target_from_field_write(
     field: &crate::model::FieldDescriptor,
     depth: usize,
 ) -> Option<CallTarget> {
-    graph.blocks.iter().find_map(|block| {
-        block.operations.iter().find_map(|op| match &op.kind {
-            OpKind::FieldWrite {
+    // The scan is flow-insensitive, so two arms writing different function
+    // pointers to the same field are indistinguishable here.  Taking the
+    // first would bake one arm's address into a call the other arm reaches,
+    // so an ambiguous initializer declines to materialise a constant and the
+    // call stays indirect.
+    let mut found: Option<CallTarget> = None;
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::FieldWrite {
                 base: write_base,
                 field: write_field,
                 value,
                 ..
-            } if write_base == base && write_field == field => value
+            } = &op.kind
+            else {
+                continue;
+            };
+            if write_base != base || write_field != field {
+                continue;
+            }
+            let target = value
                 .as_variable()
-                .and_then(|value| fn_const_target_for_var(graph, value, depth)),
-            _ => None,
-        })
-    })
+                .and_then(|value| fn_const_target_for_var(graph, value, depth))?;
+            match &found {
+                Some(seen) if *seen != target => return None,
+                Some(_) => {}
+                None => found = Some(target),
+            }
+        }
+    }
+    found
 }
 
 fn tuple_pos_field_index(name: &str) -> Option<usize> {
