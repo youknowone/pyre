@@ -2655,6 +2655,33 @@ pub(crate) fn find_catch_for_exc_resume(code: &[u8], resume_live_pos: usize) -> 
 /// outside any in-frame try.
 /// Returns the handler target (2-byte LE label after `catch_exception/L`), or
 /// `None` when the raising op sits outside any in-frame try (propagate).
+/// The `catch_exception/L` target of the can-raise op whose OWN trailing
+/// `-live-` sits at `resume_live_pos`.
+///
+/// A caught can-raise op expands to `[op, -live-, catch_exception,
+/// -live-(block entry), vable stores…]`.  [`find_catch_before_resume_live`]
+/// keys off the SUCCESSOR block-entry `-live-` and reads backward from it; a
+/// caller holding the op's own trailing `-live-` instead is one op short of
+/// that coordinate, so the same scan walks straight past the catch. Read
+/// forward for those callers: when `resume_live_pos` is a `-live-` whose very
+/// next op is a `catch_exception`, that catch is the one guarding the op.
+pub(crate) fn catch_target_after_resume_live(
+    code: &[u8],
+    resume_live_pos: usize,
+) -> Option<usize> {
+    let live = decode_op_at(code, resume_live_pos)?;
+    if live.key != "live/" {
+        return None;
+    }
+    let catch = decode_op_at(code, live.next_pc)?;
+    if catch.key != "catch_exception/L" {
+        return None;
+    }
+    let lo = *code.get(catch.pc + 1)? as usize;
+    let hi = *code.get(catch.pc + 2)? as usize;
+    Some(lo | (hi << 8))
+}
+
 pub(crate) fn find_catch_before_resume_live(code: &[u8], resume_live_pos: usize) -> Option<usize> {
     let mut pcs: Vec<usize> = crate::jitcode_runtime::decoded_ops(code)
         .map(|op| op.pc)

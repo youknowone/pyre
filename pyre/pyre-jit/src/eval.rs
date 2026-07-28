@@ -9774,7 +9774,7 @@ pub(crate) fn decode_and_restore_guard_failure(
     meta: &crate::jit::state::PyreMeta,
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
-) -> Option<(Vec<Value>, usize, usize)> {
+) -> Option<(Vec<Value>, usize, usize, Vec<(usize, usize)>)> {
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit] exit-layout trace_id={} fail_idx={} source_op={:?} rd_numb={} recovery={} resume_layout={}",
@@ -9937,7 +9937,16 @@ pub(crate) fn decode_and_restore_guard_failure(
                 }
             }
         }
-        Some((typed, resume_pc, resumed_frames.len()))
+        // Outermost-first `(w_code, py_pc)` per resumed section. The caller
+        // needs them to ask each frame's own exception table whether it
+        // catches at its own resume pc — `resume_pc` alone only addresses the
+        // innermost section, so it cannot answer that question for a
+        // multi-frame resume.
+        let coords: Vec<(usize, usize)> = resumed_frames
+            .iter()
+            .map(|f| (f.code as usize, f.py_pc))
+            .collect();
+        Some((typed, resume_pc, resumed_frames.len(), coords))
     } else {
         None
     }

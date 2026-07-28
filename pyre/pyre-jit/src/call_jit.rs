@@ -2896,19 +2896,19 @@ pub fn trace_and_compile_from_bridge(
     // live (outer) frame `eval_loop_jit` runs. Such a resume cannot be
     // completed by interpreting the live frame forward — see the
     // blackhole routing at the handoff below.
-    let (resume_pc, num_resume_frames) = if let Some(ref meta) = meta {
-        if let Some((_, pc, nframes)) = crate::eval::decode_and_restore_guard_failure(
+    let (resume_pc, num_resume_frames, resume_coords) = if let Some(ref meta) = meta {
+        if let Some((_, pc, nframes, coords)) = crate::eval::decode_and_restore_guard_failure(
             &mut jit_state_local,
             meta,
             raw_values,
             exit_layout,
         ) {
-            (pc, nframes)
+            (pc, nframes, coords)
         } else {
-            (0, 0)
+            (0, 0, Vec::new())
         }
     } else {
-        (0, 0)
+        (0, 0, Vec::new())
     };
     if resume_pc == 0 {
         return BridgeResolution::ResumeBlackhole;
@@ -3070,18 +3070,55 @@ pub fn trace_and_compile_from_bridge(
     // the frame to the caller's handler.  Compiling a real raising bridge
     // (`Finish(exc, exit_frame_with_exception_descr_ref)`) is the orthodox
     // follow-up, gated on the same exception-edge bridge epic.
+    /// The exception-table byte offset a `next_instr`-style resume coordinate
+    /// maps to, mirroring the live-frame form `frame.last_instr * 2` (where
+    /// `last_instr` is `next_instr - 1`).
+    fn exc_table_offset(py_pc: usize) -> u32 {
+        (py_pc.saturating_sub(1) as u32) * 2
+    }
+
+    /// Index of the resumed frame that catches, searched INNERMOST-first by
+    /// asking each frame's own exception table about its own resume pc.
+    /// `coords` is outermost-first, so `Some(0)` means the raise unwinds clear
+    /// out of every inlined callee into the live frame; `None` means it
+    /// escapes them all.
+    fn resumed_catch_level(coords: &[(usize, usize)]) -> Option<usize> {
+        for (level, &(w_code, py_pc)) in coords.iter().enumerate().rev() {
+            if w_code == 0 {
+                return None;
+            }
+            let raw = unsafe {
+                pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                    as *const pyre_interpreter::CodeObject
+            };
+            if raw.is_null() {
+                return None;
+            }
+            let code = unsafe { &*raw };
+            if pyre_interpreter::pycode::lookup_exceptiontable(
+                &code.exceptiontable,
+                exc_table_offset(py_pc),
+            )
+            .is_some()
+            {
+                return Some(level);
+            }
+        }
+        None
+    }
+
     let caught_in_frame = pending_exc && last_bridge_is_exception_guard && {
         if is_multiframe_resume {
             // `resume_pc` (and thus `frame.last_instr`, set above) addresses the
-            // INNERMOST inlined frame, but `code` is the live OUTER frame, so an
-            // exception-table lookup would consult the wrong code object — it can
-            // miss a try/except local to the inlined callee and let the bridge
-            // walk record the callee's NULL raised-call result. The multi-frame
-            // resume already routes through the blackhole below (`resume_via_blackhole`);
-            // decline up-front so no possibly-wrong bridge is traced/attached and
-            // the blackhole rebuilds the inlined framestack and routes the
-            // exception to the correct handler.
-            true
+            // INNERMOST inlined frame while `code` is the live OUTER frame, so
+            // the single-frame lookup below would consult the wrong code object.
+            // Ask each resumed frame about its OWN pc instead. Only a raise that
+            // unwinds clear out of every inlined callee into the live frame's
+            // own handler is routable: that unwind discards the callee frames
+            // outright, so there is no inlined framestack left to rebuild. A
+            // catch inside a callee still needs the carrier subwalk and keeps
+            // declining below, as does a raise that escapes the whole resume.
+            resumed_catch_level(&resume_coords) == Some(0)
         } else {
             let off = if frame.last_instr < 0 {
                 0u32
@@ -3091,13 +3128,23 @@ pub fn trace_and_compile_from_bridge(
             pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, off).is_some()
         }
     };
-    // Exception-edge bridge: route the caught-in-frame
-    // single-frame resume to the in-frame `except` handler (walker
-    // `find_catch_before_resume_live`) instead of declining.  The escaping case
-    // (uncaught) and the multi-frame resume still decline here — those are
-    // separate slices (raising-bridge Finish(exc) / carrier subwalk).
+    // Exception-edge bridge: route a resume whose handler lives in the LIVE
+    // frame to that `except` handler (walker `find_catch_before_resume_live`)
+    // instead of declining.  `caught_in_frame` already restricts the
+    // multi-frame case to the unwind-to-live-frame shape; the escaping case
+    // (uncaught) and a catch inside an inlined callee still decline below —
+    // those are separate slices (raising-bridge Finish(exc) / carrier subwalk).
+    // Only when the outermost resume section really IS the live frame, which is
+    // what lets the unwind land in a frame that already exists. Re-pointing the
+    // live frame to coordinates belonging to some other code object would
+    // resume the walk against the wrong bytecode.
+    let unwind_to_live_frame = is_multiframe_resume
+        && caught_in_frame
+        && resume_coords
+            .first()
+            .is_some_and(|&(outer_w_code, _)| outer_w_code == frame.pycode as usize);
     let route_exc_edge = caught_in_frame
-        && !is_multiframe_resume
+        && (!is_multiframe_resume || unwind_to_live_frame)
         && pyre_jit_trace::jitcode_dispatch::exc_edge_bridge_enabled();
     if route_exc_edge && guard_exc != 0 {
         // Publish the grabbed exception (`cpu.grab_exc_value` result) so the
@@ -3145,6 +3192,30 @@ pub fn trace_and_compile_from_bridge(
         }
         return BridgeResolution::ResumeBlackhole;
     }
+
+    // The unwind discards every inlined callee, so the state the walk must
+    // start from is the LIVE frame at its own call site — not the innermost
+    // callee coordinate `decode_and_restore_guard_failure` installed for the
+    // blackhole (its `resume_pc` override plus the matching innermost
+    // `depth_based_vsd_for_wcode` correction).  Re-point the frame to the
+    // outermost section before anything below reads it: `PyreJitState` holds
+    // only the frame pointer, so the `jit_state` built above picks this up,
+    // and `snapshot_for_tracing` then captures the coordinate the post-bridge
+    // interpreter should resume at.  Only reachable where this function used
+    // to decline outright, so no existing resume changes shape.
+    let resume_pc = match resume_coords.first() {
+        Some(&(outer_w_code, outer_py_pc)) if unwind_to_live_frame => {
+            frame.set_last_instr_from_next_instr(outer_py_pc);
+            if let Some(vsd) =
+                pyre_jit_trace::state::depth_based_vsd_for_wcode(outer_w_code, outer_py_pc)
+            {
+                jit_state.set_valuestackdepth(vsd);
+                jit_state.clear_stack_above(vsd);
+            }
+            outer_py_pc
+        }
+        _ => resume_pc,
+    };
 
     // The live frame is a virtualizable GC object held by raw bridge-trace
     // locals while retracing can collect. RPython keeps the virtualizable

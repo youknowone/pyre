@@ -1545,7 +1545,11 @@ fn carrier_root_catch_target<Sym: WalkSym>(sym: &Sym, root_pc: usize) -> Option<
     // `catch_exception/L` for the enclosing try sits BEHIND it (between the
     // CALL's post-call `-live-` and the next op), so scan backward — the same
     // lookup the single-frame exception-edge router uses.
-    let candidate = crate::jitcode_dispatch::find_catch_before_resume_live(code, root_pc);
+    // `root_pc` is the CALL's OWN trailing `-live-`, one op short of the
+    // block-entry `-live-` the backward scan keys off, so read forward first
+    // and keep the backward scan for callers already at that coordinate.
+    let candidate = crate::jitcode_dispatch::catch_target_after_resume_live(code, root_pc)
+        .or_else(|| crate::jitcode_dispatch::find_catch_before_resume_live(code, root_pc));
     if std::env::var_os("PYRE_P2_DIAG").is_some() {
         eprintln!("[p2-raise] root_pc={root_pc} catch_before={candidate:?}");
     }
