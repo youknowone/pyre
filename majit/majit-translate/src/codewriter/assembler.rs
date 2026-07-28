@@ -539,6 +539,15 @@ impl Assembler {
             });
         }
 
+        // RPython assembler.py:46 `self.check_result()`, :265-269 —
+        // the single-byte operand encoding addresses registers and
+        // constants of one kind in one space, so their sum is what the
+        // byte has to hold.
+        check_result(
+            (num_regs_i, state.constants_i.len()),
+            (num_regs_r, state.constants_r.len()),
+            (num_regs_f, state.constants_f.len()),
+        );
         // RPython assembler.py:271-281: jitcode.setup(code, ...)
         // Build the body that the codewriter will commit into the
         // pre-allocated `Arc<JitCode>` shell via `set_body`.
@@ -2787,12 +2796,12 @@ impl Assembler {
         // Check if already in pool
         for (i, &existing) in state.constants_i.iter().enumerate() {
             if existing == value {
-                return (state.num_regs_i + i) as u8;
+                return const_pool_slot(state.num_regs_i, i);
             }
         }
         // Add to pool: index = num_regs + pool_position
         state.constants_i.push(value);
-        (state.num_regs_i + state.constants_i.len() - 1) as u8
+        const_pool_slot(state.num_regs_i, state.constants_i.len() - 1)
     }
 
     /// `assembler.py:99-107` — the `allow_short` branch of `emit_const`.
@@ -2886,10 +2895,10 @@ impl Assembler {
             .iter()
             .position(|&existing| existing == bits)
         {
-            return (state.num_regs_r + index) as u8;
+            return const_pool_slot(state.num_regs_r, index);
         }
         state.constants_r.push(bits);
-        (state.num_regs_r + state.constants_r.len() - 1) as u8
+        const_pool_slot(state.num_regs_r, state.constants_r.len() - 1)
     }
 
     fn emit_const_f(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8 {
@@ -2902,10 +2911,35 @@ impl Assembler {
             .iter()
             .position(|&existing| existing == bits)
         {
-            return (state.num_regs_f + index) as u8;
+            return const_pool_slot(state.num_regs_f, index);
         }
         state.constants_f.push(bits);
-        (state.num_regs_f + state.constants_f.len() - 1) as u8
+        const_pool_slot(state.num_regs_f, state.constants_f.len() - 1)
+    }
+}
+
+/// Operand byte of a constant-pool entry: `count_regs[kind] +
+/// pool_index` (`assembler.py:132`).  Registers and constants of one
+/// kind share a single byte-wide address space, so the slot is bounded
+/// by `assembler.py:133 assert 0 <= val < 256, "too many constants"`.
+/// Without the bound a wider pool wraps modulo 256 and silently aliases
+/// a live register or an earlier constant.
+fn const_pool_slot(num_regs: usize, pool_index: usize) -> u8 {
+    let val = num_regs + pool_index;
+    assert!(val < 256, "too many constants");
+    val as u8
+}
+
+/// `assembler.py:265-269 check_result()` — "Limitation of the number of
+/// registers, from the single-byte encoding".  Each pair is
+/// `(count_regs[kind], len(constants_kind))`.
+fn check_result(int: (usize, usize), reference: (usize, usize), float: (usize, usize)) {
+    for (kind, (num_regs, num_consts)) in [("int", int), ("ref", reference), ("float", float)] {
+        assert!(
+            num_regs + num_consts <= 256,
+            "too many {kind} registers and constants \
+             ({num_regs} + {num_consts} > 256)"
+        );
     }
 }
 
