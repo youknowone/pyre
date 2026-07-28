@@ -208,21 +208,23 @@ fn iobase_next(args: &[PyObjectRef]) -> crate::PyResult {
     }
 }
 
-/// Tag a freshly allocated `_io` object with the class being constructed and
-/// put it on the finalizer queue, `interp_iobase.py:63-64`.
+/// Tag a freshly allocated `_io` object with the class being constructed, then
+/// put it on the finalizer queue — `objspace.py:485-487 allocate_instance`
+/// followed by `interp_iobase.py:63-64 W_IOBase.__init__`:
+/// `if self.needs_finalizer(): self.register_finalizer(space)`.
 ///
-/// Exactly one registration per object: `iobase_del` is inherited by every
-/// subclass, and `_call_finalizer` resolves `__del__` on the instance's own
-/// type, so an app-level override is reached through this same registration.
-/// Routing through `typedef::tag_subclass_instance` instead would register a
-/// second time for a subclass that defines `__del__`, and run it twice.
+/// An unclosed stream still has to flush and close once it is unreachable, and
+/// `iobase_del` does that. It is a builtin method on the interp-level type, so
+/// `hasuserdel` — set only for a class whose own dict carries `__del__` — is
+/// false for the plain types and the allocation hook would skip them. A
+/// subclass that does define `__del__` is registered by the hook and reaches
+/// this call too — the case `baseobjspace.py:185-188` returns early on; here
+/// the queue drops the repeat.
 pub(crate) fn tag_io_instance(obj: PyObjectRef, cls: PyObjectRef) -> PyObjectRef {
     if !cls.is_null() {
-        unsafe {
-            (*obj).w_class = cls;
-        }
+        crate::typedef::tag_subclass_instance(obj, cls);
     }
-    crate::executioncontext::register_iobase_finalizer(obj);
+    crate::executioncontext::register_finalizer(obj);
     obj
 }
 

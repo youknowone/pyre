@@ -3914,6 +3914,17 @@ impl GcAllocator for MiniMarkGC {
                 trigger,
             });
         }
+        // `register_finalizer` is contracted to run at most once per object
+        // (`rgc.py:648-649`). A second deque entry survives the first
+        // `deal_with_objects_with_finalizers` pass through `new_with_finalizer`
+        // (incminimark.py:2944-2946) and delivers the object a second time on
+        // the next major collection, so honour the contract here rather than
+        // leaving it to every caller.
+        let hdr = unsafe { header_of(obj.0) };
+        if unsafe { (*hdr).has_flag(flags::FINALIZER_REGISTERED) } {
+            return;
+        }
+        unsafe { (*hdr).set_flag(flags::FINALIZER_REGISTERED) };
         if self.oldgen.contains(obj.0) {
             // Pyre's host allocations can be born directly in old-gen and an
             // explicit non-moving major intentionally skips the leading minor.
@@ -7735,5 +7746,45 @@ mod tests {
         // can stay true for a freed block while the current arena is retained.
         // The allocator's exact live count verifies reclamation here.
         assert_eq!(gc.oldgen.object_count(), 0);
+    }
+
+    /// `rgc.py:648-649` contracts `register_finalizer` to run at most once per
+    /// object. Registering twice used to leave two deque entries: the first
+    /// major delivers the object and re-appends the survivor through
+    /// `new_with_finalizer` (incminimark.py:2944-2946), so the next major
+    /// delivers it again and the app-level `__del__` runs a second time.
+    #[test]
+    fn register_finalizer_delivers_an_object_once_however_often_it_is_registered() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static TRIGGERS: AtomicUsize = AtomicUsize::new(0);
+        fn trigger() {
+            TRIGGERS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        TRIGGERS.store(0, Ordering::Relaxed);
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 16);
+        let mut root = obj;
+        unsafe { gc.roots.add(&mut root) };
+
+        // The construction site registers, then a later out-of-band caller
+        // asks again without knowing that.
+        GcAllocator::register_finalizer(&mut gc, 0, obj, trigger);
+        GcAllocator::register_finalizer(&mut gc, 0, obj, trigger);
+        assert_eq!(gc.old_objects_with_finalizers.len(), 1);
+
+        gc.roots.remove(&mut root);
+        gc.do_collect_oldgen_nonmoving();
+        assert_eq!(TRIGGERS.load(Ordering::Relaxed), 1);
+        assert_eq!(GcAllocator::finalizer_next_dead(&mut gc, 0), Some(obj));
+        assert_eq!(GcAllocator::finalizer_next_dead(&mut gc, 0), None);
+
+        // No survivor was carried into the next cycle, so the object is not
+        // delivered a second time.
+        gc.do_collect_oldgen_nonmoving();
+        assert_eq!(TRIGGERS.load(Ordering::Relaxed), 1);
+        assert_eq!(GcAllocator::finalizer_next_dead(&mut gc, 0), None);
     }
 }

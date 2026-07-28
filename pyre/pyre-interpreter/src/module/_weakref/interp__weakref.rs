@@ -935,8 +935,11 @@ pub fn getlifeline(w_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     crate::baseobjspace::setweakref(w_obj, lifeline)?;
     // RPython's collector invalidates every rweakref when its target dies.
     // pyre routes the equivalent lifeline clear through the shared finalizer
-    // queue, including for refs/proxies without callbacks.
-    crate::executioncontext::register_weakref_finalizer(w_obj);
+    // queue, including for refs/proxies without callbacks. This is the one
+    // registration that does not sit in the target's constructor, so it can
+    // land on an object some constructor already registered; the queue drops
+    // the repeat.
+    crate::executioncontext::register_finalizer(w_obj);
     Ok(lifeline)
 }
 

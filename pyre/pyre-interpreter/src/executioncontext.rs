@@ -166,62 +166,30 @@ fn finalizer_queue_trigger() {
     }
 }
 
-/// objspace.py:486 `allocate_instance` finalizer registration callback.
+/// `baseobjspace.py:173-193 W_Root.register_finalizer` — the single entry
+/// point through which a construction site asks for `_finalize_` to run once
+/// `obj` becomes unreachable.
+///
+/// Upstream's contract is "call this at most once"; it holds structurally
+/// there, because every requester sits in the object's own constructor. pyre
+/// has one requester that does not: `getlifeline`
+/// (`interp__weakref.py:252-257`) asks at weakref-creation time and cannot
+/// know what the constructor already did. So the guard upstream writes as
+/// `if self.user_overridden_class and self.getclass(space).hasuserdel` —
+/// "`allocate_instance` got here first" — is enforced by the queue instead,
+/// which answers for every requester rather than one of them.
+pub fn register_finalizer(obj: PyObjectRef) {
+    pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
+}
+
+/// objspace.py:486-487 `allocate_instance`:
+/// `if w_subtype.hasuserdel: self.finalizer_queue.register_finalizer(instance)`.
 pub fn maybe_register_user_finalizer(obj: PyObjectRef) {
     let Some(w_type) = crate::typedef::r#type(obj) else {
         return;
     };
     if unsafe { pyre_object::w_type_get_hasuserdel(w_type.as_ptr()) } {
-        pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
-    }
-}
-
-/// Register a suspended-generator finalizer so its `finally`/`with` cleanup runs if the
-/// generator is collected while suspended inside a handler range. PyPy
-/// (generator.py:27) gates registration on `co_flags & CO_YIELD_INSIDE_TRY`; that
-/// compile-time flag is unavailable here (external compiler), so the caller gates on a
-/// non-empty code exception table — a sound necessary condition for any reachable
-/// `finally`/`except`/`with`.
-pub fn register_generator_finalizer(obj: PyObjectRef) {
-    pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
-}
-
-/// Register an interp-level object whose PyPy counterpart implements
-/// `_finalize_` solely to release an acquired buffer.  The ownership bit
-/// lives on the object itself; this queue supplies the unreachable-object
-/// callback corresponding to `register_finalizer(space)`.
-pub fn register_native_buffer_finalizer(obj: PyObjectRef) {
-    pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
-}
-
-/// `interp_iobase.py:63-64 W_IOBase.__init__`: `if self.needs_finalizer():
-/// self.register_finalizer(space)`.
-///
-/// An unclosed file must still flush and close when it becomes unreachable,
-/// and `_io`'s `__del__` (`module/_io/mod.rs` `iobase_del`) does exactly
-/// that. It is a builtin method on the interp-level type, so `hasuserdel` —
-/// which `type.__new__` sets only for a class whose own dict carries
-/// `__del__` — is false here and [`maybe_register_user_finalizer`] would
-/// skip the object. Registration is therefore explicit at construction,
-/// as upstream does it.
-pub fn register_iobase_finalizer(obj: PyObjectRef) {
-    pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
-}
-
-/// Register an object that owns a `WeakrefLifeline`. PyPy's GC invalidates the
-/// rweakrefs and registers callback-bearing lifelines themselves; until pyre's
-/// mapdict weakref SPECIAL slot is inline, the address-keyed slot keeps that
-/// lifeline rooted, so the equivalent death notification is registered on its
-/// owner. Objects with `__del__` are already in this queue and must not be
-/// registered twice.
-pub fn register_weakref_finalizer(obj: PyObjectRef) {
-    let already_registered = crate::typedef::r#type(obj)
-        .map(|w_type| unsafe { pyre_object::w_type_get_hasuserdel(w_type.as_ptr()) })
-        .unwrap_or(false);
-    let native_buffer_finalizer = crate::module::__pypy__::W_PickleBuffer::from_obj(obj).is_some()
-        || crate::module::r#struct::unpack_iter::W_UnpackIter::from_obj(obj).is_some();
-    if !already_registered && !native_buffer_finalizer {
-        pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
+        register_finalizer(obj);
     }
 }
 

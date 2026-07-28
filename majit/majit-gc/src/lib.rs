@@ -59,6 +59,20 @@ pub mod flags {
     pub const SHADOW_INITIALIZED: u64 = 1 << 11;
     /// GCFLAG_DUMMY (bit 12)
     pub const DUMMY: u64 = 1 << 12;
+    /// The object is already on a finalizer queue (bit 13).
+    ///
+    /// Not an incminimark flag — bit 13 is `_GCFLAG_FIRST_UNUSED`
+    /// (incminimark.py:169) there, so this claims the first free bit and
+    /// disturbs no RPython position. incminimark keeps the registered set
+    /// purely in its two deques and never asks the question, because
+    /// `register_finalizer` is contracted to be called at most once per
+    /// object. That contract is checked only untranslated (`rgc.py:648-649`
+    /// `assert not self._already_registered(obj)`); translated, a second
+    /// registration silently appends a second deque entry and the finalizer
+    /// runs again on the following major collection. This flag lets the
+    /// queue enforce the contract for callers that cannot establish single
+    /// registration statically.
+    pub const FINALIZER_REGISTERED: u64 = 1 << 13;
 }
 
 /// Low-level trigger stored in an RPython finalizer handler.  It must only

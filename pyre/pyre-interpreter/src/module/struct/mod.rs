@@ -1374,8 +1374,10 @@ pub mod unpack_iter {
             index: 0,
             export_active,
         });
+        // `_finalize_` releases the acquired export; nothing to release when
+        // the buffer was never acquired.
         if export_active {
-            crate::executioncontext::register_native_buffer_finalizer(w_iter);
+            crate::executioncontext::register_finalizer(w_iter);
         }
         Ok(w_iter)
     }

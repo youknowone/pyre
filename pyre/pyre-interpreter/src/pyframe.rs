@@ -744,8 +744,14 @@ impl FrameBox {
         unsafe {
             (*frame_ptr).f_generator_nowref = generator;
         }
+        // generator.py:27 registers the generator so a `finally`/`with` body
+        // still unwinds when it is collected while suspended inside a handler
+        // range. Upstream gates on `co_flags & CO_YIELD_INSIDE_TRY`; that
+        // compile-time flag is unavailable here (external compiler), so
+        // `register_final` gates on a non-empty code exception table — a sound
+        // necessary condition for any reachable `finally`/`except`/`with`.
         if register_final {
-            crate::executioncontext::register_generator_finalizer(generator);
+            crate::executioncontext::register_finalizer(generator);
         }
         Ok(generator)
     }

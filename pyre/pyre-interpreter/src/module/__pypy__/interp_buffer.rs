@@ -60,11 +60,12 @@ impl W_PickleBuffer {
             release_memoryview,
             w_release_exporter: pyre_object::gc_roots::shadow_stack_get(sp + 1),
         });
-        // Pyre also routes weakref invalidation through this finalizer queue,
-        // so register immutable-buffer wrappers too: PyPy's collector handles
-        // their weakrefs independently even when `buf.needs_release()` is
-        // false.  The idempotent release body is a no-op for that export.
-        crate::executioncontext::register_native_buffer_finalizer(w_pickle_buffer);
+        // `_finalize_` releases the acquired export. Pyre also routes weakref
+        // invalidation through this queue, so register immutable-buffer
+        // wrappers too: PyPy's collector handles their weakrefs independently
+        // even when `buf.needs_release()` is false. The idempotent release
+        // body is a no-op for that export.
+        crate::executioncontext::register_finalizer(w_pickle_buffer);
         Ok(w_pickle_buffer)
     }
 
