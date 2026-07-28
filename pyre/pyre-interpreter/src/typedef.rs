@@ -1445,6 +1445,7 @@ pub fn init_typeobjects() {
     PATCH_TYPEOBJECTS.call_once(|| {
         patch_object_class_descriptor();
         patch_complex_realimag_descriptors();
+        patch_float_realimag_descriptors();
         patch_builtin_function_descriptors();
         patch_fixed_code_descriptor_getsets();
         patch_function_member_descriptors();
@@ -1497,38 +1498,79 @@ fn patch_object_class_descriptor() {
 
 /// Install `complex.real` / `complex.imag` after the complex type exists.
 ///
-/// complexobject.py:556-561 `complexwprop` builds each as
-/// `GetSetProperty(fget, doc=doc, cls=W_ComplexObject)`; the `cls` gives the
-/// descriptor its `__objclass__` and rejects a non-complex receiver. The
-/// complex type object is not available while `init_complex_type` fills the
-/// namespace (it is created by the same call that runs the initializer), so
-/// the two descriptors are stored here, once the type is registered.
+/// PyPy complexobject.py:556-561 uses `GetSetProperty`, while CPython 3.14
+/// `complex_members` exposes the two `Py_T_DOUBLE`, `Py_READONLY` fields as
+/// `member_descriptor`. The complex type object is not available while
+/// `init_complex_type` fills the namespace, so install them after registration.
 fn patch_complex_realimag_descriptors() {
     let complex_type =
         gettypefor(&pyre_object::COMPLEX_TYPE).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
     if complex_type.is_null() || !crate::type_dict_has_storage(complex_type) {
         return;
     }
-    for (name, kind, doc) in [
+    for (name, doc, kind) in [
         (
             "real",
-            pyre_object::MEMBER_COMPLEX_REAL,
             "the real part of a complex number",
+            pyre_object::MEMBER_COMPLEX_REAL,
         ),
         (
             "imag",
-            pyre_object::MEMBER_COMPLEX_IMAG,
             "the imaginary part of a complex number",
+            pyre_object::MEMBER_COMPLEX_IMAG,
         ),
     ] {
         crate::type_dict_store(
             complex_type,
             name,
-            pyre_object::w_member_new_with_doc(
+            pyre_object::w_member_new_direct_with_doc(
                 kind,
                 name.to_owned(),
+                doc.to_owned(),
                 complex_type,
-                Some(doc.to_owned()),
+            ),
+        );
+    }
+}
+
+/// PyPy floatobject.py:747-748 installs `real` / `imag` as
+/// `GetSetProperty(W_FloatObject.descr_get_*)`. Install them after the float
+/// type exists so `reqcls` carries the same receiver constraint.
+fn patch_float_realimag_descriptors() {
+    let float_type =
+        gettypefor(&pyre_object::FLOAT_TYPE).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+    if float_type.is_null() || !crate::type_dict_has_storage(float_type) {
+        return;
+    }
+    for (name, getter) in [
+        (
+            "real",
+            make_builtin_function_with_arity(
+                "real",
+                |args| {
+                    Ok(args
+                        .get(1)
+                        .copied()
+                        .unwrap_or(pyre_object::w_float_new(0.0)))
+                },
+                2,
+            ),
+        ),
+        (
+            "imag",
+            make_builtin_function_with_arity("imag", |_| Ok(pyre_object::w_float_new(0.0)), 2),
+        ),
+    ] {
+        crate::type_dict_store(
+            float_type,
+            name,
+            make_getset_property_full(
+                getter,
+                pyre_object::PY_NULL,
+                pyre_object::PY_NULL,
+                pyre_object::PY_NULL,
+                float_type,
+                Some(name),
             ),
         );
     }
@@ -15688,32 +15730,9 @@ fn init_float_type(ns: PyObjectRef) {
             ),
         )
     };
-    // float.real / float.imag — a float is its own real part; imag is 0.0.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "real",
-            make_getset_descriptor(make_builtin_function_with_arity(
-                "real",
-                |args| {
-                    let value = unsafe { pyre_object::w_float_get_value(args[1]) };
-                    Ok(pyre_object::w_float_new(value))
-                },
-                2,
-            )),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "imag",
-            make_getset_descriptor(make_builtin_function_with_arity(
-                "imag",
-                |_| Ok(pyre_object::w_float_new(0.0)),
-                2,
-            )),
-        )
-    };
+    // float.real / float.imag are installed post-registration by
+    // `patch_float_realimag_descriptors`, where the public type is available
+    // for GetSetProperty.reqcls.
     // floatobject.py:713/715/449-455 — __int__/__trunc__ go through
     // descr_trunc (truncate-toward-zero), __floor__ / __ceil__ run
     // math.floor/ceil first, then newint_from_float.
