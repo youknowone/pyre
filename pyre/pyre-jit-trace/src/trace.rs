@@ -907,7 +907,18 @@ fn try_commit_midbody_abort_inner(
             "outer call boundary stopped being flushable during the rebuild",
         ));
     }
-    let ran = frame.execute_frame(None, None);
+    // A re-entrant trace started inside the rebuilt callee would call
+    // `fbw_store_journal_reset`, which clears the abort carrier, the executed
+    // effect odometer and every store journal — i.e. exactly the outer walk
+    // state this commit depends on.  Worse than losing it: a reset odometer
+    // reads back as 0, which `walk_end_resume_provable` can mistake for "no
+    // effects since the latch" and treat as proof.  The residual path already
+    // suspends continuation across user code for the same reason
+    // (`residual_call.rs`); the rebuilt callee is that same situation.
+    let ran = {
+        let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
+        frame.execute_frame(None, None)
+    };
     let below_now = &below_owned[..];
     match ran {
         Ok(mut retval) => {

@@ -4574,6 +4574,12 @@ pub(crate) fn outer_call_operands_below(
     post_call_py_pc: usize,
     call_stack_len: usize,
 ) -> Option<usize> {
+    // `try_commit_midbody_abort_inner` calls this before its own
+    // `cf_addr == 0` decline, so guard here rather than relying on callers to
+    // order their checks — matching `can_flush_walk_end_state_after_outer_call`.
+    if frame == 0 {
+        return None;
+    }
     let frame_ptr = frame as *const u8;
     let w_code =
         unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
