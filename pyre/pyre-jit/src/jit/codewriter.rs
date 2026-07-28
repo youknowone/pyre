@@ -6518,23 +6518,46 @@ impl CodeWriter {
                     None,
                     ($py_pc) as i64,
                 );
-                // `abort_permanent` is a runtime terminator, but RPython's
-                // flow graph has no third terminal block beside returnblock
-                // and exceptblock (`model.py:18-19`).  Keep the orthodox
-                // graph shape by linking the unreachable continuation to
-                // returnblock.  Canonical flattening serializes
-                // `abort_permanent` first; its runtime dispatch never reaches
-                // the synthetic null return.  Leaving this block with no exit
-                // would instead make `flatten.py:107-109` mistake its full
-                // FrameState input tuple for return arguments.
-                let abort_return = super::flow::Link::new(
-                    vec![super::flow::Constant::none().into()],
-                    Some(graph.returnblock.clone()),
-                    None,
-                )
-                .into_ref();
-                append_exit(&current_block.block(), abort_return);
-                needs_fallthrough = false;
+                // `abort_permanent` terminates the *run*, not the *graph*.
+                // Closing the block here would set `exits`, and the
+                // `block_closed_by_terminator` gate below then skips op
+                // dispatch for every later PC — so nothing behind this opcode
+                // is lowered, `merge_entry_by_green` loses every loop header
+                // that follows, and `compile_and_run_once` silently refuses
+                // (`n(target_pc).is_none()`) with no abort recorded.  One
+                // `class` statement, `del`, or annotated assignment in a
+                // module prologue therefore made every loop in that module
+                // permanently un-JITtable.
+                //
+                // RPython has no counterpart to compare against because it
+                // has no unsupported opcodes: `pyopcode.py:865-870
+                // LOAD_BUILD_CLASS` and `:777-778 LOAD_LOCALS` are plain
+                // value pushes and the tracer walks straight through them,
+                // and nothing in `flowcontext.py` blacklists the graph a
+                // hard-to-trace operation appears in.  The parity-preserving
+                // shape is therefore to keep the graph connected: the arms
+                // above already leave a well-typed FrameState (the
+                // `push_fresh_ref` / depth adjustments), so the fall-through
+                // continues to be lowered and a real terminator closes the
+                // block.  Runtime never reaches it — `abort_permanent` hands
+                // control back to the interpreter first.
+                //
+                // Only when the abort is the code object's last instruction
+                // is there no successor to close the block, and an exit-less
+                // block makes `flatten.py:107-109` mistake its full
+                // FrameState input tuple for return arguments.  Link that one
+                // case to returnblock, the orthodox second terminal block
+                // (`model.py:18-19`).
+                if ($py_pc) + 1 >= code.instructions.len() {
+                    let abort_return = super::flow::Link::new(
+                        vec![super::flow::Constant::none().into()],
+                        Some(graph.returnblock.clone()),
+                        None,
+                    )
+                    .into_ref();
+                    append_exit(&current_block.block(), abort_return);
+                    needs_fallthrough = false;
+                }
             }};
         }
 
@@ -7791,13 +7814,12 @@ impl CodeWriter {
                     // is expected to continue processing the canraise op's
                     // normal-flow result and subsequent ops.
                     //
-                    // `emit_abort_permanent!` is NOT excluded: it appends a
-                    // returnblock link, so `exits` is non-empty and every
-                    // later PC lands here and skips dispatch.  A body that
-                    // aborts therefore stops emitting at that opcode — which
-                    // is why `merge_entry_by_green` drops the loop headers
-                    // behind it instead of taking every header a bytecode
-                    // scan finds.
+                    // `emit_abort_permanent!` does NOT reach this gate: it
+                    // leaves the block open so the rest of the code object
+                    // keeps lowering, and only appends a returnblock link when
+                    // the abort is the last instruction (nothing follows to
+                    // dispatch).  `merge_entry_by_green` therefore keeps the
+                    // loop headers behind an unsupported opcode.
                     //
                     // Reuses `block_closed_by_terminator` computed above the
                     // loop-header `jit_merge_point` gate: the merge emission
