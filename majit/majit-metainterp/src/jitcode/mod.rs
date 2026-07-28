@@ -27,32 +27,6 @@ pub(crate) use majit_translate::insns::insn_byte;
 
 pub use majit_translate::insns::{pyre_extension_insns, wellknown_bh_insns};
 
-/// GC liveness metadata at a specific bytecode PC.
-///
-/// RPython liveness.py: `[len_i][len_r][len_f][bitset_i][bitset_r][bitset_f]`.
-/// Tracks which registers of each type (int/ref/float) are live at a given PC.
-///
-/// TODO: pyre currently keeps this per-entry form alongside the packed
-/// Temporary pyre-side liveness shape used before the codewriter emits
-/// RPython `-live-` opcodes directly. Canonical JitCode does not store this.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LivenessInfo {
-    pub pc: u16,
-    /// Live integer register indices at this PC.
-    pub live_i_regs: Vec<u16>,
-    /// Live reference register indices at this PC.
-    pub live_r_regs: Vec<u16>,
-    /// Live float register indices at this PC.
-    pub live_f_regs: Vec<u16>,
-}
-
-impl LivenessInfo {
-    /// Total number of live registers across all typed banks.
-    pub fn total_live(&self) -> usize {
-        self.live_i_regs.len() + self.live_r_regs.len() + self.live_f_regs.len()
-    }
-}
-
 /// Re-export of the canonical `enumerate_vars` function so existing
 /// metainterp callers can keep using `crate::jitcode::enumerate_vars`.
 ///

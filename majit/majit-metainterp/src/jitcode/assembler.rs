@@ -3057,8 +3057,8 @@ impl JitCodeBuilder {
         );
     }
 
-    /// of: emit canonical
-    /// `residual_call_{r,ir,irf}_v` opname/argcodes byte layout.
+    /// Emit the canonical `residual_call_{r,ir,irf}_v` opname/argcodes byte
+    /// layout.
     ///
     /// Policy-specific void calls use this same bytecode family; their
     /// behaviour is carried by `calldescr.extra_info`, matching RPython
@@ -3341,9 +3341,8 @@ impl JitCodeBuilder {
     /// `handler_residual_call_*_{i,r,f}` at `blackhole.rs:6611-6660` via
     /// `code[p]`).
     ///
-    /// of:
-    /// foundation. (`residual_call_*_canonical_*`
-    /// wrappers below) is the first non-dormant caller.
+    /// The `residual_call_*_canonical_*` wrappers below are its first
+    /// non-dormant callers.
     fn emit_canonical_call_typed(
         &mut self,
         opcodes: (u8, u8, u8),
@@ -3430,8 +3429,8 @@ impl JitCodeBuilder {
         self.call_descr_to_call_target.insert(calldescr_idx, target);
     }
 
-    /// of: int-result
-    /// sibling of [`Self::residual_call_void_canonical_via_target`].
+    /// Int-result sibling of
+    /// [`Self::residual_call_void_canonical_via_target`].
     /// `bhimpl_residual_call_{r,ir,irf}_i` (`blackhole.py:1225-1247`)
     /// dispatches via `cpu.bh_call_i` and writes the result into
     /// `bh.registers_i[dst]`.
@@ -4720,9 +4719,6 @@ impl JitCodeBuilder {
     /// pool and return its index. Used by canonical `residual_call_*` /
     /// `call_*` emit paths that need a `d` argcode descriptor (RPython
     /// `assembler.py:197-207` `_encode_descr(calldescr)`).
-    ///
-    /// of: helper only.
-    /// emits via this from the migrated emit sites.
     ///
     /// TODO: dedup is intentionally NOT done for the
     /// `Call` variant. RPython's `descr.py:660-668 _key_for_caching`
