@@ -102,7 +102,7 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    let obj = read_ref_reg(code, op, 0, ctx)?;
+    let obj = read_ref_reg_raw(code, op, 0, ctx)?;
     // Inside an inlined-callee sub-walk, a scalar getfield_vable_r
     // of the callee's namespace(idx5)/pycode(idx1) must resolve to the callee's
     // compile-time `InlineCalleeConsts` whether the callee frame is unseeded
@@ -274,7 +274,7 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
-    let obj = read_ref_reg(code, op, 0, ctx)?;
+    let obj = read_ref_reg_raw(code, op, 0, ctx)?;
     // Same unseeded-register guard as `getfield_vable_via_metainterp`:
     // a `None` box would resize the heapcache flag vector to 16 GiB.
     if obj.is_none() {
@@ -452,7 +452,7 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
             }
         }
     }
-    let vable = read_ref_reg(code, op, 0, ctx)?;
+    let vable = read_ref_reg_raw(code, op, 0, ctx)?;
     // An unseeded walker Ref register holds `OpRef::None` (`raw() ==
     // u32::MAX`); feeding it into the metainterp vable path would resize
     // the heapcache flag vector to 16 GiB. Bail to a trace abort, mirroring
@@ -618,7 +618,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
     }
-    let vable = read_ref_reg(code, op, 0, ctx)?;
+    let vable = read_ref_reg_raw(code, op, 0, ctx)?;
     // See `getarrayitem_vable_via_metainterp`: an unseeded `OpRef::None`
     // vable would resize the heapcache flag vector to 16 GiB; bail instead.
     if vable.is_none() {
@@ -767,7 +767,7 @@ pub(crate) fn arraylen_vable_via_metainterp<Sym: WalkSym>(
     op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    let vable = read_ref_reg(code, op, 0, ctx)?;
+    let vable = read_ref_reg_raw(code, op, 0, ctx)?;
     // See `getarrayitem_vable_via_metainterp`: an unseeded `OpRef::None`
     // vable would resize the heapcache flag vector to 16 GiB; bail instead.
     if vable.is_none() {

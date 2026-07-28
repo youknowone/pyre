@@ -3109,6 +3109,66 @@ fn ref_return_with_out_of_range_register_surfaces_typed_error() {
 }
 
 #[test]
+fn raise_with_unwritten_register_surfaces_register_read_unbound() {
+    // A jitcode whose `raise/r` names a Ref register no op ever writes leaves
+    // that slot at its `[None] * num_regs` initial value.  Carrying the
+    // `OpRef::NONE` into the trace produced `Finish(_)` against
+    // `ExitFrameWithExceptionDescrRef` (fail-arg type Ref), which no backend
+    // can bind — dynasm panicked in `RegisterManager.loc`, cranelift in
+    // `resolve_opref`.  The read declines instead.
+    let raise_byte = *insns_opname_to_byte()
+        .get("raise/r")
+        .expect("`raise/r` must be in insns table");
+    let code = [raise_byte, 0x01];
+    let mut tc = fresh_trace_ctx();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut registers_r = [OpRef::NONE, OpRef::NONE];
+    let mut concrete_registers_r = [ConcreteValue::Null, ConcreteValue::Null];
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut registers_r,
+        registers_i: &mut [],
+        registers_f: &mut [],
+        concrete_registers_r: &mut concrete_registers_r,
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let err = step(&code, 0, &mut wc).expect_err("must surface RegisterReadUnbound");
+    assert_eq!(
+        err,
+        DispatchError::RegisterReadUnbound {
+            pc: 0,
+            reg: 1,
+            bank: "r"
+        },
+    );
+}
+
+#[test]
 fn step_through_int_return_records_finish_with_int_descr() {
     // `int_return/i` mirrors `ref_return/r` on the int bank.
     // Top-level re-boxes the int for the Type::Ref portal exit

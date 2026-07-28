@@ -1598,6 +1598,23 @@ pub enum DispatchError {
         len: usize,
         bank: &'static str,
     },
+    /// A register operand byte indexed a slot the walk never wrote.
+    /// `MIFrame.registers_*` start as `[None] * num_regs`
+    /// (`pyjitpl.py:190-197`) and a jitcode only names a register the
+    /// codewriter's liveness proves is assigned on every path reaching the
+    /// read, so upstream never observes the hole.  Pyre's codewriter can
+    /// still emit one — an exception edge whose merge block reads a
+    /// value-stack slot none of its predecessors renames into — and the
+    /// `OpRef::NONE` that read yields is not a box: recording it produces an
+    /// op argument no backend can bind (`regalloc.py:611-622` `env[box]`
+    /// KeyError; dynasm `RegisterManager.loc`, cranelift `resolve_opref`).
+    /// Decline the walk at the read instead of carrying the hole into the
+    /// trace.
+    RegisterReadUnbound {
+        pc: usize,
+        reg: usize,
+        bank: &'static str,
+    },
     /// A `d`-coded descr index resolved past the descr pool. Surfaces
     /// either an assembler-pass bug (descr index out of range) or a
     /// caller mismatch between the codewriter's descr table size and
@@ -2031,6 +2048,7 @@ impl DispatchError {
             Self::UndecodableOpcode { .. } => "UndecodableOpcode",
             Self::UnsupportedOpname { .. } => "UnsupportedOpname",
             Self::RegisterOutOfRange { .. } => "RegisterOutOfRange",
+            Self::RegisterReadUnbound { .. } => "RegisterReadUnbound",
             Self::DescrIndexOutOfRange { .. } => "DescrIndexOutOfRange",
             Self::ExpectedJitCodeDescr { .. } => "ExpectedJitCodeDescr",
             Self::SubJitCodeNotFound { .. } => "SubJitCodeNotFound",
@@ -2517,6 +2535,32 @@ pub fn walk<Sym: WalkSym>(
 /// to its symbolic [`OpRef`]. RPython
 /// `pyjitpl.py:registers_r[code[pc+1]]` for an `r`-coded operand.
 fn read_ref_reg<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Result<OpRef, DispatchError> {
+    let reg = code[op.pc + 1 + operand_offset] as usize;
+    let value = read_ref_reg_raw(code, op, operand_offset, ctx)?;
+    // `[None] * num_regs` initial state (`pyjitpl.py:190-197`): a slot the
+    // walk never wrote holds no box, and `OpRef::NONE` is not one.  See
+    // [`DispatchError::RegisterReadUnbound`].
+    if value.is_none() {
+        return Err(DispatchError::RegisterReadUnbound {
+            pc: op.pc,
+            reg,
+            bank: "r",
+        });
+    }
+    Ok(value)
+}
+
+/// [`read_ref_reg`] without the unbound-slot check, for the handful of arms
+/// that give an unwritten slot their own, more specific decline — the
+/// `*_vable_*` family reads its object operand this way so an unseeded
+/// virtualizable register still surfaces [`DispatchError::VableBoxNotSeeded`]
+/// instead of the generic [`DispatchError::RegisterReadUnbound`].
+fn read_ref_reg_raw<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     operand_offset: usize,
