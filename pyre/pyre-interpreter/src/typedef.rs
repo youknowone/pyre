@@ -593,11 +593,8 @@ pub fn init_typeobjects() {
         // CPython `wrapper_descriptor`: slot wrappers bind their receiver and
         // are callable, but are not Python functions. Their Rust payload is
         // the immutable BuiltinCode-backed Function carrier.
-        let slot_wrapper_type = new_typeobject_with_base(
-            "wrapper_descriptor",
-            init_descriptor_type_common,
-            object_type,
-        );
+        let slot_wrapper_type =
+            new_typeobject_with_base("wrapper_descriptor", init_slot_wrapper_type, object_type);
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(slot_wrapper_type, false);
             pyre_object::w_type_set_disallow_instantiation(slot_wrapper_type);
@@ -11715,6 +11712,77 @@ fn init_builtin_code_type(ns: PyObjectRef) {
             make_getset_descriptor(flags_getter),
         )
     };
+}
+
+fn slot_wrapper_receiver(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    if obj.is_null() || !unsafe { crate::function::is_slot_wrapper(obj) } {
+        let received = crate::typedef::r#type(obj)
+            .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
+            .unwrap_or("object");
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' for 'wrapper_descriptor' objects doesn't apply to a '{received}' object"
+        )));
+    }
+    Ok(obj)
+}
+
+fn init_slot_wrapper_type(ns: PyObjectRef) {
+    // CPython 3.14 Objects/descrobject.c `PyWrapperDescr_Type` metadata.
+    // The descriptor payload remains PyPy's FunctionWithFixedCode and keeps
+    // its owner in Function.w_objclass.
+    for (name, getter) in [
+        (
+            "__name__",
+            (|args: &[PyObjectRef]| {
+                let descr = slot_wrapper_receiver(args[1], "__name__")?;
+                Ok(pyre_object::w_str_new(unsafe {
+                    crate::function::function_get_name(descr)
+                }))
+            }) as crate::gateway::BuiltinCodeFn,
+        ),
+        ("__objclass__", |args: &[PyObjectRef]| {
+            let descr = slot_wrapper_receiver(args[1], "__objclass__")?;
+            unsafe { crate::function::fget_func_objclass(descr) }
+        }),
+        ("__qualname__", |args: &[PyObjectRef]| {
+            let descr = slot_wrapper_receiver(args[1], "__qualname__")?;
+            let owner = unsafe { crate::function::fget_func_objclass(descr)? };
+            let owner_qualname = crate::baseobjspace::getattr_str(owner, "__qualname__")?;
+            let Some(owner_qualname) =
+                (unsafe { pyre_object::w_str_get_value_opt(owner_qualname) })
+            else {
+                return Err(crate::PyError::type_error(
+                    "descriptor owner __qualname__ is not a string",
+                ));
+            };
+            let method_name = unsafe { crate::function::function_get_name(descr) };
+            Ok(pyre_object::w_str_new(&format!(
+                "{owner_qualname}.{method_name}"
+            )))
+        }),
+        ("__doc__", |args: &[PyObjectRef]| {
+            let descr = slot_wrapper_receiver(args[1], "__doc__")?;
+            Ok(unsafe { crate::function::fget_func_doc(descr) })
+        }),
+        ("__text_signature__", |args: &[PyObjectRef]| {
+            let descr = slot_wrapper_receiver(args[1], "__text_signature__")?;
+            match unsafe { crate::function::fget_func_text_signature(descr) } {
+                Ok(value) => Ok(value),
+                Err(err) if err.kind == crate::PyErrorKind::AttributeError => {
+                    Ok(pyre_object::w_none())
+                }
+                Err(err) => Err(err),
+            }
+        }),
+    ] {
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_descriptor(make_builtin_function_with_arity(name, getter, 2)),
+            )
+        };
+    }
 }
 
 fn init_method_type(ns: PyObjectRef) {
