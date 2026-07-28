@@ -1358,6 +1358,89 @@ pub unsafe fn load_attr_fast_path(
     Some((w_type, version_tag, map, p.storageindex))
 }
 
+/// Shared resolution for [`property_get_fast_path`] / [`property_set_fast_path`]:
+/// when `name` on `w_obj`'s type resolves to a `property` data descriptor,
+/// return the type, its cacheable version tag, and the property object.  Applies
+/// the shape gates common to both directions — a mapdict instance and a non-zero
+/// `version_tag`.  The read/write hook gate differs (`__getattribute__` for the
+/// getter, `__setattr__` for the setter), so each caller applies its own.  A
+/// property is a data descriptor, so it takes precedence over the instance dict
+/// and the version-pinned type lookup is authoritative; the instance map is not
+/// read.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+unsafe fn property_descr_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    let map = unsafe { mapdict_map_or_null(w_obj) };
+    if map.is_null() {
+        return None;
+    }
+    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    if w_type.is_null() {
+        return None;
+    }
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type(w_type, name) }?;
+    if !unsafe { pyre_object::descriptor::is_property(w_descr) } {
+        return None;
+    }
+    Some((w_type, version_tag, w_descr))
+}
+
+/// LOAD_ATTR `property` fast path: return the type, version tag, and Python
+/// `fget` when `obj.name` reads a property getter, so the full-body walker can
+/// inline `fget(obj)` in place of the opaque `getattr` residual.  Returns `None`
+/// (leave the residual) for a write-only property or any shape
+/// [`property_descr_fast_path`] declines.  A custom `__getattribute__` owns the
+/// read (mapdict.py:1497-1499), so it declines to the residual.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn property_get_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    let (w_type, version_tag, w_descr) = unsafe { property_descr_fast_path(w_obj, name) }?;
+    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+        return None;
+    }
+    let fget = unsafe { pyre_object::descriptor::w_property_get_fget(w_descr) };
+    if fget.is_null() || unsafe { pyre_object::pyobject::is_none(fget) } {
+        return None;
+    }
+    Some((w_type, version_tag, fget))
+}
+
+/// STORE_ATTR `property` fast path: the setter twin of
+/// [`property_get_fast_path`], returning the type, version tag, and Python
+/// `fset` when `obj.name = value` writes a property setter.  Returns `None`
+/// (leave the residual) for a read-only property or any shape
+/// [`property_descr_fast_path`] declines.  A custom `__setattr__` owns the write
+/// (mapdict.py:1612-1614), so it declines to the residual.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn property_set_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    let (w_type, version_tag, w_descr) = unsafe { property_descr_fast_path(w_obj, name) }?;
+    if unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }.is_some() {
+        return None;
+    }
+    let fset = unsafe { pyre_object::descriptor::w_property_get_fset(w_descr) };
+    if fset.is_null() || unsafe { pyre_object::pyobject::is_none(fset) } {
+        return None;
+    }
+    Some((w_type, version_tag, fset))
+}
+
 /// The unboxed counterpart of [`load_attr_fast_path`].  It applies the same
 /// LOAD_ATTR resolution gates, but accepts only an `UnboxedPlainAttribute`
 /// and returns the shared longlong-list coordinates and type needed to perform

@@ -3129,6 +3129,208 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
     Ok(Some(inlined))
 }
 
+/// Inline a `property` getter read (`obj.value`) after the plain-attribute
+/// mapdict fold declines because the attribute is a data descriptor.  PyPy
+/// traces *through* `space.getattr` → `property.__get__` →
+/// `space.call_function(fget, obj)`, inlining the pure-Python getter body; pyre
+/// leaves LOAD_ATTR an opaque `getattr` `CALL_MAY_FORCE` residual whose fget
+/// runs as a fresh interpreter frame every iteration.  This fold reproduces
+/// PyPy's shape: pin the receiver class + version tag (so the property lookup
+/// const-folds), then enter the resolved-callee inline plumbing with the
+/// receiver as `self` so the getter body (commonly `return self._value`) folds
+/// to a guarded slot read inside the trace.
+///
+/// Restricted to a straight-line, nested-call-free getter: the inline then
+/// stays on the leaf sub-walk path and never reaches the loop/`CALL_ASSEMBLER`
+/// route (the only consumer of this LOAD_ATTR residual's non-call `r_args`).
+/// Top full-body frame only, for the resume-doubling reason
+/// [`try_walker_specialize_load_bound_method_attr`] documents.  Every other
+/// shape declines to the residual (SAFE — no acceleration, unchanged
+/// semantics).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    obj: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    let Some((w_type, version_tag, fget)) = (unsafe {
+        pyre_interpreter::objspace::std::mapdict::property_get_fast_path(concrete_obj, &name)
+    }) else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(fget) }) else {
+        return Ok(None);
+    };
+    if nparams != 1 {
+        return Ok(None);
+    }
+    // Leaf-only getter body: a branch or a nested Python call would drive the
+    // sub-walk into plumbing that consumes the non-call `r_args`; decline those
+    // to the residual instead.
+    let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
+        return Ok(None);
+    };
+    if !exception_string_override_straight_line(body.code) {
+        return Ok(None);
+    }
+    let Some((getter_descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
+    else {
+        return Ok(None);
+    };
+    if exception_string_override_has_nested_call(body.code, getter_descr_refs) {
+        return Ok(None);
+    }
+
+    // `[fget, <self-placeholder>, obj]`: the method-form call header the inline
+    // plumbing expects (`callable`, unused self slot, then the receiver).
+    let arg_concretes = vec![
+        ConcreteValue::Ref(fget),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_obj),
+    ];
+    let fget_const = ctx.trace_ctx.const_ref(fget as i64);
+    try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        fget_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        fget,
+        fget_const,
+        fget,
+        arg_concretes,
+        vec![obj],
+        vec![ConcreteValue::Ref(concrete_obj)],
+        true,
+        w_code,
+        nparams,
+        has_closure,
+        Some((obj, concrete_obj, w_type, version_tag)),
+        None,
+        // Getter bodies commonly read `self._slot` — a LOAD_ATTR the method-form
+        // support gate would otherwise reject; the sub-walk folds it to a slot
+        // read (same allowance the exception `__str__`/`__repr__` override uses).
+        true,
+        false,
+    )
+}
+
+/// Inline a `property` setter store (`obj.value = x`) after the plain-attribute
+/// mapdict store fold declines because the attribute is a data descriptor — the
+/// setter twin of [`try_walker_inline_property_get`].  Pin the receiver class +
+/// version tag (so the property lookup const-folds), then inline `fset(obj, x)`
+/// with the receiver as `self`; the setter body (commonly `self._value =
+/// value`) folds to a guarded slot store instead of the opaque `setattr`
+/// residual.  Same leaf-only / top-frame restrictions and residual fall-through
+/// as the getter fold.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    obj: OpRef,
+    value: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some(concrete_value) = walker_concrete_ref_object(ctx, value) else {
+        return Ok(None);
+    };
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    let Some((w_type, version_tag, fset)) = (unsafe {
+        pyre_interpreter::objspace::std::mapdict::property_set_fast_path(concrete_obj, &name)
+    }) else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(fset) }) else {
+        return Ok(None);
+    };
+    if nparams != 2 {
+        return Ok(None);
+    }
+    let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
+        return Ok(None);
+    };
+    if !exception_string_override_straight_line(body.code) {
+        return Ok(None);
+    }
+    let Some((setter_descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
+    else {
+        return Ok(None);
+    };
+    if exception_string_override_has_nested_call(body.code, setter_descr_refs) {
+        return Ok(None);
+    }
+
+    // `[fset, <self-placeholder>, obj, value]`: the method-form call header the
+    // inline plumbing expects, then the two positional args (`self`, `value`).
+    let arg_concretes = vec![
+        ConcreteValue::Ref(fset),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_obj),
+        ConcreteValue::Ref(concrete_value),
+    ];
+    let fset_const = ctx.trace_ctx.const_ref(fset as i64);
+    try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        fset_const,
+        r_args,
+        call_descr,
+        dst_bank,
+        dst,
+        fset,
+        fset_const,
+        fset,
+        arg_concretes,
+        vec![obj, value],
+        vec![
+            ConcreteValue::Ref(concrete_obj),
+            ConcreteValue::Ref(concrete_value),
+        ],
+        true,
+        w_code,
+        nparams,
+        has_closure,
+        Some((obj, concrete_obj, w_type, version_tag)),
+        None,
+        true,
+        false,
+    )
+}
+
 /// Inline a plain Python `__add__` after the numeric BINARY_OP
 /// specializations decline. The receiver class and its version tag pin the
 /// descriptor lookup, matching `try_dispatch_binary_special`'s forward arm.

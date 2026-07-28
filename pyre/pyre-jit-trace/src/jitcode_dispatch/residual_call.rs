@@ -3977,6 +3977,54 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
+                // The plain-slot fold declines a `property` (data descriptor);
+                // inline its Python getter instead of the opaque residual.
+                if let Some(inlined) = try_walker_inline_property_get(
+                    ctx,
+                    op,
+                    code,
+                    &r_args,
+                    call_descr,
+                    obj_opref,
+                    w_code_ptr,
+                    namei as usize,
+                    dst,
+                    dst_bank,
+                )? {
+                    return Ok(inlined);
+                }
+            }
+        }
+    }
+    // STORE_ATTR property setter: the plain-slot store fold above declines a
+    // `property` data descriptor; inline its Python setter instead of the
+    // opaque `setattr` residual.  `store_attr_fn` r_args = [obj, value, code].
+    if ctx.is_authoritative_executor && ei.pyre_helper == majit_ir::PyreHelperKind::StoreAttr {
+        if let (Some(&obj_opref), Some(&value_opref), Some(&code_opref), Some(&namei_opref)) =
+            (r_args.first(), r_args.get(1), r_args.get(2), i_args.first())
+        {
+            if let (
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(w_code_ptr))),
+                Some(majit_ir::Value::Int(namei)),
+            ) = (
+                ctx.trace_ctx.box_value(code_opref),
+                ctx.trace_ctx.box_value(namei_opref),
+            ) {
+                if let Some(inlined) = try_walker_inline_property_set(
+                    ctx,
+                    op,
+                    code,
+                    &r_args,
+                    call_descr,
+                    obj_opref,
+                    value_opref,
+                    w_code_ptr,
+                    namei as usize,
+                    dst,
+                    dst_bank,
+                )? {
+                    return Ok(inlined);
+                }
             }
         }
     }
