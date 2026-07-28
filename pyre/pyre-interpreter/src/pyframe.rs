@@ -1081,6 +1081,12 @@ impl PyFrame {
     /// frame-invariant and `debugdata` is debug-only; none are written on the
     /// live frame during tracing (the walk writes only the symbolic `PyreSym`
     /// shadow), so restoring them would be dead.
+    ///
+    /// The slot copy moves Refs between two frames, so it ends on
+    /// [`remember_frame_locals_array`]: `locals_cells_stack_w` is its own GC
+    /// object, and an old destination array taking a young value has to join
+    /// the remembered set.  One arm covers the whole batch because nothing in
+    /// the loop can collect — `to_vec` has already allocated by then.
     pub fn restore_resume_state_from(&mut self, src: &PyFrame) {
         self.last_instr = src.last_instr;
         self.valuestackdepth = src.valuestackdepth;
@@ -1090,6 +1096,7 @@ impl PyFrame {
         for (i, &v) in src_vals.iter().take(n).enumerate() {
             dst[i] = v;
         }
+        remember_frame_locals_array(self.locals_cells_stack_w);
     }
 }
 

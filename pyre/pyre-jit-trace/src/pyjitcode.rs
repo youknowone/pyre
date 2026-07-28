@@ -881,19 +881,6 @@ impl PyJitCode {
             || !self.metadata.depth_trivia_pred_by_jit_pc.is_empty()
     }
 
-    /// Whether the trivia-aware pcdep twin carries entries. `false` for a
-    /// skeleton / fixture install, where [`Self::pcdep_trivia_for_jitcode_pc`]
-    /// answers `None` for EVERY coordinate rather than for a particular one.
-    ///
-    /// That distinction is what makes the blackhole adopt path's pcdep
-    /// precondition decidable BEFORE `drive_*_blackhole` runs: the drive's stop
-    /// position is its own output, but "this jitcode has no pcdep trivia at
-    /// all" does not depend on it.
-    pub fn pcdep_trivia_populated(&self) -> bool {
-        !self.metadata.pcdep_trivia_marker_by_jit_pc.is_empty()
-            || !self.metadata.pcdep_trivia_pred_by_jit_pc.is_empty()
-    }
-
     /// Whether the trivia-aware result-color twin carries entries. `false`
     /// distinguishes a skeleton / fixture from an in-table `None` caused by a
     /// trailing-trivia overshoot.
