@@ -7709,12 +7709,17 @@ fn compile_and_run_once(
 ) -> Option<LoopResult> {
     let mut frame_root = FrameRoot::new(frame);
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
+    majit_metainterp::mc_diag_bump(match start {
+        CompileOnceStart::BackEdge => 18,
+        CompileOnceStart::FunctionEntry => 19,
+    });
 
     // warmspot/codewriter ordering: the portal and all drained JitCodes are
     // installed before the marker-driven metainterpreter starts.  Resolve the
     // per-green static entry here; `trace_bytecode` consumes the same sidecar
     // when it constructs the root MIFrame.
     if !crate::jit::codewriter::register_portal_jitdriver(code) {
+        majit_metainterp::mc_diag_bump(20);
         return None;
     }
     let pjc = pyre_jit_trace::state::pyjitcode_for_code(frame_root.frame().pycode)
@@ -7723,6 +7728,7 @@ fn compile_and_run_once(
     // the greens behind the abort, so the hot loop header has none.  There is
     // no coordinate to start the walk from; interpret instead.
     if pjc.merge_entry_for(target_pc).is_none() {
+        majit_metainterp::mc_diag_bump(21);
         return None;
     }
 
@@ -7738,6 +7744,7 @@ fn compile_and_run_once(
         }
     }
     if !driver.is_tracing() {
+        majit_metainterp::mc_diag_bump(22);
         return None;
     }
 

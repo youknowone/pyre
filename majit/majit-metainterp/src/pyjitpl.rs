@@ -10385,6 +10385,11 @@ impl<M: Clone> MetaInterp<M> {
                 bridge_inputarg_base,
             )
         };
+        // Restore before any exit below, for the reason given in
+        // `compile_bridge`: the optimizer is the last reader of the descrs, and
+        // an early return that skipped this would leave `staticdata.all_descrs`
+        // empty for every later trace.
+        self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
         let (optimized_ops, retrace_requested) = match bridge_optimize_result {
             Ok(result) => result,
             // unroll.py:119-123 `except (InvalidLoop, SpeculativeError)`: a
@@ -10547,7 +10552,6 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
-                self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref =
                     compute_next_global_opref(bridge_inputargs, &optimized_ops);
                 let mut traces = indexmap::IndexMap::new();
@@ -11048,6 +11052,15 @@ impl<M: Clone> MetaInterp<M> {
                 compiled.front_target_tokens = tokens;
             }
         }
+        // Hand the descrs back as soon as the optimizer is done with them,
+        // before any of the paths below can leave the function. `optimize_bridge`
+        // is the last reader; everything after it touches `optimizer` only for
+        // counters, exported state and quasi-immutable deps. Restoring here
+        // rather than on the success path keeps the InvalidLoop, retrace and
+        // giveup exits from leaving `staticdata.all_descrs` empty, which would
+        // make the next trace resolve `descr_index` against a zero-length table
+        // (`opencoder.rs` `all_descr_len`).
+        self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
         let (optimized_ops, retrace_requested) = match bridge_optimize_result {
             Ok(result) => result,
             // compile.py:1077-1078 + unroll.py:119-123 `except (InvalidLoop,
@@ -11374,7 +11387,6 @@ impl<M: Clone> MetaInterp<M> {
                         },
                     );
                 }
-                self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 self.warm_state.log_bridge_compile(fail_index);
                 self.stats.bridges_compiled += 1;
                 // `cpu.tracker.total_compiled_bridges` is bumped inside

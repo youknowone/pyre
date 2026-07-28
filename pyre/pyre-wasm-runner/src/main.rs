@@ -554,6 +554,14 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
                 "sbt_no_meta",
                 "sbt_cant_trace",
                 "sbt_short_vals",
+                "caro_backedge",
+                "caro_funcentry",
+                "caro_no_portal",
+                "caro_no_merge_entry",
+                "caro_not_tracing",
+                "stfe_cell_busy",
+                "stfe_dead_token",
+                "stfe_tick",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

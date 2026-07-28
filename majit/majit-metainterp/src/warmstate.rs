@@ -1408,6 +1408,7 @@ impl WarmEnterState {
         let mut cleanup_dead_token_cell = false;
         if let Some(cell) = self.cells.get(&green_key_hash) {
             if cell.is_compiled() || cell.is_tracing() {
+                crate::mc_diag_bump(23);
                 return false;
             }
             if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
@@ -1430,9 +1431,11 @@ impl WarmEnterState {
         if cleanup_dead_token_cell {
             // warmstate.py:483-500 — function-entry warmup must see an
             // invalidated token as a removed cell and re-count from cold.
+            crate::mc_diag_bump(24);
             self.cleanup_chain(green_key_hash);
             return false;
         }
+        crate::mc_diag_bump(25);
         self.counter
             .tick(green_key_hash, self.increment_function_threshold)
     }

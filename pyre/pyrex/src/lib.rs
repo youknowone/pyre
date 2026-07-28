@@ -858,6 +858,13 @@ fn maybe_print_jit_stats() {
         stats.guard_failures,
         stats.internal_compile_panics,
     );
+    // Gate tallies for the trace-entry and guard→bridge paths. These were
+    // reachable only through the wasm runner's `pyre_jit_mc_diag` export, so a
+    // native run had no way to see which gate declined a trace.
+    eprintln!(
+        "[jit-stats] mc_diag {}",
+        majit_metainterp::mc_diag_summary()
+    );
 }
 
 /// Shared top-level launcher bootstrap for `run_source` and `run_module`:

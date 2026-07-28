@@ -590,11 +590,61 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 /// return (JUMP args != target LABEL args), 12 = start_bridge_tracing entered,
 /// 13 = sbt early: descr not FailDescr, 14 = sbt early: no owning jct, 15 = sbt
 /// early: no compiled_meta, 16 = sbt early: !can_trace, 17 = sbt early:
-/// fail_values too short.
-pub static MC_DIAG: [std::sync::atomic::AtomicU64; 18] = {
+/// fail_values too short, 18 = compile_and_run_once entered from a back edge,
+/// 19 = compile_and_run_once entered from a function entry, 20 =
+/// compile_and_run_once early-out: portal jitcode unavailable, 21 =
+/// compile_and_run_once early-out: no merge entry at the target pc, 22 =
+/// compile_and_run_once early-out: tracing did not start, 23 =
+/// should_trace_function_entry declined (cell compiled or tracing), 24 =
+/// should_trace_function_entry declined (dead procedure token cleanup), 25 =
+/// should_trace_function_entry answered from the counter tick.
+pub static MC_DIAG: [std::sync::atomic::AtomicU64; 26] = {
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    [Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z]
+    [
+        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
+    ]
 };
+
+/// Short label per [`MC_DIAG`] slot, in index order, so a tally cannot be added
+/// without naming it. Readers join these with the counter values.
+pub const MC_DIAG_LABELS: [&str; 26] = [
+    "mc_entered",
+    "decl_shortcircuit",
+    "descr0_skip",
+    "busy_skip",
+    "FIRED",
+    "stack_full",
+    "retrace_entered",
+    "retrace_bailed",
+    "cb_entered",
+    "cb_invalidloop",
+    "cb_retrace_req",
+    "cb_arity_giveup",
+    "sbt_entered",
+    "sbt_not_faildescr",
+    "sbt_no_jct",
+    "sbt_no_meta",
+    "sbt_cant_trace",
+    "sbt_short_vals",
+    "caro_backedge",
+    "caro_funcentry",
+    "caro_no_portal",
+    "caro_no_merge_entry",
+    "caro_not_tracing",
+    "stfe_cell_busy",
+    "stfe_dead_token",
+    "stfe_tick",
+];
+
+/// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.
+pub fn mc_diag_summary() -> String {
+    MC_DIAG_LABELS
+        .iter()
+        .enumerate()
+        .map(|(i, label)| format!("{label}={}", mc_diag(i)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Read an `MC_DIAG` tally (saturating). Surfaced via `pyre_jit_mc_diag`.
 pub fn mc_diag(i: usize) -> u64 {
