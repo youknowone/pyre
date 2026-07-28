@@ -92,7 +92,7 @@ struct ServentRaw {
 /// into a `Vec<u8>` suitable for passing to a DNS resolver.
 ///
 /// Accepts str / bytes / bytearray.  For str: tries ASCII first; on
-/// UnicodeEncodeError falls back to `.encode('idna')`.  Embedded null
+/// UnicodeEncodeError falls back to the `idna` codec.  Embedded null
 /// bytes raise TypeError (matching `:120-122`).  Other input types
 /// raise TypeError.
 #[cfg(unix)]
@@ -111,23 +111,12 @@ fn socket_idna_converter(w_host: pyre_object::PyObjectRef) -> Result<Vec<u8>, cr
             if s.as_bytes().is_ascii() {
                 s.as_bytes().to_vec()
             } else {
-                let method = crate::baseobjspace::getattr_str(w_host, "encode")?;
-                let codec = pyre_object::w_str_new("idna");
-                let encoded = crate::call_function(method, &[codec]);
-                if encoded.is_null() {
-                    // The codec's own error is what the caller sees — a host
-                    // the `idna` codec rejects raises that rejection, not a
-                    // substituted one.
-                    return Err(crate::call::take_call_error().unwrap_or_else(|| {
-                        crate::PyError::type_error("idna encoding failed")
-                    }));
-                }
-                if !pyre_object::bytesobject::is_bytes_like(encoded) {
-                    return Err(crate::PyError::type_error(
-                        "idna encode did not return bytes",
-                    ));
-                }
-                pyre_object::w_bytes_data(encoded).to_vec()
+                // `space.encode_unicode_object(w_host, 'idna', None)`: the
+                // codec runs on the string value itself rather than through
+                // an `encode` attribute lookup, so a `str` subclass cannot
+                // decide how its hostname reaches the resolver, and the
+                // error a caller sees is the codec's own rejection.
+                crate::type_methods::encode_object(w_host, "idna", "strict")?
             }
         } else if pyre_object::bytesobject::is_bytes_like(w_host) {
             pyre_object::w_bytes_data(w_host).to_vec()
