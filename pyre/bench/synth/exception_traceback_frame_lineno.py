@@ -10,8 +10,11 @@
 #
 # Both frame exits have to publish, and the return exit is the one that is easy
 # to miss: `catches_here` leaves by RETURN, not by the raise, because it keeps
-# running after it catches.  The last line it reaches is the `return`, so that
-# is the line its traceback has to report.
+# running after it catches.  The two coordinates a traceback carries answer
+# different questions and only one of them moves: `tb_lineno` is frozen at the
+# raise site when the node is built, while `f_lineno` is read off the frame on
+# every access, so the `return` is the line the FRAME has to report while its
+# node keeps reporting the raise.
 #
 # The driver decides which route compiles the callee - a `while` loop reaches it
 # as a function-entry portal, a `for` loop inlines it into the loop trace - so
