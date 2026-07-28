@@ -1731,6 +1731,28 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::dict_entries_probe_object",
         pyre_object::dictmultiobject::dict_entries_probe_object as *const (),
     );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_remove_object",
+        "pyre_object::dict_entries_remove_object",
+        pyre_object::dictmultiobject::dict_entries_remove_object as *const (),
+    );
+    // A runtime-mutable global counter, not a build-time constant: bind the
+    // read seam by address so the JIT calls it instead of folding whatever
+    // serial the build process saw.
+    let next_version_tag_serial: fn() -> u64 = pyre_object::celldict::next_version_tag_serial;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::celldict::next_version_tag_serial",
+        "pyre_object::next_version_tag_serial",
+        next_version_tag_serial as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::celldict::sweep_version_watchers",
+        "pyre_object::sweep_version_watchers",
+        pyre_object::celldict::sweep_version_watchers as *const (),
+    );
     // The three typed-storage promotions: `IndexMap` construction and refill
     // end to end, so the residual boundary is the whole migration.
     push_alias_pair(

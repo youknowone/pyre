@@ -332,12 +332,28 @@ pub unsafe fn write_cell(w_cell: Option<PyObjectRef>, w_value: PyObjectRef) -> O
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VersionTag(pub u64);
 
+/// The serial [`VersionTag::fresh`] hands out — a process-global counter
+/// bumped once per tag.
+///
+/// The counter is a runtime-mutable global, so the read seam is residual
+/// (`@dont_look_inside`, `rlib/jit.py:139`, the `importing::sys_modules_dict`
+/// shape): whatever value the build process happens to observe is not a
+/// constant, and folding it would hand every dict the same tag.  Upstream
+/// allocates a fresh `VersionTag()` object here instead, which rtypes to a
+/// `malloc` the JIT models; a `static AtomicU64` has no llop counterpart, so
+/// the call itself is the last modellable point.  The `u64` serial is a single
+/// word and the newtype wrap stays traced.
+#[majit_macros::dont_look_inside]
+pub fn next_version_tag_serial() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl VersionTag {
     /// Allocate a fresh, never-before-seen version tag.
     pub fn fresh() -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        VersionTag(NEXT.fetch_add(1, Ordering::Relaxed))
+        VersionTag(next_version_tag_serial())
     }
 }
 
@@ -602,6 +618,29 @@ pub fn module_dict_strategy_gc_type_id() -> u32 {
     MODULE_DICT_STRATEGY_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Flip every live watcher flag and drop the dead weak refs — the non-empty
+/// half of [`ModuleDictStrategy::notify_version_watchers`].
+///
+/// This is the `version?` quasi-immutable invalidation walk, and upstream runs
+/// the whole of it outside traced code: `QuasiImmut.invalidate`
+/// (`metainterp/quasiimmut.py`) iterates `looptokens_wrefs` and calls
+/// `invalidate_loop` from the residual `jit_force_quasi_immutable` path, never
+/// from a trace.  Residualise it here for the same reason
+/// (`@dont_look_inside`, `rlib/jit.py:139`); the `Vec::retain` closure over
+/// `Weak::upgrade` has no lowering either way.  The `is_empty` early-out stays
+/// traced, so the common no-watcher mutation still makes no call.
+#[majit_macros::dont_look_inside]
+pub fn sweep_version_watchers(watchers: &mut Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>) {
+    watchers.retain(|w| {
+        if let Some(flag) = w.upgrade() {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+            true
+        } else {
+            false
+        }
+    });
+}
+
 impl Default for ModuleDictStrategy {
     fn default() -> Self {
         Self::new()
@@ -639,14 +678,7 @@ impl ModuleDictStrategy {
         if self.version_watchers.is_empty() {
             return;
         }
-        self.version_watchers.retain(|w| {
-            if let Some(flag) = w.upgrade() {
-                flag.store(true, std::sync::atomic::Ordering::Release);
-                true
-            } else {
-                false
-            }
-        });
+        sweep_version_watchers(&mut self.version_watchers);
     }
 
     /// `celldict.py:214-240 get_global_cache`:

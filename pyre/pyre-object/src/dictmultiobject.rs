@@ -227,6 +227,29 @@ pub unsafe fn dict_entries_probe_object(
     entries.get(&object_key_for(key)).copied()
 }
 
+/// The object-keyed remove side of the same table — `dictmultiobject.py:1081
+/// delitem`'s `del self.unerase(w_dict.dstorage)[self.unwrap(w_key)]`.
+///
+/// Residualised (`@dont_look_inside`, `rlib/jit.py:139`) because upstream's
+/// `_ll_dict_del` (`rordereddict.py:884`) carries
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(i))`, and an
+/// `IndexMap` can never be virtual to this front end, so the predicate is
+/// permanently false and the residual arm is the only reachable one.  Every
+/// arm that reaches the remove must go through here: leaving one traced keeps
+/// the enclosing graph blocked no matter what the others do
+/// ([`dict_entries_probe_object`]'s lesson).  The `bool` result is a single
+/// word, and the strategy / keys-version bumps stay traced.
+///
+/// # Safety
+/// Same as [`dict_entries_probe_object`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn dict_entries_remove_object(
+    entries: &mut indexmap::IndexMap<ObjectKey, PyObjectRef>,
+    key: PyObjectRef,
+) -> bool {
+    entries.shift_remove(&object_key_for(key)).is_some()
+}
+
 /// Borrow-key str dict GET: hash `key`'s WTF-8 bytes via the str hook and
 /// probe `entries` without building a `W_UnicodeObject`.  Falls back to the
 /// allocating `object_key_for(w_str_new(key))` path when no str hash hook is
@@ -3233,7 +3256,7 @@ pub unsafe fn w_module_dict_delitem_inner(obj: PyObjectRef, key: PyObjectRef) ->
     let _module_guard = w_dict_lock(obj);
     if w_module_dict_is_object_strategy(obj) {
         let entries = w_module_dict_object_storage_mut(obj);
-        if entries.shift_remove(&object_key_for(key)).is_some() {
+        if dict_entries_remove_object(entries, key) {
             let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
             strategy.mutated();
             w_dict_bump_keys_version(obj);
@@ -3249,7 +3272,7 @@ pub unsafe fn w_module_dict_delitem_inner(obj: PyObjectRef, key: PyObjectRef) ->
     }
     w_module_dict_switch_to_object_strategy(obj);
     let entries = w_module_dict_object_storage_mut(obj);
-    if entries.shift_remove(&object_key_for(key)).is_some() {
+    if dict_entries_remove_object(entries, key) {
         let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
         strategy.mutated();
         w_dict_bump_keys_version(obj);
