@@ -906,7 +906,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // globals: `sys_modules_dict` reads the `SYS_MODULES_DICT` pointer
     // `set_sys_modules_dict` stamps, `set_in_flight_exception` writes the
     // `IN_FLIGHT_EXCEPTION` thread-local, `lookup_exc_class` reads the
-    // `EXC_CLASS_REGISTRY` `OnceLock`, `mmap_type` the lazily-installed
+    // `EXC_CLASS_REGISTRY` `OnceLock`, `check_sys_modules` the process-owned
+    // `SYS_MODULES` registry, `mmap_type` the lazily-installed
     // `mmap` type object, and the two `note_eval_activation_*` twins move the
     // `EVAL_NESTING` thread-local `at_outermost_activation` already reads.
     // None is a build-time constant, so each carries `#[dont_look_inside]`
@@ -934,6 +935,14 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::builtins::lookup_exc_class",
         "pyre_interpreter::lookup_exc_class",
         lookup_exc_class as *const (),
+    );
+    let check_sys_modules: fn(&str) -> Option<pyre_object::PyObjectRef> =
+        crate::importing::check_sys_modules;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::importing::check_sys_modules",
+        "pyre_interpreter::check_sys_modules",
+        check_sys_modules as *const (),
     );
     // `mmap_type` is `#[cfg(unix)]` inside `interp_mmap`, and the `mmap`
     // module itself is gated at `module/mod.rs:80`; the row has to carry

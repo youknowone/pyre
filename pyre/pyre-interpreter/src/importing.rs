@@ -1394,6 +1394,13 @@ pub fn add_sys_path_0() {
 // ── check_sys_modules ────────────────────────────────────────────────
 // PyPy equivalent: importing.py `check_sys_modules(space, w_modulename)`
 
+/// Reads the process-owned `SYS_MODULES` registry (and the runtime-stamped
+/// `sys.modules` dict through `sys_modules_dict`), neither a build-time
+/// constant, so the JIT residualizes the call rather than folding a stale
+/// `sys.modules` snapshot (`@dont_look_inside`, the `sys_modules_dict` /
+/// `lookup_exc_class` shape).  The `Option<PyObjectRef>` return fits one word
+/// and the `&str` argument matches `lookup_exc_class`.
+#[majit_macros::dont_look_inside]
 pub(crate) fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
     // Consult the Python-visible sys.modules dict first so that user code
     // writing `sys.modules['foo'] = mod` is immediately visible to imports.
