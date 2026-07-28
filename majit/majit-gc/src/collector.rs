@@ -2184,6 +2184,24 @@ impl MiniMarkGC {
         }
     }
 
+    /// Whether the collector traverses references out of this object — the
+    /// property CPython's `gc.is_tracked` reports.
+    ///
+    /// Heap ownership alone is the wrong test: an atomic object such as an int
+    /// or a float is collector-allocated on some paths (`PYRE_GC_INTERP`, the
+    /// JIT, wasm) and immortal on others, so ownership would make the same
+    /// Python value answer differently per backend. Its registered type has no
+    /// reference to traverse either way, which is the stable property.
+    pub fn object_is_tracked(&self, obj_addr: usize) -> bool {
+        if !self.is_managed_heap_object(obj_addr) {
+            return false;
+        }
+        let type_id = unsafe { (*header_of(obj_addr)).type_id() };
+        self.validate_type_id(type_id, obj_addr, "object_is_tracked");
+        let type_info = self.types.get(type_id);
+        type_info.has_gc_ptrs || (type_info.items_have_gc_ptrs && type_info.item_size > 0)
+    }
+
     /// `inspector.py:get_rpy_referents`: trace one object's direct GC
     /// referents without changing collection state.
     fn visit_referents(&self, obj_addr: usize, visitor: &mut dyn FnMut(GcRef)) {
@@ -3856,6 +3874,10 @@ impl GcAllocator for MiniMarkGC {
         self.do_get_referents(obj, visitor)
     }
 
+    fn is_tracked(&mut self, obj: GcRef) -> bool {
+        self.object_is_tracked(obj.0)
+    }
+
     fn collect_oldgen_nonmoving(&mut self) {
         self.do_collect_oldgen_nonmoving();
     }
@@ -4301,6 +4323,39 @@ mod tests {
         let mut referents = Vec::new();
         gc.do_get_referents(far, &mut |gcref| referents.push(gcref));
         assert_eq!(referents, vec![holder]);
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn is_tracked_follows_the_type_not_the_heap_the_instance_landed_in() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let atomic_tid = gc.register_type(TypeInfo::object(ptr_size));
+        let holder_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+            ptr_size,
+            atomic_tid,
+            vec![0],
+        ));
+
+        let atomic = gc.alloc_with_type(atomic_tid, ptr_size);
+        let mut holder = gc.alloc_with_type(holder_tid, ptr_size);
+        unsafe {
+            *(holder.0 as *mut GcRef) = atomic;
+            gc.roots.add(&mut holder);
+        }
+        assert!(!gc.object_is_tracked(atomic.0));
+        assert!(gc.object_is_tracked(holder.0));
+
+        // The same two types answer the same way once promoted out of the
+        // nursery — the heap the instance landed in must not matter.
+        gc.do_collect_nursery();
+        let atomic = unsafe { *(holder.0 as *const GcRef) };
+        assert!(!gc.object_is_tracked(atomic.0));
+        assert!(gc.object_is_tracked(holder.0));
+
+        // An address the collector does not own is never tracked.
+        let mut off_heap = 0usize;
+        assert!(!gc.object_is_tracked(&mut off_heap as *mut usize as usize));
         gc.roots.clear();
     }
 

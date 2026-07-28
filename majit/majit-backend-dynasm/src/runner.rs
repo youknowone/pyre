@@ -193,6 +193,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_collect_full(Some(dynasm_collect_full));
     majit_gc::set_active_get_objects(Some(dynasm_get_objects));
     majit_gc::set_active_get_referents(Some(dynasm_get_referents));
+    majit_gc::set_active_is_tracked(Some(dynasm_is_tracked));
     majit_gc::set_active_collect_oldgen(Some(dynasm_collect_oldgen_nonmoving));
     majit_gc::set_active_heap_stats(Some(dynasm_heap_stats));
     majit_gc::set_active_root_hooks(Some(dynasm_gc_add_root), Some(dynasm_gc_remove_root));
@@ -511,6 +512,15 @@ fn dynasm_get_referents(obj: majit_ir::GcRef, visitor: majit_gc::GetObjectsVisit
         return;
     }
     majit_gc::gc_sync::gc_op(|g| g.get_referents(obj, &mut visit));
+}
+
+fn dynasm_is_tracked(obj: majit_ir::GcRef) -> bool {
+    if let Some(tracked) =
+        DYNASM_ACTIVE_GC.with(|c| c.borrow_mut().as_deref_mut().map(|g| g.is_tracked(obj)))
+    {
+        return tracked;
+    }
+    majit_gc::gc_sync::gc_op(|g| g.is_tracked(obj))
 }
 
 /// Non-moving old-gen-only major. Reclaims stable-allocated interp int/float

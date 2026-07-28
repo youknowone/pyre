@@ -247,10 +247,17 @@ crate::py_module! {
             w_int_new(0), w_int_new(0), w_int_new(0),
         ])),
         "is_tracked"    / 1 = |args| {
-            // CPython 3.14 `gc.is_tracked(obj)`: whether the collector visits
-            // the object. pyre's immortal allocations live outside the managed
-            // heap, so they are never traced and never reclaimed.
-            Ok(w_bool_from(majit_gc::gc_owns_object(args[0] as usize)))
+            // CPython 3.14 `gc.is_tracked(obj)`: whether the collector
+            // traverses references out of the object. Asked of the registered
+            // type rather than of the heap the instance landed in, so an int
+            // answers the same under `PYRE_GC_INTERP`, under the JIT and on
+            // wasm as it does on the immortal path.
+            //
+            // `bytes` and `int` answer True where CPython answers False: their
+            // pyre structs carry `w_dict` and `w_weakreflifeline` slots that
+            // the collector really does follow, which the CPython objects have
+            // no equivalent of.
+            Ok(w_bool_from(majit_gc::is_tracked(majit_ir::GcRef(args[0] as usize))))
         },
         "is_finalized"  / 1 = |_| Ok(w_bool_from(false)),
         // CPython 3.14 `gc.freeze()` moves the surviving objects into a
