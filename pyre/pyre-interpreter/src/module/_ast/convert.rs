@@ -99,8 +99,71 @@ impl ObjectConverter {
         Ok(unsafe { pyre_object::w_str_get_value(value).to_string() })
     }
 
+    /// How `%R` names the value an error rejected.
+    fn repr(&self, object: PyObjectRef) -> AstResult<String> {
+        unsafe { crate::display::py_repr(object) }
+    }
+
+    /// `obj_to_int` (ast.py:36) — an integer field takes an `int`, or an
+    /// instance of a subclass of one.  Nothing else is asked for `__index__`.
+    fn obj_to_int(&self, value: PyObjectRef) -> AstResult<i64> {
+        if !unsafe { crate::baseobjspace::isinstance_int_w(value) } {
+            return Err(crate::PyError::value_error(format!(
+                "invalid integer value: {}",
+                self.repr(value)?
+            )));
+        }
+        crate::builtins::space_index_w(value)
+    }
+
+    /// The source range an object carries as attributes.  A tree compiled
+    /// from objects has no source to map a range back onto, so these are read
+    /// only for what the boundary owes them: `lineno` and `col_offset` are
+    /// required, and the two end fields are optional.
+    fn location(&self, object: PyObjectRef, node: &str) -> AstResult<()> {
+        self.int_field(object, "lineno", node)?;
+        self.int_field(object, "col_offset", node)?;
+        for field in ["end_lineno", "end_col_offset"] {
+            if let Some(value) = self.optional_field(object, field)? {
+                self.obj_to_int(value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `Module.type_ignores` (ast.py:229) holds the `# type: ignore` comments
+    /// a `type_comments=True` parse collected.  The compiler AST has nowhere
+    /// to keep them and never reads them back, but the field is still walked
+    /// so that a list holding something else is reported here.
+    fn type_ignores(&self, object: PyObjectRef) -> AstResult<()> {
+        let value = match crate::baseobjspace::getattr_str(object, "type_ignores") {
+            Ok(value) => value,
+            // An unset field stands for the empty list a parse without type
+            // comments produces.
+            Err(error) if error.kind == crate::PyErrorKind::AttributeError => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if !unsafe { pyre_object::is_list(value) } {
+            return Err(crate::PyError::type_error(format!(
+                "Module field \"type_ignores\" must be a list, not a {}",
+                class_name(value)
+            )));
+        }
+        for item in unsafe { pyre_object::w_list_items_copy_as_vec(value) } {
+            if unsafe { pyre_object::is_none(item) } || self.is_node(item, "TypeIgnore")? {
+                continue;
+            }
+            return Err(crate::PyError::type_error(format!(
+                "expected some sort of type_ignore, but got {}",
+                self.repr(item)?
+            )));
+        }
+        Ok(())
+    }
+
     fn module(&mut self, object: PyObjectRef) -> AstResult<ast::Mod> {
         let node = if self.is_node(object, "Module")? {
+            self.type_ignores(object)?;
             "Module"
         } else if self.is_node(object, "Interactive")? {
             "Interactive"
@@ -114,7 +177,7 @@ impl ObjectConverter {
         } else {
             return Err(crate::PyError::type_error(format!(
                 "expected some sort of mod, but got {}",
-                unsafe { pyre_object::type_name_of(object) }
+                self.repr(object)?
             )));
         };
         Ok(ast::Mod::Module(ast::ModModule {
@@ -126,6 +189,7 @@ impl ObjectConverter {
     }
 
     fn stmt(&mut self, object: PyObjectRef) -> AstResult<ast::Stmt> {
+        self.location(object, "stmt")?;
         if self.is_node(object, "FunctionDef")? || self.is_node(object, "AsyncFunctionDef")? {
             let is_async = self.is_node(object, "AsyncFunctionDef")?;
             let node = if is_async {
@@ -428,7 +492,7 @@ impl ObjectConverter {
             let names = self.aliases(object, "ImportFrom")?;
             // `level` is optional on a hand-built node and defaults to absolute.
             let level = match self.optional_field(object, "level")? {
-                Some(value) => crate::builtins::space_index_w(value)?,
+                Some(value) => self.obj_to_int(value)?,
                 None => 0,
             };
             if level < 0 {
@@ -487,7 +551,7 @@ impl ObjectConverter {
         } else {
             Err(crate::PyError::type_error(format!(
                 "expected some sort of stmt, but got {}",
-                unsafe { pyre_object::type_name_of(object) }
+                self.repr(object)?
             )))
         }
     }
@@ -581,6 +645,7 @@ impl ObjectConverter {
     }
 
     fn parameter(&mut self, object: PyObjectRef) -> AstResult<ast::Parameter> {
+        self.location(object, "arg")?;
         Ok(ast::Parameter {
             range: Default::default(),
             node_index: Default::default(),
@@ -602,10 +667,11 @@ impl ObjectConverter {
     }
 
     fn handler(&mut self, object: PyObjectRef) -> AstResult<ast::ExceptHandler> {
+        self.location(object, "excepthandler")?;
         if !self.is_node(object, "ExceptHandler")? {
             return Err(crate::PyError::type_error(format!(
                 "expected some sort of excepthandler, but got {}",
-                unsafe { pyre_object::type_name_of(object) }
+                self.repr(object)?
             )));
         }
         Ok(ast::ExceptHandler::ExceptHandler(
@@ -652,6 +718,7 @@ impl ObjectConverter {
         self.list(object, "names", node)?
             .into_iter()
             .map(|value| {
+                self.location(value, "alias")?;
                 Ok(ast::Alias {
                     range: Default::default(),
                     node_index: Default::default(),
@@ -709,6 +776,7 @@ impl ObjectConverter {
     }
 
     fn type_param(&mut self, object: PyObjectRef) -> AstResult<ast::TypeParam> {
+        self.location(object, "type_param")?;
         if self.is_node(object, "TypeVar")? {
             let name = self.identifier(object, "name", "TypeVar")?;
             Ok(ast::TypeParam::TypeVar(ast::TypeParamTypeVar {
@@ -737,7 +805,7 @@ impl ObjectConverter {
         } else {
             Err(crate::PyError::type_error(format!(
                 "expected some sort of type_param, but got {}",
-                unsafe { pyre_object::type_name_of(object) }
+                self.repr(object)?
             )))
         }
     }
@@ -768,6 +836,7 @@ impl ObjectConverter {
     }
 
     fn pattern(&mut self, object: PyObjectRef) -> AstResult<ast::Pattern> {
+        self.location(object, "pattern")?;
         if self.is_node(object, "MatchValue")? {
             Ok(ast::Pattern::MatchValue(ast::PatternMatchValue {
                 node_index: Default::default(),
@@ -876,7 +945,7 @@ impl ObjectConverter {
         } else {
             Err(crate::PyError::type_error(format!(
                 "expected some sort of pattern, but got {}",
-                unsafe { pyre_object::type_name_of(object) }
+                self.repr(object)?
             )))
         }
     }
@@ -986,10 +1055,11 @@ impl ObjectConverter {
 
     fn int_field(&self, object: PyObjectRef, field: &str, node: &str) -> AstResult<i64> {
         let value = self.field(object, field, node)?;
-        crate::builtins::space_index_w(value)
+        self.obj_to_int(value)
     }
 
     fn expr(&mut self, object: PyObjectRef) -> AstResult<ast::Expr> {
+        self.location(object, "expr")?;
         if self.is_node(object, "UnaryOp")? {
             let operand = self.field(object, "operand", "UnaryOp")?;
             let op = self.field(object, "op", "UnaryOp")?;
@@ -1094,7 +1164,7 @@ impl ObjectConverter {
                 node_index: Default::default(),
                 range: Default::default(),
                 value: self.constant_value(value)?,
-                kind: None,
+                kind: self.constant_kind(object)?,
                 invalid_type: None,
             }))
         } else if self.is_node(object, "BoolOp")? {
@@ -1284,7 +1354,7 @@ impl ObjectConverter {
         } else {
             Err(crate::PyError::type_error(format!(
                 "expected some sort of expr, but got {}",
-                unsafe { pyre_object::type_name_of(object) }
+                self.repr(object)?
             )))
         }
     }
@@ -1334,7 +1404,10 @@ impl ObjectConverter {
                 return Ok(op);
             }
         }
-        Err(crate::PyError::type_error("expected some sort of boolop"))
+        Err(crate::PyError::type_error(format!(
+            "expected some sort of boolop, but got {}",
+            self.repr(object)?
+        )))
     }
 
     fn cmpop(&self, object: PyObjectRef) -> AstResult<ast::CmpOp> {
@@ -1354,10 +1427,14 @@ impl ObjectConverter {
                 return Ok(op);
             }
         }
-        Err(crate::PyError::type_error("expected some sort of cmpop"))
+        Err(crate::PyError::type_error(format!(
+            "expected some sort of cmpop, but got {}",
+            self.repr(object)?
+        )))
     }
 
     fn keyword(&mut self, object: PyObjectRef) -> AstResult<ast::Keyword> {
+        self.location(object, "keyword")?;
         let arg = self
             .optional_field(object, "arg")?
             .map(|value| {
@@ -1451,20 +1528,42 @@ impl ObjectConverter {
         }
     }
 
+    /// `Constant.kind` — the `u` a string literal may have been written with.
+    /// `check_string` (ast.py:18) takes bytes here as well, and the prefix is
+    /// only ever read back as text, so bytes leave the field unset.
+    fn constant_kind(&self, object: PyObjectRef) -> AstResult<Option<Box<str>>> {
+        let Some(value) = self.optional_field(object, "kind")? else {
+            return Ok(None);
+        };
+        if unsafe { crate::baseobjspace::isinstance_str_w(value) } {
+            return Ok(Some(
+                unsafe { pyre_object::w_str_get_value(value) }
+                    .to_string()
+                    .into_boxed_str(),
+            ));
+        }
+        if unsafe { crate::baseobjspace::isinstance_bytes_w(value) } {
+            return Ok(None);
+        }
+        Err(crate::PyError::type_error("AST string must be of type str"))
+    }
+
     fn context(&self, object: PyObjectRef) -> AstResult<ast::ExprContext> {
+        // The three the ASDL declares; `Invalid` is a compiler-AST state with
+        // no `_ast` class behind it, so no object can carry one.
         for (name, ctx) in [
             ("Load", ast::ExprContext::Load),
             ("Store", ast::ExprContext::Store),
             ("Del", ast::ExprContext::Del),
-            ("Invalid", ast::ExprContext::Invalid),
         ] {
             if self.is_node(object, name)? {
                 return Ok(ctx);
             }
         }
-        Err(crate::PyError::type_error(
-            "expected some sort of expr_context",
-        ))
+        Err(crate::PyError::type_error(format!(
+            "expected some sort of expr_context, but got {}",
+            self.repr(object)?
+        )))
     }
 
     fn unaryop(&self, object: PyObjectRef) -> AstResult<ast::UnaryOp> {
@@ -1478,7 +1577,10 @@ impl ObjectConverter {
                 return Ok(op);
             }
         }
-        Err(crate::PyError::type_error("expected some sort of unaryop"))
+        Err(crate::PyError::type_error(format!(
+            "expected some sort of unaryop, but got {}",
+            self.repr(object)?
+        )))
     }
 
     fn operator(&self, object: PyObjectRef) -> AstResult<ast::Operator> {
@@ -1501,7 +1603,10 @@ impl ObjectConverter {
                 return Ok(op);
             }
         }
-        Err(crate::PyError::type_error("expected some sort of operator"))
+        Err(crate::PyError::type_error(format!(
+            "expected some sort of operator, but got {}",
+            self.repr(object)?
+        )))
     }
 }
 

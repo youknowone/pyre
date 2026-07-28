@@ -147,6 +147,12 @@ def handbuilt():
         kw_defaults=kw.get("kd", []), defaults=kw.get("d", []))
     pat = lambda p: ast.Match(subject=ast.Constant(1),
                               cases=[ast.match_case(pattern=p, body=[ast.Pass()])])
+    RANGE = {"lineno": 1, "col_offset": 0, "end_lineno": 1, "end_col_offset": 1}
+
+    class Index:
+        # An integer field is not asked for `__index__`.
+        def __index__(self):
+            return 1
 
     for label, node in (
         ("missing-conversion", ast.JoinedStr(values=[
@@ -214,11 +220,51 @@ def handbuilt():
         ("match-mapping-store-key", ast.Module(body=[pat(ast.MatchMapping(
             keys=[ast.Attribute(value=ast.Name("o", S), attr="a", ctx=ast.Load())],
             patterns=[ast.MatchAs(pattern=None, name="v")], rest=None))], type_ignores=[])),
+        ("type-ignores-not-a-list", ast.Module(body=[ast.Pass()], type_ignores=42)),
+        ("type-ignores-bad-element", ast.Module(body=[ast.Pass()], type_ignores=[1])),
+        ("lineno-not-an-int", ast.Module(body=[ast.Pass(lineno=Index(), col_offset=0)],
+                                         type_ignores=[])),
+        ("constant-kind-not-str", ast.Constant(value="a", kind=1)),
+        ("expr-context-not-a-node", ast.Name("x", 1)),
+        ("boolop-not-a-node", ast.BoolOp(op=1, values=[ast.Constant(1), ast.Constant(2)])),
+        ("operator-not-a-node", ast.BinOp(left=ast.Constant(1), op=1, right=ast.Constant(2))),
+        ("unaryop-not-a-node", ast.UnaryOp(op=1, operand=ast.Constant(1))),
+        ("cmpop-not-a-node", ast.Compare(left=ast.Constant(1), ops=[1],
+                                         comparators=[ast.Constant(2)])),
     ):
         tree = node if isinstance(node, ast.Module) else ast.Expression(body=node)
         try:
             ast.fix_missing_locations(tree)
             compile(tree, "<s>", "exec" if isinstance(node, ast.Module) else "eval")
+            out.append("reject " + label + " none")
+        except BaseException as e:
+            out.append("reject " + label + " " + type(e).__name__)
+    # A source range is required on the node kinds below, so these trees are
+    # the ones `fix_missing_locations` would have repaired.
+    for label, node in (
+        ("stmt-no-range", ast.Module(body=[ast.Pass()], type_ignores=[])),
+        ("expr-no-range", ast.Module(body=[ast.Expr(value=ast.Name("x", L), **RANGE)],
+                                     type_ignores=[])),
+        ("pattern-no-range", ast.Module(body=[ast.Match(
+            subject=ast.Constant(1, **RANGE),
+            cases=[ast.match_case(pattern=ast.MatchAs(pattern=None, name="v"),
+                                  body=[ast.Pass(**RANGE)])], **RANGE)], type_ignores=[])),
+        ("excepthandler-no-range", ast.Module(body=[ast.Try(
+            body=[ast.Pass(**RANGE)],
+            handlers=[ast.ExceptHandler(type=None, name=None, body=[ast.Pass(**RANGE)])],
+            orelse=[], finalbody=[], **RANGE)], type_ignores=[])),
+        ("alias-no-range", ast.Module(body=[ast.Import(names=[ast.alias(name="os")], **RANGE)],
+                                      type_ignores=[])),
+        ("arg-no-range", ast.Module(body=[ast.FunctionDef(
+            name="f", args=args(a=[ast.arg(arg="a")]), body=[ast.Pass(**RANGE)],
+            decorator_list=[], type_params=[], **RANGE)], type_ignores=[])),
+        ("keyword-no-range", ast.Module(body=[ast.Expr(value=ast.Call(
+            func=ast.Name("f", L, **RANGE), args=[],
+            keywords=[ast.keyword(arg="k", value=ast.Constant(1, **RANGE))], **RANGE), **RANGE)],
+            type_ignores=[])),
+    ):
+        try:
+            compile(node, "<s>", "exec")
             out.append("reject " + label + " none")
         except BaseException as e:
             out.append("reject " + label + " " + type(e).__name__)
