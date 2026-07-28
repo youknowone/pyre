@@ -5013,6 +5013,27 @@ where
                             // The JUMP-into-ptoken half of :3001-3007 is not
                             // implemented — see `compile_trace_entry_data`, which
                             // declines an entry-bridge close for `header_pc != 0`.
+                            //
+                            // Two consequences of declining, both narrower than
+                            // upstream, both waiting on that half:
+                            //   * upstream reaches the `current_merge_points`
+                            //     scan whenever `compile_trace` does NOT raise;
+                            //     this arm returns to neither the scan nor the
+                            //     `append` (:3058-3060), so the merge point is
+                            //     never registered at all while a compiled loop
+                            //     sits at those greens.
+                            //   * upstream's is a JUMP into reachable code; ours
+                            //     re-traces that loop's body inline.
+                            //
+                            // Upstream's `if not self.partial_trace:` (:3003) is
+                            // NOT ported and must not be spelled `is_bridge_trace`:
+                            // `partial_trace` is set only by `retrace_needed`
+                            // (pyjitpl.py:2438-2439), so it means "this is a
+                            // RETRACE", and a bridge from a guard failure runs the
+                            // ptoken consult upstream just like a primary entry.
+                            // Pyre has no retrace at this site, so the consult is
+                            // unconditional — which is the upstream behaviour for
+                            // every trace pyre can actually produce here.
                             let mp_greens = (
                                 mp_green_ints.clone(),
                                 mp_green_refs.clone(),

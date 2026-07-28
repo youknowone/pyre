@@ -1770,7 +1770,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         }
     };
 
-    // pyjitpl.py:3449 `rebuild_state_after_failure`:
+    // pyjitpl.py:3443-3444 `rebuild_state_after_failure`:
     //     if vinfo is not None:
     //         self.virtualizable_boxes = virtualizable_boxes
     // The guard's vable section is decoded by `rebuild_from_resumedata` above;
@@ -1795,6 +1795,23 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     eprintln!(
                         "[bridgeB] vable seed={} stream={}",
                         __seeded,
+                        resume_data.virtualizable_values.len(),
+                    );
+                }
+                // A declined seed is not recoverable here and must not pass
+                // silently: `virtualizable_boxes` stays unset, so the first
+                // vable-shaped op in `__trace_*` has nothing to resolve and the
+                // bridge trace aborts — the guard keeps deopting through the
+                // blackhole, which is `compile.giveup()`'s outcome
+                // (compile.py:27) reached one step later. Surface it on the
+                // ordinary log channel so a bridge that never forms is
+                // attributable to the seed rather than looking like an
+                // unexplained abort.
+                if !__seeded && majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][bridgeB] virtualizable seed declined \
+                         (vable stream {} entries) — bridge will abort and \
+                         the guard deopts through the blackhole",
                         resume_data.virtualizable_values.len(),
                     );
                 }

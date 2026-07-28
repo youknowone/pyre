@@ -3025,6 +3025,36 @@ impl<M: Clone> MetaInterp<M> {
         self.vable_array_lengths.clone()
     }
 
+    /// Position of the virtualizable identity inside `live_values`, the
+    /// state-field counterpart of `pyjitpl.py:3295 original_boxes[index]`.
+    ///
+    /// The host declares it (`identity_live_index`); this checks the declared
+    /// position actually holds `vable_ptr` before taking it, because
+    /// `live_values` also arrives from bridge entry, where the reds are rebuilt
+    /// from a deadframe rather than emitted by the state's `extract_live`. A
+    /// host that declares nothing, or whose reds disagree with the declaration,
+    /// falls back to matching the live pointer.
+    ///
+    /// `None` when the pointer is not in the reds at all — the caller then
+    /// mints the box at the declared ref-bank index instead.
+    fn identity_live_position(
+        info: &VirtualizableInfo,
+        live_values: &[Value],
+        vable_ptr: *const u8,
+    ) -> Option<usize> {
+        if vable_ptr.is_null() {
+            return None;
+        }
+        let vable_bits = vable_ptr as usize;
+        let holds_identity = |idx: usize| match live_values.get(idx) {
+            Some(Value::Ref(r)) => r.as_usize() == vable_bits,
+            _ => false,
+        };
+        info.identity_live_index
+            .filter(|idx| holds_identity(*idx))
+            .or_else(|| (0..live_values.len()).find(|idx| holds_identity(*idx)))
+    }
+
     /// pyjitpl.py:3290 `initialize_virtualizable(self, original_boxes)`.
     ///
     /// RPython:
@@ -3059,36 +3089,6 @@ impl<M: Clone> MetaInterp<M> {
     /// `index_of_virtualizable`; the resolved virtualizable pointer and its
     /// ref-bank index are unchanged either way (the gate is a structural-parity
     /// no-op).
-    /// Position of the virtualizable identity inside `live_values`, the
-    /// state-field counterpart of `pyjitpl.py:3295 original_boxes[index]`.
-    ///
-    /// The host declares it (`identity_live_index`); this checks the declared
-    /// position actually holds `vable_ptr` before taking it, because
-    /// `live_values` also arrives from bridge entry, where the reds are rebuilt
-    /// from a deadframe rather than emitted by the state's `extract_live`. A
-    /// host that declares nothing, or whose reds disagree with the declaration,
-    /// falls back to matching the live pointer.
-    ///
-    /// `None` when the pointer is not in the reds at all — the caller then
-    /// mints the box at the declared ref-bank index instead.
-    fn identity_live_position(
-        info: &VirtualizableInfo,
-        live_values: &[Value],
-        vable_ptr: *const u8,
-    ) -> Option<usize> {
-        if vable_ptr.is_null() {
-            return None;
-        }
-        let vable_bits = vable_ptr as usize;
-        let holds_identity = |idx: usize| match live_values.get(idx) {
-            Some(Value::Ref(r)) => r.as_usize() == vable_bits,
-            _ => false,
-        };
-        info.identity_live_index
-            .filter(|idx| holds_identity(*idx))
-            .or_else(|| (0..live_values.len()).find(|idx| holds_identity(*idx)))
-    }
-
     fn initialize_virtualizable(&self, ctx: &mut TraceCtx, live_values: &[Value]) {
         // pyjitpl.py:3291: vinfo = self.jitdriver_sd.virtualizable_info
         // Prefer the trace-bound `active_jitdriver_sd` (RPython

@@ -320,13 +320,21 @@ pub struct TraceCtx {
     /// `GreenKey::hash_u64` over the declared green tuple.
     pub compiled_key_for_greens_fn:
         Option<Box<dyn Fn(&(Vec<i64>, Vec<i64>, Vec<i64>)) -> Option<u64>>>,
-    /// pyjitpl.py:2978 `if not self.partial_trace:` parity at
-    /// `reached_loop_header` — explicit "this trace started from a
-    /// guard failure" flag.  RPython distinguishes via
-    /// `self.resumekey` typing (`ResumeGuardDescr` vs
+    /// Explicit "this trace started from a guard failure" flag. RPython
+    /// distinguishes via `self.resumekey` typing (`ResumeGuardDescr` vs
     /// `ResumeFromInterpDescr`); pyre sets this to `true` at
     /// `start_bridge_tracing` and leaves the default `false` for
-    /// primary entries.  Consumers that need bridge-only behavior
+    /// primary entries.
+    ///
+    /// ⚠️This is NOT `self.partial_trace`. That flag is set only by
+    /// `retrace_needed` (pyjitpl.py:2438-2439) and means "this is a
+    /// RETRACE"; a bridge from a guard failure has `partial_trace = None`
+    /// and takes every `if not self.partial_trace:` branch. Pyre has no
+    /// retrace counterpart, so those branches are unconditional here —
+    /// gating one of them on this flag would be a new behaviour, not
+    /// parity.
+    ///
+    /// Consumers that need bridge-only behavior
     /// (e.g. `pyre-jit-trace::pyjitpl::run_to_end`'s close-loop
     /// skip when no compiled targets exist for the current
     /// greenkey) gate on this flag instead of fn presence.

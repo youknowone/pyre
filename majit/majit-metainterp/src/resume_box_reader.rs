@@ -991,7 +991,7 @@ pub fn replay_pending_fields(
 ///     self.virtualizable_boxes = virtualizable_boxes
 /// ```
 ///
-/// `virtualizable_boxes` is what `resume.py:1370 consume_virtualizable_boxes`
+/// `virtualizable_boxes` is what `resume.py:1083 consume_virtualizable_boxes`
 /// built out of the guard's vable section: the virtualizable itself comes
 /// first (`resume.py:1404 virtualizable = self.next_ref()`), then
 /// `virtualizable.py:139 load_list_of_boxes` reads one box per static field
@@ -1044,7 +1044,7 @@ pub fn seed_bridge_virtualizable_boxes(
     // replaced, folded, or never made it into the guard's fail args), and
     // dereferencing whatever value sits there would be a wild read; decline
     // the seed instead, which leaves the guard deopting through the blackhole
-    // exactly as it did before — `compile.py:725-729 compile.giveup()`.
+    // exactly as it did before — `compile.py:27 compile.giveup()`.
     let Some(identity_value @ Value::Ref(vable_ref)) = concrete(identity, fail_values) else {
         return false;
     };
@@ -1058,12 +1058,27 @@ pub fn seed_bridge_virtualizable_boxes(
     if !info.can_read_all_array_lengths_from_heap() {
         return false;
     }
-    // `pyjitpl.py:3450 rebuild_state_after_failure` pairs the assignment with
-    // `self.check_synchronized_virtualizable()`, which asserts the box just
-    // decoded IS the live virtualizable.  Pyre cannot assert: the guard's vable
-    // section is only as good as the numbering that produced it, and a decoded
-    // identity that is not the live object would be dereferenced below.  Treat
-    // the mismatch as `compile.py:725-729 compile.giveup()` instead.
+    // Upstream never validates the decoded identity here: `rebuild_state_after
+    // _failure` takes `virtualizable_boxes[-1]` and goes straight on to
+    // `reset_token_gcref` + `synchronize_virtualizable()` (pyjitpl.py:3449-3454),
+    // because the box came out of ITS OWN numbering and cannot name anything
+    // else.  Pyre's does not carry that guarantee — the state-field vable
+    // section is only as good as the numbering that produced it — and the
+    // pointer is dereferenced below, so an identity that is not the live object
+    // would be a wild read.  Check it and decline instead (`compile.giveup()`,
+    // compile.py:27), which is strictly more conservative than upstream: the
+    // guard keeps deopting through the blackhole exactly as it did before.
+    //
+    // The two writes upstream pairs with the assignment are both inert for this
+    // seed's only consumer, so neither is ported:
+    //   * `reset_token_gcref` — the state-field vinfo is built by
+    //     `VirtualizableInfo::without_vable_token()`, whose token protocol
+    //     no-ops (`codegen_state.rs` `__build_virtualizable_info`).
+    //   * `synchronize_virtualizable()` — `TraceCtx::synchronize_virtualizable`
+    //     deliberately skips the write-back for `RustVec` array storage, which
+    //     is what every `[.. ; virt]` state field is: the macro-generated
+    //     mainloop owns that struct and writes it on every opcode, so the heap
+    //     is authoritative and flushing the shadow back would clobber it.
     match ctx.virtualizable_heap_ptr() {
         Some(live) if live == vable_ptr => {}
         Some(_) | None => return false,

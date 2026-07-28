@@ -3909,11 +3909,17 @@ impl ResumeDataLoopMemo {
 
         // resume.py:240-241 virtualizable array.
         //
-        // Upstream shape is `virtualizable_boxes = read_boxes(...);`
-        // `virtualizable_boxes.append(virtualizable_box)` (pyjitpl.py:3302-3306),
-        // i.e. payload first, identity last. The snapshot already carries the
-        // tracing-time Box identities in that order, so line-by-line parity is
-        // to run the whole array through `_number_boxes()` unchanged.
+        // `metainterp.virtualizable_boxes` is payload-first, identity-last
+        // (`read_boxes(...)` then `append(virtualizable_box)`,
+        // pyjitpl.py:3302-3306) — but that is NOT the order arriving here. The
+        // snapshot writer already reordered it: `_list_of_boxes_virtualizable`
+        // (opencoder.py:718-726, `build_vable_snapshot_boxes` for the
+        // state-field path) moves `boxes[-1]` to slot 0, so `vable_array` is
+        // identity-FIRST and the readers pull the virtualizable out before its
+        // payload (`resume.py:1404 virtualizable = self.next_ref()`;
+        // `consume_vable_info`; `seed_bridge_virtualizable_boxes`'s
+        // `split_first`). Numbering must not reorder it again — running the
+        // whole array through `_number_boxes()` unchanged is the parity.
         numb_state.append_int(snapshot.vable_array.len() as i64);
         self._number_boxes(&snapshot.vable_array, &mut numb_state, env)?;
 
