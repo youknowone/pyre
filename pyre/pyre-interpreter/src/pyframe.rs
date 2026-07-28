@@ -2375,6 +2375,44 @@ impl PyFrame {
         self.nlocals() + self.ncells()
     }
 
+    /// Name the frame a stack underflow was detected on. A bare depth
+    /// assertion says an opcode popped from an empty stack but not which
+    /// opcode of which code object, which is the whole question when the
+    /// underflow means the frame — or the code behind it — is no longer the
+    /// one the loop started with.
+    #[cold]
+    #[inline(never)]
+    fn report_stack_underflow(&self) -> ! {
+        let code = unsafe { &*pyframe_get_pycode(self) };
+        let window: Vec<String> = code
+            .instructions
+            .iter()
+            .copied()
+            .enumerate()
+            .skip(self.next_instr().saturating_sub(4))
+            .take(8)
+            .map(|(pc, unit)| format!("{pc}:{unit:?}"))
+            .collect();
+        panic!(
+            "value-stack underflow: depth={} base={} (nlocals={} ncells={}) \
+             pc={} last_instr={} ninstrs={} code={:?} file={:?} frame={:p} \
+             pycode={:p} back={:p} window=[{}]",
+            self.valuestackdepth,
+            self.stack_base(),
+            self.nlocals(),
+            self.ncells(),
+            self.next_instr(),
+            self.last_instr,
+            code.instructions.len(),
+            code.obj_name,
+            code.source_path,
+            self,
+            self.pycode,
+            self.f_backref,
+            window.join(" "),
+        );
+    }
+
     // ── Stack operations ──────────────────────────────────────────────
 
     #[inline]
@@ -2387,7 +2425,9 @@ impl PyFrame {
 
     #[inline]
     pub fn pop(&mut self) -> PyObjectRef {
-        assert!(self.valuestackdepth > self.stack_base());
+        if self.valuestackdepth <= self.stack_base() {
+            self.report_stack_underflow();
+        }
         let depth = self.valuestackdepth - 1;
         let value = self.locals_w()[depth];
         self.locals_w_mut()[depth] = PY_NULL;
