@@ -28,6 +28,16 @@ fn inplace_dunder_name(op: BinaryOperator) -> Option<&'static str> {
     })
 }
 
+/// `sq_inplace_repeat` is not a numeric slot, so a builtin sequence times an
+/// operand with no `__index__` never reaches `__imul__`: the in-place multiply
+/// falls through to `sequence_repeat`, which reports the multiplier rather
+/// than running the slot's own converter.
+fn skips_inplace_special(a: PyObjectRef, b: PyObjectRef, op: BinaryOperator) -> bool {
+    matches!(op, BinaryOperator::InplaceMultiply)
+        && unsafe { crate::objspace::descroperation::is_repeat_sequence(a) }
+        && unsafe { crate::baseobjspace::lookup(b, "__index__").is_none() }
+}
+
 pub fn binary_value(
     a: PyObjectRef,
     b: PyObjectRef,
@@ -39,7 +49,7 @@ pub fn binary_value(
     // descroperation.py:825 `inplace_impl` — consult the in-place
     // special first; fall through to the binary op below when absent or
     // `NotImplemented`.
-    if let Some(idunder) = inplace_dunder_name(op) {
+    if let Some(idunder) = inplace_dunder_name(op).filter(|_| !skips_inplace_special(a, b, op)) {
         // `seq_bug_compat` applies only to `+=` / `*=`; pass the reflected
         // name so the builtin-sequence rhs-first branch can fire.
         let (rdunder, seq_bug_compat) = match op {
@@ -491,12 +501,12 @@ pub fn list_extend_value(list: PyObjectRef, iterable: PyObjectRef) -> Result<(),
     match crate::type_methods::list_method_extend(&[list, iterable]) {
         Ok(_) => Ok(()),
         Err(error) if crate::baseobjspace::is_iterable(iterable) => Err(error),
-        Err(_) => unsafe {
-            let type_name = pyre_object::type_name_of(iterable);
+        Err(_) => {
+            let type_name = crate::baseobjspace::object_functionstr_type_name(iterable);
             Err(PyError::type_error(format!(
                 "Value after * must be an iterable, not {type_name}"
             )))
-        },
+        }
     }
 }
 

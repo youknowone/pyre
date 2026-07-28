@@ -1938,6 +1938,51 @@ unsafe fn repeat_count(n: PyObjectRef) -> Result<usize, PyError> {
     }
 }
 
+/// tupleobject.py descr_mul
+pub(crate) unsafe fn tuple_repeat(t: PyObjectRef, n: PyObjectRef) -> PyResult {
+    let n = repeat_count(n)?;
+    // tupleobject.py: `if times == 1 and space.type(self) == space.w_tuple:
+    // return self`. Subclasses must still be copied to a base tuple.
+    if n == 1 && is_exact_tuple(t) {
+        return Ok(t);
+    }
+    let len = w_tuple_len(t);
+    let cap = len
+        .checked_mul(n)
+        .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "tuple is too large"))?;
+    let mut items: Vec<PyObjectRef> = Vec::new();
+    items
+        .try_reserve_exact(cap)
+        .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
+    for _ in 0..n {
+        for i in 0..len {
+            if let Some(item) = w_tuple_getitem(t, i as i64) {
+                items.push(item);
+            }
+        }
+    }
+    Ok(w_tuple_new(items))
+}
+
+/// The builtin sequences repeat through `sq_repeat`, never `nb_multiply`.
+pub(crate) unsafe fn is_repeat_sequence(obj: PyObjectRef) -> bool {
+    is_str(obj) || is_list(obj) || is_tuple(obj) || pyre_object::bytesobject::is_bytes_like(obj)
+}
+
+/// `sequence_repeat` for a receiver [`is_repeat_sequence`] accepted, with the
+/// count already reduced through `__index__`.
+unsafe fn sequence_repeat(seq: PyObjectRef, count: PyObjectRef) -> PyResult {
+    if is_str(seq) {
+        str_repeat(seq, count)
+    } else if is_list(seq) {
+        list_repeat(seq, count)
+    } else if is_tuple(seq) {
+        tuple_repeat(seq, count)
+    } else {
+        bytes_repeat(seq, count)
+    }
+}
+
 /// unicodeobject.py:619-621 descr_mul
 pub(crate) unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     // Repeat at the WTF-8 byte level — a repetition of valid WTF-8 is valid
@@ -3164,32 +3209,10 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         // tupleobject.py descr_mul
         if is_tuple(a) && is_int_or_long(b) {
-            let n = repeat_count(b)?;
-            // tupleobject.py: `if times == 1 and space.type(self) ==
-            // space.w_tuple: return self`. Subclasses must still be copied to
-            // a base tuple.
-            if n == 1 && is_exact_tuple(a) {
-                return Ok(a);
-            }
-            let len = w_tuple_len(a);
-            let cap = len
-                .checked_mul(n)
-                .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "tuple is too large"))?;
-            let mut items: Vec<PyObjectRef> = Vec::new();
-            items
-                .try_reserve_exact(cap)
-                .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
-            for _ in 0..n {
-                for i in 0..len {
-                    if let Some(item) = w_tuple_getitem(a, i as i64) {
-                        items.push(item);
-                    }
-                }
-            }
-            return Ok(w_tuple_new(items));
+            return tuple_repeat(a, b);
         }
         if is_int_or_long(a) && is_tuple(b) {
-            return mul(b, a);
+            return tuple_repeat(b, a);
         }
         // bytesobject.py descr_mul / bytearrayobject.py descr_mul
         if pyre_object::bytesobject::is_bytes_like(a) && is_int_or_long(b) {
@@ -3198,25 +3221,43 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if is_int_or_long(a) && pyre_object::bytesobject::is_bytes_like(b) {
             return mul(b, a);
         }
-        if let Some(result) = try_dispatch_binary_special(a, b, "__mul__", "__rmul__")? {
+        // `PyNumber_Multiply`: none of the builtin sequences implements
+        // `nb_multiply`, so their `__mul__` / `__rmul__` slot wrappers take no
+        // part in the operator dispatch — only the other operand can supply a
+        // numeric implementation.
+        let a_seq = is_repeat_sequence(a);
+        let b_seq = is_repeat_sequence(b);
+        let dispatched = match (a_seq, b_seq) {
+            (true, true) => None,
+            (true, false) => match lookup_type_special(b, "__rmul__") {
+                Some(method) => try_call_special(method, &[b, a])?,
+                None => None,
+            },
+            (false, true) => match lookup_type_special(a, "__mul__") {
+                Some(method) => try_call_special(method, &[a, b])?,
+                None => None,
+            },
+            (false, false) => try_dispatch_binary_special(a, b, "__mul__", "__rmul__")?,
+        };
+        if let Some(result) = dispatched {
             return Ok(result);
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
-        // Sequence repetition slot (sq_repeat): a sequence on either side
-        // with a non-int multiplier reports the non-int's type.
-        let a_seq =
-            is_str(a) || is_list(a) || is_tuple(a) || pyre_object::bytesobject::is_bytes_like(a);
-        let b_seq =
-            is_str(b) || is_list(b) || is_tuple(b) || pyre_object::bytesobject::is_bytes_like(b);
-        if a_seq {
+        // `sequence_repeat`: the count goes through `__index__`, and an
+        // operand that has none is reported by its own type — the sequence is
+        // never the one named.
+        if a_seq || b_seq {
+            let (seq, other, other_name) = if a_seq {
+                (a, b, b_name)
+            } else {
+                (b, a, a_name)
+            };
+            if !(a_seq && b_seq) && crate::baseobjspace::lookup(other, "__index__").is_some() {
+                return sequence_repeat(seq, crate::baseobjspace::getindex_repeat(other)?);
+            }
             return Err(PyError::type_error(format!(
-                "can't multiply sequence by non-int of type '{b_name}'"
-            )));
-        }
-        if b_seq {
-            return Err(PyError::type_error(format!(
-                "can't multiply sequence by non-int of type '{a_name}'"
+                "can't multiply sequence by non-int of type '{other_name}'"
             )));
         }
         Err(PyError::type_error(format!(
@@ -4047,7 +4088,12 @@ pub fn pow3(base: PyObjectRef, exp: PyObjectRef, modulus: PyObjectRef) -> PyResu
     if let Some(result) = try_dispatch_ternary_pow_special(base, exp, modulus)? {
         return Ok(result);
     }
-    Err(ternary_builtin_type_error("pow()", base, exp, modulus))
+    Err(ternary_builtin_type_error(
+        "** or pow()",
+        base,
+        exp,
+        modulus,
+    ))
 }
 
 /// `divmod(a, b)` dispatch — pypy/interpreter/baseobjspace.py
@@ -4112,11 +4158,37 @@ pub fn jit_float_fmod(x: f64, y: f64) -> f64 {
     x % y
 }
 
+/// `float_pow`: libm sets `ERANGE` when a finite base produces an
+/// out-of-range result.  An infinite base is excluded because `pow(±inf, y)`
+/// is answered by the special cases above rather than by libm, so its infinity
+/// is the exact result and not a range error.
+fn float_pow_range_check(z: f64, base: f64) -> Result<f64, FloatPowError> {
+    if z.is_infinite() && !base.is_infinite() {
+        return Err(FloatPowError::Overflow);
+    }
+    Ok(z)
+}
+
+/// 3.14 surfaces the `ERANGE` libm sets for `float_pow` through
+/// `PyErr_SetFromErrno` as the `(errno, strerror)` pair.
+/// `floatobject.py:937-943` instead lets its own `math.pow` OverflowError
+/// through as the message `"float power"`.
+fn float_pow_overflow_error() -> PyError {
+    // 34 on every platform pyre targets; spelled out rather than taken from
+    // `libc`, which does not export the errno constants for `wasm32`.
+    const ERANGE: i32 = 34;
+    PyError::errno_pair(
+        crate::PyErrorKind::OverflowError,
+        pyre_object::interp_exceptions::ExcKind::OverflowError,
+        ERANGE,
+    )
+}
+
 /// floatobject.py:865 `_pow`.
 fn float_pow_inner(x: f64, y: f64) -> Result<f64, FloatPowError> {
     // floatobject.py:800-801
     if y == 2.0 {
-        return Ok(x * x);
+        return float_pow_range_check(x * x, x);
     }
     // floatobject.py:803-804
     if y == 0.0 {
@@ -4172,10 +4244,7 @@ fn float_pow_inner(x: f64, y: f64) -> Result<f64, FloatPowError> {
         return Ok(if negate_result { -1.0 } else { 1.0 });
     }
     // floatobject.py:871-877
-    let z = bx.powf(y);
-    if z.is_infinite() && !bx.is_infinite() {
-        return Err(FloatPowError::Overflow);
-    }
+    let z = float_pow_range_check(bx.powf(y), bx)?;
     // floatobject.py:879-881
     Ok(if negate_result { -z } else { z })
 }
@@ -4190,7 +4259,7 @@ pub fn float_pow_raw(x: f64, y: f64) -> Result<f64, PyError> {
             "negative number cannot be raised to a fractional power",
         )),
         Err(FloatPowError::ZeroDivision) => Err(PyError::zero_division("zero to a negative power")),
-        Err(FloatPowError::Overflow) => Err(PyError::overflow_error("float power")),
+        Err(FloatPowError::Overflow) => Err(float_pow_overflow_error()),
     }
 }
 
@@ -4203,7 +4272,7 @@ fn float_pow_impl(x: f64, y: f64) -> PyResult {
             complex_pow(w_complex_new(x, 0.0), w_complex_new(y, 0.0))
         },
         Err(FloatPowError::ZeroDivision) => Err(PyError::zero_division("zero to a negative power")),
-        Err(FloatPowError::Overflow) => Err(PyError::overflow_error("float power")),
+        Err(FloatPowError::Overflow) => Err(float_pow_overflow_error()),
     }
 }
 
