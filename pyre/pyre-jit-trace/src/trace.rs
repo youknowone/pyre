@@ -1968,11 +1968,37 @@ fn apply_blackhole_crn(
     true
 }
 
+/// ⚠️`drive_single_frame_blackhole` **executes** — `bh.resume_mainloop()`
+/// (`jitdriver.rs`) runs the region, allocating and calling.  So every decline
+/// AFTER the drive discards work that already happened and returns to a caller
+/// that replays it: `try_adopt_force_blackhole` reports `false`, and
+/// `run_perfn_walk`'s epilogue then takes the committed escape pc or the legacy
+/// replay, both of which re-enter the region.  The locals publish below carries
+/// its own undo for exactly that reason; the `mfdbg!` sibling names the same
+/// hazard at the multi-frame `resume_py_pc` check as the reason not to add a
+/// check there.
+///
+/// Declines therefore split at the drive:
+/// - BEFORE it are free — nothing has run.
+/// - AFTER it are the double-apply class.  `apply_blackhole_crn`'s frame-shape
+///   preconditions (`frame == 0`, null `pycode`, no `concrete_nlocals`) are
+///   already discharged by the pre-drive `concrete_nlocals(cf_addr)`, so what
+///   survives needs `resume_py_pc` — the drive's own output — and cannot be
+///   hoisted without validating the whole CRN resume-pc set up front.
+///   Named under `PYRE_FBW_DEBUG_ABORT` so they are countable rather than
+///   silent; a silent one is indistinguishable from the adopt never running.
 fn try_adopt_single_frame_blackhole(
     ctx: &mut TraceCtx,
     cf_addr: usize,
     live_root_addr: usize,
 ) -> bool {
+    macro_rules! sfdbg {
+        ($($a:tt)*) => {
+            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                eprintln!("[s1-adopt-decline] {}", format!($($a)*));
+            }
+        };
+    }
     let Some(mut latched) = crate::jitcode_dispatch::take_single_frame_blackhole() else {
         return false;
     };
@@ -2076,10 +2102,14 @@ fn try_adopt_single_frame_blackhole(
                     WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
                     true
                 } else {
+                    sfdbg!("apply_blackhole_crn rejected the terminal image");
                     false
                 }
             }
-            None => false,
+            None => {
+                sfdbg!("ContinueRunningNormally with no green int");
+                false
+            }
         },
         majit_metainterp::jitexc::JitException::DoneWithThisFrameVoid => {
             crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Null);
@@ -2152,6 +2182,14 @@ fn try_adopt_multi_frame_blackhole(
     // under `PYRE_FBW_DEBUG_ABORT`, the way `build_multi_frame_miframe`'s
     // `s2dbg!` names its own: a silent decline is indistinguishable from the
     // adopt never being reached, and the two want different fixes.
+    //
+    // ⚠️The declines are NOT interchangeable — see
+    // [`try_adopt_single_frame_blackhole`].  Those before
+    // `drive_multi_frame_blackhole` are free; those after it discard a chain
+    // that already ran and hand back to a caller that replays it.  Three
+    // post-drive ones survive here (empty `green_int`, no terminal image,
+    // terminal jitcode index out of i32 range); each depends on the drive's own
+    // output and so has no pre-drive counterpart to strengthen.
     macro_rules! mfdbg {
         ($($a:tt)*) => {
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -2441,17 +2479,25 @@ fn try_adopt_multi_frame_blackhole(
                 break 'crn false;
             };
             let resume_py_pc = resume_py_pc as usize;
-            // Only the frame address is checked.  `resume_py_pc` is a
+            // `resume_py_pc` is deliberately NOT checked.  It is a
             // `depth_at_py_pc` index written through to
             // `frame.last_instr = resume_py_pc - 1`, so 0 is an ordinary
             // coordinate — the single-frame arm hands it to
             // `apply_blackhole_crn` unfiltered.  Rejecting it here would also
             // decline *after* the chain has been driven, returning to a legacy
             // replay that re-executes what the chain already committed.
-            if cf_addr == 0 {
-                mfdbg!("cf_addr {cf_addr:#x} is zero");
-                break 'crn false;
-            }
+            //
+            // `cf_addr` needs no check either: the pre-drive
+            // `concrete_nlocals(cf_addr)` above already returns `None` for a
+            // zero frame (`state.rs` `(frame != 0).then_some(..)?`), and
+            // `apply_blackhole_crn` re-checks it independently.  The decline
+            // that used to sit here was unreachable AND post-drive, i.e. it
+            // could only ever have been an instance of the hazard the comment
+            // above names.
+            debug_assert_ne!(
+                cf_addr, 0,
+                "pre-drive concrete_nlocals admitted a zero frame"
+            );
             // The terminal frame's own `setfield_vable` operations committed
             // the frame fields they wrote, but the aborted mid-expression
             // operand stack is still in place, so the resume coordinate needs
