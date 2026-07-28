@@ -1286,10 +1286,36 @@ pub unsafe fn w_exception_set_import_msg(obj: PyObjectRef, value: PyObjectRef) {
 /// GC-invisible `OnceLock` and baked into JIT constant pools, so it must
 /// stay immortal (`w_exception_new_empty_immortal`), never GC-swept.
 pub fn memory_error_singleton() -> PyObjectRef {
-    static MEMORY_ERROR_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MEMORY_ERROR_SINGLETON
         .get_or_init(|| w_exception_new_empty_immortal(ExcKind::MemoryError) as usize)
         as PyObjectRef
+}
+
+static MEMORY_ERROR_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+static STANDARD_EXC_INSTANCES: [std::sync::OnceLock<usize>; EXC_KIND_COUNT] =
+    [const { std::sync::OnceLock::new() }; EXC_KIND_COUNT];
+
+/// Visit every immortal exception singleton that has actually been created.
+///
+/// The singletons themselves are `malloc_typed` and outlive every collection,
+/// but the `args_w` / `w_traceback` / `w_context` a raise attaches to them are
+/// ordinary GC-managed objects. Because the holder is not managed, neither the
+/// write barrier nor major seeding reaches those children, so they survive only
+/// while some raw carrier happens to be parked on the singleton. Enumerating
+/// them here lets a root walker forward the children per object instead.
+///
+/// Only initialized slots are reported — reading through `get()` never forces
+/// an allocation, which must not happen from inside a collection.
+pub fn for_each_immortal_exception_singleton(mut visit: impl FnMut(PyObjectRef)) {
+    if let Some(&raw) = MEMORY_ERROR_SINGLETON.get() {
+        visit(raw as PyObjectRef);
+    }
+    for slot in STANDARD_EXC_INSTANCES.iter() {
+        if let Some(&raw) = slot.get() {
+            visit(raw as PyObjectRef);
+        }
+    }
 }
 
 /// `rpython/rtyper/exceptiondata.py:34-38 get_standard_ll_exc_instance`
@@ -1305,9 +1331,7 @@ pub fn memory_error_singleton() -> PyObjectRef {
 /// Same `OnceLock<usize>` escape hatch as `memory_error_singleton`
 /// because `PyObjectRef` is neither `Send` nor `Sync`.
 pub fn standard_exc_instance(kind: ExcKind) -> PyObjectRef {
-    static INSTANCES: [std::sync::OnceLock<usize>; EXC_KIND_COUNT] =
-        [const { std::sync::OnceLock::new() }; EXC_KIND_COUNT];
-    let slot = &INSTANCES[kind as u8 as usize];
+    let slot = &STANDARD_EXC_INSTANCES[kind as u8 as usize];
     *slot.get_or_init(|| w_exception_new_empty_immortal(kind) as usize) as PyObjectRef
 }
 
@@ -1652,6 +1676,39 @@ mod tests {
             assert!(is_exception(overflow_a));
             assert_eq!(w_exception_get_kind(overflow_a), ExcKind::OverflowError);
             assert_eq!(w_exception_get_kind(zerodiv), ExcKind::ZeroDivisionError);
+        }
+    }
+
+    #[test]
+    fn immortal_singleton_enumeration_reports_created_and_forces_none() {
+        // The root walker forwards each reported singleton's reference slots,
+        // so the enumeration must cover every singleton that exists — and must
+        // never itself create one, since it runs from inside a collection.
+        let mem = memory_error_singleton();
+        let key = standard_exc_instance(ExcKind::KeyError);
+
+        let mut seen = Vec::new();
+        for_each_immortal_exception_singleton(|exc| seen.push(exc as usize));
+        assert!(
+            seen.contains(&(mem as usize)),
+            "MemoryError singleton must be reported once created"
+        );
+        assert!(
+            seen.contains(&(key as usize)),
+            "per-kind singleton must be reported once created"
+        );
+        assert!(
+            seen.len() <= EXC_KIND_COUNT + 1,
+            "enumeration is bounded by the per-kind slots plus MemoryError"
+        );
+
+        // Enumerating must not initialize a slot: a second pass reports the
+        // same set, and every reported pointer is a real exception object.
+        let mut again = Vec::new();
+        for_each_immortal_exception_singleton(|exc| again.push(exc as usize));
+        assert_eq!(seen, again, "enumeration must not create singletons");
+        for &raw in &again {
+            assert!(unsafe { is_exception(raw as PyObjectRef) });
         }
     }
 
