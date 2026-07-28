@@ -6470,7 +6470,22 @@ impl CodeWriter {
         // `"abort_permanent"` to the builder, so the external push is
         // an exact mirror of the pre-existing internal behavior.
         macro_rules! emit_abort_permanent {
+            // Straight-line form: the arm has modelled this opcode's stack
+            // effect and the walk falls through to the next PC.  The block is
+            // closed only when nothing follows to close it.
             ($py_pc:expr) => {{
+                emit_abort_permanent!(@emit $py_pc, ($py_pc) + 1 >= code.instructions.len())
+            }};
+            // Terminal form: the marker ends this graph block.  Used by the
+            // arms that `continue` out of the dispatch instead of completing
+            // their stack model — the `Call` nargs > 14 arm (which skips its
+            // `push_and_bump!`) and the `LoadFastCheck` unbound arm (which
+            // switches into a dedicated dead-end block that has no successor
+            // by construction).
+            ($py_pc:expr, closes_block) => {{
+                emit_abort_permanent!(@emit $py_pc, true)
+            }};
+            (@emit $py_pc:expr, $closes_block:expr) => {{
                 // Publish `last_instr` to the vable before the bail so the
                 // blackhole hands the interpreter the right resume
                 // coordinate.  The blackhole replays codewriter jitcode that
@@ -6542,13 +6557,12 @@ impl CodeWriter {
                 // block.  Runtime never reaches it — `abort_permanent` hands
                 // control back to the interpreter first.
                 //
-                // Only when the abort is the code object's last instruction
-                // is there no successor to close the block, and an exit-less
-                // block makes `flatten.py:107-109` mistake its full
-                // FrameState input tuple for return arguments.  Link that one
-                // case to returnblock, the orthodox second terminal block
+                // A block with no successor to close it must still be closed:
+                // an exit-less block makes `flatten.py:107-109` mistake its
+                // full FrameState input tuple for return arguments.  Link it
+                // to returnblock, the orthodox second terminal block
                 // (`model.py:18-19`).
-                if ($py_pc) + 1 >= code.instructions.len() {
+                if $closes_block {
                     let abort_return = super::flow::Link::new(
                         vec![super::flow::Constant::none().into()],
                         Some(graph.returnblock.clone()),
@@ -8839,10 +8853,12 @@ impl CodeWriter {
                                 result.into()
                             };
                             if nargs > 14 {
-                                emit_abort_permanent!(py_pc);
-                                // `abort_permanent` closes this graph block.
-                                // Do not record the synthetic call result or
-                                // any later operation on the closed block.
+                                // `closes_block`: this arm skips the
+                                // `push_and_bump!` below, so its stack model is
+                                // incomplete and the fall-through must not be
+                                // walked.  Do not record the synthetic call
+                                // result or any later operation on the block.
+                                emit_abort_permanent!(py_pc, closes_block);
                                 continue;
                             }
                             push_and_bump!(call_result_value, py_pc);
@@ -11646,7 +11662,11 @@ impl CodeWriter {
 
                                 current_block = unbound_block;
                                 current_state = unbound_state;
-                                emit_abort_permanent!(py_pc);
+                                // `closes_block`: the null arm's block is a
+                                // dead end by construction — the bound arm
+                                // already merged the fall-through PC above, so
+                                // nothing follows to close this one.
+                                emit_abort_permanent!(py_pc, closes_block);
                                 continue;
                             }
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(
