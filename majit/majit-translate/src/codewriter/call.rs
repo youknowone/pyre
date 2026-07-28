@@ -3449,18 +3449,20 @@ impl CallControl {
 
     /// RPython `call.py:182-187 get_jitcode_calldescr` source-of-truth for
     /// `FUNC.RESULT`. Pyre derives the calldescr's result kind char from
-    /// `graph.return_type` (stamped at registration off the parsed Rust
-    /// signature, mirroring `funcptr._obj.TO.RESULT`) after projecting
-    /// Rust `Result<T, PyError>` through the success type, matching the
-    /// exception-transform shape the JIT codewriter sees. The mapping mirrors
+    /// `graph.return_type` (stamped at registration, mirroring
+    /// `funcptr._obj.TO.RESULT`). The mapping mirrors
     /// `return_type_string_to_kind` below. Returns `None` when the
     /// graph carries no return type — callers (`transform_graph_to_jitcode`)
     /// fall back to a CFG scan in that case (e.g. unit-test graphs without a
     /// parsed signature).
+    ///
+    /// The stamp is already a result-kind token, never a Rust type: it comes
+    /// from `front::mir dont_look_inside_return_token`, which is where a
+    /// scoped `Result<T, PyError>` is projected through `T` and where any
+    /// other `Result` keeps the ADT's own kind.
     pub fn declared_return_kind(&self, path: &CallPath) -> Option<char> {
         let s = self.function_graphs.get(path)?.return_type.as_ref()?.trim();
-        let effective = crate::front::typestr::transparent_result_ok_type(s).unwrap_or(s);
-        Some(return_type_string_to_kind(effective))
+        Some(return_type_string_to_kind(s))
     }
 
     /// The callee's post-`?` declared `RESULT` type (`call.py:222
