@@ -1054,6 +1054,29 @@ thread_local! {
     /// callee and retracing the enclosing loop, not by penalising the loop
     /// (`pyjitpl.py:2818-2828`).  Like the upstream flag the set has no removal
     /// path — the hazard is a static property of the callee's `CodeObject`.
+    ///
+    /// Keying on the `CodeObject` alone is the full key for this decision, not
+    /// a truncation of one.  The flag is consumed by `can_inline_callable`
+    /// (`warmstate.py:669-677`), whose only caller is `_opimpl_recursive_call`
+    /// (`pyjitpl.py:1376-1382`) — it passes the CALLEE's green args, and a
+    /// callee reached through a CALL is always entered at its own entry, so the
+    /// `next_instr` component is constant and `pycode` carries the whole
+    /// decision.  The same holds here: the deny is recorded and queried for an
+    /// inline frame pushed at a CALL boundary (`inline_call.rs`), never for a
+    /// mid-body resume.
+    ///
+    /// Per-thread for the same reason as [`crate::trace::fbw_declined`]'s
+    /// `FBW_DECLINED_KEYS` and `RANGE_FORITER_DEMOTED`: pyre's walk state is
+    /// per-thread, and an inline hazard observed while tracing is a property of
+    /// the tracing thread's framestack.  Sharing one memo while its siblings
+    /// stay per-thread would be the inconsistency.
+    ///
+    /// NOT yet ported: `warmstate.py:485-495` also treats the flag as "please
+    /// trace from here as soon as possible" — a denied cell that never had a
+    /// procedure token reaches `bound_reached` immediately, so the callee gets
+    /// its own trace instead of staying a plain residual forever.  Since
+    /// residual calls re-enter the JIT the callee does reach its own threshold,
+    /// just on the ordinary counter rather than at once.
     static FBW_HAZARDOUS_INLINE_DENY: std::cell::RefCell<std::collections::HashSet<usize>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
 }
