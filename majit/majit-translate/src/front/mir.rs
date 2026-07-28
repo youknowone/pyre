@@ -10144,14 +10144,31 @@ impl<'a> Lowering<'a> {
     /// and keeps the generic `Call` form (none arise today; the live
     /// callers are `neg`'s `int_value` and `functional`'s `step`,
     /// both `i64`).
-    /// Lower `i64::wrapping_{add,sub,mul}` (`core::num::<Impl>::wrapping_*`,
-    /// Opaque in the LLBC like every core fn) to the native
-    /// `BinOp("add"/"sub"/"mul")`.  `Signed` arithmetic is modular
-    /// machine arithmetic — `rint.py rtype_add` emits `int_add` with no
-    /// overflow check, and `int_add` wraps (`rarithmetic.py intmask`
-    /// semantics) — so the wrapping method IS the plain llop.  Restricted
-    /// to word-sized signed receivers; a narrower `wrapping_add` (which
-    /// wraps at its own width) keeps the `Call` form.
+    /// Lower `{i64,u64}::wrapping_{add,sub,mul}`
+    /// (`core::num::<Impl>::wrapping_*`, Opaque in the LLBC like every
+    /// core fn) to the native `BinOp("add"/"sub"/"mul")`.  `Signed`
+    /// arithmetic is modular machine arithmetic — `rint.py:217
+    /// rtype_add` emits `int_add` with no overflow check, and `int_add`
+    /// wraps (`rarithmetic.py intmask` semantics) — so the wrapping
+    /// method IS the plain llop.  Restricted to word-sized receivers; a
+    /// narrower `wrapping_add` (which wraps at its own width) keeps the
+    /// `Call` form.
+    ///
+    /// Both integer banks count, the lesson [`vec_index_type_is_scalar`]
+    /// already carries: `usize` serializes as `{"UInt": "Usize"}`, which
+    /// `tyref_literal_int_atom` does not see at all, so an `Int`-only
+    /// test silently declined every unsigned counter (`keys_version`,
+    /// `clear_gen`) and left the enclosing graph blocked on the call.
+    /// Unsigned is the same machine op under a different rtyper
+    /// dispatch: `rint.py`'s `opprefix` makes it `uint_add`, and
+    /// `jtransform.py:1608-1610` renames `uint_{add,sub,mul}` straight
+    /// back to `int_{add,sub,mul}` for the JIT.
+    ///
+    /// The result carries the receiver's signedness rather than a flat
+    /// `Int`.  `union_type` widens `Int ∪ Unsigned` to `Unknown`
+    /// (`binaryop.py:191` UnionError), so annotating a `usize` sum as
+    /// `Int` would poison the merge where it meets the unsigned field
+    /// read it came from.
     fn try_lower_wrapping_binop(
         &mut self,
         mir_bb: usize,
@@ -10187,7 +10204,9 @@ impl<'a> Lowering<'a> {
         let Some(src) = fd.signature.inputs.first() else {
             return Ok(false);
         };
-        if !matches!(self.tyref_literal_int_atom(src), Some("I64" | "Isize")) {
+        let signed_word = matches!(self.tyref_literal_int_atom(src), Some("I64" | "Isize"));
+        let unsigned_word = matches!(self.tyref_literal_uint_atom(src), Some("U64" | "Usize"));
+        if !signed_word && !unsigned_word {
             return Ok(false);
         }
         let bb_id = self.block_id[mir_bb];
@@ -10200,7 +10219,11 @@ impl<'a> Lowering<'a> {
                 op: op.to_string(),
                 lhs: lhs.clone(),
                 rhs: rhs.clone(),
-                result_ty: ValueType::Int,
+                result_ty: if unsigned_word {
+                    ValueType::Unsigned
+                } else {
+                    ValueType::Int
+                },
             },
         });
         self.local_var[dest_local] = Some(res);
