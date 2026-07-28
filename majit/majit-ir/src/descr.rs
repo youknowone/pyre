@@ -2791,7 +2791,9 @@ pub fn resolve_w_class_obj(vtable: usize) -> Option<i64> {
     if vtable == 0 {
         return None;
     }
-    W_CLASS_OBJ_RESOLVER.get().and_then(|resolve| resolve(vtable))
+    W_CLASS_OBJ_RESOLVER
+        .get()
+        .and_then(|resolve| resolve(vtable))
 }
 
 /// Descriptor for a fixed-size struct/object allocation.
