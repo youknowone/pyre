@@ -890,6 +890,41 @@ impl PyError {
         Self::os_error_syscall(errno, pyre_object::PY_NULL)
     }
 
+    /// `PyErr_SetFromErrno(exc)` for an exception class outside the OSError
+    /// family: `args` becomes the same `(errno, strerror)` pair, but with no
+    /// `__str__` override to fold it into `"[Errno N] strerror"` the message
+    /// is the args tuple's own repr — `OverflowError: (34, 'Result too
+    /// large')`.  A libm `ERANGE` out of `float.__pow__` is reported this way;
+    /// `floatobject.py:941` instead raises a plain `"float power"` message,
+    /// which 3.14 does not produce.
+    pub fn errno_pair(kind: PyErrorKind, exc_kind: ExcKind, errno: i32) -> Self {
+        let strerror = Self::clean_strerror(errno);
+        // Root the fresh exception across the args allocations: `exc` lives
+        // only in this Rust local while `w_int_new` / `w_str_new` /
+        // `w_list_new` run, so a collection there could sweep the unrooted
+        // exception before `w_exception_set_args` writes through it.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let exc = w_exception_new(exc_kind, &strerror);
+        pyre_object::gc_roots::pin_root(exc);
+        let args_list = pyre_object::w_list_new(vec![
+            pyre_object::w_int_new(errno as i64),
+            pyre_object::w_str_new(&strerror),
+        ]);
+        unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
+        PyError {
+            kind,
+            // Leave the display message empty so `message_text` derives it
+            // from `exc_object`, whose `descr_str` renders the two-element
+            // `args` as a tuple repr rather than as a bare string.
+            message: String::new(),
+            exc_object: exc,
+            attach_tb: true,
+            reraise_lasti: -1,
+            w_name_context: std::ptr::null_mut(),
+            w_obj_context: std::ptr::null_mut(),
+        }
+    }
+
     /// Raise an OSError carrying the C-level `(errno, strerror)` pair,
     /// matching `OSError.__init__`'s 2-argument form: `args` becomes
     /// `(errno, strerror)`, `str(e)` is `"[Errno N] strerror"`, and
@@ -1503,20 +1538,26 @@ pub fn write_exception<W: Write>(
     err: &PyError,
     include_traceback: bool,
 ) -> std::io::Result<()> {
-    if include_traceback {
-        // `traceback.py:171-194` __cause__ / __context__ chain
-        // printing.  Recurse into the older exception first, emit
-        // the bridging banner, then print the current exception.
-        if !err.exc_object.is_null() {
-            write_chained_context(writer, err.exc_object)?;
-        }
-        writeln!(writer, "Traceback (most recent call last):")?;
-        write_traceback_chain(writer, err)?;
-        writeln!(writer, "{}", err.render_exception())?;
-        write_exception_notes(writer, err.exc_object)
-    } else {
-        writeln!(writer, "{}", err.render_exception())
+    if !include_traceback {
+        return writeln!(writer, "{}", err.render_exception());
     }
+    if !err.exc_object.is_null() && unsafe { pyre_object::is_exception(err.exc_object) } {
+        // The instance carries the whole report: the cause/context chain, the
+        // group tree, the notes and the suggestion suffix all hang off it, so
+        // render it through the same structured walk `_PyErr_Display` uses
+        // rather than re-deriving a flat header here.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(err.exc_object);
+        let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+        let mut context = ExceptionPrintContext::new(exc);
+        return write_exception_object_recursive(writer, exc, &mut context);
+    }
+    // A Rust-side error that never materialised an instance carries no chain,
+    // no group and no frame list — only the header.
+    writeln!(writer, "Traceback (most recent call last):")?;
+    write_traceback_chain(writer, err)?;
+    writeln!(writer, "{}", err.render_exception())
 }
 
 /// CPython 3.14 `_PyErr_Display(file, exc_type, exc_value, exc_tb)` shape used
@@ -2459,11 +2500,35 @@ fn write_traceback_chain_from_exc<W: Write>(
     write_traceback_chain_from_tb(writer, tb)
 }
 
+/// `traceback.py:_RECURSIVE_CUTOFF` — a frame repeating the same
+/// `(filename, lineno, name)` is printed at most this many times before the
+/// rest collapse into a single `[Previous line repeated N more times]`.
+const RECURSIVE_CUTOFF: usize = 3;
+
+/// `traceback.py:StackSummary.format` collapse line, emitted when a run of
+/// identical frames just ended (or the walk finished on one).  A run at or
+/// below the cutoff was printed in full and needs no marker.
+fn write_repeated_frames<W: Write>(writer: &mut W, count: usize) -> std::io::Result<()> {
+    if count <= RECURSIVE_CUTOFF {
+        return Ok(());
+    }
+    let count = count - RECURSIVE_CUTOFF;
+    let plural = if count > 1 { "s" } else { "" };
+    writeln!(
+        writer,
+        "  [Previous line repeated {count} more time{plural}]"
+    )
+}
+
 fn write_traceback_chain_from_tb<W: Write>(
     writer: &mut W,
     mut tb: PyObjectRef,
 ) -> std::io::Result<()> {
     let _roots = pyre_object::gc_roots::push_roots();
+    // `StackSummary.format` dedup state: the previous frame's identity and how
+    // many consecutive frames have carried it.
+    let mut last: Option<(String, i64, String)> = None;
+    let mut repeats: usize = 0;
     while !tb.is_null() {
         let tb_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(tb);
@@ -2503,12 +2568,44 @@ fn write_traceback_chain_from_tb<W: Write>(
                 )
             }
         };
+        let key = (filename, lineno, funcname);
+        if last.as_ref() != Some(&key) {
+            write_repeated_frames(writer, repeats)?;
+            last = Some(key.clone());
+            repeats = 0;
+        }
+        repeats += 1;
+        if repeats > RECURSIVE_CUTOFF {
+            let current_tb = pyre_object::gc_roots::shadow_stack_get(tb_slot);
+            tb = unsafe { crate::pytraceback::w_pytraceback_get_w_next(current_tb) };
+            continue;
+        }
+        let (filename, lineno, funcname) = key;
         writeln!(
             writer,
             "  File \"{}\", line {}, in {}",
             filename, lineno, funcname
         )?;
-        if let Some(line) = read_source_line(&filename, lineno) {
+        // `FrameSummary._set_lines` collects every line the failing
+        // instruction spans, so a statement written across several lines (a
+        // class body, a multi-line call) shows all of them, dedented by the
+        // indentation they share.
+        if let Some((start_line, end_line, _, _)) = location
+            && usize::try_from(lineno).ok() == Some(start_line)
+            && end_line > start_line
+        {
+            let span: Vec<String> = (start_line..=end_line)
+                .map(|n| {
+                    read_source_line(&filename, n as i64)
+                        .map_or(String::new(), |l| l.trim_end().to_string())
+                })
+                .collect();
+            if !span.iter().all(|line| line.trim().is_empty()) {
+                for line in dedent_lines(&span) {
+                    writeln!(writer, "    {line}")?;
+                }
+            }
+        } else if let Some(line) = read_source_line(&filename, lineno) {
             let raw_line = line.trim_end_matches(['\n', '\r']);
             let shown_line = raw_line.trim_start();
             writeln!(writer, "    {shown_line}")?;
@@ -2559,7 +2656,41 @@ fn write_traceback_chain_from_tb<W: Write>(
         let current_tb = pyre_object::gc_roots::shadow_stack_get(tb_slot);
         tb = unsafe { crate::pytraceback::w_pytraceback_get_w_next(current_tb) };
     }
-    Ok(())
+    write_repeated_frames(writer, repeats)
+}
+
+/// `textwrap.dedent` — drop the longest leading-whitespace prefix shared by
+/// every non-blank line; whitespace-only lines normalise to empty.
+fn dedent_lines(lines: &[String]) -> Vec<String> {
+    let mut prefix: Option<&str> = None;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = &line[..line.len() - line.trim_start().len()];
+        prefix = Some(match prefix {
+            None => indent,
+            Some(common) => {
+                let shared = common
+                    .bytes()
+                    .zip(indent.bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                &common[..shared]
+            }
+        });
+    }
+    let prefix = prefix.unwrap_or("");
+    lines
+        .iter()
+        .map(|line| {
+            if line.trim().is_empty() {
+                String::new()
+            } else {
+                line[prefix.len()..].to_string()
+            }
+        })
+        .collect()
 }
 
 /// `traceback.py:_should_show_carets` special case: a `<name> = <call>(…)` or
