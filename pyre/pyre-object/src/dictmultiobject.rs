@@ -1443,8 +1443,13 @@ pub unsafe fn w_module_dict_object_storage_mut_opt<'a>(
 ///
 /// No-op when already in object-strategy mode.
 ///
+/// Residualised for the reason [`w_dict_switch_int_to_object_strategy`] is —
+/// the promotion is `IndexMap` construction and refill end to end, so there is
+/// no modellable point inside it to put the boundary at.
+///
 /// # Safety
 /// `obj` must point to a valid `W_ModuleDictObject`.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_module_dict_switch_to_object_strategy(obj: PyObjectRef) {
     let _module_guard = w_dict_lock(obj);
     let raw = &mut *(obj as *mut W_ModuleDictObject);
@@ -3568,6 +3573,38 @@ pub unsafe fn w_dict_clear_int_strategy(obj: PyObjectRef) {
     entries.clear();
 }
 
+/// `dictmultiobject.py:1223-1230 AbstractTypedStrategy.switch_to_object_strategy`
+/// for `IntDictStrategy` — rebuild the erased `{}` on the object shape, refill
+/// it with `newint(key)` keys, then relabel the dict.
+///
+/// Residualised (`@dont_look_inside`, `rlib/jit.py:139`) even though upstream
+/// carries no marker here: upstream can trace the body because every step is an
+/// RPython dict primitive the JIT models (`ll_newdict`,
+/// `ll_dict_setitem`'s `look_inside_iff(isvirtual)`), whereas the whole body is
+/// `IndexMap` — an external crate with no lowering at all — so the last
+/// modellable point is the call itself.  The `()` return crosses the residual
+/// boundary the way `setobject::w_set_copy_storage_from` does.
+///
+/// # Safety
+/// `w_dict` must be a valid `W_DictObject` on `INT_DICT_STRATEGY`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
+    let dict = &mut *(w_dict as *mut W_DictObject);
+    // Borrow the old typed box (its field stays live, so it is traced
+    // while the migration allocates keys); after the store the box is
+    // unreachable and the sweep reclaims it.
+    let old = &*(dict.dstorage as *const IntDictStorage);
+    let mut new_map = ObjectDictStorage::with_capacity(old.len());
+    for (&k, &v) in old.iter() {
+        let w_key = crate::w_int_new(k);
+        new_map.insert(object_key_for(w_key), v);
+    }
+    dict.dstorage =
+        crate::gc_storage::gc_alloc_storage_box(new_map, object_dict_storage_gc_type_id())
+            as *mut u8;
+    dict.dstrategy = &OBJECT_DICT_STRATEGY;
+}
+
 /// Internal helper: `BytesDictStrategy::setitem` body —
 /// `dictmultiobject.py:1061-1064` direct typed-storage write.  Caller
 /// must have already verified `is_correct_type(w_key)`.
@@ -3684,6 +3721,26 @@ pub unsafe fn w_dict_clear_bytes_strategy(obj: PyObjectRef) {
         dict.keys_version = dict.keys_version.wrapping_add(1);
     }
     entries.clear();
+}
+
+/// [`w_dict_switch_int_to_object_strategy`] for `BytesDictStrategy`, refilling
+/// with `newbytes(key)` keys.  Residualised for the same reason.
+///
+/// # Safety
+/// `w_dict` must be a valid `W_DictObject` on `BYTES_DICT_STRATEGY`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_switch_bytes_to_object_strategy(w_dict: PyObjectRef) {
+    let dict = &mut *(w_dict as *mut W_DictObject);
+    let old = &*(dict.dstorage as *const BytesDictStorage);
+    let mut new_map = ObjectDictStorage::with_capacity(old.len());
+    for (k, v) in old.iter() {
+        let w_key = crate::w_bytes_from_bytes(k.as_slice());
+        new_map.insert(object_key_for(w_key), *v);
+    }
+    dict.dstorage =
+        crate::gc_storage::gc_alloc_storage_box(new_map, object_dict_storage_gc_type_id())
+            as *mut u8;
+    dict.dstrategy = &OBJECT_DICT_STRATEGY;
 }
 
 /// Internal helper: `ObjectDictStrategy::items` body for pyre's
@@ -5229,21 +5286,7 @@ impl DictStrategy for BytesDictStrategy {
     /// `IndexMap<ObjectKey, _>` with each `Vec<u8>` wrapped via
     /// `w_bytes_from_bytes`, drops the typed box.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        // Borrow the old typed box (its field stays live, so it is traced
-        // while the migration allocates keys); after the store the box is
-        // unreachable and the sweep reclaims it.
-        let old = &*(dict.dstorage as *const crate::dictmultiobject::BytesDictStorage);
-        let mut new_map = crate::dictmultiobject::ObjectDictStorage::with_capacity(old.len());
-        for (k, v) in old.iter() {
-            let w_key = crate::w_bytes_from_bytes(k.as_slice());
-            new_map.insert(crate::dictmultiobject::object_key_for(w_key), *v);
-        }
-        dict.dstorage = crate::gc_storage::gc_alloc_storage_box(
-            new_map,
-            crate::dictmultiobject::object_dict_storage_gc_type_id(),
-        ) as *mut u8;
-        dict.dstrategy = &OBJECT_DICT_STRATEGY;
+        crate::dictmultiobject::w_dict_switch_bytes_to_object_strategy(w_dict);
     }
 
     /// `dictmultiobject.py:1244-1247 get_empty_storage` — erased `{}`
@@ -5624,21 +5667,7 @@ impl DictStrategy for IntDictStrategy {
     /// fresh `IndexMap<ObjectKey, PyObjectRef>` and drops the old typed
     /// `IndexMap<i64, PyObjectRef>` box.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        // Borrow the old typed box (its field stays live, so it is traced
-        // while the migration allocates keys); after the store the box is
-        // unreachable and the sweep reclaims it.
-        let old = &*(dict.dstorage as *const crate::dictmultiobject::IntDictStorage);
-        let mut new_map = crate::dictmultiobject::ObjectDictStorage::with_capacity(old.len());
-        for (&k, &v) in old.iter() {
-            let w_key = crate::w_int_new(k);
-            new_map.insert(crate::dictmultiobject::object_key_for(w_key), v);
-        }
-        dict.dstorage = crate::gc_storage::gc_alloc_storage_box(
-            new_map,
-            crate::dictmultiobject::object_dict_storage_gc_type_id(),
-        ) as *mut u8;
-        dict.dstrategy = &OBJECT_DICT_STRATEGY;
+        crate::dictmultiobject::w_dict_switch_int_to_object_strategy(w_dict);
     }
 
     /// `dictmultiobject.py:1339-1352 IntDictStrategy.get_empty_storage`

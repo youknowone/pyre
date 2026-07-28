@@ -96,6 +96,37 @@ pub unsafe fn w_dict_lookup_identity_strategy(
     identity_storage(obj).get(&IdentityKey(key)).copied()
 }
 
+/// `dictmultiobject.py:1143-1150 AbstractTypedStrategy.switch_to_object_strategy`
+/// instantiation for IdentityDictStrategy — `wrap` is identity (`:26-27`), so
+/// the migration ports each `IdentityKey(obj)` into
+/// `ObjectKey { hash: hash_w(obj), obj }` without rewrapping keys.
+///
+/// Residualised (`@dont_look_inside`, `rlib/jit.py:139`) for the reason
+/// `dictmultiobject::w_dict_switch_int_to_object_strategy` is: the body is
+/// `IndexMap` construction and refill end to end, and the front end has no
+/// lowering for it, so there is no modellable point inside to put the boundary
+/// at.
+///
+/// # Safety
+/// `w_dict` must be a valid `W_DictObject` on [`IDENTITY_DICT_STRATEGY`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_switch_identity_to_object_strategy(w_dict: PyObjectRef) {
+    let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+    // Borrow the old typed box (its field stays live, so it is traced
+    // while the migration builds the object map); after the store the
+    // box is unreachable and the sweep reclaims it.
+    let old = &*(dict.dstorage as *const IdentityDictStorage);
+    let mut new_map = crate::dictmultiobject::ObjectDictStorage::with_capacity(old.len());
+    for (k, &v) in old.iter() {
+        new_map.insert(crate::dictmultiobject::object_key_for(k.0), v);
+    }
+    dict.dstorage = crate::gc_storage::gc_alloc_storage_box(
+        new_map,
+        crate::dictmultiobject::object_dict_storage_gc_type_id(),
+    ) as *mut u8;
+    dict.dstrategy = &OBJECT_DICT_STRATEGY;
+}
+
 #[inline]
 unsafe fn identity_storage_mut<'a>(
     obj: PyObjectRef,
@@ -170,20 +201,7 @@ impl DictStrategy for IdentityDictStrategy {
     /// (`:26-27`), so the migration ports each `IdentityKey(obj)` into
     /// `ObjectKey { hash: hash_w(obj), obj }` without rewrapping keys.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        // Borrow the old typed box (its field stays live, so it is traced
-        // while the migration builds the object map); after the store the
-        // box is unreachable and the sweep reclaims it.
-        let old = &*(dict.dstorage as *const IdentityDictStorage);
-        let mut new_map = crate::dictmultiobject::ObjectDictStorage::with_capacity(old.len());
-        for (k, &v) in old.iter() {
-            new_map.insert(crate::dictmultiobject::object_key_for(k.0), v);
-        }
-        dict.dstorage = crate::gc_storage::gc_alloc_storage_box(
-            new_map,
-            crate::dictmultiobject::object_dict_storage_gc_type_id(),
-        ) as *mut u8;
-        dict.dstrategy = &OBJECT_DICT_STRATEGY;
+        w_dict_switch_identity_to_object_strategy(w_dict);
     }
 
     /// `identitydict.py:67-70 get_empty_storage` — erased `{}` with

@@ -73,6 +73,37 @@ pub fn kwargs_dict_storage_gc_type_id() -> u32 {
     KWARGS_DICT_STORAGE_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `kwargsdict.py:134-141 switch_to_object_strategy` — walk the parallel
+/// arrays, rebuild `IndexMap<ObjectKey, PyObjectRef>`, retire the typed
+/// parallel-array box.
+///
+/// Residualised (`@dont_look_inside`, `rlib/jit.py:139`) for the reason
+/// `dictmultiobject::w_dict_switch_int_to_object_strategy` is: upstream traces
+/// the same loop because every step is an RPython dict primitive the JIT
+/// models, whereas this body is `IndexMap` end to end and the front end has no
+/// lowering for it, so the last modellable point is the call itself.
+///
+/// # Safety
+/// `w_dict` must be a valid `W_DictObject` on [`KWARGS_DICT_STRATEGY`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_switch_kwargs_to_object_strategy(w_dict: PyObjectRef) {
+    let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+    // Borrow the old typed box (its field stays live, so it is traced
+    // while the migration builds the object map); after the store the
+    // box is unreachable and the sweep reclaims it. `PyObjectRef` is a
+    // raw pointer (Copy), so iterate by reference and copy each slot.
+    let old = &*(dict.dstorage as *const KwargsDictStorage);
+    let mut new_map = crate::dictmultiobject::ObjectDictStorage::with_capacity(old.0.len());
+    for (k, v) in old.0.iter().zip(old.1.iter()) {
+        new_map.insert(crate::dictmultiobject::object_key_for(*k), *v);
+    }
+    dict.dstorage = crate::gc_storage::gc_alloc_storage_box(
+        new_map,
+        crate::dictmultiobject::object_dict_storage_gc_type_id(),
+    ) as *mut u8;
+    dict.dstrategy = &OBJECT_DICT_STRATEGY;
+}
+
 /// `kwargsdict.py:62` size threshold past which the strategy
 /// promotes itself to UnicodeDictStrategy to avoid O(n) lookup
 /// degeneracy on too-large kwarg dicts.
@@ -144,21 +175,7 @@ impl DictStrategy for KwargsDictStrategy {
     /// parallel arrays, rebuild `IndexMap<ObjectKey, PyObjectRef>`,
     /// retire the typed parallel-array box.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        // Borrow the old typed box (its field stays live, so it is traced
-        // while the migration builds the object map); after the store the
-        // box is unreachable and the sweep reclaims it. `PyObjectRef` is a
-        // raw pointer (Copy), so iterate by reference and copy each slot.
-        let old = &*(dict.dstorage as *const KwargsDictStorage);
-        let mut new_map = crate::dictmultiobject::ObjectDictStorage::with_capacity(old.0.len());
-        for (k, v) in old.0.iter().zip(old.1.iter()) {
-            new_map.insert(crate::dictmultiobject::object_key_for(*k), *v);
-        }
-        dict.dstorage = crate::gc_storage::gc_alloc_storage_box(
-            new_map,
-            crate::dictmultiobject::object_dict_storage_gc_type_id(),
-        ) as *mut u8;
-        dict.dstrategy = &OBJECT_DICT_STRATEGY;
+        w_dict_switch_kwargs_to_object_strategy(w_dict);
     }
 
     /// `kwargsdict.py:100-108 getitem` — `is_correct_type` →

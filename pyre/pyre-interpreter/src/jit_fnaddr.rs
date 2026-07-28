@@ -1731,6 +1731,38 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::dict_entries_probe_object",
         pyre_object::dictmultiobject::dict_entries_probe_object as *const (),
     );
+    // The three typed-storage promotions: `IndexMap` construction and refill
+    // end to end, so the residual boundary is the whole migration.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_switch_int_to_object_strategy",
+        "pyre_object::w_dict_switch_int_to_object_strategy",
+        pyre_object::dictmultiobject::w_dict_switch_int_to_object_strategy as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_switch_bytes_to_object_strategy",
+        "pyre_object::w_dict_switch_bytes_to_object_strategy",
+        pyre_object::dictmultiobject::w_dict_switch_bytes_to_object_strategy as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_module_dict_switch_to_object_strategy",
+        "pyre_object::w_module_dict_switch_to_object_strategy",
+        pyre_object::dictmultiobject::w_module_dict_switch_to_object_strategy as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::kwargsdict::w_dict_switch_kwargs_to_object_strategy",
+        "pyre_object::w_dict_switch_kwargs_to_object_strategy",
+        pyre_object::kwargsdict::w_dict_switch_kwargs_to_object_strategy as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::identitydict::w_dict_switch_identity_to_object_strategy",
+        "pyre_object::w_dict_switch_identity_to_object_strategy",
+        pyre_object::identitydict::w_dict_switch_identity_to_object_strategy as *const (),
+    );
     push_alias_pair(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_float_abs",
