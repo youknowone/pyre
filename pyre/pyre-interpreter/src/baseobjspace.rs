@@ -6325,6 +6325,70 @@ pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
     Ok(w_none())
 }
 
+/// PyPy `typeobject.py:1168-1179 descr__doc` with Python 3.14's `type`
+/// docstring. Heap types read and descriptor-bind only their own `__doc__`;
+/// builtin types expose the doc stored in their native type namespace.
+pub(crate) fn type_get_doc(obj: PyObjectRef) -> PyResult {
+    unsafe {
+        if std::ptr::eq(obj, crate::typedef::w_type()) {
+            return Ok(w_str_new(
+                "type(object) -> the object's type\n\
+                 type(name, bases, dict, **kwds) -> a new type",
+            ));
+        }
+        if std::ptr::eq(
+            obj,
+            crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE),
+        ) {
+            return Ok(w_str_new(crate::typedef::PROPERTY_DOC));
+        }
+        if std::ptr::eq(
+            obj,
+            crate::typedef::gettypeobject(&crate::function::FUNCTION_TYPE),
+        ) {
+            return Ok(w_str_new(crate::typedef::FUNCTION_DOC));
+        }
+        if std::ptr::eq(
+            obj,
+            crate::typedef::gettypeobject(&pyre_object::function::METHOD_TYPE),
+        ) {
+            return Ok(w_str_new(crate::typedef::METHOD_DOC));
+        }
+        let Some(value) = crate::type_dict_lookup(obj, "__doc__") else {
+            return Ok(w_none());
+        };
+        if w_type_is_heaptype(obj) {
+            return match get(value, PY_NULL, obj)? {
+                Some(result) => Ok(result),
+                None => Ok(value),
+            };
+        }
+        Ok(value)
+    }
+}
+
+/// PyPy `typeobject.py:1181-1185 descr_set__doc`.
+pub(crate) fn type_set_doc(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
+    if !unsafe { w_type_is_heaptype(obj) } {
+        return Err(PyError::type_error(format!(
+            "cannot set '__doc__' attribute of immutable type '{}'",
+            unsafe { w_type_get_name(obj) },
+        )));
+    }
+    crate::type_dict_store(obj, "__doc__", value);
+    unsafe { mutated(obj, Some("__doc__")) };
+    Ok(w_none())
+}
+
+/// CPython 3.14 `type_set_doc(tp, NULL)`: deleting a type's doc is forbidden
+/// even for a heap type.
+pub(crate) fn type_del_doc(obj: PyObjectRef) -> PyResult {
+    Err(PyError::type_error(format!(
+        "cannot delete '__doc__' attribute of immutable type '{}'",
+        unsafe { w_type_get_name(obj) },
+    )))
+}
+
 fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResult {
     if name == "__dict__" && unsafe { is_module(obj) } {
         let dict = unsafe { pyre_object::w_module_get_w_dict(obj) };
@@ -6569,29 +6633,8 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     call_getattr,
                 );
             }
-            // PyPy replaces `W_Property.typedef.rawdict['__doc__']` with the
-            // instance descriptor while retaining the TypeDef doc separately;
-            // CPython likewise keeps `tp_doc` beside a member descriptor under
-            // the same dict key.  Pyre has no separate type-doc slot, so serve
-            // that exact builtin split here without affecting subclasses.
             if name == "__doc__" {
-                if let Some(doc) = crate::typedef::type_builtin_own_doc(obj) {
-                    return Ok(doc);
-                }
-            }
-            // typeobject.py:1166-1179 descr__doc — a heap type reads only its
-            // own dict and returns None when absent; class docs are never
-            // inherited. EnumType may omit an explicit `__doc__ = None`, so an
-            // MRO lookup here would incorrectly surface Enum.__doc__.
-            if name == "__doc__" && pyre_object::w_type_is_heaptype(obj) {
-                if let Some(value) = crate::type_dict_lookup(obj, name) {
-                    return match get(value, PY_NULL, obj) {
-                        Ok(Some(result)) => Ok(result),
-                        Ok(None) => Ok(value),
-                        Err(e) => Err(e),
-                    };
-                }
-                return Ok(w_none());
+                return type_get_doc(obj);
             }
             if name == "__code__"
                 || name == "__func__"

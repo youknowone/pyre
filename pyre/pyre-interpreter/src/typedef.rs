@@ -9730,6 +9730,31 @@ fn init_type_type(ns: PyObjectRef) {
         )
     };
 
+    // typeobject.py:1306 W_TypeObject.typedef `__doc__` getset. Python 3.14
+    // routes deletion through `type_set_doc(tp, NULL)` and rejects it.
+    let doc_getter = make_builtin_function_with_arity(
+        "__doc__",
+        |args| crate::baseobjspace::type_get_doc(args[1]),
+        2,
+    );
+    let doc_setter = make_builtin_function_with_arity(
+        "__doc__",
+        |args| crate::baseobjspace::type_set_doc(args[1], args[2]),
+        3,
+    );
+    let doc_deleter = make_builtin_function_with_arity(
+        "__doc__",
+        |args| crate::baseobjspace::type_del_doc(args[1]),
+        2,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            make_getset_property_named(doc_getter, doc_setter, doc_deleter, "__doc__"),
+        )
+    };
+
     let mro_getter = make_builtin_function_with_arity(
         "__mro__",
         |args| {
