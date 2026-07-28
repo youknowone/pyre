@@ -144,6 +144,38 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     let num_vable_identity_slots = usize::from(has_vable_identity);
     let num_ref_scalars = ref_scalars.len();
     let num_float_scalars = float_scalars.len();
+    // The virtualizable's element boxes are a strict SUFFIX of the loop-carried
+    // list upstream — `live_arg_boxes = greenboxes + redboxes` then
+    // `live_arg_boxes += self.virtualizable_boxes; live_arg_boxes.pop()`
+    // (pyjitpl.py:2981-2989), and `+=` cannot put an element before a red.
+    //
+    // Pyre's two sides disagree once a state has BOTH a `[.. ; virt]` array and
+    // a ref or float scalar:
+    //   entry (`JitDriver::extend_compiled_live_values`, jitdriver.rs)
+    //     `live_values.extend(extra_values)`
+    //     -> [ints, fixed arrays, identity, refs, floats] ++ [elements]
+    //   close (`__jit_loop_carried_boxes` below)
+    //     -> [ints, fixed arrays, identity, elements, refs, floats]
+    // Same arity, so `jump.numargs() == label.numargs()` (compile.py:334) still
+    // holds and nothing catches it — the JUMP just binds the ref/float scalars
+    // and the trailing elements to each other's LABEL slots.
+    //
+    // No interpreter in tree declares that combination (cel's `VmStateF` is
+    // arrays only; `tl` is one int scalar plus one virt array), so this refuses
+    // the shape rather than miscompiling it silently. Lifting the refusal means
+    // moving the element splice to the end of every vector that enumerates the
+    // reds, not relaxing this check.
+    if num_virt_arrays > 0 && (num_ref_scalars > 0 || num_float_scalars > 0) {
+        return quote! {
+            compile_error!(
+                "state_fields cannot yet combine a `[.. ; virt]` array with a ref or \
+                 float scalar: the closing JUMP splices the virtualizable's element \
+                 boxes ahead of those scalars while the entry contract appends them \
+                 after every red (pyjitpl.py:2981-2989 makes the elements a strict \
+                 suffix), so the two orders disagree at equal arity"
+            );
+        };
+    }
     // First ref-bank register available for ref-scalar identity slots.
     // `MIFrame::setup_call` packs the dispatch JitCode's ref args densely
     // from r0 (`program` at r0, the virtualizable identity at r1 when
