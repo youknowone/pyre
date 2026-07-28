@@ -869,7 +869,7 @@ fn maybe_print_jit_stats() {
         .0
         .meta_interp()
         .staticdata
-        .all_descrs
+        .all_descrs()
         .lock()
         .map(|d| d.len())
         .unwrap_or(0);
