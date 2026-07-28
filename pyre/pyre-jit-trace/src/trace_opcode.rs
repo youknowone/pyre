@@ -2196,6 +2196,15 @@ impl MIFrame {
         // inputargs types via `front_target_inputarg_types` (peeled-entry
         // LABEL when unrolled, root TreeLoop.inputargs otherwise — see
         // `MetaInterp::front_target_inputarg_types` doc).
+        //
+        // For a main trace the target label is the merge point being closed at
+        // (`original_boxes`, pyjitpl.py:3039-3041), which is the trace's own
+        // inputargs only when the trace closes at its own head. Resolving it
+        // through the merge point keeps the JUMP typed against the label it
+        // actually targets, the same correction `front_target_inputarg_types`
+        // makes on the bridge arm. A head close resolves to the trace-start
+        // seed, whose boxes were registered from `inputarg_types` — so that
+        // case stays byte-identical.
         let inputarg_types = {
             let (driver, _) = crate::driver::driver_pair();
             if driver.is_bridge_tracing() {
@@ -2207,7 +2216,9 @@ impl MIFrame {
                     ctx.inputarg_types()
                 }
             } else {
-                ctx.inputarg_types()
+                target_pc
+                    .and_then(|pc| ctx.merge_point_arg_types_at_header(pc))
+                    .unwrap_or_else(|| ctx.inputarg_types())
             }
         };
         let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
