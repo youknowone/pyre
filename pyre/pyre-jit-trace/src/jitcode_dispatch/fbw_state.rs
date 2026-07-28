@@ -1442,14 +1442,18 @@ pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
 /// A frame the function-entry portal compiled can outlive its trace the same
 /// way a generator's does — a traceback it hands out keeps it alive — and the
 /// lazy route is not available to narrow this back down.  Two things have to
-/// land before it is: the backend frees the jitframe chain before
+/// land before it is.  The dynasm backend frees the jitframe chain before
 /// `execute_token` returns, so the marker would name freed memory rather than
-/// a retained deadframe; and no backend arms `jf_force_descr` for a standalone
-/// trailing `GUARD_NOT_FORCED_2`, which upstream does from
-/// `consider_guard_not_forced_2` (x86/regalloc.py), so the armed-token test
-/// would answer false for a portal exit even once the chain is retained.
-/// Narrowing the force to the frames that actually escape needs both; the
-/// escape is a runtime property, which is what the token protocol answers.
+/// a retained deadframe.  And arming `jf_force_descr` for a standalone
+/// trailing `GUARD_NOT_FORCED_2` is uneven: cranelift does it, dynasm folds
+/// the opcode into the no-args guard bucket and so does not, and wasm cannot
+/// yet — its `FORCE_TOKEN` is a zero sentinel, leaving no frame identity for a
+/// token to name.  Upstream arms it on every backend, from
+/// `consider_guard_not_forced_2` (x86/regalloc.py), so until dynasm and wasm
+/// follow, the armed-token test answers false for a portal exit even once the
+/// chain is retained.  Narrowing the force to the frames that actually escape
+/// needs both; the escape is a runtime property, which is what the token
+/// protocol answers.
 ///
 /// Storing back here is what makes the token store unnecessary rather than
 /// merely redundant: `gen_store_back_in_vable` sets `forced_virtualizable`, and
@@ -1598,7 +1602,7 @@ pub(crate) fn fbw_finish_is_exception() -> bool {
 /// Map an `abort_permanent` marker's jitcode pc back to the Python opcode
 /// the interpreter must resume at.  `emit_abort_permanent` (codewriter)
 /// anchors the graph marker at `py_pc` and additionally stores
-/// `last_instr = py_pc - 1` for portal frames; the full-body walk reads the
+/// `last_instr = py_pc - 1` into the frame red; the full-body walk reads the
 /// marker coordinate here to flush the abort-point frame instead of replaying
 /// the walked region.  Returns None when the sym's jitcode / `code_ptr` is
 /// unavailable (no resume coordinate derivable → legacy replay).

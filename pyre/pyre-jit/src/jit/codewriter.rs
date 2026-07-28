@@ -6523,9 +6523,11 @@ impl CodeWriter {
                 // opcodes instead of falling back to the interpreter).
                 // `abort_permanent` is pyre-specific (no upstream
                 // RPython counterpart), but it must retain the Python
-                // opcode where interpretation resumes. In a non-portal
-                // callee there is no last_instr vable write to anchor that
-                // coordinate for the inverse map.
+                // opcode where interpretation resumes: the offset is what
+                // `fbw_abort_resume_py_pc` and the callee-rebuild leg read
+                // back through the inverse map. The rebuild reconstructs
+                // the frame wholesale and assigns its `last_instr` itself,
+                // so the vable store below cannot serve them.
                 record_graph_op(
                     &current_block.block(),
                     "abort_permanent",
