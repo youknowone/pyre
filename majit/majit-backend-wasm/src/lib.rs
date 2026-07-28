@@ -314,6 +314,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_gc_owns_object(Some(wasm_gc_owns_object));
     majit_gc::set_active_write_barrier(Some(wasm_active_gc_write_barrier));
     majit_gc::set_active_get_objects(Some(wasm_get_objects));
+    majit_gc::set_active_get_referents(Some(wasm_get_referents));
     majit_gc::set_active_collect_oldgen(Some(wasm_collect_oldgen_nonmoving));
     majit_gc::set_active_heap_stats(Some(active_gc_heap_stats));
     majit_gc::set_active_finalizer_hooks(
@@ -471,6 +472,11 @@ fn wasm_collect_oldgen_nonmoving() {
 fn wasm_get_objects(generation: i8, visitor: majit_gc::GetObjectsVisitorFn) {
     let mut visit = visitor;
     with_wasm_active_gc_mut(|gc| gc.get_objects(generation, &mut visit));
+}
+
+fn wasm_get_referents(obj: GcRef, visitor: majit_gc::GetObjectsVisitorFn) {
+    let mut visit = visitor;
+    with_wasm_active_gc_mut(|gc| gc.get_referents(obj, &mut visit));
 }
 
 fn wasm_register_finalizer(fq_index: usize, obj: GcRef, trigger: majit_gc::FinalizerTriggerFn) {

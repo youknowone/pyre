@@ -388,6 +388,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_alloc_oldgen_typed(Some(alloc_oldgen_typed_via_active_runtime));
     majit_gc::set_active_collect_full(Some(collect_full_via_active_runtime));
     majit_gc::set_active_get_objects(Some(get_objects_via_active_runtime));
+    majit_gc::set_active_get_referents(Some(get_referents_via_active_runtime));
     majit_gc::set_active_collect_oldgen(Some(collect_oldgen_nonmoving_via_active_runtime));
     majit_gc::set_active_heap_stats(Some(heap_stats_via_active_runtime));
     majit_gc::set_active_root_hooks(
@@ -1610,6 +1611,11 @@ fn collect_full_via_active_runtime() {
 fn get_objects_via_active_runtime(generation: i8, visitor: majit_gc::GetObjectsVisitorFn) {
     let mut visit = visitor;
     with_cranelift_gc(|gc| gc.get_objects(generation, &mut visit));
+}
+
+fn get_referents_via_active_runtime(obj: GcRef, visitor: majit_gc::GetObjectsVisitorFn) {
+    let mut visit = visitor;
+    with_cranelift_gc(|gc| gc.get_referents(obj, &mut visit));
 }
 
 /// Non-moving old-gen-only major trampoline — sweeps dead old-gen objects

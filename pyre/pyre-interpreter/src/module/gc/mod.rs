@@ -4,13 +4,38 @@
 //! RPython collection, then drains the finalizer queue synchronously.
 
 use pyre_object::*;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 /// `interp_gc.py` tracks a process-wide `enabled` flag on the GC
 /// frontend; pyre has no generational threshold knob, but
 /// `gc.isenabled()` should reflect the most recent `enable`/`disable`
 /// call so callers that toggle and re-read the state stay consistent.
 static GC_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// The three thresholds `gc.set_threshold` writes and `gc.get_threshold`
+/// reads back, seeded with CPython 3.14's defaults. The collector runs off a
+/// nursery size rather than per-generation allocation counters, so the values
+/// round-trip but do not decide when a collection happens.
+static GC_THRESHOLD: [AtomicI64; 3] =
+    [AtomicI64::new(2000), AtomicI64::new(10), AtomicI64::new(10)];
+
+fn pin_object(object: majit_ir::GcRef) {
+    pyre_object::gc_roots::pin_root(object.0 as PyObjectRef);
+}
+
+/// `referents.py:53-78 _list_w_obj_referents`: push the app-level objects
+/// `w_obj` refers to directly onto the shadow stack. The walk looks through
+/// the interpreter-internal structs in between, so a list reports its items
+/// and not the array holding them.
+///
+/// Only managed-heap referents are reported, the same boundary `gc.get_objects`
+/// and `gc.is_tracked` draw. An immortal referent carries a GC header but sits
+/// outside the collector's ranges, and a slot such as `ob_type` can hold a
+/// static that has no header at all, so there is no address the walk could
+/// safely widen to.
+fn pin_referents(w_obj: PyObjectRef) {
+    majit_gc::get_referents(majit_ir::GcRef(w_obj as usize), pin_object);
+}
 
 fn user_del_action() -> Option<&'static mut crate::executioncontext::UserDelAction> {
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
@@ -115,9 +140,6 @@ crate::py_module! {
             }
             let _roots = pyre_object::gc_roots::push_roots();
             let first = pyre_object::gc_roots::shadow_stack_len();
-            fn pin_object(object: majit_ir::GcRef) {
-                pyre_object::gc_roots::pin_root(object.0 as PyObjectRef);
-            }
             majit_gc::get_objects(generation as i8, pin_object);
             let objects = (first..pyre_object::gc_roots::shadow_stack_len())
                 .map(pyre_object::gc_roots::shadow_stack_get)
@@ -155,17 +177,89 @@ crate::py_module! {
             };
             Ok(w_bool_from(enabled))
         },
-        "get_referrers" / * = |_| Ok(w_list_new(vec![])),
-        "get_referents" / * = |_| Ok(w_list_new(vec![])),
-        "set_threshold" / 0 = |_| Ok(w_none()),
-        "get_threshold" / 0 = |_| Ok(w_tuple_new(vec![
-            w_int_new(700), w_int_new(10), w_int_new(10),
-        ])),
+        "get_referrers" / * = |args| {
+            // referents.py:147-169 get_referrers: list every app-level object,
+            // then keep the ones whose direct referents include an argument.
+            // An object referring to the same argument twice is reported once,
+            // but one passed the same argument twice is reported twice.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let all_first = pyre_object::gc_roots::shadow_stack_len();
+            majit_gc::get_objects(-1, pin_object);
+            let all_last = pyre_object::gc_roots::shadow_stack_len();
+            let mut result = Vec::new();
+            for slot in all_first..all_last {
+                let w_obj = pyre_object::gc_roots::shadow_stack_get(slot);
+                let _refs = pyre_object::gc_roots::push_roots();
+                let refs_first = pyre_object::gc_roots::shadow_stack_len();
+                pin_referents(w_obj);
+                let refs_last = pyre_object::gc_roots::shadow_stack_len();
+                for &w_arg in args {
+                    if (refs_first..refs_last)
+                        .any(|s| pyre_object::gc_roots::shadow_stack_get(s) == w_arg)
+                    {
+                        result.push(w_obj);
+                    }
+                }
+            }
+            // Every entry is also pinned in `all_first..all_last`, so the list
+            // allocation below cannot leave one unrooted.
+            Ok(w_list_new_object(result))
+        },
+        "get_referents" / * = |args| {
+            // referents.py:128-145 get_referents.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let first = pyre_object::gc_roots::shadow_stack_len();
+            for &w_obj in args {
+                pin_referents(w_obj);
+            }
+            let result = (first..pyre_object::gc_roots::shadow_stack_len())
+                .map(pyre_object::gc_roots::shadow_stack_get)
+                .collect();
+            Ok(w_list_new_object(result))
+        },
+        "set_threshold" / * = |args| {
+            // CPython 3.14 `gc.set_threshold(threshold0[, threshold1[,
+            // threshold2]])` writes only the positions it was given, and
+            // parses every argument before writing any of them.
+            if args.is_empty() || args.len() > 3 {
+                return Err(crate::PyError::type_error(
+                    "gc.set_threshold requires 1 to 3 arguments",
+                ));
+            }
+            let mut parsed = [0i64; 3];
+            for (i, &arg) in args.iter().enumerate() {
+                parsed[i] = crate::baseobjspace::int_w(
+                    crate::baseobjspace::space_index(arg)?,
+                )?;
+            }
+            for (i, &value) in parsed[..args.len()].iter().enumerate() {
+                GC_THRESHOLD[i].store(value, Ordering::Relaxed);
+            }
+            Ok(w_none())
+        },
+        "get_threshold" / 0 = |_| Ok(w_tuple_new(
+            GC_THRESHOLD
+                .iter()
+                .map(|slot| w_int_new(slot.load(Ordering::Relaxed)))
+                .collect(),
+        )),
         "get_count"     / 0 = |_| Ok(w_tuple_new(vec![
             w_int_new(0), w_int_new(0), w_int_new(0),
         ])),
-        "is_tracked"    / 1 = |_| Ok(w_bool_from(false)),
+        "is_tracked"    / 1 = |args| {
+            // CPython 3.14 `gc.is_tracked(obj)`: whether the collector visits
+            // the object. pyre's immortal allocations live outside the managed
+            // heap, so they are never traced and never reclaimed.
+            Ok(w_bool_from(majit_gc::gc_owns_object(args[0] as usize)))
+        },
         "is_finalized"  / 1 = |_| Ok(w_bool_from(false)),
-        "freeze"        / 0 = |_| Ok(w_none()),
+        // CPython 3.14 `gc.freeze()` moves the surviving objects into a
+        // permanent generation that later collections skip; it is a pre-fork
+        // hint, not a semantic guarantee. The collector has no permanent
+        // generation, so freezing and unfreezing are no-ops and the frozen
+        // count is always the truthful zero.
+        "freeze"           / 0 = |_| Ok(w_none()),
+        "unfreeze"         / 0 = |_| Ok(w_none()),
+        "get_freeze_count" / 0 = |_| Ok(w_int_new(0)),
     },
 }
