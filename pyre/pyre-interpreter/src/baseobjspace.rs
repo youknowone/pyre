@@ -5117,7 +5117,11 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             // Per-iterator-type pickle protocol: `__reduce__` /
             // `__setstate__` / `__length_hint__` recreate the iterator's
             // CPython 3.14 pickle shape.  `arity` includes `self`.
-            let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = if is_seq_iter(obj) {
+            // `memory_iterator` is the one seq-iter flavour with no pickle
+            // surface at all, so it takes none of these.
+            let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = if is_seq_iter(obj)
+                && !pyre_object::iterobject::is_memory_iter(obj)
+            {
                 match name {
                     "__reduce__" => Some((seq_iter_reduce_method, "__reduce__", 1)),
                     "__setstate__" => Some((seq_iter_setstate_method, "__setstate__", 2)),

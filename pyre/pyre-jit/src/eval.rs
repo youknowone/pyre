@@ -1738,12 +1738,36 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // W_SeqIterObject (list/tuple iterator) — typed payload via
     // `#[pyre_class]`.  Pre-registered ahead of the foreign-pytype
     // loop so the GC walker reaches the inline `seq` field.
-    register_pyre_class(
+    let seq_iter_tid = register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
         <pyre_object::iterobject::W_SeqIterObject
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // The producer-specific str / bytes / bytearray / memoryview iterator
+    // identities carry the same `W_SeqIterObject` payload and traced `seq`
+    // edge, so they alias its vtable rather than minting ids of their own —
+    // the shape the six dict view iterators use below.
+    for tp in [
+        &pyre_object::iterobject::STR_ASCII_ITER_TYPE,
+        &pyre_object::iterobject::STR_ITER_TYPE,
+        &pyre_object::iterobject::BYTES_ITER_TYPE,
+        &pyre_object::iterobject::BYTEARRAY_ITER_TYPE,
+        &pyre_object::iterobject::MEMORY_ITER_TYPE,
+    ] {
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            tp as *const _ as usize,
+            seq_iter_tid,
+        );
+        pytype_to_tid.insert(tp as *const _ as usize, seq_iter_tid);
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            tp as *const _ as usize,
+            <pyre_object::iterobject::W_SeqIterObject
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR
+                .ptr_offsets,
+        );
+    }
     // W_Count / W_Repeat (`itertools.count` / `itertools.repeat`) —
     // typed payload via `#[pyre_class]`.  Neither PyType is in
     // `all_foreign_pytypes()`, so pre-registration here is the only

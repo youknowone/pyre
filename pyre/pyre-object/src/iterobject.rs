@@ -45,20 +45,60 @@ pub struct W_TupleIterObject {
     pub index: i64,
 }
 
+// Python 3.14 gives str / bytes / bytearray / memoryview iteration its own
+// concrete type per producer, while PyPy serves all four from the abstract
+// `sequenceiterator`.  Keep PyPy's single payload and `descr_next` and give
+// each producer the 3.14-visible identity through its own `PyType`, the way
+// `dictmultiobject`'s six view iterators share `W_BaseDictMultiIterObject`.
+pub static STR_ASCII_ITER_TYPE: PyType = crate::pyobject::new_pytype("str_ascii_iterator");
+pub static STR_ITER_TYPE: PyType = crate::pyobject::new_pytype("str_iterator");
+pub static BYTES_ITER_TYPE: PyType = crate::pyobject::new_pytype("bytes_iterator");
+pub static BYTEARRAY_ITER_TYPE: PyType = crate::pyobject::new_pytype("bytearray_iterator");
+pub static MEMORY_ITER_TYPE: PyType = crate::pyobject::new_pytype("memory_iterator");
+
+/// The Python-visible iterator type for a sequence iterator over `seq`.
+///
+/// 3.14 splits str iteration by storage: an all-ASCII str yields
+/// `str_ascii_iterator`, anything wider yields `str_iterator`.  Producers with
+/// no specialized type keep the shared `sequenceiterator`.
+fn seq_iter_type_for(seq: PyObjectRef) -> &'static PyType {
+    unsafe {
+        if crate::is_str(seq) {
+            if crate::unicodeobject::w_str_is_ascii(seq) {
+                &STR_ASCII_ITER_TYPE
+            } else {
+                &STR_ITER_TYPE
+            }
+        } else if crate::bytesobject::is_bytes(seq) {
+            &BYTES_ITER_TYPE
+        } else if crate::bytearrayobject::is_bytearray(seq) {
+            &BYTEARRAY_ITER_TYPE
+        } else if crate::memoryview::is_w_memoryview(seq) {
+            &MEMORY_ITER_TYPE
+        } else {
+            &SEQ_ITER_TYPE
+        }
+    }
+}
+
 pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
     let _roots = crate::gc_roots::push_roots();
+    let seq_slot = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(seq);
-    W_SeqIterObject::allocate_stable(W_SeqIterObject {
+    let seq = crate::gc_roots::shadow_stack_get(seq_slot);
+    let tp = seq_iter_type_for(seq);
+    let value = W_SeqIterObject {
         ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+            ob_type: tp as *const PyType,
+            w_class: crate::pyobject::get_instantiate(tp),
         },
         seq,
         index: 0,
         length: length as i64,
         empty_kind: unsafe { if crate::is_str(seq) { 1 } else { 0 } },
-    })
+    };
+    crate::lltype::malloc_typed_stable(value) as PyObjectRef
 }
 
 pub fn w_list_iter_new(seq: PyObjectRef) -> PyObjectRef {
@@ -107,7 +147,29 @@ pub unsafe fn is_seq_iter(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return false;
     }
-    !obj.is_null() && unsafe { (*obj).ob_type == &SEQ_ITER_TYPE as *const PyType }
+    if obj.is_null() {
+        return false;
+    }
+    // Every producer-specific identity minted by `seq_iter_type_for` carries
+    // the same `W_SeqIterObject` payload, so all of them answer yes here.
+    let tp = unsafe { (*obj).ob_type };
+    tp == &SEQ_ITER_TYPE as *const PyType
+        || tp == &STR_ASCII_ITER_TYPE as *const PyType
+        || tp == &STR_ITER_TYPE as *const PyType
+        || tp == &BYTES_ITER_TYPE as *const PyType
+        || tp == &BYTEARRAY_ITER_TYPE as *const PyType
+        || tp == &MEMORY_ITER_TYPE as *const PyType
+}
+
+/// `memory_iterator` — the one producer-specific `W_SeqIterObject` identity
+/// that exposes no pickle protocol (`__length_hint__` / `__setstate__` absent,
+/// `__reduce__` inherited from `object`, which refuses).
+#[inline]
+pub unsafe fn is_memory_iter(obj: PyObjectRef) -> bool {
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return false;
+    }
+    !obj.is_null() && (*obj).ob_type == &MEMORY_ITER_TYPE as *const PyType
 }
 
 #[inline]

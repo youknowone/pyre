@@ -1006,6 +1006,37 @@ pub fn init_typeobjects() {
                 "tuple_iterator",
                 init_tuple_iterator_type as fn(PyObjectRef),
             ),
+            // The str / bytes / bytearray / memoryview iterators run the
+            // shared `W_SeqIterObject` payload behind their own 3.14
+            // identities, so they take the sequence-iterator namespace.
+            (
+                &pyre_object::iterobject::STR_ASCII_ITER_TYPE as *const PyType,
+                "str_ascii_iterator",
+                init_sequence_iterator_type as fn(PyObjectRef),
+            ),
+            (
+                &pyre_object::iterobject::STR_ITER_TYPE as *const PyType,
+                "str_iterator",
+                init_sequence_iterator_type as fn(PyObjectRef),
+            ),
+            (
+                &pyre_object::iterobject::BYTES_ITER_TYPE as *const PyType,
+                "bytes_iterator",
+                init_sequence_iterator_type as fn(PyObjectRef),
+            ),
+            (
+                &pyre_object::iterobject::BYTEARRAY_ITER_TYPE as *const PyType,
+                "bytearray_iterator",
+                init_sequence_iterator_type as fn(PyObjectRef),
+            ),
+            // `memory_iterator` carries only the iteration protocol: it has
+            // neither `__length_hint__` nor `__setstate__`, and pickling one
+            // raises `TypeError: cannot pickle 'memory_iterator' object`.
+            (
+                &pyre_object::iterobject::MEMORY_ITER_TYPE as *const PyType,
+                "memory_iterator",
+                init_memory_iterator_type as fn(PyObjectRef),
+            ),
         ] {
             let iterator_type = new_typeobject_with_base(name, init, object_type);
             unsafe {
@@ -1722,6 +1753,12 @@ fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner>
         // receiver reaches those accessors as type confusion — reproducibly a
         // SIGSEGV for `type(iter(())).__length_hint__(None)`.
         "iterator" => pyre_object::is_seq_iter,
+        // Producer-specific identities over the same `W_SeqIterObject` payload.
+        "str_ascii_iterator" => pyre_object::is_seq_iter,
+        "str_iterator" => pyre_object::is_seq_iter,
+        "bytes_iterator" => pyre_object::is_seq_iter,
+        "bytearray_iterator" => pyre_object::is_seq_iter,
+        "memory_iterator" => pyre_object::is_seq_iter,
         "list_iterator" => pyre_object::is_list_iter,
         "list_reverseiterator" => pyre_object::is_list_reverse_iter,
         "tuple_iterator" => pyre_object::is_tuple_iter,
@@ -23711,6 +23748,28 @@ fn init_sequence_iterator_type(ns: PyObjectRef) {
                 crate::baseobjspace::seq_iter_setstate_method,
                 2,
             ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+/// Python 3.14 `PySeqIter_Type` restricted to `memory_iterator`'s surface:
+/// `__iter__` and `__next__` only.  The shared `W_SeqIterObject` payload
+/// carries the index and length a `__length_hint__` / `__setstate__` would
+/// read, but the type does not expose them, and `__reduce__` falls through to
+/// `object`'s, which refuses to pickle it.
+fn init_memory_iterator_type(ns: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
+    let entries = [
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
         ),
     ];
     for (name, value) in entries {
