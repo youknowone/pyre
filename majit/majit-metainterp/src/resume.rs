@@ -7514,6 +7514,7 @@ pub fn blackhole_from_resumedata<'a>(
 /// Used for GUARD_NOT_FORCED handling.
 /// Returns (virtuals_cache_ptr, virtuals_cache_int) — RPython VirtualCache parity.
 pub fn force_from_resumedata<'a>(
+    profiler: &crate::jitprof::JitProfiler,
     rd_numb: &'a [u8],
     rd_consts: &'a [majit_ir::Const],
     all_liveness: &'a [u8],
@@ -7526,6 +7527,8 @@ pub fn force_from_resumedata<'a>(
     ginfo: Option<&dyn GreenfieldInfo>,
     allocator: &'a dyn BlackholeAllocator,
 ) -> (Vec<i64>, Vec<i64>) {
+    // resume.py:1346
+    profiler.count(crate::pyjitpl::counters::FORCE_VIRTUALIZABLES, 1);
     // resume.py:1347-1348
     let mut resumereader = ResumeDataDirectReader::new(
         rd_numb,

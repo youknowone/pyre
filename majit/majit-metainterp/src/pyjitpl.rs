@@ -11697,6 +11697,7 @@ impl<M: Clone> MetaInterp<M> {
         let vinfo = self.virtualizable_info();
         let all_liveness = self.staticdata.liveness_info.as_slice();
         let (all_virtuals_ptr, all_virtuals_int) = crate::resume::force_from_resumedata(
+            &self.staticdata.profiler,
             rd_numb,
             rd_consts,
             all_liveness,

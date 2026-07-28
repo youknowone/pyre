@@ -918,6 +918,7 @@ fn maybe_print_jit_stats() {
             profiler.finish();
         }
     }
+    maybe_print_mc_diag();
     if std::env::var_os("MAJIT_STATS").is_none() {
         return;
     }
@@ -965,6 +966,52 @@ fn maybe_print_jit_stats() {
     // Whether those slots were filled CORRECTLY, which the line above
     // cannot say. See `field_position_jit_stats`.
     eprintln!("[jit-stats] {}", pyre_jit::field_position_jit_stats());
+}
+
+/// Names for the `MC_DIAG` tallies, in index order. Mirrors the legend on
+/// `majit_metainterp::MC_DIAG` and the labels the wasm runner prints for the
+/// `pyre_jit_mc_diag` export, so a native run and a wasm run of the same
+/// program are diffable field by field.
+const MC_DIAG_FIELDS: [&str; 18] = [
+    "mc_entered",
+    "decl_shortcircuit",
+    "descr0_skip",
+    "busy_skip",
+    "FIRED",
+    "stack_full",
+    "retrace_entered",
+    "retrace_bailed",
+    "cb_entered",
+    "cb_invalidloop",
+    "cb_retrace_req",
+    "cb_arity_giveup",
+    "sbt_entered",
+    "sbt_not_faildescr",
+    "sbt_no_jct",
+    "sbt_no_meta",
+    "sbt_cant_trace",
+    "sbt_short_vals",
+];
+
+/// Print the guard-failure → bridge-trace gate tallies. Until this existed the
+/// counters were bumped on every backend but only readable through the wasm
+/// guest export, so the question "did this guard failure ever reach a bridge,
+/// or was it short-circuited by the decline blacklist" could not be asked of a
+/// native run at all.
+///
+/// Deliberately NOT under the `[jit-stats]` prefix: `check.py`'s
+/// `_jit_stats_snapshot` keeps the LAST such line, so a second one would
+/// silently replace the committed per-bench baseline. Its own env gate keeps it
+/// off the default `check.py` run, which sets `MAJIT_STATS` for every bench.
+fn maybe_print_mc_diag() {
+    if std::env::var_os("PYRE_MC_DIAG").is_none() {
+        return;
+    }
+    let mut line = String::from("[jit-mc-diag]");
+    for (i, name) in MC_DIAG_FIELDS.iter().enumerate() {
+        line.push_str(&format!(" {name}={}", majit_metainterp::mc_diag(i)));
+    }
+    eprintln!("{line}");
 }
 
 /// Shared top-level launcher bootstrap for `run_source` and `run_module`:
