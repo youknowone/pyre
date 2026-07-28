@@ -2305,6 +2305,80 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `LOAD_METHOD` classmethod fold for a type receiver (`Type.cmethod(...)`).
+/// The safety oracle is [`pyre_interpreter::classmethod_on_type_fast_path`]: it
+/// declines a custom metaclass, a metatype-defined name, an uncacheable type,
+/// and any non-`classmethod` descriptor.  On success the walker pins the exact
+/// type and its version tag, then writes the classmethod's `__func__` as a
+/// green constant.  Because the method-load result is the plain `__func__` (not
+/// a bound `Method`), the paired [`try_walker_fold_load_method_self`] runs
+/// `compute_load_method_bound`, whose `is_type` + `is_classmethod` arm binds the
+/// type as `cls`, and the following `CALL` inlines `__func__(cls, ...)` — the
+/// instance-method shape with the class in the receiver slot.
+///
+/// Restricted to the top full-body frame for the reason
+/// [`try_walker_specialize_load_bound_method_attr`] carries: a fold guard
+/// inside an inlined callee sub-walk resumes at the caller's CALL, re-running
+/// side effects.  The `getattr` residual resumes past the call, so declining
+/// there re-runs nothing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_specialize_load_classmethod_attr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    if ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    if name.contains("__") {
+        return Ok(None);
+    }
+    let Some((w_type, version_tag, w_func)) =
+        (unsafe { pyre_interpreter::classmethod_on_type_fast_path(concrete_obj, &name) })
+    else {
+        return Ok(None);
+    };
+    if unsafe { resolve_inlinable_callee(w_func) }.is_none() {
+        return Ok(None);
+    }
+
+    // Pin the exact class.  The receiver IS the type, so a single GuardValue
+    // anchors both the metaclass (exact `type`, via `is_type`) and the MRO the
+    // classmethod lookup walks; the version tag below covers method reassignment.
+    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
+    ctx.trace_ctx.heap_cache_mut().replace_box(obj, w_type_const);
+
+    // typeobject.py `promote(self.version_tag())`: class mutation or classmethod
+    // reassignment in the class or any base bumps `_version_tag`, so the pinned
+    // `__func__` side-exits.
+    let vt_op = walker_record_getfield_gc_i_uncached(
+        ctx,
+        w_type_const,
+        crate::descr::type_version_tag_descr(),
+    );
+    let vt_const = ctx.trace_ctx.const_int(version_tag as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[vt_op, vt_const])?;
+    ctx.trace_ctx.heap_cache_mut().replace_box(vt_op, vt_const);
+
+    let func_const = ctx.trace_ctx.const_ref(w_func as i64);
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, func_const)?;
+    Ok(Some(()))
+}
+
 /// Fold the `LOAD_ATTR`-method `getattr` residual for a receiver whose name
 /// resolves to a plain builtin-code function on its type — the `lst.append`
 /// shape [`try_walker_specialize_load_method_attr`] declines because upstream

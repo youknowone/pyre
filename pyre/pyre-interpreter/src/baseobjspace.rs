@@ -8565,6 +8565,53 @@ pub unsafe fn load_method_fast_path(
     Some((w_type, version_tag, w_descr))
 }
 
+/// `Type.name(...)` classmethod method-load fast path: when `w_obj` is a class
+/// whose metaclass is exactly `type` and `name` resolves to a `classmethod` in
+/// the class's own MRO, return the class, its cacheable version tag, and the
+/// classmethod's underlying `__func__`.  The full-body walker writes `__func__`
+/// as the method-load result so `compute_load_method_bound` (eval.rs) binds the
+/// class as `cls` and the following `CALL` inlines `__func__(cls, ...)` — the
+/// same shape a plain instance method takes, with the class in the receiver
+/// slot instead of an instance.
+///
+/// `is_type` is exact-metatype, so a custom metaclass declines (its
+/// `__getattribute__` may not follow `type.__getattribute__`).  A name the
+/// metatype itself defines is declined too: a metatype attribute would shadow
+/// the class attribute (data descriptor) or be returned in its place.  An
+/// uncacheable type and any non-`classmethod` descriptor also decline.
+///
+/// # Safety
+/// `w_obj` must be a valid object pointer (null tolerated).
+pub unsafe fn classmethod_on_type_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
+        return None;
+    }
+    let w_type = w_obj;
+    // `is_type` pins the metaclass to exactly `type`, so `type.__getattribute__`
+    // is the resolution path.  A metatype attribute of the same name would win
+    // over the class attribute, so decline any name the metatype defines.
+    let metatype = &pyre_object::pyobject::TYPE_TYPE as *const _ as PyObjectRef;
+    if lookup_in_type(metatype, name).is_some() {
+        return None;
+    }
+    let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
+    if version_tag == 0 {
+        return None;
+    }
+    let w_descr = lookup_in_type(w_type, name)?;
+    if !pyre_object::is_classmethod(w_descr) {
+        return None;
+    }
+    let w_func = pyre_object::function::w_classmethod_get_func(w_descr);
+    if w_func.is_null() {
+        return None;
+    }
+    Some((w_type, version_tag, w_func))
+}
+
 /// The `getattr(w_obj, name)` shape that reduces, purely, to
 /// `w_method_new(w_descr, w_obj, w_type)` — the bound method
 /// `object.__getattribute__` builds when the name resolves to a plain

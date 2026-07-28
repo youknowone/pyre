@@ -4055,6 +4055,24 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
+                // `Type.cmethod(...)`: the receiver is a class and the name
+                // resolves to a `classmethod`, which `load_method_fast_path`
+                // declines (non-instance receiver, non-method descriptor).
+                // Write the classmethod's `__func__` so the paired
+                // `load_method_self` binds the class and the CALL inlines it.
+                if try_walker_specialize_load_classmethod_attr(
+                    ctx,
+                    op.pc,
+                    obj_opref,
+                    w_code_ptr,
+                    namei as usize,
+                    dst,
+                    dst_bank,
+                )?
+                .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
                 // The `[w_descr, w_obj]` push above is restricted to
                 // `flag_method_descriptor` types, so a builtin method on a
                 // builtin receiver (`lst.append`) leaves `getattr` to build a
