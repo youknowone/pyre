@@ -18976,17 +18976,23 @@ fn bytes_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 
 /// `bytesobject.py:descr_translate` — map each byte through a 256-entry
 /// `table` (or `None` for identity) after dropping any byte present in
-/// the optional `delete` set.  `delete` may be positional or the
-/// `delete=` keyword.
+/// the optional `delete` set.  The signature is `translate(table, /,
+/// delete=b'')`: `table` is positional-only, `delete` takes either the
+/// second positional slot or the `delete=` keyword, and an explicit
+/// `delete` must be bytes-like — `None` is not "no deletion".
 fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
-    let given = positional.len() + crate::builtins::real_kwarg_count(kwargs);
-    if given > 2 {
-        return Err(crate::PyError::type_error(format!(
-            "translate() takes at most 2 arguments ({given} given)"
-        )));
-    }
+    crate::builtins::clinic_arity(
+        "translate",
+        positional.len(),
+        crate::builtins::real_kwarg_count(kwargs),
+        1,
+        2,
+        0,
+    )?;
+    // The missing-positional report wins over the unknown-keyword one:
+    // `b''.translate(bogus=1)` names the absent `table`, not `bogus`.
     let Some(&table_obj) = positional.first() else {
         return Err(crate::PyError::type_error(
             "translate() takes at least 1 positional argument (0 given)",

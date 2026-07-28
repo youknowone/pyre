@@ -365,6 +365,35 @@ assert (
 assert b"hjhtuyjyujuyj".translate(bytes.maketrans(b"hj", b"ab")) == b"abatuybyubuyb"
 assert b"hjhtuyfjtyhuhjuyj".translate(None, b"ht") == b"juyfjyujuyj"
 assert b"hjhtuyfjtyhuhjuyj".translate(None, delete=b"ht") == b"juyfjyujuyj"
+assert b"hjhtuyfjtyhuhjuyj".translate(None, delete=b"") == b"hjhtuyfjtyhuhjuyj"
+
+
+# `translate(table, /, delete=b'')`: `table` is positional-only, `delete` takes
+# either the second positional slot or the keyword, the count check is reported
+# before the missing-positional one and that before the keyword one, and an
+# explicit `delete` must be bytes-like — `None` is not "no deletion".
+NOPOS = "translate() takes at least 1 positional argument (0 given)"
+TOOMANY = "translate() takes at most 2 arguments (3 given)"
+NOTBYTES = "a bytes-like object is required, not '{}'"
+BADKW = "translate() got an unexpected keyword argument '{}'"
+for args, kw, msg in (
+    ((), {}, NOPOS),
+    ((), {"table": None, "delete": b"h"}, NOPOS),
+    ((), {"bogus": 1}, NOPOS),
+    ((None,), {"bogus": 1}, BADKW.format("bogus")),
+    ((None,), {"table": None}, BADKW.format("table")),
+    ((None, b"h", b"t"), {}, TOOMANY),
+    ((None, b"h"), {"delete": b"t"}, TOOMANY),
+    ((None, None), {}, NOTBYTES.format("NoneType")),
+    ((None,), {"delete": None}, NOTBYTES.format("NoneType")),
+    ((None,), {"delete": "ht"}, NOTBYTES.format("str")),
+):
+    try:
+        b"abc".translate(*args, **kw)
+    except TypeError as e:
+        assert str(e) == msg, (args, kw, str(e))
+    else:
+        raise AssertionError((args, kw))
 
 
 # strip lstrip rstrip

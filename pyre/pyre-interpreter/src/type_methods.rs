@@ -179,26 +179,6 @@ pub(crate) fn arity_at_least(
     Ok(())
 }
 
-/// TypeError for a method requiring at least `min` positional arguments
-/// after the receiver, called with fewer — the METH_FASTCALL
-/// "X() takes at least N positional arguments (M given)" form
-/// (`str.replace`, `bytes.translate`).
-pub(crate) fn arity_at_least_positional(
-    args: &[PyObjectRef],
-    name: &str,
-    min: usize,
-) -> Result<(), crate::PyError> {
-    reject_kwargs(args, name)?;
-    if args.len() < min + 1 {
-        return Err(crate::PyError::type_error(format!(
-            "{name}() takes at least {min} positional argument{} ({} given)",
-            if min == 1 { "" } else { "s" },
-            args_given(args),
-        )));
-    }
-    Ok(())
-}
-
 /// Validate that a str search method's substring (`args[1]`) is a `str`,
 /// else raise `TypeError("{method}() argument 1 must be str, not {type}")`.
 /// The search path reads `args[1]` as a `W_UnicodeObject`; a non-str would
