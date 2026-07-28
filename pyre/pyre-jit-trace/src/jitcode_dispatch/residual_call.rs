@@ -243,6 +243,45 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         *miframe.float_values.get_mut(color)? = Some(value.to_bits() as i64);
     }
 
+    // Seed every REMAINING color the walk has a concrete value for, not just the
+    // ones live at `resume_pc`.
+    //
+    // `_copy_data_from_miframe` (blackhole.py:1711-1730) copies
+    // `range(num_regs_i/r/f())` — the WHOLE bank, filtering only on "the MIFrame
+    // has a box here", never on liveness.  Seeding a liveness-selected subset is
+    // the deviation, and it is unsound the moment the drive leaves the straight
+    // line: the blackhole runs on to a `jit_merge_point`, whose own live set is
+    // generally LARGER (a loop-carried value defined in the prologue and not
+    // rewritten in the body is dead at a mid-body pc but live at the header).
+    // Those colors then read back NULL, and a NULL written into a live
+    // operand-stack slot faults the interpreter.
+    //
+    // Measured on the `getframe_root_loop_force_*` fixtures: live at the build
+    // pc was ref [0, 1, 6] while the merge wanted [0, 1, 2, 3, 4], and 2/3/4 all
+    // had concrete values in the walk's own bank the whole time.
+    //
+    // Seeding cannot introduce a stale value: a color the drive rewrites is
+    // overwritten before any read, and a color it does not rewrite still holds
+    // what the walk observed at the force point, which is what a merge reached
+    // without an intervening definition expects.  Colors with no concrete value
+    // stay unset, exactly as an absent upstream box does.
+    for (color, slot) in miframe.int_values.iter_mut().enumerate() {
+        if slot.is_none()
+            && let Some(ConcreteValue::Int(value)) = ctx.concrete_registers_i.get(color).copied()
+        {
+            *slot = Some(value);
+        }
+    }
+    for (color, slot) in miframe.ref_values.iter_mut().enumerate() {
+        // `ConcreteValue::Null` is the walker's "unknown" sentinel, not a proven
+        // Python null, so it seeds nothing.
+        if slot.is_none()
+            && let Some(ConcreteValue::Ref(value)) = ctx.concrete_registers_r.get(color).copied()
+        {
+            *slot = Some(value as i64);
+        }
+    }
+
     Some(miframe)
 }
 
