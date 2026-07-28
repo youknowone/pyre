@@ -1177,6 +1177,15 @@ pub fn init_typeobjects() {
             ) as usize,
         );
         reg.insert(
+            &pyre_object::interp_itertools::ISLICE_TYPE as *const PyType as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.islice",
+                init_islice_type,
+                object_type,
+                &pyre_object::interp_itertools::ISLICE_TYPE as *const PyType,
+            ) as usize,
+        );
+        reg.insert(
             &pyre_object::interp_itertools::COMPRESS_TYPE as *const PyType as usize,
             new_typeobject_with_base_and_layout(
                 "itertools.compress",
@@ -23884,6 +23893,149 @@ fn init_filterfalse_type(ns: PyObjectRef) {
             "__doc__",
             w_str_new(
                 "Return those items of iterable for which function(item) is false.\n\nIf function is None, return the items that are false.",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+// ── itertools.islice TypeDef ────────────────────────────────────────
+// PyPy W_ISlice, retaining its live source iterator and unsigned cursor
+// state.  Python 3.14 removes PyPy's pickle methods from the public type.
+
+fn islice_arg_int(
+    w_obj: PyObjectRef,
+    minimum: i64,
+    error_message: &'static str,
+) -> Result<i64, crate::PyError> {
+    // W_ISlice.arg_int_w: `space.index` + machine-word conversion; every
+    // ordinary conversion/range failure is replaced by the argument-specific
+    // ValueError.  CPython 3.14 uses the updated messages below.
+    let result = crate::builtins::space_index_w(w_obj)
+        .map_err(|_| crate::PyError::value_error(error_message))?;
+    if result < minimum {
+        return Err(crate::PyError::value_error(error_message));
+    }
+    Ok(result)
+}
+
+fn islice_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // W_ISlice___new__(space, w_subtype, w_iterable, w_startstop, __args__).
+    let exact =
+        gettypefor(&pyre_object::interp_itertools::ISLICE_TYPE).map_or(PY_NULL, |p| p.as_ptr());
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = positional.first().copied().unwrap_or(PY_NULL);
+    let args_w = positional.get(1..).unwrap_or(&[]);
+
+    let init_matches = std::ptr::eq(cls, exact)
+        || unsafe {
+            match (
+                crate::baseobjspace::lookup_in_type(cls, "__init__"),
+                crate::baseobjspace::lookup_in_type(exact, "__init__"),
+            ) {
+                (Some(sub), Some(base)) => std::ptr::eq(sub, base),
+                (None, None) => true,
+                _ => false,
+            }
+        };
+    if init_matches && crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "islice() takes no keyword arguments",
+        ));
+    }
+    if args_w.len() < 2 {
+        return Err(crate::PyError::type_error(format!(
+            "islice expected at least 2 arguments, got {}",
+            args_w.len()
+        )));
+    }
+    if args_w.len() > 4 {
+        return Err(crate::PyError::type_error(format!(
+            "islice expected at most 4 arguments, got {}",
+            args_w.len()
+        )));
+    }
+
+    // All inputs and the requested subtype must remain live while `__index__`
+    // and `iter` call back into Python and can trigger a collection.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let values_base = pyre_object::gc_roots::shadow_stack_len();
+    for &value in args_w {
+        pyre_object::gc_roots::pin_root(value);
+    }
+    let value =
+        |index: usize| unsafe { pyre_object::gc_roots::shadow_stack_get(values_base + index) };
+
+    let (start, stop_index, step_index) = if args_w.len() == 2 {
+        (0, 1, None)
+    } else {
+        let w_start = value(1);
+        let start = if unsafe { pyre_object::is_none(w_start) } {
+            0
+        } else {
+            islice_arg_int(
+                w_start,
+                0,
+                "Indices for islice() must be None or an integer: 0 <= x <= sys.maxsize.",
+            )?
+        };
+        (start, 2, (args_w.len() == 4).then_some(3))
+    };
+
+    let w_stop = value(stop_index);
+    let stop = if unsafe { pyre_object::is_none(w_stop) } {
+        -1
+    } else {
+        islice_arg_int(
+            w_stop,
+            0,
+            "Stop argument for islice() must be None or an integer: 0 <= x <= sys.maxsize.",
+        )?
+        .max(start)
+    };
+    let step = if let Some(index) = step_index {
+        let w_step = value(index);
+        if unsafe { pyre_object::is_none(w_step) } {
+            1
+        } else {
+            islice_arg_int(
+                w_step,
+                1,
+                "Step for islice() must be a positive integer or None.",
+            )?
+        }
+    } else {
+        1
+    };
+
+    let iterable = crate::baseobjspace::iter(value(0))?;
+    let obj = pyre_object::interp_itertools::w_islice_new(iterable, start, stop, step);
+    itertools_alloc_for_class(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        exact,
+        obj,
+    )
+}
+
+fn init_islice_type(ns: PyObjectRef) {
+    let entries = [
+        ("__new__", make_new_descr(islice_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "islice(iterable, stop) --> islice object\nislice(iterable, start, stop[, step]) --> islice object\n\nReturn an iterator whose next() method returns selected values from an\niterable.  If start is specified, will skip all preceding elements;\notherwise, start defaults to zero.  Step defaults to one.  If\nspecified as another value, step determines how many values are\nskipped between successive calls.  Works like a slice() on a list\nbut returns an iterator.",
             ),
         ),
     ];

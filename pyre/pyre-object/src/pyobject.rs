@@ -593,6 +593,7 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (138, Some(0)),
     (139, Some(0)),
     (140, Some(0)),
+    (141, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every
@@ -1105,6 +1106,9 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(132, typed::<crate::generator::AsyncGenValueWrapper>()),
         subclass_range_alias(133, typed::<crate::generator::AsyncGenASend>()),
         subclass_range_alias(134, typed::<crate::generator::AsyncGenAThrow>()),
+        // W_ISlice is appended after the interpreter-owned W_Local (140) in
+        // build_gc so every pre-existing Python-visible AUTO-ID stays stable.
+        subclass_range_alias(141, typed::<crate::interp_itertools::W_ISlice>()),
     ]
 }
 

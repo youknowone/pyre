@@ -323,6 +323,71 @@ pub unsafe fn is_filterfalse(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &FILTERFALSE_TYPE) }
 }
 
+// ── W_ISlice — pypy/module/itertools/interp_itertools.py:class W_ISlice ──
+//
+// ```python
+// class W_ISlice(W_Root):
+//     def __init__(self, space, w_iterable, w_startstop, args_w):
+//         self.iterable = space.iter(w_iterable)
+//         ...
+//         self.count = rffi.cast(rffi.UNSIGNED, 0)
+//         self.next = rffi.cast(rffi.UNSIGNED, start)
+//         self.stop = stop
+//         self.step = rffi.cast(rffi.UNSIGNED, step)
+// ```
+//
+// A null `iterable` is PyPy's `self.iterable = None` exhausted sentinel.
+// The remaining fields retain the exact unsigned/signed split used by the
+// upstream object: count/next/step are `rffi.UNSIGNED`, while -1 in `stop`
+// represents an unbounded slice.
+#[pyre_class("itertools.islice", static_name = "ISLICE")]
+pub struct W_ISlice {
+    pub iterable: PyObjectRef,
+    pub count: usize,
+    pub next: usize,
+    pub stop: i64,
+    pub step: usize,
+}
+
+/// `iterable` must already be an iterator (`W_ISlice.__init__` applies
+/// `space.iter`).  All numeric arguments have already passed `arg_int_w`.
+pub fn w_islice_new(iterable: PyObjectRef, start: i64, stop: i64, step: i64) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(iterable);
+    W_ISlice::allocate_stable(W_ISlice {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        iterable,
+        count: 0,
+        next: start as usize,
+        stop,
+        step: step as usize,
+    })
+}
+
+/// Check if an object is a `W_ISlice`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_islice(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &ISLICE_TYPE) }
+}
+
+/// Clear the live source after exhaustion, matching
+/// `W_ISlice.next_w/_ignore_items`.
+///
+/// # Safety
+/// `obj` must be a valid `W_ISlice`.
+#[inline]
+pub unsafe fn w_islice_clear_iterable(obj: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_ISlice)).iterable = std::ptr::null_mut();
+    }
+}
+
 // ── W_Compress — pypy/module/itertools/interp_itertools.py:W_Compress ──
 //
 // ```python
@@ -761,6 +826,19 @@ mod tests {
         assert_eq!(
             <W_FilterFalse as crate::lltype::GcType>::SIZE,
             W_FILTERFALSE_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_islice_gc_descriptor_traces_source_iterator() {
+        assert_eq!(W_ISLICE_GC_PTR_OFFSETS.len(), 1);
+        assert_eq!(
+            W_ISLICE_GC_PTR_OFFSETS[0],
+            std::mem::offset_of!(W_ISlice, iterable)
+        );
+        assert_eq!(
+            <W_ISlice as crate::lltype::GcType>::SIZE,
+            W_ISLICE_OBJECT_SIZE
         );
     }
 

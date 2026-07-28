@@ -12803,6 +12803,27 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         {
             return Ok(obj);
         }
+        // W_ISlice.iter_w returns self, but a heap subtype can replace
+        // `__iter__`; dispatch that override before taking the native fast
+        // path, as space.iter does for every W_Root TypeDef.
+        if pyre_object::interp_itertools::is_islice(obj) {
+            let exact = get_instantiate(&pyre_object::interp_itertools::ISLICE_TYPE);
+            if !std::ptr::eq((*obj).w_class, exact) {
+                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
+                    if !std::ptr::eq(src, exact) {
+                        if is_none(method) {
+                            return Err(PyError::type_error(format!(
+                                "'{}' object is not iterable",
+                                obj_type_name(obj)
+                            )));
+                        }
+                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                        return iter_check_is_iterator(w_iter);
+                    }
+                }
+            }
+            return Ok(obj);
+        }
         // itertools native iterators — iter_w returns self.
         // PyPy: W_Count.iter_w / W_Repeat.iter_w / W_TakeWhile.iter_w /
         // W_DropWhile.iter_w / W_Filter.iter_w / W_Pairwise.iter_w
@@ -13283,6 +13304,84 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     return Ok(w_obj);
                 }
             }
+        }
+        // itertools.islice — interp_itertools.py W_ISlice.next_w /
+        // _ignore_items.  The owner keeps an unsigned input position and next
+        // selected position; only the source elements needed for one output
+        // are consumed by each call.
+        if pyre_object::interp_itertools::is_islice(obj) {
+            // A subtype's Python `__next__` overrides W_ISlice.next_w.
+            let exact = get_instantiate(&pyre_object::interp_itertools::ISLICE_TYPE);
+            if !std::ptr::eq((*obj).w_class, exact) {
+                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__next__") {
+                    if !std::ptr::eq(src, exact) {
+                        return crate::call::call_function_impl_result(method, &[obj]);
+                    }
+                }
+            }
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let state = &*(w_self as *const pyre_object::interp_itertools::W_ISlice);
+            if state.iterable.is_null() {
+                return Err(PyError::stop_iteration());
+            }
+
+            // `_ignore_items`: advance until count reaches the next selected
+            // index.  Re-read the relocated owner after every Python `next`.
+            while {
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let state = &*(w_self as *const pyre_object::interp_itertools::W_ISlice);
+                state.count < state.next
+            } {
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let iterable =
+                    (*(w_self as *const pyre_object::interp_itertools::W_ISlice)).iterable;
+                match next(iterable) {
+                    Ok(_) => {
+                        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                        let state = &mut *(w_self as *mut pyre_object::interp_itertools::W_ISlice);
+                        state.count = state.count.wrapping_add(1);
+                    }
+                    Err(e) if e.kind == PyErrorKind::StopIteration => {
+                        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                        pyre_object::interp_itertools::w_islice_clear_iterable(w_self);
+                        return Err(e);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let state = &*(w_self as *const pyre_object::interp_itertools::W_ISlice);
+            if state.stop >= 0 && state.count >= state.stop as usize {
+                pyre_object::interp_itertools::w_islice_clear_iterable(w_self);
+                return Err(PyError::stop_iteration());
+            }
+
+            let iterable = state.iterable;
+            let w_item = match next(iterable) {
+                Ok(w_item) => w_item,
+                Err(e) if e.kind == PyErrorKind::StopIteration => {
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    pyre_object::interp_itertools::w_islice_clear_iterable(w_self);
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            };
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let state = &mut *(w_self as *mut pyre_object::interp_itertools::W_ISlice);
+            state.count = state.count.wrapping_add(1);
+            let old_next = state.next;
+            let new_next = old_next.wrapping_add(state.step);
+            if new_next < old_next || (state.stop >= 0 && new_next > state.stop as usize) {
+                state.next = state.stop as usize;
+            } else {
+                state.next = new_next;
+            }
+            return Ok(w_item);
         }
         // itertools.compress — interp_itertools.py W_Compress.next_w.
         // Pull data first, then its matching selector; exhaustion of either
