@@ -4449,14 +4449,21 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
             pyre_interpreter::call::set_last_exec_ctx((*parent_frame_ptr).execution_context);
         }
         let parent_frame = unsafe { &*parent_frame_ptr };
-        let result = {
-            // blackhole.py:1225 bhimpl_residual_call_* is an opaque CPU
-            // call.  Only blackhole.py:1095 bhimpl_recursive_call_* reaches
-            // the portal runner, so nested Python CALLs from this residual
-            // path must stay on eval_frame_plain as well.
-            let _plain_guard = pyre_interpreter::call::force_plain_eval();
-            pyre_interpreter::call::call_user_function_plain(parent_frame, callable, &call_args)
-        };
+        // `blackhole.py:1225 bhimpl_residual_call_*` is opaque to the TRACE,
+        // not to the JIT: `cpu.bh_call_*(func, ...)` runs the translated
+        // callee, and a callee whose graph reaches a `jit_merge_point`
+        // (`execute_frame` does) enters the JIT normally.  Pinning the callee
+        // and its whole subtree to `eval_frame_plain` here left a hot inner
+        // loop interpreted for as long as its caller's loop was compiled.
+        // `bhimpl_recursive_call_*` (`blackhole.py:1095-1132`) is not the
+        // only way back to the portal — it is the form the codewriter emits
+        // when the callee is *statically* the portal graph.
+        //
+        // Re-entrant TRACING stays blocked where upstream blocks it, on the
+        // green key (`warmstate.py:473-477` JC_TRACING, mirrored by
+        // `maybe_compile_and_run`'s `driver.is_tracing()`).
+        let result =
+            pyre_interpreter::call::call_user_function_residual(parent_frame, callable, &call_args);
         pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
         return match result {
             Ok(result) => result as i64,

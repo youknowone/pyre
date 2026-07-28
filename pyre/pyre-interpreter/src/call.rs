@@ -1334,6 +1334,30 @@ pub fn call_user_function(
     call_user_function_with_eval(frame, callable, args, eval_fn)
 }
 
+/// Residual-call sibling of [`call_user_function_plain`] that keeps the
+/// JIT-aware eval function.
+///
+/// `blackhole.py:1225 bhimpl_residual_call_r_i` is `cpu.bh_call_i(func, ...)`
+/// — it invokes the *translated function*, and when that function's graph
+/// reaches a `jit_merge_point` (`execute_frame` does) the JIT is entered
+/// normally. "Opaque to the trace" does not mean "the JIT is off inside":
+/// upstream has no flag that disables it for the extent of a residual call.
+/// `bhimpl_recursive_call_*` (`blackhole.py:1095-1132`) is not the only way
+/// to reach the portal — it is the path the codewriter emits when the callee
+/// is *statically* the portal graph.
+///
+/// Re-entrant tracing is prevented where upstream prevents it, on the green
+/// key: `warmstate.py:473-477` skips a hot back-edge while `JC_TRACING` is
+/// set, which pyre mirrors with the `driver.is_tracing()` guard in
+/// `maybe_compile_and_run`.
+pub fn call_user_function_residual(
+    frame: &PyFrame,
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+) -> PyResult {
+    call_user_function_with_eval(frame, callable, args, get_eval_fn())
+}
+
 /// Plain interpreter-only user-function call.
 ///
 /// JIT residual helpers should use this instead of the injected eval override.
