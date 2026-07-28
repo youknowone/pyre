@@ -221,10 +221,25 @@ fn iobase_next(args: &[PyObjectRef]) -> crate::PyResult {
 /// this call too — the case `baseobjspace.py:185-188` returns early on; here
 /// the queue drops the repeat.
 pub(crate) fn tag_io_instance(obj: PyObjectRef, cls: PyObjectRef) -> PyObjectRef {
+    tag_io_instance_with_finalizer(obj, cls, true)
+}
+
+/// [`tag_io_instance`] for a type that overrides
+/// `interp_iobase.py:157-159 W_IOBase.needs_finalizer` — "can return False if we
+/// know that the precise close() method of this class will have no effect".
+/// Every override reads `type(self) is not <that class>`, so a subclass, whose
+/// `close` may do anything, keeps the default answer.
+pub(crate) fn tag_io_instance_with_finalizer(
+    obj: PyObjectRef,
+    cls: PyObjectRef,
+    needs_finalizer: bool,
+) -> PyObjectRef {
     if !cls.is_null() {
         crate::typedef::tag_subclass_instance(obj, cls);
     }
-    crate::executioncontext::register_finalizer(obj);
+    if needs_finalizer {
+        crate::executioncontext::register_finalizer(obj);
+    }
     obj
 }
 
