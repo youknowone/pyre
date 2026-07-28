@@ -11597,10 +11597,11 @@ fn constants_call_leaf(reg: &RegularCall, llbc: &Llbc) -> Option<&'static str> {
 /// so the index type must be an integer.  Charon runs `monomorphize:false`,
 /// so the signature keeps the generic index param `I` (a `TypeVar` typing
 /// as `Ref`); the concrete index type is the callsite substitution
-/// `types[1]` of the impl generics `[T, I, A]`.  `Index<usize>` types as
-/// `Unsigned` and signed integer indices as `Int`; both occupy RPython's
-/// integer register bank. `Index<Range<…>>` resolves to a `Range*` Adt
-/// (`Ref`) and returns `None`. Owner/leaf are derived the same way
+/// `types[1]` of the impl generics `[T, I, A]`, which
+/// [`vec_index_type_is_scalar`] classifies: `Index<usize>` types as
+/// `Unsigned` and signed integer indices as `Int`, and both occupy RPython's
+/// integer register bank, while `Index<Range<…>>` resolves to a `Range*` Adt
+/// (`Ref`) and returns `None`.  Owner/leaf are derived the same way
 /// [`call_target_segments`]
 /// derives the call key (`impl_method_owner_for_fundecl`).  Free so the
 /// same gate is shared by the call-lowering intercept and the deferred-write
@@ -11627,13 +11628,25 @@ fn vec_index_regular_leaf(reg: &RegularCall, llbc: &Llbc) -> Option<&'static str
         .and_then(serde_json::Value::as_array)
         .and_then(|tys| tys.get(1))
         .and_then(|t| serde_json::from_value::<TyRef>(t.clone()).ok())
-        .is_some_and(|t| {
-            matches!(
-                tyref_to_value_type(&t, llbc),
-                ValueType::Int | ValueType::Unsigned
-            )
-        });
+        .is_some_and(|t| vec_index_type_is_scalar(&t, llbc));
     int_indexed.then_some(leaf)
+}
+
+/// Whether `ty` is an index type [`vec_index_regular_leaf`] may lower to a
+/// scalar `ArrayRead` / `ArrayWrite`.
+///
+/// Both integer banks count. `usize` — what essentially every real callsite
+/// indexes with — serializes as `{"UInt": "Usize"}` and types as
+/// [`ValueType::Unsigned`], so an `Int`-only test silently rejects it and
+/// leaves the whole fold dead: the `#[ignore]`d real-LLBC anchor
+/// `vec_index_mut_fill_user_function_args_real` failed with two residual
+/// `index_mut` calls.  A `Range` index types as `Ref` and is still rejected,
+/// which is what the gate exists for.
+fn vec_index_type_is_scalar(ty: &TyRef, llbc: &Llbc) -> bool {
+    matches!(
+        tyref_to_value_type(ty, llbc),
+        ValueType::Int | ValueType::Unsigned
+    )
 }
 
 /// Whether a [`RegularCall`] is a `Vec<T>` `index` **or** `index_mut` on an
@@ -20351,6 +20364,48 @@ mod tests {
             }
         });
         Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+    }
+
+    /// The `Vec` index fold must accept a `usize` index.
+    ///
+    /// `usize` types as `Unsigned`, not `Int`, so gating on `Int` alone left
+    /// both the read and write lifts dead for every real callsite — caught
+    /// only by the `#[ignore]`d real-LLBC anchor
+    /// (`vec_index_mut_fill_user_function_args_real`), which does not run in
+    /// CI.  This pins the acceptance set without the 440MB corpus.
+    #[test]
+    fn vec_index_gate_accepts_both_integer_banks_and_rejects_range() {
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let ty = |v: serde_json::Value| {
+            serde_json::from_value::<super::TyRef>(serde_json::json!({
+                "HashConsedValue": [0, v]
+            }))
+            .expect("fixture TyRef parses")
+        };
+        let usize_ty = ty(serde_json::json!({ "Literal": { "UInt": "Usize" } }));
+        assert_eq!(
+            super::tyref_to_value_type(&usize_ty, &llbc),
+            crate::model::ValueType::Unsigned,
+            "usize must type as Unsigned — the trap this gate fell into"
+        );
+        assert!(
+            super::vec_index_type_is_scalar(&usize_ty, &llbc),
+            "Vec index fold must accept a usize index"
+        );
+        assert!(
+            super::vec_index_type_is_scalar(
+                &ty(serde_json::json!({ "Literal": { "Int": "I64" } })),
+                &llbc
+            ),
+            "Vec index fold must accept a signed index"
+        );
+        assert!(
+            !super::vec_index_type_is_scalar(
+                &ty(serde_json::json!({ "Adt": { "id": { "Adt": 7 } } })),
+                &llbc
+            ),
+            "a Range index types as Ref and must stay rejected"
+        );
     }
 
     #[test]
