@@ -5218,30 +5218,43 @@ pub fn str_method_isspace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     Ok(w_bool_from(result))
 }
 
-/// True iff `s` has at least one cased (alphabetic) code point and
-/// every cased code point matches the requested case.  Lone
-/// surrogates are uncased and ignored, so `'ABC\udcff'.isupper()` is
-/// still True — unlike the character-class predicates, a surrogate
-/// does not force a false result here.
+/// PyPy: unicodeobject.py `descr_islower` / `descr_isupper` —
+///
+/// ```python
+/// cased = False
+/// for uchar in rutf8.Utf8StringIterator(self._utf8):
+///     if unicodedb.isupper(uchar) or unicodedb.istitle(uchar):
+///         return space.w_False
+///     if not cased and unicodedb.islower(uchar):
+///         cased = True
+/// return space.newbool(cased)
+/// ```
+///
+/// Only the three cased categories participate: an uncased code point —
+/// a digit, a space, a lone surrogate, or an uncased *letter* such as a
+/// Hangul syllable — is skipped rather than counted, so `'가나다a'.islower()`
+/// is True.  `is_alphabetic` is the wrong test for `cased` because it holds
+/// for those uncased letters.
 fn wtf8_cased_all(s: &Wtf8, want_upper: bool) -> bool {
-    let mut has_cased = false;
-    let mut all_match = true;
+    let mut cased = false;
     for cp in s.code_points() {
-        if let Some(c) = cp.to_char() {
-            if c.is_alphabetic() {
-                has_cased = true;
-                let ok = if want_upper {
-                    c.is_uppercase()
-                } else {
-                    c.is_lowercase()
-                };
-                if !ok {
-                    all_match = false;
-                }
-            }
+        let Some(c) = cp.to_char() else { continue };
+        // `unicodedb.istitle` is category Lt, which is neither `is_uppercase`
+        // (Lu + Other_Uppercase) nor `is_lowercase` (Ll + Other_Lowercase);
+        // it disqualifies both predicates.
+        let (rejects, qualifies) = if want_upper {
+            (c.is_lowercase() || case::is_titlecase(c), c.is_uppercase())
+        } else {
+            (c.is_uppercase() || case::is_titlecase(c), c.is_lowercase())
+        };
+        if rejects {
+            return false;
+        }
+        if !cased && qualifies {
+            cased = true;
         }
     }
-    has_cased && all_match
+    cased
 }
 
 /// PyPy: unicodeobject.py descr_isupper
