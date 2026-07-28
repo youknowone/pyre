@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=16
 # Implicit `__context__` chaining: raising inside an `except` block links the
 # new exception's `__context__` to the one being handled (the raise records
 # `SETFIELD w_context = ec.sys_exc_value`). The outer handler reads

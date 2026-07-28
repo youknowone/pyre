@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 """dict.update must notice source mutation from destination key equality."""
 
 

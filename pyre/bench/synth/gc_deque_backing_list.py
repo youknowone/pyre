@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=338
 # collections.deque holds its backing list solely through the deque object.
 # If the marker traces the deque with an empty offset set, that list is not
 # forwarded and is swept/moved on a collection driven by a hot allocator loop

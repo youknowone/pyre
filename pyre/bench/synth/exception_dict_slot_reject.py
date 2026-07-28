@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # A subclass whose base already carries an instance dict rejects a second
 # `__dict__` slot. BaseException subclasses carry the dict through the native
 # exception slot, so they must reject it too.

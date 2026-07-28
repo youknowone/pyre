@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=22
 # Coverage for the multi-frame blackhole build path: an INLINED callee that
 # forces an outer frame through `sys._getframe(2)`.
 #
@@ -35,8 +36,9 @@
 # caller name. That is the failure mode this fixture still guards: every outcome
 # arm was wrong, not only the one carrying a resume coordinate.
 #
-# Deliberately carries no `# pyre-check: max-pypy-ratio=` header: this guards
-# an output, and the forcing read makes it a poor perf subject.
+# Carries only a generous `# pyre-check: max-pypy-ratio=` tripwire (top of
+# file), not a tight perf gate: this guards an output, and the forcing read
+# makes it a poor perf subject, so the ratio is a gross-regression guard.
 import sys
 
 

@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=38
 # Benchmark: integer list pop/append loop (per-strategy ops)
 # Exercises W_ListObject.pop_end() / append() on Integer strategy.
 # PYPYLOG confirms: guard_class(IntegerListStrategy) + ArrayS 8 ops only.

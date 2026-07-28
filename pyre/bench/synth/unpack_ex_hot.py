@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=20
 # UNPACK_EX in a hot loop: `a, *b = data` with a star target compiles to the
 # unpack_ex residual (the UNPACK_SEQUENCE sibling with a starred list slot)
 # instead of an abort_permanent marker, so the hot body JIT-compiles rather

@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=18
 # Sequence repeat semantics: a count exceeding the signed machine word overflows
 # (OverflowError) rather than wrapping to a huge unsigned count that fails as
 # MemoryError, and a count of 1 on an immutable exact sequence returns the

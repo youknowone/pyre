@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # When the callable of iter(callable, sentinel) raises StopIteration, the
 # consumer sees a plain StopIteration and a list-consuming loop treats it as
 # normal end-of-iteration. The callable's StopIteration *args* are not printed:

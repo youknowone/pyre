@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # Two operand-stack temps holding heap ints (>= 256) are swapped across a
 # `goto_if_not` branch guard, a shape a per-jitcode merge-color map is prone
 # to COLLAPSE (alias both slots onto one color).  The flat-free boxed-int

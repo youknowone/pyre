@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=8
 # A None entry in sys.modules blocks the name: the import raises
 # ModuleNotFoundError('import of X halted; None in sys.modules') with .name set,
 # rather than reloading the module or searching for it. The sentinel is checked

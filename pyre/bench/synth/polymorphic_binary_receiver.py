@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=158
 # A BINARY_OP (`+`/`*`) whose receiver alternates at runtime between an exact
 # builtin int and a user-class (or int-subclass) instance at the SAME hot site.
 # The raw int specialization bypasses special-method dispatch, so it must only

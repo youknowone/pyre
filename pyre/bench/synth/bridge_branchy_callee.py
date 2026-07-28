@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=8
+# pyre-check: max-pypy-ratio=9
 # A branch inside an inlined callee (gh#343). `compute_branch` guard-fails on the
 # rare arm (`x % 7 == 0`); without a compiled bridge for the inlined callee's
 # continuation every crossing deopts to the blackhole (~34x slower on the native

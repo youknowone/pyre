@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=10
 # Nested FOR_ITER with polymorphic type flip in the inner body.
 # The inner loop iterates a list that changes type mid-way (int → float),
 # triggering a type guard deopt inside a nested FOR_ITER.

@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=38
 # bytes/bytearray split/rsplit on whitespace (sep=None) with a positive
 # maxsplit keeps the surrounding whitespace of the final remainder field,
 # matching str. Output verified against CPython/PyPy.

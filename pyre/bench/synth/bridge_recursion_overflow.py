@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # Parity fixture for the depth-1 bridge self-recursive inline lift
 # (#704). `f` is a tail-recursive
 # exact-integer callee whose `acc * 2 + 1` crosses the machine-int boundary

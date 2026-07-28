@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=6
 """Hot classmethod binding and wrapper-dictionary parity."""
 
 

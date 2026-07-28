@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=6
 # N/ITERS are kept small so the wasm backend finishes inside the synthetic
 # timeout: wasm runs every guard-exit re-entry through the not-yet-collected
 # interpreter allocation path, so the run's wall grows super-linearly in ITERS

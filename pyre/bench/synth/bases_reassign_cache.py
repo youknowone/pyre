@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # Reassigning type.__bases__ recomputes the MRO of the type and every
 # subclass and invalidates the method/attribute lookup cache, so a method or
 # class attribute that was resolved before the swap resolves through the new

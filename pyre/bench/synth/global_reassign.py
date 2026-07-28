@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=14
 # Exercises JIT global-cache invalidation, for both cell kinds.
 #
 # `run_int` reads a module global reassigned to another int between calls: the

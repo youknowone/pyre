@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # `_py_abc.ABCMeta.__new__` validates every inherited abstract-method name
 # through `getattr(cls, name, None)`: a non-string name raises TypeError.
 import abc

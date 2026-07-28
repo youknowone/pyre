@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=8
 # An unrelated-metaclass clash among the bases (or an explicit metaclass that
 # is not a subclass of a base's metaclass) is a hard TypeError, not silently
 # resolved to the first metaclass.

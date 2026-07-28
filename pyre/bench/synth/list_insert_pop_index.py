@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=8
 # list.insert(index, x) and list.pop(index) coerce the index through
 # `__index__` (`getindex_w(index, OverflowError)`): a small custom index
 # inserts/pops at the resolved position, an out-of-range pop reports "pop index

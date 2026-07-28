@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # aiter()/anext() builtins over an async iterator: aiter returns the async
 # iterator, anext drives it item by item, and the two-argument anext yields the
 # default once the iterator is exhausted. Also covers the three TypeError paths

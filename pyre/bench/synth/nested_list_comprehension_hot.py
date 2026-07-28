@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=18
 # An inlined list comprehension whose LIST_APPEND element is a non-empty nested
 # list (`[[i] …]` / `[[i, i + 1] …]`). The #171 fold virtualizes the inner list,
 # whose separately allocated backing block (NewArray / NewArrayClear) carries no

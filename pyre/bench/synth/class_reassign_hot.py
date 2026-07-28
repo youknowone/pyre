@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=46
 # Reassigning obj.__class__ inside a hot loop must actually re-root the
 # instance's type, so method lookup and type() follow the new class.  The
 # STORE_ATTR mapdict inline cache (store_attr_slowpath) used to classify

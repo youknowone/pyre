@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # typeobject.py:1006 _set_names — type.__new__ calls __set_name__(owner, name)
 # for each descriptor in the type's final __dict__.  Each descriptor is visited
 # once, with the class as owner and its own attribute name.

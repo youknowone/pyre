@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=14
 # Nested FOR_ITER with a branch-local Int condition and a kept stack at the
 # bridge resume point. The resolved-offset bridge decodes a non-empty Int bank,
 # so the Int register bank is reconstructed concretely at bridge resume and the

@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # Benchmark: integer list insert at front (per-strategy ops)
 # Exercises W_ListObject.insert() on Integer strategy.
 # PYPYLOG confirms: guard_class(IntegerListStrategy) + ll_arraymove + setarrayitem(ArrayS 8).

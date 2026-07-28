@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=62
 import struct
 
 

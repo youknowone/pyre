@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # util.py:80 _objectdir / objectobject.py:324 — dir() of a dict instance lists
 # the dict type's attributes (object.__dir__), NOT the dict's own keys.
 

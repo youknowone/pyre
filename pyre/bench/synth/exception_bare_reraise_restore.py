@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # Bare `raise` (RERAISE) inside a handler re-raises the exception currently
 # being handled, which an outer handler then catches. This exercises the
 # current-exception slot on the re-raise path: the bare raise must pick up the

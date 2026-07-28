@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=6
 # Deep operand-stack Variables across a nested-call deopt guard.
 # Several computed Variables (x, y, z) sit deep on the stack as arguments being
 # marshalled for `acc(...)` while `mul(i, i)` (a residual call that can guard /

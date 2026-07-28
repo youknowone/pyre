@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=6
 import itertools
 
 # GET_ITER + FOR_ITER directly over an itertools.cycle iterator. cycle is

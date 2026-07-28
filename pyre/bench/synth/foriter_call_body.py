@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=12
 # FOR_ITER body with a CALL: the JIT must handle calls inside for-loop bodies
 # correctly without replaying the last iteration on deopt.  `accumulating`
 # additionally threads the running total through the call, so the inline

@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # Conditional expression whose taken arm loads a heap-int constant (>= 256, a
 # LOAD_CONST rather than the inline LoadSmallInt).  That arm value reaches the
 # branch-merge block as a flow-graph Constant link arg.

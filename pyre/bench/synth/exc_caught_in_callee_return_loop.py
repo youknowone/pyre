@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=18
 # A callee catches a residual-call exception in-frame and RETURNS a sentinel
 # into a JIT-hot outer loop.  When the callee gets hot enough that a bridge is
 # compiled for the exception-guard (GUARD_NO_EXCEPTION) failure on the

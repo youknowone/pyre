@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=32
 """A key comparison that disturbs the table is retried from scratch.
 
 `ll_dict_lookup` answers a disturbed probe with `return ll_dict_lookup(...)`

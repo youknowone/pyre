@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=24
 # #171/#11 Approach C, SUBSCRIPT slice: canonical-tuple `t[i]` emits a PURE
 # getarrayitem in the JIT walker (OptPure CSEs / const-folds the element load).
 #

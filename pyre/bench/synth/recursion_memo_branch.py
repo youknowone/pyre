@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=18
 # Memoized vs plain recursion with post-warm-up branch divergence. The
 # memo-dict store (memo[n] = r) once died with a TypeError after warm-up
 # (an empty-string type name from a clobbered class read on the dict-store

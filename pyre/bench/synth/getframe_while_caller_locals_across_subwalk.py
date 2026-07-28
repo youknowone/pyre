@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=16
 # Caller locals that are live ACROSS the inlined call, exercised at a vable
 # escape inside an inline sub-walk.
 #

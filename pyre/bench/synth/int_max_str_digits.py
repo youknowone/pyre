@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # PEP 674 integer string-conversion length limit: sys.get/set_int_max_str_digits
 # with the default 4300, enforced on str()/repr()/f-string of a large int and on
 # int() parsing of a long decimal literal, bypassed for power-of-two bases, and

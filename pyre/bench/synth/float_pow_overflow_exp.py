@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=6
 # A float or complex power coerces each int operand to a double first, so an
 # over-range int base or exponent raises OverflowError up front (even
 # `1.0 ** huge`, which never reaches the arithmetic), matching float(huge).

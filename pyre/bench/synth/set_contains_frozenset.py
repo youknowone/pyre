@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=22
 # A set is unhashable, but when one is used to look an element up it stands
 # in for the frozenset holding the same elements, so `in`, discard and remove
 # find it. The element is hashed on the way, so a raising __hash__ propagates

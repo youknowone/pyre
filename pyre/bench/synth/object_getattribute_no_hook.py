@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # descroperation.py:88 vs :234 — the bare object.__getattribute__ slot raises
 # AttributeError on miss and does NOT consult __getattr__; normal attribute
 # access (space.getattr) does.  Holds for instance and class/metaclass

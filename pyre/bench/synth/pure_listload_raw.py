@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=6
 # #171/#11 Approach C read-after-write miscompile guard: LISTS stay NON-pure.
 #
 # If a list element load were ever folded to GetarrayitemGcPure{R,I,F}, OptPure

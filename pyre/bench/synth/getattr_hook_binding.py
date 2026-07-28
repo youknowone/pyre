@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # objspace.py:710 get_and_call_function: a __getattr__ (or __getattribute__)
 # defined as a classmethod or staticmethod must be bound through __get__ before
 # being called, exactly like any other special method, so it receives the

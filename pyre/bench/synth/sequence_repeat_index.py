@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # str/tuple `*` route the repeat count through getindex_w: a custom __index__
 # repeats the sequence just like list/bytes, and an out-of-index-range __index__
 # raises OverflowError naming the original operand. A hot loop first warms

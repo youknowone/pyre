@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=14
 # Coverage guard for the unconditional multi-frame blackhole path.
 #
 # A vable escape inside an INLINE sub-walk is what latches a multi-frame

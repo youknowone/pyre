@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # A hot `float(x)` builtin-call loop over int and float arguments.  The walker
 # specializes the call (`try_walker_specialize_float_call`) to an inline
 # conversion — `CastIntToFloat` + `wrapfloat` for an int/bool argument, or the

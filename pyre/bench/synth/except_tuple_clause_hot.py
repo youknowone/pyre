@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=10
 # An `except (A, B):` clause builds its match target with `BUILD_TUPLE` on
 # every visit, so the tuple is a fresh object each time the handler runs. The
 # `CHECK_EXC_MATCH` fold pins the match target it saw while tracing; pinning

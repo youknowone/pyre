@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=12
 # Warm-up-then-raise exception handling: the loop runs cleanly long enough to
 # compile, then a nested try/(try-finally)/except starts raising only after the
 # warm-up window. The post-warm-up raise is therefore NOT in the recorded trace,

@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # typeobject.py:811-819 — a metaclass data descriptor (property) named like a
 # hardcoded type attribute wins over the built-in one; an un-overridden dunder
 # still resolves through the built-in path.

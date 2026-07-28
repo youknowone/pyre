@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=12
 N = 80000
 
 # Exercises the writable type.__name__ setter under the JIT: a successful

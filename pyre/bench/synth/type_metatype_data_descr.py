@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # typeobject.py W_TypeObject.descr_getattribute: a metatype DATA descriptor
 # wins over the class's own MRO value of the same name; a metatype non-data
 # descriptor and a plain metatype attribute lose to the class's own value.

@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=64
 N = 100000
 
 METH = '\udc81'   # lone surrogate naming a method on the class

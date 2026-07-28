@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # descroperation.py:87 — a user-defined __getattribute__ slot intercepts EVERY
 # attribute access, including the name '__getattribute__' itself; there is no
 # special-casing that bypasses the custom slot for dunder names.

@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # Guard-failure blackhole resume across a LOAD_ATTR (issue #143 guard-12
 # class).  The rare branch fails its guard until the bridge threshold, and
 # each failure resumes the rest of the iteration through `c.v` — the

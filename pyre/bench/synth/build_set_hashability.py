@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=112
 # BUILD_SET (the {...} set literal) hashes every element through
 # space.hash_w, so an unhashable element — a list, or an instance whose
 # __hash__ is None / raises / returns a non-int — raises instead of silently

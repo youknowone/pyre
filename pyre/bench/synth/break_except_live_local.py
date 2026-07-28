@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=104
 MODULUS = 1_000_003
 
 

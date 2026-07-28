@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 """Version-neutral core surface for the completed set/singleton slice.
 
 The exhaustive 3.14-only names live in ``extra_tests/parity_tests``.  Synthetic

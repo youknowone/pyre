@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # util.py:62 _classdir / :80 _objectdir — dir() unions the __dict__ keys of a
 # class and ALL of its bases recursively (the full MRO), and for an instance it
 # adds the instance __dict__ on top.

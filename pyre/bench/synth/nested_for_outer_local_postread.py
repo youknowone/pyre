@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=36
 def variable_inner(n):
     total = 0
     for i in range(n):

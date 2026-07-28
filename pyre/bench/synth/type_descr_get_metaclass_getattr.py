@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # descroperation.py:234 — when a descriptor reached through a type attribute
 # lookup raises AttributeError from its __get__, the metaclass __getattr__ gets
 # the final say (the whole getattribute slot is wrapped in try/except and an

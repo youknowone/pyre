@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=6
 # The walk loop's hot body reads `head.val` (an int) and `head.next` (the next
 # node).  The full-body-walker LOAD_ATTR fold folds the object-typed `head.next`
 # read to `guard_class` + `guard_value(map)` + `getfield(storage)` +

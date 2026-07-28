@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # Loop-carried short-circuit `or` exercised on the FALSY leg, where the loop
 # lives in a callee invoked repeatedly from a hot outer loop.
 #

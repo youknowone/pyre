@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=6
 # FOR_ITER inside a while-loop: the common real-world pattern.
 # The while-loop is the JIT entry; the for-loop body must handle the FOR_ITER
 # liveness scoping correctly.  `outer_var` additionally reads the outer

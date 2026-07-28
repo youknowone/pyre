@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=44
 # An exception raised by a CALLEE (a helper function or an exhausted generator)
 # with a per-iteration computed argument, caught in a hot JIT-traced caller's
 # `except ... as e`. walker_record_guard_exception discarded the GuardException

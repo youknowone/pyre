@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # CHECK_EXC_MATCH against a non-exception target. The loop warms up with a
 # valid except class so the trace JIT-compiles, then on the final iteration the
 # except target becomes a non-exception (int 5). cmp_exc_match raises TypeError

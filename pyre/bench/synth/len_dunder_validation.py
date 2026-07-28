@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=6
 # `len()` runs the `__len__` result through `__index__` coercion and the
 # length checks: negative -> ValueError, non-int -> TypeError, and a value
 # too large for a machine word -> OverflowError.

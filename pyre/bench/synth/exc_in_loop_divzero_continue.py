@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=8
 # A try/except INSIDE a hot loop whose body raises through a may-force
 # residual call (`//`, `%`, `int("z")`) on some iterations and is CAUGHT,
 # with the loop CONTINUING afterwards.  The raising op is int-specialized

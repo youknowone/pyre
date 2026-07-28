@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=8
 # Deep operand-stack Variables live across an inner condexpr guard.
 # The first two tuple elements (a+i, b-i) are computed Variables left deep on
 # the value stack while the third element's `... if ... else ...` evaluates its

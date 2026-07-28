@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=6
 # Lone-surrogate keys survive the builtin dict / type kwargs and class
 # namespace walks instead of crashing on the non-UTF-8 key:
 #  - dict(**{surrogate: v}) and d.update(**{surrogate: v}) store the key

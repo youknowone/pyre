@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=32
 # Polymorphic accumulator slots cycling int/str/None in a hot loop, with rare
 # retype arms (int->str, str->None) opening after warm-up so the compiled
 # trace takes bridges. A deopt-resumed frame once pushed past the valuestack

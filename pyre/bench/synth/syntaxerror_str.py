@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # SyntaxError.__str__ renders 'msg (filename, line lineno)', degrading through
 # the filename-only, lineno-only and bare-msg shapes; a non-str msg falls back
 # to str(msg). (The end_lineno range form is not exercised here: PyPy renders

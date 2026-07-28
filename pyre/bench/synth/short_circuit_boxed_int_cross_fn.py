@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=6
 # Cross-function kept-stack short-circuit where a small-int function is traced
 # BEFORE a structurally-identical heap-int (>= 256) function.
 #

@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=24
 # The frame holding the `try` contributes its own traceback node, including
 # when its `except` is reached from inside its own compiled trace.
 #

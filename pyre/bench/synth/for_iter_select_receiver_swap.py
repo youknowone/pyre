@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=10
 # A conditional expression selects one of two loop locals as the receiver
 # (`q = o if cond else p`) whose attribute is then read/written inside a hot
 # `for i in range(...)` loop.  The two arms of the conditional are distinct

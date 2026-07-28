@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # #171/#11 negative-index regression: a canonical-tuple / list subscript that
 # the JIT specializes on a NON-NEGATIVE observed index must DEOPT (the
 # lower-bound guard `0 <= idx`) when a later NEGATIVE index flows through the

@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=17
 # A bare re-raise caught in the same frame keeps the original traceback: no
 # node is attached at a re-raise coordinate (RaiseWithExplicitTraceback,
 # attach_tb=False). The module-level loop makes the recording iteration itself
@@ -5,7 +6,7 @@
 # the bare-raise and handler-cleanup coordinates on exactly that iteration
 # (depth 4 instead of 2). Named re-raise (`raise e`) must still attach its
 # node (depth 3), and a `finally` passthrough attaches nothing (depth 2).
-N = 4000
+N = 22000
 
 
 def thrower(i):

@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=10
 # A residual Python call mutates an IntMutableCell in place.  The caller must
 # reload the global after the call even though the module-dict binding and its
 # quasi-immutable version did not change.

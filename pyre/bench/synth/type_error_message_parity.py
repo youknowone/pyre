@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # Error-message parity across a few type/builtin operations that both
 # reference implementations word identically.
 def main():

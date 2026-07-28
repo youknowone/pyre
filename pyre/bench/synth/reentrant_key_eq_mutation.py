@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 class Key:
     def __init__(self, value, owner):
         self.value = value

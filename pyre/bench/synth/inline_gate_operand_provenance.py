@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=92
 # The FOR_ITER inline gate admits a callee whose only unproven residual is a
 # `BINARY_OP` it expects the walker to specialize away.  That expectation rests
 # on `args_all_exact_*`, which describes the callee's INCOMING ARGUMENTS — so it

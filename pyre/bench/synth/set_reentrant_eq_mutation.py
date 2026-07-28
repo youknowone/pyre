@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=6
 class ReentrantKey:
     def __init__(self, value, state):
         self.value = value

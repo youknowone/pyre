@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # One LOAD_ATTR site alternates between maps whose insertion order assigns
 # different storage slots to `q`; promoting the map must guard the selected
 # storage coordinate, while a class-layout guard alone cannot (mapdict.py:905-916).

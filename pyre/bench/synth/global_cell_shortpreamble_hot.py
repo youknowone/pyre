@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=22
 # A module-global int accumulator carried through an inlined function that
 # branches on the loop variable `i`, where the loop body ALSO reads `i` at the
 # tail (a branch / dead guard / mid-loop reassignment). The `LOAD_NAME i` folds

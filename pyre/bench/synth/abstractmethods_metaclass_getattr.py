@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 # descroperation.py:234 — the type getattribute slot is wrapped so even the
 # hardcoded __abstractmethods__ AttributeError (raised when the slot is unset)
 # consults the metaclass __getattr__ before propagating.

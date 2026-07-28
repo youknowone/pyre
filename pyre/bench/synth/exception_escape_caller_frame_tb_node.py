@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=28
 # An exception escaping a compiled frame that holds a try block it does NOT
 # match used to lose the CALLER's traceback node:
 #

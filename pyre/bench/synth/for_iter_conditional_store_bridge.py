@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=5
 def loop_with_two_backedges(n):
     high = 0
     for i in range(n):

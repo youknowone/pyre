@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=6
 # argument.py _match_keywords: a positional-only parameter passed by keyword is
 # absorbed into **kwargs when present, else raises; a keyword that duplicates an
 # already-bound positional raises "multiple values".  Exercised through the

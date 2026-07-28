@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=8
 # Depth-1 kept-stack short-circuit with a BARE loop-varying local on the left
 # and a loop-invariant constant on the right.
 #

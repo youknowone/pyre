@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=6
 # module.py:143-162 — a module attribute miss with no module-level __getattr__
 # reports the module's __name__ in the AttributeError message.
 

@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=172
 # IMPORT_FROM in a hot loop: `from math import pi, e` runs IMPORT_FROM for
 # each imported name every iteration.  The compiled per-CodeObject jitcode
 # walks the import_from residual (getattr on the peeked module, with a

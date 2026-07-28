@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=28
 # difference_update and intersection_update hash each element of the other
 # operand as it is consumed, so an unhashable element raises and a raising
 # __hash__ propagates -- including when self is empty and nothing can match.

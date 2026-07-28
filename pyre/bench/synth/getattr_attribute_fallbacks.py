@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=6
 # descroperation.py _handle_getattribute / objspace.py getattr fast path:
 # an AttributeError raised by a custom __getattribute__ OR by a descriptor
 # __get__ falls back to __getattr__ rather than propagating.

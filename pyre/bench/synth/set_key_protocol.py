@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=20
 # A set's backing storage keys on both the hash and the equality protocol, so
 # an element is hashed exactly once per store and a raise from either callback
 # aborts that store rather than being swallowed into a corrupt container. An

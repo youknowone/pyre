@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=30
 # Exception metadata observed from inside JIT-hot handlers: traceback
 # attachment and shape, __context__ / __cause__ chaining, sys.exc_info, handler
 # name clearing, and re-raise.
@@ -11,7 +12,7 @@
 
 import sys
 
-N = 3000
+N = 12000
 
 
 def out(key, value):

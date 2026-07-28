@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=16
 # A NaN in an all-float list: the same NaN object is found by index/count/
 # containment and compares equal in list == / <= (bit-pattern identity), even
 # though `nan == nan` is false. Output verified against CPython/PyPy.
