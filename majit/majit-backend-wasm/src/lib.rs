@@ -321,6 +321,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_is_tracked(Some(wasm_is_tracked));
     majit_gc::set_active_collect_oldgen(Some(wasm_collect_oldgen_nonmoving));
     majit_gc::set_active_heap_stats(Some(active_gc_heap_stats));
+    majit_gc::set_active_major_threshold_reached(Some(active_gc_major_threshold_reached));
     majit_gc::set_active_finalizer_hooks(
         Some(wasm_register_finalizer),
         Some(wasm_finalizer_next_dead),
@@ -364,6 +365,13 @@ pub fn install_gc_standalone() {
 /// runner split GC-retained memory from host-heap growth.
 pub fn active_gc_heap_stats() -> (usize, usize) {
     with_wasm_active_gc(|gc| gc.heap_byte_stats()).unwrap_or((0, 0))
+}
+
+/// Whether the GC owned by this thread's wasm backend wants a major collection
+/// (incminimark.py:1288-1290 `threshold_reached`). Drives the interpreter GC
+/// safepoint, which is on by default on wasm.
+pub fn active_gc_major_threshold_reached() -> bool {
+    with_wasm_active_gc(|gc| gc.major_threshold_reached()).unwrap_or(false)
 }
 
 /// Diagnostic: `(minor_collections, major_collections)` of the active GC, or

@@ -199,6 +199,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_is_tracked(Some(dynasm_is_tracked));
     majit_gc::set_active_collect_oldgen(Some(dynasm_collect_oldgen_nonmoving));
     majit_gc::set_active_heap_stats(Some(dynasm_heap_stats));
+    majit_gc::set_active_major_threshold_reached(Some(dynasm_major_threshold_reached));
     majit_gc::set_active_root_hooks(Some(dynasm_gc_add_root), Some(dynasm_gc_remove_root));
     majit_gc::set_active_gc_owns_object(Some(dynasm_gc_owns_object));
     majit_gc::set_active_gc_is_nursery_object(Some(dynasm_gc_is_nursery_object));
@@ -627,6 +628,19 @@ fn dynasm_heap_stats() -> (usize, usize) {
         return r;
     }
     majit_gc::gc_sync::gc_op(|g| g.heap_byte_stats())
+}
+
+/// Report whether the GC wants a major collection, for the interpreter GC
+/// safepoint (incminimark.py:1288-1290 `threshold_reached`).
+fn dynasm_major_threshold_reached() -> bool {
+    if let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
+        c.borrow_mut()
+            .as_deref_mut()
+            .map(|g| g.major_threshold_reached())
+    }) {
+        return r;
+    }
+    majit_gc::gc_sync::gc_op(|g| g.major_threshold_reached())
 }
 
 /// Host-side root-register trampoline. Bridges

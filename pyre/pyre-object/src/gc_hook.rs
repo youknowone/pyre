@@ -420,36 +420,35 @@ pub fn try_gc_jitframe_empty() -> bool {
     }
 }
 
-/// Signature of the host-side `(oldgen_total, nursery_used)` byte-stats
-/// callback. `oldgen_total` is `get_total_memory_used`
-/// (incminimark.py:1264-1268).
-pub type GcHeapStatsHookFn = fn() -> (usize, usize);
+/// Signature of the host-side `threshold_reached` callback
+/// (incminimark.py:1288-1290).
+pub type GcMajorThresholdReachedHookFn = fn() -> bool;
 
-majit_gc::global_hook!(static GC_HEAP_STATS_HOOK: GcHeapStatsHookFn);
+majit_gc::global_hook!(static GC_MAJOR_THRESHOLD_REACHED_HOOK: GcMajorThresholdReachedHookFn);
 
-/// Install the heap-byte-stats callback.
-pub fn register_gc_heap_stats_hook(hook: GcHeapStatsHookFn) {
-    GC_HEAP_STATS_HOOK.set(Some(hook));
+/// Install the next-major-threshold callback.
+pub fn register_gc_major_threshold_reached_hook(hook: GcMajorThresholdReachedHookFn) {
+    GC_MAJOR_THRESHOLD_REACHED_HOOK.set(Some(hook));
 }
 
-/// Remove the heap-byte-stats callback.
-pub fn clear_gc_heap_stats_hook() {
-    GC_HEAP_STATS_HOOK.set(None);
+/// Remove the next-major-threshold callback.
+pub fn clear_gc_major_threshold_reached_hook() {
+    GC_MAJOR_THRESHOLD_REACHED_HOOK.set(None);
 }
 
-/// Report `(oldgen_total, nursery_used)` in bytes via the installed hook.
-/// `(0, 0)` when none is installed, which leaves the interpreter safepoint on
-/// its `min_heap_size` floor.
+/// Whether the collector has reached the threshold it set for its next major
+/// collection, via the installed hook. `false` when none is installed, so an
+/// interpreter with no collector behind it never asks for one.
 ///
-/// Reads the runtime-mutable `GC_HEAP_STATS_HOOK` fn-pointer cell, not a
-/// build-time constant, so the JIT residualizes the call instead of tracing
-/// into it (`@dont_look_inside`, the [`try_gc_jitframe_empty`] twin). It
-/// cannot raise.
+/// Reads the runtime-mutable `GC_MAJOR_THRESHOLD_REACHED_HOOK` fn-pointer cell,
+/// not a build-time constant, so the JIT residualizes the call instead of
+/// tracing into it (`@dont_look_inside`, the [`try_gc_jitframe_empty`] twin).
+/// The `-> bool` return fits a single word and it cannot raise.
 #[majit_macros::dont_look_inside]
-pub fn try_gc_heap_stats() -> (usize, usize) {
-    match GC_HEAP_STATS_HOOK.get() {
+pub fn try_gc_major_threshold_reached() -> bool {
+    match GC_MAJOR_THRESHOLD_REACHED_HOOK.get() {
         Some(f) => f(),
-        None => (0, 0),
+        None => false,
     }
 }
 

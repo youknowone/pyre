@@ -205,7 +205,7 @@ pub fn frame_entry_count() -> u64 {
 ///
 /// Touches the runtime-mutable `FRAME_ENTRY_COUNT` thread-local, not a
 /// build-time constant, so the JIT residualizes the call instead of tracing
-/// into it (`@dont_look_inside`, the `note_alloc` sibling). A `()` return has
+/// into it (`@dont_look_inside`, the `gc_interp::enabled` sibling). A `()` return has
 /// no discriminant to erase and it cannot raise.
 #[majit_macros::dont_look_inside]
 pub fn bump_frame_entry_count() {

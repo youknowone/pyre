@@ -526,6 +526,18 @@ pub trait GcAllocator: Send {
         (0, 0)
     }
 
+    /// incminimark.py:1288-1290 `threshold_reached(0)`: whether the memory the
+    /// collector is responsible for has caught up to the threshold it set for
+    /// the next major collection. Everything that shapes that threshold — the
+    /// growth ratio, `growth_rate_max`, `max_delta`, `min_heap_size`,
+    /// `max_heap_size` — lives behind this answer, so a caller that cannot
+    /// drive collection from the allocator can ask here instead of modelling
+    /// heap growth itself. Default `false` for stub allocators with no
+    /// threshold accounting.
+    fn major_threshold_reached(&self) -> bool {
+        false
+    }
+
     /// Diagnostic only: `(minor_collections, major_collections)` run so far.
     /// Used to attribute run time to collection cadence (e.g. old-gen churn
     /// driving repeated majors). Default `(0, 0)` for stub allocators.
@@ -927,6 +939,9 @@ impl GcAllocator for GcHandle {
     }
     fn heap_byte_stats(&self) -> (usize, usize) {
         gc_sync::gc_query_reentrant(|gc| gc.heap_byte_stats())
+    }
+    fn major_threshold_reached(&self) -> bool {
+        gc_sync::gc_query_reentrant(|gc| gc.major_threshold_reached())
     }
     fn collection_counts(&self) -> (usize, usize) {
         gc_sync::gc_query_reentrant(|gc| gc.collection_counts())
@@ -1609,10 +1624,11 @@ pub fn collect_oldgen_nonmoving() {
 }
 
 /// Process-global callback reporting the active GC's `heap_byte_stats`
-/// (`(oldgen_total, nursery_used)`). Lets the interpreter safepoint
-/// (`pyre_object::gc_interp`) gate a collection on an empty nursery,
-/// where the embedded minor cycle moves nothing and is therefore safe
-/// even without a shadowstack pass over Rust-stack temporaries.
+/// (`(oldgen_total, nursery_used)`). Diagnostic: it lets a host runner split
+/// GC-retained memory from host-heap growth. Deciding when to collect is not
+/// among its uses — that question is [`active_major_threshold_reached`], which
+/// answers it from the collector's own threshold rather than from a number a
+/// caller would have to compare against a threshold of its own.
 pub type HeapStatsFn = fn() -> (usize, usize);
 
 global_hook!(static ACTIVE_HEAP_STATS: HeapStatsFn);
@@ -1628,6 +1644,30 @@ pub fn active_heap_stats() -> (usize, usize) {
     match ACTIVE_HEAP_STATS.get() {
         Some(f) => f(),
         None => (0, 0),
+    }
+}
+
+/// Process-global callback reporting the active GC's `major_threshold_reached`
+/// (incminimark.py:1288-1290). The interpreter GC safepoint
+/// (`pyre_object::gc_interp`) collects when this says the collector wants a
+/// major, instead of keeping a second, poorer model of heap growth beside the
+/// collector's own.
+pub type MajorThresholdReachedFn = fn() -> bool;
+
+global_hook!(static ACTIVE_MAJOR_THRESHOLD_REACHED: MajorThresholdReachedFn);
+
+/// Install the active backend's `major_threshold_reached` trampoline.
+pub fn set_active_major_threshold_reached(hook: Option<MajorThresholdReachedFn>) {
+    ACTIVE_MAJOR_THRESHOLD_REACHED.set(hook);
+}
+
+/// Whether the active backend's GC has reached its next-major threshold.
+/// `false` when no backend has installed a hook, so a caller with no collector
+/// behind it never collects.
+pub fn active_major_threshold_reached() -> bool {
+    match ACTIVE_MAJOR_THRESHOLD_REACHED.get() {
+        Some(f) => f(),
+        None => false,
     }
 }
 

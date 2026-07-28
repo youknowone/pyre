@@ -595,7 +595,6 @@ impl FrameBox {
             debug_assert!(pyre_object::gc_hook::try_gc_owns_object(
                 frame.locals_cells_stack_w as *mut u8
             ));
-            pyre_object::gc_interp::note_alloc(std::mem::size_of::<PyFrame>());
             let ptr = raw as *mut PyFrame;
             unsafe {
                 std::ptr::write(ptr, frame);

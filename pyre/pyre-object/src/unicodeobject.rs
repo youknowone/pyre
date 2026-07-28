@@ -243,9 +243,6 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
         let recovered = unsafe { (*value).clone() };
         return w_str_from_wtf8_immortal(recovered);
     }
-    // Both the header and the value box holding the WTF-8 bytes came from the
-    // collector, so the safepoint's byte budget accounts for both.
-    crate::gc_interp::note_alloc(W_UNICODE_OBJECT_SIZE + byte_len);
     unsafe {
         std::ptr::write(raw as *mut W_UnicodeObject, unicode);
         raw as PyObjectRef

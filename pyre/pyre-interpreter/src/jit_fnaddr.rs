@@ -838,20 +838,10 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::try_gc_alloc_stable_raw",
         pyre_object::gc_hook::try_gc_alloc_stable_raw as *const (),
     );
-    // The interp-alloc boxing tail's GC-hook toucher residual: `note_alloc`
-    // bumps the runtime-mutable `ALLOC_SINCE_GC` atomic. It is not a build-time
-    // constant, so it carries `#[dont_look_inside]` and binds its `()`-returning
-    // function directly by qualified path.
-    push_alias_pair(
-        &mut entries,
-        "pyre_object::gc_interp::note_alloc",
-        "pyre_object::note_alloc",
-        pyre_object::gc_interp::note_alloc as *const (),
-    );
     // `w_type_set_abstract` stores the runtime-mutable `flag_abstract` atomic — a
     // side effect on per-type state, not a build-time constant, so it carries
     // `#[dont_look_inside]` and binds its `()`-returning `fn` directly by
-    // qualified path (sibling of `note_alloc`).
+    // qualified path (sibling of `gc_interp::enabled`).
     push_alias_pair(
         &mut entries,
         "pyre_object::typeobject::w_type_set_abstract",
@@ -1021,13 +1011,13 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::note_eval_activation_exit",
         pyre_object::gc_interp::note_eval_activation_exit as *const (),
     );
-    // The dispatch-loop safepoint's four toucher residuals plus the frame-entry
+    // The dispatch-loop safepoint's six toucher residuals plus the frame-entry
     // odometer bump and the items-block strategy gate: each reads a
-    // runtime-mutable global (`COLLECT_STATE` / `EVAL_NESTING` atomics, the two
-    // GC hook fn-pointer cells, `FRAME_ENTRY_COUNT` TLS, the `PYRE_GC_ITEMSBLOCK`
-    // `OnceLock`) — none a build-time constant — so all carry
+    // runtime-mutable global (`COLLECT_STATE` atomic, `EVAL_NESTING` / `POLL_TICK`
+    // TLS, the three GC hook fn-pointer cells, `FRAME_ENTRY_COUNT` TLS, the
+    // `PYRE_GC_ITEMSBLOCK` `OnceLock`) — none a build-time constant — so all carry
     // `#[dont_look_inside]` and bind their `-> bool` / `()` Rust `fn` directly by
-    // qualified path (siblings of `gc_interp::enabled` / `note_alloc`).
+    // qualified path (siblings of `gc_interp::enabled`).
     push_alias_pair(
         &mut entries,
         "pyre_object::gc_interp::collect_enabled",
@@ -1036,9 +1026,21 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::gc_interp::poll_due",
+        "pyre_object::poll_due",
+        pyre_object::gc_interp::poll_due as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_object::gc_interp::at_outermost_activation",
         "pyre_object::at_outermost_activation",
         pyre_object::gc_interp::at_outermost_activation as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_hook::try_gc_major_threshold_reached",
+        "pyre_object::try_gc_major_threshold_reached",
+        pyre_object::gc_hook::try_gc_major_threshold_reached as *const (),
     );
     push_alias_pair(
         &mut entries,
@@ -1063,8 +1065,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::call::bump_frame_entry_count",
         crate::call::bump_frame_entry_count as *const (),
     );
-    // The dispatch-loop safepoint entry itself reads `ALLOC_SINCE_GC` inline and
-    // dispatches to the collection hook.
+    // The dispatch-loop safepoint entry itself paces the poll inline and
+    // dispatches to the threshold and collection hooks.
     push_alias_pair(
         &mut entries,
         "pyre_object::gc_interp::safepoint",
@@ -3067,7 +3069,7 @@ mod tests {
     /// qualified path; a typo in either the module-qualified or root alias
     /// silently regresses the `#[dont_look_inside]` call to a symbolic hash,
     /// so pin both spellings against the live fnaddr (siblings of the
-    /// `gc_interp::enabled` / `note_alloc` registrations).
+    /// `gc_interp::enabled` registration).
     #[test]
     fn jit_trace_fnaddrs_covers_interp_gc_safepoint_readers() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();

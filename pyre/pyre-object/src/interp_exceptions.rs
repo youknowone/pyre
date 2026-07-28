@@ -597,7 +597,6 @@ fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
             unsafe {
                 std::ptr::write(raw as *mut W_BaseException, value);
             }
-            crate::gc_interp::note_alloc(W_BASE_EXCEPTION_SIZE);
             crate::gc_hook::try_gc_write_barrier(raw);
             return raw as PyObjectRef;
         }

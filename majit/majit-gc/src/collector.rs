@@ -4015,6 +4015,10 @@ impl GcAllocator for MiniMarkGC {
         (self.get_total_memory_used(), self.nursery.used())
     }
 
+    fn major_threshold_reached(&self) -> bool {
+        self.threshold_reached(0)
+    }
+
     fn type_size(&self, type_id: u32) -> Option<usize> {
         if (type_id as usize) < self.types.len() {
             Some(self.types.get(type_id).size)

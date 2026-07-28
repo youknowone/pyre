@@ -136,7 +136,6 @@ pub fn w_pytraceback_new(
         PYTRACEBACK_OBJECT_SIZE,
     );
     if !raw.is_null() {
-        pyre_object::gc_interp::note_alloc(PYTRACEBACK_OBJECT_SIZE);
         let ptr = raw as *mut PyTraceback;
         unsafe {
             std::ptr::write(ptr, value);

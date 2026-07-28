@@ -398,6 +398,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_is_tracked(Some(is_tracked_via_active_runtime));
     majit_gc::set_active_collect_oldgen(Some(collect_oldgen_nonmoving_via_active_runtime));
     majit_gc::set_active_heap_stats(Some(heap_stats_via_active_runtime));
+    majit_gc::set_active_major_threshold_reached(Some(major_threshold_reached_via_active_runtime));
     majit_gc::set_active_root_hooks(
         Some(gc_add_root_via_active_runtime),
         Some(gc_remove_root_via_active_runtime),
@@ -1662,6 +1663,12 @@ fn finalizer_next_dead_via_active_runtime(fq_index: usize) -> Option<GcRef> {
 /// Report `(oldgen_total, nursery_used)` for the interpreter GC safepoint.
 fn heap_stats_via_active_runtime() -> (usize, usize) {
     with_cranelift_gc(|gc| gc.heap_byte_stats()).unwrap_or((0, 0))
+}
+
+/// Report whether the GC wants a major collection, for the interpreter GC
+/// safepoint (incminimark.py:1288-1290 `threshold_reached`).
+fn major_threshold_reached_via_active_runtime() -> bool {
+    with_cranelift_gc(|gc| gc.major_threshold_reached()).unwrap_or(false)
 }
 
 /// Host-side root-register trampoline. Bridges

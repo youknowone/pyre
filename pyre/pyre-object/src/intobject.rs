@@ -111,7 +111,6 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
     if crate::gc_interp::enabled() {
         let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_INT_GC_TYPE_ID, W_INT_OBJECT_SIZE);
         if !raw.is_null() {
-            crate::gc_interp::note_alloc(W_INT_OBJECT_SIZE);
             unsafe {
                 std::ptr::write(raw as *mut W_IntObject, obj);
                 return raw as PyObjectRef;

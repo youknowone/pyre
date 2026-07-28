@@ -149,11 +149,6 @@ pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
         // until the wrapper is initialized and remembered below.
         let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_LONG_GC_TYPE_ID, W_LONG_OBJECT_SIZE);
         if !raw.is_null() {
-            // Charge the dispatch-loop safepoint's byte budget, as w_int_new /
-            // w_float_new do for their stable allocs — otherwise a long-dominated
-            // interpreter workload never reaches the safepoint threshold and the
-            // dead old-gen long wrappers + their bigint payloads accumulate.
-            crate::gc_interp::note_alloc(W_LONG_OBJECT_SIZE);
             unsafe {
                 std::ptr::write(
                     raw as *mut W_LongObject,

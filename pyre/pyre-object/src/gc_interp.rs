@@ -20,10 +20,13 @@
 //! path dict/set/list/instances already use), so they become GC-tracked without
 //! the move hazard, and trigger a full mark-sweep at a bytecode-dispatch
 //! safepoint (loop top, where the only live refs are in the frame and reachable
-//! through the registered `pyframe` root walker). The collection is throttled
-//! the way `set_major_threshold_from` (incminimark.py:575-594) throttles a
-//! major: on bytes allocated since the last one, against a threshold re-derived
-//! from what survived it, so the cost is amortised against heap growth.
+//! through the registered `pyframe` root walker). When to collect is not
+//! decided here: the safepoint asks the collector's own `threshold_reached`
+//! (incminimark.py:1288-1290), which weighs everything the collector is
+//! responsible for against the threshold `set_major_threshold_from`
+//! (incminimark.py:575-594) derived from the last major's survivors. Upstream
+//! asks that question in the allocator; pyre asks it here because here is where
+//! it can act on the answer.
 //!
 //! Gated off by default on native; enabled with `PYRE_GC_INTERP=1`. On wasm it
 //! is on by default — the env read returns nothing there, and the interp-path
@@ -32,7 +35,7 @@
 //! turns it off where the env is readable.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Tri-state: 0 = not yet read from env, 1 = disabled, 2 = enabled.
 static STATE: AtomicU8 = AtomicU8::new(0);
@@ -121,37 +124,47 @@ pub fn at_outermost_activation() -> bool {
 /// routing+collection while diagnosing root-completeness.
 static COLLECT_STATE: AtomicU8 = AtomicU8::new(0);
 
-/// Bytes of interpreter-routed object allocation since the last collection.
+/// Dispatches between two `threshold_reached` queries.
 ///
-/// The allocator accumulating a byte total is `nursery_free = result +
-/// totalsize` (minimark.py:556-557); a count of allocations has no upstream
-/// counterpart, and cannot bound anything because one allocation is not one
-/// size.
-static ALLOC_BYTES_SINCE_GC: AtomicUsize = AtomicUsize::new(0);
+/// This is a poll rate, not a collection policy: the safepoint holds no model
+/// of the heap, and this value cannot make a collection happen that the
+/// collector did not ask for. It exists only because reaching the collector
+/// costs a thread-local borrow — or, with no backend GC box installed, a
+/// `gc_op` compare-and-exchange — which is too much to spend on every bytecode
+/// dispatch. At a few tens of bytes allocated per dispatch the interval spans
+/// far less than `min_heap_size` (incminimark.py:307), the smallest threshold
+/// the collector will ever set, so no answer is reached late enough to matter.
+const POLL_INTERVAL: u32 = 1024;
 
-/// Bytes that must be allocated before the next safepoint collection.
+thread_local! {
+    /// Eligible dispatches since this thread last asked the collector; see
+    /// [`POLL_INTERVAL`]. Advanced only once the cheaper gates have passed, so
+    /// it paces the queries actually made rather than the dispatches seen.
+    /// Thread-local rather than atomic because the query it paces is itself
+    /// per-thread, and a `fetch_add` on every dispatch would cost about what it
+    /// is here to avoid.
+    static POLL_TICK: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Whether this dispatch is the one that asks the collector.
 ///
-/// `set_major_threshold_from` (incminimark.py:575-594) schedules the next major
-/// at `get_total_memory_used() * major_collection_threshold`, so the major cost
-/// is amortised against how much the heap grew rather than paid on a fixed
-/// cadence. `threshold_reached` (incminimark.py:1288-1290) is the comparison.
-///
-/// Held here as the equivalent *delta*: having allocated `b` bytes since the
-/// last major, the total is `live + b`, so `live + b >= live * threshold` is
-/// just `b >= live * (threshold - 1)`. That keeps the safepoint's per-dispatch
-/// test a plain atomic compare and confines the heap-stats read to the far
-/// rarer post-collection update.
-static NEXT_MAJOR_BYTES: AtomicUsize = AtomicUsize::new(MIN_HEAP_BYTES);
-
-/// `major_collection_threshold - 1` in hundredths (incminimark.py:198's 1.82
-/// default, as the growth delta 0.82). Integer maths keeps the safepoint free
-/// of floating point.
-const MAJOR_GROWTH_DELTA_PCT: usize = 82;
-
-/// Floor for [`NEXT_MAJOR_BYTES`], mirroring `min_heap_size`
-/// (incminimark.py:307). Without it a small live heap would schedule the next
-/// major almost immediately and the collection cost would dominate again.
-const MIN_HEAP_BYTES: usize = 8 << 20;
+/// Reads the runtime-mutable `POLL_TICK` thread-local, not a build-time
+/// constant, so the JIT residualizes the call instead of tracing into it
+/// (`@dont_look_inside`, the [`at_outermost_activation`] sibling). The
+/// `-> bool` return fits a single word and it cannot raise.
+#[majit_macros::dont_look_inside]
+pub fn poll_due() -> bool {
+    POLL_TICK.with(|t| {
+        let n = t.get() + 1;
+        if n >= POLL_INTERVAL {
+            t.set(0);
+            true
+        } else {
+            t.set(n);
+            false
+        }
+    })
+}
 
 /// Whether `PYRE_GC_INTERP` routes int/float allocations through the GC and
 /// arms the dispatch-loop safepoint. Reads the env once, then caches.
@@ -174,27 +187,25 @@ pub fn enabled() -> bool {
     }
 }
 
-/// Account for `size` bytes of interpreter-routed allocation. Called after a
-/// successful `try_gc_alloc_stable` with the payload size that succeeded.
+/// Dispatch-loop safepoint: when the collector says it has reached the
+/// threshold it set for its next major, run a non-moving old-gen-only major.
+/// A no-op when the flag is off or no collection hook is installed.
 ///
-/// Takes the size because the safepoint's budget is a byte budget: the
-/// allocator's own accumulation is `nursery_free = result + totalsize`
-/// (minimark.py:556-557). Counting allocations instead lets a workload that
-/// boxes many small objects trigger a whole-heap major far more often than the
-/// bytes it reclaims justify.
+/// The decision is entirely the collector's. `threshold_reached`
+/// (incminimark.py:1288-1290) compares `get_total_memory_used()` — every byte
+/// the collector is responsible for, headers included, whatever allocated them
+/// — against the threshold `set_major_threshold_from` (incminimark.py:575-594)
+/// derived from the last major's survivors under `major_collection_threshold`,
+/// `growth_rate_max`, `max_delta`, `min_heap_size` and `max_heap_size`. Running
+/// the collection re-derives it, because `do_collect_oldgen_nonmoving` drives
+/// `major_collection_step` to the end of the cycle and `finish_incremental_cycle`
+/// sets the next threshold there.
 ///
-/// Touches the runtime-mutable `ALLOC_BYTES_SINCE_GC` atomic; the value is not
-/// a build-time constant, so the JIT residualises the call instead of tracing
-/// into it (`@dont_look_inside`, the [`enabled`] sibling). A `()` return has no
-/// discriminant to erase.
-#[majit_macros::dont_look_inside]
-pub fn note_alloc(size: usize) {
-    ALLOC_BYTES_SINCE_GC.fetch_add(size, Ordering::Relaxed);
-}
-
-/// Dispatch-loop safepoint: when enough interpreter objects have accumulated,
-/// run a non-moving old-gen-only major to reclaim the dead ones, then reset the
-/// counter. A no-op when the flag is off or no collection hook is installed.
+/// The safepoint deliberately keeps no counter of its own. Upstream asks this
+/// question in the allocator, where every allocation passes; a second tally
+/// kept beside the collector could only ever see the subset of allocations
+/// that remembered to report, and would answer for a heap that is not the one
+/// being collected.
 ///
 /// The collection is `try_gc_collect_oldgen` — it seeds roots, marks, and
 /// sweeps ONLY the old generation, never touching the nursery (not moved, not
@@ -212,13 +223,12 @@ pub fn note_alloc(size: usize) {
 /// module code — whose Rust-stack roots the pyframe walker cannot see — never
 /// triggers it.
 ///
-/// Reads the runtime-mutable `ALLOC_SINCE_GC` atomic and dispatches to the
-/// installed collection hook, neither a build-time constant, so the JIT
-/// residualizes the call instead of tracing into it (`@dont_look_inside`, the
-/// [`enabled`] sibling). A `()` return has no discriminant to erase and it
-/// cannot raise. On the cold interpreter dispatch loop its first act is
-/// already the non-inlined `enabled()` early-return; the residual adds no
-/// hot-path cost the un-residualized form did not already pay.
+/// Dispatches to the installed threshold and collection hooks, neither a
+/// build-time constant, so the JIT residualizes the call instead of tracing
+/// into it (`@dont_look_inside`, the [`enabled`] sibling). A `()` return has no
+/// discriminant to erase and it cannot raise. On the cold interpreter dispatch
+/// loop its first act is already the non-inlined `enabled()` early-return; the
+/// residual adds no hot-path cost the un-residualized form did not already pay.
 #[majit_macros::dont_look_inside]
 pub fn safepoint() {
     if !enabled() {
@@ -226,18 +236,11 @@ pub fn safepoint() {
     }
     if collect_enabled()
         && at_outermost_activation()
-        && ALLOC_BYTES_SINCE_GC.load(Ordering::Relaxed) >= NEXT_MAJOR_BYTES.load(Ordering::Relaxed)
+        && poll_due()
+        && crate::gc_hook::try_gc_major_threshold_reached()
         && crate::gc_hook::try_gc_jitframe_empty()
     {
         crate::gc_hook::try_gc_collect_oldgen();
-        // `set_major_threshold_from` (incminimark.py:575-594) re-derives the
-        // next threshold from what survived, so a heap that keeps growing pays
-        // proportionally more between majors and a steady-state one stops
-        // collecting altogether.
-        let (oldgen_live, _nursery_used) = crate::gc_hook::try_gc_heap_stats();
-        let next = (oldgen_live / 100).saturating_mul(MAJOR_GROWTH_DELTA_PCT);
-        NEXT_MAJOR_BYTES.store(next.max(MIN_HEAP_BYTES), Ordering::Relaxed);
-        ALLOC_BYTES_SINCE_GC.store(0, Ordering::Relaxed);
     }
 }
 
