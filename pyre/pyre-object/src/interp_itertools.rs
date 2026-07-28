@@ -488,6 +488,51 @@ pub unsafe fn is_product(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &PRODUCT_TYPE) }
 }
 
+// ── W_Combinations — PyPy interp_itertools.py:W_Combinations ───────
+//
+// `pool_w`, `indices`, and `last_result_w` are the translated equivalents of
+// PyPy's three list attributes.  A null last_result_w is the initial None
+// sentinel.  The signed machine-word `r` matches RPython `int`.
+#[pyre_class("itertools.combinations", static_name = "COMBINATIONS")]
+pub struct W_Combinations {
+    pub pool_w: PyObjectRef,
+    pub indices: PyObjectRef,
+    pub r: isize,
+    pub last_result_w: PyObjectRef,
+    pub stopped: bool,
+}
+
+pub fn w_combinations_new(
+    pool_w: PyObjectRef,
+    indices: PyObjectRef,
+    r: isize,
+    stopped: bool,
+) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(pool_w);
+    crate::gc_roots::pin_root(indices);
+    W_Combinations::allocate_stable(W_Combinations {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        pool_w,
+        indices,
+        r,
+        last_result_w: std::ptr::null_mut(),
+        stopped,
+    })
+}
+
+/// Check if an object is a `W_Combinations`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_combinations(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &COMBINATIONS_TYPE) }
+}
+
 // ── W_Compress — pypy/module/itertools/interp_itertools.py:W_Compress ──
 //
 // ```python
@@ -968,6 +1013,22 @@ mod tests {
         assert_eq!(
             <W_Product as crate::lltype::GcType>::SIZE,
             W_PRODUCT_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_combinations_gc_descriptor_traces_all_owned_lists() {
+        assert_eq!(
+            W_COMBINATIONS_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_Combinations, pool_w),
+                std::mem::offset_of!(W_Combinations, indices),
+                std::mem::offset_of!(W_Combinations, last_result_w),
+            ]
+        );
+        assert_eq!(
+            <W_Combinations as crate::lltype::GcType>::SIZE,
+            W_COMBINATIONS_OBJECT_SIZE
         );
     }
 

@@ -4858,6 +4858,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::interp_itertools::is_chain(obj)
             || pyre_object::interp_itertools::is_batched(obj)
             || pyre_object::interp_itertools::is_product(obj)
+            || pyre_object::interp_itertools::is_combinations(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = match name {
                 "__next__" => Some((iter_next_method, "__next__", 1)),
@@ -12542,6 +12543,7 @@ pub fn is_iterable(obj: PyObjectRef) -> bool {
             || pyre_object::interp_itertools::is_chain(obj)
             || pyre_object::interp_itertools::is_batched(obj)
             || pyre_object::interp_itertools::is_product(obj)
+            || pyre_object::interp_itertools::is_combinations(obj)
         {
             return true;
         }
@@ -12852,6 +12854,24 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // override dispatch.
         if pyre_object::interp_itertools::is_product(obj) {
             let exact = get_instantiate(&pyre_object::interp_itertools::PRODUCT_TYPE);
+            if !std::ptr::eq((*obj).w_class, exact) {
+                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
+                    if !std::ptr::eq(src, exact) {
+                        if is_none(method) {
+                            return Err(PyError::type_error(format!(
+                                "'{}' object is not iterable",
+                                obj_type_name(obj)
+                            )));
+                        }
+                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                        return iter_check_is_iterator(w_iter);
+                    }
+                }
+            }
+            return Ok(obj);
+        }
+        if pyre_object::interp_itertools::is_combinations(obj) {
+            let exact = get_instantiate(&pyre_object::interp_itertools::COMBINATIONS_TYPE);
             if !std::ptr::eq((*obj).w_class, exact) {
                 if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
                     if !std::ptr::eq(src, exact) {
@@ -13596,6 +13616,158 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             for index in 0..result_len {
                 let item = pyre_object::w_list_getitem(lst, index as i64)
                     .expect("product result in range");
+                pyre_object::gc_roots::pin_root(item);
+                result_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
+            }
+            return Ok(pyre_object::w_tuple_new(
+                result_slots
+                    .into_iter()
+                    .map(|slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                    .collect(),
+            ));
+        }
+        // itertools.combinations — PyPy W_Combinations.descr_next.
+        if pyre_object::interp_itertools::is_combinations(obj) {
+            let exact = get_instantiate(&pyre_object::interp_itertools::COMBINATIONS_TYPE);
+            if !std::ptr::eq((*obj).w_class, exact) {
+                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__next__") {
+                    if !std::ptr::eq(src, exact) {
+                        return crate::call::call_function_impl_result(method, &[obj]);
+                    }
+                }
+            }
+
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let state = &*(w_self as *const pyre_object::interp_itertools::W_Combinations);
+            if state.stopped {
+                return Err(PyError::stop_iteration());
+            }
+            let r = state.r as usize;
+            let pool_len = pyre_object::w_list_len(state.pool_w);
+
+            let result = if state.last_result_w.is_null() {
+                // First pass: result_w[i] = pool_w[indices[i]].
+                let mut item_slots = Vec::with_capacity(r);
+                for i in 0..r {
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    let state = &*(w_self as *const pyre_object::interp_itertools::W_Combinations);
+                    let w_index = pyre_object::w_list_getitem(state.indices, i as i64)
+                        .expect("combinations index in range");
+                    let index = pyre_object::w_int_get_value(w_index);
+                    let item = pyre_object::w_list_getitem(state.pool_w, index)
+                        .expect("combinations pool index in range");
+                    pyre_object::gc_roots::pin_root(item);
+                    item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
+                }
+                pyre_object::w_list_new(
+                    item_slots
+                        .into_iter()
+                        .map(|slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                        .collect(),
+                )
+            } else {
+                // Copy the previous result before mutating, exactly as
+                // `result_w = self.last_result_w[:]`.
+                let mut old_item_slots = Vec::with_capacity(r);
+                for i in 0..r {
+                    let item = pyre_object::w_list_getitem(state.last_result_w, i as i64)
+                        .expect("combinations result index in range");
+                    pyre_object::gc_roots::pin_root(item);
+                    old_item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
+                }
+                let result = pyre_object::w_list_new(
+                    old_item_slots
+                        .into_iter()
+                        .map(|slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                        .collect(),
+                );
+                pyre_object::gc_roots::pin_root(result);
+                let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+                // Scan right-to-left for an index below i + n - r.
+                let mut changed = r;
+                while changed > 0 {
+                    let i = changed - 1;
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    let state = &*(w_self as *const pyre_object::interp_itertools::W_Combinations);
+                    let w_index = pyre_object::w_list_getitem(state.indices, i as i64)
+                        .expect("combinations index in range");
+                    let index = pyre_object::w_int_get_value(w_index) as usize;
+                    if index != i + pool_len - r {
+                        break;
+                    }
+                    changed -= 1;
+                }
+                if changed == 0 {
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    (*(w_self as *mut pyre_object::interp_itertools::W_Combinations)).stopped =
+                        true;
+                    return Err(PyError::stop_iteration());
+                }
+                let first_changed = changed - 1;
+
+                // Increment the selected index, then reset every index to its
+                // right to one greater than its predecessor.
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let state = &*(w_self as *const pyre_object::interp_itertools::W_Combinations);
+                let current = pyre_object::w_int_get_value(
+                    pyre_object::w_list_getitem(state.indices, first_changed as i64)
+                        .expect("combinations index in range"),
+                ) + 1;
+                let w_current = pyre_object::w_int_new(current);
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let indices =
+                    (*(w_self as *const pyre_object::interp_itertools::W_Combinations)).indices;
+                pyre_object::w_list_setitem(indices, first_changed as i64, w_current);
+                for j in (first_changed + 1)..r {
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    let indices =
+                        (*(w_self as *const pyre_object::interp_itertools::W_Combinations)).indices;
+                    let previous = pyre_object::w_int_get_value(
+                        pyre_object::w_list_getitem(indices, (j - 1) as i64)
+                            .expect("combinations prior index in range"),
+                    ) + 1;
+                    let w_index = pyre_object::w_int_new(previous);
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    let indices =
+                        (*(w_self as *const pyre_object::interp_itertools::W_Combinations)).indices;
+                    pyre_object::w_list_setitem(indices, j as i64, w_index);
+                }
+
+                // Update the copied result starting at the leftmost changed
+                // index.
+                for i in first_changed..r {
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    let state = &*(w_self as *const pyre_object::interp_itertools::W_Combinations);
+                    let index = pyre_object::w_int_get_value(
+                        pyre_object::w_list_getitem(state.indices, i as i64)
+                            .expect("combinations index in range"),
+                    );
+                    let item = pyre_object::w_list_getitem(state.pool_w, index)
+                        .expect("combinations pool index in range");
+                    let result = pyre_object::gc_roots::shadow_stack_get(result_slot);
+                    pyre_object::w_list_setitem(result, i as i64, item);
+                }
+                pyre_object::gc_roots::shadow_stack_get(result_slot)
+            };
+
+            pyre_object::gc_roots::pin_root(result);
+            let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            (*(w_self as *mut pyre_object::interp_itertools::W_Combinations)).last_result_w =
+                pyre_object::gc_roots::shadow_stack_get(result_slot);
+            pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
+
+            let mut result_slots = Vec::with_capacity(r);
+            for i in 0..r {
+                let item = pyre_object::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(result_slot),
+                    i as i64,
+                )
+                .expect("combinations result in range");
                 pyre_object::gc_roots::pin_root(item);
                 result_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
             }

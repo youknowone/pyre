@@ -181,57 +181,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             Ok(pyre_object::w_seq_iter_new(list, n))
         }),
     );
-    // combinations(iterable, r)
+    // PyPy W_Combinations: retain pool/index/result state and advance one
+    // lexicographic combination at a time.
     crate::module_ns_store(
         ns,
         "combinations",
-        crate::make_builtin_function_with_arity_and_maybe_sig(
-            "combinations",
-            |args| {
-                crate::gateway::check_declared_arity("combinations", 2, args.len())?;
-                let r = crate::builtins::space_index_w(args[1])?;
-                if r < 0 {
-                    return Err(crate::PyError::value_error("r must be non-negative"));
-                }
-                let r = r as usize;
-                let pool = crate::builtins::collect_iterable(args[0])?;
-                if r > pool.len() {
-                    let list = pyre_object::w_list_new(vec![]);
-                    return Ok(pyre_object::w_seq_iter_new(list, 0));
-                }
-                fn combs(
-                    pool: &[pyre_object::PyObjectRef],
-                    r: usize,
-                    start: usize,
-                ) -> Vec<Vec<pyre_object::PyObjectRef>> {
-                    if r == 0 {
-                        return vec![vec![]];
-                    }
-                    let mut out = Vec::new();
-                    for i in start..pool.len() {
-                        for mut tail in combs(pool, r - 1, i + 1) {
-                            let mut v = vec![pool[i]];
-                            v.append(&mut tail);
-                            out.push(v);
-                        }
-                    }
-                    out
-                }
-                let all = combs(&pool, r, 0);
-                let tuples: Vec<_> = all.into_iter().map(pyre_object::w_tuple_new).collect();
-                let n = tuples.len();
-                let list = pyre_object::w_list_new(tuples);
-                Ok(pyre_object::w_seq_iter_new(list, n))
-            },
-            2,
-            Some(crate::gateway::Signature::new(
-                vec!["iterable", "r"],
-                None,
-                None,
-                0,
-                0,
-            )),
-        ),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::COMBINATIONS_TYPE)
+            .expect("itertools.combinations TypeDef initialized")
+            .as_ptr(),
     );
     // combinations_with_replacement(iterable, r) — like combinations, but an
     // element may repeat, so the recursion re-enters at `i` rather than `i + 1`
