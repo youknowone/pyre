@@ -2994,6 +2994,7 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             iterobject::BYTEARRAY_ITER_TYPE
         ),
         pytype_addr!("iterobject::MEMORY_ITER_TYPE", iterobject::MEMORY_ITER_TYPE),
+        pytype_addr!("iterobject::ARRAY_ITER_TYPE", iterobject::ARRAY_ITER_TYPE),
         pytype_addr!("iterobject::LIST_ITER_TYPE", iterobject::LIST_ITER_TYPE),
         pytype_addr!(
             "iterobject::LIST_REVERSE_ITER_TYPE",

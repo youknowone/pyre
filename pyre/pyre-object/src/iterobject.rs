@@ -55,6 +55,7 @@ pub static STR_ITER_TYPE: PyType = crate::pyobject::new_pytype("str_iterator");
 pub static BYTES_ITER_TYPE: PyType = crate::pyobject::new_pytype("bytes_iterator");
 pub static BYTEARRAY_ITER_TYPE: PyType = crate::pyobject::new_pytype("bytearray_iterator");
 pub static MEMORY_ITER_TYPE: PyType = crate::pyobject::new_pytype("memory_iterator");
+pub static ARRAY_ITER_TYPE: PyType = crate::pyobject::new_pytype("array.arrayiterator");
 
 /// The Python-visible iterator type for a sequence iterator over `seq`.
 ///
@@ -75,6 +76,8 @@ fn seq_iter_type_for(seq: PyObjectRef) -> &'static PyType {
             &BYTEARRAY_ITER_TYPE
         } else if crate::memoryview::is_w_memoryview(seq) {
             &MEMORY_ITER_TYPE
+        } else if crate::interp_array::is_array(seq) {
+            &ARRAY_ITER_TYPE
         } else {
             &SEQ_ITER_TYPE
         }
@@ -159,6 +162,7 @@ pub unsafe fn is_seq_iter(obj: PyObjectRef) -> bool {
         || tp == &BYTES_ITER_TYPE as *const PyType
         || tp == &BYTEARRAY_ITER_TYPE as *const PyType
         || tp == &MEMORY_ITER_TYPE as *const PyType
+        || tp == &ARRAY_ITER_TYPE as *const PyType
 }
 
 /// `memory_iterator` — the one producer-specific `W_SeqIterObject` identity
@@ -170,6 +174,16 @@ pub unsafe fn is_memory_iter(obj: PyObjectRef) -> bool {
         return false;
     }
     !obj.is_null() && (*obj).ob_type == &MEMORY_ITER_TYPE as *const PyType
+}
+
+/// `array.arrayiterator` — carries `__reduce__` / `__setstate__` but, unlike
+/// the str and bytes flavours, no `__length_hint__`.
+#[inline]
+pub unsafe fn is_array_iter(obj: PyObjectRef) -> bool {
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
+        return false;
+    }
+    !obj.is_null() && (*obj).ob_type == &ARRAY_ITER_TYPE as *const PyType
 }
 
 #[inline]

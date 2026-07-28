@@ -1037,6 +1037,13 @@ pub fn init_typeobjects() {
                 "memory_iterator",
                 init_memory_iterator_type as fn(PyObjectRef),
             ),
+            // `array.arrayiterator` pickles like the other flavours but
+            // reports no `__length_hint__`.
+            (
+                &pyre_object::iterobject::ARRAY_ITER_TYPE as *const PyType,
+                "array.arrayiterator",
+                init_array_iterator_type as fn(PyObjectRef),
+            ),
         ] {
             let iterator_type = new_typeobject_with_base(name, init, object_type);
             unsafe {
@@ -1759,6 +1766,7 @@ fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner>
         "bytes_iterator" => pyre_object::is_seq_iter,
         "bytearray_iterator" => pyre_object::is_seq_iter,
         "memory_iterator" => pyre_object::is_seq_iter,
+        "array.arrayiterator" => pyre_object::is_seq_iter,
         "list_iterator" => pyre_object::is_list_iter,
         "list_reverseiterator" => pyre_object::is_list_reverse_iter,
         "tuple_iterator" => pyre_object::is_tuple_iter,
@@ -1856,10 +1864,16 @@ unsafe fn stamp_method_owners(ns: PyObjectRef, owner: &'static crate::gateway::M
         .into_iter()
         .filter_map(|(key, _)| pyre_object::w_str_get_value_opt(key).map(str::to_owned))
         .collect();
+    // `type_ready_fill_dict` names a static type's methods after the type,
+    // so `list.append.__qualname__` is "list.append".  The qualifier is the
+    // last component of `tp_name`: `array.array`'s methods report
+    // "array.tolist", not "array.array.tolist".
+    let qualifier = owner
+        .type_name
+        .rsplit('.')
+        .next()
+        .unwrap_or(owner.type_name);
     for key in keys {
-        if key == "__new__" {
-            continue;
-        }
         let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
         let Some(descr) = pyre_object::w_dict_getitem_str(ns, &key) else {
             continue;
@@ -1871,7 +1885,16 @@ unsafe fn stamp_method_owners(ns: PyObjectRef, owner: &'static crate::gateway::M
         if code.is_null() || !crate::gateway::is_builtin_code(code) {
             continue;
         }
-        crate::gateway::builtin_code_set_owner(code, owner);
+        crate::function::function_set_qualname(
+            descr,
+            pyre_object::w_str_new(&format!("{qualifier}.{key}")),
+        );
+        // `__new__` takes the type being instantiated rather than an
+        // instance, so it carries the qualified name but not the receiver
+        // test that the owner stamps.
+        if key != "__new__" {
+            crate::gateway::builtin_code_set_owner(code, owner);
+        }
     }
 }
 
@@ -2033,6 +2056,14 @@ fn new_typeobject_with_base_and_layout(
     let ns = pyre_object::w_dict_new();
     pyre_object::gc_roots::pin_root(ns);
     init(ns);
+    // `type_ready_set_dict` — a static type whose `tp_name` is qualified
+    // publishes the leading component as a `__module__` entry, so
+    // `array.array.__dict__["__module__"] == "array"`.  An unqualified name
+    // stores nothing and the `type.__module__` getset reports "builtins".
+    if let Some((module, _)) = name.rsplit_once('.') {
+        let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, "__module__", w_str_new(module)) };
+    }
     // The namespace is complete, so every method descriptor in it can be
     // bound to the type that defines it before the type goes live.
     if let Some(owner) = method_owner(name) {
@@ -23776,6 +23807,43 @@ fn init_memory_iterator_type(ns: PyObjectRef) {
         (
             "__next__",
             make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+/// `arrayiterator`'s Python 3.14 surface: the iteration protocol plus the
+/// `__reduce__` / `__setstate__` pickle pair, but no `__length_hint__` —
+/// `arrayiter_type` declares no `__length_hint__` slot even though the shared
+/// `W_SeqIterObject` payload could answer one.
+fn init_array_iterator_type(ns: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
+    let entries = [
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__reduce__",
+            make_builtin_function_with_arity(
+                "__reduce__",
+                crate::baseobjspace::seq_iter_reduce_method,
+                1,
+            ),
+        ),
+        (
+            "__setstate__",
+            make_builtin_function_with_arity(
+                "__setstate__",
+                crate::baseobjspace::seq_iter_setstate_method,
+                2,
+            ),
         ),
     ];
     for (name, value) in entries {

@@ -4,6 +4,7 @@
 # the 3.14 identity, so this pins both the reported type name and the surface
 # that type exposes. (These assertions deliberately disagree with PyPy, so they
 # cannot live in the synthetic suite, which requires cpython == pypy output.)
+import array
 import pickle
 
 
@@ -21,6 +22,7 @@ NAMES = [
     (iter(b"abc"), "bytes_iterator"),
     (iter(bytearray(b"abc")), "bytearray_iterator"),
     (iter(memoryview(b"abc")), "memory_iterator"),
+    (iter(array.array("i", [1, 2, 3])), "arrayiterator"),
     (iter([1]), "list_iterator"),
     (iter((1,)), "tuple_iterator"),
     (iter(range(3)), "range_iterator"),
@@ -55,12 +57,27 @@ except TypeError:
     pass
 assert list(mem) == [97, 98, 99]
 
+# `arrayiterator` is qualified by its defining module and pickles, but it
+# declares no `__length_hint__`.
+arr = iter(array.array("i", [1, 2, 3]))
+assert type(arr).__module__ == "array"
+assert type(arr).__dict__["__module__"] == "array"
+assert repr(type(arr)) == "<class 'array.arrayiterator'>"
+assert sorted(set(dir(type(arr))) - set(dir(object))) == [
+    "__iter__",
+    "__module__",
+    "__next__",
+    "__setstate__",
+]
+assert not hasattr(arr, "__length_hint__")
+
 # Every other flavour keeps the pickle protocol its 3.14 type declares.
 for make in (
     lambda: iter("abc"),
     lambda: iter("aéc"),
     lambda: iter(b"abc"),
     lambda: iter(bytearray(b"abc")),
+    lambda: iter(array.array("i", [1, 2, 3])),
     lambda: iter(Seq()),
 ):
     it = make()

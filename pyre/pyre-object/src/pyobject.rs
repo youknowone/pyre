@@ -1015,7 +1015,7 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(21, &crate::function::CLASSMETHOD_TYPE),
         subclass_range_alias(22, &crate::_pypy_generic_alias::UNION_TYPE),
         subclass_range_alias(23, &crate::iterobject::SEQ_ITER_TYPE),
-        // The producer-specific str/bytes/bytearray/memoryview iterator
+        // The producer-specific str/bytes/bytearray/memoryview/array iterator
         // identities all carry the `W_SeqIterObject` payload, so they share
         // its GC type id the way the six dict view iterators share 115.
         subclass_range_alias(23, &crate::iterobject::STR_ASCII_ITER_TYPE),
@@ -1023,6 +1023,7 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(23, &crate::iterobject::BYTES_ITER_TYPE),
         subclass_range_alias(23, &crate::iterobject::BYTEARRAY_ITER_TYPE),
         subclass_range_alias(23, &crate::iterobject::MEMORY_ITER_TYPE),
+        subclass_range_alias(23, &crate::iterobject::ARRAY_ITER_TYPE),
         subclass_range_alias(24, typed::<crate::interp_itertools::W_Count>()),
         subclass_range_alias(25, typed::<crate::interp_itertools::W_Repeat>()),
         // `enumerate` W_Enumerate — auto-id `allocate_stable` registered at the
