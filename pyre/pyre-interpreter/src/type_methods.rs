@@ -2360,7 +2360,7 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, c
 /// a new string through [`format_value_dispatch`].
 pub fn format_value_dispatch_w(
     val: PyObjectRef,
-    spec: &str,
+    spec: &Wtf8,
 ) -> Result<PyObjectRef, crate::PyError> {
     if spec.is_empty() && unsafe { pyre_object::is_exact_type(val, &pyre_object::STR_TYPE) } {
         return Ok(val);
