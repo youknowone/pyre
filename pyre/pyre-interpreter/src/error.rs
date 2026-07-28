@@ -188,17 +188,7 @@ impl OperationError {
     ) -> Result<PyObjectRef, PyError> {
         let w_type = crate::baseobjspace::exception_getclass(w_inst);
         if w_type.is_null() || !unsafe { crate::baseobjspace::exception_is_valid_class_w(w_type) } {
-            let constructor = unsafe { crate::display::py_repr(w_constructor) }
-                .unwrap_or_else(|_| "<exception class>".to_string());
-            let returned_type = if w_type.is_null() {
-                "<unknown type>".to_string()
-            } else {
-                unsafe { crate::display::py_repr(w_type) }
-                    .unwrap_or_else(|_| "<unknown type>".to_string())
-            };
-            return Err(PyError::type_error(format!(
-                "calling {constructor} should have returned an instance of BaseException, not {returned_type}"
-            )));
+            return Err(exception_from_call_type_error(w_constructor, w_inst));
         }
         Ok(w_type)
     }
@@ -245,6 +235,25 @@ impl OperationError {
         }
         Ok(())
     }
+}
+
+/// The TypeError raised when instantiating a raised exception class yields
+/// something that is not a `BaseException` instance:
+/// "calling C should have returned an instance of BaseException, not T".
+/// A direct `raise non_exception`, which never calls a constructor, keeps
+/// the ordinary "exceptions must derive from BaseException" wording.
+pub fn exception_from_call_type_error(w_constructor: PyObjectRef, w_inst: PyObjectRef) -> PyError {
+    let constructor = unsafe { crate::display::py_repr(w_constructor) }
+        .unwrap_or_else(|_| "<exception class>".to_string());
+    let w_type = crate::baseobjspace::exception_getclass(w_inst);
+    let returned_type = if w_type.is_null() {
+        "<unknown type>".to_string()
+    } else {
+        unsafe { crate::display::py_repr(w_type) }.unwrap_or_else(|_| "<unknown type>".to_string())
+    };
+    PyError::type_error(format!(
+        "calling {constructor} should have returned an instance of BaseException, not {returned_type}"
+    ))
 }
 
 /// `pypy/interpreter/error.py:478-509 _break_context_cycle` parity —

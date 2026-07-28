@@ -210,9 +210,8 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
             };
             match result {
                 Ok(obj) if pyre_object::is_exception(obj) => obj,
-                Ok(_) => {
-                    PyError::type_error("exceptions must derive from BaseException").to_exc_object()
-                }
+                Ok(obj) => pyre_interpreter::error::exception_from_call_type_error(exc, obj)
+                    .to_exc_object(),
                 Err(mut err) => err.to_exc_object(),
             }
         } else {

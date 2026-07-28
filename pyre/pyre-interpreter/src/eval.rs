@@ -1384,6 +1384,27 @@ pub fn normalize_raise_value(value: PyObjectRef) -> PyObjectRef {
     value
 }
 
+/// `pyopcode.py:764-766` — `raise Class` instantiates the class, and
+/// `normalize_exception` then validates the result.  `space.call_function`
+/// propagates the constructor's own error in RPython; pyre's returns
+/// `PY_NULL` with the error parked in the pending-call slot, so an unchecked
+/// null would both lose that error and report the raise as
+/// "exceptions must derive from BaseException".
+///
+/// # Safety
+/// `w_type` must be a live exception class (`exception_is_valid_obj_as_class_w`).
+unsafe fn instantiate_raised_class(w_type: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let result = unsafe { crate::call_function(w_type, &[]) };
+    if result.is_null() {
+        return Err(crate::call::take_call_error()
+            .unwrap_or_else(|| PyError::type_error("exceptions must derive from BaseException")));
+    }
+    if !unsafe { pyre_object::is_exception(result) } {
+        return Err(crate::error::exception_from_call_type_error(w_type, result));
+    }
+    Ok(result)
+}
+
 /// Normalize the `from` cause of a `raise X from Y` statement: instantiate
 /// the cause if it is an exception class, validate that the result is
 /// `None` / a `BaseException` instance, and return a `PyError::type_error`
@@ -3408,15 +3429,9 @@ impl OpcodeStepExecutor for PyFrame {
                 unsafe {
                     if crate::baseobjspace::exception_is_valid_obj_as_class_w(w_value) {
                         // pyopcode.py:711-713 — class raise: call the type.
-                        let result = crate::call_function(w_value, &[]);
-                        if pyre_object::is_exception(result) {
-                            attach_raise_cause(result, None)?;
-                            Err(PyError::from_exc_object(result))
-                        } else {
-                            Err(PyError::type_error(
-                                "exceptions must derive from BaseException",
-                            ))
-                        }
+                        let result = instantiate_raised_class(w_value)?;
+                        attach_raise_cause(result, None)?;
+                        Err(PyError::from_exc_object(result))
                     } else if pyre_object::is_exception(w_value) {
                         attach_raise_cause(w_value, None)?;
                         Err(PyError::from_exc_object(w_value))
@@ -3448,15 +3463,9 @@ impl OpcodeStepExecutor for PyFrame {
                             pyre_object::gc_roots::pin_root(c);
                         }
                         // pyopcode.py:711-713 — class raise: call the type.
-                        let result = crate::call_function(w_value, &[]);
-                        if pyre_object::is_exception(result) {
-                            attach_raise_cause(result, cause)?;
-                            Err(PyError::from_exc_object(result))
-                        } else {
-                            Err(PyError::type_error(
-                                "exceptions must derive from BaseException",
-                            ))
-                        }
+                        let result = instantiate_raised_class(w_value)?;
+                        attach_raise_cause(result, cause)?;
+                        Err(PyError::from_exc_object(result))
                     } else if pyre_object::is_exception(w_value) {
                         attach_raise_cause(w_value, cause)?;
                         Err(PyError::from_exc_object(w_value))
