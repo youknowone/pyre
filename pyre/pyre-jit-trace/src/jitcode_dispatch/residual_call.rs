@@ -1829,33 +1829,43 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // Publish the current Python pc so a force inside the callee reports
         // the executing line rather than the one the last resume point left
         // behind.
-        let last_instr = ctx.trace_ctx.const_int(ctx.vstack_cur_pypc as i64);
-        crate::trace_opcode::mirror_vable_static_to_boxes(
-            ctx.trace_ctx,
-            "last_instr",
-            last_instr,
-            majit_ir::Value::Int(ctx.vstack_cur_pypc as i64),
-        );
-        // …and the heap half of the same `_opimpl_setfield_vable` shape
-        // (`virtualizable_boxes[index] = valuebox; synchronize_virtualizable()`
-        // — the mirror above is only the box half, and writes the trace's
-        // shadow, never the frame).  The same constant feeds both so the
-        // shadow and the heap cannot disagree.
         //
-        // Upstream needs neither at a residual call: its frame readers are
-        // traced in and read `last_instr` off the virtual frame.  pyre
-        // residualizes them and reads the heap, and the frame-chain walk no
-        // longer forces (`ExecutionContext::force_frame`), so without this
-        // store nothing keeps the field current in compiled code: left at the
-        // last resume point, `_warnings::setup_context` keys its registry on
-        // the wrong line and re-issues a warning the interpreted run already
-        // deduplicated.
-        if let Some(vable_ref) = ctx.trace_ctx.standard_virtualizable_box()
-            && let Some(idx) = info.static_field_index_by_name("last_instr")
-        {
-            let descr = info.static_field_descr(idx);
-            ctx.trace_ctx
-                .vable_setfield_descr(vable_ref, last_instr, descr);
+        // Only while the pc indexes the walk's own virtualizable.  Inside an
+        // inline sub-walk `vstack_cur_pypc` is in the CALLEE's code, and both
+        // halves below name the outer frame, so publishing there stamps a
+        // foreign pc onto it — `offset2lineno` then resolves it against the
+        // outer code object and reports whatever line that byte happens to sit
+        // on.  [`LiveLastInstrGuard`] makes the matching retarget for the
+        // concrete store, publishing onto the callee's own frame instead.
+        if INLINE_CONCRETE_FRAME.with(|slot| slot.get()).is_null() {
+            let last_instr = ctx.trace_ctx.const_int(ctx.vstack_cur_pypc as i64);
+            crate::trace_opcode::mirror_vable_static_to_boxes(
+                ctx.trace_ctx,
+                "last_instr",
+                last_instr,
+                majit_ir::Value::Int(ctx.vstack_cur_pypc as i64),
+            );
+            // …and the heap half of the same `_opimpl_setfield_vable` shape
+            // (`virtualizable_boxes[index] = valuebox; synchronize_virtualizable()`
+            // — the mirror above is only the box half, and writes the trace's
+            // shadow, never the frame).  The same constant feeds both so the
+            // shadow and the heap cannot disagree.
+            //
+            // Upstream needs neither at a residual call: its frame readers are
+            // traced in and read `last_instr` off the virtual frame.  pyre
+            // residualizes them and reads the heap, and the frame-chain walk no
+            // longer forces (`ExecutionContext::force_frame`), so without this
+            // store nothing keeps the field current in compiled code: left at
+            // the last resume point, `_warnings::setup_context` keys its
+            // registry on the wrong line and re-issues a warning the
+            // interpreted run already deduplicated.
+            if let Some(vable_ref) = ctx.trace_ctx.standard_virtualizable_box()
+                && let Some(idx) = info.static_field_index_by_name("last_instr")
+            {
+                let descr = info.static_field_descr(idx);
+                ctx.trace_ctx
+                    .vable_setfield_descr(vable_ref, last_instr, descr);
+            }
         }
         unsafe {
             majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut **obj));
