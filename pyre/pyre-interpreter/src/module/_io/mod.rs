@@ -590,7 +590,13 @@ fn init_iobase_type(ns: PyObjectRef) {
     type_method(
         ns,
         "closed",
-        crate::typedef::make_getset_descriptor_named(closed_getter, "closed"),
+        crate::typedef::make_getset_property_named_doc(
+            closed_getter,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+            "True if the file is closed",
+            "closed",
+        ),
     );
     type_method(
         ns,

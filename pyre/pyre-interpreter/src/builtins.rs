@@ -10692,12 +10692,12 @@ pub(crate) fn init_fileio_type(ns: PyObjectRef) {
         (
             "closefd",
             fileio_get_closefd as crate::gateway::BuiltinCodeFn,
-            None,
+            Some("True if the file descriptor will be closed"),
         ),
         (
             "mode",
             fileio_get_mode as crate::gateway::BuiltinCodeFn,
-            None,
+            Some("String giving the file mode"),
         ),
         (
             "_blksize",

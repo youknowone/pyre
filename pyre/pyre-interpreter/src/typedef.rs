@@ -9528,7 +9528,7 @@ pub(crate) fn make_getset_property_named(
 
 /// `GetSetProperty(..., doc=..., name=...)` — the full descriptor payload
 /// used by doc-bearing getsets such as `mapping`, `__dict__`, and `__weakref__`.
-fn make_getset_property_named_doc(
+pub(crate) fn make_getset_property_named_doc(
     fget: pyre_object::PyObjectRef,
     fset: pyre_object::PyObjectRef,
     fdel: pyre_object::PyObjectRef,
