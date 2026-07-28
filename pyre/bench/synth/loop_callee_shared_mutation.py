@@ -4,13 +4,9 @@
 # loop is JIT-compiled: the callee's traced iteration is committed concretely
 # during recording AND re-applied at the trace->compile boundary.
 #
-# Expected: len(acc) == 2 * N. Under the bug the JIT prints 2*N + 3 (a constant
+# Expected: len(acc) == 2 * N. Under the bug the JIT printed 2*N + 3 (a constant
 # over-count, independent of N, present only once N crosses the compile
-# threshold). Both backends share the trace/resume layer, so both diverge.
-#
-# Kept under _pending/ (excluded by check.py's non-recursive `*.py` glob) so it
-# does not fail the gate while #14 is open. Run explicitly with:
-#   python3 pyre/check.py --synthetic-only --synthetic-pattern '_pending/loop_callee_shared_mutation.py'
+# threshold), on both backends, which share the trace/resume layer.
 N = 20000
 
 

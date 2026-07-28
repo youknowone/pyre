@@ -1,11 +1,9 @@
-# KNOWN FAILING on cranelift: aborts with
+# Regression oracle. Was `_pending/`: cranelift aborted 8/10 to 9/10 runs with
 #   GC BUG: invalid type_id=... site=object_total_size
 # from `gc_alloc_nursery_shim` -> `alloc_with_type` -> `do_collect_nursery` ->
 # `incremental_mark_step`, i.e. a dangling nursery pointer on the MAJOR gray
-# stack.  dynasm and PYRE_JIT=0 are clean, which matches the known
-# cranelift/wasm/Windows-only shape of that signature.
-#
-# Intermittent but high-rate - 8/10 to 9/10 runs - and needs no GC stress build.
+# stack, while dynasm and the no-JIT run stayed clean.  Now 20/20 clean on
+# cranelift with the pinned output below.
 #
 # REFUTED lead, do not re-attempt: the unbarriered `(*frame).f_backref =
 # saved_topframeref` in ResidualFrameChainGuard::enter looks exactly like the
