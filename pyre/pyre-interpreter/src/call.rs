@@ -1860,6 +1860,10 @@ pub(crate) fn bind_kwargs_to_signature(
         }
         if !matched {
             if has_varkw {
+                // The key is born old-stable (non-moving) and is held in this
+                // Rust Vec only across native-only work (the rest of this loop,
+                // then w_tuple_new / w_dict_new_kwargs below): no safepoint fires
+                // before it is installed, so the unrooted buffer stays valid.
                 extra_kwargs.push((pyre_object::w_str_from_wtf8_managed(key.clone()), *value));
             } else {
                 unmatched_kw_names.push(key.clone());
@@ -2054,6 +2058,11 @@ pub fn call_with_kwargs(
             let mut full_args = pos_args.to_vec();
             if !kwargs.is_empty() {
                 let kwargs_dict = pyre_object::w_dict_new();
+                // Each key is born old-stable (non-moving) and this loop is
+                // straight-line native (str key hash/eq, non-collecting dict
+                // alloc): no safepoint fires between a key's allocation and its
+                // dict install, so an unrooted Rust temporary cannot be swept
+                // or relocated here — unlike a path that re-enters the eval loop.
                 for (key, value) in kwargs {
                     unsafe {
                         pyre_object::w_dict_store(
@@ -2319,6 +2328,9 @@ pub fn call_with_kwargs(
             }
             if has_varkw {
                 let kw_dict = pyre_object::w_dict_new();
+                // See the kwargs-packing note above: born old-stable keys plus a
+                // straight-line native loop mean no safepoint separates a key's
+                // allocation from its install, so no shadow-stack pin is needed.
                 for (key, value) in &extra_kwargs {
                     unsafe {
                         pyre_object::w_dict_store(
