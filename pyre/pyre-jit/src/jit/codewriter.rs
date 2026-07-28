@@ -8426,7 +8426,26 @@ impl CodeWriter {
                             // raises and catches, the raise.  Store `py_pc`, not the
                             // `py_pc - 1` of the resume-at sites (`emit_abort_permanent!`)
                             // — this opcode is dispatched here, not resumed at.
-                            {
+                            //
+                            // Portal jitcode only.  In a non-portal callee
+                            // `frame_var` aliases the OUTERMOST frame rather
+                            // than naming that callee's own (the same aliasing
+                            // the `LoadGlobal` register-form namespace declines
+                            // for below), so the store would stamp the callee's
+                            // coordinate into its caller and the caller would
+                            // then resolve it against its own line table.  A
+                            // frame observed after an inlined callee returned —
+                            // through `sys._getframe(1)` or a retained traceback
+                            // — would report an unrelated line, which is the
+                            // very failure this store exists to remove.
+                            // Declining leaves the caller's own coordinate
+                            // intact.  The inlined callee's own frame stays
+                            // unpublished, the same inner-level gap the
+                            // `-live-` marker hook declines on
+                            // (`publish_last_instr_at_live_marker` resolves the
+                            // frame from the replaying level's own portal red
+                            // and requires a code-object match).
+                            if is_true_portal {
                                 let v_li: super::flow::FlowValue =
                                     super::flow::Constant::signed(py_pc as i64).into();
                                 record_graph_op(
