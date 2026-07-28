@@ -2540,10 +2540,17 @@ impl<S: JitState> JitDriver<S> {
                                 .meta
                                 .trace_ctx()
                                 .and_then(|ctx| ctx.collect_virtualizable_typed_boxes());
-                            let finish_args = match vable_boxes {
+                            let mut finish_args = match vable_boxes {
                                 Some(ref boxes) => S::collect_jump_args_with_boxes(sym, boxes),
                                 None => S::collect_jump_args(sym),
                             };
+                            // pyjitpl.py:2978-2987: the same normalization the
+                            // loop close applies — the bridge JUMP is built from
+                            // the same `live_arg_boxes`.
+                            if let Some(ctx) = self.meta.trace_ctx() {
+                                ctx.remove_consts_and_duplicates_untyped(&mut finish_args);
+                            }
+                            let finish_args = finish_args;
                             let continue_running_normally_values = {
                                 let trace_meta = self.meta.trace_meta().cloned();
                                 match (trace_meta, self.sym.as_ref()) {
@@ -2625,10 +2632,17 @@ impl<S: JitState> JitDriver<S> {
                         .meta
                         .trace_ctx()
                         .and_then(|ctx| ctx.collect_virtualizable_typed_boxes());
-                    let jump_args = match vable_boxes {
+                    let mut jump_args = match vable_boxes {
                         Some(ref boxes) => S::collect_jump_args_with_boxes(sym, boxes),
                         None => S::collect_jump_args(sym),
                     };
+                    // pyjitpl.py:2978-2987 `remove_consts_and_duplicates` runs
+                    // over this list before anything consumes it, so the JUMP
+                    // never passes a constant or the same box twice.
+                    if let Some(ctx) = self.meta.trace_ctx() {
+                        ctx.remove_consts_and_duplicates_untyped(&mut jump_args);
+                    }
+                    let jump_args = jump_args;
                     // pyjitpl.py:2993-3036 parity: compile_loop borrows the
                     // frontend meta the same way `self.history` is a shared
                     // mutable object on the RPython MetaInterp — the caller

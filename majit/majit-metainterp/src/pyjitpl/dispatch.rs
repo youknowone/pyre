@@ -5125,10 +5125,17 @@ where
                                 let vable_boxes =
                                     ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
                                 let original_boxes = match sym.loop_carried_boxes(&vable_boxes) {
-                                    Some(boxes) => boxes
-                                        .into_iter()
-                                        .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
-                                        .collect(),
+                                    Some(mut boxes) => {
+                                        // pyjitpl.py:2978-2987 normalizes the list
+                                        // before it becomes anything — the LABEL
+                                        // this registration turns into cannot carry
+                                        // a constant or a repeated box.
+                                        ctx.remove_consts_and_duplicates(&mut boxes);
+                                        boxes
+                                            .into_iter()
+                                            .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
+                                            .collect()
+                                    }
                                     None => live_arg_boxes,
                                 };
                                 if crate::mptrace_enabled() {
