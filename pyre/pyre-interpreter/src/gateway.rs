@@ -697,6 +697,16 @@ pub fn builtin_code_new_passthrough_args1(name: &'static str, func: BuiltinCodeF
 /// Full constructor for `BuiltinCode`.  `sig` is a `*const Signature`
 /// (null for positional-only builtins); the pointee must outlive the
 /// object — callers leak it to `'static`.
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`), the
+/// `w_dict_new` twin: the body boxes a `BuiltinCode` through the non-numeric
+/// `malloc_typed` (`fuse_boxing_alloc` fuses only the numeric boxes), so
+/// tracing into it carries the unported `malloc->new` lowering into the caller.
+/// Residualise the whole constructor — the JIT models it by signature as a
+/// plain `PyObjectRef` GCREF and emits a residual call. Every
+/// `builtin_code_new*` / `make_builtin_function_with_arity` head bottoms out
+/// here.
+#[majit_macros::dont_look_inside]
 fn builtin_code_new_full(
     name: &'static str,
     func: BuiltinCodeFn,
