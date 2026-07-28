@@ -6753,24 +6753,35 @@ fn reconstruct_inline_recipe(
     cache: &mut BridgeVirtualCache,
     in_a_call: bool,
 ) -> Option<ReconstructRecipe> {
+    // Each decline below ends the whole multi-frame path (`recipes.clear()` in
+    // the caller), so name every class: an uncensused decline is invisible in
+    // the corpus and shows up only as the caller's NoRecipes abort.
+    macro_rules! decline {
+        ($class:literal) => {{
+            crate::jitcode_dispatch::census_record(concat!("P2Recipe::", $class));
+            return None;
+        }};
+    }
     if frame.pc < 0 {
-        return None;
+        decline!("NoSnapshotPc");
     }
     let py_pc = forward_py_pc_or_backxlat(frame.jitcode_index, frame.pc) as usize;
-    let w_code = code_for_jitcode_index(frame.jitcode_index)?;
+    let Some(w_code) = code_for_jitcode_index(frame.jitcode_index) else {
+        decline!("NoCodeForJitcodeIndex");
+    };
     if w_code.is_null() {
-        return None;
+        decline!("NullWCode");
     }
     let raw_code = unsafe {
         pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
             as *const pyre_interpreter::CodeObject
     };
     if raw_code.is_null() {
-        return None;
+        decline!("NullRawCode");
     }
     let code_ref = unsafe { &*raw_code };
     if !code_ref.freevars.is_empty() || pyre_interpreter::pyframe::ncells(code_ref) != 0 {
-        return None;
+        decline!("CellsOrFreevars");
     }
     // pyframe.py:128-132 get_w_globals_storage(): the reconstructed callee frame's
     // globals come from its own pycode (`assemble_bridge_inline_pending`
@@ -6779,14 +6790,14 @@ fn reconstruct_inline_recipe(
     // namespace), there is nothing to restore, so abort to the single-frame
     // bridge — the forward inline path declines the same way.
     if recover_inline_callee_globals(raw_code as *const ()).is_null() {
-        return None;
+        decline!("NoCalleeGlobals");
     }
     let nlocals = code_ref.varnames.len();
 
     let liveness = crate::liveness::liveness_for(raw_code);
     let stack_only = match liveness.stack_depth_at(py_pc) {
         Some(d) => d,
-        None => return None,
+        None => decline!("NoStackDepthAtPc"),
     };
     let pending_result_abs_slot = if in_a_call && stack_only > 0 {
         Some(nlocals + stack_only - 1)
@@ -6813,13 +6824,14 @@ fn reconstruct_inline_recipe(
         None
     };
     let pending_result_color = if in_a_call {
-        Some(
-            pyjitcode_for_jitcode_index(frame.jitcode_index).and_then(|p| {
-                p.result_color_trivia_for_jitcode_pc(frame.pc as usize)
-                    .map(|c| c as usize)
-                    .filter(|&c| c != u16::MAX as usize)
-            })?,
-        )
+        let Some(color) = pyjitcode_for_jitcode_index(frame.jitcode_index).and_then(|p| {
+            p.result_color_trivia_for_jitcode_pc(frame.pc as usize)
+                .map(|c| c as usize)
+                .filter(|&c| c != u16::MAX as usize)
+        }) else {
+            decline!("NoPendingResultColor");
+        };
+        Some(color)
     } else {
         None
     };
@@ -6836,7 +6848,7 @@ fn reconstruct_inline_recipe(
         if reg_indices.int.iter().any(|&c| c as usize == color)
             || reg_indices.float.iter().any(|&c| c as usize == color)
         {
-            return None;
+            decline!("PendingResultNotRef");
         }
         if let Some(ref_pos) = reg_indices.ref_.iter().position(|&c| c as usize == color) {
             pending_value_index = Some(reg_indices.int.len() + ref_pos);
@@ -6855,7 +6867,7 @@ fn reconstruct_inline_recipe(
     // resume.py:1054 consume_boxes: the liveness enumeration count must match
     // the (pending-excluded) encoded frame section exactly.
     if reg_indices.total_len() != values.len() {
-        return None;
+        decline!("LivenessValueCountMismatch");
     }
     // virtualizable.py:86-98: at a bytecode boundary (every resume pc is one)
     // the frame's locals_cells_stack_w is a W_Root array — all live slots are
@@ -6866,7 +6878,7 @@ fn reconstruct_inline_recipe(
     // always reads `registers_r[k]`, trace_opcode.rs). Fall back to
     // the single-frame bridge rather than synthesize an unboxed local.
     if !reg_indices.int.is_empty() || !reg_indices.float.is_empty() {
-        return None;
+        decline!("UnboxedLiveRegister");
     }
 
     // Virtualizable-callee shape (pyre's "every function is its own portal"
@@ -6931,7 +6943,9 @@ fn reconstruct_inline_recipe(
             crate::jitcode_dispatch::census_record("P2Recipe::PortalSiblingAdmit");
         }
         use majit_ir::resumedata::{RebuiltValue, TAGVIRTUAL, UNINITIALIZED_TAG, untag};
-        let frame_pos = reg_indices.ref_.iter().position(|&c| c == pframe_reg)?;
+        let Some(frame_pos) = reg_indices.ref_.iter().position(|&c| c == pframe_reg) else {
+            decline!("NoFrameRedPosition");
+        };
         // resume.py:1042-1057 rebuild_from_resumedata consumes the saved boxes
         // for every frame without requiring the frame object itself to remain
         // virtual.  A Pyre callee frame can be forced before the guard (for
@@ -6984,25 +6998,33 @@ fn reconstruct_inline_recipe(
             });
         }
         let RebuiltValue::Virtual(frame_vidx) = values[frame_pos] else {
-            return None;
+            decline!("FrameRedNotVirtual");
         };
         // The `frame` red virtual is a PyFrame VirtualInfo; its
         // `locals_cells_stack_w` array field is at PYFRAME_LOCALS_CELLS_STACK_OFFSET.
         let array_vidx = {
+            let Some(frame_virtual) = rd_virtual_at(rd_virtuals, *frame_vidx) else {
+                decline!("FrameVirtualMissing");
+            };
             let majit_ir::RdVirtualInfo::VirtualInfo {
                 fieldnums,
                 fielddescrs,
                 ..
-            } = rd_virtual_at(rd_virtuals, *frame_vidx)?
+            } = frame_virtual
             else {
-                return None;
+                decline!("FrameVirtualNotStruct");
             };
-            let arr_field_idx = fielddescrs.iter().position(|fd| {
+            let Some(arr_field_idx) = fielddescrs.iter().position(|fd| {
                 fd.offset == crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET
-            })?;
-            let (av, tb) = untag(*fieldnums.get(arr_field_idx)?);
+            }) else {
+                decline!("NoLocalsArrayField");
+            };
+            let Some(&arr_fieldnum) = fieldnums.get(arr_field_idx) else {
+                decline!("LocalsArrayFieldnumMissing");
+            };
+            let (av, tb) = untag(arr_fieldnum);
             if tb != TAGVIRTUAL {
-                return None;
+                decline!("LocalsArrayNotVirtual");
             }
             if av < 0 {
                 (rd_virtuals.map_or(0, |v| v.len()) as i32 + av) as usize
@@ -7010,14 +7032,17 @@ fn reconstruct_inline_recipe(
                 av as usize
             }
         };
-        let arr: Vec<i16> = match rd_virtual_at(rd_virtuals, array_vidx)? {
+        let Some(array_virtual) = rd_virtual_at(rd_virtuals, array_vidx) else {
+            decline!("LocalsArrayVirtualMissing");
+        };
+        let arr: Vec<i16> = match array_virtual {
             majit_ir::RdVirtualInfo::VArrayInfoClear { fieldnums, .. }
             | majit_ir::RdVirtualInfo::VArrayInfoNotClear { fieldnums, .. } => fieldnums.clone(),
-            _ => return None,
+            _ => decline!("LocalsArrayNotArrayInfo"),
         };
         let valuestackdepth = nlocals + stack_only;
         if valuestackdepth > arr.len() {
-            return None;
+            decline!("LocalsArrayTooShort");
         }
         let callinfocollection = ctx.callinfocollection.clone();
         let mut registers_r = vec![OpRef::NONE; valuestackdepth];
@@ -7261,7 +7286,7 @@ fn reconstruct_inline_recipe(
             continue;
         }
         if registers_r[s] == OpRef::NONE {
-            return None;
+            decline!("MandatoryOperandMissing");
         }
     }
 
