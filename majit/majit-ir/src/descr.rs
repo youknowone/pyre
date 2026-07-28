@@ -1226,6 +1226,21 @@ impl GcCache {
         // descr.py:108-118 caches the SizeDescr. Multiple pyre producers may
         // report partial layouts, so the cached owner is upgraded when the
         // incoming frozen list has more fields.
+        //
+        // Field count alone is not authority. The analyzer-side producer
+        // (`majit-translate` `bh_size_spec_from_callcontrol`) reports
+        // `vtable: 0` because a build-time spec has no runtime type object to
+        // point at, and it reports the inherited header fields the runtime
+        // groups deliberately keep out of their positional list — so it
+        // outranks the runtime publish on count while carrying strictly less
+        // information. Letting it displace a vtable-bearing descr loses the
+        // only copy of that vtable, and `new_with_vtable` then skips its
+        // typeptr store (`majit-gc/src/rewrite.rs` gates
+        // `gen_initialize_vtable` on `vtable != 0`) over zeroed nursery
+        // memory, so the fresh object reads back with a null `ob_type`.
+        // Upstream has no upgrade rule to begin with: `descr.py:104-126
+        // get_size_descr` mints once per STRUCT and caches, and `gc.py:536-542
+        // init_size_descr` stamps the tid on that one owner.
         let should_insert = match self._cache_size.get(&key) {
             None => true,
             Some(existing) => {
@@ -1237,7 +1252,13 @@ impl GcCache {
                     .as_size_descr()
                     .map(|sd| sd.all_fielddescrs().len())
                     .unwrap_or(0);
-                new_count > existing_count
+                let existing_vtable = existing.as_size_descr().map_or(0, |sd| sd.vtable());
+                let new_vtable = descr.as_size_descr().map_or(0, |sd| sd.vtable());
+                if existing_vtable != 0 && new_vtable == 0 {
+                    false
+                } else {
+                    new_count > existing_count
+                }
             }
         };
         if should_insert {
@@ -5349,6 +5370,58 @@ impl FailDescr for SimpleFailDescr {
     }
     fn vector_info(&self) -> Vec<AccumInfo> {
         flatten_vector_info(unsafe { (&*self.vector_info.get()).as_deref() })
+    }
+}
+
+#[cfg(test)]
+mod register_keyed_size_authority_tests {
+    use super::*;
+
+    fn size_descr(type_id: u32, vtable: usize, nfields: usize) -> DescrRef {
+        let mut sd = SimpleSizeDescr::with_vtable(u32::MAX, 32, type_id, vtable);
+        let fields: Vec<Arc<dyn FieldDescr>> = (0..nfields)
+            .map(|i| {
+                Arc::new(SimpleFieldDescr::new_with_name(
+                    i as u32,
+                    i * 8,
+                    8,
+                    Type::Int,
+                    false,
+                    ArrayFlag::Signed,
+                    format!("f{i}"),
+                    format!("f{i}"),
+                )) as Arc<dyn FieldDescr>
+            })
+            .collect();
+        sd = sd.with_all_fielddescrs(fields);
+        Arc::new(sd) as DescrRef
+    }
+
+    /// The analyzer-side producer reports MORE fields (it includes the
+    /// inherited header) and NO vtable. Field count alone would let it evict
+    /// the runtime publish, which holds the only copy of the vtable
+    /// `new_with_vtable`'s typeptr store needs.
+    #[test]
+    fn a_vtable_less_producer_never_displaces_a_vtable_bearing_one() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(0x8463ec159694d229);
+        gc.register_keyed_size(key.clone(), size_descr(7, 0x1000, 1));
+        gc.register_keyed_size(key.clone(), size_descr(0x9694d229, 0, 3));
+        let cached = gc._cache_size.get(&key).unwrap().as_size_descr().unwrap();
+        assert_eq!(cached.type_id(), 7, "the real gc tid must survive");
+        assert_ne!(cached.vtable(), 0, "the vtable must survive");
+    }
+
+    /// The upgrade rule itself is unchanged when both sides carry a vtable.
+    #[test]
+    fn a_fuller_layout_still_upgrades_when_both_carry_a_vtable() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(11);
+        gc.register_keyed_size(key.clone(), size_descr(7, 0x1000, 1));
+        gc.register_keyed_size(key.clone(), size_descr(9, 0x2000, 3));
+        let cached = gc._cache_size.get(&key).unwrap().as_size_descr().unwrap();
+        assert_eq!(cached.type_id(), 9);
+        assert_eq!(cached.all_fielddescrs().len(), 3);
     }
 }
 
