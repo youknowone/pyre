@@ -2279,6 +2279,25 @@ fn try_adopt_multi_frame_blackhole(
     // the snapshot.  The snapshot is freed at the end of this walk, so a link
     // to it would survive as a dangling `f_back` for any later
     // `sys._getframe().f_back` or traceback walk.
+    //
+    // The links are recorded as they are overwritten, because they only hold
+    // for a chain that is actually driven.  An adopt keeps them; every decline
+    // below returns to legacy escape/replay, which never entered these levels,
+    // so leaving a synthetic `f_back` behind would show the abandoned chain to
+    // anything that still reaches one of these frames — a `sys._getframe().f_back`
+    // walk or a traceback the walk handed out.
+    let relink_barrier = |callee: *mut pyre_interpreter::PyFrame| {
+        // `enter` stores into a frame whose allocation barrier is still in
+        // effect; these frames were built many collections ago, so each
+        // store needs its own remembered-set entry.
+        if pyre_object::gc_hook::try_gc_owns_object(callee as *mut u8) {
+            pyre_object::gc_hook::try_gc_write_barrier(callee as *mut u8);
+        }
+    };
+    let mut saved_links: Vec<(
+        *mut pyre_interpreter::PyFrame,
+        *mut pyre_interpreter::PyFrame,
+    )> = Vec::with_capacity(per_frame.len());
     unsafe {
         for i in 0..per_frame.len() {
             let callee = per_frame[i].0 as *mut pyre_interpreter::PyFrame;
@@ -2290,15 +2309,22 @@ fn try_adopt_multi_frame_blackhole(
             if std::ptr::eq(callee, f_back) {
                 continue;
             }
+            saved_links.push((callee, (*callee).f_backref));
             (*callee).f_backref = f_back;
-            // `enter` stores into a frame whose allocation barrier is still in
-            // effect; these frames were built many collections ago, so each
-            // store needs its own remembered-set entry.
-            if pyre_object::gc_hook::try_gc_owns_object(callee as *mut u8) {
-                pyre_object::gc_hook::try_gc_write_barrier(callee as *mut u8);
-            }
+            relink_barrier(callee);
         }
     }
+    let restore_links = |saved: &[(
+        *mut pyre_interpreter::PyFrame,
+        *mut pyre_interpreter::PyFrame,
+    )]| {
+        for &(callee, f_back) in saved {
+            unsafe {
+                (*callee).f_backref = f_back;
+            }
+            relink_barrier(callee);
+        }
+    };
     // Frame 0 is the walked frame, and the escape flush that ran ahead of the
     // forcing residual declined — that decline is what the latch is gated on.
     // Its LOCALS half is not optional for frame 0's level either: every
@@ -2320,6 +2346,7 @@ fn try_adopt_multi_frame_blackhole(
     // drive rather than after it.
     let Some(mut locals_undo) = crate::state::capture_frame_locals(root_addr) else {
         mfdbg!("frame 0: {root_addr:#x} locals not capturable");
+        restore_links(&saved_links);
         return false;
     };
     let undo_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
@@ -2329,6 +2356,7 @@ fn try_adopt_multi_frame_blackhole(
     if !crate::state::write_back_outer_locals(ctx, root_addr) {
         crate::state::restore_frame_locals(root_addr, &locals_undo);
         majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
+        restore_links(&saved_links);
         mfdbg!("frame 0: {root_addr:#x} locals publish declined");
         return false;
     }
@@ -2491,8 +2519,9 @@ fn try_adopt_multi_frame_blackhole(
     } else {
         // Same withdrawal as the single-frame arm: an unadoptable terminal
         // returns to legacy escape/replay, which resumes the walked frame from
-        // its pre-walk state.
+        // its pre-walk state.  The chain the drive was given comes down with it.
         crate::state::restore_frame_locals(root_addr, &locals_undo);
+        restore_links(&saved_links);
     }
     majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
     adopted
@@ -3769,11 +3798,17 @@ fn run_perfn_walk<Sym: WalkSym>(
     let journal = crate::jitcode_dispatch::fbw_store_journal_len();
     if committed {
         crate::jitcode_dispatch::fbw_store_journal_commit();
+        crate::jitcode_dispatch::fbw_exit_last_instr_commit();
         // A committed bridge recording keeps its advanced iterator cursor (the
         // compiled bridge / adopted end state owns the iteration count).
         crate::jitcode_dispatch::fbw_bridge_iter_journal_clear();
     } else {
         crate::jitcode_dispatch::fbw_store_journal_rollback();
+        // The exit coordinate the walk published goes back too: this replay
+        // resumes the frame from its pre-walk state and derives the next
+        // instruction from that field, so a kept exit coordinate would restart
+        // it past its own return or raise.
+        crate::jitcode_dispatch::fbw_exit_last_instr_rollback();
         // A bridge/retrace recording that does not commit restores the
         // iterator cursor it eagerly advanced, so the interpreter resume
         // re-consumes the in-flight item exactly once (no drop).

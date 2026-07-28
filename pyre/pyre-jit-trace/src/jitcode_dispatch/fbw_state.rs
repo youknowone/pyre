@@ -157,6 +157,25 @@ thread_local! {
     static FBW_FINISH_CONCRETE: std::cell::Cell<Option<FinishConcrete>> =
         const { std::cell::Cell::new(None) };
 
+    /// `(frame, last_instr_before)` for the concrete half of
+    /// [`fbw_publish_exit_last_instr`], so a walk that does not commit can put
+    /// the field back.
+    ///
+    /// The publish fires when the walk reaches the exit; whether that exit is
+    /// kept is decided afterwards, in the walk-end epilogue.  A declined walk
+    /// returns to a replay that resumes the frame from the pre-walk state, and
+    /// `last_instr` is exactly what that resume reads
+    /// (`PyFrame::next_instr` = `last_instr + 1`), so an exit coordinate left
+    /// behind would restart the frame PAST its own return or raise.  The
+    /// recorded `setfield_vable_i` half needs no undo — it only reaches a frame
+    /// on a compiled run.
+    ///
+    /// Only the first publish of a walk is recorded, so the restore targets the
+    /// value the frame carried when the walk began rather than an intermediate
+    /// one.  Cleared with the store journal at the start of every walk.
+    static FBW_EXIT_LAST_INSTR_UNDO: std::cell::Cell<Option<(usize, isize)>> =
+        const { std::cell::Cell::new(None) };
+
     /// Armed by the bridge tracer (`call_jit::trace_and_compile_from_bridge`)
     /// before a single-frame, direct-return-capable guard-failure walk.  When
     /// set, the `run_perfn_walk` epilogue lets a bridge `Terminate` walk keep
@@ -359,6 +378,29 @@ pub(crate) fn fbw_store_journal_reset() {
     // unrelated POP_EXCEPT in this walk.
     FBW_EXC_PREV.with(|s| s.borrow_mut().clear());
     FBW_EXC_PENDING_PUSH_SET.with(|c| c.set(false));
+    FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.set(None));
+}
+
+/// Put `last_instr` back for a walk that did not commit its end state, so the
+/// replay resumes where the frame stood before the walk.  Runs beside
+/// [`fbw_store_journal_rollback`] on every non-committed exit; the commit side
+/// just drops the undo ([`fbw_exit_last_instr_commit`]).
+pub(crate) fn fbw_exit_last_instr_rollback() {
+    let Some((frame, before)) = FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.take()) else {
+        return;
+    };
+    // SAFETY: the frame the publish wrote is the walk's live recording frame,
+    // which outlives the walk, and `frame_layout` pins `last_instr` to this
+    // offset with a compile-time assertion against the interpreter's constant.
+    unsafe {
+        *((frame + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize) = before;
+    }
+}
+
+/// Drop the undo: the walk's end state is kept, so the published exit
+/// coordinate is the one the frame should carry.
+pub(crate) fn fbw_exit_last_instr_commit() {
+    FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.set(None));
 }
 
 /// Record the element a walked eager list store displaces, for rollback
@@ -1444,13 +1486,22 @@ pub(crate) fn fbw_publish_exit_last_instr<Sym: WalkSym>(
     // `recording_frame_ptr` is the LIVE frame, not `virtualizable_heap_ptr`'s
     // trace-stepping snapshot: the snapshot's storage is released when tracing
     // ends, so a store there reaches nothing the interpreter goes on to read.
+    // Unlike the recorded store, this one lands whether or not the walk goes on
+    // to commit, so it is journaled: a declined walk resumes the frame from its
+    // pre-walk state and reads this very field to find the next instruction.
     if recording_frame_ptr != 0 {
         // SAFETY: the recording frame is the live `PyFrame` this walk steps,
         // and `frame_layout` pins `last_instr` to this offset with a
         // compile-time assertion against the interpreter's own constant.
+        let slot =
+            (recording_frame_ptr + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize;
+        FBW_EXIT_LAST_INSTR_UNDO.with(|c| {
+            if c.get().is_none() {
+                c.set(Some((recording_frame_ptr, unsafe { *slot })));
+            }
+        });
         unsafe {
-            *((recording_frame_ptr + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET)
-                as *mut isize) = py_pc as isize;
+            *slot = py_pc as isize;
         }
     }
 }
