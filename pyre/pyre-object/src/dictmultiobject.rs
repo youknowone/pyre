@@ -184,6 +184,49 @@ impl indexmap::Equivalent<ObjectKey> for StrLookupKey<'_> {
     }
 }
 
+/// The borrow-key probe [`dict_entries_get_str`] runs once the str hash hook
+/// has produced `hash` — `celldict.py:143-145 getitem_str`'s single
+/// `self.unerase(w_dict.dstorage).get(key)`.
+///
+/// Residualise the probe alone (`@dont_look_inside`, `rlib/jit.py:139`), the
+/// twin of [`w_dict_lookup_int_strategy`] and
+/// [`w_module_dict_lookup_object_entries`]: the `IndexMap::get` it wraps is an
+/// external-crate heap lookup the tracer cannot model — the oopspec'd residual
+/// arm of `rordereddict.ll_dict_getitem` (traced only for a virtual dict).  The
+/// user `__eq__` a str-subclass key can run sits inside the same probe upstream
+/// (`rdict.py:576 ll_dict_lookup` carries `@jit.oopspec('dict.lookup')` over
+/// the whole `keyeq` loop), so it does not argue for a narrower boundary.  The
+/// enclosing [`dict_entries_get_str`] keeps its hook gate and its allocating
+/// fallback visible.
+///
+/// # Safety
+/// `entries` must be a live entry table whose keys are valid `ObjectKey`s.
+#[majit_macros::dont_look_inside]
+pub unsafe fn dict_entries_probe_str(
+    entries: &indexmap::IndexMap<ObjectKey, PyObjectRef>,
+    hash: i64,
+    key: &str,
+) -> Option<PyObjectRef> {
+    entries.get(&StrLookupKey { hash, key }).copied()
+}
+
+/// The owned-key probe [`dict_entries_get_str`]'s no-hook arm runs — the same
+/// `IndexMap::get` behind an [`object_key_for`] key instead of a borrowed one.
+///
+/// Residualised for the reason [`dict_entries_probe_str`] is: a body that
+/// reaches either `get` stops there, so leaving one arm traced keeps the
+/// enclosing graph blocked no matter what the other arm does.
+///
+/// # Safety
+/// Same as [`dict_entries_probe_str`]; `key` must be a valid PyObjectRef.
+#[majit_macros::dont_look_inside]
+pub unsafe fn dict_entries_probe_object(
+    entries: &indexmap::IndexMap<ObjectKey, PyObjectRef>,
+    key: PyObjectRef,
+) -> Option<PyObjectRef> {
+    entries.get(&object_key_for(key)).copied()
+}
+
 /// Borrow-key str dict GET: hash `key`'s WTF-8 bytes via the str hook and
 /// probe `entries` without building a `W_UnicodeObject`.  Falls back to the
 /// allocating `object_key_for(w_str_new(key))` path when no str hash hook is
@@ -199,9 +242,9 @@ unsafe fn dict_entries_get_str(
             // Clear any stale eq flag so a str-subclass comparison in the probe
             // starts clean, matching `object_key_for`'s pre-probe reset (:125).
             crate::dict_eq_hook::take_eq_error();
-            entries.get(&StrLookupKey { hash, key }).copied()
+            dict_entries_probe_str(entries, hash, key)
         }
-        None => entries.get(&object_key_for(crate::w_str_new(key))).copied(),
+        None => dict_entries_probe_object(entries, crate::w_str_new(key)),
     }
 }
 

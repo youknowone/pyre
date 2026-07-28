@@ -49,7 +49,16 @@ fn import_module(name: &str) -> Result<PyObjectRef, PyError> {
 /// valid and unmoved.
 static STATE_NS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn state_ns() -> PyObjectRef {
+/// The captured `State` namespace, or `PY_NULL` before the module is built —
+/// the single read seam every traced reader of `STATE_NS` goes through.
+///
+/// `setup_after_space_initialization` stamps the pointer at runtime, so it is
+/// not a build-time constant and the JIT residualizes the read rather than
+/// folding whatever the build process happened to see
+/// (`@dont_look_inside`, the `importing::sys_modules_dict` shape).  The
+/// `-> PyObjectRef` return fits a single word and it cannot raise.
+#[majit_macros::dont_look_inside]
+pub(crate) fn state_ns() -> PyObjectRef {
     STATE_NS.load(std::sync::atomic::Ordering::Acquire) as PyObjectRef
 }
 

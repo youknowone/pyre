@@ -988,6 +988,13 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::sys_modules_registry_get",
         sys_modules_registry_get as *const (),
     );
+    let warnings_state_ns: fn() -> pyre_object::PyObjectRef = crate::module::_warnings::state_ns;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::module::_warnings::state_ns",
+        "pyre_interpreter::state_ns",
+        warnings_state_ns as *const (),
+    );
     // The host-boundary seams beside them: the two fd writers every
     // diagnostic path funnels through, and the thread-identity read.
     let emit_stdout: fn(&[u8]) = crate::host_seam::emit_stdout;
@@ -1711,6 +1718,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::dict_eq_hook::hash_str_hooked_bytes",
         "pyre_object::hash_str_hooked_bytes",
         pyre_object::dict_eq_hook::hash_str_hooked_bytes as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_probe_str",
+        "pyre_object::dict_entries_probe_str",
+        pyre_object::dictmultiobject::dict_entries_probe_str as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_probe_object",
+        "pyre_object::dict_entries_probe_object",
+        pyre_object::dictmultiobject::dict_entries_probe_object as *const (),
     );
     push_alias_pair(
         &mut entries,
