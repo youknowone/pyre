@@ -9253,6 +9253,13 @@ pub unsafe fn compute_default_mro(w_type: PyObjectRef) -> Vec<PyObjectRef> {
 /// zero-argument `super()` / `__class__` closure must already resolve to the
 /// new type.
 pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
+    // typeobject.py:1596 `default_mro_w =
+    // w_self.compute_default_mro()[:]` runs before a custom metaclass mro().
+    // PyPy's C3 merge raises here when the bases are inconsistent; pyre's
+    // low-level Vec-returning helper cannot carry that exception, so preserve
+    // the same ordering through its fallible validation front door.
+    let w_bases = pyre_object::typeobject::w_type_get_bases(w_self);
+    validate_c3_mro(w_bases)?;
     let default_mro = compute_default_mro(w_self);
     if pyre_object::w_type_is_heaptype(w_self) {
         let w_metaclass = (*w_self).w_class;

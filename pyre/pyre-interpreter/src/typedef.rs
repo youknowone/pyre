@@ -10027,28 +10027,83 @@ fn init_type_type(ns: PyObjectRef) {
     };
 }
 
-/// `typeobject.py:1090 mro_subclasses` — recompute the MRO of `w_type` and,
-/// recursively, of every subclass, after a base change alters the
-/// linearization.  The subclasses stay reachable through the (rooted) type
-/// hierarchy across each `compute_mro` allocation, so the walk needs no
-/// extra rooting (mirrors `baseobjspace::mutated`).
-unsafe fn mro_subclasses(w_type: PyObjectRef) {
-    let mro = crate::baseobjspace::compute_mro(w_type);
-    pyre_object::w_type_set_mro(w_type, mro);
-    for w_sc in unsafe { pyre_object::typeobject::w_type_get_subclasses(w_type, false) } {
-        mro_subclasses(w_sc);
-    }
+struct MroUpdate {
+    w_type_root: usize,
+    old_mro_roots: Option<(usize, usize)>,
+    new_mro: *mut pyre_object::object_array::FixedObjectArray,
 }
 
-/// Whether `w_type` appears in `w_base`'s MRO — the `w_type in
-/// w_newbase.compute_mro()` test of `descr_set__bases__`.  A non-type entry
-/// answers `false`; the type check that rejects it follows separately.
+/// `typeobject.py:1090-1096 mro_subclasses` — recompute the MRO of `w_type`
+/// through the ordinary `compute_mro` path (including a custom metaclass
+/// `mro()`), remember the exact update, then recurse over its subclasses.
+///
+/// PyPy's `temp` is a list of `(w_type, old_mro_w, new_mro_w)`.  The Rust
+/// list stores the old immutable MRO contents plus the identity of the newly
+/// installed fixed-array block; the latter preserves the same reentrancy
+/// guard during rollback.
+unsafe fn mro_subclasses(
+    w_type: PyObjectRef,
+    temp: &mut Vec<MroUpdate>,
+) -> Result<(), crate::PyError> {
+    let w_type_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_type);
+    let old_mro_ptr = pyre_object::w_type_get_mro(w_type);
+    let old_mro_roots = if old_mro_ptr.is_null() {
+        None
+    } else {
+        let start = pyre_object::gc_roots::shadow_stack_len();
+        let old_mro = (*old_mro_ptr).as_slice();
+        for &w_class in old_mro {
+            pyre_object::gc_roots::pin_root(w_class);
+        }
+        Some((start, old_mro.len()))
+    };
+    let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_root);
+    crate::baseobjspace::compute_and_set_mro(w_type)?;
+    let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_root);
+    let new_mro = pyre_object::w_type_get_mro(w_type);
+    temp.push(MroUpdate {
+        w_type_root,
+        old_mro_roots,
+        new_mro,
+    });
+    let subclasses = pyre_object::typeobject::w_type_get_subclasses(w_type, false);
+    let subclass_roots = pyre_object::gc_roots::shadow_stack_len();
+    for &w_sc in &subclasses {
+        pyre_object::gc_roots::pin_root(w_sc);
+    }
+    for index in 0..subclasses.len() {
+        let w_sc = pyre_object::gc_roots::shadow_stack_get(subclass_roots + index);
+        mro_subclasses(w_sc, temp)?;
+    }
+    Ok(())
+}
+
+/// Whether `w_type` appears in `w_base`'s current inheritance chain.
+///
+/// PyPy's `w_type in w_newbase.compute_mro()` observes the live bases while
+/// computing the candidate MRO.  CPython 3.14 additionally walks `tp_base`
+/// because a reentrant `mro()` can change bases before the cached MRO is
+/// installed.  Pyre derives `tp_base` as `find_best_base(__bases__)`; walk
+/// that linear chain first, then retain the cached-MRO membership check.
 unsafe fn type_in_mro(w_base: PyObjectRef, w_type: PyObjectRef) -> bool {
     if std::ptr::eq(w_base, w_type) {
         return true;
     }
     if !unsafe { pyre_object::is_type(w_base) } {
         return false;
+    }
+    let mut chain = Vec::new();
+    let mut w_current = w_base;
+    while !w_current.is_null() && unsafe { pyre_object::is_type(w_current) } {
+        if std::ptr::eq(w_current, w_type) {
+            return true;
+        }
+        if chain.iter().any(|&seen| std::ptr::eq(seen, w_current)) {
+            break;
+        }
+        chain.push(w_current);
+        w_current = unsafe { pyre_object::typeobject::w_type_get_best_base(w_current) };
     }
     let mro = unsafe { pyre_object::w_type_get_mro(w_base) };
     if mro.is_null() {
@@ -10131,33 +10186,68 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 pyre_object::w_type_get_name(w_oldbestbase),
             )));
         }
-        // The linearization has to hold for the new bases before anything is
-        // mutated; recomputing it afterwards would leave the type half-changed
-        // (typeobject.py:1148 restores the old bases when `mro_subclasses`
-        // raises).
-        crate::baseobjspace::validate_c3_mro(w_value)?;
+        // PyPy's `saved_bases_w`, `newbases_w`, and `temp` list keep every
+        // rollback value GC-visible while custom mro() methods execute.
+        let _mro_roots = pyre_object::gc_roots::push_roots();
+        let w_type_root = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_type);
+        let saved_bases_root = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(saved_bases);
+        let new_bases_root = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_value);
         // Invalidate the method cache of w_type and every subclass before the
         // hierarchy changes (typeobject.py:1130 `w_type.mutated(None)`).
+        let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_root);
         crate::baseobjspace::mutated(w_type, None);
         // Unlink w_type from its old bases' subclass lists before switching to
         // the new bases (typeobject.py:1136-1138 `remove_subclass`); the new
         // bases are relinked by `w_type_ready` below (typeobject.py:1140-1142
         // `add_subclass`).
+        let saved_bases = pyre_object::gc_roots::shadow_stack_get(saved_bases_root);
         if !saved_bases.is_null() {
             let old_n = pyre_object::w_tuple_len(saved_bases);
             for i in 0..old_n as i64 {
                 if let Some(w_oldbase) = pyre_object::w_tuple_getitem(saved_bases, i) {
                     if pyre_object::is_type(w_oldbase) {
+                        let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_root);
                         pyre_object::typeobject::w_type_remove_subclass(w_oldbase, w_type);
                     }
                 }
             }
         }
+        let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_root);
+        let w_value = pyre_object::gc_roots::shadow_stack_get(new_bases_root);
         pyre_object::typeobject::w_type_set_bases(w_type, w_value);
         pyre_object::typeobject::w_type_ready(w_type);
-        // Recompute the MRO of w_type and, recursively, of every subclass
-        // (typeobject.py:1144 `mro_subclasses`).
-        mro_subclasses(w_type);
+        // typeobject.py:1132-1153 — recompute through the full custom-MRO
+        // path.  If any class fails, restore only entries that still contain
+        // the MRO/bases installed by this call; a reentrant assignment owns
+        // any values that have since replaced them.
+        let mut temp = Vec::new();
+        let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_root);
+        if let Err(err) = mro_subclasses(w_type, &mut temp) {
+            for update in temp {
+                let w_updated_type = pyre_object::gc_roots::shadow_stack_get(update.w_type_root);
+                if pyre_object::w_type_get_mro(w_updated_type) == update.new_mro {
+                    match update.old_mro_roots {
+                        Some((start, len)) => {
+                            let old_mro = (start..start + len)
+                                .map(pyre_object::gc_roots::shadow_stack_get)
+                                .collect();
+                            pyre_object::w_type_set_mro(w_updated_type, old_mro);
+                        }
+                        None => pyre_object::w_type_clear_mro(w_updated_type),
+                    }
+                }
+            }
+            let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_root);
+            let w_value = pyre_object::gc_roots::shadow_stack_get(new_bases_root);
+            if pyre_object::typeobject::w_type_get_bases(w_type) == w_value {
+                let saved_bases = pyre_object::gc_roots::shadow_stack_get(saved_bases_root);
+                pyre_object::typeobject::w_type_set_bases(w_type, saved_bases);
+            }
+            return Err(err);
+        }
         Ok(pyre_object::w_none())
     }
 }

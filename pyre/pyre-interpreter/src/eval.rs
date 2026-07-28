@@ -7188,6 +7188,37 @@ except TypeError:
     }
 
     #[test]
+    fn test_set_bases_rolls_back_after_mro_conflict() {
+        let source = "\
+class A:
+    pass
+class B:
+    pass
+class C(A, B):
+    pass
+class D(A, B):
+    pass
+class E(C, D):
+    pass
+old_bases = C.__bases__
+old_mro = C.__mro__
+rejected = False
+try:
+    C.__bases__ = (B, A)
+except TypeError:
+    rejected = True
+restored = C.__bases__ == old_bases and C.__mro__ == old_mro";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("MRO rollback regression");
+        unsafe {
+            for name in ["rejected", "restored"] {
+                let value = w_dict_getitem_str(frame.w_globals, name).unwrap();
+                assert!(is_true(value).unwrap(), "{name} should be true");
+            }
+        }
+    }
+
+    #[test]
     fn test_function_dunder_globals_and_code_are_materialized() {
         crate::test_hooks::install_hash_hook();
         let source = "\

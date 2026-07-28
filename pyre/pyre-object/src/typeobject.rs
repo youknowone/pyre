@@ -978,11 +978,14 @@ pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
     }
 }
 
-/// Restore the uninitialised `tp_mro == NULL` state while a metaclass MRO
-/// calculation is in progress or when a transactional base update rolls
-/// back a nascent type.
+/// Restore the pre-`compute_mro` incomplete state (`mro_w is None`).
+///
+/// `typeobject.py:1090-1153 mro_subclasses` keeps the old MRO value and may
+/// restore `None` when a reentrant `__bases__` update fails while a type is
+/// still being constructed.
 pub unsafe fn w_type_clear_mro(obj: PyObjectRef) {
     (*(obj as *mut W_TypeObject)).mro_w = std::ptr::null_mut();
+    w_type_set_version_tag(obj, 0);
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
