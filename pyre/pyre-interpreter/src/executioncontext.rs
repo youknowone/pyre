@@ -907,7 +907,7 @@ impl ExecutionContext {
             self.w_tracefunc = pyre_object::PY_NULL;
         } else {
             self.force_all_frames(false);
-            // executioncontext.py:296-298 — increase the JIT's
+            // executioncontext.py settrace — increase the JIT's
             // trace_limit when a tracefunc is installed; tracing
             // generates a ton of extra ops per bytecode.
             crate::call::set_jit_param("trace_limit", 10000);
@@ -918,7 +918,7 @@ impl ExecutionContext {
         self.w_tracefunc
     }
 
-    /// pypy/interpreter/executioncontext.py:303-310 setprofile.
+    /// `executioncontext.py setprofile`.
     pub fn setprofile(&mut self, w_func: PyObjectRef) -> Result<(), crate::PyError> {
         if w_func.is_null() || w_func == pyre_object::w_none() {
             self.profilefunc = None;
@@ -929,19 +929,19 @@ impl ExecutionContext {
         }
     }
 
-    /// pypy/interpreter/executioncontext.py:312-313 getprofile.
+    /// `executioncontext.py getprofile`.
     pub fn getprofile(&self) -> PyObjectRef {
         self.w_profilefuncarg
     }
 
-    /// pypy/interpreter/executioncontext.py:315-321 setllprofile.
+    /// `executioncontext.py setllprofile`.
     pub fn setllprofile(
         &mut self,
         func: Option<ProfileFunc>,
         w_arg: PyObjectRef,
     ) -> Result<(), crate::PyError> {
         if func.is_some() {
-            // executioncontext.py:317-318 `if w_arg is None: raise
+            // executioncontext.py setllprofile: `if w_arg is None: raise
             // ValueError("Cannot call setllprofile with real None")`.
             // The check is against RPython-level None (== null in pyre);
             // Python-level `w_none()` (`space.w_None`) is a valid user
@@ -958,9 +958,24 @@ impl ExecutionContext {
         Ok(())
     }
 
+    /// `executioncontext.py force_all_frames` — "force" every frame in the
+    /// sense of the JIT, so one that is running in assembler fails its next
+    /// `GUARD_NOT_FORCED` and falls back to interpreted execution, where the
+    /// freshly installed trace / profile callback is honoured.
+    ///
+    /// Upstream gets that effect from the walk itself: `f_backref` holds a
+    /// `jit.virtual_ref`, so `getnextframe_nohidden`'s `frame.f_backref()` is a
+    /// `jit_force_virtual`, and `virtualref.force_virtual` runs
+    /// `ResumeGuardForcedDescr.force_now` on a token that still names a live
+    /// JIT frame.  Pyre's walk calls [`force_vref`] at the same points, but
+    /// nothing stores a `JitVirtualRef` in the chain yet, so it is the identity
+    /// and the walk forces nothing.  Until the tracer emits `VIRTUAL_REF` at
+    /// the inline push, this consumer — whose whole purpose is the force —
+    /// states it directly.
     pub fn force_all_frames(&mut self, is_being_profiled: bool) {
         let mut frame = self.gettopframe_nohidden();
         while !frame.is_null() {
+            force_frame(frame);
             if is_being_profiled {
                 unsafe {
                     (*frame).getorcreatedebug(-1).is_being_profiled = true;

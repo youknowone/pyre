@@ -22,9 +22,10 @@ use crate::pyobject::*;
 /// Python string object.
 ///
 /// Layout:
-/// `[ob_type | w_class | value:*mut Wtf8Buf | byte_len | len | w_slots | hash]`
-/// `byte_len` is the WTF-8 byte count (RPython STR `rstr.py:1226
-/// Array(Char)` parity — `llmodel.py:667 bh_strlen` reads this).
+/// `[ob_type | w_class | value:*mut Wtf8Buf | byte_len | len | w_slots |
+///   index_storage:*mut Utf8IndexStorage | hash]`
+/// `byte_len` is the WTF-8 byte count (RPython STR `rstr.py Array(Char)`
+/// parity — `llmodel.py bh_strlen` reads this).
 /// `len` is the codepoint count (RPython UNICODE parity —
 /// `bh_unicodelen` reads this).  The `value` pointer owns a
 /// heap-allocated `Wtf8Buf` (via `Box::into_raw`).
