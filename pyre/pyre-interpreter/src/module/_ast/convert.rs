@@ -30,6 +30,8 @@ pub fn compile_object(
         depth: 0,
     };
     let module = converter.module(object)?;
+    // compiling.py:73 — the tree is walked before it reaches the compiler.
+    crate::astcompiler::validate::validate_ast(&module)?;
     let source_file = rustpython_compiler::core::SourceFileBuilder::new(filename, "").finish();
     rustpython_compiler::codegen::compile::compile_top(module, source_file, mode, opts)
         .map_err(|error| crate::PyError::syntax_error(error.to_string()))
@@ -424,9 +426,7 @@ impl ObjectConverter {
                 None => 0,
             };
             if level < 0 {
-                return Err(crate::PyError::value_error(
-                    "ImportFrom level must be non-negative",
-                ));
+                return Err(crate::PyError::value_error("Negative ImportFrom level"));
             }
             Ok(ast::Stmt::ImportFrom(ast::StmtImportFrom {
                 node_index: Default::default(),
@@ -492,9 +492,9 @@ impl ObjectConverter {
         // both lists are distributed here.
         let defaults = self.exprs(object, "defaults", "arguments")?;
         let kw_defaults = self.list(object, "kw_defaults", "arguments")?;
-        if kw_defaults.len() > kwonlyargs.len() {
+        if kw_defaults.len() != kwonlyargs.len() {
             return Err(crate::PyError::value_error(
-                "arguments has more kw_defaults than kwonlyargs",
+                "length of kwonlyargs is not the same as kw_defaults on arguments",
             ));
         }
         let mut positional: Vec<ast::Parameter> = posonlyargs;
@@ -502,7 +502,7 @@ impl ObjectConverter {
         positional.extend(args);
         if defaults.len() > positional.len() {
             return Err(crate::PyError::value_error(
-                "arguments has more defaults than args",
+                "more positional defaults than args on arguments",
             ));
         }
         let first_default = positional.len() - defaults.len();
@@ -769,7 +769,7 @@ impl ObjectConverter {
                     }
                 } else {
                     return Err(crate::PyError::value_error(
-                        "MatchSingleton value must be True, False or None",
+                        "MatchSingleton can only contain True, False and None",
                     ));
                 }
             };
@@ -863,9 +863,11 @@ impl ObjectConverter {
         }
     }
 
-    /// A missing element of a statement or expression list is rejected before
-    /// the node conversion, which would only report the type it did not
-    /// recognise.  Lists of the other ASDL nodes carry no such check.
+    /// `_validate_stmts` / `_validate_exprs` (validate.py:132, :151) reject a
+    /// missing element of a statement or expression list.  The compiler AST
+    /// has nowhere to hold one, so unlike the rest of the validation this runs
+    /// during the conversion, where it is still visible.  Lists of the other
+    /// ASDL nodes carry no such check.
     fn require_node(&self, value: PyObjectRef, kind: &str) -> AstResult<()> {
         if unsafe { pyre_object::is_none(value) } {
             return Err(crate::PyError::value_error(format!(
@@ -1212,11 +1214,6 @@ impl ObjectConverter {
                 .map(|op| self.cmpop(op))
                 .collect::<Result<Vec<_>, _>>()?;
             let comparators = self.exprs(object, "comparators", "Compare")?;
-            if ops.len() != comparators.len() {
-                return Err(crate::PyError::value_error(
-                    "Compare doesn't have the same number of ops as comparators",
-                ));
-            }
             Ok(ast::Expr::Compare(ast::ExprCompare {
                 node_index: Default::default(),
                 range: Default::default(),
@@ -1278,10 +1275,11 @@ impl ObjectConverter {
                 expression,
                 debug_text: None,
                 conversion,
-                // A parsed spec is the element list standing between the
-                // braces, while the object carries a `JoinedStr`; codegen
-                // formats with that expression whenever the field below is
-                // set, so the parsed shape has nothing to hold.
+                // A spec is an expression that gets compiled like any other
+                // (`visit_FormattedValue`, codegen.py:2371). The compiler AST
+                // instead keeps the elements the parser found between the
+                // braces, which an object does not carry, so the spec rides
+                // the field below and the parsed shape stays empty.
                 format_spec: None,
                 runtime_str: None,
                 runtime_interpolation_format_spec: None,
@@ -1290,6 +1288,9 @@ impl ObjectConverter {
         ))
     }
 
+    /// `visit_FormattedValue` (codegen.py:2364) matches `s`, `r` and `a` and
+    /// leaves anything else at no conversion at all; 3.14 stops instead, so a
+    /// character it does not know is an error here.
     fn conversion(&self, object: PyObjectRef) -> AstResult<ast::ConversionFlag> {
         match self.int_field(object, "conversion", "FormattedValue")? {
             -1 => Ok(ast::ConversionFlag::None),
@@ -1477,10 +1478,11 @@ impl ObjectConverter {
     }
 }
 
-/// An f-string expression built from `_ast` objects.  The parser splits an
-/// f-string into the literal and interpolated parts the compiler AST holds,
-/// but a `JoinedStr` object carries only the values to join, so those go to
-/// codegen as the joined values and the part list stays empty.  A
+/// An f-string expression built from `_ast` objects.  `visit_JoinedStr`
+/// (codegen.py:2357) compiles the values one after another and joins them,
+/// which is the shape an object carries; the compiler AST instead holds the
+/// literal and interpolated parts the parser split, so the values are handed
+/// over as the parts to join and that part list stays empty.  A
 /// `FormattedValue` on its own is a single interpolated part, which does fit
 /// the part list.
 fn fstring(
@@ -2282,9 +2284,9 @@ impl Converter<'_> {
                     let mut conversion = interpolation.conversion;
                     if let Some(debug_text) = interpolation.debug_text.as_ref() {
                         self.push_debug_text(parts, interpolation, debug_text);
-                        // `=` echoes the expression text and then reprs the
-                        // value, unless a conversion or a format spec already
-                        // says how to render it.
+                        // fstring.py:315 — a debugging expression defaults to
+                        // `!r` when neither a conversion nor a format spec
+                        // says how to render the value.
                         if matches!(
                             (conversion, &interpolation.format_spec),
                             (ast::ConversionFlag::None, None)
@@ -2324,9 +2326,11 @@ impl Converter<'_> {
         Ok(())
     }
 
-    /// The literal an `=` conversion echoes: the source text of the
-    /// expression, framed by whatever stood between the brace and the
-    /// expression and between the expression and the `!`, `:` or `}`.
+    /// The literal an `=` conversion echoes.  `fstring_find_expr`
+    /// (fstring.py:279) takes it as one slice of the source, from the start of
+    /// the expression through the `=` and the whitespace after it; the parser
+    /// here hands over that frame as the text on either side of the
+    /// expression, so the slice is put back together from the two.
     fn push_debug_text(
         &self,
         parts: &mut Vec<JoinedPart>,
@@ -2830,10 +2834,12 @@ fn class_name(object: PyObjectRef) -> &'static str {
     }
 }
 
-/// A value of a `JoinedStr` under construction.  Consecutive literal pieces
-/// are one `Constant`, so what the parser kept apart -- an implicit
-/// concatenation, the text an `=` conversion echoes -- is joined as it
-/// arrives instead of reaching the tree one node per piece.
+/// A value of a `JoinedStr` under construction.  `add_constant_string`
+/// (fstring.py:23) folds a piece into the `Constant` before it, keeping that
+/// node's start and taking the new end, and an empty piece is dropped
+/// (`f_string_to_ast_node`, fstring.py:449); what the parser kept apart -- an
+/// implicit concatenation, the text an `=` conversion echoes -- therefore
+/// reaches the tree as one node, not one per piece.
 enum JoinedPart {
     Literal { start: u32, end: u32, value: String },
     Value(PyObjectRef),

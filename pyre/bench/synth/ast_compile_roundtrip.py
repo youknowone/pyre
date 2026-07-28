@@ -139,6 +139,14 @@ def handbuilt():
         delattr(node, field)
         return node
 
+    # A tree the parser could never have produced. Only the class is compared:
+    # the wording differs between runtimes.
+    L, S, D = ast.Load(), ast.Store(), ast.Del()
+    args = lambda **kw: ast.arguments(
+        posonlyargs=kw.get("po", []), args=kw.get("a", []), kwonlyargs=kw.get("ko", []),
+        kw_defaults=kw.get("kd", []), defaults=kw.get("d", []))
+    pat = lambda p: ast.Match(subject=ast.Constant(1),
+                              cases=[ast.match_case(pattern=p, body=[ast.Pass()])])
     for label, node in (
         ("missing-conversion", ast.JoinedStr(values=[
             without(ast.FormattedValue(value=name, conversion=-1), "conversion")])),
@@ -147,6 +155,58 @@ def handbuilt():
         ("values-not-a-list", ast.JoinedStr(values=ast.Constant("a"))),
         ("none-in-values", ast.JoinedStr(values=[None])),
         ("none-in-body", ast.Module(body=[None], type_ignores=[])),
+        ("more-defaults-than-args", ast.Lambda(
+            args=args(d=[ast.Constant(1), ast.Constant(2)]), body=ast.Constant(1))),
+        ("kw-defaults-length", ast.Lambda(
+            args=args(ko=[ast.arg(arg="a"), ast.arg(arg="b")], kd=[ast.Constant(1)]),
+            body=ast.Constant(1))),
+        ("compare-no-comparators", ast.Compare(left=ast.Constant(1), ops=[], comparators=[])),
+        ("compare-ops-mismatch", ast.Compare(left=ast.Constant(1), ops=[ast.Lt()], comparators=[])),
+        ("boolop-one-value", ast.BoolOp(op=ast.And(), values=[ast.Constant(1)])),
+        ("boolop-no-values", ast.BoolOp(op=ast.And(), values=[])),
+        ("comprehension-no-generators", ast.ListComp(elt=ast.Constant(1), generators=[])),
+        ("named-target-not-name", ast.NamedExpr(target=ast.Constant(1), value=ast.Constant(1))),
+        ("name-is-a-constant", ast.Name("None", L)),
+        ("store-in-load-position", ast.Name("x", S)),
+        ("empty-body-functiondef", ast.Module(body=[ast.FunctionDef(
+            name="f", args=args(), body=[], decorator_list=[], type_params=[])], type_ignores=[])),
+        ("empty-body-classdef", ast.Module(body=[ast.ClassDef(
+            name="C", bases=[], keywords=[], body=[], decorator_list=[], type_params=[])],
+            type_ignores=[])),
+        ("empty-targets-assign", ast.Module(body=[ast.Assign(targets=[], value=ast.Constant(1))],
+                                            type_ignores=[])),
+        ("load-target-assign", ast.Module(body=[ast.Assign(targets=[ast.Name("x", L)],
+                                                           value=ast.Constant(1))],
+                                          type_ignores=[])),
+        ("load-target-delete", ast.Module(body=[ast.Delete(targets=[ast.Name("x", L)])],
+                                          type_ignores=[])),
+        ("empty-names-import", ast.Module(body=[ast.Import(names=[])], type_ignores=[])),
+        ("negative-import-level", ast.Module(body=[ast.ImportFrom(
+            module="x", names=[ast.alias(name="y")], level=-1)], type_ignores=[])),
+        ("raise-cause-no-exc", ast.Module(body=[ast.Raise(exc=None, cause=ast.Name("x", L))],
+                                          type_ignores=[])),
+        ("try-without-handlers", ast.Module(body=[ast.Try(
+            body=[ast.Pass()], handlers=[], orelse=[], finalbody=[])], type_ignores=[])),
+        ("empty-except-body", ast.Module(body=[ast.Try(body=[ast.Pass()], handlers=[
+            ast.ExceptHandler(type=None, name=None, body=[])], orelse=[], finalbody=[])],
+            type_ignores=[])),
+        ("empty-items-with", ast.Module(body=[ast.With(items=[], body=[ast.Pass()])],
+                                        type_ignores=[])),
+        ("empty-cases-match", ast.Module(body=[ast.Match(subject=ast.Constant(1), cases=[])],
+                                         type_ignores=[])),
+        ("match-or-one-pattern", ast.Module(body=[pat(ast.MatchOr(
+            patterns=[ast.MatchValue(value=ast.Constant(1))]))], type_ignores=[])),
+        ("match-star-alone", ast.Module(body=[pat(ast.MatchStar(name="a"))], type_ignores=[])),
+        ("match-as-no-name", ast.Module(body=[pat(ast.MatchAs(
+            pattern=ast.MatchValue(value=ast.Constant(1)), name=None))], type_ignores=[])),
+        ("match-capture-underscore", ast.Module(body=[pat(ast.MatchAs(
+            pattern=ast.MatchValue(value=ast.Constant(1)), name="_"))], type_ignores=[])),
+        ("match-class-bad-cls", ast.Module(body=[pat(ast.MatchClass(
+            cls=ast.Constant(1), patterns=[], kwd_attrs=[], kwd_patterns=[]))], type_ignores=[])),
+        ("match-singleton-bad", ast.Module(body=[pat(ast.MatchSingleton(value=42))],
+                                           type_ignores=[])),
+        ("match-value-bad-constant", ast.Module(body=[pat(ast.MatchValue(
+            value=ast.Constant(value=None)))], type_ignores=[])),
     ):
         tree = node if isinstance(node, ast.Module) else ast.Expression(body=node)
         try:

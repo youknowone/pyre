@@ -29,6 +29,7 @@ pub use compile::*;
 pub mod _pypy_generic_alias;
 pub mod _structseq;
 pub mod argument;
+pub mod astcompiler;
 pub mod baseobjspace;
 pub mod builtins;
 pub mod display;
