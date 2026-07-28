@@ -1987,6 +1987,19 @@ fn apply_blackhole_crn(
 ///   hoisted without validating the whole CRN resume-pc set up front.
 ///   Named under `PYRE_FBW_DEBUG_ABORT` so they are countable rather than
 ///   silent; a silent one is indistinguishable from the adopt never running.
+///
+/// ⭐The exposure is narrower than the decline count suggests: BOTH post-drive
+/// declines live in the `ContinueRunningNormally` arm, and every other arm
+/// (`DoneWithThisFrame*`, `ExitFrameWithExceptionRef`) is already infallible —
+/// it records a concrete frame result and adopts.  So the whole double-apply
+/// class here is "the CRN arm rejected the image".
+///
+/// ⚠️And that arm is UNEXERCISED: over `pyre/bench/synth` (312 files) all 50
+/// single-frame adoptions took a frame-terminal arm and none reported a green,
+/// i.e. `apply_blackhole_crn` is never reached from here on this corpus.  Any
+/// work to make the CRN arm infallible therefore needs a shape that enters it
+/// first, or it cannot be tested — see the `[latch-vs-bh]` probe in
+/// `residual_call.rs`, which measures the most likely such shape.
 fn try_adopt_single_frame_blackhole(
     ctx: &mut TraceCtx,
     cf_addr: usize,
@@ -2016,6 +2029,18 @@ fn try_adopt_single_frame_blackhole(
     let Some(stack_base) = crate::state::concrete_nlocals(cf_addr) else {
         return false;
     };
+    // `apply_blackhole_crn` cannot reconstruct the frame without pcdep trivia at
+    // the position the drive stops at.  That position is the drive's own output,
+    // but whether this jitcode carries ANY pcdep trivia is not — and when it
+    // carries none, the post-drive lookup is already doomed for every position.
+    // Deciding it here turns a decline that would have discarded an executed
+    // region into one taken before anything runs.  Taken ahead of the locals
+    // publish below, whose undo only covers declines that reach
+    // `restore_frame_locals`.
+    if !crate::state::pcdep_trivia_populated(jitcode_index) {
+        sfdbg!("jitcode {jitcode_index} carries no pcdep trivia (pre-drive)");
+        return false;
+    }
     // The escape flush that ran ahead of the forcing residual is
     // all-or-nothing, and its decline is what this latch is gated on
     // (`committed_frame_escape_pc().is_none()`).  What it declines on is the
@@ -2099,6 +2124,12 @@ fn try_adopt_single_frame_blackhole(
                     &terminal.registers_f,
                     resume_py_pc,
                 ) {
+                    // The green this CRN handed back.  Closing the remaining
+                    // post-drive declines means pre-validating
+                    // `apply_blackhole_crn` over the set of greens the drive can
+                    // produce, so what that set actually is is the next thing to
+                    // measure — report it per adoption.
+                    sfdbg!("adopted with green resume_py_pc={resume_py_pc}");
                     WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
                     true
                 } else {
@@ -2190,6 +2221,15 @@ fn try_adopt_multi_frame_blackhole(
     // post-drive ones survive here (empty `green_int`, no terminal image,
     // terminal jitcode index out of i32 range); each depends on the drive's own
     // output and so has no pre-drive counterpart to strengthen.
+    //
+    // In particular the single-frame path's pre-drive pcdep hoist does NOT
+    // transfer.  There the index handed to `apply_blackhole_crn` is the latched
+    // MIFrame's own, fixed before the drive; here it is
+    // `terminal.jitcode_index` = `bh.jitcode.index()` of whichever interpreter
+    // the chain ended in (`BlackholeTerminalImage::take_from`), and the run can
+    // enter jitcodes that are not levels of `latched.framestack`.  Pre-checking
+    // the levels would therefore add a decline without discharging the
+    // post-drive one.
     macro_rules! mfdbg {
         ($($a:tt)*) => {
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {

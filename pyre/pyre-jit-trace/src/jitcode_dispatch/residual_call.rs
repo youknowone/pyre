@@ -2083,6 +2083,59 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // failure leaves the pre-existing escape/replay path untouched.
             let odometer_unchanged = heap_write_odometer_before
                 .is_some_and(|before| pyre_interpreter::call::frame_entry_count() == before);
+            // Feasibility probe for retiring the rewind latch in favour of the
+            // orthodox resume-PAST-the-residual path (`blackhole.py:1653-1662`
+            // splices the callee result into the caller past its call, so no
+            // re-runnability licence is needed at all).  The latch shape is the
+            // exact complement of the C3 S1 gate: it is `!writes_live_heap` and
+            // has already committed an escape pc, so it can never reach the
+            // build below.  Measure whether it COULD: build the image and throw
+            // it away.  `build_single_frame_miframe` only reads liveness and the
+            // concrete register banks, so discarding it is free.
+            if fbw_debug_abort_enabled()
+                && !writes_live_heap
+                && odometer_unchanged
+                && matches!(
+                    committed_frame_escape_pc(),
+                    Some((_, EscapeResumeKind::Exact))
+                )
+                && !ctx.trace_ctx.is_bridge_trace
+                && !ctx.fbw_mode.inline_subwalk
+                && ctx.session.borrow().framestack.is_empty()
+                && !ctx.fbw_mode.snapshot_sym.is_null()
+            {
+                let built = blackhole_result.and_then(|(resume_pc, result_bank, result_color)| {
+                    let lastop_result = match exec_result {
+                        Ok(value) => {
+                            (result_bank != 'v').then_some((result_bank, result_color, value))
+                        }
+                        Err(_) => None,
+                    };
+                    let jitcode = unsafe {
+                        let sym = &*ctx.fbw_mode.snapshot_sym;
+                        (!sym.jitcode().is_null())
+                            .then(|| (&(*sym.jitcode()).payload).jitcode.clone())
+                    };
+                    jitcode.map(|jitcode| {
+                        (
+                            resume_pc,
+                            build_single_frame_miframe(ctx, jitcode, resume_pc, lastop_result)
+                                .is_some(),
+                        )
+                    })
+                });
+                match built {
+                    Some((resume_pc, true)) => eprintln!(
+                        "[latch-vs-bh] latch shape COULD build a resume-past image at \
+                         resume_pc={resume_pc}"
+                    ),
+                    Some((resume_pc, false)) => eprintln!(
+                        "[latch-vs-bh] latch shape could NOT build an image at \
+                         resume_pc={resume_pc}"
+                    ),
+                    None => eprintln!("[latch-vs-bh] latch shape has no blackhole_result/jitcode"),
+                }
+            }
             if fbw_debug_abort_enabled() && ctx.fbw_mode.inline_subwalk {
                 eprintln!(
                     "[s2-gate] inline_subwalk fs={} flag={} writes_live={} odo_unchanged={} \

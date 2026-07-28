@@ -1673,6 +1673,21 @@ pub fn pcdep_trivia_at(jitcode_index: i32, jit_pc: i32) -> Option<Vec<(u8, u16, 
     })
 }
 
+/// Whether `jitcode_index` carries any pcdep trivia at all — the
+/// position-INDEPENDENT half of [`pcdep_trivia_at`]'s answer, and the only half
+/// the blackhole adopt path can evaluate before driving. `false` for a missing
+/// index or a skeleton / fixture payload, i.e. exactly when every later
+/// `pcdep_trivia_at` on this jitcode is already doomed to `None`.
+pub fn pcdep_trivia_populated(jitcode_index: i32) -> bool {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        sd.jitcodes
+            .get(jitcode_index as usize)
+            .is_some_and(|jc| jc.payload.pcdep_trivia_populated())
+    })
+}
+
 /// Depth-based `valuestackdepth` for `w_code` at `py_pc`:
 /// `nlocals + ncells + depth_at_py_pc[py_pc]`.  Mirrors the encoder's
 /// published vsd (the `jitcode_dispatch` valuestackdepth publish).  The
