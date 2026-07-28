@@ -180,7 +180,10 @@ impl ObjectConverter {
             let targets = self
                 .list(object, "targets", "Assign")?
                 .into_iter()
-                .map(|value| self.recurse(|this| this.expr(value)))
+                .map(|value| {
+                    self.require_node(value, "expression")?;
+                    self.recurse(|this| this.expr(value))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let value = self.field(object, "value", "Assign")?;
             Ok(ast::Stmt::Assign(ast::StmtAssign {
@@ -331,7 +334,10 @@ impl ObjectConverter {
                     let values = std::mem::take(&mut orelse);
                     let clause_body = values
                         .into_iter()
-                        .map(|value| self.recurse(|this| this.stmt(value)))
+                        .map(|value| {
+                            self.require_node(value, "statement")?;
+                            self.recurse(|this| this.stmt(value))
+                        })
                         .collect::<Result<Vec<_>, _>>()?;
                     elif_else_clauses.push(ast::ElifElseClause {
                         range: Default::default(),
@@ -660,6 +666,7 @@ impl ObjectConverter {
         self.list(object, "decorator_list", node)?
             .into_iter()
             .map(|value| {
+                self.require_node(value, "expression")?;
                 Ok(ast::Decorator {
                     range: Default::default(),
                     node_index: Default::default(),
@@ -1008,7 +1015,10 @@ impl ObjectConverter {
             let args = self
                 .list(object, "args", "Call")?
                 .into_iter()
-                .map(|arg| self.recurse(|this| this.expr(arg)))
+                .map(|arg| {
+                    self.require_node(arg, "expression")?;
+                    self.recurse(|this| this.expr(arg))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let keywords = self
                 .list(object, "keywords", "Call")?
@@ -1046,7 +1056,10 @@ impl ObjectConverter {
             let elements = self
                 .list(object, "elts", if is_tuple { "Tuple" } else { "List" })?
                 .into_iter()
-                .map(|element| self.recurse(|this| this.expr(element)))
+                .map(|element| {
+                    self.require_node(element, "expression")?;
+                    self.recurse(|this| this.expr(element))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let ctx = self.context(self.field(object, "ctx", "sequence")?)?;
             if is_tuple {
@@ -1141,6 +1154,7 @@ impl ObjectConverter {
                     } else {
                         Some(self.recurse(|this| this.expr(key))?)
                     };
+                    self.require_node(value, "expression")?;
                     Ok(ast::DictItem {
                         key,
                         value: self.recurse(|this| this.expr(value))?,
@@ -1412,7 +1426,9 @@ impl ObjectConverter {
                 Ok(ast::ConstantValue::Ellipsis)
             } else if pyre_object::is_tuple(object) {
                 // A container constant never comes out of the parser; it reaches
-                // here from a tree an optimizer folded, and it nests.
+                // here from a tree an optimizer folded, and it nests. The node
+                // depth guard does not apply: it counts AST nodes, and a
+                // constant nested past it still compiles where 3.14 compiles.
                 Ok(ast::ConstantValue::Tuple(
                     pyre_object::w_tuple_items_copy_as_vec(object)
                         .into_iter()
