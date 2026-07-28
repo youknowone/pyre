@@ -2878,73 +2878,140 @@ fn resolve_default_print_target() -> Result<DefaultPrintTarget, crate::PyError> 
     Ok(DefaultPrintTarget::Rebound(stdout))
 }
 
-fn input_call_method(
-    object: PyObjectRef,
-    name: &str,
-    args: &[PyObjectRef],
-) -> Result<PyObjectRef, crate::PyError> {
-    let result = crate::baseobjspace::call_method(object, name, args);
-    if result.is_null() {
-        Err(crate::call::take_call_error()
-            .unwrap_or_else(|| crate::PyError::runtime_error(format!("{name} failed"))))
-    } else {
-        Ok(result)
+fn input_eof_error() -> crate::PyError {
+    let mut error = crate::PyError::value_error("");
+    if let Some(cls) = lookup_exc_class("EOFError") {
+        let args = [cls];
+        if let Ok(exc) = exc_exception_new(&args) {
+            error.exc_object = exc;
+        }
     }
+    error
 }
 
-/// PyPy `pypy/module/__builtin__/app_io.py:input`.
+/// `pypy/module/__builtin__/app_io.py:24-66 input` — non-readline path.
 ///
-/// Resolve all three live sys streams, flush stderr, emit and flush the prompt
-/// through stdout, then consume one line from stdin. This preserves redirected
-/// StringIO streams as well as the interpreter-created standard streams.
+/// The tty/readline hook remains owned by `sys.__raw_input__`; when it is not
+/// installed (the normal Pyre configuration), this is the literal app-level
+/// sequence: fetch the three live `sys` streams, flush stderr, write and flush
+/// the prompt, call `stdin.readline()`, then strip one trailing newline.
 fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() > 1 {
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "input() takes no keyword arguments",
+        ));
+    }
+    if pos.len() > 1 {
         return Err(crate::PyError::type_error(format!(
             "input expected at most 1 argument, got {}",
-            args.len()
+            pos.len()
         )));
     }
-    let sys = crate::importing::get_sys_module("sys")
-        .ok_or_else(|| crate::PyError::runtime_error("input: lost sys.stdin"))?;
-    let stream = |name: &str| {
-        crate::baseobjspace::getattr_str(sys, name)
-            .map_err(|_| crate::PyError::runtime_error(format!("input: lost sys.{name}")))
-    };
-    let stdin = stream("stdin")?;
-    let stdout = stream("stdout")?;
-    let stderr = stream("stderr")?;
-    let _ = input_call_method(stderr, "flush", &[])?;
 
-    let prompt = match args.first().copied() {
-        Some(value) => builtin_str(&[value])?,
-        None => w_str_new(""),
+    let prompt = pos
+        .first()
+        .copied()
+        .unwrap_or_else(|| pyre_object::w_str_new(""));
+    let Some(sys) = crate::importing::get_sys_module("sys") else {
+        return Err(crate::PyError::runtime_error("input: lost sys.stdin"));
     };
+
     let _roots = pyre_object::gc_roots::push_roots();
+    let root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(sys);
     pyre_object::gc_roots::pin_root(prompt);
+
+    let stream = |name: &str| -> Result<PyObjectRef, crate::PyError> {
+        let sys = pyre_object::gc_roots::shadow_stack_get(root);
+        match crate::baseobjspace::getattr_str(sys, name) {
+            Ok(value) => Ok(value),
+            Err(error) if error.kind == crate::PyErrorKind::AttributeError => Err(
+                crate::PyError::runtime_error(format!("input: lost sys.{name}")),
+            ),
+            Err(error) => Err(error),
+        }
+    };
+
+    let stdin = stream("stdin")?;
+    pyre_object::gc_roots::pin_root(stdin);
+    let stdin_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let stdout = stream("stdout")?;
+    pyre_object::gc_roots::pin_root(stdout);
+    let stdout_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let stderr = stream("stderr")?;
+    pyre_object::gc_roots::pin_root(stderr);
+    let stderr_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    // app_io.py:44 `stderr.flush()`.
+    let stderr_flush = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(stderr_slot),
+        "flush",
+    )?;
+    pyre_object::gc_roots::pin_root(stderr_flush);
+    crate::call_and_check(
+        pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1),
+        &[],
+    )?;
+
+    // app_io.py `_write_prompt`: `str(prompt)`, `stdout.write`, then an
+    // optional `stdout.flush`.
+    let prompt_text = builtin_str(&[pyre_object::gc_roots::shadow_stack_get(root + 1)])?;
+    pyre_object::gc_roots::pin_root(prompt_text);
     let prompt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let _ = input_call_method(
-        stdout,
+    let stdout_write = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(stdout_slot),
         "write",
+    )?;
+    pyre_object::gc_roots::pin_root(stdout_write);
+    let write_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    crate::call_and_check(
+        pyre_object::gc_roots::shadow_stack_get(write_slot),
         &[pyre_object::gc_roots::shadow_stack_get(prompt_slot)],
     )?;
-    let _ = input_call_method(stdout, "flush", &[])?;
-
-    let line = input_call_method(stdin, "readline", &[])?;
-    if !unsafe { pyre_object::is_str(line) } {
-        return Err(crate::PyError::type_error("input() returned non-string"));
-    }
-    let value = crate::baseobjspace::str_utf8_w(line)?;
-    if value.is_empty() {
-        let message = "EOF when reading a line";
-        let mut error = crate::PyError::value_error(message);
-        if let Some(class) = lookup_exc_class("EOFError") {
-            if let Ok(exception) = exc_exception_new(&[class, w_str_new(message)]) {
-                error.exc_object = exception;
-            }
+    match crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(stdout_slot),
+        "flush",
+    ) {
+        Ok(flush) => {
+            pyre_object::gc_roots::pin_root(flush);
+            crate::call_and_check(
+                pyre_object::gc_roots::shadow_stack_get(
+                    pyre_object::gc_roots::shadow_stack_len() - 1,
+                ),
+                &[],
+            )?;
         }
-        return Err(error);
+        Err(error) if error.kind == crate::PyErrorKind::AttributeError => {}
+        Err(error) => return Err(error),
     }
-    Ok(w_str_new(value.strip_suffix('\n').unwrap_or(value)))
+
+    // app_io.py:56-65 `line = stdin.readline()` and strip one LF.
+    let readline = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(stdin_slot),
+        "readline",
+    )?;
+    pyre_object::gc_roots::pin_root(readline);
+    let line = crate::call_and_check(
+        pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1),
+        &[],
+    )?;
+    if unsafe { !pyre_object::is_str(line) } {
+        return Err(crate::PyError::type_error(
+            "input(): stdin.readline() returned non-string",
+        ));
+    }
+    let text = unsafe { pyre_object::w_str_get_wtf8(line) };
+    if text.as_bytes().is_empty() {
+        return Err(input_eof_error());
+    }
+    if text.as_bytes().last() == Some(&b'\n') {
+        let body = rustpython_wtf8::Wtf8::from_bytes(&text.as_bytes()[..text.len() - 1])
+            .expect("removing ASCII LF preserves WTF-8");
+        Ok(pyre_object::w_str_from_wtf8_managed(body.to_wtf8_buf()))
+    } else {
+        Ok(line)
+    }
 }
 
 fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
