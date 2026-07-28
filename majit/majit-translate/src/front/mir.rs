@@ -14624,12 +14624,25 @@ fn tuple_per_shape_enabled() -> bool {
 /// Route inline-Field `dyn Trait` virtual calls through the faithful
 /// `CallTarget::Indirect` vtable pipeline instead of the synthetic
 /// `__dyn_call` residual (see the `(CallClass::Dynamic, ..)` arm).
-/// Default-OFF — `PYRE_DYN_INDIRECT=1` opts in; every other value (unset
-/// included) keeps the inert `__dyn_call` emit.
+///
+/// `__dyn_call` is not a lowering, it is a placeholder: an unregistered
+/// synthetic path that stops whatever graph reaches it.  Routing through
+/// `Indirect` is what `jtransform.py`'s `indirect_call` does, so this is the
+/// faithful side.  It was gated while the widening it forces — the annotator
+/// now annotates every family member's body — outweighed what it bought;
+/// census at the flip point, both states, same corpus:
+///
+/// | gate | records | biggest wall |
+/// |---|---:|---|
+/// | off | 243 | `__dyn_call` 48 |
+/// | on  | **224** | `Wtf8::as_str` 37 |
+///
+/// On by default; `PYRE_DYN_INDIRECT=0` is the kill switch that restores the
+/// inert `__dyn_call` emit.
 pub(crate) fn dyn_indirect_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("PYRE_DYN_INDIRECT").as_deref(),
-        Ok("1") | Ok("true")
+        Ok("0") | Ok("false")
     )
 }
 

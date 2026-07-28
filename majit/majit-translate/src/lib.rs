@@ -1450,18 +1450,20 @@ fn analyze_pipeline_from_module_paths(
             },
         )
         .collect();
-    // Gated auto-population (issue #346): with `PYRE_DYN_INDIRECT`
-    // on, register EVERY `>=2`-impl trait so its inline `dyn Trait`
-    // receiver (lowered to `CallTarget::Indirect`) narrows to the family
-    // base ClassDef.  Union with the config list (dedup by base_root),
-    // never replacing it, to stay forward-safe with the aheui census.
-    // MUST stay behind the gate: minting base/impl subclass classdefs
-    // perturbs `pyre_struct_root_names` → `ensure_session` inheritance-id
-    // numbering even off-path, so gate-OFF keeps the config-only (empty in
-    // prod) set byte-identical.  Applies the same within-family `dup_leaf`
-    // guard as the config path plus the cross-registry `struct_leaf_counts`
-    // bail: an impl leaf that also names a DIFFERENT registered struct
-    // would mis-seed the family, so skip it (fail-safe classdef-less).
+    // Auto-population (issue #346): register EVERY `>=2`-impl trait so its
+    // inline `dyn Trait` receiver (lowered to `CallTarget::Indirect`) narrows
+    // to the family base ClassDef.  Union with the config list (dedup by
+    // base_root), never replacing it, to stay forward-safe with the aheui
+    // census.  Shares [`dyn_indirect_enabled`] with the lowering arm because
+    // the two are one decision: minting base/impl subclass classdefs perturbs
+    // `pyre_struct_root_names` → `ensure_session` inheritance-id numbering
+    // even off-path, so `PYRE_DYN_INDIRECT=0` must restore BOTH the
+    // `__dyn_call` emit and the config-only (empty in prod) set together for
+    // the kill switch to be byte-identical.  Applies the same within-family
+    // `dup_leaf` guard as the config path plus the cross-registry
+    // `struct_leaf_counts` bail: an impl leaf that also names a DIFFERENT
+    // registered struct would mis-seed the family, so skip it (fail-safe
+    // classdef-less).
     if front::mir::dyn_indirect_enabled() {
         let already: std::collections::HashSet<&str> = trait_family_registrations
             .iter()

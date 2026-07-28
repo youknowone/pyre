@@ -48,10 +48,11 @@ Registration is driven two ways:
 - **config** `PipelineConfig.register_trait_families: Vec<String>` (pipeline.rs:58) — a list of
   trait qualified paths; harvested into `TraitFamilyRegistration` at lib.rs:1225, applied at
   codewriter.rs:158. **Empty in production** (test_support.rs:51). NOT gated.
-- **auto** every `>=2`-impl trait, gated behind `PYRE_DYN_INDIRECT` (lib.rs:1264). The gate
-  comment (lib.rs:1257) warns: minting base/impl subclass classdefs perturbs
-  `pyre_struct_root_names` → `ensure_session` inheritance-id numbering even off-path, so the
-  gate keeps prod byte-identical.
+- **auto** every `>=2`-impl trait, behind `dyn_indirect_enabled()` — **on by default** since
+  the `__dyn_call` flip; `PYRE_DYN_INDIRECT=0` is the kill switch. The gate comment warns:
+  minting base/impl subclass classdefs perturbs `pyre_struct_root_names` → `ensure_session`
+  inheritance-id numbering even off-path, which is why the kill switch has to restore this
+  registration and the `__dyn_call` emit together.
 
 The machinery is wired only to the **parameter-seeding** path (`derive_subject_inputcells`
 trait-family arm, flowspace_adapter.rs:2823) — a `&dyn Trait` function argument. It is NOT
@@ -70,8 +71,8 @@ register_trait_families: vec!["pyre_object::dictmultiobject::DictStrategy".to_st
 
 `trait_impl_owners` (lib.rs:1158, harvested from `concrete_trait_methods`) already maps this
 qualified path to its 6 impl owners, so `make_registration` (lib.rs:1200) builds the family
-with no further work. This runs through the NON-gated config path, so `PYRE_DYN_INDIRECT` is
-untouched.
+with no further work. This runs through the NON-gated config path, so `dyn_indirect_enabled()`
+is untouched.
 
 **RISK (measure first, in isolation):** the gate comment says config registration also mints
 classdefs that shift `ensure_session` inheritance-id numbering. Whether one family shifts prod
