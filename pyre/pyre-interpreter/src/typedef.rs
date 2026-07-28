@@ -1223,6 +1223,15 @@ pub fn init_typeobjects() {
             ) as usize,
         );
         reg.insert(
+            &pyre_object::interp_itertools::PERMUTATIONS_TYPE as *const PyType as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.permutations",
+                init_permutations_type,
+                object_type,
+                &pyre_object::interp_itertools::PERMUTATIONS_TYPE as *const PyType,
+            ) as usize,
+        );
+        reg.insert(
             &pyre_object::interp_itertools::COMPRESS_TYPE as *const PyType as usize,
             new_typeobject_with_base_and_layout(
                 "itertools.compress",
@@ -24502,6 +24511,138 @@ fn init_combinations_with_replacement_type(ns: PyObjectRef) {
             "__doc__",
             w_str_new(
                 "Return successive r-length combinations of elements in the iterable allowing individual elements to have successive repeats.\n\ncombinations_with_replacement('ABC', 2) --> ('A','A'), ('A','B'), ('A','C'), ('B','B'), ('B','C'), ('C','C')",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+// ── itertools.permutations TypeDef ─────────────────────────────────
+// PyPy W_Permutations state machine with Python 3.14's exact-int r
+// conversion, reduced pickle surface, and __sizeof__ method.
+
+fn permutations_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exact = gettypefor(&pyre_object::interp_itertools::PERMUTATIONS_TYPE)
+        .map_or(PY_NULL, |p| p.as_ptr());
+    let (cls, scope) =
+        itertools_constructor_scope(args, "permutations", vec!["iterable", "r"], &[w_none()])?;
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    for &value in &scope {
+        pyre_object::gc_roots::pin_root(value);
+    }
+    let values_base = pyre_object::gc_roots::shadow_stack_len() - scope.len();
+
+    // PyPy fixedview and CPython PySequence_Tuple both consume the iterable
+    // before validating the optional r object.
+    let items = crate::builtins::collect_iterable(unsafe {
+        pyre_object::gc_roots::shadow_stack_get(values_base)
+    })?;
+    for &item in &items {
+        pyre_object::gc_roots::pin_root(item);
+    }
+    let n = items.len();
+    let pool_w = pyre_object::w_list_new(items);
+    pyre_object::gc_roots::pin_root(pool_w);
+    let pool_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    let w_r = unsafe { pyre_object::gc_roots::shadow_stack_get(values_base + 1) };
+    let r = if unsafe { pyre_object::is_none(w_r) } {
+        isize::try_from(n).map_err(|_| {
+            crate::PyError::overflow_error("Python int too large to convert to C ssize_t")
+        })?
+    } else {
+        // CPython 3.14 deliberately uses PyLong_Check + PyLong_AsSsize_t,
+        // rather than the index protocol used by combinations.
+        if !unsafe { crate::baseobjspace::isinstance_int_w(w_r) } {
+            return Err(crate::PyError::type_error("Expected int as r"));
+        }
+        let value = crate::baseobjspace::int_w(w_r).map_err(|err| {
+            if err.kind == crate::PyErrorKind::OverflowError {
+                crate::PyError::overflow_error("Python int too large to convert to C ssize_t")
+            } else {
+                err
+            }
+        })?;
+        isize::try_from(value).map_err(|_| {
+            crate::PyError::overflow_error("Python int too large to convert to C ssize_t")
+        })?
+    };
+    if r < 0 {
+        return Err(crate::PyError::value_error("r must be non-negative"));
+    }
+
+    let stopped = r as usize > n;
+    let (indices, cycles) = if stopped {
+        (PY_NULL, PY_NULL)
+    } else {
+        let indices =
+            pyre_object::w_list_new((0..n).map(|i| pyre_object::w_int_new(i as i64)).collect());
+        pyre_object::gc_roots::pin_root(indices);
+        let indices_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let cycles = pyre_object::w_list_new(
+            (0..r as usize)
+                .map(|i| pyre_object::w_int_new((n - i) as i64))
+                .collect(),
+        );
+        (
+            unsafe { pyre_object::gc_roots::shadow_stack_get(indices_slot) },
+            cycles,
+        )
+    };
+    let obj = pyre_object::interp_itertools::w_permutations_new(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(pool_slot) },
+        r,
+        stopped,
+        indices,
+        cycles,
+    );
+    itertools_alloc_for_class(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        exact,
+        obj,
+    )
+}
+
+fn permutations_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args[0];
+    unsafe {
+        if !pyre_object::interp_itertools::is_permutations(obj) {
+            return Err(crate::PyError::type_error(
+                "descriptor '__sizeof__' requires a 'itertools.permutations' object",
+            ));
+        }
+        let permutations = &*(obj as *const pyre_object::interp_itertools::W_Permutations);
+        let size = std::mem::size_of::<pyre_object::interp_itertools::W_Permutations>()
+            + (pyre_object::w_list_len(permutations.pool_w) + permutations.r as usize)
+                * std::mem::size_of::<isize>();
+        Ok(pyre_object::w_int_new(size as i64))
+    }
+}
+
+fn init_permutations_type(ns: PyObjectRef) {
+    let entries = [
+        ("__new__", make_new_descr(permutations_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__sizeof__",
+            make_builtin_function_with_arity("__sizeof__", permutations_sizeof, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Return successive r-length permutations of elements in the iterable.\n\npermutations(range(3), 2) --> (0,1), (0,2), (1,0), (1,2), (2,0), (2,1)",
             ),
         ),
     ];

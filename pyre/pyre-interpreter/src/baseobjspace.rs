@@ -4860,6 +4860,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::interp_itertools::is_product(obj)
             || pyre_object::interp_itertools::is_combinations(obj)
             || pyre_object::interp_itertools::is_combinations_with_replacement(obj)
+            || pyre_object::interp_itertools::is_permutations(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = match name {
                 "__next__" => Some((iter_next_method, "__next__", 1)),
@@ -12546,6 +12547,7 @@ pub fn is_iterable(obj: PyObjectRef) -> bool {
             || pyre_object::interp_itertools::is_product(obj)
             || pyre_object::interp_itertools::is_combinations(obj)
             || pyre_object::interp_itertools::is_combinations_with_replacement(obj)
+            || pyre_object::interp_itertools::is_permutations(obj)
         {
             return true;
         }
@@ -12893,6 +12895,24 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if pyre_object::interp_itertools::is_combinations_with_replacement(obj) {
             let exact =
                 get_instantiate(&pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE);
+            if !std::ptr::eq((*obj).w_class, exact) {
+                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
+                    if !std::ptr::eq(src, exact) {
+                        if is_none(method) {
+                            return Err(PyError::type_error(format!(
+                                "'{}' object is not iterable",
+                                obj_type_name(obj)
+                            )));
+                        }
+                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                        return iter_check_is_iterator(w_iter);
+                    }
+                }
+            }
+            return Ok(obj);
+        }
+        if pyre_object::interp_itertools::is_permutations(obj) {
+            let exact = get_instantiate(&pyre_object::interp_itertools::PERMUTATIONS_TYPE);
             if !std::ptr::eq((*obj).w_class, exact) {
                 if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
                     if !std::ptr::eq(src, exact) {
@@ -13938,6 +13958,105 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     .map(|slot| pyre_object::gc_roots::shadow_stack_get(slot))
                     .collect(),
             ));
+        }
+        // itertools.permutations — PyPy W_Permutations.descr_next.
+        if pyre_object::interp_itertools::is_permutations(obj) {
+            let exact = get_instantiate(&pyre_object::interp_itertools::PERMUTATIONS_TYPE);
+            if !std::ptr::eq((*obj).w_class, exact) {
+                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__next__") {
+                    if !std::ptr::eq(src, exact) {
+                        return crate::call::call_function_impl_result(method, &[obj]);
+                    }
+                }
+            }
+
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
+            if state.stopped {
+                (*(w_self as *mut pyre_object::interp_itertools::W_Permutations))
+                    .raised_stop_iteration = true;
+                return Err(PyError::stop_iteration());
+            }
+            let r = state.r as usize;
+            let n = pyre_object::w_list_len(state.pool_w);
+
+            // Construct the result from the current indices before advancing
+            // the cycles, exactly as PyPy does.
+            let mut result_item_slots = Vec::with_capacity(r);
+            for i in 0..r {
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
+                let index = pyre_object::w_int_get_value(
+                    pyre_object::w_list_getitem(state.indices, i as i64)
+                        .expect("permutations index in range"),
+                );
+                let item = pyre_object::w_list_getitem(state.pool_w, index)
+                    .expect("permutations pool index in range");
+                pyre_object::gc_roots::pin_root(item);
+                result_item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
+            }
+            let result = pyre_object::w_tuple_new(
+                result_item_slots
+                    .into_iter()
+                    .map(|slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                    .collect(),
+            );
+            pyre_object::gc_roots::pin_root(result);
+            let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+            let mut i = r;
+            while i > 0 {
+                i -= 1;
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
+                let j = pyre_object::w_int_get_value(
+                    pyre_object::w_list_getitem(state.cycles, i as i64)
+                        .expect("permutations cycle in range"),
+                ) - 1;
+                if j > 0 {
+                    let w_j = pyre_object::w_int_new(j);
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
+                    pyre_object::w_list_setitem(state.cycles, i as i64, w_j);
+
+                    let swap_index = n - j as usize;
+                    let left = pyre_object::w_list_getitem(state.indices, i as i64)
+                        .expect("permutations left swap index in range");
+                    let right = pyre_object::w_list_getitem(state.indices, swap_index as i64)
+                        .expect("permutations right swap index in range");
+                    pyre_object::w_list_setitem(state.indices, i as i64, right);
+                    pyre_object::w_list_setitem(state.indices, swap_index as i64, left);
+                    return Ok(pyre_object::gc_roots::shadow_stack_get(result_slot));
+                }
+
+                let w_cycle = pyre_object::w_int_new((n - i) as i64);
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let state = &*(w_self as *const pyre_object::interp_itertools::W_Permutations);
+                pyre_object::w_list_setitem(state.cycles, i as i64, w_cycle);
+
+                // Rotate indices[i:] one position to the left.
+                let first = pyre_object::w_list_getitem(state.indices, i as i64)
+                    .expect("permutations rotation index in range");
+                let last = n - 1;
+                for k in i..last {
+                    let next = pyre_object::w_list_getitem(state.indices, (k + 1) as i64)
+                        .expect("permutations rotation source in range");
+                    pyre_object::w_list_setitem(state.indices, k as i64, next);
+                }
+                pyre_object::w_list_setitem(state.indices, last as i64, first);
+            }
+
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let state = &mut *(w_self as *mut pyre_object::interp_itertools::W_Permutations);
+            state.stopped = true;
+            if state.started {
+                return Err(PyError::stop_iteration());
+            }
+            state.started = true;
+            return Ok(pyre_object::gc_roots::shadow_stack_get(result_slot));
         }
         // itertools.compress — interp_itertools.py W_Compress.next_w.
         // Pull data first, then its matching selector; exhaustion of either

@@ -581,6 +581,61 @@ pub unsafe fn is_combinations_with_replacement(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &COMBINATIONS_WITH_REPLACEMENT_TYPE) }
 }
 
+// ── W_Permutations — PyPy interp_itertools.py:W_Permutations ───────
+//
+// `pool_w`, `indices`, and `cycles` are the translated RPython list
+// attributes.  PyPy leaves indices/cycles unset when r > len(pool_w), which
+// is represented by null list pointers while `stopped` is true.
+#[pyre_class("itertools.permutations", static_name = "PERMUTATIONS")]
+pub struct W_Permutations {
+    pub pool_w: PyObjectRef,
+    pub r: isize,
+    pub stopped: bool,
+    pub raised_stop_iteration: bool,
+    pub indices: PyObjectRef,
+    pub cycles: PyObjectRef,
+    pub started: bool,
+}
+
+pub fn w_permutations_new(
+    pool_w: PyObjectRef,
+    r: isize,
+    stopped: bool,
+    indices: PyObjectRef,
+    cycles: PyObjectRef,
+) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(pool_w);
+    if !indices.is_null() {
+        crate::gc_roots::pin_root(indices);
+    }
+    if !cycles.is_null() {
+        crate::gc_roots::pin_root(cycles);
+    }
+    W_Permutations::allocate_stable(W_Permutations {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        pool_w,
+        r,
+        stopped,
+        raised_stop_iteration: stopped,
+        indices,
+        cycles,
+        started: false,
+    })
+}
+
+/// Check if an object is a `W_Permutations`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_permutations(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &PERMUTATIONS_TYPE) }
+}
+
 // ── W_Compress — pypy/module/itertools/interp_itertools.py:W_Compress ──
 //
 // ```python
@@ -1093,6 +1148,22 @@ mod tests {
         assert_eq!(
             <W_CombinationsWithReplacement as crate::lltype::GcType>::SIZE,
             W_COMBINATIONS_WITH_REPLACEMENT_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_permutations_gc_descriptor_traces_all_owned_lists() {
+        assert_eq!(
+            W_PERMUTATIONS_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_Permutations, pool_w),
+                std::mem::offset_of!(W_Permutations, indices),
+                std::mem::offset_of!(W_Permutations, cycles),
+            ]
+        );
+        assert_eq!(
+            <W_Permutations as crate::lltype::GcType>::SIZE,
+            W_PERMUTATIONS_OBJECT_SIZE
         );
     }
 

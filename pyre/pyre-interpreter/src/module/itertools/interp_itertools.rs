@@ -122,64 +122,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // dataobject type would only save buffer copies; the deque-per-copy recipe
     // keeps the copies lazy and independent, which is what callers observe.
     crate::importing::appleveldef_install(ns, TEE_SRC, "<inline>", &["tee"]);
-    // permutations(iterable, r=None) — PyPy: pypy/module/itertools/interp_itertools.py
+    // PyPy W_Permutations: retain the pool, indices, and rollover cycles,
+    // yielding one permutation at a time.
     crate::module_ns_store(
         ns,
         "permutations",
-        crate::make_builtin_function("permutations", |args| {
-            // `interp_itertools.py W_Permutations.__init__` — iterable
-            // is required; missing argument is a TypeError, not an
-            // empty result that silently hides call-site bugs.
-            if args.is_empty() {
-                return Err(crate::PyError::type_error(
-                    "permutations() missing required argument 'iterable'",
-                ));
-            }
-            let pool = crate::builtins::collect_iterable(args[0])?;
-            let n = pool.len();
-            let r = if args.len() >= 2 {
-                if unsafe { pyre_object::is_none(args[1]) } {
-                    n
-                } else {
-                    let r = crate::builtins::space_index_w(args[1])?;
-                    if r < 0 {
-                        return Err(crate::PyError::value_error("r must be non-negative"));
-                    }
-                    r as usize
-                }
-            } else {
-                n
-            };
-            if r > n {
-                let list = pyre_object::w_list_new(vec![]);
-                return Ok(pyre_object::w_seq_iter_new(list, 0));
-            }
-            // Heap/Lehmer would be clearer; use a recursive closure-free helper.
-            fn perms(
-                pool: &[pyre_object::PyObjectRef],
-                r: usize,
-            ) -> Vec<Vec<pyre_object::PyObjectRef>> {
-                if r == 0 {
-                    return vec![vec![]];
-                }
-                let mut out = Vec::new();
-                for i in 0..pool.len() {
-                    let mut rest: Vec<_> = pool.to_vec();
-                    let head = rest.remove(i);
-                    for mut tail in perms(&rest, r - 1) {
-                        let mut v = vec![head];
-                        v.append(&mut tail);
-                        out.push(v);
-                    }
-                }
-                out
-            }
-            let all = perms(&pool, r);
-            let tuples: Vec<_> = all.into_iter().map(pyre_object::w_tuple_new).collect();
-            let n = tuples.len();
-            let list = pyre_object::w_list_new(tuples);
-            Ok(pyre_object::w_seq_iter_new(list, n))
-        }),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::PERMUTATIONS_TYPE)
+            .expect("itertools.permutations TypeDef initialized")
+            .as_ptr(),
     );
     // PyPy W_Combinations: retain pool/index/result state and advance one
     // lexicographic combination at a time.

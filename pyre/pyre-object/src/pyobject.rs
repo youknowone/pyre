@@ -598,6 +598,7 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (143, Some(0)),
     (144, Some(0)),
     (145, Some(0)),
+    (146, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every
@@ -1122,6 +1123,7 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
             145,
             typed::<crate::interp_itertools::W_CombinationsWithReplacement>(),
         ),
+        subclass_range_alias(146, typed::<crate::interp_itertools::W_Permutations>()),
     ]
 }
 
