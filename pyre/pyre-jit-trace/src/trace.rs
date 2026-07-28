@@ -2108,6 +2108,23 @@ fn try_adopt_single_frame_blackhole(
         latched.raising_exception,
     );
 
+    sfdbg!(
+        "drive outcome = {}",
+        match terminal.outcome {
+            majit_metainterp::jitexc::JitException::ContinueRunningNormally { .. } =>
+                "ContinueRunningNormally",
+            majit_metainterp::jitexc::JitException::DoneWithThisFrameVoid =>
+                "DoneWithThisFrameVoid",
+            majit_metainterp::jitexc::JitException::DoneWithThisFrameInt(_) =>
+                "DoneWithThisFrameInt",
+            majit_metainterp::jitexc::JitException::DoneWithThisFrameRef(_) =>
+                "DoneWithThisFrameRef",
+            majit_metainterp::jitexc::JitException::DoneWithThisFrameFloat(_) =>
+                "DoneWithThisFrameFloat",
+            majit_metainterp::jitexc::JitException::ExitFrameWithExceptionRef(_) =>
+                "ExitFrameWithExceptionRef",
+        }
+    );
     let adopted = match terminal.outcome {
         majit_metainterp::jitexc::JitException::ContinueRunningNormally {
             ref green_int, ..
