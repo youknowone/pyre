@@ -202,6 +202,16 @@ pub trait GcAllocator: Send {
     /// root set, so a moving collection under this call would strand them. The
     /// allocator must grow instead of evacuating. The default forwards to the
     /// collecting form, which is correct for a non-moving collector.
+    ///
+    /// The forward is not itself a guard, so the obligation is on the
+    /// implementor: a MOVING headerless-aware allocator must override this
+    /// rather than inherit the forward. No current one does, and the two shapes
+    /// that reach here are both safe — [`MiniMarkGC`](crate::collector::MiniMarkGC)
+    /// moves but is headered, so `alloc_nursery_headerless`'s own default panics
+    /// before any collection; the headerless boxes the backends install grow
+    /// their pool instead of evacuating, which is exactly what this method asks
+    /// for. Adding a moving headerless box without an override would reintroduce
+    /// the silent stranding.
     fn alloc_nursery_headerless_no_collect(&mut self, size: usize) -> GcRef {
         self.alloc_nursery_headerless(size)
     }
