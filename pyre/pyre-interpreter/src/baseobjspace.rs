@@ -5354,14 +5354,10 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
                     if !w_dict.is_null() {
                         if let Some(mod_getattr) = finditem_str(w_dict, "__getattr__")? {
                             if !mod_getattr.is_null() {
-                                match crate::call::call_function_impl_result(
-                                    mod_getattr,
-                                    &[w_name],
-                                ) {
+                                match crate::call::call_function_impl_result(mod_getattr, &[w_name])
+                                {
                                     Ok(v) => return Ok(v),
-                                    Err(e2)
-                                        if e2.kind == crate::PyErrorKind::AttributeError =>
-                                    {
+                                    Err(e2) if e2.kind == crate::PyErrorKind::AttributeError => {
                                         e = e2;
                                     }
                                     Err(e2) => return Err(e2),
