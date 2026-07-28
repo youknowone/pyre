@@ -15341,7 +15341,7 @@ fn same_inherited_slot(a: Option<PyObjectRef>, b: Option<PyObjectRef>) -> bool {
     }
 }
 
-fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_object = w_object();
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let Some(&w_type_arg) = positional.first() else {

@@ -564,6 +564,41 @@ fn init_iobase_type(ns: PyObjectRef) {
         "__getstate__",
         crate::make_builtin_function_with_arity("__getstate__", iobase_getstate, 1),
     );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__new__",
+            crate::typedef::make_new_descr(iobase_new),
+        )
+    };
+}
+
+/// `interp_iobase.py:335 __new__ = generic_new_descr(W_IOBase)`.
+///
+/// `typedef.py:558-564 generic_new_descr` allocates the instance and then runs
+/// the interp-level `W_IOBase.__init__`, whose only effect is
+/// `interp_iobase.py:63-64` — put the stream on the finalizer queue, so an
+/// unclosed one still flushes and closes once it becomes unreachable. Because
+/// it sits in `__new__` rather than in the app-level `__init__`, a subclass
+/// that overrides `__init__` without calling up is registered all the same.
+///
+/// Every `_io` type keeping the generic instance layout inherits this through
+/// the MRO: `FileIO`, the `_RawIOBase`/`_BufferedIOBase`/`_TextIOBase` bases,
+/// and app-level subclasses of any of them. The typed payloads override
+/// `__new__` and reach the same queue through [`tag_io_instance`].
+///
+/// The extra arguments go to `__init__`; `generic_new_descr` ignores its
+/// `__args__` in the same way.
+fn iobase_new(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, _) = crate::builtins::split_builtin_kwargs(args);
+    let Some(&cls) = positional.first() else {
+        return Err(crate::PyError::type_error(
+            "_IOBase.__new__(): not enough arguments",
+        ));
+    };
+    let obj = crate::typedef::object_descr_new(&[cls])?;
+    crate::executioncontext::register_finalizer(obj);
+    Ok(obj)
 }
 
 /// `interp_iobase.py:rawiobase_read_w` — the default raw `read` is a
