@@ -139,7 +139,7 @@ impl ObjectConverter {
             let body = self.body(object, "body", node)?;
             let decorator_list = self.decorators(object, node)?;
             let returns = self.opt_expr(object, "returns")?;
-            let type_params = self.type_params(object)?;
+            let type_params = self.type_params(object, node)?;
             Ok(ast::Stmt::FunctionDef(ast::StmtFunctionDef {
                 node_index: Default::default(),
                 range: Default::default(),
@@ -202,7 +202,7 @@ impl ObjectConverter {
                 .collect::<Result<Vec<_>, _>>()?;
             let body = self.body(object, "body", "ClassDef")?;
             let decorator_list = self.decorators(object, "ClassDef")?;
-            let type_params = self.type_params(object)?;
+            let type_params = self.type_params(object, "ClassDef")?;
             // An absent argument list and an empty one are different trees, and
             // only the former elides the parentheses.
             let arguments = if bases.is_empty() && keywords.is_empty() {
@@ -237,7 +237,7 @@ impl ObjectConverter {
             }))
         } else if self.is_node(object, "TypeAlias")? {
             let name = self.req_expr(object, "name", "TypeAlias")?;
-            let type_params = self.type_params(object)?;
+            let type_params = self.type_params(object, "TypeAlias")?;
             let value = self.req_expr(object, "value", "TypeAlias")?;
             Ok(ast::Stmt::TypeAlias(ast::StmtTypeAlias {
                 node_index: Default::default(),
@@ -428,12 +428,18 @@ impl ObjectConverter {
             if level < 0 {
                 return Err(crate::PyError::value_error("Negative ImportFrom level"));
             }
+            // The field is read as a Python index, so a value past the range a
+            // level is stored in has to stop here rather than wrap and turn a
+            // relative import into an absolute one.
+            let level = u32::try_from(level).map_err(|_| {
+                crate::PyError::overflow_error("Python int too large to convert to C int")
+            })?;
             Ok(ast::Stmt::ImportFrom(ast::StmtImportFrom {
                 node_index: Default::default(),
                 range: Default::default(),
                 module,
                 names,
-                level: level as u32,
+                level,
                 is_lazy: false,
                 runtime_level: None,
             }))
@@ -665,14 +671,19 @@ impl ObjectConverter {
 
     /// `type_params` postdates the original positional constructors, so a
     /// manually built legacy node without the field means an empty list.
-    fn type_params(&mut self, object: PyObjectRef) -> AstResult<Option<Box<ast::TypeParams>>> {
+    fn type_params(
+        &mut self,
+        object: PyObjectRef,
+        node: &str,
+    ) -> AstResult<Option<Box<ast::TypeParams>>> {
         let Some(field) = self.optional_field(object, "type_params")? else {
             return Ok(None);
         };
         if !unsafe { pyre_object::is_list(field) } {
-            return Err(crate::PyError::type_error(
-                "AST list field must be a list, not object",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "{node} field \"type_params\" must be a list, not a {}",
+                class_name(field)
+            )));
         }
         let values = unsafe { pyre_object::w_list_items_copy_as_vec(field) };
         if values.is_empty() {

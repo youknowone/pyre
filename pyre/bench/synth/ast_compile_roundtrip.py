@@ -147,6 +147,7 @@ def handbuilt():
         kw_defaults=kw.get("kd", []), defaults=kw.get("d", []))
     pat = lambda p: ast.Match(subject=ast.Constant(1),
                               cases=[ast.match_case(pattern=p, body=[ast.Pass()])])
+
     for label, node in (
         ("missing-conversion", ast.JoinedStr(values=[
             without(ast.FormattedValue(value=name, conversion=-1), "conversion")])),
@@ -207,6 +208,12 @@ def handbuilt():
                                            type_ignores=[])),
         ("match-value-bad-constant", ast.Module(body=[pat(ast.MatchValue(
             value=ast.Constant(value=None)))], type_ignores=[])),
+        # Only trees the two oracles agree on belong here: every backend's
+        # output is compared byte for byte against PyPy's. Where 3.14 and PyPy
+        # disagree the check lives in `astcompiler::validate`'s own tests.
+        ("match-mapping-store-key", ast.Module(body=[pat(ast.MatchMapping(
+            keys=[ast.Attribute(value=ast.Name("o", S), attr="a", ctx=ast.Load())],
+            patterns=[ast.MatchAs(pattern=None, name="v")], rest=None))], type_ignores=[])),
     ):
         tree = node if isinstance(node, ast.Module) else ast.Expression(body=node)
         try:

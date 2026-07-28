@@ -180,6 +180,7 @@ impl AstValidator {
             }
             ast::Stmt::TypeAlias(node) => {
                 self.validate_expr(&node.name, ast::ExprContext::Store)?;
+                self.validate_type_params(node.type_params.as_deref())?;
                 self.validate_expr(&node.value, ast::ExprContext::Load)
             }
             ast::Stmt::For(node) => {
@@ -267,6 +268,7 @@ impl AstValidator {
             "FunctionDef"
         };
         self.validate_body(&node.body, owner)?;
+        self.validate_type_params(node.type_params.as_deref())?;
         self.visit_parameters(&node.parameters)?;
         self.validate_decorators(&node.decorator_list)?;
         match &node.returns {
@@ -277,6 +279,7 @@ impl AstValidator {
 
     fn visit_class_def(&self, node: &ast::StmtClassDef) -> ValidateResult {
         self.validate_body(&node.body, "ClassDef")?;
+        self.validate_type_params(node.type_params.as_deref())?;
         if let Some(arguments) = node.arguments.as_deref() {
             self.validate_exprs(&arguments.args, ast::ExprContext::Load)?;
             for keyword in &arguments.keywords {
@@ -284,6 +287,29 @@ impl AstValidator {
             }
         }
         self.validate_decorators(&node.decorator_list)
+    }
+
+    /// A type parameter carries a name, and everything else it holds is an
+    /// expression read in Load context. The checked-in tree predates PEP 695
+    /// and has no counterpart, so this answers to 3.14.
+    fn validate_type_params(&self, type_params: Option<&ast::TypeParams>) -> ValidateResult {
+        let Some(type_params) = type_params else {
+            return Ok(());
+        };
+        for type_param in &type_params.type_params {
+            let (name, bound, default) = match type_param {
+                ast::TypeParam::TypeVar(node) => {
+                    (&node.name, node.bound.as_deref(), node.default.as_deref())
+                }
+                ast::TypeParam::TypeVarTuple(node) => (&node.name, None, node.default.as_deref()),
+                ast::TypeParam::ParamSpec(node) => (&node.name, None, node.default.as_deref()),
+            };
+            self.validate_name(name)?;
+            for expr in [bound, default].into_iter().flatten() {
+                self.validate_expr(expr, ast::ExprContext::Load)?;
+            }
+        }
+        Ok(())
     }
 
     fn validate_decorators(&self, decorators: &[ast::Decorator]) -> ValidateResult {
@@ -388,34 +414,45 @@ impl AstValidator {
         match pattern {
             ast::Pattern::MatchValue(node) => {
                 self.validate_expr(&node.value, ast::ExprContext::Load)?;
-                let literal = match node.value.as_ref() {
-                    ast::Expr::Constant(constant) => matches!(
-                        constant.value,
-                        ast::ConstantValue::Integer(_)
-                            | ast::ConstantValue::Float(_)
-                            | ast::ConstantValue::Complex { .. }
-                            | ast::ConstantValue::Str(_)
-                            | ast::ConstantValue::Bytes(_)
-                    ),
-                    // Anything the parser produced is a literal or an
-                    // attribute lookup already.
-                    _ => true,
-                };
-                if literal {
-                    Ok(())
-                } else {
-                    Err(validation_error(
-                        "unexpected constant inside of a literal pattern",
-                    ))
+                match node.value.as_ref() {
+                    ast::Expr::Constant(constant) => {
+                        // Ellipsis and the immutable containers are out; True,
+                        // False and None belong to MatchSingleton.
+                        if matches!(
+                            constant.value,
+                            ast::ConstantValue::Integer(_)
+                                | ast::ConstantValue::Float(_)
+                                | ast::ConstantValue::Complex { .. }
+                                | ast::ConstantValue::Str(_)
+                                | ast::ConstantValue::Bytes(_)
+                        ) {
+                            Ok(())
+                        } else {
+                            Err(validation_error(
+                                "unexpected constant inside of a literal pattern",
+                            ))
+                        }
+                    }
+                    // An attribute lookup is always permitted, and a complex
+                    // literal reaches here as the operation that builds it,
+                    // whose shape the code generator checks.
+                    ast::Expr::Attribute(_) | ast::Expr::BinOp(_) | ast::Expr::UnaryOp(_) => Ok(()),
+                    // Upstream stops at the constant check and lets everything
+                    // else through; 3.14 rejects it here, before the code
+                    // generator reports the same thing as a SyntaxError.
+                    _ => Err(validation_error(
+                        "patterns may only match literals and attribute lookups",
+                    )),
                 }
             }
             ast::Pattern::MatchSingleton(_) => Ok(()),
             ast::Pattern::MatchSequence(node) => self.validate_patterns(&node.patterns, true),
             ast::Pattern::MatchMapping(node) => {
-                if !node.keys.is_empty()
-                    && !node.patterns.is_empty()
-                    && node.keys.len() != node.patterns.len()
-                {
+                // Upstream compares the two only when both are non-empty, so a
+                // node carrying keys and no patterns reaches the code
+                // generator, which zips them; 3.14 compares unconditionally.
+                // `{**rest}` leaves both empty and still passes.
+                if node.keys.len() != node.patterns.len() {
                     return Err(validation_error(
                         "MatchMapping doesn't have the same number of keys as patterns",
                     ));
@@ -429,9 +466,13 @@ impl AstValidator {
                         ));
                     }
                 }
+                self.validate_exprs(&node.keys, ast::ExprContext::Load)?;
                 if let Some(rest) = &node.rest {
                     self.validate_capture(rest)?;
                 }
+                // Upstream walks `keys` here, which are expressions, so a
+                // pattern nested in the mapping goes unchecked; 3.14 walks the
+                // patterns and this follows it.
                 self.validate_patterns(&node.patterns, false)
             }
             ast::Pattern::MatchClass(node) => {
@@ -627,5 +668,202 @@ impl AstValidator {
             self.validate_exprs(&comprehension.ifs, ast::ExprContext::Load)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Where the walk and 3.14 disagree the shared roundtrip fixture cannot
+    /// carry the case: every backend's output there is compared against PyPy's.
+    fn validate(body: Vec<ast::Stmt>) -> ValidateResult {
+        validate_ast(&ast::Mod::Module(ast::ModModule {
+            node_index: Default::default(),
+            range: Default::default(),
+            body,
+            runtime_body: None,
+        }))
+    }
+
+    fn name(id: &str, ctx: ast::ExprContext) -> ast::Expr {
+        ast::Expr::Name(ast::ExprName {
+            node_index: Default::default(),
+            range: Default::default(),
+            id: id.into(),
+            ctx,
+        })
+    }
+
+    fn constant(value: i32) -> ast::Expr {
+        ast::Expr::Constant(ast::ExprConstant {
+            node_index: Default::default(),
+            range: Default::default(),
+            value: ast::ConstantValue::Integer(value.to_string().into_boxed_str()),
+            kind: None,
+            invalid_type: None,
+        })
+    }
+
+    fn pass() -> ast::Stmt {
+        ast::Stmt::Pass(ast::StmtPass {
+            node_index: Default::default(),
+            range: Default::default(),
+        })
+    }
+
+    fn matched(pattern: ast::Pattern) -> Vec<ast::Stmt> {
+        vec![ast::Stmt::Match(ast::StmtMatch {
+            node_index: Default::default(),
+            range: Default::default(),
+            subject: Box::new(constant(1)),
+            cases: vec![ast::MatchCase {
+                node_index: Default::default(),
+                range: Default::default(),
+                pattern,
+                guard: None,
+                body: vec![pass()],
+                runtime_body: None,
+            }],
+        })]
+    }
+
+    fn mapping(keys: Vec<ast::Expr>, patterns: Vec<ast::Pattern>) -> ast::Pattern {
+        ast::Pattern::MatchMapping(ast::PatternMatchMapping {
+            node_index: Default::default(),
+            range: Default::default(),
+            keys,
+            patterns,
+            rest: None,
+            runtime_keys: None,
+            runtime_patterns: None,
+        })
+    }
+
+    fn message(result: ValidateResult) -> String {
+        result.unwrap_err().message
+    }
+
+    #[test]
+    fn match_value_takes_only_a_literal_or_an_attribute() {
+        let value = ast::Pattern::MatchValue(ast::PatternMatchValue {
+            node_index: Default::default(),
+            range: Default::default(),
+            value: Box::new(name("foo", ast::ExprContext::Load)),
+        });
+        assert_eq!(
+            message(validate(matched(value))),
+            "patterns may only match literals and attribute lookups"
+        );
+
+        let value = ast::Pattern::MatchValue(ast::PatternMatchValue {
+            node_index: Default::default(),
+            range: Default::default(),
+            value: Box::new(ast::Expr::Attribute(ast::ExprAttribute {
+                node_index: Default::default(),
+                range: Default::default(),
+                value: Box::new(name("o", ast::ExprContext::Load)),
+                attr: ast::Identifier::new("a", Default::default()),
+                ctx: ast::ExprContext::Load,
+            })),
+        });
+        assert!(validate(matched(value)).is_ok());
+    }
+
+    #[test]
+    fn match_mapping_counts_keys_against_patterns() {
+        assert_eq!(
+            message(validate(matched(mapping(vec![constant(1)], Vec::new())))),
+            "MatchMapping doesn't have the same number of keys as patterns"
+        );
+        // `{**rest}` leaves both empty, which is not a mismatch.
+        assert!(validate(matched(mapping(Vec::new(), Vec::new()))).is_ok());
+    }
+
+    #[test]
+    fn match_mapping_reads_its_keys_in_load_context() {
+        let key = ast::Expr::Attribute(ast::ExprAttribute {
+            node_index: Default::default(),
+            range: Default::default(),
+            value: Box::new(name("o", ast::ExprContext::Store)),
+            attr: ast::Identifier::new("a", Default::default()),
+            ctx: ast::ExprContext::Load,
+        });
+        let pattern = ast::Pattern::MatchAs(ast::PatternMatchAs {
+            node_index: Default::default(),
+            range: Default::default(),
+            pattern: None,
+            name: Some(ast::Identifier::new("v", Default::default())),
+        });
+        assert_eq!(
+            message(validate(matched(mapping(vec![key], vec![pattern])))),
+            "expression must have Load context but has Store instead"
+        );
+    }
+
+    #[test]
+    fn match_mapping_walks_the_patterns_not_the_keys() {
+        // Upstream walks `keys`, so a star nested here goes unreported.
+        let star = ast::Pattern::MatchStar(ast::PatternMatchStar {
+            node_index: Default::default(),
+            range: Default::default(),
+            name: Some(ast::Identifier::new("a", Default::default())),
+        });
+        assert_eq!(
+            message(validate(matched(mapping(vec![constant(1)], vec![star])))),
+            "can't use MatchStar here"
+        );
+    }
+
+    #[test]
+    fn type_params_are_read_in_load_context() {
+        let type_params = |type_param| {
+            Some(Box::new(ast::TypeParams {
+                node_index: Default::default(),
+                range: Default::default(),
+                type_params: vec![type_param],
+                runtime_type_params: None,
+            }))
+        };
+        let function = |type_param| {
+            vec![ast::Stmt::FunctionDef(ast::StmtFunctionDef {
+                node_index: Default::default(),
+                range: Default::default(),
+                is_async: false,
+                decorator_list: Vec::new(),
+                name: ast::Identifier::new("f", Default::default()),
+                type_params: type_params(type_param),
+                parameters: Box::new(ast::Parameters::default()),
+                returns: None,
+                body: vec![pass()],
+                runtime_decorator_list: None,
+                runtime_type_comment: None,
+                runtime_type_comment_bytes: None,
+                runtime_body: None,
+            })]
+        };
+
+        let bound = ast::TypeParam::TypeVar(ast::TypeParamTypeVar {
+            node_index: Default::default(),
+            range: Default::default(),
+            name: ast::Identifier::new("T", Default::default()),
+            bound: Some(Box::new(name("x", ast::ExprContext::Store))),
+            default: None,
+        });
+        assert_eq!(
+            message(validate(function(bound))),
+            "expression must have Load context but has Store instead"
+        );
+
+        let named = ast::TypeParam::ParamSpec(ast::TypeParamParamSpec {
+            node_index: Default::default(),
+            range: Default::default(),
+            name: ast::Identifier::new("None", Default::default()),
+            default: None,
+        });
+        assert_eq!(
+            message(validate(function(named))),
+            "identifier field can't represent 'None' constant"
+        );
     }
 }
