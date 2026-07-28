@@ -1511,9 +1511,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // (`rpython/jit/metainterp/executor.py:446`), is neither can-raise nor a
     // call (`resoperation.py:1124-1125`), and is inserted only by the backend
     // GC rewrite pass after optimization (`backend/llsupport/rewrite.py:948`),
-    // so it never participates in the metainterp's side-effect analysis.  On
-    // the in-place Object-append arm it is not recorded at all, for the same
-    // reason — see `FbwWalkMode::append_inplace_wb_covered`.
+    // so it never participates in the metainterp's side-effect analysis.
     let is_idempotent_gc_barrier = pyre_interpreter::is_list_write_barrier(func_ptr as usize);
     if allboxes.len() - 1 > majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY {
         return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
@@ -3430,31 +3428,18 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                 .profiler()
                 .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
         }
-        // `list_write_barrier` on the Object strategy's in-place append arm:
-        // the backend GC rewrite already marks the same store's items block
-        // with `COND_CALL_GC_WB_ARRAY`, and the list's `items` pointer did not
-        // change, so a recorded barrier call is a second barrier upstream never
-        // emits. Skip the record; the executor below still runs it concretely,
-        // because the walk itself mutates the live heap. `OpRef::NONE` is safe
-        // as the result slot: the barrier is void, so the only consumer
-        // (`set_opref_concrete` on the executed result) is the `Type::Void`
-        // no-op arm.
-        let wb_covered = ctx
-            .fbw_mode
-            .append_inplace_wb_covered_receiver
-            .is_some_and(|receiver| {
-                allboxes.len() == 2
-                    && matches!(ctx.trace_ctx.box_value(allboxes[0]), Some(majit_ir::Value::Int(addr))
-                        if pyre_interpreter::is_list_write_barrier(addr as usize))
-                    && matches!(ctx.trace_ctx.box_value(allboxes[1]), Some(majit_ir::Value::Ref(r))
-                        if r.as_usize() == receiver)
-            });
-        let recorded = if wb_covered {
-            OpRef::NONE
-        } else {
-            ctx.trace_ctx
-                .record_op_with_descr(call_opcode, &allboxes, descr.clone())
-        };
+        // Always record `list_write_barrier` on the Object strategy's in-place
+        // append arm.  Dropping it in favour of the backend's
+        // `COND_CALL_GC_WB_ARRAY` on the block's `setarrayitem` is unsound: a
+        // guard-failure bridge that re-materializes the items block appends into
+        // it without that array barrier ever firing, so an `old -> young` slot
+        // store leaves the block off the remembered set.  A later minor frees
+        // the still-referenced young element and the collector then reads a
+        // freed (poison) header.  The list barrier remembers the enclosing
+        // `W_ListObject`, whose trace reaches every slot, and keeps them alive.
+        let recorded = ctx
+            .trace_ctx
+            .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
         // pyjitpl.py `_record_helper_pure` parity: for
         // `CallPure*` whose every argbox carries a known `box_value`,

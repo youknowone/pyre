@@ -1479,12 +1479,10 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // store leaves to native ops, leaving `list_write_barrier(l)` as a
     // residual call. Register it so the codewriter resolves the residual to a
     // runtime-patchable address instead of a `symbolic_fnaddr_for_path` hash
-    // the inline sub-walk must decline. The address is also what the walker
-    // matches on to drop the residual entirely when the backend GC rewrite
-    // already covers the store (`FbwWalkMode::append_inplace_wb_covered`);
-    // with an off-GC ItemsBlock the residual stays, because there the
-    // collector reaches the block's slots only through the remembered
-    // `W_ListObject`.
+    // the inline sub-walk must decline. The residual barrier remembers the
+    // enclosing `W_ListObject`, whose trace reaches every item slot, and is
+    // the only thing keeping an appended `old -> young` element reachable
+    // across a minor collection.
     push_alias_pair(
         &mut entries,
         "pyre_object::listobject::list_write_barrier",

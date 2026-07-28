@@ -1161,27 +1161,6 @@ pub unsafe fn w_list_uses_empty_storage(obj: PyObjectRef) -> bool {
     list.strategy == ListStrategy::Empty
 }
 
-/// True when the next `w_list_append` on `obj` takes the Object strategy's
-/// in-place arm (`rlist.py:285` resize-ge fast case) into a GC-managed items
-/// block: spare capacity, so the store is an item-slot write and the list's
-/// `items` pointer does not change.
-///
-/// The tracer uses this to decide whether the recorded trace needs
-/// `list_write_barrier` at all — see `FbwWalkMode::append_inplace_wb_covered`.
-/// A `std::alloc` block (`PYRE_GC_ITEMSBLOCK=0`) answers false: it has no GC
-/// header for an array barrier to mark, so the barrier on the enclosing
-/// `W_ListObject` is the only thing keeping the block's slots reachable.
-///
-/// # Safety
-/// `obj` must point to a valid `W_ListObject`.
-pub unsafe fn w_list_append_stores_into_gc_block_in_place(obj: PyObjectRef) -> bool {
-    let list = &*(obj as *const W_ListObject);
-    list.strategy == ListStrategy::Object
-        && ll_list_obj_length(list) < ll_list_obj_capacity(list)
-        && !list.items.is_null()
-        && crate::gc_hook::try_gc_owns_object(list.items as *mut u8)
-}
-
 /// Rebuild the list's object storage from a Vec.
 unsafe fn rebuild_object_items(list: &mut W_ListObject, items: Vec<PyObjectRef>) {
     list.set_object_items_from_vec(items);

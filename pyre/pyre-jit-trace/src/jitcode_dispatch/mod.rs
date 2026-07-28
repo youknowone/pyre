@@ -891,34 +891,6 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// boundary rather than mapping the callee `op_pc` through the outer
     /// jitcode in `walker_capture_snapshot_for_last_guard`.
     pub inline_subwalk: bool,
-    /// The enclosing `w_list_append` fold took the Object strategy's in-place
-    /// arm on a block that existed before this append, so the appended ref
-    /// lands in a `SetarrayitemGc` the backend GC rewrite already covers with
-    /// `COND_CALL_GC_WB_ARRAY`
-    /// (`rewrite.py:936-944` `handle_write_barrier_setarrayitem`). The list's
-    /// own `items` pointer is unchanged on that arm, so remembering the
-    /// `W_ListObject` adds nothing the array barrier does not already do.
-    ///
-    /// `list_write_barrier` still RUNS concretely during the walk — the walk
-    /// mutates the live heap — but recording it would leave a barrier call in
-    /// the compiled trace, and upstream emits none: pyjitpl never executes a
-    /// write barrier (`executor.py:446`), `COND_CALL_GC_WB` is neither
-    /// can-raise nor a call (`resoperation.py:1124-1125`), and the only
-    /// barrier in a compiled loop is the one the backend rewrite inserts.
-    ///
-    /// Carries the receiver address rather than a flag so only that list's
-    /// barrier is dropped — a barrier reached for any other list inside the
-    /// sub-walk is recorded normally.
-    ///
-    /// Never set for Empty->Object promotion: that transition also installs
-    /// the new block in `W_ListObject.items`, so the owner barrier is
-    /// load-bearing even though the subsequent element store is in-place.
-    ///
-    /// Only set while the items block is GC-managed. With
-    /// `PYRE_GC_ITEMSBLOCK=0` the block is `std::alloc` memory with no GC
-    /// header, the collector reaches its slots only through the remembered
-    /// `W_ListObject`, and the hand barrier is load-bearing.
-    pub append_inplace_wb_covered_receiver: Option<usize>,
     /// A bridge-carrier resume folds nested self-recursive calls directly to
     /// `CALL_ASSEMBLER` (`opimpl_recursive_call_assembler`) rather than
     /// re-unrolling the call tree to the multi-frame depth cap.
@@ -984,7 +956,6 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
         Self {
             snapshot_sym: std::ptr::null(),
             inline_subwalk: false,
-            append_inplace_wb_covered_receiver: None,
             carrier_resume: false,
             current_exception_seed: None,
             current_exception_seed_concrete: pyre_object::PY_NULL,
