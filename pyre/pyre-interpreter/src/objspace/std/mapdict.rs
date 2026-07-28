@@ -2471,7 +2471,8 @@ unsafe fn terminator_read<O: MapdictObject>(
             // from the materialised instance dict (`space.finditem_str(
             // obj.getdict(space), name)`).
             let w_dict = obj.getdict();
-            unsafe { pyre_object::w_dict_getitem_wtf8(w_dict, name) }
+            let backing = crate::type_methods::resolve_dict_backing(w_dict);
+            unsafe { pyre_object::w_dict_getitem_wtf8(backing, name) }
         }
         // Terminator / DictTerminator / NoDictTerminator read nothing.
         _ => None,
@@ -2656,8 +2657,9 @@ unsafe fn node_delete<O: MapdictObject>(
             // carrier on this terminator (`Terminator.copy(self, obj)`).
             TerminatorKind::Devolved if attrkind == DICT => {
                 let w_dict = obj.getdict();
+                let backing = crate::type_methods::resolve_dict_backing(w_dict);
                 let w_key = pyre_object::w_str_from_wtf8(name.to_owned());
-                unsafe { pyre_object::w_dict_delitem(w_dict, w_key) };
+                unsafe { pyre_object::w_dict_delitem(backing, w_key) };
                 Some(unsafe { node_copy(self_node, obj) })
             }
             _ => None,
@@ -3071,7 +3073,8 @@ unsafe fn write_terminator<O: MapdictObject>(
             // into the materialised instance dict (`space.setitem_str(
             // obj.getdict(space), name, w_value)`).
             let w_dict = obj.getdict();
-            unsafe { pyre_object::w_dict_setitem_wtf8(w_dict, name, w_value) };
+            let backing = crate::type_methods::resolve_dict_backing(w_dict);
+            unsafe { pyre_object::w_dict_setitem_wtf8(backing, name, w_value) };
             return true;
         }
         _ => {}
@@ -3889,6 +3892,11 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
             "setting dictionary to a non-dict".to_string(),
         ));
     }
+    if crate::type_methods::resolve_dict_backing(w_dict).is_null() {
+        return Err(PyError::type_error(
+            "setting dictionary to a non-dict".to_string(),
+        ));
+    }
     if unsafe { pyre_object::is_instance(self_ref) } {
         // mapdict.py:892-900: the old dict has `self` as its dstorage, so
         // before pointing the "dict" SPECIAL slot at the new dict, force the
@@ -3899,12 +3907,13 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
         // `old = obj.__dict__; obj.__dict__ = {}` leaves `old` an empty shell
         // that still mirrors the live instance.
         let w_olddict = _obj_getdict(self_ref);
+        let old_backing = crate::type_methods::resolve_dict_backing(w_olddict);
         let is_map_view = unsafe {
-            pyre_object::dictmultiobject::w_dict_get_strategy(w_olddict).strategy_kind()
+            pyre_object::dictmultiobject::w_dict_get_strategy(old_backing).strategy_kind()
                 == pyre_object::dictmultiobject::StrategyKind::Map
         };
         if is_map_view {
-            unsafe { mapdict_switch_to_object_strategy(w_olddict) };
+            unsafe { mapdict_switch_to_object_strategy(old_backing) };
         }
         let flag = unsafe { instance_set_dict_slot(self_ref, w_dict) };
         debug_assert!(flag, "write to the \"dict\" SPECIAL slot failed");
