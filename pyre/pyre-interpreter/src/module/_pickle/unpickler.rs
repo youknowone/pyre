@@ -140,23 +140,37 @@ impl W_Unpickler {
     }
 
     fn load(&mut self) -> Result<PyObjectRef, PyError> {
-        // Fresh stack each load; the memo persists across `load` calls so a
-        // later object can back-reference one memoized by an earlier load
-        // (lazily created when the unpickler was built only via `__new__`).
-        self.w_stack = pyre_object::listobject::w_list_new(Vec::new());
-        self.w_metastack = pyre_object::listobject::w_list_new(Vec::new());
-        if unsafe { pyre_object::is_none(self.w_memo) } {
-            self.w_memo = pyre_object::listobject::w_list_new(Vec::new());
-            self.memo_index = 0;
-        }
-        self.w_frame = pyre_object::w_none();
-        self.frame_index = 0;
-        self.proto = 0;
-
+        // Pin `self` before the fresh-stack allocations: `w_list_new` can
+        // collect and relocate the unpickler, so the stores must go through the
+        // re-read `cur(slot)` and each store into the (possibly already-marked)
+        // unpickler needs the write barrier.
         let self_ptr = self as *mut W_Unpickler as PyObjectRef;
         let _roots = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(self_ptr);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+        // Fresh stack each load; the memo persists across `load` calls so a
+        // later object can back-reference one memoized by an earlier load
+        // (lazily created when the unpickler was built only via `__new__`).
+        let w_stack = pyre_object::listobject::w_list_new(Vec::new());
+        let me = cur(slot);
+        me.w_stack = w_stack;
+        unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
+        let w_metastack = pyre_object::listobject::w_list_new(Vec::new());
+        let me = cur(slot);
+        me.w_metastack = w_metastack;
+        unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
+        if unsafe { pyre_object::is_none(cur(slot).w_memo) } {
+            let w_memo = pyre_object::listobject::w_list_new(Vec::new());
+            let me = cur(slot);
+            me.w_memo = w_memo;
+            me.memo_index = 0;
+            unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
+        }
+        let me = cur(slot);
+        me.w_frame = pyre_object::w_none();
+        me.frame_index = 0;
+        me.proto = 0;
 
         loop {
             let opcode = read1(slot)?;
@@ -229,6 +243,7 @@ impl W_Unpickler {
     #[setter]
     fn set_persistent_load(&mut self, w_value: PyObjectRef) {
         self.w_persistent_load = w_value;
+        unpickler_write_barrier(self as *mut W_Unpickler as PyObjectRef);
     }
 
     #[deleter("persistent_load")]
@@ -284,6 +299,7 @@ impl W_Unpickler {
             };
             me.w_memo = w_list;
             me.memo_index = next;
+            unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
         } else if unsafe { pyre_object::is_dict(w_value) } {
             // Validate keys, then discard: a dict assignment yields an empty memo.
             let items = unsafe { pyre_object::dictmultiobject::w_dict_items(w_value) };
@@ -301,6 +317,7 @@ impl W_Unpickler {
             };
             me.w_memo = empty;
             me.memo_index = 0;
+            unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
         } else {
             return Err(PyError::type_error(format!(
                 "'memo' attribute must be an UnpicklerMemoProxy object or dict, not {}",
@@ -393,6 +410,7 @@ mod memo_proxy {
             };
             u.w_memo = empty;
             u.memo_index = 0;
+            unpickler_write_barrier(u as *mut W_Unpickler as PyObjectRef);
         }
     }
 }
@@ -401,6 +419,18 @@ mod memo_proxy {
 #[inline]
 fn cur(slot: usize) -> &'static mut W_Unpickler {
     unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(slot) as *mut W_Unpickler) }
+}
+
+/// Old-to-young / incremental-mark write barrier for a store into the
+/// unpickler's own GC-pointer fields (`w_stack` / `w_metastack` / `w_memo` /
+/// `w_frame` / …). RPython's GC transform emits `ll_writebarrier` after every
+/// such store; the hand-written port must call it, or an incremental major
+/// collection sweeps a freshly stored (white) child that the already-marked
+/// unpickler still references — leaving a dangling field the next mark trips
+/// over.
+#[inline]
+fn unpickler_write_barrier(obj: PyObjectRef) {
+    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 // ── stack / metastack helpers ────────────────────────────────────────
@@ -432,7 +462,9 @@ fn mark(slot: usize) {
     let me = cur(slot);
     unsafe { pyre_object::listobject::w_list_append(me.w_metastack, me.w_stack) };
     let new_stack = pyre_object::listobject::w_list_new(Vec::new());
-    cur(slot).w_stack = new_stack;
+    let me = cur(slot);
+    me.w_stack = new_stack;
+    unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
 }
 
 /// `pop_mark` — return the items pushed since the last MARK and restore the
@@ -442,7 +474,9 @@ fn pop_mark(slot: usize) -> Result<PyObjectRef, PyError> {
     let items = me.w_stack;
     let prev = unsafe { pyre_object::listobject::w_list_pop_end(me.w_metastack) }
         .ok_or_else(|| unpickling_error("no items on stack"))?;
-    cur(slot).w_stack = prev;
+    let me = cur(slot);
+    me.w_stack = prev;
+    unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
     Ok(items)
 }
 
@@ -644,6 +678,7 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             let me = cur(slot);
             me.w_frame = w_frame;
             me.frame_index = 0;
+            unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
         }
         x if x == op::NONE => push(slot, pyre_object::w_none()),
         x if x == op::NEWTRUE => push(slot, pyre_object::w_bool_from(true)),
