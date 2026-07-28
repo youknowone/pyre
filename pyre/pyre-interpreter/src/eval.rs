@@ -7368,6 +7368,25 @@ else:
     }
 
     #[test]
+    fn test_exact_immutable_rejects_layout_compatible_class_assignment() {
+        let source = "\
+class MyInt(int):
+    __slots__ = ()
+try:
+    (1).__class__ = MyInt
+except TypeError:
+    result = True
+else:
+    result = False";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("immutable exact builtin class-assignment regression");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(is_true(result).unwrap());
+        }
+    }
+
+    #[test]
     fn test_function_dunder_globals_and_code_are_materialized() {
         crate::test_hooks::install_hash_hook();
         let source = "\

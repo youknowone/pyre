@@ -9961,18 +9961,6 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
                 pyre_object::type_name_of(w_newcls),
             )));
         }
-        // objectobject.py:166-171 — assignment targets are heap types or the
-        // exact module type.  The latter lets a ModuleType subclass restore
-        // its receiver to ModuleType after temporarily overriding the slots.
-        let w_module_type =
-            crate::typedef::gettypefor(&pyre_object::MODULE_TYPE as *const pyre_object::PyType)
-                .map_or(PY_NULL, |p| p.as_ptr());
-        if !w_type_is_heaptype(w_newcls) && !std::ptr::eq(w_newcls, w_module_type) {
-            return Err(crate::PyError::type_error(
-                "__class__ assignment only supported for heap types or ModuleType subclasses"
-                    .to_string(),
-            ));
-        }
         // objectobject.py:146-147 — get the old class
         let w_oldcls = match crate::typedef::r#type(w_obj) {
             Some(c) => c,
@@ -9982,10 +9970,21 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
                 ));
             }
         };
-        if !w_type_is_heaptype(w_oldcls.as_ptr()) && !std::ptr::eq(w_oldcls.as_ptr(), w_module_type)
-        {
+        // objectobject.py:166-171 plus W_Root.setclass: both ends must be
+        // mutable heap types, except that the exact module type participates
+        // so a ModuleType subclass can be installed on and removed from a
+        // module object.  Checking only the new class bypassed
+        // W_Root.setclass and let immutable exact builtins be retagged as
+        // layout-compatible heap subclasses.
+        let w_module_type =
+            crate::typedef::gettypefor(&pyre_object::MODULE_TYPE as *const pyre_object::PyType)
+                .map_or(PY_NULL, |p| p.as_ptr());
+        let old_supported =
+            w_type_is_heaptype(w_oldcls.as_ptr()) || std::ptr::eq(w_oldcls.as_ptr(), w_module_type);
+        let new_supported = w_type_is_heaptype(w_newcls) || std::ptr::eq(w_newcls, w_module_type);
+        if !old_supported || !new_supported {
             return Err(crate::PyError::type_error(
-                "__class__ assignment only supported for mutable types or ModuleType subclasses"
+                "__class__ assignment only supported for heap types or ModuleType subclasses"
                     .to_string(),
             ));
         }
