@@ -259,9 +259,7 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
         if let Some(canonical) = crate::typedef::gettypefor(&pyre_object::interp_array::ARRAY_TYPE)
         {
             if !std::ptr::eq(cls, canonical.as_ptr()) {
-                unsafe {
-                    (*obj).w_class = cls;
-                }
+                crate::typedef::tag_subclass_instance(obj, cls);
             }
         }
     }

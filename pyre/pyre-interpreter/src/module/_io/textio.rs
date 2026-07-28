@@ -845,8 +845,7 @@ impl W_TextIOWrapper {
         let obj = Self::allocate_stable(Self::default());
         // A subclass still uses this concrete storage layout, while its
         // Python-visible class remains `cls`.
-        unsafe { (*obj).w_class = cls };
-        obj
+        super::tag_io_instance(obj, cls)
     }
 
     fn __init__(

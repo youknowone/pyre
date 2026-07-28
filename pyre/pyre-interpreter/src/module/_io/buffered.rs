@@ -547,8 +547,9 @@ impl W_BufferedReader {
 )]
 impl W_BufferedReader {
     #[staticmethod]
-    fn __new__(_cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
-        W_BufferedReader::allocate_stable(W_BufferedReader::default())
+    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
+        let obj = W_BufferedReader::allocate_stable(W_BufferedReader::default());
+        super::tag_io_instance(obj, cls)
     }
 
     fn __init__(

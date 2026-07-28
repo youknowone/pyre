@@ -208,6 +208,24 @@ fn iobase_next(args: &[PyObjectRef]) -> crate::PyResult {
     }
 }
 
+/// Tag a freshly allocated `_io` object with the class being constructed and
+/// put it on the finalizer queue, `interp_iobase.py:63-64`.
+///
+/// Exactly one registration per object: `iobase_del` is inherited by every
+/// subclass, and `_call_finalizer` resolves `__del__` on the instance's own
+/// type, so an app-level override is reached through this same registration.
+/// Routing through `typedef::tag_subclass_instance` instead would register a
+/// second time for a subclass that defines `__del__`, and run it twice.
+pub(crate) fn tag_io_instance(obj: PyObjectRef, cls: PyObjectRef) -> PyObjectRef {
+    if !cls.is_null() {
+        unsafe {
+            (*obj).w_class = cls;
+        }
+    }
+    crate::executioncontext::register_iobase_finalizer(obj);
+    obj
+}
+
 fn iobase_del(args: &[PyObjectRef]) -> crate::PyResult {
     let Some(&self_obj) = args.first() else {
         return Ok(w_none());

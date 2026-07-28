@@ -730,7 +730,7 @@ pub fn descr__init__weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
     Ok(pyre_object::w_none())
 }
 
-/// pypy/module/_weakref/interp__weakref.py:216-223 descr_hash
+/// pypy/module/_weakref/interp__weakref.py:212-219 descr_hash
 ///
 /// ```python
 /// def descr_hash(self):
@@ -755,8 +755,16 @@ pub fn descr_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if w_obj.is_null() || unsafe { pyre_object::is_none(w_obj) } {
         return Err(PyError::type_error("weak object has gone away".to_string()));
     }
-    // pyre's hash: identity-based for non-int/non-str. Mirrors space.hash(w_obj).
-    let h = pyre_object::w_int_new(w_obj as i64);
+    // `self.w_hash = self.space.hash(w_obj)`: the reference hashes as its
+    // referent, so a ref and the object it points at land in the same bucket.
+    // `hash_w_strict` can run a user-defined `__hash__`, which allocates, so
+    // the referent is rooted across the call and `current_self` re-reads the
+    // reference afterwards.
+    pyre_object::gc_roots::pin_root(w_obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let h = pyre_object::w_int_new(crate::baseobjspace::hash_w_strict(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+    )?);
     write_attr(current_self(), ATTR_W_HASH, h);
     Ok(h)
 }

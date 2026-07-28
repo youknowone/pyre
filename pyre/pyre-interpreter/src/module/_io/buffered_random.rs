@@ -655,7 +655,7 @@ impl W_BufferedRandom {
 )]
 impl W_BufferedRandom {
     #[staticmethod]
-    fn __new__(_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let (params, kwargs) = crate::builtins::split_builtin_kwargs(args);
         let given = params.len().saturating_sub(1) + crate::builtins::real_kwarg_count(kwargs);
         if given > 2 {
@@ -664,9 +664,8 @@ impl W_BufferedRandom {
                 given
             )));
         }
-        Ok(W_BufferedRandom::allocate_stable(
-            W_BufferedRandom::default(),
-        ))
+        let obj = W_BufferedRandom::allocate_stable(W_BufferedRandom::default());
+        Ok(super::tag_io_instance(obj, cls))
     }
 
     fn __init__(

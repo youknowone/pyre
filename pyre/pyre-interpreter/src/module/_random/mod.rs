@@ -151,9 +151,9 @@ impl W_Random {
         let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 2;
         let seed_slot = cls_slot + 1;
         let obj = W_Random::allocate_stable(W_Random::default());
-        unsafe {
-            (*obj).w_class = pyre_object::gc_roots::shadow_stack_get(cls_slot);
-        }
+        crate::typedef::tag_subclass_instance(obj, unsafe {
+            pyre_object::gc_roots::shadow_stack_get(cls_slot)
+        });
         let random = W_Random::from_obj(obj)
             .expect("a freshly allocated _random.Random has the Random layout");
         random.seed(pyre_object::gc_roots::shadow_stack_get(seed_slot))?;

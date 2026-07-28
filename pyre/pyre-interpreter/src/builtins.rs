@@ -4111,9 +4111,7 @@ fn type_descr_new_with_metaclass(
         // rclass.py:739-743 — set w_class (typeptr) at allocation time.
         // For type objects, w_class is the metaclass (type(C) → Meta).
         // baseobjspace.py getclass() returns the metatype.
-        unsafe {
-            (*w_type).w_class = w_metaclass;
-        }
+        crate::typedef::tag_subclass_instance(w_type, w_metaclass);
 
         // type_new_classcell — bind the captured `__classcell__` to the
         // new type so `__class__` / zero-arg `super()` in the methods
@@ -5039,9 +5037,7 @@ fn os_error_family_new(
         cls
     };
     if let Some(w_target) = w_target {
-        unsafe {
-            (*(exc as *mut pyre_object::PyObject)).w_class = w_target;
-        }
+        crate::typedef::tag_subclass_instance(exc, w_target);
     }
     // Fill the slots after the retag so `os_error_fill_slots` can see the
     // resolved class (the `BlockingIOError` numeric-filename special-case).
@@ -5318,9 +5314,7 @@ macro_rules! exc_new_wrapper {
             // Set the exception's w_class to the actual exception type (e.g. AssertionError)
             // so that `type(e) is AssertionError` holds and `except ExcType` via isinstance works.
             if let Some(cls) = cls {
-                unsafe {
-                    (*(exc as *mut pyre_object::PyObject)).w_class = cls;
-                }
+                crate::typedef::tag_subclass_instance(exc, cls);
             }
             Ok(exc)
         }
@@ -5703,8 +5697,8 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         pyre_object::interp_exceptions::ExcKind::BaseException
     };
     let exc = pyre_object::interp_exceptions::w_exception_new_empty(kind);
+    crate::typedef::tag_subclass_instance(exc, cls);
     unsafe {
-        (*exc).w_class = cls;
         let tuple = pyre_object::w_tuple_new(exceptions);
         let w_dict = pyre_object::interp_exceptions::w_exception_getdict(exc);
         pyre_object::w_dict_setitem_str(w_dict, EG_MESSAGE_KEY, message);

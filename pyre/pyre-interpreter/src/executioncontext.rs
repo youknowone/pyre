@@ -180,6 +180,20 @@ pub fn register_native_buffer_finalizer(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
 }
 
+/// `interp_iobase.py:63-64 W_IOBase.__init__`: `if self.needs_finalizer():
+/// self.register_finalizer(space)`.
+///
+/// An unclosed file must still flush and close when it becomes unreachable,
+/// and `_io`'s `__del__` (`module/_io/mod.rs` `iobase_del`) does exactly
+/// that. It is a builtin method on the interp-level type, so `hasuserdel` —
+/// which `type.__new__` sets only for a class whose own dict carries
+/// `__del__` — is false here and [`maybe_register_user_finalizer`] would
+/// skip the object. Registration is therefore explicit at construction,
+/// as upstream does it.
+pub fn register_iobase_finalizer(obj: PyObjectRef) {
+    pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
+}
+
 /// Register an object that owns a `WeakrefLifeline`. PyPy's GC invalidates the
 /// rweakrefs and registers callback-bearing lifelines themselves; until pyre's
 /// mapdict weakref SPECIAL slot is inline, the address-keyed slot keeps that

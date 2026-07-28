@@ -322,8 +322,9 @@ impl W_BufferedWriter {
 )]
 impl W_BufferedWriter {
     #[staticmethod]
-    fn __new__(_cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
-        W_BufferedWriter::allocate_stable(W_BufferedWriter::default())
+    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
+        let obj = W_BufferedWriter::allocate_stable(W_BufferedWriter::default());
+        super::tag_io_instance(obj, cls)
     }
 
     fn __init__(

@@ -2122,7 +2122,7 @@ fn module_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let w_module = pyre_object::w_module_new_managed("");
     if let Some(cls) = args.first().copied() {
         if !cls.is_null() {
-            unsafe { (*w_module).w_class = cls };
+            tag_subclass_instance(w_module, cls);
         }
     }
     Ok(w_module)
@@ -3003,7 +3003,7 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `hasuserdel`, so tagging must precede registration. Registering an
 /// instance whose type has no `__del__` is a no-op, the hook gates on
 /// `hasuserdel` exactly as upstream does.
-fn tag_subclass_instance(obj: PyObjectRef, sub: PyObjectRef) -> PyObjectRef {
+pub(crate) fn tag_subclass_instance(obj: PyObjectRef, sub: PyObjectRef) -> PyObjectRef {
     unsafe {
         (*obj).w_class = sub;
     }
@@ -12219,7 +12219,7 @@ fn staticmethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
     check_user_subclass(staticmethod_type, cls)?;
     let sm = pyre_object::function::w_staticmethod_new(w_none());
     if !std::ptr::eq(cls, staticmethod_type) {
-        unsafe { (*sm).w_class = cls };
+        tag_subclass_instance(sm, cls);
     }
     Ok(sm)
 }
@@ -12505,7 +12505,7 @@ fn classmethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
     check_user_subclass(classmethod_type, cls)?;
     let cm = pyre_object::function::w_classmethod_new(w_none());
     if !std::ptr::eq(cls, classmethod_type) {
-        unsafe { (*cm).w_class = cls };
+        tag_subclass_instance(cm, cls);
     }
     Ok(cm)
 }
@@ -12833,7 +12833,7 @@ fn property_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
     check_user_subclass(property_type, cls)?;
     let prop = pyre_object::w_property_new(PY_NULL, PY_NULL, PY_NULL);
     if !std::ptr::eq(cls, property_type) {
-        unsafe { (*prop).w_class = cls };
+        tag_subclass_instance(prop, cls);
     }
     Ok(prop)
 }
@@ -22848,7 +22848,7 @@ fn itertools_alloc_for_class(
     // freshly allocated interpreter object.
     check_user_subclass(exact_type, cls)?;
     if !std::ptr::eq(cls, exact_type) {
-        unsafe { (*obj).w_class = cls };
+        tag_subclass_instance(obj, cls);
     }
     Ok(obj)
 }
