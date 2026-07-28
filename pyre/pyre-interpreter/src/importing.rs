@@ -2169,10 +2169,29 @@ impl AppleveldefNamespace for PyObjectRef {
 }
 
 pub fn appleveldef_install(
+    ns: impl AppleveldefNamespace,
+    source: &str,
+    filename: &str,
+    names: &[&str],
+) {
+    appleveldef_install_seeded(ns, source, filename, names, &[]);
+}
+
+/// [`appleveldef_install`] with `seed` bound into the app namespace before the
+/// source runs.
+///
+/// `mixedmodule.py:135 MixedModule.get` executes the sibling app file lazily, on
+/// the first access to a name it defines, so by then the module is importable
+/// and the file can reach its own interp-level types through a plain
+/// `import _io` (`app_io.py:1`).  pyre installs app files eagerly from the
+/// module initializer, before the module object exists, so a name the source
+/// needs from its own module is bound up front instead.
+pub fn appleveldef_install_seeded(
     mut ns: impl AppleveldefNamespace,
     source: &str,
     filename: &str,
     names: &[&str],
+    seed: &[(&str, PyObjectRef)],
 ) {
     let code = compile_source_with_filename(source, Mode::Exec, filename)
         .unwrap_or_else(|e| panic!("appleveldef `{filename}`: compile failed — {e}"));
@@ -2183,6 +2202,9 @@ pub fn appleveldef_install(
     let w_app_globals = unsafe { (*ctx).fresh_module_globals() };
     let _root = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(w_app_globals);
+    for &(name, value) in seed {
+        unsafe { pyre_object::w_dict_setitem_str(w_app_globals, name, value) };
+    }
     let code_ptr = Box::into_raw(Box::new(code));
     let w_code = crate::w_code_new(code_ptr as *const ());
     let mut frame = crate::pyframe::createframe_obj(w_code as *const (), w_app_globals, ctx, None)

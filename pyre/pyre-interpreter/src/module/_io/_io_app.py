@@ -3,10 +3,25 @@
 BytesIO is an in-memory binary stream backed by a bytearray plus an
 integer position, sufficient for pickle's pure-Python Pickler/Unpickler
 (write/getvalue on dump, read/readline on load).
+
+`_BufferedIOBase` and `_TextIOBase` are bound by the module initializer
+before this source runs.
 """
 
 
-class BytesIO:
+class BytesIO(_BufferedIOBase):
+    def __new__(cls, *args, **kwargs):
+        # interp_bytesio.py:196-198 `needs_finalizer`: `self.close()` is not
+        # necessary when the object goes away, so the exact class stays off the
+        # finalizer queue.  A subclass, whose `close` may do anything, goes on
+        # it through the base `__new__`.  That base is also the one entry into
+        # the autoflusher, which interp_bytesio.py:70 opts out of
+        # (`add_to_autoflusher=False`) — an in-memory buffer has nothing to
+        # write out at exit.
+        if cls is BytesIO:
+            return object.__new__(cls)
+        return _BufferedIOBase.__new__(cls)
+
     def __init__(self, initial_bytes=b""):
         self._buffer = bytearray(initial_bytes)
         self._pos = 0
@@ -190,11 +205,22 @@ class BytesIO:
         return False
 
 
-class StringIO:
+class StringIO(_TextIOBase):
     """In-memory text stream backed by a str buffer plus an integer
     position.  Covers the common producers/consumers (logging /
     traceback / csv / json) without the C `_io.StringIO` accelerator.
     """
+
+    def __new__(cls, *args, **kwargs):
+        # interp_stringio.py:465-467 `needs_finalizer`: `self.buf = None` is not
+        # necessary when the object goes away, so the exact class stays off the
+        # finalizer queue; a subclass goes on it through the base `__new__`.
+        # That base also enters the stream into the autoflusher, which
+        # interp_stringio.py inherits (`add_to_autoflusher` defaults to True);
+        # for the exact class the flush it would run has no effect either.
+        if cls is StringIO:
+            return object.__new__(cls)
+        return _TextIOBase.__new__(cls)
 
     def __init__(self, initial_value="", newline="\n"):
         if newline is not None and not isinstance(newline, str):

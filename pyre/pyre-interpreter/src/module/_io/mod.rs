@@ -990,11 +990,6 @@ crate::py_module! {
     interpleveldefs: {
         "DEFAULT_BUFFER_SIZE" => w_int_new(DEFAULT_BUFFER_SIZE),
     },
-    // BytesIO / StringIO are the pure-Python in-memory streams: pickle's
-    // Pickler/Unpickler use BytesIO; logging / traceback / csv use StringIO.
-    appleveldefs: {
-        "_io_app.py" => ["BytesIO", "StringIO", "IncrementalNewlineDecoder"],
-    },
     functions: {
         "open"            / * = crate::builtins::builtin_open,
         // `io.open_code(path)` — `_PyIO_open_code` opens the path in binary
@@ -1085,5 +1080,23 @@ crate::py_module! {
             pyre_object::w_type_set_acceptable_as_base_class(text_io_wrapper, true);
         }
         crate::module_ns_store(ns, "TextIOWrapper", text_io_wrapper);
+
+        // The pure-Python in-memory streams: pickle's Pickler/Unpickler use
+        // BytesIO; logging / traceback / csv use StringIO.  `W_BytesIO` derives
+        // `W_BufferedIOBase` (interp_bytesio.py:65) and `W_StringIO`
+        // `W_TextIOBase` (interp_stringio.py:390), so both bases have to be
+        // bound before the source runs; that is what puts this install here
+        // rather than in the `appleveldefs:` table, which the macro expands
+        // ahead of `extra_init`.
+        crate::importing::appleveldef_install_seeded(
+            ns,
+            include_str!("_io_app.py"),
+            "_io_app.py",
+            &["BytesIO", "StringIO", "IncrementalNewlineDecoder"],
+            &[
+                ("_BufferedIOBase", buffered_base),
+                ("_TextIOBase", text_base),
+            ],
+        );
     }
 }
