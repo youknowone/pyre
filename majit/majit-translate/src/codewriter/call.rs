@@ -5939,6 +5939,28 @@ pub fn effectinfo_from_writeanalyze(
     write_descrs_interiorfields.sort_unstable();
     write_descrs_interiorfields.dedup();
 
+    // The `read \ write` exclusion sets are captured HERE, before the
+    // elidable/loop-invariant write blanking below, because
+    // `effectinfo_from_writeanalyze` runs its `tupw not in effects`
+    // subtraction against the full effects tuple (effectinfo.py:345-360)
+    // and only afterwards does `EffectInfo.__new__` blank the write sets
+    // (effectinfo.py:169-181).  Reading them after the blanking would
+    // make the subtraction a no-op and route a descr that is both read
+    // and written into `_readonly_descrs_*`, where upstream puts it in
+    // neither set.
+    let field_write_ptr_set: std::collections::HashSet<*const ()> = field_write_descrs
+        .iter()
+        .map(|d| std::sync::Arc::as_ptr(&d.0).cast::<()>())
+        .collect();
+    let interior_write_ptr_set: std::collections::HashSet<*const ()> = interior_write_descrs
+        .iter()
+        .map(|d| std::sync::Arc::as_ptr(&d.0).cast::<()>())
+        .collect();
+    let array_write_ptr_set: std::collections::HashSet<*const ()> = array_write_descrs
+        .iter()
+        .map(|d| std::sync::Arc::as_ptr(&d.0).cast::<()>())
+        .collect();
+
     // effectinfo.py:169-181: for elidable/loopinvariant, ignore writes.
     if matches!(
         extraeffect,
@@ -6034,26 +6056,14 @@ pub fn effectinfo_from_writeanalyze(
     // sharing a `descr.index()` due to side-table collisions remain
     // distinct under pointer equality, matching PyPy's tuple-identity
     // membership test.
-    let field_write_ptr_set: std::collections::HashSet<*const ()> = field_write_descrs
-        .iter()
-        .map(|d| std::sync::Arc::as_ptr(&d.0).cast::<()>())
-        .collect();
     let read_fields_canon =
         canonicalize_keyed_descrs(field_read_descrs_raw, Some(&field_write_ptr_set));
     let write_fields_canon = canonicalize_keyed_descrs(field_write_descrs, None);
     // Same `read \ write` subtract for interiorfield + array (PyPy
     // `effectinfo.py:351-360`), again by Arc identity.
-    let interior_write_ptr_set: std::collections::HashSet<*const ()> = interior_write_descrs
-        .iter()
-        .map(|d| std::sync::Arc::as_ptr(&d.0).cast::<()>())
-        .collect();
     let read_interior_canon =
         canonicalize_keyed_descrs(interior_read_descrs_raw, Some(&interior_write_ptr_set));
     let write_interior_canon = canonicalize_keyed_descrs(interior_write_descrs, None);
-    let array_write_ptr_set: std::collections::HashSet<*const ()> = array_write_descrs_snapshot
-        .iter()
-        .map(|d| std::sync::Arc::as_ptr(&d.0).cast::<()>())
-        .collect();
     let read_arrays_canon =
         canonicalize_keyed_descrs(array_read_descrs_raw, Some(&array_write_ptr_set));
     let write_arrays_canon = canonicalize_keyed_descrs(array_write_descrs_snapshot, None);
@@ -8646,6 +8656,88 @@ mod tests {
             .as_ref()
             .expect("elidable getcalldescr populates write_descrs_fields");
         assert!(writes.is_empty());
+    }
+
+    #[test]
+    fn elidable_read_and_written_field_lands_in_neither_descr_set() {
+        // `effectinfo_from_writeanalyze` subtracts `read \ write` against
+        // the full effects tuple (effectinfo.py:345-360) and only then does
+        // `EffectInfo.__new__` blank the writes (effectinfo.py:169-181), so a
+        // field that is both read and written by an elidable graph ends up in
+        // NEITHER `_readonly_descrs_fields` nor `_write_descrs_fields`.
+        let mut cc = CallControl::new();
+        // `fielddescrof_concrete` returns None for an unregistered struct,
+        // which would leave the descr sets empty and make the assertions
+        // below vacuous.
+        cc.struct_fields.fields.insert(
+            "Cache".to_string(),
+            vec![("slot".to_string(), "i64".to_string())],
+        );
+        let mut graph = FunctionGraph::new("pure_cache");
+        let base_var = graph.alloc_value_var();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldRead {
+                base: base_var.clone(),
+                field: crate::model::FieldDescriptor::new("slot", Some("Cache".into())),
+                ty: ValueType::Int,
+                pure: false,
+            },
+            true,
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base: base_var.clone(),
+                field: crate::model::FieldDescriptor::new("slot", Some("Cache".into())),
+                value: crate::model::LinkArg::Value(base_var),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+        let path = CallPath::from_segments(["pure_cache"]);
+        register_int_result_graph(&mut cc, path.clone(), graph);
+        cc.mark_elidable(path);
+        cc.find_all_graphs_for_tests();
+
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["pure_cache"])),
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            ExtraEffect::ElidableCannotRaise
+        );
+        // The write blanking must not resurrect the descr as read-only:
+        // reading the exclusion set after the blanking would make the
+        // subtraction a no-op and leave `slot` in `_readonly_descrs_fields`.
+        assert_eq!(
+            descriptor
+                .extra_info
+                ._readonly_descrs_fields
+                .as_deref()
+                .unwrap_or_default()
+                .len(),
+            0,
+            "a read-and-written field must not become read-only when the \
+             elidable write blanking runs",
+        );
+        assert_eq!(
+            descriptor
+                .extra_info
+                ._write_descrs_fields
+                .as_deref()
+                .unwrap_or_default()
+                .len(),
+            0,
+        );
     }
 
     #[test]
