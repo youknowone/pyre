@@ -1251,6 +1251,28 @@ pub fn init_typeobjects() {
             &pyre_object::interp_itertools::GROUPBY_ITERATOR_TYPE as *const PyType as usize,
             groupby_iterator_type as usize,
         );
+        let tee_dataobject_type = new_typeobject_with_base_and_layout(
+            "itertools._tee_dataobject",
+            init_tee_dataobject_type,
+            object_type,
+            &pyre_object::interp_itertools::TEE_DATAOBJECT_TYPE as *const PyType,
+        );
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(tee_dataobject_type, false) };
+        reg.insert(
+            &pyre_object::interp_itertools::TEE_DATAOBJECT_TYPE as *const PyType as usize,
+            tee_dataobject_type as usize,
+        );
+        let tee_iterable_type = new_typeobject_with_base_and_layout(
+            "itertools._tee",
+            init_tee_iterable_type,
+            object_type,
+            &pyre_object::interp_itertools::TEE_ITERABLE_TYPE as *const PyType,
+        );
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(tee_iterable_type, false) };
+        reg.insert(
+            &pyre_object::interp_itertools::TEE_ITERABLE_TYPE as *const PyType as usize,
+            tee_iterable_type as usize,
+        );
         reg.insert(
             &pyre_object::interp_itertools::COMPRESS_TYPE as *const PyType as usize,
             new_typeobject_with_base_and_layout(
@@ -24779,6 +24801,281 @@ fn init_groupby_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+}
+
+// ── itertools._tee_dataobject / itertools._tee TypeDefs ───────────
+// PyPy W_TeeChainedListNode and W_TeeIterable.  The data object is the
+// one-item linked-list node used by the PyPy implementation; Python 3.14
+// exposes both concrete types and makes them final.
+
+fn tee_dataobject_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exact = gettypefor(&pyre_object::interp_itertools::TEE_DATAOBJECT_TYPE)
+        .map_or(PY_NULL, |p| p.as_ptr());
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = positional.first().copied().unwrap_or(PY_NULL);
+    let values = positional.get(1..).unwrap_or(&[]);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "teedataobject() takes no keyword arguments",
+        ));
+    }
+    if values.len() != 3 {
+        return Err(crate::PyError::type_error(format!(
+            "teedataobject() takes exactly 3 arguments ({} given)",
+            values.len()
+        )));
+    }
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    for &value in values {
+        pyre_object::gc_roots::pin_root(value);
+    }
+    let values_base = pyre_object::gc_roots::shadow_stack_len() - values.len();
+    let w_values = unsafe { pyre_object::gc_roots::shadow_stack_get(values_base + 1) };
+    if !unsafe { crate::baseobjspace::isinstance_list_w(w_values) } {
+        return Err(crate::PyError::type_error(format!(
+            "teedataobject() argument 2 must be list, not {}",
+            arg_type_name(w_values)
+        )));
+    }
+
+    // CPython's pickle constructor accepts at most one LINKCELLS block.
+    // PyPy represents that block as one item per linked node; translate the
+    // supplied list into that exact node shape.
+    const LINKCELLS: usize = 57;
+    let value_count = unsafe { pyre_object::w_list_len(w_values) };
+    let w_next = unsafe { pyre_object::gc_roots::shadow_stack_get(values_base + 2) };
+    let next_is_none = unsafe { pyre_object::is_none(w_next) };
+    let next_is_node = unsafe { pyre_object::interp_itertools::is_tee_dataobject(w_next) };
+    if value_count > LINKCELLS
+        || (value_count < LINKCELLS && !next_is_none)
+        || (value_count == LINKCELLS && !next_is_none && !next_is_node)
+    {
+        return Err(crate::PyError::value_error("Invalid arguments"));
+    }
+
+    let head = pyre_object::interp_itertools::w_tee_chained_list_node_new();
+    pyre_object::gc_roots::pin_root(head);
+    let head_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let mut current_slot = head_slot;
+    for index in 0..value_count {
+        let w_values = unsafe { pyre_object::gc_roots::shadow_stack_get(values_base + 1) };
+        let w_item = unsafe {
+            pyre_object::w_list_getitem(w_values, index as i64)
+                .expect("tee dataobject list index in range")
+        };
+        pyre_object::gc_roots::pin_root(w_item);
+        let item_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let last_with_link = index + 1 == LINKCELLS && !next_is_none;
+        let next = if last_with_link {
+            unsafe { pyre_object::gc_roots::shadow_stack_get(values_base + 2) }
+        } else {
+            pyre_object::interp_itertools::w_tee_chained_list_node_new()
+        };
+        pyre_object::gc_roots::pin_root(next);
+        let next_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+        let current = unsafe { pyre_object::gc_roots::shadow_stack_get(current_slot) };
+        let state =
+            unsafe { &mut *(current as *mut pyre_object::interp_itertools::W_TeeChainedListNode) };
+        state.w_obj = unsafe { pyre_object::gc_roots::shadow_stack_get(item_slot) };
+        state.w_next = unsafe { pyre_object::gc_roots::shadow_stack_get(next_slot) };
+        pyre_object::gc_hook::try_gc_write_barrier(current as *mut u8);
+        current_slot = next_slot;
+    }
+
+    itertools_alloc_for_class(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        exact,
+        unsafe { pyre_object::gc_roots::shadow_stack_get(head_slot) },
+    )
+}
+
+fn tee_iterable_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exact = gettypefor(&pyre_object::interp_itertools::TEE_ITERABLE_TYPE)
+        .map_or(PY_NULL, |p| p.as_ptr());
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = positional.first().copied().unwrap_or(PY_NULL);
+    let values = positional.get(1..).unwrap_or(&[]);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "_tee() takes no keyword arguments",
+        ));
+    }
+    if values.len() != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "_tee() takes exactly one argument ({} given)",
+            values.len()
+        )));
+    }
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(values[0]);
+    let source_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let (w_iterator, w_chained_list) = if unsafe {
+        pyre_object::interp_itertools::is_tee_iterable(values[0])
+    } {
+        let source = unsafe { pyre_object::gc_roots::shadow_stack_get(source_slot) };
+        let state = unsafe { &*(source as *const pyre_object::interp_itertools::W_TeeIterable) };
+        (state.w_iterator, state.w_chained_list)
+    } else {
+        let iterator = crate::baseobjspace::iter(unsafe {
+            pyre_object::gc_roots::shadow_stack_get(source_slot)
+        })?;
+        (
+            iterator,
+            pyre_object::interp_itertools::w_tee_chained_list_node_new(),
+        )
+    };
+    let obj = pyre_object::interp_itertools::w_tee_iterable_new(w_iterator, w_chained_list);
+    itertools_alloc_for_class(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        exact,
+        obj,
+    )
+}
+
+fn tee_copy_method(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args.first().copied().unwrap_or(PY_NULL);
+    if !unsafe { pyre_object::interp_itertools::is_tee_iterable(obj) } {
+        return Err(crate::PyError::type_error(
+            "descriptor '__copy__' requires a 'itertools._tee' object",
+        ));
+    }
+    let state = unsafe { &*(obj as *const pyre_object::interp_itertools::W_TeeIterable) };
+    Ok(pyre_object::interp_itertools::w_tee_iterable_new(
+        state.w_iterator,
+        state.w_chained_list,
+    ))
+}
+
+fn init_tee_dataobject_type(ns: PyObjectRef) {
+    let entries = [
+        ("__new__", make_new_descr(tee_dataobject_descr_new)),
+        (
+            "__doc__",
+            w_str_new("Data container common to multiple tee objects."),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn init_tee_iterable_type(ns: PyObjectRef) {
+    let entries = [
+        ("__new__", make_new_descr(tee_iterable_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__copy__",
+            make_builtin_function_with_arity("__copy__", tee_copy_method, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new("Iterator wrapped to make it copyable."),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+pub(crate) fn itertools_tee(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "tee() takes no keyword arguments",
+        ));
+    }
+    if positional.is_empty() || positional.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "tee expected at most 2 arguments, got {}",
+            positional.len()
+        )));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(positional[0]);
+    let source_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    if positional.len() == 2 {
+        pyre_object::gc_roots::pin_root(positional[1]);
+    }
+    let n = if positional.len() == 2 {
+        crate::builtins::space_index_w(unsafe {
+            pyre_object::gc_roots::shadow_stack_get(source_slot + 1)
+        })?
+    } else {
+        2
+    };
+    if n < 0 {
+        return Err(crate::PyError::value_error("n must be >= 0"));
+    }
+    if n == 0 {
+        return Ok(pyre_object::w_tuple_new(Vec::new()));
+    }
+
+    let w_iterator =
+        crate::baseobjspace::iter(unsafe { pyre_object::gc_roots::shadow_stack_get(source_slot) })?;
+    pyre_object::gc_roots::pin_root(w_iterator);
+    let iterator_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    let mut result_slots = Vec::with_capacity(n as usize);
+    if let Some(w_copy) = crate::baseobjspace::findattr_result(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(iterator_slot) },
+        "__copy__",
+    )? {
+        pyre_object::gc_roots::pin_root(w_copy);
+        let copy_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let first_copy = if unsafe {
+            pyre_object::interp_itertools::is_tee_iterable(pyre_object::gc_roots::shadow_stack_get(
+                iterator_slot,
+            ))
+        } {
+            0
+        } else {
+            // PyPy accepts any iterator supplying __copy__ and preserves the
+            // original as the first result.  Python 3.14 instead clones a
+            // native _tee for every result.
+            result_slots.push(iterator_slot);
+            1
+        };
+        for _ in first_copy..n {
+            let copied = crate::call::call_function_impl_result(
+                unsafe { pyre_object::gc_roots::shadow_stack_get(copy_slot) },
+                &[],
+            )?;
+            pyre_object::gc_roots::pin_root(copied);
+            result_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
+        }
+    } else {
+        let node = pyre_object::interp_itertools::w_tee_chained_list_node_new();
+        pyre_object::gc_roots::pin_root(node);
+        let node_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        for _ in 0..n {
+            let tee = pyre_object::interp_itertools::w_tee_iterable_new(
+                unsafe { pyre_object::gc_roots::shadow_stack_get(iterator_slot) },
+                unsafe { pyre_object::gc_roots::shadow_stack_get(node_slot) },
+            );
+            pyre_object::gc_roots::pin_root(tee);
+            result_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
+        }
+    }
+    Ok(pyre_object::w_tuple_new(
+        result_slots
+            .into_iter()
+            .map(|slot| unsafe { pyre_object::gc_roots::shadow_stack_get(slot) })
+            .collect(),
+    ))
 }
 
 fn init_compress_type(ns: PyObjectRef) {

@@ -4863,6 +4863,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::interp_itertools::is_permutations(obj)
             || pyre_object::interp_itertools::is_groupby(obj)
             || pyre_object::interp_itertools::is_groupby_iterator(obj)
+            || pyre_object::interp_itertools::is_tee_iterable(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = match name {
                 "__next__" => Some((iter_next_method, "__next__", 1)),
@@ -12965,6 +12966,7 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             || pyre_object::interp_itertools::is_cycle(obj)
             || pyre_object::interp_itertools::is_chain(obj)
             || pyre_object::interp_itertools::is_groupby_iterator(obj)
+            || pyre_object::interp_itertools::is_tee_iterable(obj)
         {
             return Ok(obj);
         }
@@ -14241,6 +14243,80 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             parent_state.w_currvalue = PY_NULL;
             parent_state.w_currkey = PY_NULL;
             return Ok(pyre_object::gc_roots::shadow_stack_get(result_slot));
+        }
+        // itertools._tee — PyPy W_TeeIterable.next_w.  Each copy owns only a
+        // cursor; an empty shared node is filled exactly once from the common
+        // source and then linked to a fresh empty node.
+        if pyre_object::interp_itertools::is_tee_iterable(obj) {
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let w_node =
+                (*(w_self as *const pyre_object::interp_itertools::W_TeeIterable)).w_chained_list;
+            if w_node.is_null() {
+                return Err(PyError::stop_iteration());
+            }
+            pyre_object::gc_roots::pin_root(w_node);
+            let node_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+            let node = pyre_object::gc_roots::shadow_stack_get(node_slot);
+            let node_state =
+                &mut *(node as *mut pyre_object::interp_itertools::W_TeeChainedListNode);
+            if node_state.running {
+                return Err(PyError::runtime_error("cannot re-enter the tee iterator"));
+            }
+            if node_state.w_obj.is_null() {
+                node_state.running = true;
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let w_iterator =
+                    (*(w_self as *const pyre_object::interp_itertools::W_TeeIterable)).w_iterator;
+                pyre_object::gc_roots::pin_root(w_iterator);
+                let iterator_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let next_result = next(pyre_object::gc_roots::shadow_stack_get(iterator_slot));
+                let w_item = match next_result {
+                    Ok(w_item) => w_item,
+                    Err(err) => {
+                        let node = pyre_object::gc_roots::shadow_stack_get(node_slot);
+                        (*(node as *mut pyre_object::interp_itertools::W_TeeChainedListNode))
+                            .running = false;
+                        if err.kind == crate::PyErrorKind::StopIteration {
+                            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                            (*(w_self as *mut pyre_object::interp_itertools::W_TeeIterable))
+                                .w_chained_list = PY_NULL;
+                            pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
+                        }
+                        return Err(err);
+                    }
+                };
+                pyre_object::gc_roots::pin_root(w_item);
+                let item_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let w_next = pyre_object::interp_itertools::w_tee_chained_list_node_new();
+                pyre_object::gc_roots::pin_root(w_next);
+                let next_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+                let node = pyre_object::gc_roots::shadow_stack_get(node_slot);
+                let node_state =
+                    &mut *(node as *mut pyre_object::interp_itertools::W_TeeChainedListNode);
+                node_state.running = false;
+                node_state.w_obj = pyre_object::gc_roots::shadow_stack_get(item_slot);
+                node_state.w_next = pyre_object::gc_roots::shadow_stack_get(next_slot);
+                pyre_object::gc_hook::try_gc_write_barrier(node as *mut u8);
+            }
+
+            let node = pyre_object::gc_roots::shadow_stack_get(node_slot);
+            let node_state = &*(node as *const pyre_object::interp_itertools::W_TeeChainedListNode);
+            let w_item = node_state.w_obj;
+            let w_next = node_state.w_next;
+            pyre_object::gc_roots::pin_root(w_item);
+            let item_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            pyre_object::gc_roots::pin_root(w_next);
+            let next_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            (*(w_self as *mut pyre_object::interp_itertools::W_TeeIterable)).w_chained_list =
+                pyre_object::gc_roots::shadow_stack_get(next_slot);
+            pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
+            return Ok(pyre_object::gc_roots::shadow_stack_get(item_slot));
         }
         // itertools.compress — interp_itertools.py W_Compress.next_w.
         // Pull data first, then its matching selector; exhaustion of either

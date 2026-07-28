@@ -704,6 +704,61 @@ pub unsafe fn is_groupby_iterator(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &GROUPBY_ITERATOR_TYPE) }
 }
 
+// ── W_TeeChainedListNode / W_TeeIterable — PyPy interp_itertools.py ─
+//
+// Each shared node owns one cached item and the next node.  Every tee copy
+// holds its own cursor into this same chain while sharing the source iterator.
+#[pyre_class("itertools._tee_dataobject", static_name = "TEE_DATAOBJECT")]
+pub struct W_TeeChainedListNode {
+    pub w_next: PyObjectRef,
+    pub w_obj: PyObjectRef,
+    pub running: bool,
+}
+
+pub fn w_tee_chained_list_node_new() -> PyObjectRef {
+    W_TeeChainedListNode::allocate_stable(W_TeeChainedListNode {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_next: std::ptr::null_mut(),
+        w_obj: std::ptr::null_mut(),
+        running: false,
+    })
+}
+
+#[inline]
+pub unsafe fn is_tee_dataobject(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &TEE_DATAOBJECT_TYPE) }
+}
+
+#[pyre_class("itertools._tee", static_name = "TEE_ITERABLE")]
+pub struct W_TeeIterable {
+    pub w_iterator: PyObjectRef,
+    pub w_chained_list: PyObjectRef,
+}
+
+pub fn w_tee_iterable_new(w_iterator: PyObjectRef, w_chained_list: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(w_iterator);
+    if !w_chained_list.is_null() {
+        crate::gc_roots::pin_root(w_chained_list);
+    }
+    W_TeeIterable::allocate_stable(W_TeeIterable {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_iterator,
+        w_chained_list,
+    })
+}
+
+#[inline]
+pub unsafe fn is_tee_iterable(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &TEE_ITERABLE_TYPE) }
+}
+
 // ── W_Compress — pypy/module/itertools/interp_itertools.py:W_Compress ──
 //
 // ```python
@@ -1266,6 +1321,36 @@ mod tests {
         assert_eq!(
             <W_GroupByIterator as crate::lltype::GcType>::SIZE,
             W_GROUPBY_ITERATOR_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_tee_dataobject_gc_descriptor_traces_item_and_next() {
+        assert_eq!(
+            W_TEE_DATAOBJECT_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_TeeChainedListNode, w_next),
+                std::mem::offset_of!(W_TeeChainedListNode, w_obj),
+            ]
+        );
+        assert_eq!(
+            <W_TeeChainedListNode as crate::lltype::GcType>::SIZE,
+            W_TEE_DATAOBJECT_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_tee_iterable_gc_descriptor_traces_source_and_cursor() {
+        assert_eq!(
+            W_TEE_ITERABLE_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_TeeIterable, w_iterator),
+                std::mem::offset_of!(W_TeeIterable, w_chained_list),
+            ]
+        );
+        assert_eq!(
+            <W_TeeIterable as crate::lltype::GcType>::SIZE,
+            W_TEE_ITERABLE_OBJECT_SIZE
         );
     }
 

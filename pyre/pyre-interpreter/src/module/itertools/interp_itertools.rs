@@ -2,46 +2,6 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-/// tee(iterable, n=2) — itertools-docs pure-Python equivalent.  Each `_tee`
-/// keeps its own deque; when a deque runs dry the shared source iterator is
-/// advanced once and the new value is fanned out to every deque, so the copies
-/// stay independent and an unbounded source is drawn lazily.
-const TEE_SRC: &str = r#"
-import collections
-import operator
-
-class _tee:
-    __module__ = 'itertools'
-    def __init__(self, it, deques, mydeque):
-        self._it = it
-        self._deques = deques
-        self._mydeque = mydeque
-    def __iter__(self):
-        return self
-    def __copy__(self):
-        # W_TeeIterable.copy_w: the clone starts at this iterator's current
-        # node while sharing the same source and future buffer fan-out.
-        mydeque = collections.deque(self._mydeque)
-        self._deques.append(mydeque)
-        return _tee(self._it, self._deques, mydeque)
-    def __next__(self):
-        if not self._mydeque:
-            newval = next(self._it)
-            for d in self._deques:
-                d.append(newval)
-        return self._mydeque.popleft()
-
-def tee(iterable, n=2):
-    n = operator.index(n)
-    if n < 0:
-        raise ValueError("n must be >= 0")
-    it = iter(iterable)
-    if hasattr(it, '__copy__'):
-        return tuple(it if i == 0 else it.__copy__() for i in range(n))
-    deques = [collections.deque() for _ in range(n)]
-    return tuple(_tee(it, deques, d) for d in deques)
-"#;
-
 pub fn register_module(ns: pyre_object::PyObjectRef) {
     // PyPy exports W_Chain.typedef itself. Its __new__ and classmethod
     // from_iterable both preserve lazy traversal of the outer iterable.
@@ -97,10 +57,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             .expect("itertools._grouper TypeDef initialized")
             .as_ptr(),
     );
-    // tee(iterable, n=2) — the itertools-docs pure-Python equivalent.  A native
-    // dataobject type would only save buffer copies; the deque-per-copy recipe
-    // keeps the copies lazy and independent, which is what callers observe.
-    crate::importing::appleveldef_install(ns, TEE_SRC, "<inline>", &["tee"]);
+    // PyPy W_TeeIterable copies hold independent cursors into one shared
+    // W_TeeChainedListNode chain.
+    crate::module_ns_store(
+        ns,
+        "tee",
+        crate::make_builtin_function("tee", crate::typedef::itertools_tee),
+    );
+    crate::module_ns_store(
+        ns,
+        "_tee",
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::TEE_ITERABLE_TYPE)
+            .expect("itertools._tee TypeDef initialized")
+            .as_ptr(),
+    );
+    crate::module_ns_store(
+        ns,
+        "_tee_dataobject",
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::TEE_DATAOBJECT_TYPE)
+            .expect("itertools._tee_dataobject TypeDef initialized")
+            .as_ptr(),
+    );
     // PyPy W_Permutations: retain the pool, indices, and rollover cycles,
     // yielding one permutation at a time.
     crate::module_ns_store(
