@@ -5011,11 +5011,30 @@ where
                             // counts too low to reach the merge point twice.
                             //
                             // The JUMP-into-ptoken half of :3001-3007 is not
-                            // implemented — see `compile_trace_entry_data`, which
-                            // declines an entry-bridge close for `header_pc != 0`.
+                            // implemented here.  It is not blocked on missing
+                            // machinery — that was tried and measured:
+                            // publishing the token key plus `close_greens` and
+                            // returning `CloseLoop` reaches `close_bridge` for a
+                            // guard origin and `compile_trace_from_interp`
+                            // (through `compile_trace_entry_data`, which needs
+                            // `header_pc == 0`) for an interp origin, and both
+                            // land.  cel's `nested_list_loop_varying_trip_count`
+                            // then keeps its results and loses its 4 aborts, but
+                            // its `spread 0..32` deopts go 959 → 1763 over 4000
+                            // rows and 1275 → 2601 over 16000: the residual
+                            // per-row tail worsens ~2.6x.  Jumping in ends the
+                            // trace at the inner loop, where the ordinary close
+                            // covered the whole outer iteration, and the exit
+                            // guards that shape leaves behind do not converge.
+                            // Routing the closing JUMP's target tokens off the
+                            // token it enters instead of off the bridge origin
+                            // (`unroll.py:196-197 cell_token = jump_op.getdescr()`
+                            // — pyre's `compile_bridge` hands `optimize_bridge`
+                            // the ORIGIN loop's `front_target_tokens`) recovers
+                            // only 7% of that, so the gap is elsewhere.
                             //
                             // Two consequences of declining, both narrower than
-                            // upstream, both waiting on that half:
+                            // upstream:
                             //   * upstream reaches the `current_merge_points`
                             //     scan whenever `compile_trace` does NOT raise;
                             //     this arm returns to neither the scan nor the
@@ -5025,15 +5044,18 @@ where
                             //   * upstream's is a JUMP into reachable code; ours
                             //     re-traces that loop's body inline.
                             //
-                            // Upstream's `if not self.partial_trace:` (:3003) is
-                            // NOT ported and must not be spelled `is_bridge_trace`:
-                            // `partial_trace` is set only by `retrace_needed`
-                            // (pyjitpl.py:2438-2439), so it means "this is a
-                            // RETRACE", and a bridge from a guard failure runs the
-                            // ptoken consult upstream just like a primary entry.
-                            // Pyre has no retrace at this site, so the consult is
-                            // unconditional — which is the upstream behaviour for
-                            // every trace pyre can actually produce here.
+                            // The token lookup below is unconditional, where
+                            // upstream guards it with `if not self.partial_trace:`
+                            // (:3002).  That gate must not be spelled
+                            // `is_bridge_trace`: `partial_trace` is set only by
+                            // `retrace_needed` (pyjitpl.py:2438-2439), so it means
+                            // "this is a RETRACE", and a bridge from a guard
+                            // failure runs the consult upstream just like a
+                            // primary entry.  Its live reading is
+                            // `MetaInterp::partial_trace()`, which this loop
+                            // cannot reach while it holds the TraceCtx borrow —
+                            // harmless while the lookup only decides a log line,
+                            // and part of what the JUMP half has to carry.
                             let mp_greens = (
                                 mp_green_ints.clone(),
                                 mp_green_refs.clone(),
