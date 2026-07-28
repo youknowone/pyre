@@ -7349,6 +7349,25 @@ result = C.__dict__[1] == 2";
     }
 
     #[test]
+    fn test_module_and_str_layouts_conflict() {
+        let source = "\
+MT = type(__builtins__)
+try:
+    class Module(MT, str):
+        pass
+except TypeError:
+    result = True
+else:
+    result = False";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("module/str layout conflict regression");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(is_true(result).unwrap());
+        }
+    }
+
+    #[test]
     fn test_function_dunder_globals_and_code_are_materialized() {
         crate::test_hooks::install_hash_hook();
         let source = "\

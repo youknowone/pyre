@@ -448,7 +448,12 @@ pub fn init_typeobjects() {
         // `__flags__`, `isinstance(m, object)` and the inherited
         // `object.__reduce_ex__` all resolve.  `get_instantiate(&MODULE_TYPE)`
         // (read by `w_module_new`) is wired by the `set_instantiate` loop below.
-        let module_type = new_typeobject_with_base("module", init_module_type, object_type);
+        let module_type = new_typeobject_with_base_and_layout(
+            "module",
+            init_module_type,
+            object_type,
+            &pyre_object::MODULE_TYPE as *const PyType,
+        );
         unsafe {
             // module.py Module.getdict plus Module.typedef.__weakref__.
             pyre_object::w_type_set_hasdict(module_type, true);
