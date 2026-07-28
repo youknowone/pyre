@@ -984,6 +984,25 @@ fn try_commit_midbody_abort_inner(
 /// True when `start_pc` is the target of a `JumpBackward` in `code` — i.e. a
 /// loop header, the origin of a loop-header trace rather than a function-entry
 /// trace.
+/// Whether `code` contains any backward jump, i.e. any Python loop header.
+///
+/// This is the same condition the codewriter emits `jit_merge_point` under —
+/// `loop_header_pcs` is built from the dominating `JUMP_BACKWARD` /
+/// `JUMP_BACKWARD_NO_INTERRUPT` targets (`codewriter.rs` `find_loop_header_pcs`,
+/// consumed at the `loop_header_pcs.contains(&py_pc) && is_true_portal` gate).
+/// So a code object without one produces a portal body with NO merge point, and
+/// a blackhole driven inside it can only ever leave through a frame terminal.
+fn code_has_loop_header(code: &pyre_interpreter::CodeObject) -> bool {
+    use pyre_interpreter::Instruction as I;
+    let mut arg_state = pyre_interpreter::OpArgState::default();
+    code.instructions.iter().copied().any(|unit| {
+        matches!(
+            arg_state.get(unit).0,
+            I::JumpBackward { .. } | I::JumpBackwardNoInterrupt { .. }
+        )
+    })
+}
+
 fn start_pc_is_loop_header(code: &pyre_interpreter::CodeObject, start_pc: usize) -> bool {
     use pyre_interpreter::Instruction as I;
     let mut arg_state = pyre_interpreter::OpArgState::default();
@@ -1877,6 +1896,14 @@ fn seed_loop_entry_ref_slots(
 /// treatment (a chain whose inner levels committed through their own
 /// virtualizable still leaves the portal's `valuestackdepth` at the aborted
 /// mid-expression value).
+macro_rules! sfdbg_crn {
+    ($($a:tt)*) => {
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!("[crn-apply-decline] {}", format!($($a)*));
+        }
+    };
+}
+
 fn apply_blackhole_crn(
     frame: usize,
     jitcode_index: i32,
@@ -1936,6 +1963,27 @@ fn apply_blackhole_crn(
             _ => false,
         };
         if !present {
+            return false;
+        }
+        // A Ref color that reads back NULL is an UNPOPULATED register, not a
+        // live value.  Writing it into a live operand-STACK slot and resuming
+        // there faults the interpreter, which pops NULL where a real object is
+        // expected — the walk's own flush declines exactly this case and says
+        // so (`state.rs` "NULL operand-stack shadow slot (mid-expression)").
+        // The blackhole image gets there a different way: the CRN merge point
+        // is a different pc than the one the MIFrame was built at, so a color
+        // live at the merge need not have been populated at the build.
+        // A LOCAL slot may legitimately be NULL (an unbound local), so this
+        // guards the stack region only, matching the sibling.
+        //
+        // ⚠️This must stay UNREACHABLE: it is a post-drive decline, and one was
+        // measured to turn a correct 199990000 into 200005595 by handing an
+        // already-executed region back to the replay.  The loop-header gate in
+        // `try_adopt_single_frame_blackhole` keeps the CRN arm out of reach; the
+        // check survives only so an incomplete gate degrades to a wrong answer
+        // instead of the SIGSEGV this class produced before it existed.
+        if slot >= stack_base && bank == 1 && registers_r[color] == 0 {
+            sfdbg_crn!("NULL Ref color {color} for live stack slot {slot}");
             return false;
         }
         if !writes.iter().any(|(existing, _, _)| *existing == slot) {
@@ -2041,6 +2089,37 @@ fn try_adopt_single_frame_blackhole(
         sfdbg!("jitcode {jitcode_index} carries no pcdep trivia (pre-drive)");
         return false;
     }
+    // ⭐Drive only bodies where EVERY outcome arm is infallible.
+    //
+    // The `DoneWithThisFrame*` / `ExitFrameWithExceptionRef` arms always adopt;
+    // only `ContinueRunningNormally` can reject the image, and rejecting it
+    // AFTER the drive discards an executed region and hands back to a replay —
+    // measured to produce a wrong answer, not merely a lost optimization
+    // (`root_loop_force.py`: 199990000 correct vs 200005595 after a post-drive
+    // decline).  A CRN can only arise at a `jit_merge_point`, which the
+    // codewriter emits solely at Python loop headers of the true portal, so a
+    // loop-free body cannot reach that arm at all.
+    //
+    // This is a RESTRICTION, not the convergence.  The real fix is to make the
+    // CRN image complete by construction — the MIFrame is seeded from the live
+    // colors at the BUILD pc, while the merge point it stops at has its own
+    // live set, so a color live at the merge but not at the build reads back
+    // NULL.  Until that seeding is total, a loop body cannot be driven safely.
+    let has_loop = {
+        let pf = unsafe { &*(cf_addr as *const pyre_interpreter::PyFrame) };
+        let w_code = pf.pycode;
+        !w_code.is_null() && {
+            let raw_code = unsafe {
+                pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                    as *const pyre_interpreter::CodeObject
+            };
+            code_has_loop_header(unsafe { &*raw_code })
+        }
+    };
+    if has_loop {
+        sfdbg!("frame code has a loop header, so the drive could reach a merge point (pre-drive)");
+        return false;
+    }
     // The escape flush that ran ahead of the forcing residual is
     // all-or-nothing, and its decline is what this latch is gated on
     // (`committed_frame_escape_pc().is_none()`).  What it declines on is the
@@ -2108,23 +2187,27 @@ fn try_adopt_single_frame_blackhole(
         latched.raising_exception,
     );
 
-    sfdbg!(
-        "drive outcome = {}",
-        match terminal.outcome {
-            majit_metainterp::jitexc::JitException::ContinueRunningNormally { .. } =>
-                "ContinueRunningNormally",
-            majit_metainterp::jitexc::JitException::DoneWithThisFrameVoid =>
-                "DoneWithThisFrameVoid",
-            majit_metainterp::jitexc::JitException::DoneWithThisFrameInt(_) =>
-                "DoneWithThisFrameInt",
-            majit_metainterp::jitexc::JitException::DoneWithThisFrameRef(_) =>
-                "DoneWithThisFrameRef",
-            majit_metainterp::jitexc::JitException::DoneWithThisFrameFloat(_) =>
-                "DoneWithThisFrameFloat",
-            majit_metainterp::jitexc::JitException::ExitFrameWithExceptionRef(_) =>
-                "ExitFrameWithExceptionRef",
-        }
-    );
+    // Its own prefix: this is not a decline, and reading it as one is exactly
+    // the confusion that made the CRN arm look unreachable.
+    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+        eprintln!(
+            "[s1-drive-outcome] {}",
+            match terminal.outcome {
+                majit_metainterp::jitexc::JitException::ContinueRunningNormally { .. } =>
+                    "ContinueRunningNormally",
+                majit_metainterp::jitexc::JitException::DoneWithThisFrameVoid =>
+                    "DoneWithThisFrameVoid",
+                majit_metainterp::jitexc::JitException::DoneWithThisFrameInt(_) =>
+                    "DoneWithThisFrameInt",
+                majit_metainterp::jitexc::JitException::DoneWithThisFrameRef(_) =>
+                    "DoneWithThisFrameRef",
+                majit_metainterp::jitexc::JitException::DoneWithThisFrameFloat(_) =>
+                    "DoneWithThisFrameFloat",
+                majit_metainterp::jitexc::JitException::ExitFrameWithExceptionRef(_) =>
+                    "ExitFrameWithExceptionRef",
+            }
+        );
+    }
     let adopted = match terminal.outcome {
         majit_metainterp::jitexc::JitException::ContinueRunningNormally {
             ref green_int, ..
