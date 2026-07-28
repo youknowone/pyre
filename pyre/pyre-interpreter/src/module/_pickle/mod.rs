@@ -375,7 +375,10 @@ pub(crate) fn compat_map(
     // unchanged; `text_w` raises TypeError on a non-str remap value.
     if let Some(v) = crate::baseobjspace::finditem_str(w_import_map, module)? {
         if crate::baseobjspace::is_true(v)? {
-            return Ok((crate::baseobjspace::text_w(v)?.to_string(), name.to_string()));
+            return Ok((
+                crate::baseobjspace::text_w(v)?.to_string(),
+                name.to_string(),
+            ));
         }
     }
     Ok((module.to_string(), name.to_string()))
