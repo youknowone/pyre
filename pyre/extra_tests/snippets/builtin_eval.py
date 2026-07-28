@@ -1,4 +1,6 @@
 assert 3 == eval("1+2")
+assert 2 == eval(" \t 1+1\n")
+assert 42 == eval(memoryview(b"40+2"))
 
 code = compile("5+3", "x.py", "eval")
 assert eval(code) == 8

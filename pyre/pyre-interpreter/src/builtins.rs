@@ -7681,6 +7681,52 @@ const PYCF_ACCEPT_NULL_BYTES: i64 = 0x1000_0000;
 /// i.e. the flags `getcodeflags` masks out of a caller's `co_flags`.
 const COMPILER_FLAGS: i64 = 0x01FE_0000;
 
+/// `pyopcode.py:source_as_str` — turn text or one readable `PyBUF_SIMPLE`
+/// export into compiler input.  The export remains acquired while its bytes
+/// are copied and is released before decoding can raise.
+fn source_as_str(
+    source: PyObjectRef,
+    funcname: &str,
+    what: &str,
+    filename: &str,
+    flags: &mut i64,
+) -> Result<String, crate::PyError> {
+    unsafe {
+        if pyre_object::is_str(source) {
+            // A text source is encoded strictly and coding-cookie detection is
+            // disabled, matching PyPy's unicode branch.
+            let bytes = crate::type_methods::encode_object(source, "utf-8", "strict")?;
+            *flags |= PYCF_IGNORE_COOKIE;
+            return Ok(String::from_utf8(bytes).expect("strict utf-8 encode yields valid utf-8"));
+        }
+        if pyre_object::bytesobject::is_bytes(source) {
+            return crate::compile::decode_source_bytes(
+                pyre_object::bytesobject::bytes_like_data(source),
+                filename,
+                *flags & PYCF_IGNORE_COOKIE != 0,
+            );
+        }
+    }
+
+    let buffer = match crate::baseobjspace::simple_buffer_bytes(source) {
+        Ok(Some(buffer)) => buffer,
+        Ok(None) => {
+            return Err(crate::PyError::type_error(format!(
+                "{funcname}() arg 1 must be a {what} object"
+            )));
+        }
+        Err(error) if error.kind == crate::PyErrorKind::TypeError => {
+            return Err(crate::PyError::type_error(format!(
+                "{funcname}() arg 1 must be a {what} object"
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    let bytes = buffer.as_bytes().to_vec();
+    buffer.release();
+    crate::compile::decode_source_bytes(&bytes, filename, *flags & PYCF_IGNORE_COOKIE != 0)
+}
+
 fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `compile(source, filename, mode, flags=0, dont_inherit=False,
     // optimize=-1, *, _feature_version=-1)`: the three required parameters and
@@ -7792,44 +7838,29 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         optimize = i64::from(crate::importing::optimize_flag());
     }
 
-    let source_str = unsafe {
-        if pyre_object::is_str(source) {
-            // The source is decoded to UTF-8 for the tokenizer; a lone
-            // surrogate raises `UnicodeEncodeError` (strict) rather than
-            // panicking in `w_str_get_value`.
-            let bytes = crate::type_methods::encode_object(source, "utf-8", "strict")?;
-            Some(String::from_utf8(bytes).expect("strict utf-8 encode yields valid utf-8"))
-        } else if pyre_object::bytesobject::is_bytes_like(source) {
-            // A bytes-like source honours the PEP 263 coding cookie and raises
-            // SyntaxError on undecodable bytes rather than lossily replacing.
-            Some(crate::compile::decode_source_bytes(
-                pyre_object::bytesobject::bytes_like_data(source),
-                &filename,
-                false,
-            )?)
-        } else {
-            // PyPy returns an AST input unchanged when ONLY_AST is requested.
-            // Keep this check at the public `_ast.AST` boundary so subclasses
-            // behave the same way as native nodes.
-            let ast_module = crate::importing::importhook(
-                "_ast",
-                PY_NULL,
-                PY_NULL,
-                0,
-                crate::call::take_last_exec_ctx(),
-            )?;
-            let ast_type = crate::baseobjspace::getattr_str(ast_module, "AST")?;
-            if crate::baseobjspace::isinstance_w(source, ast_type) {
-                if flags & PYCF_ONLY_AST != 0 {
-                    return Ok(source);
-                }
-                None
-            } else {
-                return Err(crate::PyError::type_error(
-                    "compile() arg 1 must be a string, bytes or AST object",
-                ));
-            }
+    // PyPy checks the public AST boundary before source_as_str so AST
+    // subclasses are compiled as trees rather than probed for a buffer.
+    let ast_module = crate::importing::importhook(
+        "_ast",
+        PY_NULL,
+        PY_NULL,
+        0,
+        crate::call::take_last_exec_ctx(),
+    )?;
+    let ast_type = crate::baseobjspace::getattr_str(ast_module, "AST")?;
+    let source_str = if unsafe { crate::baseobjspace::isinstance_w(source, ast_type) } {
+        if flags & PYCF_ONLY_AST != 0 {
+            return Ok(source);
         }
+        None
+    } else {
+        Some(source_as_str(
+            source,
+            "compile",
+            "string, bytes or AST",
+            &filename,
+            &mut flags,
+        )?)
     };
 
     // Assemble CompileOpts: the __future__ feature bits, the two PyCF_*
@@ -7927,38 +7958,30 @@ fn exec_or_eval(
     // original argument was already a code object (vs a compiled str /
     // bytes) — the closure validation below branches on it.
     let (code_obj_ref, source_is_code) = unsafe {
-        // `compiling.py:103 source_as_str` — accepts a str or a bytes-like
-        // source (decoded), or an already-compiled code object.
-        let source_str = if pyre_object::is_str(source) {
-            Some(pyre_object::w_str_get_value(source).to_string())
-        } else if pyre_object::bytesobject::is_bytes_like(source) {
-            // A bytes-like source honours the PEP 263 coding cookie and raises
-            // SyntaxError on undecodable bytes rather than lossily replacing.
-            Some(crate::compile::decode_source_bytes(
-                pyre_object::bytesobject::bytes_like_data(source),
-                "<string>",
-                false,
-            )?)
+        if !source.is_null() && crate::is_code(source) {
+            (source, true)
         } else {
-            None
-        };
-        if let Some(s) = source_str {
+            let mut flags = PYCF_SOURCE_IS_UTF8;
+            let mut source = source_as_str(
+                source,
+                if is_eval { "eval" } else { "exec" },
+                "string, bytes or code",
+                "<string>",
+                &mut flags,
+            )?;
+            if is_eval {
+                // compiling.py:eval compiles `source.lstrip(' \t')`.
+                source = source.trim_start_matches([' ', '\t']).to_owned();
+            }
             let mode = if is_eval {
                 crate::compile::Mode::Eval
             } else {
                 crate::compile::Mode::Exec
             };
-            let code = crate::compile::compile_source(&s, mode)
-                .map_err(|e| compile_err_to_syntax_error(e, &s))?;
+            let code = crate::compile::compile_source(&source, mode)
+                .map_err(|e| compile_err_to_syntax_error(e, &source))?;
             let code_ptr = Box::into_raw(Box::new(code)) as *const ();
             (crate::w_code_new(code_ptr), false)
-        } else if !source.is_null() && crate::is_code(source) {
-            (source, true)
-        } else {
-            return Err(crate::PyError::type_error(format!(
-                "{}() arg 1 must be a string, bytes or code object",
-                if is_eval { "eval" } else { "exec" }
-            )));
         }
     };
     let raw_code = unsafe {

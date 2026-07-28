@@ -7,6 +7,12 @@ assert isinstance(
 assert compile("1 + 1", "<test>", "eval") is not None
 assert compile("1", "<test>", "single") is not None
 
+# `source_as_str` accepts every readable contiguous buffer, not only bytes and
+# bytearray.  This is exercised directly by CPython's test_builtin suite.
+namespace = {}
+exec(compile(memoryview(b"answer = 42"), "<buffer>", "exec"), namespace)
+assert namespace["answer"] == 42
+
 # `optimize` accepts -1 (use config default), 0, 1, 2 only.
 # Anything else raises ValueError with CPython's exact wording.
 for ok in (-1, 0, 1, 2):
