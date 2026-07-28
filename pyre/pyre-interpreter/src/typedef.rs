@@ -25874,6 +25874,13 @@ fn descr_del_dict(
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     let _closure = args[0];
     let w_obj = args[1];
+    // CPython 3.14 keeps BaseException.__dict__ non-deletable even when a
+    // regular heap base precedes BaseException in the MRO and contributes
+    // this generic descriptor.  PyPy permits the deletion, but 3.14 is the
+    // selected surface for this version difference.
+    if unsafe { pyre_object::is_exception(w_obj) } {
+        return Err(crate::PyError::type_error("__dict__ may not be deleted"));
+    }
     crate::baseobjspace::setdict(w_obj, pyre_object::w_dict_new())?;
     Ok(pyre_object::w_none())
 }

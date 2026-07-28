@@ -7111,6 +7111,46 @@ while i < 3000:
     }
 
     #[test]
+    fn test_inherited_dict_descriptor_preserves_native_namespace_ownership() {
+        let source = "\
+class Base:
+    pass
+class Meta(Base, type):
+    pass
+class C(metaclass=Meta):
+    pass
+type_set_rejected = False
+try:
+    Base.__dict__['__dict__'].__set__(C, {})
+except (TypeError, AttributeError):
+    type_set_rejected = True
+type_mapping_rejected = False
+try:
+    C.__dict__['x'] = 1
+except TypeError:
+    type_mapping_rejected = True
+class Exc(Base, Exception):
+    pass
+exception_delete_rejected = False
+try:
+    Base.__dict__['__dict__'].__delete__(Exc())
+except (TypeError, AttributeError):
+    exception_delete_rejected = True";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("native namespace ownership regression");
+        unsafe {
+            for name in [
+                "type_set_rejected",
+                "type_mapping_rejected",
+                "exception_delete_rejected",
+            ] {
+                let value = w_dict_getitem_str(frame.w_globals, name).unwrap();
+                assert!(is_true(value).unwrap(), "{name} should be true");
+            }
+        }
+    }
+
+    #[test]
     fn test_function_dunder_globals_and_code_are_materialized() {
         crate::test_hooks::install_hash_hook();
         let source = "\

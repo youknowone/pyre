@@ -4224,6 +4224,25 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
 /// it to call `_obj_getdict`. pyre dispatches at runtime via the type's
 /// hasdict flag because Rust has no per-class virtual table.
 pub fn getdict(obj: PyObjectRef) -> PyResult {
+    // typeobject.py:582-589 W_TypeObject.getdict exposes the live class
+    // namespace through a ClassDictStrategy dictionary, whose app-level
+    // surface is readonly.  Use pyre's live mapping-proxy wrapper even when
+    // this hook is reached through an inherited generic __dict__ descriptor.
+    if unsafe { is_type(obj) } {
+        let dict_ptr = unsafe { pyre_object::w_type_get_dict_ptr(obj) };
+        let canonical = if dict_ptr.is_null() {
+            pyre_object::w_dict_new()
+        } else {
+            dict_ptr as PyObjectRef
+        };
+        return Ok(pyre_object::w_dict_proxy_new(canonical));
+    }
+    // module.py:77-78 Module.getdict returns its native namespace mapping.
+    // The __dict__ attribute is readonly, but the returned mapping itself is
+    // intentionally mutable.
+    if unsafe { is_module(obj) } {
+        return Ok(unsafe { pyre_object::w_module_get_w_dict(obj) });
+    }
     // pypy/module/thread/os_local.py Local.getdict selects the dictionary
     // belonging to the current ExecutionContext before ordinary mapdict
     // dispatch.  The Local object itself owns the mapping and cache.
@@ -4526,6 +4545,17 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
         require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::complexobject::w_complex_setdict(obj, w_dict) };
         return Ok(());
+    }
+    // W_TypeObject and Module keep their namespace mappings as readonly
+    // attributes.  Their Python class/metaclass may itself inherit a regular
+    // instance `__dict__` slot, but that must not redirect replacement of the
+    // native type/module namespace through mapdict.  PyPy leaves both on
+    // W_Root.setdict here (Module's own __dict__ getset has no setter).
+    if unsafe { is_type(obj) || is_module(obj) } {
+        return Err(PyError::type_error(format!(
+            "attribute '__dict__' of '{}' objects is not writable",
+            object_functionstr_type_name(obj),
+        )));
     }
     let w_type = match crate::typedef::r#type(obj) {
         Some(tp) => tp,
