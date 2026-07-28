@@ -161,10 +161,33 @@ impl Assembler {
         let all_liveness = pyre_jit_trace::jitcode_runtime::all_liveness().to_vec();
         let all_liveness_length = all_liveness.len();
         let insns = pyre_jit_trace::jitcode_runtime::insns_opname_to_byte().clone();
+        // `assembler.py:31 self.all_liveness_positions` is the third half of
+        // the same continuation. Seeding the bytes without it leaves the
+        // resumed assembler blind to every record the prefix already holds, so
+        // the first runtime `_encode_liveness` of a triple the build-time drain
+        // already wrote appends a second copy instead of returning its offset.
+        // The `-live-` operand is 2 bytes, so those duplicates come out of one
+        // shared 64 KiB budget.
+        let all_liveness_positions =
+            majit_translate::liveness::decode_liveness_records(&all_liveness)
+                .into_iter()
+                .filter_map(|(live_i, live_r, live_f, offset)| {
+                    let offset = u16::try_from(offset).ok()?;
+                    Some((
+                        (
+                            live_i.into_iter().collect::<VecSet<u8>>(),
+                            live_r.into_iter().collect::<VecSet<u8>>(),
+                            live_f.into_iter().collect::<VecSet<u8>>(),
+                        ),
+                        offset,
+                    ))
+                })
+                .collect();
         Self {
             insns,
             all_liveness,
             all_liveness_length,
+            all_liveness_positions,
             ..Self::default()
         }
     }

@@ -421,6 +421,53 @@ pub fn encode_liveness(live: &[u8]) -> Vec<u8> {
     liveness
 }
 
+/// Walk an `all_liveness` buffer back into the `(live_i, live_r, live_f)`
+/// records [`encode_liveness`] wrote into it, each with its own offset.
+///
+/// `assembler.py:236-250 _encode_liveness` appends every record at the
+/// buffer's current end — three count bytes then the three bitsets — so the
+/// buffer is a contiguous run of records starting at 0 and this walk recovers
+/// them exactly. Upstream never needs it: one `Assembler` holds one buffer and
+/// one `all_liveness_positions` dict for the whole program. pyre assembles the
+/// extracted interpreter graphs in `build.rs` and the Python-bytecode graphs at
+/// runtime, and the runtime side resumes the build-time bytes; without this the
+/// resumed side starts with an empty dedup dict and re-appends a record the
+/// prefix already holds, spending the 2-byte `-live-` operand's 64 KiB budget
+/// on duplicates.
+///
+/// Each returned tuple is `(live_i, live_r, live_f, offset)`, with the sets in
+/// the sorted/deduped form `encode_liveness` canonicalises to — the same shape
+/// upstream's `frozenset` key has.
+pub fn decode_liveness_records(all_liveness: &[u8]) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>, usize)> {
+    let mut records = Vec::new();
+    let mut pos = 0usize;
+    while pos + 3 <= all_liveness.len() {
+        let offset = pos;
+        let counts = [
+            all_liveness[pos],
+            all_liveness[pos + 1],
+            all_liveness[pos + 2],
+        ];
+        pos += 3;
+        let mut sets: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for (bank, &count) in counts.iter().enumerate() {
+            if count == 0 {
+                // `encode_liveness(&[])` emits no bytes, so an empty bank
+                // consumes none either.
+                continue;
+            }
+            let mut it = LivenessIterator::new(pos, u32::from(count), all_liveness);
+            for index in it.by_ref() {
+                sets[bank].push(index as u8);
+            }
+            pos = it.offset;
+        }
+        let [live_i, live_r, live_f] = sets;
+        records.push((live_i, live_r, live_f, offset));
+    }
+    records
+}
+
 /// RPython liveness.py:170-200 `LivenessIterator`.
 ///
 /// Iterates set bit positions from a bitset stored in `all_liveness`
@@ -479,6 +526,36 @@ impl<'a> Iterator for LivenessIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_liveness_records_round_trips_encode() {
+        // Same layout `assembler.py:241-247` writes: three count bytes then
+        // the three encoded banks, appended back to back.
+        let banks: [(Vec<u8>, Vec<u8>, Vec<u8>); 4] = [
+            (vec![0, 3, 7], vec![1], vec![]),
+            (vec![], vec![], vec![]),
+            (vec![2], vec![], vec![9, 10]),
+            (vec![0, 1, 2, 3, 4, 5, 6, 7, 8], vec![255], vec![4]),
+        ];
+        let mut all = Vec::new();
+        let mut offsets = Vec::new();
+        for (i, r, f) in &banks {
+            offsets.push(all.len());
+            all.push(i.len() as u8);
+            all.push(r.len() as u8);
+            all.push(f.len() as u8);
+            for live in [i.as_slice(), r.as_slice(), f.as_slice()] {
+                all.extend_from_slice(&encode_liveness(live));
+            }
+        }
+        let decoded = decode_liveness_records(&all);
+        assert_eq!(decoded.len(), banks.len());
+        for (idx, (i, r, f, off)) in decoded.iter().enumerate() {
+            assert_eq!((i, r, f), (&banks[idx].0, &banks[idx].1, &banks[idx].2));
+            assert_eq!(*off, offsets[idx]);
+        }
+    }
+
     use crate::flatten::FlatOp;
     use crate::model::{OpKind, SpaceOperation, ValueType};
 

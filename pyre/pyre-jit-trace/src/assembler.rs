@@ -68,12 +68,29 @@ impl AssemblerState {
         let insns = crate::jitcode_runtime::insns_opname_to_byte().clone();
         Self {
             insns,
+            all_liveness_positions: liveness_positions_of(&all_liveness),
             all_liveness,
             all_liveness_length,
-            all_liveness_positions: IndexMap::new(),
             num_liveness_ops: 0,
         }
     }
+}
+
+/// `assembler.py:31 self.all_liveness_positions` for a buffer that was handed
+/// over rather than built here.
+///
+/// Both entries into this state receive the bytes wholesale — `new` resumes the
+/// build-time drain's prefix, `publish_state` mirrors the writer's buffer — and
+/// the dict has to describe the same records those bytes hold, or the next
+/// `intern_liveness` re-appends a triple already present and spends part of the
+/// 2-byte `-live-` operand's 64 KiB budget on a duplicate.
+fn liveness_positions_of(all_liveness: &[u8]) -> IndexMap<(Vec<u8>, Vec<u8>, Vec<u8>), u16> {
+    majit_translate::liveness::decode_liveness_records(all_liveness)
+        .into_iter()
+        .filter_map(|(live_i, live_r, live_f, offset)| {
+            Some(((live_i, live_r, live_f), u16::try_from(offset).ok()?))
+        })
+        .collect()
 }
 
 thread_local! {
@@ -138,10 +155,11 @@ pub fn publish_state(
         asm.all_liveness.extend_from_slice(all_liveness);
         asm.all_liveness_length = all_liveness_length;
         asm.num_liveness_ops = num_liveness_ops;
-        // The dedup table is keyed by offsets into the previous
-        // all_liveness buffer; clear it so subsequent intern_liveness
-        // lookups cannot reuse stale offsets against the fresh buffer.
-        asm.all_liveness_positions.clear();
+        // The dedup table describes the *previous* buffer, so rebuild it from
+        // the one just installed. Clearing instead would leave the mirror
+        // unable to see any record in the fresh bytes, and the next
+        // `intern_liveness` would append a duplicate of one already there.
+        asm.all_liveness_positions = liveness_positions_of(all_liveness);
     });
     crate::state::publish_liveness_info(all_liveness.to_vec());
 }

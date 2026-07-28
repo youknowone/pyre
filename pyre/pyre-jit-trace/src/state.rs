@@ -465,7 +465,19 @@ pub fn intern_liveness(live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> Option<u1
         // inside `_encode_liveness`. The counter measures write-insn call
         // frequency, not unique-entry count.
         asm.num_liveness_ops += 1;
-        let key = (live_i.to_vec(), live_r.to_vec(), live_f.to_vec());
+        // `assembler.py:238` keys on the three frozensets. `encode_liveness`
+        // sorts and dedups before writing, so two argument orderings of one
+        // set encode to identical bytes; keying on the raw slice order would
+        // miss the dedup and append a second copy of a record already in the
+        // buffer. Canonicalise to the same sorted/deduped form the writer side
+        // (`VecSet`) and `decode_liveness_records` produce.
+        let canonical = |live: &[u8]| {
+            let mut v = live.to_vec();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let key = (canonical(live_i), canonical(live_r), canonical(live_f));
         if let Some(&pos) = asm.all_liveness_positions.get(&key) {
             return Some((pos, asm.all_liveness.clone()));
         }
