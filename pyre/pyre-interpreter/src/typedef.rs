@@ -16372,6 +16372,10 @@ fn bytearray_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::bytearrayobject::BYTEARRAY_TYPE)? {
         let data = unsafe { pyre_object::bytesobject::bytes_like_data(value).to_vec() };
         let fresh = pyre_object::bytearrayobject::w_bytearray_subclass_from_bytes(&data, sub);
+        // bytearrayobject.py:new_bytearray uses `space.allocate_instance`;
+        // register a user-defined finalizer after the subclass allocator has
+        // installed the concrete class.
+        pyre_object::gc_hook::maybe_register_finalizer(fresh);
         return Ok(fresh);
     }
     Ok(value)
@@ -19398,6 +19402,9 @@ fn bytes_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // fresh object before retagging to avoid aliasing the input.
         let data = unsafe { pyre_object::bytesobject::bytes_like_data(value).to_vec() };
         let fresh = pyre_object::bytesobject::w_bytes_subclass_from_bytes(&data, sub);
+        // bytesobject.py:descr_new allocates strict subtypes through
+        // `space.allocate_instance(W_BytesObject, w_stringtype)`.
+        pyre_object::gc_hook::maybe_register_finalizer(fresh);
         return Ok(fresh);
     }
     Ok(value)
