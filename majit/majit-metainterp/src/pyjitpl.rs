@@ -16006,6 +16006,19 @@ impl MetaInterpStaticData {
     /// same bitstrings (compute_bitstrings's class assignment is
     /// deterministic for a given EI population).
     pub fn finish_setup_descrs(&self) {
+        // `warmspot.py:289` runs `finish_setup` once, in one process,
+        // before any tracing, so its writes onto the shared descrs have a
+        // single writer by construction.  Pyre keeps `MetaInterpStaticData`
+        // per thread while the descrs it mutates here (`set_descr_index`,
+        // `set_ei_index`, `set_effect_bitstrings`) live in the
+        // process-global `GcCache`, so two threads reaching this at once
+        // are two writers over one `EffectInfoCell` — each dropping the
+        // other's just-installed bitstring `Vec`.  Serialise the publish so
+        // the single-writer contract `EffectInfoCell::set_bitstrings`
+        // documents holds for real.
+        static PUBLISH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _publish = PUBLISH.lock().unwrap_or_else(|e| e.into_inner());
+
         // PyPy `backend/llsupport/descr.py:25-47 setup_descrs` walks
         // `gc_cache` per-category in this fixed order: size, field,
         // array, arraylen, call, interiorfield.  Each visit assigns
