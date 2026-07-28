@@ -1195,6 +1195,15 @@ pub fn init_typeobjects() {
             ) as usize,
         );
         reg.insert(
+            &pyre_object::interp_itertools::PRODUCT_TYPE as *const PyType as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.product",
+                init_product_type,
+                object_type,
+                &pyre_object::interp_itertools::PRODUCT_TYPE as *const PyType,
+            ) as usize,
+        );
+        reg.insert(
             &pyre_object::interp_itertools::COMPRESS_TYPE as *const PyType as usize,
             new_typeobject_with_base_and_layout(
                 "itertools.compress",
@@ -24140,6 +24149,137 @@ fn init_batched_type(ns: PyObjectRef) {
             "__doc__",
             w_str_new(
                 "Batch data into tuples of length n. The last batch may be shorter than n.\n\nLoops over the input iterable and accumulates data into tuples\nup to size n.  The input is consumed lazily, just enough to\nfill a batch.  The result is yielded as soon as a batch is full\nor when the input iterable is exhausted.\n\nIf \"strict\" is True, raises a ValueError if the final batch is shorter\nthan n.",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+// ── itertools.product TypeDef ───────────────────────────────────────
+// PyPy W_Product state and odometer transition, with Python 3.14's
+// repeat conversion, repeat=0 input non-consumption, and public surface.
+
+fn product_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exact =
+        gettypefor(&pyre_object::interp_itertools::PRODUCT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = positional.first().copied().unwrap_or(PY_NULL);
+    let inputs = positional.get(1..).unwrap_or(&[]);
+    crate::builtins::kwarg_reject_unknown(kwargs, &["repeat"], "product")?;
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let inputs_base = pyre_object::gc_roots::shadow_stack_len();
+    for &input in inputs {
+        pyre_object::gc_roots::pin_root(input);
+    }
+    let repeat_slot = crate::builtins::kwarg_get(kwargs, "repeat").map(|value| {
+        pyre_object::gc_roots::pin_root(value);
+        pyre_object::gc_roots::shadow_stack_len() - 1
+    });
+    let repeat = match repeat_slot {
+        Some(slot) => crate::builtins::space_index_w(unsafe {
+            pyre_object::gc_roots::shadow_stack_get(slot)
+        })?,
+        None => 1,
+    };
+    if repeat < 0 {
+        return Err(crate::PyError::value_error(
+            "repeat argument cannot be negative",
+        ));
+    }
+    let repeat = usize::try_from(repeat)
+        .map_err(|_| crate::PyError::overflow_error("repeat argument too large"))?;
+    let npools = if repeat == 0 {
+        0
+    } else {
+        inputs
+            .len()
+            .checked_mul(repeat)
+            .filter(|count| *count <= isize::MAX as usize / std::mem::size_of::<isize>())
+            .ok_or_else(|| crate::PyError::overflow_error("repeat argument too large"))?
+    };
+
+    // CPython 3.14 deliberately sets nargs=0 for repeat=0, so the supplied
+    // iterables are not touched.  Otherwise snapshot each input exactly once,
+    // matching PyPy's `space.unpackiterable(arg_w)[:]`.
+    let mut pool_slots = Vec::with_capacity(inputs.len().min(npools));
+    let mut stopped = false;
+    if repeat != 0 {
+        for index in 0..inputs.len() {
+            let items = crate::builtins::collect_iterable(unsafe {
+                pyre_object::gc_roots::shadow_stack_get(inputs_base + index)
+            })?;
+            stopped |= items.is_empty();
+            for &item in &items {
+                pyre_object::gc_roots::pin_root(item);
+            }
+            let pool = pyre_object::w_list_new(items);
+            pyre_object::gc_roots::pin_root(pool);
+            pool_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
+        }
+    }
+
+    let mut gear_items = Vec::with_capacity(npools);
+    for _ in 0..repeat {
+        for &slot in &pool_slots {
+            gear_items.push(unsafe { pyre_object::gc_roots::shadow_stack_get(slot) });
+        }
+    }
+    let gears = pyre_object::w_list_new(gear_items);
+    pyre_object::gc_roots::pin_root(gears);
+    let gears_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let indices = pyre_object::w_list_new((0..npools).map(|_| pyre_object::w_int_new(0)).collect());
+    let obj = pyre_object::interp_itertools::w_product_new(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(gears_slot) },
+        indices,
+        stopped,
+    );
+    itertools_alloc_for_class(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        exact,
+        obj,
+    )
+}
+
+fn product_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args[0];
+    unsafe {
+        if !pyre_object::interp_itertools::is_product(obj) {
+            return Err(crate::PyError::type_error(
+                "descriptor '__sizeof__' requires a 'itertools.product' object",
+            ));
+        }
+        let product = &*(obj as *const pyre_object::interp_itertools::W_Product);
+        let npools = pyre_object::w_list_len(product.gears);
+        let size = std::mem::size_of::<pyre_object::interp_itertools::W_Product>()
+            + npools * std::mem::size_of::<isize>();
+        Ok(pyre_object::w_int_new(size as i64))
+    }
+}
+
+fn init_product_type(ns: PyObjectRef) {
+    let entries = [
+        ("__new__", make_new_descr(product_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__sizeof__",
+            make_builtin_function_with_arity("__sizeof__", product_sizeof, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Cartesian product of input iterables.  Equivalent to nested for-loops.\n\nFor example, product(A, B) returns the same as:  ((x,y) for x in A for y in B).\nThe leftmost iterators are in the outermost for-loop, so the output tuples\ncycle in a manner similar to an odometer (with the rightmost element changing\non every iteration).\n\nTo compute the product of an iterable with itself, specify the number\nof repetitions with the optional repeat keyword argument. For example,\nproduct(A, repeat=4) means the same as product(A, A, A, A).\n\nproduct('ab', range(3)) --> ('a',0) ('a',1) ('a',2) ('b',0) ('b',1) ('b',2)\nproduct((0,1), (0,1), (0,1)) --> (0,0,0) (0,0,1) (0,1,0) (0,1,1) (1,0,0) ...",
             ),
         ),
     ];

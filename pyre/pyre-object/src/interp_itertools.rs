@@ -440,6 +440,54 @@ pub unsafe fn w_batched_set_exhausted(obj: PyObjectRef) {
     }
 }
 
+// ── W_Product — pypy/module/itertools/interp_itertools.py:W_Product ──
+//
+// ```python
+// class W_Product(W_Root):
+//     def __init__(self, space, args_w, w_repeat):
+//         self.gears = [...]
+//         self.indices = [0] * len(self.gears)
+//         self.lst = None
+//         self.stopped = False
+// ```
+//
+// Each translated RPython list is represented by an owned W_ListObject.  The
+// outer `gears` list owns list snapshots of the input pools; `indices` and
+// `lst` preserve the upstream mutable per-iterator state.  A null `lst`
+// represents PyPy's None sentinel before the first result and after rollover.
+#[pyre_class("itertools.product", static_name = "PRODUCT")]
+pub struct W_Product {
+    pub gears: PyObjectRef,
+    pub indices: PyObjectRef,
+    pub lst: PyObjectRef,
+    pub stopped: bool,
+}
+
+pub fn w_product_new(gears: PyObjectRef, indices: PyObjectRef, stopped: bool) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(gears);
+    crate::gc_roots::pin_root(indices);
+    W_Product::allocate_stable(W_Product {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        gears,
+        indices,
+        lst: std::ptr::null_mut(),
+        stopped,
+    })
+}
+
+/// Check if an object is a `W_Product`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_product(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &PRODUCT_TYPE) }
+}
+
 // ── W_Compress — pypy/module/itertools/interp_itertools.py:W_Compress ──
 //
 // ```python
@@ -904,6 +952,22 @@ mod tests {
         assert_eq!(
             <W_Batched as crate::lltype::GcType>::SIZE,
             W_BATCHED_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_product_gc_descriptor_traces_all_owned_lists() {
+        assert_eq!(
+            W_PRODUCT_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_Product, gears),
+                std::mem::offset_of!(W_Product, indices),
+                std::mem::offset_of!(W_Product, lst),
+            ]
+        );
+        assert_eq!(
+            <W_Product as crate::lltype::GcType>::SIZE,
+            W_PRODUCT_OBJECT_SIZE
         );
     }
 

@@ -4857,6 +4857,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::interp_itertools::is_cycle(obj)
             || pyre_object::interp_itertools::is_chain(obj)
             || pyre_object::interp_itertools::is_batched(obj)
+            || pyre_object::interp_itertools::is_product(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = match name {
                 "__next__" => Some((iter_next_method, "__next__", 1)),
@@ -12540,6 +12541,7 @@ pub fn is_iterable(obj: PyObjectRef) -> bool {
             || pyre_object::interp_itertools::is_cycle(obj)
             || pyre_object::interp_itertools::is_chain(obj)
             || pyre_object::interp_itertools::is_batched(obj)
+            || pyre_object::interp_itertools::is_product(obj)
         {
             return true;
         }
@@ -12830,6 +12832,26 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // heap subtype to replace `__iter__`.
         if pyre_object::interp_itertools::is_batched(obj) {
             let exact = get_instantiate(&pyre_object::interp_itertools::BATCHED_TYPE);
+            if !std::ptr::eq((*obj).w_class, exact) {
+                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
+                    if !std::ptr::eq(src, exact) {
+                        if is_none(method) {
+                            return Err(PyError::type_error(format!(
+                                "'{}' object is not iterable",
+                                obj_type_name(obj)
+                            )));
+                        }
+                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                        return iter_check_is_iterator(w_iter);
+                    }
+                }
+            }
+            return Ok(obj);
+        }
+        // PyPy W_Product.iter_w returns self, with normal heap-subtype
+        // override dispatch.
+        if pyre_object::interp_itertools::is_product(obj) {
+            let exact = get_instantiate(&pyre_object::interp_itertools::PRODUCT_TYPE);
             if !std::ptr::eq((*obj).w_class, exact) {
                 if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
                     if !std::ptr::eq(src, exact) {
@@ -13462,6 +13484,127 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 .map(|slot| pyre_object::gc_roots::shadow_stack_get(slot))
                 .collect();
             return Ok(pyre_object::w_tuple_new(items));
+        }
+        // itertools.product — PyPy W_Product.fill_next_result /
+        // _rotate_previous_gears.  The rightmost pool advances like an
+        // odometer; only one result tuple is allocated per call.
+        if pyre_object::interp_itertools::is_product(obj) {
+            let exact = get_instantiate(&pyre_object::interp_itertools::PRODUCT_TYPE);
+            if !std::ptr::eq((*obj).w_class, exact) {
+                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__next__") {
+                    if !std::ptr::eq(src, exact) {
+                        return crate::call::call_function_impl_result(method, &[obj]);
+                    }
+                }
+            }
+
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let state = &*(w_self as *const pyre_object::interp_itertools::W_Product);
+            if state.stopped {
+                return Err(PyError::stop_iteration());
+            }
+
+            if state.lst.is_null() {
+                // First pass: fill the result list with gear[0].
+                let gear_count = pyre_object::w_list_len(state.gears);
+                let mut item_slots = Vec::with_capacity(gear_count);
+                for index in 0..gear_count {
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    let gears =
+                        (*(w_self as *const pyre_object::interp_itertools::W_Product)).gears;
+                    let gear = pyre_object::w_list_getitem(gears, index as i64)
+                        .expect("product gear index in range");
+                    if pyre_object::w_list_len(gear) == 0 {
+                        let state = &mut *(w_self as *mut pyre_object::interp_itertools::W_Product);
+                        state.stopped = true;
+                        return Err(PyError::stop_iteration());
+                    }
+                    let item =
+                        pyre_object::w_list_getitem(gear, 0).expect("non-empty product gear");
+                    pyre_object::gc_roots::pin_root(item);
+                    item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
+                }
+                let initial = pyre_object::w_list_new(
+                    item_slots
+                        .into_iter()
+                        .map(|slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                        .collect(),
+                );
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                (*(w_self as *mut pyre_object::interp_itertools::W_Product)).lst = initial;
+                pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
+            } else {
+                let gear_count = pyre_object::w_list_len(state.gears);
+                if gear_count == 0 {
+                    let state = &mut *(w_self as *mut pyre_object::interp_itertools::W_Product);
+                    state.stopped = true;
+                    return Err(PyError::stop_iteration());
+                }
+
+                // Advance right-to-left until one gear does not roll over.
+                let mut position = gear_count;
+                let mut advanced = false;
+                while position > 0 {
+                    position -= 1;
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    let state = &*(w_self as *const pyre_object::interp_itertools::W_Product);
+                    let gear = pyre_object::w_list_getitem(state.gears, position as i64)
+                        .expect("product gear index in range");
+                    let old_index_obj = pyre_object::w_list_getitem(state.indices, position as i64)
+                        .expect("product index in range");
+                    let old_index = pyre_object::w_int_get_value(old_index_obj) as usize;
+                    let next_index = old_index + 1;
+                    let gear_len = pyre_object::w_list_len(gear);
+                    let stored_index = if next_index < gear_len {
+                        advanced = true;
+                        next_index
+                    } else {
+                        0
+                    };
+
+                    // Integer boxing can collect. Re-read the owner and pool
+                    // before publishing both the index and selected item.
+                    let w_index = pyre_object::w_int_new(stored_index as i64);
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    let state = &*(w_self as *const pyre_object::interp_itertools::W_Product);
+                    let gear = pyre_object::w_list_getitem(state.gears, position as i64)
+                        .expect("product gear index in range");
+                    let item = pyre_object::w_list_getitem(gear, stored_index as i64)
+                        .expect("product item index in range");
+                    pyre_object::w_list_setitem(state.indices, position as i64, w_index);
+                    pyre_object::w_list_setitem(state.lst, position as i64, item);
+                    if advanced {
+                        break;
+                    }
+                }
+                if !advanced {
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    let state = &mut *(w_self as *mut pyre_object::interp_itertools::W_Product);
+                    state.lst = std::ptr::null_mut();
+                    state.stopped = true;
+                    return Err(PyError::stop_iteration());
+                }
+            }
+
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let lst = (*(w_self as *const pyre_object::interp_itertools::W_Product)).lst;
+            let result_len = pyre_object::w_list_len(lst);
+            let mut result_slots = Vec::with_capacity(result_len);
+            for index in 0..result_len {
+                let item = pyre_object::w_list_getitem(lst, index as i64)
+                    .expect("product result in range");
+                pyre_object::gc_roots::pin_root(item);
+                result_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
+            }
+            return Ok(pyre_object::w_tuple_new(
+                result_slots
+                    .into_iter()
+                    .map(|slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                    .collect(),
+            ));
         }
         // itertools.compress — interp_itertools.py W_Compress.next_w.
         // Pull data first, then its matching selector; exhaustion of either

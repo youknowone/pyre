@@ -294,61 +294,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             )),
         ),
     );
-    // product(*iterables, repeat=1)
+    // PyPy W_Product: retain only the pool snapshots and odometer state rather
+    // than eagerly materializing the Cartesian result.
     crate::module_ns_store(
         ns,
         "product",
-        crate::make_builtin_function("product", |args| {
-            // `interp_itertools.py W_Product.__init__` —
-            // `product(*iterables, repeat=1)`.  The kwarg arrives via
-            // the trailing `__pyre_kw__` dict, mirroring how
-            // `enumerate`/`zip` extract their kwargs in this module.
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            crate::builtins::kwarg_reject_unknown(kwargs, &["repeat"], "product")?;
-            let repeat = match crate::builtins::kwarg_get(kwargs, "repeat") {
-                Some(w) => unsafe {
-                    if !pyre_object::is_int(w) {
-                        return Err(crate::PyError::type_error(
-                            "product() 'repeat' argument must be an integer",
-                        ));
-                    }
-                    pyre_object::w_int_get_value(w)
-                },
-                None => 1,
-            };
-            if repeat < 0 {
-                return Err(crate::PyError::value_error(
-                    "repeat argument cannot be negative",
-                ));
-            }
-            let base_pools: Vec<Vec<_>> = positional
-                .iter()
-                .map(|&a| crate::builtins::collect_iterable(a))
-                .collect::<Result<_, _>>()?;
-            let mut pools: Vec<Vec<pyre_object::PyObjectRef>> =
-                Vec::with_capacity(base_pools.len() * (repeat as usize));
-            for _ in 0..repeat {
-                for p in &base_pools {
-                    pools.push(p.clone());
-                }
-            }
-            let mut result: Vec<Vec<pyre_object::PyObjectRef>> = vec![vec![]];
-            for pool in &pools {
-                let mut new_result = Vec::with_capacity(result.len() * pool.len());
-                for existing in &result {
-                    for &item in pool {
-                        let mut v = existing.clone();
-                        v.push(item);
-                        new_result.push(v);
-                    }
-                }
-                result = new_result;
-            }
-            let tuples: Vec<_> = result.into_iter().map(pyre_object::w_tuple_new).collect();
-            let n = tuples.len();
-            let list = pyre_object::w_list_new(tuples);
-            Ok(pyre_object::w_seq_iter_new(list, n))
-        }),
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::PRODUCT_TYPE)
+            .expect("itertools.product TypeDef initialized")
+            .as_ptr(),
     );
     // PyPy exports W_ZipLongest.typedef.  Construction keeps each source as a
     // live iterator, so unbounded inputs remain lazy.
