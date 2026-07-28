@@ -6,10 +6,14 @@ import itertools
 assert isinstance(itertools.compress, type)
 assert itertools.compress.__module__ == "itertools"
 assert itertools.compress.__name__ == "compress"
-assert itertools.compress.__doc__ == (
-    "Return data elements corresponding to true selector elements.\n\n"
-    "Forms a shorter iterator from selected data elements using the selectors to\n"
-    "choose the data elements."
+# The paragraph text is the parity property, not where the lines break:
+# 3.14.5 wraps after "the selectors", 3.14.6 after "using the selectors",
+# so pinning one of them makes the reference interpreter fail this test on
+# the other.  Compare with the line breaks collapsed.
+assert " ".join(itertools.compress.__doc__.split()) == (
+    "Return data elements corresponding to true selector elements. "
+    "Forms a shorter iterator from selected data elements using the selectors "
+    "to choose the data elements."
 )
 assert {"__new__", "__iter__", "__next__", "__doc__"} <= set(
     itertools.compress.__dict__

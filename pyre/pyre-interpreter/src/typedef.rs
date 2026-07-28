@@ -23410,7 +23410,7 @@ fn init_compress_type(ns: PyObjectRef) {
         (
             "__doc__",
             w_str_new(
-                "Return data elements corresponding to true selector elements.\n\nForms a shorter iterator from selected data elements using the selectors to\nchoose the data elements.",
+                "Return data elements corresponding to true selector elements.\n\nForms a shorter iterator from selected data elements using the selectors\nto choose the data elements.",
             ),
         ),
     ];
