@@ -7295,6 +7295,29 @@ result = C.__dict__['f'](Proxy(C()))";
     }
 
     #[test]
+    fn test_empty_member_slot_error_uses_fully_qualified_type_name() {
+        let source = "\
+def make_type():
+    class X:
+        __slots__ = 'a'
+    return X
+X = make_type()
+try:
+    X().a
+except AttributeError as exc:
+    result = str(exc)";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("member slot AttributeError regression");
+        unsafe {
+            let value = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert_eq!(
+                w_str_get_wtf8(value).as_str(),
+                Ok("'__main__.make_type.<locals>.X' object has no attribute 'a'")
+            );
+        }
+    }
+
+    #[test]
     fn test_function_dunder_globals_and_code_are_materialized() {
         crate::test_hooks::install_hash_hook();
         let source = "\

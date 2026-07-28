@@ -12409,14 +12409,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                 };
                 match found {
                     Some(v) => Ok(v),
-                    None => Err(crate::PyError::new(
-                        crate::PyErrorKind::AttributeError,
-                        format!(
-                            "'{}' object has no attribute '{}'",
-                            unsafe { (*(*obj).ob_type).name },
-                            slot_name,
-                        ),
-                    )),
+                    None => Err(crate::baseobjspace::raiseattrerror(obj, slot_name, None)),
                 }
             }),
         )

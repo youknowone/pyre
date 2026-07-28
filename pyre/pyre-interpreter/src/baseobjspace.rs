@@ -10915,7 +10915,11 @@ pub(crate) fn setdictvalue(
 /// ```
 // dont_look_inside: attribute-miss / read-only AttributeError construction; slow path.
 #[majit_macros::dont_look_inside]
-fn raiseattrerror(obj: PyObjectRef, name: &str, w_descr: Option<PyObjectRef>) -> PyError {
+pub(crate) fn raiseattrerror(
+    obj: PyObjectRef,
+    name: &str,
+    w_descr: Option<PyObjectRef>,
+) -> PyError {
     // descroperation.py:58-67 — with a descriptor in hand, the attribute
     // exists on the type but has no reachable `__set__`/`__delete__` and the
     // receiver has no dict to store into: it is read-only.  Otherwise this is
@@ -10924,7 +10928,10 @@ fn raiseattrerror(obj: PyObjectRef, name: &str, w_descr: Option<PyObjectRef>) ->
     if w_descr.is_some() {
         let tp_name = unsafe {
             match crate::typedef::r#type(obj) {
-                Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
+                // Python 3.14 `PyUnicode_FromFormat("%T")` calls
+                // `PyType_GetFullyQualifiedName`, which uses
+                // `<module>.<qualname>` for heap types.
+                Some(tp) => type_repr_qualified_name(tp.as_ptr()),
                 None => (*(*obj).ob_type).name.to_string(),
             }
         };
@@ -10940,7 +10947,7 @@ fn raiseattrerror(obj: PyObjectRef, name: &str, w_descr: Option<PyObjectRef>) ->
             format!("type object '{}'", pyre_object::w_type_get_name(obj))
         } else {
             let tp_name = match crate::typedef::r#type(obj) {
-                Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
+                Some(tp) => type_repr_qualified_name(tp.as_ptr()),
                 None => (*(*obj).ob_type).name.to_string(),
             };
             format!("'{}' object", tp_name)
