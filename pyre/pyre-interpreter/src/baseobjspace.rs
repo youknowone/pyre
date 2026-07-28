@@ -5342,10 +5342,13 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
                 if e.kind != crate::PyErrorKind::AttributeError {
                     return Err(e);
                 }
-                // module.py:139-142 PEP 562: a module-level `__getattr__` in the
-                // module's own dict is consulted on miss, called unbound with
-                // just the name (a module hook is a dict value, not a type
-                // descriptor).
+                // module.py:139-162 PEP 562: a module-level `__getattr__` in the
+                // module's own dict is consulted first on miss, called unbound
+                // with just the name (a module hook is a dict value, not a type
+                // descriptor).  With no module hook, fall through to the
+                // class-level `__getattr__` on the module's type
+                // (descroperation.py:242-245), matching the non-surrogate path's
+                // `module_getattr_fallback`.
                 if is_module(obj) {
                     let w_dict = pyre_object::w_module_get_w_dict(obj);
                     if !w_dict.is_null() {
@@ -5358,7 +5361,6 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
                             }
                         }
                     }
-                    return Err(e);
                 }
                 // `space.lookup(w_obj, '__getattr__')` walks `type(w_obj)` —
                 // the metaclass for a type receiver, the class for an
