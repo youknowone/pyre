@@ -2053,38 +2053,63 @@ impl MiniMarkGC {
     }
 
     fn seed_major_root(&mut self, gcref: GcRef) {
-        if !gcref.is_null() && self.is_managed_heap_object(gcref.0) {
-            let hdr = unsafe { header_of(gcref.0) };
-            // SAFETY: header_of returns a raw pointer; keep each access
-            // short-lived to avoid creating overlapping exclusive borrows.
-            let newly_marked = unsafe {
-                if !(*hdr).has_flag(flags::VISITED) {
-                    (*hdr).set_flag(flags::VISITED);
-                    true
-                } else {
-                    false
-                }
-            };
-            if newly_marked {
-                self.incr_state.gray_stack.push(gcref.0);
-                self.note_nonmoving_nursery_mark(gcref.0);
+        if gcref.is_null()
+            || !self.is_managed_heap_object(gcref.0)
+            || !self.may_enter_marking_worklist(gcref.0)
+        {
+            return;
+        }
+        let hdr = unsafe { header_of(gcref.0) };
+        // SAFETY: header_of returns a raw pointer; keep each access
+        // short-lived to avoid creating overlapping exclusive borrows.
+        let newly_marked = unsafe {
+            if !(*hdr).has_flag(flags::VISITED) {
+                (*hdr).set_flag(flags::VISITED);
+                true
+            } else {
+                false
+            }
+        };
+        if newly_marked {
+            self.incr_state.gray_stack.push(gcref.0);
+            self.note_nonmoving_nursery_mark(gcref.0);
 
-                // incminimark.py:1322-1340 requires marking worklists to
-                // contain no nursery objects after a minor. Pyre JITFRAME
-                // gcmap spills are collector metadata, not SETFIELD_GC
-                // writes: a frame first grayed in STATE_SCANNING can leave
-                // the active shadow stack before the next minor without a
-                // mutator barrier. Arm this newly seeded old root in the
-                // existing old_objects_pointing_to_young shape once, so that
-                // minor forwards any such spill before resetting nursery.
-                if !self.is_in_nursery(gcref.0)
-                    && unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) }
-                {
-                    unsafe { (*hdr).clear_flag(flags::TRACK_YOUNG_PTRS) };
-                    self.remembered_set.push(gcref.0);
-                }
+            // incminimark.py:1322-1340 requires marking worklists to
+            // contain no nursery objects after a minor. Pyre JITFRAME
+            // gcmap spills are collector metadata, not SETFIELD_GC
+            // writes: a frame first grayed in STATE_SCANNING can leave
+            // the active shadow stack before the next minor without a
+            // mutator barrier. Arm this newly seeded old root in the
+            // existing old_objects_pointing_to_young shape once, so that
+            // minor forwards any such spill before resetting nursery.
+            if !self.is_in_nursery(gcref.0) && unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
+                unsafe { (*hdr).clear_flag(flags::TRACK_YOUNG_PTRS) };
+                self.remembered_set.push(gcref.0);
             }
         }
+    }
+
+    /// `incminimark.py:2739-2753 _collect_obj`: an object in the nursery is
+    /// never appended to `objects_to_trace` — "such an object is handled by
+    /// minor collections and shouldn't be specially handled by major
+    /// collections" — and `visit` (:2797-2799) asserts
+    /// `not self.is_in_nursery(obj)` on every popped entry.  The worklist
+    /// outlives the mutator resuming, so a nursery address left on it is read
+    /// back after the next `reset_nursery` has recycled those bytes: the
+    /// header decodes to a garbage `type_id`.
+    ///
+    /// A young object stays reachable without the entry.  When the minor
+    /// promotes it, `drag_out_root` greys the promoted copy
+    /// (`_trace_drag_out1_marking_phase`); when it is only reachable from an
+    /// old parent, that parent is in the remembered set and gets requeued
+    /// while MARKING (`_add_to_more_objects_to_trace`).
+    ///
+    /// The non-moving oldgen major is the one mode that marks the nursery in
+    /// place — it leaves those bytes untouched by contract, and
+    /// [`Self::note_nonmoving_nursery_mark`] clears the marks afterwards.
+    #[inline]
+    fn may_enter_marking_worklist(&self, addr: usize) -> bool {
+        self.oldgen_nonmoving_active || !self.is_in_nursery(addr)
     }
 
     /// Record a nursery object greyed during a non-moving major so its
@@ -2552,7 +2577,7 @@ impl MiniMarkGC {
     /// type system guarantees every `Ptr(GcStruct)` is GC-managed; it converges
     /// away once every `gc_ptr_offsets` target is a real GC allocation.
     fn grey_child(&mut self, addr: usize, holder_addr: usize, slot_addr: usize, site: &str) {
-        if self.is_managed_heap_object(addr) {
+        if self.is_managed_heap_object(addr) && self.may_enter_marking_worklist(addr) {
             let hdr = unsafe { header_of(addr) };
             let type_id = unsafe { (*hdr).type_id() };
             if type_id as usize >= self.types.len() {
@@ -2586,6 +2611,12 @@ impl MiniMarkGC {
         // varsize GC-pointer array is never buffered (the gray stack already
         // retains the live children); only the bounded fixed-field offsets are
         // copied into the reused `mark_offsets` buffer.
+        // incminimark.py:2797-2799 `visit`: `ll_assert(not
+        // self.is_in_nursery(obj), "nursery object in 'objects_to_trace'")`.
+        debug_assert!(
+            self.may_enter_marking_worklist(obj_addr),
+            "nursery object {obj_addr:#x} in the marking worklist",
+        );
         let type_id = unsafe { (*header_of(obj_addr)).type_id() };
         // A non-moving major can trace a live nursery object without first
         // copying it into its reserved old-gen shadow.  Keep that unoccupied
