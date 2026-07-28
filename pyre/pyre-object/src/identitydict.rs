@@ -74,6 +74,28 @@ unsafe fn identity_storage<'a>(
     &*(dict.dstorage as *const indexmap::IndexMap<IdentityKey, PyObjectRef>)
 }
 
+/// Internal helper: `IdentityDictStrategy::getitem` body.  Caller must have
+/// already verified `is_correct_type(w_key)`.
+///
+/// Residualise the identity-storage getitem leaf (`@dont_look_inside`,
+/// `rlib/jit.py:139`), the twin of `dictmultiobject::w_dict_lookup_int_strategy`:
+/// the `IndexMap::get` it wraps is an external-crate heap-lookup the tracer
+/// cannot model — the oopspec'd residual arm of
+/// `rordereddict.ll_dict_getitem` (traced only for a virtual dict).
+/// [`IdentityKey`] hashes and compares by address, so the probe runs no user
+/// Python code at all.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject` on
+/// [`IDENTITY_DICT_STRATEGY`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_lookup_identity_strategy(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+) -> Option<PyObjectRef> {
+    identity_storage(obj).get(&IdentityKey(key)).copied()
+}
+
 #[inline]
 unsafe fn identity_storage_mut<'a>(
     obj: PyObjectRef,
@@ -180,7 +202,7 @@ impl DictStrategy for IdentityDictStrategy {
     /// O(1) identity-keyed lookup.
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
         if Self::is_correct_type(w_key) {
-            return identity_storage(w_dict).get(&IdentityKey(w_key)).copied();
+            return w_dict_lookup_identity_strategy(w_dict, w_key);
         }
         // `identitydict.py:40-41 _never_equal_to` → always False, so
         // mismatched keys always promote and retry.
