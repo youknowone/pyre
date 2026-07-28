@@ -861,8 +861,20 @@ fn maybe_print_jit_stats() {
     // Gate tallies for the trace-entry and guard→bridge paths. These were
     // reachable only through the wasm runner's `pyre_jit_mc_diag` export, so a
     // native run had no way to see which gate declined a trace.
+    //
+    // `all_descrs` rides along because it is the one table the optimizer grows
+    // per trace while `descr.py:47` asserts it stays under 2**15 — upstream
+    // fills it once at translation time, so only pyre can run into that bound.
+    let all_descrs_len = pyre_jit::eval::driver_pair()
+        .0
+        .meta_interp()
+        .staticdata
+        .all_descrs
+        .lock()
+        .map(|d| d.len())
+        .unwrap_or(0);
     eprintln!(
-        "[jit-stats] mc_diag {}",
+        "[jit-stats] mc_diag {} all_descrs={all_descrs_len}",
         majit_metainterp::mc_diag_summary()
     );
 }
