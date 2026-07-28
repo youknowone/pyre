@@ -976,6 +976,29 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::sys_modules_registry_get",
         sys_modules_registry_get as *const (),
     );
+    // The host-boundary seams beside them: the two fd writers every
+    // diagnostic path funnels through, and the thread-identity read.
+    let emit_stdout: fn(&[u8]) = crate::host_seam::emit_stdout;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::host_seam::emit_stdout",
+        "pyre_interpreter::emit_stdout",
+        emit_stdout as *const (),
+    );
+    let emit_stderr: fn(&[u8]) = crate::host_seam::emit_stderr;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::host_seam::emit_stderr",
+        "pyre_interpreter::emit_stderr",
+        emit_stderr as *const (),
+    );
+    let current_ident: fn() -> i64 = crate::module::thread::current_ident;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::module::thread::current_ident",
+        "pyre_interpreter::current_ident",
+        current_ident as *const (),
+    );
     let set_in_flight_exception: fn(pyre_object::PyObjectRef) =
         crate::eval::set_in_flight_exception;
     push_alias_pair(

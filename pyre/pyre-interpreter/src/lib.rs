@@ -50,12 +50,19 @@ pub mod host_seam;
 #[cfg(not(unix))]
 pub mod host_seam {
     /// Emit bytes to the interpreter's stdout (fd 1).
+    ///
+    /// Carries `dont_look_inside` for the same reason as the unix body: the
+    /// write is the host boundary, so the front end residualizes the call.
+    /// Both spellings need it — a corpus extracted on a non-unix host sees
+    /// only this one.
+    #[majit_macros::dont_look_inside]
     pub fn emit_stdout(bytes: &[u8]) {
         use std::io::Write;
         let _ = std::io::stdout().write_all(bytes);
     }
 
     /// Emit bytes to the interpreter's stderr (fd 2).
+    #[majit_macros::dont_look_inside]
     pub fn emit_stderr(bytes: &[u8]) {
         use std::io::Write;
         let _ = std::io::stderr().write_all(bytes);
