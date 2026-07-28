@@ -1583,6 +1583,27 @@ impl majit_backend::Backend for WasmBackend {
         self.bh_new_array(length, arraydescr)
     }
 
+    /// llmodel.py:585-588 bh_arraylen_gc: read the length prefix at
+    /// `lendescr.offset`. Word-width (`*const usize`), matching the store
+    /// `bh_new_array` makes at the same offset — a fixed 8-byte read would fold
+    /// the first item into the high half on wasm32.
+    ///
+    /// Without this the trait stub answers `0` for every array length reached
+    /// at trace time, so a spare-capacity test (`length < len(items)`) records
+    /// its at-capacity arm on a list that has room. The compiled code reads the
+    /// real length, so that guard then fails on nearly every iteration and the
+    /// trace never stays in compiled code.
+    fn bh_arraylen_gc(
+        &self,
+        array_ptr: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
+    ) -> i64 {
+        let ofs = arraydescr
+            .array_len_offset()
+            .expect("bh_arraylen_gc requires ArrayDescr.lendescr");
+        unsafe { *((array_ptr as *const u8).add(ofs) as *const usize) as i64 }
+    }
+
     fn compile_loop(
         &mut self,
         inputargs: &[InputArg],
@@ -2735,7 +2756,18 @@ impl majit_backend::Backend for WasmBackend {
                     wasm_alloc_oldgen_typed(wasm_jitframe_tid(), JitFrame::alloc_size(depth));
                 assert!(jf_ref.0 != 0, "wasm JitFrame allocation failed");
                 let jf = jf_ref.0 as *mut JitFrame;
-                unsafe { JitFrame::init(jf, std::ptr::null(), depth) };
+                // `JitFrame::init` requires zero-filled storage, which the
+                // native `calloc` entry (`runner.rs` `execute_token`) and the
+                // wasm nursery reset (`nursery.rs` `reset`) both provide but
+                // the old-gen arena does not — `ArenaCollection::malloc`
+                // deliberately returns recycled bytes. `build_home_gcmap`
+                // marks every Ref home of the frozen geometry, so a home the
+                // trace has not defined yet when a collection lands must read
+                // as null rather than as a stale word.
+                unsafe {
+                    std::ptr::write_bytes(jf as *mut u8, 0, JitFrame::alloc_size(depth));
+                    JitFrame::init(jf, std::ptr::null(), depth);
+                }
 
                 // Per-loop gcmap over the surviving Ref-home region. Held in this
                 // stack frame (jf_gcmap points at it) until the outputs are read
