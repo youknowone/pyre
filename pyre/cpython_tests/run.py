@@ -13,7 +13,9 @@ Each module is launched one of three ways, selectable with `--mode`:
     as `__main__` so its `if __name__ == "__main__": unittest.main()` block
     fires. Needs only `unittest` plus the module's own imports; bypasses
     `runpy` / `importlib.util.find_spec` (which pyre's native importer does
-    not yet feed), so it is the most robust mode today.
+    not yet feed), so it is the most robust mode today. Runner metadata gives
+    resource-heavy or dotted-identity-sensitive modules the corresponding
+    libregrtest bootstrap without changing this default.
   * module: `pyre -m test.<module>` — same unittest entry but via `runpy`
     (currently blocked until `importlib.util.find_spec` is wired to pyre's
     importer).
@@ -195,12 +197,29 @@ def is_package(module: str) -> bool:
 # Driver that imports a test *package* with real package context (so its
 # `__init__.py` / `load_tests` discovers the sub-suite) and runs it through
 # unittest, emitting the `Ran N`/`OK`/`FAILED (` markers classify() keys on.
-_PKG_DRIVER = (
+_DOTTED_DRIVER = (
     "import sys, unittest\n"
     "mod = {module!r}\n"
     "__import__(mod)\n"
     "unittest.main(module=sys.modules[mod], argv=['pyre'], verbosity=2)\n"
 )
+
+_RESOURCE_DRIVER = (
+    "import runpy\n"
+    "from test import support\n"
+    "support.use_resources = {{}}\n"
+    "runpy.run_path({path!r}, run_name='__main__')\n"
+)
+
+# test_descr asserts fully qualified class names in exception text. Running
+# its file as __main__ changes those names even on CPython, so preserve the
+# dotted identity that libregrtest gives it.
+DOTTED_IDENTITY_MODULES = {"test.test_descr"}
+
+# test_datetime's load_tests appends an exhaustive test class for every
+# installed system timezone when test.support.use_resources is left as None.
+# libregrtest and PyPy's conftest use an empty default resource set.
+DEFAULT_RESOURCE_MODULES = {"test.test_datetime"}
 
 
 def build_cmd(binary: Path, module: str, mode: str) -> list[str]:
@@ -223,7 +242,20 @@ def run_module(binary: Path, module: str, mode: str, timeout: int,
             # running a submodule file directly breaks its relative imports);
             # drive it through a synthesized unittest entry instead.
             driver = Path(cwd) / "_pyre_pkg_main.py"
-            driver.write_text(_PKG_DRIVER.format(module=module), encoding="utf-8")
+            driver.write_text(_DOTTED_DRIVER.format(module=module), encoding="utf-8")
+            cmd = [str(binary), str(driver)]
+        elif mode == "script" and module in DOTTED_IDENTITY_MODULES:
+            driver = Path(cwd) / "_pyre_dotted_main.py"
+            driver.write_text(_DOTTED_DRIVER.format(module=module), encoding="utf-8")
+            cmd = [str(binary), str(driver)]
+        elif mode == "script" and module in DEFAULT_RESOURCE_MODULES:
+            # Match libregrtest's runner-owned default resource policy while
+            # retaining direct-file __main__ semantics.
+            driver = Path(cwd) / "_pyre_script_main.py"
+            driver.write_text(
+                _RESOURCE_DRIVER.format(path=str(module_path(module))),
+                encoding="utf-8",
+            )
             cmd = [str(binary), str(driver)]
         else:
             cmd = build_cmd(binary, module, mode)
