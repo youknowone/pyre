@@ -323,6 +323,14 @@ thread_local! {
     /// per-mutator root area next to `BH_LAST_EXC_VALUE` so a collection
     /// started by another thread still reaches a stopped mutator's parked
     /// exception.
+    ///
+    /// Thread-local is the faithful shape rather than a concession: upstream
+    /// keeps one shadow stack per thread and switches between them on GIL
+    /// hand-off (`shadowstack.py:140-215`, a `{tid: SHADOWSTACKREF}` map), and
+    /// enumerates every thread's block at collection time instead of resolving
+    /// the thread local on whichever thread started collecting
+    /// (`rthread.py:429-437 _trace_tlref`). This cell plus the per-mutator area
+    /// is that pair, hand-materialized for one live value.
     pub static GUARD_EXC_VALUE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 

@@ -3297,9 +3297,9 @@ fn walk_jit_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     if exc == 0 {
         return;
     }
-    // A GC-managed exception (post-#18) marked here has its registered child
-    // offsets traced by the collector; the exception is oldgen-stable so a
-    // bare mark suffices.
+    // A GC-managed exception marked here has its registered child offsets
+    // traced by the collector; the exception is oldgen-stable so a bare mark
+    // suffices.
     let mut gcref = majit_ir::GcRef(exc as usize);
     visitor(&mut gcref);
     // The carrier is non-moving (oldgen-stable / malloc_typed), so a minor
@@ -3308,6 +3308,24 @@ fn walk_jit_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     // tracebacks appended by the raise in flight, args — would be left
     // dangling inside the exception across the minor. Forward the raw child
     // slots explicitly, as the EC root walk does for `sys_exc_value`.
+    //
+    // For a *managed* exception the explicit walk is belt-and-braces: minor is
+    // already covered by the remembered set, since every reference setter goes
+    // through `exception_write_barrier`, and major marking traces the type's
+    // registered pointer offsets. It is load-bearing only for exceptions that
+    // live outside the GC heap — the `malloc_typed` immortals such as the
+    // MemoryError singleton — where the write barrier and major seeding both
+    // ignore a non-managed holder, leaving this walker as the sole traversal
+    // of their children.
+    //
+    // That asymmetry is why the carrier cannot be demoted to a plain
+    // shadow-stack entry (the direct analogue of the GC transform's rooted
+    // local, `shadowstack.py:31-39`): a generic root reaches an off-GC
+    // exception's fields through neither collection. Pushing the children
+    // individually does not substitute either — forwarding would rewrite the
+    // pushed copies, not the slots inside the exception. A walker with
+    // mutable access to the real slots is the only shape that works while the
+    // heap admits off-GC exception holders.
     unsafe {
         pyre_interpreter::eval::walk_raw_exception_roots(
             gcref.0 as pyre_object::PyObjectRef,

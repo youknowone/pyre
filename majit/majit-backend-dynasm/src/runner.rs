@@ -1678,8 +1678,9 @@ impl DynasmBackend {
     ///
     /// `frame_ptr` is required so the `propagate_exception_descr` arm
     /// can run the equivalent of `compile.py:1092-1098`'s
-    /// `cpu.grab_exc_value(deadframe)` — read+clear `jf_guard_exc` and
-    /// stage the value into `jf_frame[0]` before synthesizing the
+    /// `cpu.grab_exc_value(deadframe)` — read `jf_guard_exc` (the grab is
+    /// read-only, `llmodel.py:240-242`; the clear alongside it is pyre's)
+    /// and stage the value into `jf_frame[0]` before synthesizing the
     /// exit-frame-with-exception descr the toplevel consumer expects.
     fn find_descr_by_ptr(
         &self,
@@ -1748,7 +1749,9 @@ impl DynasmBackend {
         // _store_and_reset_exception, x86/assembler.rs:2304-...) into
         // `jf_frame[0]` so the existing slot-0 Ref reader picks it up.
         if ptr != 0 && ptr == attached.propagate_exception_descr {
-            // grab_exc_value: read+clear jf_guard_exc.
+            // grab_exc_value reads jf_guard_exc (llmodel.py:240-242); the
+            // clear is pyre's — the value moves into jf_frame[0] below and
+            // the slot must not hand a second copy to a later grab.
             let exc_val = unsafe {
                 let slot = &mut (*frame_ptr).jf_guard_exc;
                 let v = *slot;

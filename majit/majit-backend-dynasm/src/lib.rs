@@ -108,7 +108,9 @@ pub fn jit_exc_class_raw() -> i64 {
     JIT_EXC_TYPE.load(Ordering::Relaxed)
 }
 
-/// cpu.grab_exc_value parity: read and clear exception value.
+/// `_store_and_reset_exception` (x86/assembler.py:1838, 1847-1848) parity:
+/// read `pos_exc_value` and zero the global.  Not `grab_exc_value`, which
+/// reads `jf_guard_exc` off the deadframe and does not write.
 pub fn jit_exc_value_raw() -> i64 {
     JIT_EXC_VALUE.swap(0, Ordering::Relaxed)
 }
@@ -201,10 +203,12 @@ use std::sync::OnceLock;
 /// the descr is the sole identity carrier.  No surrogate triple
 /// crosses the C-ABI.
 ///
-/// `guard_exc` is `cpu.grab_exc_value(deadframe)` (`llmodel.py:240`):
+/// `guard_exc` is `cpu.grab_exc_value(deadframe)` (`llmodel.py:240-242`):
 /// the pending exception the `must_save_exception` failure-recovery
-/// stub staged into `jf_guard_exc`, grabbed (read + clear) off the
-/// jitframe before it is freed.  `blackhole.py:1794
+/// stub staged into `jf_guard_exc`, read off the jitframe before it is
+/// freed.  The grab itself does not write the slot upstream — clearing
+/// `jf_guard_exc` is emitted code's job (`_restore_exception`,
+/// x86/assembler.py:1855-1857).  `blackhole.py:1794
 /// _prepare_resume_from_failure` hands it to the resumed frame so an
 /// exception guard unwinds into its handler instead of resuming the
 /// no-exception continuation.  `0` = no pending exception.
@@ -664,11 +668,16 @@ fn handle_fail_resume_guard(
     // `debug_assert_eq!(source_jct.green_key, green_key)` (pyjitpl.rs:8297-8301).
     let owning_jct = majit_backend::descr_owning_jct(descr);
 
-    // llmodel.py:240 `grab_exc_value(deadframe)`: read + clear
-    // `jf_guard_exc` while the jitframe is still alive.  The
-    // `must_save_exception` failure-recovery stub (GUARD_EXCEPTION /
-    // GUARD_NO_EXCEPTION / GUARD_NOT_FORCED) staged `pos_exc_value`
-    // here; non-exception guards leave it null.
+    // llmodel.py:240-242 `grab_exc_value(deadframe)`: read `jf_guard_exc`
+    // while the jitframe is still alive.  The `must_save_exception`
+    // failure-recovery stub (GUARD_EXCEPTION / GUARD_NO_EXCEPTION /
+    // GUARD_NOT_FORCED) staged `pos_exc_value` here; non-exception guards
+    // leave it null.
+    //
+    // The grab is read-only upstream; the additional clear below is pyre's,
+    // so the rooted local is the sole carrier for the rest of this function
+    // (the value is read back from `guard_exc_root`, never re-read from the
+    // slot).
     //
     // Clearing the slot drops the only GC root for the exception object
     // (`jf_guard_exc` is a GCREF visited by `jitframe_trace`).  The bridge
