@@ -1672,6 +1672,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::dict_eq_hook::has_eq_w_hook",
+        "pyre_object::has_eq_w_hook",
+        pyre_object::dict_eq_hook::has_eq_w_hook as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dict_eq_hook::eq_w_hooked",
+        "pyre_object::eq_w_hooked",
+        pyre_object::dict_eq_hook::eq_w_hooked as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_object::dict_eq_hook::has_hash_str_hook",
         "pyre_object::has_hash_str_hook",
         pyre_object::dict_eq_hook::has_hash_str_hook as *const (),
