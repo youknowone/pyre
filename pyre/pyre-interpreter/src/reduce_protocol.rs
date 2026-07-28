@@ -152,17 +152,16 @@ pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
 /// objectobject.py:201 `_getnewargs(space, w_obj)` — returns
 /// `(hasargs, w_args, w_kwargs)`.
 pub fn getnewargs(w_obj: PyObjectRef) -> Result<(bool, PyObjectRef, PyObjectRef), PyError> {
+    let w_type = crate::typedef::r#type(w_obj)
+        .ok_or_else(|| PyError::type_error("cannot determine type for __getnewargs__"))?;
     let w_descr = unsafe { crate::baseobjspace::lookup(w_obj, "__getnewargs_ex__") };
     let hasargs;
     let w_args;
     let w_kwargs;
     if let Some(w_descr) = w_descr {
-        // objectobject.py:204:
-        // `space.get_and_call_function(w_descr, w_obj)`.
-        let w_type =
-            crate::typedef::r#type(w_obj).map_or(pyre_object::PY_NULL, |w_type| w_type.as_ptr());
-        let w_result =
-            unsafe { crate::baseobjspace::get_and_call_function(w_descr, w_obj, w_type, &[]) }?;
+        let w_result = unsafe {
+            crate::baseobjspace::get_and_call_function(w_descr, w_obj, w_type.as_ptr(), &[])
+        }?;
         if !unsafe { pyre_object::is_tuple(w_result) } {
             return Err(PyError::type_error(format!(
                 "__getnewargs_ex__ should return a tuple, not '{}'",
@@ -196,12 +195,9 @@ pub fn getnewargs(w_obj: PyObjectRef) -> Result<(bool, PyObjectRef, PyObjectRef)
     } else {
         let w_descr = unsafe { crate::baseobjspace::lookup(w_obj, "__getnewargs__") };
         if let Some(w_descr) = w_descr {
-            // objectobject.py:212:
-            // `space.get_and_call_function(w_descr, w_obj)`.
-            let w_type = crate::typedef::r#type(w_obj)
-                .map_or(pyre_object::PY_NULL, |w_type| w_type.as_ptr());
-            let wa =
-                unsafe { crate::baseobjspace::get_and_call_function(w_descr, w_obj, w_type, &[]) }?;
+            let wa = unsafe {
+                crate::baseobjspace::get_and_call_function(w_descr, w_obj, w_type.as_ptr(), &[])
+            }?;
             if !unsafe { pyre_object::is_tuple(wa) } {
                 return Err(PyError::type_error(format!(
                     "__getnewargs__ should return a tuple, not '{}'",
