@@ -313,11 +313,14 @@ macro_rules! py_module {
                     $crate::module_ns_store(
                         ns,
                         stringify!($ifn_name),
-                        $crate::make_module_builtin_function_with_arity_and_maybe_sig(
-                            stringify!($ifn_name),
-                            $ifn_name,
-                            ::paste::paste! { [<$ifn_name _pyre_arity>]() },
-                            ::paste::paste! { [<$ifn_name _pyre_sig>]() },
+                        $crate::gateway::with_module(
+                            $name,
+                            $crate::make_module_builtin_function_with_arity_and_maybe_sig(
+                                stringify!($ifn_name),
+                                $ifn_name,
+                                ::paste::paste! { [<$ifn_name _pyre_arity>]() },
+                                ::paste::paste! { [<$ifn_name _pyre_sig>]() },
+                            ),
                         ),
                     );
                 }
@@ -325,13 +328,19 @@ macro_rules! py_module {
             $($(
                 $crate::module_ns_store(
                     ns, $fn_key,
-                    $crate::py_module_fn!($fn_key, $fn_arity, $fn_path),
+                    $crate::gateway::with_module(
+                        $name,
+                        $crate::py_module_fn!($fn_key, $fn_arity, $fn_path),
+                    ),
                 );
             )*)?
             $($(
                 $crate::module_ns_store(
                     ns, $mfn_key,
-                    $crate::py_module_module_fn!($mfn_key, $mfn_arity, $mfn_path),
+                    $crate::gateway::with_module(
+                        $name,
+                        $crate::py_module_module_fn!($mfn_key, $mfn_arity, $mfn_path),
+                    ),
                 );
             )*)?
             $(

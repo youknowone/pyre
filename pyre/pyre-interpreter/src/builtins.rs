@@ -13319,8 +13319,10 @@ fn builtin_divmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
     if args.len() != 2 {
+        // `_PyArg_CheckPositional` names the function bare and parenthesis-free
+        // once it declares two or more arguments.
         return Err(crate::PyError::type_error(format!(
-            "divmod() takes exactly two arguments ({} given)",
+            "divmod expected 2 arguments, got {}",
             args.len()
         )));
     }

@@ -33,17 +33,46 @@ pub(crate) fn eval_slice_index(w_int: PyObjectRef) -> Result<i64, crate::PyError
 /// Converts `w_index` via `__index__`, normalizes negatives against
 /// `size`, and clamps at zero.
 pub fn adapt_lower_bound(size: i64, w_index: PyObjectRef) -> Result<i64, crate::PyError> {
-    let mut index = eval_slice_index(w_index)?;
-    if index < 0 {
-        // `eval_slice_index` clamps an out-of-word index to `i64::MIN`, so fold
-        // by `size` without overflowing before flooring at 0.
-        index = index.saturating_add(size);
-        if index < 0 {
-            index = 0;
-        }
-    }
+    let index = adapt_bound(size, eval_slice_index(w_index)?);
     debug_assert!(index >= 0);
     Ok(index)
+}
+
+/// `eval_slice_index` for a bound that may not be `None`
+/// (`_PyEval_SliceIndexNotNone`), which is how a sequence `index` method
+/// converts its optional start/stop: `[1, 2].index(2, None)` is a TypeError
+/// even though `[1, 2][None:]` is not.  The message drops the `or None` the
+/// slicing form offers.
+pub(crate) fn eval_slice_index_not_none(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
+    if unsafe { is_none(w_int) } || crate::builtins::getindex_w(w_int).is_err() {
+        return Err(crate::PyError::type_error(
+            "slice indices must be integers or have an __index__ method",
+        ));
+    }
+    eval_slice_index(w_int)
+}
+
+/// `unwrap_start_stop` for the bounds of a sequence `index` method, which
+/// rejects `None` rather than reading it as "this side unbounded".
+pub fn unwrap_start_stop_not_none(
+    size: i64,
+    w_start: PyObjectRef,
+    w_end: PyObjectRef,
+) -> Result<(i64, i64), crate::PyError> {
+    let start = adapt_bound(size, eval_slice_index_not_none(w_start)?);
+    let end = adapt_bound(size, eval_slice_index_not_none(w_end)?);
+    Ok((start, end))
+}
+
+/// The negative-index normalization `adapt_lower_bound` applies once the
+/// bound has already been converted to an `i64`.
+fn adapt_bound(size: i64, index: i64) -> i64 {
+    if index >= 0 {
+        return index;
+    }
+    // An out-of-word index arrives clamped to `i64::MIN`, so fold by `size`
+    // without overflowing before flooring at 0.
+    index.saturating_add(size).max(0)
 }
 
 /// sliceobject.py:242 `unwrap_start_stop(space, size, w_start, w_end)`.

@@ -56,13 +56,85 @@ pub(crate) fn arg_or_none(args: &[PyObjectRef], i: usize) -> PyObjectRef {
     if i < args.len() { args[i] } else { w_none() }
 }
 
+/// `TYPE.NAME`, the name a bound builtin method reports itself under.  TYPE
+/// comes from the receiver rather than from the type the method is declared
+/// on, so a call on a subclass instance names the subclass
+/// (`class L(list)` — `L().copy` reports `L.copy`); a receiver that IS a type
+/// reports under its own name, which is what a class method binds to
+/// (`dict.fromkeys`, not `type.fromkeys`).  With no receiver at all the bare
+/// name is used; `require_receiver` normally rejects that first.
+fn method_qualname(args: &[PyObjectRef], name: &str) -> String {
+    match args.first() {
+        Some(&receiver) => {
+            let ty = if unsafe { pyre_object::typeobject::is_type(receiver) } {
+                unsafe { pyre_object::w_type_get_name(receiver) }.to_string()
+            } else {
+                crate::baseobjspace::object_functionstr_type_name(receiver)
+            };
+            format!("{ty}.{name}")
+        }
+        None => name.to_string(),
+    }
+}
+
+/// The builtin type a method reached through `receiver` is declared on — the
+/// first non-heap type in the receiver's MRO.  Whether a name is filled by a
+/// `wrapper_descriptor` or a `method_descriptor` is a property of the
+/// declaring type, not of the subclass the call came in on, so the wording
+/// split reads this while the qualified name reads the receiver's own type.
+fn declaring_builtin_type_name(receiver: PyObjectRef) -> String {
+    unsafe {
+        let Some(w_type) = crate::typedef::r#type(receiver) else {
+            return String::new();
+        };
+        let mro = pyre_object::w_type_get_mro(w_type.as_ptr());
+        if !mro.is_null() {
+            for &entry in (*mro).as_slice() {
+                if !pyre_object::typeobject::w_type_is_heaptype(entry) {
+                    return pyre_object::w_type_get_name(entry).to_string();
+                }
+            }
+        }
+        pyre_object::w_type_get_name(w_type.as_ptr()).to_string()
+    }
+}
+
+/// TypeError for a keyword handed to a builtin method that takes a fixed
+/// number of positional arguments.
+///
+/// Every arity helper here counts the raw slice length, so the body it guards
+/// has no parameter a keyword could name — a keyword-aware builtin reads the
+/// trailing marker dict itself (`split_builtin_kwargs`) and never validates by
+/// slice length.  Without this the marker would be counted as a positional
+/// value and reach the implementation as one.  A slot wrapper reports itself
+/// as `wrapper NAME()`, everything else under its qualified name.
+fn reject_kwargs(args: &[PyObjectRef], name: &str) -> Result<(), crate::PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if !crate::builtins::has_real_kwargs(kwargs) {
+        return Ok(());
+    }
+    let slot = positional.first().is_some_and(|&receiver| {
+        crate::gateway::is_slot_wrapper(&declaring_builtin_type_name(receiver), name)
+    });
+    let subject = if slot {
+        format!("wrapper {name}")
+    } else {
+        method_qualname(positional, name)
+    };
+    Err(crate::PyError::type_error(format!(
+        "{subject}() takes no keyword arguments"
+    )))
+}
+
 /// TypeError for a method requiring exactly `n` positional arguments after
-/// the receiver, called with a different count.
+/// the receiver, called with a different count.  `name` is the bare method
+/// name; the message qualifies it with the receiver's type.
 pub(crate) fn arity_exact(
     args: &[PyObjectRef],
     name: &str,
     n: usize,
 ) -> Result<(), crate::PyError> {
+    reject_kwargs(args, name)?;
     if args.len() != n + 1 {
         let expected = match n {
             0 => "no arguments".to_string(),
@@ -70,7 +142,8 @@ pub(crate) fn arity_exact(
             k => format!("exactly {k} arguments"),
         };
         return Err(crate::PyError::type_error(format!(
-            "{name}() takes {expected} ({} given)",
+            "{}() takes {expected} ({} given)",
+            method_qualname(args, name),
             args_given(args),
         )));
     }
@@ -85,6 +158,7 @@ pub(crate) fn arity_at_least(
     name: &str,
     min: usize,
 ) -> Result<(), crate::PyError> {
+    reject_kwargs(args, name)?;
     if args.len() < min + 1 {
         return Err(crate::PyError::type_error(format!(
             "{name} expected at least {min} argument{}, got {}",
@@ -104,6 +178,7 @@ pub(crate) fn arity_at_least_positional(
     name: &str,
     min: usize,
 ) -> Result<(), crate::PyError> {
+    reject_kwargs(args, name)?;
     if args.len() < min + 1 {
         return Err(crate::PyError::type_error(format!(
             "{name}() takes at least {min} positional argument{} ({} given)",
@@ -137,6 +212,7 @@ pub(crate) fn arity_at_most(
     name: &str,
     max: usize,
 ) -> Result<(), crate::PyError> {
+    reject_kwargs(args, name)?;
     if args.len() > max + 1 {
         return Err(crate::PyError::type_error(format!(
             "{name} expected at most {max} argument{}, got {}",
@@ -158,6 +234,7 @@ pub(crate) fn arity_exact_unpack(
     name: &str,
     n: usize,
 ) -> Result<(), crate::PyError> {
+    reject_kwargs(args, name)?;
     if args.len() != n + 1 {
         return Err(crate::PyError::type_error(format!(
             "{name} expected {n} argument{}, got {}",
@@ -184,11 +261,14 @@ pub(crate) fn arity_slot(args: &[PyObjectRef], n: usize) -> Result<(), crate::Py
 }
 
 /// TypeError for a METH_NOARGS method called with positional arguments —
-/// the "X() takes no arguments (M given)" form (`list.__reversed__`).
+/// the "X() takes no arguments (M given)" form (`list.__reversed__`).  `name`
+/// is the bare method name; the message qualifies it with the receiver's type.
 pub(crate) fn arity_no_args(args: &[PyObjectRef], name: &str) -> Result<(), crate::PyError> {
+    reject_kwargs(args, name)?;
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
-            "{name}() takes no arguments ({} given)",
+            "{}() takes no arguments ({} given)",
+            method_qualname(args, name),
             args_given(args),
         )));
     }
@@ -197,8 +277,10 @@ pub(crate) fn arity_no_args(args: &[PyObjectRef], name: &str) -> Result<(), crat
 
 /// TypeError for the ternary-power slot (`__pow__` / `__rpow__`), which
 /// accepts one or two positional arguments after the receiver — the
-/// "expected 1 or 2 arguments, got M" form with no method name.
-pub(crate) fn arity_pow(args: &[PyObjectRef]) -> Result<(), crate::PyError> {
+/// "expected 1 or 2 arguments, got M" form with no method name.  `name` is
+/// carried only for the keyword rejection, which does name the wrapper.
+pub(crate) fn arity_pow(args: &[PyObjectRef], name: &str) -> Result<(), crate::PyError> {
+    reject_kwargs(args, name)?;
     let extra = args_given(args);
     if !(1..=2).contains(&extra) {
         return Err(crate::PyError::type_error(format!(
@@ -206,6 +288,16 @@ pub(crate) fn arity_pow(args: &[PyObjectRef]) -> Result<(), crate::PyError> {
         )));
     }
     Ok(())
+}
+
+/// `int.__round__` / `float.__round__`, which share `round()`'s body but are
+/// methods: the receiver is the number, `ndigits` the one optional argument,
+/// and the count in a mismatch excludes the receiver
+/// (`__round__ expected at most 1 argument, got 2`).
+pub fn number_dunder_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_receiver(args, "__round__")?;
+    arity_at_most(args, "__round__", 1)?;
+    crate::builtins::builtin_round(args)
 }
 
 /// TypeError for an unbound method descriptor invoked with no receiver
@@ -439,14 +531,14 @@ pub(crate) fn require_no_args(args: &[PyObjectRef], name: &str) -> Result<(), cr
 
 pub fn list_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "append", true)?;
-    arity_exact(args, "list.append", 1)?;
+    arity_exact(args, "append", 1)?;
     unsafe { w_list_append(args[0], args[1]) };
     Ok(w_none())
 }
 
 pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "extend", true)?;
-    arity_exact(args, "list.extend", 1)?;
+    arity_exact(args, "extend", 1)?;
     let list = args[0];
     let other = args[1];
     unsafe {
@@ -574,7 +666,7 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// PyPy: listobject.py descr_clear — list.clear()
 pub fn list_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "clear", true)?;
-    arity_no_args(args, "list.clear")?;
+    arity_no_args(args, "clear")?;
     unsafe { pyre_object::listobject::w_list_clear(args[0]) };
     Ok(w_none())
 }
@@ -582,7 +674,7 @@ pub fn list_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// PyPy: listobject.py descr_copy — list.copy()
 pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "copy", true)?;
-    arity_no_args(args, "list.copy")?;
+    arity_no_args(args, "copy")?;
     let list = args[0];
     unsafe {
         let n = w_list_len(list);
@@ -599,7 +691,7 @@ pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// PyPy: listobject.py descr_reverse — list.reverse()
 pub fn list_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "reverse", true)?;
-    arity_no_args(args, "list.reverse")?;
+    arity_no_args(args, "reverse")?;
     unsafe { pyre_object::listobject::w_list_reverse(args[0]) };
     Ok(w_none())
 }
@@ -653,7 +745,7 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     } else {
         w_int_new(i64::MAX)
     };
-    let (start, stop) = crate::sliceobject::unwrap_start_stop(size, w_start, w_stop)?;
+    let (start, stop) = crate::sliceobject::unwrap_start_stop_not_none(size, w_start, w_stop)?;
     match crate::listobject::w_list_find_or_count(list, value, start, stop, false)? {
         crate::listobject::FindOrCountResult::Index(i) => Ok(w_int_new(i)),
         crate::listobject::FindOrCountResult::NotFound => {
@@ -677,7 +769,7 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// listobject.py:744 `descr_count` — list.count(value)
 pub fn list_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "count", true)?;
-    arity_exact(args, "list.count", 1)?;
+    arity_exact(args, "count", 1)?;
     let list = args[0];
     let value = args[1];
     match crate::listobject::w_list_find_or_count(list, value, 0, i64::MAX, true)? {
@@ -692,7 +784,7 @@ pub fn list_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// listobject.py:782 `descr_remove` — list.remove(value).
 pub fn list_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "remove", true)?;
-    arity_exact(args, "list.remove", 1)?;
+    arity_exact(args, "remove", 1)?;
     crate::listobject::w_list_remove(args[0], args[1])?;
     Ok(w_none())
 }
@@ -1006,7 +1098,7 @@ pub fn str_method_casefold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// custom `Mapping` subclasses, and any object that only implements
 /// `__getitem__`.
 pub fn str_method_format_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_exact(args, "str.format_map", 1)?;
+    arity_exact(args, "format_map", 1)?;
     let fmt = args[0];
     let mapping = args[1];
     str_method_format_core(fmt, &[], None, Some(mapping))
@@ -1061,6 +1153,7 @@ fn extract_strip_chars(arg: PyObjectRef, fn_name: &str) -> Result<Option<Wtf8Buf
 
 pub fn str_method_strip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "strip")?;
+    arity_at_most(args, "strip", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let chars = match args.get(1) {
         Some(&a) => extract_strip_chars(a, "strip")?,
@@ -1071,6 +1164,7 @@ pub fn str_method_strip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 pub fn str_method_lstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "lstrip")?;
+    arity_at_most(args, "lstrip", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let chars = match args.get(1) {
         Some(&a) => extract_strip_chars(a, "lstrip")?,
@@ -1081,6 +1175,7 @@ pub fn str_method_lstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "rstrip")?;
+    arity_at_most(args, "rstrip", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let chars = match args.get(1) {
         Some(&a) => extract_strip_chars(a, "rstrip")?,
@@ -4195,7 +4290,7 @@ fn is_identifier(s: &str) -> bool {
 /// a sign character (`+`/`-`), the sign stays at the front and zeros
 /// fill between it and the digits (`'-42'.zfill(5) == '-0042'`).
 pub fn str_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_exact(args, "str.zfill", 1)?;
+    arity_exact(args, "zfill", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?.max(0) as usize;
     let len = unsafe { pyre_object::w_str_len(args[0]) };
@@ -5197,7 +5292,7 @@ fn wtf8_replace(input: &Wtf8, sub: &Wtf8, by: &Wtf8, maxcount: i64) -> (Wtf8Buf,
 
 /// PyPy: unicodeobject.py descr_partition
 pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_exact(args, "str.partition", 1)?;
+    arity_exact(args, "partition", 1)?;
     if !unsafe { pyre_object::is_str(args[1]) } {
         return Err(crate::PyError::type_error(format!(
             "must be str, not {}",
@@ -5221,7 +5316,7 @@ pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 
 /// PyPy: unicodeobject.py descr_rpartition
 pub fn str_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_exact(args, "str.rpartition", 1)?;
+    arity_exact(args, "rpartition", 1)?;
     if !unsafe { pyre_object::is_str(args[1]) } {
         return Err(crate::PyError::type_error(format!(
             "must be str, not {}",
@@ -5446,7 +5541,7 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// str.translate(table) — table is a mapping from ordinals (int) to
 /// ordinals (int), strings (str), or None (delete).
 pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    arity_exact(args, "str.translate", 1)?;
+    arity_exact(args, "translate", 1)?;
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let table = args[1];
     let mut result = Wtf8Buf::with_capacity(s.len());
@@ -6130,7 +6225,7 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// so popping the last entry matches the spec.
 pub fn dict_method_popitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "popitem")?;
-    arity_no_args(args, "dict.popitem")?;
+    arity_no_args(args, "popitem")?;
     let dict = resolve_dict_backing(args[0]);
     if dict.is_null() {
         return Err(crate::PyError::key_error("popitem(): dictionary is empty"));
@@ -6264,18 +6359,8 @@ mod dict_method_tests {
 /// tupleobject.py descr_index — tuple.index(value[, start[, stop]]).
 pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_tuple_receiver(args, "index", true)?;
-    if args.len() < 2 {
-        return Err(crate::PyError::type_error(format!(
-            "index expected at least 1 argument, got {}",
-            args_given(args)
-        )));
-    }
-    if args.len() > 4 {
-        return Err(crate::PyError::type_error(format!(
-            "index expected at most 3 arguments, got {}",
-            args.len() - 1
-        )));
-    }
+    arity_at_least(args, "index", 1)?;
+    arity_at_most(args, "index", 3)?;
     let tup = args[0];
     let value = args[1];
     // descr_index defaults: w_start=0, w_stop=maxint; unwrap_start_stop does
@@ -6298,7 +6383,7 @@ pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         let sp = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(tup);
         pyre_object::gc_roots::pin_root(value);
-        let (start, stop) = crate::sliceobject::unwrap_start_stop(size, w_start, w_stop)?;
+        let (start, stop) = crate::sliceobject::unwrap_start_stop_not_none(size, w_start, w_stop)?;
         let mut i = start.max(0);
         while i < stop {
             let tup = pyre_object::gc_roots::shadow_stack_get(sp);

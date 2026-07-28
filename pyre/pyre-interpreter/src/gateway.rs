@@ -625,6 +625,12 @@ pub struct BuiltinCode {
     /// The pointee is `'static`, so it carries no Drop obligation and is not
     /// a GC pointer.
     pub owner: *const MethodOwner,
+    /// The module this function is defined in — `PyCFunctionObject.m_module`.
+    /// Empty for a builtin that is not a module-level function, and for
+    /// `builtins` itself, which is the module `_PyObject_FunctionStr` leaves
+    /// off (`len()`, not `builtins.len()`).  `'static` like `name`, so it is
+    /// neither a Drop obligation nor a GC pointer.
+    pub module: &'static str,
 }
 
 /// Fixed payload size used by `gct_fv_gc_malloc`'s `c_size`
@@ -725,7 +731,34 @@ fn builtin_code_new_full(
         fast_natural_arity,
         sig,
         owner: std::ptr::null(),
+        module: "",
     }) as PyObjectRef
+}
+
+/// Record the module a function object was defined in and hand the object
+/// back, so a registration table can wrap its constructor in place.  A
+/// non-`BuiltinCode` callable (an app-level def installed by the same table)
+/// passes through untouched.
+///
+/// The first writer wins: a module registered under two names, or one whose
+/// namespace is swept after the table already stamped it, keeps the module
+/// that defined the function rather than the one that re-exported it.
+pub fn with_module(module: &'static str, func: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        // A module namespace holds every kind of value, so the callable check
+        // has to come before `getcode` reads a `Function` field off it.
+        if func.is_null() || !crate::function::is_function(func) {
+            return func;
+        }
+        let code = crate::function::getcode(func) as PyObjectRef;
+        if !code.is_null() && is_builtin_code(code) {
+            let code = code as *mut BuiltinCode;
+            if std::ptr::read(&raw const (*code).module).is_empty() {
+                (*code).module = module;
+            }
+        }
+    }
+    func
 }
 
 /// Allocate a `BuiltinCode` carrying an argument `Signature`.  The
@@ -798,13 +831,22 @@ pub unsafe fn builtin_code_call(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     let code = obj as *const BuiltinCode;
+    // The trailing marker dict is not an argument, so every check below reads
+    // the positional slice: counting it as the receiver would report the
+    // keyword dict as the object the descriptor was called on.
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let receiver = positional.first().copied();
     let owner = unsafe { (*code).owner };
     if !owner.is_null() {
         let owner = unsafe { &*owner };
-        let accepted = matches!(args.first(), Some(&receiver)
+        let accepted = matches!(receiver, Some(receiver)
             if owner.is_instance.is_none_or(|is_instance| is_instance(receiver)));
         if !accepted {
-            return Err(receiver_mismatch(owner, unsafe { (*code).name }, args));
+            return Err(receiver_mismatch(
+                owner,
+                unsafe { (*code).name },
+                positional,
+            ));
         }
     }
     // eval.py:16-23 — a `fast_natural_arity` of 0..=4 is the exact positional
@@ -812,13 +854,19 @@ pub unsafe fn builtin_code_call(
     // `PASSTHROUGHARGS1` and the `FLATPYCALL` bit all exceed 4.  A body with a
     // fixed arity indexes its slice directly, so a call that supplies a
     // different number of arguments is rejected before the body runs.  The
-    // slice length is the positional count on every call but a keyword one, so
-    // fixed-count bodies reject a trailing keyword marker before it can be read
-    // as an ordinary argument.
+    // trailing marker dict occupies a slot of its own, so the keyword one
+    // argument short of the arity leaves the slice at exactly the declared
+    // length — the split has to happen before the count is read, not only once
+    // a length already mismatched.
     let arity = unsafe { (*code).fast_natural_arity } as usize;
-    if arity <= 4 && args.len() != arity {
-        let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-        let receiver = positional.first().copied();
+    if arity <= 4 {
+        // A builtin registered by arity alone declares no parameter names
+        // (`sig` is null), so it is positional-only and a keyword cannot name
+        // anything it accepts.  Checked ahead of the count, which is the order
+        // the messages come in (`','.join('a', 'b', x=1)` reports the keyword).
+        if unsafe { (*code).sig.is_null() } && crate::builtins::has_real_kwargs(kwargs) {
+            return Err(no_keyword_arguments(unsafe { &*code }, receiver));
+        }
         if positional.len() != arity {
             return Err(arity_mismatch(
                 unsafe { &*code },
@@ -826,13 +874,6 @@ pub unsafe fn builtin_code_call(
                 arity,
                 positional.len(),
             ));
-        }
-        // A builtin registered by arity alone declares no parameter names
-        // (`sig` is null), so it is positional-only and a keyword cannot name
-        // anything it accepts.  The positional count already matched, so the
-        // keyword is purely extra and the body would silently ignore it.
-        if unsafe { (*code).sig.is_null() } && crate::builtins::has_real_kwargs(kwargs) {
-            return Err(no_keyword_arguments(unsafe { &*code }, receiver));
         }
     }
     unsafe { ((*code).func)(args) }
@@ -853,20 +894,22 @@ fn no_keyword_arguments(code: &BuiltinCode, receiver: Option<PyObjectRef>) -> cr
     crate::PyError::type_error(format!("{subject}() takes no keyword arguments"))
 }
 
-/// The name a builtin reports itself under (`methodobject.c
-/// meth_get__qualname__`): a module-level builtin its bare name, a descriptor
-/// `TYPE.name` — where TYPE is the receiver itself when the receiver IS a type
-/// (`int.__subclasses__`), otherwise the receiver's type (`ValueError.add_note`
-/// for a `ValueError` instance, even though the method is declared on
-/// `BaseException`).  With no receiver to read, fall back to the type the
-/// method was stamped onto.
+/// The name a builtin reports itself under (`_PyObject_FunctionStr` of the
+/// `__module__` and `__qualname__` a `builtin_function_or_method` carries): a
+/// module-level builtin `module.name` — bare for `builtins`, whose module
+/// prefix is left off — and a descriptor `TYPE.name`, where TYPE is the
+/// receiver itself when the receiver IS a type (`int.__subclasses__`) and
+/// otherwise the receiver's type (`ValueError.add_note` for a `ValueError`
+/// instance, even though the method is declared on `BaseException`).  With no
+/// receiver to read, fall back to the type the method was stamped onto.
 fn builtin_names(
     code: &BuiltinCode,
     receiver: Option<PyObjectRef>,
 ) -> (Option<&'static MethodOwner>, String) {
     let owner = unsafe { code.owner.as_ref() };
     let qualname = match owner {
-        None => code.name.to_string(),
+        None if code.module.is_empty() || code.module == "builtins" => code.name.to_string(),
+        None => format!("{}.{}", code.module, code.name),
         Some(owner) => {
             let ty = match receiver {
                 Some(r) if unsafe { pyre_object::typeobject::is_type(r) } => {
@@ -950,7 +993,7 @@ pub unsafe fn builtin_code_no_keyword_arguments(
 /// receiver errors differently, so only the slot names need listing — every
 /// other name is an ordinary method.  `__contains__` and `__getitem__` are
 /// slots everywhere except on the types that expose them through `tp_methods`.
-fn is_slot_wrapper(type_name: &str, name: &str) -> bool {
+pub(crate) fn is_slot_wrapper(type_name: &str, name: &str) -> bool {
     match name {
         "__contains__" => !matches!(type_name, "dict" | "set" | "frozenset"),
         "__getitem__" => !matches!(type_name, "dict" | "list"),

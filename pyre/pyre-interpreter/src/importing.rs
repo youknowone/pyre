@@ -901,7 +901,13 @@ fn init_sysconfigdata_empty(ns: PyObjectRef) {
 /// `allocate_and_init_instance(module=True)`. Pyre mirrors that here:
 /// the initializer writes directly into a rooted, non-moving module dict.
 pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
-    let module_def = BUILTIN_MODULES.lock().unwrap().get(name).copied()?;
+    // The registry key outlives the module, which is what lets the sweep below
+    // hand the name to `BuiltinCode.module` without copying it.
+    let (static_name, module_def) = {
+        let table = BUILTIN_MODULES.lock().unwrap();
+        let (static_name, def) = table.get_key_value(name)?;
+        (*static_name, *def)
+    };
     let w_dict = pyre_object::dictmultiobject::w_module_dict_new();
     let _roots = pyre_object::gc_roots::push_roots();
     let save_point = pyre_object::gc_roots::shadow_stack_len();
@@ -938,6 +944,11 @@ pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
                     pyre_object::gc_roots::shadow_stack_get(save_point + 1),
                 );
             }
+            // The same name on the code object, where the error wordings read
+            // it (`math.sqrt() takes exactly one argument`).  A module built by
+            // a registration table already stamped its own functions, so this
+            // only reaches the hand-built namespaces.
+            crate::gateway::with_module(static_name, value);
         }
     }
     let module = pyre_object::w_module_new_aliasing_dict(name, w_dict);

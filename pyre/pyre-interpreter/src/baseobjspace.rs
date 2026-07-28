@@ -550,7 +550,7 @@ fn check_class(w_obj: PyObjectRef, msg: &str) -> Result<(), PyError> {
 /// `w_type` is a real type object: tries the MRO walk via `isinstance_w`
 /// first, then consults `w_inst.__class__` to honour any custom class
 /// override.
-unsafe fn p_recursive_isinstance_type_w(
+pub(crate) unsafe fn p_recursive_isinstance_type_w(
     w_inst: PyObjectRef,
     w_type: PyObjectRef,
 ) -> Result<bool, PyError> {
@@ -736,7 +736,7 @@ pub(crate) fn p_abstract_issubclass_w(
 /// abstractinst.py:150-169 `p_recursive_issubclass_w`. The both-types
 /// fast path is the common case; otherwise both arguments are validated
 /// via `check_class()` before entering the abstract walk.
-unsafe fn p_recursive_issubclass_w(
+pub(crate) unsafe fn p_recursive_issubclass_w(
     w_derived: PyObjectRef,
     w_cls: PyObjectRef,
 ) -> Result<bool, PyError> {
@@ -1461,9 +1461,10 @@ pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 
 /// `pypy/interpreter/baseobjspace.py:1574 getindex_w` — the `TypeError`
 /// raised when a sequence subscript is neither an integer nor a slice:
-/// `"<descr> indices must be integers or slices, not '<type>'"` (the `%T`
-/// operand names the key's own class).  The reference `pypy3` quotes the
-/// type name here; a later source tree emits it unquoted.
+/// `"<descr> indices must be integers or slices, not <type>"` (the `%T`
+/// operand names the key's own class).  The reference `pypy3` quotes the type
+/// name here; 3.14 emits it unquoted, and only the `str` wording
+/// ([`string_index_type_error`]) keeps the quotes.
 fn index_type_error(descr: &str, index: PyObjectRef) -> PyError {
     let tp = if index.is_null() {
         "NULL".to_string()
@@ -1471,7 +1472,7 @@ fn index_type_error(descr: &str, index: PyObjectRef) -> PyError {
         object_functionstr_type_name(index)
     };
     PyError::type_error(format!(
-        "{descr} indices must be integers or slices, not '{tp}'"
+        "{descr} indices must be integers or slices, not {tp}"
     ))
 }
 

@@ -4598,7 +4598,7 @@ fn init_list_type(ns: PyObjectRef) {
                 "__getitem__",
                 |args| {
                     crate::type_methods::require_list_receiver(args, "__getitem__", true)?;
-                    crate::type_methods::arity_exact(args, "list.__getitem__", 1)?;
+                    crate::type_methods::arity_exact(args, "__getitem__", 1)?;
                     crate::baseobjspace::getitem_slot(args[0], args[1])
                 },
                 2,
@@ -4698,7 +4698,7 @@ fn init_list_type(ns: PyObjectRef) {
                     // `reversed(list)` (walks `getitem(seq, remaining)` downward).
                     let obj =
                         crate::type_methods::require_list_receiver(args, "__reversed__", true)?;
-                    crate::type_methods::arity_no_args(args, "list.__reversed__")?;
+                    crate::type_methods::arity_no_args(args, "__reversed__")?;
                     let n = unsafe { pyre_object::w_list_len(obj) } as i64;
                     Ok(pyre_object::w_list_reverse_iter_new(obj, n - 1))
                 },
@@ -5830,7 +5830,7 @@ fn init_dict_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__getitem__",
                 |args| {
-                    crate::type_methods::arity_exact(args, "dict.__getitem__", 1)?;
+                    crate::type_methods::arity_exact(args, "__getitem__", 1)?;
                     unsafe {
                         if pyre_object::is_dict(args[0]) {
                             return crate::baseobjspace::getitem(args[0], args[1]);
@@ -5869,7 +5869,7 @@ fn init_dict_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__contains__",
                 |args| {
-                    crate::type_methods::arity_exact(args, "dict.__contains__", 1)?;
+                    crate::type_methods::arity_exact(args, "__contains__", 1)?;
                     let dict = crate::type_methods::resolve_dict_backing(args[0]);
                     if !dict.is_null() {
                         return match unsafe {
@@ -6226,7 +6226,7 @@ fn init_dict_type(ns: PyObjectRef) {
                     // regardless of key type by dispatching through the
                     // strategy's `clear` (`celldict.py:162-164` for
                     // module dicts).  `w_dict_clear` does the dispatch.
-                    crate::type_methods::arity_no_args(args, "dict.clear")?;
+                    crate::type_methods::arity_no_args(args, "clear")?;
                     let d = crate::type_methods::resolve_dict_backing(args[0]);
                     if !d.is_null() {
                         unsafe { pyre_object::dictmultiobject::w_dict_clear(d) };
@@ -9945,6 +9945,7 @@ fn init_type_type(ns: PyObjectRef) {
                 ));
             }
         };
+        crate::type_methods::arity_no_args(args, "__subclasses__")?;
         let subs = unsafe { pyre_object::w_type_get_subclasses(cls, true) };
         Ok(pyre_object::w_list_new(subs))
     });
@@ -9954,6 +9955,44 @@ fn init_type_type(ns: PyObjectRef) {
             "__subclasses__",
             subclasses_method,
         )
+    };
+
+    // typeobject.py:1317-1318 `__instancecheck__ = interp2app(type_isinstance)`
+    // / `__subclasscheck__ = interp2app(type_issubtype)` (:1280-1287).  Both
+    // take the recursive form that does NOT re-consult the override, which is
+    // what lets `ABCMeta.__instancecheck__` fall back on `type`'s without
+    // looping, and what `super().__instancecheck__(x)` in a metaclass reaches.
+    let instancecheck_method = make_builtin_function_with_arity(
+        "__instancecheck__",
+        |args| {
+            crate::type_methods::arity_exact(args, "__instancecheck__", 1)?;
+            let matched =
+                unsafe { crate::baseobjspace::p_recursive_isinstance_type_w(args[1], args[0])? };
+            Ok(pyre_object::w_bool_from(matched))
+        },
+        2,
+    );
+    let subclasscheck_method = make_builtin_function_with_arity(
+        "__subclasscheck__",
+        |args| {
+            crate::type_methods::arity_exact(args, "__subclasscheck__", 1)?;
+            let matched =
+                unsafe { crate::baseobjspace::p_recursive_issubclass_w(args[1], args[0])? };
+            Ok(pyre_object::w_bool_from(matched))
+        },
+        2,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__instancecheck__",
+            instancecheck_method,
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__subclasscheck__",
+            subclasscheck_method,
+        );
     };
 
     // `pypy/objspace/std/typeobject.py:614-624 get_module` /
@@ -14233,7 +14272,7 @@ int_binop_rev!(
 /// `int.__rpow__(self, base[, mod])` — the reflected slot accepts an
 /// optional modulus argument, so it validates arity as one-or-two.
 fn int_dunder_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_pow(args)?;
+    crate::type_methods::arity_pow(args, "__rpow__")?;
     if !unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
         return Ok(pyre_object::w_not_implemented());
     }
@@ -14282,7 +14321,7 @@ int_binop_rev!(
 /// `int.__pow__(self, exp[, mod])` — optional modulus routes through the
 /// three-argument modular power.
 fn int_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_pow(args)?;
+    crate::type_methods::arity_pow(args, "__pow__")?;
     // intobject.py:674 descr_pow — a non-int exponent defers to the other
     // operand's reflected slot.
     if !unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
@@ -14379,7 +14418,7 @@ fn float_pow_reject_modulus(args: &[PyObjectRef]) -> Result<(), crate::PyError> 
 /// `float.__pow__` / `__rpow__` — the ternary-power slot accepts an
 /// optional modulus argument, so arity is validated as one-or-two.
 fn float_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_pow(args)?;
+    crate::type_methods::arity_pow(args, "__pow__")?;
     let b = args[1];
     if unsafe { pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b) } {
         // The operand is coerced to a double first, so an over-range int
@@ -14392,7 +14431,7 @@ fn float_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     }
 }
 fn float_dunder_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_pow(args)?;
+    crate::type_methods::arity_pow(args, "__rpow__")?;
     let b = args[1];
     if unsafe { pyre_object::pyobject::is_float(b) || pyre_object::pyobject::is_int_or_long(b) } {
         unsafe { crate::objspace::descroperation::reject_pow_operand_overflow(b)? };
@@ -14447,7 +14486,7 @@ fn complex_pow_reject_modulus(args: &[PyObjectRef]) -> Result<(), crate::PyError
 /// `complex.__pow__` / `__rpow__` — the ternary-power slot accepts an
 /// optional modulus argument, so arity is validated as one-or-two.
 fn complex_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_pow(args)?;
+    crate::type_methods::arity_pow(args, "__pow__")?;
     if complex_binop_operand(args[1]) {
         complex_pow_reject_modulus(args)?;
         crate::objspace::descroperation::pow_builtin(args[0], args[1])
@@ -14456,7 +14495,7 @@ fn complex_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     }
 }
 fn complex_dunder_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_pow(args)?;
+    crate::type_methods::arity_pow(args, "__rpow__")?;
     if complex_binop_operand(args[1]) {
         complex_pow_reject_modulus(args)?;
         crate::objspace::descroperation::pow_builtin(args[1], args[0])
@@ -15050,7 +15089,7 @@ fn init_int_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__round__",
-            make_builtin_function("__round__", crate::builtins::builtin_round),
+            make_builtin_function("__round__", crate::type_methods::number_dunder_round),
         )
     };
     unsafe {
@@ -15627,54 +15666,49 @@ fn init_float_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "fromhex",
-            pyre_object::function::w_classmethod_new(make_builtin_function_with_arity(
-                "fromhex",
-                |args| {
-                    // float.fromhex(s) — PyPy: floatobject.py descr_fromhex.
-                    // Parse hexadecimal floating-point literals like '0x1.8p3'.
-                    if args.len() < 2 {
-                        return Err(crate::PyError::type_error(
-                            "fromhex() requires a string argument",
-                        ));
+            // Registered without a fixed arity so the body's own `arity_exact`
+            // words the mismatch: a class method's receiver is the class, and
+            // only the body knows to discount it.
+            pyre_object::function::w_classmethod_new(make_builtin_function("fromhex", |args| {
+                // float.fromhex(s) — PyPy: floatobject.py descr_fromhex.
+                // Parse hexadecimal floating-point literals like '0x1.8p3'.
+                crate::type_methods::arity_exact(args, "fromhex", 1)?;
+                let s_arg = if unsafe { pyre_object::is_str(args[1]) } {
+                    unsafe { pyre_object::w_str_get_value(args[1]).to_string() }
+                } else {
+                    return Err(crate::PyError::type_error(
+                        "fromhex() requires a string argument",
+                    ));
+                };
+                // Delegate parsing to the shared hex-float reader, which rounds
+                // round-half-even over the full exponent range (subnormals down to
+                // 0x1p-1074), accepts the inf/nan spellings, handles surrounding
+                // ASCII whitespace itself, and flags overflow distinctly.
+                match rustpython_common::float_ops::from_hex(&s_arg) {
+                    Ok(v) => {
+                        let w_float = pyre_object::w_float_new(v);
+                        // floatobject.py:419: return
+                        // space.call_function(w_cls, w_float).  This runs a
+                        // subclass's __new__ and __init__ rather than merely
+                        // retagging the parsed base float.
+                        crate::call::call_function_impl_result(args[0], &[w_float])
                     }
-                    let s_arg = if unsafe { pyre_object::is_str(args[1]) } {
-                        unsafe { pyre_object::w_str_get_value(args[1]).to_string() }
-                    } else {
-                        return Err(crate::PyError::type_error(
-                            "fromhex() requires a string argument",
-                        ));
-                    };
-                    // Delegate parsing to the shared hex-float reader, which rounds
-                    // round-half-even over the full exponent range (subnormals down to
-                    // 0x1p-1074), accepts the inf/nan spellings, handles surrounding
-                    // ASCII whitespace itself, and flags overflow distinctly.
-                    match rustpython_common::float_ops::from_hex(&s_arg) {
-                        Ok(v) => {
-                            let w_float = pyre_object::w_float_new(v);
-                            // floatobject.py:419: return
-                            // space.call_function(w_cls, w_float).  This runs a
-                            // subclass's __new__ and __init__ rather than merely
-                            // retagging the parsed base float.
-                            crate::call::call_function_impl_result(args[0], &[w_float])
-                        }
-                        Err(e) => {
-                            use rustpython_common::float_ops::HexFloatError;
-                            Err(match e {
-                                HexFloatError::Overflow => crate::PyError::overflow_error(
-                                    "hexadecimal value too large to represent as a float",
-                                ),
-                                HexFloatError::TooLong => crate::PyError::value_error(
-                                    "hexadecimal string too long to convert",
-                                ),
-                                HexFloatError::Invalid => crate::PyError::value_error(
-                                    "invalid hexadecimal floating-point string",
-                                ),
-                            })
-                        }
+                    Err(e) => {
+                        use rustpython_common::float_ops::HexFloatError;
+                        Err(match e {
+                            HexFloatError::Overflow => crate::PyError::overflow_error(
+                                "hexadecimal value too large to represent as a float",
+                            ),
+                            HexFloatError::TooLong => crate::PyError::value_error(
+                                "hexadecimal string too long to convert",
+                            ),
+                            HexFloatError::Invalid => crate::PyError::value_error(
+                                "invalid hexadecimal floating-point string",
+                            ),
+                        })
                     }
-                },
-                2,
-            )),
+                }
+            })),
         )
     };
     unsafe {
@@ -15791,7 +15825,7 @@ fn init_float_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__round__",
-            make_builtin_function("__round__", crate::builtins::builtin_round),
+            make_builtin_function("__round__", crate::type_methods::number_dunder_round),
         )
     };
     unsafe {
@@ -16636,7 +16670,7 @@ fn init_object_type(ns: PyObjectRef) {
                             "descriptor '__repr__' of 'object' object needs an argument",
                         ));
                     }
-                    crate::type_methods::arity_no_args(args, "object.__repr__")?;
+                    crate::type_methods::arity_no_args(args, "__repr__")?;
                     let obj = args[0];
                     unsafe {
                         if pyre_object::is_instance(obj) {
@@ -16669,7 +16703,7 @@ fn init_object_type(ns: PyObjectRef) {
                             "descriptor '__str__' of 'object' object needs an argument",
                         ));
                     }
-                    crate::type_methods::arity_no_args(args, "object.__str__")?;
+                    crate::type_methods::arity_no_args(args, "__str__")?;
                     // Delegate to __repr__ to avoid infinite recursion
                     // PyPy: objectobject.py descr___str__ → space.repr(w_self)
                     Ok(pyre_object::w_str_new_managed(&unsafe {
@@ -16693,7 +16727,7 @@ fn init_object_type(ns: PyObjectRef) {
                             "unbound method object.__format__() needs an argument",
                         ));
                     }
-                    crate::type_methods::arity_exact(args, "object.__format__", 1)?;
+                    crate::type_methods::arity_exact(args, "__format__", 1)?;
                     // object.__format__(self, format_spec): the spec must be
                     // a `str` (a `bytes` spec is rejected like any other
                     // non-`str`); a non-empty one is unsupported, an empty
@@ -16727,7 +16761,7 @@ fn init_object_type(ns: PyObjectRef) {
                             "unbound method object.__reduce__() needs an argument",
                         ));
                     }
-                    crate::type_methods::arity_no_args(args, "object.__reduce__")?;
+                    crate::type_methods::arity_no_args(args, "__reduce__")?;
                     crate::reduce_protocol::descr_reduce(args[0])
                 },
                 1,
@@ -16746,7 +16780,7 @@ fn init_object_type(ns: PyObjectRef) {
                             "unbound method object.__reduce_ex__() needs an argument",
                         ));
                     }
-                    crate::type_methods::arity_exact(args, "object.__reduce_ex__", 1)?;
+                    crate::type_methods::arity_exact(args, "__reduce_ex__", 1)?;
                     let proto = crate::builtins::space_index_w(args[1])?;
                     crate::reduce_protocol::descr_reduce_ex(args[0], proto)
                 },
@@ -16766,7 +16800,7 @@ fn init_object_type(ns: PyObjectRef) {
                             "unbound method object.__getstate__() needs an argument",
                         ));
                     }
-                    crate::type_methods::arity_no_args(args, "object.__getstate__")?;
+                    crate::type_methods::arity_no_args(args, "__getstate__")?;
                     crate::reduce_protocol::object_getstate_default(args[0])
                 },
                 1,
@@ -16785,7 +16819,7 @@ fn init_object_type(ns: PyObjectRef) {
                             "unbound method object.__dir__() needs an argument",
                         ));
                     }
-                    crate::type_methods::arity_no_args(args, "object.__dir__")?;
+                    crate::type_methods::arity_no_args(args, "__dir__")?;
                     crate::builtins::object_dir_default(args[0])
                 },
                 1,
@@ -16804,7 +16838,7 @@ fn init_object_type(ns: PyObjectRef) {
                             "unbound method object.__sizeof__() needs an argument",
                         ));
                     }
-                    crate::type_methods::arity_no_args(args, "object.__sizeof__")?;
+                    crate::type_methods::arity_no_args(args, "__sizeof__")?;
                     object_descr_sizeof(args)
                 },
                 1,
@@ -18133,16 +18167,19 @@ fn bytes_strip(
 
 fn bytes_method_strip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "strip")?;
+    crate::type_methods::arity_at_most(args, "strip", 1)?;
     bytes_strip(args, true, true)
 }
 
 fn bytes_method_lstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "lstrip")?;
+    crate::type_methods::arity_at_most(args, "lstrip", 1)?;
     bytes_strip(args, true, false)
 }
 
 fn bytes_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "rstrip")?;
+    crate::type_methods::arity_at_most(args, "rstrip", 1)?;
     bytes_strip(args, false, true)
 }
 
@@ -18483,12 +18520,7 @@ fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// element raises the CPython `sequence item N: expected a bytes-like
 /// object, <T> found` TypeError.
 fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 2 {
-        return Err(crate::PyError::type_error(format!(
-            "join() takes exactly one argument ({} given)",
-            args.len().saturating_sub(1)
-        )));
-    }
+    crate::type_methods::arity_exact(args, "join", 1)?;
     // Python 3.14's bytearray join holds a buffer export on the separator
     // while materialising the iterable and copying its items (GH-112625).
     // A re-entrant iterator therefore cannot resize/clear the separator out
@@ -18780,7 +18812,7 @@ fn bytes_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// `bytesobject.py:descr_zfill` — left-pad with `b'0'` to `width`,
 /// keeping a leading `+`/`-` sign ahead of the zeros.
 fn bytes_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_exact(args, "bytes.zfill", 1)?;
+    crate::type_methods::arity_exact(args, "zfill", 1)?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?;
     let len = data.len() as i64;
@@ -19120,11 +19152,6 @@ fn bytes_maketrans(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// the end raises the even-count error, any other non-hex byte raises
 /// the positional error.
 fn parse_hex_string(args: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
-    if args.len() != 1 {
-        return Err(crate::PyError::type_error(
-            "fromhex() takes exactly one argument",
-        ));
-    }
     let a = args[0];
     if unsafe { pyre_object::is_str(a) } {
         return parse_hex_bytes(unsafe { pyre_object::w_str_get_value(a) }.as_bytes());
@@ -19314,6 +19341,7 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 // `cls(value)` when called on a subclass.
 fn bytes_fromhex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    crate::type_methods::arity_exact(args, "fromhex", 1)?;
     let out = parse_hex_string(&args[1..])?;
     let w_bytes = pyre_object::bytesobject::w_bytes_from_bytes(&out);
     let base = crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE);
@@ -19326,6 +19354,7 @@ fn bytes_fromhex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 fn bytearray_fromhex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    crate::type_methods::arity_exact(args, "fromhex", 1)?;
     let out = parse_hex_string(&args[1..])?;
     let base = crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE);
     if cls.is_null() || crate::baseobjspace::is_w(cls, base) {
@@ -20342,7 +20371,7 @@ fn bytearray_method_imul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// `bytearrayobject.py:descr_append` — append one byte in place.
 fn bytearray_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_exact(args, "bytearray.append", 1)?;
+    crate::type_methods::arity_exact(args, "append", 1)?;
     unsafe { crate::builtins::bytearray_check_exports(args[0])? };
     let b = bytearray_byte_arg(args[1])?;
     unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).push(b) };
@@ -20473,7 +20502,7 @@ fn bytearray_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// `bytearrayobject.py:descr_reverse` — reverse the bytes in place.
 fn bytearray_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "reverse")?;
-    crate::type_methods::arity_no_args(args, "bytearray.reverse")?;
+    crate::type_methods::arity_no_args(args, "reverse")?;
     unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).reverse() };
     Ok(pyre_object::w_none())
 }
@@ -20481,7 +20510,7 @@ fn bytearray_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// `bytearrayobject.py:descr_clear` — empty the bytearray in place.
 fn bytearray_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "clear")?;
-    crate::type_methods::arity_no_args(args, "bytearray.clear")?;
+    crate::type_methods::arity_no_args(args, "clear")?;
     unsafe {
         crate::builtins::bytearray_check_exports(args[0])?;
         pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).clear();
@@ -20493,7 +20522,7 @@ fn bytearray_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// same bytes.
 fn bytearray_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "copy")?;
-    crate::type_methods::arity_no_args(args, "bytearray.copy")?;
+    crate::type_methods::arity_no_args(args, "copy")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(data))
 }
@@ -22515,7 +22544,7 @@ fn set_method_intersection_update(
 fn set_method_symmetric_difference_update(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_exact(args, "set.symmetric_difference_update", 1)?;
+    crate::type_methods::arity_exact(args, "symmetric_difference_update", 1)?;
     let w_other_as_set = set_operand_as_set(args[1])?;
     let w_new = set_symmetric_difference_storage(args[0], w_other_as_set)?;
     // `setobject.py` — the computed storage replaces self's.
@@ -22666,7 +22695,7 @@ fn init_set_type(ns: PyObjectRef) {
                 "add",
                 |args| {
                     crate::type_methods::require_set_receiver(args, "add", true)?;
-                    crate::type_methods::arity_exact(args, "set.add", 1)?;
+                    crate::type_methods::arity_exact(args, "add", 1)?;
                     // `try_hash_value` may run a user `__hash__` that
                     // allocates and triggers a moving minor collection;
                     // root `self` and the element across it, then reload.
@@ -22702,7 +22731,7 @@ fn init_set_type(ns: PyObjectRef) {
                 "discard",
                 |args| {
                     crate::type_methods::require_set_receiver(args, "discard", true)?;
-                    crate::type_methods::arity_exact(args, "set.discard", 1)?;
+                    crate::type_methods::arity_exact(args, "discard", 1)?;
                     set_discard_from_set(args[0], args[1])?;
                     Ok(pyre_object::w_none())
                 },
@@ -22718,7 +22747,7 @@ fn init_set_type(ns: PyObjectRef) {
                 "remove",
                 |args| {
                     crate::type_methods::require_set_receiver(args, "remove", true)?;
-                    crate::type_methods::arity_exact(args, "set.remove", 1)?;
+                    crate::type_methods::arity_exact(args, "remove", 1)?;
                     if !set_discard_from_set(args[0], args[1])? {
                         return Err(crate::PyError::key_error_with_key(args[1]));
                     }
@@ -22736,7 +22765,7 @@ fn init_set_type(ns: PyObjectRef) {
                 "pop",
                 |args| {
                     crate::type_methods::require_set_receiver(args, "pop", true)?;
-                    crate::type_methods::arity_no_args(args, "set.pop")?;
+                    crate::type_methods::arity_no_args(args, "pop")?;
                     if let Some(item) = unsafe { pyre_object::w_set_popitem(args[0]) } {
                         return Ok(item);
                     }
@@ -22757,7 +22786,7 @@ fn init_set_type(ns: PyObjectRef) {
                 "clear",
                 |args| {
                     crate::type_methods::require_set_receiver(args, "clear", true)?;
-                    crate::type_methods::arity_no_args(args, "set.clear")?;
+                    crate::type_methods::arity_no_args(args, "clear")?;
                     unsafe { pyre_object::w_set_clear(args[0]) };
                     Ok(pyre_object::w_none())
                 },

@@ -97,7 +97,10 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, crate::PyError> {
         Err(err) if err.kind != crate::PyErrorKind::AttributeError => return Err(err),
         Err(_) => {}
     }
-    Err(crate::PyError::type_error("must be real number"))
+    Err(crate::PyError::type_error(format!(
+        "must be real number, not {}",
+        crate::type_methods::arg_type_name(obj)
+    )))
 }
 
 type PyResult = Result<PyObjectRef, crate::PyError>;
@@ -650,10 +653,23 @@ pub fn isfinite(args: &[PyObjectRef]) -> PyResult {
 
 pub fn isclose(args: &[PyObjectRef]) -> PyResult {
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if pos.len() != 2 {
-        return Err(crate::PyError::type_error(
-            "isclose() takes exactly 2 positional arguments",
-        ));
+    if pos.len() < 2 {
+        // `_PyArg_ParseStackAndKeywords` names the first slot it could not
+        // fill; both are positional-only, so a keyword never fills one.
+        let missing = if pos.is_empty() {
+            "a' (pos 1"
+        } else {
+            "b' (pos 2"
+        };
+        return Err(crate::PyError::type_error(format!(
+            "isclose() missing required argument '{missing})"
+        )));
+    }
+    if pos.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "isclose() takes exactly 2 positional arguments ({} given)",
+            pos.len()
+        )));
     }
     // `rel_tol` and `abs_tol` are the only (keyword-only) parameters.
     crate::builtins::kwarg_reject_unknown(kwargs, &["rel_tol", "abs_tol"], "isclose")?;
