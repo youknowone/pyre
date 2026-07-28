@@ -7181,13 +7181,28 @@ fn handle_fail(
     // resuming, so the next back-edge warms and compiles against the new
     // quasi-immutable value instead of re-entering the stale containing
     // machine trace on every iteration.
-    if descr_arc
+    //
+    // Only when the guard's owning token IS the one currently installed.  A
+    // retired token's descrs stay reachable through the loop's side tables
+    // long after the key has been recompiled, and `invalidate_loop` resolves
+    // the key through `get_procedure_token`, which skips invalidated tokens —
+    // so an unscoped revoke kills the *replacement* loop instead, on every
+    // guard failure that still reports through the old trace.  `QuasiImmut.
+    // invalidate` (quasiimmut.py:84-109) marks only the looptokens registered
+    // on that instance and then drops the list, so a retired token never
+    // revokes a later compile upstream.
+    if let Some(owner) = descr_arc
         .as_fail_descr()
         .and_then(majit_backend::descr_owning_jct)
-        .is_some_and(|token| token.is_invalidated())
+        .filter(|token| token.is_invalidated())
     {
         let (driver, _) = driver_pair();
-        driver.invalidate_loop(green_key);
+        if driver
+            .get_loop_token_arc(green_key)
+            .is_some_and(|installed| std::sync::Arc::ptr_eq(&installed, &owner))
+        {
+            driver.invalidate_loop(green_key);
+        }
     }
 
     // The range FOR_ITER `GuardClass(RANGE_ITER)` proves its own site
