@@ -6275,7 +6275,32 @@ fn const_pool_slot_upper_bound(c: &pyre_interpreter::ConstantData) -> usize {
     }
 }
 
+/// Memoized wrapper over [`unsupported_jit_shape_uncached`], which runs on
+/// every frame entry but is a pure function of the code object: it flattens the
+/// whole constant table and walks the instruction stream up to four times.
+///
+/// The `CodeObject` allocation is owned for the process lifetime by
+/// `PyCode.code_ptr` (`Box::into_raw`, never freed), so its address is a stable
+/// key that is never reused — the same property the frame-shape decline census
+/// already relies on.
 fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitShape {
+    thread_local! {
+        static SHAPE_CACHE: std::cell::RefCell<
+            std::collections::HashMap<usize, UnsupportedJitShape>,
+        > = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = code as *const _ as usize;
+    if let Some(cached) = SHAPE_CACHE.with(|c| c.borrow().get(&key).copied()) {
+        return cached;
+    }
+    let shape = unsupported_jit_shape_uncached(code);
+    SHAPE_CACHE.with(|c| {
+        c.borrow_mut().insert(key, shape);
+    });
+    shape
+}
+
+fn unsupported_jit_shape_uncached(code: &pyre_interpreter::CodeObject) -> UnsupportedJitShape {
     // RPython/PyPy has no counterpart to this function at all: `jit_merge_point`
     // and `can_enter_jit` are unconditional (`pypy/module/pypyjit/interp_jit.py`),
     // and `JitPolicy.look_inside_graph` (`rpython/jit/codewriter/policy.py:48`)
