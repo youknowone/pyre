@@ -2686,7 +2686,11 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
         0,
         0,
         &[
-            field(0, "sys_exc_value", pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET),
+            field(
+                0,
+                "sys_exc_value",
+                pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET,
+            ),
             field(1, "topframeref", pyre_interpreter::EC_TOPFRAMEREF_OFFSET),
         ],
     )
