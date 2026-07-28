@@ -128,13 +128,21 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
 /// exactly the identity a subclass instance must not have. It always
 /// allocates a distinct heap box, independent of `CAN_BE_TAGGED`.
 pub fn w_int_new_unique(value: i64) -> PyObjectRef {
-    crate::lltype::malloc_typed(W_IntObject {
+    let obj = W_IntObject {
         ob_header: PyObject {
             ob_type: &INT_TYPE as *const PyType,
             w_class: get_instantiate(&INT_TYPE),
         },
         intval: value,
-    }) as PyObjectRef
+    };
+    // `intobject.py:_as_subint` creates a subtype through
+    // `space.allocate_instance(W_IntObject, w_inttype)`, so the fresh box is
+    // an ordinary collector-owned instance (and can enter the finalizer
+    // queue when the subtype defines `__del__`).  Unlike exact ephemeral int
+    // boxes, a user instance must not use the non-moving old-gen fast path:
+    // that path is intentionally long-lived and would prevent the subtype's
+    // registered finalizer from observing that the instance became dead.
+    crate::lltype::malloc_typed_managed(obj) as PyObjectRef
 }
 
 /// Allocate a `W_IntObject` for an `int` subclass instance, on the managed
