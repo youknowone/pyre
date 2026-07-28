@@ -572,8 +572,11 @@ pub fn init_typeobjects() {
 
         // CPython `method_descriptor`, backed by PyPy's immutable
         // FunctionWithFixedCode payload.
-        let method_descriptor_type =
-            new_typeobject_with_base("method_descriptor", init_descriptor_type_common, object_type);
+        let method_descriptor_type = new_typeobject_with_base(
+            "method_descriptor",
+            init_descriptor_type_common,
+            object_type,
+        );
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(method_descriptor_type, false);
             pyre_object::w_type_set_disallow_instantiation(method_descriptor_type);
@@ -590,8 +593,11 @@ pub fn init_typeobjects() {
         // CPython `wrapper_descriptor`: slot wrappers bind their receiver and
         // are callable, but are not Python functions. Their Rust payload is
         // the immutable BuiltinCode-backed Function carrier.
-        let slot_wrapper_type =
-            new_typeobject_with_base("wrapper_descriptor", init_descriptor_type_common, object_type);
+        let slot_wrapper_type = new_typeobject_with_base(
+            "wrapper_descriptor",
+            init_descriptor_type_common,
+            object_type,
+        );
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(slot_wrapper_type, false);
             pyre_object::w_type_set_disallow_instantiation(slot_wrapper_type);
@@ -10089,6 +10095,13 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // bases are relinked by `w_type_ready` below (typeobject.py:1140-1142
         // `add_subclass`).
         let saved_bases = pyre_object::typeobject::w_type_get_bases(w_type);
+        // `w_type_set_bases` below drops `saved_bases`' last rooted owner, and a
+        // custom `mro()` reached through `mro_subclasses` can trigger a
+        // collection before the rollback reads it back.  Pin it so the
+        // collector keeps it alive and updates the slot if it moves.
+        let _saved_bases_roots = pyre_object::gc_roots::push_roots();
+        let saved_bases_sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(saved_bases);
         if !saved_bases.is_null() {
             let old_n = pyre_object::w_tuple_len(saved_bases);
             for i in 0..old_n as i64 {
@@ -10105,32 +10118,31 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // (typeobject.py:1144 `mro_subclasses`).
         let mut temp = Vec::new();
         if let Err(err) = mro_subclasses(w_type, &mut temp) {
-            // A nested `__bases__` assignment may have superseded this
-            // operation while custom `mro()` code ran.  Preserve that newer
-            // hierarchy; otherwise restore the exact pre-update state.
-            let bases_now = pyre_object::typeobject::w_type_get_bases(w_type);
-            if std::ptr::eq(bases_now, w_value) {
-                for (cls, old_mro) in temp.into_iter().rev() {
-                    match old_mro {
-                        Some(mro) => pyre_object::w_type_set_mro(cls, mro),
-                        None => pyre_object::w_type_clear_mro(cls),
+            // typeobject.py:961-963 — on any recomputation failure restore every
+            // visited class's previous MRO and the type's old bases.  Reload the
+            // pinned `saved_bases` first: the `mro()` code may have moved it once
+            // the swap above unrooted it.
+            let saved_bases = pyre_object::gc_roots::shadow_stack_get(saved_bases_sp);
+            for (cls, old_mro) in temp.into_iter().rev() {
+                match old_mro {
+                    Some(mro) => pyre_object::w_type_set_mro(cls, mro),
+                    None => pyre_object::w_type_clear_mro(cls),
+                }
+            }
+            pyre_object::typeobject::w_type_set_bases(w_type, saved_bases);
+            for i in 0..n as i64 {
+                if let Some(base) = pyre_object::w_tuple_getitem(w_value, i) {
+                    if pyre_object::is_type(base) {
+                        pyre_object::typeobject::w_type_remove_subclass(base, w_type);
                     }
                 }
-                pyre_object::typeobject::w_type_set_bases(w_type, saved_bases);
-                for i in 0..n as i64 {
-                    if let Some(base) = pyre_object::w_tuple_getitem(w_value, i) {
+            }
+            if !saved_bases.is_null() {
+                let old_n = pyre_object::w_tuple_len(saved_bases);
+                for i in 0..old_n as i64 {
+                    if let Some(base) = pyre_object::w_tuple_getitem(saved_bases, i) {
                         if pyre_object::is_type(base) {
-                            pyre_object::typeobject::w_type_remove_subclass(base, w_type);
-                        }
-                    }
-                }
-                if !saved_bases.is_null() {
-                    let old_n = pyre_object::w_tuple_len(saved_bases);
-                    for i in 0..old_n as i64 {
-                        if let Some(base) = pyre_object::w_tuple_getitem(saved_bases, i) {
-                            if pyre_object::is_type(base) {
-                                pyre_object::typeobject::w_type_add_subclass(base, w_type);
-                            }
+                            pyre_object::typeobject::w_type_add_subclass(base, w_type);
                         }
                     }
                 }

@@ -28,7 +28,8 @@ pub unsafe fn slot_get(
     if slots.is_null() {
         return None;
     }
-    unsafe { crate::listobject::w_list_getitem(slots, index as i64) }.filter(|value| !value.is_null())
+    unsafe { crate::listobject::w_list_getitem(slots, index as i64) }
+        .filter(|value| !value.is_null())
 }
 
 /// Store `value` into slot `index`, growing (or creating) the backing list as

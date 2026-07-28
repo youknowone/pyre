@@ -8666,6 +8666,30 @@ pub unsafe fn type_repr_qualified_name(w_type: PyObjectRef) -> String {
     }
 }
 
+/// LOAD_SPECIAL attribute resolution, shared by the interpreter
+/// (`eval::load_special`) and the JIT residual (`call_jit::bh_load_special_fn`).
+/// `_PyObject_LookupSpecial` resolves a special method on the type only,
+/// bypassing the instance dict and any `__getattribute__` override, so a pure
+/// `lookup_in_type` followed by the descriptor's `__get__` keeps both engines
+/// calling the same method even when the receiver overrides `__getattribute__`.
+pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    let w_type = crate::typedef::r#type(obj).map_or(pyre_object::PY_NULL, |w_type| w_type.as_ptr());
+    let descr = if w_type.is_null() {
+        None
+    } else {
+        unsafe { lookup_in_type(w_type, name) }
+    }
+    .ok_or_else(|| {
+        crate::PyError::attribute_error(format!(
+            "'{}' object has no attribute '{}'",
+            object_functionstr_type_name(obj),
+            name,
+        ))
+    })?;
+    let bound = unsafe { get(descr, obj, w_type) }?.unwrap_or(descr);
+    Ok(bound)
+}
+
 /// `callmethod.py:25-85 LOAD_METHOD` fast-path decision, shared by the
 /// interpreter (`eval::load_method`) and the JIT tracer
 /// (`jitcode_dispatch::try_walker_specialize_load_method_attr`) so both produce the

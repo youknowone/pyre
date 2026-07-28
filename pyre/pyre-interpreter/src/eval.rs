@@ -4158,21 +4158,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn load_special(&mut self, name: &str) -> Result<(), PyError> {
         let obj = self.pop();
-        let w_type =
-            crate::typedef::r#type(obj).map_or(pyre_object::PY_NULL, |w_type| w_type.as_ptr());
-        let descr = if w_type.is_null() {
-            None
-        } else {
-            unsafe { crate::baseobjspace::lookup_in_type(w_type, name) }
-        }
-        .ok_or_else(|| {
-            PyError::attribute_error(format!(
-                "'{}' object has no attribute '{}'",
-                crate::baseobjspace::object_functionstr_type_name(obj),
-                name,
-            ))
-        })?;
-        let bound = unsafe { crate::baseobjspace::get(descr, obj, w_type) }?.unwrap_or(descr);
+        let bound = crate::baseobjspace::load_special_resolve(obj, name)?;
         self.push(bound);
         self.push(PY_NULL);
         Ok(())

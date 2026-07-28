@@ -5248,19 +5248,19 @@ fn load_special_method_name(method_kind: i64) -> &'static str {
     }
 }
 
-/// Resolve `getattr(obj, special_method_name(method_kind))` for LOAD_SPECIAL.
-/// This is the fixed-name counterpart of [`bh_load_attr_fn`]: the codewriter
-/// passes the bytecode's special-method discriminant instead of a `co_names`
-/// index.
+/// Resolve the LOAD_SPECIAL method named by `method_kind`.  Mirrors the
+/// interpreter's `load_special` through the shared `load_special_resolve`:
+/// `_PyObject_LookupSpecial` looks the method up on the type only, bypassing
+/// the instance dict and any `__getattribute__` override, so a traced
+/// `with`/`async with` calls the same method the interpreter would.  Returns
+/// the bound method; [`bh_load_special_self_fn`] therefore reports a NULL self.
 pub extern "C" fn bh_load_special_fn(obj: i64, method_kind: i64) -> i64 {
     let name = load_special_method_name(method_kind);
-    if let Some((_, _, w_descr)) =
-        unsafe { pyre_interpreter::baseobjspace::load_method_fast_path(obj as _, name) }
-    {
-        return w_descr as i64;
-    }
-    match pyre_interpreter::baseobjspace::getattr_str(obj as pyre_object::PyObjectRef, name) {
-        Ok(attr) => attr as i64,
+    match pyre_interpreter::baseobjspace::load_special_resolve(
+        obj as pyre_object::PyObjectRef,
+        name,
+    ) {
+        Ok(bound) => bound as i64,
         Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object() as i64);
             0
@@ -5268,16 +5268,11 @@ pub extern "C" fn bh_load_special_fn(obj: i64, method_kind: i64) -> i64 {
     }
 }
 
-/// Compute the LOAD_SPECIAL `null_or_self` value for an already-resolved
-/// special method.  Mirrors [`bh_load_method_self_fn`] without a code-object
-/// name lookup.
-pub extern "C" fn bh_load_special_self_fn(obj: i64, attr: i64, method_kind: i64) -> i64 {
-    let name = load_special_method_name(method_kind);
-    pyre_interpreter::eval::compute_load_method_bound(
-        obj as pyre_object::PyObjectRef,
-        attr as pyre_object::PyObjectRef,
-        name,
-    ) as i64
+/// The LOAD_SPECIAL `null_or_self` value.  [`bh_load_special_fn`] returns the
+/// method already bound through the descriptor's `__get__`, so — as in the
+/// interpreter's `load_special` — the pushed pair carries a NULL self.
+pub extern "C" fn bh_load_special_self_fn(_obj: i64, _attr: i64, _method_kind: i64) -> i64 {
+    pyre_object::PY_NULL as i64
 }
 
 /// `LOAD_NAME` residual for the standalone (blackhole / deopt)
