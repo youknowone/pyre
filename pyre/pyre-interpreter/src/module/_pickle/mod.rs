@@ -308,7 +308,9 @@ pub(crate) fn walk_pickle_state_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
         visitor(&mut *std::ptr::addr_of_mut!((*ptr).w_name_mapping));
         visitor(&mut *std::ptr::addr_of_mut!((*ptr).w_import_mapping));
         visitor(&mut *std::ptr::addr_of_mut!((*ptr).w_reverse_name_mapping));
-        visitor(&mut *std::ptr::addr_of_mut!((*ptr).w_reverse_import_mapping));
+        visitor(&mut *std::ptr::addr_of_mut!(
+            (*ptr).w_reverse_import_mapping
+        ));
     }
 }
 

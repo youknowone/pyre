@@ -4019,6 +4019,10 @@ fn pyre_object_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         let gcref: &mut majit_ir::GcRef =
             unsafe { &mut *(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef) };
         visitor(gcref);
+        // Forward the GC-managed children of a `malloc_typed`-immortal pinned
+        // object, which the visit above skips. See `pyre_object_root_walker_area`.
+        let value = gcref.0 as pyre_object::PyObjectRef;
+        unsafe { pyre_interpreter::eval::walk_raw_immortal_roots(value, visitor) };
     });
 }
 
@@ -4029,6 +4033,14 @@ unsafe fn pyre_object_root_walker_area(
     unsafe {
         pyre_object::gc_roots::walk_shadow_stack_area(data, |slot| {
             visit_pyobject_root(slot, visitor);
+            // A `pin_root`ed object may be `malloc_typed`-immortal (e.g. a
+            // `_pickle.Unpickler` kept alive only through this pin), so the
+            // visit above is a no-op for it and its GC-managed children
+            // (`w_stack`, `w_memo`, …) are never traced. Forward them in
+            // place. Read the slot AFTER the visitor so a relocated value is
+            // the live one.
+            let value: pyre_object::PyObjectRef = *slot;
+            pyre_interpreter::eval::walk_raw_immortal_roots(value, visitor);
         });
     }
 }

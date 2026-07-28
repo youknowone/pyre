@@ -321,15 +321,20 @@ pub unsafe fn walk_raw_exception_roots(
 const IMMORTAL_WALK_MAX_DEPTH: u32 = 8;
 
 /// Force-forward the managed children of any `malloc_typed`-immortal REGISTERED
-/// pyre object reachable from a value-stack slot.  Such objects are outside the
-/// GC arenas, so the marker skips them and their registered `gc_ptr_offsets`
-/// trace never fires; a managed child held solely through one is freed by a
-/// collection (a bare `for x in <expr>:` whose iterator sits on the value
-/// stack, a `d.keys()` view, an immortal iterator's source list).  Drive off
-/// the per-type offset registry so every present and future immortal type is
-/// covered.  Runs on both minor and major collections via the
-/// collection-kind-agnostic `visitor`.
-unsafe fn walk_raw_immortal_roots(
+/// pyre object reachable from a root slot (a frame value-stack/locals slot, or
+/// an explicit `gc_roots::pin_root` shadow-stack slot).  Such objects are
+/// outside the GC arenas, so the marker skips them and their registered
+/// `gc_ptr_offsets` trace never fires; a managed child held solely through one
+/// is freed by a collection (a bare `for x in <expr>:` whose iterator sits on
+/// the value stack, a `d.keys()` view, an immortal iterator's source list, an
+/// `_pickle.Unpickler` pinned across `load`).  Drive off the per-type offset
+/// registry so every present and future immortal type is covered.  Runs on both
+/// minor and major collections via the collection-kind-agnostic `visitor`.
+///
+/// # Safety
+/// `value` must be a valid `PyObjectRef` or null, and `visitor` must accept the
+/// forwarded child slots for the duration of the walk.
+pub unsafe fn walk_raw_immortal_roots(
     value: PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
