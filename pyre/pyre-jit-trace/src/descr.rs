@@ -1360,7 +1360,13 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "valuestackdepth",
                 crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET,
-                8,
+                // `usize`, not a fixed 64-bit int.  The other `Type::Int`
+                // fields in this table are all `i64`, so 8 is right for
+                // them; this one and `last_instr` below are the two that
+                // are a machine word wide.  A literal 8 makes the store a
+                // byte pair too wide on a 32-bit target, and the overrun
+                // lands on `last_instr`, which sits immediately after it.
+                std::mem::size_of::<usize>(),
                 Type::Int,
                 true,
                 false,
@@ -1369,7 +1375,8 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "last_instr",
                 crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET,
-                8,
+                // `isize` — see the width note on `valuestackdepth` above.
+                std::mem::size_of::<isize>(),
                 Type::Int,
                 true,
                 false,

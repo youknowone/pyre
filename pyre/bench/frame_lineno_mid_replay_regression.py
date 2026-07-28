@@ -15,20 +15,19 @@
 # answer and the replayed one together and a divergence appears as a SECOND
 # element rather than a shifted single value.
 #
-# Why this is not a synthetic bench: the wasm backend does not satisfy the
-# invariant today, and check.py's synthetic suite has no per-backend scoping.
-# Measured on this HEAD -- `plain` below reports `[0, 4]` on wasm against `[4]`
-# on pypy3, CPython, dynasm and cranelift, with the divergence appearing from
-# the first COMPILED call onward and persisting.  Instrumenting both ends showed
-# the marker hook writing the right coordinate into the right frame at the right
-# offset and reading it back intact, and the interpreter then reading 0 from
-# that same address -- so a wasm-side writer clears it between the publish and
-# the residual `sys._getframe`.  Neither `restore_resume_state_from` nor
-# `set_last_instr_from_next_instr` is that writer (probed: neither ever targets
-# the caller frame), and a blackhole `setfield_vable_i` cannot be, because the
-# wasm blackhole builder carries no cpu and that handler would panic.  The
-# invariant is asserted here for the native backends while that is open; the
-# post-return coordinate, which wasm does satisfy, stays in the synthetic bench.
+# It asserts rather than diffing against pypy3 so the recursive case can pin an
+# exact per-level tuple, which an output diff cannot express.
+#
+# It is also the guard for a store-width defect, which is why it is worth
+# keeping separate: `PyFrame.valuestackdepth` and `PyFrame.last_instr` are
+# adjacent machine words, so a store that takes its width from a descr
+# declaring a fixed 8 bytes runs past the first field and deposits the zero
+# high half onto the second.  On a 64-bit target the two are the same number
+# and nothing happens; on wasm32 the words are 4 bytes and `plain` below
+# reported `[0, 4]` against `[4]` everywhere else, from the first compiled call
+# onward.  The publish itself was never at fault -- it stores through
+# `*mut isize` and read back intact; the clobber came afterwards, from the
+# blackhole replaying a `setfield_vable_i` at the neighbouring offset.
 import sys
 
 N = 4000
