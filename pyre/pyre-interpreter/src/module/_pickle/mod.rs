@@ -248,6 +248,13 @@ static PICKLE_STATE: AtomicPtr<PickleState> = AtomicPtr::new(std::ptr::null_mut(
 /// The cached `_compat_pickle` tables, built on first use. Returns `None` when
 /// `_compat_pickle` or one of its four tables is unavailable, so `compat_map`
 /// falls back to the identity mapping.
+///
+/// `State.startup` (state.py) imports `_compat_pickle` eagerly at space startup
+/// and lets a failure propagate. This builds the same tables lazily on the first
+/// `compat_map` and degrades to the identity mapping when the module is absent
+/// rather than propagating: the eager-startup hook has no pyre counterpart, and
+/// the fallback keeps protocol-<3 pickling usable on a minimal stdlib that omits
+/// `_compat_pickle` (proto>=3 never reaches `compat_map`).
 fn pickle_state() -> Option<&'static PickleState> {
     let ptr = PICKLE_STATE.load(Ordering::Acquire);
     if !ptr.is_null() {
@@ -343,13 +350,19 @@ pub(crate) fn compat_map(
     } else {
         state.w_name_mapping
     };
+    // `if w_1:` (find_class, interp_pickle.py:2612) — a present-but-falsy value
+    // is not selected; a truthy one commits to `w_module_name, w_name =
+    // space.listview(w_1)`, which requires exactly two elements (ValueError on
+    // any other arity) and whose `text_w` conversions raise TypeError on a
+    // non-str element, as the downstream `__import__` / `getattr` would. Reading
+    // the value with an unchecked tuple/str cast would instead silently fall
+    // back or dereference a non-str payload.
     if let Some(v) = crate::baseobjspace::finditem(w_name_map, key)? {
-        let m = unsafe { pyre_object::tupleobject::w_tuple_getitem(v, 0) };
-        let n = unsafe { pyre_object::tupleobject::w_tuple_getitem(v, 1) };
-        if let (Some(m), Some(n)) = (m, n) {
+        if crate::baseobjspace::is_true(v)? {
+            let pair = crate::baseobjspace::fixedview(v, 2)?;
             return Ok((
-                unsafe { pyre_object::unicodeobject::w_str_get_value(m) }.to_string(),
-                unsafe { pyre_object::unicodeobject::w_str_get_value(n) }.to_string(),
+                crate::baseobjspace::text_w(pair[0])?.to_string(),
+                crate::baseobjspace::text_w(pair[1])?.to_string(),
             ));
         }
     }
@@ -358,11 +371,12 @@ pub(crate) fn compat_map(
     } else {
         state.w_import_mapping
     };
+    // `elif w_2:` — truthiness gate, then `w_module_name = w_2` with `name`
+    // unchanged; `text_w` raises TypeError on a non-str remap value.
     if let Some(v) = crate::baseobjspace::finditem_str(w_import_map, module)? {
-        return Ok((
-            unsafe { pyre_object::unicodeobject::w_str_get_value(v) }.to_string(),
-            name.to_string(),
-        ));
+        if crate::baseobjspace::is_true(v)? {
+            return Ok((crate::baseobjspace::text_w(v)?.to_string(), name.to_string()));
+        }
     }
     Ok((module.to_string(), name.to_string()))
 }
