@@ -890,10 +890,16 @@ impl GcCache {
     /// descr.py:234-238: parent_descr = get_size_descr(gccache, STRUCT, vtable).
     /// Looked up from _cache_size[STRUCT]. Caller must ensure get_size_descr
     /// was called first (matches RPython's call at descr.py:238).
+    ///
+    /// `display_name`: descr.py:227 `'%s.%s' % (STRUCT._name, fieldname)`.
+    /// Callers that know the owning struct's source name pass the full
+    /// `Owner.field` spelling; `None` falls back to the `T<type_id>.` stand-in
+    /// for the mint sites that only carry the numeric struct identity.
     pub fn get_field_descr(
         &mut self,
         struct_key: LLType,
         field_name: &str,
+        display_name: Option<&str>,
         offset: usize,
         field_size: usize,
         field_type: Type,
@@ -934,11 +940,16 @@ impl GcCache {
             }
         }
         // descr.py:227: name = '%s.%s' % (STRUCT._name, fieldname)
-        let type_id = match &struct_key {
-            LLType::Struct(id) => *id,
-            _ => 0,
+        let name = match display_name {
+            Some(n) => n.to_string(),
+            None => {
+                let type_id = match &struct_key {
+                    LLType::Struct(id) => *id,
+                    _ => 0,
+                };
+                format!("T{type_id}.{field_name}")
+            }
         };
-        let name = format!("T{type_id}.{field_name}");
         // descr.py:234-238: parent_descr = get_size_descr(gccache, STRUCT, vtable)
         let parent = self._cache_size.get(&struct_key).cloned();
         // descr.py:230-231: FieldDescr(name, offset, size, flag, index_in_parent, is_pure)
@@ -4289,6 +4300,7 @@ pub fn make_simple_descr_group_keyed_with_headerless(
             gc.get_field_descr(
                 struct_key.clone(),
                 &spec.field_key,
+                Some(spec.name.as_str()),
                 spec.offset,
                 spec.field_size,
                 spec.field_type,

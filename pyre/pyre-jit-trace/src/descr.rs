@@ -3401,6 +3401,7 @@ fn field_descr_from_bh_field(
                 let fd = gc.get_field_descr(
                     key,
                     &field_key,
+                    Some(field.name.as_str()),
                     field.offset,
                     field.field_size,
                     field.field_type,

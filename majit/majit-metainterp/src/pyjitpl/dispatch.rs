@@ -193,6 +193,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         let fd = gc.get_field_descr(
                             struct_key,
                             name,
+                            None,
                             *offset,
                             *field_size,
                             *field_type,

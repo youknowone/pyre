@@ -2134,6 +2134,7 @@ impl CallControl {
                 let descr = majit_ir::descr::gc_cache().lock().unwrap().get_field_descr(
                     struct_key,
                     field_name,
+                    None,
                     field_offset,
                     field_size,
                     ir_type,
@@ -2285,6 +2286,7 @@ impl CallControl {
                     let mint = gc.get_field_descr(
                         struct_key,
                         field_name,
+                        None,
                         offset,
                         field_size,
                         ir_type,
@@ -6887,6 +6889,7 @@ fn all_interiorfielddescrs(
                     gc.get_field_descr(
                         struct_key.clone(),
                         name,
+                        None,
                         *offset,
                         *field_size,
                         *field_type,
@@ -7019,6 +7022,7 @@ fn all_interiorfielddescrs(
                 gc.get_field_descr(
                     struct_key.clone(),
                     name,
+                    None,
                     *fld_offset,
                     *field_size,
                     *field_type,

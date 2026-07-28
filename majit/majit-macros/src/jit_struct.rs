@@ -64,6 +64,7 @@ pub(crate) fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let _ = gc_cache.get_field_descr(
                 __majit_key.clone(),
                 #fname_str,
+                None,
                 ::std::mem::offset_of!(Self, #fname),
                 ::std::mem::size_of::<#fty>(),
                 #ir_type_tok,
