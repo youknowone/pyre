@@ -363,6 +363,14 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 /// # Safety
 /// `code_ptr` must be a valid pointer to a `CodeObject` obtained
 /// via `Box::into_raw`.
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the body
+/// boxes the `PyCode` and its per-name cache tables through direct
+/// `Box::into_raw(Box::new(...))`, whose `Box::new_uninit` primitive carries no
+/// annotator (raw allocation is deliberately unlifted). Residualise the whole
+/// constructor — a `PyObjectRef` GCREF modelled by signature. Code objects are
+/// built at import/compile time, never on a traced hot path.
+#[majit_macros::dont_look_inside]
 pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: bool) -> PyObjectRef {
     // RPython pointer alignment idiom (`rpython/memory/gc/minimarkpage.py:159
     // ll_assert((nsize & (WORD-1)) == 0, "malloc: size is not aligned")`):
@@ -476,6 +484,10 @@ pub fn w_code_new(code_ptr: *const ()) -> PyObjectRef {
 /// `PyCode` value shape instead of inventing an RPython layout for the opaque
 /// Rust clone. Keep clone, Box ownership transfer, and wrapper publication in
 /// the one boundary.
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the body
+/// `Box::into_raw`s a cloned `CodeObject` (unlifted raw allocation) before
+/// forwarding to the residualised `w_code_new`.
 #[majit_macros::dont_look_inside]
 pub fn box_code_constant(code: &crate::CodeObject) -> PyObjectRef {
     let code_ptr = Box::into_raw(Box::new(code.clone())) as *const ();
