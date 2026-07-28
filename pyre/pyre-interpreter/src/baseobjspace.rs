@@ -114,7 +114,7 @@ pub(crate) unsafe fn walk_pending_hash_error_area(
 pub fn clear_method_cache() {
     let mut cache = METHOD_CACHE.lock();
     cache.versions.fill(0);
-    cache.names.fill(None);
+    cache.names.fill(std::ptr::null_mut());
     cache
         .lookup_where
         .fill((std::ptr::null_mut(), std::ptr::null_mut()));
@@ -8338,9 +8338,18 @@ pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Op
 /// `(null, null)` pair on a valid `(version, name)` entry is the cached
 /// negative result (`_lookup_where_all_typeobjects` returned
 /// `(None, None)`).
+///
+/// `names[h]` holds the interned name *object* and is validated by identity
+/// (`typeobject.py:541` `cache.names[method_hash] is name`), so a probe costs
+/// one pointer compare rather than a digest plus a `memcmp` over the bytes,
+/// and a fill stores the pointer rather than allocating a copy of the name.
+/// Every name reaching the cache comes from `box_str_constant`, which
+/// allocates through `malloc_typed`: the object is immortal and never
+/// relocated, so the slot needs no GC forwarding and its address is never
+/// reused by a later, different name (`null` = empty).
 struct MethodCache {
     versions: Vec<u64>,
-    names: Vec<Option<String>>,
+    names: Vec<PyObjectRef>,
     lookup_where: Vec<(PyObjectRef, PyObjectRef)>,
 }
 
@@ -8357,7 +8366,7 @@ static METHOD_CACHE: std::sync::LazyLock<parking_lot::Mutex<MethodCache>> =
     std::sync::LazyLock::new(|| {
         parking_lot::Mutex::new(MethodCache {
             versions: vec![0u64; METHOD_CACHE_SIZE],
-            names: vec![None; METHOD_CACHE_SIZE],
+            names: vec![std::ptr::null_mut(); METHOD_CACHE_SIZE],
             lookup_where: vec![(std::ptr::null_mut(), std::ptr::null_mut()); METHOD_CACHE_SIZE],
         })
     });
@@ -8366,12 +8375,16 @@ static METHOD_CACHE: std::sync::LazyLock<parking_lot::Mutex<MethodCache>> =
 /// version token directly (PyPy hashes `current_object_addr_as_int(
 /// version_tag)`; the u64 is its own address-stable surrogate).
 /// `name_hash` only needs to be deterministic — the slot's validity is
-/// the exact `(version, name)` match, not the hash — so an FNV-1a over
-/// the bytes stands in for `compute_hash(name)`.
-fn method_hash(version_tag: u64, name: &str) -> usize {
+/// the exact `(version, name)` match, not the hash.  Upstream's
+/// `hash(name)` is the interned string's memoized digest, i.e. a
+/// per-name-object constant; the interned pointer is the same constant
+/// without the byte walk, so an FNV-1a over its bytes stands in.  Two
+/// threads that interned the same name into different objects then land
+/// in different slots instead of evicting each other from a shared one.
+fn method_hash(version_tag: u64, w_name: PyObjectRef) -> usize {
     let mut name_hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in name.as_bytes() {
-        name_hash ^= *b as u64;
+    for b in (w_name as usize as u64).to_le_bytes() {
+        name_hash ^= b as u64;
         name_hash = name_hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     const SHIFT2: u32 = 64 - METHOD_CACHE_SIZE_EXP;
@@ -8439,14 +8452,13 @@ pub unsafe fn _pure_lookup_where_with_method_cache(
     w_name: PyObjectRef,
     version_tag: u64,
 ) -> PyObjectRef {
-    let name = pyre_object::unicodeobject::w_str_get_value(w_name);
     // PyPy's elidable returns the cached `(w_class, w_value)` tuple
     // object; the residual-call ABI here carries one raw register, so
     // the elidable surface projects the `w_value` half.  Callers that
     // need the defining class go through the interpreter front door
     // `lookup_where_with_method_cache`, which reads the same cache
     // entry.
-    _cached_lookup_where(w_type, name, version_tag).1
+    _cached_lookup_where(w_type, w_name, version_tag).1
 }
 
 /// `lookup_where` *class* projection — the `@elidable` companion of
@@ -8470,8 +8482,7 @@ pub unsafe fn _pure_lookup_class_with_method_cache(
     w_name: PyObjectRef,
     version_tag: u64,
 ) -> PyObjectRef {
-    let name = pyre_object::unicodeobject::w_str_get_value(w_name);
-    _cached_lookup_where(w_type, name, version_tag).0
+    _cached_lookup_where(w_type, w_name, version_tag).0
 }
 
 /// The `MethodCache` probe/fill shared by the `@elidable` JIT surface
@@ -8479,16 +8490,21 @@ pub unsafe fn _pure_lookup_class_with_method_cache(
 /// slot; on a miss runs the raw MRO walk (`typeobject.py:478-489
 /// _lookup_where_all_typeobjects`) and fills the slot with the
 /// `(w_class, w_value)` pair (`typeobject.py:545-549`).
+///
+/// `w_name` must be an interned name object (`box_str_constant`): the slot
+/// is keyed by its address, so a collectable or non-interned string would
+/// let a later allocation at the same address answer a hit for a different
+/// name.
 unsafe fn _cached_lookup_where(
     w_type: PyObjectRef,
-    name: &str,
+    w_name: PyObjectRef,
     version_tag: u64,
 ) -> (PyObjectRef, PyObjectRef) {
-    let h = method_hash(version_tag, name);
+    let h = method_hash(version_tag, w_name);
     // Probe without holding the borrow across the MRO walk below.
     let hit = {
         let cache = METHOD_CACHE.lock();
-        if cache.versions[h] == version_tag && cache.names[h].as_deref() == Some(name) {
+        if cache.versions[h] == version_tag && cache.names[h] == w_name {
             // A valid entry with null pointers is the cached negative result.
             Some(cache.lookup_where[h])
         } else {
@@ -8498,6 +8514,7 @@ unsafe fn _cached_lookup_where(
     if let Some(tup) = hit {
         return tup;
     }
+    let name = pyre_object::unicodeobject::w_str_get_value(w_name);
     let tup =
         lookup_where_pair(w_type, name).unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
     // Prebuilt-family store: the cache slot is reached only by
@@ -8505,7 +8522,7 @@ unsafe fn _cached_lookup_where(
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     let mut cache = METHOD_CACHE.lock();
     cache.versions[h] = version_tag;
-    cache.names[h] = Some(name.to_string());
+    cache.names[h] = w_name;
     cache.lookup_where[h] = tup;
     tup
 }
