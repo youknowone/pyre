@@ -1971,8 +1971,11 @@ fn apply_blackhole_crn(
         // expected — the walk's own flush declines exactly this case and says
         // so (`state.rs` "NULL operand-stack shadow slot (mid-expression)").
         // The blackhole image gets there a different way: the CRN merge point
-        // is a different pc than the one the MIFrame was built at, so a color
-        // live at the merge need not have been populated at the build.
+        // is a different pc than the one the MIFrame was built at, and its live
+        // set is generally the larger of the two.  `build_single_frame_miframe`
+        // now seeds the whole concrete bank rather than the colors live at the
+        // build pc, so reaching here means the walk held no concrete for the
+        // color at all, not that a liveness filter dropped it.
         // A LOCAL slot may legitimately be NULL (an unbound local), so this
         // guards the stack region only, matching the sibling.
         //
@@ -1981,7 +1984,10 @@ fn apply_blackhole_crn(
         // already-executed region back to the replay.  The loop-header gate in
         // `try_adopt_single_frame_blackhole` keeps the CRN arm out of reach; the
         // check survives only so an incomplete gate degrades to a wrong answer
-        // instead of the SIGSEGV this class produced before it existed.
+        // instead of the SIGSEGV this class produced before it existed.  With
+        // that gate lifted the corpus reaches the CRN arm 10 times and fires
+        // this decline zero times — which is why the gate's own comment names
+        // discharging these declines, not lifting the gate, as the convergence.
         if slot >= stack_base && bank == 1 && registers_r[color] == 0 {
             sfdbg_crn!("NULL Ref color {color} for live stack slot {slot}");
             return false;
@@ -2042,12 +2048,12 @@ fn apply_blackhole_crn(
 /// it records a concrete frame result and adopts.  So the whole double-apply
 /// class here is "the CRN arm rejected the image".
 ///
-/// ⚠️And that arm is UNEXERCISED: over `pyre/bench/synth` (312 files) all 50
-/// single-frame adoptions took a frame-terminal arm and none reported a green,
-/// i.e. `apply_blackhole_crn` is never reached from here on this corpus.  Any
-/// work to make the CRN arm infallible therefore needs a shape that enters it
-/// first, or it cannot be tested — see the `[latch-vs-bh]` probe in
-/// `residual_call.rs`, which measures the most likely such shape.
+/// ⚠️That arm is unreachable HERE, but only because the loop-header gate below
+/// keeps it so.  Under the gate all 50 single-frame adoptions over
+/// `pyre/bench/synth` take a frame-terminal arm; with the gate lifted the same
+/// corpus reaches it 10 times, from the two `getframe_root_loop_force_*`
+/// fixtures, and declines none of them.  The gate comment carries that
+/// measurement and why it is still not enough to lift.
 fn try_adopt_single_frame_blackhole(
     ctx: &mut TraceCtx,
     cf_addr: usize,
@@ -2100,11 +2106,40 @@ fn try_adopt_single_frame_blackhole(
     // codewriter emits solely at Python loop headers of the true portal, so a
     // loop-free body cannot reach that arm at all.
     //
-    // This is a RESTRICTION, not the convergence.  The real fix is to make the
-    // CRN image complete by construction — the MIFrame is seeded from the live
-    // colors at the BUILD pc, while the merge point it stops at has its own
-    // live set, so a color live at the merge but not at the build reads back
-    // NULL.  Until that seeding is total, a loop body cannot be driven safely.
+    // This is a RESTRICTION, not the convergence.  Both defects that made a
+    // driven loop body wrong are fixed: the image now carries the whole
+    // concrete bank rather than a liveness-selected subset, and the locals
+    // publish below writes the walk's locals into the frame the image's own
+    // register names, which is the live one and not the snapshot the walk
+    // stepped.  Without that publish the drive read pre-walk locals — on
+    // `getframe_root_loop_force_blackhole_crn` it accumulated `total += 1039`
+    // where the walk already had i=1040, and the total came out short by
+    // exactly the adoption count.  Lifting the gate was then measured over
+    // `pyre/bench/synth`:
+    // 10 CRN adoptions (both `getframe_root_loop_force_*` fixtures, 5 each),
+    // ZERO `apply_blackhole_crn` declines, no output differing from the
+    // interpreter on any corpus file, and check.py green on all three
+    // backends.
+    //
+    // It stays shut anyway, on two grounds.  The measurement is not a proof:
+    // `apply_blackhole_crn` can still decline post-drive on a shape the corpus
+    // does not contain (a NULL Ref for a live stack slot, an absent pcdep at
+    // the drive's own stop position, a live stack slot no color covers), and
+    // that decline's failure mode is a wrong answer rather than a crash.  And
+    // there is nothing on the other side of the trade: adoption fires once per
+    // trace attempt that meets a force, so the corpus's 10 adoptions bought no
+    // CPU time distinguishable from measurement floor (0.090s vs 0.080s and
+    // 0.050s vs 0.050s, min of 5 interleaved rounds), while the refused
+    // adoption's fallbacks — the committed escape or the legacy replay — are
+    // themselves correct.
+    //
+    // The convergence is to delete the decline instead of the gate.
+    // `convert_and_run_from_pyjitpl` (`blackhole.py:1799-1821`) has no path
+    // that rejects an image; it builds the interps and runs them.  Every
+    // decline in `apply_blackhole_crn` guards pyre's own resume metadata being
+    // incomplete at the merge point.  Once those are discharged, the CRN arm is
+    // infallible like the other three and this gate has nothing left to stand
+    // on.
     let has_loop = {
         let pf = unsafe { &*(cf_addr as *const pyre_interpreter::PyFrame) };
         let w_code = pf.pycode;

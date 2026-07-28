@@ -18,6 +18,15 @@
 # post-drive decline discards a region the drive already executed and hands it
 # back to the replay, which turned 199990000 into 200005595. The gate has to be
 # taken before the drive.
+#
+# This shape is also the one that exposed the two defects behind that NULL. The
+# image seeded only the colors live at the build pc rather than the whole
+# concrete bank; and the walk synchronized the virtualizable into the
+# snapshot_for_tracing copy while the image's vable identity pointed at the live
+# frame, so the drive read locals one Python iteration stale and accumulated
+# total += 1039 where i was already 1040. Both are fixed. The loop-header gate
+# still refuses this drive, so what the fixture pins day to day is the
+# interpreter-equal answer; drop that gate locally to exercise the CRN arm.
 import sys
 
 
