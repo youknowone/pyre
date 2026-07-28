@@ -607,17 +607,11 @@ pub fn capture_pyframe_root_area() -> *const () {
 /// slot instead holds a `JitVirtualRef`, and reading that as a `PyFrame` would
 /// interpret its `virtual_token` word as frame fields.  Hop through the vref
 /// instead.  A still-virtual vref ends the walk: the frames it stands for have
-/// no heap image to visit, and `virtualref.py:157 force_virtual_if_necessary`
+/// no heap image to visit, and `virtualref.py force_virtual_if_necessary`
 /// cannot run here because materializing one allocates.
 #[inline]
 unsafe fn chain_next_frame(f_backref: *mut PyFrame) -> *mut PyFrame {
-    unsafe {
-        if majit_metainterp::virtualref::ptr_is_virtual_ref(f_backref as *const u8) {
-            majit_metainterp::virtualref::vref_forced(f_backref as *const u8) as *mut PyFrame
-        } else {
-            f_backref
-        }
-    }
+    crate::executioncontext::vref_referent(f_backref)
 }
 
 /// Walk one captured thread's active frame and interpreter root state.

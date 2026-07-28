@@ -109,9 +109,10 @@ use super::*;
 ///     that the converged walker would route through. Production reach
 ///     today is zero — `jtransform.rs jit.force_virtual` is the only
 ///     producer and pyre's interpreter does not emit it.
-///   - `vrefs_after_residual_call` is unported; no `jit.virtual_ref`
-///     producers exist today, so the upstream loops are empty. Vable forces
-///     are detected by the residual-call execution path's heap-token bracket.
+///   - `vrefs_after_residual_call` is ported on `TraceCtx` but the walker
+///     never calls it; no `jit.virtual_ref` producers exist today, so the
+///     upstream loops are empty either way. Vable forces are detected by the
+///     residual-call execution path's heap-token bracket.
 ///   - `direct_libffi_call` (`pyjitpl.py`) — pyre's live
 ///     tracer also returns `None` from this helper unless a
 ///     `CIF_DESCRIPTION_P` parser + dynamic `calldescr` builder lands

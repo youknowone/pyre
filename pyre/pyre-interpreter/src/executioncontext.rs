@@ -49,9 +49,34 @@ pub fn register_force_vref_hook(f: ForceVRefFn) {
     let _ = FORCE_VREF_HOOK.set(f);
 }
 
+/// The frame a chain slot NAMES, read WITHOUT forcing —
+/// `virtualref.py force_virtual`'s trailing `return vref.forced`.
+///
+/// Exact for the whole recording walk: `virtual_ref_during_tracing` writes
+/// `forced = real_object` at allocation and only `continue_tracing` ever
+/// rewrites it.  Null when the vref is still virtual with nothing
+/// materialized — a live compiled frame — so callers must read that as
+/// "names no reachable frame", never as a match.
+///
+/// For identity tests only, never for handing a frame to application code.
+/// Forcing would be wrong here, not merely expensive: a live vref carries
+/// `TOKEN_TRACING_RESCALL` across a residual, `force_virtual` clears it, and
+/// that cleared token is the one marker `tracing_after_residual_call` reads as
+/// "the callee forced this vref".  A reader that forced would report its own
+/// read as a callee escape.
+#[inline]
+pub fn vref_referent(ptr: *mut PyFrame) -> *mut PyFrame {
+    if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(ptr as *const u8) } {
+        unsafe { majit_metainterp::virtualref::vref_forced(ptr as *const u8) as *mut PyFrame }
+    } else {
+        ptr
+    }
+}
+
 /// Force a vref stored in the frame chain (`topframeref` / `f_backref`).
-/// `virtualref.py:135`: `if inst.typeptr != jit_virtual_ref_vtable: return inst`
-/// (the pointer already *is* the frame) else materialize via `force_virtual`.
+/// `virtualref.py force_virtual_if_necessary`: `if inst.typeptr !=
+/// jit_virtual_ref_vtable: return inst` (the pointer already *is* the frame)
+/// else materialize via `force_virtual`.
 #[inline]
 pub(crate) fn force_vref(ptr: *mut PyFrame) -> *mut PyFrame {
     if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(ptr as *const u8) } {

@@ -439,7 +439,7 @@ impl Drop for InlineConcreteFrameGuard {
     }
 }
 
-/// `executioncontext.py:85 enter` / `:91 leave` around one concretely executed
+/// `executioncontext.py enter` / `leave` around one concretely executed
 /// residual call of an inline sub-walk.
 ///
 /// Inlining a call elides the callee's real call sequence, so nothing
@@ -454,6 +454,9 @@ struct ResidualFrameChainGuard {
     frame: *mut pyre_interpreter::PyFrame,
     saved_topframeref: *mut pyre_interpreter::PyFrame,
     previous_published: *mut pyre_interpreter::PyFrame,
+    /// Whether this guard performed the chain write, so `Drop` restores only
+    /// what it changed.  False when the chain already named `frame`.
+    entered: bool,
 }
 
 impl ResidualFrameChainGuard {
@@ -467,20 +470,32 @@ impl ResidualFrameChainGuard {
             return None;
         }
         let saved_topframeref = unsafe { (*ec).topframeref };
-        // Re-entering the same frame would make it its own caller.
-        if std::ptr::eq(saved_topframeref, frame) {
-            return None;
+        // Re-entering the same frame would make it its own caller.  `topframeref`
+        // holds a `jit.virtual_ref`, so a vref that NAMES this frame is the same
+        // re-entry as the bare pointer; resolve the referent without forcing,
+        // because forcing clears `TOKEN_TRACING_RESCALL` and
+        // `tracing_after_residual_call` reads that as a callee escape.
+        let entered = !std::ptr::eq(
+            pyre_interpreter::executioncontext::vref_referent(saved_topframeref),
+            frame,
+        );
+        if entered {
+            unsafe {
+                (*frame).f_backref = saved_topframeref;
+                (*ec).topframeref = frame;
+            }
         }
-        unsafe {
-            (*frame).f_backref = saved_topframeref;
-            (*ec).topframeref = frame;
-        }
+        // Published whether or not this guard wrote the chain: `frame` is the
+        // one a force inside the residual must redirect its escape onto
+        // (`flush_active_frame_escape`), and the chain already naming it makes
+        // that more true, not less.
         let previous_published = PUBLISHED_INLINE_FRAME.with(|slot| slot.replace(frame));
         Some(Self {
             ec,
             frame,
             saved_topframeref,
             previous_published,
+            entered,
         })
     }
 }
@@ -488,14 +503,16 @@ impl ResidualFrameChainGuard {
 impl Drop for ResidualFrameChainGuard {
     fn drop(&mut self) {
         unsafe {
-            // `executioncontext.py:91-109 leave`: move the raw caller vref
-            // back without forcing it, then, when the frame escaped, force
-            // the caller and mark it escaped too.  A frame handed to
-            // application code keeps a reference to its caller, so the caller
-            // must stay materialised; dropping that propagation would leave
-            // the escape recorded only on a frame the walk owns privately.
+            // `executioncontext.py leave`: move the raw caller vref back without
+            // forcing it, then, when the frame escaped, force the caller and
+            // mark it escaped too.  A frame handed to application code keeps a
+            // reference to its caller, so the caller must stay materialised;
+            // dropping that propagation would leave the escape recorded only on
+            // a frame the walk owns privately.
             PUBLISHED_INLINE_FRAME.with(|slot| slot.set(self.previous_published));
-            (*self.ec).topframeref = self.saved_topframeref;
+            if self.entered {
+                (*self.ec).topframeref = self.saved_topframeref;
+            }
             if (*self.frame).escaped() {
                 let f_back = (*self.frame).get_f_back();
                 if !f_back.is_null() {
@@ -2492,14 +2509,15 @@ pub(crate) fn do_not_in_trace_call_result(
 /// `*token_ptr == 0` assertion in `tracing_before_residual_call`
 /// intact.
 ///
-/// `vrefs_before_residual_call` / `vrefs_after_residual_call`
-/// (`pyjitpl.py`) are unported.  `PyreSym` does carry
-/// `virtualref_boxes` (`state.rs`), so what is missing is the bracket
-/// itself: the pre-call `vrefinfo.tracing_before_residual_call` loop
-/// and the post-call `stop_tracking_virtualref`.  Unreachable today —
-/// the codewriter emits no `jit.virtual_ref` producers
-/// (`jit/call.rs`), leaving `virtualref_boxes` empty so both upstream
-/// loops iterate zero times.
+/// Despite the name it records no vref half.  `vrefs_before_residual_call` /
+/// `vrefs_after_residual_call` / `stop_tracking_virtualref` are ported on
+/// `TraceCtx` and wired on the metainterp leg; what is missing is the walker
+/// calling them.  Note the two `virtualref_boxes`: the bracket and the guard
+/// snapshots read `TraceCtx`'s, while `PyreSym`'s is touched only by the
+/// caller-less `opimpl_virtual_ref` and the resume-side decode.  Unreachable
+/// today — the codewriter emits no `jit.virtual_ref` producers
+/// (`jit/call.rs`), leaving both empty so every upstream loop iterates zero
+/// times.
 pub(crate) fn walker_vable_and_vrefs_before_residual_call(ctx: &mut TraceCtx) {
     // pyjitpl.py: vinfo = self.jitdriver_sd.virtualizable_info;
     //                       if vinfo is not None:
