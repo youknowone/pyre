@@ -1958,6 +1958,27 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // gates is attribute/item READS of frame-family objects, which are
         // idempotently re-executable (re-execution reads the same flushed
         // values the first execution saw; a token re-force is a no-op).
+        //
+        // Why the licence is `!writes_live_heap` and not the effect class the
+        // rewound residual declares: BOTH upstream-shaped static licences are
+        // empty on this path.  `check_is_elidable()`/`EF_LOOPINVARIANT` is
+        // disjoint from forcing by construction — `pyjitpl.py:2007` takes the
+        // forcing arm iff `check_forces_virtual_or_virtualizable()`
+        // (`extraeffect >= EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`, effectinfo.py:250)
+        // and routes elidable/loop-invariant down the `else` arm at `:2084`.
+        // An empty declared write set is unavailable too: every residual that
+        // reaches this gate carries `EF_RANDOM_EFFECTS`, whose write-descr sets
+        // are `None` — top, not bottom — by upstream's own assertion
+        // (effectinfo.py:149-155).  So no `EffectInfo` predicate can license
+        // this rewind, and the licence has to come from the shape gates above.
+        // Measured over `pyre/bench/synth` (312 files, 115 forces): the only
+        // shape that commits an `EscapeResumeKind::Exact` is a `LoadAttr`/`Ref`
+        // frame-family read, 10 of them, from `getframe_stored_fback_walk` and
+        // `getframe_force_cancel_journal`; 5 enter a user frame and have the
+        // commit withdrawn below, 5 do not and are re-executed.  Every other
+        // force either commits nothing or takes the merge-point fallback, whose
+        // `RerunsOpcode` kind `commit_walk_end` refuses outright.
+        //
         // A sub-walk's mirror describes the callee frame, not the escape
         // frame, so it is never latched (the nested unjournaled-residual
         // decline above already aborts before this).
@@ -2015,6 +2036,31 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
         }
         if forced {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[force-shape] helper={helper:?} rtype={:?} writes_live={writes_live_heap} \
+                     reentrant={reentrant_residual} commit={} entered_frame={} bh={} \
+                     fs={} subwalk={} bridge={} wf={:?} wa={:?} wi={:?} rnd={} fn=0x{:x} \
+                     pc={op_pc}",
+                    call_descr.result_type(),
+                    match committed_frame_escape_pc() {
+                        None => "none",
+                        Some((_, EscapeResumeKind::Exact)) => "exact",
+                        Some((_, EscapeResumeKind::RerunsOpcode)) => "reruns",
+                    },
+                    heap_write_odometer_before
+                        .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before),
+                    blackhole_result.is_some(),
+                    ctx.session.borrow().framestack.len(),
+                    ctx.fbw_mode.inline_subwalk,
+                    ctx.trace_ctx.is_bridge_trace,
+                    ei._write_descrs_fields.as_ref().map(Vec::len),
+                    ei._write_descrs_arrays.as_ref().map(Vec::len),
+                    ei._write_descrs_interiorfields.as_ref().map(Vec::len),
+                    ei.has_random_effects(),
+                    func_ptr as usize,
+                );
+            }
             // The escaping residual also entered a user Python frame whose
             // body may have committed irreversible effects; a committed
             // escape resume would re-execute this opcode and re-run that
