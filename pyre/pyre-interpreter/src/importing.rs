@@ -1416,9 +1416,26 @@ pub(crate) fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
             }
         }
     }
+    sys_modules_registry_get(name)
+}
+
+/// Look `name` up in `SYS_MODULES`, the process-owned name→module registry.
+///
+/// The single read seam every traced reader of `SYS_MODULES` goes through.
+/// Entries are stamped at runtime by `set_sys_module` / `remove_sys_module`,
+/// so the map is not a build-time constant and the JIT residualizes the read
+/// instead of tracing into it (`@dont_look_inside`, the `sys_modules_dict`
+/// shape).  The mutating and GC-walking users keep the raw static.
+///
+/// The read is poison-tolerant, following the `get_interpreter_sys_module`
+/// spelling this replaces: a poisoned mutex means another thread panicked
+/// while holding it, and a `HashMap<String, usize>` has no invariant a panic
+/// mid-`insert`/`remove` could leave broken.
+#[majit_macros::dont_look_inside]
+pub(crate) fn sys_modules_registry_get(name: &str) -> Option<PyObjectRef> {
     SYS_MODULES
         .lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(name)
         .copied()
         .map(|module| module as PyObjectRef)
@@ -1462,12 +1479,7 @@ pub fn get_sys_module(name: &str) -> Option<PyObjectRef> {
 /// module registry and is independently walked as a GC root, so its original
 /// `sys` entry is the corresponding owner.
 pub fn get_interpreter_sys_module() -> Option<PyObjectRef> {
-    SYS_MODULES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get("sys")
-        .copied()
-        .map(|module| module as PyObjectRef)
+    sys_modules_registry_get("sys")
 }
 
 /// The Python-visible `sys.modules` dict, or `PY_NULL` before it is

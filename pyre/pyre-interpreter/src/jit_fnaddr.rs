@@ -950,7 +950,9 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     // The same shape over the object space's remaining runtime-mutable
     // globals: `sys_modules_dict` reads the `SYS_MODULES_DICT` pointer
-    // `set_sys_modules_dict` stamps, `set_in_flight_exception` writes the
+    // `set_sys_modules_dict` stamps, `sys_modules_registry_get` the
+    // `SYS_MODULES` name→module registry those stamps mirror,
+    // `set_in_flight_exception` writes the
     // `IN_FLIGHT_EXCEPTION` thread-local, `lookup_exc_class` reads the
     // `EXC_CLASS_REGISTRY` `OnceLock`, `check_sys_modules` the process-owned
     // `SYS_MODULES` registry, `mmap_type` the lazily-installed
@@ -965,6 +967,14 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::importing::sys_modules_dict",
         "pyre_interpreter::sys_modules_dict",
         sys_modules_dict as *const (),
+    );
+    let sys_modules_registry_get: fn(&str) -> Option<pyre_object::PyObjectRef> =
+        crate::importing::sys_modules_registry_get;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::importing::sys_modules_registry_get",
+        "pyre_interpreter::sys_modules_registry_get",
+        sys_modules_registry_get as *const (),
     );
     let set_in_flight_exception: fn(pyre_object::PyObjectRef) =
         crate::eval::set_in_flight_exception;
