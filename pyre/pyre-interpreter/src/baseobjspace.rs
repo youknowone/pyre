@@ -13368,11 +13368,24 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //         self.w_c = self.space.add(w_c, self.w_step)
         //         return w_c
         if pyre_object::interp_itertools::is_count(obj) {
-            let w_c = pyre_object::interp_itertools::w_count_get_c(obj);
-            let w_step = pyre_object::interp_itertools::w_count_get_step(obj);
-            let new_c = add(w_c, w_step)?;
-            pyre_object::interp_itertools::w_count_set_c(obj, new_c);
-            return Ok(w_c);
+            let _guard = pyre_object::interp_itertools::w_count_lock(obj);
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let w_c = pyre_object::interp_itertools::w_count_get_c(w_self);
+            pyre_object::gc_roots::pin_root(w_c);
+            let current_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_step = pyre_object::interp_itertools::w_count_get_step(w_self);
+            pyre_object::gc_roots::pin_root(w_step);
+            let step_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let new_c = add(
+                pyre_object::gc_roots::shadow_stack_get(current_slot),
+                pyre_object::gc_roots::shadow_stack_get(step_slot),
+            )?;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            pyre_object::interp_itertools::w_count_set_c(w_self, new_c);
+            return Ok(pyre_object::gc_roots::shadow_stack_get(current_slot));
         }
         // itertools.repeat.next_w — PyPy interp_itertools.py W_Repeat.next_w
         //

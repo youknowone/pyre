@@ -7,6 +7,57 @@
 
 use crate::pyobject::*;
 use pyre_macros::pyre_class;
+use std::cell::UnsafeCell;
+use std::sync::LazyLock;
+
+// PyPy's GIL makes W_Count.next_w's read/add/write sequence indivisible.
+// Pyre is free-threaded, so preserve W_Count as the sole semantic owner and
+// serialize only that sequence with the same address-striped reentrant shape
+// used for PyPy's GIL-protected list/dict transitions.
+struct ForkCountLock(UnsafeCell<parking_lot::ReentrantMutex<()>>);
+unsafe impl Sync for ForkCountLock {}
+
+impl ForkCountLock {
+    fn new() -> Self {
+        Self(UnsafeCell::new(parking_lot::ReentrantMutex::new(())))
+    }
+
+    fn get(&self) -> &parking_lot::ReentrantMutex<()> {
+        unsafe { &*self.0.get() }
+    }
+
+    unsafe fn reinit_after_fork(&self) {
+        unsafe { self.0.get().write(parking_lot::ReentrantMutex::new(())) };
+    }
+}
+
+static COUNT_LOCKS: LazyLock<Vec<ForkCountLock>> =
+    LazyLock::new(|| (0..256).map(|_| ForkCountLock::new()).collect());
+
+pub type CountGuard = parking_lot::lock_api::ReentrantMutexGuard<
+    'static,
+    parking_lot::RawMutex,
+    parking_lot::RawThreadId,
+    (),
+>;
+
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_count_lock(obj: PyObjectRef) -> CountGuard {
+    let lock = COUNT_LOCKS[(obj as usize >> 4) & (COUNT_LOCKS.len() - 1)].get();
+    if let Some(guard) = lock.try_lock() {
+        return guard;
+    }
+    let blocked = majit_gc::gc_sync::before_external_block();
+    let guard = lock.lock();
+    drop(blocked);
+    guard
+}
+
+pub fn count_locks_after_fork_child() {
+    for lock in COUNT_LOCKS.iter() {
+        unsafe { lock.reinit_after_fork() };
+    }
+}
 
 // ── W_Count — pypy/module/itertools/interp_itertools.py:class W_Count ──
 //
