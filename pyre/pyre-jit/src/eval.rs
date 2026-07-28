@@ -3318,20 +3318,20 @@ fn walk_jit_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     // major reaches the children on its own, through the type's registered
     // pointer offsets. A minor reaches them only through the remembered set,
     // which is exactly as complete as the barrier discipline over the twenty
-    // reference slots. That discipline has been audited and is not yet
-    // complete: the interpreter's slot writers all barrier
-    // (`exception_write_barrier` on every one), and a compiled SETFIELD_GC
-    // into a pointer field picks up a `COND_CALL_GC_WB` from the rewrite pass
-    // (`rewrite.py:930-931`, `:948-953`), but the blackhole's
-    // `bh_setfield_gc_r` / `bh_setinteriorfield_gc_r` store a reference with
-    // no barrier at all, where upstream's `write_ref_at_mem`
-    // (`llmodel.py:495-497`) gets one implicitly from the GC transform. A
-    // `w_context` or `w_traceback` written during a blackhole resume is
-    // therefore exactly the old-to-young edge the remembered set misses, so
-    // the walk stays load-bearing for both populations. Even once that gap
-    // closes, the coverage is a maintained invariant rather than a structural
-    // one — narrowing this walk to the off-GC family would make every future
-    // unbarriered exception-slot store a use-after-free instead of a leak.
+    // reference slots. All three store paths have been audited and all three
+    // now barrier: the interpreter's slot writers call
+    // `exception_write_barrier` on every one, a compiled SETFIELD_GC into a
+    // pointer field picks up a `COND_CALL_GC_WB` from the rewrite pass
+    // (`rewrite.py:930-931`, `:948-953`), and the blackhole's
+    // `bh_setfield_gc_r` / `bh_setinteriorfield_gc_r` barrier the destination
+    // the way upstream's `write_ref_at_mem` (`llmodel.py:495-497`) does
+    // implicitly through the GC transform.
+    //
+    // That still does not make the walk removable. The coverage is a
+    // maintained invariant rather than a structural one: pyre has no transform
+    // inserting these barriers, so each one is a hand-written call that a
+    // future store can omit. Narrowing this walk to the off-GC family would
+    // turn every such omission from a leak into a use-after-free.
     //
     // Either way the carrier cannot be demoted to a plain shadow-stack entry
     // (the direct analogue of the GC transform's rooted local,
@@ -10658,6 +10658,11 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         unsafe {
             ((struct_ptr as *mut u8).add(descr_info.offset) as *mut usize).write(value as usize);
         }
+        // llmodel.py:723 `bh_setfield_gc_r` → :495 `write_ref_at_mem`: the
+        // ref store carries an implied write barrier on the destination struct.
+        if pyre_object::gc_hook::try_gc_owns_object(struct_ptr as *mut u8) {
+            pyre_object::gc_hook::try_gc_write_barrier(struct_ptr as *mut u8);
+        }
     }
 
     fn bh_setfield_gc_f(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
@@ -10722,6 +10727,12 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         descr: &majit_ir::DescrRef,
     ) {
         self.bh_setinteriorfield_gc_i(array, index, value, descr);
+        // llmodel.py:659 `bh_setinteriorfield_gc_r` → :495
+        // `write_ref_at_mem`: the ref store carries an implied write barrier
+        // on the destination array.
+        if array != 0 && pyre_object::gc_hook::try_gc_owns_object(array as *mut u8) {
+            pyre_object::gc_hook::try_gc_write_barrier(array as *mut u8);
+        }
     }
 
     fn bh_setinteriorfield_gc_f(
