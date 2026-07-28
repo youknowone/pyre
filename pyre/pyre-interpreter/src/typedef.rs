@@ -1232,7 +1232,12 @@ pub fn init_typeobjects() {
         );
         reg.insert(
             &pyre_object::interp_itertools::CHAIN_TYPE as *const PyType as usize,
-            new_typeobject_with_base("itertools.chain", |_| {}, object_type) as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.chain",
+                init_chain_type,
+                object_type,
+                &pyre_object::interp_itertools::CHAIN_TYPE as *const PyType,
+            ) as usize,
         );
         // `pypy/objspace/std/specialisedtupleobject.py` — three SpecialisedTuple
         // variants share the public `tuple` PyType name, so all three
@@ -24090,6 +24095,117 @@ fn init_cycle_type(ns: PyObjectRef) {
             "__doc__",
             w_str_new(
                 "Return elements from the iterable until it is exhausted. Then repeat the sequence indefinitely.",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+// ── itertools.chain TypeDef ─────────────────────────────────────────
+// PyPy W_Chain.typedef, with Python 3.14's reduced public surface (the old
+// PyPy __reduce__ / __setstate__ entries are not exposed).
+
+fn chain_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // W_Chain___new__: accept variadic positional source iterables and reject
+    // keywords unless a subtype overrides __init__ to consume them.
+    let exact =
+        gettypefor(&pyre_object::interp_itertools::CHAIN_TYPE).map_or(PY_NULL, |p| p.as_ptr());
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = positional.first().copied().unwrap_or(PY_NULL);
+    builtinclass_new_args_check(
+        "chain",
+        exact,
+        cls,
+        0,
+        crate::builtins::has_real_kwargs(kwargs),
+    )?;
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let sources_base = pyre_object::gc_roots::shadow_stack_len();
+    for &source in positional.get(1..).unwrap_or(&[]) {
+        pyre_object::gc_roots::pin_root(source);
+    }
+    let sources = (0..positional.len().saturating_sub(1))
+        .map(|index| unsafe { pyre_object::gc_roots::shadow_stack_get(sources_base + index) })
+        .collect();
+    let w_args = pyre_object::w_tuple_new(sources);
+    let w_iterables = crate::baseobjspace::iter(w_args)?;
+    let obj = pyre_object::interp_itertools::w_chain_new(w_iterables);
+    itertools_alloc_for_class(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        exact,
+        obj,
+    )
+}
+
+fn chain_from_iterable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // chain_from_iterable(space, w_cls, w_arg): classmethod binding supplies
+    // the requested class as args[0], and this alternate constructor does not
+    // invoke the subtype's __init__.
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "chain.from_iterable() takes no keyword arguments",
+        ));
+    }
+    let given = positional.len().saturating_sub(1);
+    if given != 1 {
+        return Err(crate::PyError::type_error(format!(
+            "chain.from_iterable() takes exactly one argument ({given} given)"
+        )));
+    }
+    let cls = positional[0];
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(positional[1]);
+    let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_iterables = crate::baseobjspace::iter(unsafe {
+        pyre_object::gc_roots::shadow_stack_get(iterable_slot)
+    })?;
+    let obj = pyre_object::interp_itertools::w_chain_new(w_iterables);
+    let exact =
+        gettypefor(&pyre_object::interp_itertools::CHAIN_TYPE).map_or(PY_NULL, |p| p.as_ptr());
+    itertools_alloc_for_class(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        exact,
+        obj,
+    )
+}
+
+fn init_chain_type(ns: PyObjectRef) {
+    let entries = [
+        ("__new__", make_new_descr(chain_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "from_iterable",
+            pyre_object::function::w_classmethod_new(make_builtin_function(
+                "from_iterable",
+                chain_from_iterable,
+            )),
+        ),
+        (
+            "__class_getitem__",
+            pyre_object::function::w_classmethod_new(make_builtin_function(
+                "__class_getitem__",
+                crate::_pypy_generic_alias::generic_alias_class_getitem,
+            )),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Return a chain object whose .__next__() method returns elements from the\nfirst iterable until it is exhausted, then elements from the next\niterable, until all of the iterables are exhausted.",
             ),
         ),
     ];

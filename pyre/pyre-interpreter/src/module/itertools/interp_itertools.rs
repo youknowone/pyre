@@ -73,33 +73,15 @@ def tee(iterable, n=2):
 "#;
 
 pub fn register_module(ns: pyre_object::PyObjectRef) {
-    // chain(*iterables) — W_Chain___new__: store `iter(newtuple(args))` as
-    // the source-iterables iterator.  W_Chain.next_w (baseobjspace::next)
-    // lazily draws each sub-iterable's iterator on demand, so infinite
-    // arguments (e.g. `chain([3], repeat(3))`) do not hang at construction.
-    let chain_fn = crate::make_builtin_function("chain", |args| {
-        let tup = pyre_object::w_tuple_new(args.to_vec());
-        let iterables = crate::baseobjspace::iter(tup)?;
-        Ok(pyre_object::interp_itertools::w_chain_new(iterables))
-    });
-    // chain.from_iterable(iterable) — W_Chain.descr_from_iterable: flatten a
-    // single iterable of iterables.  Attached as an attribute on the `chain`
-    // callable (the classmethod is read straight off the function object, so
-    // it is called with just the outer iterable).
-    let from_iterable_fn = crate::make_builtin_function("from_iterable", |args| {
-        if args.len() != 1 {
-            return Err(crate::PyError::type_error(format!(
-                "chain.from_iterable() takes exactly one argument ({} given)",
-                args.len()
-            )));
-        }
-        let outer = args[0];
-        let iterables = crate::baseobjspace::iter(outer)?;
-        Ok(pyre_object::interp_itertools::w_chain_new(iterables))
-    });
-    crate::setattr_str(chain_fn, "from_iterable", from_iterable_fn)
-        .expect("attach itertools.chain.from_iterable");
-    crate::module_ns_store(ns, "chain", chain_fn);
+    // PyPy exports W_Chain.typedef itself. Its __new__ and classmethod
+    // from_iterable both preserve lazy traversal of the outer iterable.
+    crate::module_ns_store(
+        ns,
+        "chain",
+        crate::typedef::gettypefor(&pyre_object::interp_itertools::CHAIN_TYPE)
+            .expect("itertools.chain TypeDef initialized")
+            .as_ptr(),
+    );
     // PyPy exports W_StarMap.typedef itself; its __new__ stores a live source
     // iterator and next_w performs one expanded call at a time.
     crate::module_ns_store(
