@@ -159,11 +159,19 @@ assert rlock.acquire() is True
 rlock.release()
 rlock.release()
 
-# `TIMEOUT_MAX` is the whole-second bound of the nanosecond timestamp the
-# argument is converted to, and that conversion runs before either the
-# blocking or the sign check.
-assert _thread.TIMEOUT_MAX == 9223372036.0
+# `TIMEOUT_MAX` is the largest timeout `acquire` accepts, floored to whole
+# seconds.  The bound is platform-dependent — each implementation clamps it to
+# what its own wait API takes, and on Windows that is far below the nanosecond
+# timestamp bound — so pin the relationships to it rather than one platform's
+# constant.
+timeout_max = _thread.TIMEOUT_MAX
+assert isinstance(timeout_max, float)
+assert timeout_max > 0.0
+assert timeout_max == float(int(timeout_max))
 
+# The timestamp conversion runs before either the blocking or the sign check,
+# so a value past the nanosecond range raises from that conversion on every
+# platform, whatever `TIMEOUT_MAX` happens to be.
 for timeout, exc_type, message in [
     (float("nan"), ValueError, "Invalid value NaN (not a number)"),
     (9223372036.9, OverflowError, "timestamp out of range for platform time_t"),
@@ -185,7 +193,7 @@ except ValueError as exc:
 else:
     raise AssertionError("non-blocking acquire accepted a timeout")
 
-# The fractional tail below the nanosecond bound is still in range.
-assert _thread.allocate_lock().acquire(True, 9223372036.854) is True
+# The bound is inclusive.
+assert _thread.allocate_lock().acquire(True, timeout_max) is True
 
 print("OK")
