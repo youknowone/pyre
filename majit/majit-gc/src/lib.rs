@@ -1671,17 +1671,6 @@ pub fn active_major_threshold_reached() -> bool {
     }
 }
 
-/// Whether the JIT-frame shadow stack is empty — i.e. no compiled trace
-/// is suspended on this thread. The interpreter GC safepoint only
-/// collects when this holds: a suspended jitframe's gcmap describes its
-/// own suspension PC, and a collection driven from the nested interpreter
-/// (not from compiled code at a real safepoint) can mis-root it. The
-/// JIT's own nursery-full collections are safe; this gate keeps the
-/// interpreter-driven one out of the trace-suspended window.
-pub fn jitframe_shadow_stack_empty() -> bool {
-    shadow_stack::jf_top_ptr().is_null()
-}
-
 /// Process-global callback that reports whether a raw address is owned
 /// by the active backend's GC heap. Used by host-side allocators
 /// (`pyre-object`'s `dealloc_items_block`) to discriminate

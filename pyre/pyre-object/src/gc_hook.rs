@@ -386,40 +386,6 @@ pub extern "C" fn maybe_register_finalizer(obj: PyObjectRef) {
     }
 }
 
-/// Signature of the host-side "is the JIT-frame shadow stack empty"
-/// callback. Used by the interpreter GC safepoint to avoid collecting
-/// while a compiled trace is suspended (its jitframe roots can be
-/// mis-mapped from a nested interpreter collection).
-pub type GcJitframeEmptyHookFn = fn() -> bool;
-
-majit_gc::global_hook!(static GC_JITFRAME_EMPTY_HOOK: GcJitframeEmptyHookFn);
-
-/// Install the jitframe-shadow-stack-empty callback.
-pub fn register_gc_jitframe_empty_hook(hook: GcJitframeEmptyHookFn) {
-    GC_JITFRAME_EMPTY_HOOK.set(Some(hook));
-}
-
-/// Remove the jitframe-shadow-stack-empty callback.
-pub fn clear_gc_jitframe_empty_hook() {
-    GC_JITFRAME_EMPTY_HOOK.set(None);
-}
-
-/// Whether no compiled trace is suspended (jitframe shadow stack empty),
-/// via the installed hook. `true` when no hook is installed (no JIT →
-/// no jitframes).
-///
-/// Reads the runtime-mutable `GC_JITFRAME_EMPTY_HOOK` fn-pointer cell, not a
-/// build-time constant, so the JIT residualizes the call instead of tracing
-/// into it (`@dont_look_inside`, the [`try_gc_collect_oldgen`] twin). The
-/// `-> bool` return fits a single word and it cannot raise.
-#[majit_macros::dont_look_inside]
-pub fn try_gc_jitframe_empty() -> bool {
-    match GC_JITFRAME_EMPTY_HOOK.get() {
-        Some(f) => f(),
-        None => true,
-    }
-}
-
 /// Signature of the host-side `threshold_reached` callback
 /// (incminimark.py:1288-1290).
 pub type GcMajorThresholdReachedHookFn = fn() -> bool;
@@ -442,7 +408,7 @@ pub fn clear_gc_major_threshold_reached_hook() {
 ///
 /// Reads the runtime-mutable `GC_MAJOR_THRESHOLD_REACHED_HOOK` fn-pointer cell,
 /// not a build-time constant, so the JIT residualizes the call instead of
-/// tracing into it (`@dont_look_inside`, the [`try_gc_jitframe_empty`] twin).
+/// tracing into it (`@dont_look_inside`, the [`try_gc_collect_oldgen`] twin).
 /// The `-> bool` return fits a single word and it cannot raise.
 #[majit_macros::dont_look_inside]
 pub fn try_gc_major_threshold_reached() -> bool {

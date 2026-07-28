@@ -1011,10 +1011,10 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::note_eval_activation_exit",
         pyre_object::gc_interp::note_eval_activation_exit as *const (),
     );
-    // The dispatch-loop safepoint's six toucher residuals plus the frame-entry
+    // The dispatch-loop safepoint's five toucher residuals plus the frame-entry
     // odometer bump and the items-block strategy gate: each reads a
     // runtime-mutable global (`COLLECT_STATE` atomic, `EVAL_NESTING` / `POLL_TICK`
-    // TLS, the three GC hook fn-pointer cells, `FRAME_ENTRY_COUNT` TLS, the
+    // TLS, the two GC hook fn-pointer cells, `FRAME_ENTRY_COUNT` TLS, the
     // `PYRE_GC_ITEMSBLOCK` `OnceLock`) — none a build-time constant — so all carry
     // `#[dont_look_inside]` and bind their `-> bool` / `()` Rust `fn` directly by
     // qualified path (siblings of `gc_interp::enabled`).
@@ -1047,12 +1047,6 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::gc_hook::try_gc_collect_oldgen",
         "pyre_object::try_gc_collect_oldgen",
         pyre_object::gc_hook::try_gc_collect_oldgen as *const (),
-    );
-    push_alias_pair(
-        &mut entries,
-        "pyre_object::gc_hook::try_gc_jitframe_empty",
-        "pyre_object::try_gc_jitframe_empty",
-        pyre_object::gc_hook::try_gc_jitframe_empty as *const (),
     );
     push_alias_pair(
         &mut entries,
@@ -3101,17 +3095,6 @@ mod tests {
         assert_eq!(
             bindings["pyre_object::try_gc_collect_oldgen"],
             collect_oldgen
-        );
-
-        let jitframe_empty =
-            pyre_object::gc_hook::try_gc_jitframe_empty as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_object::gc_hook::try_gc_jitframe_empty"],
-            jitframe_empty
-        );
-        assert_eq!(
-            bindings["pyre_object::try_gc_jitframe_empty"],
-            jitframe_empty
         );
 
         let itemsblock =

@@ -166,13 +166,6 @@ fn pyre_object_gc_finalizer_next_dead_trampoline(fq_index: usize) -> pyre_object
         .unwrap_or(pyre_object::PY_NULL)
 }
 
-/// Jitframe-empty trampoline for the interpreter GC safepoint. Bridges
-/// pyre-object's hook to `majit_gc::jitframe_shadow_stack_empty`, so the
-/// safepoint can skip collecting while a compiled trace is suspended.
-fn pyre_object_gc_jitframe_empty_trampoline() -> bool {
-    majit_gc::jitframe_shadow_stack_empty()
-}
-
 /// Trampoline: register a caller-owned slot as
 /// a GC root with the active backend. Bridges `*mut *mut u8` (the
 /// pyre-object-facing shape that does not depend on majit-gc) to
@@ -3546,7 +3539,6 @@ fn install_pyre_object_hooks() {
         pyre_object_gc_register_finalizer_trampoline,
         pyre_object_gc_finalizer_next_dead_trampoline,
     );
-    pyre_object::gc_hook::register_gc_jitframe_empty_hook(pyre_object_gc_jitframe_empty_trampoline);
     pyre_object::register_gc_root_hooks(
         pyre_object_gc_add_root_trampoline,
         pyre_object_gc_remove_root_trampoline,

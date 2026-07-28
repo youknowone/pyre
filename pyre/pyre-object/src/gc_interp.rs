@@ -215,13 +215,15 @@ pub fn enabled() -> bool {
 /// reclamation can now fire under an active JIT, exactly when the interp-path
 /// old-gen leak accumulates. Reachability stays exact: the marker walks through
 /// nursery objects (`old -> nursery -> old` edges are followed) so no live old
-/// object is freed. The `jitframe_empty` gate is kept conservatively: a
-/// suspended trace's gcmap roots are seeded by `seed_major_roots`, but until
-/// that path is independently re-validated the safepoint stays out of the
-/// trace-suspended window. It also fires only at the outermost eval activation
-/// ([`at_outermost_activation`]) so a Python callback nested inside native
-/// module code — whose Rust-stack roots the pyframe walker cannot see — never
-/// triggers it.
+/// object is freed. A suspended compiled trace is no obstacle either: a trace
+/// suspends by making a residual call into the interpreter, and a call site is
+/// where the backend emits a gcmap, so `enumerate_root_walker_values` reaches
+/// the suspended frame's live refs by expanding each jitframe on the JF shadow
+/// stack through `trace_libc_jitframe`. That is the same basis on which
+/// upstream collects with compiled frames on the stack. The safepoint fires
+/// only at the outermost eval activation ([`at_outermost_activation`]) so a
+/// Python callback nested inside native module code — whose Rust-stack roots
+/// the pyframe walker cannot see — never triggers it.
 ///
 /// Dispatches to the installed threshold and collection hooks, neither a
 /// build-time constant, so the JIT residualizes the call instead of tracing
@@ -238,7 +240,6 @@ pub fn safepoint() {
         && at_outermost_activation()
         && poll_due()
         && crate::gc_hook::try_gc_major_threshold_reached()
-        && crate::gc_hook::try_gc_jitframe_empty()
     {
         crate::gc_hook::try_gc_collect_oldgen();
     }
