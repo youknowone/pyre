@@ -694,6 +694,13 @@ fn handle_fail_resume_guard(
         *slot = 0;
         v
     });
+    // The blackhole receiver parks this same value in the metainterp's raw
+    // guard-exception carrier as soon as it is entered, so across the
+    // `blackhole` call below the value is rooted twice over. Collapsing the
+    // pair onto the park alone is not reachable from here: this crate does not
+    // depend on `majit-metainterp`, and `BridgeFn` does not carry the
+    // exception, so the bridge hook cannot park a value it never receives.
+    // Either fix costs more machinery than the root pair it would delete.
     let guard_exc_rooted = guard_exc_root.0 != 0;
     if guard_exc_rooted {
         unsafe { majit_gc::gc_add_root(&mut guard_exc_root as *mut majit_ir::GcRef) };
