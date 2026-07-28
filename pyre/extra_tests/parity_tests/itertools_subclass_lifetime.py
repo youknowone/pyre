@@ -22,6 +22,7 @@ objects = [
     make_finalizing("dropwhile", itertools.dropwhile, (bool, [])),
     make_finalizing("filterfalse", itertools.filterfalse, (None, [])),
     make_finalizing("islice", itertools.islice, ([], None)),
+    make_finalizing("batched", itertools.batched, ([], 2)),
     make_finalizing("compress", itertools.compress, ([], [])),
     make_finalizing("starmap", itertools.starmap, (pow, [])),
     make_finalizing("accumulate", itertools.accumulate, ([],)),
@@ -32,6 +33,7 @@ gc.collect()
 
 assert sorted(finalized) == [
     "accumulate",
+    "batched",
     "compress",
     "count",
     "dropwhile",

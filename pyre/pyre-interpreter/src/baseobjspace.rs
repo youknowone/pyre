@@ -4856,6 +4856,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::interp_itertools::is_pairwise(obj)
             || pyre_object::interp_itertools::is_cycle(obj)
             || pyre_object::interp_itertools::is_chain(obj)
+            || pyre_object::interp_itertools::is_batched(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = match name {
                 "__next__" => Some((iter_next_method, "__next__", 1)),
@@ -12538,6 +12539,7 @@ pub fn is_iterable(obj: PyObjectRef) -> bool {
             || pyre_object::interp_itertools::is_pairwise(obj)
             || pyre_object::interp_itertools::is_cycle(obj)
             || pyre_object::interp_itertools::is_chain(obj)
+            || pyre_object::interp_itertools::is_batched(obj)
         {
             return true;
         }
@@ -12808,6 +12810,26 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // path, as space.iter does for every W_Root TypeDef.
         if pyre_object::interp_itertools::is_islice(obj) {
             let exact = get_instantiate(&pyre_object::interp_itertools::ISLICE_TYPE);
+            if !std::ptr::eq((*obj).w_class, exact) {
+                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
+                    if !std::ptr::eq(src, exact) {
+                        if is_none(method) {
+                            return Err(PyError::type_error(format!(
+                                "'{}' object is not iterable",
+                                obj_type_name(obj)
+                            )));
+                        }
+                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                        return iter_check_is_iterator(w_iter);
+                    }
+                }
+            }
+            return Ok(obj);
+        }
+        // CPython 3.14 batched is likewise self-iterating while permitting a
+        // heap subtype to replace `__iter__`.
+        if pyre_object::interp_itertools::is_batched(obj) {
+            let exact = get_instantiate(&pyre_object::interp_itertools::BATCHED_TYPE);
             if !std::ptr::eq((*obj).w_class, exact) {
                 if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
                     if !std::ptr::eq(src, exact) {
@@ -13382,6 +13404,64 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 state.next = new_next;
             }
             return Ok(w_item);
+        }
+        // itertools.batched — CPython 3.14
+        // Modules/itertoolsmodule.c:batched_next.  Pull exactly one batch,
+        // retaining each item as a GC root while subsequent source `next`
+        // calls can allocate and relocate objects.
+        if pyre_object::interp_itertools::is_batched(obj) {
+            let exact = get_instantiate(&pyre_object::interp_itertools::BATCHED_TYPE);
+            if !std::ptr::eq((*obj).w_class, exact) {
+                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__next__") {
+                    if !std::ptr::eq(src, exact) {
+                        return crate::call::call_function_impl_result(method, &[obj]);
+                    }
+                }
+            }
+
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let state = &*(w_self as *const pyre_object::interp_itertools::W_Batched);
+            if state.batch_size < 0 {
+                return Err(PyError::stop_iteration());
+            }
+            let n = state.batch_size as usize;
+            let mut item_slots = Vec::with_capacity(n);
+            for index in 0..n {
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let it = (*(w_self as *const pyre_object::interp_itertools::W_Batched)).it;
+                match next(it) {
+                    Ok(item) => {
+                        pyre_object::gc_roots::pin_root(item);
+                        item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
+                    }
+                    Err(e) if e.kind == PyErrorKind::StopIteration => {
+                        if index == 0 {
+                            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                            pyre_object::interp_itertools::w_batched_set_exhausted(w_self);
+                            return Err(PyError::stop_iteration());
+                        }
+                        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                        if (*(w_self as *const pyre_object::interp_itertools::W_Batched)).strict {
+                            pyre_object::interp_itertools::w_batched_set_exhausted(w_self);
+                            return Err(PyError::value_error("batched(): incomplete batch"));
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                        pyre_object::interp_itertools::w_batched_set_exhausted(w_self);
+                        return Err(e);
+                    }
+                }
+            }
+            let items = item_slots
+                .into_iter()
+                .map(|slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                .collect();
+            return Ok(pyre_object::w_tuple_new(items));
         }
         // itertools.compress — interp_itertools.py W_Compress.next_w.
         // Pull data first, then its matching selector; exhaustion of either

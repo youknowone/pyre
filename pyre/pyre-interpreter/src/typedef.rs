@@ -1186,6 +1186,15 @@ pub fn init_typeobjects() {
             ) as usize,
         );
         reg.insert(
+            &pyre_object::interp_itertools::BATCHED_TYPE as *const PyType as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.batched",
+                init_batched_type,
+                object_type,
+                &pyre_object::interp_itertools::BATCHED_TYPE as *const PyType,
+            ) as usize,
+        );
+        reg.insert(
             &pyre_object::interp_itertools::COMPRESS_TYPE as *const PyType as usize,
             new_typeobject_with_base_and_layout(
                 "itertools.compress",
@@ -24036,6 +24045,101 @@ fn init_islice_type(ns: PyObjectRef) {
             "__doc__",
             w_str_new(
                 "islice(iterable, stop) --> islice object\nislice(iterable, start, stop[, step]) --> islice object\n\nReturn an iterator whose next() method returns selected values from an\niterable.  If start is specified, will skip all preceding elements;\notherwise, start defaults to zero.  Step defaults to one.  If\nspecified as another value, step determines how many values are\nskipped between successive calls.  Works like a slice() on a list\nbut returns an iterator.",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+// ── itertools.batched TypeDef ───────────────────────────────────────
+// CPython 3.14 Modules/itertoolsmodule.c `batched_new_impl`; PyPy's
+// current itertools module predates this type.
+
+fn batched_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let exact =
+        gettypefor(&pyre_object::interp_itertools::BATCHED_TYPE).map_or(PY_NULL, |p| p.as_ptr());
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = positional.first().copied().unwrap_or(PY_NULL);
+    let positional = positional.get(1..).unwrap_or(&[]);
+
+    // Argument Clinic signature:
+    //     batched(iterable, n, *, strict=False)
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let mut keyword_names_w = Vec::new();
+    let mut keywords_w = Vec::new();
+    if let Some(dict) = kwargs {
+        for (key, value) in unsafe { pyre_object::w_dict_str_entries_wtf8(dict) } {
+            if key.as_str() == Ok("__pyre_kw__") {
+                continue;
+            }
+            let w_name = pyre_object::w_str_from_wtf8(key);
+            pyre_object::gc_roots::pin_root(w_name);
+            keyword_names_w.push(w_name);
+            keywords_w.push(value);
+        }
+    }
+    let signature =
+        crate::gateway::Signature::new(vec!["iterable", "n", "strict"], None, None, 1, 0);
+    let arguments = crate::argument::Arguments::with_kw(positional, &keyword_names_w, &keywords_w);
+    let w_kw_defaults = pyre_object::w_dict_new();
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            w_kw_defaults,
+            "strict",
+            pyre_object::w_bool_from(false),
+        )
+    };
+    pyre_object::gc_roots::pin_root(w_kw_defaults);
+    let kw_defaults_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let mut scope_w = vec![PY_NULL; signature.scope_length()];
+    arguments.parse_into_scope(PY_NULL, &mut scope_w, "batched", &signature, None, unsafe {
+        pyre_object::gc_roots::shadow_stack_get(kw_defaults_slot)
+    })?;
+
+    // Clinic converts n and strict before entering batched_new_impl.
+    for &value in &scope_w {
+        pyre_object::gc_roots::pin_root(value);
+    }
+    let values_base = pyre_object::gc_roots::shadow_stack_len() - scope_w.len();
+    let value =
+        |index: usize| unsafe { pyre_object::gc_roots::shadow_stack_get(values_base + index) };
+    let n = crate::builtins::space_index_w(value(1))?;
+    let n = isize::try_from(n).map_err(|_| {
+        crate::PyError::overflow_error("Python int too large to convert to C ssize_t")
+    })?;
+    let strict = crate::baseobjspace::is_true(value(2))?;
+
+    if n < 1 {
+        return Err(crate::PyError::value_error("n must be at least one"));
+    }
+    let it = crate::baseobjspace::iter(value(0))?;
+    let obj = pyre_object::interp_itertools::w_batched_new(it, n, strict);
+    itertools_alloc_for_class(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        exact,
+        obj,
+    )
+}
+
+fn init_batched_type(ns: PyObjectRef) {
+    let entries = [
+        ("__new__", make_new_descr(batched_descr_new)),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Batch data into tuples of length n. The last batch may be shorter than n.\n\nLoops over the input iterable and accumulates data into tuples\nup to size n.  The input is consumed lazily, just enough to\nfill a batch.  The result is yielded as soon as a batch is full\nor when the input iterable is exhausted.\n\nIf \"strict\" is True, raises a ValueError if the final batch is shorter\nthan n.",
             ),
         ),
     ];

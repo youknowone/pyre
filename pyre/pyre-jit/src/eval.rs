@@ -3085,6 +3085,14 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         <pyre_object::interp_itertools::W_ISlice
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // W_Batched is the next Python-visible AUTO-ID after W_ISlice.  Keep the
+    // append-only ordering so all previously assigned IDs remain stable.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::interp_itertools::W_Batched
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // A Block is GC-managed but is not an rclass.OBJECT subclass and has no
     // Python-visible vtable.  Registering it through `register_pyre_class`
     // would add a spurious subclass-range alias and shift W_Deque's canonical

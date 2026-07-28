@@ -388,6 +388,58 @@ pub unsafe fn w_islice_clear_iterable(obj: PyObjectRef) {
     }
 }
 
+// ── W_Batched — CPython 3.14 Modules/itertoolsmodule.c:batchedobject ──
+//
+// PyPy's current itertools port predates `batched`; Python 3.14 is the
+// project's compatibility authority for this newer type.  Preserve the
+// upstream object shape: one live iterator, a signed Py_ssize_t-sized batch
+// count whose -1 value latches exhaustion, and the strict flag.
+#[pyre_class("itertools.batched", static_name = "BATCHED")]
+pub struct W_Batched {
+    pub it: PyObjectRef,
+    pub batch_size: isize,
+    pub strict: bool,
+}
+
+/// `it` must already be an iterator (`batched_new_impl` applies
+/// `PyObject_GetIter` before allocating the instance).
+pub fn w_batched_new(it: PyObjectRef, batch_size: isize, strict: bool) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(it);
+    W_Batched::allocate_stable(W_Batched {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        it,
+        batch_size,
+        strict,
+    })
+}
+
+/// Check if an object is a `W_Batched`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_batched(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &BATCHED_TYPE) }
+}
+
+/// Latch the iterator as exhausted and release its source, matching
+/// `batched_next`'s `batch_size = -1` / `Py_CLEAR(bo->it)` paths.
+///
+/// # Safety
+/// `obj` must be a valid `W_Batched`.
+#[inline]
+pub unsafe fn w_batched_set_exhausted(obj: PyObjectRef) {
+    unsafe {
+        let batched = &mut *(obj as *mut W_Batched);
+        batched.batch_size = -1;
+        batched.it = std::ptr::null_mut();
+    }
+}
+
 // ── W_Compress — pypy/module/itertools/interp_itertools.py:W_Compress ──
 //
 // ```python
@@ -839,6 +891,19 @@ mod tests {
         assert_eq!(
             <W_ISlice as crate::lltype::GcType>::SIZE,
             W_ISLICE_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_batched_gc_descriptor_traces_source_iterator() {
+        assert_eq!(W_BATCHED_GC_PTR_OFFSETS.len(), 1);
+        assert_eq!(
+            W_BATCHED_GC_PTR_OFFSETS[0],
+            std::mem::offset_of!(W_Batched, it)
+        );
+        assert_eq!(
+            <W_Batched as crate::lltype::GcType>::SIZE,
+            W_BATCHED_OBJECT_SIZE
         );
     }
 
