@@ -1382,11 +1382,15 @@ pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
 ///
 /// A frame the function-entry portal compiled can outlive its trace the same
 /// way a generator's does — a traceback it hands out keeps it alive — and the
-/// lazy route is not available to narrow this back down: the backend frees the
-/// jitframe chain before `execute_token` returns, so that marker would name
-/// freed memory rather than a retained deadframe.  Narrowing the force to the
-/// frames that actually escape needs that retention first; the escape is a
-/// runtime property, which is exactly what the token protocol exists to answer.
+/// lazy route is not available to narrow this back down.  Two things have to
+/// land before it is: the backend frees the jitframe chain before
+/// `execute_token` returns, so the marker would name freed memory rather than
+/// a retained deadframe; and no backend arms `jf_force_descr` for a standalone
+/// trailing `GUARD_NOT_FORCED_2`, which upstream does from
+/// `consider_guard_not_forced_2` (x86/regalloc.py), so the armed-token test
+/// would answer false for a portal exit even once the chain is retained.
+/// Narrowing the force to the frames that actually escape needs both; the
+/// escape is a runtime property, which is what the token protocol answers.
 ///
 /// Storing back here is what makes the token store unnecessary rather than
 /// merely redundant: `gen_store_back_in_vable` sets `forced_virtualizable`, and

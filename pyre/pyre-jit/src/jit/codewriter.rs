@@ -7846,12 +7846,14 @@ impl CodeWriter {
                     // hundred instructions.  Convergence path: a value operand that
                     // encodes the immediate inline instead of through the per-kind
                     // pool, after which this becomes an unconditional per-PC store.
-                    // Until then the coordinate is published only where the frame
-                    // stops being replayed — the frame exits (`ReturnValue`,
-                    // `emit_abort_permanent!`) and the raises that resume in the
-                    // interpreter — so a frame observed MID-replay (via a callee's
-                    // `sys._getframe` or traceback) still reports the last published
-                    // coordinate.
+                    // Until then the jitcode carries the store only at the frame
+                    // exits (`ReturnValue`, `emit_abort_permanent!`) and the raises
+                    // that resume in the interpreter.  A frame observed MID-replay
+                    // — through a callee's `sys._getframe` or a traceback — is
+                    // answered instead by the blackhole, which publishes the
+                    // coordinate at each `-live-` marker it passes; the levels that
+                    // still go unpublished are the inlined non-portal callees,
+                    // whose `frame_var` aliases the outermost frame.
                     // pyframe.py: valuestackdepth is written per-push/per-pop
                     // via setfield_vable_i (jtransform.py), NOT once at opcode
                     // entry. The per-push/per-pop emit_vsd! calls below mirror that.
