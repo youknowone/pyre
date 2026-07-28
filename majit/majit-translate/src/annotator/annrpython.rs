@@ -2263,7 +2263,25 @@ impl RPythonAnnotator {
                     crate::tool::error::SHOW_DEFAULT_LINES_OF_CODE,
                 )
                 .join("\n");
-                let e = format!("{e}\n\n[mergeinputargs slot={slot}]\n{source}");
+                // `source_lines1` answers `no source!` for every graph lowered
+                // from LLBC rather than from Python (`graph.source` is absent),
+                // which is all of them here. Quote the block's operations
+                // instead — the same "show the offending block" role upstream's
+                // source-line range plays, rendered the way `gather_error`
+                // already renders an operation (`tool/error.rs:498`).
+                let ops = {
+                    let b = block.borrow();
+                    if b.operations.is_empty() {
+                        "    <no operations>".to_string()
+                    } else {
+                        b.operations
+                            .iter()
+                            .map(|op| format!("    {op}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                };
+                let e = format!("{e}\n\n[mergeinputargs slot={slot}]\n{source}\n{ops}");
                 // Upstream keeps going when `self.keepgoing` is set;
                 // otherwise re-raises.
                 if self.keepgoing {
