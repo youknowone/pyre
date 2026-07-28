@@ -6738,6 +6738,54 @@ impl CodeWriter {
             }};
         }
 
+        // `flowcontext.py:130-156 BlockRecorder.guessexception` closes the
+        // recording block AT the can-raise operation and resumes normal flow
+        // in a fresh `EggBlock`, so an opcode whose can-raise op is followed
+        // by its own exit wiring (`guessbool` setting the Bool exitswitch,
+        // FOR_ITER's exhaustion split) records the exception edge on the
+        // FIRST block and the branch on the SECOND.  Pyre's arms build both
+        // in one pass, and the generic per-PC catch emission at the bottom of
+        // the dispatch runs too late — it finds the block already closed and
+        // skips the edge.  This macro performs the `guessexception` cut in the
+        // middle of such an arm: attach the exception edge here, then hand the
+        // walker a fresh successor to wire the branch into.
+        //
+        // `$threaded` carries the Variables the successor consumes that the
+        // FrameState does not list — the can-raise op's own result feeding the
+        // branch.  `unsimplify.py:59-76 split_block` threads exactly those
+        // through the link so `regalloc.py:26-77 make_dependencies`, which
+        // computes liveness per block from `inputargs`, sees them live.
+        macro_rules! emit_catch_exception_and_split {
+            ($catch_label:expr, $py_pc:expr, $threaded:expr) => {{
+                let py_pc = $py_pc;
+                emit_catch_exception!($catch_label);
+                let mut next_state = current_state.clone();
+                next_state.next_offset = py_pc;
+                next_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                let next_block =
+                    SpamBlockRef::new(graph.new_block(Vec::new()), Some(next_state.clone()));
+                all_walker_blocks.push(next_block.clone());
+                // Identity split: every surviving Variable passes through
+                // unchanged, so `link_args` mirrors `inputargs`.
+                let mut inputargs: Vec<super::flow::FlowValue> = next_state.getvariables();
+                for value in $threaded {
+                    let value: super::flow::FlowValue = value.into();
+                    if let Some(variable) = value.as_variable()
+                        && !inputargs.iter().any(|arg| arg == &value)
+                    {
+                        inputargs.push(variable.into());
+                    }
+                }
+                next_block.block().borrow_mut().inputargs = inputargs.clone();
+                append_exit(
+                    &current_block.block(),
+                    super::flow::Link::new(inputargs, Some(next_block.block()), None).into_ref(),
+                );
+                restore_canraise_exit_order(&current_block.block());
+                current_block = next_block;
+            }};
+        }
+
         // Dual emission for block `Label`. RPython parity:
         // `flatten.py:180` `self.emitline(Label(block))` marks block
         // entry; `assembler.py:157-158` records the label position in
@@ -8249,6 +8297,14 @@ impl CodeWriter {
                                 cond_value,
                                 py_pc as i64,
                             );
+                            // `bool` runs the operand's `__bool__`, so inside a
+                            // `try` range it needs its own exception edge before
+                            // `guessbool` closes the block with the two Bool
+                            // exits.
+                            if let Some(catch_label) = catch_for_pc[py_pc] {
+                                emit_catch_exception_and_split!(catch_label, py_pc, [bool_value]);
+                                exception_edge_handled = true;
+                            }
                             // flowcontext.py:756-763 `block.exitswitch = w_cond`.
                             current_block.block().borrow_mut().exitswitch =
                                 Some(super::flow::ExitSwitch::Value(bool_value.into()));
@@ -8329,6 +8385,13 @@ impl CodeWriter {
                                 cond_value,
                                 py_pc as i64,
                             );
+                            // See PopJumpIfFalse — the `bool` can raise out of
+                            // `__bool__`, so cut the block here when the PC is
+                            // covered by a `try` range.
+                            if let Some(catch_label) = catch_for_pc[py_pc] {
+                                emit_catch_exception_and_split!(catch_label, py_pc, [bool_value]);
+                                exception_edge_handled = true;
+                            }
                             // flowcontext.py:756-763 `block.exitswitch = w_cond`.
                             current_block.block().borrow_mut().exitswitch =
                                 Some(super::flow::ExitSwitch::Value(bool_value.into()));
@@ -10068,22 +10131,11 @@ impl CodeWriter {
                             // — the catch fires only on a non-null backend
                             // exception.
                             if let Some(catch_label) = catch_for_pc[py_pc] {
-                                emit_catch_exception!(catch_label);
-                                let mut b_state = current_state.clone();
-                                b_state.next_offset = py_pc;
-                                b_state.blocklist = frame_blocks_for_offset(code, py_pc);
-                                let block_b = SpamBlockRef::new(
-                                    graph.new_block(Vec::new()),
-                                    Some(b_state.clone()),
+                                emit_catch_exception_and_split!(
+                                    catch_label,
+                                    py_pc,
+                                    [next_value.clone()]
                                 );
-                                all_walker_blocks.push(block_b.clone());
-                                block_b.block().borrow_mut().inputargs = b_state.getvariables();
-                                append_exit(
-                                    &current_block.block(),
-                                    output_link(&current_state, &b_state, block_b.block()),
-                                );
-                                restore_canraise_exit_order(&current_block.block());
-                                current_block = block_b;
                             }
                             // Emit the exhaustion branch: ptr_nonzero(next)
                             // selects between the continue arm (non-null →
