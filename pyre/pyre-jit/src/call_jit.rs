@@ -1919,40 +1919,6 @@ fn jit_blackhole_resume_from_guard(
     None
 }
 
-/// RAII guard registering each slot of the `#326` rollback snapshot's
-/// `locals` copy as a GC root for the duration of `bh.run()`.  The snapshot
-/// is a plain `Vec<PyObjectRef>` holding raw object pointers; the collector
-/// is moving (incminimark nursery -> oldgen copying), so a minor collection
-/// during the forward run would relocate those objects and leave the Vec
-/// holding from-space pointers.  Registering each element slot makes the
-/// root walker forward them in place (`collector.rs` reads `*slot`, copies,
-/// writes back), so the abort arm restores the live pointers rather than
-/// stale ones.  Mirrors `LocalsRoot` / the callee-locals root in `call.rs`.
-struct VableRollbackRoots {
-    slots: Vec<*mut *mut u8>,
-}
-
-impl VableRollbackRoots {
-    fn register(base: *const PyObjectRef, len: usize) -> Self {
-        let mut slots = Vec::with_capacity(len);
-        for i in 0..len {
-            let slot = unsafe { base.add(i) } as *mut *mut u8;
-            if unsafe { pyre_object::gc_hook::try_gc_add_root(slot) } {
-                slots.push(slot);
-            }
-        }
-        Self { slots }
-    }
-}
-
-impl Drop for VableRollbackRoots {
-    fn drop(&mut self) {
-        for &slot in &self.slots {
-            pyre_object::gc_hook::try_gc_remove_root(slot);
-        }
-    }
-}
-
 /// RAII guard registering each `Ref`-typed slot of the resume `deadframe`
 /// copy as a GC root for the duration of `blackhole_from_resumedata`.
 ///
@@ -1965,7 +1931,7 @@ impl Drop for VableRollbackRoots {
 /// freed memory.  Resume *constants* are already forwarded by
 /// `rd_consts_root_walker_area`, but the box-sourced slots here are not.
 /// Registering each `Ref` element slot makes the root walker forward it in
-/// place, mirroring `VableRollbackRoots` (#326).
+/// place.
 ///
 /// Only `Ref`-typed slots are registered: `Int`/`Float` slots hold raw
 /// scalars (`decode_ref` boxes those lazily via `box_int`/`box_float`), and a
@@ -2434,46 +2400,22 @@ pub fn blackhole_resume_via_rd_numb(
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);
     }
 
-    // #326 blackhole-continuation rollback snapshot.  The blackhole
-    // commits every STORE_FAST / operand push to the virtualizable heap
-    // frame as it runs forward (`setarrayitem_vable_*` /
-    // `setfield_vable_i`).  If it later aborts — an opcode pyre cannot
-    // translate emits `BC_ABORT_PERMANENT` — the deopt drops back to the
-    // plain interpreter, which re-runs from the guard's resume PC.  But
-    // the heap frame still carries the aborted run's partial forward
-    // mutations, so any side effect already committed before the abort is
-    // applied a second time.  Capture the live frame here, right after the
-    // resume restore put it at the guard snapshot and before `bh.run()`
-    // mutates it, so the abort arm can roll it back and the interpreter's
-    // re-run applies each side effect exactly once.
-    //
-    // The snapshot holds raw `PyObjectRef`s across `bh.run()`; the GC is a
-    // moving collector (#336), so a minor collection during the run could
-    // relocate these.  `VableRollbackRoots` below registers each `locals`
-    // slot with the root walker so the collector forwards them in place and
-    // the abort arm restores live pointers, not from-space ones.  Capture
-    // the snapshotted frame pointer too, so the abort arm can confirm the
-    // frame that aborted is the same one this state belongs to before
-    // restoring it.
-    let vable_rollback: Option<(*mut PyFrame, Vec<PyObjectRef>, usize, isize)> = {
-        let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
-        if frame_ptr.is_null() {
-            None
-        } else {
-            let frame = unsafe { &*frame_ptr };
-            Some((
-                frame_ptr,
-                frame.locals_w().as_slice().to_vec(),
-                frame.valuestackdepth,
-                frame.last_instr,
-            ))
-        }
-    };
-    // Keep the snapshot's locals rooted for the whole forward run / abort
-    // window; dropped (roots removed) when this function returns.
-    let _vable_rollback_roots = vable_rollback
-        .as_ref()
-        .map(|(_, locals, _, _)| VableRollbackRoots::register(locals.as_ptr(), locals.len()));
+    // #326: no rollback snapshot is taken across `bh.run()`.  The blackhole
+    // commits every STORE_FAST / operand push to the virtualizable heap frame
+    // as it runs forward, and an abort used to restore that frame to the
+    // guard snapshot so the interpreter's re-run from the guard resume PC
+    // "applied each side effect exactly once".  That reasoning only covered
+    // frame-local state: a `print`, a heap store or a user frame the blackhole
+    // already executed has no undo, so rewinding re-applied every one of them
+    // (`x = [1,2]; <hot loop>; x.append(3); class C: pass` left `[1,2,3,3]`).
+    // The only abort that can reach the blackhole at runtime sits on a Python
+    // opcode boundary — `abort` is gated out of blackhole dispatch by
+    // `PyJitCode::has_abort_opcode`, leaving `abort_permanent` (a whole
+    // unsupported opcode) and the two declined-call rejections (whose call
+    // never ran) — so the frame the blackhole leaves behind is a valid resume
+    // point and the interpreter continues from it.  This is
+    // `convert_and_run_from_pyjitpl`'s shape (`blackhole.py:1799-1821`): each
+    // frame resumes at its own current pc, never rewound.
 
     // blackhole.py:1794-1795 resume_in_blackhole:
     //   current_exc = _prepare_resume_from_failure(guard_opnum, deadframe)
@@ -2619,34 +2561,6 @@ pub fn blackhole_resume_via_rd_numb(
             };
         }
         if !bh.got_exception && bh.aborted {
-            // #326: roll the virtualizable heap frame back to the guard
-            // snapshot captured before `bh.run()`, discarding this aborted
-            // run's partial forward mutations.  The interpreter resumes
-            // from the guard resume PC with the pre-blackhole frame state,
-            // so every side effect (the aborting opcode's included) is
-            // applied exactly once instead of twice.
-            if let Some((snap_frame_ptr, locals, vsd, last_instr)) = &vable_rollback {
-                let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
-                // Roll back only when the frame that aborted is the same one
-                // the snapshot was captured from.  The `_run_forever` loop
-                // reassigns `bh` to a caller on callee return / exception
-                // propagation; a later abort then lands on the caller frame,
-                // whose valuestackdepth / last_instr would be clobbered with
-                // the callee's snapshot.  A per-frame snapshot for that
-                // multi-frame case is the #124 stack-snapshot epic; until
-                // then, skip rather than corrupt the caller frame.
-                if !frame_ptr.is_null() && frame_ptr == *snap_frame_ptr {
-                    let frame = unsafe { &mut *frame_ptr };
-                    let arr = frame.locals_w_mut().as_mut_slice();
-                    // The locals_cells_stack array length is fixed for a
-                    // frame's lifetime; restore it verbatim.
-                    if arr.len() == locals.len() {
-                        arr.copy_from_slice(locals);
-                    }
-                    frame.valuestackdepth = *vsd;
-                    frame.last_instr = *last_instr;
-                }
-            }
             if nbody_debug {
                 eprintln!(
                     "[nbody-debug] blackhole_resume_via_rd_numb failed: bh.aborted position={} last_opcode_position={}",
