@@ -2949,6 +2949,14 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             return Ok(());
         };
         let s_obj = pyre_object::w_str_from_wtf8_managed(unsafe { crate::py_str_wtf8(source)? });
+        // `s_obj` is a fresh managed str reachable only through this Rust local.
+        // `call_method`'s "write" attribute lookup can run a Python descriptor or
+        // `__getattr__`, re-entering the eval loop where the `PYRE_GC_INTERP`
+        // safepoint may sweep an unrooted old-gen object. Pin it across the call.
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(s_obj);
+        let s_obj =
+            pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1);
         let r = crate::baseobjspace::call_method(fp, "write", &[s_obj]);
         if r.is_null() {
             return Err(crate::call::take_call_error()
@@ -2965,8 +2973,14 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             crate::print_output(lit);
             return Ok(());
         };
-        let r =
-            crate::baseobjspace::call_method(fp, "write", &[pyre_object::w_str_new_managed(lit)]);
+        // Pin the managed separator/terminator across the write, whose "write"
+        // lookup may re-enter the eval loop and reach the safepoint. See `emit`.
+        let s = pyre_object::w_str_new_managed(lit);
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(s);
+        let s =
+            pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1);
+        let r = crate::baseobjspace::call_method(fp, "write", &[s]);
         if r.is_null() {
             return Err(crate::call::take_call_error()
                 .unwrap_or_else(|| crate::PyError::runtime_error("print: file.write() failed")));
