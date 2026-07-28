@@ -190,66 +190,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             .expect("itertools.combinations TypeDef initialized")
             .as_ptr(),
     );
-    // combinations_with_replacement(iterable, r) — like combinations, but an
-    // element may repeat, so the recursion re-enters at `i` rather than `i + 1`
-    // and `r` may exceed the pool length.  `r` is taken through `__index__`
-    // before the iterable is drawn, matching the argument-clinic evaluation
-    // order, and a negative `r` is a ValueError.
+    // PyPy W_CombinationsWithReplacement: retain pool/index/result state and
+    // advance one repeated combination at a time.
     crate::module_ns_store(
         ns,
         "combinations_with_replacement",
-        crate::make_builtin_function_with_arity_and_maybe_sig(
-            "combinations_with_replacement",
-            |args| {
-                let missing = match args.len() {
-                    0 => Some("iterable"),
-                    1 => Some("r"),
-                    _ => None,
-                };
-                if let Some(name) = missing {
-                    return Err(crate::PyError::type_error(format!(
-                        "combinations_with_replacement() missing required argument '{name}'"
-                    )));
-                }
-                let r = crate::builtins::space_index_w(args[1])?;
-                if r < 0 {
-                    return Err(crate::PyError::value_error("r must be non-negative"));
-                }
-                let r = r as usize;
-                let pool = crate::builtins::collect_iterable(args[0])?;
-                fn cwr(
-                    pool: &[pyre_object::PyObjectRef],
-                    r: usize,
-                    start: usize,
-                ) -> Vec<Vec<pyre_object::PyObjectRef>> {
-                    if r == 0 {
-                        return vec![vec![]];
-                    }
-                    let mut out = Vec::new();
-                    for i in start..pool.len() {
-                        for mut tail in cwr(pool, r - 1, i) {
-                            let mut v = vec![pool[i]];
-                            v.append(&mut tail);
-                            out.push(v);
-                        }
-                    }
-                    out
-                }
-                let all = cwr(&pool, r, 0);
-                let tuples: Vec<_> = all.into_iter().map(pyre_object::w_tuple_new).collect();
-                let n = tuples.len();
-                let list = pyre_object::w_list_new(tuples);
-                Ok(pyre_object::w_seq_iter_new(list, n))
-            },
-            2,
-            Some(crate::gateway::Signature::new(
-                vec!["iterable", "r"],
-                None,
-                None,
-                0,
-                0,
-            )),
-        ),
+        crate::typedef::gettypefor(
+            &pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE,
+        )
+        .expect("itertools.combinations_with_replacement TypeDef initialized")
+        .as_ptr(),
     );
     // PyPy W_Product: retain only the pool snapshots and odometer state rather
     // than eagerly materializing the Cartesian result.

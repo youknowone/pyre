@@ -533,6 +533,54 @@ pub unsafe fn is_combinations(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &COMBINATIONS_TYPE) }
 }
 
+// ── W_CombinationsWithReplacement — PyPy interp_itertools.py ───────
+//
+// PyPy subclasses W_Combinations and inherits the same five attributes.
+// Rust's concrete GC layouts are flat, so repeat those fields in the same
+// order while the interpreter shares the inherited next-state algorithm.
+#[pyre_class(
+    "itertools.combinations_with_replacement",
+    static_name = "COMBINATIONS_WITH_REPLACEMENT"
+)]
+pub struct W_CombinationsWithReplacement {
+    pub pool_w: PyObjectRef,
+    pub indices: PyObjectRef,
+    pub r: isize,
+    pub last_result_w: PyObjectRef,
+    pub stopped: bool,
+}
+
+pub fn w_combinations_with_replacement_new(
+    pool_w: PyObjectRef,
+    indices: PyObjectRef,
+    r: isize,
+    stopped: bool,
+) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(pool_w);
+    crate::gc_roots::pin_root(indices);
+    W_CombinationsWithReplacement::allocate_stable(W_CombinationsWithReplacement {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        pool_w,
+        indices,
+        r,
+        last_result_w: std::ptr::null_mut(),
+        stopped,
+    })
+}
+
+/// Check if an object is a `W_CombinationsWithReplacement`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_combinations_with_replacement(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &COMBINATIONS_WITH_REPLACEMENT_TYPE) }
+}
+
 // ── W_Compress — pypy/module/itertools/interp_itertools.py:W_Compress ──
 //
 // ```python
@@ -1029,6 +1077,22 @@ mod tests {
         assert_eq!(
             <W_Combinations as crate::lltype::GcType>::SIZE,
             W_COMBINATIONS_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_combinations_with_replacement_gc_descriptor_traces_all_owned_lists() {
+        assert_eq!(
+            W_COMBINATIONS_WITH_REPLACEMENT_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_CombinationsWithReplacement, pool_w),
+                std::mem::offset_of!(W_CombinationsWithReplacement, indices),
+                std::mem::offset_of!(W_CombinationsWithReplacement, last_result_w),
+            ]
+        );
+        assert_eq!(
+            <W_CombinationsWithReplacement as crate::lltype::GcType>::SIZE,
+            W_COMBINATIONS_WITH_REPLACEMENT_OBJECT_SIZE
         );
     }
 

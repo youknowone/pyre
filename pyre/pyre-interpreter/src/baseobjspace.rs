@@ -4859,6 +4859,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
             || pyre_object::interp_itertools::is_batched(obj)
             || pyre_object::interp_itertools::is_product(obj)
             || pyre_object::interp_itertools::is_combinations(obj)
+            || pyre_object::interp_itertools::is_combinations_with_replacement(obj)
         {
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = match name {
                 "__next__" => Some((iter_next_method, "__next__", 1)),
@@ -12544,6 +12545,7 @@ pub fn is_iterable(obj: PyObjectRef) -> bool {
             || pyre_object::interp_itertools::is_batched(obj)
             || pyre_object::interp_itertools::is_product(obj)
             || pyre_object::interp_itertools::is_combinations(obj)
+            || pyre_object::interp_itertools::is_combinations_with_replacement(obj)
         {
             return true;
         }
@@ -12872,6 +12874,25 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         }
         if pyre_object::interp_itertools::is_combinations(obj) {
             let exact = get_instantiate(&pyre_object::interp_itertools::COMBINATIONS_TYPE);
+            if !std::ptr::eq((*obj).w_class, exact) {
+                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
+                    if !std::ptr::eq(src, exact) {
+                        if is_none(method) {
+                            return Err(PyError::type_error(format!(
+                                "'{}' object is not iterable",
+                                obj_type_name(obj)
+                            )));
+                        }
+                        let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
+                        return iter_check_is_iterator(w_iter);
+                    }
+                }
+            }
+            return Ok(obj);
+        }
+        if pyre_object::interp_itertools::is_combinations_with_replacement(obj) {
+            let exact =
+                get_instantiate(&pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE);
             if !std::ptr::eq((*obj).w_class, exact) {
                 if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__") {
                     if !std::ptr::eq(src, exact) {
@@ -13768,6 +13789,146 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     i as i64,
                 )
                 .expect("combinations result in range");
+                pyre_object::gc_roots::pin_root(item);
+                result_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
+            }
+            return Ok(pyre_object::w_tuple_new(
+                result_slots
+                    .into_iter()
+                    .map(|slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                    .collect(),
+            ));
+        }
+        // itertools.combinations_with_replacement — PyPy
+        // W_CombinationsWithReplacement.descr_next inherits the combinations
+        // state machine and changes only get_maximum/max_index.
+        if pyre_object::interp_itertools::is_combinations_with_replacement(obj) {
+            let exact =
+                get_instantiate(&pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE);
+            if !std::ptr::eq((*obj).w_class, exact) {
+                if let Some((src, method)) = lookup_where_pair((*obj).w_class, "__next__") {
+                    if !std::ptr::eq(src, exact) {
+                        return crate::call::call_function_impl_result(method, &[obj]);
+                    }
+                }
+            }
+
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let state =
+                &*(w_self as *const pyre_object::interp_itertools::W_CombinationsWithReplacement);
+            if state.stopped {
+                return Err(PyError::stop_iteration());
+            }
+            let r = state.r as usize;
+            let pool_len = pyre_object::w_list_len(state.pool_w);
+
+            let result = if state.last_result_w.is_null() {
+                // On the first pass every index is zero.
+                let mut item_slots = Vec::with_capacity(r);
+                for i in 0..r {
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    let state = &*(w_self
+                        as *const pyre_object::interp_itertools::W_CombinationsWithReplacement);
+                    let w_index = pyre_object::w_list_getitem(state.indices, i as i64)
+                        .expect("combinations_with_replacement index in range");
+                    let index = pyre_object::w_int_get_value(w_index);
+                    let item = pyre_object::w_list_getitem(state.pool_w, index)
+                        .expect("combinations_with_replacement pool index in range");
+                    pyre_object::gc_roots::pin_root(item);
+                    item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
+                }
+                pyre_object::w_list_new(
+                    item_slots
+                        .into_iter()
+                        .map(|slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                        .collect(),
+                )
+            } else {
+                let mut old_item_slots = Vec::with_capacity(r);
+                for i in 0..r {
+                    let item = pyre_object::w_list_getitem(state.last_result_w, i as i64)
+                        .expect("combinations_with_replacement result index in range");
+                    pyre_object::gc_roots::pin_root(item);
+                    old_item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
+                }
+                let result = pyre_object::w_list_new(
+                    old_item_slots
+                        .into_iter()
+                        .map(|slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                        .collect(),
+                );
+                pyre_object::gc_roots::pin_root(result);
+                let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+                // W_CombinationsWithReplacement.get_maximum always returns
+                // len(pool_w) - 1.
+                let mut changed = r;
+                while changed > 0 {
+                    let i = changed - 1;
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    let state = &*(w_self
+                        as *const pyre_object::interp_itertools::W_CombinationsWithReplacement);
+                    let index = pyre_object::w_int_get_value(
+                        pyre_object::w_list_getitem(state.indices, i as i64)
+                            .expect("combinations_with_replacement index in range"),
+                    ) as usize;
+                    if index != pool_len - 1 {
+                        break;
+                    }
+                    changed -= 1;
+                }
+                if changed == 0 {
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    (*(w_self
+                        as *mut pyre_object::interp_itertools::W_CombinationsWithReplacement))
+                        .stopped = true;
+                    return Err(PyError::stop_iteration());
+                }
+                let first_changed = changed - 1;
+
+                // Increment the selected index and copy it to all positions
+                // on the right (PyPy max_index returns indices[j - 1]).
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let state = &*(w_self
+                    as *const pyre_object::interp_itertools::W_CombinationsWithReplacement);
+                let index = pyre_object::w_int_get_value(
+                    pyre_object::w_list_getitem(state.indices, first_changed as i64)
+                        .expect("combinations_with_replacement index in range"),
+                ) + 1;
+                for i in first_changed..r {
+                    let w_index = pyre_object::w_int_new(index);
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    let indices = (*(w_self
+                        as *const pyre_object::interp_itertools::W_CombinationsWithReplacement))
+                        .indices;
+                    pyre_object::w_list_setitem(indices, i as i64, w_index);
+                    let state = &*(w_self
+                        as *const pyre_object::interp_itertools::W_CombinationsWithReplacement);
+                    let item = pyre_object::w_list_getitem(state.pool_w, index)
+                        .expect("combinations_with_replacement pool index in range");
+                    let result = pyre_object::gc_roots::shadow_stack_get(result_slot);
+                    pyre_object::w_list_setitem(result, i as i64, item);
+                }
+                pyre_object::gc_roots::shadow_stack_get(result_slot)
+            };
+
+            pyre_object::gc_roots::pin_root(result);
+            let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            (*(w_self as *mut pyre_object::interp_itertools::W_CombinationsWithReplacement))
+                .last_result_w = pyre_object::gc_roots::shadow_stack_get(result_slot);
+            pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
+
+            let mut result_slots = Vec::with_capacity(r);
+            for i in 0..r {
+                let item = pyre_object::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(result_slot),
+                    i as i64,
+                )
+                .expect("combinations_with_replacement result in range");
                 pyre_object::gc_roots::pin_root(item);
                 result_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
             }

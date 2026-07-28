@@ -1213,6 +1213,16 @@ pub fn init_typeobjects() {
             ) as usize,
         );
         reg.insert(
+            &pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE as *const PyType
+                as usize,
+            new_typeobject_with_base_and_layout(
+                "itertools.combinations_with_replacement",
+                init_combinations_with_replacement_type,
+                object_type,
+                &pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE as *const PyType,
+            ) as usize,
+        );
+        reg.insert(
             &pyre_object::interp_itertools::COMPRESS_TYPE as *const PyType as usize,
             new_typeobject_with_base_and_layout(
                 "itertools.compress",
@@ -24386,6 +24396,112 @@ fn init_combinations_type(ns: PyObjectRef) {
             "__doc__",
             w_str_new(
                 "Return successive r-length combinations of elements in the iterable.\n\ncombinations(range(4), 3) --> (0,1,2), (0,1,3), (0,2,3), (1,2,3)",
+            ),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+// ── itertools.combinations_with_replacement TypeDef ────────────────
+// PyPy W_CombinationsWithReplacement with Python 3.14's keyword-capable
+// constructor, reduced pickle surface, and __sizeof__ method.
+
+fn combinations_with_replacement_descr_new(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let exact = gettypefor(&pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE)
+        .map_or(PY_NULL, |p| p.as_ptr());
+    let (cls, scope) = itertools_constructor_scope(
+        args,
+        "combinations_with_replacement",
+        vec!["iterable", "r"],
+        &[],
+    )?;
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    for &value in &scope {
+        pyre_object::gc_roots::pin_root(value);
+    }
+    let values_base = pyre_object::gc_roots::shadow_stack_len() - scope.len();
+    let r = crate::builtins::space_index_w(unsafe {
+        pyre_object::gc_roots::shadow_stack_get(values_base + 1)
+    })?;
+    let r = isize::try_from(r).map_err(|_| {
+        crate::PyError::overflow_error("Python int too large to convert to C ssize_t")
+    })?;
+    if r < 0 {
+        return Err(crate::PyError::value_error("r must be non-negative"));
+    }
+
+    let items = crate::builtins::collect_iterable(unsafe {
+        pyre_object::gc_roots::shadow_stack_get(values_base)
+    })?;
+    let stopped = items.is_empty() && r > 0;
+    for &item in &items {
+        pyre_object::gc_roots::pin_root(item);
+    }
+    let pool_w = pyre_object::w_list_new(items);
+    pyre_object::gc_roots::pin_root(pool_w);
+    let pool_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let indices = pyre_object::w_list_new((0..r).map(|_| pyre_object::w_int_new(0)).collect());
+    let obj = pyre_object::interp_itertools::w_combinations_with_replacement_new(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(pool_slot) },
+        indices,
+        r,
+        stopped,
+    );
+    itertools_alloc_for_class(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        exact,
+        obj,
+    )
+}
+
+fn combinations_with_replacement_sizeof(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args[0];
+    unsafe {
+        if !pyre_object::interp_itertools::is_combinations_with_replacement(obj) {
+            return Err(crate::PyError::type_error(
+                "descriptor '__sizeof__' requires a 'itertools.combinations_with_replacement' object",
+            ));
+        }
+        let combinations =
+            &*(obj as *const pyre_object::interp_itertools::W_CombinationsWithReplacement);
+        let size =
+            std::mem::size_of::<pyre_object::interp_itertools::W_CombinationsWithReplacement>()
+                + combinations.r as usize * std::mem::size_of::<isize>();
+        Ok(pyre_object::w_int_new(size as i64))
+    }
+}
+
+fn init_combinations_with_replacement_type(ns: PyObjectRef) {
+    let entries = [
+        (
+            "__new__",
+            make_new_descr(combinations_with_replacement_descr_new),
+        ),
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+        ),
+        (
+            "__sizeof__",
+            make_builtin_function_with_arity("__sizeof__", combinations_with_replacement_sizeof, 1),
+        ),
+        (
+            "__doc__",
+            w_str_new(
+                "Return successive r-length combinations of elements in the iterable allowing individual elements to have successive repeats.\n\ncombinations_with_replacement('ABC', 2) --> ('A','A'), ('A','B'), ('A','C'), ('B','B'), ('B','C'), ('C','C')",
             ),
         ),
     ];
