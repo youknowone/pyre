@@ -2928,21 +2928,40 @@ pub(crate) unsafe fn vable_write_array_item(
         // `size_of::<usize>()` (4 bytes on wasm32) while an `i64` payload
         // array is a fixed 8, regardless of word width.
         let item_size = array.item_size;
-        let data_ptr = match array.storage {
+        // `owner_ptr` is the block base the GC would know, i.e. before the
+        // items offset — the barrier argument.  `data_ptr` is items-adjusted
+        // and is not a valid object address.
+        let (data_ptr, owner_ptr) = match array.storage {
             VableArrayStorage::EmbeddedArray { ptr_offset } => {
                 let container = *(vable_ptr.add(array.field_offset) as *const *mut u8);
-                *(container.add(ptr_offset) as *const *mut u8)
+                let data = *(container.add(ptr_offset) as *const *mut u8);
+                (data, data)
             }
             VableArrayStorage::DirectPointer => {
                 let arr_ptr = *(vable_ptr.add(array.field_offset) as *const *mut u8);
-                arr_ptr.add(array.items_offset)
+                (arr_ptr.add(array.items_offset), arr_ptr)
             }
-            VableArrayStorage::RustVec { data_ptr_fn, .. } => data_ptr_fn(vable_ptr) as *mut u8,
+            VableArrayStorage::RustVec { data_ptr_fn, .. } => {
+                (data_ptr_fn(vable_ptr) as *mut u8, std::ptr::null_mut())
+            }
         };
         if !data_ptr.is_null() {
             let dest = data_ptr.add(index * item_size);
             if array.item_type == Type::Ref {
                 std::ptr::write(dest as *mut usize, value as usize);
+                // `llmodel.py:495-497 write_ref_at_mem` — "the write barrier is
+                // implied above" — is what every blackhole ref store funnels
+                // through upstream.  The stored ref can be nursery-young while
+                // the array and its owning frame are old-gen, so arm whichever
+                // side the collector owns, exactly as the sibling
+                // `VirtualizableInfo::write_array_item` already does.
+                if value != 0 {
+                    if majit_gc::gc_owns_object(owner_ptr as usize) {
+                        majit_gc::gc_write_barrier(majit_ir::GcRef(owner_ptr as usize));
+                    } else if majit_gc::gc_owns_object(vable_ptr as usize) {
+                        majit_gc::gc_write_barrier(majit_ir::GcRef(vable_ptr as usize));
+                    }
+                }
             } else {
                 std::ptr::write(dest as *mut i64, value);
             }

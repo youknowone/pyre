@@ -16667,9 +16667,29 @@ impl majit_backend::Backend for CraneliftBackend {
             type_id != 0,
             "bh_new_array requires ArrayDescr.tid (descr.py:340) — got 0"
         );
-        active_runtime_alloc_varsize_typed_and_set_len(
+        let obj = active_runtime_alloc_varsize_typed_and_set_len(
             type_id, base_size, itemsize, len_offset, length,
-        ) as i64
+        );
+        // The nursery is not zero-filled (`incminimark.py:211
+        // malloc_zero_filled = False`), so the fresh block still holds the
+        // recycled bytes of whatever lived there before.  `framework.py:1058-1079
+        // gct_do_malloc_varsize_clear` compensates by memclearing the fixed and
+        // the variable part and only then storing the length, which is what a
+        // GC-traced array needs: the tracer visits every item slot, including
+        // the ones past `valuestackdepth` that nobody has written yet.
+        //
+        // This belongs here rather than in the shared allocation helper: the
+        // inline allocators in compiled code get their clearing from the
+        // rewriter's ZERO_ARRAY (`rewrite.py:499`, `:521`) and must stay
+        // memclear-free on the fast path.
+        if obj != 0 {
+            unsafe {
+                let p = obj as *mut u8;
+                std::ptr::write_bytes(p, 0, base_size + itemsize * length);
+                *(p.add(len_offset) as *mut usize) = length;
+            }
+        }
+        obj as i64
     }
 
     /// llmodel.py:790 bh_new_array_clear = bh_new_array.
