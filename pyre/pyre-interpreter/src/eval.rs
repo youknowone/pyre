@@ -278,16 +278,19 @@ pub unsafe fn walk_raw_code_roots(
     }
 }
 
-/// Mark the GC-managed children of an immortal `W_BaseException`.
+/// Mark the GC-managed children of a `W_BaseException`.
 ///
-/// Exceptions are `malloc_typed`-immortal (`interp_exceptions.rs` `new_exception`
-/// / "lives forever"), so the collector never traces them — the root visitor's
-/// `is_managed_heap_object` guard short-circuits on the immortal exception, and
-/// `mark_object` is never reached for it (it is not an old-gen object). Its
+/// Exception allocation is split: an ordinary exception goes to the non-moving
+/// oldgen via `try_gc_alloc_stable_raw`, while the immortal singletons and the
+/// GC-allocation-failure fallback use `malloc_typed` (`interp_exceptions.rs`
+/// `new_exception`). For the `malloc_typed` family the collector never traces
+/// the exception at all — the root visitor's `is_managed_heap_object` guard
+/// short-circuits and `mark_object` is never reached — and for the oldgen
+/// family a minor reaches the children only through the remembered set. Its
 /// `args_w` tuple, `w_errno` / `w_strerror` / `w_filename` ints/strings,
 /// `w_traceback` / `w_context` / `w_cause`, `w_dict`, … are ordinary GC-managed
 /// objects, so when an exception is the only holder of those children (a caught
-/// `except X as e` bound to a frame local) a major collection sweeps them and a
+/// `except X as e` bound to a frame local) a collection sweeps them and a
 /// later `e.args` / `e.errno` reads freed memory. Visit every
 /// `W_BASE_EXCEPTION_GC_PTR_OFFSETS` slot in place, the same shape
 /// `walk_raw_function_roots` / `walk_raw_getset_roots` use for Box/`malloc_typed`

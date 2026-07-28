@@ -3309,23 +3309,29 @@ fn walk_jit_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     // dangling inside the exception across the minor. Forward the raw child
     // slots explicitly, as the EC root walk does for `sys_exc_value`.
     //
-    // For a *managed* exception the explicit walk is belt-and-braces: minor is
-    // already covered by the remembered set, since every reference setter goes
-    // through `exception_write_barrier`, and major marking traces the type's
-    // registered pointer offsets. It is load-bearing only for exceptions that
-    // live outside the GC heap — the `malloc_typed` immortals such as the
-    // MemoryError singleton — where the write barrier and major seeding both
-    // ignore a non-managed holder, leaving this walker as the sole traversal
-    // of their children.
+    // For an off-GC exception — the `malloc_typed` immortals such as the
+    // MemoryError singleton, and the fallback taken when the GC allocation
+    // fails — this walk is the sole traversal of the children: both the write
+    // barrier and major seeding ignore a non-managed holder.
     //
-    // That asymmetry is why the carrier cannot be demoted to a plain
-    // shadow-stack entry (the direct analogue of the GC transform's rooted
-    // local, `shadowstack.py:31-39`): a generic root reaches an off-GC
-    // exception's fields through neither collection. Pushing the children
-    // individually does not substitute either — forwarding would rewrite the
-    // pushed copies, not the slots inside the exception. A walker with
-    // mutable access to the real slots is the only shape that works while the
-    // heap admits off-GC exception holders.
+    // For a GC-managed exception the picture is narrower but not empty. A
+    // major reaches the children on its own, through the type's registered
+    // pointer offsets. A minor reaches them only through the remembered set,
+    // which is exactly as complete as the barrier discipline over the twenty
+    // reference slots — and the sibling carriers keep this same explicit
+    // forwarding precisely because children built while tracing are not
+    // covered by it. Treat the walk as load-bearing for both populations
+    // until every store into a `W_BaseException` reference slot has been
+    // audited for a barrier; narrowing it to the off-GC family on the
+    // strength of the setters alone would reintroduce swept children.
+    //
+    // Either way the carrier cannot be demoted to a plain shadow-stack entry
+    // (the direct analogue of the GC transform's rooted local,
+    // `shadowstack.py:31-39`): a generic root reaches an off-GC exception's
+    // fields through neither collection, and pushing the children
+    // individually does not substitute — forwarding would rewrite the pushed
+    // copies, not the slots inside the exception. A walker with mutable
+    // access to the real slots is the only shape that works.
     unsafe {
         pyre_interpreter::eval::walk_raw_exception_roots(
             gcref.0 as pyre_object::PyObjectRef,
