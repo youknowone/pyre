@@ -341,6 +341,17 @@ pub(crate) fn compat_map(
         pyre_object::w_str_new(module),
         pyre_object::w_str_new(name),
     ]);
+    // `finditem` below is generic: a replaced or non-dict `*_MAPPING` routes
+    // through `getitem`, which can run Python and drive a collection. Pin the
+    // freshly built key so a collection there cannot sweep it mid-lookup — the
+    // Rust counterpart of the RPython GC transform auto-rooting `w_key` across
+    // `space.finditem`. The key is a born-old-stable (non-moving) tuple over
+    // immortal element strings, so keeping it alive is sufficient (no re-read),
+    // and each cached mapping field is re-read from `state` after the probe.
+    // The cached real-dict tables take the native `w_dict_lookup_checked` path
+    // and never collect, so this only guards a user-replaced mapping.
+    let _key_root = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(key);
     // (module, name) entry takes precedence over a bare module remap.  Read the
     // mapping through the generic `space.finditem` so a replaced or non-dict
     // `*_MAPPING` and a raising key comparison are handled like PyPy's
