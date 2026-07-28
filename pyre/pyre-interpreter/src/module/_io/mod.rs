@@ -208,6 +208,136 @@ fn iobase_next(args: &[PyObjectRef]) -> crate::PyResult {
     }
 }
 
+// ── AutoFlusher ──────────────────────────────────────────────────────
+//
+// `interp_iobase.py:444-476` keeps one `AutoFlusher` per space, weakly holding
+// every stream ever constructed, and `moduledef.py:37-40 Module.shutdown`
+// flushes whatever is still alive.  Without it an unclosed buffered stream
+// loses its writes whenever it outlives the only teardown pyre performs — the
+// `__main__` globals — which is every stream reachable from another module,
+// from `sys.modules`, or from a container.
+//
+// `rweaklist.py:52 store_handle` holds each stream through `weakref.ref`; the
+// `GcWeakrefBox` is pyre's rweakref, so the handle list is a `Vec` of boxes.
+// Those are immortal, so their addresses stay valid across collections, but
+// their inner rweakref is walked by the boxing thread alone
+// (`weakref.rs WEAKREF_BOXES`) — hence the list lives with them, per thread, and
+// shutdown flushes the streams of the thread it runs on.
+
+/// `rweaklist.py:4 INITIAL_SIZE`.
+const AUTOFLUSHER_INITIAL_SIZE: usize = 4;
+
+#[derive(Default)]
+struct AutoFlusher {
+    /// `rweaklist.py:18 self.handles` — index → `GcWeakrefBox`. A null slot is
+    /// the `dead_ref` placeholder RPython pre-fills the list with.
+    handles: Vec<PyObjectRef>,
+    /// `rweaklist.py:19 self.free_list`.
+    free_list: Vec<usize>,
+}
+
+impl AutoFlusher {
+    /// `rweaklist.py:17-20 initialize`.
+    fn initialize(&mut self) {
+        self.handles = vec![std::ptr::null_mut(); AUTOFLUSHER_INITIAL_SIZE];
+        self.free_list = (0..AUTOFLUSHER_INITIAL_SIZE).collect();
+    }
+
+    /// `rweaklist.py:23-42 reserve_next_handle_index`.
+    fn reserve_next_handle_index(&mut self) -> usize {
+        if self.handles.is_empty() {
+            self.initialize();
+        }
+        if let Some(index) = self.free_list.pop() {
+            return index;
+        }
+        for (index, &handle) in self.handles.iter().enumerate() {
+            if unsafe { pyre_object::weakref::w_gc_weakref_box_deref(handle) }.is_null() {
+                self.free_list.push(index);
+            }
+        }
+        if self.free_list.len() * 3 < self.handles.len() * 2 {
+            let length = self.handles.len();
+            self.free_list.extend(length..length * 2);
+            self.handles.resize(length * 2, std::ptr::null_mut());
+        }
+        self.free_list
+            .pop()
+            .expect("the doubling above always frees an index")
+    }
+}
+
+thread_local! {
+    /// `interp_iobase.py:475-476 get_autoflusher` — `space.fromcache(AutoFlusher)`.
+    static AUTOFLUSHER: std::cell::RefCell<AutoFlusher> =
+        std::cell::RefCell::new(AutoFlusher::default());
+}
+
+/// `interp_iobase.py:447-453 AutoFlusher.add`, reached from
+/// `interp_iobase.py:61-62 W_IOBase.__init__` for every stream that does not
+/// opt out.
+///
+/// Returns `w_iobase`, which the rweakref allocation may have relocated.
+fn autoflusher_add(w_iobase: PyObjectRef) -> PyObjectRef {
+    if w_iobase.is_null() {
+        return w_iobase;
+    }
+    let index = AUTOFLUSHER.with(|flusher| flusher.borrow_mut().reserve_next_handle_index());
+    let _roots = pyre_object::gc_roots::push_roots();
+    let target_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_iobase);
+    // `rweaklist.py:51-52 store_handle` — reuse the slot's box when it already
+    // holds one, so a long-lived process bounds the immortal boxes by its peak
+    // number of open streams.
+    let handle = AUTOFLUSHER.with(|flusher| flusher.borrow().handles[index]);
+    let stored = unsafe { pyre_object::weakref::w_gc_weakref_box_retarget(handle, w_iobase) };
+    if !stored {
+        let boxed = pyre_object::weakref::w_gc_weakref_box_new(
+            pyre_object::gc_roots::shadow_stack_get(target_root),
+        );
+        AUTOFLUSHER.with(|flusher| flusher.borrow_mut().handles[index] = boxed);
+    }
+    pyre_object::gc_roots::shadow_stack_get(target_root)
+}
+
+/// `interp_iobase.py:455-472 AutoFlusher.flush_all`, run from
+/// `moduledef.py:37-40 Module.shutdown` — "at shutdown, flush all open streams.
+/// Ignore I/O errors."
+pub fn flush_all_streams() {
+    loop {
+        let handles = AUTOFLUSHER.with(|flusher| {
+            let mut flusher = flusher.borrow_mut();
+            flusher.free_list.clear();
+            // `self.initialize()` — reset the state here, so a stream created
+            // while flushing is picked up by the next round instead of being
+            // flushed twice.
+            std::mem::take(&mut flusher.handles)
+        });
+        let mut progress = false;
+        for handle in handles {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let stream_root = pyre_object::gc_roots::shadow_stack_len();
+            let stream = unsafe { pyre_object::weakref::w_gc_weakref_box_deref(handle) };
+            if stream.is_null() {
+                continue;
+            }
+            pyre_object::gc_roots::pin_root(stream);
+            progress = true;
+            // "Silencing all errors is bad, but getting randomly interrupted
+            // here is equally as bad, and potentially more frequent (because of
+            // shutdown issues)."
+            let _ = call_method_result(
+                pyre_object::gc_roots::shadow_stack_get(stream_root),
+                "flush",
+                &[],
+            );
+        }
+        if !progress {
+            break;
+        }
+    }
+}
+
 /// Tag a freshly allocated `_io` object with the class being constructed, then
 /// put it on the finalizer queue — `objspace.py:485-487 allocate_instance`
 /// followed by `interp_iobase.py:63-64 W_IOBase.__init__`:
@@ -237,6 +367,7 @@ pub(crate) fn tag_io_instance_with_finalizer(
     if !cls.is_null() {
         crate::typedef::tag_subclass_instance(obj, cls);
     }
+    let obj = autoflusher_add(obj);
     if needs_finalizer {
         crate::executioncontext::register_finalizer(obj);
     }
@@ -591,9 +722,10 @@ fn init_iobase_type(ns: PyObjectRef) {
 /// `interp_iobase.py:335 __new__ = generic_new_descr(W_IOBase)`.
 ///
 /// `typedef.py:558-564 generic_new_descr` allocates the instance and then runs
-/// the interp-level `W_IOBase.__init__`, whose only effect is
-/// `interp_iobase.py:63-64` — put the stream on the finalizer queue, so an
-/// unclosed one still flushes and closes once it becomes unreachable. Because
+/// the interp-level `W_IOBase.__init__`, whose only effects are
+/// `interp_iobase.py:61-64` — hand the stream to the autoflusher, and put it on
+/// the finalizer queue so an unclosed one still flushes and closes once it
+/// becomes unreachable. Because
 /// it sits in `__new__` rather than in the app-level `__init__`, a subclass
 /// that overrides `__init__` without calling up is registered all the same.
 ///
@@ -611,7 +743,7 @@ fn iobase_new(args: &[PyObjectRef]) -> crate::PyResult {
             "_IOBase.__new__(): not enough arguments",
         ));
     };
-    let obj = crate::typedef::object_descr_new(&[cls])?;
+    let obj = autoflusher_add(crate::typedef::object_descr_new(&[cls])?);
     crate::executioncontext::register_finalizer(obj);
     Ok(obj)
 }

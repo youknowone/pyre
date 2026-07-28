@@ -1007,6 +1007,12 @@ fn collect_and_run_finalizers(ec_ptr: *const PyExecutionContext) {
 /// methods may reference are still present.
 fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecutionContext) {
     run_threading_shutdown();
+    // baseobjspace.py:498-501 `finish()` runs every started module's shutdown
+    // hook; `_io`'s (moduledef.py:37-40) flushes the streams that are still
+    // alive.  The per-global teardown below reaches only the ones `__main__`
+    // itself holds, so without this a stream owned by any other module loses
+    // its buffered writes.
+    pyre_interpreter::module::_io::flush_all_streams();
     collect_and_run_finalizers(ec_ptr);
     let mut entries = unsafe { pyre_object::w_dict_str_entries(canonical) };
     entries.reverse();

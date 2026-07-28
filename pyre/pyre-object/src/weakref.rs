@@ -230,6 +230,37 @@ pub unsafe fn w_gc_weakref_box_deref(obj: PyObjectRef) -> PyObjectRef {
     unsafe { w_weakref_deref(wref) }
 }
 
+/// Point an existing box at `target` by installing a fresh rweakref.
+///
+/// `rweaklist.py:44-52 add_handle` reuses the slot of a handle whose referent
+/// died rather than appending a new one; reusing the box with it keeps the
+/// immortal-box count at the peak number of simultaneously live handles instead
+/// of the number of registrations. The previous inner Weakref becomes
+/// unreachable and is collected — it is the *new* one that
+/// [`w_weakref_new`] registers with the collector, which is what keeps the weak
+/// semantics. Storing it into the immortal box needs the prebuilt-family write
+/// barrier, since the `inner` slot is reached only by
+/// [`walk_gc_weakref_box_inner_roots`].
+///
+/// Returns false for a null target or a slot that is not a box.
+///
+/// # Safety
+///
+/// `obj` must be null or a live `GcWeakrefBox`, and `target` must be rooted by
+/// the caller: allocating the replacement rweakref can collect.
+pub unsafe fn w_gc_weakref_box_retarget(obj: PyObjectRef, target: PyObjectRef) -> bool {
+    if target.is_null() || !unsafe { is_gc_weakref_box(obj) } {
+        return false;
+    }
+    let inner = unsafe { w_weakref_new(target) };
+    if inner.is_null() {
+        return false;
+    }
+    unsafe { (*(obj as *mut GcWeakrefBox)).inner = inner };
+    crate::gc_roots::mark_prebuilt_roots_dirty();
+    true
+}
+
 /// Clear the wrapped rweakref, mirroring
 /// `W_WeakrefBase.clear(): self.w_obj_weak = dead_ref`.
 ///
