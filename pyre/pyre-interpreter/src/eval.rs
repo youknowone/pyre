@@ -1013,6 +1013,18 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     crate::reduce_protocol::walk_handle_roots(visitor);
     // The aiter/anext app-level handles are the same off-GC-slot case.
     crate::async_operation::walk_handle_roots(visitor);
+    // `_compat_pickle`'s fix_imports tables are `space.fromcache(State)` off-GC
+    // slots; forward them on every collection so a minor move updates the cached
+    // mapping pointers. Placed with the ungated handle roots (not the gated
+    // prebuilt block) because the state is published lazily without
+    // `mark_prebuilt_roots_dirty`, so its possibly-young dicts must be forwarded
+    // on the first collection regardless of the prebuilt-remember bit.
+    {
+        let mut fwd = |slot: &mut PyObjectRef| {
+            visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+        };
+        crate::module::_pickle::walk_pickle_state_gc(&mut fwd);
+    }
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
     let scan_prebuilt = !is_minor
