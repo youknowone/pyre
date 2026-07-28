@@ -482,7 +482,7 @@ pub fn builtin_module_names() -> Vec<&'static str> {
 /// `default_modules` / `working_modules`) is likewise an explicit set of
 /// string literals with platform conditionals, not filesystem discovery.
 /// Automatic discovery is intentionally not done: it could not express
-/// the alias arms (`"_operator"` → `operator`), explicit-path arms
+/// the alias arms (`"builtins"` → `__builtin__`), explicit-path arms
 /// (`importlib.machinery` → a non-default init fn), or the
 /// `#[cfg(unix)]` gating that `resource` / `fcntl` / `syslog` require.
 pub fn install_builtin_modules() {

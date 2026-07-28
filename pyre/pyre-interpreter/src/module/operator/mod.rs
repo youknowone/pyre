@@ -133,7 +133,10 @@ use crate::baseobjspace::{
 };
 
 crate::py_module! {
-    "operator",
+    // `Modules/_operator.c` — the accelerator module.  `operator` itself is
+    // the pure-Python `lib-python/3/operator.py`, which imports from here.
+    // `moduledef.py:5` names it `_operator` too (`applevel_name`).
+    "_operator",
     // `moduledef.py` `app_names` — `countOf` (a plain `app_operator.py` loop)
     // and the `attrgetter`/`itemgetter`/`methodcaller` factory classes (which
     // cannot be plain interp-level functions) — are the only app-level names.
