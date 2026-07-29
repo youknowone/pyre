@@ -4705,6 +4705,17 @@ pub fn rehydrate_effect_info(ei: &mut majit_ir::EffectInfo) {
         ei.extraeffect = majit_ir::ExtraEffect::RandomEffects;
         // effectinfo.py:364-365 — the wildcard forces can_collect.
         ei.can_collect = true;
+        // `call.py:284-286` states it outright: "random_effects implies
+        // can_invalidate".  `effectinfo.py:271-273 MOST_GENERAL` is built with
+        // `can_invalidate=True`, and so is pyre's own
+        // `EffectInfo::MOST_GENERAL`.  Without this a degraded EI is a shape
+        // upstream cannot construct — random effects with
+        // `check_can_invalidate()` still false — and `check_can_invalidate`
+        // is read on a path `has_random_effects()` does not cover
+        // (`heap.py:457-459`; `_seen_guard_not_invalidated` is otherwise only
+        // reset in `__init__`, `heap.py:341`), so a quasi-immutable guard
+        // would survive a call the wildcard says invalidates everything.
+        ei.can_invalidate = true;
         ei._readonly_descrs_fields = None;
         ei._write_descrs_fields = None;
         ei._readonly_descrs_arrays = None;
@@ -4734,6 +4745,14 @@ pub fn rehydrate_effect_info(ei: &mut majit_ir::EffectInfo) {
     };
     let resolve = |members: &[majit_ir::effectinfo::DescrSetMember]| {
         let mut out = Vec::with_capacity(members.len());
+        // Walk the WHOLE set even once it is known to be incomplete: the
+        // ledger behind `record_set_member_lookup` is what
+        // `descr_set_absent` / `descr_set_ambiguous` report, and those are
+        // gated in `check.py`.  Returning at the first non-answer would stop
+        // counting the rest of the set, so the gate's own numbers would shrink
+        // with the defect they exist to measure — by an order-dependent
+        // amount, which is worse than useless.
+        let mut complete = true;
         for m in members {
             let looked_up = descr_from_set_member(m);
             record_set_member_lookup(m, &looked_up);
@@ -4758,10 +4777,10 @@ pub fn rehydrate_effect_info(ei: &mut majit_ir::EffectInfo) {
                 // lives on.  Closing the serialized universe (the
                 // build-time `DescrMintSpec` channel) is what makes this
                 // arm unreachable rather than merely rare.
-                SetMemberLookup::AbsentContainer | SetMemberLookup::Ambiguous => return None,
+                SetMemberLookup::AbsentContainer | SetMemberLookup::Ambiguous => complete = false,
             }
         }
-        Some(majit_ir::effectinfo::canonicalize_descr_set(out))
+        complete.then(|| majit_ir::effectinfo::canonicalize_descr_set(out))
     };
     let resolved = (
         resolve(&keys.readonly_fields),
