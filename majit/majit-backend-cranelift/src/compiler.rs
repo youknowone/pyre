@@ -4992,64 +4992,34 @@ fn build_ref_root_slots(
     let mut seen = IndexSet::new();
     let mut slots = Vec::new();
 
-    // RPython parity: when jump_to_preamble is used without
-    // force_box_for_end_of_preamble, the body JUMP may pass Float/Int
-    // values at Ref-typed inputarg positions. Build a set of inputarg
-    // OpRef raw values that receive non-Ref values from the backedge JUMP.
-    // These positions must NOT be treated as GC ref roots, because
-    // (1) the GC would try to trace Float/Int bits as pointers, and
-    // (2) the preamble guard check would dereference non-pointer values.
+    // `regalloc.py:786` `v.type == REF`: a frame slot is a GC root because of
+    // the type of the value that lives in it, never because of what some JUMP
+    // passes. A JUMP writes into the *target label's* arg locations
+    // (`x86/regalloc.py:1303-1326 consider_jump` moves each arg into
+    // `descr._x86_arglocs[i]`), so the closing JUMP says nothing about this
+    // trace's own inputarg slots: in a bridge the target is a different
+    // trace's label, and in an unrolled loop it is the LABEL in the middle of
+    // this trace — in neither case the entry `inputargs` this list is built
+    // from. Positional comparison against `inputargs` therefore lines up two
+    // unrelated lists and drops live Ref roots.
     //
     // Phase E.2b: bridge `InputArg.index` is shifted into the disjoint
     // `[bridge_inputarg_base..)` range, so `arg.0` and `inputargs[i].index`
     // are not interchangeable. RPython relies on Box identity here
     // (regalloc.py treats `box is inputarg` as the test); pyre's
-    // line-by-line analog is `arg.0 == inputargs[i].index`. Key both
-    // `non_ref_at_backedge` and `used_inputargs` by the InputArg's raw
-    // OpRef value so the downstream loop's `contains(&input.index)` checks
-    // line up with the keys we inserted.
+    // line-by-line analog is `arg.0 == inputargs[i].index`. Key
+    // `used_inputargs` by the InputArg's raw OpRef value so the downstream
+    // loop's `contains(&input.index)` checks line up with the keys inserted.
     let inputarg_oprefs: IndexSet<u32> = inputargs.iter().map(|ia| ia.index).collect();
-    let mut non_ref_at_backedge: IndexSet<u32> = IndexSet::new();
-    // Find the closing JUMP and check arg types against inputarg types
-    if let Some((jump_idx, jump)) = ops
-        .iter()
-        .enumerate()
-        .rfind(|(_, op)| op.opcode == OpCode::Jump && op.num_args() == inputargs.len())
-    {
-        let num_inputs = inputargs.len();
-        for (i, arg) in jump.getarglist().iter().enumerate() {
-            if i >= num_inputs {
-                break;
-            }
-            if inputargs[i].tp != Type::Ref {
-                continue;
-            }
-            // RPython regalloc.py: backedge JUMP arg `is` an inputarg Box →
-            // GC roots already cover it. Pyre analog: arg.raw() matches some
-            // InputArg.index whose .tp is Ref. Phase E.2b shifted bridge
-            // inputargs into `[bridge_inputarg_base..)`, so a dense lookup
-            // by position no longer maps to the right InputArg.
-            // Const operands (history.py:189-220) are never InputArgs.
-            if !arg.is_constant()
-                && inputargs
-                    .iter()
-                    .any(|ia| ia.index == arg.to_opref().raw() && ia.tp == Type::Ref)
-            {
-                continue; // inputarg reference — always safe
-            }
-            if let Some(actual_tp) = lookup_type_at(type_index, overrides, arg.to_opref(), jump_idx)
-            {
-                if actual_tp != Type::Ref {
-                    non_ref_at_backedge.insert(inputargs[i].index);
-                    if std::env::var_os("MAJIT_LOG").is_some() {
-                        eprintln!(
-                            "[ref-root] SKIP inputarg idx={}: backedge passes {:?} (arg={:?})",
-                            inputargs[i].index, actual_tp, arg
-                        );
-                    }
-                }
-            }
-        }
+
+    // The one JUMP whose target *is* part of this trace does have to line up
+    // type-for-type with the LABEL it writes into. RPython cannot express a
+    // violation — a Box carries its type through every forwarding step — while
+    // majit's flat, typeless OpRef can (SameAsF/SameAsI replacing a Ref).
+    // Report it rather than compensating for it: a trace that reaches the
+    // backend ill-typed is a defect upstream of codegen.
+    if std::env::var_os("MAJIT_LOG").is_some() {
+        log_internal_jump_type_mismatches(ops, type_index, overrides);
     }
 
     // RPython regalloc parity: only track ref roots that are actually
@@ -5076,7 +5046,6 @@ fn build_ref_root_slots(
     for input in inputargs {
         if input.tp == Type::Ref
             && !force_tokens.contains(&input.index)
-            && !non_ref_at_backedge.contains(&input.index)
             && used_inputargs.contains(&input.index)
             && seen.insert(input.index)
         {
@@ -5113,22 +5082,76 @@ fn build_ref_root_slots(
         }
     }
 
-    // RPython parity note: this situation (non-Ref at Ref inputarg position)
-    // does not arise in RPython because Box identity preserves types through
-    // optimization. In RPython, force_box_for_end_of_preamble materializes
-    // virtuals; the type of the Box never changes. majit's flat OpRef model
-    // allows type substitution (SameAsF/SameAsI replacing Ref) which RPython
-    // cannot express.
-    //
-    // Both crossings are handled the same way, by `non_ref_at_backedge` above:
-    // the slot is left out of the root list, so the GC never reads the
-    // non-pointer bits sitting there. Float needs no separate treatment — an
-    // IEEE754 payload is never a pointer, which makes dropping the slot exactly
-    // right, where Int is the crossing that can still be carrying a live GC
-    // pointer forwarded through SameAsI. The dynasm backend has no analogous
-    // check because regalloc.rs builds its gcmap from the runtime live type
-    // rather than the declared inputarg type, so the crossing never reaches it.
     Ok(slots)
+}
+
+/// Report JUMPs whose args do not line up type-for-type with the LABEL they
+/// write into, for the LABELs that live inside this same trace.
+///
+/// `x86/regalloc.py:1303-1326 consider_jump` moves arg `i` straight into the
+/// target's `_x86_arglocs[i]` and classifies it by the *arg's* own type, which
+/// is sound only because RPython cannot build a JUMP that disagrees with its
+/// LABEL — a Box carries its type through every forwarding step. majit's flat
+/// OpRef is typeless, so the disagreement is expressible; when it happens the
+/// trace is ill-typed before codegen ever sees it.
+///
+/// Debug-only: this reports, it does not compensate.
+fn log_internal_jump_type_mismatches(
+    ops: &[Op],
+    type_index: &OpTypeIndex<'_>,
+    overrides: &IndexMap<u32, Type>,
+) {
+    // Key by `descr_identity` (Arc allocation address) per `history.py:477`
+    // TargetToken object identity: `d.index()` is not unique across distinct
+    // TargetTokens in the same trace.
+    let labels: Vec<(usize, usize)> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| op.opcode == OpCode::Label)
+        .filter_map(|(idx, op)| {
+            op.getdescr()
+                .as_ref()
+                .map(|d| (majit_ir::descr_identity(d), idx))
+        })
+        .collect();
+    if labels.is_empty() {
+        return;
+    }
+    for (jump_idx, jump) in ops.iter().enumerate() {
+        if jump.opcode != OpCode::Jump {
+            continue;
+        }
+        let Some(jump_id) = jump.getdescr().as_ref().map(majit_ir::descr_identity) else {
+            continue;
+        };
+        // A JUMP whose descr matches no LABEL here targets another trace; its
+        // types are that trace's contract, not ours.
+        let Some(&(_, label_idx)) = labels.iter().find(|(id, _)| *id == jump_id) else {
+            continue;
+        };
+        let label = &ops[label_idx];
+        if label.num_args() != jump.num_args() {
+            continue;
+        }
+        for (i, (arg, want_arg)) in jump
+            .getarglist()
+            .iter()
+            .zip(label.getarglist().iter())
+            .enumerate()
+        {
+            let got = lookup_type_at(type_index, overrides, arg.to_opref(), jump_idx);
+            let want = lookup_type_at(type_index, overrides, want_arg.to_opref(), label_idx);
+            if let (Some(got), Some(want)) = (got, want) {
+                if got != want {
+                    eprintln!(
+                        "[ref-root] JUMP/LABEL type mismatch at arg {i}: \
+                         label wants {want:?}, jump passes {got:?} \
+                         (jump_idx={jump_idx} label_idx={label_idx})"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Simple normalization: assign sequential pos to ops without pos.
@@ -18494,11 +18517,10 @@ mod tests {
     fn test_compiled_terminal_exit_layouts_include_backend_jump_recovery_layout() {
         let mut backend = CraneliftBackend::new();
 
-        // Int (not Float) at slot 0 so the JUMP backedge passes Int into a
-        // Ref-typed inputarg position. build_ref_root_slots permits Int-at-Ref
-        // (SameAsI may forward GC pointers without changing runtime value);
-        // Float-at-Ref is rejected because IEEE754 bits are never valid
-        // pointers.
+        // The JUMP passes its two args in the opposite order to the LABEL, so
+        // the recovery layout under test is built from a Ref and an Int that
+        // sit at swapped positions rather than from a straight-through
+        // backedge.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
         let ops = vec![
             mk_op(
