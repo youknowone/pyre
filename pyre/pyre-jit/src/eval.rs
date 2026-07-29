@@ -5665,15 +5665,11 @@ fn drive_unpack_iterable_trace(
         // `begin_trace_session`).
         //
         // Opening the session here (the meta is fully static for the novable
-        // driver, so it is the value the back-edge arm above builds) does
-        // compile the trace, but it exposes a second defect that has to land
-        // first: the error parked just above is then delivered at an unrelated
-        // later call site instead of at this unpack.
-        // `synth/unpack_drain_star_raise` case 4 (`RaisingEarly`) catches it —
-        // the `ValueError` escapes the following round's `count(*Counting(N))`.
-        // Draining at the merge point in `_unpackiterable_unknown_length` is
-        // necessary but not sufficient, so the park/deliver pairing is what
-        // needs the root-cause pass.
+        // driver, so it is the value the back-edge arm above builds) is what
+        // would compile the trace; the defect that used to block it — the
+        // parked error resurfacing at an unrelated later unpack, which
+        // `synth/unpack_drain_star_raise` case 4 catches — was the backend
+        // `_store_exception` leak drained just above, not the park itself.
         match meta.compile_finish_from_active_session(
             &finish_args,
             finish_arg_types,
