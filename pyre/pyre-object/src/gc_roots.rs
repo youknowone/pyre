@@ -197,6 +197,27 @@ pub fn shadow_stack_copy_range(base: usize, dst: &mut [PyObjectRef]) {
     });
 }
 
+/// Overwrite a single shadow-stack slot by index, panicking if the index
+/// is out of bounds. A slot whose contents change over a bracket's lifetime
+/// is written here rather than re-pinned, mirroring `gc_save_root`'s
+/// overwrite of an already allocated slot (`shadowcolor.py:126-129`).
+///
+/// Writes the thread-local `SHADOW_STACK` the tracer cannot type; the JIT
+/// residualises the write instead of tracing into it (`@dont_look_inside`,
+/// `rlib/jit.py:139`), the [`shadow_stack_get`] twin.
+#[majit_macros::dont_look_inside]
+pub fn shadow_stack_set(index: usize, root: PyObjectRef) {
+    // Publish the raw value first, for the reason [`pin_root`] gives: the
+    // `try_gc_current_object_address` query is itself a GC operation and may
+    // wait behind another thread's collection, so the value must already be
+    // visible to that collector before we enter the query safepoint.
+    SHADOW_STACK.with(|s| s.borrow_mut()[index] = root);
+    // Then normalize a GCREF the caller may have copied before a foreign
+    // mutator's nursery collection, so the slot never keeps a forwarding stub.
+    let root = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
+    SHADOW_STACK.with(|s| s.borrow_mut()[index] = root);
+}
+
 /// Visit every pinned root in the shadow stack with mutable access.
 /// `pyre-jit/src/eval.rs` registers a thin adapter through
 /// `majit_gc::shadow_stack::register_extra_root_walker` that forwards

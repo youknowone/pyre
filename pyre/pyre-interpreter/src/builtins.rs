@@ -3728,63 +3728,207 @@ fn min_max_dispatch(
             "Cannot specify a default for {fn_name}() with multiple positional arguments"
         )));
     }
-    let items: Vec<PyObjectRef> = if positional.len() == 1 {
-        collect_iterable(positional[0])?
+    if positional.len() == 1 {
+        min_max_sequence(positional[0], key_fn, default, want_max, fn_name)
     } else {
-        positional.to_vec()
-    };
-    if items.is_empty() {
-        if let Some(d) = default {
-            return Ok(d);
-        }
-        return Err(crate::PyError::new(
-            crate::PyErrorKind::ValueError,
-            format!("{fn_name}() iterable argument is empty"),
-        ));
+        min_max_multiple_args(positional, key_fn, want_max)
     }
-    select_extremum(&items, key_fn, want_max)
 }
 
-/// Shared min/max body — `pypy/module/__builtin__/functional.py:115-148
-/// min_max`.  Builds (key, item) pairs (identity when no `key=`),
-/// keeps a running best by comparing keys via `space.gt`/`space.lt`
-/// (the PyPy compare paths invoke `__gt__` / `__lt__` and propagate
-/// errors), returns the corresponding item.  PyPy's stable-tie rule:
-/// keep the first-seen extremum (`<` for min, `>` for max), matching
-/// CPython 3.x semantics.
-fn select_extremum(
-    items: &[PyObjectRef],
+/// `pypy/module/__builtin__/functional.py:125-158 min_max_sequence`.
+fn min_max_sequence(
+    sequence: PyObjectRef,
     key_fn: Option<PyObjectRef>,
+    default: Option<PyObjectRef>,
     want_max: bool,
+    fn_name: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let key_of = |item: PyObjectRef| -> PyObjectRef {
-        match key_fn {
-            Some(kf) => crate::call_function(kf, &[item]),
-            None => item,
-        }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sequence_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(sequence);
+    let it = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(sequence_slot))?;
+    let iterator_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(it);
+    // Dict-view iterators are off-GC carriers, so retain their source dict
+    // explicitly while the iterator is rooted by this native loop.
+    if unsafe {
+        pyre_object::dictmultiobject::is_dict_view_iterator(
+            pyre_object::gc_roots::shadow_stack_get(iterator_slot),
+        )
+    } {
+        let w_dict = unsafe {
+            pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(
+                pyre_object::gc_roots::shadow_stack_get(iterator_slot),
+            )
+        };
+        pyre_object::gc_roots::pin_root(w_dict);
+    }
+    let key_fn_slot = key_fn.map(|key| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(key);
+        slot
+    });
+    let has_default = default.is_some();
+    let best_item_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(default.unwrap_or_else(pyre_object::w_none));
+    let best_key_slot = if key_fn_slot.is_some() {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_none());
+        slot
+    } else {
+        best_item_slot
+    };
+    let candidate_item_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(pyre_object::w_none());
+    let candidate_key_slot = if key_fn_slot.is_some() {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_none());
+        slot
+    } else {
+        candidate_item_slot
     };
     let cmp_op = if want_max {
         crate::baseobjspace::CompareOp::Gt
     } else {
         crate::baseobjspace::CompareOp::Lt
     };
-    let mut best_item = items[0];
-    let mut best_key = key_of(best_item);
-    for &item in &items[1..] {
-        let key = key_of(item);
+    let mut has_item = false;
+    loop {
+        let it_now = pyre_object::gc_roots::shadow_stack_get(iterator_slot);
+        let item = match crate::baseobjspace::next(it_now) {
+            Ok(item) => item,
+            Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+            Err(e) => return Err(e),
+        };
+        pyre_object::gc_roots::shadow_stack_set(candidate_item_slot, item);
+        if let Some(key_fn_slot) = key_fn_slot {
+            let candidate_key = crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(key_fn_slot),
+                &[pyre_object::gc_roots::shadow_stack_get(candidate_item_slot)],
+            )?;
+            pyre_object::gc_roots::shadow_stack_set(candidate_key_slot, candidate_key);
+        }
+        if !has_item {
+            pyre_object::gc_roots::shadow_stack_set(
+                best_item_slot,
+                pyre_object::gc_roots::shadow_stack_get(candidate_item_slot),
+            );
+            if key_fn_slot.is_some() {
+                pyre_object::gc_roots::shadow_stack_set(
+                    best_key_slot,
+                    pyre_object::gc_roots::shadow_stack_get(candidate_key_slot),
+                );
+            }
+            has_item = true;
+            continue;
+        }
+        if crate::baseobjspace::is_true(crate::baseobjspace::compare(
+            pyre_object::gc_roots::shadow_stack_get(candidate_key_slot),
+            pyre_object::gc_roots::shadow_stack_get(best_key_slot),
+            cmp_op,
+        )?)? {
+            pyre_object::gc_roots::shadow_stack_set(
+                best_item_slot,
+                pyre_object::gc_roots::shadow_stack_get(candidate_item_slot),
+            );
+            if key_fn_slot.is_some() {
+                pyre_object::gc_roots::shadow_stack_set(
+                    best_key_slot,
+                    pyre_object::gc_roots::shadow_stack_get(candidate_key_slot),
+                );
+            }
+        }
+    }
+    if !has_item && !has_default {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::ValueError,
+            format!("{fn_name}() iterable argument is empty"),
+        ));
+    }
+    Ok(pyre_object::gc_roots::shadow_stack_get(best_item_slot))
+}
+
+/// `pypy/module/__builtin__/functional.py:163-184 min_max_multiple_args`.
+fn min_max_multiple_args(
+    positional: &[PyObjectRef],
+    key_fn: Option<PyObjectRef>,
+    want_max: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let item_base = pyre_object::gc_roots::shadow_stack_len();
+    for &item in positional {
+        pyre_object::gc_roots::pin_root(item);
+    }
+    let key_fn_slot = key_fn.map(|key| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(key);
+        slot
+    });
+    let cmp_op = if want_max {
+        crate::baseobjspace::CompareOp::Gt
+    } else {
+        crate::baseobjspace::CompareOp::Lt
+    };
+    let best_item_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(item_base));
+    let best_key_slot = if let Some(key_fn_slot) = key_fn_slot {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_none());
+        let first_key = crate::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(key_fn_slot),
+            &[pyre_object::gc_roots::shadow_stack_get(best_item_slot)],
+        )?;
+        pyre_object::gc_roots::shadow_stack_set(slot, first_key);
+        slot
+    } else {
+        best_item_slot
+    };
+    let candidate_item_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(best_item_slot));
+    let candidate_key_slot = if key_fn_slot.is_some() {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(best_key_slot));
+        slot
+    } else {
+        candidate_item_slot
+    };
+    for i in 1..positional.len() {
+        pyre_object::gc_roots::shadow_stack_set(
+            candidate_item_slot,
+            pyre_object::gc_roots::shadow_stack_get(item_base + i),
+        );
+        if let Some(key_fn_slot) = key_fn_slot {
+            let candidate_key = crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(key_fn_slot),
+                &[pyre_object::gc_roots::shadow_stack_get(candidate_item_slot)],
+            )?;
+            pyre_object::gc_roots::shadow_stack_set(candidate_key_slot, candidate_key);
+        }
         // `functional.py:139 if space.is_true(space.gt(key, best_key))`
         // — route through the generic comparison dispatch which
         // handles int/long/str/float/tuple natively and falls
         // through to user-defined `__gt__`/`__lt__` for other
-        // types.  Errors (TypeError from incomparable types) are
-        // propagated to the caller as PyPy does.
-        let result = crate::baseobjspace::compare(key, best_key, cmp_op)?;
-        if crate::baseobjspace::is_true(result)? {
-            best_item = item;
-            best_key = key;
+        // types.  Errors (TypeError from incomparable types or an
+        // exception from the key call, as in functional.py min_max)
+        // are propagated to the caller.
+        if crate::baseobjspace::is_true(crate::baseobjspace::compare(
+            pyre_object::gc_roots::shadow_stack_get(candidate_key_slot),
+            pyre_object::gc_roots::shadow_stack_get(best_key_slot),
+            cmp_op,
+        )?)? {
+            pyre_object::gc_roots::shadow_stack_set(
+                best_item_slot,
+                pyre_object::gc_roots::shadow_stack_get(candidate_item_slot),
+            );
+            if key_fn_slot.is_some() {
+                pyre_object::gc_roots::shadow_stack_set(
+                    best_key_slot,
+                    pyre_object::gc_roots::shadow_stack_get(candidate_key_slot),
+                );
+            }
         }
     }
-    Ok(best_item)
+    Ok(pyre_object::gc_roots::shadow_stack_get(best_item_slot))
 }
 
 /// `type(obj)` — return the type name as a string (simplified).

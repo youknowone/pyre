@@ -598,6 +598,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::gc_roots::shadow_stack_set",
+        "pyre_object::shadow_stack_set",
+        pyre_object::gc_roots::shadow_stack_set as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_object::typeobject::w_type_set_uses_object_setattr",
         "pyre_object::w_type_set_uses_object_setattr",
         crate::opcode_ops::bh_w_type_set_uses_object_setattr as *const (),
