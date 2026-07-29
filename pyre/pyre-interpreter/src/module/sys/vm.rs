@@ -2097,10 +2097,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(
         ns,
         "set_coroutine_origin_tracking_depth",
-        make_builtin_function_with_arity(
+        // `depth` is positional-or-keyword, so this cannot take the
+        // fixed-arity carrier (which rejects keywords before the body runs).
+        crate::make_builtin_function(
             "set_coroutine_origin_tracking_depth",
             sys_set_coroutine_origin_tracking_depth,
-            1,
         ),
     );
     module_ns_store(

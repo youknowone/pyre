@@ -538,14 +538,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         return Ok(pyre_object::w_int_new(0));
                     }
                 };
-                // `interp_imp.is_builtin`: 0 = not a builtin, 1 = a builtin
-                // not yet imported, -1 = a builtin already in sys.modules and
-                // thus not re-initializable (sys/builtins and any other
-                // already-imported builtin).
+                // `import.c is_builtin`: 0 = not a builtin, -1 = an inittab
+                // entry whose `initfunc` is NULL and so cannot be
+                // (re)initialized, 1 = every other builtin.  `sys` and
+                // `builtins` are the two NULL-initfunc entries.
+                // `interp_imp.py is_builtin` instead answers -1 for *any*
+                // builtin already in `sys.modules`, which makes an ordinary
+                // imported builtin such as `time` report -1.
                 let is_builtin = BUILTIN_MODULES.lock().unwrap().contains_key(name);
                 let result = if !is_builtin {
                     0
-                } else if crate::importing::check_sys_modules(name).is_some() {
+                } else if matches!(name, "sys" | "builtins") {
                     -1
                 } else {
                     1
