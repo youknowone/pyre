@@ -3469,6 +3469,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                 write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, truth)?;
                 return Ok((DispatchOutcome::Continue, op.next_pc));
             }
+            // The boxed bool a residual `COMPARE_OP` leaves behind — the int
+            // arm above guards `INT_TYPE` and declines it, so without this the
+            // test on every `if a == b:` stays a second may-force call.
+            if let Some(truth) = try_walker_specialize_truth_bool(ctx, op.pc, r_args[0])? {
+                write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, truth)?;
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
         }
     }
 

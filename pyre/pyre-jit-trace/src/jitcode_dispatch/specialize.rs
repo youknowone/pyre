@@ -337,6 +337,40 @@ pub(crate) fn try_walker_specialize_truth_int<Sym: WalkSym>(
     Ok(Some(truth))
 }
 
+/// Truth specialization for a concrete `W_BoolObject` operand — the sibling
+/// [`try_walker_specialize_truth_int`] declines it, because it emits
+/// `GUARD_CLASS INT` and a bool carries `BOOL_TYPE`.  Same `intval: i64`
+/// layout, so only the guarded class constant differs; `is_true` on the
+/// unboxed field is `W_BoolObject.is_true`'s `self.intval != 0`.
+///
+/// This is the shape every `if a == b:` reaches: `COMPARE_OP` leaves a boxed
+/// bool the following `TO_BOOL` / `POP_JUMP_IF_*` tests, so without this arm a
+/// comparison costs two `CALL_MAY_FORCE`s and two force/exception guard pairs
+/// instead of one call and a field read.  When the comparison itself already
+/// specialized, [`bool_box_truth_lookup`] folds the test first and this never
+/// runs; it covers the case where the comparison stayed a residual.
+pub(crate) fn try_walker_specialize_truth_bool<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+) -> Result<Option<OpRef>, DispatchError> {
+    let Some(obj) = walker_concrete_ref_object(ctx, operand) else {
+        return Ok(None);
+    };
+    let val = unsafe {
+        if !pyre_object::is_bool(obj) {
+            return Ok(None);
+        }
+        pyre_object::w_int_get_value(obj)
+    };
+    let bool_type_addr = &pyre_object::pyobject::BOOL_TYPE as *const _ as i64;
+    let raw = walker_unbox_int(ctx, op_pc, operand, bool_type_addr)?;
+    let truth = ctx.trace_ctx.record_op(OpCode::IntIsTrue, &[raw]);
+    ctx.trace_ctx
+        .set_opref_concrete(truth, majit_ir::Value::Int((val != 0) as i64));
+    Ok(Some(truth))
+}
+
 /// #57: walker-native speculative int specialization for the `BINARY_OP`
 /// helper residual_call (oopspec `BinaryOp`).  Re-derives
 /// the former int fast path's structure (`guard_class` + `getfield_gc_i` per
