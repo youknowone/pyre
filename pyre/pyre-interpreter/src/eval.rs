@@ -779,6 +779,23 @@ pub unsafe fn walk_pyframe_roots_area(
             let (arr_ptr, depth, next_frame) = unsafe {
                 let f_back_slot = &mut (*(frame)).f_backref as *mut *mut PyFrame;
                 visitor(&mut *(f_back_slot as *mut majit_ir::GcRef));
+                // The visitor above forwarded the slot, which for a vref leaves
+                // the vref itself put — it is old-gen, so mark-sweep does not
+                // move it — while the frame its `forced` slot names may be
+                // young and relocating. `forced` is an interior slot the
+                // collector reaches later, off the gray stack, but
+                // `chain_next_frame` reads it during THIS scan, so forward it
+                // here as well; otherwise the walk steps into a frame copy the
+                // collector is about to abandon, and the roots only this walker
+                // knows about (caught exceptions, module-dict cells, the
+                // prebuilt families) get forwarded into dead memory. A direct
+                // `f_backref` needs no such hop — the visitor already left it
+                // naming the live copy.
+                let f_backref = *f_back_slot;
+                if majit_metainterp::virtualref::ptr_is_virtual_ref(f_backref as *const u8) {
+                    let vref = f_backref as *mut majit_metainterp::virtualref::JitVirtualRef;
+                    visitor(&mut *(&mut (*vref).forced as *mut *mut u8 as *mut majit_ir::GcRef));
+                }
 
                 // pyframe.py:102 `self.pycode` — the running code object.
                 // Visited as a root so a code object reachable only via

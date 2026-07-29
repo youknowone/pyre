@@ -974,7 +974,11 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 /// `FrameDebugData` fields. Both require a custom trace.
 ///
 /// Forwarded (mirrors `walk_pyframe_roots` eval.rs:496-556):
-///   - `f_backref` — the parent frame pointer.
+///   - `f_backref` — the parent frame pointer, or the `JitVirtualRef` standing
+///     in for it once the JIT virtualizes an inlined callee. The vref is a GC
+///     object registered with `forced` as its one traced slot, so forwarding
+///     this slot greys the vref and the collector reaches the parent frame
+///     through it; no hop is needed here.
 ///   - `pycode` — visited to match the walker; inert while code objects
 ///     are Box-immortal (`is_nursery_object_start` short-circuits).
 ///   - `locals_cells_stack_w` — the array pointer.  A GC-managed nursery

@@ -152,7 +152,7 @@ pub unsafe fn vref_forced(ptr: *const u8) -> *mut u8 {
 /// InvalidVirtualRef`); re-exported here for convenience.
 pub use crate::jit::InvalidVirtualRef;
 
-/// Allocate a concrete JitVirtualRef on the heap.
+/// Allocate a concrete JitVirtualRef.
 /// `virtualref.py:85-91 virtual_ref_during_tracing(real_object)`.
 /// Initializes virtual_token = TOKEN_NONE, forced = real_object.
 /// Returns raw pointer; caller owns the allocation.
