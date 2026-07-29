@@ -5,6 +5,7 @@ import pickle
 import weakref
 from array import array
 from collections import deque
+from ctypes import Array as CTypesArray
 from os import DirEntry
 from types import GenericAlias
 from typing import TypeVar
@@ -73,6 +74,12 @@ assert dir_entry_alias.__origin__ is DirEntry
 assert dir_entry_alias.__args__ == (T,)
 assert copy.copy(dir_entry_alias) == dir_entry_alias
 assert copy.deepcopy(dir_entry_alias) == dir_entry_alias
+
+ctypes_array_alias = CTypesArray[T]
+assert ctypes_array_alias.__origin__ is CTypesArray
+assert ctypes_array_alias.__args__ == (T,)
+assert copy.copy(ctypes_array_alias) == ctypes_array_alias
+assert copy.deepcopy(ctypes_array_alias) == ctypes_array_alias
 
 nested = GenericAlias(list, ([T, [U]],))
 assert nested.__parameters__ == (T, U)

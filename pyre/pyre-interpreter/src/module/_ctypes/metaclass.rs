@@ -299,6 +299,16 @@ fn finish_element_base(tp: PyObjectRef, metaclass: PyObjectRef) {
 }
 
 fn init_array_base(ns: PyObjectRef) {
+    // CPython 3.14 Modules/_ctypes/_ctypes.c Array_methods —
+    // Py_GenericAlias with METH_CLASS.
+    type_ns_store(
+        ns,
+        "__class_getitem__",
+        pyre_object::function::w_classmethod_new(crate::make_builtin_function(
+            "__class_getitem__",
+            crate::_pypy_generic_alias::generic_alias_class_getitem,
+        )),
+    );
     install_new(ns, array_new);
     type_ns_store(
         ns,
