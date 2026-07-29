@@ -27,6 +27,19 @@ with warnings.catch_warnings(record=True) as caught:
     assert warning.line is None
 
 with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    source = []
+    _warnings.warn("positional source", UserWarning, 1, source)
+    assert caught[-1].source is source
+
+try:
+    _warnings.warn("too many", UserWarning, 1, None, ())
+except TypeError:
+    pass
+else:
+    raise AssertionError("positional skip_file_prefixes accepted")
+
+with warnings.catch_warnings(record=True) as caught:
     warnings.simplefilter("ignore", UserWarning)
     registry = {}
     _warnings.warn_explicit(

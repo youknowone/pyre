@@ -813,7 +813,7 @@ crate::py_module! {
             message: PyObjectRef,
             #[default(pyre_object::PY_NULL)] category: PyObjectRef,
             #[default(1i64)] stacklevel: i64,
-            #[kwonly] #[default(pyre_object::PY_NULL)] source: PyObjectRef,
+            #[default(pyre_object::PY_NULL)] source: PyObjectRef,
             #[kwonly] #[default(pyre_object::PY_NULL)] skip_file_prefixes: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
             // CPython 3.14 `_warnings.warn`: `skip_file_prefixes` is a

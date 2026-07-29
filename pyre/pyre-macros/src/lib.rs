@@ -150,7 +150,14 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     // unwrap statements below index their slots directly, so the count is
     // checked here — a missing required slot would otherwise read past the
     // end of `args`.  A raw whole-args slice takes any count.
-    let count_preamble = if has_varargs {
+    // A signature with kw-only / **kwargs markers is matched by the gateway
+    // before this wrapper runs.  The resulting scope contains every
+    // positional and kw-only slot, so `args.len()` is no longer the number
+    // of positionals supplied by the caller.  PyPy's
+    // `BuiltinCode.funcrun_obj` likewise runs the activation directly after
+    // `args.parse_obj(...)`; do not perform a second positional-count check
+    // on that already-bound scope.
+    let count_preamble = if has_varargs || has_kw_markers {
         quote! {}
     } else {
         let total = param_positional
