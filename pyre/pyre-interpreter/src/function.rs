@@ -2842,6 +2842,14 @@ fn _flat_pycall(
     for i in 0..nargs {
         new_frame.set_locals_w(i, frame.peekvalue(nargs - 1 - i));
     }
+    // The callee's locals array is old-gen (`OldGenGc`) and the arguments
+    // just written into it are young. RPython's GC transform emits the
+    // old-to-young `write_barrier` (minimark.py:1065) after such a store;
+    // pyre has no transform pass, so the batch barrier runs here. Until the
+    // callee frame is installed on the `f_backref` chain nothing else exposes
+    // these slots, so a minor collection before then would leave every
+    // argument stale.
+    crate::pyframe::remember_frame_locals_array(new_frame.locals_cells_stack_w);
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
 
@@ -2925,6 +2933,9 @@ fn _flat_pycall_defaults(
         }
     }
 
+    // Same old-to-young barrier as `_flat_pycall`: positional arguments and
+    // defaults were written into the callee's old-gen locals array.
+    crate::pyframe::remember_frame_locals_array(new_frame.locals_cells_stack_w);
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
 
