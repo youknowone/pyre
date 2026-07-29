@@ -523,7 +523,12 @@ pub fn init_typeobjects() {
         // `assert not PyFrame.typedef.acceptable_as_base_class` (typedef.py:754)
         // — no `__new__`, cannot be subclassed.
         let frame_type = new_typeobject_with_base("frame", init_frame_type, object_type);
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(frame_type, false) };
+        // No `__new__` in the typedef — a frame is produced only by the
+        // evaluator, so `tp_new` is NULL (`Py_TPFLAGS_DISALLOW_INSTANTIATION`).
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(frame_type);
+            pyre_object::w_type_set_acceptable_as_base_class(frame_type, false);
+        }
         reg.insert(
             &crate::pyframe::FRAME_TYPE as *const PyType as usize,
             frame_type as usize,
@@ -635,7 +640,12 @@ pub fn init_typeobjects() {
             init_member_descriptor_type,
             object_type,
         );
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(member_desc_type, false) };
+        // No `__new__` in the typedef — a member descriptor is built by the
+        // type machinery, so `tp_new` is NULL.
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(member_desc_type);
+            pyre_object::w_type_set_acceptable_as_base_class(member_desc_type, false);
+        }
         reg.insert(
             &pyre_object::typedef::MEMBER_TYPE as *const PyType as usize,
             member_desc_type as usize,
@@ -681,9 +691,17 @@ pub fn init_typeobjects() {
 
         // setobject.py W_SetIterObject.typedef. Python 3.14 exposes the
         // concrete name as `set_iterator` (PyPy 3.11 used `setiterator`).
+        let set_iterator_type =
+            new_typeobject_with_base("set_iterator", init_set_iterator_type, object_type);
+        // No `__new__` in the typedef — the iterator is produced only by
+        // `iter(set)`, so `tp_new` is NULL.
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(set_iterator_type);
+            pyre_object::w_type_set_acceptable_as_base_class(set_iterator_type, false);
+        }
         reg.insert(
             &pyre_object::setobject::SET_ITERATOR_TYPE as *const PyType as usize,
-            new_typeobject_with_base("set_iterator", init_set_iterator_type, object_type) as usize,
+            set_iterator_type as usize,
         );
 
         // typedef.py:941-946 Ellipsis.typedef.
@@ -2123,6 +2141,11 @@ fn new_typeobject_with_base_and_layout(
     unsafe { w_type_set_mro(type_obj, mro) };
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     unsafe { stamp_new_descr_self(ns, type_obj) };
+    // `typeobject.py:1789-1790 TypeCache.ready(w_type)` runs `w_type.ready()`
+    // for every builtin typedef the space cache builds, exactly as
+    // `_type_new` (typeobject.py:970) does for a heap type — so a builtin
+    // shows up in `base.__subclasses__()` too.
+    unsafe { pyre_object::typeobject::w_type_ready(type_obj) };
     type_obj
 }
 
@@ -9116,7 +9139,11 @@ fn getset_descriptor_type() -> pyre_object::PyObjectRef {
             &pyre_object::typedef::GETSET_DESCRIPTOR_TYPE as *const PyType,
         );
         // typedef.py:446 assert not GetSetProperty.typedef.acceptable_as_base_class
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(tp, false) };
+        // No `__new__` in the typedef either, so `tp_new` is NULL.
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(tp);
+            pyre_object::w_type_set_acceptable_as_base_class(tp, false);
+        }
         // `init_typeobjects` would normally hand the W_TypeObject
         // to `set_instantiate(pytype, w_typeobject)` so allocators
         // can stamp `ob_header.w_class` at construction time
@@ -10103,6 +10130,7 @@ fn init_type_type(ns: PyObjectRef) {
             // `A.__module__ = "x"` is reflected in `A.__dict__`.
             let cls = args[1];
             let value = args[2];
+            check_set_special_type_attr(cls, value, "__module__")?;
             unsafe {
                 if pyre_object::is_type(cls) {
                     crate::type_dict_store(cls, "__module__", value);
@@ -10123,7 +10151,7 @@ fn init_type_type(ns: PyObjectRef) {
             make_getset_property_named(
                 module_getter,
                 module_setter,
-                pyre_object::PY_NULL,
+                make_builtin_function_with_arity("__module__", type_del_module, 2),
                 "__module__",
             ),
         )
@@ -10166,13 +10194,8 @@ fn init_type_type(ns: PyObjectRef) {
         |args| {
             let w_type = args[1];
             let w_value = args[2];
-            // typeobject.py:1048 — only heap types may be renamed.
-            if !unsafe { pyre_object::w_type_is_heaptype(w_type) } {
-                return Err(crate::PyError::type_error(format!(
-                    "can't set {}.__name__",
-                    unsafe { pyre_object::w_type_get_name(w_type) }
-                )));
-            }
+            // Only heap types may be renamed.
+            check_set_special_type_attr(w_type, w_value, "__name__")?;
             // typeobject.py:1050 — `space.isinstance_w(w_value, space.w_text)`
             // accepts str and any str subclass, not only the exact type.
             if !unsafe { crate::baseobjspace::isinstance_str_w(w_value) } {
@@ -10207,7 +10230,12 @@ fn init_type_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__name__",
-            make_getset_property_named(name_getter, name_setter, pyre_object::PY_NULL, "__name__"),
+            make_getset_property_named(
+                name_getter,
+                name_setter,
+                make_builtin_function_with_arity("__name__", type_del_name, 2),
+                "__name__",
+            ),
         )
     };
 
@@ -10223,13 +10251,7 @@ fn init_type_type(ns: PyObjectRef) {
         |args| {
             let w_type = args[1];
             let value = args[2];
-            // typeobject.py:1066-1067 — builtin types are immutable.
-            if !unsafe { pyre_object::w_type_is_heaptype(w_type) } {
-                return Err(crate::PyError::type_error(format!(
-                    "can't set {}.__qualname__",
-                    unsafe { pyre_object::w_type_get_name(w_type) }
-                )));
-            }
+            check_set_special_type_attr(w_type, value, "__qualname__")?;
             if !unsafe { crate::baseobjspace::isinstance_str_w(value) } {
                 return Err(crate::PyError::type_error(format!(
                     "can only assign string to {}.__qualname__, not '{}'",
@@ -10245,17 +10267,6 @@ fn init_type_type(ns: PyObjectRef) {
         },
         3,
     );
-    let qualname_deleter = make_builtin_function_with_arity(
-        "__qualname__",
-        |args| {
-            let w_type = args[1];
-            Err(crate::PyError::type_error(format!(
-                "cannot delete '__qualname__' attribute of immutable type '{}'",
-                unsafe { pyre_object::w_type_get_name(w_type) }
-            )))
-        },
-        2,
-    );
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -10263,7 +10274,7 @@ fn init_type_type(ns: PyObjectRef) {
             make_getset_property_named(
                 qualname_getter,
                 qualname_setter,
-                qualname_deleter,
+                make_builtin_function_with_arity("__qualname__", type_del_qualname, 2),
                 "__qualname__",
             ),
         )
@@ -10288,7 +10299,7 @@ fn init_type_type(ns: PyObjectRef) {
             make_getset_property_named(
                 bases_getter,
                 bases_setter,
-                pyre_object::PY_NULL,
+                make_builtin_function_with_arity("__bases__", type_del_bases, 2),
                 "__bases__",
             ),
         )
@@ -10405,6 +10416,56 @@ unsafe fn type_in_mro(w_base: PyObjectRef, w_type: PyObjectRef) -> bool {
         .any(|&entry| std::ptr::eq(entry, w_type))
 }
 
+/// `typeobject.c check_set_special_type_attr` — the shared guard the
+/// `__name__` / `__qualname__` / `__module__` / `__bases__` setters run
+/// before touching the type.  A static type carries
+/// `Py_TPFLAGS_IMMUTABLETYPE`, so it refuses assignment *and* deletion under
+/// the "cannot set" wording; a heap type only refuses the deletion (a null
+/// `w_value`).
+fn check_set_special_type_attr(
+    w_type: PyObjectRef,
+    w_value: PyObjectRef,
+    name: &str,
+) -> Result<(), crate::PyError> {
+    let immutable = !unsafe { pyre_object::w_type_is_heaptype(w_type) };
+    if !immutable && !w_value.is_null() {
+        return Ok(());
+    }
+    let verb = if immutable { "set" } else { "delete" };
+    let type_name = unsafe { pyre_object::w_type_get_name(w_type) };
+    Err(crate::PyError::type_error(format!(
+        "cannot {verb} '{name}' attribute of immutable type '{type_name}'"
+    )))
+}
+
+/// The `fdel` half of the special type getsets: deletion is never allowed,
+/// so it is `check_set_special_type_attr` with a null value.  Without an
+/// `fdel` the generic getset `__delete__` slot would answer with PyPy's
+/// `AttributeError` (typedef.py:404) instead.
+fn special_type_attr_delete(
+    args: &[PyObjectRef],
+    name: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    check_set_special_type_attr(args[1], pyre_object::PY_NULL, name)?;
+    Ok(pyre_object::w_none())
+}
+
+fn type_del_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    special_type_attr_delete(args, "__name__")
+}
+
+fn type_del_qualname(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    special_type_attr_delete(args, "__qualname__")
+}
+
+fn type_del_module(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    special_type_attr_delete(args, "__module__")
+}
+
+fn type_del_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    special_type_attr_delete(args, "__bases__")
+}
+
 /// `type.__bases__` setter (typeobject.py:1064-1105 `descr_set__bases__`).
 /// Heap types only; the new bases must be a non-empty tuple of classes whose
 /// best base shares the current instance layout (so instances stay valid).
@@ -10415,11 +10476,7 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let w_type = args[1];
         let w_value = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
         let type_name = pyre_object::w_type_get_name(w_type);
-        if !pyre_object::w_type_is_heaptype(w_type) {
-            return Err(crate::PyError::type_error(format!(
-                "can't set {type_name}.__bases__"
-            )));
-        }
+        check_set_special_type_attr(w_type, w_value, "__bases__")?;
         if w_value.is_null() || !pyre_object::is_tuple(w_value) {
             return Err(crate::PyError::type_error(format!(
                 "can only assign tuple to {type_name}.__bases__, not {}",
@@ -11222,11 +11279,12 @@ fn init_function_type(ns: PyObjectRef) {
         },
         3,
     );
+    let dict_deleter = make_builtin_function_with_arity("__dict__", dict_del_rejected, 2);
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__dict__",
-            make_getset_property(dict_getter, dict_setter, pyre_object::PY_NULL),
+            make_getset_property(dict_getter, dict_setter, dict_deleter),
         )
     };
     // CPython 3.14 `function.__annotate__`: callable-or-None, not deletable.
@@ -13391,7 +13449,9 @@ fn staticmethod_annotate_del(args: &[PyObjectRef]) -> crate::PyResult {
     staticmethod_wrapped_attr_del(args, "__annotate__")
 }
 
-fn staticmethod_dict_del(_args: &[PyObjectRef]) -> crate::PyResult {
+/// `PyObject_GenericSetDict` with a null value — no `__dict__`-carrying
+/// object lets the slot be removed.
+fn dict_del_rejected(_args: &[PyObjectRef]) -> crate::PyResult {
     Err(crate::PyError::type_error("cannot delete __dict__"))
 }
 
@@ -13413,7 +13473,7 @@ fn staticmethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
 fn init_staticmethod_type(ns: PyObjectRef) {
     let dict_getter = make_builtin_function_with_arity("__dict__", descr_get_dict, 2);
     let dict_setter = make_builtin_function_with_arity("__dict__", descr_set_dict, 3);
-    let dict_deleter = make_builtin_function_with_arity("__dict__", staticmethod_dict_del, 2);
+    let dict_deleter = make_builtin_function_with_arity("__dict__", dict_del_rejected, 2);
     let annotations_getter =
         make_builtin_function_with_arity("__annotations__", staticmethod_annotations_get, 2);
     let annotations_setter =
@@ -13657,10 +13717,6 @@ fn classmethod_annotate_del(args: &[PyObjectRef]) -> crate::PyResult {
     classmethod_wrapped_attr_del(args, "__annotate__")
 }
 
-fn classmethod_dict_del(_args: &[PyObjectRef]) -> crate::PyResult {
-    Err(crate::PyError::type_error("cannot delete __dict__"))
-}
-
 /// function.py:767-768 `descr_repr` / CPython 3.14 `cm_repr`.
 fn classmethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let cm = classmethod_require(args.first().copied().unwrap_or(PY_NULL), "__repr__")?;
@@ -13679,7 +13735,7 @@ fn classmethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
 fn init_classmethod_type(ns: PyObjectRef) {
     let dict_getter = make_builtin_function_with_arity("__dict__", descr_get_dict, 2);
     let dict_setter = make_builtin_function_with_arity("__dict__", descr_set_dict, 3);
-    let dict_deleter = make_builtin_function_with_arity("__dict__", classmethod_dict_del, 2);
+    let dict_deleter = make_builtin_function_with_arity("__dict__", dict_del_rejected, 2);
     let annotations_getter =
         make_builtin_function_with_arity("__annotations__", classmethod_annotations_get, 2);
     let annotations_setter =
