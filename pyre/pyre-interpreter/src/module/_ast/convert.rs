@@ -37,6 +37,65 @@ pub fn compile_object(
         .map_err(|error| crate::PyError::syntax_error(error.to_string()))
 }
 
+/// CPython 3.14 `_PyCompile_AstPreprocess`: apply the same AST preprocessing
+/// pass used immediately before bytecode generation.  `syntax_check_only`
+/// is true for plain `PyCF_ONLY_AST` and false for `PyCF_OPTIMIZED_AST`.
+fn preprocess_module(
+    module: &mut ast::Mod,
+    mode: crate::compile::Mode,
+    opts: crate::compile::CompileOpts,
+    syntax_check_only: bool,
+) {
+    let future_annotations = opts
+        .future_features
+        .contains(crate::compile::CodeFlags::FUTURE_ANNOTATIONS)
+        || rustpython_compiler::codegen::preprocess::has_future_annotations(module);
+    if matches!(mode, crate::compile::Mode::Single)
+        && let ast::Mod::Module(module) = module
+    {
+        rustpython_compiler::codegen::preprocess::preprocess_statements(
+            &mut module.body,
+            opts.optimize,
+            future_annotations,
+            syntax_check_only,
+        );
+    } else {
+        rustpython_compiler::codegen::preprocess::preprocess_mod(
+            module,
+            opts.optimize,
+            future_annotations,
+            syntax_check_only,
+        );
+    }
+}
+
+/// CPython 3.14 `compile(ast_obj, ..., flags=PyCF_*_AST)`: convert and
+/// validate the public tree, preprocess it, then convert the native tree back
+/// to a fresh public `_ast` object.
+pub fn preprocess_object_to_object(
+    object: PyObjectRef,
+    source: &str,
+    mode: crate::compile::Mode,
+    opts: crate::compile::CompileOpts,
+    syntax_check_only: bool,
+) -> crate::PyResult {
+    let ast_module = crate::importing::importhook(
+        "_ast",
+        PY_NULL,
+        PY_NULL,
+        0,
+        crate::call::take_last_exec_ctx(),
+    )?;
+    let mut converter = ObjectConverter {
+        ast_module,
+        depth: 0,
+    };
+    let mut module = converter.module(object)?;
+    crate::astcompiler::validate::validate_ast(&module)?;
+    preprocess_module(&mut module, mode, opts, syntax_check_only);
+    module_to_object(module, source, mode, ast_module)
+}
+
 struct ObjectConverter {
     ast_module: PyObjectRef,
     depth: usize,
@@ -1636,16 +1695,28 @@ fn fstring(
 }
 
 pub fn parse_to_object(source: &str, mode: crate::compile::Mode) -> crate::PyResult {
-    let parsed = match mode {
+    parse_to_object_with_opts(source, mode, crate::compile::CompileOpts::default(), true)
+}
+
+/// CPython 3.14 `Py_CompileStringObject` AST-returning branch: parse, run
+/// `_PyCompile_AstPreprocess`, and expose the resulting native tree.
+pub fn parse_to_object_with_opts(
+    source: &str,
+    mode: crate::compile::Mode,
+    opts: crate::compile::CompileOpts,
+    syntax_check_only: bool,
+) -> crate::PyResult {
+    let mut module = match mode {
         crate::compile::Mode::Eval => parser::parse_expression(source)
-            .map(|parsed| ParsedRoot::Expression(parsed.into_syntax())),
+            .map(|parsed| ast::Mod::Expression(parsed.into_syntax())),
         crate::compile::Mode::Exec
         | crate::compile::Mode::Single
         | crate::compile::Mode::BlockExpr => {
-            parser::parse_module(source).map(|parsed| ParsedRoot::Module(parsed.into_syntax()))
+            parser::parse_module(source).map(|parsed| ast::Mod::Module(parsed.into_syntax()))
         }
     }
     .map_err(|error| crate::PyError::syntax_error(error.to_string()))?;
+    preprocess_module(&mut module, mode, opts, syntax_check_only);
 
     let ast_module = crate::importing::importhook(
         "_ast",
@@ -1654,16 +1725,25 @@ pub fn parse_to_object(source: &str, mode: crate::compile::Mode) -> crate::PyRes
         0,
         crate::call::take_last_exec_ctx(),
     )?;
+    module_to_object(module, source, mode, ast_module)
+}
+
+fn module_to_object(
+    module: ast::Mod,
+    source: &str,
+    mode: crate::compile::Mode,
+    ast_module: PyObjectRef,
+) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(ast_module);
     let converter = Converter { source, ast_module };
-    match parsed {
-        ParsedRoot::Expression(module) => converter.node(
+    match module {
+        ast::Mod::Expression(module) => converter.node(
             "Expression",
             None,
             &[("body", converter.expr(&module.body)?)],
         ),
-        ParsedRoot::Module(module) => {
+        ast::Mod::Module(module) => {
             let root_name = if matches!(mode, crate::compile::Mode::Single) {
                 "Interactive"
             } else {
@@ -1681,11 +1761,6 @@ pub fn parse_to_object(source: &str, mode: crate::compile::Mode) -> crate::PyRes
             }
         }
     }
-}
-
-enum ParsedRoot {
-    Module(ast::ModModule),
-    Expression(ast::ModExpression),
 }
 
 struct Converter<'a> {

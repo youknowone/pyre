@@ -8064,7 +8064,7 @@ const PYCF_IGNORE_COOKIE: i64 = 0x0800;
 const PYCF_TYPE_COMMENTS: i64 = 0x4000_0000;
 const PYCF_ALLOW_TOP_LEVEL_AWAIT: i64 = 0x2000;
 const PYCF_ALLOW_INCOMPLETE_INPUT: i64 = 0x4000;
-const PYCF_OPTIMIZED_AST: i64 = 0x8000;
+const PYCF_OPTIMIZED_AST: i64 = 0x8000 | PYCF_ONLY_AST;
 const PYCF_ACCEPT_NULL_BYTES: i64 = 0x1000_0000;
 /// `future.py` `allowed_flags` — the union of the `__future__`
 /// `compiler_flag` bits (`CO_FUTURE_DIVISION` … `CO_FUTURE_ANNOTATIONS`),
@@ -8234,10 +8234,8 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         crate::call::take_last_exec_ctx(),
     )?;
     let ast_type = crate::baseobjspace::getattr_str(ast_module, "AST")?;
-    let source_str = if unsafe { crate::baseobjspace::isinstance_w(source, ast_type) } {
-        if flags & PYCF_ONLY_AST != 0 {
-            return Ok(source);
-        }
+    let source_is_ast = unsafe { crate::baseobjspace::isinstance_w(source, ast_type) };
+    let source_str = if source_is_ast {
         None
     } else {
         Some(source_as_str(
@@ -8259,12 +8257,28 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         ..Default::default()
     };
     if flags & PYCF_ONLY_AST != 0 {
-        return crate::module::_ast::convert::parse_to_object(
-            source_str
-                .as_deref()
-                .expect("AST input returned above for ONLY_AST"),
-            mode,
-        );
+        // CPython 3.14 bltinmodule.c:847 / pythonrun.c:1524:
+        // plain ONLY_AST runs syntax-only preprocessing; OPTIMIZED_AST
+        // includes ONLY_AST and enables constant folding.
+        let syntax_check_only = flags & PYCF_OPTIMIZED_AST == PYCF_ONLY_AST;
+        return if source_is_ast {
+            crate::module::_ast::convert::preprocess_object_to_object(
+                source,
+                "",
+                mode,
+                opts,
+                syntax_check_only,
+            )
+        } else {
+            crate::module::_ast::convert::parse_to_object_with_opts(
+                source_str
+                    .as_deref()
+                    .expect("non-AST source has decoded text"),
+                mode,
+                opts,
+                syntax_check_only,
+            )
+        };
     }
     if source_str.is_none() {
         let code = crate::module::_ast::convert::compile_object(source, &filename, mode, opts)?;

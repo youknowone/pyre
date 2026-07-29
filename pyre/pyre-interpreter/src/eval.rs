@@ -7478,4 +7478,27 @@ except TypeError:
             assert_eq!(w_int_get_value(result), 1);
         }
     }
+
+    #[test]
+    fn test_compile_optimized_ast_folds_debug_for_source_and_ast_input() {
+        crate::importing::install_builtin_modules();
+        let source = "\
+import _ast
+raw = compile('a*__debug__', 'f.py', 'exec', flags=_ast.PyCF_ONLY_AST)
+opt_source = compile('a*__debug__', 'f.py', 'exec', flags=_ast.PyCF_OPTIMIZED_AST)
+opt_tree = compile(raw, 'f.py', 'exec', flags=_ast.PyCF_OPTIMIZED_AST)
+result = (
+    isinstance(raw.body[0].value.right, _ast.Name)
+    and isinstance(opt_source.body[0].value.right, _ast.Constant)
+    and opt_source.body[0].value.right.value is True
+    and isinstance(opt_tree.body[0].value.right, _ast.Constant)
+    and opt_tree.body[0].value.right.value is True
+)";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("PyCF_OPTIMIZED_AST compile failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
 }

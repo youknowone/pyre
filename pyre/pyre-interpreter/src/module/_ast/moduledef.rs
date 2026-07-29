@@ -256,7 +256,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("PyCF_ONLY_AST", 0x0400i64),
         ("PyCF_ALLOW_TOP_LEVEL_AWAIT", 0x2000),
         ("PyCF_TYPE_COMMENTS", 0x4000_0000),
-        ("PyCF_OPTIMIZED_AST", 0x8000),
+        // CPython 3.14 Include/cpython/compile.h: requesting an optimized
+        // tree necessarily requests an AST result as well.
+        ("PyCF_OPTIMIZED_AST", 0x8000 | 0x0400),
     ] {
         crate::module_ns_store(ns, name, pyre_object::w_int_new(*value));
     }
