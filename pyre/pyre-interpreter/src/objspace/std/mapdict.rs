@@ -417,6 +417,27 @@ pub unsafe fn instance_node_setdictvalue(
     flag
 }
 
+/// Whether `map` is rooted at a `DevolvedDictTerminator` (mapdict.py:382),
+/// i.e. the instance has spilled its attributes into a real dictionary.
+///
+/// A devolved map no longer names the instance's attributes, and it does not
+/// change when one is added, so a JIT fold that re-proves "no instance
+/// attribute shadows this name" by pinning the map value is unsound here and
+/// must decline instead.
+///
+/// # Safety
+/// `map`, when non-null, must be a live map node.
+pub unsafe fn map_is_devolved(map: MapRef) -> bool {
+    if map.is_null() {
+        return false;
+    }
+    let terminator = unsafe { (*map).terminator() };
+    if terminator.is_null() {
+        return false;
+    }
+    unsafe { (*terminator).as_terminator() }.kind == TerminatorKind::Devolved
+}
+
 /// `getdictvalue` routed to the mapdict node layer (mapdict.py:846-847
 /// `MapdictDictSupport.getdictvalue` → `map.read(self, attrname, DICT)`).
 /// Returns the value or `None` when the attribute is absent.
