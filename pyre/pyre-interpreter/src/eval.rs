@@ -7868,4 +7868,33 @@ for constructor in (bytes, bytearray):
             assert!(crate::baseobjspace::is_true(result).unwrap());
         }
     }
+
+    #[test]
+    fn test_bytes_no_arg_methods_reject_extra_arguments() {
+        let source = "\
+names = (
+    'capitalize', 'lower', 'upper', 'swapcase', 'title',
+    'isdigit', 'isalpha', 'isalnum', 'isspace', 'isascii',
+    'isupper', 'islower', 'istitle',
+)
+result = True
+for value in (b'x', bytearray(b'x')):
+    owner = type(value).__name__
+    for name in names:
+        try:
+            getattr(value, name)(42)
+        except TypeError as exc:
+            result = result and str(exc) == (
+                owner + '.' + name + '() takes no arguments (1 given)'
+            )
+        else:
+            result = False
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytes-like no-argument method validation failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
 }

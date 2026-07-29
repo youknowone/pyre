@@ -17901,8 +17901,21 @@ fn cut_bytes_like(recv: PyObjectRef, piece: &[u8]) -> PyObjectRef {
     new_bytes_like(recv, piece)
 }
 
+/// `interpindirect2app(W_AbstractBytesObject.descr_*)` /
+/// `interp2app(W_BytearrayObject.descr_*)` gateway arity for methods whose
+/// upstream signature is only `(self, space)`.
+fn bytes_require_no_args(args: &[PyObjectRef], name: &str) -> Result<(), crate::PyError> {
+    crate::type_methods::require_receiver(args, name)?;
+    let owner = if unsafe { pyre_object::bytearrayobject::is_bytearray(args[0]) } {
+        "bytearray"
+    } else {
+        "bytes"
+    };
+    crate::type_methods::arity_no_args(args, &format!("{owner}.{name}"))
+}
+
 fn bytes_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::require_receiver(args, "upper")?;
+    bytes_require_no_args(args, "upper")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let out: Vec<u8> = data.iter().map(|b| b.to_ascii_uppercase()).collect();
     Ok(new_bytes_like(args[0], &out))
@@ -17910,7 +17923,7 @@ fn bytes_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 
 /// `bytesobject.py:247 descr_lower` — ASCII-only case mapping.
 fn bytes_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::require_receiver(args, "lower")?;
+    bytes_require_no_args(args, "lower")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let out: Vec<u8> = data.iter().map(|b| b.to_ascii_lowercase()).collect();
     Ok(new_bytes_like(args[0], &out))
@@ -18435,6 +18448,7 @@ fn bytes_all_nonempty(data: &[u8], pred: impl Fn(u8) -> bool) -> bool {
 }
 
 fn bytes_method_isdigit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    bytes_require_no_args(args, "isdigit")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     Ok(pyre_object::w_bool_from(bytes_all_nonempty(data, |b| {
         b.is_ascii_digit()
@@ -18442,6 +18456,7 @@ fn bytes_method_isdigit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 fn bytes_method_isalpha(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    bytes_require_no_args(args, "isalpha")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     Ok(pyre_object::w_bool_from(bytes_all_nonempty(data, |b| {
         b.is_ascii_alphabetic()
@@ -18449,6 +18464,7 @@ fn bytes_method_isalpha(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 fn bytes_method_isalnum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    bytes_require_no_args(args, "isalnum")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     Ok(pyre_object::w_bool_from(bytes_all_nonempty(data, |b| {
         b.is_ascii_alphanumeric()
@@ -18456,6 +18472,7 @@ fn bytes_method_isalnum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 fn bytes_method_isspace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    bytes_require_no_args(args, "isspace")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     Ok(pyre_object::w_bool_from(bytes_all_nonempty(data, |b| {
         BYTES_WHITESPACE.contains(&b)
@@ -18465,12 +18482,14 @@ fn bytes_method_isspace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// `bytes.isascii` / `bytearray.isascii` — every byte is <= 0x7F.
 /// An empty buffer is ASCII (`descr_isascii` returns True on no bytes).
 fn bytes_method_isascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    bytes_require_no_args(args, "isascii")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     Ok(pyre_object::w_bool_from(data.is_ascii()))
 }
 
 /// `bytes.isupper` — at least one cased byte and no lowercase byte.
 fn bytes_method_isupper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    bytes_require_no_args(args, "isupper")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let mut cased = false;
     for &b in data {
@@ -18486,6 +18505,7 @@ fn bytes_method_isupper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// `bytes.islower` — at least one cased byte and no uppercase byte.
 fn bytes_method_islower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    bytes_require_no_args(args, "islower")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let mut cased = false;
     for &b in data {
@@ -18502,6 +18522,7 @@ fn bytes_method_islower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// `bytes.istitle` — titlecased: every run of cased bytes starts with an
 /// uppercase byte followed by lowercase, with at least one cased byte.
 fn bytes_method_istitle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    bytes_require_no_args(args, "istitle")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let mut cased = false;
     let mut prev_cased = false;
@@ -18621,6 +18642,7 @@ fn bytes_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// run is uppercased, the rest lowercased; non-alphabetic bytes reset
 /// the run.
 fn bytes_method_title(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    bytes_require_no_args(args, "title")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let mut prev_cased = false;
     let out: Vec<u8> = data
@@ -18646,6 +18668,7 @@ fn bytes_method_title(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// `bytes.capitalize` — ASCII: first byte uppercased, the rest
 /// lowercased.
 fn bytes_method_capitalize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    bytes_require_no_args(args, "capitalize")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let out: Vec<u8> = data
         .iter()
@@ -18663,6 +18686,7 @@ fn bytes_method_capitalize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 
 /// `bytes.swapcase` — ASCII: swap the case of each cased byte.
 fn bytes_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    bytes_require_no_args(args, "swapcase")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let out: Vec<u8> = data
         .iter()
