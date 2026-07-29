@@ -2242,11 +2242,28 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// The receiver-layout-specific half of the LOAD_METHOD fold: which field the
+/// walker guards to keep "no instance attribute shadows this method" true for
+/// the life of the trace.
+///
+/// `load_method_fast_path` proved the property once, at record time; this is
+/// what re-proves it on every execution.  One variant per layout whose
+/// non-allocating dictionary peek that predicate covers.
+enum ShadowGuard {
+    /// A `W_ObjectObject` receiver: pin the mapdict map, so adding
+    /// `obj.<name>` grows the map chain and side-exits.
+    InstanceMap(*const u8),
+    /// A `W_BaseException` receiver: pin `w_dict` at null, so the lazy
+    /// allocation `e.<name> = ...` performs side-exits.  Carries the kind
+    /// because the field descrs are grouped per `ExcKind` vtable.
+    ExceptionDictIsNull(pyre_object::interp_exceptions::ExcKind),
+}
+
 /// `callmethod.py LOAD_METHOD` method-cache fold for the
 /// codewriter's method-form `LOAD_ATTR` residual.  The safety oracle is the
 /// interpreter's `load_method_fast_path`: it declines custom
-/// `__getattribute__`, uncacheable types, non-function descriptors,
-/// shadowing instance attributes, and non-instance receivers.  On success the
+/// `__getattribute__`, uncacheable types, non-function descriptors, and
+/// shadowing instance attributes.  On success the
 /// walker emits the guards that keep that decision stable, then writes
 /// `w_descr` as a green constant so the following `CALL` can use the existing
 /// constant-callee inline path.
@@ -2280,23 +2297,38 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     if unsafe { resolve_inlinable_callee(w_descr) }.is_none() {
         return Ok(None);
     }
-    let map = unsafe {
-        let inst = &*(concrete_obj as *const pyre_object::W_ObjectObject);
-        inst.map
-    };
-    if map.is_null() {
+    // `space.type` reaches an exception's class through the kind registry when
+    // the generic stub is still installed, and the `w_class` guard below can
+    // only pin a class the slot actually holds.
+    if !std::ptr::eq(unsafe { (*concrete_obj).w_class }, w_type) {
         return Ok(None);
     }
+    let shadow = unsafe {
+        if pyre_object::is_instance(concrete_obj) {
+            let map = (*(concrete_obj as *const pyre_object::W_ObjectObject)).map;
+            if map.is_null() {
+                return Ok(None);
+            }
+            ShadowGuard::InstanceMap(map)
+        } else if pyre_object::is_exception(concrete_obj) {
+            ShadowGuard::ExceptionDictIsNull(pyre_object::w_exception_get_kind(concrete_obj))
+        } else {
+            // `load_method_fast_path` admits only the layouts above; keep the
+            // two in step so a new layout there cannot reach an emit that has
+            // no shadowing guard for it.
+            return Ok(None);
+        }
+    };
 
-    // guard_class(obj, &INSTANCE_TYPE): receiver is a user instance, so the
-    // `w_class` and map fields read below are valid.
-    let instance_type_addr = &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64;
+    // guard_class(obj, ob_type): pins the payload layout, so the `w_class` and
+    // shadowing-slot reads below name the fields they were recorded against.
+    let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(instance_type_addr);
+        let type_const = ctx.trace_ctx.const_int(physical_type);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
         ctx.trace_ctx
             .heap_cache_mut()
-            .class_now_known(obj, instance_type_addr);
+            .class_now_known(obj, physical_type);
     }
 
     // Pin the Python-level receiver class (`w_class`) exactly.  This is the
@@ -2325,15 +2357,24 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[vt_op, vt_const])?;
     ctx.trace_ctx.heap_cache_mut().replace_box(vt_op, vt_const);
 
-    // mapdict.py LOAD_ATTR caching: guard the instance map so adding a
-    // shadowing `obj.method` attribute changes shape and side-exits before the
-    // constant descriptor is reused.
-    let map_op = walker_record_getfield_gc_i_uncached(ctx, obj, crate::descr::object_map_descr());
-    let map_const = ctx.trace_ctx.const_int(map as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[map_op, map_const])?;
+    // Re-prove the shadowing precondition: growing an instance attribute named
+    // like the method must side-exit before the constant descriptor is reused.
+    // mapdict.py LOAD_ATTR caching does this by pinning the map; an exception
+    // has no map, and pins the still-unallocated `w_dict` slot instead.
+    let (slot_op, slot_const) = match shadow {
+        ShadowGuard::InstanceMap(map) => (
+            walker_record_getfield_gc_i_uncached(ctx, obj, crate::descr::object_map_descr()),
+            ctx.trace_ctx.const_int(map as i64),
+        ),
+        ShadowGuard::ExceptionDictIsNull(kind) => (
+            walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_exception_dict_descr(kind)),
+            ctx.trace_ctx.const_ref(0),
+        ),
+    };
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[slot_op, slot_const])?;
     ctx.trace_ctx
         .heap_cache_mut()
-        .replace_box(map_op, map_const);
+        .replace_box(slot_op, slot_const);
 
     let method_const = ctx.trace_ctx.const_ref(w_descr as i64);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, method_const)?;

@@ -8719,13 +8719,18 @@ pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef,
 /// `CALL`.
 ///
 /// Returns `Some((w_type, version_tag, w_descr))` for the
-/// plain-instance-method case the fast path binds `self` for
-/// (callmethod.py:55-68); `None` (fall back to `getattr`) for every other
-/// receiver / descriptor shape.  Mirror of `callmethod.py`:
-/// `has_object_getattribute()` (line 33), `version_tag()` (line 56),
-/// `_pure_lookup_where_with_method_cache` (line 59),
-/// `flag_method_descriptor` (line 66), and the instance-dict shadowing
-/// check (line 66).
+/// plain-instance-method case the fast path binds `self` for; `None` (fall
+/// back to `getattr`) for every other receiver / descriptor shape.  Mirror of
+/// `callmethod.py`: `has_object_getattribute()`, `version_tag()`,
+/// `_pure_lookup_where_with_method_cache`, `flag_method_descriptor`, and the
+/// instance-dict shadowing check.
+///
+/// The gate is the receiver's Python class, never its payload layout —
+/// `LOAD_METHOD` opens with `w_type = space.type(w_obj)` and asks nothing else
+/// about `w_obj`.  An exception subclass instance is a `W_BaseException`
+/// rather than a `W_ObjectObject`, so a layout gate here would leave every
+/// `e.method()` on it resolving through `getattr` into a fresh bound `Method`,
+/// which the tracer cannot inline.
 ///
 /// # Safety
 /// `w_obj` must be a valid object pointer (null tolerated).
@@ -8733,13 +8738,11 @@ pub unsafe fn load_method_fast_path(
     w_obj: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, u64, PyObjectRef)> {
-    if w_obj.is_null() || !is_instance(w_obj) {
+    if w_obj.is_null() {
         return None;
     }
-    let w_type = w_instance_get_type(w_obj);
-    if w_type.is_null() {
-        return None;
-    }
+    // callmethod.py `w_type = space.type(w_obj)`.
+    let w_type = crate::typedef::r#type(w_obj)?.as_ptr();
     // typeobject.py:56-58 `version_tag = self.version_tag()`; `None`
     // (uncacheable) is `0` here.
     let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
@@ -8764,11 +8767,9 @@ pub unsafe fn load_method_fast_path(
     if !pyre_object::typeobject::w_type_get_flag_method_descriptor(w_descr_type.as_ptr()) {
         return None;
     }
-    // callmethod.py:66-67 `w_value = w_obj.getdictvalue(space, name)`: a
-    // shadowing instance attribute means the method is not bound.
-    if crate::objspace::std::mapdict::instance_node_getdictvalue(w_obj, Wtf8::new(name)).is_some() {
-        return None;
-    }
+    // callmethod.py `w_value = w_obj.getdictvalue(space, name)`: a shadowing
+    // instance attribute means the method is not bound.
+    instance_dict_does_not_shadow(w_obj, name)?;
     Some((w_type, version_tag, w_descr))
 }
 
@@ -8817,6 +8818,46 @@ pub unsafe fn classmethod_on_type_fast_path(
         return None;
     }
     Some((w_type, version_tag, w_func))
+
+/// `callmethod.py`'s `w_obj.getdictvalue(space, name)` shadowing check,
+/// restricted to a probe that neither allocates nor runs Python.
+///
+/// [`getdict`] installs a fresh instance dictionary on several layouts
+/// (exceptions, bytes, bytearray), and a `LOAD_METHOD` that materialises one
+/// has changed the receiver just by looking at it.  The tracer shares this
+/// predicate, so it must also stay free of anything that could run a user
+/// `__eq__`.
+///
+/// `Some(())` = no instance attribute of this name shadows the type lookup,
+/// proven without touching the receiver.  `None` = either a shadowing entry,
+/// or a layout this cannot answer for — both decline the fast path.
+///
+/// # Safety
+/// `w_obj` must be a valid, non-null object pointer.
+unsafe fn instance_dict_does_not_shadow(w_obj: PyObjectRef, name: &str) -> Option<()> {
+    if is_instance(w_obj) {
+        // Mapdict side storage: the entry lookup reads the map chain and
+        // allocates nothing.
+        return crate::objspace::std::mapdict::instance_node_getdictvalue(w_obj, Wtf8::new(name))
+            .is_none()
+            .then_some(());
+    }
+    if pyre_object::is_exception(w_obj) {
+        // The `descr_reduce` peek: the raw `w_dict` slot, `PY_NULL` until the
+        // instance grows a dictionary.  A receiver that already carries one is
+        // declined rather than probed, since `finditem_str` on it can run a
+        // user `__eq__` against a colliding non-string key.  This is stricter
+        // than `callmethod.py`, and it is also what lets the tracer express
+        // the shadowing precondition as a single "slot is null" guard.
+        return pyre_object::interp_exceptions::w_exception_peek_dict(w_obj)
+            .is_null()
+            .then_some(());
+    }
+    // Every other layout (list / str / tuple / native-payload subclasses)
+    // keeps its instance attributes somewhere this probe does not read yet.
+    // Adding a layout means adding its non-allocating dictionary peek here and
+    // the matching shadowing guard on the tracer side.
+    None
 }
 
 /// The `getattr(w_obj, name)` shape that reduces, purely, to

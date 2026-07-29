@@ -2602,6 +2602,26 @@ pub fn w_exception_context_descr(kind: ExcKind) -> DescrRef {
     field_descr_from_group(group, 3)
 }
 
+/// Field descr for `W_BaseException.w_dict` (the lazily allocated instance
+/// dictionary), the last slot of the per-kind exception descr group.  The
+/// LOAD_METHOD method-cache fold reads it to pin the receiver at "carries no
+/// instance dictionary", which is what makes the folded descriptor safe: a
+/// later `e.<name> = ...` allocates the dictionary and side-exits.
+pub fn w_exception_dict_descr(kind: ExcKind) -> DescrRef {
+    let idx = kind as u8 as usize;
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    if cache[idx].is_none() {
+        cache[idx] = Some(build_w_exception_group(kind));
+    }
+    let group = cache[idx].as_ref().unwrap();
+    debug_assert_eq!(
+        group.field_descrs[20].offset(),
+        pyre_object::interp_exceptions::EXC_W_DICT_OFFSET,
+        "exception descr group index 20 is no longer w_dict",
+    );
+    field_descr_from_group(group, 20)
+}
+
 /// Field descriptor for `W_BaseException.w_traceback`, sharing the
 /// per-kind exception allocation descriptor with the other exception slots.
 pub fn w_exception_traceback_descr(kind: ExcKind) -> DescrRef {
