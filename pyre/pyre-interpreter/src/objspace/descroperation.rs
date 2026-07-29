@@ -4389,7 +4389,10 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // type | type — PEP 604 union types (Python 3.10+)
         // PyPy: typeobject.py descr_or → _pypy_generic_alias._create_union,
         // which collapses identical operands (`int | int` is `int`).
-        if unionable(a) && unionable(b) {
+        // `None | type` reaches the type's reflected union descriptor, but
+        // `None | None` has no type / UnionType / GenericAlias descriptor on
+        // either side and must remain an unsupported bitwise operation.
+        if unionable(a) && unionable(b) && !(is_none(a) && is_none(b)) {
             return crate::_pypy_generic_alias::create_union(a, b);
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
