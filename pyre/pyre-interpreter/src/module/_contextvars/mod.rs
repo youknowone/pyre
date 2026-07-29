@@ -1,10 +1,7 @@
 //! _contextvars module — PyPy: `lib_pypy/_contextvars.py`.
 //!
-//! Stub providing ContextVar / Context / Token shells.  `ContextVar`
-//! returns an opaque object with `.get(default=None)` and `.set(value)`
-//! attached as builtin functions — adequate for callers that only use
-//! the decorator-style API; full contextvar propagation across tasks is
-//! not modelled.
+//! Stub providing ContextVar / Context / Token shells.  Full contextvar
+//! propagation across tasks is not modelled yet.
 
 use pyre_object::*;
 use std::sync::OnceLock;
@@ -35,57 +32,146 @@ fn new_context(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_instance_new(context_type()))
 }
 
-/// `ContextVar` instance type — needs `__dict__` so `name` / `get` / `set`
-/// can be stored as instance attributes.  Plain `object` instances reject
-/// `setattr`, leaving the shell without its methods.
 fn context_var_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
     *TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("ContextVar", |_| {});
+        let tp = crate::typedef::make_builtin_type("_contextvars.ContextVar", |ns| {
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__new__",
+                    crate::typedef::make_new_descr(context_var_new),
+                );
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__init__",
+                    crate::make_builtin_function("__init__", |_| Ok(w_none())),
+                );
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "get",
+                    crate::make_builtin_function("get", context_var_get),
+                );
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "set",
+                    crate::make_builtin_function_with_arity("set", context_var_set, 2),
+                );
+                // PyPy lib_pypy/_contextvars.py ContextVar.__class_getitem__
+                // and CPython 3.14 Python/context.c PyContextVar_methods.
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__class_getitem__",
+                    pyre_object::function::w_classmethod_new(crate::make_builtin_function(
+                        "__class_getitem__",
+                        crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    )),
+                );
+            }
+        });
         unsafe { typeobject::w_type_set_hasdict(tp, true) };
+        unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
         tp as usize
     }) as PyObjectRef
 }
 
-fn context_var(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `interp_contextvars` ContextVar(name, *, default=MISSING) — name is required.
-    if args.is_empty() {
+fn context_var_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // PyPy lib_pypy/_contextvars.py ContextVar.__init__(name, *,
+    // default=_NO_DEFAULT): the type-call ABI supplies cls at position zero.
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if pos.len() < 2 {
         return Err(crate::PyError::type_error(
             "ContextVar() missing required argument: 'name'",
         ));
     }
-    let obj = w_instance_new(context_var_type());
-    let _ = crate::baseobjspace::setattr_str(obj, "name", args[0]);
-    let _ = crate::baseobjspace::setattr_str(
-        obj,
-        "get",
-        // `W_ContextVar.get(*default)` raises LookupError when no
-        // current value and no default supplied.  Both accessors live in the
-        // instance dict, which is read without the descriptor protocol, so
-        // they receive no bound receiver.
-        crate::make_builtin_function("get", |args| {
-            if let Some(&w_default) = args.first() {
-                return Ok(w_default);
+    if pos.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "ContextVar() takes at most 1 positional argument ({} given)",
+            pos.len() - 1
+        )));
+    }
+    if !unsafe { is_str(pos[1]) } {
+        return Err(crate::PyError::type_error(
+            "context variable name must be a str",
+        ));
+    }
+    if let Some(dict) = kwargs {
+        for (key, _) in unsafe { w_dict_str_entries_wtf8(dict) } {
+            let key = key.as_str().unwrap_or("");
+            if key != "__pyre_kw__" && key != "default" {
+                return Err(crate::PyError::type_error(format!(
+                    "'{key}' is an invalid keyword argument for ContextVar()"
+                )));
             }
-            Err(crate::PyError::lookup_error(
-                "context variable has no value and no default supplied",
-            ))
-        }),
-    );
-    let _ = crate::baseobjspace::setattr_str(
-        obj,
-        "set",
-        crate::make_builtin_function_with_arity("set", |_| Ok(w_none()), 1),
-    );
+        }
+    }
+    let obj = w_instance_new(context_var_type());
+    crate::baseobjspace::setattr_str(obj, "name", pos[1])?;
+    if let Some(default) = crate::builtins::kwarg_get(kwargs, "default") {
+        crate::baseobjspace::setattr_str(obj, "_default", default)?;
+    }
     Ok(obj)
+}
+
+fn context_var_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "get() takes from 1 to 2 positional arguments but {} were given",
+            args.len()
+        )));
+    }
+    if let Some(&default) = args.get(1) {
+        return Ok(default);
+    }
+    if let Some(default) = crate::baseobjspace::findattr_result(args[0], "_default")? {
+        return Ok(default);
+    }
+    Err(crate::PyError::lookup_error(
+        "context variable has no value and no default supplied",
+    ))
+}
+
+fn context_var_set(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(w_none())
+}
+
+fn token_type() -> PyObjectRef {
+    static TYPE: OnceLock<usize> = OnceLock::new();
+    *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("_contextvars.Token", |ns| unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                "__new__",
+                crate::typedef::make_new_descr(|_| {
+                    Err(crate::PyError::type_error(
+                        "Tokens can only be created by ContextVars",
+                    ))
+                }),
+            );
+            // PyPy lib_pypy/_contextvars.py Token.__class_getitem__ and
+            // CPython 3.14 Python/context.c PyContextTokenType_methods.
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                "__class_getitem__",
+                pyre_object::function::w_classmethod_new(crate::make_builtin_function(
+                    "__class_getitem__",
+                    crate::_pypy_generic_alias::generic_alias_class_getitem,
+                )),
+            );
+        });
+        unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 crate::py_module! {
     "_contextvars",
+    interpleveldefs: {
+        "ContextVar" => context_var_type(),
+        "Token" => token_type(),
+    },
     functions: {
-        "ContextVar"   / * = context_var,
         "Context"      / 0 = new_context,
-        "Token"        / 0 = |_| Ok(w_none()),
         "copy_context" / 0 = new_context,
     },
 }

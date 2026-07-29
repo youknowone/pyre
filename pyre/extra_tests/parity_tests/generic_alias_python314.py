@@ -5,6 +5,7 @@ import pickle
 import weakref
 from array import array
 from collections import deque
+from contextvars import ContextVar, Token
 from ctypes import Array as CTypesArray
 from os import DirEntry
 from string.templatelib import Interpolation, Template
@@ -88,6 +89,13 @@ for template_type in (Template, Interpolation):
     assert template_alias.__args__ == (T,)
     assert copy.copy(template_alias) == template_alias
     assert copy.deepcopy(template_alias) == template_alias
+
+for context_type in (ContextVar, Token):
+    context_alias = context_type[T]
+    assert context_alias.__origin__ is context_type
+    assert context_alias.__args__ == (T,)
+    assert copy.copy(context_alias) == context_alias
+    assert copy.deepcopy(context_alias) == context_alias
 
 nested = GenericAlias(list, ([T, [U]],))
 assert nested.__parameters__ == (T, U)
