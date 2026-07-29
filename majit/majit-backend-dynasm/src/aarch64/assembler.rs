@@ -3813,15 +3813,26 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    /// Map a float comparison OpCode to a condition code (after ucomisd).
+    /// Map a float comparison OpCode to a condition code (after `fcmp`).
+    ///
+    /// `fcmp` sets NZCV = 0b0011 when either operand is NaN, so C is SET and
+    /// V is SET for an unordered compare.  Only conditions that are false in
+    /// that state may be used for `<`, `<=`, `>`, `>=`; `==` must be false and
+    /// `!=` true.  `opassembler.py:310-315` picks exactly these:
+    /// `VFP_LT` = `lo` (C clear), `VFP_LE` = `ls` (C clear or Z set),
+    /// `gt` (Z clear and N == V), `ge` (N == V), `eq`, `ne`.
+    ///
+    /// `hi`/`hs` — the x86 `seta`/`setae` spelling, correct after `ucomisd`
+    /// because that sets CF on unordered — are both TRUE after an unordered
+    /// `fcmp` and must not be used here.
     fn float_opcode_to_cc(opcode: OpCode) -> u8 {
         match opcode {
-            OpCode::FloatLt => CC_B,  // ucomisd: below = less than
-            OpCode::FloatLe => CC_BE, // below or equal
-            OpCode::FloatGt => CC_A,  // above
-            OpCode::FloatGe => CC_AE, // above or equal
-            OpCode::FloatEq => CC_E,  // equal
-            OpCode::FloatNe => CC_NE, // not equal
+            OpCode::FloatLt => CC_B,  // lo: C clear
+            OpCode::FloatLe => CC_BE, // ls: C clear or Z set
+            OpCode::FloatGt => CC_G,  // gt: Z clear and N == V
+            OpCode::FloatGe => CC_GE, // ge: N == V
+            OpCode::FloatEq => CC_E,  // eq
+            OpCode::FloatNe => CC_NE, // ne
             _ => CC_E,
         }
     }
