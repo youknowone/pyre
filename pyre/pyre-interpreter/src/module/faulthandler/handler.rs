@@ -4,7 +4,6 @@
 //! was renamed to `register_module`; the host_env signal handlers and the
 //! `faulthandler_extract_fd` helper stay private.
 
-
 // faulthandler module — PyPy: pypy/module/faulthandler/.
 //
 // CPython's faulthandler dumps the Python traceback on fatal signals.
@@ -60,27 +59,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_signature(
             "enable",
             |args| {
-            // `handler.py:141-145 enable` — file=None, all_threads=True.
-            let _fd =
-                faulthandler_extract_fd(args.first().copied().unwrap_or(pyre_object::PY_NULL))?;
-            #[cfg(all(unix, feature = "host_env"))]
-            {
-                let ok = rustpython_host_env::faulthandler::enable_fatal_handlers(
-                    faulthandler_signal_handler,
-                    libc::SA_NODEFER | libc::SA_ONSTACK,
-                );
-                if ok {
-                    FAULTHANDLER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return Ok(pyre_object::w_none());
+                // `handler.py:141-145 enable` — file=None, all_threads=True.
+                let _fd =
+                    faulthandler_extract_fd(args.first().copied().unwrap_or(pyre_object::PY_NULL))?;
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    let ok = rustpython_host_env::faulthandler::enable_fatal_handlers(
+                        faulthandler_signal_handler,
+                        libc::SA_NODEFER | libc::SA_ONSTACK,
+                    );
+                    if ok {
+                        FAULTHANDLER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(pyre_object::w_none());
+                    }
+                    return Err(crate::PyError::runtime_error(
+                        "faulthandler.enable: sigaction failed",
+                    ));
                 }
-                return Err(crate::PyError::runtime_error(
-                    "faulthandler.enable: sigaction failed",
-                ));
-            }
-            #[cfg(not(all(unix, feature = "host_env")))]
-            Err(crate::PyError::not_implemented(
-                "faulthandler.enable requires host_env feature",
-            ))
+                #[cfg(not(all(unix, feature = "host_env")))]
+                Err(crate::PyError::not_implemented(
+                    "faulthandler.enable requires host_env feature",
+                ))
             },
             // `enable(file=sys.stderr, all_threads=True, c_stack=True)` —
             // `c_stack` (3.14) selects C-stack dumping; accept and ignore it.
@@ -163,58 +162,59 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_signature(
             "register",
             |args| {
-            let w_signum = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-            if w_signum.is_null() {
-                return Err(crate::PyError::type_error("register() missing signal"));
-            }
-            let signum = (unsafe { pyre_object::w_int_get_value(w_signum) }) as libc::c_int;
-            let fd = faulthandler_extract_fd(args.get(1).copied().unwrap_or(pyre_object::PY_NULL))?;
-            // handler.py:174 `@unwrap_spec(all_threads=int, chain=int)`
-            // with defaults `all_threads=1, chain=0`: the arguments are
-            // coerced as integers (`gateway_int_w`, raising on a non-int),
-            // not by truthiness; `register` then tests `if all_threads:`.  An
-            // omitted keyword leaves a null slot from the signature binding, so
-            // treat null as the default.
-            let all_threads = args
-                .get(2)
-                .copied()
-                .filter(|a| !a.is_null())
-                .map(crate::baseobjspace::gateway_int_w)
-                .transpose()?
-                .unwrap_or(1)
-                != 0;
-            let chain = args
-                .get(3)
-                .copied()
-                .filter(|a| !a.is_null())
-                .map(crate::baseobjspace::gateway_int_w)
-                .transpose()?
-                .unwrap_or(0)
-                != 0;
-            #[cfg(all(unix, feature = "host_env"))]
-            {
-                rustpython_host_env::faulthandler::register_user_signal(
-                    signum,
-                    fd,
-                    all_threads,
-                    chain,
-                    faulthandler_user_handler,
-                )
-                .map_err(|e| {
-                    crate::PyError::os_error_with_errno(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("register: {e}"),
+                let w_signum = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                if w_signum.is_null() {
+                    return Err(crate::PyError::type_error("register() missing signal"));
+                }
+                let signum = (unsafe { pyre_object::w_int_get_value(w_signum) }) as libc::c_int;
+                let fd =
+                    faulthandler_extract_fd(args.get(1).copied().unwrap_or(pyre_object::PY_NULL))?;
+                // handler.py:174 `@unwrap_spec(all_threads=int, chain=int)`
+                // with defaults `all_threads=1, chain=0`: the arguments are
+                // coerced as integers (`gateway_int_w`, raising on a non-int),
+                // not by truthiness; `register` then tests `if all_threads:`.  An
+                // omitted keyword leaves a null slot from the signature binding, so
+                // treat null as the default.
+                let all_threads = args
+                    .get(2)
+                    .copied()
+                    .filter(|a| !a.is_null())
+                    .map(crate::baseobjspace::gateway_int_w)
+                    .transpose()?
+                    .unwrap_or(1)
+                    != 0;
+                let chain = args
+                    .get(3)
+                    .copied()
+                    .filter(|a| !a.is_null())
+                    .map(crate::baseobjspace::gateway_int_w)
+                    .transpose()?
+                    .unwrap_or(0)
+                    != 0;
+                #[cfg(all(unix, feature = "host_env"))]
+                {
+                    rustpython_host_env::faulthandler::register_user_signal(
+                        signum,
+                        fd,
+                        all_threads,
+                        chain,
+                        faulthandler_user_handler,
                     )
-                })?;
-                return Ok(pyre_object::w_none());
-            }
-            #[cfg(not(all(unix, feature = "host_env")))]
-            {
-                let _ = (fd, all_threads, chain);
-                Err(crate::PyError::not_implemented(
-                    "faulthandler.register requires host_env feature",
-                ))
-            }
+                    .map_err(|e| {
+                        crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("register: {e}"),
+                        )
+                    })?;
+                    return Ok(pyre_object::w_none());
+                }
+                #[cfg(not(all(unix, feature = "host_env")))]
+                {
+                    let _ = (fd, all_threads, chain);
+                    Err(crate::PyError::not_implemented(
+                        "faulthandler.register requires host_env feature",
+                    ))
+                }
             },
             crate::Signature::new(
                 vec!["signum", "file", "all_threads", "chain"],
@@ -259,31 +259,41 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "_read_null",
-        crate::make_builtin_function_with_arity(
-            "_read_null",
-            |_| {
-                // `handler.py:225 read_null` — null-pointer deref.
-                let p: *const u8 = std::ptr::null();
-                let _ = unsafe { p.read_volatile() };
-                Ok(pyre_object::w_none())
-            },
-            0,
-        ),
+        crate::make_builtin_function("_read_null", |args| {
+            if args.len() > 1 {
+                return Err(crate::PyError::type_error(format!(
+                    "_read_null() takes at most 1 argument ({} given)",
+                    args.len()
+                )));
+            }
+            if let Some(&release_gil) = args.first() {
+                let _ = crate::baseobjspace::int_w(release_gil)?;
+            }
+            // `handler.py:225 read_null` — null-pointer deref.
+            let p: *const u8 = std::ptr::null();
+            let _ = unsafe { p.read_volatile() };
+            Ok(pyre_object::w_none())
+        }),
     );
     crate::module_ns_store(
         ns,
         "_sigsegv",
-        crate::make_builtin_function_with_arity(
-            "_sigsegv",
-            |_| {
-                #[cfg(unix)]
-                unsafe {
-                    libc::raise(libc::SIGSEGV);
-                }
-                Ok(pyre_object::w_none())
-            },
-            0,
-        ),
+        crate::make_builtin_function("_sigsegv", |args| {
+            if args.len() > 1 {
+                return Err(crate::PyError::type_error(format!(
+                    "_sigsegv() takes at most 1 argument ({} given)",
+                    args.len()
+                )));
+            }
+            if let Some(&release_gil) = args.first() {
+                let _ = crate::baseobjspace::int_w(release_gil)?;
+            }
+            #[cfg(unix)]
+            unsafe {
+                libc::raise(libc::SIGSEGV);
+            }
+            Ok(pyre_object::w_none())
+        }),
     );
     crate::module_ns_store(
         ns,
