@@ -16877,14 +16877,17 @@ fn bytes_count_from_index(arg: PyObjectRef) -> Result<Option<usize>, crate::PyEr
     Ok(Some(count as usize))
 }
 
-fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // args[0] = cls (ignored — bytearray subclasses still allocate the
-    // primitive layout). bytearrayobject.py descr_new accepts:
+fn bytearray_descr_init_value(
+    args: &[PyObjectRef],
+    target: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    // args[0] is the receiver and `target` is its primitive bytearray layout.
+    // bytearrayobject.py descr_init accepts:
     //   bytearray()           → empty
     //   bytearray(int)        → zero-filled buffer of length n
     //   bytearray(bytes-like) → copy of the contents
     //   bytearray(str, encoding[, errors]) → encoded bytes (encoding ignored)
-    // args[0] = cls. `bytearray(source=b'', encoding=None, errors=None)` —
+    // `bytearray(source=b'', encoding=None, errors=None)` —
     // every parameter is positional-or-keyword (bytearrayobject.py
     // descr_init shares bytesobject.newbytesdata_w); `encoding`/`errors`
     // are only valid with a str source.
@@ -16973,11 +16976,10 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             ));
         }
     }
-    // `_from_byte_sequence_loop`: stream the source through `byte_w` (honours
-    // __index__, "byte must be in range(0, 256)"; a non-index element → "'X'
-    // object cannot be interpreted as an integer").  A source with no __iter__
-    // → "cannot convert 'X' object to bytearray"; an error raised by
-    // __iter__/__next__ propagates unchanged.
+    // CPython 3.14 bytearray___init___impl's iterable slow path appends each
+    // converted byte directly to `self`.  This makes the initialized prefix
+    // and its allocation visible if the iterator inspects the receiver, and
+    // leaves that prefix in place if iteration fails.
     unsafe {
         let it = match crate::baseobjspace::iter(arg) {
             Ok(it) => it,
@@ -16991,15 +16993,18 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 return Err(e);
             }
         };
-        let mut buf = Vec::new();
         loop {
             match crate::baseobjspace::next(it) {
-                Ok(item) => buf.push(crate::baseobjspace::byte_w(item, "byte")?),
+                Ok(item) => {
+                    let byte = crate::baseobjspace::byte_w(item, "byte")?;
+                    crate::builtins::bytearray_check_exports(target)?;
+                    pyre_object::bytearrayobject::w_bytearray_vec_mut(target).push(byte);
+                }
                 Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
                 Err(e) => return Err(e),
             }
         }
-        Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf))
+        Ok(target)
     }
 }
 
@@ -20277,15 +20282,26 @@ fn bytearray_method_release_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     Ok(pyre_object::w_none())
 }
 
-/// `bytearrayobject.py:247 descr_init` — materialize the replacement first,
-/// then replace the receiver's resizable storage in one step.
+/// CPython 3.14 `bytearray___init___impl` — clear `self` before converting the
+/// source.  Fast paths may materialize a replacement, while the iterable slow
+/// path above grows `self` incrementally.
 fn bytearray_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "__init__")?;
-    let fresh = bytearray_descr_new_impl(args)?;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(fresh).to_vec() };
     unsafe {
-        crate::builtins::bytearray_check_exports(args[0])?;
-        *pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]) = data;
+        if !pyre_object::bytesobject::bytes_like_data(args[0]).is_empty() {
+            crate::builtins::bytearray_check_exports(args[0])?;
+            pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).clear();
+        }
+    }
+    let fresh = bytearray_descr_init_value(args, args[0])?;
+    if !std::ptr::eq(fresh, args[0]) {
+        let data = unsafe { pyre_object::bytesobject::bytes_like_data(fresh).to_vec() };
+        if !data.is_empty() {
+            unsafe {
+                crate::builtins::bytearray_check_exports(args[0])?;
+                *pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]) = data;
+            }
+        }
     }
     Ok(w_none())
 }
