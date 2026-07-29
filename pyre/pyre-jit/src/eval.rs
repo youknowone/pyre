@@ -611,6 +611,14 @@ unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
     f(&mut ba.w_weakreflifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 }
 
+/// `interp_array.py W_ArrayBase.__del__`: free the raw element buffer when
+/// the managed array header is swept.
+unsafe fn array_object_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_object::interp_array::w_array_dealloc(obj_addr as pyre_object::PyObjectRef);
+    }
+}
+
 /// Reclaim the owned Rust heap (source string, token / error vectors, line
 /// table) of a swept tokenizer iterator, which `register_pyre_class` registers
 /// through the generic no-destructor path.
@@ -2692,15 +2700,37 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // W_Array (`array.array`) — typed payload via `#[pyre_class]`
-    // in AUTO-ID mode; its elements are unboxed scalars in an off-GC
-    // `*mut Vec<u8>` buffer (the bytearray storage model), so the
-    // descriptor reports zero traced pointer fields.  Tail of the tid
-    // chain.
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_object::interp_array::W_Array as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
+    // in AUTO-ID mode. Its elements are unboxed scalars in a raw
+    // `*mut Vec<u8>` buffer, released by W_ArrayBase.__del__; the descriptor
+    // traces the object-resident mapdict, weakref, and indexed-slot fields.
+    // Tail of the tid chain.
+    {
+        let array_descr = <pyre_object::interp_array::W_Array
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+        let array_tid = gc.register_type(
+            TypeInfo::object_subclass_with_gc_ptrs(
+                array_descr.object_size,
+                object_tid,
+                array_descr.ptr_offsets.to_vec(),
+            )
+            .with_destructor_fn(array_object_destructor),
+        );
+        if array_descr.gc_type_id.is_unassigned() {
+            array_descr.gc_type_id.set(array_tid);
+        } else {
+            debug_assert_eq!(array_tid, array_descr.gc_type_id.get());
+        }
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            array_descr.pytype_ptr as usize,
+            array_tid,
+        );
+        pytype_to_tid.insert(array_descr.pytype_ptr as usize, array_tid);
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            array_descr.pytype_ptr as usize,
+            array_descr.ptr_offsets,
+        );
+    }
     // W_Chain (`itertools.chain`) — typed payload via `#[pyre_class]` in
     // AUTO-ID mode.  Both the `w_iterables` source iterator and the current
     // sub-iterator `w_it` are owned solely by the W_Chain (no external

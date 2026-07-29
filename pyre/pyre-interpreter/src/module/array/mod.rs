@@ -1469,6 +1469,13 @@ pub fn init_array_type(ns: PyObjectRef) {
             ),
         )
     };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__weakref__",
+            crate::typedef::make_weakref_descr(PY_NULL),
+        )
+    };
 }
 
 /// `array` module init — `moduledef.py interpleveldefs`.

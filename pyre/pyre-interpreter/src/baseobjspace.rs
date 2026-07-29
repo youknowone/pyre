@@ -4356,6 +4356,28 @@ pub fn getdict(obj: PyObjectRef) -> PyResult {
             return Ok(w_dict);
         }
     }
+    if unsafe { pyre_object::interp_array::is_array(obj) } {
+        let Some(w_type) = crate::typedef::r#type(obj) else {
+            return Ok(PY_NULL);
+        };
+        if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
+            let existing = unsafe { pyre_object::interp_array::w_array_getdict(obj) };
+            if !existing.is_null() {
+                return Ok(existing);
+            }
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(obj);
+            let w_dict = pyre_object::w_dict_new();
+            unsafe {
+                pyre_object::interp_array::w_array_setdict(
+                    pyre_object::gc_roots::shadow_stack_get(root_base),
+                    w_dict,
+                )
+            };
+            return Ok(w_dict);
+        }
+    }
     let w_type = match crate::typedef::r#type(obj) {
         Some(tp) => tp,
         None => return Ok(pyre_object::PY_NULL),
@@ -4399,6 +4421,9 @@ pub(crate) fn native_slot_get(
     if unsafe { pyre_object::is_complex(obj) } {
         return Ok(unsafe { pyre_object::complexobject::w_complex_slot_get(obj, index as usize) });
     }
+    if unsafe { pyre_object::interp_array::is_array(obj) } {
+        return Ok(unsafe { pyre_object::interp_array::w_array_slot_get(obj, index as usize) });
+    }
     let w_dict = getdict(obj)?;
     if w_dict.is_null() {
         return Ok(None);
@@ -4432,6 +4457,10 @@ pub(crate) fn native_slot_set(
         unsafe { pyre_object::complexobject::w_complex_slot_set(obj, index as usize, value) };
         return Ok(true);
     }
+    if unsafe { pyre_object::interp_array::is_array(obj) } {
+        unsafe { pyre_object::interp_array::w_array_slot_set(obj, index as usize, value) };
+        return Ok(true);
+    }
     let w_dict = getdict(obj)?;
     if w_dict.is_null() {
         return Ok(false);
@@ -4457,6 +4486,9 @@ pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str, index: u32) -> Resul
     }
     if unsafe { pyre_object::is_complex(obj) } {
         return Ok(unsafe { pyre_object::complexobject::w_complex_slot_del(obj, index as usize) });
+    }
+    if unsafe { pyre_object::interp_array::is_array(obj) } {
+        return Ok(unsafe { pyre_object::interp_array::w_array_slot_del(obj, index as usize) });
     }
     let w_dict = getdict(obj)?;
     if w_dict.is_null() {
@@ -4540,6 +4572,11 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
     if unsafe { pyre_object::is_complex(obj) } {
         require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::complexobject::w_complex_setdict(obj, w_dict) };
+        return Ok(());
+    }
+    if unsafe { pyre_object::interp_array::is_array(obj) } {
+        require_dict_for_setdict(w_dict)?;
+        unsafe { pyre_object::interp_array::w_array_setdict(obj, w_dict) };
         return Ok(());
     }
     // W_TypeObject and Module keep their namespace mappings as readonly
@@ -4677,6 +4714,15 @@ pub fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
         }
         return None;
     }
+    if unsafe { pyre_object::interp_array::is_array(obj) } {
+        if crate::typedef::r#type(obj)
+            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
+        {
+            let lifeline = unsafe { pyre_object::interp_array::w_array_getweakref(obj) };
+            return (!lifeline.is_null()).then_some(lifeline);
+        }
+        return None;
+    }
     let w_type = crate::typedef::r#type(obj)?;
     if unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) } {
         crate::objspace::std::mapdict::getweakref(obj)
@@ -4712,6 +4758,14 @@ pub fn setweakref(obj: PyObjectRef, weakreflifeline: PyObjectRef) -> Result<(), 
             .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
         {
             unsafe { pyre_object::bytearrayobject::w_bytearray_setweakref(obj, weakreflifeline) };
+            return Ok(());
+        }
+    }
+    if unsafe { pyre_object::interp_array::is_array(obj) } {
+        if crate::typedef::r#type(obj)
+            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
+        {
+            unsafe { pyre_object::interp_array::w_array_setweakref(obj, weakreflifeline) };
             return Ok(());
         }
     }
@@ -4759,6 +4813,14 @@ pub fn delweakref(obj: PyObjectRef) {
             .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
         {
             unsafe { pyre_object::bytearrayobject::w_bytearray_setweakref(obj, PY_NULL) };
+            return;
+        }
+    }
+    if unsafe { pyre_object::interp_array::is_array(obj) } {
+        if crate::typedef::r#type(obj)
+            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
+        {
+            unsafe { pyre_object::interp_array::w_array_setweakref(obj, PY_NULL) };
             return;
         }
     }
