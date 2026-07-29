@@ -302,6 +302,7 @@ impl MetaInterpStaticData {
     /// This preserves RPython's stable `metainterp_sd.jitcodes` invariant
     /// for already-captured resume data.
     fn set_jitcodes_from_make_result(&mut self, payloads: Vec<std::sync::Arc<crate::PyJitCode>>) {
+        self.reserve_build_time_index_space();
         for payload in payloads {
             assert!(
                 !payload.code_ptr.is_null(),
@@ -366,6 +367,7 @@ impl MetaInterpStaticData {
         code: *const (),
         supplied: Option<std::sync::Arc<crate::PyJitCode>>,
     ) -> *const JitCode {
+        self.reserve_build_time_index_space();
         let raw_key = Self::canonical_code_key_opt(code).unwrap_or(0);
         if let Some(pos) = self.installed_jitcode_pos_for_raw_key(raw_key) {
             match supplied {
@@ -402,6 +404,29 @@ impl MetaInterpStaticData {
         let ptr = &*jitcode as *const JitCode;
         self.jitcodes.push(jitcode);
         ptr
+    }
+
+    /// Keep the leading `jitcodes` slots that a build-time jitcode's baked
+    /// `JitCode::index` can name out of the runtime append space.
+    ///
+    /// The build-time table is dense (`all_jitcodes()[i].index == i`), so its
+    /// length is exactly that range, and
+    /// [`install_build_time_jitcode_at`] writes into it verbatim — a resume
+    /// frame records the baked index and resolves it as `sd.jitcodes[index]`.
+    /// Runtime PyCode entries append at `len()`, so without the reservation
+    /// the first one takes slot 0, the build-time install overwrites it, and
+    /// [`Self::compiled_jitcode_lookup`] answers `None` for a code the
+    /// codewriter still reports as drained.
+    ///
+    /// Idempotent: a no-op once the leading slots exist.
+    fn reserve_build_time_index_space(&mut self) {
+        let reserved = crate::jitcode_runtime::all_jitcodes().len();
+        while self.jitcodes.len() < reserved {
+            let index = self.jitcodes.len() as i32;
+            let payload = std::sync::Arc::new(crate::PyJitCode::skeleton(std::ptr::null()));
+            Self::stamp_payload_index(index, &payload);
+            self.jitcodes.push(Box::new(JitCode { index, payload }));
+        }
     }
 
     /// Return the installed SD entry for a `PyCode`.
@@ -692,13 +717,11 @@ pub fn install_jitcode_for(
 /// resume decoders to resolve `sd.jitcodes[index]` to the portal, it must sit
 /// at exactly that slot.
 ///
-/// The build-time absolute index space and the runtime-grown user-PyCode slot
-/// space collide here (both start at 0): overwriting `index` clobbers whatever
-/// user jitcode last took that slot.  This is sound only while the jd1
-/// experiment's overwritten slot holds a jitcode with no live resume data (the
-/// import-time `_get_exports_list` at slot 0 is dead by the time user code
-/// drives jd1).  Reconciling the two index spaces into one absolute table is
-/// the standing follow-up.
+/// The two index spaces no longer overlap: the leading
+/// `all_jitcodes().len()` slots are reserved for build-time indices
+/// (`MetaInterpStaticData::reserve_build_time_index_space`) and runtime
+/// PyCode entries append above them, so the write below can only replace a
+/// reserved skeleton or an earlier install of the same portal.
 ///
 /// Dropping the install is NOT an available shortcut, measured: without it the
 /// jd1 live-enter blackhole resume resolves slot 0 to the user jitcode that
@@ -712,15 +735,7 @@ pub fn install_build_time_jitcode_at(index: usize, payload: std::sync::Arc<crate
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let mut sd = r.borrow_mut();
-        while sd.jitcodes.len() < index {
-            let i = sd.jitcodes.len() as i32;
-            let skeleton = std::sync::Arc::new(crate::PyJitCode::skeleton(std::ptr::null()));
-            skeleton.jitcode.set_index(i as usize);
-            sd.jitcodes.push(Box::new(JitCode {
-                index: i,
-                payload: skeleton,
-            }));
-        }
+        sd.reserve_build_time_index_space();
         // Idempotent same-value stamp: the portal core already carries `index`.
         payload.jitcode.set_index(index);
         let slot = Box::new(JitCode {
@@ -728,6 +743,11 @@ pub fn install_build_time_jitcode_at(index: usize, payload: std::sync::Arc<crate
             payload,
         });
         if index < sd.jitcodes.len() {
+            debug_assert!(
+                sd.jitcodes[index].payload.is_skeleton()
+                    || unsafe { sd.jitcodes[index].raw_code() }.is_null(),
+                "build-time slot {index} is occupied by a runtime PyCode entry",
+            );
             sd.jitcodes[index] = slot;
         } else {
             sd.jitcodes.push(slot);
@@ -13307,7 +13327,10 @@ mod indirectcalltargets_tests {
         let hit = sd
             .compiled_jitcode_lookup(code)
             .expect("populated payload should be installed by make_jitcodes");
-        assert!(std::ptr::eq(sd.jitcodes[0].as_ref(), hit));
+        // Runtime entries append above the reserved build-time index space, so
+        // read the slot back through the entry's own index.
+        let index = unsafe { (*hit).index } as usize;
+        assert!(std::ptr::eq(sd.jitcodes[index].as_ref(), hit));
     }
 
     #[test]
@@ -13327,9 +13350,11 @@ mod indirectcalltargets_tests {
         let mut sd = MetaInterpStaticData::new();
         let (_code, expected_raw) = make_code("x = 1\n");
         sd.set_jitcodes_from_make_result(vec![populated_pyjit(expected_raw)]);
+        // The install appends above the reserved build-time index space.
+        let index = sd.jitcodes.len() as i32 - 1;
         let _sd_guard = MetainterpSdGuard::swap(sd);
 
-        let hit = raw_code_for_jitcode_index(0).expect("jitcode index 0 must resolve");
+        let hit = raw_code_for_jitcode_index(index).expect("installed jitcode index must resolve");
         assert_eq!(hit, expected_raw);
     }
 }
