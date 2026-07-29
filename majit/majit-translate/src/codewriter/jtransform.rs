@@ -729,7 +729,7 @@ impl<'a> Transformer<'a> {
             ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => {
                 crate::codewriter::type_state::ConcreteType::Signed
             }
-            ValueType::Ref(_) => crate::codewriter::type_state::ConcreteType::GcRef,
+            ValueType::Ref(_) | ValueType::Str => crate::codewriter::type_state::ConcreteType::GcRef,
             ValueType::Float => crate::codewriter::type_state::ConcreteType::Float,
             ValueType::Void => crate::codewriter::type_state::ConcreteType::Void,
             ValueType::Unknown | ValueType::Int128 | ValueType::UInt128 => return,
@@ -5423,7 +5423,7 @@ fn value_type_to_kind(ty: &ValueType) -> char {
         // return `'int'` (ll Bool / Unsigned share register class
         // with Signed at the codewriter register-kind layer).
         ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => 'i',
-        ValueType::Ref(_) | ValueType::Unknown => 'r',
+        ValueType::Ref(_) | ValueType::Str | ValueType::Unknown => 'r',
         ValueType::Float => 'f',
         ValueType::Void => 'v',
         ValueType::Int128 | ValueType::UInt128 => {
@@ -5492,7 +5492,7 @@ fn value_type_to_ir_type(ty: &ValueType) -> majit_ir::value::Type {
         ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => {
             majit_ir::value::Type::Int
         }
-        ValueType::Ref(_) | ValueType::Unknown => majit_ir::value::Type::Ref,
+        ValueType::Ref(_) | ValueType::Str | ValueType::Unknown => majit_ir::value::Type::Ref,
         ValueType::Float => majit_ir::value::Type::Float,
         ValueType::Void => majit_ir::value::Type::Void,
         ValueType::Int128 | ValueType::UInt128 => {

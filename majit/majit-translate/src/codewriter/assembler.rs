@@ -3023,7 +3023,7 @@ fn value_type_to_kind(ty: &crate::model::ValueType) -> char {
         // shares register class with Signed/Unsigned — all `'i'` for
         // the codewriter.
         ValueType::Int | ValueType::Unsigned | ValueType::Bool => 'i',
-        ValueType::Ref(_) => 'r',
+        ValueType::Ref(_) | ValueType::Str => 'r',
         ValueType::Float => 'f',
         ValueType::Void | ValueType::State | ValueType::Unknown => 'v',
         ValueType::Int128 | ValueType::UInt128 => {

@@ -74,7 +74,7 @@ pub(crate) fn valuetype_to_concrete(vt: &ValueType) -> ConcreteType {
         // == 'int'`); only the rtyper picks `IntegerRepr.lowleveltype
         // = Unsigned` based on `SomeInteger.unsigned`.
         ValueType::Int | ValueType::Unsigned | ValueType::Bool => ConcreteType::Signed,
-        ValueType::Ref(_) => ConcreteType::GcRef,
+        ValueType::Ref(_) | ValueType::Str => ConcreteType::GcRef,
         ValueType::Float => ConcreteType::Float,
         ValueType::Void => ConcreteType::Void,
         ValueType::State | ValueType::Unknown | ValueType::Int128 | ValueType::UInt128 => {

@@ -6765,9 +6765,9 @@ fn collect_readwrite_effects(
                             | crate::model::ValueType::Unsigned
                             | crate::model::ValueType::Bool
                             | crate::model::ValueType::State => majit_ir::value::Type::Int,
-                            crate::model::ValueType::Ref(_) | crate::model::ValueType::Unknown => {
-                                majit_ir::value::Type::Ref
-                            }
+                            crate::model::ValueType::Ref(_)
+                            | crate::model::ValueType::Str
+                            | crate::model::ValueType::Unknown => majit_ir::value::Type::Ref,
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
                             crate::model::ValueType::Void => majit_ir::value::Type::Void,
                             crate::model::ValueType::Int128 | crate::model::ValueType::UInt128 => {
@@ -6817,9 +6817,9 @@ fn collect_readwrite_effects(
                             | crate::model::ValueType::Unsigned
                             | crate::model::ValueType::Bool
                             | crate::model::ValueType::State => majit_ir::value::Type::Int,
-                            crate::model::ValueType::Ref(_) | crate::model::ValueType::Unknown => {
-                                majit_ir::value::Type::Ref
-                            }
+                            crate::model::ValueType::Ref(_)
+                            | crate::model::ValueType::Str
+                            | crate::model::ValueType::Unknown => majit_ir::value::Type::Ref,
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
                             crate::model::ValueType::Void => majit_ir::value::Type::Void,
                             crate::model::ValueType::Int128 | crate::model::ValueType::UInt128 => {
@@ -7685,7 +7685,7 @@ fn value_type_discriminant(ty: &crate::model::ValueType) -> u8 {
         // and `INT_TYPE` under the same `'int'` kind for descriptor
         // indexing (`lltypesystem/lloperation.py:108 getkind`).
         ValueType::Int | ValueType::Unsigned | ValueType::Bool => 0,
-        ValueType::Ref(_) => 1,
+        ValueType::Ref(_) | ValueType::Str => 1,
         ValueType::Float => 2,
         ValueType::Void => 3,
         ValueType::State => 4,

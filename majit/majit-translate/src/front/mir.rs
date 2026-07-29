@@ -13471,7 +13471,7 @@ fn clone_tyref(ty: &TyRef) -> TyRef {
 fn value_type_bank(ty: &ValueType) -> u8 {
     match ty {
         ValueType::Int | ValueType::Unsigned | ValueType::Bool => 0,
-        ValueType::Ref(_) => 1,
+        ValueType::Ref(_) | ValueType::Str => 1,
         ValueType::Float => 2,
         ValueType::Void => 3,
         ValueType::State => 4,
@@ -13731,7 +13731,7 @@ fn dont_look_inside_return_token(output: &TyRef, llbc: &Llbc) -> Option<String> 
         ValueType::Ref(_) if output_type_is_objectptr(output, llbc) => {
             return Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE.to_string());
         }
-        ValueType::Ref(_) => "ref",
+        ValueType::Ref(_) | ValueType::Str => "ref",
         ValueType::Void | ValueType::State | ValueType::Unknown => return None,
     };
     Some(token.to_string())
@@ -13885,6 +13885,14 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // no `pair(SomeInteger, SomeInstance).union()` handler and walls.
     if tyref_is_fieldless_enum_free(ty, llbc) {
         return ValueType::Int;
+    }
+    // A `str`/`String`/`Wtf8` field seeds a `SomeString` attr shell (via
+    // valuetype_to_someshell) instead of the classdef-less `Ref(None)`
+    // SomeInstance the fallback yields; the latter walls when the first
+    // typed string write unions `String ∪ Instance(classdef-less)` with no
+    // pair(SomeString, SomeInstance).union() handler.
+    if tyref_is_string_value(ty, llbc) {
+        return ValueType::Str;
     }
     ValueType::Ref(None)
 }

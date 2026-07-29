@@ -63,6 +63,15 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
         // as `SomeBool::default` matching `SomeBool()` upstream.
         ValueType::Bool => Some(SomeValue::Bool(crate::annotator::model::SomeBool::default())),
         ValueType::Float => Some(SomeValue::Float(SomeFloat::default())),
+        // A `str`/`String`/`Wtf8` value shells to `SomeString`
+        // (`annotator/model.py` `SomeString`), the widest string shell
+        // (not-const, may-contain-nul), so a string-typed struct field
+        // seeds a string attr that unions cleanly with the value written
+        // to it instead of the classdef-less `SomeInstance(None)` the
+        // `Ref` fallback yields.
+        ValueType::Str => Some(SomeValue::String(
+            crate::annotator::model::SomeString::new(false, false),
+        )),
         ValueType::Ref(_) => {
             // RPython typed pointers lift to `SomePtr(ll_ptrtype)`
             // (`llannotation.py:64-70`), but the correct Ptr must come

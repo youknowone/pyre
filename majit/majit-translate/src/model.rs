@@ -92,6 +92,11 @@ pub enum ValueType {
     /// object-identity-based lltype semantics.
     Ref(Option<String>),
     Float,
+    /// RPython `SomeString` — a Rust `str`/`String`/`Wtf8`/`Wtf8Buf`
+    /// value (`tyref_is_string_value`).  Distinct from `Ref` so a
+    /// string-typed struct field seeds a `SomeString` shell rather than
+    /// the classdef-less `SomeInstance(None)` the `Ref` fallback yields.
+    Str,
     Void,
     State,
     Unknown,
