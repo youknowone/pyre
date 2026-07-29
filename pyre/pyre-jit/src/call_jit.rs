@@ -478,6 +478,83 @@ fn publish_residual_call_exception(exc_obj: i64) {
     store_jit_exception(exc_obj);
 }
 
+/// The caller's residual-call exception pair, taken out of its cells for the
+/// span of a nested JIT re-entry by [`park_residual_call_exception`].
+///
+/// A cell is the only root its exception has (`walk_bh_last_exc_value` /
+/// `walk_jit_exc_value`), so a value taken out of one is pinned on the shadow
+/// stack for the span and read back relocated: an RPython local holding a GC
+/// object is a shadow-stack root, a Rust local is not.
+struct ParkedResidualException {
+    /// `None` when both cells were empty — the ordinary case, since a
+    /// residual call is reached with no exception in flight.
+    scope: Option<pyre_object::gc_roots::RootScope>,
+    save: usize,
+    bh_pinned: bool,
+    backend_pinned: bool,
+}
+
+/// Take the caller's `BH_LAST_EXC_VALUE` / backend `_store_exception` pair out
+/// of their cells and leave both empty.
+///
+/// Upstream never needs this: the raise a residual call reports lives in
+/// `metainterp.last_exc_value`, a field of the MetaInterp instance that owns
+/// the call, and `llmodel.py:194 _store_exception` is read back by the same
+/// `bh_call_*` that armed it. Pyre keeps one cell per thread, so a nested
+/// execution inside the call aliases the caller's.
+fn park_residual_call_exception() -> ParkedResidualException {
+    let bh = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+    let backend = crate::eval::jit_exc_value_peek_backend();
+    if bh == 0 && backend == 0 {
+        return ParkedResidualException {
+            scope: None,
+            save: 0,
+            bh_pinned: false,
+            backend_pinned: false,
+        };
+    }
+    let scope = pyre_object::gc_roots::push_roots();
+    let save = pyre_object::gc_roots::shadow_stack_len();
+    let bh_pinned = bh != 0;
+    if bh_pinned {
+        pyre_object::gc_roots::pin_root(bh as pyre_object::PyObjectRef);
+    }
+    let backend_pinned = backend != 0;
+    if backend_pinned {
+        pyre_object::gc_roots::pin_root(backend as pyre_object::PyObjectRef);
+    }
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    drain_backend_jit_exc();
+    ParkedResidualException {
+        scope: Some(scope),
+        save,
+        bh_pinned,
+        backend_pinned,
+    }
+}
+
+/// Restore what [`park_residual_call_exception`] took, discarding whatever the
+/// nested execution left in the cells: a raise the nested callee already
+/// handled is not this helper's to report, and the caller's
+/// `GUARD_NO_EXCEPTION` would read it as a spurious pending exception — the
+/// failure [`drain_backend_jit_exc`] names for the walker's snapshot side.
+fn unpark_residual_call_exception(parked: ParkedResidualException) {
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    drain_backend_jit_exc();
+    if parked.scope.is_none() {
+        return;
+    }
+    let mut index = parked.save;
+    if parked.bh_pinned {
+        let bh = pyre_object::gc_roots::shadow_stack_get(index) as i64;
+        index += 1;
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(bh));
+    }
+    if parked.backend_pinned {
+        store_jit_exception(pyre_object::gc_roots::shadow_stack_get(index) as i64);
+    }
+}
+
 /// Drain the backend `_store_exception` cells (`jit_exc_clear`) without
 /// touching `BH_LAST_EXC_VALUE`.
 ///
@@ -4462,8 +4539,23 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         // Re-entrant TRACING stays blocked where upstream blocks it, on the
         // green key (`warmstate.py:473-477` JC_TRACING, mirrored by
         // `maybe_compile_and_run`'s `driver.is_tracing()`).
+        //
+        // Letting the callee re-enter the JIT also lets a nested compiled /
+        // blackhole execution run inside this helper, and that nesting writes
+        // the very cells this helper publishes to: `BH_LAST_EXC_VALUE` and the
+        // backend `_store_exception` pair. Upstream cannot alias them — the
+        // raise lives in `metainterp.last_exc_value`, a field of the
+        // MetaInterp instance that owns the call, and `llmodel.py:194
+        // _store_exception` is read back by the same `bh_call_*` that armed
+        // it. Park the caller's pair across the nested run so this helper's
+        // own outcome is the only thing it publishes; a nested raise the
+        // callee handled internally would otherwise be read by the caller's
+        // `GUARD_NO_EXCEPTION` as a spurious pending exception (the failure
+        // `drain_backend_jit_exc` names for the walker's snapshot side).
+        let parked = park_residual_call_exception();
         let result =
             pyre_interpreter::call::call_user_function_residual(parent_frame, callable, &call_args);
+        unpark_residual_call_exception(parked);
         pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
         return match result {
             Ok(result) => result as i64,

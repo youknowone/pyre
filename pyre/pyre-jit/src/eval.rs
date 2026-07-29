@@ -3259,11 +3259,11 @@ fn install_gc_into_backend() {
 /// GC root walker. Mirrors `install_gc_into_backend`'s backend-selection cfg
 /// (cranelift wins over dynasm when both features are on; wasm on wasm32).
 #[cfg(target_arch = "wasm32")]
-fn jit_exc_value_peek_backend() -> i64 {
+pub(crate) fn jit_exc_value_peek_backend() -> i64 {
     majit_backend_wasm::jit_exc_value_peek()
 }
 #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
-fn jit_exc_value_peek_backend() -> i64 {
+pub(crate) fn jit_exc_value_peek_backend() -> i64 {
     majit_backend_cranelift::jit_exc_value_peek()
 }
 #[cfg(all(
@@ -3271,11 +3271,11 @@ fn jit_exc_value_peek_backend() -> i64 {
     not(feature = "cranelift"),
     not(target_arch = "wasm32")
 ))]
-fn jit_exc_value_peek_backend() -> i64 {
+pub(crate) fn jit_exc_value_peek_backend() -> i64 {
     majit_backend_dynasm::jit_exc_value_peek()
 }
 #[cfg(not(any(target_arch = "wasm32", feature = "cranelift", feature = "dynasm")))]
-fn jit_exc_value_peek_backend() -> i64 {
+pub(crate) fn jit_exc_value_peek_backend() -> i64 {
     0
 }
 
