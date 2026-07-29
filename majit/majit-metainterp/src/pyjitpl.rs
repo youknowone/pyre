@@ -5501,22 +5501,6 @@ impl<M: Clone> MetaInterp<M> {
         if self.retrace_after_bridge {
             self.retrace_after_bridge = false;
         }
-        // pyjitpl.py:3162: has_compiled_targets(ptoken) →
-        // raise SwitchToBlackhole(ABORT_BAD_LOOP).
-        if let Some(ctx) = self.tracing.as_ref() {
-            let gk = ctx.green_key;
-            if self.has_compiled_targets(gk) {
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] compile_loop → SwitchToBlackhole: has_compiled_targets key={}",
-                        gk
-                    );
-                }
-                self.abort_trace(false);
-                return CompileOutcome::Aborted;
-            }
-        }
-
         let vable_config = self.current_virtualizable_optimizer_config();
         // pyjitpl.py:3015-3032 parity: compile_loop uses `self.history`
         // without consuming it, so cancel paths can fall through to
@@ -5535,6 +5519,25 @@ impl<M: Clone> MetaInterp<M> {
             // jitcell_token. RPython: jitcell_token = cross_loop.jitcell_token.
             (cut_inner.unwrap_or(outer), cut_inner)
         };
+
+        // pyjitpl.py:3185-3189: has_compiled_targets(ptoken) →
+        // raise SwitchToBlackhole(ABORT_BAD_LOOP).  The key is the one the
+        // loop would be stored under — `original_boxes[:num_green_args]`,
+        // the greens of the merge point that was closed at, which for a
+        // cross-loop cut is the inner loop's key, not the trace's own.
+        if self.has_compiled_targets(green_key) {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] compile_loop → SwitchToBlackhole: has_compiled_targets key={}",
+                    green_key
+                );
+            }
+            // Reason-keyed, so the profiler tallies this under `bad loop`
+            // and not the `Generic` catch-all, which is ABORT_BRIDGE.
+            self.abort_trace_live(false);
+            self.aborted_tracing(counters::ABORT_BAD_LOOP);
+            return CompileOutcome::Aborted;
+        }
 
         // pyjitpl.py:3015-3032 parity: pyre caches the retrace limit per
         // green_key so guard-heavy recompilations do not loop forever.
