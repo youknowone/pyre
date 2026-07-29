@@ -7839,4 +7839,33 @@ result = bytes(source) == b'abc'
             assert!(crate::baseobjspace::is_true(result).unwrap());
         }
     }
+
+    #[test]
+    fn test_bytes_search_uses_rpython_adaptive_algorithm() {
+        let source = "\
+n = 10000
+a = b'a' * n
+b = b'b' * n
+haystack = a + a + b + a + a
+needle = a + b + b + a
+result = True
+for constructor in (bytes, bytearray):
+    value = constructor(haystack)
+    sub = constructor(needle)
+    result = (
+        result
+        and value.find(sub) == -1
+        and value.rfind(sub) == -1
+        and value.count(sub) == 0
+        and (value + sub).find(sub) == len(value)
+        and (value + sub).count(sub) == 1
+    )
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytes-like adaptive search failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
 }

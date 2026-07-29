@@ -4222,7 +4222,7 @@ pub fn str_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SearchMode {
+pub(crate) enum SearchMode {
     Count,
     Find,
     RFind,
@@ -4660,7 +4660,7 @@ fn rstring_adaptive_find(
     }
 }
 
-fn rstring_search_normal(
+pub(crate) fn rstring_search_normal(
     value: &[u8],
     other: &[u8],
     mut start: usize,
