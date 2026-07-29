@@ -2229,11 +2229,15 @@ fn build_stub_pygraph_with_result_shell(
 ///
 /// Returns `None` for container types
 /// (`Func` / `Struct` / `Array` / `FixedSizeArray` / `Opaque` /
-/// `ForwardReference`) that `lltype_to_annotation` rejects, and for
-/// `Address` (upstream `SomeAddress`; not yet ported to the pyre
-/// `SomeValue` enum — see `model.rs:21` TODO).  The caller
+/// `ForwardReference`) that `lltype_to_annotation` rejects.  The caller
 /// treats `None` as "skip this fn"; the unported path then surfaces
 /// the original "not registered" Skip.
+///
+/// `Address` maps to the untyped `SomeAddress` shell (`llmemory.py:573
+/// SomeAddress`) — the annotation-stage projection a `*const T` / `*mut T`
+/// raw pointer carries when its element type is not modeled.  A
+/// `<[T]>::as_ptr` result is consumed here only as a residual-call argument
+/// (`hash_str_hooked(ptr, len)`), for which the untyped address is faithful.
 pub(crate) fn default_someshell_for_lltype(
     lltype: &LowLevelType,
 ) -> Option<crate::annotator::model::SomeValue> {
@@ -2241,9 +2245,9 @@ pub(crate) fn default_someshell_for_lltype(
         return None;
     }
     match lltype {
-        // SomeAddress is not yet present in the SomeValue enum
-        // (model.rs:21 TODO); skip until ported.
-        LowLevelType::Address => None,
+        LowLevelType::Address => Some(crate::annotator::model::SomeValue::Address(
+            crate::annotator::model::SomeAddress::new(),
+        )),
         _ => Some(crate::translator::rtyper::llannotation::lltype_to_annotation(lltype.clone())),
     }
 }
@@ -2412,17 +2416,25 @@ pub(crate) fn register_unsafe_fn_stubs(
 /// - `core::f64::<Impl>::to_bits` returns `u64` reinterpreted as `i64` —
 ///   `Signed` result.
 ///
-/// Paths whose faithful result is a non-scalar value the stub carrier
-/// cannot express (`alloc::fmt::format` → `String`,
+/// A raw `*const T` / `*mut T` result maps to the untyped `Address` shell
+/// (`core::slice::<Impl>::as_ptr`, `vec::Vec::as_ptr`) — faithful when the
+/// pointer is consumed only as a residual-call argument.  Paths whose
+/// faithful result is a non-scalar value the stub carrier still cannot
+/// express (`alloc::fmt::format` → `String`,
 /// `core::array::iter::<Impl>::into_iter` → an iterator with no Repr,
-/// `core::slice::<Impl>::as_ptr` → a raw `*const T`, `core::num::<Impl>::
-/// checked_*` → `Option<i64>`) are intentionally absent: registering
-/// them with a placeholder `Void`/`Signed` result mis-models the value
-/// and only migrates the failure to a deeper annotation wall (union
-/// pollution / raw-pointer modeling), so they stay residual at the
-/// "not registered" Skip until their result type can be modeled.
+/// `core::num::<Impl>::checked_*` → `Option<i64>`) stay intentionally
+/// absent: registering them with a placeholder `Void`/`Signed` result
+/// mis-models the value and only migrates the failure to a deeper
+/// annotation wall, so they stay residual at the "not registered" Skip
+/// until their result type can be modeled.
 const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
     (&["core", "mem", "swap"], &["x", "y"], LowLevelType::Void),
+    (
+        &["core", "slice", "<Impl>", "as_ptr"],
+        &["self"],
+        LowLevelType::Address,
+    ),
+    (&["vec", "Vec", "as_ptr"], &["self"], LowLevelType::Address),
     (
         &["cell", "Cell", "set"],
         &["self", "val"],
