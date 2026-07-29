@@ -956,6 +956,11 @@ impl W_TextIOWrapper {
     /// reports itself unreadable however readable its buffer is, and only the
     /// methods `make_std_stream` installs as instance overrides work.
     ///
+    /// The standard streams are constructed while the `sys` module itself is
+    /// being created, and the codec lookup imports `encodings` — an import that
+    /// cannot run before `importlib._bootstrap` registers itself, which is why
+    /// the bootstrap tail is what calls this.
+    ///
     /// Skips a stream this did not build — a replaced `sys.stdout`, one that
     /// already has a codec, one carrying no encoding string.  A codec the
     /// registry refuses, or an incremental encoder/decoder that will not
@@ -973,7 +978,14 @@ impl W_TextIOWrapper {
             return Ok(());
         }
         let payload = unsafe { &mut *(stream as *mut Self) };
-        if !payload.w_encoder.is_null() || !payload.w_decoder.is_null() {
+        // The buffer is read below for the probes `descr_init` runs against it,
+        // so a wrapper without one has nothing to attach rather than a null to
+        // dereference.
+        if !payload.w_encoder.is_null()
+            || !payload.w_decoder.is_null()
+            || payload.w_buffer.is_null()
+            || unsafe { pyre_object::is_none(payload.w_buffer) }
+        {
             return Ok(());
         }
         let Some(encoding) =
@@ -982,7 +994,19 @@ impl W_TextIOWrapper {
             return Ok(());
         };
         let codec = Self::lookup_text_codec(&encoding)?;
-        payload.set_encoder_decoder(codec)
+        payload.set_encoder_decoder(codec)?;
+        // The rest of the `descr_init` tail `allocate_stdio` also had to defer:
+        // the seekable/telling pair and the `read1` probe both call into the
+        // buffer, which is why they wait for the same moment the codec does.
+        // `interp_textio.py:601-610` runs them in this order, after the codec.
+        if let Ok(w_seekable) = super::call_method_result(payload.w_buffer, "seekable", &[])
+            && let Ok(seekable) = crate::baseobjspace::is_true(w_seekable)
+        {
+            payload.seekable_flag = seekable;
+            payload.telling = seekable;
+        }
+        payload.has_read1 = crate::baseobjspace::getattr_str(payload.w_buffer, "read1").is_ok();
+        Ok(())
     }
 }
 

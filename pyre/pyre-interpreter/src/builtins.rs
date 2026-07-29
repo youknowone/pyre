@@ -3300,7 +3300,7 @@ fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         .copied()
         .unwrap_or_else(|| pyre_object::w_str_new(""));
     let Some(sys) = crate::importing::get_sys_module("sys") else {
-        return Err(crate::PyError::runtime_error("input: lost sys.stdin"));
+        return Err(crate::PyError::runtime_error("lost sys.stdin"));
     };
 
     let _roots = pyre_object::gc_roots::push_roots();
@@ -3308,13 +3308,15 @@ fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     pyre_object::gc_roots::pin_root(sys);
     pyre_object::gc_roots::pin_root(prompt);
 
+    // `bltinmodule.c builtin_input_impl`: an absent — or `None` — standard
+    // stream is a `RuntimeError`, not an attribute error from the stream call.
     let stream = |name: &str| -> Result<PyObjectRef, crate::PyError> {
         let sys = pyre_object::gc_roots::shadow_stack_get(root);
+        let lost = || crate::PyError::runtime_error(format!("lost sys.{name}"));
         match crate::baseobjspace::getattr_str(sys, name) {
+            Ok(value) if unsafe { pyre_object::is_none(value) } => Err(lost()),
             Ok(value) => Ok(value),
-            Err(error) if error.kind == crate::PyErrorKind::AttributeError => Err(
-                crate::PyError::runtime_error(format!("input: lost sys.{name}")),
-            ),
+            Err(error) if error.kind == crate::PyErrorKind::AttributeError => Err(lost()),
             Err(error) => Err(error),
         }
     };

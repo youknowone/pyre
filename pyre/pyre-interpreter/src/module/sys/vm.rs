@@ -2433,6 +2433,14 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(buffer);
     let buffer_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    // `app_main.py:484 create_stdio` names the raw descriptor object rather
+    // than the wrapper, so `repr(sys.stdin.buffer)` reads `name='<stdin>'`
+    // instead of the bare descriptor number.
+    if let Ok(raw) =
+        crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(buffer_slot), "raw")
+    {
+        let _ = crate::baseobjspace::setattr_str(raw, "name", w_str_new(name));
+    }
     let (encoding, configured_errors) = stdio_encoding_and_errors();
     let errors = if to_stderr {
         "backslashreplace"
