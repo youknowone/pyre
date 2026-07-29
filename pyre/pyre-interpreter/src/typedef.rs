@@ -18737,14 +18737,20 @@ fn bytes_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// the optional `delete` set.  `delete` may be positional or the
 /// `delete=` keyword.
 fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_at_least_positional(args, "translate", 1)?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    let given = positional.len() + crate::builtins::real_kwarg_count(kwargs);
+    if given > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "translate() takes at most 2 arguments ({given} given)"
+        )));
+    }
     let Some(&table_obj) = positional.first() else {
         return Err(crate::PyError::type_error(
             "translate() takes at least 1 positional argument (0 given)",
         ));
     };
+    crate::builtins::kwarg_reject_unknown(kwargs, &["delete"], "translate")?;
     let table: Option<&[u8]> = unsafe {
         if pyre_object::is_none(table_obj) {
             None
@@ -18769,17 +18775,15 @@ fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         .or_else(|| crate::builtins::kwarg_get(kwargs, "delete"));
     let mut deleted = [false; 256];
     if let Some(d) = delete_obj {
-        if !d.is_null() && unsafe { !pyre_object::is_none(d) } {
-            if let Some(src) = buffer_as_bytes_like(d)? {
-                for &b in unsafe { pyre_object::bytesobject::bytes_like_data(src) } {
-                    deleted[b as usize] = true;
-                }
-            } else {
-                return Err(crate::PyError::type_error(format!(
-                    "a bytes-like object is required, not '{}'",
-                    type_name_of(d)
-                )));
+        if let Some(src) = buffer_as_bytes_like(d)? {
+            for &b in unsafe { pyre_object::bytesobject::bytes_like_data(src) } {
+                deleted[b as usize] = true;
             }
+        } else {
+            return Err(crate::PyError::type_error(format!(
+                "a bytes-like object is required, not '{}'",
+                type_name_of(d)
+            )));
         }
     }
     let mut out = Vec::with_capacity(data.len());

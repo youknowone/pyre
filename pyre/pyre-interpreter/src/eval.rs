@@ -7790,4 +7790,31 @@ for value in (bytearray(), bytearray(b'preserved')):
             assert!(crate::baseobjspace::is_true(result).unwrap());
         }
     }
+
+    #[test]
+    fn test_bytes_translate_validates_delete_and_arity() {
+        let source = "\
+result = True
+for value in (bytes(b'hello'), bytearray(b'hello')):
+    for args in ((), (None, None), (None, b'', b'')):
+        try:
+            value.translate(*args)
+        except TypeError:
+            pass
+        else:
+            result = False
+    try:
+        value.translate(None, unexpected=b'')
+    except TypeError:
+        pass
+    else:
+        result = False
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytes-like translate argument validation failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
 }
