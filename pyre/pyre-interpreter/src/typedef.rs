@@ -18867,9 +18867,22 @@ fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// current line (the column resets on `\n` / `\r`); a non-positive
 /// `tabsize` drops tabs entirely.
 fn bytes_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::require_receiver(args, "expandtabs")?;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::type_methods::require_receiver(pos, "expandtabs")?;
+    let positional = pos.len().saturating_sub(1);
+    let keyword = crate::builtins::real_kwarg_count(kwargs);
+    let given = positional + keyword;
+    if given > 1 {
+        let kind = if positional == 0 {
+            "keyword argument"
+        } else {
+            "argument"
+        };
+        return Err(crate::PyError::type_error(format!(
+            "expandtabs() takes at most 1 {kind} ({given} given)"
+        )));
+    }
+    crate::builtins::kwarg_reject_unknown(kwargs, &["tabsize"], "expandtabs")?;
     let tabsize = match pos
         .get(1)
         .copied()
@@ -18878,6 +18891,10 @@ fn bytes_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         Some(t) if !t.is_null() => crate::builtins::space_index_w(t)?,
         _ => 8,
     };
+    // `unwrap_spec(tabsize=int)` converts before `descr_expandtabs` calls
+    // `_val`; a re-entrant `__index__` can therefore resize a bytearray and
+    // the method must read the resulting value.
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
     let mut out: Vec<u8> = Vec::with_capacity(data.len());
     let mut col: i64 = 0;
     for &b in data {
@@ -18899,7 +18916,7 @@ fn bytes_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             }
         }
     }
-    Ok(new_bytes_like(args[0], &out))
+    Ok(new_bytes_like(pos[0], &out))
 }
 
 /// `bytesobject.py:descr_maketrans` — build a 256-byte translation table

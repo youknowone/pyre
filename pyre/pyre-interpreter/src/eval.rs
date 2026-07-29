@@ -7897,4 +7897,37 @@ for value in (b'x', bytearray(b'x')):
             assert!(crate::baseobjspace::is_true(result).unwrap());
         }
     }
+
+    #[test]
+    fn test_bytes_expandtabs_validates_before_reading_receiver() {
+        let source = "\
+result = True
+for value in (b'a\\tb', bytearray(b'a\\tb')):
+    for call, expected in (
+        (lambda: value.expandtabs(2, 3),
+         'expandtabs() takes at most 1 argument (2 given)'),
+        (lambda: value.expandtabs(one=1, two=2),
+         'expandtabs() takes at most 1 keyword argument (2 given)'),
+    ):
+        try:
+            call()
+        except TypeError as exc:
+            result = result and str(exc) == expected
+        else:
+            result = False
+
+value = bytearray(b'a\\tb')
+class TabSize:
+    def __index__(self):
+        value[:] = b'x\\ty'
+        return 4
+result = result and value.expandtabs(TabSize()) == bytearray(b'x   y')
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytes-like expandtabs validation failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
 }
