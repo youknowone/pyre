@@ -3241,64 +3241,115 @@ impl CallControl {
             // is_candidate that treats "has graph" as candidate).
             for block in &graph.blocks {
                 for op in &block.operations {
-                    let target = match &op.kind {
-                        OpKind::Call { target, .. } => target,
+                    // `call.py:76-77` — only `direct_call` and
+                    // `indirect_call` ops are walked; everything else is
+                    // skipped.  The op-shape dispatch produces the callee
+                    // set `call.py:83 graphs_from(op, is_candidate)` would
+                    // yield: one path for a direct call, the whole family
+                    // for an indirect one.
+                    let callees: Vec<CallPath> = match &op.kind {
+                        // `call.py:103-112` indirect_call — the attached
+                        // `c_graphs` family, `None` meaning "unknown
+                        // family" and classifying the site as residual.
+                        OpKind::IndirectCall { graphs, .. } => match graphs {
+                            Some(graphs) => graphs.clone(),
+                            None => continue,
+                        },
+                        // Same indirect_call site, spelled the way it
+                        // exists *before* `rpbc::lower_indirect_calls`
+                        // rewrites it into `VtableMethodPtr` +
+                        // `IndirectCall`.  That lowering runs inside
+                        // `transform_graph_to_jitcode`, i.e. strictly
+                        // after `find_all_graphs`, so this is the shape
+                        // the BFS actually sees.  The family is the same
+                        // one the lowering stamps into `graphs`
+                        // (`rpbc.py:216 c_graphs = row_of_graphs.values()`),
+                        // so resolving it here keeps the walk equivalent
+                        // to walking the lowered op.
+                        OpKind::Call {
+                            target:
+                                CallTarget::Indirect {
+                                    trait_root,
+                                    method_name,
+                                },
+                            ..
+                        } => self.all_impls_for_indirect(trait_root, method_name),
+                        // `call.py:117-136` direct_call.  These three
+                        // classifications are attached to the single
+                        // `funcobj` and so apply to the direct branch
+                        // only; an indirect family is instead validated
+                        // as a whole in `getcalldescr`.
+                        OpKind::Call { target, .. } => {
+                            let callee_path = match self.target_to_path(target) {
+                                Some(path) => path,
+                                None => continue,
+                            };
+                            // `call.py:119-120`
+                            // jitdriver_sd_from_portal_runner_ptr → recursive.
+                            if self
+                                .jitdrivers_sd
+                                .iter()
+                                .any(|jd| jd.portal_graph == callee_path)
+                            {
+                                continue;
+                            }
+                            // `call.py:129-134`
+                            // `_gctransformer_hint_close_stack_` → residual.
+                            // `get_jitcode` asserts such a graph never
+                            // reaches it, so following one here would turn
+                            // a residual classification into a panic.
+                            if self
+                                .func_effects(&callee_path)
+                                .is_some_and(|f| f.close_stack)
+                            {
+                                continue;
+                            }
+                            // `call.py:135-136`
+                            // `hasattr(targetgraph.func, 'oopspec')` → builtin.
+                            if self
+                                .func_effects(&callee_path)
+                                .is_some_and(|f| f.oopspec.is_some())
+                            {
+                                continue;
+                            }
+                            vec![callee_path]
+                        }
                         _ => continue,
                     };
-                    // `call.py:97` direct_call → `funcobj.graph` — co-fetch
-                    // path + graph through the single Box-identity helper.
-                    // A missing graph (unregistered target) and a missing
-                    // path collapse into the same "skip" decision: the
-                    // earlier path-then-Some(graph) two-step never built a
-                    // SemanticFunction either when the graph wasn't in
-                    // `function_graphs`.
-                    let (callee_path, graph_ref) = match self.target_to_path_and_graph(target) {
-                        Some(pair) => pair,
-                        None => continue,
-                    };
-                    // RPython call.py:80: kind = self.guess_call_kind(op, is_candidate)
-                    // Skip recursive (portal) and builtin calls — these are NOT
-                    // followed during BFS. Only "regular" calls are followed.
-                    if self
-                        .jitdrivers_sd
-                        .iter()
-                        .any(|jd| jd.portal_graph == callee_path)
-                    {
-                        continue; // recursive — don't follow
-                    }
-                    // call.py:135 — `hasattr(targetgraph.func, 'oopspec')`
-                    // ⇒ builtin; builtins are not followed during BFS.
-                    if self
-                        .func_effects(&callee_path)
-                        .is_some_and(|f| f.oopspec.is_some())
-                    {
-                        continue; // builtin — don't follow
-                    }
-                    if self.candidate_graphs.contains(&callee_path) {
-                        continue; // already discovered
-                    }
-                    // RPython call.py:84,87: callee must satisfy
-                    // policy.look_inside_graph(graph). Synthesize a
-                    // SemanticFunction from the stored graph + hints so
-                    // the policy's `_jit_*_` / `_elidable_function_`
-                    // checks fire identically to upstream.
-                    let hints = graph_ref.hints.clone();
-                    let graph = graph_ref.clone();
-                    let func = SemanticFunction {
-                        name: callee_path.last_segment().unwrap_or_default().to_string(),
-                        graph,
-                        return_type: None,
-                        self_ty_root: None,
-                        hints,
-                        module_path: String::new(),
-                        access_directly: false,
-                        trait_root: None,
-                        trait_qualified: None,
-                        returns_objectptr: false,
-                    };
-                    if policy.look_inside_graph(&func) {
-                        self.candidate_graphs.insert(callee_path.clone());
-                        todo.push(callee_path);
+                    for callee_path in callees {
+                        // `call.py:81-82` — already discovered.
+                        if self.candidate_graphs.contains(&callee_path) {
+                            continue;
+                        }
+                        // A target with no registered graph is upstream's
+                        // `funcobj.graph is None` → residual (call.py:127).
+                        let graph_ref = match self.function_graphs.get(&callee_path) {
+                            Some(g) => g,
+                            None => continue,
+                        };
+                        // RPython call.py:84,87: callee must satisfy
+                        // policy.look_inside_graph(graph). Synthesize a
+                        // SemanticFunction from the stored graph + hints so
+                        // the policy's `_jit_*_` / `_elidable_function_`
+                        // checks fire identically to upstream.
+                        let hints = graph_ref.hints.clone();
+                        let graph = graph_ref.clone();
+                        let func = SemanticFunction {
+                            name: callee_path.last_segment().unwrap_or_default().to_string(),
+                            graph,
+                            return_type: None,
+                            self_ty_root: None,
+                            hints,
+                            module_path: String::new(),
+                            access_directly: false,
+                            trait_root: None,
+                            trait_qualified: None,
+                            returns_objectptr: false,
+                        };
+                        if policy.look_inside_graph(&func) {
+                            self.candidate_graphs.insert(callee_path.clone());
+                            todo.push(callee_path);
+                        }
                     }
                 }
             }
