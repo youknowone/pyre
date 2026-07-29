@@ -1111,6 +1111,7 @@ unsafe fn fill_cache(
     if !crate::baseobjspace::side_effects_ok() {
         return;
     }
+    let _code_cache_guard = code_cache_lock(pycode);
     let entry = MapdictCacheEntry {
         cached_map: map,
         cached_attr: attr,
@@ -1210,26 +1211,33 @@ pub unsafe fn load_attr_caching(
     nameindex: usize,
     name: &str,
 ) -> Result<PyObjectRef, PyError> {
-    // PyPy's GIL makes the per-instance map/storage pair and the per-code
-    // `_mapdict_caches` entry one atomic observation.  Preserve those exact
-    // owners under free threading with narrow synchronization around the
-    // upstream cache operation.
-    let _instance_guard = instance_lock(w_obj);
-    let _code_cache_guard = code_cache_lock(pycode);
-    let entry = unsafe { crate::pycode::w_code_mapdict_caches_get(pycode, nameindex) };
-    // mapdict.py:1482 `map = w_obj._get_mapdict_map()`.
-    let map = unsafe { mapdict_map_or_null(w_obj) };
-    if let Some(e) = entry {
-        // mapdict.py:1483 `if entry.is_valid_for_map(map) and entry.w_method is None`.
-        if !map.is_null() && unsafe { e.is_valid_for_map(map, false) } && e.w_method.is_null() {
-            // mapdict.py:1485-1487 `attr = entry.attr_wref(); if attr is not None`.
-            if !e.cached_attr.is_null() {
+    // Copy the immortal-node cache entry under its code-owned lock, then
+    // release that lock before touching an instance. Holding both locks
+    // across the slow path would extend them across arbitrary descriptor
+    // calls, unlike PyPy's single GIL critical section, and permits
+    // instance-A -> code -> instance-B / instance-B -> code cycles.
+    let entry = {
+        let _code_cache_guard = code_cache_lock(pycode);
+        unsafe { crate::pycode::w_code_mapdict_caches_get(pycode, nameindex) }
+    };
+    let map = {
+        let _instance_guard = instance_lock(w_obj);
+        // mapdict.py:1482 `map = w_obj._get_mapdict_map()`.
+        let map = unsafe { mapdict_map_or_null(w_obj) };
+        if let Some(e) = entry {
+            // mapdict.py:1483-1487 — valid cache entry with a live attr.
+            if !map.is_null()
+                && unsafe { e.is_valid_for_map(map, false) }
+                && e.w_method.is_null()
+                && !e.cached_attr.is_null()
+            {
                 let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
                 // mapdict.py:1487 `return attr._direct_read(w_obj)`.
                 return Ok(unsafe { direct_read(e.cached_attr, inst) });
             }
         }
-    }
+        map
+    };
     unsafe { load_attr_slowpath(pycode, w_obj, nameindex, name, map) }
 }
 
@@ -1270,8 +1278,26 @@ unsafe fn load_attr_slowpath(
             // mapdict.py:1526 `if attrkind != INVALID:`.
             if attrkind != INVALID {
                 let attrname = if is_slot { "slot" } else { name };
-                // mapdict.py:1527 `attr = map.find_map_attr(attrname, attrkind)`.
-                if let Some(attr) = unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) } {
+                // The type/descriptor lookup above can execute Python. Re-lock
+                // only for the direct map/storage observation and abandon the
+                // cache path if another thread changed the instance map.
+                let direct = {
+                    let _instance_guard = instance_lock(w_obj);
+                    let current_map = unsafe { mapdict_map_or_null(w_obj) };
+                    if std::ptr::eq(current_map, map) {
+                        unsafe { find_map_attr(current_map, Wtf8::new(attrname), attrkind) }.map(
+                            |attr| {
+                                let inst =
+                                    unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
+                                let value = unsafe { direct_read(attr, inst) };
+                                (current_map, attr, value)
+                            },
+                        )
+                    } else {
+                        None
+                    }
+                };
+                if let Some((current_map, attr, value)) = direct {
                     // mapdict.py:1531-1532 `_fill_cache(...,
                     // valid_for_store=w_type.setattr_if_not_from_object() is None)`.
                     let valid_for_store =
@@ -1281,7 +1307,7 @@ unsafe fn load_attr_slowpath(
                         fill_cache(
                             pycode,
                             nameindex,
-                            map,
+                            current_map,
                             version_tag,
                             attr,
                             std::ptr::null_mut(),
@@ -1289,8 +1315,7 @@ unsafe fn load_attr_slowpath(
                         );
                     }
                     // mapdict.py:1533 `return attr._direct_read(w_obj)`.
-                    let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
-                    return Ok(unsafe { direct_read(attr, inst) });
+                    return Ok(value);
                 }
             }
         }
@@ -1618,17 +1643,21 @@ pub unsafe fn store_attr_caching(
     name: &str,
     w_value: PyObjectRef,
 ) -> Result<(), PyError> {
-    let _instance_guard = instance_lock(w_obj);
-    let _code_cache_guard = code_cache_lock(pycode);
-    let entry = unsafe { crate::pycode::w_code_mapdict_caches_get(pycode, nameindex) };
-    // mapdict.py:1577 `map = w_obj._get_mapdict_map()`.
-    let map = unsafe { mapdict_map_or_null(w_obj) };
-    if let Some(e) = entry {
-        // mapdict.py:1578 `entry.is_valid_for_map(map, store=True) and
-        // entry.w_method is None`.
-        if !map.is_null() && unsafe { e.is_valid_for_map(map, true) } && e.w_method.is_null() {
-            // mapdict.py:1580-1585 `attr = entry.attr_wref(); if attr is not None`.
-            if !e.cached_attr.is_null() {
+    let entry = {
+        let _code_cache_guard = code_cache_lock(pycode);
+        unsafe { crate::pycode::w_code_mapdict_caches_get(pycode, nameindex) }
+    };
+    let map = {
+        let _instance_guard = instance_lock(w_obj);
+        // mapdict.py:1577 `map = w_obj._get_mapdict_map()`.
+        let map = unsafe { mapdict_map_or_null(w_obj) };
+        if let Some(e) = entry {
+            // mapdict.py:1578-1585 — valid cache entry with a live attr.
+            if !map.is_null()
+                && unsafe { e.is_valid_for_map(map, true) }
+                && e.w_method.is_null()
+                && !e.cached_attr.is_null()
+            {
                 let attr = e.cached_attr;
                 let p = unsafe { (*attr).as_plain() };
                 // mapdict.py:1582-1583 `if not attr.ever_mutated: attr.ever_mutated = True`.
@@ -1641,7 +1670,8 @@ pub unsafe fn store_attr_caching(
                 return Ok(());
             }
         }
-    }
+        map
+    };
     unsafe { store_attr_slowpath(pycode, w_obj, nameindex, name, map, w_value, entry) }
 }
 
@@ -1702,12 +1732,29 @@ unsafe fn store_attr_slowpath(
                         None => true,
                     };
                     if typsafe {
-                        // mapdict.py:1610 `_switch_map_and_write_increase_storage1`.
-                        let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
-                        unsafe {
-                            switch_map_and_write_increase_storage1(attr_to_add, inst, w_value)
+                        let switched = {
+                            let _instance_guard = instance_lock(w_obj);
+                            let current_map = unsafe { mapdict_map_or_null(w_obj) };
+                            if std::ptr::eq(current_map, map) {
+                                // mapdict.py:1610
+                                // `_switch_map_and_write_increase_storage1`.
+                                let inst =
+                                    unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
+                                unsafe {
+                                    switch_map_and_write_increase_storage1(
+                                        attr_to_add,
+                                        inst,
+                                        w_value,
+                                    )
+                                };
+                                true
+                            } else {
+                                false
+                            }
                         };
-                        return Ok(());
+                        if switched {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -1729,6 +1776,34 @@ unsafe fn store_attr_slowpath(
                 // mapdict.py:1628 `attr = map.find_map_attr(attrname, attrkind)`.
                 match unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) } {
                     Some(attr) => {
+                        let written = {
+                            let _instance_guard = instance_lock(w_obj);
+                            let current_map = unsafe { mapdict_map_or_null(w_obj) };
+                            if !std::ptr::eq(current_map, map)
+                                || unsafe {
+                                    find_map_attr(current_map, Wtf8::new(attrname), attrkind)
+                                }
+                                .is_none()
+                            {
+                                false
+                            } else {
+                                let p = unsafe { (*attr).as_plain() };
+                                // mapdict.py:1632-1633
+                                // `if not attr.ever_mutated: ...`.
+                                if !p.ever_mutated.get() {
+                                    p.ever_mutated.set(true);
+                                }
+                                // mapdict.py:1634 `attr._direct_write(...)`.
+                                let inst =
+                                    unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
+                                unsafe { plain_direct_write(attr, inst, w_value) };
+                                true
+                            }
+                        };
+                        if !written {
+                            return crate::baseobjspace::setattr_str(w_obj, name, w_value)
+                                .map(|_| ());
+                        }
                         // mapdict.py:1630-1631 — fill only when there is no custom
                         // `__getattribute__` to upset the cache invariant.
                         if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }
@@ -1746,14 +1821,6 @@ unsafe fn store_attr_slowpath(
                                 );
                             }
                         }
-                        let p = unsafe { (*attr).as_plain() };
-                        // mapdict.py:1632-1633 `if not attr.ever_mutated: ...`.
-                        if !p.ever_mutated.get() {
-                            p.ever_mutated.set(true);
-                        }
-                        // mapdict.py:1634 `attr._direct_write(w_obj, w_value)`.
-                        let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
-                        unsafe { plain_direct_write(attr, inst, w_value) };
                         return Ok(());
                     }
                     None => {
@@ -1765,13 +1832,35 @@ unsafe fn store_attr_slowpath(
                                 == TerminatorKind::Dict
                         {
                             let term = unsafe { (*map).terminator() };
-                            let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
-                            // mapdict.py:1639 `map.terminator._write_terminator(...)`.
-                            unsafe {
-                                write_terminator(term, inst, Wtf8::new(name), attrkind, w_value)
+                            let mapnew = {
+                                let _instance_guard = instance_lock(w_obj);
+                                let current_map = unsafe { mapdict_map_or_null(w_obj) };
+                                if !std::ptr::eq(current_map, map) {
+                                    std::ptr::null()
+                                } else {
+                                    let inst = unsafe {
+                                        &mut *(w_obj as *mut pyre_object::W_ObjectObject)
+                                    };
+                                    // mapdict.py:1639
+                                    // `map.terminator._write_terminator(...)`.
+                                    unsafe {
+                                        write_terminator(
+                                            term,
+                                            inst,
+                                            Wtf8::new(name),
+                                            attrkind,
+                                            w_value,
+                                        )
+                                    };
+                                    // mapdict.py:1640
+                                    // `mapnew = w_obj._get_mapdict_map()`.
+                                    inst._get_mapdict_map()
+                                }
                             };
-                            // mapdict.py:1640 `mapnew = w_obj._get_mapdict_map()`.
-                            let mapnew = inst._get_mapdict_map();
+                            if mapnew.is_null() {
+                                return crate::baseobjspace::setattr_str(w_obj, name, w_value)
+                                    .map(|_| ());
+                            }
                             // mapdict.py:1642-1648 — fill only when no attribute
                             // reordering happened (the new attr is the leaf whose
                             // `back` is the pre-write map).
