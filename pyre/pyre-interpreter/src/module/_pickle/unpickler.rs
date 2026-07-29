@@ -1443,6 +1443,13 @@ fn instantiate(w_cls: PyObjectRef, w_args: PyObjectRef) -> Result<PyObjectRef, P
 
 /// `cls.__new__(cls, *args)`.
 fn new_instance(w_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    if !unsafe { pyre_object::typeobject::is_type(w_cls) } {
+        let message = format!(
+            "NEWOBJ class argument must be a type, not {}",
+            crate::type_methods::arg_type_name(w_cls),
+        );
+        return Err(unpickling_error(&message));
+    }
     let w_new = crate::baseobjspace::getattr_str(w_cls, "__new__")?;
     let mut call_args = vec![w_cls];
     call_args.extend_from_slice(args);
@@ -1458,6 +1465,13 @@ fn new_instance_kw(
     args: &[PyObjectRef],
     kw_items: &[(PyObjectRef, PyObjectRef)],
 ) -> Result<PyObjectRef, PyError> {
+    if !unsafe { pyre_object::typeobject::is_type(w_cls) } {
+        let message = format!(
+            "NEWOBJ_EX class argument must be a type, not {}",
+            crate::type_methods::arg_type_name(w_cls),
+        );
+        return Err(unpickling_error(&message));
+    }
     let w_new = crate::baseobjspace::getattr_str(w_cls, "__new__")?;
     let mut call_args = Vec::with_capacity(1 + args.len());
     call_args.push(w_cls);
