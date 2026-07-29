@@ -45,3 +45,5 @@ assert extended_reduce_args[1] == (5,)
 assert extended_reduce_args[2] == {"value": 6}
 
 assert DescriptorArgs().__reduce_ex__(2)[1][1:] == (7, 8)
+
+print("OK")

@@ -64,3 +64,5 @@ class Child(Parent):
 
 assert pow(Parent(), Child(), 7) == "parent"
 assert subtype_events == ["child rpow", "parent pow"]
+
+print("OK")

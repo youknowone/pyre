@@ -36,6 +36,9 @@ objects = [
     make_finalizing("starmap", itertools.starmap, (pow, [])),
     make_finalizing("accumulate", itertools.accumulate, ([],)),
     make_finalizing("zip_longest", itertools.zip_longest, ([], [])),
+    make_finalizing("chain", itertools.chain, ([],)),
+    make_finalizing("cycle", itertools.cycle, ([],)),
+    make_finalizing("pairwise", itertools.pairwise, ([],)),
 ]
 del objects
 gc.collect()
@@ -43,14 +46,17 @@ gc.collect()
 assert sorted(finalized) == [
     "accumulate",
     "batched",
+    "chain",
     "combinations",
     "combinations_with_replacement",
     "compress",
     "count",
+    "cycle",
     "dropwhile",
     "filterfalse",
     "groupby",
     "islice",
+    "pairwise",
     "permutations",
     "product",
     "repeat",
