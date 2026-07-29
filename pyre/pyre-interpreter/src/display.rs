@@ -1378,21 +1378,19 @@ unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Result<Option<Wtf8Buf>, 
                 } else {
                     None
                 };
-            // `have_filename` → `os.path.basename(self.filename or "???")`.
+            // `have_filename` → `my_basename(self.filename)`.
+            // `interp_exceptions.py:875` substitutes `"???"` for a falsy
+            // filename; 3.14 only tests `PyUnicode_Check`, so an *empty*
+            // filename basenames to the empty string.
             let w_filename = crate::baseobjspace::syntax_error_attr(obj, "filename");
             if pyre_object::pyobject::is_exact_type(w_filename, &STR_TYPE) {
                 let fbuf = pyre_object::w_str_get_wtf8(w_filename).to_wtf8_buf();
-                let fname = if fbuf.as_bytes().is_empty() {
-                    Wtf8Buf::from_string("???".to_string())
-                } else {
-                    let start = fbuf
-                        .as_bytes()
-                        .iter()
-                        .rposition(|&b| b == b'/')
-                        .map_or(0, |i| i + 1);
-                    fbuf[start..].to_wtf8_buf()
-                };
-                let mut inner = fname;
+                let start = fbuf
+                    .as_bytes()
+                    .iter()
+                    .rposition(|&b| b == b'/')
+                    .map_or(0, |i| i + 1);
+                let mut inner = fbuf[start..].to_wtf8_buf();
                 if let Some(l) = lineno_str {
                     inner.push_str(", ");
                     inner.push_wtf8(&l);

@@ -8682,6 +8682,7 @@ pub fn compile_err_to_syntax_error(
     source: &str,
 ) -> crate::PyError {
     let msg = e.to_string();
+    let subclass = syntax_error_subclass(&e);
     let (lineno, offset) = e.python_location();
     if lineno == 0 {
         return crate::PyError::syntax_error(msg);
@@ -8690,7 +8691,7 @@ pub fn compile_err_to_syntax_error(
     let filename = e.source_path().to_string();
     // The offending source line, keeping its trailing newline like `e.text`.
     let text = source.split_inclusive('\n').nth(lineno - 1);
-    crate::PyError::syntax_error_located(
+    let mut err = crate::PyError::syntax_error_located(
         msg,
         &filename,
         lineno as i64,
@@ -8698,7 +8699,33 @@ pub fn compile_err_to_syntax_error(
         end_lineno as i64,
         end_offset as i64,
         text,
-    )
+    );
+    if let Some(name) = subclass {
+        err.retag_exception_class(name);
+    }
+    err
+}
+
+/// The `SyntaxError` subclass a compile failure belongs to.  3.14 raises
+/// `IndentationError` for every indentation-shaped tokenizer failure and
+/// plain `SyntaxError` for the rest; `TabError` needs the tokenizer's
+/// tabsize-8 vs tabsize-1 column pair, which the parser does not surface,
+/// so a tab/space clash still lands on `IndentationError`.
+fn syntax_error_subclass(e: &crate::compile::CompileError) -> Option<&'static str> {
+    use rustpython_compiler::parser::{LexicalErrorType, ParseErrorType};
+    let crate::compile::CompileError::Parse(parse_err) = e else {
+        return None;
+    };
+    match &parse_err.error {
+        ParseErrorType::UnexpectedIndentation
+        | ParseErrorType::Lexical(LexicalErrorType::IndentationError) => Some("IndentationError"),
+        // `pegen`'s "expected an indented block after <clause> on line N",
+        // which the compiler reconstructs as a plain message.
+        ParseErrorType::OtherError(msg) if msg.starts_with("expected an indented block") => {
+            Some("IndentationError")
+        }
+        _ => None,
+    }
 }
 
 /// `pypy/interpreter/astcompiler/consts.py` compilation flag bits.

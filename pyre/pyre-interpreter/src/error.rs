@@ -571,6 +571,22 @@ impl PyError {
         Self::new(PyErrorKind::ValueError, msg)
     }
 
+    /// Retag the materialised exception to a subclass that shares its
+    /// layout, the way `os_error_family_new` picks the errno subclass:
+    /// the `ExcKind` (and so the storage) stays put and only `w_class`
+    /// moves.  Used for `IndentationError` / `TabError`, which are
+    /// `SyntaxError` subclasses with no storage of their own.
+    pub fn retag_exception_class(&mut self, class_name: &str) {
+        if self.exc_object.is_null() {
+            return;
+        }
+        if let Some(w_target) = crate::builtins::lookup_exc_class(class_name) {
+            unsafe {
+                (*(self.exc_object as *mut pyre_object::PyObject)).w_class = w_target;
+            }
+        }
+    }
+
     pub fn syntax_error(msg: impl Into<String>) -> Self {
         Self::new(PyErrorKind::SyntaxError, msg)
     }
