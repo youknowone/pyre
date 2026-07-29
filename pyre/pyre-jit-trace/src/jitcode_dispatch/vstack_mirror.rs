@@ -884,26 +884,25 @@ pub(crate) fn seed_vstack_mirror<Sym: WalkSym>(
 /// current.  A survivor slot the shadow cannot source stays a NONE hole and
 /// the guard's `mirror_covers_kept` declines for it (safe fallback).
 ///
-/// `handler_jit_pc` is the catch target (an OUTER full-body jitcode pc).
-/// No-op outside the full-body walk or inside an inline sub-walk (where the
-/// pc is a callee coordinate the outer metadata cannot map).
+/// `handler_jit_pc` is the catch target: an OUTER full-body jitcode pc, or a
+/// CALLEE coordinate when the catch happens inside an inline sub-walk.  No-op
+/// when the walk has no jitcode to map the pc through.
 pub(crate) fn vstack_enter_exception_handler<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     handler_jit_pc: usize,
     exc: OpRef,
 ) {
+    if ctx.fbw_mode.inline_subwalk {
+        vstack_enter_exception_handler_callee(ctx, handler_jit_pc, exc);
+        return;
+    }
     // The handler-entry operand stack is a FRESH reconstruction from the
     // authoritative virtualizable shadow plus the caught `exc` — it does NOT
     // depend on the pre-raise mirror being valid (the unwind discards the
     // operand stack above the handler depth, and the surviving slots below
     // are read from the shadow).  So REVIVE the mirror here even when the
     // pre-raise walk invalidated it (e.g. at a `LOAD_GLOBAL` NULL-sentinel on
-    // the `raise` expression).  Only an inline sub-walk (callee coordinate)
-    // or a missing full-body sym is unrecoverable.
-    if ctx.fbw_mode.inline_subwalk {
-        ctx.vstack_valid = false;
-        return;
-    }
+    // the `raise` expression).  Only a missing full-body sym is unrecoverable.
     let full_body_sym = ctx.fbw_mode.snapshot_sym;
     if full_body_sym.is_null() {
         return;
@@ -965,4 +964,53 @@ pub(crate) fn vstack_enter_exception_handler<Sym: WalkSym>(
     // skips the already-set exc slot (non-NONE).  Leaves un-sourceable slots
     // NONE (per-slot decline) rather than latching the whole mirror invalid.
     let _ = reseed_vstack_from_shadow(ctx, handler_depth);
+}
+
+/// Handler-entry re-seed for a catch that happens INSIDE an inline sub-walk.
+///
+/// Two things differ from the full-body path, and both follow from the sub-walk
+/// carrying a CALLEE-local mirror ([`seed_callee_vstack_mirror`]):
+///
+/// * The catch target is a callee coordinate, so the handler py_pc and depth
+///   come from the active resume frame's own metadata rather than the outer
+///   full-body tables.
+/// * The virtualizable shadow belongs to the OUTER frame and cannot name a
+///   callee operand slot, so the surviving slots below the pushed exception are
+///   sourced from the callee-local mirror itself — the same premise that makes
+///   `reconcile_vstack_at_boundary` skip the shadow hole-fill in a sub-walk.
+///   The unwind only truncates ABOVE the handler depth, so those slots still
+///   hold what the sub-walk tracked at the raise point.
+///
+/// Without a shadow to fall back on there is no way to REVIVE an already-invalid
+/// mirror here, so an invalidated sub-walk stays invalid.
+fn vstack_enter_exception_handler_callee<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    handler_jit_pc: usize,
+    exc: OpRef,
+) {
+    if !fbw_callee_vstack_enabled() || !ctx.vstack_valid {
+        ctx.vstack_valid = false;
+        return;
+    }
+    let Some(frame) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym) else {
+        ctx.vstack_valid = false;
+        return;
+    };
+    let Some((handler_py, _code_ptr, handler_depth)) =
+        frame.vstack_coordinate_for_jitcode_pc(handler_jit_pc)
+    else {
+        ctx.vstack_valid = false;
+        return;
+    };
+    // Truncate to the handler's setup depth, keeping the tracked survivors; a
+    // mirror shallower than the handler depth pads with NONE holes, which
+    // `mirror_covers_kept` declines per slot rather than latching invalid.
+    ctx.vstack_boxes.resize(handler_depth, OpRef::NONE);
+    // The unwinder pushes the caught exception onto the new TOS.
+    if handler_depth >= 1 && exc != OpRef::NONE {
+        ctx.vstack_boxes[handler_depth - 1] = exc;
+    }
+    ctx.vstack_cur_pypc = handler_py;
+    ctx.vstack_depth = handler_depth;
+    ctx.vstack_last_ref = OpRef::NONE;
 }
