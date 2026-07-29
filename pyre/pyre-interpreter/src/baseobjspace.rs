@@ -12484,6 +12484,14 @@ pub fn pick_builtin_obj_checked(
                     if !space_builtin.is_null() && std::ptr::eq(w_builtin, space_builtin) {
                         return Ok(w_builtin);
                     }
+                    // `exec`/`eval` plant the builtins *dict* rather than the
+                    // module (3.14 `PyEval_GetBuiltins`), so the identity test
+                    // has to cover that spelling too — otherwise every frame
+                    // created under an exec'd namespace would allocate a fresh
+                    // aliasing module below.
+                    if std::ptr::eq(w_builtin, unsafe { (*exec_ctx).get_builtin_dict() }) {
+                        return Ok(space_builtin);
+                    }
                 }
                 if unsafe { pyre_object::is_module(w_builtin) } {
                     return Ok(w_builtin);

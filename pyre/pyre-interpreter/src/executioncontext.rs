@@ -1336,6 +1336,14 @@ impl ExecutionContext {
     /// the Module identity so identity-sensitive callers (PyPy
     /// `pick_builtin` `if w_builtin is space.builtin: return space.builtin`)
     /// observe the same object every call.
+    /// The dict half of [`Self::get_builtin`] — `interp->builtins`, the
+    /// object 3.14 plants as `__builtins__` in a fresh `exec`/`eval`
+    /// namespace and in every imported module (only `__main__` gets the
+    /// module itself).
+    pub fn get_builtin_dict(&self) -> PyObjectRef {
+        self.builtins_module
+    }
+
     pub fn get_builtin(&self) -> PyObjectRef {
         let cached = execution_context_builtin_cache_get(self);
         if !cached.is_null() {
@@ -1368,15 +1376,12 @@ impl ExecutionContext {
             }
         }
         self.builtin_dict_cache.set(module);
-        // `pypy/interpreter/baseobjspace.py:647` —
-        // `self.setitem(self.builtin.w_dict, 'builtins',  w_builtin)`.
-        // After the builtins module exists, install the self-reference
-        // so `__builtins__.__builtins__ is __builtins__` and
-        // user-level `import builtins; builtins.__builtins__` round-trips
-        // through `space.builtin.w_dict[__builtins__]`.
-        unsafe {
-            pyre_object::w_dict_setitem_str(self.builtins_module, "__builtins__", module);
-        }
+        // `baseobjspace.py:650` installs a self-reference here
+        // (`self.setitem(self.builtin.w_dict, '__builtins__', w_builtin)`).
+        // 3.14 does not: `__builtins__` is planted by the frame/import
+        // machinery into *other* modules' globals, so `builtins` itself has
+        // no such key and `import builtins; builtins.__builtins__` raises
+        // AttributeError.
         module
     }
 

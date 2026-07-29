@@ -9067,6 +9067,18 @@ fn exec_or_eval(
         }
     }
 
+    /// `PyEval_GetBuiltins()` — the value `exec`/`eval` plant under
+    /// `__builtins__` in a namespace that lacks it.  PyPy stores the picked
+    /// `Module` (`compiling.py:110 space.builtin`); 3.14 stores that module's
+    /// *dict*, which is what `isinstance(__builtins__, dict)` inside
+    /// `exec(src, {})` observes.
+    fn planted_builtins(w_builtin: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+        if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
+            return unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+        }
+        w_builtin
+    }
+
     fn ensure_eval_builtins(
         w_globals: pyre_object::PyObjectRef,
         exec_ctx: *const crate::PyExecutionContext,
@@ -9081,7 +9093,7 @@ fn exec_or_eval(
         // not fire for eval() in PyPy.  Dispatch on the dict object so
         // the str-keyed write fans into the storage proxy.
         let w_builtin = if !exec_ctx.is_null() {
-            unsafe { (*exec_ctx).get_builtin() }
+            planted_builtins(unsafe { (*exec_ctx).get_builtin() })
         } else {
             pyre_object::PY_NULL
         };
@@ -9111,9 +9123,9 @@ fn exec_or_eval(
         // `w_globals` object so a dict-subclass `setdefault` override
         // fires.
         let w_builtin = if !caller_frame.is_null() {
-            unsafe { (*caller_frame).get_builtin() }
+            planted_builtins(unsafe { (*caller_frame).get_builtin() })
         } else if !exec_ctx.is_null() {
-            unsafe { (*exec_ctx).get_builtin() }
+            planted_builtins(unsafe { (*exec_ctx).get_builtin() })
         } else {
             pyre_object::PY_NULL
         };
