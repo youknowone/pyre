@@ -1573,7 +1573,20 @@ fn build_instance(w_inst: PyObjectRef, w_state: PyObjectRef) -> Result<(), PyErr
 
     if !unsafe { pyre_object::is_none(w_dict_state) } {
         let w_inst_dict = crate::baseobjspace::getattr_str(w_inst, "__dict__")?;
-        call_meth(w_inst_dict, "update", &[w_dict_state])?;
+        if !unsafe { pyre_object::is_dict(w_dict_state) } {
+            return Err(unpickling_error("state is not a dictionary"));
+        }
+        for (key, value) in unsafe { pyre_object::dictmultiobject::w_dict_items(w_dict_state) } {
+            // CPython 3.14 Modules/_pickle.c:6837-6843: exact `str`
+            // instance-attribute keys pass through the interpreter intern
+            // table before PyObject_SetItem.
+            let key = if unsafe { pyre_object::is_exact_type(key, &pyre_object::STR_TYPE) } {
+                unsafe { pyre_object::unicodeobject::intern_exact_str(key) }
+            } else {
+                key
+            };
+            crate::baseobjspace::setitem(w_inst_dict, key, value)?;
+        }
     }
     if !unsafe { pyre_object::is_none(w_slot_state) } {
         for (k, v) in unsafe { pyre_object::dictmultiobject::w_dict_items(w_slot_state) } {

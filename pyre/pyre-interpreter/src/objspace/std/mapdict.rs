@@ -2703,8 +2703,9 @@ unsafe fn node_remove_dict_entries<O: MapdictObject>(self_node: MapRef, obj: &O)
 /// PyPy's two methods differ only in the dict they fill (an `r_dict` keyed by
 /// `space.eq_w`/`hash_w` vs a `str_dict` keyed by unicode), and both insert via
 /// `space.newtext(name)`; here both targets are a `W_DictObject` whose strategy
-/// (Object or Unicode) is already installed, so `w_dict_store(w_dict,
-/// w_str_new(name), value)` is the single faithful insert for either.
+/// (Object or Unicode) is already installed. Attribute names are interned at
+/// the object-space boundary, so materialisation uses `box_str_constant(name)`
+/// before the single `w_dict_store` shared by both strategies.
 ///
 /// # Safety
 /// `self_node` and its `back` chain must point to live map nodes; `w_dict` must
@@ -2724,7 +2725,7 @@ unsafe fn node_materialize_dict<O: MapdictObject>(
             // self._prim_direct_read(obj)`). `plain_direct_read` performs that
             // prim read, boxing the slot when the attribute is unboxed.
             let w_value = unsafe { plain_direct_read(self_node, obj) };
-            let w_attr = pyre_object::w_str_from_wtf8(p.name.clone());
+            let w_attr = pyre_object::unicodeobject::box_str_constant(&p.name);
             unsafe { pyre_object::w_dict_store(w_dict, w_attr, w_value) };
         } else {
             // mapdict.py:499/508 — keep the non-DICT attribute on the carrier.
@@ -3253,7 +3254,7 @@ pub unsafe fn instance_node_dict_keys(obj: PyObjectRef) -> Vec<PyObjectRef> {
     while i < nodes.len() {
         let node = nodes[i];
         let name = &(*node).as_plain().name;
-        keys.push(pyre_object::w_str_from_wtf8(name.clone()));
+        keys.push(pyre_object::unicodeobject::box_str_constant(name));
         i += 1;
     }
     keys
@@ -3310,7 +3311,7 @@ pub unsafe fn instance_node_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, Py
     while i < nodes.len() {
         let node = nodes[i];
         let name = &(*node).as_plain().name;
-        let w_key = pyre_object::w_str_from_wtf8(name.clone());
+        let w_key = pyre_object::unicodeobject::box_str_constant(name);
         let w_value = plain_direct_read(node, inst);
         out.push((w_key, w_value));
         i += 1;

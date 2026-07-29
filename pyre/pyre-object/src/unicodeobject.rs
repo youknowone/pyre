@@ -12,8 +12,8 @@
 //! Rust `&str` is valid WTF-8, so the common (surrogate-free) path is
 //! zero-cost via `Wtf8::as_str`.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
@@ -486,12 +486,15 @@ pub unsafe fn w_str_slot_del(obj: PyObjectRef, index: usize) -> bool {
 }
 
 /// FNV-1a over the key bytes, the digest the type-lookup method cache already
-/// uses. The interning table is thread-local, holds only internal identifier
-/// strings, and its entries are immortal, so the default SipHash buys nothing
-/// here while charging every attribute-name lookup a full siphash24 of the
-/// name — 10 of the top-of-stack samples in a profile of
+/// uses. The default SipHash charges every attribute-name lookup a full
+/// siphash24 of the name — 10 of the top-of-stack samples in a profile of
 /// `exception_subclass_attrs`, reached through
 /// `type_descr_call_impl` -> `lookup_in_type_where` -> `box_str_constant`.
+///
+/// `sys.intern` reaches the same table, so the keys are no longer only the
+/// internal identifiers `box_str_constant` presents; a caller that chooses its
+/// own keys can collide them at will. It costs the process nothing it could not
+/// already spend on itself.
 #[derive(Default)]
 pub struct Fnv1aHasher(u64);
 
@@ -516,30 +519,72 @@ impl std::hash::Hasher for Fnv1aHasher {
 
 type Fnv1aBuild = std::hash::BuildHasherDefault<Fnv1aHasher>;
 
-thread_local! {
-    /// String constant interning cache — single-threaded, no lock needed.
-    /// RPython has no equivalent lock; string interning is handled by the
-    /// translator at compile time, not at runtime.  Keyed by WTF-8 so a
-    /// surrogate-bearing constant (a `'\udcff'` literal) interns too.
-    static STRING_CONSTANT_CACHE: RefCell<HashMap<Wtf8Buf, usize, Fnv1aBuild>> =
-        RefCell::new(HashMap::default());
+/// Process-global string intern table.
+///
+/// CPython 3.14 keeps its interned strings in the interpreter's interned-dict
+/// state (`_PyUnicode_InternMortal`), and PyPy's translated string constants
+/// likewise have process-wide identity.  Pyre currently has one object space,
+/// so the corresponding owner is process-global.  In particular this must not
+/// be TLS: `sys.intern()` and attribute names have observable identity across
+/// threads.
+///
+/// The `HashMap` is the direct counterpart of CPython's interned dict.  Each
+/// value lives in a separately allocated stable slot because a mortal string
+/// first presented to `sys.intern()` must remain that exact object and the
+/// moving collector must be able to update its pointer without depending on a
+/// hash-table bucket address.
+///
+/// Keyed by WTF-8 so a surrogate-bearing constant (a `'\udcff'` literal)
+/// interns too.
+static STRING_INTERN_TABLE: LazyLock<Mutex<HashMap<Wtf8Buf, Box<usize>, Fnv1aBuild>>> =
+    LazyLock::new(|| Mutex::new(HashMap::default()));
+
+/// Return the process-wide canonical exact `str` for `obj`'s value.
+///
+/// CPython 3.14 `_PyUnicode_InternMortal` returns the original object when the
+/// value is first interned, or the existing canonical object otherwise.
+///
+/// # Safety
+/// `obj` must be an exact `str`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
+    debug_assert!(unsafe { is_exact_type(obj, &STR_TYPE) });
+    let value = unsafe { w_str_get_wtf8(obj) }.to_owned();
+    let mut table = STRING_INTERN_TABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(slot) = table.get(&value) {
+        return **slot as PyObjectRef;
+    }
+
+    let mut slot = Box::new(obj as usize);
+    let root_slot = (&mut *slot) as *mut usize as *mut *mut u8;
+    // A managed dynamic string must stay live and have its address rewritten
+    // after a moving collection.  Before the GC hooks are installed, dynamic
+    // string constructors already fall back to immortal allocation.
+    unsafe {
+        crate::gc_hook::try_gc_add_root(root_slot);
+    }
+    table.insert(value, slot);
+    obj
 }
 
 /// Box a string constant into a heap Python str object.
 ///
-/// Reads the thread-local `STRING_CONSTANT_CACHE` the tracer cannot model;
-/// the JIT residualises the call instead of tracing into it
-/// (`@dont_look_inside`, `rlib/jit.py:139`), the `box_str`/`pin_root` twin.
+/// Reads the process-global intern table the tracer cannot model; the JIT
+/// residualises the call instead of tracing into it (`@dont_look_inside`,
+/// `rlib/jit.py:139`), the `box_str`/`pin_root` twin.
 #[majit_macros::dont_look_inside]
 pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
-    STRING_CONSTANT_CACHE.with(|cache| {
-        if let Some(&cached) = cache.borrow().get(value) {
-            return cached as PyObjectRef;
-        }
-        let obj = w_str_from_wtf8_immortal(value.to_owned());
-        cache.borrow_mut().insert(value.to_owned(), obj as usize);
-        obj
-    })
+    let mut table = STRING_INTERN_TABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(slot) = table.get(value) {
+        return **slot as PyObjectRef;
+    }
+    let obj = w_str_from_wtf8_immortal(value.to_owned());
+    table.insert(value.to_owned(), Box::new(obj as usize));
+    obj
 }
 
 /// Extract the &str value from a known W_UnicodeObject pointer.

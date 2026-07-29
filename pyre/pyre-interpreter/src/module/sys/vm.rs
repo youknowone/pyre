@@ -1058,11 +1058,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         make_builtin_function_with_arity(
             "intern",
             |args| {
-                Ok(if args.is_empty() {
-                    w_str_new("")
-                } else {
-                    args[0]
-                })
+                let s = args[0];
+                if !unsafe { pyre_object::is_exact_type(s, &pyre_object::STR_TYPE) } {
+                    return Err(crate::PyError::type_error(format!(
+                        "can't intern {}",
+                        crate::type_methods::arg_type_name(s)
+                    )));
+                }
+                Ok(unsafe { pyre_object::unicodeobject::intern_exact_str(s) })
             },
             1,
         ),
