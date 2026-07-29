@@ -5284,13 +5284,21 @@ impl<M: Clone> MetaInterp<M> {
         }
         // Bridge traces start from rebuilt resume state, not a fresh portal
         // entry, so `initial_inputarg_consts` is not seeded with the
-        // virtualizable inputarg's ConstPtr. The live virtualizable pointer
-        // cached by `set_vable_ptr` during JitState setup is the same heap
-        // object (`orig_inpargs[idx].getref_base()`), so fall back to it.
+        // virtualizable inputarg's ConstPtr.  The TraceCtx pointer is the
+        // trace-bound equivalent of `orig_inpargs[idx].getref_base()`.
+        //
+        // Prefer it over MetaInterp's ambient pointer: an inlined residual
+        // callee can temporarily update `self.vable_ptr`, while the residual
+        // boundary restores the caller's pointer on this TraceCtx. Reading the
+        // ambient slot here would combine the caller loop's expanded inputargs
+        // with the callee frame's array length, collapsing frame identity.
+        if let Some(ptr) = ctx.virtualizable_heap_ptr() {
+            return ptr;
+        }
         if !self.vable_ptr.is_null() {
             return self.vable_ptr;
         }
-        ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null())
+        std::ptr::null()
     }
 
     /// compile.py:168 / pyjitpl.py:3605 parity: every real loop token must
