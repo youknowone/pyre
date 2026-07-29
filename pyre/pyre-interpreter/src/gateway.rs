@@ -1467,6 +1467,24 @@ mod tests {
 // `#[pyre_function]` / `#[pyre_methods]` `PyPath` typed-receiver alias
 // (gateway.py visit_fsencode line 365) and by posix call sites that
 // previously inlined the same extraction.
+/// `posixmodule.c path_converter`: a path given as `bytes` (directly or from
+/// `__fspath__`) makes the names the call reports back `bytes` as well.
+pub fn fspath_is_bytes(obj: pyre_object::PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
+        return true;
+    }
+    if unsafe { pyre_object::is_str(obj) } {
+        return false;
+    }
+    crate::typedef::r#type(obj)
+        .and_then(|pt| unsafe { crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__") })
+        .and_then(|fspath_fn| crate::call::call_function_impl_result(fspath_fn, &[obj]).ok())
+        .is_some_and(|result| unsafe { pyre_object::bytesobject::is_bytes_like(result) })
+}
+
 pub fn fsencode_w(obj: pyre_object::PyObjectRef) -> Result<String, crate::PyError> {
     let data = fsencode_bytes_w(obj)?;
     Ok(String::from_utf8_lossy(&data).into_owned())
