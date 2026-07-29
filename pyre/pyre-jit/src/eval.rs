@@ -5073,8 +5073,14 @@ fn set_jit_param_string_via_warmstate(text: &str) -> Result<(), ()> {
 
 /// Gate for jd1 (`unpackiterable_driver`): the merge-point hook drives a
 /// `JitCodeMachine` trace of `_unpackiterable_unknown_length` on hot unpack
-/// sites, closing and compiling the drain loop. ON by default, alongside the
-/// main JIT. Opt out with `PYRE_NO_JD1` (or `PYRE_JD1=0`); it also follows the
+/// sites, closing and compiling the drain loop. This remains opt-in with
+/// `PYRE_JD1=1`: unlike RPython, pyre currently drives jd1 through the same
+/// `MetaInterp.tracing` slot as the bytecode portal. A residual `next()` on a
+/// generator can run an arbitrarily large Python computation before yielding;
+/// while that happens the jd1 trace consists only of the opaque `next()` call,
+/// but the shared tracing flag suppresses every jd0 merge point reached by the
+/// generator body. Keep the incomplete second-driver experiment dormant until
+/// it has RPython's independent recursive-portal behavior. It also follows the
 /// master JIT off-switches (`PYRE_NO_JIT`, `PYRE_JIT=0`) so "no JIT" means no
 /// jd1.
 ///
@@ -5098,7 +5104,7 @@ fn jd1_experiment_enabled() -> bool {
         {
             return false;
         }
-        true
+        std::env::var("PYRE_JD1").as_deref() == Ok("1")
     })
 }
 
