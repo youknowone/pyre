@@ -146,8 +146,16 @@ pub fn pin_root(root: PyObjectRef) {
     // bracket.  RPython's `_trace_drag_out` always rewrites a root that names
     // an already-forwarded nursery object; normalize the host-side copy at
     // the same boundary so the shadow stack never gains a forwarding stub.
-    let root = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
-    SHADOW_STACK.with(|s| s.borrow_mut()[index] = root);
+    let normalized = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
+    // The slot already holds `root`, so a query that found no forwarding stub
+    // has nothing to write back.  That is the steady state — nothing collected
+    // between the push above and the query — and the write-back is not free:
+    // this thread-local resolves through `_tlv_get_addr` on every `with`, and
+    // pinning sits on the interpreter's allocation and call paths, so the
+    // second resolve plus its `RefCell` borrow is paid once per pinned livevar.
+    if normalized != root {
+        SHADOW_STACK.with(|s| s.borrow_mut()[index] = normalized);
+    }
 }
 
 /// Current length of the thread-local shadow stack. Used by
