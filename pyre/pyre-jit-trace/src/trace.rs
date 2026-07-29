@@ -128,6 +128,10 @@ pub(crate) enum WalkEndCommitLeg {
     /// otherwise reports these walks as `committed=true leg=0`, which reads as
     /// "no leg" when it means "a commit path outside the leg contract".
     TerminateNoReplay = 8,
+    /// `SwitchToBlackhole(ABORT_TOO_LONG)`: the post-step MIFrame image was
+    /// converted to blackhole frames and run forward, never replayed from the
+    /// trace entry.
+    TraceTooLong = 9,
 }
 
 /// Where a committing leg puts the interpreter, relative to the effects the
@@ -1953,6 +1957,7 @@ fn try_adopt_single_frame_blackhole(
     ctx: &mut TraceCtx,
     cf_addr: usize,
     live_root_addr: usize,
+    commit_leg: WalkEndCommitLeg,
 ) -> bool {
     macro_rules! sfdbg {
         ($($a:tt)*) => {
@@ -2149,7 +2154,7 @@ fn try_adopt_single_frame_blackhole(
         crate::jitcode_dispatch::fbw_foriter_inflight_clear();
         // The blackhole ran the region to a frame terminal, so the resume is
         // the frame's RESULT, not a pc that re-runs anything.
-        let _ = commit_walk_end(WalkEndCommitLeg::VableEscape, WalkEndResume::Terminal);
+        let _ = commit_walk_end(commit_leg, WalkEndResume::Terminal);
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!(
                 "[fbw-blackhole] adopted single-frame terminal at jitcode_index={} \
@@ -2186,6 +2191,7 @@ fn try_adopt_multi_frame_blackhole(
     ctx: &mut TraceCtx,
     cf_addr: usize,
     live_root_addr: usize,
+    commit_leg: WalkEndCommitLeg,
 ) -> bool {
     // Every arm below returns to the legacy escape/replay path.  Name each one
     // under `PYRE_FBW_DEBUG_ABORT`, the way `build_multi_frame_miframe`'s
@@ -2581,7 +2587,7 @@ fn try_adopt_multi_frame_blackhole(
         crate::jitcode_dispatch::discard_escape_flush_undo();
         crate::jitcode_dispatch::fbw_foriter_inflight_clear();
         // Same as the single-frame adoption: a frame terminal, not a resume pc.
-        let _ = commit_walk_end(WalkEndCommitLeg::VableEscape, WalkEndResume::Terminal);
+        let _ = commit_walk_end(commit_leg, WalkEndResume::Terminal);
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] adopted multi-frame terminal depth={depth}");
         }
@@ -2600,9 +2606,14 @@ fn try_adopt_multi_frame_blackhole(
     adopted
 }
 
-fn try_adopt_force_blackhole(ctx: &mut TraceCtx, cf_addr: usize, live_root_addr: usize) -> bool {
-    try_adopt_multi_frame_blackhole(ctx, cf_addr, live_root_addr)
-        || try_adopt_single_frame_blackhole(ctx, cf_addr, live_root_addr)
+fn try_adopt_blackhole(
+    ctx: &mut TraceCtx,
+    cf_addr: usize,
+    live_root_addr: usize,
+    commit_leg: WalkEndCommitLeg,
+) -> bool {
+    try_adopt_multi_frame_blackhole(ctx, cf_addr, live_root_addr, commit_leg)
+        || try_adopt_single_frame_blackhole(ctx, cf_addr, live_root_addr, commit_leg)
 }
 
 fn run_perfn_walk<Sym: WalkSym>(
@@ -3319,10 +3330,19 @@ fn run_perfn_walk<Sym: WalkSym>(
         // forward abort has already distinguished an outside mark from a mark
         // inside its discarded attempt.
         let live_root_addr = sym.live_vable_frame_addr();
-        let force_blackhole_adopted = matches!(
-            &walk_result,
-            Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
-        ) && try_adopt_force_blackhole(ctx, cf_addr, live_root_addr);
+        let trace_too_long_adopted =
+            matches!(
+                &walk_result,
+                Err(crate::jitcode_dispatch::DispatchError::TraceTooLong { .. })
+            ) && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::TraceTooLong);
+        let force_blackhole_adopted =
+            matches!(
+                &walk_result,
+                Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
+            ) && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::VableEscape);
+        if trace_too_long_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!("[fbw-blackhole] adopted ABORT_TOO_LONG forward resume");
+        }
         if !force_blackhole_adopted
             && matches!(
                 &walk_result,
@@ -3821,6 +3841,7 @@ fn run_perfn_walk<Sym: WalkSym>(
     let blackhole_terminal_no_replay = matches!(
         &walk_result,
         Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
+            | Err(crate::jitcode_dispatch::DispatchError::TraceTooLong { .. })
     ) && WALK_END_FLUSH_COMMITTED.with(|slot| slot.get())
         && crate::jitcode_dispatch::fbw_finish_concrete_peek().is_some();
     if !terminate_no_replay && !blackhole_terminal_no_replay {

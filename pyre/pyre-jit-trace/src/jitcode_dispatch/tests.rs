@@ -160,7 +160,10 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
     let exc_obj_ptr: pyre_object::PyObjectRef = 0xDEAD_BEEFusize as _;
     let descr_pool: Vec<DescrRef> = Vec::new();
     let mut tc = fresh_trace_ctx();
-    let oprefs = distinct_const_refs(&mut tc, 3);
+    let mut oprefs = distinct_const_refs(&mut tc, 3);
+    // A non-constant input box has no intrinsic `TraceCtx` concrete payload;
+    // only the parallel MIFrame-style register shadow knows its value.
+    oprefs[1] = OpRef::input_arg_ref(17);
     let mut regs_r = oprefs.clone();
     let mut concrete = vec![
         ConcreteValue::Null,
@@ -227,6 +230,20 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
             reg_idx,
         );
     }
+    let code = [0u8, 1u8];
+    let op = DecodedOp {
+        key: "fixture/r",
+        opname: "fixture",
+        argcodes: "r",
+        pc: 0,
+        next_pc: 2,
+    };
+    assert_eq!(wc.trace_ctx.concrete_of_opref(wc.registers_r[1]), None);
+    assert_eq!(
+        super::vable_ops::vable_value_concrete(&code, &op, 0, &wc, 'r', wc.registers_r[1]),
+        Some(Value::Ref(majit_ir::GcRef(exc_obj_ptr as usize))),
+        "vable writes must preserve the concrete half of a non-constant register Box",
+    );
 }
 
 /// `getfield_vable_*` must abort to `VableBoxNotSeeded` when the

@@ -64,3 +64,25 @@ while i < N:
     i = i + 1
 
 print(free_total, total, box[0], d["k"], len(obj), sum(obj) % 1000003)
+
+
+# Phase C — the same exactly-once contract for a function-entry trace. Its
+# trace root is pc 0 rather than the loop header below, so the root key is
+# never revisited and only ABORT_TOO_LONG's forward blackhole handoff bounds
+# the recording. Returning the three independently observable mutation
+# classes also checks that the handoff does not replay from function entry.
+def function_entry_effects(n):
+    box = [0]
+    d = {"k": 0}
+    obj = []
+    total = 0
+    for i in range(n):
+        box[0] += 1
+        d["k"] = d["k"] + 1
+        obj.append(i)
+        total += i
+    return total, box[0], d["k"], len(obj)
+
+
+set_trace_limit(100)
+print(function_entry_effects(N))

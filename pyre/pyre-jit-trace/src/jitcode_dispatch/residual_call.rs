@@ -129,6 +129,80 @@ pub(crate) fn reset_single_frame_blackhole() {
     });
 }
 
+/// Snapshot the live meta-interpreter framestack for
+/// `SwitchToBlackhole(ABORT_TOO_LONG)`.
+///
+/// RPython calls `blackhole_if_trace_too_long()` immediately after
+/// `MIFrame.run_one_step()` and `convert_and_run_from_pyjitpl` copies every
+/// live MIFrame at its already-advanced `pc` (`pyjitpl.py:2863-2866`,
+/// `blackhole.py:1799-1821`).  The full-body walker has the same state here:
+/// `resume_pc` is `walk()`'s post-step `next_pc`, and the current
+/// [`WalkContext`] plus [`WalkSession::framestack`] own the concrete banks for
+/// the live frame and all paused callers.
+///
+/// Return `false` without publishing a partial image when any live value is
+/// unresolved.  A zero-effect walk may then use the legacy entry replay;
+/// an effectful walk must keep recording until a complete image can be built,
+/// because replaying it would apply the effect twice.
+pub(crate) fn latch_trace_too_long_blackhole<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    resume_pc: usize,
+) -> bool {
+    let last_exc_value = match ctx.last_exc_value_concrete {
+        ConcreteValue::Ref(value) => value as i64,
+        _ => 0,
+    };
+
+    if ctx.session.borrow().framestack.is_empty() && !ctx.fbw_mode.inline_subwalk {
+        let jitcode = unsafe {
+            if ctx.fbw_mode.snapshot_sym.is_null() {
+                None
+            } else {
+                let jitcode = (&*ctx.fbw_mode.snapshot_sym).jitcode();
+                (!jitcode.is_null()).then(|| (&(*jitcode).payload).jitcode.clone())
+            }
+        };
+        let Some(jitcode) = jitcode else {
+            return false;
+        };
+        let Some(mut miframe) = build_single_frame_miframe(ctx, jitcode, resume_pc, None) else {
+            return false;
+        };
+        fill_trace_too_long_register_banks(ctx, &mut miframe);
+        // Keep the per-frame red identity seeded by `frame_box`.  The
+        // authoritative walk executed against `snapshot_for_tracing`, but the
+        // adopter validates this identity and publishes that snapshot's locals
+        // to the matching live frame before driving the blackhole. Replacing
+        // the register with the snapshot address would collapse those two
+        // identities and fail the live-root check.
+        FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| {
+            *slot.borrow_mut() = Some(LatchedSingleFrameBlackhole {
+                miframe,
+                last_exc_value,
+                raising_exception: false,
+            });
+        });
+        true
+    } else if ctx.fbw_mode.inline_subwalk && multi_frame_blackhole_resume_enabled() {
+        let Some(mut framestack) = build_multi_frame_miframe(ctx, resume_pc, None) else {
+            return false;
+        };
+        if let Some(innermost) = framestack.frames.last_mut() {
+            fill_trace_too_long_register_banks(ctx, innermost);
+        }
+        FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
+            *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
+                framestack,
+                last_exc_value,
+                raising_exception: false,
+            });
+        });
+        true
+    } else {
+        false
+    }
+}
+
 /// `PYRE_FBW_BLACKHOLE_RESUME` (default ON) — a top-level one-frame walk whose
 /// residual forced the vable and writes live heap resumes PAST the escaping
 /// opcode through the blackhole instead of falling back to escape/replay.  Both
@@ -283,6 +357,89 @@ fn build_single_frame_miframe<Sym: WalkSym>(
     }
 
     Some(miframe)
+}
+
+/// Fill every currently-known register color, matching
+/// `blackhole.py:_copy_data_from_miframe`.
+///
+/// The vable-escape latch above only needs the resume marker's live set: it
+/// resumes immediately after one forcing residual whose result is supplied
+/// separately. `ABORT_TOO_LONG` is different — the blackhole can follow
+/// arbitrary control flow from a post-step pc before reaching a terminal, so
+/// colors outside that marker-local live set may be read later. RPython copies
+/// all three complete MIFrame banks; do the same for this abort instead of
+/// relying on the narrower resume-liveness cache.
+fn fill_trace_too_long_register_banks<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    miframe: &mut majit_metainterp::MIFrame,
+) {
+    for color in 0..miframe.int_values.len() {
+        if let Some(value) = ctx
+            .concrete_registers_i
+            .get(color)
+            .copied()
+            .and_then(|value| match value {
+                ConcreteValue::Int(value) => Some(value),
+                ConcreteValue::Bool(value) => Some(i64::from(value)),
+                _ => None,
+            })
+        {
+            miframe.int_values[color] = Some(value);
+            continue;
+        }
+        if miframe.int_values[color].is_none() {
+            miframe.int_values[color] = ctx
+                .registers_i
+                .get(color)
+                .copied()
+                .and_then(|opref| ctx.trace_ctx.concrete_of_opref(opref))
+                .and_then(|value| match value {
+                    majit_ir::Value::Int(value) => Some(value),
+                    _ => None,
+                });
+        }
+    }
+
+    for color in 0..miframe.ref_values.len() {
+        if let Some(value) = ctx
+            .concrete_registers_r
+            .get(color)
+            .copied()
+            .and_then(|value| match value {
+                ConcreteValue::Ref(value) => Some(value as i64),
+                _ => None,
+            })
+        {
+            miframe.ref_values[color] = Some(value);
+            continue;
+        }
+        if miframe.ref_values[color].is_none() {
+            miframe.ref_values[color] = ctx
+                .registers_r
+                .get(color)
+                .copied()
+                .and_then(|opref| ctx.trace_ctx.recover_ref_value(opref, 8))
+                .and_then(|value| match value {
+                    majit_ir::Value::Ref(value) => Some(value.0 as i64),
+                    _ => None,
+                });
+        }
+    }
+
+    for color in 0..miframe.float_values.len() {
+        if miframe.float_values[color].is_some() {
+            continue;
+        }
+        miframe.float_values[color] = ctx
+            .registers_f
+            .get(color)
+            .copied()
+            .and_then(|opref| ctx.trace_ctx.concrete_of_opref(opref))
+            .and_then(|value| match value {
+                majit_ir::Value::Float(value) => Some(value.to_bits() as i64),
+                _ => None,
+            });
+    }
 }
 
 fn build_multi_frame_miframe<Sym: WalkSym>(
