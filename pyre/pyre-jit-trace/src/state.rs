@@ -6783,12 +6783,32 @@ fn reconstruct_inline_recipe(
     }
     let nlocals = code_ref.varnames.len();
 
-    let stack_only = match crate::liveness::liveness_for(raw_code).stack_depth_at(py_pc) {
+    let liveness = crate::liveness::liveness_for(raw_code);
+    let stack_only = match liveness.stack_depth_at(py_pc) {
         Some(d) => d,
         None => return None,
     };
     let pending_result_abs_slot = if in_a_call && stack_only > 0 {
         Some(nlocals + stack_only - 1)
+    } else {
+        None
+    };
+    // `stack_depth_at(pc)` is the depth BEFORE executing `pc` (`[0]` is the
+    // entry depth and `[pc + 1]` is `pc`'s fallthrough depth), so at the call
+    // site an `in_a_call` frame is paused on, it still counts the whole operand
+    // region the call consumes — the callable and every argument.  Resuming
+    // once the callee returns collapses that region to one result, which the
+    // framestack walk delivers through `make_result_of_lastop` rather than from
+    // resumedata, so no callee ever flushed those operands to
+    // `locals_cells_stack_w` and none of them is reconstructable.  Exempt the
+    // whole region from the mandatory-operand demand below, not just its
+    // topmost slot: with one argument or more the top slot alone left the
+    // callable and the arguments demanded, so every argument-taking inlined
+    // call declined and its guard was blacklisted.
+    let unreconstructable_operand_floor = if in_a_call {
+        liveness
+            .stack_depth_at(py_pc + 1)
+            .map(|post| nlocals + post.saturating_sub(1))
     } else {
         None
     };
@@ -7029,10 +7049,35 @@ fn reconstruct_inline_recipe(
             concrete_r[k] = value_for_slot(Type::Ref, bits);
         }
         for s in nlocals..valuestackdepth {
-            if Some(s) == pending_result_abs_slot {
+            if Some(s) == pending_result_abs_slot
+                || unreconstructable_operand_floor.is_some_and(|floor| s >= floor)
+            {
                 continue;
             }
             if registers_r[s] == OpRef::NONE {
+                if std::env::var_os("PYRE_P2_DIAG").is_some() {
+                    let sem: Vec<(u32, Option<usize>)> = reg_indices
+                        .ref_
+                        .iter()
+                        .map(|&c| {
+                            (
+                                c,
+                                semantic_ref_slot_for_reg_color(
+                                    nlocals,
+                                    stack_only,
+                                    &maps.pcdep_entries,
+                                    c as usize,
+                                ),
+                            )
+                        })
+                        .collect();
+                    eprintln!(
+                        "[p2-recipe] jitcode_index={} pc={} py_pc={py_pc} in_a_call={in_a_call} \
+                         nlocals={nlocals} stack_only={stack_only} vsd={valuestackdepth} \
+                         missing={s} arr={arr:?} pframe={pframe_reg} pec={pec_reg} live_ref={sem:?}",
+                        frame.jitcode_index, frame.pc
+                    );
+                }
                 crate::jitcode_dispatch::census_record("P2Recipe::MandatoryOperandMissing");
                 return None;
             }
