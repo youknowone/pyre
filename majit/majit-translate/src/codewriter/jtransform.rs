@@ -9804,7 +9804,7 @@ mod tests {
         let return_str = match result_ty {
             ValueType::Int | ValueType::State => "i64",
             ValueType::Unsigned => "u64",
-            ValueType::Ref(_) | ValueType::Unknown => "String",
+            ValueType::Ref(_) | ValueType::Str | ValueType::Unknown => "String",
             ValueType::Float => "f64",
             ValueType::Void => "",
             ValueType::Bool => "bool",
@@ -10056,7 +10056,7 @@ mod tests {
         let return_str = match result_ty {
             ValueType::Int | ValueType::State => "i64",
             ValueType::Unsigned => "u64",
-            ValueType::Ref(_) | ValueType::Unknown => "String",
+            ValueType::Ref(_) | ValueType::Str | ValueType::Unknown => "String",
             ValueType::Float => "f64",
             ValueType::Void => "",
             ValueType::Bool => "bool",
