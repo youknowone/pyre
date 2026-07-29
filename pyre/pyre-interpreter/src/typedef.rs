@@ -16987,7 +16987,8 @@ fn bytearray_descr_init_value(
         // through to the buffer path below. (bytearray does NOT honour
         // `__bytes__`, so there is no invoke_bytes_method here.)
         if let Some(count) = bytes_count_from_index(arg)? {
-            return Ok(pyre_object::bytearrayobject::w_bytearray_new(count));
+            return pyre_object::bytearrayobject::w_bytearray_try_new(count)
+                .ok_or_else(crate::builtins::reservation_failed);
         }
         // `_convert_from_buffer_or_iterable`: acquire a read-only buffer
         // before trying the iterable path.  This includes Python 3.14's
@@ -18599,7 +18600,8 @@ fn bytes_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     if width <= len {
         return Ok(new_bytes_like(args[0], data));
     }
-    let mut out = data.to_vec();
+    let mut out = crate::builtins::try_vec_with_capacity(width as usize)?;
+    out.extend_from_slice(data);
     out.resize(width as usize, fill);
     Ok(new_bytes_like(args[0], &out))
 }
@@ -18614,7 +18616,8 @@ fn bytes_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     if width <= len {
         return Ok(new_bytes_like(args[0], data));
     }
-    let mut out = vec![fill; (width - len) as usize];
+    let mut out = crate::builtins::try_vec_with_capacity(width as usize)?;
+    out.resize((width - len) as usize, fill);
     out.extend_from_slice(data);
     Ok(new_bytes_like(args[0], &out))
 }
@@ -18633,7 +18636,8 @@ fn bytes_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     }
     let d = width - len;
     let offset = (d / 2 + (d & width & 1)) as usize;
-    let mut out = vec![fill; offset];
+    let mut out = crate::builtins::try_vec_with_capacity(width as usize)?;
+    out.resize(offset, fill);
     out.extend_from_slice(data);
     out.resize(width as usize, fill);
     Ok(new_bytes_like(args[0], &out))
@@ -18650,7 +18654,7 @@ fn bytes_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         return Ok(new_bytes_like(args[0], data));
     }
     let pad = (width - len) as usize;
-    let mut out = Vec::with_capacity(width as usize);
+    let mut out = crate::builtins::try_vec_with_capacity(width as usize)?;
     let rest = match data.split_first() {
         Some((&first, tail)) if first == b'+' || first == b'-' => {
             out.push(first);
@@ -20106,10 +20110,9 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         // newbytesdata_w_tail: a successful `__index__` supplies a count of
         // NUL bytes; TypeError falls through to the buffer/iterable path.
         if let Some(count) = bytes_count_from_index(arg)? {
-            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&vec![
-                0u8;
-                count
-            ]));
+            let mut zeros = crate::builtins::try_vec_with_capacity(count)?;
+            zeros.resize(count, 0u8);
+            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&zeros));
         }
         // `_convert_from_buffer_or_iterable`: acquire a read-only buffer
         // before trying the iterable path.  This includes Python 3.14's

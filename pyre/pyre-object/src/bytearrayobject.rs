@@ -90,6 +90,20 @@ pub fn w_bytearray_new(size: usize) -> PyObjectRef {
     w_bytearray_alloc(vec![0u8; size])
 }
 
+/// [`w_bytearray_new`] for a `size` that came from Python, returning `None`
+/// when the buffer cannot be reserved.
+///
+/// `bytearray(sys.maxsize)` reaches the allocator with an unsatisfiable
+/// request; an infallible `vec!` aborts the process there, while the caller
+/// needs to raise `MemoryError`.
+#[majit_macros::dont_look_inside]
+pub fn w_bytearray_try_new(size: usize) -> Option<PyObjectRef> {
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(size).ok()?;
+    buf.resize(size, 0);
+    Some(w_bytearray_alloc(buf))
+}
+
 /// Allocate a new bytearray from a byte slice.
 ///
 /// `dont_look_inside` (`rlib/jit.py:139`): see [`w_bytearray_new`].

@@ -323,7 +323,21 @@ fn cformat_rbigint(spec: &CFormatSpec, num: &BigInt) -> Result<String, PyError> 
     }
 }
 
+/// Reserve a spec's padding run before the formatter materialises it.
+///
+/// `min_field_width` reaches here straight from Python — `'%*s' % (n, x)`
+/// takes it from the argument tuple — and the fill run is built eagerly, so
+/// an unsatisfiable width has to unwind rather than abort the process. The
+/// fill character is always ASCII, so `width` bounds the run in bytes.
+fn check_min_field_width(spec: &CFormatSpec) -> Result<(), PyError> {
+    if let Some(CFormatQuantity::Amount(width)) = spec.min_field_width {
+        crate::builtins::try_vec_with_capacity::<u8>(width)?;
+    }
+    Ok(())
+}
+
 unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<u8>, PyError> {
+    check_min_field_width(spec)?;
     match &spec.format_type {
         CFormatType::String(conversion) => match conversion {
             CFormatConversion::Repr | CFormatConversion::Ascii => {
@@ -439,6 +453,7 @@ unsafe fn spec_format_string(
     obj: PyObjectRef,
     idx: usize,
 ) -> Result<Wtf8Buf, PyError> {
+    check_min_field_width(spec)?;
     match &spec.format_type {
         CFormatType::String(conversion) => {
             let result = match conversion {

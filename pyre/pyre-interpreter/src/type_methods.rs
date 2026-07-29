@@ -2053,24 +2053,30 @@ fn group_fractional_digits(s: String, separator: char, digits: usize) -> String 
 /// Pad `body` to `width` characters with `fill`, honouring the numeric
 /// alignments.  `=` splits a leading sign (and `0x`/`0o`/`0b` base prefix)
 /// from the digits and inserts the fill between them.
-fn pad_to_width(body: String, fill: CodePoint, align: char, width: usize) -> Wtf8Buf {
+fn pad_to_width(
+    body: String,
+    fill: CodePoint,
+    align: char,
+    width: usize,
+) -> Result<Wtf8Buf, crate::PyError> {
     if body.chars().count() >= width {
-        return Wtf8Buf::from_string(body);
+        return Ok(Wtf8Buf::from_string(body));
     }
     let need = width - body.chars().count();
-    match align {
+    let capacity = padded_byte_len(body.len(), need, fill);
+    Ok(match align {
         '<' => {
             let mut s = Wtf8Buf::from_string(body);
-            push_cp_repeated(&mut s, fill, need);
+            push_cp_repeated(&mut s, fill, need)?;
             s
         }
         '^' => {
             let left = need / 2;
             let right = need - left;
-            let mut s = Wtf8Buf::with_capacity(width);
-            push_cp_repeated(&mut s, fill, left);
+            let mut s = crate::builtins::try_wtf8_with_capacity(capacity)?;
+            push_cp_repeated(&mut s, fill, left)?;
             s.push_str(&body);
-            push_cp_repeated(&mut s, fill, right);
+            push_cp_repeated(&mut s, fill, right)?;
             s
         }
         '=' => {
@@ -2093,19 +2099,19 @@ fn pad_to_width(body: String, fill: CodePoint, align: char, width: usize) -> Wtf
                 }
             }
             let digits: String = chars.collect();
-            let mut s = Wtf8Buf::with_capacity(width);
+            let mut s = crate::builtins::try_wtf8_with_capacity(capacity)?;
             s.push_str(&prefix);
-            push_cp_repeated(&mut s, fill, need);
+            push_cp_repeated(&mut s, fill, need)?;
             s.push_str(&digits);
             s
         }
         _ => {
-            let mut s = Wtf8Buf::with_capacity(width);
-            push_cp_repeated(&mut s, fill, need);
+            let mut s = crate::builtins::try_wtf8_with_capacity(capacity)?;
+            push_cp_repeated(&mut s, fill, need)?;
             s.push_str(&body);
             s
         }
-    }
+    })
 }
 
 fn separate_integer_digits(
@@ -2224,12 +2230,12 @@ fn format_rbigint(num: &BigInt, spec: &Wtf8, type_name: &str) -> Result<Wtf8Buf,
         };
         magnitude = separate_integer_digits(magnitude, interval, separator, displayed_digits);
     }
-    Ok(pad_to_width(
+    pad_to_width(
         format!("{sign_prefix}{magnitude}"),
         p.fill,
         p.align.unwrap_or('>'),
         p.width,
-    ))
+    )
 }
 
 /// A `&str` paired with its precomputed code-point count, adapting a
@@ -2578,7 +2584,7 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
                 && !matches!(p.sign, Some('+') | Some(' '))
             {
                 let body = Wtf8Buf::from_string(crate::py_str(val)?);
-                return Ok(pad_wtf8(&body, p.fill, align, p.width));
+                return pad_wtf8(&body, p.fill, align, p.width);
             }
             // CPython _PyComplex_FormatAdvancedWriter: component flags
             // (sign / alternate / grouping / precision / type) are applied
@@ -2604,7 +2610,7 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
                 format!("{real_text}{imag_text}j")
             };
             let body = Wtf8Buf::from_string(text);
-            return Ok(pad_wtf8(&body, p.fill, align, p.width));
+            return pad_wtf8(&body, p.fill, align, p.width);
         }
         if pyre_object::is_str(val) {
             let full = pyre_object::w_str_get_wtf8(val);
@@ -2761,7 +2767,7 @@ fn format_surrogate_str(body: &Wtf8, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyEr
     } else {
         body.to_wtf8_buf()
     };
-    Ok(pad_wtf8(&body, fill, align, width))
+    pad_wtf8(&body, fill, align, width)
 }
 
 /// Format an integer through the `c` presentation type: reject the flags
@@ -2811,7 +2817,7 @@ fn format_char(num: &BigInt, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
     let mut body = Wtf8Buf::new();
     body.push(cp);
     // `c` keeps the integer default alignment (right).
-    Ok(pad_wtf8(&body, p.fill, p.align.unwrap_or('>'), p.width))
+    pad_wtf8(&body, p.fill, p.align.unwrap_or('>'), p.width)
 }
 
 /// Format `inf` / `nan`: validate the presentation type, then emit the
@@ -2844,7 +2850,7 @@ fn format_nonfinite(v: f64, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
         }
     };
     let body = format!("{sign}{magnitude}");
-    Ok(pad_to_width(body, p.fill, p.align.unwrap_or('>'), p.width))
+    pad_to_width(body, p.fill, p.align.unwrap_or('>'), p.width)
 }
 
 /// Validate a float presentation spec against the reference rules,
@@ -2930,7 +2936,7 @@ fn format_finite_float(v: f64, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
             }
             None => body,
         };
-        return Ok(pad_to_width(body, p.fill, p.align.unwrap_or('>'), p.width));
+        return pad_to_width(body, p.fill, p.align.unwrap_or('>'), p.width);
     }
     if let Some(separator) = p.fractional_grouping {
         let unpadded_spec = float_engine_spec_with_width(&p, None);
@@ -2961,31 +2967,37 @@ fn format_finite_float(v: f64, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
 /// Pad a WTF-8 string body to `width` code points with `fill`,
 /// honouring `<` / `^` / `>` alignment.  String bodies never use the
 /// numeric `=` alignment, so any non-`<`/`^` alignment right-aligns.
-fn pad_wtf8(body: &Wtf8, fill_cp: CodePoint, align: char, width: usize) -> Wtf8Buf {
+fn pad_wtf8(
+    body: &Wtf8,
+    fill_cp: CodePoint,
+    align: char,
+    width: usize,
+) -> Result<Wtf8Buf, crate::PyError> {
     let body_len = body.code_points().count();
     if body_len >= width {
-        return body.to_wtf8_buf();
+        return Ok(body.to_wtf8_buf());
     }
     let need = width - body_len;
-    let mut out = Wtf8Buf::with_capacity(body.len() + need * 4);
+    let mut out =
+        crate::builtins::try_wtf8_with_capacity(padded_byte_len(body.len(), need, fill_cp))?;
     match align {
         '<' => {
             out.push_wtf8(body);
-            push_cp_repeated(&mut out, fill_cp, need);
+            push_cp_repeated(&mut out, fill_cp, need)?;
         }
         '^' => {
             let left = need / 2;
             let right = need - left;
-            push_cp_repeated(&mut out, fill_cp, left);
+            push_cp_repeated(&mut out, fill_cp, left)?;
             out.push_wtf8(body);
-            push_cp_repeated(&mut out, fill_cp, right);
+            push_cp_repeated(&mut out, fill_cp, right)?;
         }
         _ => {
-            push_cp_repeated(&mut out, fill_cp, need);
+            push_cp_repeated(&mut out, fill_cp, need)?;
             out.push_wtf8(body);
         }
     }
-    out
+    Ok(out)
 }
 
 /// runicode.py:333 unicode_encode_utf_8 + interp_codecs.py
@@ -4216,16 +4228,15 @@ pub fn str_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         return Ok(str_result_unchanged(args[0]));
     }
     let need = width - len;
+    let zero = CodePoint::from_char('0');
     let mut cps = s.code_points();
-    let mut out = Wtf8Buf::with_capacity(width);
+    let mut out = crate::builtins::try_wtf8_with_capacity(padded_byte_len(s.len(), need, zero))?;
     let first = cps.clone().next();
     if first == Some(CodePoint::from_char('+')) || first == Some(CodePoint::from_char('-')) {
         out.push(first.unwrap());
         cps.next();
     }
-    for _ in 0..need {
-        out.push_char('0');
-    }
+    push_cp_repeated(&mut out, zero, need)?;
     for cp in cps {
         out.push(cp);
     }
@@ -4964,11 +4975,27 @@ fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<CodePoint, crate::
     Ok(first.unwrap())
 }
 
+/// Byte length of a `body_len`-byte string once `run` copies of `fill` are
+/// added to it.
+///
+/// Saturating throughout: a `width` near `sys.maxsize` would otherwise wrap
+/// the product and hand the reservation a small, satisfiable capacity.
+fn padded_byte_len(body_len: usize, run: usize, fill: CodePoint) -> usize {
+    run.saturating_mul(fill.len_wtf8()).saturating_add(body_len)
+}
+
 /// Append `cp` to `out`, `n` times.
-fn push_cp_repeated(out: &mut Wtf8Buf, cp: CodePoint, n: usize) {
+///
+/// `n` is a padding run derived from a caller-supplied `width`, so the space
+/// for it is reserved fallibly up front; growing the buffer one code point at
+/// a time would abort the process on an unsatisfiable run.
+fn push_cp_repeated(out: &mut Wtf8Buf, cp: CodePoint, n: usize) -> Result<(), crate::PyError> {
+    out.try_reserve_exact(n.saturating_mul(cp.len_wtf8()))
+        .map_err(|_| crate::builtins::reservation_failed())?;
     for _ in 0..n {
         out.push(cp);
     }
+    Ok(())
 }
 
 /// `unicode_result_unchanged`: a str method whose result equals the
@@ -4996,10 +5023,10 @@ pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let d = width - s_len;
     let left = d / 2 + (d & width & 1);
     let right = d - left;
-    let mut out = Wtf8Buf::with_capacity(s.len() + (left + right) * 4);
-    push_cp_repeated(&mut out, fillchar, left);
+    let mut out = crate::builtins::try_wtf8_with_capacity(padded_byte_len(s.len(), d, fillchar))?;
+    push_cp_repeated(&mut out, fillchar, left)?;
     out.push_wtf8(s);
-    push_cp_repeated(&mut out, fillchar, right);
+    push_cp_repeated(&mut out, fillchar, right)?;
     Ok(w_str_from_wtf8_managed(out))
 }
 
@@ -5013,9 +5040,10 @@ pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     if s_len >= width {
         return Ok(str_result_unchanged(args[0]));
     }
-    let mut out = Wtf8Buf::with_capacity(s.len() + (width - s_len) * 4);
+    let mut out =
+        crate::builtins::try_wtf8_with_capacity(padded_byte_len(s.len(), width - s_len, fillchar))?;
     out.push_wtf8(s);
-    push_cp_repeated(&mut out, fillchar, width - s_len);
+    push_cp_repeated(&mut out, fillchar, width - s_len)?;
     Ok(w_str_from_wtf8_managed(out))
 }
 
@@ -5029,8 +5057,9 @@ pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     if s_len >= width {
         return Ok(str_result_unchanged(args[0]));
     }
-    let mut out = Wtf8Buf::with_capacity(s.len() + (width - s_len) * 4);
-    push_cp_repeated(&mut out, fillchar, width - s_len);
+    let mut out =
+        crate::builtins::try_wtf8_with_capacity(padded_byte_len(s.len(), width - s_len, fillchar))?;
+    push_cp_repeated(&mut out, fillchar, width - s_len)?;
     out.push_wtf8(s);
     Ok(w_str_from_wtf8_managed(out))
 }

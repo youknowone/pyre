@@ -8022,17 +8022,33 @@ pub(crate) fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     Ok(w_list_new(collect_iterable(obj)?))
 }
 
+/// The message-less `MemoryError` an unsatisfiable reservation raises.
+pub fn reservation_failed() -> crate::PyError {
+    crate::PyError::memory_error("")
+}
+
 /// An empty `Vec` with room for `count` elements, reserved fallibly.
 ///
 /// A builtin that sizes its storage from a Python-supplied count —
-/// `itertools.combinations([], sys.maxsize)` and its neighbours — cannot use
-/// `Vec::with_capacity`: an oversized request aborts the process instead of
-/// unwinding, so ordinary Python code terminates the interpreter. CPython
-/// raises `MemoryError` for the same call, with no message.
+/// `itertools.combinations([], sys.maxsize)`, `b'a'.rjust(sys.maxsize)` and
+/// their neighbours — cannot use `Vec::with_capacity`: an oversized request
+/// aborts the process instead of unwinding, so ordinary Python code
+/// terminates the interpreter. PyPy answers those calls with `MemoryError`.
 pub fn try_vec_with_capacity<T>(count: usize) -> Result<Vec<T>, crate::PyError> {
     let mut out = Vec::new();
     out.try_reserve_exact(count)
-        .map_err(|_| crate::PyError::new(crate::PyErrorKind::MemoryError, ""))?;
+        .map_err(|_| reservation_failed())?;
+    Ok(out)
+}
+
+/// The `Wtf8Buf` counterpart of [`try_vec_with_capacity`], for the str
+/// methods that size their buffer from a caller-supplied `width`.
+pub fn try_wtf8_with_capacity(
+    byte_count: usize,
+) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
+    let mut out = rustpython_wtf8::Wtf8Buf::new();
+    out.try_reserve_exact(byte_count)
+        .map_err(|_| reservation_failed())?;
     Ok(out)
 }
 
