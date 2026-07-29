@@ -8818,6 +8818,7 @@ pub unsafe fn classmethod_on_type_fast_path(
         return None;
     }
     Some((w_type, version_tag, w_func))
+}
 
 /// `callmethod.py`'s `w_obj.getdictvalue(space, name)` shadowing check,
 /// restricted to a probe that neither allocates nor runs Python.
