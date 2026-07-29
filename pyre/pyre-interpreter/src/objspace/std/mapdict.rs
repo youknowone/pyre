@@ -14,7 +14,7 @@ use pyre_object::PyObjectRef;
 
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use std::cell::{Cell, RefCell, UnsafeCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
 // PyPy serializes mapdict map/storage transitions with the GIL.  Pyre is
@@ -3121,6 +3121,29 @@ pub static INSTANCE_DICT: LazyLock<Mutex<HashMap<usize, usize>>> =
 pub static WEAKREF_TABLE: LazyLock<Mutex<HashMap<usize, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Keys whose table value has been stored since the last minor root walk, and
+/// so may still be a nursery object.  See [`snapshot_root_entries`].
+static INSTANCE_DICT_PENDING: LazyLock<Mutex<HashSet<usize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+static WEAKREF_TABLE_PENDING: LazyLock<Mutex<HashSet<usize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn instance_dict_insert(key: PyObjectRef, w_dict: PyObjectRef) {
+    INSTANCE_DICT
+        .lock()
+        .unwrap()
+        .insert(key as usize, w_dict as usize);
+    INSTANCE_DICT_PENDING.lock().unwrap().insert(key as usize);
+}
+
+fn weakref_table_insert(key: PyObjectRef, value: PyObjectRef) {
+    WEAKREF_TABLE
+        .lock()
+        .unwrap()
+        .insert(key as usize, value as usize);
+    WEAKREF_TABLE_PENDING.lock().unwrap().insert(key as usize);
+}
+
 struct MapdictRootArea;
 static MAPDICT_ROOT_AREA: MapdictRootArea = MapdictRootArea;
 
@@ -3540,10 +3563,7 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
             return w_dict;
         }
         let w_dict = pyre_object::w_dict_new();
-        INSTANCE_DICT
-            .lock()
-            .unwrap()
-            .insert(self_ref as usize, w_dict as usize);
+        instance_dict_insert(self_ref, w_dict);
         w_dict
     }
 }
@@ -3639,32 +3659,84 @@ pub fn capture_mapdict_root_area() -> *const () {
     &MAPDICT_ROOT_AREA as *const _ as *const ()
 }
 
+/// The `(owner, value)` pairs a root walk of `table` has to visit.
+///
+/// A major walk visits the whole table.  A minor one visits only the keys
+/// stored since the previous minor walk, and retires them: an entry an earlier
+/// minor walk already visited had its value dragged out to the old generation
+/// and its key rewritten to the owner's post-move address, and an old value's
+/// own contents are reached through its write barrier and custom trace
+/// (`dict_write_barrier` / `dict_object_custom_trace`), never from here.  A
+/// non-moving major (`do_collect_oldgen`) leaves the nursery intact, so only
+/// the minor walk may drain the pending set.
+///
+/// Without this split each collection cloned and walked the whole table, whose
+/// entries are roots and therefore outlive their owners: the per-collection
+/// cost grew with the number of hasdict builtin-layout objects the program had
+/// ever created.
+fn snapshot_root_entries(
+    table: &Mutex<HashMap<usize, usize>>,
+    pending: &Mutex<HashSet<usize>>,
+    minor: bool,
+) -> Vec<(usize, PyObjectRef)> {
+    if !minor {
+        return table
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&key, &value)| (key, value as PyObjectRef))
+            .collect();
+    }
+    let keys = std::mem::take(&mut *pending.lock().unwrap());
+    let table = table.lock().unwrap();
+    keys.into_iter()
+        .filter_map(|key| table.get(&key).map(|&value| (key, value as PyObjectRef)))
+        .collect()
+}
+
+/// Re-key and re-point the entries a root walk moved, as `(old, new, value)`.
+///
+/// Collected during the walk and applied in one pass because the walk must not
+/// hold the table lock across a visitor callback, and a major walk that
+/// re-locked per entry paid a lock and a hash lookup for every entry the
+/// program had ever created — almost none of which move, since only a nursery
+/// object has an address to rewrite.
+fn apply_root_rekeys(table: &Mutex<HashMap<usize, usize>>, rekeys: Vec<(usize, usize, usize)>) {
+    if rekeys.is_empty() {
+        return;
+    }
+    let mut table = table.lock().unwrap();
+    for (key, new_key, value) in rekeys {
+        if new_key == key {
+            if let Some(slot) = table.get_mut(&key) {
+                *slot = value;
+            }
+        } else if table.remove(&key).is_some() {
+            table.insert(new_key, value);
+        }
+    }
+}
+
 /// # Safety
 /// `data` must come from [`capture_mapdict_root_area`], and the owning thread
 /// must be quiesced.
 pub unsafe fn walk_mapdict_roots_area(_data: *const (), mut visitor: impl FnMut(&mut PyObjectRef)) {
-    let dict_values = {
-        INSTANCE_DICT
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(&key, &dict)| (key, dict as PyObjectRef))
-            .collect::<Vec<_>>()
-    };
-    // SAFETY: do not hold the RefCell borrow while invoking callbacks. The
-    // visitor and w_dict_walk_entries_mut may re-enter mapdict/dict APIs.
+    // incminimark.py:339-355 prebuilt-object scanning parity: a minor
+    // collection reaches an old structure only through the write barrier, so
+    // only the entries stored since the previous minor walk are visited here.
+    let minor = majit_gc::shadow_stack::extra_root_walk_kind()
+        == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
+    let dict_values = snapshot_root_entries(&INSTANCE_DICT, &INSTANCE_DICT_PENDING, minor);
+    // SAFETY: do not hold the table lock while invoking callbacks. The visitor
+    // and w_dict_walk_entries_mut may re-enter mapdict/dict APIs; every write
+    // back into the table is deferred to `apply_root_rekeys`.
+    let mut dict_rekeys = Vec::new();
     for (key, mut dict) in dict_values {
+        let old_dict = dict;
         visitor(&mut dict);
         let new_key = current_owner_key(key);
-        {
-            let mut table = INSTANCE_DICT.lock().unwrap();
-            if new_key == key {
-                if let Some(slot) = table.get_mut(&key) {
-                    *slot = dict as usize;
-                }
-            } else if table.remove(&key).is_some() {
-                table.insert(new_key, dict as usize);
-            }
+        if new_key != key || dict != old_dict {
+            dict_rekeys.push((key, new_key, dict as usize));
         }
         // Trace the dict's own r_dict entries. INSTANCE_DICT now holds only
         // non-instance hasdict wrappers (property/member) — never a
@@ -3695,28 +3767,19 @@ pub unsafe fn walk_mapdict_roots_area(_data: *const (), mut visitor: impl FnMut(
         // via the instance/wrapper write barriers that enter the remembered set.
         // So no instance is walked here.
     }
-    let weakref_values = {
-        WEAKREF_TABLE
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(&key, &value)| (key, value as PyObjectRef))
-            .collect::<Vec<_>>()
-    };
+    apply_root_rekeys(&INSTANCE_DICT, dict_rekeys);
+
+    let weakref_values = snapshot_root_entries(&WEAKREF_TABLE, &WEAKREF_TABLE_PENDING, minor);
+    let mut weakref_rekeys = Vec::new();
     for (key, mut value) in weakref_values {
+        let old_value = value;
         visitor(&mut value);
         let new_key = current_owner_key(key);
-        {
-            let mut table = WEAKREF_TABLE.lock().unwrap();
-            if new_key == key {
-                if let Some(slot) = table.get_mut(&key) {
-                    *slot = value as usize;
-                }
-            } else if table.remove(&key).is_some() {
-                table.insert(new_key, value as usize);
-            }
+        if new_key != key || value != old_value {
+            weakref_rekeys.push((key, new_key, value as usize));
         }
     }
+    apply_root_rekeys(&WEAKREF_TABLE, weakref_rekeys);
 }
 
 /// objspace/std/mapdict.py:842-860 _obj_setdict.
@@ -3773,10 +3836,7 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
         // Non-instance hasdict objects (property/member, baseobjspace
         // 1850/3786) keep a plain own-storage dict in the address-keyed side
         // table; it never delegates to a backing object, so no force step.
-        INSTANCE_DICT
-            .lock()
-            .unwrap()
-            .insert(self_ref as usize, w_dict as usize);
+        instance_dict_insert(self_ref, w_dict);
     }
     Ok(())
 }
@@ -3820,10 +3880,7 @@ pub fn setweakref(self_ref: PyObjectRef, weakreflifeline: PyObjectRef) {
         let flag = unsafe { instance_set_weakref_slot(self_ref, weakreflifeline) };
         debug_assert!(flag, "write to the weakref SPECIAL slot failed");
     } else {
-        WEAKREF_TABLE
-            .lock()
-            .unwrap()
-            .insert(self_ref as usize, weakreflifeline as usize);
+        weakref_table_insert(self_ref, weakreflifeline);
     }
 }
 
