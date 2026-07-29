@@ -18822,23 +18822,32 @@ fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 /// on each emitted line, and a trailing terminator does not produce an
 /// extra empty entry.
 fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::require_receiver(args, "splitlines")?;
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::type_methods::require_receiver(pos, "splitlines")?;
+    let positional = pos.len().saturating_sub(1);
+    let keyword = crate::builtins::real_kwarg_count(kwargs);
+    let given = positional + keyword;
+    if given > 1 {
+        let kind = if positional == 0 {
+            "keyword argument"
+        } else {
+            "argument"
+        };
+        return Err(crate::PyError::type_error(format!(
+            "splitlines() takes at most 1 {kind} ({given} given)"
+        )));
+    }
     crate::builtins::kwarg_reject_unknown(kwargs, &["keepends"], "splitlines")?;
-    crate::builtins::kwarg_reject_duplicate(
-        kwargs,
-        "splitlines",
-        "keepends",
-        pos.get(1).is_some(),
-    )?;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
     // keepends is positional-or-keyword.
     let keepends = crate::builtins::kwarg_get(kwargs, "keepends")
         .or_else(|| pos.get(1).copied())
         .map(crate::baseobjspace::is_true)
         .transpose()?
         .unwrap_or(false);
-    let args = pos;
+    // The gateway's `unwrap_spec(keepends=bool)` conversion runs before
+    // `descr_splitlines` calls `_val`; observe any bytearray resize performed
+    // by a re-entrant `__bool__`.
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
     let mut parts: Vec<PyObjectRef> = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
@@ -18849,7 +18858,7 @@ fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
                 term_end += 1;
             }
             let end = if keepends { term_end } else { i };
-            parts.push(cut_bytes_like(args[0], &data[start..end]));
+            parts.push(cut_bytes_like(pos[0], &data[start..end]));
             start = term_end;
             i = term_end;
         } else {
@@ -18857,7 +18866,7 @@ fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         }
     }
     if start < data.len() {
-        parts.push(cut_bytes_like(args[0], &data[start..]));
+        parts.push(cut_bytes_like(pos[0], &data[start..]));
     }
     Ok(pyre_object::w_list_new(parts))
 }
