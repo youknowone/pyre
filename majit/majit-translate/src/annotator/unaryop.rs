@@ -4274,7 +4274,13 @@ fn init_someinstance_overrides(
                 // unaryop.py:848-852 — `attrdef = clsdef.attrs[attr];
                 // attrdef.modified(clsdef); if attrdef.s_value.contains(s_obj):
                 // return`.
-                let already_contains = {
+                // `attrdef.modified` needs `clsdef` mutably, but the following
+                // `s_value.contains(s_obj)` reads `clsdef`'s mro through
+                // `commonbase` (a shared borrow) when either side carries a
+                // classdef — so the mutable borrow must be released first.
+                // Upstream (unaryop.py:848-852) holds no exclusive borrow;
+                // clone `s_value` out and drop the borrow before the read.
+                let s_value = {
                     let mut clsdef_mut = clsdef.borrow_mut();
                     let attrdef = clsdef_mut.attrs.get_mut(&attr).unwrap_or_else(|| {
                         panic!(
@@ -4288,8 +4294,9 @@ fn init_someinstance_overrides(
                              modified failed: {err:?}"
                         )
                     });
-                    attrdef.s_value.contains(&s_obj)
+                    attrdef.s_value.clone()
                 };
+                let already_contains = s_value.contains(&s_obj);
                 if !already_contains {
                     // unaryop.py:854 — `clsdef.generalize_attr(attr, s_obj)`.
                     super::classdesc::ClassDef::generalize_attr(
