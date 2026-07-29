@@ -192,6 +192,22 @@ pub fn enabled() -> bool {
     }
 }
 
+/// Whether a collection reaching this safepoint right now would be performed.
+///
+/// The allocator asks it too, before arming a deferred major request, so the
+/// two cannot drift: a request armed past a safepoint that will refuse is
+/// re-armed by every following born-old allocation, because the threshold
+/// stays reached until a major completes
+/// (`majit_gc::collector::set_deferred_major_request_probe`).
+///
+/// Plain rather than `@dont_look_inside`: both callers are already outside
+/// traced code — [`safepoint`] is itself a residual, and the allocator reaches
+/// this through an installed `fn` pointer — and each of the three questions it
+/// asks carries the attribute in its own right.
+pub fn would_collect() -> bool {
+    enabled() && collect_enabled() && at_outermost_activation()
+}
+
 /// Dispatch-loop safepoint: when the collector says it has reached the
 /// threshold it set for its next major, run a non-moving old-gen-only major.
 /// A no-op when the flag is off or no collection hook is installed.
@@ -220,7 +236,8 @@ pub fn enabled() -> bool {
 /// executed while one is hot, and old-gen allocations made from inside it
 /// would go unanswered until the loop exited. The armed bit fails the trace's
 /// back-edge poll instead, which deopts to this loop and lands on the taker
-/// above.
+/// above. The allocator arms it only when [`would_collect`] holds, so the
+/// request cannot outlive the conditions that let this safepoint answer it.
 ///
 /// The collection is `try_gc_collect_oldgen` — it seeds roots, marks, and
 /// sweeps ONLY the old generation, never touching the nursery (not moved, not
@@ -252,11 +269,11 @@ pub fn safepoint() {
         return;
     }
     // Take any request the old-gen allocator armed, and take it before the
-    // decisions below: a request left armed fails every compiled back-edge
-    // poll, so a safepoint that declined to collect but kept the bit would
-    // deopt the loop once per iteration.
+    // decision below: the bit is a compiled loop's deopt trigger, so one left
+    // armed by a safepoint that declined to collect fires again on the next
+    // back edge, and the next.
     let requested = majit_gc::collector::take_deferred_major_request();
-    if !collect_enabled() || !at_outermost_activation() {
+    if !would_collect() {
         return;
     }
     // The request already carries the collector's answer — it was armed by

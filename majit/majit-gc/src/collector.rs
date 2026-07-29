@@ -9,7 +9,7 @@
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::GcRef;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::address_dict::AddressMap;
 use crate::flags;
@@ -19,28 +19,49 @@ use crate::oldgen::OldGen;
 use crate::trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout, TypeRegistry};
 use crate::{FinalizerTriggerFn, GcAllocator};
 
-/// Whether a born-old allocation that crosses the next-major threshold may
-/// request a collection through the eval-breaker word.
+/// Host predicate answering whether the consumer of a deferred major request
+/// would act on one right now. Unset = never arm.
 ///
-/// The request is only useful where something consumes it: the interpreter
-/// dispatch-loop safepoint. Left off, the threshold is answered the way it
-/// always was — by the major progress every minor collection drives. Armed
-/// with no consumer, the request would re-fail every compiled back-edge poll
-/// until a major completed, since `threshold_reached` stays true across the
-/// whole span. The host turns it on when it installs that safepoint.
-static DEFERRED_MAJOR_REQUEST: AtomicBool = AtomicBool::new(false);
+/// A standing switch is not enough, because the consumer — the interpreter
+/// dispatch-loop safepoint — refuses in two different ways. It refuses for the
+/// whole process when the interpreter GC is off, and it refuses per-thread,
+/// moment to moment, whenever the eval loop is nested too deep for the frame
+/// walker to see the full root set. Arming through the second kind of refusal
+/// is not merely wasted: `threshold_reached` stays true until a major
+/// completes, so every subsequent born-old allocation re-arms, the compiled
+/// back-edge poll fails continuously, and the guard accumulates bridges. Once
+/// a bridge is attached at each level the chain closes on itself and compiled
+/// code stops returning to the dispatch loop at all — which starves the rest of
+/// the word, `EB_ASYNC` included, so a signal goes undelivered for as long as
+/// the loop runs. Measured on a depth-3 loop: SIGINT delivery went from 0.11 s
+/// to over 30 s.
+///
+/// So ask the consumer. The probe is called only after `threshold_reached`, and
+/// only on the born-old path, so it costs nothing on the ordinary nursery
+/// allocation. Left unset the threshold is answered the way it always was — by
+/// the major progress every minor collection drives.
+pub type DeferredMajorRequestProbeFn = fn() -> bool;
 
-/// Let born-old allocations request a major collection at the next
-/// root-complete point. See [`DEFERRED_MAJOR_REQUEST`].
-pub fn set_deferred_major_request_enabled(on: bool) {
-    DEFERRED_MAJOR_REQUEST.store(on, Ordering::Relaxed);
+crate::global_hook!(static DEFERRED_MAJOR_REQUEST_PROBE: DeferredMajorRequestProbeFn);
+
+/// Install the predicate gating born-old major requests, or `None` to stop
+/// arming them. See [`DEFERRED_MAJOR_REQUEST_PROBE`].
+pub fn set_deferred_major_request_probe(probe: Option<DeferredMajorRequestProbeFn>) {
+    DEFERRED_MAJOR_REQUEST_PROBE.set(probe);
+}
+
+/// Whether a request armed now would be acted on. False with no probe installed.
+fn deferred_major_request_wanted() -> bool {
+    DEFERRED_MAJOR_REQUEST_PROBE
+        .get()
+        .is_some_and(|probe| probe())
 }
 
 /// Consume a pending request, reporting whether one was armed.
 ///
-/// Clear it whether or not the caller goes on to collect: a request left armed
-/// fails every compiled back-edge poll until it is taken, so the loop would
-/// deopt once per iteration rather than once per request.
+/// Clear it whether or not the caller goes on to collect: the bit is the
+/// compiled back edge's deopt trigger, so one the caller keeps fires again on
+/// the next back edge, and the next.
 pub fn take_deferred_major_request() -> bool {
     majit_ir::eval_breaker_word::take_gc()
 }
@@ -1206,7 +1227,12 @@ impl MiniMarkGC {
         // where upstream asks it and defer only the answer — the request rides
         // the eval-breaker word to the interpreter dispatch loop, where the
         // frame walker sees the whole root set.
-        if DEFERRED_MAJOR_REQUEST.load(Ordering::Relaxed) && self.threshold_reached(total_size) {
+        //
+        // Only where that walk will actually happen: the threshold stays
+        // reached until a major completes, so arming past a consumer that
+        // refuses re-arms on every following allocation.
+        // See [`DEFERRED_MAJOR_REQUEST_PROBE`].
+        if self.threshold_reached(total_size) && deferred_major_request_wanted() {
             majit_ir::eval_breaker_word::set_gc();
         }
         GcRef(obj_addr)
@@ -4469,10 +4495,23 @@ mod tests {
 
     /// A born-old allocation that crosses the next-major threshold asks for a
     /// collection the way `external_malloc` (incminimark.py:987-994) does — and
-    /// only where a safepoint is there to answer, since a request no one takes
-    /// re-fails every compiled back-edge poll.
+    /// asks the consumer first, every time.
+    ///
+    /// The refusing arm is the load-bearing one. The threshold stays reached
+    /// until a major completes, so arming past a consumer that will not answer
+    /// re-arms on every following allocation; the compiled back-edge poll then
+    /// fails continuously and the guard grows a bridge chain that stops
+    /// returning to the dispatch loop, starving the rest of the eval-breaker
+    /// word — signals included.
     #[test]
-    fn born_old_allocation_past_the_threshold_requests_a_major() {
+    fn born_old_allocation_past_the_threshold_asks_the_consumer_every_time() {
+        fn refuse() -> bool {
+            false
+        }
+        fn accept() -> bool {
+            true
+        }
+
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::object(64));
         // Put the threshold within reach of any single allocation.
@@ -4480,18 +4519,27 @@ mod tests {
         let size = GcHeader::SIZE + 64;
         majit_ir::eval_breaker_word::take_gc();
 
-        set_deferred_major_request_enabled(false);
+        set_deferred_major_request_probe(None);
         gc.alloc_in_oldgen(tid, size);
         assert!(
             !majit_ir::eval_breaker_word::take_gc(),
             "no consumer installed, so no request should be armed"
         );
 
-        set_deferred_major_request_enabled(true);
+        set_deferred_major_request_probe(Some(refuse));
+        for _ in 0..4 {
+            gc.alloc_in_oldgen(tid, size);
+        }
+        assert!(
+            !majit_ir::eval_breaker_word::take_gc(),
+            "the consumer refused, so none of the four allocations may arm"
+        );
+
+        set_deferred_major_request_probe(Some(accept));
         gc.alloc_in_oldgen(tid, size);
         assert!(majit_ir::eval_breaker_word::take_gc());
 
-        set_deferred_major_request_enabled(false);
+        set_deferred_major_request_probe(None);
         majit_ir::eval_breaker_word::take_gc();
     }
 
