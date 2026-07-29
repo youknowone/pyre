@@ -1772,6 +1772,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         )
     }
     crate::module_ns_store(ns, "terminal_size", terminal_size_seq_type());
+    crate::module_ns_store(ns, "statvfs_result", statvfs_result_seq_type());
+    crate::module_ns_store(ns, "times_result", times_result_seq_type());
+    crate::module_ns_store(ns, "uname_result", uname_result_seq_type());
 
     // ── posix.get_terminal_size(fd=1) → os.terminal_size(columns, lines) ──
     // Inspects the controlling terminal via ioctl(TIOCGWINSZ); stubbed under
