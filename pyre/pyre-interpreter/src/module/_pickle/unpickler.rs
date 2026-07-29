@@ -1630,7 +1630,16 @@ fn build_instance(w_inst: PyObjectRef, w_state: PyObjectRef) -> Result<(), PyErr
         }
     }
     if !unsafe { pyre_object::is_none(w_slot_state) } {
+        if !unsafe { pyre_object::is_dict(w_slot_state) } {
+            return Err(unpickling_error("slot state is not a dictionary"));
+        }
         for (k, v) in unsafe { pyre_object::dictmultiobject::w_dict_items(w_slot_state) } {
+            if !unsafe { pyre_object::is_str(k) } {
+                return Err(PyError::type_error(format!(
+                    "attribute name must be string, not '{}'",
+                    crate::type_methods::arg_type_name(k),
+                )));
+            }
             crate::baseobjspace::setattr(w_inst, k, v)?;
         }
     }
