@@ -3330,7 +3330,12 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             if !is_long(b) && as_float(b) == 0.0 {
                 return Err(PyError::zero_division("division by zero"));
             }
-            if is_long(a) || is_long(b) {
+            // intobject.py:332 `_truediv`: machine ints wider than the
+            // binary64 mantissa deliberately overflow into the rbigint path
+            // so division is rounded once, after exact integer arithmetic.
+            let wide_int = (!is_long(a) && int_value(a).unsigned_abs() >> 53 != 0)
+                || (!is_long(b) && int_value(b).unsigned_abs() >> 53 != 0);
+            if is_long(a) || is_long(b) || wide_int {
                 let a_owned;
                 let va = if is_long(a) {
                     w_long_get_value(a)
@@ -3496,7 +3501,11 @@ pub(crate) fn truediv_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             if !is_long(b) && as_float(b) == 0.0 {
                 return Err(PyError::zero_division("division by zero"));
             }
-            if is_long(a) || is_long(b) {
+            // Match `_truediv`'s overflow-to-rbigint leg for i64 values that
+            // are not exactly representable in a binary64 mantissa.
+            let wide_int = (!is_long(a) && int_value(a).unsigned_abs() >> 53 != 0)
+                || (!is_long(b) && int_value(b).unsigned_abs() >> 53 != 0);
+            if is_long(a) || is_long(b) || wide_int {
                 let a_owned;
                 let va = if is_long(a) {
                     w_long_get_value(a)
@@ -5329,6 +5338,14 @@ mod tests {
         assert_eq!(bigint_truediv(&a.neg(), &b).unwrap(), -5.0);
         assert_eq!(bigint_truediv(&a, &b.neg()).unwrap(), -5.0);
         assert!(bigint_truediv(&a, &BigInt::from(0)).is_err());
+    }
+
+    #[test]
+    fn test_machine_int_truediv_uses_rbigint_rounding_past_binary64_mantissa() {
+        let result = truediv_builtin(w_int_new(63_050_394_783_186_940), w_int_new(7)).unwrap();
+        unsafe {
+            assert_eq!(w_float_get_value(result), 9_007_199_254_740_991.0);
+        }
     }
 
     #[test]

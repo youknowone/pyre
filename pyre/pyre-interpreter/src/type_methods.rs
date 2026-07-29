@@ -2145,6 +2145,17 @@ fn format_rbigint(num: &BigInt, spec: &Wtf8, type_name: &str) -> Result<Wtf8Buf,
             "Precision not allowed in integer format specifier",
         ));
     }
+    // newformat.py validates a requested grouping option against the
+    // presentation code before reporting that an otherwise unknown code is
+    // unsupported: `format(3, ",s")` names the illegal comma/`s` pairing.
+    if let Some(separator) = p.grouping
+        && !matches!(p.ty, '\0' | 'd' | 'b' | 'o' | 'x' | 'X' | 'n')
+    {
+        return Err(crate::PyError::value_error(format!(
+            "Cannot specify '{separator}' with '{}'.",
+            p.ty
+        )));
+    }
     let (radix, interval, upper, prefix) = match p.ty {
         '\0' | 'd' => (10, 3, false, ""),
         'b' => (2, 4, false, if p.alt_form { "0b" } else { "" }),

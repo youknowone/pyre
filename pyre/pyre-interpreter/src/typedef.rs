@@ -14530,6 +14530,18 @@ fn init_int_type(ns: PyObjectRef) {
             make_new_descr(int_descr_new),
         )
     };
+    // CPython 3.14 exposes the storage digit width on the type and reports
+    // the same four-byte, 30-bit ABI through `sys.int_info`.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__itemsize__", w_int_new(4))
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__basicsize__",
+            w_int_new(3 * std::mem::size_of::<usize>() as i64),
+        )
+    };
     // intobject.py descr_repr. CPython 3.14 inherits object.__str__, whose
     // implementation delegates virtually to this repr slot.
     let int_to_text = |args: &[PyObjectRef]| {
@@ -19055,10 +19067,32 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let data_obj = pos.get(1).copied().ok_or_else(|| {
         crate::PyError::type_error("from_bytes() missing required argument 'bytes' (pos 1)")
     })?;
-    // `makebytesdata_w` — the buffer protocol, else an iterable of ints.
-    let bytes: Vec<u8> = if unsafe { pyre_object::bytesobject::is_bytes_like(data_obj) } {
+    // bytesobject.py `makebytesdata_w`: `__bytes__` takes precedence over the
+    // buffer/iterable conversion and must itself return a bytes instance.
+    let bytes_method = unsafe { crate::baseobjspace::lookup(data_obj, "__bytes__") };
+    let bytes: Vec<u8> = if let Some(method) = bytes_method {
+        let w_type = crate::typedef::r#type(data_obj).map_or(pyre_object::PY_NULL, |t| t.as_ptr());
+        let w_bytes =
+            unsafe { crate::baseobjspace::get_and_call_function(method, data_obj, w_type, &[])? };
+        if !unsafe { pyre_object::bytesobject::is_bytes(w_bytes) } {
+            return Err(crate::PyError::type_error(format!(
+                "__bytes__ returned non-bytes (type '{}')",
+                unsafe { pyre_object::type_name_of(w_bytes) }
+            )));
+        }
+        unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes).to_vec() }
+    } else if unsafe { pyre_object::bytesobject::is_bytes_like(data_obj) } {
         unsafe { pyre_object::bytesobject::bytes_like_data(data_obj).to_vec() }
     } else {
+        // `_convert_from_buffer_or_iterable`: unicode is rejected before the
+        // generic iterable-of-bytes path.  In particular, an empty string is
+        // not accepted as an empty byte sequence.
+        let str_type = crate::typedef::gettypeobject(&pyre_object::STR_TYPE);
+        if unsafe { crate::baseobjspace::isinstance_w(data_obj, str_type) } {
+            return Err(crate::PyError::type_error(
+                "cannot convert 'str' object to bytes",
+            ));
+        }
         let items = crate::builtins::collect_iterable(data_obj)?;
         let mut v = Vec::with_capacity(items.len());
         for it in items {
