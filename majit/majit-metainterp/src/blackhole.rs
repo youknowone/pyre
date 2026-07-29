@@ -2222,6 +2222,20 @@ impl BlackholeInterpBuilder {
         interp.nextblackholeinterp = None;
         interp.aborted = false;
         interp.got_exception = false;
+        // The virtualizable handle is frame identity, not builder state, and
+        // `acquire_interp` refreshes only the six builder-shared fields.  A
+        // pooled interp that kept `virtualizable_ptr` would hand the next user
+        // a pointer to the frame this run just finished with:
+        // `blackhole_from_resumedata` never assigns either field, so
+        // `call_jit.rs`'s "a novable resume runs no vable opcodes, so leave
+        // both the pointer and the vinfo handle unset (null)" only holds for
+        // an interp that comes back from the pool clean.  `run()` dereferences
+        // `virtualizable_ptr` for every chain frame whose `virtualizable_info`
+        // is non-null (`push_resume_ref_roots`), so a stale pair reads a dead
+        // frame and roots its slots.  Reset with `virtualizable_stack_base`,
+        // which is the same frame-scoped triple.
+        interp.virtualizable_ptr = 0;
+        interp.virtualizable_info = std::ptr::null();
         interp.virtualizable_stack_base = 0;
         self.pool.push(interp);
     }
@@ -3537,6 +3551,38 @@ mod tests {
             let bh2 = builder.acquire_interp();
             // Reused from pool
             assert!(bh2.registers_i.is_empty());
+        }
+
+        /// A pooled interp must not carry the previous run's frame identity.
+        ///
+        /// `acquire_interp` refreshes only the six builder-shared fields
+        /// (`blackhole.py:284-289`), and `blackhole_from_resumedata` assigns
+        /// neither `virtualizable_ptr` nor `virtualizable_info` — the guard
+        /// path sets them afterwards, and deliberately does not for a
+        /// `novable` resume ("leave both the pointer and the vinfo handle
+        /// unset (null)", `pyre-jit/src/call_jit.rs`).  That contract is only
+        /// true if the pool hands back a cleared interp: `run()` dereferences
+        /// `virtualizable_ptr` for every chain frame with a non-null
+        /// `virtualizable_info` to push its GC roots, so a leaked pair reads
+        /// the frame the previous blackhole finished with.
+        ///
+        /// The handle here is never dereferenced — the assertion is on the
+        /// pointer word, so a dangling non-null stand-in is enough.
+        #[test]
+        fn released_interp_does_not_leak_its_virtualizable_handle_to_the_next_user() {
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
+            bh.virtualizable_ptr = 0x7f00_0000_1234;
+            bh.virtualizable_info =
+                std::ptr::NonNull::<crate::virtualizable::VirtualizableInfo>::dangling().as_ptr();
+            bh.virtualizable_stack_base = 9;
+
+            builder.release_interp(bh);
+            let reused = builder.acquire_interp();
+
+            assert_eq!(reused.virtualizable_ptr, 0);
+            assert!(reused.virtualizable_info.is_null());
+            assert_eq!(reused.virtualizable_stack_base, 0);
         }
 
         #[test]
