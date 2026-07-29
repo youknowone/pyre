@@ -2471,10 +2471,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     }
     // A legacy, unseeded inline sub-walk inside a FOR_ITER body resumes a guard
     // at the caller's CALL boundary, so deopt re-executes the whole callee.
-    // Replaying a live-heap mutation would double it.  Keep classifying that
-    // shape here, but do not reject Dirty yet: the per-frame path below now
-    // builds a real red callee frame and snapshots its own resume coordinate.
-    // Dirty is accepted only if that frame seed actually succeeds.
+    // Replaying a live-heap mutation would double it, so a Dirty body stays on
+    // the residual call path.
     //
     // A body whose only unproven ops are Python-level CALL residuals is
     // admitted too: this same gate re-runs for each callee the lever resolves
@@ -2484,7 +2482,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // declines — `helper(i)` calling `add(i, 1, 2)` residualizes both calls
     // per iteration, though each body on its own is pure arithmetic.
     let mut foriter_deferred_admit = false;
-    let foriter_replay_safety = if fbw_foriter_inflight_active() {
+    if fbw_foriter_inflight_active() {
         let safety = fbw_callee_body_replay_safety(
             body.code,
             &exact_numeric_args,
@@ -2510,39 +2508,18 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 exact_numeric_args.iter().filter(|arg| arg.numeric).count(),
             );
         }
-        if safety == CalleeReplaySafety::DeferredCall && !legacy_admit {
-            return Ok(None);
-        }
-        Some(safety)
-    } else {
-        None
-    };
-    let requires_seeded_callee_frame = foriter_replay_safety == Some(CalleeReplaySafety::Dirty);
-    if requires_seeded_callee_frame {
-        // Keep the two explicit multi-frame hazards
-        // `fbw_inline_callee_hazardous` documents out of this newly admitted
-        // path.  A callee-owned FOR_ITER still lacks reliable Option-C item
-        // delivery, and self-recursion must fold through CALL_ASSEMBLER rather
-        // than recursively seed dirty frames.  `random.gauss` has neither;
-        // recursive `partial_product` in test_math has the latter and must
-        // remain on its established residual/assembler path.
-        let raw = unsafe {
-            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                as *const pyre_interpreter::CodeObject
-        };
-        if raw.is_null()
-            || unsafe {
-                pyre_interpreter::code_has_for_iter(&*raw)
-                    || pyre_interpreter::code_is_self_recursive(&*raw)
-            }
-        {
+        // A `Dirty` body is not admitted by seeding its frame.  Its residual
+        // can raise, and the local `except` that catches it is a callee-owned
+        // catch edge the inline path does not compile, so the exception
+        // escapes the caller instead of being handled where the source
+        // handles it.  Keep the ordinary residual call until that edge exists.
+        if !legacy_admit {
             return Ok(None);
         }
     }
     if method_form
         && !allow_method_load_attr
         && !method_form_callee_body_supported(body.code, callee_descr_refs)
-        && !requires_seeded_callee_frame
     {
         return Ok(None);
     }
@@ -2934,9 +2911,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // single-frame collapse — a 3-frame snapshot the resume path is sound for
     // only one paused caller frame.
     let strict_seed = strict_inlinable && inline_depth < fbw_max_multiframe_depth();
-    if requires_seeded_callee_frame && !(try_multiframe || strict_seed) {
-        return Ok(None);
-    }
     // True once the callee frame reds are actually seeded (all preconditions
     // below met).  For a strict callee this gates routing its guards through the
     // multi-frame snapshot vs. falling back to collapse.
@@ -3148,10 +3122,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             callee_frame_seeded = true;
         }
     }
-    if requires_seeded_callee_frame && !callee_frame_seeded {
-        return Err(DispatchError::callee_inline_unsupported(op.pc));
-    }
-
     // gh#467 forward-flush inputs are captured AT the CALL, after this
     // iteration's pre-CALL effects and before any callee sub-walk.  Hoisting
     // them above the paused-caller-frame gate lets its try-block decline use
