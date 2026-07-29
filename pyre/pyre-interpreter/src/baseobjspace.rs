@@ -11369,6 +11369,20 @@ pub fn unpackiterable(
         // `return items`); read it back into the `Vec<PyObjectRef>` the Rust
         // signature promises here, outside the traced/blackholed drain body.
         let w_list = _unpackiterable_unknown_length(w_iterator, w_iterable)?;
+        // `warmspot.py:998-1005` re-raises `ExitFrameWithExceptionRef` out of
+        // `ll_portal_runner`.  jd1 is entered from a merge-point hook that
+        // returns unit, so a recording walk that ran the raising `next()` for
+        // real parks the error instead; surface it here, at the first host-side
+        // point after the drain.  It cannot be surfaced inside the drain loop:
+        // that body is the jitcode the jd1 walker records, and a `Result` shell
+        // of its own there is a discriminant switch over niladic constructors
+        // with no host symbol — `try_fuse_drain_match`
+        // (majit-translate front/result_exc.rs) rewrites only the one such
+        // shell it recognises, the `match next(w_iterator)` at the loop's core,
+        // and the walker faults executing any other.  The walk leaves a
+        // truncated list when it parked; raising discards it, which is what the
+        // raise means.
+        crate::stack_check::drain_jit_pending_exception()?;
         Ok(drain_collect_items(w_list))
     } else {
         // baseobjspace.py:996-998 — known-length path with shape validation.
@@ -11564,15 +11578,6 @@ fn _unpackiterable_unknown_length(
         // baseobjspace.py:1012
         // `unpackiterable_driver.jit_merge_point(greenkey=greenkey)`.
         unpackiterable_driver.jit_merge_point(greenkey, w_iterator, items);
-        // `warmspot.py:998-1005` re-raises `ExitFrameWithExceptionRef` out of
-        // `ll_portal_runner`, so upstream's merge point is an raising call.
-        // The hook returns unit, so a drain that ran the raising `next()` for
-        // real parks the error instead; surface it here, at the same point the
-        // portal's raise would have landed. Deferring to the `next()` below
-        // loses it whenever the iterator is not exhaustion-stable: it reports
-        // StopIteration on the retry and this drain returns a truncated list
-        // with the error still parked for an unrelated later call.
-        crate::stack_check::drain_jit_pending_exception()?;
         match next(w_iterator) {
             Ok(w_item) => unsafe { pyre_object::listobject::drain_list_append(items, w_item) },
             // `except OperationError as e: if not e.match(space,
