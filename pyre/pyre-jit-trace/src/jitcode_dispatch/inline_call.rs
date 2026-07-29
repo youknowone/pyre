@@ -1574,12 +1574,24 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
             ctx.fbw_mode.inline_subwalk,
         );
     }
+    // Name every bail between the entry print and callee resolution.  An
+    // `[inline-entry]` with no follow-up line otherwise leaves the reason
+    // unobservable, which is the whole distance between "this call did not
+    // inline" and knowing why.
+    macro_rules! decline {
+        ($why:expr) => {{
+            if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+                eprintln!("[inline-decline] pc={} why={}", op.pc, $why);
+            }
+            return Ok(None);
+        }};
+    }
     if r_args.is_empty() {
-        return Ok(None);
+        decline!("no ref args");
     }
     let mut arg_concretes = read_ref_var_list_concrete(code, op, ref_operand_offset, ctx);
     if r_args.len() < 2 {
-        return Ok(None);
+        decline!("fewer than two ref args");
     }
     for i in 0..2 {
         if matches!(arg_concretes.get(i), Some(ConcreteValue::Null)) {
@@ -1591,10 +1603,10 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         }
     }
     let ConcreteValue::Ref(callable) = arg_concretes[0] else {
-        return Ok(None);
+        decline!("callable slot carries no concrete ref");
     };
     if callable.is_null() {
-        return Ok(None);
+        decline!("callable is null");
     }
     // The receiver slot is a checked `PY_NULL` sentinel for a plain no-receiver
     // call; its concrete shadow arrives as `Null` (`call_kw`) or `Ref(PY_NULL)`
@@ -1602,7 +1614,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     let null_or_self = match arg_concretes[1] {
         ConcreteValue::Ref(r) => r,
         ConcreteValue::Null => pyre_object::PY_NULL,
-        _ => return Ok(None),
+        _ => decline!("receiver slot carries no concrete ref"),
     };
     let mut method_form = !null_or_self.is_null() && null_or_self != pyre_object::PY_NULL;
     // baseobjspace.py:1254-1259 unwraps `_Method` before the Function
@@ -1629,10 +1641,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     let Some((w_code, nparams, has_closure)) =
         (unsafe { resolve_inlinable_callee(resolved_callable) })
     else {
-        if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
-            eprintln!("[inline-decline] pc={} callee not inlinable", op.pc);
-        }
-        return Ok(None);
+        decline!("callee not inlinable");
     };
     if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
         eprintln!(
