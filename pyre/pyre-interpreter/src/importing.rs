@@ -617,6 +617,7 @@ pub fn install_builtin_modules() {
     }
     pyre_install_module!(_locale);
     pyre_install_module!(_random);
+    pyre_install_module!(_pypy_generic_alias);
     pyre_install_module!(_pickle);
     pyre_install_module!("_struct"(r#struct));
     pyre_install_module!(binascii);

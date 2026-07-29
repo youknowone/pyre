@@ -48,6 +48,8 @@ pub mod _posixsubprocess;
 #[allow(non_snake_case)]
 pub mod _random;
 #[allow(non_snake_case)]
+pub mod _pypy_generic_alias;
+#[allow(non_snake_case)]
 #[cfg(not(feature = "sandbox"))]
 pub mod _socket;
 pub mod _sre;
