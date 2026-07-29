@@ -106,6 +106,21 @@ pub fn emit_trace_call_ref_typed(
     ctx.call_ref_typed_with_effect(helper, args, arg_types, default_effect_info())
 }
 
+/// Read the value at a promoted exact-dict entry index.  The caller guards
+/// `W_DictObject.keys_version`, the explicit pyre representation of PyPy's
+/// live strategy-iterator state, so the index remains attached to the same
+/// identity key.  Value overwrites do not bump that version and are observed
+/// by this live read, matching the r_dict entry-value load.
+pub extern "C" fn jit_dict_nth_value(dict: i64, index: i64) -> i64 {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_nth_item(
+            dict as pyre_object::PyObjectRef,
+            index as usize,
+        )
+        .map_or(0, |(_, value)| value as i64)
+    }
+}
+
 pub fn emit_trace_call_ref_typed_elidable_cannot_raise(
     ctx: &mut TraceCtx,
     helper: *const (),

@@ -94,4 +94,7 @@ crate::py_module! {
         "perm"  / * = m::perm,
         "isqrt" / 1 = m::isqrt,
     },
+    extra_init: |ns| {
+        m::register_jit_builtin_wrappers(ns);
+    },
 }

@@ -219,23 +219,103 @@ pm1_edom!(atanh, "expected a number between -1 and 1");
 // Exponential / logarithmic
 pm1_edom!(sqrt, "expected a nonnegative input");
 
-/// True iff `callable` is the canonical builtin `math.sqrt` function object.
-/// The JIT walker uses the builtin-code native fn-pointer identity to
-/// distinguish it from a value rebound under the same `math.sqrt` name, so a
-/// monkeypatched `math.sqrt` correctly declines the pure-inline specialization.
-pub fn is_math_sqrt_function(callable: PyObjectRef) -> bool {
+static MATH_SQRT_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MATH_FREXP_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MATH_LDEXP_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Record the checked-arity wrapper pointers installed by `py_module!`.
+///
+/// `py_checked_arity_fn!` wraps each `interp_math` body in a non-capturing
+/// closure, so a BuiltinCode stores the wrapper pointer rather than (for
+/// example) [`frexp`] itself.  The wrappers are immutable process code, hence
+/// process-global `OnceLock<usize>` is the same ownership shape as pyre's
+/// other immortal runtime metadata and needs no GC rooting.
+pub fn register_jit_builtin_wrappers(ns: PyObjectRef) {
+    for (name, slot) in [
+        ("sqrt", &MATH_SQRT_WRAPPER),
+        ("frexp", &MATH_FREXP_WRAPPER),
+        ("ldexp", &MATH_LDEXP_WRAPPER),
+    ] {
+        let callable = crate::module_ns_get(ns, name)
+            .unwrap_or_else(|| panic!("math.{name} missing after module registration"));
+        let wrapper = unsafe {
+            let code = crate::function_get_code(callable) as PyObjectRef;
+            debug_assert!(crate::gateway::is_builtin_code(code));
+            crate::gateway::builtin_code_get(code) as usize
+        };
+        let installed = slot.get_or_init(|| wrapper);
+        debug_assert_eq!(*installed, wrapper);
+    }
+}
+
+unsafe fn math_builtin_wrapper_matches(
+    callable: PyObjectRef,
+    expected: &std::sync::OnceLock<usize>,
+) -> bool {
     unsafe {
         if callable.is_null() || !crate::is_function(callable) {
             return false;
         }
         let code = crate::function_get_code(callable) as PyObjectRef;
-        if code.is_null() || !crate::gateway::is_builtin_code(code) {
-            return false;
-        }
-        std::ptr::fn_addr_eq(
-            crate::gateway::builtin_code_get(code),
-            sqrt as crate::gateway::BuiltinCodeFn,
-        )
+        !code.is_null()
+            && crate::gateway::is_builtin_code(code)
+            && expected
+                .get()
+                .is_some_and(|addr| *addr == crate::gateway::builtin_code_get(code) as usize)
+    }
+}
+
+/// True iff `callable` is the canonical builtin `math.sqrt` function object.
+/// The JIT walker uses the builtin-code native fn-pointer identity to
+/// distinguish it from a value rebound under the same `math.sqrt` name, so a
+/// monkeypatched `math.sqrt` correctly declines the pure-inline specialization.
+pub fn is_math_sqrt_function(callable: PyObjectRef) -> bool {
+    unsafe { math_builtin_wrapper_matches(callable, &MATH_SQRT_WRAPPER) }
+}
+
+/// Callable-identity probes used by the meta-trace walker.  As with
+/// [`is_math_sqrt_function`], compare the immutable BuiltinCode function
+/// pointer rather than a module/name string so rebinding `math.frexp` or
+/// `math.ldexp` cannot enter a specialization for the old callable.
+pub fn is_math_frexp_function(callable: PyObjectRef) -> bool {
+    unsafe { math_builtin_wrapper_matches(callable, &MATH_FREXP_WRAPPER) }
+}
+
+pub fn is_math_ldexp_function(callable: PyObjectRef) -> bool {
+    unsafe { math_builtin_wrapper_matches(callable, &MATH_LDEXP_WRAPPER) }
+}
+
+/// Raw, allocation-free counterparts of RPython's `ll_math_frexp` result
+/// components.  The translated PyPy trace carries the pair as two unboxed
+/// values before `space.newtuple2` virtualizes; pyre's walker emits one pure
+/// call per component because the IR has no multi-result call opcode.
+pub extern "C" fn jit_math_frexp_mantissa(x: f64) -> f64 {
+    pymath::math::frexp(x).0
+}
+
+pub extern "C" fn jit_math_frexp_exponent(x: f64) -> i64 {
+    pymath::math::frexp(x).1 as i64
+}
+
+/// Non-raising raw `ldexp` for a guarded JIT fast path.  RPython lowers
+/// `ll_math_ldexp` to the platform operation and guards its exceptional
+/// result.  On overflow, return signed infinity so the walker's finite-result
+/// guard deoptimizes and the ordinary builtin re-executes to raise
+/// `OverflowError`; successful finite/underflow results are returned exactly.
+pub extern "C" fn jit_math_ldexp_raw(x: f64, exp: i64) -> f64 {
+    if x == 0.0 || !x.is_finite() {
+        return x;
+    }
+    let Ok(exp) = i32::try_from(exp) else {
+        return if exp < 0 {
+            0.0f64.copysign(x)
+        } else {
+            f64::INFINITY.copysign(x)
+        };
+    };
+    match pymath::math::ldexp(x, exp) {
+        Ok(result) => result,
+        Err(_) => f64::INFINITY.copysign(x),
     }
 }
 pm1!(cbrt);

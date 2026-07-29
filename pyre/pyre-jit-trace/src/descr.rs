@@ -913,6 +913,31 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
+/// `W_DictObject.keys_version` is pyre's explicit representation of the live
+/// strategy-iterator state PyPy carries implicitly
+/// (`dictmultiobject.py:807-845`).  Key insertion/removal/strategy replacement
+/// bumps it; value-only replacement deliberately does not.  A promoted
+/// identity-key lookup can therefore guard this field to pin the resolved
+/// entry index while continuing to read that entry's value live.
+static W_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        pyre_object::dictmultiobject::W_DICT_OBJECT_SIZE,
+        W_DICT_GC_TYPE_ID,
+        &pyre_object::pyobject::DICT_TYPE as *const _ as usize,
+        &[(
+            "keys_version",
+            std::mem::offset_of!(pyre_object::dictmultiobject::W_DictObject, keys_version),
+            std::mem::size_of::<usize>(),
+            Type::Int,
+            false,
+            false,
+            false,
+        )],
+        "W_DictObject",
+        "dictmultiobject::W_DictObject",
+    )
+});
+
 /// `Method` field layout — `w_function`, `w_self`, `w_class` per
 /// `function.rs:9-15`. All three are Ref slots; the JIT only consumes
 /// `w_function` (for guarding which method) and `w_self` (for recovering
@@ -1848,6 +1873,10 @@ pub fn range_length_descr() -> DescrRef {
 /// bound-method specialization in `call_callable_value`.
 pub fn method_w_function_descr() -> DescrRef {
     field_descr_from_group(&W_METHOD_DESCR_GROUP, 0)
+}
+
+pub fn dict_keys_version_descr() -> DescrRef {
+    field_descr_from_group(&W_DICT_DESCR_GROUP, 0)
 }
 
 /// `Method.w_self` — the receiver object. The bound-method
