@@ -3390,6 +3390,9 @@ mod tests {
             let mut builder = BlackholeInterpBuilder::new();
             let mut entries: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
             entries.insert("int_copy/i>i".to_string(), insns::BC_MOVE_I);
+            // `load_const_i_value` picks the `USE_C_FORM` short encoding for
+            // byte-sized constants, so both `int_copy` variants must be wired.
+            entries.insert("int_copy/c>i".to_string(), insns::BC_MOVE_I_C);
             entries.insert("ref_copy/r>r".to_string(), insns::BC_MOVE_R);
             entries.insert("int_add/ii>i".to_string(), insns::BC_INT_ADD);
             entries.insert("int_mul/ii>i".to_string(), insns::BC_INT_MUL);
