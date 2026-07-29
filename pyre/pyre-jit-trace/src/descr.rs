@@ -2614,12 +2614,18 @@ pub fn w_exception_dict_descr(kind: ExcKind) -> DescrRef {
         cache[idx] = Some(build_w_exception_group(kind));
     }
     let group = cache[idx].as_ref().unwrap();
-    debug_assert_eq!(
-        group.field_descrs[20].offset(),
-        pyre_object::interp_exceptions::EXC_W_DICT_OFFSET,
-        "exception descr group index 20 is no longer w_dict",
-    );
-    field_descr_from_group(group, 20)
+    // Located by offset rather than by a hand-counted position.  The field
+    // list is edited by hand, and naming the wrong index does not fail to
+    // compile: it silently reads a neighbouring slot that stays null for an
+    // ordinary subclass, which turns the shadowing guard below into a no-op
+    // and lets compiled code keep calling a method an instance attribute has
+    // already shadowed.
+    let field = group
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == pyre_object::interp_exceptions::EXC_W_DICT_OFFSET)
+        .expect("exception descr group has no w_dict field");
+    field_descr_from_group(group, field)
 }
 
 /// Field descriptor for `W_BaseException.w_traceback`, sharing the
