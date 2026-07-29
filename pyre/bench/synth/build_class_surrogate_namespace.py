@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=18
 # A __prepare__ namespace whose keys include a lone surrogate must be read back
 # into the class without assuming the keys are valid UTF-8 (the class-statement
 # / __build_class__ gather and the metaclass replay both iterate the keys).

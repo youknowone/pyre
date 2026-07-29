@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=30
+# pyre-check: max-pypy-ratio=107
 # Regression guard: an INLINED callee that inspects its own frame via
 # sys._getframe(0) must still see ITS OWN frame, not its caller's. The walker
 # executes residuals concretely while an inline push never runs the

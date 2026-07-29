@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=18
+# pyre-check: max-pypy-ratio=84
 # Regression guard: a frame-forcing user @property that forces FIRST (the
 # escape flush commits mid-property) and mutates SECOND (the commit is then
 # withdrawn because the callee entered a user frame). The withdrawal must

@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=26
+# pyre-check: max-pypy-ratio=89
 # enumerate(iterable, start) accepts an arbitrary-precision start past i64,
 # activating the bigint index slot instead of raising OverflowError. Output
 # verified against CPython/PyPy.

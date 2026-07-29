@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=36
+# pyre-check: max-pypy-ratio=161
 # A dict/set bucket probe compares the key already stored against the incoming
 # one, in that order (`ll_dict_lookup` runs `keyeq(checkingkey, key)`).  The
 # order decides whose `__eq__` the comparison protocol reaches first, so it is

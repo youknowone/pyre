@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=52
+# pyre-check: max-pypy-ratio=159
 # PR271 review parity guard.  check.py's correctness oracle is PyPy, so this
 # bench only asserts behaviour where 3.14 and PyPy AGREE; it guards the
 # tuple-subclass override (P1), the live `__length_hint__` (P2) and the

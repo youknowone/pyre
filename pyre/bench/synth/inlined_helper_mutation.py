@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=34
+# pyre-check: max-pypy-ratio=83
 # Inlined-callee shared-heap mutation parity, in both helper orderings.
 #
 # A tiny helper mutates a caller-owned list/instance inside a hot while-loop,

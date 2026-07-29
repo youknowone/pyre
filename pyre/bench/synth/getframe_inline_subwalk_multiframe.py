@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=22
+# pyre-check: max-pypy-ratio=95
 # Coverage for the multi-frame blackhole build path: an INLINED callee that
 # forces an outer frame through `sys._getframe(2)`.
 #

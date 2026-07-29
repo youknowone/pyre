@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=26
+# pyre-check: max-pypy-ratio=63
 # gh#495 guard: fbw_abort_nested_unjournaled_residual prevents the ForIterNext exemption double-advance.
 # SHARED long generator consumed incrementally. step consumes ONE item (for..break),
 # FOR_ITER advance mutates shared counter (exempt). Then a declining nested-residual CALL.

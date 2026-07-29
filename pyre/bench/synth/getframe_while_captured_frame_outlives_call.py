@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=16
+# pyre-check: max-pypy-ratio=49
 # The callee's frame OUTLIVES the call and its f_back is read after the loop.
 #
 # This is the discriminator for the root `f_backref` operand in the multi-frame

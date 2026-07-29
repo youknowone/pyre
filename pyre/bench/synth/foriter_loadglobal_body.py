@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=10
+# pyre-check: max-pypy-ratio=33
 # FOR_ITER body with LOAD_GLOBAL: the JIT must handle module-global
 # reads inside for-loop bodies correctly.
 

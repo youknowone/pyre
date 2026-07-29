@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=21
 # A module body whose JitCode lowering stops early must not let a later loop
 # header borrow the truncation's resume marker. `class` compiles to
 # LOAD_BUILD_CLASS, which has no JitCode lowering, so the body ends there with

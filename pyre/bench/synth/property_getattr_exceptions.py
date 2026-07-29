@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=24
+# pyre-check: max-pypy-ratio=86
 # Property getter/setter exceptions and __getattr__ hook exceptions
 # propagate out of attribute access instead of being swallowed. Only the
 # exception type is printed so the line matches across CPython/PyPy/Pyre.

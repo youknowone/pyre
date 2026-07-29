@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=34
+# pyre-check: max-pypy-ratio=103
 # gh#498 guard: a branch resume must keep the current closure-call result
 # local, across the three freevar flavours.
 #

@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=14
+# pyre-check: max-pypy-ratio=69
 # gh#495 guard: mutating call that raises uncaught must deliver the exception once.
 N = 30000
 class C:

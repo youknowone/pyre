@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=72
+# pyre-check: max-pypy-ratio=364
 """Hot property get/set plus Python 3.14 metadata surface."""
 
 

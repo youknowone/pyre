@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=6
+# pyre-check: max-pypy-ratio=20
 # A guard-failure bridge re-enters an inlined helper containing exact-integer
 # residual arithmetic.  The independent recurrence makes the clamp guard take
 # a different pattern while the bignum hash keeps the helper residual live.

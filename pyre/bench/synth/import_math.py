@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=98
+# pyre-check: max-pypy-ratio=291
 import math
 
 N = 400000

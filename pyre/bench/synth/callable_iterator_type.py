@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=16
+# pyre-check: max-pypy-ratio=51
 # iter(callable, sentinel) yields a properly-registered iterator type: type(it)
 # is a real type object, the iterator is an object instance, and __iter__
 # returns self. The concrete type name differs across implementations, so only

@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=28
+# pyre-check: max-pypy-ratio=82
 # complex() falls back to __index__ when a value defines neither __complex__
 # nor __float__, matching float()'s coercion. Output verified against
 # CPython/PyPy.

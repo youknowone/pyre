@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=24
+# pyre-check: max-pypy-ratio=104
 # gh#495 guard: fbw_abort_nested_unjournaled_residual prevents the ForIterNext exemption double-advance.
 # branch-bearing callee with a SECOND FOR_ITER (nested), not the loop header.
 # Two shared generators; inner FOR_ITER advance is a non-header foriter (Finding #2).

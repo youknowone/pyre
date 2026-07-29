@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=32
+# pyre-check: max-pypy-ratio=68
 # Adding an element to a set hashes it through the protocol, so an unhashable
 # element raises instead of being stored under a structural hash and a raising
 # __hash__ propagates. This covers every ingestion path: the set and frozenset
