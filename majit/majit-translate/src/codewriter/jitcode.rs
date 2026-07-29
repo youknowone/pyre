@@ -1151,6 +1151,37 @@ fn ir_type_to_result_char(result_type: majit_ir::value::Type) -> char {
 /// [`BhDescr::is_headerless`] for why the flag rides in the owner slot.
 pub const HEADERLESS_SIZE_OWNER_MARKER: &str = "__majit_headerless_size__";
 
+/// Key-sorted serialization for [`BhDescr::Switch`]'s lookup map.
+///
+/// The map is a pure lookup table, so its in-memory order never matters —
+/// but it is written to a build artefact (`opcode_descrs.bin`,
+/// `jit_metadata.json`), and a `HashMap` serializes in iteration order, which
+/// varies per process. Two builds of one unchanged source tree therefore
+/// produced two different artefacts, which defeats build caching and makes an
+/// A/B bisection impossible to attribute. Emit the same key order
+/// `const_keys_in_order` already canonicalises to (`jitcode.py:135
+/// sorted(as_dict.keys())`). The shape is unchanged — still a map — so the
+/// artefacts stay readable by the existing deserializer.
+mod sorted_switch_dict {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::collections::HashMap;
+
+    pub fn serialize<S: Serializer>(
+        dict: &HashMap<i64, usize>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut items: Vec<(&i64, &usize)> = dict.iter().collect();
+        items.sort_unstable_by_key(|(key, _)| **key);
+        serializer.collect_map(items)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<HashMap<i64, usize>, D::Error> {
+        HashMap::deserialize(deserializer)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BhDescr {
     /// Field descriptor: for getfield/setfield.
@@ -1290,6 +1321,7 @@ pub enum BhDescr {
     },
     /// SwitchDictDescr: maps int values to bytecode positions.
     Switch {
+        #[serde(with = "sorted_switch_dict")]
         dict: std::collections::HashMap<i64, usize>,
         const_keys_in_order: Vec<i64>,
     },
