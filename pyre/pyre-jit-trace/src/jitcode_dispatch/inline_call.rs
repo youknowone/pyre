@@ -2033,6 +2033,10 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     let call_site_word = call_site_marker
         .map(|marker| marker as i32)
         .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
+    // Rewind point for the un-lowered-helper decline below.  Nothing above
+    // this line records IR or touches the heap cache, so cutting back to it
+    // leaves the caller's trace exactly as the ordinary residual call found it.
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     let call_site_active = collect_outer_active_boxes(
         sym,
         ctx.trace_ctx,
@@ -2182,6 +2186,8 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     let saved_raw_descrs = ctx.raw_descrs;
     let saved_lookup = ctx.sub_jitcode_lookup;
     let saved_fbw_mode = ctx.fbw_mode;
+    let journal_before = fbw_store_journal_len();
+    let unjournaled_before = fbw_has_unjournaled_effect();
     ctx.entry_py_pc = EntryPyPc::Jit(op.pc);
     ctx.outer_resume_marker_jit_pc = call_site_marker;
     ctx.outer_jitcode_index = outer_jitcode_index;
@@ -2209,7 +2215,30 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     ctx.raw_descrs = saved_raw_descrs;
     ctx.sub_jitcode_lookup = saved_lookup;
 
-    let walk_result = walk_result?;
+    let walk_result = match walk_result {
+        Ok(outcome) => outcome,
+        // `try_execute_residual_call_via_executor` declines an un-lowered
+        // in-body helper (a `>>47` symbolic fnaddr) while inlining a
+        // sub-jitcode, so the descent aborts instead of baking the hash as a
+        // code address.  Propagating that abort from here strands the CALL:
+        // this walk is the authoritative executor and the descent declined
+        // *before* running the call, so the aborted trace resumes past a
+        // Python instruction whose effect never happened — `d.popleft()`
+        // returns its value and leaves the element in place.  Roll the partial
+        // descent back and let the ordinary residual call run, the same way
+        // the orthodox `w_list_append` descent does.  A descent that already
+        // applied an effect cannot be rewound this way, so it keeps the abort.
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. })
+            if fbw_store_journal_len() == journal_before
+                && fbw_has_unjournaled_effect() == unjournaled_before =>
+        {
+            ctx.trace_ctx.cut_trace(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            bool_box_truth_reset();
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     match walk_result {
         DispatchOutcome::SubReturn {
             result: Some(value),
