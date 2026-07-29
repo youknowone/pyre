@@ -2094,6 +2094,11 @@ fn try_adopt_single_frame_blackhole(
         .iter()
         .map(|&index| latched.miframe.ref_values[index].expect("location came from Some"))
         .collect();
+    let image_exception_root = (latched.last_exc_value != 0).then(|| {
+        let index = image_ref_roots.len();
+        image_ref_roots.push(latched.last_exc_value);
+        index
+    });
     let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
     unsafe {
         majit_gc::shadow_stack::push_resume_ref_roots(image_ref_roots.as_mut_slice());
@@ -2113,6 +2118,9 @@ fn try_adopt_single_frame_blackhole(
     }
     for (&index, &forwarded) in image_ref_locations.iter().zip(&image_ref_roots) {
         latched.miframe.ref_values[index] = Some(forwarded);
+    }
+    if let Some(index) = image_exception_root {
+        latched.last_exc_value = image_ref_roots[index];
     }
     let committed_root_addr = latched
         .miframe

@@ -145,7 +145,7 @@ pub fn drive_single_frame_blackhole(
     virtualizable_ptr: i64,
     virtualizable_stack_base: usize,
     metainterp_sd: &crate::pyjitpl::MetaInterpStaticData,
-    last_exc_value: i64,
+    mut last_exc_value: i64,
     raising_exception: bool,
 ) -> SingleFrameBlackholeResult {
     // The MIFrame is handed here from a force-time TLS latch.  Publish its Ref
@@ -161,6 +161,15 @@ pub fn drive_single_frame_blackhole(
         .collect();
     let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
     let mut packed_ref_roots: Vec<i64> = ref_roots.iter().map(|(_, value)| *value).collect();
+    // `MetaInterp.last_exc_value` is not necessarily present in an MIFrame
+    // Ref register (e.g. between `last_exception` and `last_exc_value/>r`).
+    // Root it beside the bank for the full drive, matching the multi-frame
+    // driver's explicit exception root.
+    let exception_root = (last_exc_value != 0).then(|| {
+        let index = packed_ref_roots.len();
+        packed_ref_roots.push(last_exc_value);
+        index
+    });
     unsafe {
         majit_gc::shadow_stack::push_resume_ref_roots(packed_ref_roots.as_mut_slice());
     }
@@ -174,6 +183,9 @@ pub fn drive_single_frame_blackhole(
     for ((index, value), forwarded) in ref_roots.iter_mut().zip(&packed_ref_roots) {
         *value = *forwarded;
         miframe.ref_values[*index] = Some(*forwarded);
+    }
+    if let Some(index) = exception_root {
+        last_exc_value = packed_ref_roots[index];
     }
 
     builder.setup_jitdrivers_sd(bh_jitdrivers_sd(metainterp_sd));
