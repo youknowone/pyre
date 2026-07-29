@@ -253,8 +253,12 @@ fn cformat_rbigint(spec: &CFormatSpec, num: &BigInt) -> Result<String, PyError> 
         _ => unreachable!("validated radix formatting returned an unrelated error"),
     })?;
     if negative {
-        debug_assert!(magnitude.starts_with('-'));
-        magnitude.remove(0);
+        let Some(unsigned) = magnitude.strip_prefix('-') else {
+            return Err(PyError::system_error(
+                "rbigint formatting omitted the negative sign",
+            ));
+        };
+        magnitude = unsigned.to_owned();
     }
     if upper {
         magnitude.make_ascii_uppercase();

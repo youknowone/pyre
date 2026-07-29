@@ -33,7 +33,8 @@ predicate:
 
 - `adt_head_instantiation_suffix` (mir.rs:12384) returns `Some("<…>")` **iff** the head is an
   `TypeDeclKind::Enum` (mir.rs:12390 — **structs always collapse**) AND every rendered type-arg passes
-- `type_arg_splits_per_instantiation` (mir.rs:12361): `false` for `DEFERRED = ["f32","f64","()",""]`.
+- `type_arg_splits_per_instantiation` (mir.rs:12361): `false` for
+  `DEFERRED = ["f32","()",""]` (`SingleFloat` is int-banked; `f64` splits).
 
 ClassDef identity is the canonical name STRING (`classdesc.rs:2198` — `struct ClassDef` carries
 `name: String`, **no generic-args field**; dedup by `canonical_struct_name`, descr.rs:429). So bare

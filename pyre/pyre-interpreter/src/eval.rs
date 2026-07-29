@@ -1057,6 +1057,10 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     if !scan_prebuilt {
         return;
     }
+    // PyPy's GC reaches standalone code objects through the ordinary object
+    // graph. Pyre's Box-immortal wrappers need the equivalent process-global
+    // owner before walking module/type caches below.
+    crate::pycode::walk_prebuilt_code_roots(visitor);
     unsafe {
         let mut forward = |slot: &mut PyObjectRef| {
             visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));

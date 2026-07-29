@@ -72,6 +72,11 @@ impl ArenaCollection {
     pub fn new(arena_size: usize, page_size: usize, small_request_threshold: usize) -> Self {
         assert_eq!(arena_size % WORD, 0);
         assert_eq!(page_size % WORD, 0);
+        assert_eq!(
+            page_size % ARENA_ALIGN,
+            0,
+            "page size must preserve the GC object alignment"
+        );
         assert_eq!(small_request_threshold % WORD, 0);
         let length = small_request_threshold / WORD + 1;
         let hdrsize = std::mem::size_of::<PageHeader>();

@@ -1035,11 +1035,6 @@ unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         owned_a = BigInt::from(int_value(a));
         &owned_a
     };
-    if is_long(a) && va.get_sign() == 1 && vb.int_eq(1) {
-        return Ok(pyre_object::longobject::w_long_from_raw(
-            w_long_get_raw_value(a),
-        ));
-    }
     // rbigint.floordiv → _divmod, returning the quotient half (rbigint.py:1001).
     // `_floordiv`/`_int_floordiv` both `newlong` the quotient, keeping a long.
     Ok(w_long_new(bigint_floordiv_nonzero(va, vb)))
@@ -1120,8 +1115,6 @@ unsafe fn integer_divmod_pair(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
     // longobject.py `_make_descr_binop(_divmod, _int_divmod)` preserves a
     // dedicated long/int residual; reflected int/long follows `_divmod`.
-    let quotient_aliases_a =
-        is_long(a) && is_int_like(b) && int_value(b) == 1 && w_long_get_value(a).get_sign() == 1;
     let remainder_aliases_a = if is_long(a) && is_long(b) {
         let va = w_long_get_value(a);
         let vb = w_long_get_value(b);
@@ -1154,11 +1147,7 @@ unsafe fn integer_divmod_pair(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let q = RBigIntGcRoot::new(q);
     let r = RBigIntGcRoot::new(r);
     if is_long(a) || is_long(b) {
-        let w_q = if quotient_aliases_a {
-            pyre_object::longobject::w_long_from_raw(w_long_get_raw_value(a))
-        } else {
-            w_long_new(q.translated_alias())
-        };
+        let w_q = w_long_new(q.translated_alias());
         let w_r = if remainder_aliases_a {
             pyre_object::longobject::w_long_from_raw(w_long_get_raw_value(a))
         } else {
@@ -5251,6 +5240,16 @@ mod tests {
     }
 
     #[test]
+    fn test_machine_int_host_seams_use_dedicated_rbigint_legs() {
+        let value = BigInt::one().lshift(130).unwrap().int_add(17);
+        let quotient = bigint_int_floordiv_nonzero(&value, 3);
+        assert!(quotient.eq(&value.int_floordiv(3).unwrap()));
+
+        let power = bigint_int_pow_nomod(&value, 3).expect("small exponent");
+        assert!(power.eq(&value.int_pow(3, None).unwrap()));
+    }
+
+    #[test]
     fn test_bigint_truediv_exponent() {
         // Regression: the exponent assembly carried a spurious `+ 1` that
         // doubled every quotient (equal operands gave 2.0, not 1.0).
@@ -5402,12 +5401,18 @@ mod tests {
                 long_mul(value, w_int_new(1)).unwrap(),
                 long_mul(w_bool_from(true), value).unwrap(),
                 long_floordiv(value, w_int_new(1)).unwrap(),
-                long_floordiv(value, w_long_new(BigInt::one())).unwrap(),
                 long_pow(value, w_int_new(1)).unwrap(),
             ] {
                 assert_ne!(result, value);
                 assert_eq!(w_long_get_raw_value(result), payload);
             }
+
+            // `rbigint.int_floordiv(1)` returns `self`, but the long-divisor
+            // path goes through `rbigint.divmod` -> `int_divmod`, whose
+            // quotient is freshly constructed.
+            let long_divisor_result = long_floordiv(value, w_long_new(BigInt::one())).unwrap();
+            assert_ne!(w_long_get_raw_value(long_divisor_result), payload);
+            assert!(w_long_get_value(long_divisor_result).eq(w_long_get_value(value)));
 
             // These upstream methods check zero before their alias shortcut
             // and return canonical NULLRBIGINT, not a fresh zero operand.
@@ -5430,7 +5435,8 @@ mod tests {
 
             let pair = integer_divmod_pair(value, w_int_new(1)).unwrap();
             let pair_quotient = w_tuple_getitem(pair, 0).expect("quotient");
-            assert_eq!(w_long_get_raw_value(pair_quotient), payload);
+            assert_ne!(w_long_get_raw_value(pair_quotient), payload);
+            assert!(w_long_get_value(pair_quotient).eq(w_long_get_value(value)));
         }
     }
 

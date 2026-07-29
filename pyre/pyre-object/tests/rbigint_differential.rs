@@ -69,18 +69,18 @@ fn oracle_floor_divmod(a: &Oracle, b: &Oracle) -> (Oracle, Oracle) {
     (q, r)
 }
 
-/// Machine-word operand stream for the `int_*` legs: mostly random words, but
-/// weighted towards the boundaries those legs special-case — zero, ±1, powers
-/// of two, and the ends of the signed range where the single-digit fast path
-/// gives way to a `fromint` fallback.
+/// Machine-word operand stream for the `int_*` legs: seven boundary-focused
+/// arms and one random arm. The boundaries cover zero, ±1, powers of two, and
+/// the ends of the signed range where the single-digit fast path gives way to
+/// a `fromint` fallback.
 fn machine_word(state: &mut u64) -> i64 {
     let raw = next_u64(state);
     match raw % 8 {
         0 => 0,
         1 => 1,
         2 => -1,
-        3 => 1_i64 << (raw >> 32) % 62,
-        4 => -(1_i64 << (raw >> 32) % 62),
+        3 => 1_i64 << ((raw >> 32) % 62),
+        4 => -(1_i64 << ((raw >> 32) % 62)),
         5 => i64::MAX,
         6 => i64::MIN,
         _ => raw as i64,
@@ -308,10 +308,22 @@ fn deterministic_arbitrary_size_arithmetic_matches_independent_oracle() {
             assert_eq!(to_oracle(&iq), oq, "int_divmod q, iteration {iteration}");
             assert_eq!(to_oracle(&ir), or, "int_divmod r, iteration {iteration}");
         } else {
-            assert!(a.int_floordiv(word).is_err());
-            assert!(a.int_mod(word).is_err());
-            assert!(a.int_mod_int_result(word).is_err());
-            assert!(a.int_divmod(word).is_err());
+            assert!(
+                a.int_floordiv(word).is_err(),
+                "int_floordiv zero divisor, iteration {iteration}"
+            );
+            assert!(
+                a.int_mod(word).is_err(),
+                "int_mod zero divisor, iteration {iteration}"
+            );
+            assert!(
+                a.int_mod_int_result(word).is_err(),
+                "int_mod_int_result zero divisor, iteration {iteration}"
+            );
+            assert!(
+                a.int_divmod(word).is_err(),
+                "int_divmod zero divisor, iteration {iteration}"
+            );
         }
 
         let exponent = (next_u64(&mut state) % 13) as i64;

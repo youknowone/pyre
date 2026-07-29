@@ -4490,7 +4490,7 @@ impl PendingPartsCacheDigitRoot {
     /// guard's lifetime.
     unsafe fn new(value: &std::sync::Arc<RBigInt>) -> Self {
         let value = std::sync::Arc::as_ptr(value) as *mut RBigInt;
-        let slot = unsafe { &mut (*value)._digits as *mut *mut TypedItemsBlock as *mut *mut u8 };
+        let slot = unsafe { std::ptr::addr_of_mut!((*value)._digits).cast::<*mut u8>() };
         let registered = unsafe { crate::gc_hook::try_gc_add_root(slot) };
         Self { slot, registered }
     }

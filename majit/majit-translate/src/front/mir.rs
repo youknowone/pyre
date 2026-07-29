@@ -14670,7 +14670,7 @@ fn tyref_tuple_suffix(ty: &TyRef, llbc: &Llbc) -> String {
 /// payload — the spelling a static `Some(..)`/`Ok(..)` construction already
 /// mints.  Extracts `ty`'s `{"Adt": …}` node (as [`tyref_tuple_suffix`]
 /// does) and defers to [`adt_head_instantiation_suffix`], already RC2-gated
-/// (an `f32`/`f64`/`()`/`""` argument yields `None`).  Fail-closed: a
+/// (an `f32`/`()`/`""` argument yields `None`).  Fail-closed: a
 /// missing `Adt` node, a non-enum type, or a deferred argument yields `""` —
 /// the bare owner, unchanged.
 fn tyref_enum_instantiation_suffix(ty: &TyRef, llbc: &Llbc) -> String {
@@ -14748,16 +14748,19 @@ fn option_payload_tuple_suffix(recv_ty: &TyRef, llbc: &Llbc) -> String {
 /// generic enum `Option<…>`, a tuple of references) are one word-sized GC
 /// pointer; the scalar integer/bool/char primitives are unboxed but each
 /// carries a well-defined int-banked repr, so all of these split.
-/// Float payloads split too: the per-instantiation row records `f32`/`f64`,
-/// and the codewriter's `get_type_flag`/`type_flag_from_str` selects the
-/// float bank, producing `setfield_gc_f`/`getfield_gc_f` rather than the
-/// generic GC-word fallback.  Excluded:
+/// An `f64` payload splits too: the per-instantiation row records `f64`, and
+/// the codewriter's `get_type_flag`/`type_flag_from_str` selects the float
+/// bank, producing `setfield_gc_f`/`getfield_gc_f` rather than the generic
+/// GC-word fallback.  Excluded:
+///   - `f32` — RPython's `SingleFloat` is int-banked (`getkind(...) == "int"`),
+///     while the textual field-descriptor path still classifies float atoms
+///     as float-banked. Defer the split until both paths agree.
 ///   - `()` — the unit-`Ok` return widens to a genuine void return
 ///     (`widen_unit_return_to_void`) and never materialises a payload field.
 ///   - `""` — a degenerate/absent type-arg that would render a malformed
 ///     `<>` suffix.
 fn type_arg_splits_per_instantiation(arg: &str) -> bool {
-    const DEFERRED: &[&str] = &["()", ""];
+    const DEFERRED: &[&str] = &["f32", "()", ""];
     !DEFERRED.contains(&arg)
 }
 
@@ -18025,7 +18028,7 @@ mod tests {
     }
 
     #[test]
-    fn type_arg_splits_per_instantiation_defers_only_unit_and_empty() {
+    fn type_arg_splits_per_instantiation_defers_singlefloat_unit_and_empty() {
         use super::type_arg_splits_per_instantiation;
         // Bare named heap classes split (1-word GC pointer in the
         // erased model).
@@ -18044,12 +18047,11 @@ mod tests {
         ] {
             assert!(type_arg_splits_per_instantiation(p), "{p} must split");
         }
-        // Float payloads carry a concrete float-bank field descriptor.
-        for p in ["f32", "f64"] {
-            assert!(type_arg_splits_per_instantiation(p), "{p} must split");
-        }
-        // Deferred: unit/degenerate atoms have no materialised payload field.
-        for p in ["()", ""] {
+        // DoubleFloat is float-banked. SingleFloat is int-banked in RPython,
+        // so it remains deferred until the textual descriptor path agrees.
+        assert!(type_arg_splits_per_instantiation("f64"));
+        // Unit/degenerate atoms have no materialised payload field.
+        for p in ["f32", "()", ""] {
             assert!(!type_arg_splits_per_instantiation(p), "{p} must not split");
         }
     }

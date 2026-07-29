@@ -235,6 +235,44 @@ pub const CODE_PTR_OFFSET: usize = std::mem::offset_of!(PyCode, code_ptr);
 /// Field offset of `w_globals` within `PyCode`.
 pub const CODE_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyCode, w_globals);
 
+/// Box-immortal `PyCode` wrappers that own off-GC `w_globals` and
+/// `co_consts_w` slots.
+///
+/// PyPy's `PyCode` is GC-managed, so ordinary graph tracing reaches these
+/// fields even when a code object is stored directly in a module/container
+/// without first becoming a function or frame. Pyre's wrappers are
+/// `Box::into_raw`-immortal; retain their exact process-global lifetime and
+/// expose every wrapper through one small insertion-ordered registry instead
+/// of a TLS or per-value side table.
+static PREBUILT_CODE_ROOTS: std::sync::OnceLock<std::sync::Mutex<Vec<usize>>> =
+    std::sync::OnceLock::new();
+
+fn register_prebuilt_code_root(code: PyObjectRef) {
+    let roots = PREBUILT_CODE_ROOTS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut roots = roots
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let identity = code as usize;
+    if !roots.contains(&identity) {
+        roots.push(identity);
+    }
+}
+
+/// Trace every Box-immortal code wrapper exactly as PyPy traces every live
+/// GC-managed `PyCode`. Nested code constants are handled by the raw walker's
+/// own mark-state analogue.
+pub(crate) fn walk_prebuilt_code_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    let Some(roots) = PREBUILT_CODE_ROOTS.get() else {
+        return;
+    };
+    let roots = roots
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for &code in roots.iter() {
+        unsafe { crate::eval::walk_raw_code_roots(code as PyObjectRef, visitor) };
+    }
+}
+
 /// GC type id assigned to `PyCode`.
 ///
 /// `PyCode` is a normal interpreter-level code object in PyPy
@@ -406,7 +444,9 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         mapdict_caches,
         co_consts_w,
     });
-    Box::into_raw(obj) as PyObjectRef
+    let obj = Box::into_raw(obj) as PyObjectRef;
+    register_prebuilt_code_root(obj);
+    obj
 }
 
 /// pypy/interpreter/pycode.py:107-147 `PyCode.__init__` shorthand —
@@ -462,29 +502,41 @@ unsafe fn w_code_fill_consts_from_tuple(obj: PyObjectRef, constants: PyObjectRef
     }
     let slots = unsafe { &*code.co_consts_w };
     let count = slots.len().min(pyre_object::w_tuple_len(constants));
+    let mut filled = false;
     for (index, slot) in slots.iter().take(count).enumerate() {
         if let Some(value) = unsafe { pyre_object::w_tuple_getitem(constants, index as i64) } {
             slot.store(value, std::sync::atomic::Ordering::Release);
+            filled = true;
         }
     }
-    pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    if filled {
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    }
 }
 
 /// Preserve the existing wrapped constant array when `code.replace()` changes
-/// fields other than `co_consts`.
+/// fields other than `co_consts`. PyPy copies an already-wrapped list; pyre
+/// must therefore copy only source slots that have already been realized,
+/// without turning `code.replace()` into an eager realization boundary.
 unsafe fn w_code_copy_const_slots(dst: PyObjectRef, src: PyObjectRef) {
     let dst_code = unsafe { &*(dst as *const PyCode) };
-    if dst_code.co_consts_w.is_null() {
+    let src_code = unsafe { &*(src as *const PyCode) };
+    if dst_code.co_consts_w.is_null() || src_code.co_consts_w.is_null() {
         return;
     }
-    let slots = unsafe { &*dst_code.co_consts_w };
-    for (index, slot) in slots.iter().enumerate() {
-        let value = unsafe { w_code_const(src, index) };
+    let dst_slots = unsafe { &*dst_code.co_consts_w };
+    let src_slots = unsafe { &*src_code.co_consts_w };
+    let mut copied = false;
+    for (dst_slot, src_slot) in dst_slots.iter().zip(src_slots.iter()) {
+        let value = src_slot.load(std::sync::atomic::Ordering::Acquire);
         if !value.is_null() {
-            slot.store(value, std::sync::atomic::Ordering::Release);
+            dst_slot.store(value, std::sync::atomic::Ordering::Release);
+            copied = true;
         }
     }
-    pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    if copied {
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    }
 }
 
 /// The keyword-only fields `code.replace` accepts, in the order
@@ -2142,6 +2194,60 @@ mod tests {
             visited,
             "Box-immortal PyCode must expose managed co_consts_w values as roots"
         );
+
+        let mut globally_visited = false;
+        walk_prebuilt_code_roots(&mut |root| {
+            if root.0 == first as usize {
+                globally_visited = true;
+            }
+        });
+        assert!(
+            globally_visited,
+            "a standalone PyCode must remain a root without a function/frame owner"
+        );
+    }
+
+    #[test]
+    fn copy_const_slots_preserves_unrealized_source_slots() {
+        let code = compile_exec(
+            "x = 12345678901234567890123456789012345678901234567890\n\
+             y = 98765432109876543210987654321098765432109876543210\n",
+        )
+        .expect("compile failed");
+        let integer_indices: Vec<usize> = code
+            .constants
+            .iter()
+            .enumerate()
+            .filter_map(|(index, constant)| {
+                matches!(
+                    constant,
+                    crate::bytecode::ConstantData::Integer { value }
+                        if num_traits::ToPrimitive::to_i64(value).is_none()
+                )
+                .then_some(index)
+            })
+            .collect();
+        assert!(integer_indices.len() >= 2);
+        let realized_idx = integer_indices[0];
+        let unrealized_idx = integer_indices[1];
+        let src = box_code_constant(&code);
+        let dst = box_code_constant(&code);
+        let realized = unsafe { w_code_const(src, realized_idx) };
+
+        unsafe {
+            w_code_copy_const_slots(dst, src);
+            let dst_slots = &*(*(dst as *const PyCode)).co_consts_w;
+            assert_eq!(
+                dst_slots[realized_idx].load(std::sync::atomic::Ordering::Acquire),
+                realized
+            );
+            assert!(
+                dst_slots[unrealized_idx]
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .is_null(),
+                "code.replace must not eagerly realize a missing source constant"
+            );
+        }
     }
 
     #[test]

@@ -24,7 +24,7 @@ def zero_and_negative():
     for _ in range(ROUNDS):
         out = (BIG**0, NEG**0, type(BIG**0) is int)
     neg = BIG**-1
-    return out, type(neg) is float, round(neg, 70) == 0.0
+    return out, type(neg) is float, 0.0 < neg < 1e-50
 
 
 def small_bases():
