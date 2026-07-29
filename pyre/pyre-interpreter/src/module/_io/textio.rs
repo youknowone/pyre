@@ -800,21 +800,28 @@ impl W_TextIOWrapper {
     /// Allocate the typed payload used by the interpreter-created standard
     /// streams.  Their methods and metadata remain instance overrides until
     /// sys stream construction is ported to a real FileIO-backed pipeline.
-    pub(crate) fn allocate_stdio(name: &str, encoding: &str, errors: &str) -> PyObjectRef {
+    pub(crate) fn allocate_stdio(
+        name: &str,
+        buffer: PyObjectRef,
+        encoding: &str,
+        errors: &str,
+        line_buffering: bool,
+        write_through: bool,
+    ) -> PyObjectRef {
         // Establish the Python type and its mapdict layout before allocating
         // a payload whose stdio methods are installed in the instance dict.
         let _ = type_object();
         let obj = Self::allocate_stable(Self {
             state: STATE_OK,
-            w_buffer: w_none(),
+            w_buffer: buffer,
             w_encoding: w_str_new(encoding),
             w_errors: w_str_new(errors),
             w_newline: w_none(),
             w_stdio_name: w_str_new(name),
             w_encoder: PY_NULL,
             w_decoder: PY_NULL,
-            line_buffering: false,
-            write_through: false,
+            line_buffering,
+            write_through,
             decoded: DecodeBuffer::default(),
             snapshot: None,
             pending_bytes: None,

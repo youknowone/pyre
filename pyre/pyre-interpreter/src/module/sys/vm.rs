@@ -247,11 +247,7 @@ fn simple_namespace_ne(args: &[PyObjectRef]) -> crate::PyResult {
     simple_namespace_richcompare(args, "__ne__", true)
 }
 
-fn simple_namespace_richcompare(
-    args: &[PyObjectRef],
-    name: &str,
-    negate: bool,
-) -> crate::PyResult {
+fn simple_namespace_richcompare(args: &[PyObjectRef], name: &str, negate: bool) -> crate::PyResult {
     // `def __eq__(self, other)` — a missing argument is an arity error, not a
     // NotImplemented result.
     let (Some(&self_obj), Some(&other)) = (args.first(), args.get(1)) else {
@@ -617,6 +613,30 @@ pub fn exc_info_direct() -> PyObjectRef {
 pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(ns, "maxsize", w_int_new(i64::MAX));
     module_ns_store(ns, "maxunicode", w_int_new(0x10FFFF));
+    module_ns_store(
+        ns,
+        "orig_argv",
+        w_list_new(
+            crate::importing::sys_orig_argv()
+                .iter()
+                .map(|arg| w_str_new(arg))
+                .collect(),
+        ),
+    );
+    // pypy/interpreter/app_main.py:785-786:
+    //   sys._xoptions = dict(x.split('=', 1) if '=' in x else (x, True)
+    //                        for x in options['_xoptions'])
+    let xoptions = w_dict_new();
+    for option in crate::importing::xoptions() {
+        let (name, value) = match option.split_once('=') {
+            Some((name, value)) => (name, w_str_new(value)),
+            None => (option.as_str(), w_bool_from(true)),
+        };
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(xoptions, name, value);
+        }
+    }
+    module_ns_store(ns, "_xoptions", xoptions);
     // Format matches `platform._sys_version`'s CPython parser:
     // `version (buildinfo) [compiler]`.
     module_ns_store(ns, "version", w_str_new("3.14.6 (pyre 0.0.1) [Rust]"));
@@ -835,7 +855,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 w_int_new(i64::from(crate::importing::no_site_flag())),
                 w_int_new(i64::from(crate::importing::ignore_environment_flag())),
                 w_int_new(0), // verbose
-                w_int_new(0), // bytes_warning
+                w_int_new(crate::importing::bytes_warning_flag()),
                 w_int_new(i64::from(crate::importing::quiet_flag())),
                 w_int_new(0), // hash_randomization
                 w_int_new(i64::from(crate::importing::isolated_flag())),
@@ -1299,7 +1319,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     };
     module_ns_store(ns, "argv", argv);
     // sys.warnoptions
-    module_ns_store(ns, "warnoptions", w_list_new(vec![]));
+    module_ns_store(
+        ns,
+        "warnoptions",
+        w_list_new(
+            crate::importing::warnoptions()
+                .iter()
+                .map(|option| w_str_new(option))
+                .collect(),
+        ),
+    );
     // sys.builtin_module_names — tuple of names of modules compiled into
     // the interpreter. PyPy: pypy/module/sys/state.py get_builtin_module_names,
     // which reads the same registry `import` resolves against, so the
@@ -1316,50 +1345,303 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // by the module shadowing check for the stronger stdlib rename hint.  The
     // list is the full set regardless of platform, as upstream ships it.
     const STDLIB_MODULE_NAMES: &[&str] = &[
-        "__future__", "_abc", "_aix_support", "_android_support", "_apple_support", "_ast",
-        "_ast_unparse", "_asyncio", "_bisect", "_blake2", "_bz2", "_codecs", "_codecs_cn",
-        "_codecs_hk", "_codecs_iso2022", "_codecs_jp", "_codecs_kr", "_codecs_tw",
-        "_collections", "_collections_abc", "_colorize", "_compat_pickle", "_contextvars",
-        "_csv", "_ctypes", "_curses", "_curses_panel", "_datetime", "_dbm", "_decimal",
-        "_elementtree", "_frozen_importlib", "_frozen_importlib_external", "_functools",
-        "_gdbm", "_hashlib", "_heapq", "_hmac", "_imp", "_interpchannels", "_interpqueues",
-        "_interpreters", "_io", "_ios_support", "_json", "_locale", "_lsprof", "_lzma",
-        "_markupbase", "_md5", "_multibytecodec", "_multiprocessing", "_opcode",
-        "_opcode_metadata", "_operator", "_osx_support", "_overlapped", "_pickle",
-        "_posixshmem", "_posixsubprocess", "_py_abc", "_py_warnings", "_pydatetime",
-        "_pydecimal", "_pyio", "_pylong", "_pyrepl", "_queue", "_random",
-        "_remote_debugging", "_scproxy", "_sha1", "_sha2", "_sha3", "_signal",
-        "_sitebuiltins", "_socket", "_sqlite3", "_sre", "_ssl", "_stat", "_statistics",
-        "_string", "_strptime", "_struct", "_suggestions", "_symtable", "_sysconfig",
-        "_thread", "_threading_local", "_tkinter", "_tokenize", "_tracemalloc", "_types",
-        "_typing", "_uuid", "_warnings", "_weakref", "_weakrefset", "_winapi", "_wmi",
-        "_zoneinfo", "_zstd", "abc", "annotationlib", "antigravity", "argparse", "array",
-        "ast", "asyncio", "atexit", "base64", "bdb", "binascii", "bisect", "builtins",
-        "bz2", "cProfile", "calendar", "cmath", "cmd", "code", "codecs", "codeop",
-        "collections", "colorsys", "compileall", "compression", "concurrent",
-        "configparser", "contextlib", "contextvars", "copy", "copyreg", "csv", "ctypes",
-        "curses", "dataclasses", "datetime", "dbm", "decimal", "difflib", "dis", "doctest",
-        "email", "encodings", "ensurepip", "enum", "errno", "faulthandler", "fcntl",
-        "filecmp", "fileinput", "fnmatch", "fractions", "ftplib", "functools", "gc",
-        "genericpath", "getopt", "getpass", "gettext", "glob", "graphlib", "grp", "gzip",
-        "hashlib", "heapq", "hmac", "html", "http", "idlelib", "imaplib", "importlib",
-        "inspect", "io", "ipaddress", "itertools", "json", "keyword", "linecache", "locale",
-        "logging", "lzma", "mailbox", "marshal", "math", "mimetypes", "mmap",
-        "modulefinder", "msvcrt", "multiprocessing", "netrc", "nt", "ntpath", "nturl2path",
-        "numbers", "opcode", "operator", "optparse", "os", "pathlib", "pdb", "pickle",
-        "pickletools", "pkgutil", "platform", "plistlib", "poplib", "posix", "posixpath",
-        "pprint", "profile", "pstats", "pty", "pwd", "py_compile", "pyclbr", "pydoc",
-        "pydoc_data", "pyexpat", "queue", "quopri", "random", "re", "readline", "reprlib",
-        "resource", "rlcompleter", "runpy", "sched", "secrets", "select", "selectors",
-        "shelve", "shlex", "shutil", "signal", "site", "smtplib", "socket", "socketserver",
-        "sqlite3", "sre_compile", "sre_constants", "sre_parse", "ssl", "stat", "statistics",
-        "string", "stringprep", "struct", "subprocess", "symtable", "sys", "sysconfig",
-        "syslog", "tabnanny", "tarfile", "tempfile", "termios", "textwrap", "this",
-        "threading", "time", "timeit", "tkinter", "token", "tokenize", "tomllib", "trace",
-        "traceback", "tracemalloc", "tty", "turtle", "turtledemo", "types", "typing",
-        "unicodedata", "unittest", "urllib", "uuid", "venv", "warnings", "wave", "weakref",
-        "webbrowser", "winreg", "winsound", "wsgiref", "xml", "xmlrpc", "zipapp", "zipfile",
-        "zipimport", "zlib", "zoneinfo",
+        "__future__",
+        "_abc",
+        "_aix_support",
+        "_android_support",
+        "_apple_support",
+        "_ast",
+        "_ast_unparse",
+        "_asyncio",
+        "_bisect",
+        "_blake2",
+        "_bz2",
+        "_codecs",
+        "_codecs_cn",
+        "_codecs_hk",
+        "_codecs_iso2022",
+        "_codecs_jp",
+        "_codecs_kr",
+        "_codecs_tw",
+        "_collections",
+        "_collections_abc",
+        "_colorize",
+        "_compat_pickle",
+        "_contextvars",
+        "_csv",
+        "_ctypes",
+        "_curses",
+        "_curses_panel",
+        "_datetime",
+        "_dbm",
+        "_decimal",
+        "_elementtree",
+        "_frozen_importlib",
+        "_frozen_importlib_external",
+        "_functools",
+        "_gdbm",
+        "_hashlib",
+        "_heapq",
+        "_hmac",
+        "_imp",
+        "_interpchannels",
+        "_interpqueues",
+        "_interpreters",
+        "_io",
+        "_ios_support",
+        "_json",
+        "_locale",
+        "_lsprof",
+        "_lzma",
+        "_markupbase",
+        "_md5",
+        "_multibytecodec",
+        "_multiprocessing",
+        "_opcode",
+        "_opcode_metadata",
+        "_operator",
+        "_osx_support",
+        "_overlapped",
+        "_pickle",
+        "_posixshmem",
+        "_posixsubprocess",
+        "_py_abc",
+        "_py_warnings",
+        "_pydatetime",
+        "_pydecimal",
+        "_pyio",
+        "_pylong",
+        "_pyrepl",
+        "_queue",
+        "_random",
+        "_remote_debugging",
+        "_scproxy",
+        "_sha1",
+        "_sha2",
+        "_sha3",
+        "_signal",
+        "_sitebuiltins",
+        "_socket",
+        "_sqlite3",
+        "_sre",
+        "_ssl",
+        "_stat",
+        "_statistics",
+        "_string",
+        "_strptime",
+        "_struct",
+        "_suggestions",
+        "_symtable",
+        "_sysconfig",
+        "_thread",
+        "_threading_local",
+        "_tkinter",
+        "_tokenize",
+        "_tracemalloc",
+        "_types",
+        "_typing",
+        "_uuid",
+        "_warnings",
+        "_weakref",
+        "_weakrefset",
+        "_winapi",
+        "_wmi",
+        "_zoneinfo",
+        "_zstd",
+        "abc",
+        "annotationlib",
+        "antigravity",
+        "argparse",
+        "array",
+        "ast",
+        "asyncio",
+        "atexit",
+        "base64",
+        "bdb",
+        "binascii",
+        "bisect",
+        "builtins",
+        "bz2",
+        "cProfile",
+        "calendar",
+        "cmath",
+        "cmd",
+        "code",
+        "codecs",
+        "codeop",
+        "collections",
+        "colorsys",
+        "compileall",
+        "compression",
+        "concurrent",
+        "configparser",
+        "contextlib",
+        "contextvars",
+        "copy",
+        "copyreg",
+        "csv",
+        "ctypes",
+        "curses",
+        "dataclasses",
+        "datetime",
+        "dbm",
+        "decimal",
+        "difflib",
+        "dis",
+        "doctest",
+        "email",
+        "encodings",
+        "ensurepip",
+        "enum",
+        "errno",
+        "faulthandler",
+        "fcntl",
+        "filecmp",
+        "fileinput",
+        "fnmatch",
+        "fractions",
+        "ftplib",
+        "functools",
+        "gc",
+        "genericpath",
+        "getopt",
+        "getpass",
+        "gettext",
+        "glob",
+        "graphlib",
+        "grp",
+        "gzip",
+        "hashlib",
+        "heapq",
+        "hmac",
+        "html",
+        "http",
+        "idlelib",
+        "imaplib",
+        "importlib",
+        "inspect",
+        "io",
+        "ipaddress",
+        "itertools",
+        "json",
+        "keyword",
+        "linecache",
+        "locale",
+        "logging",
+        "lzma",
+        "mailbox",
+        "marshal",
+        "math",
+        "mimetypes",
+        "mmap",
+        "modulefinder",
+        "msvcrt",
+        "multiprocessing",
+        "netrc",
+        "nt",
+        "ntpath",
+        "nturl2path",
+        "numbers",
+        "opcode",
+        "operator",
+        "optparse",
+        "os",
+        "pathlib",
+        "pdb",
+        "pickle",
+        "pickletools",
+        "pkgutil",
+        "platform",
+        "plistlib",
+        "poplib",
+        "posix",
+        "posixpath",
+        "pprint",
+        "profile",
+        "pstats",
+        "pty",
+        "pwd",
+        "py_compile",
+        "pyclbr",
+        "pydoc",
+        "pydoc_data",
+        "pyexpat",
+        "queue",
+        "quopri",
+        "random",
+        "re",
+        "readline",
+        "reprlib",
+        "resource",
+        "rlcompleter",
+        "runpy",
+        "sched",
+        "secrets",
+        "select",
+        "selectors",
+        "shelve",
+        "shlex",
+        "shutil",
+        "signal",
+        "site",
+        "smtplib",
+        "socket",
+        "socketserver",
+        "sqlite3",
+        "sre_compile",
+        "sre_constants",
+        "sre_parse",
+        "ssl",
+        "stat",
+        "statistics",
+        "string",
+        "stringprep",
+        "struct",
+        "subprocess",
+        "symtable",
+        "sys",
+        "sysconfig",
+        "syslog",
+        "tabnanny",
+        "tarfile",
+        "tempfile",
+        "termios",
+        "textwrap",
+        "this",
+        "threading",
+        "time",
+        "timeit",
+        "tkinter",
+        "token",
+        "tokenize",
+        "tomllib",
+        "trace",
+        "traceback",
+        "tracemalloc",
+        "tty",
+        "turtle",
+        "turtledemo",
+        "types",
+        "typing",
+        "unicodedata",
+        "unittest",
+        "urllib",
+        "uuid",
+        "venv",
+        "warnings",
+        "wave",
+        "weakref",
+        "webbrowser",
+        "winreg",
+        "winsound",
+        "wsgiref",
+        "xml",
+        "xmlrpc",
+        "zipapp",
+        "zipfile",
+        "zipimport",
+        "zlib",
+        "zoneinfo",
     ];
     module_ns_store(
         ns,
@@ -1420,32 +1702,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(
         ns,
         "getsizeof",
-        make_builtin_function(
-            "getsizeof",
-            |args| {
-                if args.len() > 2 {
-                    return Err(crate::PyError::type_error(format!(
-                        "getsizeof() takes at most 2 arguments ({} given)",
-                        args.len()
-                    )));
-                }
-                let Some(&w_obj) = args.first() else {
-                    return Err(crate::PyError::type_error(
-                        "getsizeof() takes at least 1 argument (0 given)",
-                    ));
-                };
-                if unsafe { pyre_object::is_str(w_obj) } {
-                    let method = crate::baseobjspace::getattr_str(w_obj, "__sizeof__")?;
-                    return crate::call::call_function_impl_result(method, &[]);
-                }
-                match args.get(1).copied() {
-                    Some(w_default) => Ok(w_default),
-                    None => Err(crate::PyError::type_error(
-                        "getsizeof(object, default) -> int: object size is not tracked; supply a default",
-                    )),
-                }
-            },
-        ),
+        make_builtin_function("getsizeof", |args| {
+            if args.len() > 2 {
+                return Err(crate::PyError::type_error(format!(
+                    "getsizeof() takes at most 2 arguments ({} given)",
+                    args.len()
+                )));
+            }
+            let Some(&w_obj) = args.first() else {
+                return Err(crate::PyError::type_error(
+                    "getsizeof() takes at least 1 argument (0 given)",
+                ));
+            };
+            if unsafe { pyre_object::is_str(w_obj) } {
+                let method = crate::baseobjspace::getattr_str(w_obj, "__sizeof__")?;
+                return crate::call::call_function_impl_result(method, &[]);
+            }
+            match args.get(1).copied() {
+                Some(w_default) => Ok(w_default),
+                None => Err(crate::PyError::type_error(
+                    "getsizeof(object, default) -> int: object size is not tracked; supply a default",
+                )),
+            }
+        }),
     );
     // PyPy normally omits CPython's raw refcount API.  The shared ctypes
     // tests only require the strong-reference delta created by a c_char_p
@@ -1493,20 +1772,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(
         ns,
         "_settraceallthreads",
-        make_builtin_function_with_arity(
-            "_settraceallthreads",
-            sys_settraceallthreads_impl,
-            1,
-        ),
+        make_builtin_function_with_arity("_settraceallthreads", sys_settraceallthreads_impl, 1),
     );
     module_ns_store(
         ns,
         "_setprofileallthreads",
-        make_builtin_function_with_arity(
-            "_setprofileallthreads",
-            sys_setprofileallthreads_impl,
-            1,
-        ),
+        make_builtin_function_with_arity("_setprofileallthreads", sys_setprofileallthreads_impl, 1),
     );
     module_ns_store(
         ns,
@@ -1663,35 +1934,137 @@ fn sys_clear_type_descriptors(args: &[PyObjectRef]) -> crate::PyResult {
 /// real W_File-backed `TextIOWrapper`; pyre routes writes through Rust's
 /// stdout/stderr (the same sink as `print`) so output ordering is preserved,
 /// storing the read/write surface as instance attributes.
+fn stdio_encoding_and_errors() -> (String, String) {
+    // PyPy app_main.py `initstdio`: a non-empty encoding before ':' is
+    // explicit; an omitted encoding defaults to UTF-8 here, while a non-empty
+    // errors suffix overrides the normal strict policy. stderr replaces its
+    // error policy separately below.
+    let Some(raw) = crate::importing::stdio_encoding() else {
+        return ("utf-8".to_string(), "strict".to_string());
+    };
+    let (encoding, errors) = match raw.split_once(':') {
+        Some((encoding, errors)) => (
+            if encoding.is_empty() {
+                "utf-8"
+            } else {
+                encoding
+            },
+            if errors.is_empty() { "strict" } else { errors },
+        ),
+        None if raw.is_empty() => ("utf-8", "strict"),
+        None => (raw.as_str(), "strict"),
+    };
+    (encoding.to_string(), errors.to_string())
+}
+
+fn live_stdio_encoding_errors(stream_name: &str, default_errors: &str) -> (String, String) {
+    let defaults = stdio_encoding_and_errors();
+    let Some(sys) = crate::importing::get_sys_module("sys") else {
+        return (defaults.0, default_errors.to_string());
+    };
+    let Ok(stream) = crate::baseobjspace::getattr_str(sys, stream_name) else {
+        return (defaults.0, default_errors.to_string());
+    };
+    let text_attr = |name: &str, default: &str| {
+        crate::baseobjspace::getattr_str(stream, name)
+            .ok()
+            .filter(|value| unsafe { is_str(*value) })
+            .map(|value| unsafe { w_str_get_value(value) }.to_string())
+            .unwrap_or_else(|| default.to_string())
+    };
+    (
+        text_attr("encoding", &defaults.0),
+        text_attr("errors", default_errors),
+    )
+}
+
+fn stdio_stdin_readline(args: &[PyObjectRef]) -> crate::PyResult {
+    if args.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "readline() takes at most one argument ({} given)",
+            args.len()
+        )));
+    }
+    let sys = crate::importing::get_sys_module("sys")
+        .ok_or_else(|| crate::PyError::runtime_error("lost sys.stdin"))?;
+    let stdin = crate::baseobjspace::getattr_str(sys, "stdin")?;
+    let buffer = crate::baseobjspace::getattr_str(stdin, "buffer")?;
+    let bytes = crate::baseobjspace::call_method(buffer, "readline", args);
+    if bytes.is_null() {
+        return Err(crate::call::take_call_error()
+            .unwrap_or_else(|| crate::PyError::runtime_error("readline failed")));
+    }
+    if !unsafe { pyre_object::is_bytes(bytes) } {
+        return Err(crate::PyError::type_error(
+            "underlying readline() should have returned a bytes-like object",
+        ));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(bytes);
+    let bytes_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let (encoding, errors) = live_stdio_encoding_errors("stdin", "strict");
+    crate::typedef::bytes_method_decode(&[
+        pyre_object::gc_roots::shadow_stack_get(bytes_slot),
+        w_str_new(&encoding),
+        w_str_new(&errors),
+    ])
+}
+
 fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     let writable = fd != 0;
     let to_stderr = fd == 2;
+    let unbuffered = writable && crate::importing::unbuffered_flag();
+    // PyPy app_main.py `create_stdio`: retain the FileIO-backed binary layer
+    // as TextIOWrapper.buffer. libregrtest workers deliberately write invalid
+    // byte sequences through this exact owner.
+    //
+    // `create_stdio` also answers a descriptor `_io.open` rejects with no
+    // stream at all. These streams keep instance-override methods that reach
+    // the descriptor without going through the buffer, so a descriptor the
+    // host does not open — the sandbox controller mounts no real files —
+    // leaves the buffer absent instead of removing `sys.stdout` outright.
+    let buffer = crate::builtins::builtin_open(&[
+        w_int_new(i64::from(fd)),
+        w_str_new(if writable { "wb" } else { "rb" }),
+        w_int_new(if unbuffered { 0 } else { -1 }),
+        w_none(),
+        w_none(),
+        w_none(),
+        w_bool_from(false),
+    ])
+    .unwrap_or_else(|_| w_none());
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(buffer);
+    let buffer_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let (encoding, configured_errors) = stdio_encoding_and_errors();
+    let errors = if to_stderr {
+        "backslashreplace"
+    } else {
+        configured_errors.as_str()
+    };
     let stream = crate::module::_io::W_TextIOWrapper::allocate_stdio(
         name,
-        "utf-8",
-        if to_stderr {
-            "backslashreplace"
-        } else {
-            "strict"
-        },
+        pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+        &encoding,
+        errors,
+        unbuffered || to_stderr,
+        unbuffered,
     );
     crate::baseobjspace::setdictvalue_native(stream, "name", w_str_new(name));
-    crate::baseobjspace::setdictvalue_native(stream, "encoding", w_str_new("utf-8"));
     // `pylifecycle.c init_set_builtins_open`/`init_sys_streams`: stderr uses the
     // `backslashreplace` handler so traceback printing never fails on a lone
     // surrogate; stdout/stdin default to `strict`.
     crate::baseobjspace::setdictvalue_native(
         stream,
-        "errors",
-        w_str_new(if to_stderr {
-            "backslashreplace"
-        } else {
-            "strict"
-        }),
+        "mode",
+        w_str_new(if writable { "w" } else { "r" }),
     );
-    crate::baseobjspace::setdictvalue_native(stream, "mode", w_str_new(if writable { "w" } else { "r" }));
     crate::baseobjspace::setdictvalue_native(stream, "closed", w_bool_from(false));
-    crate::baseobjspace::setdictvalue_native(stream, "buffer", w_none());
+    crate::baseobjspace::setdictvalue_native(
+        stream,
+        "buffer",
+        pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+    );
     // Instance-stored builtin methods do not get `self` prepended (see
     // pyopcode load_method dispatch), so the first arg may be the string
     // directly. Pick whichever element is a real str.
@@ -1709,7 +2082,9 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     let write_fn = if to_stderr {
         crate::make_builtin_function("write", |args| {
             if let Some(s_obj) = pick_str(args) {
-                let bytes = crate::type_methods::encode_object(s_obj, "utf-8", "backslashreplace")?;
+                let (encoding, _) = live_stdio_encoding_errors("stderr", "backslashreplace");
+                let bytes =
+                    crate::type_methods::encode_object(s_obj, &encoding, "backslashreplace")?;
                 // Under sandbox fd 1 is the marshalling pipe, so a raw write
                 // would corrupt the protocol: route through ll_os_write(2,…)
                 // and let the controller relay it to its own stderr.
@@ -1728,7 +2103,8 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     } else {
         crate::make_builtin_function("write", |args| {
             if let Some(s_obj) = pick_str(args) {
-                let bytes = crate::type_methods::encode_object(s_obj, "utf-8", "strict")?;
+                let (encoding, errors) = live_stdio_encoding_errors("stdout", "strict");
+                let bytes = crate::type_methods::encode_object(s_obj, &encoding, &errors)?;
                 #[cfg(not(feature = "sandbox"))]
                 {
                     use std::io::Write;
@@ -1743,6 +2119,13 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
         })
     };
     crate::baseobjspace::setdictvalue_native(stream, "write", write_fn);
+    if fd == 0 {
+        crate::baseobjspace::setdictvalue_native(
+            stream,
+            "readline",
+            crate::make_builtin_function("readline", stdio_stdin_readline),
+        );
+    }
     crate::baseobjspace::setdictvalue_native(
         stream,
         "flush",
@@ -1762,14 +2145,6 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
         stream,
         "isatty",
         crate::make_builtin_function("isatty", |_| Ok(w_bool_from(false))),
-    );
-    // `TextIOWrapper.reconfigure(*, encoding=None, errors=None, ...)` only
-    // adjusts codec/newline policy; pyre's streams are fixed UTF-8, so accept
-    // and ignore the request.
-    crate::baseobjspace::setdictvalue_native(
-        stream,
-        "reconfigure",
-        crate::make_builtin_function("reconfigure", |_| Ok(w_none())),
     );
     // `BuiltinCodeFn` is a bare `fn` pointer (no captures), so select a
     // constant-returning function per descriptor rather than closing over `fd`.

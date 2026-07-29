@@ -43,7 +43,7 @@ enum RunMode {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct LaunchFlags {
     inspect: bool,
     quiet: bool,
@@ -56,7 +56,16 @@ struct LaunchFlags {
     safe_path: bool,
     // `-O` count on the command line; PYTHONOPTIMIZE folds in during finalize.
     optimize: i64,
+    bytes_warning: i64,
     dont_write_bytecode: bool,
+    unbuffered: bool,
+    warnoptions: Vec<String>,
+    // app_main.py passes the raw PYTHONIOENCODING value to initstdio after
+    // applying -E/-I. Keep it raw until stdio parses the optional errors part.
+    stdio_encoding: Option<String>,
+    // PyPy app_main.py keeps every raw `-X` value in a list until sys module
+    // initialization turns it into `sys._xoptions`.
+    xoptions: Vec<String>,
 }
 
 impl Default for LaunchFlags {
@@ -72,7 +81,12 @@ impl Default for LaunchFlags {
             utf8_mode: None,
             safe_path: false,
             optimize: 0,
+            bytes_warning: 0,
             dont_write_bytecode: false,
+            unbuffered: false,
+            warnoptions: Vec::new(),
+            stdio_encoding: None,
+            xoptions: Vec::new(),
         }
     }
 }
@@ -226,6 +240,33 @@ fn finalize_flags(mut flags: LaunchFlags) -> LaunchFlags {
     flags.optimize = resolve_optimize(&flags);
     flags.dont_write_bytecode = resolve_dont_write_bytecode(&flags);
     flags.safe_path = resolve_safe_path(&flags);
+    flags.stdio_encoding = if flags.ignore_environment {
+        None
+    } else {
+        std::env::var("PYTHONIOENCODING").ok()
+    };
+    // pypy/interpreter/app_main.py:892-906 — lowest-precedence entries first;
+    // the warnings module installs later entries ahead of earlier ones.
+    let mut warnoptions = Vec::new();
+    if flags.dev_mode {
+        warnoptions.push("default".to_string());
+    }
+    if !flags.ignore_environment {
+        if let Ok(value) = std::env::var("PYTHONWARNINGS") {
+            if !value.is_empty() {
+                warnoptions.extend(value.split(',').map(str::to_string));
+            }
+        }
+    }
+    warnoptions.append(&mut flags.warnoptions);
+    if flags.bytes_warning > 0 {
+        warnoptions.push(if flags.bytes_warning > 1 {
+            "error::BytesWarning".to_string()
+        } else {
+            "default::BytesWarning".to_string()
+        });
+    }
+    flags.warnoptions = warnoptions;
     flags
 }
 
@@ -270,24 +311,26 @@ fn parse_args(binary_name: &str) -> Result<(RunMode, LaunchFlags, Vec<String>), 
                     }
                     _ => {}
                 }
+                flags.xoptions.push(option);
             }
             // Accepted for CPython/PyPy command-line compatibility.  Warning
             // filter installation is handled by the warnings module; keeping
             // the option/value in launcher parsing lets stdlib subprocesses
             // reach their command or module.
             Short('W') => {
-                let _filter = parser.value()?.string()?;
+                flags.warnoptions.push(parser.value()?.string()?);
             }
             // `-O` / `-OO` raise the optimization level; each occurrence counts
             // (app_main.py `optimize`). PYTHONOPTIMIZE folds in during finalize.
             Short('O') => flags.optimize = flags.optimize.saturating_add(1),
+            // PyPy app_main.py `simple_option`: repeated `-b` increments the
+            // bytes-warning level (`-bb` therefore records 2).
+            Short('b') => flags.bytes_warning = flags.bytes_warning.saturating_add(1),
             // `-B` disables writing bytecode caches (PYTHONDONTWRITEBYTECODE).
             Short('B') => flags.dont_write_bytecode = true,
-            // Unbuffered stdio: pyre's stdout/stderr wrappers already write
-            // through to the fd on every call, so the flag has nothing left
-            // to disable; accepting it keeps `script_helper`-style spawns
-            // (`sys.executable -E -u script`) working.
-            Short('u') => {}
+            // PyPy app_main.py `unbuffered`: writing streams use raw FileIO
+            // underneath TextIOWrapper and set write_through.
+            Short('u') => flags.unbuffered = true,
             Short('q') => flags.quiet = true,
             Short('s') => flags.no_user_site = true,
             Short('S') => flags.no_site = true,
@@ -556,6 +599,10 @@ fn real_main(binary_name: &str) {
             default_hook(info);
         }
     }));
+    // pypy/interpreter/app_main.py `entry_point`: preserve the executable and
+    // every original launcher argument before command-line parsing rewrites
+    // them into the run mode and `sys.argv`.
+    importing::set_sys_orig_argv(std::env::args().collect());
     let (mode, flags, args) = match parse_args(binary_name) {
         Ok(v) => v,
         Err(e) => {
@@ -574,7 +621,12 @@ fn real_main(binary_name: &str) {
         utf8_mode,
         safe_path,
         optimize,
+        bytes_warning,
         dont_write_bytecode,
+        unbuffered,
+        xoptions,
+        warnoptions,
+        stdio_encoding,
     } = flags;
 
     // The `interact` controller does not run the embedded interpreter; it only
@@ -614,7 +666,12 @@ fn real_main(binary_name: &str) {
         utf8_mode.unwrap_or(0),
         safe_path,
         optimize,
+        bytes_warning,
         dont_write_bytecode,
+        unbuffered,
+        xoptions,
+        warnoptions,
+        stdio_encoding,
     );
 
     // OS-level hardening (default-on in any Linux `sandbox` build): lock the

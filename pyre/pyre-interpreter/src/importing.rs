@@ -1657,7 +1657,16 @@ static SYS_DEV_MODE: AtomicBool = AtomicBool::new(false);
 static SYS_UTF8_MODE: AtomicI64 = AtomicI64::new(0);
 static SYS_SAFE_PATH: AtomicBool = AtomicBool::new(false);
 static SYS_OPTIMIZE: AtomicI64 = AtomicI64::new(0);
+static SYS_BYTES_WARNING: AtomicI64 = AtomicI64::new(0);
 static SYS_DONT_WRITE_BYTECODE: AtomicBool = AtomicBool::new(false);
+static SYS_UNBUFFERED: AtomicBool = AtomicBool::new(false);
+// pypy/interpreter/app_main.py keeps the raw `-X` strings in
+// `options['_xoptions']` (a list) until sys initialization builds the public
+// dict.  Preserve that owner/storage shape rather than introducing a map here.
+static SYS_XOPTIONS: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static SYS_WARNOPTIONS: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static SYS_ORIG_ARGV: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static SYS_STDIO_ENCODING: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Record whether the launcher was given `-S` (no `site` import), so the
 /// `sys.flags.no_site` field built during sys module init reflects it. Set
@@ -1685,7 +1694,12 @@ pub fn set_runtime_flags(
     utf8_mode: i64,
     safe_path: bool,
     optimize: i64,
+    bytes_warning: i64,
     dont_write_bytecode: bool,
+    unbuffered: bool,
+    xoptions: Vec<String>,
+    warnoptions: Vec<String>,
+    stdio_encoding: Option<String>,
 ) {
     SYS_QUIET.store(quiet, Ordering::Relaxed);
     SYS_INSPECT.store(inspect, Ordering::Relaxed);
@@ -1696,7 +1710,41 @@ pub fn set_runtime_flags(
     SYS_UTF8_MODE.store(utf8_mode, Ordering::Relaxed);
     SYS_SAFE_PATH.store(safe_path, Ordering::Relaxed);
     SYS_OPTIMIZE.store(optimize, Ordering::Relaxed);
+    SYS_BYTES_WARNING.store(bytes_warning, Ordering::Relaxed);
     SYS_DONT_WRITE_BYTECODE.store(dont_write_bytecode, Ordering::Relaxed);
+    SYS_UNBUFFERED.store(unbuffered, Ordering::Relaxed);
+    *SYS_XOPTIONS.lock().unwrap() = xoptions;
+    *SYS_WARNOPTIONS.lock().unwrap() = warnoptions;
+    *SYS_STDIO_ENCODING.lock().unwrap() = stdio_encoding;
+}
+
+/// Raw `-X` values recorded by the launcher, in command-line order.
+pub fn xoptions() -> Vec<String> {
+    SYS_XOPTIONS.lock().unwrap().clone()
+}
+
+pub fn bytes_warning_flag() -> i64 {
+    SYS_BYTES_WARNING.load(Ordering::Relaxed)
+}
+
+pub fn unbuffered_flag() -> bool {
+    SYS_UNBUFFERED.load(Ordering::Relaxed)
+}
+
+pub fn warnoptions() -> Vec<String> {
+    SYS_WARNOPTIONS.lock().unwrap().clone()
+}
+
+pub fn stdio_encoding() -> Option<String> {
+    SYS_STDIO_ENCODING.lock().unwrap().clone()
+}
+
+pub fn set_sys_orig_argv(argv: Vec<String>) {
+    *SYS_ORIG_ARGV.lock().unwrap() = argv;
+}
+
+pub fn sys_orig_argv() -> Vec<String> {
+    SYS_ORIG_ARGV.lock().unwrap().clone()
 }
 
 pub fn quiet_flag() -> bool {

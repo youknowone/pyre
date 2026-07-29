@@ -2359,7 +2359,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         crate::typedef::gettypeobject(&pyre_object::functional::FILTER_TYPE)
     });
     crate::module_ns_get_or_insert_with(ns, "input", || {
-        make_module_builtin_function("input", |_| Ok(pyre_object::w_str_new("")))
+        make_module_builtin_function("input", builtin_input)
     });
     crate::module_ns_get_or_insert_with(ns, "open", || {
         make_module_builtin_function("open", builtin_open)
@@ -2873,6 +2873,75 @@ fn resolve_default_print_target() -> Result<DefaultPrintTarget, crate::PyError> 
         }
     }
     Ok(DefaultPrintTarget::Rebound(stdout))
+}
+
+fn input_call_method(
+    object: PyObjectRef,
+    name: &str,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let result = crate::baseobjspace::call_method(object, name, args);
+    if result.is_null() {
+        Err(crate::call::take_call_error()
+            .unwrap_or_else(|| crate::PyError::runtime_error(format!("{name} failed"))))
+    } else {
+        Ok(result)
+    }
+}
+
+/// PyPy `pypy/module/__builtin__/app_io.py:input`.
+///
+/// Resolve all three live sys streams, flush stderr, emit and flush the prompt
+/// through stdout, then consume one line from stdin. This preserves redirected
+/// StringIO streams as well as the interpreter-created standard streams.
+fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "input expected at most 1 argument, got {}",
+            args.len()
+        )));
+    }
+    let sys = crate::importing::get_sys_module("sys")
+        .ok_or_else(|| crate::PyError::runtime_error("input: lost sys.stdin"))?;
+    let stream = |name: &str| {
+        crate::baseobjspace::getattr_str(sys, name)
+            .map_err(|_| crate::PyError::runtime_error(format!("input: lost sys.{name}")))
+    };
+    let stdin = stream("stdin")?;
+    let stdout = stream("stdout")?;
+    let stderr = stream("stderr")?;
+    let _ = input_call_method(stderr, "flush", &[])?;
+
+    let prompt = match args.first().copied() {
+        Some(value) => builtin_str(&[value])?,
+        None => w_str_new(""),
+    };
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(prompt);
+    let prompt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let _ = input_call_method(
+        stdout,
+        "write",
+        &[pyre_object::gc_roots::shadow_stack_get(prompt_slot)],
+    )?;
+    let _ = input_call_method(stdout, "flush", &[])?;
+
+    let line = input_call_method(stdin, "readline", &[])?;
+    if !unsafe { pyre_object::is_str(line) } {
+        return Err(crate::PyError::type_error("input() returned non-string"));
+    }
+    let value = crate::baseobjspace::str_utf8_w(line)?;
+    if value.is_empty() {
+        let message = "EOF when reading a line";
+        let mut error = crate::PyError::value_error(message);
+        if let Some(class) = lookup_exc_class("EOFError") {
+            if let Ok(exception) = exc_exception_new(&[class, w_str_new(message)]) {
+                error.exc_object = exception;
+            }
+        }
+        return Err(error);
+    }
+    Ok(w_str_new(value.strip_suffix('\n').unwrap_or(value)))
 }
 
 fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
