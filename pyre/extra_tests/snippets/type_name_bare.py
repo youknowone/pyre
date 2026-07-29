@@ -11,9 +11,10 @@ class Foo:
 
 assert Foo.__name__ == "Foo"
 
-# types.UnionType (PEP 604): __name__ strips the module prefix, repr keeps it.
+# PEP 604 unions: 3.14 unified `types.UnionType` with `typing.Union`, so the
+# type reports the bare `Union` while its repr keeps the module prefix.
 u = int | str
-assert type(u).__name__ == "UnionType"
-assert repr(type(u)) == "<class 'types.UnionType'>"
+assert type(u).__name__ == "Union"
+assert repr(type(u)) == "<class 'typing.Union'>"
 
 print("type_name_bare ok")
