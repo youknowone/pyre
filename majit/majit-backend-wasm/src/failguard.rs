@@ -78,6 +78,59 @@ pub struct WasmFrameData {
     /// exited through a GuardNoException / GuardException (0 = none), surfaced
     /// via `grab_exc_value`.
     pub exc_value: i64,
+    /// Slots handed to [`crate::wasm_gc_add_root`] by [`WasmFrameData::boxed`],
+    /// released again in `Drop`.
+    roots: Vec<usize>,
+}
+
+impl WasmFrameData {
+    /// `llmodel.py:225-238` reads `get_ref_value` straight out of the JITFRAME,
+    /// which stays a GC root (its `jf_gcmap` covers the exit slots) for as long
+    /// as the deadframe lives. wasm has no host-visible JITFRAME to hand back:
+    /// `execute_token` copies the exit values into `raw_values` and drops the
+    /// guest frame, so the copies must carry that rooting themselves. Between
+    /// the copy and the last `get_ref_value`, resume/blackhole reconstruction
+    /// allocates freely, and a minor collection there moves exactly the objects
+    /// these slots name.
+    ///
+    /// Only `Type::Ref` exit slots are rooted, matching the gcmap the guest
+    /// frame carried. A wasm32 `GcRef` occupies the low half of its `i64` slot,
+    /// so the root address is the slot address (same aliasing the Ref home
+    /// slots already rely on).
+    pub fn boxed(
+        raw_values: Vec<i64>,
+        fail_descr: Arc<WasmFailDescr>,
+        exc_value: i64,
+    ) -> Box<Self> {
+        let mut data = Box::new(WasmFrameData {
+            raw_values,
+            fail_descr,
+            exc_value,
+            roots: Vec::new(),
+        });
+        let mut roots: Vec<usize> = Vec::new();
+        for i in 0..data.raw_values.len() {
+            if data.fail_descr.fail_arg_types.get(i) == Some(&Type::Ref) {
+                roots.push(&mut data.raw_values[i] as *mut i64 as usize);
+            }
+        }
+        // `grab_exc_value` hands this out as a `GcRef` too, and the resume path
+        // reads it after it has already allocated.
+        roots.push(&mut data.exc_value as *mut i64 as usize);
+        for slot in &roots {
+            unsafe { crate::wasm_gc_add_root(*slot as *mut majit_ir::GcRef) };
+        }
+        data.roots = roots;
+        data
+    }
+}
+
+impl Drop for WasmFrameData {
+    fn drop(&mut self) {
+        for slot in self.roots.drain(..) {
+            crate::wasm_gc_remove_root(slot as *mut majit_ir::GcRef);
+        }
+    }
 }
 
 /// A resumable `LABEL` of a compiled loop, published in `LABEL_TARGETS` so a

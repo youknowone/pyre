@@ -870,12 +870,12 @@ fn build_callee_gcmap(
 /// # Safety
 /// Caller must keep `slot` valid until [`wasm_gc_remove_root`] is
 /// called with the same pointer.
-unsafe fn wasm_gc_add_root(slot: *mut GcRef) {
+pub(crate) unsafe fn wasm_gc_add_root(slot: *mut GcRef) {
     with_wasm_active_gc_mut(|gc| unsafe { gc.add_root(slot) });
 }
 
 /// Companion to [`wasm_gc_add_root`].
-fn wasm_gc_remove_root(slot: *mut GcRef) {
+pub(crate) fn wasm_gc_remove_root(slot: *mut GcRef) {
     with_wasm_active_gc_mut(|gc| gc.remove_root(slot));
 }
 
@@ -1600,11 +1600,7 @@ pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> Dead
         .map(|i| unsafe { *frame.add(1 + i) })
         .collect();
     DeadFrame {
-        data: Box::new(WasmFrameData {
-            raw_values,
-            fail_descr,
-            exc_value,
-        }),
+        data: WasmFrameData::boxed(raw_values, fail_descr, exc_value),
     }
 }
 
@@ -2975,11 +2971,7 @@ impl majit_backend::Backend for WasmBackend {
                 drop(gcmap);
 
                 return DeadFrame {
-                    data: Box::new(WasmFrameData {
-                        raw_values,
-                        fail_descr,
-                        exc_value,
-                    }),
+                    data: WasmFrameData::boxed(raw_values, fail_descr, exc_value),
                 };
             }
 
@@ -3018,11 +3010,7 @@ impl majit_backend::Backend for WasmBackend {
             let num_outputs = fail_descr.fail_arg_types.len();
             let raw_values: Vec<i64> = (0..num_outputs).map(|i| frame[1 + i]).collect();
             DeadFrame {
-                data: Box::new(WasmFrameData {
-                    raw_values,
-                    fail_descr,
-                    exc_value,
-                }),
+                data: WasmFrameData::boxed(raw_values, fail_descr, exc_value),
             }
         }
     }
