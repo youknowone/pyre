@@ -4786,6 +4786,26 @@ mod tests {
     }
 
     #[test]
+    fn test_equal_user_types_try_both_operands_after_not_implemented() {
+        let source = r#"calls = []
+class A:
+    def __eq__(self, other):
+        calls.append(1)
+        return NotImplemented
+result = A() == A()
+"#;
+        let code = compile_exec(source).expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        frame.execute_frame(None, None).expect("execution failed");
+        unsafe {
+            let calls = w_dict_getitem_str(frame.w_globals, "calls").unwrap();
+            assert_eq!(pyre_object::listobject::w_list_len(calls), 2);
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(!w_bool_get_value(result));
+        }
+    }
+
+    #[test]
     fn test_store_load_namespace() {
         let source = "x = 5\ny = x * x";
         let code = compile_exec(source).expect("compile failed");

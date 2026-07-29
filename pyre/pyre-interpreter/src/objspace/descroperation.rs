@@ -2666,8 +2666,11 @@ unsafe fn issubtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
 /// `object.__ne__`; the latter deliberately calls the receiver's live
 /// `__eq__`.  Builtin layouts retain the override-only lookup because their
 /// inherited slots delegate straight back into [`compare`] and would recurse
-/// forever.  The reflected method of a proper subclass has priority, and
-/// equal types only invoke the shared `__eq__` / `__ne__` implementation once.
+/// forever.  The reflected method of a proper subclass has priority.  PyPy
+/// 3.11 suppresses the second call for equal user-defined types, but CPython
+/// 3.14 `Objects/object.c:do_richcompare` tries `tp_richcompare` in both
+/// operand directions when the first call returns `NotImplemented`; pyre's
+/// Python 3.14 compatibility rule takes precedence here.
 unsafe fn try_compare_override(
     a: PyObjectRef,
     b: PyObjectRef,
@@ -2694,12 +2697,7 @@ unsafe fn try_compare_override(
     let a_type = crate::typedef::r#type(a);
     let b_type = crate::typedef::r#type(b);
     let a_ov = comparison_method(a, dunder);
-    let mut b_ov = comparison_method(b, rdunder);
-    if dunder == rdunder && matches!((a_type, b_type), (Some(at), Some(bt)) if at == bt) {
-        // descroperation.py: for __eq__ and __ne__, objects of the same
-        // class resolve the same method, so do not invoke it twice.
-        b_ov = None;
-    }
+    let b_ov = comparison_method(b, rdunder);
     if a_ov.is_none() && b_ov.is_none() {
         return Ok(None);
     }
