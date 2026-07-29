@@ -27,7 +27,11 @@ class Context(metaclass=Unsubclassable):
     #_data: Map
     #_is_entered: bool
 
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
+        # CPython 3.14 context_new() rejects both positional and keyword
+        # arguments with this dedicated error, while still accepting **{}.
+        if args or kwargs:
+            raise TypeError("Context() does not accept any arguments")
         self._data = Map()
         self._is_entered = False
 

@@ -42,6 +42,60 @@ else:
     raise AssertionError("an entered Context must reject re-entry")
 
 
+def check_bindings():
+    bound = ContextVar("bound")
+    try:
+        bound.get()
+    except LookupError as exc:
+        assert "<ContextVar name='bound'" in str(exc)
+    else:
+        raise AssertionError("an unbound ContextVar must raise LookupError")
+
+    first = bound.set(42)
+    assert bound.get() == 42
+    assert first.var is bound
+    assert first.old_value is first.MISSING
+    assert first.old_value is type(first).MISSING
+
+    second = bound.set("new")
+    assert second.old_value == 42
+    bound.reset(second)
+    assert bound.get() == 42
+    bound.reset(first)
+    assert bound.get(None) is None
+
+    try:
+        bound.reset(first)
+    except RuntimeError as exc:
+        assert "has already been used" in str(exc)
+    else:
+        raise AssertionError("a Token may only be reset once")
+
+    with bound.set("temporary") as token:
+        assert token.var is bound
+        assert bound.get() == "temporary"
+    assert bound.get(None) is None
+
+    other = ContextVar("other")
+    token = bound.set(1)
+    try:
+        other.reset(token)
+    except ValueError as exc:
+        assert "different ContextVar" in str(exc)
+    else:
+        raise AssertionError("a Token must only reset its own ContextVar")
+    bound.reset(token)
+
+
+Context().run(check_bindings)
+
+recursive_default = []
+recursive_var = ContextVar("recursive", default=recursive_default)
+recursive_default.append(recursive_var)
+assert "..." in repr(recursive_var)
+assert "..." in repr(recursive_default)
+
+
 class UnhashableStr(str):
     __hash__ = None
 
