@@ -7769,4 +7769,25 @@ else:
             assert!(crate::baseobjspace::is_true(result).unwrap());
         }
     }
+
+    #[test]
+    fn test_bytearray_resize_reports_allocation_failure() {
+        let source = "\
+result = True
+for value in (bytearray(), bytearray(b'preserved')):
+    original = value.copy()
+    try:
+        value.resize((1 << 63) - 1)
+    except MemoryError as exc:
+        result = result and str(exc) == '' and value == original
+    else:
+        result = False
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytearray.resize allocation failure handling failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
 }

@@ -20385,10 +20385,17 @@ fn bytearray_descr_resize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         // CPython 3.14 `bytearray_resize_impl` delegates to
         // `PyByteArray_Resize`, whose same-size fast path returns before the
         // export check.  A live buffer only forbids an actual size change.
-        if pyre_object::bytearrayobject::w_bytearray_len(args[0]) != size as usize {
+        let new_size = size as usize;
+        let old_size = pyre_object::bytearrayobject::w_bytearray_len(args[0]);
+        if old_size != new_size {
             crate::builtins::bytearray_check_exports(args[0])?;
         }
-        pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]).resize(size as usize, 0);
+        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
+        if new_size > old_size {
+            vec.try_reserve_exact(new_size - old_size)
+                .map_err(|_| crate::PyError::memory_error(""))?;
+        }
+        vec.resize(new_size, 0);
     }
     Ok(w_none())
 }
