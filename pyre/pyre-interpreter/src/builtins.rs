@@ -8022,6 +8022,20 @@ pub(crate) fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     Ok(w_list_new(collect_iterable(obj)?))
 }
 
+/// An empty `Vec` with room for `count` elements, reserved fallibly.
+///
+/// A builtin that sizes its storage from a Python-supplied count —
+/// `itertools.combinations([], sys.maxsize)` and its neighbours — cannot use
+/// `Vec::with_capacity`: an oversized request aborts the process instead of
+/// unwinding, so ordinary Python code terminates the interpreter. CPython
+/// raises `MemoryError` for the same call, with no message.
+pub fn try_vec_with_capacity<T>(count: usize) -> Result<Vec<T>, crate::PyError> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(count)
+        .map_err(|_| crate::PyError::new(crate::PyErrorKind::MemoryError, ""))?;
+    Ok(out)
+}
+
 pub fn collect_iterable(obj: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
     // `iter(obj)` itself can execute arbitrary allocating Python code.  Root
     // the input before that first collection point, matching the root that

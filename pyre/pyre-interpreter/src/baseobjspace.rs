@@ -13736,7 +13736,9 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 return Err(PyError::stop_iteration());
             }
             let n = state.batch_size as usize;
-            let mut item_slots = Vec::with_capacity(n);
+            // The batch size comes straight from Python, and the reservation
+            // precedes the pull that would reveal an exhausted source.
+            let mut item_slots = crate::builtins::try_vec_with_capacity(n)?;
             for index in 0..n {
                 let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 let it = (*(w_self as *const pyre_object::interp_itertools::W_Batched)).it;

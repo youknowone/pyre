@@ -24798,7 +24798,9 @@ fn product_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         }
     }
 
-    let mut gear_items = Vec::with_capacity(npools);
+    // `npools` is `len(inputs) * repeat`; the overflow guard above only bounds
+    // it by `isize::MAX`, so both reservations stay fallible.
+    let mut gear_items = crate::builtins::try_vec_with_capacity(npools)?;
     for _ in 0..repeat {
         for &slot in &pool_slots {
             gear_items.push(unsafe { pyre_object::gc_roots::shadow_stack_get(slot) });
@@ -24807,7 +24809,9 @@ fn product_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let gears = pyre_object::w_list_new(gear_items);
     pyre_object::gc_roots::pin_root(gears);
     let gears_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let indices = pyre_object::w_list_new((0..npools).map(|_| pyre_object::w_int_new(0)).collect());
+    let mut index_items = crate::builtins::try_vec_with_capacity(npools)?;
+    index_items.extend((0..npools).map(|_| pyre_object::w_int_new(0)));
+    let indices = pyre_object::w_list_new(index_items);
     let obj = pyre_object::interp_itertools::w_product_new(
         unsafe { pyre_object::gc_roots::shadow_stack_get(gears_slot) },
         indices,
@@ -24900,11 +24904,11 @@ fn combinations_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let pool_w = pyre_object::w_list_new(items);
     pyre_object::gc_roots::pin_root(pool_w);
     let pool_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let indices = pyre_object::w_list_new(
-        (0..r)
-            .map(|index| pyre_object::w_int_new(index as i64))
-            .collect(),
-    );
+    // `r` is unbounded above — the odometer is sized before `stopped` gets a
+    // chance to short-circuit it.
+    let mut index_items = crate::builtins::try_vec_with_capacity(r as usize)?;
+    index_items.extend((0..r).map(|index| pyre_object::w_int_new(index as i64)));
+    let indices = pyre_object::w_list_new(index_items);
     let obj = pyre_object::interp_itertools::w_combinations_new(
         unsafe { pyre_object::gc_roots::shadow_stack_get(pool_slot) },
         indices,
@@ -25003,7 +25007,11 @@ fn combinations_with_replacement_descr_new(
     let pool_w = pyre_object::w_list_new(items);
     pyre_object::gc_roots::pin_root(pool_w);
     let pool_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let indices = pyre_object::w_list_new((0..r).map(|_| pyre_object::w_int_new(0)).collect());
+    // `r` is bounded only by `ssize_t`, and an empty pool sets `stopped`
+    // without shrinking the odometer.
+    let mut index_items = crate::builtins::try_vec_with_capacity(r as usize)?;
+    index_items.extend((0..r).map(|_| pyre_object::w_int_new(0)));
+    let indices = pyre_object::w_list_new(index_items);
     let obj = pyre_object::interp_itertools::w_combinations_with_replacement_new(
         unsafe { pyre_object::gc_roots::shadow_stack_get(pool_slot) },
         indices,
@@ -25534,7 +25542,8 @@ pub(crate) fn itertools_tee(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     pyre_object::gc_roots::pin_root(w_iterator);
     let iterator_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
-    let mut result_slots = Vec::with_capacity(n as usize);
+    // `n` is the caller's requested copy count, so the reservation is fallible.
+    let mut result_slots = crate::builtins::try_vec_with_capacity(n as usize)?;
     if let Some(w_copy) = crate::baseobjspace::findattr_result(
         unsafe { pyre_object::gc_roots::shadow_stack_get(iterator_slot) },
         "__copy__",
