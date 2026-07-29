@@ -1434,6 +1434,17 @@ pub fn init_array_type(ns: PyObjectRef) {
     m(ns, "byteswap", array_byteswap_method, 1);
     m(ns, "__copy__", array_copy_method, 1);
     m(ns, "__deepcopy__", array_copy_method, 2);
+    // CPython 3.14 arraymodule.c:2471 — Py_GenericAlias with METH_CLASS.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__class_getitem__",
+            pyre_object::function::w_classmethod_new(crate::make_builtin_function(
+                "__class_getitem__",
+                crate::_pypy_generic_alias::generic_alias_class_getitem,
+            )),
+        )
+    };
     // `pop` accepts an optional index.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(

@@ -2,6 +2,7 @@
 
 import copy
 import pickle
+from array import array
 from collections import deque
 from types import GenericAlias
 from typing import TypeVar
@@ -36,6 +37,13 @@ assert deque_alias.__args__ == (T,)
 assert deque_alias([1, 2]) == deque([1, 2])
 assert copy.copy(deque_alias) == deque_alias
 assert copy.deepcopy(deque_alias) == deque_alias
+
+array_alias = array[T]
+assert array_alias.__origin__ is array
+assert array_alias.__args__ == (T,)
+assert array_alias("i", [1, 2]) == array("i", [1, 2])
+assert copy.copy(array_alias) == array_alias
+assert copy.deepcopy(array_alias) == array_alias
 
 nested = GenericAlias(list, ([T, [U]],))
 assert nested.__parameters__ == (T, U)
