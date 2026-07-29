@@ -689,6 +689,16 @@ impl W_Deque {
         })
     }
 
+    // interp_deque.py:619-620 — exact classmethod binding preserves a deque
+    // subclass as the GenericAlias origin.
+    #[classmethod]
+    fn __class_getitem__(
+        cls: PyObjectRef,
+        item: PyObjectRef,
+    ) -> Result<PyObjectRef, crate::PyError> {
+        crate::_pypy_generic_alias::generic_alias_class_getitem(&[cls, item])
+    }
+
     // `init(iterable=None, maxlen=None)` — remember maxlen, then
     // extend so the bound is enforced while filling.
     fn __init__(

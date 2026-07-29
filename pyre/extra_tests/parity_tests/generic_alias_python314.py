@@ -2,6 +2,7 @@
 
 import copy
 import pickle
+from collections import deque
 from types import GenericAlias
 from typing import TypeVar
 
@@ -29,6 +30,13 @@ assert deepcopied == alias
 
 T = TypeVar("T")
 U = TypeVar("U")
+deque_alias = deque[T]
+assert deque_alias.__origin__ is deque
+assert deque_alias.__args__ == (T,)
+assert deque_alias([1, 2]) == deque([1, 2])
+assert copy.copy(deque_alias) == deque_alias
+assert copy.deepcopy(deque_alias) == deque_alias
+
 nested = GenericAlias(list, ([T, [U]],))
 assert nested.__parameters__ == (T, U)
 specialized = nested[str, int]
