@@ -9425,6 +9425,24 @@ fn make_getset_property_full(
     )
 }
 
+/// `descr__doc` (typeobject.py:982-983): a non-heap type serves its own
+/// TypeDef doc rather than inheriting.  property / function / method keep an
+/// *instance* `__doc__` descriptor under the `__doc__` key, and pyre has no
+/// separate type-doc slot, so their type doc is served from these constants.
+/// Every other type (subclasses included) falls through to its own dict.
+pub(crate) fn type_builtin_own_doc(cls: PyObjectRef) -> Option<PyObjectRef> {
+    let doc = if std::ptr::eq(cls, gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE)) {
+        PROPERTY_DOC
+    } else if std::ptr::eq(cls, gettypeobject(&crate::function::FUNCTION_TYPE)) {
+        FUNCTION_DOC
+    } else if std::ptr::eq(cls, gettypeobject(&pyre_object::function::METHOD_TYPE)) {
+        METHOD_DOC
+    } else {
+        return None;
+    };
+    Some(pyre_object::w_str_new(doc))
+}
+
 fn init_type_type(ns: PyObjectRef) {
     // `type.__setattr__` is a distinct slot wrapper from
     // `object.__setattr__`.  Both terminate in the shared storage routine,
@@ -9503,6 +9521,12 @@ fn init_type_type(ns: PyObjectRef) {
         "__doc__",
         |args| {
             let cls = args[1];
+            // typeobject.py:982-983 — a non-heap type whose `__doc__` key holds
+            // an instance descriptor (property/function/method) serves its own
+            // TypeDef doc, not the bound descriptor.
+            if let Some(doc) = type_builtin_own_doc(cls) {
+                return Ok(doc);
+            }
             let Some(doc) = crate::type_dict_lookup(cls, "__doc__") else {
                 return Ok(pyre_object::w_none());
             };
@@ -10204,6 +10228,13 @@ fn descr_carrier_get(args: &[PyObjectRef]) -> crate::PyResult {
         args.first().copied().unwrap_or(pyre_object::PY_NULL),
         "__get__",
     )?;
+    carrier_descr_bind(w_function, args)
+}
+
+/// The descriptor bind shared once the receiver type has been validated.
+/// Class access (`obj` is None) returns the bare carrier; instance access
+/// binds it into a `method`.
+fn carrier_descr_bind(w_function: PyObjectRef, args: &[PyObjectRef]) -> crate::PyResult {
     let w_obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
     let w_cls = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
     // The class-access case (`w_obj == None and w_cls is some type`) returns
@@ -10228,6 +10259,41 @@ fn descr_carrier_get(args: &[PyObjectRef]) -> crate::PyResult {
         };
         Ok(pyre_object::w_method_new(w_function, w_obj, owner))
     }
+}
+
+/// Strict receiver check for the `function` type's own slots (`__get__`,
+/// `__repr__`).  `function_receiver` accepts any function-layout carrier so the
+/// `**rawdict` getters shared with `builtin_function` keep working; these slots
+/// instead demand a genuine `function`, since `builtin_function` overrides them
+/// (or, for `__get__`, deletes it) — a builtin reaching them is a mis-applied
+/// descriptor.
+fn function_type_receiver(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    if obj.is_null() || !unsafe { pyre_object::py_type_check(obj, &crate::function::FUNCTION_TYPE) }
+    {
+        let received = if obj.is_null() {
+            "object"
+        } else {
+            crate::typedef::r#type(obj)
+                .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
+                .unwrap_or("object")
+        };
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' for 'function' objects doesn't apply to a '{received}' object"
+        )));
+    }
+    Ok(obj)
+}
+
+/// `function.py:464 descr_function_get` — the `function` type's own `__get__`.
+/// Unlike the shared `descr_carrier_get`, the receiver must be a genuine
+/// `function`: `builtin_function` deletes `__get__` (it is already bound), so
+/// `function.__get__(<builtin>, ...)` is a mis-applied descriptor and raises.
+fn descr_function_get(args: &[PyObjectRef]) -> crate::PyResult {
+    let recv = function_type_receiver(
+        args.first().copied().unwrap_or(pyre_object::PY_NULL),
+        "__get__",
+    )?;
+    carrier_descr_bind(recv, args)
 }
 
 /// `init_function_type_common` plus the descriptor `__get__` that
@@ -10843,7 +10909,7 @@ fn init_function_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__repr__",
                 |args| {
-                    let function = function_receiver(
+                    let function = function_type_receiver(
                         args.first().copied().unwrap_or(pyre_object::PY_NULL),
                         "__repr__",
                     )?;
@@ -10978,7 +11044,7 @@ fn init_function_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__get__",
-            make_builtin_function("__get__", descr_carrier_get),
+            make_builtin_function("__get__", descr_function_get),
         )
     };
 }

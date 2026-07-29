@@ -6537,29 +6537,10 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // CPython likewise keeps `tp_doc` beside a member descriptor under
             // the same dict key.  Pyre has no separate type-doc slot, so serve
             // that exact builtin split here without affecting subclasses.
-            if name == "__doc__"
-                && std::ptr::eq(
-                    obj,
-                    crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE),
-                )
-            {
-                return Ok(w_str_new(crate::typedef::PROPERTY_DOC));
-            }
-            if name == "__doc__"
-                && std::ptr::eq(
-                    obj,
-                    crate::typedef::gettypeobject(&crate::function::FUNCTION_TYPE),
-                )
-            {
-                return Ok(w_str_new(crate::typedef::FUNCTION_DOC));
-            }
-            if name == "__doc__"
-                && std::ptr::eq(
-                    obj,
-                    crate::typedef::gettypeobject(&pyre_object::function::METHOD_TYPE),
-                )
-            {
-                return Ok(w_str_new(crate::typedef::METHOD_DOC));
+            if name == "__doc__" {
+                if let Some(doc) = crate::typedef::type_builtin_own_doc(obj) {
+                    return Ok(doc);
+                }
             }
             // typeobject.py:1166-1179 descr__doc — a heap type reads only its
             // own dict and returns None when absent; class docs are never
