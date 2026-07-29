@@ -2502,6 +2502,8 @@ pub trait WalkSym {
     fn valuestackdepth(&self) -> usize;
     fn jitcode(&self) -> *const JitCode;
     fn concrete_execution_context(&self) -> *const pyre_interpreter::PyExecutionContext;
+    /// Interpreter-frame snapshot the authoritative walker steps concretely.
+    fn tracing_vable_frame_addr(&self) -> usize;
     fn live_vable_frame_addr(&self) -> usize;
     fn set_live_vable_frame_addr(&mut self, value: usize);
     fn bridge_walk_entry_pc(&self) -> Option<usize>;
@@ -2610,6 +2612,11 @@ impl WalkSym for PyreSym {
     #[inline]
     fn concrete_execution_context(&self) -> *const pyre_interpreter::PyExecutionContext {
         self.concrete_execution_context
+    }
+
+    #[inline]
+    fn tracing_vable_frame_addr(&self) -> usize {
+        self.concrete_vable_ptr as usize
     }
 
     #[inline]
@@ -4904,15 +4911,18 @@ pub(crate) fn restore_frame_scalars(frame: usize, saved: FrameScalars) {
 /// Materialize the outer frame's locals from the virtualizable shadow.
 /// Callers must run their complete preflight before executing a rebuilt
 /// callee; after that point a failure would make replay unsafe.
-pub(crate) fn write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
+fn outer_locals_publish_target(
+    ctx: &TraceCtx,
+    frame: usize,
+) -> Option<(usize, *mut pyre_object::FixedObjectArray, usize)> {
     if frame == 0 {
-        return false;
+        return None;
     }
     let Some(nlocals) = concrete_nlocals(frame) else {
-        return false;
+        return None;
     };
     let Some(info) = ctx.virtualizable_info() else {
-        return false;
+        return None;
     };
     let frame_ptr = frame as *mut u8;
     let arr_ptr = unsafe {
@@ -4920,7 +4930,7 @@ pub(crate) fn write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
             as *const *mut pyre_object::FixedObjectArray)
     };
     if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < nlocals {
-        return false;
+        return None;
     }
     let base = info.num_static_extra_boxes;
     // Every slot has to resolve before the first store, the way the merge-point
@@ -4928,15 +4938,31 @@ pub(crate) fn write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
     // the frame carrying a mix of walk-current and pre-walk locals, which is
     // neither of the two states a caller can recover from.
     if (0..nlocals).any(|abs| ctx.virtualizable_entry_at(base + abs).is_none()) {
-        return false;
+        return None;
     }
+    Some((nlocals, arr_ptr, base))
+}
+
+/// Read-only half of [`write_back_outer_locals`].
+///
+/// `ABORT_TOO_LONG` has already executed the current opcode when it decides to
+/// stop tracing. It uses this census before publishing a blackhole image so a
+/// later adoption cannot decline into trace-entry replay after those effects.
+pub(crate) fn can_write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
+    outer_locals_publish_target(ctx, frame).is_some()
+}
+
+pub(crate) fn write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
+    let Some((nlocals, arr_ptr, base)) = outer_locals_publish_target(ctx, frame) else {
+        return false;
+    };
     // Boxing an Int/Float slot allocates; the detached frame array is
     // forwarded only while it is in the remembered set, and each minor
     // consumes that entry, so re-arm the barrier after every store.
     for abs in 0..nlocals {
-        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
-            return false;
-        };
+        let (_opref, value) = ctx
+            .virtualizable_entry_at(base + abs)
+            .expect("outer-locals target was completely preflighted");
         let boxed = boxed_slot_value_for_type(Type::Ref, &value);
         unsafe {
             (*arr_ptr).as_mut_slice()[abs] = boxed;

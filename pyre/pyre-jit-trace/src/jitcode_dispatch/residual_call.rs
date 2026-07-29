@@ -154,21 +154,59 @@ pub(crate) fn latch_trace_too_long_blackhole<Sym: WalkSym>(
     };
 
     if ctx.session.borrow().framestack.is_empty() && !ctx.fbw_mode.inline_subwalk {
-        let jitcode = unsafe {
+        let Some((jitcode, cf_addr, live_root_addr)) = (unsafe {
             if ctx.fbw_mode.snapshot_sym.is_null() {
                 None
             } else {
-                let jitcode = (&*ctx.fbw_mode.snapshot_sym).jitcode();
-                (!jitcode.is_null()).then(|| (&(*jitcode).payload).jitcode.clone())
+                let sym = &*ctx.fbw_mode.snapshot_sym;
+                let jitcode = sym.jitcode();
+                (!jitcode.is_null()).then(|| {
+                    (
+                        (&(*jitcode).payload).jitcode.clone(),
+                        sym.tracing_vable_frame_addr(),
+                        sym.live_vable_frame_addr(),
+                    )
+                })
             }
-        };
-        let Some(jitcode) = jitcode else {
+        }) else {
             return false;
         };
         let Some(miframe) = build_trace_too_long_single_frame_miframe(ctx, jitcode, resume_pc)
         else {
             return false;
         };
+        // `walk()` has already executed this step, so returning TraceTooLong
+        // is safe only when every pre-drive adopter gate is known to pass.
+        // RPython's `run_blackhole_interp_to_cancel_tracing()` cannot return
+        // to entry replay. Keep the same boundary: incomplete images merely
+        // keep recording until a later step supplies a complete handoff.
+        let Some(jitcode_index) = i32::try_from(miframe.jitcode.index()).ok() else {
+            return false;
+        };
+        if ctx.trace_ctx.virtualizable_info().is_none()
+            || crate::state::concrete_nlocals(cf_addr).is_none()
+        {
+            return false;
+        }
+        let root_addr = if live_root_addr != 0 {
+            live_root_addr
+        } else {
+            cf_addr
+        };
+        let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index);
+        let vable_frame = miframe
+            .ref_values
+            .get(frame_reg as usize)
+            .copied()
+            .flatten()
+            .unwrap_or(0) as usize;
+        if vable_frame == 0
+            || vable_frame != root_addr
+            || crate::state::capture_frame_locals(vable_frame).is_none()
+            || !crate::state::can_write_back_outer_locals(ctx.trace_ctx, vable_frame)
+        {
+            return false;
+        }
         // Keep the per-frame red identity seeded by `frame_box`.  The
         // authoritative walk executed against `snapshot_for_tracing`, but the
         // adopter validates this identity and publishes that snapshot's locals
@@ -183,21 +221,11 @@ pub(crate) fn latch_trace_too_long_blackhole<Sym: WalkSym>(
             });
         });
         true
-    } else if ctx.fbw_mode.inline_subwalk && multi_frame_blackhole_resume_enabled() {
-        let Some(framestack) =
-            build_multi_frame_miframe(ctx, resume_pc, InnermostMiframeBuild::TraceTooLong)
-        else {
-            return false;
-        };
-        FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
-            *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
-                framestack,
-                last_exc_value,
-                raising_exception: false,
-            });
-        });
-        true
     } else {
+        // An inlined trace needs one independently materialized locals image
+        // per MIFrame. The opt-in multi-frame vable-force experiment still
+        // lacks that shape, so it cannot serve ABORT_TOO_LONG: this abort has
+        // already executed effects and has no safe entry-replay fallback.
         false
     }
 }

@@ -5406,8 +5406,8 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     // The vable-force and trace-too-long MIFrame images survive the dispatch
     // unwind in TLS. Their Option<i64> Ref banks are not otherwise visible to
     // the collector, so forward every populated color until the walk-end
-    // handler takes the latch. The blackhole drivers install their own packed
-    // roots after the image leaves TLS.
+    // handler takes the latch. The adopters bridge the pre-drive publication
+    // window and the blackhole drivers then install their own packed roots.
     let single_frame_blackhole = unsafe { &mut *(*area.single_frame_blackhole).as_ptr() };
     if let Some(latched) = single_frame_blackhole.as_mut() {
         for value in latched.miframe.ref_values.iter_mut().flatten() {

@@ -1967,21 +1967,44 @@ fn try_adopt_single_frame_blackhole(
             }
         };
     }
+    // A zero-effect overlong walk deliberately permits entry replay even when
+    // no blackhole image was representable. Only an effectful TraceTooLong
+    // carries the irrevocable, fully preflighted adoption contract.
+    let trace_too_long = commit_leg == WalkEndCommitLeg::TraceTooLong
+        && crate::jitcode_dispatch::fbw_executed_effect_count() != 0;
     let Some(mut latched) = crate::jitcode_dispatch::take_single_frame_blackhole() else {
+        assert!(
+            !trace_too_long,
+            "preflighted trace-too-long blackhole image disappeared before adoption"
+        );
         return false;
     };
     let jitcode_index = match i32::try_from(latched.miframe.jitcode.index()) {
         Ok(index) => index,
-        Err(_) => return false,
+        Err(_) => {
+            assert!(
+                !trace_too_long,
+                "preflighted trace-too-long jitcode index no longer fits i32"
+            );
+            return false;
+        }
     };
     let virtualizable_info = ctx
         .virtualizable_info()
         .map(std::sync::Arc::as_ptr)
         .unwrap_or(std::ptr::null());
     if virtualizable_info.is_null() {
+        assert!(
+            !trace_too_long,
+            "preflighted trace-too-long virtualizable info disappeared"
+        );
         return false;
     }
     let Some(stack_base) = crate::state::concrete_nlocals(cf_addr) else {
+        assert!(
+            !trace_too_long,
+            "preflighted trace-too-long frame lost its concrete locals base"
+        );
         return false;
     };
     // Two gates used to sit here, and both were scaffolding around a decline
@@ -2043,29 +2066,69 @@ fn try_adopt_single_frame_blackhole(
         .flatten()
         .unwrap_or(0) as usize;
     if vable_frame == 0 || vable_frame != root_addr {
+        assert!(
+            !trace_too_long,
+            "preflighted trace-too-long frame identity changed before adoption"
+        );
         return false;
     }
     let Some(mut locals_undo) = crate::state::capture_frame_locals(vable_frame) else {
+        assert!(
+            !trace_too_long,
+            "preflighted trace-too-long frame locals became uncapturable"
+        );
         return false;
     };
+    // `take_single_frame_blackhole` removed the image from the TLS root
+    // walker. `write_back_outer_locals` may box Int/Float locals and collect
+    // before the blackhole driver installs its own packed roots, so bridge
+    // that interval explicitly and copy forwarding updates into the MIFrame.
+    let image_ref_locations: Vec<usize> = latched
+        .miframe
+        .ref_values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| value.map(|_| index))
+        .collect();
+    let mut image_ref_roots: Vec<i64> = image_ref_locations
+        .iter()
+        .map(|&index| latched.miframe.ref_values[index].expect("location came from Some"))
+        .collect();
     let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
     unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(image_ref_roots.as_mut_slice());
         majit_gc::shadow_stack::push_resume_ref_roots(locals_undo.as_mut_slice());
     }
     if !crate::state::write_back_outer_locals(ctx, vable_frame) {
         crate::state::restore_frame_locals(vable_frame, &locals_undo);
         majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
+        assert!(
+            !trace_too_long,
+            "preflighted trace-too-long locals publication declined"
+        );
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] single-frame locals publish declined — legacy replay kept");
         }
         return false;
     }
+    for (&index, &forwarded) in image_ref_locations.iter().zip(&image_ref_roots) {
+        latched.miframe.ref_values[index] = Some(forwarded);
+    }
+    let committed_root_addr = latched
+        .miframe
+        .ref_values
+        .get(frame_reg as usize)
+        .copied()
+        .flatten()
+        .expect("preflighted frame register disappeared after forwarding")
+        as usize;
     // The locals publish is the last recoverable adoption gate. Its undo image
     // only needs rooting through that gate; after this point the blackhole may
     // execute irreversible effects and the handoff must commit or fail loudly,
     // never return to trace-entry replay.
     majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
     drop(locals_undo);
+    drop(image_ref_roots);
     let terminal = majit_metainterp::drive_single_frame_blackhole(
         &mut latched.miframe,
         majit_metainterp::blackhole::StateFieldLayout::default(),
@@ -2076,6 +2139,18 @@ fn try_adopt_single_frame_blackhole(
         latched.last_exc_value,
         latched.raising_exception,
     );
+    // Vable opcodes address the frame carried in the MIFrame's red register,
+    // i.e. the live frame whose locals were published above. Fold every
+    // blackhole write back into the tracing snapshot before the portal
+    // epilogue propagates that snapshot. This matters for terminal exceptions:
+    // their traceback keeps `tb_frame.f_locals` observable after the walk.
+    if committed_root_addr != cf_addr {
+        unsafe {
+            (*(cf_addr as *mut pyre_interpreter::PyFrame)).restore_resume_state_from(
+                &*(committed_root_addr as *const pyre_interpreter::PyFrame),
+            );
+        }
+    }
 
     // Its own prefix: this is not a decline, and reading it as one is exactly
     // the confusion that made the CRN arm look unreachable.
