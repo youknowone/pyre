@@ -184,8 +184,8 @@ impl CachedField {
     }
 
     /// heap.py:169-170 CachedField._get_rhs_from_set_op
-    fn _get_rhs_from_set_op(op: &Op) -> OpRef {
-        op.arg(1).to_opref()
+    fn _get_rhs_from_set_op(op: &Op) -> Operand {
+        op.arg(1)
     }
 
     /// heap.py:189-196 CachedField.invalidate(descr)
@@ -279,7 +279,7 @@ impl CachedField {
             if same_ptr_info(ctx, lazy_op.arg(0).to_opref(), struct_opref) {
                 let rhs = Self::_get_rhs_from_set_op(lazy_op);
                 return Some(crate::optimizeopt::info::FieldEntry::Value(
-                    ctx.materialize_operand_at(rhs),
+                    ctx.materialize_operand_at(rhs.to_opref()),
                 ));
             }
         }
@@ -430,7 +430,7 @@ impl CachedField {
 }
 
 /// Cache key for an array item access: (array OpRef, descriptor index, constant array index).
-type ArrayItemKey = (OpRef, u32, i64);
+type ArrayItemKey = (OpRef, usize, i64);
 
 /// heap.py:228-298 ArrayCachedItem(AbstractCachedEntry)
 struct ArrayCachedItem {
@@ -473,8 +473,8 @@ impl ArrayCachedItem {
     }
 
     /// heap.py:235-236 ArrayCachedItem._get_rhs_from_set_op
-    fn _get_rhs_from_set_op(op: &Op) -> OpRef {
-        op.arg(2).to_opref()
+    fn _get_rhs_from_set_op(op: &Op) -> Operand {
+        op.arg(2)
     }
 
     /// heap.py:268-276 ArrayCachedItem._cannot_alias_via_classes_or_lengths
@@ -615,7 +615,7 @@ impl ArrayCachedItem {
             if same_ptr_info(ctx, lazy_op.arg(0).to_opref(), array_opref) {
                 let rhs = Self::_get_rhs_from_set_op(lazy_op);
                 return Some(crate::optimizeopt::info::FieldEntry::Value(
-                    ctx.materialize_operand_at(rhs),
+                    ctx.materialize_operand_at(rhs.to_opref()),
                 ));
             }
         }
@@ -789,7 +789,7 @@ pub struct OptHeap {
     /// RPython heap.py: cached_fields OrderedDict keyed by descr.
     cached_fields: Vec<(u32, DescrRef, CachedField)>,
     /// heap.py:332: cached_arrayitems OrderedDict keyed by array descr.
-    cached_arrayitems: Vec<(u32, DescrRef, ArrayCacheSubMap)>,
+    cached_arrayitems: Vec<(usize, DescrRef, ArrayCacheSubMap)>,
     /// Whether we've already emitted a GUARD_NOT_INVALIDATED.
     seen_guard_not_invalidated: bool,
     /// Postponed operation: held back until the next GUARD_NO_EXCEPTION.
@@ -832,12 +832,10 @@ pub struct OptHeap {
     /// `arraydescr.ei_index` inside `effectinfo.check_write_descr_array(arraydescr)`
     /// at invalidation time (`effectinfo.py:220-222`).  Pyre keeps the
     /// `DescrRef` alive on the value side so the same lazy resolution can
-    /// happen via `descr.get_ei_index()` at
-    /// `force_from_effectinfo`; the `u32` key dedups by raw `descr.index()`
-    /// to mirror PyPy's `dict[arraydescr]` "later registration wins" idiom
-    /// (the registration is gated by a `cached_dict_reads` first-encounter
-    /// check, so duplicates are rare anyway — see `_optimize_call_dict_lookup`).
-    corresponding_array_descrs: indexmap::IndexMap<u32, (DescrRef, usize)>,
+    /// happen via `descr.get_ei_index()` at `force_from_effectinfo`.
+    /// The map key is the descriptor object's identity; `descr.index()` is
+    /// not globally unique across descriptor objects.
+    corresponding_array_descrs: indexmap::IndexMap<usize, (DescrRef, usize)>,
     /// Fields known to be quasi-immutable: (obj box, field_idx) -> cached value
     /// OpRef. Keyed by the object's `Operand` identity (heap keys structs by box,
     /// not by the retired `opref.raw()` slot). Populated by QUASIIMMUT_FIELD,
@@ -877,7 +875,7 @@ impl OptHeap {
             .position(|(_, cached_descr, _)| descr_identity(cached_descr) == identity)
     }
 
-    fn cached_array_pos_for_index(&self, descr_idx: u32) -> Option<usize> {
+    fn cached_array_pos_for_index(&self, descr_idx: usize) -> Option<usize> {
         self.cached_arrayitems
             .iter()
             .position(|(idx, _, _)| *idx == descr_idx)
@@ -1008,7 +1006,7 @@ impl OptHeap {
         let index_val = ctx
             .resolve_operand_operand_opt(&op.arg(1))
             .and_then(|b| ctx.get_constant_int_box(&b))?;
-        Some((array, descr.index(), index_val))
+        Some((array, descr_identity(&descr), index_val))
     }
 
     /// Register a struct opref in the per-descr CachedField.
@@ -1054,21 +1052,11 @@ impl OptHeap {
 
     /// heap.py:399-407 arrayitem_submap(descr, create_if_nonexistant=True)
     ///
-    /// `descr_idx` is the registry-slot identity (`descr.index()`),
-    /// matching every other cache-identity site in this file:
-    /// `arrayitem_key` (`:878-884`), the varindex lookup (`:2485`),
-    /// the lazy-set force probe (`:2586`), and the immutable-array
-    /// flag (`:2447` insert / `:1282` query) all key on
-    /// `descr.index()`.  Using `array_effect_index` here would publish
-    /// the ei_index slot once the codewriter set it
-    /// (`effectinfo.py:465 compute_bitstrings`), which puts insert and
-    /// lookup in different identity domains — PyPy's
-    /// `cached_arrayitems[descr]` (`heap.py:399`) avoids this by
-    /// keying on the descriptor object itself, and reserves
-    /// `descr.get_ei_index()` for the EffectInfo bitstring check
-    /// (`effectinfo.py:217 check_write_descr_array`).
+    /// `descr_idx` is the descriptor object's identity. PyPy's
+    /// `cached_arrayitems[descr]` (`heap.py:399`) uses the descriptor object
+    /// itself and reserves `descr.get_ei_index()` for EffectInfo bitstrings.
     fn arrayitem_submap(&mut self, descr: &DescrRef) -> &mut ArrayCacheSubMap {
-        let descr_idx = descr.index();
+        let descr_idx = descr_identity(descr);
         let pos = match self.cached_array_pos_for_descr(descr) {
             Some(pos) => pos,
             None => {
@@ -1086,22 +1074,22 @@ impl OptHeap {
         self.arrayitem_submap(descr).const_get_or_new(index)
     }
 
-    fn get_cached_array_submap(&self, descr_idx: u32) -> Option<&ArrayCacheSubMap> {
+    fn get_cached_array_submap(&self, descr_idx: usize) -> Option<&ArrayCacheSubMap> {
         self.cached_array_pos_for_index(descr_idx)
             .map(|pos| &self.cached_arrayitems[pos].2)
     }
 
-    fn get_cached_array_submap_mut(&mut self, descr_idx: u32) -> Option<&mut ArrayCacheSubMap> {
+    fn get_cached_array_submap_mut(&mut self, descr_idx: usize) -> Option<&mut ArrayCacheSubMap> {
         let pos = self.cached_array_pos_for_index(descr_idx)?;
         Some(&mut self.cached_arrayitems[pos].2)
     }
 
-    fn get_cached_array_descr(&self, descr_idx: u32) -> Option<DescrRef> {
+    fn get_cached_array_descr(&self, descr_idx: usize) -> Option<DescrRef> {
         self.cached_array_pos_for_index(descr_idx)
             .map(|pos| self.cached_arrayitems[pos].1.clone())
     }
 
-    fn invalidate_arrayitem_cache(&mut self, descr_idx: u32, index: i64, ctx: &mut OptContext) {
+    fn invalidate_arrayitem_cache(&mut self, descr_idx: usize, index: i64, ctx: &mut OptContext) {
         if let Some(submap) = self.get_cached_array_submap_mut(descr_idx) {
             if let Some(cai) = submap.const_get_mut(index) {
                 cai.invalidate(ctx);
@@ -1112,7 +1100,7 @@ impl OptHeap {
     fn cache_arrayitem(
         &mut self,
         array_box: &Operand,
-        descr_idx: u32,
+        descr_idx: usize,
         index: i64,
         descr: Option<&DescrRef>,
     ) {
@@ -1181,9 +1169,9 @@ impl OptHeap {
         }
     }
 
-    fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext, get_rhs: fn(&Op) -> OpRef) {
+    fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext, get_rhs: fn(&Op) -> Operand) {
         let rhs = get_rhs(op);
-        let resolved_box = ctx.get_box_replacement_operand_opt(rhs);
+        let resolved_box = ctx.resolve_operand_operand_opt(&rhs);
         let rhs_is_virtual = resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b));
         // A virtual value stored into the standard virtualizable frame is
         // deferred, not flushed: the frame is a tracked existing object whose
@@ -1204,7 +1192,7 @@ impl OptHeap {
                 .as_ref()
                 .map_or(false, |b| ctx.is_virtualizable(b))
         {
-            ctx.force_box_inline(rhs);
+            ctx.force_box_inline(rhs.to_opref());
         }
 
         // Resolve forwarding and route after heap
@@ -1257,7 +1245,7 @@ impl OptHeap {
         //
         // force_lazy_setarrayitem_submap (heap.py:589-593) iterates
         // submap.const_indexes and calls cf.force_lazy_set per cai.
-        let entries: Vec<(u32, DescrRef, Vec<i64>)> = self
+        let entries: Vec<(usize, DescrRef, Vec<i64>)> = self
             .cached_arrayitems
             .iter()
             .map(|(idx, descr, submap)| {
@@ -1384,7 +1372,7 @@ impl OptHeap {
         // heap.py:622-636: iterate cached array items
         //   for descr, submap in self.cached_arrayitems.iteritems():
         //       for index, cf in submap.const_indexes.iteritems():
-        let array_entries: Vec<(u32, i64, Op)> = self
+        let array_entries: Vec<(usize, i64, Op)> = self
             .cached_arrayitems
             .iter_mut()
             .flat_map(|(descr_idx, _, submap)| {
@@ -1471,7 +1459,7 @@ impl OptHeap {
         // walks `cached_arrayitems` directly so each `cai.invalidate(ctx)`
         // can drop the matching `arrayinfo._items[index]` slot through
         // `ctx.get_ptr_info_mut` / `ctx.get_const_info_mut`.
-        let descr_entries: Vec<(u32, bool)> = self
+        let descr_entries: Vec<(usize, bool)> = self
             .cached_arrayitems
             .iter()
             .map(|(idx, descr, _)| (*idx, descr.is_always_pure()))
@@ -1558,7 +1546,7 @@ impl OptHeap {
             self.cached_dict_reads
                 .insert(descr1_id, indexmap::IndexMap::new());
             self.corresponding_array_descrs
-                .insert(descr2.index(), (descr2, descr1_id));
+                .insert(descr_identity(&descr2), (descr2, descr1_id));
         }
         let d = self
             .cached_dict_reads
@@ -1997,7 +1985,7 @@ impl OptHeap {
         // slot in-place at `compute_bitstrings` time, and
         // `effectinfo.py:496 descr.ei_index = sys.maxint` is the
         // sentinel for descrs absent from any EI's raw set.
-        let array_descrs: Vec<(u32, DescrRef, u32)> = self
+        let array_descrs: Vec<(usize, DescrRef, u32)> = self
             .cached_arrayitems
             .iter()
             .map(|(idx, descr, _)| (*idx, descr.clone(), descr.get_ei_index()))
@@ -2439,14 +2427,14 @@ impl OptHeap {
 
     /// heap.py:169-170 CachedField._get_rhs_from_set_op — the new
     /// value of a SETFIELD_GC is its second arg.
-    fn field_get_rhs(op: &Op) -> OpRef {
-        op.arg(1).to_opref()
+    fn field_get_rhs(op: &Op) -> Operand {
+        op.arg(1)
     }
 
     /// heap.py:300 ArrayCachedItem._get_rhs_from_set_op — the new
     /// value of a SETARRAYITEM_GC is its third arg.
-    fn array_get_rhs(op: &Op) -> OpRef {
-        op.arg(2).to_opref()
+    fn array_get_rhs(op: &Op) -> Operand {
+        op.arg(2)
     }
 
     /// heap.py:122-145 `AbstractCachedEntry.force_lazy_set(optheap,
@@ -2460,7 +2448,7 @@ impl OptHeap {
     /// - `_get_rhs_from_set_op` uses op.arg(2) at the put_back step.
     fn force_lazy_set_array(
         &mut self,
-        descr_idx: u32,
+        descr_idx: usize,
         const_index: i64,
         can_cache: bool,
         ctx: &mut OptContext,
@@ -2525,7 +2513,7 @@ impl OptHeap {
         op: &Op,
         descr: &DescrRef,
         array: OpRef,
-        descr_idx: u32,
+        descr_idx: usize,
         const_index: i64,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
@@ -2890,7 +2878,7 @@ impl OptHeap {
             };
             self.force_lazy_setarrayitem(&descr, Some(&indexb), true, ctx);
 
-            let descr_idx = descr.index();
+            let descr_idx = descr_identity(&descr);
             let arrayinfo = array_ref;
             let indexbox = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
             if let Some(submap) = self.get_cached_array_submap(descr_idx) {
@@ -3515,29 +3503,6 @@ impl Optimization for OptHeap {
             .collect();
         sort_descr_item_refs_untranslated(&mut field_entries);
         for (descr, (field_idx, cf)) in field_entries {
-            // NOT heap.py:370-372, which has no filter here.
-            //
-            // Hoisting a cached MUTABLE field into the peeled loop's label is
-            // only sound if the back-edge re-supplies it. `shortpreamble.py:465-476
-            // ExtendedShortPreambleBuilder.add_preamble_op` appends
-            // `preamble_op.op` to the label args and `preamble_op.preamble_op` —
-            // the RE-EXECUTED operation — to the jump args, so upstream re-reads
-            // the field each iteration. pyre's peeled body currently passes the
-            // ENTRY value straight back: with this filter removed,
-            // `pyre/bench/synth/callee_store_global_read_after_call.py` emits
-            // `v245 = SameAsI(<preamble getfield IntMutableCell.intvalue>)` and
-            // `Jump(..., v245)`, so a global a residual call mutates every
-            // iteration is treated as loop-invariant (316836 vs 240008).
-            // `is_always_pure()` descrs are exempt because re-reading them cannot
-            // observe a change. Remove this once the back-edge supplies the
-            // re-executed op.
-            let effect_idx = Self::field_effect_index(descr);
-            if majit_ir::effectinfo::compute_bitstrings_has_run()
-                && effect_idx == u32::MAX
-                && !descr.is_always_pure()
-            {
-                continue;
-            }
             cf.produce_potential_short_preamble_ops(sb, descr, field_idx, ctx);
         }
         // heap.py:374-377:
@@ -3545,18 +3510,27 @@ impl Optimization for OptHeap {
         //         for index, d in submap.const_indexes.items():
         //             d.produce_potential_short_preamble_ops(self.optimizer, sb, descr, index)
         for (_, descr, submap) in &self.cached_arrayitems {
-            // Same back-edge gap as the field loop above, for array items.
-            let effect_idx = Self::array_effect_index(descr);
-            if majit_ir::effectinfo::compute_bitstrings_has_run()
-                && effect_idx == u32::MAX
-                && !descr.is_always_pure()
-            {
-                continue;
-            }
             for (_, cai) in &submap.const_indexes {
                 cai.produce_potential_short_preamble_ops(sb, &descr, ctx);
             }
         }
+    }
+
+    fn register_preamble_cached_field(&mut self, struct_box: &Operand, descr: &DescrRef) {
+        // shortpreamble.py:72-75:
+        // `opinfo.setfield(..., optheap=optheap, cf=cf)` registers the
+        // imported PtrInfo immediately, before the body first reads it.
+        self.cache_field(struct_box, descr);
+    }
+
+    fn register_preamble_cached_arrayitem(
+        &mut self,
+        array_box: &Operand,
+        descr: &DescrRef,
+        index: i64,
+    ) {
+        // shortpreamble.py:84-85, symmetric ArrayCachedItem registration.
+        self.arrayitem_cache(descr, index).register_info(array_box);
     }
 
     fn name(&self) -> &'static str {
@@ -4820,7 +4794,7 @@ mod tests {
         assert!(matches!(result, OptimizationResult::Remove));
         // _lazy_set holds the pending op; PtrInfo is NOT yet written.
         let cai = pass
-            .get_cached_array_submap(d.index())
+            .get_cached_array_submap(majit_ir::descr::descr_identity(&d))
             .and_then(|s| s.const_get(3))
             .expect("ArrayCachedItem must exist");
         assert!(
@@ -7071,6 +7045,34 @@ mod tests {
                 ..Default::default()
             },
         })
+    }
+
+    #[test]
+    fn array_caches_are_keyed_by_descr_identity_not_numeric_index() {
+        // heap.py:332/399 keys cached_arrayitems and
+        // corresponding_array_descrs by the descriptor object itself.
+        // Two distinct descriptors may legitimately share `index()`.
+        let array1: DescrRef = descr(81);
+        let array2: DescrRef = descr(81);
+        assert_ne!(
+            majit_ir::descr::descr_identity(&array1),
+            majit_ir::descr::descr_identity(&array2)
+        );
+
+        let mut heap = OptHeap::new();
+        heap.arrayitem_submap(&array1);
+        heap.arrayitem_submap(&array2);
+        assert_eq!(heap.cached_arrayitems.len(), 2);
+
+        heap.corresponding_array_descrs.insert(
+            majit_ir::descr::descr_identity(&array1),
+            (array1.clone(), 1),
+        );
+        heap.corresponding_array_descrs.insert(
+            majit_ir::descr::descr_identity(&array2),
+            (array2.clone(), 2),
+        );
+        assert_eq!(heap.corresponding_array_descrs.len(), 2);
     }
 
     /// heap.py:480-528 parity: FLAG_LOOKUP deduplicates consecutive dict lookups.
