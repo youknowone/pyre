@@ -2429,6 +2429,10 @@ pub(crate) fn register_unsafe_fn_stubs(
 /// until their result type can be modeled.
 const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
     (&["core", "mem", "swap"], &["x", "y"], LowLevelType::Void),
+    // `mem::drop(x)` runs `x`'s destructor and returns `()`; the trace model
+    // does not model destructors (the `Drop` terminator lowers to a
+    // pass-through `Goto`), so a Void no-op stub is faithful.
+    (&["core", "mem", "drop"], &["x"], LowLevelType::Void),
     (
         &["core", "slice", "<Impl>", "as_ptr"],
         &["self"],
