@@ -9602,6 +9602,53 @@ fn init_type_type(ns: PyObjectRef) {
             make_builtin_function("__init__", |_| Ok(pyre_object::w_none())),
         )
     };
+    // CPython 3.14 typeobject.c slotdefs: type has its own native
+    // tp_setattro, distinct from object.__setattr__/__delattr__.  Keeping
+    // these as separate descriptors is load-bearing for hackcheck: an
+    // indirect call to object.__setattr__ must not jump over type's native
+    // override, while an explicit type.__setattr__ remains valid.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__setattr__",
+            make_builtin_function_with_arity(
+                "__setattr__",
+                |args| {
+                    if !pyre_object::is_str(args[1]) {
+                        return Err(crate::PyError::type_error("attribute name must be string"));
+                    }
+                    let name = pyre_object::w_str_get_wtf8(args[1]);
+                    match name.as_str() {
+                        Ok(s) => crate::baseobjspace::object_setattr(args[0], s, args[2]),
+                        Err(_) => crate::baseobjspace::object_setattr_surrogate(
+                            args[0], args[1], name, args[2],
+                        ),
+                    }
+                },
+                3,
+            ),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__delattr__",
+            make_builtin_function_with_arity(
+                "__delattr__",
+                |args| {
+                    if !pyre_object::is_str(args[1]) {
+                        return Err(crate::PyError::type_error("attribute name must be string"));
+                    }
+                    let name = pyre_object::w_str_get_wtf8(args[1]);
+                    match name.as_str() {
+                        Ok(s) => crate::baseobjspace::object_delattr(args[0], s),
+                        Err(_) => {
+                            crate::baseobjspace::object_delattr_surrogate(args[0], args[1], name)
+                        }
+                    }
+                },
+                2,
+            ),
+        );
+    }
     // type.__call__(cls, *args) — typeobject.c type_call.  The implicit
     // instantiation path handles `Cls()` directly, but a custom metaclass
     // whose `__call__` delegates via `super().__call__(...)` needs this
@@ -16657,6 +16704,16 @@ fn init_object_type(ns: PyObjectRef) {
                             "__setattr__ requires 3 arguments",
                         ));
                     }
+                    // CPython 3.14 typeobject.c hackcheck: a type object has
+                    // type's native tp_setattro between it and object's
+                    // generic setter.  Calling object.__setattr__ here would
+                    // jump over that override (the Carlo Verre hack).
+                    if unsafe { pyre_object::is_type(args[0]) } {
+                        return Err(crate::PyError::type_error(format!(
+                            "can't apply this __setattr__ to {} object",
+                            crate::baseobjspace::object_functionstr_type_name(args[0]),
+                        )));
+                    }
                     if !unsafe { pyre_object::is_str(args[1]) } {
                         return Err(crate::PyError::type_error("attribute name must be string"));
                     }
@@ -16689,6 +16746,12 @@ fn init_object_type(ns: PyObjectRef) {
                         return Err(crate::PyError::type_error(
                             "__delattr__ requires 2 arguments",
                         ));
+                    }
+                    if unsafe { pyre_object::is_type(args[0]) } {
+                        return Err(crate::PyError::type_error(format!(
+                            "can't apply this __delattr__ to {} object",
+                            crate::baseobjspace::object_functionstr_type_name(args[0]),
+                        )));
                     }
                     if !unsafe { pyre_object::is_str(args[1]) } {
                         return Err(crate::PyError::type_error("attribute name must be string"));

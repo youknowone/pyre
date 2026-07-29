@@ -7387,6 +7387,39 @@ else:
     }
 
     #[test]
+    fn test_carlo_verre_hackcheck_keeps_type_setattr_distinct() {
+        let source = "\
+class Direct(type):
+    def __setattr__(cls, name, value):
+        type.__setattr__(cls, name, value)
+class Plain:
+    pass
+class DirectMeta(Plain, Direct):
+    pass
+direct = DirectMeta('DirectClass', (object,), {})
+direct.answer = 42
+class Indirect(type):
+    def __setattr__(cls, name, value):
+        object.__setattr__(cls, name, value)
+class IndirectMeta(Plain, Indirect):
+    pass
+indirect = IndirectMeta('IndirectClass', (object,), {})
+try:
+    indirect.answer = 42
+except TypeError:
+    rejected = True
+else:
+    rejected = False
+result = direct.answer == 42 and rejected";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("Carlo Verre slot-wrapper regression");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(is_true(result).unwrap());
+        }
+    }
+
+    #[test]
     fn test_function_dunder_globals_and_code_are_materialized() {
         crate::test_hooks::install_hash_hook();
         let source = "\
