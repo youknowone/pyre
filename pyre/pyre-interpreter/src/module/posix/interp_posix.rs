@@ -2244,6 +2244,51 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         extras.push(("st_flags", pyre_object::w_int_new(st.st_flags as i64)));
         crate::_structseq::new_instance_with_extra(stat_result_seq_type(), seq, extras)
     }
+    /// `os.stat(path, *, dir_fd=None, follow_symlinks=True)` /
+    /// `os.lstat(path, *, dir_fd=None)` — `follow_symlinks` is keyword-only,
+    /// so `stat` cannot take the fixed-arity carrier that rejects keywords.
+    /// `dir_fd` stays unimplemented (the `*at` family is absent from
+    /// `_have_functions`), so only `None` is accepted.
+    fn stat_entry(
+        args: &[pyre_object::PyObjectRef],
+        default_follow: bool,
+    ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+        let name = if default_follow { "stat" } else { "lstat" };
+        let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+        let allowed: &[&str] = if default_follow {
+            &["path", "dir_fd", "follow_symlinks"]
+        } else {
+            &["path", "dir_fd"]
+        };
+        crate::builtins::kwarg_reject_unknown(kwargs, allowed, name)?;
+        if pos.len() > 1 {
+            return Err(crate::PyError::type_error(format!(
+                "{name}() takes at most 1 positional argument ({} given)",
+                pos.len()
+            )));
+        }
+        let path = match pos.first().copied().or(crate::builtins::kwarg_get(kwargs, "path")) {
+            Some(path) => path,
+            None => {
+                return Err(crate::PyError::type_error(format!(
+                    "{name}() missing required argument 'path' (pos 1)"
+                )));
+            }
+        };
+        if let Some(dir_fd) = crate::builtins::kwarg_get(kwargs, "dir_fd")
+            && !unsafe { pyre_object::is_none(dir_fd) }
+        {
+            return Err(crate::PyError::not_implemented(format!(
+                "{name}: dir_fd unavailable on this platform"
+            )));
+        }
+        let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+            Some(v) => crate::baseobjspace::is_true(v)?,
+            None => default_follow,
+        };
+        stat_impl(&[path], follow_symlinks)
+    }
+
     fn stat_impl(
         args: &[pyre_object::PyObjectRef],
         follow_symlinks: bool,
@@ -2568,12 +2613,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "stat",
-        crate::make_builtin_function_with_arity("stat", |args| stat_impl(args, true), 1),
+        crate::make_builtin_function("stat", |args| stat_entry(args, true)),
     );
     crate::module_ns_store(
         ns,
         "lstat",
-        crate::make_builtin_function_with_arity("lstat", |args| stat_impl(args, false), 1),
+        crate::make_builtin_function("lstat", |args| stat_entry(args, false)),
     );
     crate::module_ns_store(
         ns,
