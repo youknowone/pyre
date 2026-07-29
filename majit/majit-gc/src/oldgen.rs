@@ -186,6 +186,13 @@ impl OldGen {
                 hdr.clear_flag(flags::VISITED);
                 self.old_rawmalloced_objects.push(object);
             } else {
+                if std::env::var_os("MAJIT_GC_LIFETIME_LOG").is_some() {
+                    eprintln!(
+                        "[gc][free] addr={:#x} type_id={} kind=raw",
+                        object.header_addr + GcHeader::SIZE,
+                        hdr.type_id()
+                    );
+                }
                 self.rawmalloced_total_size -= object.layout.size();
                 let removed = self
                     .rawmalloced_payloads
@@ -212,6 +219,13 @@ impl OldGen {
                     hdr.clear_flag(flags::VISITED);
                     false
                 } else {
+                    if std::env::var_os("MAJIT_GC_LIFETIME_LOG").is_some() {
+                        eprintln!(
+                            "[gc][free] addr={:#x} type_id={} kind=arena",
+                            header_ptr as usize + GcHeader::SIZE,
+                            hdr.type_id()
+                        );
+                    }
                     true
                 }
             },

@@ -556,6 +556,11 @@ const _: () = assert!(std::mem::offset_of!(GcFramePrefix, frame) == GC_HEADER_SI
 /// valid header at `frame - GC_HEADER_SIZE`.
 pub struct FrameBox {
     ptr: *mut PyFrame,
+    /// RPython's translated Rust local is a shadow-stack livevar for the
+    /// complete lifetime of the owning handle.  In particular it remains a
+    /// root after `FrameBox::new` returns and before `execute_frame` installs
+    /// the frame on the ExecutionContext chain.
+    owner_root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
 }
 
 impl FrameBox {
@@ -578,7 +583,31 @@ impl FrameBox {
     /// every reader (`frame - GC_HEADER_SIZE` write-barrier header,
     /// `pyframe_object_custom_trace`) is regime-independent; `Drop`
     /// distinguishes them with `try_gc_owns_object`.
-    pub fn new(frame: PyFrame) -> Self {
+    pub fn new(mut frame: PyFrame) -> Self {
+        // `frame` is an RPython aggregate local whose GCREF fields are all
+        // translated livevars across the frame allocation. Publish every field
+        // before the first GC operation; a contended stable allocation parks
+        // this mutator and lets another collector run.
+        let input_roots = [
+            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
+                frame.ob_header.w_class as usize,
+            )),
+            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.pycode as usize)),
+            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
+                frame.locals_cells_stack_w as usize,
+            )),
+            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.debugdata as usize)),
+            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.lastblock as usize)),
+            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
+                frame.f_generator_nowref as usize,
+            )),
+            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
+                frame.w_yielding_from as usize,
+            )),
+            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.f_backref as usize)),
+            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.w_builtin as usize)),
+            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.w_globals as usize)),
+        ];
         let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
             PYFRAME_GC_TYPE_ID,
             std::mem::size_of::<PyFrame>(),
@@ -592,6 +621,17 @@ impl FrameBox {
             // collector between this allocation and the barrier below.
             let frame_root = pyre_object::gc_roots::push_roots();
             pyre_object::gc_roots::pin_root(raw as pyre_object::PyObjectRef);
+            frame.ob_header.w_class = input_roots[0].get().0 as pyre_object::PyObjectRef;
+            frame.pycode = input_roots[1].get().0 as *const ();
+            frame.locals_cells_stack_w =
+                input_roots[2].get().0 as *mut pyre_object::FixedObjectArray;
+            frame.debugdata = input_roots[3].get().0 as *mut FrameDebugData;
+            frame.lastblock = input_roots[4].get().0 as *mut FrameBlock;
+            frame.f_generator_nowref = input_roots[5].get().0 as pyre_object::PyObjectRef;
+            frame.w_yielding_from = input_roots[6].get().0 as pyre_object::PyObjectRef;
+            frame.f_backref = input_roots[7].get().0 as *mut PyFrame;
+            frame.w_builtin = input_roots[8].get().0 as pyre_object::PyObjectRef;
+            frame.w_globals = input_roots[9].get().0 as pyre_object::PyObjectRef;
             debug_assert!(pyre_object::gc_hook::try_gc_owns_object(
                 frame.locals_cells_stack_w as *mut u8
             ));
@@ -604,8 +644,13 @@ impl FrameBox {
             // tracer, exactly as `generator.rs:72` does for a stable
             // generator wrapping young frame contents.
             pyre_object::gc_hook::try_gc_write_barrier(raw);
+            let owner_root =
+                majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(ptr as usize));
             drop(frame_root);
-            return FrameBox { ptr };
+            return FrameBox {
+                ptr,
+                owner_root: Some(owner_root),
+            };
         }
         debug_assert!(!pyre_object::gc_hook::try_gc_owns_object(
             frame.locals_cells_stack_w as *mut u8
@@ -627,13 +672,17 @@ impl FrameBox {
             frame,
         }));
         let ptr = unsafe { std::ptr::addr_of_mut!((*raw).frame) };
-        FrameBox { ptr }
+        FrameBox {
+            ptr,
+            owner_root: None,
+        }
     }
 
     /// Relinquish ownership, returning the inner-frame pointer. The header
     /// remains at `ptr - GC_HEADER_SIZE`; reclaim via [`FrameBox::from_raw`].
-    pub fn into_raw(self) -> *mut PyFrame {
+    pub fn into_raw(mut self) -> *mut PyFrame {
         let ptr = self.ptr;
+        drop(self.owner_root.take());
         std::mem::forget(self);
         ptr
     }
@@ -645,7 +694,22 @@ impl FrameBox {
     /// `ptr` must originate from [`FrameBox::into_raw`] / [`FrameBox::new`]
     /// and must not have been freed.
     pub unsafe fn from_raw(ptr: *mut PyFrame) -> Self {
-        FrameBox { ptr }
+        // Publish before asking the collector whether the address is managed:
+        // the ownership query is a GC operation and may park behind another
+        // thread's collection.
+        let owner_root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(ptr as usize));
+        if pyre_object::gc_hook::try_gc_owns_object(ptr as *mut u8) {
+            FrameBox {
+                ptr,
+                owner_root: Some(owner_root),
+            }
+        } else {
+            drop(owner_root);
+            FrameBox {
+                ptr,
+                owner_root: None,
+            }
+        }
     }
 
     /// Raw pointer to the inner frame (header at `ptr - GC_HEADER_SIZE`).
@@ -828,7 +892,7 @@ impl Drop for FrameBox {
         // and block chain with the frame, so no manual cleanup runs here.
         // Only a `std::alloc` snapshot / bootstrap fallback box is freed
         // manually — reconstruct and drop it, which runs `PyFrame::drop`.
-        if pyre_object::gc_hook::try_gc_owns_object(self.ptr as *mut u8) {
+        if self.owner_root.take().is_some() {
             return;
         }
         unsafe {
@@ -3731,6 +3795,12 @@ impl PyFrame {
         let locals_cells_stack_w = unsafe {
             alloc_frame_locals_array(num_locals + num_cells + max_stack, PY_NULL, allocation)
         };
+        // The allocation result is a translated livevar before it is stored in
+        // the eventual PyFrame. Publish it before `w_cell_new`, the barrier,
+        // or any other GC operation can park this free-threaded mutator.
+        let _locals_owner_root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
+            locals_cells_stack_w as usize,
+        ));
 
         {
             // Populate the freshly-allocated array via its mutable slice.

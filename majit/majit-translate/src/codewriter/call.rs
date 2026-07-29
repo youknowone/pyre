@@ -3361,11 +3361,24 @@ impl CallControl {
                         // `IndirectCall`.  That lowering runs inside
                         // `transform_graph_to_jitcode`, i.e. strictly
                         // after `find_all_graphs`, so this is the shape
-                        // the BFS actually sees.  The family is the same
-                        // one the lowering stamps into `graphs`
-                        // (`rpbc.py:216 c_graphs = row_of_graphs.values()`),
-                        // so resolving it here keeps the walk equivalent
-                        // to walking the lowered op.
+                        // the BFS actually sees.
+                        //
+                        // This is not a second family resolver: the arm
+                        // below and `lower_indirect_calls` both call
+                        // `all_impls_for_indirect`, and the lowering only
+                        // folds an empty answer into `graphs = None`,
+                        // which the arm above skips exactly as an empty
+                        // `callees` does here.  The two arms therefore
+                        // enumerate the same callees
+                        // (`rpbc.py:216 c_graphs = row_of_graphs.values()`).
+                        //
+                        // Running the lowering before graph discovery so
+                        // only the post-rtyper shape reaches the BFS would
+                        // match RPython's phase order, but it forces every
+                        // registered graph to be lowered up front, which is
+                        // the eager pass on-demand body lowering replaced
+                        // when the prepass peak RSS came down from 7.71 GB
+                        // to 4.25 GB.
                         OpKind::Call {
                             target:
                                 CallTarget::Indirect {

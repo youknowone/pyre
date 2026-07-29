@@ -821,7 +821,16 @@ impl W_TextIOWrapper {
             w_buffer: buffer,
             w_encoding: w_str_new(encoding),
             w_errors: w_str_new(errors),
-            w_newline: w_none(),
+            // `app_main.py create_stdio:494`
+            // `newline = None if sys.platform == 'win32' else '\n'`.  Universal
+            // newline mode must never be on for POSIX stdio — '\r\n' in stdin
+            // does not mean '\n' there, unlike a file explicitly opened in text
+            // mode — while Windows wants the translation in both directions.
+            w_newline: if cfg!(windows) {
+                w_none()
+            } else {
+                w_str_new("\n")
+            },
             w_stdio_name: w_str_new(name),
             w_encoder: PY_NULL,
             w_decoder: PY_NULL,
@@ -834,8 +843,9 @@ impl W_TextIOWrapper {
             chunk_size: 8192,
             b2cratio: 0.0,
             has_read1: false,
-            readuniversal: true,
-            readtranslate: true,
+            // What `set_newline` derives from the `w_newline` above.
+            readuniversal: cfg!(windows),
+            readtranslate: cfg!(windows),
             seekable_flag: false,
             telling: false,
             encoding_start_of_stream: false,

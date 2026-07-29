@@ -1298,7 +1298,7 @@ impl MiniMarkGC {
                 // RPython parity: old-gen jitframes need their interior
                 // nursery refs traced directly. The custom_trace hook
                 // walks gcmap bits to find Ref slots.
-                self.trace_and_update_object(gcref.0);
+                self.trace_and_update_object(gcref.0, "minor_jitframe_root");
             } else if !gcref.is_null() && crate::shadow_stack::is_libc_jitframe(gcref.0) {
                 // pyre dynasm extension: jitframes allocated via
                 // `libc::calloc` in execute_token are neither in the
@@ -1429,7 +1429,7 @@ impl MiniMarkGC {
 
                 // Trace this old-gen object's fields and copy any nursery
                 // objects they reference.
-                self.trace_and_update_object(obj_addr);
+                self.trace_and_update_object(obj_addr, "minor_remembered_set");
             }
             self.remembered_set.clear();
 
@@ -1907,6 +1907,12 @@ impl MiniMarkGC {
                 (*(new_header_ptr as *mut GcHeader)).clear_flag(flags::TRACK_YOUNG_PTRS);
             }
             self.remembered_set.push(new_obj_addr);
+            if std::env::var_os("MAJIT_GC_LIFETIME_LOG").is_some() {
+                eprintln!(
+                    "[gc][remember] addr={:#x} type_id={} source=promotion state={:?}",
+                    new_obj_addr, type_id, self.gc_state
+                );
+            }
         }
 
         GcRef(new_obj_addr)
@@ -1977,9 +1983,9 @@ impl MiniMarkGC {
 
     /// Trace an object's GC pointer fields and update any that point
     /// into the nursery by copying the target.
-    fn trace_and_update_object(&mut self, obj_addr: usize) {
+    fn trace_and_update_object(&mut self, obj_addr: usize, site: &str) {
         let type_id = unsafe { (*header_of(obj_addr)).type_id() };
-        self.validate_type_id(type_id, obj_addr, "trace_and_update_object");
+        self.validate_type_id(type_id, obj_addr, site);
         let custom_trace = self.types.get(type_id).custom_trace;
 
         // custom_trace_hook parity: use custom trace function if registered.
@@ -2155,6 +2161,14 @@ impl MiniMarkGC {
             if !self.is_in_nursery(gcref.0) && unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
                 unsafe { (*hdr).clear_flag(flags::TRACK_YOUNG_PTRS) };
                 self.remembered_set.push(gcref.0);
+                if std::env::var_os("MAJIT_GC_LIFETIME_LOG").is_some() {
+                    eprintln!(
+                        "[gc][remember] addr={:#x} type_id={} source=major_seed state={:?}",
+                        gcref.0,
+                        unsafe { (*hdr).type_id() },
+                        self.gc_state
+                    );
+                }
             }
         }
     }
@@ -3381,6 +3395,17 @@ impl MiniMarkGC {
         // mutated and therefore cannot be re-added between sweep steps.
         self.remembered_set.push(obj.0);
         let hdr = unsafe { header_of(obj.0) };
+        if std::env::var_os("MAJIT_GC_LIFETIME_LOG").is_some() {
+            eprintln!(
+                "[gc][remember] addr={:#x} type_id={} source=write_barrier state={:?}",
+                obj.0,
+                unsafe { (*hdr).type_id() },
+                self.gc_state
+            );
+            if unsafe { (*hdr).type_id() } == 9 {
+                eprintln!("{}", std::backtrace::Backtrace::force_capture());
+            }
+        }
         unsafe { (*hdr).clear_flag(flags::TRACK_YOUNG_PTRS) };
     }
 

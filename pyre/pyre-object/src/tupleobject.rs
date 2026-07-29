@@ -187,6 +187,16 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
         w_class: get_instantiate(&TUPLE_TYPE),
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_TUPLE_GC_TYPE_ID, W_TUPLE_OBJECT_SIZE);
+    // The freshly allocated tuple header is itself a translated livevar across
+    // the items-block allocation and the write barrier below. Publish it
+    // immediately; in a free-threaded run either operation may park behind a
+    // foreign collector even though the address is old-gen and non-moving.
+    let raw_slot = if raw.is_null() {
+        None
+    } else {
+        crate::gc_roots::pin_root(raw as PyObjectRef);
+        Some(crate::gc_roots::shadow_stack_len() - 1)
+    };
 
     // pop_roots: read the relocated item pointers back out of the shadow
     // stack, then build the items block. On the Phase L2 nursery path
@@ -198,6 +208,9 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
         .map(|i| crate::gc_roots::shadow_stack_get(save_point + i))
         .collect();
     let items_block = unsafe { alloc_tuple_items_block_gc(&relocated) };
+    let raw = raw_slot
+        .map(crate::gc_roots::shadow_stack_get)
+        .unwrap_or(std::ptr::null_mut()) as *mut u8;
 
     if !raw.is_null() {
         unsafe {

@@ -10143,7 +10143,17 @@ fn handle<Sym: WalkSym>(
                     // the same case for the same reason. Only a cross-loop cut
                     // is declined: a trace that started at these greens still
                     // closes on its own back-edge below.
-                    if key != ctx.trace_ctx.root_green_key() {
+                    // One decline is not a plain "keep tracing": compile.py:1079
+                    // `metainterp.retrace_needed` leaves `partial_trace` and
+                    // `retracing_from` pointing at this header's position. The
+                    // return below skips the merge-point registration further
+                    // down, so the later close at the root header would compare
+                    // the root merge point against a `retracing_from` no merge
+                    // point was ever recorded for, and abort instead of
+                    // retracing. `has_partial` was false above, so a partial
+                    // trace here is the one this attempt just requested.
+                    let retrace_requested = driver.meta_interp().partial_trace().is_some();
+                    if !retrace_requested && key != ctx.trace_ctx.root_green_key() {
                         if majit_metainterp::majit_log_enabled() {
                             eprintln!(
                                 "[jit][walker-reached-loop-header] merge point pc={} already \

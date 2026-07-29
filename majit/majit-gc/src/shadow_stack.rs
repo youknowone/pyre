@@ -214,6 +214,12 @@ thread_local! {
     /// Thread-local shadow stack for individual GcRef roots.
     static SHADOW_STACK: RefCell<ShadowStack> = const { RefCell::new(ShadowStack::new()) };
 
+    /// Long-lived translated livevar slots whose owners are not lexical
+    /// `push`/`pop_to` scopes.  RPython assigns these values fixed shadow-stack
+    /// frame slots; keeping a separate slot vector preserves that ownership
+    /// when Rust RAII scopes nest across a `FrameBox`.
+    static OWNER_ROOTS: RefCell<Vec<Option<GcRef>>> = const { RefCell::new(Vec::new()) };
+
     /// Thread-local flat jitframe root stack. Rust tests run multiple
     /// JIT/GC tests in parallel, so using one process-global root stack lets
     /// one GC walk another test's jitframe. RPython's root stack is per
@@ -252,6 +258,7 @@ thread_local! {
 struct MutatorEntry {
     thread_id: std::thread::ThreadId,
     shadow_stack: *const RefCell<ShadowStack>,
+    owner_roots: *const RefCell<Vec<Option<GcRef>>>,
     jf_root_stack: *const RefCell<JitFrameShadowStack>,
     bh_regs_stack: *const RefCell<Vec<BhRegsEntry>>,
     resume_ref_roots_stack: *const RefCell<Vec<(*mut i64, usize)>>,
@@ -277,11 +284,12 @@ unsafe impl Send for MutatorEntry {}
 
 static MUTATOR_REGISTRY: Mutex<Vec<MutatorEntry>> = Mutex::new(Vec::new());
 
-/// Register the current thread's four TLS root structures for STW root walks.
+/// Register the current thread's TLS root structures for STW root walks.
 /// Unregistration is supplied by the caller's RAII destructor (pyre-jit's `GcMutatorRegistration` thread-local, armed in `init_gc_subsystem`, whose `Drop` calls [`unregister_mutator`]); callers must arm that pairing, while an API-level return guard is a tracked follow-up.
 pub fn register_mutator() {
     let thread_id = std::thread::current().id();
     let shadow_stack = SHADOW_STACK.with(|stack| stack as *const _);
+    let owner_roots = OWNER_ROOTS.with(|roots| roots as *const _);
     let jf_root_stack = JF_ROOT_STACK.with(|stack| stack as *const _);
     let bh_regs_stack = BH_REGS_STACK.with(|stack| stack as *const _);
     let resume_ref_roots_stack = RESUME_REF_ROOTS_STACK.with(|stack| stack as *const _);
@@ -294,6 +302,7 @@ pub fn register_mutator() {
     registry.push(MutatorEntry {
         thread_id,
         shadow_stack,
+        owner_roots,
         jf_root_stack,
         bh_regs_stack,
         resume_ref_roots_stack,
@@ -441,6 +450,59 @@ pub fn get(index: usize) -> GcRef {
     })
 }
 
+/// Acquire a fixed translated-livevar root slot.
+pub fn acquire_owner_root(root: GcRef) -> usize {
+    OWNER_ROOTS.with(|roots| {
+        let mut roots = roots.borrow_mut();
+        if let Some(index) = roots.iter().position(Option::is_none) {
+            roots[index] = Some(root);
+            index
+        } else {
+            let index = roots.len();
+            roots.push(Some(root));
+            index
+        }
+    })
+}
+
+/// Release a fixed translated-livevar root slot.
+pub fn release_owner_root(index: usize) {
+    let _ = OWNER_ROOTS.try_with(|roots| {
+        let mut roots = roots.borrow_mut();
+        assert!(
+            index < roots.len() && roots[index].is_some(),
+            "releasing an inactive owner-root slot"
+        );
+        roots[index] = None;
+        while roots.last().is_some_and(Option::is_none) {
+            roots.pop();
+        }
+    });
+}
+
+/// RAII owner for one fixed translated-livevar root slot.
+pub struct OwnerRootGuard {
+    index: usize,
+}
+
+impl OwnerRootGuard {
+    pub fn new(root: GcRef) -> Self {
+        Self {
+            index: acquire_owner_root(root),
+        }
+    }
+
+    pub fn get(&self) -> GcRef {
+        OWNER_ROOTS.with(|roots| roots.borrow()[self.index].expect("inactive owner-root guard"))
+    }
+}
+
+impl Drop for OwnerRootGuard {
+    fn drop(&mut self) {
+        release_owner_root(self.index);
+    }
+}
+
 /// An opaque handle to this thread's `SHADOW_STACK` cell.
 ///
 /// The pointer is stable for the life of the owning thread (the same
@@ -482,6 +544,13 @@ pub fn walk_roots(mut visitor: impl FnMut(&mut GcRef)) {
             }
         }
     });
+    OWNER_ROOTS.with(|roots| {
+        for root in roots.borrow_mut().iter_mut().flatten() {
+            if !root.is_null() {
+                visitor(root);
+            }
+        }
+    });
 }
 
 /// Walk every registered mutator's GcRef shadow stack during STW.
@@ -503,6 +572,12 @@ pub fn walk_all_roots(mut visitor: impl FnMut(&mut GcRef)) {
         for entry in ss.entries.iter_mut() {
             if !entry.is_null() {
                 visitor(entry);
+            }
+        }
+        let owner_roots = unsafe { &mut *(*mutator.owner_roots).as_ptr() };
+        for root in owner_roots.iter_mut().flatten() {
+            if !root.is_null() {
+                visitor(root);
             }
         }
     }
@@ -546,6 +621,7 @@ pub fn increase_root_stack_depth(new_depth: usize) {
 /// Clear both shadow stacks.
 pub fn clear() {
     SHADOW_STACK.with(|ss| ss.borrow_mut().entries.clear());
+    OWNER_ROOTS.with(|roots| roots.borrow_mut().clear());
     JF_ROOT_STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
         stack.ensure_init();
@@ -1246,6 +1322,27 @@ mod tests {
         assert_eq!(get(0), GcRef(0x1100));
         assert_eq!(get(1), GcRef(0x2100));
         clear();
+    }
+
+    #[test]
+    fn test_owner_roots_have_independent_fixed_slots() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        clear();
+        let lexical = push(GcRef(0x1000));
+        let first = acquire_owner_root(GcRef(0x2000));
+        let second = acquire_owner_root(GcRef(0x3000));
+
+        pop_to(lexical);
+        assert_eq!(super::depth(), 0);
+        let mut walked = Vec::new();
+        walk_roots(|root| walked.push(*root));
+        assert_eq!(walked, vec![GcRef(0x2000), GcRef(0x3000)]);
+
+        release_owner_root(first);
+        release_owner_root(second);
+        walked.clear();
+        walk_roots(|root| walked.push(*root));
+        assert!(walked.is_empty());
     }
 
     #[test]

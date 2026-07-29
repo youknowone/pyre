@@ -8,23 +8,31 @@
 //
 // CPython's faulthandler dumps the Python traceback on fatal signals.
 // Pyre has no Python-level traceback machinery yet, so our handler
-// writes a short "Fatal Python error: <name>" line to fd 2 and then
-// restores the default disposition + reraises the signal so the
-// process dies the normal way.
+// writes a short "Fatal Python error: <name>" line to the descriptor
+// `enable` was given and then restores the default disposition +
+// reraises the signal so the process dies the normal way.
 // ──────────────────────────────────────────────────────────────────────
 
 #[cfg(all(unix, feature = "host_env"))]
 static FAULTHANDLER_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// The descriptor `enable` resolved from its `file` argument.  `handler.py`
+/// keeps it on the Handler instance, but the signal handler below is a bare
+/// `extern "C" fn` and cannot capture, so it is handed over through a static.
+/// Defaults to 2, which is what `get_fileno_and_file` answers for None.
+#[cfg(all(unix, feature = "host_env"))]
+static FAULTHANDLER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(2);
+
 #[cfg(all(unix, feature = "host_env"))]
 extern "C" fn faulthandler_signal_handler(signum: libc::c_int) {
-    // Stay async-signal-safe: write to fd 2 with raw libc::write and
-    // restore the default disposition before reraising.
+    // Stay async-signal-safe: write with raw libc::write and restore the
+    // default disposition before reraising.
     let name =
         rustpython_host_env::faulthandler::fatal_signal_name(signum).unwrap_or("unknown signal");
     let msg = format!("Fatal Python error: {name}\n");
-    rustpython_host_env::faulthandler::write_fd(2, msg.as_bytes());
+    let fd = FAULTHANDLER_FD.load(std::sync::atomic::Ordering::Relaxed);
+    rustpython_host_env::faulthandler::write_fd(fd, msg.as_bytes());
     rustpython_host_env::faulthandler::signal_default_and_raise(signum);
 }
 
@@ -60,10 +68,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "enable",
             |args| {
                 // `handler.py:141-145 enable` — file=None, all_threads=True.
-                let _fd =
+                let fd =
                     faulthandler_extract_fd(args.first().copied().unwrap_or(pyre_object::PY_NULL))?;
                 #[cfg(all(unix, feature = "host_env"))]
                 {
+                    FAULTHANDLER_FD.store(fd, std::sync::atomic::Ordering::Relaxed);
                     let ok = rustpython_host_env::faulthandler::enable_fatal_handlers(
                         faulthandler_signal_handler,
                         libc::SA_NODEFER | libc::SA_ONSTACK,
@@ -77,9 +86,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     ));
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
-                Err(crate::PyError::not_implemented(
-                    "faulthandler.enable requires host_env feature",
-                ))
+                {
+                    let _ = fd;
+                    Err(crate::PyError::not_implemented(
+                        "faulthandler.enable requires host_env feature",
+                    ))
+                }
             },
             // `enable(file=sys.stderr, all_threads=True, c_stack=True)` —
             // `c_stack` (3.14) selects C-stack dumping; accept and ignore it.
