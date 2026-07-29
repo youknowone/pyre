@@ -27,9 +27,9 @@ pub mod _ctypes;
 pub mod _functools;
 #[allow(non_snake_case)]
 pub mod _hashlib;
-pub mod _io;
 #[allow(non_snake_case)]
 pub mod _immutables_map;
+pub mod _io;
 #[allow(non_snake_case)]
 pub mod _locale;
 #[allow(non_snake_case)]
@@ -46,9 +46,9 @@ pub mod _posixshmem;
 #[cfg(not(feature = "sandbox"))]
 pub mod _posixsubprocess;
 #[allow(non_snake_case)]
-pub mod _random;
-#[allow(non_snake_case)]
 pub mod _pypy_generic_alias;
+#[allow(non_snake_case)]
+pub mod _random;
 #[allow(non_snake_case)]
 #[cfg(not(feature = "sandbox"))]
 pub mod _socket;
