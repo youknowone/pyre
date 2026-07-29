@@ -2719,6 +2719,19 @@ pub fn pytraceback_field_descr(index: usize) -> DescrRef {
     field_descr_from_group(&PYTRACEBACK_DESCR_GROUP, index)
 }
 
+/// Field descriptor for `PyTraceback.w_next`, the chain link `descr_get_next`
+/// reads.  Located by offset rather than by a hand-counted position, so a
+/// later edit to the field list above cannot silently repoint this at a
+/// neighbouring slot.
+pub fn pytraceback_w_next_descr() -> DescrRef {
+    let index = PYTRACEBACK_DESCR_GROUP
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == pyre_interpreter::pytraceback::PYTRACEBACK_W_NEXT_OFFSET)
+        .expect("PyTraceback descr group has no w_next field");
+    field_descr_from_group(&PYTRACEBACK_DESCR_GROUP, index)
+}
+
 /// Cached field descriptor for a raw reference slot selected by the
 /// exception attribute fold.  Indices are those of `build_w_exception_group`;
 /// no parallel descriptor is constructed.

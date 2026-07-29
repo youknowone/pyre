@@ -1958,6 +1958,55 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
+    // `pytraceback.py:51-53 descr_get_next` reads `w_next` and surfaces the
+    // null chain terminator as None; it marks nothing escaped and cannot
+    // raise, so the whole getter is the field read below.  Left residual, one
+    // `tb.tb_next` step costs two forcing calls, which is what makes a
+    // `while tb is not None: tb = tb.tb_next` walk dominate every traceback
+    // fixture.
+    if name == "tb_next"
+        && std::ptr::eq(
+            unsafe { (*concrete_obj).ob_type },
+            &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE,
+        )
+    {
+        let w_type =
+            pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::pytraceback::PYTRACEBACK_TYPE);
+        let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
+        if version_tag == 0 {
+            return Ok(None);
+        }
+        let stored = unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_w_next(concrete_obj) };
+        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+        let raw_value = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            obj,
+            crate::descr::pytraceback_w_next_descr(),
+        );
+        let value = if stored.is_null() {
+            // End of the chain.  There is no is-null guard opcode, so pin the
+            // slot against the null constant the way the exception `w_dict`
+            // shadow guard does, then produce the None the getter returns.
+            let null_const = ctx.trace_ctx.const_ref(0);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[raw_value, null_const],
+            )?;
+            ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
+        } else {
+            walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[raw_value])?;
+            ctx.trace_ctx.set_opref_concrete(
+                raw_value,
+                majit_ir::Value::Ref(majit_ir::GcRef(stored as usize)),
+            );
+            raw_value
+        };
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+        return Ok(Some(()));
+    }
+
     if let Some((slot, kind, w_type, version_tag, stored)) = unsafe {
         pyre_interpreter::baseobjspace::exception_attr_slot_fold(concrete_obj, &name, false)
     } {
