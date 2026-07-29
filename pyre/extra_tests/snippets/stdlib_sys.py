@@ -183,8 +183,17 @@ with assert_raises(TypeError):
 with assert_raises(TypeError):
     sys.getsizeof("x", 1, 2)
 
+# The default is returned only when `__sizeof__` is missing or raises
+# TypeError; an object with a working `__sizeof__` reports its size.
 default = object()
-assert sys.getsizeof(object(), default) is default
+assert sys.getsizeof(object(), default) == object().__sizeof__()
+
+
+class NoSizeof:
+    __sizeof__ = None
+
+
+assert sys.getsizeof(NoSizeof(), default) is default
 
 
 def test_getframemodulename():

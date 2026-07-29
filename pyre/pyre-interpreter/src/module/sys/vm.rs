@@ -1055,6 +1055,64 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             Ok(current as pyre_object::PyObjectRef)
         }),
     );
+    // `sys._getframemodulename(depth=0)` — the module name of the frame
+    // `depth` levels up, or None when the walk runs off the stack.  Used by
+    // `warnings` and `functools` to attribute a call to its module without
+    // materialising the frame.
+    //
+    // `sys__getframemodulename_impl` reads `PyFunction_GetModule(f->f_funcobj)`.
+    // A pyre frame carries `pycode` and `w_globals` but no link back to the
+    // function object (the JIT virtualizable layout is the hot path, and
+    // `debugdata` is allocated lazily), so the module name comes from
+    // `globals["__name__"]` — the value `__module__` is initialised from.  A
+    // function whose `__module__` was reassigned after definition therefore
+    // still reports its defining module.
+    module_ns_store(
+        ns,
+        "_getframemodulename",
+        crate::make_builtin_function("_getframemodulename", |args| {
+            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            crate::builtins::kwarg_reject_unknown(kwargs, &["depth"], "_getframemodulename")?;
+            if positional.len() > 1 {
+                return Err(crate::PyError::type_error(format!(
+                    "_getframemodulename() takes at most 1 argument ({} given)",
+                    positional.len()
+                )));
+            }
+            let depth = match positional
+                .first()
+                .copied()
+                .or(crate::builtins::kwarg_get(kwargs, "depth"))
+            {
+                Some(v) => crate::baseobjspace::int_w(crate::baseobjspace::space_index(v)?)?,
+                None => 0,
+            };
+            if depth < 0 {
+                return Ok(pyre_object::w_none());
+            }
+            let ec = current_execution_context();
+            if ec.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let mut current = unsafe { (*ec).gettopframe_nohidden() };
+            let mut remaining = depth;
+            while !current.is_null() && remaining > 0 {
+                current = crate::executioncontext::ExecutionContext::getnextframe_nohidden(current);
+                remaining -= 1;
+            }
+            if current.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let w_globals = unsafe { (*current).w_globals };
+            if w_globals.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            match crate::baseobjspace::finditem_str(w_globals, "__name__")? {
+                Some(name) if !name.is_null() => Ok(name),
+                _ => Ok(pyre_object::w_none()),
+            }
+        }),
+    );
     // sys.exc_info() → (type, value, traceback)
     //
     // Tuple construction is shared with `exc_info_direct` (the JIT fast-path
@@ -1986,28 +2044,41 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     "getsizeof",
                 )?;
                 let w_obj = scope[0];
-                if let Some(w_type) = crate::typedef::r#type(w_obj) {
-                    if let Some(w_sizeof) = unsafe {
-                        crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__sizeof__")
-                    } {
-                        let w_size = unsafe {
-                            crate::baseobjspace::get_and_call_function(
-                                w_sizeof,
-                                w_obj,
-                                w_type.as_ptr(),
-                                &[],
-                            )
-                        }?;
-                        // getsizeof must yield a non-negative integer: a
-                        // non-int result is rejected like a failed index
-                        // coercion, and a negative one (including a bignum)
-                        // raises ValueError.
-                        if unsafe { !pyre_object::is_int(w_size) } {
-                            return Err(crate::PyError::type_error(format!(
-                                "'{}' object cannot be interpreted as an integer",
-                                crate::type_methods::arg_type_name(w_size)
-                            )));
-                        }
+                let w_default = Some(scope[1]).filter(|d| !d.is_null());
+                // `sys_getsizeof` looks `__sizeof__` up on the type and calls
+                // it.  The `default` covers every TypeError along that route —
+                // a missing slot, an uncallable one, and a result that is not
+                // an integer — but not the negative-result ValueError.
+                // `vm.py:355 getsizeof` instead returns the default
+                // unconditionally ("not implemented on PyPy"); 3.14 reports the
+                // real size, and pyre's types all carry a working
+                // `__sizeof__`.  The GC header CPython adds for tracked
+                // objects has no fixed pyre counterpart, so the reported size
+                // is the object's own.
+                let sized = match unsafe {
+                    crate::baseobjspace::lookup_special(w_obj, "__sizeof__")
+                } {
+                    Ok(Some(method)) => crate::call::call_function_impl_result(method, &[]),
+                    Ok(None) => Err(crate::PyError::type_error(format!(
+                        "Type {} doesn't define __sizeof__",
+                        crate::baseobjspace::object_functionstr_type_name(w_obj)
+                    ))),
+                    Err(e) => Err(e),
+                }
+                .and_then(|w_size| {
+                    // `PyLong_AsSsize_t(res)` — no `__index__` coercion, so a
+                    // non-integer result is the TypeError the default covers.
+                    let is_integer = unsafe {
+                        pyre_object::is_int(w_size) || pyre_object::pyobject::is_long(w_size)
+                    };
+                    if is_integer {
+                        Ok(w_size)
+                    } else {
+                        Err(crate::PyError::type_error("an integer is required"))
+                    }
+                });
+                match (sized, w_default) {
+                    (Ok(w_size), _) => {
                         let negative = crate::baseobjspace::is_true(
                             crate::objspace::descroperation::compare(
                                 w_size,
@@ -2020,14 +2091,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 "__sizeof__() should return >= 0",
                             ));
                         }
-                        return Ok(w_size);
+                        Ok(w_size)
                     }
-                }
-                match Some(scope[1]).filter(|d| !d.is_null()) {
-                    Some(w_default) => Ok(w_default),
-                    None => Err(crate::PyError::type_error(
-                        "getsizeof(object, default) -> int: object size is not tracked; supply a default",
-                    )),
+                    (Err(e), Some(w_default)) if e.kind == crate::PyErrorKind::TypeError => {
+                        Ok(w_default)
+                    }
+                    (Err(e), _) => Err(e),
                 }
             },
         ),
