@@ -160,9 +160,12 @@ pub struct PyCode {
     /// `pycode.py:105 "w_globals?"`).  Module globals are `malloc_typed`-
     /// immortal, but `exec`/custom-globals dicts are `try_gc_alloc` movable.
     /// The code object is Box-immortal, so the collector never reaches this
-    /// slot by tracing into it; `eval::walk_raw_code_roots` forwards it as a
-    /// root (via `walk_raw_function_roots` for `func.code` and the frame walk
-    /// for `frame.pycode`). Null until first stamped by `frame_stores_global`.
+    /// slot by tracing into it; every stamped code object is registered in
+    /// [`W_GLOBALS_STAMPED_CODES`] and forwarded from there on each
+    /// collection. `eval::walk_raw_code_roots` additionally forwards it
+    /// wherever a code object is already reached as a root (via
+    /// `walk_raw_function_roots` for `func.code` and the frame walk for
+    /// `frame.pycode`). Null until first stamped by `frame_stores_global`.
     pub w_globals: PyObjectRef,
     /// PyPy: `PyCode.hidden_applevel` (`pycode.py:111, 147`). Set by
     /// `pycompiler.compile(hidden_applevel=True)` for PyPy gateway/
@@ -1637,6 +1640,7 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
     if !w_globals.is_null() {
         let code_ptr = unsafe { (*(obj as *const PyCode)).code_ptr };
         register_live_code_wrapper(code_ptr, obj);
+        register_w_globals_stamped_code(obj);
     }
 }
 
@@ -1652,6 +1656,7 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
         // Prebuilt-family store (see `w_code_set_w_globals`).
         pyre_object::gc_roots::mark_prebuilt_roots_dirty();
         register_live_code_wrapper(code.code_ptr, obj);
+        register_w_globals_stamped_code(obj);
         return false;
     }
     !std::ptr::eq(code.w_globals, w_globals)
@@ -1942,6 +1947,56 @@ thread_local! {
     /// registry retires when code objects become GC-managed.
     static MAPDICT_METHOD_CACHE_CODES: std::cell::RefCell<std::collections::HashSet<usize>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
+    /// Code objects whose `w_globals` has been stamped
+    /// (`pycode.py:159-165 frame_stores_global`).  `w_globals` is a permanent
+    /// strong field: the first globals object a code object runs in is kept
+    /// for the code object's lifetime and never replaced.  Upstream that
+    /// field is traced through the GC-managed `PyCode`; pyre code objects are
+    /// Box-immortal (`w_code_new` → `Box::into_raw`), so the only paths that
+    /// reach the slot are the opportunistic `walk_raw_code_roots` calls on
+    /// `frame.pycode` and `func.code`.  Those miss any stamped code object
+    /// that is off the frame chain and not held in a walked frame slot at
+    /// collection time, which leaves a pre-move nursery address in
+    /// `w_globals` once its dict is promoted — the next call through that
+    /// code object then forwards a dangling pointer.  This registry makes the
+    /// slot a root of its own, in the same family as
+    /// [`MAPDICT_METHOD_CACHE_CODES`].  Entries are immortal code pointers,
+    /// so they never dangle; the registry retires when code objects become
+    /// GC-managed.
+    static W_GLOBALS_STAMPED_CODES: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Record `obj` as a code object holding a stamped `w_globals` slot.
+fn register_w_globals_stamped_code(obj: PyObjectRef) {
+    W_GLOBALS_STAMPED_CODES.with(|s| {
+        s.borrow_mut().insert(obj as usize);
+    });
+}
+
+pub(crate) fn capture_w_globals_stamped_code_root_area() -> *const () {
+    W_GLOBALS_STAMPED_CODES.with(|codes| codes as *const _ as *const ())
+}
+
+/// Forward the stamped `w_globals` slot of every registered code object.
+///
+/// # Safety
+/// `data` must come from [`capture_w_globals_stamped_code_root_area`], and the
+/// owning thread must be quiesced.
+pub(crate) unsafe fn walk_w_globals_stamped_code_root_area(
+    data: *const (),
+    forward: &mut dyn FnMut(&mut PyObjectRef),
+) {
+    let codes = unsafe {
+        &*(*(data as *const std::cell::RefCell<std::collections::HashSet<usize>>)).as_ptr()
+    };
+    for &code in codes.iter() {
+        let code = unsafe { &mut *(code as *mut PyCode) };
+        if code.w_globals.is_null() {
+            continue;
+        }
+        forward(&mut code.w_globals);
+    }
 }
 
 /// Forward every filled `entry.w_method` slot during collection — the
