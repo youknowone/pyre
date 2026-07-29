@@ -1,5 +1,5 @@
 bridges_compiled=9
-guard_failures=1846
+guard_failures=1804
 internal_compile_panics=0
-loops_aborted=1
-loops_compiled=5
+loops_aborted=0
+loops_compiled=3
