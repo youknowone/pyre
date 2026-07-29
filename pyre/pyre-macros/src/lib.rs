@@ -164,6 +164,13 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             .iter()
             .filter(|&&positional| positional)
             .count();
+        // `Arguments.parse_obj` fills every parameter slot before the body
+        // runs, so a keyword-only parameter widens the received `args` past
+        // the positional count.  The positional bound stays in the message,
+        // but the surplus guard compares against the full slot count — the
+        // same bound `bind_builtin_kwargs` uses — so a keyword-only slot is
+        // not mistaken for a surplus positional.
+        let slot_total = param_positional.len();
         let required = param_required
             .iter()
             .zip(param_positional.iter())
@@ -176,7 +183,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             if args.len() < #required {
                 return ::std::result::Result::Err(crate::PyError::type_error(#too_few));
             }
-            if __pyre_positional_count > #total {
+            if __pyre_positional_count > #slot_total {
                 return ::std::result::Result::Err(crate::PyError::type_error(#too_many));
             }
         }
@@ -1909,7 +1916,13 @@ fn expand_pyre_methods(
                     .zip(param_positional.iter())
                     .filter(|(required, positional)| **required && **positional)
                     .count();
-                let expected_total = receiver_slots + visible_max;
+                // `Arguments.parse_obj` fills every parameter slot before the
+                // body runs, so a keyword-only parameter widens `args` past
+                // the positional count.  The positional bound stays in the
+                // message, but the surplus guard compares against the full
+                // slot count so a keyword-only slot is not mistaken for a
+                // surplus positional.
+                let expected_total = receiver_slots + param_positional.len();
                 let fn_name = mname.to_string();
                 let expected = if visible_required == visible_max {
                     match visible_max {
