@@ -1437,7 +1437,13 @@ fn save_tuple(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
 
     if n <= 3 && ctx.proto >= 2 {
         for i in 0..n {
-            save(ctx, buf, elem(i))?;
+            save(ctx, buf, elem(i)).map_err(|error| {
+                add_serializing_note(
+                    error,
+                    pyre_object::gc_roots::shadow_stack_get(slot),
+                    &format!("item {i}"),
+                )
+            })?;
         }
         // Subtle: saving the elements may have memoized this very tuple
         // (a recursive tuple). If so, discard the elements and GET it.
@@ -1455,7 +1461,13 @@ fn save_tuple(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
 
     buf.push(op::MARK);
     for i in 0..n {
-        save(ctx, buf, elem(i))?;
+        save(ctx, buf, elem(i)).map_err(|error| {
+            add_serializing_note(
+                error,
+                pyre_object::gc_roots::shadow_stack_get(slot),
+                &format!("item {i}"),
+            )
+        })?;
     }
     if let Some(idx) = ctx.memo_get(pyre_object::gc_roots::shadow_stack_get(slot)) {
         // Recursive tuple: throw away the stack contents and GET it.
@@ -2364,8 +2376,28 @@ fn save_reduce(
         )?;
         buf.push(op::NEWOBJ);
     } else {
-        save(ctx, buf, rv_get(0))?;
-        save(ctx, buf, rv_get(1))?;
+        save(ctx, buf, rv_get(0)).map_err(|error| {
+            if let Some(slot) = w_obj_slot {
+                add_serializing_note(
+                    error,
+                    pyre_object::gc_roots::shadow_stack_get(slot),
+                    "reconstructor",
+                )
+            } else {
+                error
+            }
+        })?;
+        save(ctx, buf, rv_get(1)).map_err(|error| {
+            if let Some(slot) = w_obj_slot {
+                add_serializing_note(
+                    error,
+                    pyre_object::gc_roots::shadow_stack_get(slot),
+                    "reconstructor arguments",
+                )
+            } else {
+                error
+            }
+        })?;
         buf.push(op::REDUCE);
     }
 
