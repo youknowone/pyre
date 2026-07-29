@@ -847,6 +847,8 @@ crate::py_module! {
             message: PyObjectRef,
             #[default(pyre_object::PY_NULL)] category: PyObjectRef,
             #[default(1i64)] stacklevel: i64,
+            // `source` is positional-or-keyword; only `skip_file_prefixes`
+            // sits behind the clinic's `*`.
             #[default(pyre_object::PY_NULL)] source: PyObjectRef,
             #[kwonly] #[default(pyre_object::PY_NULL)] skip_file_prefixes: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
@@ -905,7 +907,7 @@ crate::py_module! {
             #[default(pyre_object::PY_NULL)] module: PyObjectRef,
             #[default(pyre_object::PY_NULL)] registry: PyObjectRef,
             #[default(pyre_object::PY_NULL)] module_globals: PyObjectRef,
-            #[kwonly] #[default(pyre_object::PY_NULL)] source: PyObjectRef,
+            #[default(pyre_object::PY_NULL)] source: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
             let source_line = get_source_line(module_globals, lineno)?;
             let _roots = pyre_object::gc_roots::push_roots();
