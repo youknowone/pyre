@@ -2151,15 +2151,26 @@ fn try_adopt_single_frame_blackhole(
         latched.last_exc_value,
         latched.raising_exception,
     );
+    // The blackhole roots and forwards its Ref bank in place. A collection
+    // during the drive can therefore move the live frame away from the
+    // pre-drive `committed_root_addr`; recover the authoritative post-drive
+    // identity from the same per-frame red register before dereferencing it.
+    let forwarded_root_addr = terminal
+        .registers_r
+        .get(frame_reg as usize)
+        .copied()
+        .filter(|&addr| addr != 0)
+        .expect("post-blackhole frame register lost the live frame identity")
+        as usize;
     // Vable opcodes address the frame carried in the MIFrame's red register,
     // i.e. the live frame whose locals were published above. Fold every
     // blackhole write back into the tracing snapshot before the portal
     // epilogue propagates that snapshot. This matters for terminal exceptions:
     // their traceback keeps `tb_frame.f_locals` observable after the walk.
-    if committed_root_addr != cf_addr {
+    if forwarded_root_addr != cf_addr {
         unsafe {
             (*(cf_addr as *mut pyre_interpreter::PyFrame)).restore_resume_state_from(
-                &*(committed_root_addr as *const pyre_interpreter::PyFrame),
+                &*(forwarded_root_addr as *const pyre_interpreter::PyFrame),
             );
         }
     }
