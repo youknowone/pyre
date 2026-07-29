@@ -180,6 +180,14 @@ tempfile = "3"
 walkdir = "2"
 insta = "1"
 
+# `cargo run --release` is the benchmark/developer performance surface too.
+# Give it the same cross-crate optimization used by distributable binaries;
+# codegen-units=1 additionally lets LLVM optimize the interpreter's large
+# dispatch/call graph as one unit instead of preserving parallel-CGU barriers.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
