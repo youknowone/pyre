@@ -1044,6 +1044,9 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         x if x == op::REDUCE => {
             let w_args = pop(slot)?;
             let w_func = pop(slot)?;
+            if !unsafe { pyre_object::is_tuple(w_args) } {
+                return Err(PyError::type_error("argument list must be a tuple"));
+            }
             let args = tuple_items(w_args);
             let w_obj = call_fn(w_func, &args)?;
             push(slot, w_obj);
