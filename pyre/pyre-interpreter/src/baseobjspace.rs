@@ -5397,22 +5397,44 @@ unsafe fn super_getattribute_wtf8(
         }
         let super_type = pyre_object::descriptor::w_super_get_type(obj);
         let bound_obj = pyre_object::descriptor::w_super_get_obj(obj);
-        // descriptor.py:127-149 _super_check: `su_obj` is itself a subtype of
-        // `su_type` only in the classmethod / class-level case.  A class whose
-        // metaclass is `su_type` is an *instance* of `su_type`, not a subtype,
-        // so it must resolve through `type(su_obj)` — otherwise its MRO never
-        // reaches `su_type` and the lookup fails.  The `type()` fallback also
-        // lets non-INSTANCE builtin subclasses (W_BaseException and friends)
-        // resolve their class through the path that powers `type(obj)`
-        // (`pypy/objspace/std/typeobject.py:1083 type_get_mro`).
-        let w_obj_type = if is_type(bound_obj) && issubtype_w(bound_obj, super_type) {
-            bound_obj
-        } else if is_instance(bound_obj) {
+        // descriptor.py:127-149 _super_check.  `type(su_obj)` — read from the
+        // instance `w_class` for a heap instance, otherwise the `space.type`
+        // path that also serves non-INSTANCE builtin subclasses (W_BaseException
+        // and friends, `pypy/objspace/std/typeobject.py:1083 type_get_mro`).
+        let w_raw_type = if is_instance(bound_obj) {
             w_instance_get_type(bound_obj)
         } else if let Some(cls) = crate::typedef::r#type(bound_obj) {
             cls.as_ptr()
         } else {
-            return Err(PyError::type_error("super: bad obj type"));
+            std::ptr::null_mut()
+        };
+        let w_obj_type = if is_type(bound_obj) && issubtype_w(bound_obj, super_type) {
+            // classmethod / class-level case: `su_obj` is itself a subtype of
+            // `su_type`.
+            bound_obj
+        } else if !w_raw_type.is_null() && issubtype_w(w_raw_type, super_type) {
+            // normal case: `isinstance(su_obj, su_type)`.  A class whose
+            // metaclass is `su_type` also lands here — it is an instance of
+            // `su_type`, resolved through `type(su_obj)`.
+            w_raw_type
+        } else {
+            // slow path: `su_obj.__class__` honouring `__getattribute__`, so a
+            // proxy that forwards `__class__` to a wrapped object is still a
+            // valid target when that class is a subtype of `su_type`.  A
+            // missing `__class__` falls back to `type(su_obj)`; any other error
+            // propagates.
+            let w_type = match getattr_str(bound_obj, "__class__") {
+                Ok(w) => w,
+                Err(e) if e.kind == crate::PyErrorKind::AttributeError => w_raw_type,
+                Err(e) => return Err(e),
+            };
+            if !w_type.is_null() && issubtype_w(w_type, super_type) {
+                w_type
+            } else {
+                return Err(PyError::type_error(
+                    "super(type, obj): obj must be an instance or subtype of type",
+                ));
+            }
         };
         let mro_ptr = w_type_get_mro(w_obj_type);
         if mro_ptr.is_null() {
