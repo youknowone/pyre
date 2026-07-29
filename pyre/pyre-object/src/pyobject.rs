@@ -620,6 +620,11 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (149, Some(0)),
     (150, Some(0)),
     (152, Some(0)),
+    // `_thread` lock / RLock / handle, registered at the absolute tail of
+    // `build_gc` for the header `w_class` edge (`all_w_class_only_descriptors`).
+    (153, Some(0)),
+    (154, Some(0)),
+    (155, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every

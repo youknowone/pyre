@@ -482,8 +482,9 @@ pub struct W_IntRangeIterator {
 
 /// Field offsets of inline scalar slots — consumed by JIT field-access
 /// IR (`pyre-jit/src/jit/codewriter.rs` GetfieldGcI / SetfieldGcI).
-/// The macro's auto-generated `W_RANGE_ITER_GC_PTR_OFFSETS` is empty
-/// here (no PyObjectRef fields) and does not depend on these.
+/// The macro's auto-generated `W_RANGE_ITER_GC_PTR_OFFSETS` holds only the
+/// header `w_class` edge here (no PyObjectRef payload field) and does not
+/// depend on these.
 pub const RANGE_ITER_CURRENT_OFFSET: usize = std::mem::offset_of!(W_IntRangeIterator, current);
 pub const RANGE_ITER_REMAINING_OFFSET: usize = std::mem::offset_of!(W_IntRangeIterator, remaining);
 pub const RANGE_ITER_STEP_OFFSET: usize = std::mem::offset_of!(W_IntRangeIterator, step);

@@ -616,7 +616,7 @@ mod lock_class {
         }
     }
 }
-use lock_class::W_Lock;
+pub use lock_class::W_Lock;
 
 mod rlock_class {
     use super::*;
@@ -844,7 +844,7 @@ mod rlock_class {
         }
     }
 }
-use rlock_class::W_RLock;
+pub use rlock_class::W_RLock;
 
 mod handle_class {
     use super::*;
@@ -966,7 +966,7 @@ mod handle_class {
         }
     }
 }
-use handle_class::W_ThreadHandle;
+pub use handle_class::W_ThreadHandle;
 
 impl W_ThreadHandle {
     fn start(&self, ident: i64) -> Result<(), crate::PyError> {

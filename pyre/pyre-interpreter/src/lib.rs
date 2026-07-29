@@ -966,6 +966,40 @@ pub fn all_foreign_pytypes() -> &'static [(
     PYTYPES
 }
 
+/// Managed `#[pyre_class]` types whose only inline GC edge is the header's
+/// `w_class`, in the order `build_gc` must register them.  `allocate_stable`
+/// puts their instances in the old generation, so the marker needs a type id
+/// carrying that offset — otherwise a `class L(_thread.LockType)` instance
+/// leaves its heap type unreachable.  The tail order pins the type ids the
+/// alias census below and `SUBCLASS_RANGE_HIERARCHY` assert.
+pub fn all_w_class_only_descriptors() -> Vec<&'static pyre_object::lltype::PyreClassDescriptor> {
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    vec![
+        <crate::module::thread::W_Lock as PyreClassPyTypeOf>::DESCRIPTOR,
+        <crate::module::thread::W_RLock as PyreClassPyTypeOf>::DESCRIPTOR,
+        <crate::module::thread::W_ThreadHandle as PyreClassPyTypeOf>::DESCRIPTOR,
+    ]
+}
+
+/// The same edge for `#[pyre_class]` types allocated through the immortal
+/// `allocate`: the collector never walks them, so their `w_class` is reached
+/// by the interpreter's immortal-root walker instead of a type id, and they
+/// take no place in the type-id censuses.  Each is behind a target/feature
+/// gate this crate spells exactly.
+pub fn all_immortal_w_class_only_descriptors()
+-> Vec<&'static pyre_object::lltype::PyreClassDescriptor> {
+    #[allow(unused_imports)]
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    vec![
+        #[cfg(all(unix, feature = "host_env"))]
+        <crate::module::select::interp_select::Poll as PyreClassPyTypeOf>::DESCRIPTOR,
+        #[cfg(all(target_os = "macos", feature = "host_env"))]
+        <crate::module::select::interp_kqueue::W_Kqueue as PyreClassPyTypeOf>::DESCRIPTOR,
+        #[cfg(all(target_os = "macos", feature = "host_env"))]
+        <crate::module::select::interp_kevent::W_Kevent as PyreClassPyTypeOf>::DESCRIPTOR,
+    ]
+}
+
 /// Interpreter-owned PyType aliases in the shared GC inheritance census.
 /// `pyre-object::pyobject::all_subclass_range_aliases` supplies the object
 /// layer; `init_typeobjects` passes both slices to the common numbering
@@ -1020,6 +1054,11 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(138, typed::<crate::module::_io::W_BufferedRandom>()),
         subclass_range_alias(139, typed::<crate::module::_io::W_TextIOWrapper>()),
         subclass_range_alias(140, typed::<crate::module::thread::W_Local>()),
+        // `all_w_class_only_descriptors` order, registered at the absolute
+        // tail of `build_gc` after `W_DequeBlock` and `W_BufferWrapper`.
+        subclass_range_alias(153, typed::<crate::module::thread::W_Lock>()),
+        subclass_range_alias(154, typed::<crate::module::thread::W_RLock>()),
+        subclass_range_alias(155, typed::<crate::module::thread::W_ThreadHandle>()),
     ]
 }
 

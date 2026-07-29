@@ -1362,9 +1362,16 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         w_int_tid,
     ));
     debug_assert_eq!(w_bool_tid, W_BOOL_GC_TYPE_ID);
-    let range_iter_tid = gc.register_type(TypeInfo::object_subclass(
+    // The payload is three machine ints; the one traced offset is the
+    // header's `w_class`, which a `class R(range_iterator)` instance points
+    // at a managed heap type.
+    let range_iter_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
         std::mem::size_of::<pyre_object::functional::W_IntRangeIterator>(),
         object_tid,
+        <pyre_object::functional::W_IntRangeIterator
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR
+            .ptr_offsets
+            .to_vec(),
     ));
     debug_assert_eq!(range_iter_tid, RANGE_ITER_GC_TYPE_ID);
     // rlist.py:116 parity: W_ListObject has a single GC pointer
@@ -3266,6 +3273,23 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         <pyre_object::memoryview::W_BufferWrapper
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // The remaining `#[pyre_class]` types carry no inline `PyObjectRef`
+    // payload field, so the only edge the marker has to forward is the
+    // header's `w_class` — which a Python subclass instance
+    // (`class L(_thread.LockType)`) points at a managed heap type.  Appended
+    // last so every automatic type id assigned above stays put.
+    for descriptor in pyre_interpreter::all_w_class_only_descriptors() {
+        register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
+    }
+    // Their immortal counterparts take no type id — the collector never walks
+    // an `allocate`d object — so only the immortal-root walker's offset
+    // registry learns the edge.
+    for descriptor in pyre_interpreter::all_immortal_w_class_only_descriptors() {
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            descriptor.pytype_ptr as usize,
+            descriptor.ptr_offsets,
+        );
+    }
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
     // `PYRE_CLASS_DESCRIPTORS` slice.  A type with inline managed children

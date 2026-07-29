@@ -1256,8 +1256,14 @@ fn expand_pyre_class(
         named.named.insert(0, ob_field);
     }
 
-    // Collect `PyObjectRef` fields' offsets for GC tracing.  Skip `ob`
-    // because the GC walks the header through the parent (object) tid.
+    // Collect `PyObjectRef` fields' offsets for GC tracing.  `ob` is the
+    // `PyObject` header; its `w_class` word is the instance -> class edge
+    // and is listed explicitly.  A `#[pyre_class]` instance created for a
+    // Python subclass carries the (managed) heap type there, and the
+    // collector traces nothing but the offsets registered for the
+    // instance's own type id — a parent tid contributes none — so leaving
+    // it out let the subclass type be swept while instances were live.
+    // `ob_type` stays out: it always points at the `static PyType`.
     let mut ptr_field_idents: Vec<syn::Ident> = Vec::new();
     for f in named.named.iter() {
         let Some(ident) = f.ident.clone() else {
@@ -1270,11 +1276,15 @@ fn expand_pyre_class(
             ptr_field_idents.push(ident);
         }
     }
-    let ptr_offsets_len = ptr_field_idents.len();
-    let ptr_offsets_inits: Vec<proc_macro2::TokenStream> = ptr_field_idents
-        .iter()
-        .map(|i| quote! { ::std::mem::offset_of!(#st_name, #i) })
-        .collect();
+    let ptr_offsets_len = ptr_field_idents.len() + 1;
+    let ptr_offsets_inits: Vec<proc_macro2::TokenStream> =
+        std::iter::once(quote! { ::std::mem::offset_of!(#st_name, ob.w_class) })
+            .chain(
+                ptr_field_idents
+                    .iter()
+                    .map(|i| quote! { ::std::mem::offset_of!(#st_name, #i) }),
+            )
+            .collect();
 
     Ok(quote! {
         #st
