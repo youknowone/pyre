@@ -2464,6 +2464,12 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         LowLevelType::Void,
     ),
     (
+        &["core", "slice", "<Impl>", "as_ptr"],
+        &["self"],
+        LowLevelType::Address,
+    ),
+    (&["vec", "Vec", "as_ptr"], &["self"], LowLevelType::Address),
+    (
         &["cell", "Cell", "set"],
         &["self", "val"],
         LowLevelType::Void,
