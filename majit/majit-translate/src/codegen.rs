@@ -174,6 +174,7 @@ mod tests {
             jitcodes_by_path: indexmap::IndexMap::new(),
             insns: indexmap::IndexMap::new(),
             descrs: Vec::new(),
+            ei_descr_mints: Vec::new(),
             all_liveness: Vec::new(),
             total_blocks: 0,
             total_ops: 0,
