@@ -267,6 +267,13 @@ impl<'a> RegAlloc<'a> {
     /// aarch64 `int_is_true` / `int_is_zero`: shares the 3-op `prepare_unary`
     /// shape from regalloc.py:456 since `cmp Xn, #0 ; cset Wd, ne` keeps
     /// the input register live while writing a fresh destination.
+    ///
+    /// When the next op consumes the flags, `regalloc.py:469
+    /// prepare_comp_unary` allocates no destination at all and
+    /// `opassembler.py:210 emit_comp_op_int_is_true` emits the `cmp` alone,
+    /// returning the condition.  `force_allocate_reg_or_cc` spells that as
+    /// the frame-register sentinel, which the `IntIsTrue` / `IntIsZero` emit
+    /// arms recognise through `flush_cc`.
     pub(crate) fn consider_int_is_true_j2(
         &mut self,
         dst: OpRef,
@@ -274,7 +281,15 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        self.consider_unary_int_j2(dst, arg, i, output);
+        assert!(
+            !arg.is_constant(),
+            "prepare_comp_unary expects a non-const arg; got constant OpRef {arg:?} (should have been folded earlier)"
+        );
+        let arg_loc = self.make_sure_var_in_reg(arg, Type::Int, &[], None, false);
+        self.possibly_free_var(arg, Type::Int);
+        let ops_ref: &[majit_ir::Op] = self.operations;
+        let res = self.force_allocate_reg_or_cc(dst, ops_ref, i);
+        self.perform(i, vec![arg_loc], Some(res), output);
     }
 
     /// aarch64/regalloc.py:397 `prepare_op_uint_mul_high = prepare_op_int_mul`.

@@ -2333,24 +2333,19 @@ impl<'a> AssemblerARM64<'a> {
                 if arglocs.len() >= 2 {
                     self.emit_cmp_loc_loc(&arglocs[0], &arglocs[1]);
                 }
-                if let Some(Loc::Reg(r)) = result_loc {
-                    let cc = Self::opcode_to_cc(op.opcode);
-                    self.emit_setcc(cc, r.value);
-                    self.pending_cmp_cc = Some((*r, cc));
-                }
+                let cc = Self::opcode_to_cc(op.opcode);
+                self.flush_cc(cc, result_loc);
             }
             OpCode::IntIsTrue => {
-                if let (Some(src), Some(Loc::Reg(r))) = (arglocs.first(), result_loc) {
+                if let Some(src) = arglocs.first() {
                     self.emit_test_loc(src);
-                    self.emit_setcc(CC_NE, r.value);
-                    self.pending_cmp_cc = Some((*r, CC_NE));
+                    self.flush_cc(CC_NE, result_loc);
                 }
             }
             OpCode::IntIsZero => {
-                if let (Some(src), Some(Loc::Reg(r))) = (arglocs.first(), result_loc) {
+                if let Some(src) = arglocs.first() {
                     self.emit_test_loc(src);
-                    self.emit_setcc(CC_E, r.value);
-                    self.pending_cmp_cc = Some((*r, CC_E));
+                    self.flush_cc(CC_E, result_loc);
                 }
             }
             OpCode::UintMulHigh => {
@@ -3449,26 +3444,18 @@ impl<'a> AssemblerARM64<'a> {
             OpCode::GuardTrue | OpCode::VecGuardTrue | OpCode::GuardNonnull => {
                 // arglocs[0] = condition location
                 if let Some(loc) = arglocs.first() {
-                    match self.take_pending_cmp_cc(loc) {
-                        Some(cc) => self.guard_success_cc = Some(cc),
-                        None => {
-                            self.emit_test_loc(loc);
-                            self.guard_success_cc = Some(CC_NE);
-                        }
-                    }
+                    self.load_condition_into_cc(loc);
                 }
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
+            // `assembler.py:1777 genop_guard_guard_false` inverts the
+            // published cc, then implements: a folded IntLt that published
+            // CC_L becomes a CC_L failure jump here.
             OpCode::GuardFalse | OpCode::VecGuardFalse | OpCode::GuardIsnull => {
                 if let Some(loc) = arglocs.first() {
-                    match self.take_pending_cmp_cc(loc) {
-                        Some(cc) => self.guard_success_cc = Some(invert_cc(cc)),
-                        None => {
-                            self.emit_test_loc(loc);
-                            self.guard_success_cc = Some(CC_E);
-                        }
-                    }
+                    self.load_condition_into_cc(loc);
                 }
+                self.guard_success_cc = self.guard_success_cc.map(invert_cc);
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
             OpCode::GuardValue => {
@@ -3562,6 +3549,10 @@ impl<'a> AssemblerARM64<'a> {
                 self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
             }
         }
+        // Every arm emits its own flag-setting code, so a comparison record
+        // that `load_condition_into_cc` did not consume cannot describe the
+        // live NZCV any more.
+        self.pending_cmp_cc = None;
     }
 
     /// Helper: guard class comparison
@@ -3835,7 +3826,29 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    /// Guard with faillocs — emit conditional jump and store faillocs on descr.
+    /// `x86/regalloc.py:265 force_allocate_reg_or_cc` hands a comparison the
+    /// frame register as its result when the next op consumes the flags
+    /// directly (`RegAlloc::force_allocate_reg_or_cc`).  That is a sentinel,
+    /// not a real destination — `cset x29, cc` would destroy the frame
+    /// pointer — so publish the condition for the following guard and emit
+    /// nothing.  Otherwise materialize the boolean and remember the pair so
+    /// an adjacent guard can still branch on the live flags.
+    fn flush_cc(&mut self, cond: u8, result_loc: Option<&Loc>) {
+        let frame_reg_value = crate::aarch64::regalloc::frame_reg().value;
+        if let Some(Loc::Reg(r)) = result_loc {
+            if r.value == frame_reg_value {
+                debug_assert!(
+                    self.guard_success_cc.is_none(),
+                    "flush_cc: guard_success_cc already set",
+                );
+                self.guard_success_cc = Some(cond);
+                return;
+            }
+            self.emit_setcc(cond, r.value);
+            self.pending_cmp_cc = Some((*r, cond));
+        }
+    }
+
     /// The comparison NZCV flags are still live iff the immediately
     /// preceding `RegAllocOp` was a comparison writing exactly `loc` — the
     /// `operations[i + 1]` adjacency `assembler.py:1186 _walk_operations`
@@ -3851,6 +3864,25 @@ impl<'a> AssemblerARM64<'a> {
         (cmp_reg.value == guard_reg.value && cmp_reg.is_xmm == guard_reg.is_xmm).then_some(cc)
     }
 
+    /// `x86/regalloc.py:429 load_condition_into_cc` on the emit side. The
+    /// comparison either published its condition through the frame-register
+    /// sentinel (`flush_cc`) or materialized a boolean; in the second case
+    /// an ADJACENT comparison still left its flags live, so branch on those.
+    /// Only when neither holds is the operand an unrelated boolean that has
+    /// to be re-tested.
+    fn load_condition_into_cc(&mut self, loc: &Loc) {
+        if self.guard_success_cc.is_some() {
+            return;
+        }
+        if let Some(cc) = self.take_pending_cmp_cc(loc) {
+            self.guard_success_cc = Some(cc);
+            return;
+        }
+        self.emit_test_loc(loc);
+        self.guard_success_cc = Some(CC_NE);
+    }
+
+    /// Guard with faillocs — emit conditional jump and store faillocs on descr.
     fn implement_guard_with_faillocs(
         &mut self,
         op: &Op,
@@ -6938,12 +6970,21 @@ impl<'a> AssemblerARM64<'a> {
     /// False)` parity, inlined like the WB slowpath.
     fn genop_discard_cond_call(&mut self, op: &Op, arglocs: &[Loc]) {
         let _ = op;
-        // Test the condition in a scratch register (ip0/x16), not an
-        // allocatable register, so the test never clobbers a live value
-        // before it is saved.
-        self.emit_load_loc_to_ip0(arglocs[0]);
         let skip_label = self.mc.new_dynamic_label();
-        dynasm!(self.mc ; .arch aarch64 ; cbz x16, =>skip_label);
+        // `opassembler.py:864 _emit_op_cond_call` skips the CMP when
+        // `arglocs[0] is None` — the condition is already in the flags.
+        // Here that case is signalled by `guard_success_cc`, published by
+        // `flush_cc` when the regalloc handed the comparison the
+        // frame-register sentinel.
+        if let Some(cc) = self.guard_success_cc.take() {
+            self.emit_jcc_to_label(invert_cc(cc), skip_label);
+        } else {
+            // Test the condition in a scratch register (ip0/x16), not an
+            // allocatable register, so the test never clobbers a live value
+            // before it is saved.
+            self.emit_load_loc_to_ip0(arglocs[0]);
+            dynasm!(self.mc ; .arch aarch64 ; cbz x16, =>skip_label);
+        }
 
         self.emit_push_all_volatile_regs();
         self.emit_call_from_arglocs(arglocs, 1);

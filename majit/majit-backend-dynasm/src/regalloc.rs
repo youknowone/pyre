@@ -3603,7 +3603,6 @@ impl<'a> RegAlloc<'a> {
     /// - `CondCallN` via `guard_success_cc` (see
     ///   `genop_discard_cond_call`, mirrors `x86/assembler.py:2526
     ///   cond_call`).
-    #[cfg(target_arch = "x86_64")]
     fn next_op_can_accept_cc(&self, ops: &[Op], i: usize, result: OpRef) -> bool {
         if i + 1 >= ops.len() {
             return false;
@@ -3666,19 +3665,15 @@ impl<'a> RegAlloc<'a> {
     /// following guard. Otherwise force-allocate a general-purpose
     /// register (with `need_lower_byte` so `SETcc r8b` is encodable).
     ///
-    /// The CC-sentinel path is x86-only: the aarch64 CompOp emit at
-    /// `aarch64/assembler.rs` unconditionally emits `setcc result_loc`
-    /// and has no `flush_cc` equivalent, so receiving `frame_reg` as
-    /// the result there would clobber x29 (the frame pointer). On
-    /// non-x86 architectures, fall through to a plain force-allocate.
+    /// Both backends recognise the sentinel: `x86/assembler.rs flush_cc`
+    /// and `aarch64/assembler.rs flush_cc` publish `guard_success_cc` and
+    /// emit nothing when `result_loc` is the frame register, so neither
+    /// clobbers rbp / x29.
     pub(crate) fn force_allocate_reg_or_cc(&mut self, result: OpRef, ops: &[Op], i: usize) -> Loc {
-        #[cfg(target_arch = "x86_64")]
         if self.next_op_can_accept_cc(ops, i, result) {
             self.rm.force_allocate_frame_reg(result);
             return Loc::Reg(arch_regalloc::frame_reg());
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = (ops, i);
         Loc::Reg(self.force_allocate_reg(result, Type::Int, &[], None, true))
     }
 
