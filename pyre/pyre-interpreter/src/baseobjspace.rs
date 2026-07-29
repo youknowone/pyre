@@ -3803,17 +3803,20 @@ unsafe fn setitem_bytearray_slice(
             ),
         ));
     }
-    // Index walk rather than `.iter().enumerate()` / `slice::get_mut`, both of
-    // which are unregistered foreign leaves that stop this graph;
-    // `bytearrayobject.py setitem__Bytearray_ANY_ANY`'s extended arm is the
-    // same plain `range` loop.
+    // `bytearrayobject.py setitem__Bytearray_ANY_ANY`: the extended arm is a
+    // plain `for i in range(slicelength)` walk.  Spell it as a scalar while
+    // loop for the translator and avoid computing the unused successor after
+    // the final write: a normalized Python slice step may be `i64::MAX`.
+    let mut i = start;
     let mut k = 0usize;
-    while k < indices.len() {
-        let idx = indices[k];
-        if idx < vec.len() {
-            vec[idx] = sequence2[k];
+    while k < sequence2.len() {
+        if i >= 0 && (i as usize) < vec.len() {
+            vec[i as usize] = sequence2[k];
         }
         k += 1;
+        if k < sequence2.len() {
+            i += step;
+        }
     }
     Ok(w_none())
 }
