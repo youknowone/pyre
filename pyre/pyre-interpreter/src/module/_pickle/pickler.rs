@@ -1011,9 +1011,15 @@ fn save_global_or_reduce(
     buf: &mut Framer,
     w_obj: PyObjectRef,
 ) -> Result<(), PyError> {
-    // CPython 3.14 pickle.py save_type: the three singleton types have no
-    // importable builtins global, so encode them as type(singleton).
-    if unsafe { pyre_object::typeobject::is_type(w_obj) } {
+    // CPython 3.14 pickle.py dispatch[type] = save_type: only a class whose
+    // exact metaclass is `type` takes this built-in dispatch entry. A class
+    // with a custom metaclass must consult dispatch_table first.
+    let is_class = unsafe { pyre_object::typeobject::is_type(w_obj) };
+    let has_exact_type_metaclass = is_class
+        && crate::typedef::r#type(w_obj).is_some_and(|metaclass| {
+            crate::baseobjspace::is_w(metaclass.as_ptr(), crate::typedef::w_type())
+        });
+    if has_exact_type_metaclass {
         return save_type(ctx, buf, w_obj);
     }
     // Functions are saved by reference.
@@ -1025,6 +1031,12 @@ fn save_global_or_reduce(
     // precedence over `__reduce_ex__`.
     if let Some(w_rv) = dispatch_table_reduce(ctx, w_obj)? {
         return save_reduce_value(ctx, buf, w_obj, w_rv);
+    }
+
+    // pickle.py: a class with a custom metaclass and no registered reducer is
+    // still a global, but only after the metaclass dispatch-table lookup.
+    if is_class {
+        return save_global(ctx, buf, w_obj, None);
     }
 
     // Everything else goes through the reduce protocol.
