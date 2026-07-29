@@ -183,6 +183,15 @@ const CC_LE: u8 = 12; // signed <=
 const CC_G: u8 = 13; // signed >
 
 /// Invert a condition code.
+/// Forward reach of `b.cond`: a signed 19-bit displacement in 4-byte words.
+const BCOND_FORWARD_RANGE: usize = 1 << 20;
+
+/// Ceiling assumed for one operation's machine code when deciding whether a
+/// trace can use single-instruction guard branches.  The largest emitters are
+/// `Label`/`Jump` (one store per live register, ~120 bytes) and calls with a
+/// full argument list; 1KB leaves roughly an 8x margin.
+const MAX_BYTES_PER_OP: usize = 1024;
+
 fn invert_cc(cc: u8) -> u8 {
     match cc {
         CC_O => CC_NO,
@@ -290,6 +299,18 @@ pub struct AssemblerARM64<'a> {
     /// Cleared by every non-guard `RegAllocOp`, so only an ADJACENT pair
     /// folds — the same `operations[i + 1]` window upstream uses.
     pending_cmp_cc: Option<(RegLoc, u8)>,
+
+    /// Whether guards must use the two-instruction long-branch form.
+    /// `b.cond` carries a signed 19-bit word displacement, so it reaches
+    /// +1MB; the failure-recovery stubs are written straight after the body,
+    /// so a guard reaches its stub whenever the trace's own code fits inside
+    /// that window.  Only a trace too large for that has to pay the extra
+    /// inversion and `b`.  Decided once per trace in `_assemble`.
+    long_guard_branch: bool,
+
+    /// Offset of the current trace's first emitted byte, for the
+    /// `long_guard_branch` range check.
+    trace_start_offset: usize,
     /// x86/assembler.py:93 target_tokens_currently_compiling parity.
     /// Keyed by descriptor pointer identity (PyPy uses Python `is`).
     target_tokens_currently_compiling: IndexMap<usize, DynamicLabel>,
@@ -487,6 +508,8 @@ impl<'a> AssemblerARM64<'a> {
             next_slot: 0,
             guard_success_cc: None,
             pending_cmp_cc: None,
+            long_guard_branch: false,
+            trace_start_offset: 0,
             target_tokens_currently_compiling: IndexMap::new(),
             compiled_target_tokens: Vec::new(),
             vtable_offset,
@@ -1996,6 +2019,9 @@ impl<'a> AssemblerARM64<'a> {
     fn _assemble(&mut self, emit_prologue: bool) -> Result<(), BackendError> {
         let inputargs: &'a [InputArg] = self.inputargs;
         let ops: &'a [Op] = self.operations;
+        self.trace_start_offset = self.mc.offset().0;
+        self.long_guard_branch =
+            ops.len().saturating_mul(MAX_BYTES_PER_OP) >= BCOND_FORWARD_RANGE;
         if emit_prologue {
             self._call_header(inputargs);
         } else {
@@ -2180,6 +2206,22 @@ impl<'a> AssemblerARM64<'a> {
                 fail_index
             );
         }
+
+        // The `MAX_BYTES_PER_OP` estimate that let this trace use
+        // single-instruction guard branches has to have held: every guard's
+        // stub is written after this point, so the body plus the stubs must
+        // stay inside `b.cond`'s forward reach.  One stub is a handful of
+        // instructions per guard, so charge 64 bytes each.
+        debug_assert!(
+            self.long_guard_branch
+                || (self.mc.offset().0 - self.trace_start_offset)
+                    + self.pending_guard_tokens.len() * 64
+                    < BCOND_FORWARD_RANGE,
+            "trace emitted {} bytes with {} guards but used single-instruction \
+             guard branches; MAX_BYTES_PER_OP is too small",
+            self.mc.offset().0 - self.trace_start_offset,
+            self.pending_guard_tokens.len(),
+        );
 
         // assembler.py:1167-1171 `_assemble`: grow the frame to fit a
         // cross-loop JUMP target.  The closing `br` jumps into the target
@@ -4585,13 +4627,36 @@ impl<'a> AssemblerARM64<'a> {
         fail_label
     }
 
-    /// Emit a conditional branch to `label` using the long-branch pattern:
-    /// `b.<inv_cc> skip; b =>label; skip:` so that the displacement of the
-    /// unconditional `b` is 26-bit / ±128MB instead of the 19-bit / ±1MB
-    /// of `b.cond`. The extra inversion+skip adds one instruction per
-    /// guard, but avoids `ImpossibleRelocation` on large traces (logo's
-    /// 70000-op trace generates >1MB of machine code).
+    /// Emit a conditional branch to `label`.
+    ///
+    /// `opassembler.py:857 _emit_op_cond_call` and the guard emitters reserve
+    /// one instruction and patch it with `B_ofs_cond`, which is what the
+    /// steady-state loop should contain.  A trace whose code exceeds
+    /// `b.cond`'s +1MB reach cannot do that, and falls back to
+    /// `b.<inv_cc> skip; b =>label; skip:` — the unconditional `b` carries a
+    /// 26-bit displacement (±128MB) at the cost of one extra instruction per
+    /// guard.  logo's 70000-op trace needs it.
     fn emit_bcond_to_label(&mut self, cc: u8, label: DynamicLabel) {
+        if !self.long_guard_branch {
+            match cc {
+                CC_L => dynasm!(self.mc ; .arch aarch64 ; b.lt =>label),
+                CC_LE => dynasm!(self.mc ; .arch aarch64 ; b.le =>label),
+                CC_G => dynasm!(self.mc ; .arch aarch64 ; b.gt =>label),
+                CC_GE => dynasm!(self.mc ; .arch aarch64 ; b.ge =>label),
+                CC_E => dynasm!(self.mc ; .arch aarch64 ; b.eq =>label),
+                CC_NE => dynasm!(self.mc ; .arch aarch64 ; b.ne =>label),
+                CC_B => dynasm!(self.mc ; .arch aarch64 ; b.lo =>label),
+                CC_BE => dynasm!(self.mc ; .arch aarch64 ; b.ls =>label),
+                CC_A => dynasm!(self.mc ; .arch aarch64 ; b.hi =>label),
+                CC_AE => dynasm!(self.mc ; .arch aarch64 ; b.hs =>label),
+                CC_O => dynasm!(self.mc ; .arch aarch64 ; b.vs =>label),
+                CC_NO => dynasm!(self.mc ; .arch aarch64 ; b.vc =>label),
+                CC_S => dynasm!(self.mc ; .arch aarch64 ; b.mi =>label),
+                CC_NS => dynasm!(self.mc ; .arch aarch64 ; b.pl =>label),
+                _ => dynasm!(self.mc ; .arch aarch64 ; b.eq =>label),
+            }
+            return;
+        }
         let skip = self.mc.new_dynamic_label();
         // Invert: branch over the unconditional `b` when the guard succeeds
         match cc {
