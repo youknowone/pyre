@@ -536,6 +536,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_functools);
     pyre_install_module!("_thread"(thread));
     pyre_install_module!(itertools);
+    pyre_install_module!(_immutables_map);
     pyre_install_module!(_contextvars);
     pyre_install_module!(_codecs);
     // moduledef.py: `applevel_name = os.name` installs the one posix module

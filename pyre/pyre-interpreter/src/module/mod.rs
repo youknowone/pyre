@@ -29,6 +29,8 @@ pub mod _functools;
 pub mod _hashlib;
 pub mod _io;
 #[allow(non_snake_case)]
+pub mod _immutables_map;
+#[allow(non_snake_case)]
 pub mod _locale;
 #[allow(non_snake_case)]
 #[cfg(not(feature = "sandbox"))]
