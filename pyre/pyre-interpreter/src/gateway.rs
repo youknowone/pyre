@@ -1194,6 +1194,20 @@ pub fn make_module_builtin_function(name: &'static str, func: BuiltinCodeFn) -> 
     crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// `make_module_builtin_function` carrying PyPy `BuiltinCode.docstring`.
+///
+/// PyPy's gateway derives this from the wrapped interpreter function's
+/// `__doc__`; Rust functions have no runtime doc attribute, so line-by-line
+/// ports pass the upstream literal at registration.
+pub fn make_module_builtin_function_with_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    docstring: &'static str,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_doc(name, func, Some(docstring));
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
 /// `make_module_builtin_function` with known fixed arity for fast-path dispatch.
 pub fn make_module_builtin_function_with_arity(
     name: &'static str,

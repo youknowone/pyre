@@ -3,7 +3,7 @@ use pyre_object::rbigint::RBigInt as BigInt;
 
 use crate::{
     make_builtin_function, make_builtin_function_with_arity, make_module_builtin_function,
-    make_module_builtin_function_with_arity,
+    make_module_builtin_function_with_arity, make_module_builtin_function_with_doc,
 };
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
@@ -2197,10 +2197,30 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         )
     });
     crate::module_ns_get_or_insert_with(ns, "min", || {
-        make_module_builtin_function("min", builtin_min)
+        make_module_builtin_function_with_doc(
+            "min",
+            builtin_min,
+            "min(iterable, *[, default=obj, key=func]) -> value\n\
+             min(arg1, arg2, *args, *[, key=func]) -> value\n\
+             \n\
+             With a single iterable argument, return its smallest item. The\n\
+             default keyword-only argument specifies an object to return if\n\
+             the provided iterable is empty.\n\
+             With two or more positional arguments, return the smallest argument.",
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "max", || {
-        make_module_builtin_function("max", builtin_max)
+        make_module_builtin_function_with_doc(
+            "max",
+            builtin_max,
+            "max(iterable, *[, default=obj, key=func]) -> value\n\
+             max(arg1, arg2, *args, *[, key=func]) -> value\n\
+             \n\
+             With a single iterable argument, return its biggest item. The\n\
+             default keyword-only argument specifies an object to return if\n\
+             the provided iterable is empty.\n\
+             With two or more positional arguments, return the largest argument.",
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "type", || crate::typedef::w_type());
     crate::module_ns_get_or_insert_with(ns, "isinstance", || {
