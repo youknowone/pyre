@@ -1119,6 +1119,16 @@ pub struct MetaInterp<M: Clone> {
     /// `live_arg_boxes += virtualizable_boxes` (pyjitpl.py:2982-2989). `None`
     /// outside single-pass or when the state has no virtualizable array.
     pub(crate) single_pass_virt_array_values: Option<Vec<i64>>,
+    /// `pyjitpl.py:2949 run_blackhole_interp_to_cancel_tracing` input, staged
+    /// across the two borrows it needs.  The Abort arm of `merge_point` holds
+    /// the aborting framestack and the live sym but no native `state`; the
+    /// conversion needs `JitState::state_field_layout` to place the sym's
+    /// state-field values into the identity registers the blackhole's
+    /// `state_field` handlers read.  The arm therefore stages both halves here
+    /// and the `jit_merge_point!` hook — which does have `state` — runs
+    /// `blackhole.py:1799 convert_and_run_from_pyjitpl` off the stash.  `None`
+    /// unless a walk aborted with the conversion enabled.
+    pub(crate) pending_abort_blackhole: Option<crate::PendingAbortBlackhole>,
     /// Single-pass tracing: concrete values for a direct TargetToken LABEL
     /// entry, in that LABEL's compact argument order.  RPython's backend records
     /// `TargetToken._x86_arglocs` in `regalloc.py:consider_label` and
@@ -2548,6 +2558,7 @@ impl<M: Clone> MetaInterp<M> {
             single_pass_finish: false,
             single_pass_scalar_values: None,
             single_pass_virt_array_values: None,
+            pending_abort_blackhole: None,
             single_pass_compact_label_values: None,
             single_pass_full_live_values: None,
             single_pass_compiled_key: None,

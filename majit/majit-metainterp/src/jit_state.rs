@@ -398,6 +398,15 @@ pub trait JitState: Sized {
         Vec::new()
     }
 
+    /// Ref-bank sibling of [`collect_scalar_state_field_values`], in ref-scalar
+    /// state-field index order (idx `0..num_ref_scalars`). Raw pointer bits, the
+    /// encoding `registers_r` holds. Read off the same still-live sym, for the
+    /// same reason: the walk keeps ref state fields on the sym and native
+    /// `state` is frozen at trace-start.
+    fn collect_ref_scalar_state_field_values(_sym: &Self::Sym) -> Vec<i64> {
+        Vec::new()
+    }
+
     /// Whole-circuit single-pass: write the walk's scalar state-field concrete
     /// values (captured at close time by `collect_scalar_state_field_values`)
     /// into native state. `values[idx]` is the scalar at state-field index

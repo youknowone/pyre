@@ -1222,6 +1222,17 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! { args.push(sym.#fname); }
         })
         .collect();
+    // Ref-bank mirror of `collect_scalar_values_parts`: the concrete pointer
+    // bits the walk carries for each ref state field, in ref-scalar index
+    // order. Consumed by the tracing-abort blackhole conversion, which seeds
+    // `registers_r[ref_scalar_slot(j)]` before running the aborted framestack.
+    let collect_ref_scalar_values_parts: Vec<TokenStream> = ref_scalars
+        .iter()
+        .map(|(_, f)| {
+            let value_name = quote::format_ident!("{}_value", f.name);
+            quote! { values.push(sym.#value_name); }
+        })
+        .collect();
     // Canonical ref-bank identity slots: ref scalar `j` lives at
     // `ref_regs[ref_identity_base + j]` so the guard-time snapshot's
     // live_r decode (`get_list_of_active_boxes`) and the blackhole's
@@ -2829,6 +2840,12 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 let mut values = Vec::new();
                 #(#collect_scalar_values_parts)*
                 #(#collect_float_scalar_values_parts)*
+                values
+            }
+
+            fn collect_ref_scalar_state_field_values(sym: &Self::Sym) -> Vec<i64> {
+                let mut values = Vec::new();
+                #(#collect_ref_scalar_values_parts)*
                 values
             }
 

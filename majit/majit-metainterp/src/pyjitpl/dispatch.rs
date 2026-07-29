@@ -2199,6 +2199,9 @@ where
                             message
                         );
                     }
+                    // The unwind left `code_cursor` inside the panicking
+                    // instruction, so the frames name no resumable position.
+                    ctx.abort_after_panic = true;
                     sym.abort_portal_op();
                     return TraceAction::Abort;
                 }
@@ -2230,23 +2233,25 @@ where
             //   self.blackhole_if_trace_too_long()
             //
             // RPython answers the overflow with `SwitchToBlackhole(
-            // ABORT_TOO_LONG)`, and its handler (pyjitpl.py:2949
-            // `run_blackhole_interp_to_cancel_tracing` → blackhole.py:1799
-            // `convert_and_run_from_pyjitpl`) finishes the *current* jitcode
-            // frame in the blackhole before control returns to the
-            // interpreter.  Pyre has no such consumer: the abort hands a
-            // source-level pc back to the merge-point hook
-            // (jitdriver.rs `TraceAction::Abort` → `single_pass_outcome`),
-            // taken from the walk's root frame i0 — which dispatch advances
-            // *before* running the opcode arm.  Returning here mid-opcode
-            // would therefore resume the interpreter past an opcode whose
-            // side effects only partly ran: aheui's `pi.jinseo` lost the
-            // `size += 1` half of a push whose `head = node` had already run,
-            // leaving a list whose chain is one node longer than its size.
-            // Defer to the next merge point instead — the walk is between
-            // opcodes there, so i0 names a resume position with nothing half
-            // applied.  The extra ops land in a trace that is discarded
-            // anyway, and the runaway backstops above still bound the work.
+            // ABORT_TOO_LONG)` right here, mid-opcode, because its handler
+            // (pyjitpl.py:2949 `run_blackhole_interp_to_cancel_tracing` →
+            // blackhole.py:1799 `convert_and_run_from_pyjitpl`) finishes the
+            // *current* jitcode frame in the blackhole before control returns
+            // to the interpreter.  `JitDriver::run_pending_abort_blackhole` is
+            // that consumer, but it declines for state shapes it cannot seed
+            // and `MAJIT_ABORT_BLACKHOLE=0` turns it off entirely; the abort
+            // then falls back to a source-level pc taken from the walk's root
+            // frame i0, which dispatch advances *before* running the opcode
+            // arm.  Returning mid-opcode on that fallback resumes the
+            // interpreter past an opcode whose side effects only partly ran:
+            // aheui's `pi.jinseo` lost the `size += 1` half of a push whose
+            // `head = node` had already run, leaving a list whose chain is one
+            // node longer than its size.  Deferring to the next merge point
+            // keeps the fallback sound — the walk is between opcodes there, so
+            // i0 names a resume position with nothing half applied — and costs
+            // the conversion nothing when it does run.  The extra ops land in a
+            // trace that is discarded anyway, and the runaway backstops above
+            // still bound the work.
             if ctx.is_too_long() && !too_long {
                 too_long = true;
                 ctx.abort_at_next_merge_point = true;
@@ -4426,6 +4431,13 @@ where
                 // check there).
                 if ctx.abort_at_next_merge_point {
                     ctx.abort_at_next_merge_point = false;
+                    // The cursor already stepped past the opcode byte, so it
+                    // sits inside this instruction's operands.  Name the
+                    // instruction itself: `blackhole.py:1799
+                    // convert_and_run_from_pyjitpl` resumes each level at
+                    // `frame.pc`, and re-executing the merge point is what
+                    // reports the resume greens (`blackhole.py:1068-1069`).
+                    ctx.abort_resume_jitcode_pc = Some(mp_opcode_pc);
                     return TraceAction::Abort;
                 }
                 let jdindex_byte = frame.next_reg();
@@ -7984,10 +7996,15 @@ where
     // dropped so the jit_merge_point single-pass handoff can resume after the
     // committed prefix instead of replaying it from the trace header.
     //
-    // This is the portal equivalent of blackhole.py:1799
-    // convert_and_run_from_pyjitpl(): resume from the current frame position,
-    // not from the trace-start snapshot.  CloseLoop and Finish already capture
-    // their own positions; only Abort needs this recovery handoff.
+    // i0 alone only names a sound resume position when the walk stopped at a
+    // source-opcode boundary; `pyjitpl.py:2949
+    // run_blackhole_interp_to_cancel_tracing` does not depend on that, because
+    // `blackhole.py:1799 convert_and_run_from_pyjitpl` finishes the current
+    // jitcode frames in the blackhole and takes the resume position from the
+    // `jit_merge_point` they reach.  Hand the whole framestack to the abort
+    // consumer so it can do that; i0 stays as the fallback for a consumer that
+    // declines the conversion.  CloseLoop and Finish already capture their own
+    // positions; only Abort needs this recovery handoff.
     if matches!(action, TraceAction::Abort) && !standalone.frames.is_empty() {
         if let Some(pc) = standalone.frames.frames[0]
             .int_values
@@ -7997,6 +8014,21 @@ where
             .and_then(|pc| usize::try_from(pc).ok())
         {
             ctx.walk_final_pc = Some(pc);
+        }
+        // Every frame below the top already carries its own resume position:
+        // `BC_INLINE_CALL` sets `frame.pc = frame.code_cursor` on the caller
+        // before pushing the callee.  The top frame's is still the last guard's
+        // `orgpc` swap, so publish the position the walk actually stopped at —
+        // `copy_data_from_miframe` (`blackhole.py:1804`) reads `frame.pc` as
+        // each level's `setposition`.  An abort taken between steps leaves the
+        // cursor on an instruction boundary; one taken from inside an opcode
+        // arm names its own boundary through `abort_resume_jitcode_pc`.
+        let resume_jitcode_pc = ctx.abort_resume_jitcode_pc.take();
+        if !std::mem::replace(&mut ctx.abort_after_panic, false) {
+            if let Some(top) = standalone.frames.frames.last_mut() {
+                top.pc = resume_jitcode_pc.unwrap_or(top.code_cursor);
+            }
+            ctx.aborted_framestack = Some(std::mem::take(&mut standalone.frames));
         }
     }
     action

@@ -246,6 +246,28 @@ pub struct MultiFrameBlackholeResult {
     pub terminal: Option<crate::blackhole::BlackholeTerminalImage>,
 }
 
+/// `pyjitpl.py:2949 run_blackhole_interp_to_cancel_tracing` input, captured at
+/// the abort and cashed in one step later.
+///
+/// RPython runs the conversion inline in the abort handler because
+/// `metainterp.framestack` and the interpreter state are both reachable there.
+/// Pyre's abort handler (`merge_point`'s `TraceAction::Abort` arm) sees the
+/// framestack and the live sym but not native `state`, and the blackhole needs
+/// `JitState::state_field_layout` to know which registers the `state_field`
+/// handlers read.  So the arm records both halves here and the
+/// `jit_merge_point!` hook — the first point that holds `state` — runs
+/// [`JitDriver::run_pending_abort_blackhole`].
+pub struct PendingAbortBlackhole {
+    /// The aborting walk's frames, outermost first, each already carrying its
+    /// own resume `pc` (`blackhole.py:1804 _copy_data_from_miframe`).
+    pub framestack: crate::pyjitpl::MIFrameStack,
+    /// `JitState::collect_scalar_state_field_values` — int scalars followed by
+    /// float scalars, read off the sym while it was still live.
+    pub scalar_values: Vec<i64>,
+    /// `JitState::collect_ref_scalar_state_field_values`.
+    pub ref_scalar_values: Vec<i64>,
+}
+
 /// Run a tracing MIFrame chain through the structured multi-frame blackhole
 /// conversion.  Every frame shares the portal-level virtualizable layout, but
 /// retains its own jitcode, register banks, and blackhole interpreter.
@@ -431,6 +453,23 @@ fn failvals_enabled() -> bool {
 fn portal_rca_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("PYRE_PORTAL_RCA").is_some())
+}
+
+/// `MAJIT_ABORT_BLACKHOLE=0` opts out of routing a tracing abort through
+/// `blackhole.py:1799 convert_and_run_from_pyjitpl`, leaving the abort on the
+/// walk's raw source pc.
+///
+/// RPython has no switch here — `pyjitpl.py:2949` always converts — so this is
+/// an escape hatch, not a policy: the conversion re-enters the aborted
+/// framestack in the blackhole, which needs the frontend's whole dispatch
+/// jitcode to be dispatchable there.  A frontend that trips an unwired opcode
+/// can fall back with it while the gap is closed.
+fn abort_blackhole_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| match std::env::var_os("MAJIT_ABORT_BLACKHOLE") {
+        Some(v) => v != "0" && v != "false",
+        None => true,
+    })
 }
 
 fn format_rca_live_values(labels: Option<&[String]>, values: &[Value]) -> String {
@@ -1837,6 +1876,171 @@ impl<S: JitState> JitDriver<S> {
         self.meta.single_pass_outcome.take()
     }
 
+    /// `pyjitpl.py:2949 run_blackhole_interp_to_cancel_tracing` →
+    /// `blackhole.py:1799 convert_and_run_from_pyjitpl`.
+    ///
+    /// A tracing abort can land anywhere in the portal jitcode, including in
+    /// the middle of a source opcode whose remaining effects have not run.  The
+    /// walk's own registers name no source position there, so RPython does not
+    /// read one: it converts `metainterp.framestack` into a blackhole chain,
+    /// runs it forward until the bottommost frame reaches its
+    /// `jit_merge_point`, and resumes the interpreter from the greens that
+    /// merge point reports (`blackhole.py:1068-1069` raises
+    /// `ContinueRunningNormally`, caught by `warmspot.py:961
+    /// handle_jitexception`).  Every opcode the walk left half-executed
+    /// therefore *finishes* instead of being skipped.
+    ///
+    /// Returns the resume pc when the conversion ran and reached a merge point,
+    /// having already written the blackhole's register banks back into `state`.
+    /// `None` leaves the abort on the pre-existing source-pc handoff — the walk
+    /// did not abort, the gate is off, or the state shape has no seed path (see
+    /// below).
+    ///
+    /// **Seeding.** The walk keeps state fields on the sym; the blackhole reads
+    /// them out of the identity registers `StateFieldLayout` names.  The abort
+    /// arm captured the sym's image, and this places it into the root frame's
+    /// banks before the conversion.  Two shapes have no counterpart yet and
+    /// decline: a virtualizable array (`num_vable_identity_slots != 0` — pyre's
+    /// own frame-blackhole path owns that case, `trace.rs`
+    /// `drive_multi_frame_blackhole`) and a flattened fixed `[int]` array
+    /// (`array_lens`), whose per-element slots have no sym collector.
+    pub fn run_pending_abort_blackhole(&mut self, state: &mut S, env: &S::Env) -> Option<usize> {
+        let pending = self.meta.pending_abort_blackhole.take()?;
+        let PendingAbortBlackhole {
+            mut framestack,
+            scalar_values,
+            ref_scalar_values,
+        } = pending;
+        let layout = state.state_field_layout();
+        if layout.num_vable_identity_slots != 0 || !layout.array_lens.is_empty() {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[bh] abort-blackhole declined: unseeded state shape \
+                     (vable_identity={} arrays={})",
+                    layout.num_vable_identity_slots,
+                    layout.array_lens.len(),
+                );
+            }
+            return None;
+        }
+        let Some(root) = framestack.frames.first_mut() else {
+            return None;
+        };
+        // `scalar_values` is `[int scalars.., float scalars..]` — the order
+        // `collect_scalar_state_field_values` builds and
+        // `writeback_scalar_state_fields_from_values` consumes.
+        for (field_idx, value) in scalar_values.iter().take(layout.num_scalars).enumerate() {
+            let slot = layout.scalar_slot(field_idx);
+            if slot < root.int_values.len() {
+                root.int_values[slot] = Some(*value);
+            }
+        }
+        for (field_idx, value) in scalar_values.iter().skip(layout.num_scalars).enumerate() {
+            let slot = layout.float_scalar_slot(field_idx);
+            if slot < root.float_values.len() {
+                root.float_values[slot] = Some(*value);
+            }
+        }
+        for (field_idx, value) in ref_scalar_values.iter().enumerate() {
+            let slot = layout.ref_scalar_slot(field_idx);
+            if slot < root.ref_values.len() {
+                root.ref_values[slot] = Some(*value);
+            }
+        }
+
+        let mut bh_builder = BackEdgeBhBuilder::lease();
+        let staticdata = &self.meta.staticdata;
+        let outcome = drive_multi_frame_blackhole(
+            &mut bh_builder,
+            &mut framestack,
+            layout.clone(),
+            std::ptr::null(),
+            0,
+            0,
+            staticdata,
+            // `stb.raising_exception` is not carried across the abort boundary
+            // yet (see the `merge_point` Abort arm), so the chain starts with
+            // no pending exception.
+            0,
+            false,
+            None,
+            None,
+        );
+        let MultiFrameBlackholeResult { outcome, terminal } = outcome;
+        if crate::majit_log_enabled() {
+            eprintln!("[bh] abort-blackhole: convert_and_run → {:?}", outcome);
+        }
+        // The chain has run: it executed the rest of the half-finished opcodes
+        // against the real heap.  The sym image the Abort arm staged predates
+        // those effects, so applying it would roll `state` back to before them
+        // — but only the terminal image can replace it, so keep it as the
+        // fallback when the run produced none.
+        if terminal.is_some() {
+            self.meta.single_pass_scalar_values = None;
+            self.meta.single_pass_virt_array_values = None;
+        } else if crate::majit_log_enabled() {
+            eprintln!(
+                "[bh] abort-blackhole: no terminal image — state falls back to \
+                 the staged sym scalars"
+            );
+        }
+        // `warmspot.py:961 handle_jitexception` reads the terminal frame's
+        // banks the same way the guard-failure resume does
+        // (`back_edge_structured`'s CRN arm).
+        let writeback = |state: &mut S, resume_pc: usize| {
+            let Some(terminal) = terminal.as_ref() else {
+                return;
+            };
+            let int_base = layout.int_scalar_base.min(terminal.registers_i.len());
+            let ref_base = layout.ref_scalar_base.min(terminal.registers_r.len());
+            let float_base = layout.float_scalar_base.min(terminal.registers_f.len());
+            let meta = S::build_meta(state, resume_pc, env);
+            state.restore_banked3(
+                &meta,
+                &terminal.registers_i[int_base..],
+                &terminal.registers_r[ref_base..],
+                &terminal.registers_f[float_base..],
+            );
+            state.recover_after_compiled_run();
+        };
+        match outcome {
+            // The bottommost frame reached its `jit_merge_point`
+            // (`blackhole.py:1068-1069`): resume the interpreter at the green
+            // pc it reported.  Every `greens` declaration puts `pc` first.
+            crate::jitexc::JitException::ContinueRunningNormally { ref green_int, .. } => {
+                let resume_pc = green_int.first().map(|&pc| pc as usize)?;
+                writeback(state, resume_pc);
+                Some(resume_pc)
+            }
+            // The portal itself returned inside the blackhole
+            // (`blackhole.py:1664 _done_with_this_frame`).  There is no forward
+            // green pc; the native dispatch loop must exit and run its own
+            // post-loop return, which is what `single_pass_finish` tells the
+            // `jit_merge_point!` hook to do — it breaks before reading the pc.
+            crate::jitexc::JitException::DoneWithThisFrameVoid
+            | crate::jitexc::JitException::DoneWithThisFrameInt(_)
+            | crate::jitexc::JitException::DoneWithThisFrameRef(_)
+            | crate::jitexc::JitException::DoneWithThisFrameFloat(_) => {
+                // `usize::MAX` is the same "no forward pc" sentinel the
+                // guard-failure resume uses for this outcome.  It reaches
+                // `build_meta` only as the `header_pc` the `#[jit_interp]`
+                // impl ignores, and the hook breaks before using it as a pc.
+                writeback(state, usize::MAX);
+                self.meta.single_pass_finish = true;
+                Some(usize::MAX)
+            }
+            // `blackhole.py:1679 _exit_frame_with_exception` → the exception
+            // escaped every converted frame.  Hand it to the interpreter's own
+            // machinery; an interpreter with no exception surface returns
+            // `None` and the walk falls back to the source-pc handoff.
+            crate::jitexc::JitException::ExitFrameWithExceptionRef(exc) => {
+                let resume_pc = state.deliver_blackhole_exception(exc)?;
+                writeback(state, resume_pc);
+                Some(resume_pc)
+            }
+        }
+    }
+
     /// Whether the just-published single-pass outcome came from a terminal
     /// dispatch return (`TraceAction::Finish`) rather than a `CloseLoop`
     /// back-edge. A CloseLoop resumes the native loop at the merge-point green
@@ -2299,6 +2503,11 @@ impl<S: JitState> JitDriver<S> {
         if !self.meta.is_tracing() {
             return;
         }
+        // A stash still here belongs to an earlier abort whose consumer never
+        // ran (a `jit_merge_point!` expansion without a `state` argument, or a
+        // non-macro driver).  It names frames from a finished walk, so drop it
+        // rather than let this merge point's handoff read it.
+        self.meta.pending_abort_blackhole = None;
         if self.sym.is_none() || self.meta.trace_meta().is_none() {
             crate::debug::log_one("jit-abort", "mp: abort:sym_none");
             self.meta.abort_trace(false);
@@ -3106,27 +3315,20 @@ impl<S: JitState> JitDriver<S> {
                 // `SwitchToBlackhole(ABORT_TOO_LONG)`
                 // path (`pyjitpl.py:2807`).
                 //
-                // TODO: virtualizable-escape aborts
-                // in RPython actually flow through
-                // `pyjitpl.py:2907-2916 _compile_and_run_once` →
-                // `pyjitpl.py:2949 run_blackhole_interp_to_cancel_tracing(stb)`,
-                // which calls `aborted_tracing(stb.reason)` AND
-                // `convert_and_run_from_pyjitpl(self,
-                // stb.raising_exception)` — the latter converts the
-                // framestack into blackhole interpreters and runs them
-                // with the `raising_exception` flag so the residual
-                // call's eventual exception is preserved
-                // (`pyjitpl.py:3391-3393` comment).  Pyre wires only
-                // the accounting half here; the `convert_and_run_from_pyjitpl`
-                // helper exists in `blackhole.rs` (port of
-                // `blackhole.py:1799`) but is not yet invoked from
-                // this consumer, so `stb.raising_exception` is
-                // currently a no-op and the helper-side exception is
-                // dropped at the abort boundary.  Full cancel-tracing
-                // semantics requires `BlackholeInterpBuilder` +
-                // `last_exc_value` plumbed here and a JitException
-                // return surface on the back-edge runner —
-                // followup.
+                // The other half of `pyjitpl.py:2949
+                // run_blackhole_interp_to_cancel_tracing(stb)` —
+                // `convert_and_run_from_pyjitpl(self, stb.raising_exception)`
+                // — is staged below into `MetaInterp::pending_abort_blackhole`
+                // and run by [`JitDriver::run_pending_abort_blackhole`], which
+                // is the first point that also holds native `state`.
+                //
+                // `stb.raising_exception` (`pyjitpl.py:3391-3393`: a
+                // virtualizable-escape abort carries the forcing residual's
+                // pending exception into the blackhole) is not staged with it
+                // yet: `TraceCtx::pending_switch_to_blackhole` records the
+                // reason but no exception value, so the conversion runs with
+                // `raising_exception = false` and an escape abort still drops
+                // the helper-side exception at this boundary.
                 let pending_reason = self
                     .meta
                     .tracing
@@ -3168,6 +3370,26 @@ impl<S: JitState> JitDriver<S> {
                             .and_then(|ctx| ctx.collect_virtualizable_element_values());
                         if let Some(elems) = virt_elems {
                             self.meta.single_pass_virt_array_values = Some(elems);
+                        }
+                    }
+                    // `pyjitpl.py:2954 convert_and_run_from_pyjitpl(self,
+                    // stb.raising_exception)`: the source pc above is only a
+                    // sound resume position when the walk happened to stop at a
+                    // source-opcode boundary.  Stage the framestack and the
+                    // sym's state-field image so the `jit_merge_point!` hook can
+                    // finish the half-executed opcodes in the blackhole and take
+                    // the resume position from the merge point they reach.
+                    if abort_blackhole_enabled() {
+                        let framestack = self
+                            .meta
+                            .trace_ctx()
+                            .and_then(|ctx| ctx.aborted_framestack.take());
+                        if let (Some(framestack), Some(sym)) = (framestack, self.sym.as_ref()) {
+                            self.meta.pending_abort_blackhole = Some(PendingAbortBlackhole {
+                                framestack,
+                                scalar_values: S::collect_scalar_state_field_values(sym),
+                                ref_scalar_values: S::collect_ref_scalar_state_field_values(sym),
+                            });
                         }
                     }
                 }

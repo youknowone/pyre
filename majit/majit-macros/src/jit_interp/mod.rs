@@ -2081,7 +2081,23 @@ fn rewrite_body(
                         // `None` whenever the walk did not populate reds.
                         quote! {
                             if #driver.is_tracing() {
-                                let __mp_out = #merge_fn(&mut #driver, #env, #pc);
+                                let mut __mp_out = #merge_fn(&mut #driver, #env, #pc);
+                                // pyjitpl.py:2949
+                                // run_blackhole_interp_to_cancel_tracing: an
+                                // abort can stop mid-source-opcode, where the
+                                // walk's own pc names no resume position. The
+                                // Abort arm staged the framestack; finish those
+                                // opcodes in the blackhole here — the first
+                                // point that also holds `state` — and take the
+                                // resume pc from the merge point they reach.
+                                // `None` when the walk did not abort or the
+                                // conversion declined, leaving the source-pc
+                                // handoff below untouched.
+                                if let Some(__bh_pc) = #driver.run_pending_abort_blackhole(
+                                    &mut #state, #env,
+                                ) {
+                                    __mp_out = Some((__bh_pc, ::std::vec::Vec::new()));
+                                }
                                 if let Some((__sp_pc, __sp_reds)) = __mp_out
                                 {
                                     // Push the walk-mutated scalar state fields
