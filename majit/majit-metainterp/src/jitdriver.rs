@@ -176,13 +176,14 @@ pub fn drive_single_frame_blackhole(
         miframe.ref_values[*index] = Some(*forwarded);
     }
 
+    builder.setup_jitdrivers_sd(bh_jitdrivers_sd(metainterp_sd));
+
     let mut bh = builder.acquire_interp();
     bh.copy_data_from_miframe(miframe);
     bh.state_field_layout = state_field_layout;
     bh.virtualizable_info = virtualizable_info;
     bh.virtualizable_ptr = virtualizable_ptr;
     bh.virtualizable_stack_base = virtualizable_stack_base;
-    bh.jitdrivers_sd = bh_jitdrivers_sd(metainterp_sd);
 
     // The blackhole may allocate/collect while executing.  Its Ref bank is the
     // authoritative live register file and must be forwarded in place.
@@ -284,7 +285,8 @@ pub fn drive_multi_frame_blackhole(
         last_exc_value = packed_ref_roots[index];
     }
 
-    let jitdrivers_sd = bh_jitdrivers_sd(metainterp_sd);
+    builder.setup_jitdrivers_sd(bh_jitdrivers_sd(metainterp_sd));
+
     let mut terminal = None;
     let outcome = crate::blackhole::convert_and_run_from_pyjitpl(
         builder,
@@ -296,7 +298,6 @@ pub fn drive_multi_frame_blackhole(
             virtualizable_info,
             virtualizable_ptr,
             virtualizable_stack_base,
-            jitdrivers_sd: &jitdrivers_sd,
             per_frame,
             on_enter_level,
         }),
@@ -3709,6 +3710,15 @@ impl<S: JitState> JitDriver<S> {
                     self.meta_interp().staticdata.op_catch_exception,
                     self.meta_interp().staticdata.op_rvmprof_code,
                 );
+                // `blackhole_from_resumedata` below acquires one interpreter
+                // per resumed frame, and every frame that still has a caller
+                // takes `bhimpl_jit_merge_point`'s recursive-portal branch
+                // (blackhole.py:1079-1093), which indexes `jitdrivers_sd`
+                // directly.  The lease is thread-local and carries whatever
+                // the previous resume left on it, so seed the table here
+                // instead of depending on that.
+                let jitdrivers_sd = bh_jitdrivers_sd(&self.meta_interp().staticdata);
+                bh_builder.setup_jitdrivers_sd(jitdrivers_sd);
                 let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
                 // The state-field macro's `&state` is host-stack storage, so
                 // its identity may be folded out of the failing frame. Ask
@@ -6117,6 +6127,15 @@ impl<S: JitState> JitDriver<S> {
                     self.meta_interp().staticdata.op_catch_exception,
                     self.meta_interp().staticdata.op_rvmprof_code,
                 );
+                // `blackhole_from_resumedata` below acquires one interpreter
+                // per resumed frame, and every frame that still has a caller
+                // takes `bhimpl_jit_merge_point`'s recursive-portal branch
+                // (blackhole.py:1079-1093), which indexes `jitdrivers_sd`
+                // directly.  The lease is thread-local and carries whatever
+                // the previous resume left on it, so seed the table here
+                // instead of depending on that.
+                let jitdrivers_sd = bh_jitdrivers_sd(&self.meta_interp().staticdata);
+                bh_builder.setup_jitdrivers_sd(jitdrivers_sd);
                 let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
                 // See `back_edge_internal`: only the macro state-field host
                 // opts in to this per-call host-stack identity source.

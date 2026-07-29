@@ -2082,20 +2082,11 @@ pub fn blackhole_resume_via_rd_numb(
     // down the whole chain, mirroring the forward-exec inheritance
     // `self.virtualizable_info = parent.virtualizable_info` performed when
     // a frame enters a callee.
-    {
-        let vinfo = bh.virtualizable_info;
-        let mut current = Some(&mut bh);
-        while let Some(frame) = current {
-            frame.virtualizable_info = vinfo;
-            frame.record_caught_exception = Some(record_caught_blackhole_traceback);
-            current = frame.nextblackholeinterp.as_deref_mut();
-        }
-    }
     // blackhole.py:1095-1099 get_portal_runner parity:
     //   jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
     //   fnptr        = adr2int(jitdriver_sd.portal_runner_adr)
     //   calldescr    = jitdriver_sd.mainjitcode.calldescr
-    bh.jitdrivers_sd = vec![majit_metainterp::blackhole::BhJitDriverSd {
+    let jitdrivers_sd = vec![majit_metainterp::blackhole::BhJitDriverSd {
         result_type: majit_metainterp::blackhole::BhReturnType::Ref,
         portal_runner_ptr: Some(bh_portal_runner_c),
         mainjitcode_calldescr: {
@@ -2115,6 +2106,25 @@ pub fn blackhole_resume_via_rd_numb(
             d
         },
     }];
+    {
+        let vinfo = bh.virtualizable_info;
+        let mut current = Some(&mut bh);
+        while let Some(frame) = current {
+            frame.virtualizable_info = vinfo;
+            frame.record_caught_exception = Some(record_caught_blackhole_traceback);
+            // Upstream resolves `jitdrivers_sd[jdindex]` through
+            // `self.builder.metainterp_sd` (blackhole.py:1079, :1096), so every
+            // frame of a chain shares one table.  `BlackholeInterpBuilder`
+            // carries that snapshot and `acquire_interp` hands it out, but this
+            // path derives the entry from the innermost frame's own jitcode and
+            // so cannot seed the builder before `blackhole_from_resumedata`
+            // acquires the chain.  Publish it to every frame instead: any frame
+            // above the bottom one reaches `bhimpl_jit_merge_point`'s
+            // recursive-portal branch, which indexes the table directly.
+            frame.jitdrivers_sd = jitdrivers_sd.clone();
+            current = frame.nextblackholeinterp.as_deref_mut();
+        }
+    }
 
     // Portal red-arg registers (`pypy/module/pypyjit/interp_jit.py:67
     // reds = ['frame', 'ec']`) are filled per-frame by
