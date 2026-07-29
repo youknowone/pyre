@@ -2057,18 +2057,23 @@ fn try_adopt_single_frame_blackhole(
     // QUIETER, not smaller — before it the accumulator was visibly wrong too.
     // So the decline had to go, not be gated around.
     //
-    // The escape flush that ran ahead of the forcing residual is
-    // all-or-nothing, and its decline is what this latch is gated on
-    // (`committed_frame_escape_pc().is_none()`).  What it declines on is the
-    // operand-stack half — the shadow's stack region reads NULL away from a
-    // merge point — and the drive reconstructs that half itself, through the
-    // vable stores its own execution makes.
-    // The LOCALS half is not optional: every LOAD_FAST lowers to
+    // The escape flush that ran ahead of the forcing residual is all-or-
+    // nothing, and its decline is what the vable-escape latch is gated on
+    // (`committed_frame_escape_pc().is_none()`).  The LOCALS half is not
+    // optional: every LOAD_FAST lowers to
     // `getarrayitem_vable_r` on the frame the latched image's register names,
     // so without it the drive reads whatever that frame held before the walk
     // began, and a local the walk assigned comes back null.  Publish that half
     // here, and withdraw it if it cannot complete — the withdrawal is honest
     // only because nothing has run at that point.
+    //
+    // Trace-too-long is also post-step: its MIFrame `resume_pc` and concrete
+    // banks already describe the next jitcode instruction.  The detached
+    // `snapshot_for_tracing` therefore owns the matching active operand stack
+    // and Python-frame coordinate.  RPython's MIFrame and red frame are one
+    // coherent per-call state at this boundary; publish the snapshot stack to
+    // the same live red frame before driving instead of leaving only
+    // `valuestackdepth` to advance over null slots.
     //
     // Which frame gets it is an identity question, and the walked frame has two
     // representations: `cf_addr` is the `snapshot_for_tracing` copy the walk
@@ -2106,10 +2111,25 @@ fn try_adopt_single_frame_blackhole(
         );
         return false;
     };
+    let mut captured_stack = if commit_leg == WalkEndCommitLeg::TraceTooLong {
+        match crate::state::capture_frame_stack_for_publish(cf_addr, vable_frame) {
+            Some(stack) => Some(stack),
+            None => {
+                assert!(
+                    !trace_too_long,
+                    "preflighted trace-too-long operand stack became uncapturable"
+                );
+                return false;
+            }
+        }
+    } else {
+        None
+    };
     // `take_single_frame_blackhole` removed the image from the TLS root
     // walker. `write_back_outer_locals` may box Int/Float locals and collect
-    // before the blackhole driver installs its own packed roots, so bridge
-    // that interval explicitly and copy forwarding updates into the MIFrame.
+    // before the blackhole driver installs its own packed roots. Bridge that
+    // interval explicitly, including the detached snapshot's active operand
+    // stack, and copy forwarding updates into the MIFrame.
     let image_ref_locations: Vec<usize> = latched
         .miframe
         .ref_values
@@ -2130,6 +2150,9 @@ fn try_adopt_single_frame_blackhole(
     unsafe {
         majit_gc::shadow_stack::push_resume_ref_roots(image_ref_roots.as_mut_slice());
         majit_gc::shadow_stack::push_resume_ref_roots(locals_undo.as_mut_slice());
+        if let Some(stack) = captured_stack.as_mut() {
+            majit_gc::shadow_stack::push_resume_ref_roots(stack.roots_mut());
+        }
     }
     if !crate::state::write_back_outer_locals(ctx, vable_frame) {
         crate::state::restore_frame_locals(vable_frame, &locals_undo);
@@ -2157,13 +2180,25 @@ fn try_adopt_single_frame_blackhole(
         .flatten()
         .expect("preflighted frame register disappeared after forwarding")
         as usize;
-    // The locals publish is the last recoverable adoption gate. Its undo image
-    // only needs rooting through that gate; after this point the blackhole may
-    // execute irreversible effects and the handoff must commit or fail loudly,
-    // never return to trace-entry replay.
+    if let Some(stack) = captured_stack.as_ref() {
+        if !crate::state::publish_captured_frame_stack(committed_root_addr, stack) {
+            crate::state::restore_frame_locals(committed_root_addr, &locals_undo);
+            majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
+            assert!(
+                !trace_too_long,
+                "preflighted trace-too-long operand-stack publication declined"
+            );
+            return false;
+        }
+    }
+    // Locals plus the no-allocation stack publication are the last recoverable
+    // adoption gates. Their undo image only needs rooting through this point;
+    // after it the blackhole may execute irreversible effects and the handoff
+    // must commit or fail loudly, never return to trace-entry replay.
     majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
     drop(locals_undo);
     drop(image_ref_roots);
+    drop(captured_stack);
     let terminal = majit_metainterp::drive_single_frame_blackhole(
         &mut latched.miframe,
         majit_metainterp::blackhole::StateFieldLayout::default(),
@@ -2236,7 +2271,7 @@ fn try_adopt_single_frame_blackhole(
                  replay is forbidden after blackhole effects",
             );
             let resume_py_pc = resume_py_pc as usize;
-            adopt_blackhole_crn(cf_addr, vable_frame, resume_py_pc);
+            adopt_blackhole_crn(cf_addr, forwarded_root_addr, resume_py_pc);
             sfdbg!("adopted with green resume_py_pc={resume_py_pc}");
             WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
         }

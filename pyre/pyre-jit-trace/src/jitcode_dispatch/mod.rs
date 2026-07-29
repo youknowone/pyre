@@ -1470,6 +1470,14 @@ fn trace_too_long_blackhole_snapshot_safe(outcome: &DispatchOutcome) -> bool {
     matches!(outcome, DispatchOutcome::Continue)
 }
 
+fn trace_too_long_abort_safe(
+    outcome: &DispatchOutcome,
+    blackhole_latched: bool,
+    executed_effects: usize,
+) -> bool {
+    trace_too_long_blackhole_snapshot_safe(outcome) && (blackhole_latched || executed_effects == 0)
+}
+
 /// Errors surfaced by the trace-side walker.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum DispatchError {
@@ -2218,11 +2226,13 @@ pub fn walk<Sym: WalkSym>(
             // frame transition: in particular, `SubRaise` may enter this
             // frame's handler and `SubReturn` is delivered to its caller by
             // the inline-call boundary. RPython checks the length only after
-            // those transitions have happened, so never publish the
-            // pre-transition callee image here.
-            let blackhole_latched = trace_too_long_blackhole_snapshot_safe(&outcome)
-                && latch_trace_too_long_blackhole(ctx, pc);
-            if blackhole_latched || fbw_executed_effect_count() == 0 {
+            // those transitions have happened, so never abort from the
+            // pre-transition callee image here — even a zero-effect entry
+            // replay would resume the caller without delivering the return or
+            // raise that this step produced.
+            let snapshot_safe = trace_too_long_blackhole_snapshot_safe(&outcome);
+            let blackhole_latched = snapshot_safe && latch_trace_too_long_blackhole(ctx, pc);
+            if trace_too_long_abort_safe(&outcome, blackhole_latched, fbw_executed_effect_count()) {
                 let ops = ctx.trace_ctx.num_recorded_ops();
                 crate::state::note_root_trace_too_long(
                     ctx.trace_ctx.current_merge_points_first_greenkey(),

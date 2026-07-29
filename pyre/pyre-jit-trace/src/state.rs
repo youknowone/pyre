@@ -4871,6 +4871,129 @@ pub(crate) fn restore_frame_locals(frame: usize, saved: &[i64]) {
     frame_array_write_barrier(frame as *mut u8, arr_ptr);
 }
 
+/// The active operand-stack half of a tracer snapshot that must be published
+/// to its live virtualizable before an overlong trace is continued in the
+/// blackhole.
+///
+/// RPython has no separate copy step here: `convert_and_run_from_pyjitpl`
+/// copies the already-advanced MIFrame, whose red virtualizable is the one
+/// frame object carrying that call's locals and stack.  Pyre concretely steps
+/// a detached `snapshot_for_tracing`, so the corresponding state has to cross
+/// back to that same live frame explicitly.  The raw Ref words are exposed as
+/// a mutable slice because publishing locals can allocate; callers root the
+/// slice so nursery forwarding is reflected before the stack is stored.
+pub(crate) struct CapturedFrameStack {
+    stack_base: usize,
+    scalars: FrameScalars,
+    roots: Vec<i64>,
+}
+
+impl CapturedFrameStack {
+    pub(crate) fn roots_mut(&mut self) -> &mut [i64] {
+        self.roots.as_mut_slice()
+    }
+}
+
+fn frame_stack_transfer_shape(
+    snapshot: usize,
+    live_frame: usize,
+) -> Option<(
+    usize,
+    usize,
+    *const pyre_object::FixedObjectArray,
+    *mut pyre_object::FixedObjectArray,
+)> {
+    if snapshot == 0 || live_frame == 0 {
+        return None;
+    }
+    let snapshot_base = concrete_nlocals(snapshot)?;
+    let live_base = concrete_nlocals(live_frame)?;
+    if snapshot_base != live_base {
+        return None;
+    }
+    let snapshot_depth = concrete_stack_depth(snapshot)?;
+    if snapshot_depth < snapshot_base {
+        return None;
+    }
+    let snapshot_arr = unsafe {
+        *((snapshot as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *const pyre_object::FixedObjectArray)
+    };
+    let live_arr = unsafe {
+        *((live_frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if snapshot_arr.is_null()
+        || live_arr.is_null()
+        || unsafe { &*snapshot_arr }.as_slice().len() < snapshot_depth
+        || unsafe { &*live_arr }.as_slice().len() < snapshot_depth
+    {
+        return None;
+    }
+    Some((snapshot_base, snapshot_depth, snapshot_arr, live_arr))
+}
+
+/// Allocation-free preflight for [`capture_frame_stack_for_publish`].
+pub(crate) fn can_publish_frame_stack(snapshot: usize, live_frame: usize) -> bool {
+    frame_stack_transfer_shape(snapshot, live_frame).is_some()
+}
+
+/// Copy the tracer snapshot's active operand stack into a rootable carrier.
+/// The destination is checked at capture time and checked again at commit, so
+/// no partial stack is ever published if frame identity or layout changes.
+pub(crate) fn capture_frame_stack_for_publish(
+    snapshot: usize,
+    live_frame: usize,
+) -> Option<CapturedFrameStack> {
+    let (stack_base, stack_depth, snapshot_arr, _) =
+        frame_stack_transfer_shape(snapshot, live_frame)?;
+    let slots = unsafe { &*snapshot_arr }.as_slice();
+    Some(CapturedFrameStack {
+        stack_base,
+        scalars: capture_frame_scalars(snapshot)?,
+        roots: slots[stack_base..stack_depth]
+            .iter()
+            .map(|&value| value as i64)
+            .collect(),
+    })
+}
+
+/// Commit a captured post-step operand stack and its Python-frame coordinate
+/// to the live red frame.  This performs no allocation: once the caller has
+/// published locals and reached this point, the blackhole handoff is
+/// irrevocable.
+pub(crate) fn publish_captured_frame_stack(
+    live_frame: usize,
+    captured: &CapturedFrameStack,
+) -> bool {
+    let Some(live_base) = concrete_nlocals(live_frame) else {
+        return false;
+    };
+    if live_base != captured.stack_base
+        || captured.scalars.valuestackdepth != live_base + captured.roots.len()
+    {
+        return false;
+    }
+    let live_arr = unsafe {
+        *((live_frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if live_arr.is_null()
+        || unsafe { &*live_arr }.as_slice().len() < captured.scalars.valuestackdepth
+    {
+        return false;
+    }
+    unsafe {
+        let slots = (*live_arr).as_mut_slice();
+        for (offset, &value) in captured.roots.iter().enumerate() {
+            slots[live_base + offset] = value as usize as PyObjectRef;
+        }
+    }
+    restore_frame_scalars(live_frame, captured.scalars);
+    frame_array_write_barrier(live_frame as *mut u8, live_arr);
+    true
+}
+
 /// The scalar half of the frame image [`capture_frame_locals`] covers.
 #[derive(Clone, Copy)]
 pub(crate) struct FrameScalars {

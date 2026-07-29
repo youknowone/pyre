@@ -14,10 +14,12 @@ use super::*;
 ///
 /// RPython's MIFrame banks hold Box objects, so assigning a valuebox to
 /// `virtualizable_boxes` preserves its concrete value. Pyre splits that Box
-/// between an OpRef bank and a parallel concrete bank. Prefer the latter:
-/// residual results do not necessarily have an intrinsic value attached to
-/// their OpRef, but they do have the concrete value produced by the
-/// authoritative walker.
+/// between an OpRef bank and a parallel concrete bank. Ref values prefer the
+/// recorder Box payload because the active-trace root walker forwards it in
+/// place across a collection; the raw concrete shadow is not a GC root and can
+/// retain the pre-forwarding address. Residual results do not necessarily have
+/// such a payload, so they fall back to the authoritative walker's shadow.
+/// Int/Float values are not GC addresses and keep the shadow-first order.
 pub(super) fn vable_value_concrete<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -39,7 +41,14 @@ pub(super) fn vable_value_concrete<Sym: WalkSym>(
         ('f', ConcreteValue::Float(value)) => Some(Value::Float(value)),
         _ => None,
     };
-    from_register.or_else(|| ctx.trace_ctx.concrete_of_opref(value))
+    if bank == 'r' {
+        ctx.trace_ctx
+            .lookup_opref_concrete(value)
+            .or_else(|| ctx.trace_ctx.recover_ref_value(value, 8))
+            .or(from_register)
+    } else {
+        from_register.or_else(|| ctx.trace_ctx.concrete_of_opref(value))
+    }
 }
 
 /// Resolve the concrete value after an operand-stack recovery may have

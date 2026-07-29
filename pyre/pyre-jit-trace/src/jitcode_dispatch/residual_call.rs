@@ -163,11 +163,15 @@ pub(crate) fn latch_trace_too_long_blackhole<Sym: WalkSym>(
             } else {
                 let sym = &*ctx.fbw_mode.snapshot_sym;
                 let jitcode = sym.jitcode();
+                let forwarded_live_root = match ctx.trace_ctx.lookup_opref_concrete(sym.frame()) {
+                    Some(majit_ir::Value::Ref(value)) if value.0 != 0 => value.0,
+                    _ => sym.live_vable_frame_addr(),
+                };
                 (!jitcode.is_null()).then(|| {
                     (
                         (&(*jitcode).payload).jitcode.clone(),
                         sym.tracing_vable_frame_addr(),
-                        sym.live_vable_frame_addr(),
+                        forwarded_live_root,
                     )
                 })
             }
@@ -207,6 +211,7 @@ pub(crate) fn latch_trace_too_long_blackhole<Sym: WalkSym>(
             || vable_frame != root_addr
             || crate::state::capture_frame_locals(vable_frame).is_none()
             || !crate::state::can_write_back_outer_locals(ctx.trace_ctx, vable_frame)
+            || !crate::state::can_publish_frame_stack(cf_addr, vable_frame)
         {
             return false;
         }
@@ -448,30 +453,31 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
     }
 
     for color in 0..miframe.ref_values.len() {
-        if let Some(value) = ctx
-            .concrete_registers_r
-            .get(color)
-            .copied()
-            .and_then(|value| match value {
-                ConcreteValue::Ref(value) => Some(value as i64),
-                _ => None,
-            })
-        {
+        let opref = ctx.registers_r.get(color).copied();
+        let forwarded = opref
+            .filter(|&value| value != OpRef::NONE)
+            .and_then(|value| {
+                match ctx
+                    .trace_ctx
+                    .lookup_opref_concrete(value)
+                    .or_else(|| ctx.trace_ctx.recover_ref_value(value, 8))
+                {
+                    Some(majit_ir::Value::Ref(value)) => Some(value.0 as i64),
+                    _ => None,
+                }
+            });
+        let from_shadow =
+            ctx.concrete_registers_r
+                .get(color)
+                .copied()
+                .and_then(|value| match value {
+                    ConcreteValue::Ref(value) => Some(value as i64),
+                    _ => None,
+                });
+        if let Some(value) = forwarded.or(from_shadow) {
             miframe.ref_values[color] = Some(value);
-            continue;
-        }
-        if miframe.ref_values[color].is_none() {
-            let Some(opref) = ctx.registers_r.get(color).copied() else {
-                continue;
-            };
-            if opref == OpRef::NONE {
-                continue;
-            }
-            let Some(majit_ir::Value::Ref(value)) = ctx.trace_ctx.recover_ref_value(opref, 8)
-            else {
-                return false;
-            };
-            miframe.ref_values[color] = Some(value.0 as i64);
+        } else if opref.is_some_and(|value| value != OpRef::NONE) {
+            return false;
         }
     }
 
