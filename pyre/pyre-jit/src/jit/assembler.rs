@@ -2476,9 +2476,11 @@ mod tests {
     #[test]
     fn assemble_int_copy_from_constant_uses_copy_opcode_and_constant_pool() {
         let mut ssarepr = SSARepr::new("const_copy");
+        // Outside the signed-byte range `assembler.py:101` accepts, so the
+        // value takes a `constants_i` slot and the `i` argcode.
         ssarepr.insns.push(Insn::op_with_result(
             "int_copy",
-            vec![Operand::ConstInt(42)],
+            vec![Operand::ConstInt(4242)],
             Register::new(Kind::Int, 0),
         ));
 
@@ -2494,9 +2496,39 @@ mod tests {
         let copy_opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
             .get("int_copy/i>i")
             .expect("int_copy must be registered in wellknown insns");
-        assert_eq!(jitcode.constants_i, vec![42]);
+        assert_eq!(jitcode.constants_i, vec![4242]);
         assert_eq!(jitcode.code[0], copy_opcode);
         assert_eq!(jitcode.code[1], 1);
+        assert_eq!(jitcode.code[2], 0);
+    }
+
+    #[test]
+    fn assemble_int_copy_from_small_constant_uses_the_short_form() {
+        let mut ssarepr = SSARepr::new("small_const_copy");
+        ssarepr.insns.push(Insn::op_with_result(
+            "int_copy",
+            vec![Operand::ConstInt(42)],
+            Register::new(Kind::Int, 0),
+        ));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                int: 1,
+                ..NumRegs::default()
+            }),
+        );
+
+        // `int_copy` is in `USE_C_FORM` (`assembler.py:312`), so
+        // `assembler.py:99-107` writes a byte-sized value inline and
+        // `assembler.py:172` spells the argcode `c` instead of `i`.
+        let copy_opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
+            .get("int_copy/c>i")
+            .expect("int_copy/c>i must be registered in wellknown insns");
+        assert!(jitcode.constants_i.is_empty());
+        assert_eq!(jitcode.code[0], copy_opcode);
+        assert_eq!(jitcode.code[1], 42);
         assert_eq!(jitcode.code[2], 0);
     }
 
