@@ -392,10 +392,12 @@ fn array_getitem(args: &[PyObjectRef]) -> PyResult {
         let src = unsafe { arr::w_array_bytes(obj) }.to_vec();
         let mut out: Vec<u8> = Vec::with_capacity(n as usize * isz);
         let mut i = start;
-        for _ in 0..n {
+        for k in 0..n {
             let off = i as usize * isz;
             out.extend_from_slice(&src[off..off + isz]);
-            i += step;
+            if k + 1 < n {
+                i += step;
+            }
         }
         return Ok(arr::w_array_from_bytes(tc, isz as u8, out));
     }
@@ -448,7 +450,9 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
                 let dst = i as usize * isz;
                 let s = k as usize * isz;
                 vec[dst..dst + isz].copy_from_slice(&src[s..s + isz]);
-                i += step;
+                if k + 1 < n {
+                    i += step;
+                }
             }
         }
         return Ok(pyre_object::w_none());
@@ -494,9 +498,11 @@ fn array_delitem(args: &[PyObjectRef]) -> PyResult {
         // Collect element indices to drop, then rebuild the buffer.
         let mut drop_set: Vec<usize> = Vec::with_capacity(n as usize);
         let mut i = start;
-        for _ in 0..n {
+        for k in 0..n {
             drop_set.push(i as usize);
-            i += step;
+            if k + 1 < n {
+                i += step;
+            }
         }
         drop_set.sort_unstable();
         let src = unsafe { arr::w_array_bytes(obj) }.to_vec();
