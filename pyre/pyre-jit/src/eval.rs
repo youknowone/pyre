@@ -5662,28 +5662,42 @@ fn drive_unpack_iterable_trace(
         // envelope that pairs with `MetaInterp.tracing`, and jd1 opens the
         // tracer through `MetaInterp::force_start_tracing`, which installs no
         // envelope (only `JitDriver::force_start_tracing` calls
-        // `begin_trace_session`). The no-op also leaves the shared tracer slot
-        // installed, so `is_tracing()` answers true and every later trace
-        // attempt in the process bails at the guard above — an
-        // `exc.args = <iterable>` drain inside a hot loop costs ~12x for that
-        // reason.
+        // `begin_trace_session`).
         //
         // Opening the session here (the meta is fully static for the novable
         // driver, so it is the value the back-edge arm above builds) does
-        // compile the trace and release the tracer, but it exposes a second
-        // defect that has to land first: the error parked just above is then
-        // delivered at an unrelated later call site instead of at this
-        // unpack. `synth/unpack_drain_star_raise` case 4 (`RaisingEarly`)
-        // catches it — the `ValueError` escapes the following round's
-        // `count(*Counting(N))`. Draining at the merge point in
-        // `_unpackiterable_unknown_length` is necessary but not sufficient, so
-        // the park/deliver pairing is what needs the root-cause pass.
+        // compile the trace, but it exposes a second defect that has to land
+        // first: the error parked just above is then delivered at an unrelated
+        // later call site instead of at this unpack.
+        // `synth/unpack_drain_star_raise` case 4 (`RaisingEarly`) catches it —
+        // the `ValueError` escapes the following round's `count(*Counting(N))`.
+        // Draining at the merge point in `_unpackiterable_unknown_length` is
+        // necessary but not sufficient, so the park/deliver pairing is what
+        // needs the root-cause pass.
         match meta.compile_finish_from_active_session(
             &finish_args,
             finish_arg_types,
             exit_with_exception,
         ) {
             Ok(()) => {
+                // The no-op arm answers `Ok(())` without draining the tracer,
+                // and `tracing` is one slot shared by every driver: left
+                // installed it makes `is_tracing()` answer true for the rest of
+                // the process, so every later trace attempt in any driver bails
+                // at the guard above and nothing is ever compiled again. Any
+                // module defining a class with `__slots__` reaches this — the
+                // slots tuple is drained during type creation and the drain
+                // ends by raising — which costs an unrelated loop in the same
+                // module ~150x.
+                //
+                // A finish that could not be compiled is an abort, so treat it
+                // as the `else` arm below does: drop the trace non-permanently
+                // and let the cell's abort budget self-limit retrace storms.
+                // `abort_trace` also closes the profiler/debug scope
+                // `force_start_tracing` opened, via `clear_trace_session`.
+                if meta.is_tracing() {
+                    meta.abort_trace(false);
+                }
                 if dbg {
                     eprintln!(
                         "[jd1] compile_finish ok exit_with_exception={exit_with_exception} \
