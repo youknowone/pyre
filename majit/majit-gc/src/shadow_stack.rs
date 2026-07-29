@@ -773,12 +773,15 @@ pub fn jf_under_top_ptr() -> GcRef {
 /// is the number of slots (working registers AND constants — constants
 /// are pre-existing old-gen pointers and pass through `copy_nursery_object`
 /// untouched). `tmpreg_ptr` points at the temporary ref register that
-/// holds in-flight call return values.
+/// holds in-flight call return values.  `exc_ptr` points at the caught
+/// exception slot, which holds a reference for as long as the frame's
+/// handler runs.
 #[derive(Clone, Copy)]
 struct BhRegsEntry {
     regs_ptr: *mut i64,
     regs_len: usize,
     tmpreg_ptr: *mut i64,
+    exc_ptr: *mut i64,
 }
 
 // `*mut i64` is not `Send` by default. The thread-local storage means we
@@ -795,7 +798,7 @@ unsafe impl Send for BhRegsEntry {}
 ///
 /// # Safety
 /// `regs` must remain alive and pinned until pop.
-pub unsafe fn push_bh_regs(regs: &mut [i64], tmpreg: &mut i64) -> usize {
+pub unsafe fn push_bh_regs(regs: &mut [i64], tmpreg: &mut i64, exc: &mut i64) -> usize {
     BH_REGS_STACK.with(|ss| {
         let mut ss = ss.borrow_mut();
         let depth = ss.len();
@@ -805,6 +808,7 @@ pub unsafe fn push_bh_regs(regs: &mut [i64], tmpreg: &mut i64) -> usize {
             regs_ptr: regs.as_mut_ptr(),
             regs_len: regs.len(),
             tmpreg_ptr: tmpreg as *mut i64,
+            exc_ptr: exc as *mut i64,
         });
         depth
     })
@@ -842,6 +846,16 @@ pub fn walk_bh_regs(mut visitor: impl FnMut(&mut GcRef)) {
             // automatically a root.
             let tmp = unsafe { &mut *(entry.tmpreg_ptr as *mut GcRef) };
             visitor(tmp);
+            // `exception_last_value` is the same kind of slot: `route_to_catch`
+            // stores the caught exception there and jumps to the handler
+            // (`blackhole.py:396-411`), and the handler recovers it much later
+            // through `last_exc_value` / `last_exception` — which dereferences
+            // it via `bh_classof`. Everything the handler runs in between can
+            // allocate, so the reference has to survive a minor collection.
+            // Upstream needs no root here for the same reason it needs none for
+            // tmpreg: the field lives on a GC-managed interpreter object.
+            let exc = unsafe { &mut *(entry.exc_ptr as *mut GcRef) };
+            visitor(exc);
         }
     });
 }
@@ -865,6 +879,8 @@ pub fn walk_all_bh_regs(mut visitor: impl FnMut(&mut GcRef)) {
             }
             let tmp = unsafe { &mut *(entry.tmpreg_ptr as *mut GcRef) };
             visitor(tmp);
+            let exc = unsafe { &mut *(entry.exc_ptr as *mut GcRef) };
+            visitor(exc);
         }
     }
 }

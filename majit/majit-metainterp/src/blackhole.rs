@@ -1313,11 +1313,18 @@ impl BlackholeInterpreter {
         // slot NULL) and a vable opcode dereferences it.  Rooting the full
         // pending chain here mirrors the RPython invariant.
         let bh_depth = unsafe {
-            let depth =
-                majit_gc::shadow_stack::push_bh_regs(&mut self.registers_r, &mut self.tmpreg_r);
+            let depth = majit_gc::shadow_stack::push_bh_regs(
+                &mut self.registers_r,
+                &mut self.tmpreg_r,
+                &mut self.exception_last_value,
+            );
             let mut caller = self.nextblackholeinterp.as_deref_mut();
             while let Some(frame) = caller {
-                majit_gc::shadow_stack::push_bh_regs(&mut frame.registers_r, &mut frame.tmpreg_r);
+                majit_gc::shadow_stack::push_bh_regs(
+                    &mut frame.registers_r,
+                    &mut frame.tmpreg_r,
+                    &mut frame.exception_last_value,
+                );
                 caller = frame.nextblackholeinterp.as_deref_mut();
             }
             depth
@@ -3651,7 +3658,11 @@ mod tests {
             assert_eq!(reused.tmpreg_r, 0);
 
             let depth = unsafe {
-                majit_gc::shadow_stack::push_bh_regs(&mut reused.registers_r, &mut reused.tmpreg_r)
+                majit_gc::shadow_stack::push_bh_regs(
+                    &mut reused.registers_r,
+                    &mut reused.tmpreg_r,
+                    &mut reused.exception_last_value,
+                )
             };
             let mut roots: Vec<usize> = Vec::new();
             majit_gc::shadow_stack::walk_bh_regs(|slot| roots.push(slot.0));
@@ -3659,6 +3670,43 @@ mod tests {
             assert!(
                 roots.iter().all(|&word| word == 0),
                 "pooled interp handed the root walker stale references: {roots:x?}",
+            );
+        }
+
+        /// The caught exception is reachable from the root walker while the
+        /// frame's handler runs.
+        ///
+        /// `route_to_catch` stores it in `exception_last_value` and jumps to
+        /// the handler (`blackhole.py:396-411`); the handler recovers it much
+        /// later through `last_exc_value` / `last_exception`, and the latter
+        /// dereferences it via `bh_classof`.  Every allocation the handler
+        /// performs in between can trigger a minor collection, so the slot has
+        /// to be a root — a moved object would leave the read on a from-space
+        /// address, and an otherwise-unreferenced one would simply be
+        /// reclaimed.  Upstream gets this for free: the field lives on a
+        /// GC-managed interpreter object, exactly like `tmpreg_r`.
+        #[test]
+        fn the_caught_exception_slot_is_a_gc_root_for_the_handler_window() {
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
+            const EXC: i64 = 0x7f00_0000_abc0;
+            bh.exception_last_value = EXC;
+            bh.tmpreg_r = 0;
+
+            let depth = unsafe {
+                majit_gc::shadow_stack::push_bh_regs(
+                    &mut bh.registers_r,
+                    &mut bh.tmpreg_r,
+                    &mut bh.exception_last_value,
+                )
+            };
+            let mut roots: Vec<usize> = Vec::new();
+            majit_gc::shadow_stack::walk_bh_regs(|slot| roots.push(slot.0));
+            majit_gc::shadow_stack::pop_bh_regs_to(depth);
+            assert!(
+                roots.contains(&(EXC as usize)),
+                "the caught exception is invisible to the collector while the \
+                 handler runs; roots were {roots:x?}",
             );
         }
 
