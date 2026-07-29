@@ -2123,21 +2123,29 @@ pub unsafe fn w_dict_lookup_checked(
 /// `dict_keys_equal` answers from its builtin type ladder and no user
 /// `__eq__` observes or mutates the dict mid-probe.
 ///
-/// Returns `None` when a comparison escaped the ladder: `op` withholds its
+/// Yields `None` when a comparison escaped the ladder: the body withholds its
 /// mutation in that case, so the dict is untouched and the caller re-runs the
 /// operation by scanning entries without holding a table borrow across a
 /// callback.
-#[inline]
-unsafe fn callback_free_dict_op<T>(op: impl FnOnce() -> T) -> Option<Result<T, DictKeyError>> {
-    crate::dict_eq_hook::begin_callback_free_probe();
-    let result = op();
-    if crate::dict_eq_hook::end_callback_free_probe() {
-        return None;
-    }
-    if take_dict_key_error() {
-        return Some(Err(DictKeyError));
-    }
-    Some(Ok(result))
+///
+/// A macro rather than a function taking `impl FnOnce`: a closure parameter
+/// puts an `FnOnce::call_once` in front of every probe and closures have no
+/// lifted counterpart, so each dict graph that probes stops there.  Upstream
+/// writes the attempt out at the call site (`ll_dict_lookup`'s fast pass
+/// before the paranoia restart, `rordereddict.py:1057`) rather than passing
+/// it as a callable.
+macro_rules! callback_free_dict_op {
+    ($body:block) => {{
+        crate::dict_eq_hook::begin_callback_free_probe();
+        let result = $body;
+        if crate::dict_eq_hook::end_callback_free_probe() {
+            None
+        } else if take_dict_key_error() {
+            Some(Err(DictKeyError))
+        } else {
+            Some(Ok(result))
+        }
+    }};
 }
 
 /// Find `key` in the object storage by scanning same-hash entries one at a
@@ -2246,7 +2254,7 @@ pub unsafe fn w_dict_lookup_object_strategy_checked(
 ) -> Result<Option<PyObjectRef>, DictKeyError> {
     let _dict_guard = w_dict_lock(obj);
     let object_key = object_key_for_checked(key)?;
-    if let Some(result) = callback_free_dict_op(|| {
+    if let Some(result) = callback_free_dict_op!({
         let dict = &*(obj as *const W_DictObject);
         let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
         entries.get(&object_key).copied()
@@ -2543,20 +2551,21 @@ pub unsafe fn w_dict_setdefault_checked(
         // comparison the builtin ladder cannot settle withholds the insert and
         // re-runs the probe over `scan_dict_key_reentrant`.
         let object_key = object_key_for_checked(key)?;
-        if let Some(result) = callback_free_dict_op(|| -> Option<PyObjectRef> {
+        if let Some(result) = callback_free_dict_op!({
             let dict = &mut *(obj as *mut W_DictObject);
             let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
             let index = entries.get_index_of(&object_key);
             if crate::dict_eq_hook::callback_free_probe_broken() {
-                return None;
-            }
-            match index {
-                Some(i) => Some(*entries.get_index(i).unwrap().1),
-                None => {
-                    entries.insert(object_key, value);
-                    w_dict_bump_keys_version(obj);
-                    dict_write_barrier(obj);
-                    Some(value)
+                None
+            } else {
+                match index {
+                    Some(i) => Some(*entries.get_index(i).unwrap().1),
+                    None => {
+                        entries.insert(object_key, value);
+                        w_dict_bump_keys_version(obj);
+                        dict_write_barrier(obj);
+                        Some(value)
+                    }
                 }
             }
         }) {
@@ -2632,19 +2641,23 @@ pub unsafe fn w_dict_pop_checked(
             // withholds the removal and re-runs it over
             // `scan_dict_key_reentrant`.
             let object_key = object_key_for_checked(key)?;
-            if let Some(result) = callback_free_dict_op(|| -> Option<PyObjectRef> {
+            if let Some(result) = callback_free_dict_op!({
                 let dict = &mut *(obj as *mut W_DictObject);
                 let entries =
                     &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
                 let index = entries.get_index_of(&object_key);
                 if crate::dict_eq_hook::callback_free_probe_broken() {
-                    return None;
+                    None
+                } else {
+                    match index {
+                        Some(i) => {
+                            let removed = entries.shift_remove_index(i).unwrap().1;
+                            w_dict_bump_keys_version(obj);
+                            Some(removed)
+                        }
+                        None => None,
+                    }
                 }
-                index.map(|i| {
-                    let removed = entries.shift_remove_index(i).unwrap().1;
-                    w_dict_bump_keys_version(obj);
-                    removed
-                })
             }) {
                 return result;
             }
@@ -2715,23 +2728,22 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
     // builtin ladder the probe updates or appends in place; a pair it cannot
     // decide breaks the probe, withholds the store, and re-runs it over
     // `scan_dict_key_reentrant`.
-    if let Some(result) = callback_free_dict_op(|| {
+    if let Some(result) = callback_free_dict_op!({
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
         let index = entries.get_index_of(&object_key);
-        if crate::dict_eq_hook::callback_free_probe_broken() {
-            return;
-        }
-        match index {
-            Some(i) => {
-                *entries.get_index_mut(i).unwrap().1 = value;
+        if !crate::dict_eq_hook::callback_free_probe_broken() {
+            match index {
+                Some(i) => {
+                    *entries.get_index_mut(i).unwrap().1 = value;
+                }
+                None => {
+                    entries.insert(object_key, value);
+                    dict.keys_version = dict.keys_version.wrapping_add(1);
+                }
             }
-            None => {
-                entries.insert(object_key, value);
-                dict.keys_version = dict.keys_version.wrapping_add(1);
-            }
+            dict_write_barrier(obj);
         }
-        dict_write_barrier(obj);
     }) {
         return result;
     }
@@ -3178,22 +3190,25 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
             w_module_dict_switch_to_object_strategy(obj);
         }
         let object_key = object_key_for_checked(key)?;
-        if let Some(result) = callback_free_dict_op(|| {
+        if let Some(result) = callback_free_dict_op!({
             let entries = w_module_dict_object_storage_mut(obj);
-            let Some(index) = entries.get_index_of(&object_key) else {
-                return false;
-            };
-            if entries
-                .get_index(index)
-                .is_none_or(|(_, stored)| *stored != value)
-            {
-                return false;
+            match entries.get_index_of(&object_key) {
+                Some(index)
+                    if entries
+                        .get_index(index)
+                        .is_none_or(|(_, stored)| *stored != value) =>
+                {
+                    false
+                }
+                Some(index) => {
+                    entries.shift_remove_index(index);
+                    let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+                    strategy.mutated();
+                    w_dict_bump_keys_version(obj);
+                    true
+                }
+                None => false,
             }
-            entries.shift_remove_index(index);
-            let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-            strategy.mutated();
-            w_dict_bump_keys_version(obj);
-            true
         }) {
             return result;
         }
@@ -3205,21 +3220,24 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
         strategy.switch_to_object_strategy(obj);
     }
     let object_key = object_key_for_checked(key)?;
-    if let Some(result) = callback_free_dict_op(|| {
+    if let Some(result) = callback_free_dict_op!({
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
-        let Some(index) = entries.get_index_of(&object_key) else {
-            return false;
-        };
-        if entries
-            .get_index(index)
-            .is_none_or(|(_, stored)| *stored != value)
-        {
-            return false;
+        match entries.get_index_of(&object_key) {
+            Some(index)
+                if entries
+                    .get_index(index)
+                    .is_none_or(|(_, stored)| *stored != value) =>
+            {
+                false
+            }
+            Some(index) => {
+                entries.shift_remove_index(index);
+                dict.keys_version = dict.keys_version.wrapping_add(1);
+                true
+            }
+            None => false,
         }
-        entries.shift_remove_index(index);
-        dict.keys_version = dict.keys_version.wrapping_add(1);
-        true
     }) {
         return result;
     }
@@ -3268,20 +3286,21 @@ pub unsafe fn w_dict_delitem_object_strategy_checked(
     // dict while the `IndexMap` borrow is live.  A comparison the builtin
     // ladder cannot settle withholds the removal and re-runs the probe over
     // `scan_dict_key_reentrant`.
-    if let Some(result) = callback_free_dict_op(|| {
+    if let Some(result) = callback_free_dict_op!({
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
         let index = entries.get_index_of(&object_key);
         if crate::dict_eq_hook::callback_free_probe_broken() {
-            return false;
-        }
-        match index {
-            Some(i) => {
-                entries.shift_remove_index(i);
-                dict.keys_version = dict.keys_version.wrapping_add(1);
-                true
+            false
+        } else {
+            match index {
+                Some(i) => {
+                    entries.shift_remove_index(i);
+                    dict.keys_version = dict.keys_version.wrapping_add(1);
+                    true
+                }
+                None => false,
             }
-            None => false,
         }
     }) {
         return result;

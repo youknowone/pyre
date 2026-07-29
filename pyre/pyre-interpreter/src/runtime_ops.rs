@@ -401,15 +401,23 @@ define_known_function_call_helper!(
     arg7
 );
 
-pub fn dispatch_callable<R, FBuiltin, FUser>(
-    callable: PyObjectRef,
-    on_builtin: FBuiltin,
-    on_user: FUser,
-) -> Result<R, PyError>
-where
-    FBuiltin: FnOnce(PyObjectRef) -> Result<R, PyError>,
-    FUser: FnOnce(PyObjectRef) -> Result<R, PyError>,
-{
+/// Which arm a callable dispatches through (`baseobjspace.py:1243`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CallableKind {
+    /// A `BuiltinCode` carrier — `call_args_and_c_profile` / native code.
+    Builtin,
+    /// A `PyCode` carrier — an interpreted user function.
+    User,
+}
+
+/// Name the arm `callable` dispatches through, or report it as not
+/// callable.
+///
+/// The caller branches on the answer with the two arms written out
+/// (`baseobjspace.py:1243`); handing them in as closures instead puts an
+/// `FnOnce::call_once` in front of every dispatch, and a closure has no
+/// lifted counterpart — RPython spells this as a plain conditional.
+pub fn classify_callable(callable: PyObjectRef) -> Result<CallableKind, PyError> {
     // Drain any pending JIT-prologue overflow first so a backend probe that
     // already detected an overflow surfaces here as the user-visible
     // RecursionError.  A fresh check is performed only when a Python frame is
@@ -422,9 +430,9 @@ where
             // builtins (BuiltinCode) from user functions (PyCode).
             let code = crate::getcode(callable);
             if is_builtin_code(code as PyObjectRef) {
-                on_builtin(callable)
+                Ok(CallableKind::Builtin)
             } else {
-                on_user(callable)
+                Ok(CallableKind::User)
             }
         } else {
             let type_name = crate::typedef::r#type(callable)
@@ -1664,20 +1672,18 @@ mod tests {
     use pyre_object::{w_int_get_value, w_int_new};
 
     #[test]
-    fn test_dispatch_callable_runs_builtin_branch() {
+    fn test_classify_callable_names_the_builtin_arm() {
         let ctx = PyExecutionContext::default();
         let abs = ctx.lookup_builtin("abs").expect("abs builtin must exist");
-        let result = dispatch_callable(
-            abs,
-            |callable| {
-                // Builtins are now Function objects; extract code then func pointer.
-                let code = unsafe { crate::getcode(callable) };
-                let func = unsafe { crate::builtin_code_get(code as PyObjectRef) };
-                func(&[w_int_new(-9)])
-            },
-            |_callable| panic!("builtin callable should not take user branch"),
-        )
-        .expect("builtin dispatch should succeed");
+        assert_eq!(
+            classify_callable(abs).expect("builtin dispatch should succeed"),
+            CallableKind::Builtin
+        );
+
+        // Builtins are now Function objects; extract code then func pointer.
+        let code = unsafe { crate::getcode(abs) };
+        let func = unsafe { crate::builtin_code_get(code as PyObjectRef) };
+        let result = func(&[w_int_new(-9)]).expect("abs(-9) should succeed");
 
         unsafe {
             assert_eq!(w_int_get_value(result), 9);
@@ -1685,9 +1691,8 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_callable_rejects_non_callable() {
-        let err = dispatch_callable(w_int_new(3), |_callable| Ok(()), |_callable| Ok(()))
-            .expect_err("non-callable dispatch should fail");
+    fn test_classify_callable_rejects_non_callable() {
+        let err = classify_callable(w_int_new(3)).expect_err("non-callable dispatch should fail");
 
         assert!(matches!(err.kind, PyErrorKind::TypeError));
         assert!(err.message.contains("not callable"));

@@ -8,9 +8,10 @@ use std::sync::OnceLock;
 
 use rustpython_wtf8::Wtf8Buf;
 
+use crate::runtime_ops::{CallableKind, classify_callable};
 use crate::{
-    PyError, PyResult, builtin_code_get, dispatch_callable, function_get_closure,
-    function_get_globals_obj, function_get_name, function_get_qualname,
+    PyError, PyResult, builtin_code_get, function_get_closure, function_get_globals_obj,
+    function_get_name, function_get_qualname,
 };
 
 /// `function.py:131/214/231 new_frame.run(self.name, self.qualname)`.
@@ -1288,19 +1289,17 @@ fn call_callable_with_mode(
     }
 
     let frame_ptr = frame as *mut PyFrame;
-    dispatch_callable(
-        callable,
-        |callable| {
+    match classify_callable(callable)? {
+        CallableKind::Builtin => {
             // baseobjspace.py:1243 — `if frame.get_is_being_profiled() and
             // is_builtin_code(w_func): ... return self.call_args_and_c_profile(...)`
             // The `is_builtin_code(w_func)` check is structurally implicit
-            // here: dispatch_callable already routed via the builtin arm
-            // (runtime_ops.rs:275 `if is_builtin_code(code) { on_builtin }`),
-            // so reaching this closure means the callable is a builtin.
-            // The remaining condition is the per-frame profile flag, set
-            // by `ec.call_trace` (executioncontext.py:150) on frame entry
-            // and cleared by `_c_call_return_trace` when profilefunc was
-            // turned off (executioncontext.py:122-123).
+            // here: `classify_callable` already answered `Builtin`, so
+            // reaching this arm means the callable is one.  The remaining
+            // condition is the per-frame profile flag, set by `ec.call_trace`
+            // (executioncontext.py:150) on frame entry and cleared by
+            // `_c_call_return_trace` when profilefunc was turned off
+            // (executioncontext.py:122-123).
             let profile_active = unsafe { (*frame_ptr).get_is_being_profiled() };
             if profile_active {
                 let w_res = crate::baseobjspace::call_args_and_c_profile(
@@ -1316,12 +1315,12 @@ fn call_callable_with_mode(
             }
             let code = unsafe { crate::getcode(callable) };
             call_builtin_code_positional(code as pyre_object::PyObjectRef, args)
-        },
-        |callable| match mode {
+        }
+        CallableKind::User => match mode {
             CallMode::Jit => call_user_function(frame, callable, args),
             CallMode::Plain => call_user_function_plain(frame, callable, args),
         },
-    )
+    }
 }
 
 pub fn call_user_function(
