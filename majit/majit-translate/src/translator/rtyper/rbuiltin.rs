@@ -528,6 +528,23 @@ fn lookup_typer(func: &HostObject) -> Option<BuiltinTyperFn> {
         .copied()
 }
 
+/// Qualname-keyed typer fallback for host callables that are Rust
+/// associated functions rather than module-level functions, so they never
+/// enter the `HostObject`-keyed `BUILTIN_TYPER` map built from `(module,
+/// attr)` imports.  The four empty-string constructor spellings match the
+/// annotator's qualname-keyed `string_constructor` registrations
+/// (`annotator/builtin.rs` — `String.new` / `String.with_capacity` /
+/// `Wtf8Buf.new` / `Wtf8Buf.with_capacity`), keeping the annotate and rtype
+/// stages in agreement on the empty-`SomeString` shell.
+fn lookup_typer_by_qualname(qualname: &str) -> Option<BuiltinTyperFn> {
+    match qualname {
+        "String.new" | "String.with_capacity" | "Wtf8Buf.new" | "Wtf8Buf.with_capacity" => {
+            Some(rtype_empty_string_ctor)
+        }
+        _ => None,
+    }
+}
+
 /// RPython `class BuiltinFunctionRepr(Repr)` (rbuiltin.py:67-110).
 ///
 /// Void-typed repr for a statically known Python builtin callable.
@@ -584,6 +601,15 @@ impl BuiltinFunctionRepr {
     /// defines no base `specialize_call`, so this is a per-arm decision.
     pub(crate) fn findbltintyper(&self) -> Result<BuiltinTyperFn, TyperError> {
         if let Some(f) = lookup_typer(&self.builtinfunc) {
+            return Ok(f);
+        }
+        // Qualname fallback for Rust associated-function host callables
+        // (`String::new`, `Wtf8Buf::new`, …) that are not module-level
+        // functions, so they never enter the `(module, attr)`-imported
+        // `BUILTIN_TYPER` map.  Mirrors the annotator's qualname-keyed
+        // `BUILTIN_ANALYZERS` dispatch (`annotator/builtin.rs`) — the
+        // rtyper twin of `string_constructor`.
+        if let Some(f) = lookup_typer_by_qualname(self.builtinfunc.qualname()) {
             return Ok(f);
         }
         let as_const = ConstValue::HostObject(self.builtinfunc.clone());
@@ -3312,6 +3338,29 @@ fn rtype_ptr_null(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeR
         .as_ref()
         .ok_or_else(|| TyperError::message("rtype_ptr_null: r_result missing".to_string()))?;
     let c = crate::translator::rtyper::rmodel::inputconst(r_result.as_ref(), &ConstValue::None)?;
+    Ok(Some(Hlvalue::Constant(c)))
+}
+
+/// Empty-string constructors — `String::new()` / `String::with_capacity(n)`
+/// / `Wtf8Buf::new()` / `Wtf8Buf::with_capacity(n)`.  The annotator's
+/// `string_constructor` (`annotator/builtin.rs`) shells all four to an empty
+/// `SomeString`, so the rtyper folds them to the interned empty `rpy_string`
+/// constant (`ByteStr([])` → `StringRepr::convert_const` →
+/// `const_str_cache_llstr`).  A capacity argument does not affect the empty
+/// content and is dropped: the string value model is immutable, so a later
+/// append yields a fresh string rather than mutating this initial value.
+fn rtype_empty_string_ctor(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::flowspace::model::Hlvalue;
+
+    hop.exception_cannot_occur()?;
+    let r_result_borrow = hop.r_result.borrow();
+    let r_result = r_result_borrow.as_ref().ok_or_else(|| {
+        TyperError::message("rtype_empty_string_ctor: r_result missing".to_string())
+    })?;
+    let c = crate::translator::rtyper::rmodel::inputconst(
+        r_result.as_ref(),
+        &ConstValue::ByteStr(Vec::new()),
+    )?;
     Ok(Some(Hlvalue::Constant(c)))
 }
 
