@@ -682,7 +682,11 @@ impl ExecutionContext {
     /// observes the unmodified instr_prev_plus_one and can fire its
     /// first `line` event correctly).
     pub fn bytecode_only_trace(&mut self, frame: *mut PyFrame) -> Result<(), crate::PyError> {
-        if self.space.is_null() || frame.is_null() {
+        // PyPy has no object-space-null guard here: `space` is the interpreter
+        // owner, not an optional tracing flag. Pyre represents that owner with
+        // PY_NULL in this runtime, so testing it suppressed every line event
+        // while still allowing call/return events through `_trace`.
+        if frame.is_null() {
             return Ok(());
         }
         let f_trace_is_none = unsafe { (*frame).get_w_f_trace().is_null() };
@@ -716,7 +720,7 @@ impl ExecutionContext {
     ///     d.instr_prev_plus_one = frame.last_instr + 1
     /// ```
     pub fn run_trace_func(&mut self, frame: *mut PyFrame) -> Result<(), crate::PyError> {
-        if self.space.is_null() || frame.is_null() {
+        if frame.is_null() {
             return Ok(());
         }
         // executioncontext.py:189-192:
