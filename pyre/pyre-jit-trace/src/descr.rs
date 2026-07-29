@@ -761,15 +761,42 @@ static W_FLOAT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         std::mem::size_of::<W_FloatObject>(),
         W_FLOAT_GC_TYPE_ID,
         &FLOAT_TYPE as *const _ as usize,
-        &[(
-            "floatval",
-            FLOAT_FLOATVAL_OFFSET,
-            8,
-            Type::Float,
-            false,
-            true,
-            false,
-        )],
+        &[
+            (
+                "floatval",
+                FLOAT_FLOATVAL_OFFSET,
+                8,
+                Type::Float,
+                false,
+                true,
+                false,
+            ),
+            // Native-subclass `__dict__` / `__slots__` GC-pointer slots. The
+            // runtime TypeInfo traces both, so they must enter gc_fielddescrs
+            // for rewrite.py:498-504 to emit the delayed NULL stores that
+            // malloc_zero_filled=false requires; otherwise a NewWithVtable'd
+            // exact float carries uninitialised nursery bytes here and the
+            // collector traces poison. They follow `floatval` so its stable
+            // field index stays 0.
+            (
+                "w_dict",
+                FLOAT_W_DICT_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "w_slots",
+                FLOAT_W_SLOTS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
         "W_FloatObject",
         "floatobject::W_FloatObject",
     )
@@ -1675,7 +1702,9 @@ pub fn make_array_descr_with_full_id(
 
 // ── Range iterator field descriptors ─────────────────────────────────
 
-use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
+use pyre_object::floatobject::{
+    FLOAT_FLOATVAL_OFFSET, FLOAT_W_DICT_OFFSET, FLOAT_W_SLOTS_OFFSET, W_FloatObject,
+};
 use pyre_object::functional::{
     RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_REMAINING_OFFSET, RANGE_ITER_STEP_OFFSET,
     RANGE_LENGTH_OFFSET, RANGE_START_OFFSET, RANGE_STEP_OFFSET, W_Range,
