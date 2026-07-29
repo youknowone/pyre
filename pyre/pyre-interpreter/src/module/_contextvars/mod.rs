@@ -32,20 +32,35 @@ fn new_context(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_instance_new(context_type()))
 }
 
-fn context_var_type() -> PyObjectRef {
+pub(crate) fn context_var_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
     *TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("_contextvars.ContextVar", |ns| {
+            let signature =
+                crate::gateway::Signature::new(vec!["cls", "name", "default"], None, None, 1, 2);
             unsafe {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "__new__",
-                    crate::typedef::make_new_descr(context_var_new),
+                    crate::typedef::make_new_descr_with_signature(
+                        context_var_new,
+                        signature.clone(),
+                    ),
                 );
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "__init__",
-                    crate::make_builtin_function("__init__", |_| Ok(w_none())),
+                    crate::make_builtin_function_with_signature(
+                        "__init__",
+                        |_| Ok(w_none()),
+                        crate::gateway::Signature::new(
+                            vec!["self", "name", "default"],
+                            None,
+                            None,
+                            1,
+                            2,
+                        ),
+                    ),
                 );
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
@@ -56,6 +71,14 @@ fn context_var_type() -> PyObjectRef {
                     ns,
                     "set",
                     crate::make_builtin_function_with_arity("set", context_var_set, 2),
+                );
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "name",
+                    crate::typedef::make_getset_descriptor_named(
+                        crate::make_builtin_function_with_arity("name", context_var_name_get, 2),
+                        "name",
+                    ),
                 );
                 // PyPy lib_pypy/_contextvars.py ContextVar.__class_getitem__
                 // and CPython 3.14 Python/context.c PyContextVar_methods.
@@ -77,40 +100,33 @@ fn context_var_type() -> PyObjectRef {
 
 fn context_var_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // PyPy lib_pypy/_contextvars.py ContextVar.__init__(name, *,
-    // default=_NO_DEFAULT): the type-call ABI supplies cls at position zero.
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if pos.len() < 2 {
+    // default=_NO_DEFAULT): the signature-aware gateway supplies
+    // [cls, name, default], with PY_NULL for an omitted default.
+    if args.len() < 2 || args[1].is_null() {
         return Err(crate::PyError::type_error(
             "ContextVar() missing required argument: 'name'",
         ));
     }
-    if pos.len() > 2 {
-        return Err(crate::PyError::type_error(format!(
-            "ContextVar() takes at most 1 positional argument ({} given)",
-            pos.len() - 1
-        )));
-    }
-    if !unsafe { is_str(pos[1]) } {
+    if !unsafe { is_str(args[1]) } {
         return Err(crate::PyError::type_error(
             "context variable name must be a str",
         ));
     }
-    if let Some(dict) = kwargs {
-        for (key, _) in unsafe { w_dict_str_entries_wtf8(dict) } {
-            let key = key.as_str().unwrap_or("");
-            if key != "__pyre_kw__" && key != "default" {
-                return Err(crate::PyError::type_error(format!(
-                    "'{key}' is an invalid keyword argument for ContextVar()"
-                )));
-            }
-        }
-    }
+    // CPython 3.14 contextvar_new stores the name's hash eagerly; this also
+    // rejects an unhashable str subclass at construction time.
+    crate::baseobjspace::hash_w_strict(args[1])?;
     let obj = w_instance_new(context_var_type());
-    crate::baseobjspace::setattr_str(obj, "name", pos[1])?;
-    if let Some(default) = crate::builtins::kwarg_get(kwargs, "default") {
+    crate::baseobjspace::setattr_str(obj, "_name", args[1])?;
+    if let Some(&default) = args.get(2)
+        && !default.is_null()
+    {
         crate::baseobjspace::setattr_str(obj, "_default", default)?;
     }
     Ok(obj)
+}
+
+fn context_var_name_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::baseobjspace::getattr_str(args[1], "_name")
 }
 
 fn context_var_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

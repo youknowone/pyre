@@ -2283,6 +2283,16 @@ pub(crate) fn make_new_descr(
     pyre_object::w_staticmethod_new(f)
 }
 
+/// Signature-aware [`make_new_descr`] for builtin constructors with keyword
+/// or keyword-only parameters.
+pub(crate) fn make_new_descr_with_signature(
+    func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    signature: crate::gateway::Signature,
+) -> PyObjectRef {
+    let f = crate::make_builtin_function_as_builtin_with_signature("__new__", func, signature);
+    pyre_object::w_staticmethod_new(f)
+}
+
 /// `typeobject.c tp_new_wrapper` — `__new__` takes the class to instantiate
 /// as its first argument, so a call without one is rejected before the body
 /// reads the value positionals behind it.

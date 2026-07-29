@@ -1047,6 +1047,18 @@ pub fn make_builtin_function_as_builtin(name: &'static str, func: BuiltinCodeFn)
     crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// Signature-aware [`make_builtin_function_as_builtin`].  Builtin `__new__`
+/// descriptors need the builtin-function carrier for `copyreg` parity while
+/// still routing keyword-only arguments through the gateway binder.
+pub fn make_builtin_function_as_builtin_with_signature(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    signature: Signature,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_signature(name, func, None, signature);
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
 /// `make_builtin_function` for a builtin with a declared argument
 /// `Signature`, so the call path binds keyword arguments into positional
 /// order before the function runs (see `call::bind_kwargs_to_signature`).

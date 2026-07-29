@@ -2452,19 +2452,20 @@ pub fn call_with_kwargs(
         // keywords: FunctionType has `kwdefaults=...`, CPython 3.14 exposes
         // `memoryview(object=...)`, and the deque iterator constructors accept
         // (and ignore) `index=...`.  Route them through `__new__`.
-        let accepts_keywords_despite_nonbase = std::ptr::eq(
-            callable,
-            crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
-        ) || std::ptr::eq(
-            callable,
-            crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
-        ) || std::ptr::eq(
-            callable,
-            crate::module::_collections::deque_iter::public_type(),
-        ) || std::ptr::eq(
-            callable,
-            crate::module::_collections::deque_rev_iter::public_type(),
-        );
+        let accepts_keywords_despite_nonbase =
+            std::ptr::eq(
+                callable,
+                crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
+            ) || std::ptr::eq(
+                callable,
+                crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
+            ) || std::ptr::eq(
+                callable,
+                crate::module::_collections::deque_iter::public_type(),
+            ) || std::ptr::eq(
+                callable,
+                crate::module::_collections::deque_rev_iter::public_type(),
+            ) || std::ptr::eq(callable, crate::module::_contextvars::context_var_type());
         if !kwargs.is_empty()
             && !accepts_keywords_despite_nonbase
             && !unsafe { pyre_object::w_type_get_acceptable_as_base_class(callable) }
