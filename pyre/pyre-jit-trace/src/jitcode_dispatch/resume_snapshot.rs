@@ -1094,9 +1094,16 @@ pub(crate) fn decline_inline_caller_frame_for_catch_marker(
     // caller's `lastblock` (a static box in its virtualizable image) unwinds to
     // the catch handler in the blackhole — bit-exact — while a hot raise bridges
     // into the enclosing loop via the carrier-boundary delivery
-    // (`drive_bridge_carrier_walk`'s `finishframe_exception`).  A handler that
-    // does not rejoin any loop (returns out of the frame) stays declined, since
-    // its raise cannot be bridged.
+    // (`drive_bridge_carrier_walk`'s `finishframe_exception`).
+    //
+    // The rejoin test is a TRACEBACK constraint here, not a bridgeability one:
+    // the exc-edge router itself no longer needs it (`bridge_subwalk.rs` routes
+    // on the catch alone, as `pyjitpl.py:2530-2546` does).  Inlining a caller
+    // whose handler returns out of the frame instead makes
+    // `exception_traceback_frame_lineno` report the raising frame twice, once at
+    // the wrong lineno — the catching frame's traceback node is dropped when the
+    // inlined callee's raise is delivered.  Keep the decline until that is
+    // fixed; both backends reproduce it.
     //
     // `resume_pos` is the CALL's post-call `live/`; the `catch_exception/L` for
     // the enclosing try sits right after it (`finishframe_exception` lookahead),

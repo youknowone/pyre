@@ -208,22 +208,24 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         && trace_ctx.bridge_source_is_exception_guard()
         && !sym.last_exc_box().is_none()
         && !sym.last_exc_value().is_null();
+    // `finishframe_exception` (`pyjitpl.py:2530-2546`) reads the frame's
+    // `catch_exception` and jumps to the handler with no further condition on
+    // where the handler leads.  A handler that RETURNS out of the frame instead
+    // of rejoining a loop is the ordinary `finishframe` case
+    // (`pyjitpl.py:2503-2525`): the frame is popped and the result either lands
+    // in the caller's last op or, with the framestack empty, becomes
+    // `DoneWithThisFrame`.  Route on the catch alone.
     let exc_edge_catch_target = if exc_edge_precondition {
         find_catch_for_exc_resume(jitcode_code, position)
-            // Only route when the handler rejoins this frame's loop; a handler
-            // that returns out of the frame (called function's `try/except:
-            // return`, compiled as its own function trace) needs cross-frame
-            // resume pyre does not yet reconstruct — decline it to the blackhole.
-            .filter(|&catch_target| exc_handler_rejoins_loop(jitcode_code, catch_target))
     } else {
         None
     };
     if exc_edge_precondition && exc_edge_catch_target.is_none() {
-        // Routed by `call_jit` but the handler is unroutable here (returns out of
-        // the frame).  Abort BEFORE any recording so the guard failure resumes
-        // via the blackhole (correct caught-exception + callee-return handling),
+        // Routed by `call_jit` with no `catch_exception` in this frame at all,
+        // which the routing precondition above is supposed to exclude.  Abort
+        // BEFORE any recording so the guard failure resumes via the blackhole,
         // exactly as when the flag is off.
-        return Err(DispatchError::ExcEdgeCrossFrameReturnUnsupported { pc: position });
+        return Err(DispatchError::ExcEdgeNoInFrameCatch { pc: position });
     }
     let exc_edge_concrete = sym.last_exc_value();
     // typeptr at offset 0 (`_store_exception` invariant): the expected class the

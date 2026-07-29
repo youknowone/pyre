@@ -1896,17 +1896,17 @@ pub enum DispatchError {
     /// rewind it and a deliver re-run would double it, so the walk declines BEFORE
     /// the commit and the location interprets permanently (`AbortPermanent`).
     InplaceContainerMutationUnsupported { pc: usize },
-    /// Exception-edge bridge: the failing exception
-    /// guard is caught in-frame, but the `except` handler RETURNS out of the
-    /// frame (a called function's `try/except: return`, compiled as its own
-    /// function trace) rather than rejoining this frame's loop.  Routing the
-    /// walk to such a handler records a `Finish`/`DoneWithThisFrame` whose
-    /// cross-frame return pyre cannot yet reconstruct (the caller frame is not
-    /// rebuilt at the bridge → NULL-frame deref on return).  Abort so the guard
-    /// failure resumes via the blackhole, which handles the caught exception and
-    /// the callee return correctly.  The loop-rejoin case (same-frame handler)
-    /// still routes.
-    ExcEdgeCrossFrameReturnUnsupported { pc: usize },
+    /// Exception-edge bridge: `call_jit` routed the exc edge (published the
+    /// standing exception and declined to hand the guard to the blackhole), but
+    /// this frame carries no `catch_exception` covering the raise — a state the
+    /// routing precondition is supposed to exclude, since a routed walk must
+    /// resume at a handler rather than fall through to the NULL raised-call
+    /// result.  Abort so the guard failure resumes via the blackhole instead.
+    /// Where the handler LEADS does not reach this error: a handler that returns
+    /// out of the frame routes like any other (`pyjitpl.py:2530-2546`
+    /// `finishframe_exception` jumps to the catch unconditionally, and the
+    /// return is `finishframe`'s ordinary case, `pyjitpl.py:2503-2525`).
+    ExcEdgeNoInFrameCatch { pc: usize },
     /// The recorded trace passed `warmstate.trace_limit` (`rlib/jit.py:592`
     /// default 6000). RPython checks this after every traced step —
     /// `pyjitpl.py:2865 _interpret` calls `blackhole_if_trace_too_long()` right
@@ -1980,7 +1980,7 @@ impl DispatchError {
             Self::InplaceContainerMutationUnsupported { .. } => {
                 "InplaceContainerMutationUnsupported"
             }
-            Self::ExcEdgeCrossFrameReturnUnsupported { .. } => "ExcEdgeCrossFrameReturnUnsupported",
+            Self::ExcEdgeNoInFrameCatch { .. } => "ExcEdgeNoInFrameCatch",
             Self::TraceTooLong { .. } => "TraceTooLong",
         }
     }
@@ -2692,16 +2692,17 @@ fn label_operand_offset(key: &str) -> Option<usize> {
 /// (reaching a `jit_merge_point` back-edge), rather than returning out of the
 /// frame (`*_return`)?
 ///
-/// The exception-edge bridge is only sound when the handler REJOINS the loop in
-/// the SAME frame: the bridge records the handler body and closes with a `Jump`
-/// to the loop header, exactly like the no-exception path.  When the handler
-/// instead RETURNS out of the frame (a called function's `try/except: return`,
-/// compiled as its own function trace, not inlined into the caller's loop), the
-/// walk records a `Finish`/`DoneWithThisFrame` and the bridge must hand the
-/// return value back across the frame boundary to the caller — a cross-frame
-/// exception resume pyre does not yet reconstruct (the caller frame is not
-/// rebuilt at the bridge, so the return path derefs a NULL frame).  Route only
-/// the loop-rejoin case; the caller-return case declines to the blackhole.
+/// Sole caller: [`decline_inline_caller_frame_for_catch_marker`].  The
+/// exception-edge bridge router itself does NOT consult this — it routes on the
+/// `catch_exception` alone, the way `finishframe_exception`
+/// (`pyjitpl.py:2530-2546`) does, and a handler that returns out of the frame is
+/// `finishframe`'s ordinary case (`pyjitpl.py:2503-2525`).
+///
+/// What the predicate still gates is INLINING a caller whose in-try CALL would
+/// deliver a raise across the inline boundary: with a non-rejoining handler that
+/// delivery drops the catching frame's traceback node, so
+/// `exception_traceback_frame_lineno` reports the raising frame twice and at the
+/// wrong lineno (both backends).
 ///
 /// Bounded forward reachability from `catch_target`, following `goto`/
 /// `goto_if_not` successors: `true` as soon as any path reaches a

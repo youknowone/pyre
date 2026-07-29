@@ -1501,9 +1501,9 @@ fn inject_root_call_result<Sym: WalkSym>(
 /// inlined callee raised).  `root_pc` is the CALL's post-call resume `-live-`,
 /// with the enclosing try's `catch_exception/L` sitting BEHIND it (the same
 /// shape the single-frame exception-edge router scans), so read backward.
-/// Accept the handler only when it rejoins a loop (`exc_handler_rejoins_loop`)
-/// so the bridge closes with a `Jump` into the enclosing loop instead of a
-/// cross-frame return the carrier cannot reconstruct.
+/// The handler is accepted on the catch alone, as `finishframe_exception`
+/// (`pyjitpl.py:2530-2546`) does; where the handler leads is `finishframe`'s
+/// business (`pyjitpl.py:2503-2525`).
 fn carrier_root_catch_target<Sym: WalkSym>(sym: &Sym, root_pc: usize) -> Option<usize> {
     if sym.jitcode().is_null() {
         return None;
@@ -1516,12 +1516,9 @@ fn carrier_root_catch_target<Sym: WalkSym>(sym: &Sym, root_pc: usize) -> Option<
     // lookup the single-frame exception-edge router uses.
     let candidate = crate::jitcode_dispatch::find_catch_before_resume_live(code, root_pc);
     if std::env::var_os("PYRE_P2_DIAG").is_some() {
-        eprintln!(
-            "[p2-raise] root_pc={root_pc} catch_before={candidate:?} rejoins={:?}",
-            candidate.map(|t| crate::jitcode_dispatch::exc_handler_rejoins_loop(code, t)),
-        );
+        eprintln!("[p2-raise] root_pc={root_pc} catch_before={candidate:?}");
     }
-    candidate.filter(|&t| crate::jitcode_dispatch::exc_handler_rejoins_loop(code, t))
+    candidate
 }
 
 fn drive_bridge_carrier_walk<Sym: WalkSym>(
@@ -4737,16 +4734,16 @@ fn full_body_walk_trace<Sym: WalkSym>(
                     TraceAction::Abort
                 }
                 // The exc-edge routing decision is `find_catch_for_exc_resume`
-                // + `exc_handler_rejoins_loop` over `(jitcode_code, position)`
-                // alone, so the same guard reaches it on every retrace — the
-                // premise the `AbortPermanent` decline below is written for.
-                // It cannot take that mapping: the abort is raised before any
-                // recording precisely so the guard resumes via the blackhole,
-                // which is the correct handling, not a location to retire.
-                // Record only the bridge-guard decline, so the guard stops
-                // re-walking the whole body (executing its residual calls
-                // concretely) to re-derive a static answer.
-                DE::ExcEdgeCrossFrameReturnUnsupported { .. } => {
+                // over `(jitcode_code, position)` alone, so the same guard
+                // reaches it on every retrace — the premise the `AbortPermanent`
+                // decline below is written for.  It cannot take that mapping:
+                // the abort is raised before any recording precisely so the
+                // guard resumes via the blackhole, which is the correct
+                // handling, not a location to retire.  Record only the
+                // bridge-guard decline, so the guard stops re-walking the whole
+                // body (executing its residual calls concretely) to re-derive a
+                // static answer.
+                DE::ExcEdgeNoInFrameCatch { .. } => {
                     fbw_bridge_decline(ctx);
                     TraceAction::Abort
                 }
