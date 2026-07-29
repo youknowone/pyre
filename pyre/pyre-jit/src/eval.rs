@@ -8575,6 +8575,17 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     if stack_almost_full() {
         return None;
     }
+    // `compile_and_run_once` traces, runs the backend compiler, and then enters
+    // the code it just produced, all in native frames no `stack_check()` ever
+    // saw.  Upstream's backend is a few RPython frames and stays well inside the
+    // budget, so it marks only the sub-regions where an interruption would leave
+    // dangling state (`compile.py:976`, `pyjitpl.py:3305`, `resume.py:1318`);
+    // Cranelift's is an optimizing compiler measuring ~1.2 MB against a 768 KB
+    // budget, so the prologue probe of the code being entered reports an
+    // overflow at a Python call depth of 2.  `report_error = 0` for the region
+    // is what `stack.h:42-43` is for — a real overflow still surfaces from the
+    // interpreter once the region exits.
+    let _cc_guard = majit_metainterp::CriticalCodeGuard::enter();
     let env = PyreEnv;
     if majit_metainterp::majit_log_enabled() {
         eprintln!(

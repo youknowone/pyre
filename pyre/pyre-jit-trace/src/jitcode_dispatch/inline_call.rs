@@ -2517,10 +2517,12 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // admit it too so a rare guard-bridge continuation inlines its nested
         // int-arith calls instead of residualizing them (the gh#343 branchy-callee
         // cost).
-        let root_bridge = !ctx.fbw_mode.carrier_resume
-            && !ctx.fbw_mode.inline_subwalk
-            && !ctx.fbw_mode.snapshot_sym.is_null()
-            && ctx.session.borrow().framestack.is_empty();
+        // The nested levels are admitted on the same terms.
+        // `opimpl_recursive_call` (`pyjitpl.py:1390-1416`) makes the inline
+        // decision from the portal-frame count alone — already applied above via
+        // `fbw_inline_recursion_count` — and asks nothing about how deep the
+        // framestack is or whether a bridge or a primary trace is walking.
+        let root_bridge = !ctx.fbw_mode.carrier_resume && !ctx.fbw_mode.snapshot_sym.is_null();
         // A carrier-resume sub-walk (`drive_bridge_frame_subwalk`) drives its
         // reconstructed frame(s) forward through the same metainterp the initial
         // trace uses, so its inline of a nested int-arith call is the SAME as a
@@ -2675,17 +2677,17 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // A self-recursive callee routes to the direct `CALL_ASSEMBLER` arm
+    // A self-recursive callee unrolls until its own frame count reaches
+    // `max_unroll_recursion`, then routes to the direct `CALL_ASSEMBLER` arm
     // (`try_walker_call_assembler_self_recursive`, reached when this inline
-    // attempt returns `Ok(None)`) rather than the multiframe inline path.
-    // Multi-parameter all-int calls fold there; other self-recursive shapes
-    // decline from the fold to the plain residual call instead of aborting.
-    // Detected before the multiframe gate: a forward-branch self-recursive
-    // callee is `try_multiframe`-eligible, but unbounded self-recursion bottoms
-    // out the multiframe inline at the depth cap.  A strict-inlinable callee is
-    // a straight-line leaf (no self-recursion), so this never preempts the
-    // strict path.
-    if !strict_inlinable && nparams >= 1 {
+    // attempt returns `Ok(None)`).  That bound is the one
+    // `fbw_inline_recursion_count` already applied above, matching
+    // `opimpl_recursive_call` (`pyjitpl.py:1390-1416`), which counts the portal
+    // frames already on the framestack and inlines while the count is below
+    // `max_unroll_recursion`.  A carrier-resume sub-walk is the exception: it
+    // reconstructs its frames rather than entering them, so the count is not
+    // the walk's own recursion depth.
+    if !strict_inlinable && nparams >= 1 && ctx.fbw_mode.carrier_resume {
         let sym_ptr = ctx.fbw_mode.snapshot_sym;
         let self_recursive = !sym_ptr.is_null()
             && unsafe {
@@ -2694,20 +2696,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             } as usize
                 == w_code as usize;
         if self_recursive {
-            // RPython `opimpl_recursive_call` / `do_recursive_call`
-            // (`pyjitpl.py`) unroll within `max_unroll_recursion`,
-            // then fall back to the assembler-call path. A primary trace spends the
-            // recursion-unroll budget unrolling below `max_unroll_recursion`
-            // (`fbw_max_rec_unroll_depth`, a bound distinct from the
-            // straight-line chain-inline depth `fbw_max_multiframe_depth`)
-            // before folding the deepest call to the recursive portal
-            // `CALL_ASSEMBLER`.
-            let unroll = !ctx.fbw_mode.carrier_resume
-                && ctx.session.borrow().framestack.len() < fbw_max_rec_unroll_depth();
-            if !unroll {
-                return Ok(None);
-            }
-            // fall through to the multiframe gate (unroll one level)
+            return Ok(None);
         }
     }
     // #68: a forward-branch-bearing callee is inlinable with a multi-frame
