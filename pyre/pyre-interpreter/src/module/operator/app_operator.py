@@ -141,6 +141,13 @@ class itemgetter(object):
             a = ', '.join([repr(i) for i in self._idx])
         return 'operator.itemgetter(%s)' % (a,)
 
+    def __reduce__(self):
+        if self._single:
+            items = (self._idx,)
+        else:
+            items = tuple(self._idx)
+        return type(self), items
+
 
 class methodcaller(object):
     """
@@ -167,3 +174,10 @@ class methodcaller(object):
         for key, value in self._kwargs.items():
             args.append('%s=%r' % (key, value))
         return 'operator.methodcaller(%s)' % (', '.join(args),)
+
+    def __reduce__(self):
+        if not self._kwargs:
+            return type(self), (self._method_name,) + self._args
+        else:
+            from functools import partial
+            return partial(type(self), self._method_name, **self._kwargs), self._args
