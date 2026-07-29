@@ -646,12 +646,15 @@ impl ExecutionContext {
         Ok(())
     }
 
+    #[inline(always)]
     pub fn bytecode_trace(
         &mut self,
         frame: *mut PyFrame,
         decr_by: usize,
     ) -> Result<(), crate::PyError> {
-        crate::module::thread::apply_all_thread_hooks(self)?;
+        if !crate::module::thread::all_thread_hooks_current(self) {
+            crate::module::thread::apply_all_thread_hooks(self)?;
+        }
         if majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_ASYNC != 0 {
             let w_async_exception_type =
                 crate::module::thread::take_async_exception(self as *mut ExecutionContext);
@@ -720,6 +723,7 @@ impl ExecutionContext {
     /// per-frame trace is unset (so a later `frame.f_trace = cb`
     /// observes the unmodified instr_prev_plus_one and can fire its
     /// first `line` event correctly).
+    #[inline(always)]
     pub fn bytecode_only_trace(&mut self, frame: *mut PyFrame) -> Result<(), crate::PyError> {
         // PyPy has no object-space-null guard here: `space` is the interpreter
         // owner, not an optional tracing flag. Pyre represents that owner with

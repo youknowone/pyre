@@ -203,6 +203,19 @@ pub(crate) fn set_profile_all_execution_contexts(
     Ok(())
 }
 
+/// Fast bytecode-boundary gate for CPython's all-thread tracing extensions.
+///
+/// PyPy's ordinary `bytecode_trace` common path contains only its trace check
+/// and action ticker.  Pyre additionally has to notice process-wide
+/// `_settraceallthreads` / `_setprofileallthreads` generations, but when
+/// neither changed it need not enter the updater (and its mutex-bearing slow
+/// arms) at every opcode.
+#[inline(always)]
+pub(crate) fn all_thread_hooks_current(ec: &crate::PyExecutionContext) -> bool {
+    ec.trace_all_generation == TRACE_ALL_GENERATION.load(Ordering::Acquire)
+        && ec.profile_all_generation == PROFILE_ALL_GENERATION.load(Ordering::Acquire)
+}
+
 pub(crate) fn apply_all_thread_hooks(
     ec: &mut crate::PyExecutionContext,
 ) -> Result<(), crate::PyError> {
