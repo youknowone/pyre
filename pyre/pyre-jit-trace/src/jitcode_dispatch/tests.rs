@@ -260,6 +260,19 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
         Some(Value::Ref(majit_ir::GcRef(exc_obj_ptr as usize))),
         "vable writes must preserve the concrete half of a non-constant register Box",
     );
+    assert_eq!(
+        super::vable_ops::vable_effective_value_concrete(
+            &code,
+            &op,
+            0,
+            &wc,
+            'r',
+            wc.registers_r[1],
+            wc.registers_r[0],
+        ),
+        Some(Value::Ref(majit_ir::GcRef(0xC0DE_0000))),
+        "a TOS override must resolve its own box instead of the stale encoded register shadow",
+    );
 
     let runtime_jc = majit_metainterp::jitcode::JitCode::new("trace_too_long_arbitrary_pc");
     runtime_jc.set_body(majit_translate::jitcode::JitCodeBody {

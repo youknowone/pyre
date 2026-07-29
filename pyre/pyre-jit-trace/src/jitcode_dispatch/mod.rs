@@ -5403,9 +5403,11 @@ pub unsafe fn fbw_store_journal_root_walker_area(
             visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
         }
     }
-    // C3 S1: the force-time MIFrame survives the dispatch unwind in TLS.
-    // Its Option<i64> Ref bank is not visible to the collector, so forward
-    // every populated color until the walk-end handler takes the latch.
+    // The vable-force and trace-too-long MIFrame images survive the dispatch
+    // unwind in TLS. Their Option<i64> Ref banks are not otherwise visible to
+    // the collector, so forward every populated color until the walk-end
+    // handler takes the latch. The blackhole drivers install their own packed
+    // roots after the image leaves TLS.
     let single_frame_blackhole = unsafe { &mut *(*area.single_frame_blackhole).as_ptr() };
     if let Some(latched) = single_frame_blackhole.as_mut() {
         for value in latched.miframe.ref_values.iter_mut().flatten() {

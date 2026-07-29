@@ -42,6 +42,29 @@ pub(super) fn vable_value_concrete<Sym: WalkSym>(
     from_register.or_else(|| ctx.trace_ctx.concrete_of_opref(value))
 }
 
+/// Resolve the concrete value after an operand-stack recovery may have
+/// replaced the bytecode register's box.
+///
+/// The register shadow is authoritative only while `effective_value` is the
+/// box encoded by the instruction. Once TOS recovery substitutes another box,
+/// re-reading that original color can return a stale concrete value from a
+/// prior loop iteration.
+pub(super) fn vable_effective_value_concrete<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_, Sym>,
+    bank: char,
+    encoded_value: OpRef,
+    effective_value: OpRef,
+) -> Option<Value> {
+    if effective_value == encoded_value {
+        vable_value_concrete(code, op, operand_offset, ctx, bank, effective_value)
+    } else {
+        ctx.trace_ctx.concrete_of_opref(effective_value)
+    }
+}
+
 /// `getfield_vable_<i|r|f>/rd>X` handler. Operand layout `rd>X`:
 /// 1B r-reg(vable_box) + 2B descr(field) + 1B X-dst.
 ///
@@ -569,12 +592,13 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
             });
         }
     };
-    let mut value = match value_bank {
+    let encoded_value = match value_bank {
         'i' => read_int_reg(code, op, 2, ctx)?,
         'r' => read_ref_reg(code, op, 2, ctx)?,
         'f' => read_float_reg(code, op, 2, ctx)?,
         _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
     };
+    let mut value = encoded_value;
     // A STORE_FAST (`index < nlocals`) pops the operand-stack TOS and writes
     // it into a local slot.  When the popped value lives in an operand-stack
     // temp that spans a nested loop, the loop-header merge-point seeds no
@@ -603,7 +627,9 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         }
     }
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 3, 5, ctx)?;
-    let concrete = vable_value_concrete(code, op, 2, ctx, value_bank, value).unwrap_or(Value::Void);
+    let concrete =
+        vable_effective_value_concrete(code, op, 2, ctx, value_bank, encoded_value, value)
+            .unwrap_or(Value::Void);
     let guards_before = ctx.trace_ctx.num_guards();
     ctx.trace_ctx.vable_setarrayitem_indexed(
         op.pc,
