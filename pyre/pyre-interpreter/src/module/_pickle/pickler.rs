@@ -1011,10 +1011,13 @@ fn save_global_or_reduce(
     buf: &mut Framer,
     w_obj: PyObjectRef,
 ) -> Result<(), PyError> {
-    // Classes and functions are saved by reference.
-    if unsafe { pyre_object::typeobject::is_type(w_obj) }
-        || unsafe { crate::function::is_function(w_obj) }
-    {
+    // CPython 3.14 pickle.py save_type: the three singleton types have no
+    // importable builtins global, so encode them as type(singleton).
+    if unsafe { pyre_object::typeobject::is_type(w_obj) } {
+        return save_type(ctx, buf, w_obj);
+    }
+    // Functions are saved by reference.
+    if unsafe { crate::function::is_function(w_obj) } {
         return save_global(ctx, buf, w_obj, None);
     }
 
@@ -1033,6 +1036,42 @@ fn save_global_or_reduce(
         },
     };
     save_reduce_value(ctx, buf, w_obj, w_rv)
+}
+
+/// CPython 3.14 `pickle._Pickler.save_type`, line by line.
+fn save_type(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
+    let singleton = [
+        pyre_object::w_none(),
+        pyre_object::special::w_not_implemented(),
+        pyre_object::special::w_ellipsis(),
+    ]
+    .into_iter()
+    .find(|&value| {
+        crate::typedef::r#type(value)
+            .is_some_and(|w_type| crate::baseobjspace::is_w(w_obj, w_type.as_ptr()))
+    });
+    let Some(singleton) = singleton else {
+        return save_global(ctx, buf, w_obj, None);
+    };
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_type = builtin_attr("type")?;
+    pyre_object::gc_roots::pin_root(w_type);
+    let type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_args = pyre_object::tupleobject::w_tuple_new(vec![singleton]);
+    pyre_object::gc_roots::pin_root(w_args);
+    let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    save_reduce(
+        ctx,
+        buf,
+        &[
+            pyre_object::gc_roots::shadow_stack_get(type_slot),
+            pyre_object::gc_roots::shadow_stack_get(args_slot),
+        ],
+        Some(pyre_object::gc_roots::shadow_stack_get(obj_slot)),
+    )
 }
 
 /// Save the result of a reduce hook (`reducer_override` / `dispatch_table` /
