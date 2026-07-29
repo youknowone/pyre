@@ -19117,57 +19117,14 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "bytes_per_sep"], "hex")?;
     crate::builtins::kwarg_reject_duplicate(kwargs, "hex", "sep", pos.get(1).is_some())?;
     crate::builtins::kwarg_reject_duplicate(kwargs, "hex", "bytes_per_sep", pos.get(2).is_some())?;
-    // No sep / default grouping — produces "ffff" for [0xff, 0xff].
-    // The sep + bytes_per_sep kwargs are deferred until first observed
-    // need; CPython callers without args hit the hot path.
     let sep_arg = pos
         .get(1)
         .copied()
         .or_else(|| crate::builtins::kwarg_get(kwargs, "sep"));
-    if sep_arg.is_none() {
-        // Nothing below can run Python code, so the payload is read here.
-        let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
-        let mut out = String::with_capacity(data.len() * 2);
-        for &b in data {
-            out.push_str(&format!("{:02x}", b));
-        }
-        return Ok(pyre_object::w_str_new(&out));
-    }
-    // `pypy/objspace/std/bytearrayobject.py:645-687 _binascii_hexstr`
-    // sep validation — must be a length-1 ASCII string or length-1
-    // bytes; otherwise ValueError per PyPy.
-    let sep_obj = sep_arg.unwrap();
-    // CPython 3.14 `_Py_strhex_impl` deliberately uses `PyObject_Length`
-    // before inspecting the separator payload.  A bytes/str subclass may
-    // therefore run arbitrary `__len__` code here (gh-143195).  Once it
-    // reports one, the first payload unit is used; an empty payload supplies
-    // the terminating NUL, matching `_PyUnicode_AsUTF8AndSize`/`PyBytes_AS_STRING`.
-    let sep_length_error =
-        || crate::PyError::new(crate::PyErrorKind::ValueError, "sep must be length 1.");
-    let sep_ascii_error =
-        || crate::PyError::new(crate::PyErrorKind::ValueError, "sep must be ASCII.");
-    if crate::baseobjspace::len_w(sep_obj)? != 1 {
-        return Err(sep_length_error());
-    }
-    let sep_char: char = if unsafe { pyre_object::is_str(sep_obj) } {
-        let s = unsafe { pyre_object::w_str_get_value(sep_obj) };
-        if !s.is_ascii() {
-            return Err(sep_ascii_error());
-        }
-        s.chars().next().unwrap_or('\0')
-    } else if unsafe { pyre_object::is_bytes(sep_obj) } {
-        let sep_bytes = unsafe { pyre_object::bytesobject::bytes_like_data(sep_obj) };
-        if !sep_bytes.is_ascii() {
-            return Err(sep_ascii_error());
-        }
-        sep_bytes.first().copied().unwrap_or(0) as char
-    } else {
-        return Err(crate::PyError::type_error("sep must be str or bytes."));
-    };
-    let sep_str = sep_char.to_string();
-    // `bytearrayobject.py:680-692` — positive `bytes_per_sep` groups
-    // from the right (default), negative groups from the left; zero
-    // disables separators entirely.
+    // CPython 3.14 Argument Clinic converts `bytes_per_sep` before
+    // `bytearray_hex_impl` acquires the receiver export. Its `__index__` may
+    // therefore resize the receiver, and the live payload must be read only
+    // after this conversion.
     let raw_group: i64 = match pos
         .get(2)
         .copied()
@@ -19176,27 +19133,76 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         Some(o) => crate::baseobjspace::int_w(o)?,
         None => 1,
     };
-    let group = raw_group.unsigned_abs() as usize;
-    let group_from_left = raw_group < 0;
-    // Read the payload only now: `bytes_per_sep` coercion above can run
-    // `__index__`, which may clear or resize a bytearray receiver and
-    // leave any slice taken earlier describing a stale length.
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
-    let mut out = String::with_capacity(data.len() * 2 + data.len());
-    for (i, b) in data.iter().enumerate() {
-        if i > 0 && group != 0 {
-            let boundary = if group_from_left {
-                i % group == 0
-            } else {
-                (data.len() - i) % group == 0
-            };
-            if boundary {
-                out.push_str(&sep_str);
+
+    // bytearrayobject.c:2615-2628 `bytearray_hex_impl`: hold one export from
+    // before `_Py_strhex_with_sep` reads the receiver until it returns.
+    // `_Py_strhex_with_sep` calls `len(sep)`, so this export makes a
+    // re-entrant resize raise BufferError instead of invalidating the
+    // receiver pointer/length pair (gh-143195).
+    let receiver = crate::baseobjspace::simple_buffer_bytes(pos[0])?
+        .expect("bytes/bytearray receiver always exports a buffer");
+    let result = (|| {
+        let data = receiver.as_bytes();
+        let Some(sep_obj) = sep_arg else {
+            let mut out = String::with_capacity(data.len() * 2);
+            for &byte in data {
+                out.push_str(&format!("{byte:02x}"));
             }
+            return Ok(pyre_object::w_str_new(&out));
+        };
+
+        // `pypy/objspace/std/bytearrayobject.py:645-687 _binascii_hexstr`
+        // sep validation — must be a length-1 ASCII string or length-1
+        // bytes; otherwise ValueError per PyPy.
+        // CPython 3.14 `_Py_strhex_impl` deliberately uses `PyObject_Length`
+        // before inspecting the separator payload. A bytes/str subclass may
+        // therefore run arbitrary `__len__` code here.
+        let sep_length_error =
+            || crate::PyError::new(crate::PyErrorKind::ValueError, "sep must be length 1.");
+        let sep_ascii_error =
+            || crate::PyError::new(crate::PyErrorKind::ValueError, "sep must be ASCII.");
+        if crate::baseobjspace::len_w(sep_obj)? != 1 {
+            return Err(sep_length_error());
         }
-        out.push_str(&format!("{:02x}", b));
-    }
-    Ok(pyre_object::w_str_new(&out))
+        let sep_char: char = if unsafe { pyre_object::is_str(sep_obj) } {
+            let s = unsafe { pyre_object::w_str_get_value(sep_obj) };
+            if !s.is_ascii() {
+                return Err(sep_ascii_error());
+            }
+            s.chars().next().unwrap_or('\0')
+        } else if unsafe { pyre_object::is_bytes(sep_obj) } {
+            let sep_bytes = unsafe { pyre_object::bytesobject::bytes_like_data(sep_obj) };
+            if !sep_bytes.is_ascii() {
+                return Err(sep_ascii_error());
+            }
+            sep_bytes.first().copied().unwrap_or(0) as char
+        } else {
+            return Err(crate::PyError::type_error("sep must be str or bytes."));
+        };
+        let sep_str = sep_char.to_string();
+        // `bytearrayobject.py:680-692` — positive `bytes_per_sep` groups
+        // from the right (default), negative groups from the left; zero
+        // disables separators entirely.
+        let group = raw_group.unsigned_abs() as usize;
+        let group_from_left = raw_group < 0;
+        let mut out = String::with_capacity(data.len() * 2 + data.len());
+        for (i, byte) in data.iter().enumerate() {
+            if i > 0 && group != 0 {
+                let boundary = if group_from_left {
+                    i % group == 0
+                } else {
+                    (data.len() - i) % group == 0
+                };
+                if boundary {
+                    out.push_str(&sep_str);
+                }
+            }
+            out.push_str(&format!("{byte:02x}"));
+        }
+        Ok(pyre_object::w_str_new(&out))
+    })();
+    receiver.release();
+    result
 }
 
 /// interp_codecs.py:298/363 — encode-only handlers raise TypeError on decode

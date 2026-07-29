@@ -7638,4 +7638,31 @@ result = (
             assert!(crate::baseobjspace::is_true(result).unwrap());
         }
     }
+
+    #[test]
+    fn test_bytearray_hex_exports_receiver_during_separator_len() {
+        let source = "\
+value = bytearray(b'\\xaa')
+
+class Separator(bytes):
+    def __len__(self):
+        value.clear()
+        return 1
+
+try:
+    value.hex(Separator(b':'))
+except BufferError:
+    preserved = value == bytearray(b'\\xaa')
+    value.clear()
+    result = preserved and value == bytearray()
+else:
+    result = False
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytearray.hex receiver export lifetime failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
 }
