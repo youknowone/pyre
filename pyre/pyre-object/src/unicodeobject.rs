@@ -219,7 +219,7 @@ pub fn w_str_from_wtf8(value: Wtf8Buf) -> PyObjectRef {
 pub fn w_str_from_codepoint(code_point: u32) -> PyObjectRef {
     let mut one = Wtf8Buf::new();
     one.push(CodePoint::from_u32(code_point).unwrap_or(CodePoint::from_char('\u{fffd}')));
-    w_str_from_wtf8(one)
+    w_str_from_wtf8_managed(one)
 }
 
 /// The code points at `start, start + step, …` boxed as a fresh `str` —
@@ -253,7 +253,7 @@ pub unsafe fn w_str_slice_codepoints(
             i += step;
         }
     }
-    w_str_from_wtf8(result)
+    w_str_from_wtf8_managed(result)
 }
 
 /// `ll_strconcat` (`rstr.py:425-428`) — the two operands' WTF-8 buffers

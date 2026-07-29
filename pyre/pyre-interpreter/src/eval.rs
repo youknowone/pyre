@@ -2527,7 +2527,7 @@ impl IterOpcodeHandler for PyFrame {
                     .map(|c| {
                         let mut one = rustpython_wtf8::Wtf8Buf::new();
                         one.push(c);
-                        pyre_object::w_str_from_wtf8(one)
+                        pyre_object::w_str_from_wtf8_managed(one)
                     })
                     .collect();
                 let len = chars.len();

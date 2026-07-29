@@ -9463,19 +9463,16 @@ fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let val = val
         .to_u32()
         .expect("chr range check guarantees a value fitting u32");
-    match char::from_u32(val) {
-        Some(c) => Ok(w_str_new(&c.to_string())),
+    let cp = match char::from_u32(val) {
+        Some(c) => CodePoint::from(c),
         // Surrogate code points (0xD800-0xDFFF) are valid chr() arguments and
         // produce a lone-surrogate string; char::from_u32 rejects them, so
         // build the string through a WTF-8 code point instead.
-        None => {
-            let cp = CodePoint::from_u32(val as u32)
-                .expect("val is in 0..=0x10ffff per the range check above");
-            let mut one = Wtf8Buf::new();
-            one.push(cp);
-            Ok(w_str_from_wtf8(one))
-        }
-    }
+        None => CodePoint::from_u32(val).expect("val is in 0..=0x10ffff per the range check above"),
+    };
+    let mut one = Wtf8Buf::new();
+    one.push(cp);
+    Ok(pyre_object::w_str_from_wtf8_managed(one))
 }
 
 /// `filter(function or None, iterable)` — `functional.py:980-995

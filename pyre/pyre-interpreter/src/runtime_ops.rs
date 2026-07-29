@@ -1192,7 +1192,7 @@ pub fn sequence_getitem(seq: PyObjectRef, index: usize) -> Result<PyObjectRef, P
                 .map(|c| {
                     let mut one = Wtf8Buf::new();
                     one.push(c);
-                    w_str_from_wtf8(one)
+                    pyre_object::w_str_from_wtf8_managed(one)
                 })
                 .ok_or_else(|| PyError::type_error("string index out of range"));
         }
@@ -1464,7 +1464,7 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
                 pyre_object::w_str_codepoint_at(si.seq, idx as usize).map(|cp| {
                     let mut one = Wtf8Buf::new();
                     one.push(cp);
-                    w_str_from_wtf8(one)
+                    pyre_object::w_str_from_wtf8_managed(one)
                 })
             } else if pyre_object::bytesobject::is_bytes_like(si.seq) {
                 // Each item is the byte's ordinal, read from the live buffer so
