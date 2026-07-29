@@ -4739,8 +4739,26 @@ pub fn rehydrate_effect_info(ei: &mut majit_ir::EffectInfo) {
             record_set_member_lookup(m, &looked_up);
             match looked_up {
                 SetMemberLookup::Resolved(d) => out.push(d),
-                SetMemberLookup::AbsentContainer => {}
-                SetMemberLookup::Ambiguous => return None,
+                // `effectinfo.py:479-494 compute_bitstrings` unions EVERY
+                // member of every raw set; a member there is a live descr
+                // object, so upstream has no third answer.  Both of pyre's
+                // non-answers therefore mean the same thing — this set
+                // cannot be completed — and the only sound reply is the
+                // `EF_RANDOM_EFFECTS` wildcard.  Keeping a *concrete* set
+                // with the member omitted is what breaks the contract
+                // `optimizeopt/heap.rs force_from_effectinfo` relies on:
+                // out-of-range `bitcheck` returns false (`bitstring.py:16-20`
+                // parity), so the omission reads as "the callee does not
+                // write this field" and the optimizer keeps a stale heap
+                // cache entry across a call that does write it.
+                //
+                // Absence is not even stable — the descr universe keeps
+                // growing after the raw sets freeze, so a container absent
+                // at rehydrate time can arrive later while the omission
+                // lives on.  Closing the serialized universe (the
+                // build-time `DescrMintSpec` channel) is what makes this
+                // arm unreachable rather than merely rare.
+                SetMemberLookup::AbsentContainer | SetMemberLookup::Ambiguous => return None,
             }
         }
         Some(majit_ir::effectinfo::canonicalize_descr_set(out))
