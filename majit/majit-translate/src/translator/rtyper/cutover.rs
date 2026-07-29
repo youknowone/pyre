@@ -2433,6 +2433,14 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
     // does not model destructors (the `Drop` terminator lowers to a
     // pass-through `Goto`), so a Void no-op stub is faithful.
     (&["core", "mem", "drop"], &["x"], LowLevelType::Void),
+    // `handle_alloc_error(layout) -> !` aborts on OOM; it never returns and
+    // its result is never consumed. The divergence is carried by the CFG, so
+    // a Void stub lets the alloc helpers lift while the residual call aborts.
+    (
+        &["alloc", "alloc", "handle_alloc_error"],
+        &["layout"],
+        LowLevelType::Void,
+    ),
     (
         &["core", "slice", "<Impl>", "as_ptr"],
         &["self"],
