@@ -16801,18 +16801,20 @@ fn init_object_type(ns: PyObjectRef) {
 }
 
 fn bytearray_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-    let value = bytearray_descr_new_impl(args)?;
+    // bytearrayobject.py:218-219 `descr_new`: allocate an empty instance and
+    // leave every source/encoding/errors argument untouched for `descr_init`.
+    // In particular, a one-shot iterator must be consumed exactly once.
+    let (pos, _kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let cls = pos.first().copied().unwrap_or(pyre_object::PY_NULL);
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::bytearrayobject::BYTEARRAY_TYPE)? {
-        let data = unsafe { pyre_object::bytesobject::bytes_like_data(value).to_vec() };
-        let fresh = pyre_object::bytearrayobject::w_bytearray_subclass_from_bytes(&data, sub);
+        let fresh = pyre_object::bytearrayobject::w_bytearray_subclass_from_bytes(&[], sub);
         // bytearrayobject.py:new_bytearray uses `space.allocate_instance`;
         // register a user-defined finalizer after the subclass allocator has
         // installed the concrete class.
         pyre_object::gc_hook::maybe_register_finalizer(fresh);
         return Ok(fresh);
     }
-    Ok(value)
+    Ok(pyre_object::bytearrayobject::w_bytearray_new(0))
 }
 
 /// CPython 3.14 `bytes.__new__` / `bytearray.__init__` Argument Clinic
