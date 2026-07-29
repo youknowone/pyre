@@ -2010,7 +2010,12 @@ fn memoize(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) {
 /// that `module_name.name` resolves back to this exact object, raising a
 /// PicklingError otherwise — the dump-time check that the wire reference is
 /// actually loadable.
-fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
+enum ModuleName {
+    Utf8(String),
+    Surrogate(PyObjectRef),
+}
+
+fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
     if name.split('.').any(|s| s == "<locals>") {
         return Err(pickling_error(format!("Can't pickle local object {name}")));
     }
@@ -2018,18 +2023,57 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
     // `__module__`. A non-string module name is invalid; reject it here with
     // `TypeError("module name must be a string")` — the same error it surfaces
     // once used, raised at resolution time rather than deferred to the import.
-    let from_attr: Option<String> = match crate::baseobjspace::findattr_result(w_obj, "__module__")?
-    {
-        Some(m) if !unsafe { pyre_object::is_none(m) } => {
-            if !unsafe { pyre_object::is_str(m) } {
-                return Err(PyError::type_error("module name must be a string"));
+    let from_attr: Option<ModuleName> =
+        match crate::baseobjspace::findattr_result(w_obj, "__module__")? {
+            Some(m) if !unsafe { pyre_object::is_none(m) } => {
+                if !unsafe { pyre_object::is_str(m) } {
+                    return Err(PyError::type_error("module name must be a string"));
+                }
+                match unsafe { pyre_object::unicodeobject::w_str_get_value_opt(m) } {
+                    Some(module) => Some(ModuleName::Utf8(module.to_string())),
+                    None => Some(ModuleName::Surrogate(m)),
+                }
             }
-            Some(unsafe { pyre_object::unicodeobject::w_str_get_value(m) }.to_string())
-        }
-        _ => None,
-    };
+            _ => None,
+        };
     let module_name = match from_attr {
-        Some(mn) => mn,
+        Some(ModuleName::Utf8(mn)) => mn,
+        Some(ModuleName::Surrogate(w_module_name)) => {
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(w_obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            pyre_object::gc_roots::pin_root(w_module_name);
+            let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let modules = crate::importing::sys_modules_dict();
+            let module = unsafe {
+                pyre_object::w_dict_lookup(
+                    modules,
+                    pyre_object::gc_roots::shadow_stack_get(module_slot),
+                )
+            }
+            .ok_or_else(|| pickling_error("Can't pickle object: module is not in sys.modules"))?;
+            let resolved = match getattribute_dotted(module, name) {
+                Ok((value, _)) => Some(value),
+                Err(error) if matches!(error.kind, crate::PyErrorKind::AttributeError) => None,
+                Err(error) => return Err(error),
+            };
+            return match resolved {
+                Some(resolved)
+                    if crate::baseobjspace::is_w(
+                        resolved,
+                        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    ) =>
+                {
+                    Ok(ModuleName::Surrogate(
+                        pyre_object::gc_roots::shadow_stack_get(module_slot),
+                    ))
+                }
+                Some(_) => Err(pickling_error(
+                    "Can't pickle object: global identity mismatch",
+                )),
+                None => Err(pickling_error("Can't pickle object: global is not found")),
+            };
+        }
         None => {
             // Scan sys.modules; a match here is already verified by identity.
             let modules = crate::importing::sys_modules_dict();
@@ -2073,7 +2117,7 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
                 }
             }
             match found {
-                Some(mn) => return Ok(pyre_object::w_str_new(&mn)),
+                Some(mn) => return Ok(ModuleName::Utf8(mn)),
                 None => String::from("__main__"),
             }
         }
@@ -2111,7 +2155,7 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
     };
     match resolved {
         Some(resolved) if crate::baseobjspace::is_w(resolved, w_obj) => {
-            Ok(pyre_object::w_str_new(&module_name))
+            Ok(ModuleName::Utf8(module_name))
         }
         Some(_) => Err(pickling_error(format!(
             "Can't pickle object: it's not the same object as {module_name}.{name}"
@@ -2156,9 +2200,15 @@ fn save_global(
     else {
         return save_global_surrogate_name(ctx, buf, obj_slot, name_slot);
     };
-    let w_module_name = whichmodule(pyre_object::gc_roots::shadow_stack_get(obj_slot), &name)?;
-    let module_name =
-        unsafe { pyre_object::unicodeobject::w_str_get_value(w_module_name) }.to_string();
+    let module_name = whichmodule(pyre_object::gc_roots::shadow_stack_get(obj_slot), &name)?;
+    let module_name = match module_name {
+        ModuleName::Utf8(module_name) => module_name,
+        ModuleName::Surrogate(w_module_name) => {
+            pyre_object::gc_roots::pin_root(w_module_name);
+            let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            return save_global_surrogate_module(ctx, buf, obj_slot, name_slot, module_slot);
+        }
+    };
 
     // protocol >= 2: a `copyreg` extension code is emitted as EXT1/EXT2/EXT4
     // (and the object is not memoized — the reference is idempotent).
@@ -2203,6 +2253,42 @@ fn save_global(
     } else {
         save_toplevel_by_name(ctx, buf, &module_name, &name)?;
     }
+    memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(obj_slot));
+    Ok(())
+}
+
+fn save_global_surrogate_module(
+    ctx: &mut PickleCtx,
+    buf: &mut Framer,
+    obj_slot: usize,
+    name_slot: usize,
+    module_slot: usize,
+) -> Result<(), PyError> {
+    if ctx.proto < 4 {
+        let encoding = if ctx.proto < 3 { "ascii" } else { "utf-8" };
+        return match crate::type_methods::encode_object(
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
+            encoding,
+            "strict",
+        ) {
+            Ok(_) => Err(pickling_error(
+                "surrogate module identifier unexpectedly encoded",
+            )),
+            Err(error) => Err(identifier_encoding_error(
+                error,
+                pyre_object::gc_roots::shadow_stack_get(module_slot),
+                "module",
+                ctx.proto,
+            )),
+        };
+    }
+    save(
+        ctx,
+        buf,
+        pyre_object::gc_roots::shadow_stack_get(module_slot),
+    )?;
+    save(ctx, buf, pyre_object::gc_roots::shadow_stack_get(name_slot))?;
+    buf.push(op::STACK_GLOBAL);
     memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(obj_slot));
     Ok(())
 }
