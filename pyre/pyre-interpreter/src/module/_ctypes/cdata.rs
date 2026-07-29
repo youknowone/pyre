@@ -544,6 +544,20 @@ pub(crate) fn cdata_bytes(obj: PyObjectRef) -> Option<&'static [u8]> {
     }
 }
 
+/// `b_ptr[..b_size]` boxed as a `bytes`, or `None` for an instance with no
+/// view.
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the
+/// address arm borrows foreign memory through `host_ctypes::borrow_memory`,
+/// which has no lifted model, and the `&[u8]` [`cdata_bytes`] hands back is
+/// two words where a residual result is one.  Every caller boxes the slice
+/// immediately, so the box happens inside the boundary and a single
+/// null-niche `Option<PyObjectRef>` crosses it.
+#[majit_macros::dont_look_inside]
+pub(crate) fn cdata_bytes_object(obj: PyObjectRef) -> Option<PyObjectRef> {
+    cdata_bytes(obj).map(pyre_object::bytesobject::w_bytes_from_bytes)
+}
+
 /// `b_size` — the view length.
 pub(super) fn cdata_len(obj: PyObjectRef) -> Option<usize> {
     if let Some(ba) = cdata_buffer(obj) {

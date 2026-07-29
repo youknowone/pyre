@@ -1311,6 +1311,24 @@ impl ExecutionContext {
 
 /// Residual entry point for the bytecode-trace slow path: run pending
 /// async actions (signal delivery, finalizers).  Marked
+/// Arm the eval breaker's async bit (`interp_signal.py:34-36`
+/// `SignalActionFlag.reset_ticker` publishing a negative ticker).
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the
+/// bit lives in a process-global word an OS signal handler also writes, so
+/// the tracer cannot model the read-modify-write and residualises it, the
+/// [`disarm_async_eval_breaker`] twin.
+#[majit_macros::dont_look_inside]
+pub fn arm_async_eval_breaker() {
+    majit_ir::eval_breaker_word::set_async();
+}
+
+/// Clear the eval breaker's async bit — see [`arm_async_eval_breaker`].
+#[majit_macros::dont_look_inside]
+pub fn disarm_async_eval_breaker() {
+    majit_ir::eval_breaker_word::clear_async();
+}
+
 /// `dont_look_inside` so the tracer treats it as an opaque call and never
 /// follows the action machinery's trait-object virtual dispatch +
 /// `Result<(), PyError>` propagation (which the JIT codewriter cannot
@@ -1695,10 +1713,10 @@ impl ActionFlagOps for ActionFlag {
         self._ticker = value;
         if self.is_registered_ticker() {
             if value < 0 {
-                majit_ir::eval_breaker_word::set_async();
+                arm_async_eval_breaker();
             } else {
                 if !crate::module::thread::has_pending_async_exception() {
-                    majit_ir::eval_breaker_word::clear_async();
+                    disarm_async_eval_breaker();
                 }
                 // A signal delivered between the ticker store and this clear
                 // rearms the ticker to -1 and re-sets the async bit; the clear
@@ -1708,7 +1726,7 @@ impl ActionFlagOps for ActionFlag {
                 // registered pointer, so force a fresh load — and restore the
                 // bit if it was rearmed.
                 if unsafe { std::ptr::read_volatile(&self._ticker) } < 0 {
-                    majit_ir::eval_breaker_word::set_async();
+                    arm_async_eval_breaker();
                 }
             }
         }
@@ -1739,7 +1757,7 @@ impl ActionFlagOps for ActionFlag {
             // This path bypasses reset_ticker, so mirror a future periodic
             // decrement that crosses negative.
             if self.is_registered_ticker() && self._ticker < 0 {
-                majit_ir::eval_breaker_word::set_async();
+                arm_async_eval_breaker();
             }
         }
         self._ticker

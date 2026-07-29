@@ -740,6 +740,12 @@ pub unsafe fn w_type_get_uses_object_getattribute(obj: PyObjectRef) -> bool {
 }
 /// Write-side companion to [`w_type_get_uses_object_getattribute`]
 /// (typeobject.py:275, 315).
+///
+/// Mutates the per-type `uses_object_getattribute` atomic — a side effect on
+/// runtime type state the tracer cannot model, so the JIT residualises
+/// the call rather than tracing into it (`@dont_look_inside`,
+/// `rlib/jit.py:139`), the [`w_type_set_uses_object_setattr`] twin.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_type_set_uses_object_getattribute(obj: PyObjectRef, v: bool) {
     if obj.is_null() || !is_type(obj) {
         return;

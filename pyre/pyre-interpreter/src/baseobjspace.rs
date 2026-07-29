@@ -1662,19 +1662,12 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         {
             return Ok(obj);
         }
-        let mut result = Wtf8Buf::new();
-        let mut i = start;
-        for n in 0..slicelength {
-            if i >= 0 {
-                if let Some(cp) = at(i as usize) {
-                    result.push(cp);
-                }
-            }
-            if n + 1 < slicelength {
-                i += step;
-            }
-        }
-        return Ok(w_str_from_wtf8(result));
+        return Ok(pyre_object::unicodeobject::w_str_slice_codepoints(
+            obj,
+            start,
+            step,
+            slicelength,
+        ));
     }
     // `descr_getitem`: getindex_w(index, IndexError, "string") — coercion
     // inlined for the same rtyper reason as `getitem_list`.
@@ -1707,9 +1700,9 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let actual_idx = if idx < 0 { len as i64 + idx } else { idx };
     if actual_idx >= 0 {
         if let Some(cp) = at(actual_idx as usize) {
-            let mut one = Wtf8Buf::new();
-            one.push(cp);
-            return Ok(w_str_from_wtf8(one));
+            return Ok(pyre_object::unicodeobject::w_str_from_codepoint(
+                cp.to_u32(),
+            ));
         }
     }
     Err(PyError::new(
@@ -7642,15 +7635,14 @@ pub fn str_utf8_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
             crate::type_methods::arg_type_name(obj)
         )));
     }
-    // The raw buffer read below is only valid for a `str`.
-    let wtf8 = unsafe { pyre_object::w_str_get_wtf8(obj) };
-    match wtf8.as_str() {
-        Ok(s) => Ok(s),
-        Err(_) => {
-            let pos = wtf8
-                .code_points()
-                .position(|cp| cp.to_char().is_none())
-                .unwrap_or(0);
+    // The buffer read below is only valid for a `str`.
+    match unsafe { pyre_object::w_str_get_value_opt(obj) } {
+        Some(s) => Ok(s),
+        None => {
+            // `w_str_first_surrogate` already located the offending code
+            // point while deciding there was no `&str` view; re-reading it
+            // costs a second scan only on the raising path.
+            let pos = unsafe { pyre_object::w_str_first_surrogate(obj) }.max(0) as usize;
             Err(crate::typedef::unicode_encode_error(
                 "utf-8",
                 obj,
@@ -12731,11 +12723,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 // Box the idx-th code point as a one-character str,
                 // reading the WTF-8 view so a lone surrogate is yielded
                 // instead of panicking.
-                pyre_object::w_str_codepoint_at(seq, idx as usize).map(|cp| {
-                    let mut one = Wtf8Buf::new();
-                    one.push(cp);
-                    w_str_from_wtf8(one)
-                })
+                pyre_object::w_str_codepoint_at(seq, idx as usize)
+                    .map(|cp| pyre_object::unicodeobject::w_str_from_codepoint(cp.to_u32()))
             } else if pyre_object::bytesobject::is_bytes_like(seq) {
                 // Each item is the byte's ordinal, read from the live buffer.
                 if (idx as usize) < pyre_object::bytesobject::bytes_like_len(seq) {
@@ -13010,9 +12999,12 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             for &arg in &call_args {
                 pyre_object::gc_roots::pin_root(arg);
             }
-            let rooted_args: Vec<_> = (0..call_args.len())
-                .map(|index| pyre_object::gc_roots::shadow_stack_get(first_arg_slot + index))
-                .collect();
+            let mut rooted_args = Vec::with_capacity(call_args.len());
+            for index in 0..call_args.len() {
+                rooted_args.push(pyre_object::gc_roots::shadow_stack_get(
+                    first_arg_slot + index,
+                ));
+            }
             let w_fun = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
                 as *const pyre_object::interp_itertools::W_StarMap))
                 .w_fun;
@@ -13130,9 +13122,12 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             // Rebuild from roots because any preceding `next` may have moved
             // the yielded objects after their raw addresses entered `objects`.
             let objects_base = pyre_object::gc_roots::shadow_stack_len() - objects.len();
-            let rooted_objects = (0..objects.len())
-                .map(|index| pyre_object::gc_roots::shadow_stack_get(objects_base + index))
-                .collect();
+            let mut rooted_objects = Vec::with_capacity(objects.len());
+            for index in 0..objects.len() {
+                rooted_objects.push(pyre_object::gc_roots::shadow_stack_get(
+                    objects_base + index,
+                ));
+            }
             return Ok(pyre_object::w_tuple_new(rooted_objects));
         }
         // `pypy/module/__builtin__/functional.py:930-942 W_Filter.next_w`
@@ -13217,9 +13212,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         mo::w_map_get_fun(pyre_object::gc_roots::shadow_stack_get(obj_slot));
                     pyre_object::gc_roots::pin_root(w_fun);
                     let fun_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                    let rooted_items: Vec<_> = (0..items.len())
-                        .map(|index| pyre_object::gc_roots::shadow_stack_get(items_base + index))
-                        .collect();
+                    let mut rooted_items = Vec::with_capacity(items.len());
+                    for index in 0..items.len() {
+                        rooted_items
+                            .push(pyre_object::gc_roots::shadow_stack_get(items_base + index));
+                    }
                     crate::call::call_function_impl_result(
                         pyre_object::gc_roots::shadow_stack_get(fun_slot),
                         &rooted_items,

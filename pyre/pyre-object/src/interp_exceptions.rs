@@ -694,21 +694,26 @@ pub unsafe fn w_exception_get_args(obj: PyObjectRef) -> PyObjectRef {
         // a freshly-allocated tuple.
         let items: Vec<PyObjectRef> = if crate::pyobject::is_list(stored) {
             let len = crate::listobject::w_list_len(stored) as i64;
-            (0..len)
-                .map(|i| {
-                    crate::listobject::w_list_getitem(stored, i).unwrap_or(crate::pyobject::PY_NULL)
-                })
-                .collect()
+            let mut items = Vec::with_capacity(len as usize);
+            for i in 0..len {
+                items.push(
+                    crate::listobject::w_list_getitem(stored, i)
+                        .unwrap_or(crate::pyobject::PY_NULL),
+                );
+            }
+            items
         } else if crate::pyobject::is_tuple(stored) {
             // Legacy compat — pre-list storage path; treat as already
             // a sequence and rebuild the tuple identically.
             let len = crate::tupleobject::w_tuple_len(stored) as i64;
-            (0..len)
-                .map(|i| {
+            let mut items = Vec::with_capacity(len as usize);
+            for i in 0..len {
+                items.push(
                     crate::tupleobject::w_tuple_getitem(stored, i)
-                        .unwrap_or(crate::pyobject::PY_NULL)
-                })
-                .collect()
+                        .unwrap_or(crate::pyobject::PY_NULL),
+                );
+            }
+            items
         } else {
             Vec::new()
         };

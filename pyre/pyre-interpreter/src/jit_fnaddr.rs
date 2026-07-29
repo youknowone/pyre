@@ -558,6 +558,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::w_type_set_uses_object_setattr",
         crate::opcode_ops::bh_w_type_set_uses_object_setattr as *const (),
     );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::typeobject::w_type_set_uses_object_getattribute",
+        "pyre_object::w_type_set_uses_object_getattribute",
+        crate::opcode_ops::bh_w_type_set_uses_object_getattribute as *const (),
+    );
     // `w_type_issubtype` is the MRO membership scan (`_issubtype`,
     // typeobject.py:1640), run under the JIT inside `_pure_issubtype`
     // (`@elidable_promote`, typeobject.py:1657).  Its `#[dont_look_inside]`
@@ -628,6 +634,42 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::unicodeobject::w_str_new",
         "pyre_object::w_str_new",
         pyre_object::unicodeobject::w_str_new as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::unicodeobject::w_str_from_codepoint",
+        "pyre_object::w_str_from_codepoint",
+        pyre_object::unicodeobject::w_str_from_codepoint as *const (),
+    );
+    let w_str_slice_codepoints: unsafe fn(
+        pyre_object::PyObjectRef,
+        i64,
+        i64,
+        i64,
+    ) -> pyre_object::PyObjectRef = pyre_object::unicodeobject::w_str_slice_codepoints;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::unicodeobject::w_str_slice_codepoints",
+        "pyre_object::w_str_slice_codepoints",
+        w_str_slice_codepoints as *const (),
+    );
+    let w_str_concat: unsafe fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> pyre_object::PyObjectRef = pyre_object::unicodeobject::w_str_concat;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::unicodeobject::w_str_concat",
+        "pyre_object::w_str_concat",
+        w_str_concat as *const (),
+    );
+    let w_str_first_surrogate: unsafe fn(pyre_object::PyObjectRef) -> i64 =
+        pyre_object::unicodeobject::w_str_first_surrogate;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::unicodeobject::w_str_first_surrogate",
+        "pyre_object::w_str_first_surrogate",
+        w_str_first_surrogate as *const (),
     );
     push_alias_pair(
         &mut entries,
@@ -1055,6 +1097,20 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
             "pyre_interpreter::module::mmap::interp_mmap::mmap_type",
             "pyre_interpreter::mmap_type",
             mmap_type as *const (),
+        );
+    }
+    // `cdata_bytes_object` carries the `_ctypes` module's own gate
+    // (`module/mod.rs`), so the row repeats it rather than resolving a path
+    // configured out of the build.
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    {
+        let cdata_bytes_object: fn(pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> =
+            crate::module::_ctypes::cdata::cdata_bytes_object;
+        push_alias_pair(
+            &mut entries,
+            "pyre_interpreter::module::_ctypes::cdata::cdata_bytes_object",
+            "pyre_interpreter::cdata_bytes_object",
+            cdata_bytes_object as *const (),
         );
     }
     push_alias_pair(
@@ -1824,6 +1880,33 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_interpreter::executioncontext::arm_async_eval_breaker",
+        "pyre_interpreter::arm_async_eval_breaker",
+        crate::executioncontext::arm_async_eval_breaker as *const (),
+    );
+    let show_warning: fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        i64,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> Result<(), crate::PyError> = crate::module::_warnings::show_warning;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::module::_warnings::show_warning",
+        "pyre_interpreter::show_warning",
+        show_warning as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::executioncontext::disarm_async_eval_breaker",
+        "pyre_interpreter::disarm_async_eval_breaker",
+        crate::executioncontext::disarm_async_eval_breaker as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_interpreter::executioncontext::execution_context_builtin_cache_get",
         "pyre_interpreter::execution_context_builtin_cache_get",
         crate::executioncontext::execution_context_builtin_cache_get as *const (),
@@ -2146,6 +2229,15 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::pyframe::pyframe_get_pycode",
         "pyre_interpreter::pyframe_get_pycode",
         pyframe_get_pycode_fn as *const (),
+    );
+
+    let report_stack_underflow: fn(&crate::pyframe::PyFrame) =
+        crate::pyframe::report_stack_underflow;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::pyframe::report_stack_underflow",
+        "pyre_interpreter::report_stack_underflow",
+        report_stack_underflow as *const (),
     );
 
     let pyframe_ncells_free: fn(&crate::CodeObject) -> usize = crate::pyframe::ncells;

@@ -1909,17 +1909,10 @@ unsafe fn long_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// Concatenate two str objects.
 
 pub(crate) unsafe fn str_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    // Read the surrogate-aware WTF-8 view so concatenating a
+    // `w_str_concat` joins the surrogate-aware WTF-8 views, so concatenating a
     // surrogateescape/surrogatepass-decoded string does not go through
     // `w_str_get_value` (which rejects lone surrogates).
-    let sa = w_str_get_wtf8(a);
-    let sb = w_str_get_wtf8(b);
-    let mut result = Wtf8Buf::with_capacity(sa.len() + sb.len());
-    result.push_wtf8(sa);
-    result.push_wtf8(sb);
-    // Concatenation is a dominant dynamic-churn producer; its result lives in
-    // GC-traced slots (locals, list/dict/set members), so make it collectable.
-    Ok(w_str_from_wtf8_managed(result))
+    Ok(pyre_object::unicodeobject::w_str_concat(a, b))
 }
 
 /// Extract a non-negative repeat count from an int or long.

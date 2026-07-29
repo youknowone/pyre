@@ -1231,18 +1231,22 @@ unsafe fn temporarily_as_objects(list: &W_ListObject) -> Vec<PyObjectRef> {
         // listobject.py:1142 EmptyListStrategy.getitems returns [].
         ListStrategy::Empty => Vec::new(),
         ListStrategy::Object => list.object_to_vec(),
-        ListStrategy::Integer => list
-            .int_items
-            .as_slice()
-            .iter()
-            .map(|&v| w_int_new(v))
-            .collect(),
-        ListStrategy::Float => list
-            .float_items
-            .as_slice()
-            .iter()
-            .map(|&v| w_float_new(v))
-            .collect(),
+        ListStrategy::Integer => {
+            let items = list.int_items.as_slice();
+            let mut boxed = Vec::with_capacity(items.len());
+            for &v in items {
+                boxed.push(w_int_new(v));
+            }
+            boxed
+        }
+        ListStrategy::Float => {
+            let items = list.float_items.as_slice();
+            let mut boxed = Vec::with_capacity(items.len());
+            for &v in items {
+                boxed.push(w_float_new(v));
+            }
+            boxed
+        }
     }
 }
 

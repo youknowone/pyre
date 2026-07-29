@@ -202,6 +202,84 @@ pub fn w_str_from_wtf8(value: Wtf8Buf) -> PyObjectRef {
     }) as PyObjectRef
 }
 
+/// Box one code point as a one-character `str`, `rutf8.unichr_as_utf8`
+/// (`rutf8.py:40`) under `_getitem_result` (`unicodeobject.py:1205`).
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`), the
+/// [`w_str_new`] twin: the body encodes into a fresh `Wtf8Buf` and runs the
+/// unfused `malloc_typed` NewWithVtable behind it.  The code point crosses
+/// as its scalar value because a `CodePoint` is a struct, which the residual
+/// argument slots do not carry.
+///
+/// The value is `w_str_from_wtf8`'s, so a code point outside the Unicode
+/// range cannot reach here; an out-of-range word yields `U+FFFD` rather than
+/// constructing an invalid string.
+#[majit_macros::dont_look_inside]
+pub fn w_str_from_codepoint(code_point: u32) -> PyObjectRef {
+    let mut one = Wtf8Buf::new();
+    one.push(CodePoint::from_u32(code_point).unwrap_or(CodePoint::from_char('\u{fffd}')));
+    w_str_from_wtf8(one)
+}
+
+/// The code points at `start, start + step, …` boxed as a fresh `str` —
+/// `_unicode_sliced` / `descr_getslice` (`unicodeobject.py:1373-1379`).
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`), the
+/// [`w_str_from_codepoint`] twin: the cut is assembled by pushing code
+/// points into a `Wtf8Buf`, and a mutable string builder has no counterpart
+/// in the immutable lifted string model.  The caller keeps the
+/// whole-string identity shortcut traced ahead of this call, so only a real
+/// cut reaches here.
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_str_slice_codepoints(
+    obj: PyObjectRef,
+    start: i64,
+    step: i64,
+    slicelength: i64,
+) -> PyObjectRef {
+    let mut result = Wtf8Buf::new();
+    let mut i = start;
+    for n in 0..slicelength {
+        if i >= 0
+            && let Some(cp) = unsafe { w_str_codepoint_at(obj, i as usize) }
+        {
+            result.push(cp);
+        }
+        if n + 1 < slicelength {
+            i += step;
+        }
+    }
+    w_str_from_wtf8(result)
+}
+
+/// `ll_strconcat` (`rstr.py:425-428`) — the two operands' WTF-8 buffers
+/// joined into a fresh collectable `str`.
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`):
+/// upstream reaches concatenation through `@jit.oopspec('stroruni.concat')`
+/// rather than tracing the buffer build, and pyre's build — `Wtf8Buf`
+/// reserve plus two `push_wtf8` — has no lowering in the immutable lifted
+/// string model.
+///
+/// Concatenation is a dominant dynamic-churn producer and its result lives
+/// in GC-traced slots (locals, list/dict/set members), so the result is
+/// collectable.
+///
+/// # Safety
+/// `a` and `b` must point to valid `W_UnicodeObject`s.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_str_concat(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
+    let sa = unsafe { w_str_get_wtf8(a) };
+    let sb = unsafe { w_str_get_wtf8(b) };
+    let mut result = Wtf8Buf::with_capacity(sa.len() + sb.len());
+    result.push_wtf8(sa);
+    result.push_wtf8(sb);
+    w_str_from_wtf8_managed(result)
+}
+
 /// Collectable `w_str_from_wtf8` for dynamic strings — see [`w_str_new_managed`].
 ///
 /// Builds config (b): a GC value box (greyed by the header `value` edge, tid 34
@@ -445,12 +523,63 @@ pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
 /// surrogate rather than silently corrupting.
 #[inline]
 pub unsafe fn w_str_get_value(obj: PyObjectRef) -> &'static str {
-    unsafe {
-        let str_obj = obj as *const W_UnicodeObject;
-        (*(*str_obj).value)
-            .as_str()
-            .expect("w_str_get_value: backing Wtf8Buf is not valid UTF-8 (lone surrogate)")
+    match unsafe { w_str_get_value_opt(obj) } {
+        Some(value) => value,
+        None => panic!("w_str_get_value: backing Wtf8Buf is not valid UTF-8 (lone surrogate)"),
     }
+}
+
+/// The `&str` view of a WTF-8 buffer already known to hold no lone
+/// surrogate.
+///
+/// `str`, `String`, `Wtf8` and `Wtf8Buf` all project to the single immutable
+/// lifted string value, so this is the identity `Wtf8::as_str` is minus the
+/// validity arm the caller has already taken — `as_str` itself hands back a
+/// `Result<&str, Utf8Error>` whose two-word `Ok` payload crosses no residual
+/// boundary, which is why the check and the view are split here.
+///
+/// # Safety
+/// `value` must be valid UTF-8; [`w_str_is_utf8`] is what decides that.
+#[inline]
+pub unsafe fn as_str_unchecked(value: &Wtf8) -> &str {
+    unsafe { std::str::from_utf8_unchecked(value.as_bytes()) }
+}
+
+/// Scan the buffer for the code point index of its first lone surrogate, or
+/// `-1` when every code point encodes as UTF-8.
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the
+/// scan walks the whole buffer, and both answers it carries — the validity
+/// bit [`w_str_is_utf8`] tests and the error offset `str_utf8_w` reports —
+/// ride back in the one machine word.
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_str_first_surrogate(obj: PyObjectRef) -> i64 {
+    let value = unsafe { &*(*(obj as *const W_UnicodeObject)).value };
+    if value.as_str().is_ok() {
+        return -1;
+    }
+    value
+        .code_points()
+        .position(|cp| cp.to_char().is_none())
+        .map_or(0, |pos| pos as i64)
+}
+
+/// Whether the backing buffer has a `&str` view — false exactly when it
+/// carries a lone surrogate.
+///
+/// An ascii payload is one byte per code point (`unicodeobject.py:1245`
+/// `_length == len(_utf8)`) and so is valid UTF-8 by construction; the
+/// cached counts answer for it without touching the bytes, and anything
+/// else scans behind [`w_str_first_surrogate`].
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject`.
+#[inline]
+pub unsafe fn w_str_is_utf8(obj: PyObjectRef) -> bool {
+    unsafe { w_str_is_ascii(obj) || w_str_first_surrogate(obj) < 0 }
 }
 
 /// Borrow the WTF-8 view of a known W_UnicodeObject, surrogate-aware.
@@ -504,8 +633,10 @@ pub unsafe fn w_str_set_hash(obj: PyObjectRef, hash: i64) {
 #[inline]
 pub unsafe fn w_str_get_value_opt(obj: PyObjectRef) -> Option<&'static str> {
     unsafe {
-        let str_obj = obj as *const W_UnicodeObject;
-        (*(*str_obj).value).as_str().ok()
+        if !w_str_is_utf8(obj) {
+            return None;
+        }
+        Some(as_str_unchecked(w_str_get_wtf8(obj)))
     }
 }
 

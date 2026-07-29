@@ -973,6 +973,16 @@ pub extern "C" fn bh_w_type_set_uses_object_setattr(obj: i64, v: i64) {
 }
 
 /// C-ABI residual bridge for the `dont_look_inside`
+/// [`pyre_object::typeobject::w_type_set_uses_object_getattribute`], the
+/// [`bh_w_type_set_uses_object_setattr`] twin.
+#[allow(improper_ctypes_definitions)]
+pub extern "C" fn bh_w_type_set_uses_object_getattribute(obj: i64, v: i64) {
+    unsafe {
+        pyre_object::typeobject::w_type_set_uses_object_getattribute(obj as PyObjectRef, v != 0);
+    }
+}
+
+/// C-ABI residual bridge for the `dont_look_inside`
 /// [`pyre_object::interp_exceptions::lookup_exc_class_for_kind`]: its `ExcKind`
 /// parameter does not match the integer arg slot a residual call
 /// supplies, so reconstruct it from `i64` here before forwarding. The

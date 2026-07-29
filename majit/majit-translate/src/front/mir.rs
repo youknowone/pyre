@@ -8694,10 +8694,15 @@ impl<'a> Lowering<'a> {
 
     /// `<String as AsRef<str>>::as_ref(&self) -> &str`,
     /// `String::as_str(&self) -> &str`, `Wtf8::as_str(&self) -> &str`, and
-    /// `<String as Borrow<str>>::borrow(&self) -> &str` — every one
+    /// `<String as Borrow<str>>::borrow(&self) -> &str`, and pyre's
+    /// `as_str_unchecked(&Wtf8) -> &str` — every one
     /// returns a `&str` view of the same string, an identity in the
     /// lifted value model (Rust `String`/`&str`/`str`/`Wtf8`/`Wtf8Buf`
-    /// all lower to the immutable rpy_string).  Without the intercept the
+    /// all lower to the immutable rpy_string).  `as_str_unchecked` names
+    /// the view `Wtf8::as_str` gives once its validity arm has been taken
+    /// separately: `as_str` itself returns `Result<&str, Utf8Error>`,
+    /// whose destination does not strip to `str`, so it fails the gate
+    /// below and stays a wall.  Without the intercept the
     /// call keeps a `CallTarget::Method` `as_ref` getattr the rtyper
     /// cannot route on the classdef-less string receiver (the `Cannot
     /// find attribute "as_ref" on UnicodeString` wall).  Bind the
@@ -8724,7 +8729,7 @@ impl<'a> Lowering<'a> {
         let Some(leaf) = np.rsplit("::").next() else {
             return false;
         };
-        if !matches!(leaf, "as_ref" | "as_str" | "borrow") {
+        if !matches!(leaf, "as_ref" | "as_str" | "as_str_unchecked" | "borrow") {
             return false;
         }
         if !first_arg_ty.is_some_and(|ty| tyref_is_string_value(ty, self.llbc)) {

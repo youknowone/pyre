@@ -1109,6 +1109,53 @@ pub unsafe fn pyframe_get_pycode(frame: &PyFrame) -> *const CodeObject {
     unsafe { crate::w_code_get_ptr(frame.pycode as pyre_object::PyObjectRef) as *const CodeObject }
 }
 
+/// Name the frame a stack underflow was detected on. A bare depth
+/// assertion says an opcode popped from an empty stack but not which
+/// opcode of which code object, which is the whole question when the
+/// underflow means the frame — or the code behind it — is no longer the
+/// one the loop started with.
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`):
+/// [`PyFrame::pop`] reaches this on the branch it never takes, so the
+/// instruction-window formatting below — a `Vec<String>` built through
+/// `enumerate`/`skip`/`take`/`map` over the `CodeUnits` deref — would
+/// otherwise be lowered into every graph that pops a value.  The report
+/// diverges by panicking; the `()` result is what crosses the residual
+/// boundary.
+#[majit_macros::dont_look_inside]
+#[cold]
+#[inline(never)]
+pub fn report_stack_underflow(frame: &PyFrame) {
+    let code = unsafe { &*pyframe_get_pycode(frame) };
+    let window: Vec<String> = code
+        .instructions
+        .iter()
+        .copied()
+        .enumerate()
+        .skip(frame.next_instr().saturating_sub(4))
+        .take(8)
+        .map(|(pc, unit)| format!("{pc}:{unit:?}"))
+        .collect();
+    panic!(
+        "value-stack underflow: depth={} base={} (nlocals={} ncells={}) \
+         pc={} last_instr={} ninstrs={} code={:?} file={:?} frame={:p} \
+         pycode={:p} back={:p} window=[{}]",
+        frame.valuestackdepth,
+        frame.stack_base(),
+        frame.nlocals(),
+        frame.ncells(),
+        frame.next_instr(),
+        frame.last_instr,
+        code.instructions.len(),
+        code.obj_name,
+        code.source_path,
+        frame,
+        frame.pycode,
+        frame.f_backref,
+        window.join(" "),
+    );
+}
+
 /// True when a `sys.settrace` / `sys.setprofile` hook is installed on the
 /// execution context this frame runs under.
 ///
@@ -2381,44 +2428,6 @@ impl PyFrame {
         self.nlocals() + self.ncells()
     }
 
-    /// Name the frame a stack underflow was detected on. A bare depth
-    /// assertion says an opcode popped from an empty stack but not which
-    /// opcode of which code object, which is the whole question when the
-    /// underflow means the frame — or the code behind it — is no longer the
-    /// one the loop started with.
-    #[cold]
-    #[inline(never)]
-    fn report_stack_underflow(&self) -> ! {
-        let code = unsafe { &*pyframe_get_pycode(self) };
-        let window: Vec<String> = code
-            .instructions
-            .iter()
-            .copied()
-            .enumerate()
-            .skip(self.next_instr().saturating_sub(4))
-            .take(8)
-            .map(|(pc, unit)| format!("{pc}:{unit:?}"))
-            .collect();
-        panic!(
-            "value-stack underflow: depth={} base={} (nlocals={} ncells={}) \
-             pc={} last_instr={} ninstrs={} code={:?} file={:?} frame={:p} \
-             pycode={:p} back={:p} window=[{}]",
-            self.valuestackdepth,
-            self.stack_base(),
-            self.nlocals(),
-            self.ncells(),
-            self.next_instr(),
-            self.last_instr,
-            code.instructions.len(),
-            code.obj_name,
-            code.source_path,
-            self,
-            self.pycode,
-            self.f_backref,
-            window.join(" "),
-        );
-    }
-
     // ── Stack operations ──────────────────────────────────────────────
 
     #[inline]
@@ -2432,7 +2441,7 @@ impl PyFrame {
     #[inline]
     pub fn pop(&mut self) -> PyObjectRef {
         if self.valuestackdepth <= self.stack_base() {
-            self.report_stack_underflow();
+            report_stack_underflow(self);
         }
         let depth = self.valuestackdepth - 1;
         let value = self.locals_w()[depth];
@@ -2857,7 +2866,7 @@ impl PyFrame {
     /// user-visible callbacks never see the gateway machinery.
     ///
     /// Pyre does not allocate a `PyFrame` for builtin calls — the
-    /// `dispatch_callable` builtin closure (`runtime_ops.rs:275`)
+    /// `CallableKind::Builtin` arm (`classify_callable`, `runtime_ops.rs`)
     /// invokes the BuiltinCode function pointer directly, with no
     /// frame attached, so the trace path never observes builtin
     /// frames.  Hidden-applevel user frames (the `app_main.py`
@@ -3621,9 +3630,10 @@ impl PyFrame {
             pyre_object::gc_roots::shadow_stack_get(root_base + 1),
             execution_context,
         )?;
-        let current_args: Vec<PyObjectRef> = (0..args.len())
-            .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 3 + i))
-            .collect();
+        let mut current_args: Vec<PyObjectRef> = Vec::with_capacity(args.len());
+        for i in 0..args.len() {
+            current_args.push(pyre_object::gc_roots::shadow_stack_get(root_base + 3 + i));
+        }
         Ok(Self::finish_for_call_with_globals_obj(
             pyre_object::gc_roots::shadow_stack_get(root_base) as *const (),
             &current_args,
@@ -3663,9 +3673,10 @@ impl PyFrame {
             pyre_object::gc_roots::shadow_stack_get(root_base + 1),
             execution_context,
         );
-        let current_args: Vec<PyObjectRef> = (0..args.len())
-            .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 3 + i))
-            .collect();
+        let mut current_args: Vec<PyObjectRef> = Vec::with_capacity(args.len());
+        for i in 0..args.len() {
+            current_args.push(pyre_object::gc_roots::shadow_stack_get(root_base + 3 + i));
+        }
         Self::finish_for_call_with_globals_obj(
             pyre_object::gc_roots::shadow_stack_get(root_base) as *const (),
             &current_args,

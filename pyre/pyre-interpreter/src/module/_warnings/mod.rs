@@ -408,7 +408,12 @@ fn update_registry(
     )
 }
 
-fn show_warning(
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the
+/// line is assembled in a `Wtf8Buf`, which has no counterpart in the
+/// immutable lifted string model, and the whole body is a write to
+/// `sys.stderr` — an opaque host action with nothing for a trace to reuse.
+#[majit_macros::dont_look_inside]
+pub(crate) fn show_warning(
     message: PyObjectRef,
     text: PyObjectRef,
     category: PyObjectRef,

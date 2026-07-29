@@ -17083,8 +17083,8 @@ pub(crate) fn buffer_as_bytes_like(
         })));
     }
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-    if let Some(data) = crate::module::_ctypes::cdata::cdata_bytes(obj) {
-        return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(data)));
+    if let Some(data) = crate::module::_ctypes::cdata::cdata_bytes_object(obj) {
+        return Ok(Some(data));
     }
     // `W_MMap.readbuf_w` — the mapping is a bytes-like source in its own
     // right, so `bytes(m)` / `bytearray(m)` copy it here instead of falling
