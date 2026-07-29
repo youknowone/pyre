@@ -10850,24 +10850,34 @@ impl CodeWriter {
 
                         // PopJumpIfNone / PopJumpIfNotNone: pops 1. Net: -1.
                         //
-                        // `flowcontext.py` folds these to a static
-                        // `is None` constant test with no residual guard.
-                        // The meta-trace analog composes two already-ported
-                        // front-end ops: `is`/`is_not` against the immortal
-                        // `None` singleton (`pyobject_const_ref_value(w_none())`
-                        // — GC-safe to const-fold; `None` never moves), then
-                        // `bool` on that Ref result to feed the generic Bool
-                        // exitswitch.  Both variants jump on TRUE, so the exit
-                        // wiring is identical to POP_JUMP_IF_TRUE; the only
-                        // difference is `is` (POP_JUMP_IF_NONE) vs `is_not`
-                        // (POP_JUMP_IF_NOT_NONE).
+                        // `pyopcode.py POP_JUMP_FORWARD_IF_NONE` /
+                        // `_IF_NOT_NONE` branch straight on
+                        // `space.is_w(w_value, space.w_None)` — an `lltype.Bool`.
+                        // There is no `is_true` / boxed `w_True`-`w_False`
+                        // round-trip; that belongs to `IS_OP`
+                        // (`pyopcode.py IS_OP`), which has to *push* a
+                        // Python bool.  So this pair lowers to a bare pointer
+                        // identity test against the immortal `None` singleton
+                        // (`pyobject_const_ref_value(w_none())` — GC-safe to
+                        // const-fold; `None` never moves) feeding the Bool
+                        // exitswitch directly.  Routing it through the
+                        // `is`/`is_not` COMPARE_OP tags instead put a residual
+                        // `compare_fn` may-force call plus a GuardClass and an
+                        // unbox in every trace, which is enough to keep the
+                        // enclosing loop from closing when the test sits in an
+                        // inlined callee.
+                        //
+                        // Both variants jump on TRUE, so the exit wiring is
+                        // identical to POP_JUMP_IF_TRUE; the only difference is
+                        // `ptr_eq` (POP_JUMP_IF_NONE) vs `ptr_ne`
+                        // (POP_JUMP_IF_NOT_NONE).  Neither can raise, so unlike
+                        // the `bool`-based branches this needs no exception edge
+                        // inside a `try` range.
                         Instruction::PopJumpIfNone { delta }
                         | Instruction::PopJumpIfNotNone { delta } => {
-                            let invert_kind = match instruction {
-                                Instruction::PopJumpIfNone { .. } => {
-                                    pyre_interpreter::bytecode::Invert::No
-                                }
-                                _ => pyre_interpreter::bytecode::Invert::Yes,
+                            let identity_opname = match instruction {
+                                Instruction::PopJumpIfNone { .. } => "ptr_eq",
+                                _ => "ptr_ne",
                             };
                             let target_py_pc = jump_target_forward(
                                 code,
@@ -10877,24 +10887,16 @@ impl CodeWriter {
                             );
                             let _cond_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let cond_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            // `x is None` / `x is not None` — the None singleton
-                            // is const-folded as a Ref operand.
                             let none_value = pyobject_const_ref_value(pyre_object::w_none());
-                            let is_value = emit_frontend_is_op(
+                            let bool_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
-                                cond_value,
-                                none_value,
-                                invert_kind,
+                                identity_opname,
+                                vec![cond_value.into(), none_value.into()],
+                                Kind::Int,
                                 py_pc as i64,
                             );
-                            let bool_value = emit_frontend_bool(
-                                &mut graph,
-                                &current_block.block(),
-                                is_value.into(),
-                                py_pc as i64,
-                            );
-                            // flowcontext.py:756-763 `block.exitswitch = w_cond`.
+                            // flowcontext.py `block.exitswitch = w_cond`.
                             current_block.block().borrow_mut().exitswitch =
                                 Some(super::flow::ExitSwitch::Value(bool_value.into()));
                             let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;

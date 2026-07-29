@@ -3071,9 +3071,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // provably has no inner loop and that rationale does not reach here.
     //
     // All of these sit before the first recorded op (the `GETFIELD_GC_R`
-    // below), so returning costs nothing but the inline.  The
-    // POP_JUMP_IF_NONE scan is the one exception and still aborts — see the
-    // note at that site.
+    // below), so returning costs nothing but the inline.
     if try_multiframe || strict_seed {
         'seed: {
             // Branch-A frame shape only (mirror REC_CA): existing freevar
@@ -3081,49 +3079,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             if !callee_code.cellvars.is_empty() {
                 if try_multiframe {
                     return Ok(None);
-                }
-                break 'seed;
-            }
-            // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to an `is`/`is_not`
-            // identity residual call whose operands must be Ref (the codewriter
-            // PopJumpIfNone arm), then a branch guard.  When the multiframe inline
-            // int-specializes the tested local, the mid-body guard resume cannot
-            // source that operand's Ref form from the callee register banks
-            // (`collect_callee_active_boxes` would read a stale/mismatched box), so
-            // the encoded liveness stream disagrees with the decoder
-            // (`resume.rs decode_ref: unexpected tag`) and the caller frame is
-            // corrupted. Decline to the ordinary residual call until
-            // the multi-frame resume reboxes int-specialized identity operands.
-            // POP_JUMP_IF_TRUE/FALSE stay inlinable: their `bool` truth folds in the
-            // int bank, so no Ref rebox is needed.  A strict straight-line callee
-            // has no branch at all, so this scan never fires for it.
-            //
-            // This is the one precondition here that still aborts instead of
-            // returning `Ok(None)`, and deliberately so.  Residualizing it does
-            // work — `bench/synth/_pending/gc_bug_bridge_flavor_traceback_names`
-            // goes from 98 aborts to 2 and
-            // `_pending/exception_nested_exc_info_restore` from 5 aborts to 0,
-            // both compiling loops they never compiled before — but the loops it
-            // newly compiles then print traceback tuples missing their outermost
-            // frame, diverging from the interpreter (that fixture pins its
-            // expected output in its header).  The abort was masking a lost
-            // `PyTraceback` node on the compiled exception path, not preventing
-            // one.  Restore `Ok(None)` here once that node is recorded; it is the
-            // largest single win left in this function.
-            if (bound_method.is_none() || method_form)
-                && (0..callee_code.instructions.len()).any(|pc| {
-                    matches!(
-                        pyre_interpreter::decode_instruction_at(callee_code, pc),
-                        Some((
-                            pyre_interpreter::bytecode::Instruction::PopJumpIfNone { .. }
-                                | pyre_interpreter::bytecode::Instruction::PopJumpIfNotNone { .. },
-                            _
-                        ))
-                    )
-                })
-            {
-                if try_multiframe {
-                    return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
                 break 'seed;
             }
@@ -3336,14 +3291,29 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // the call stays residual, where the post-call catch resume
         // (`GuardCaptureScope::residual_call_catch_resume`) routes the raise.
         //
-        // FIXME: this `Err` discards the whole enclosing loop trace, where the
-        // comment above describes only declining the inline.  It cannot become
-        // `Ok(None)` in place like the seed preconditions below: by here the
-        // seed block has already recorded `GETFIELD_GC_R` +
-        // `emit_new_pyframe_inline_with_params` and stamped a concrete
-        // `FrameBox` onto that op, so returning would leave dead IR behind.
-        // Closing it means hoisting `decline_inline_caller_frame_for_catch_marker`
-        // ahead of the seed block.
+        // This `Err` discards the whole enclosing loop trace, where the comment
+        // above describes only declining the inline — and it costs real
+        // compilation: `synth/exception_nested_exc_info_restore`'s
+        // `classify(sys.exc_info()[0])` calls sit in handler bodies, whose
+        // implicit cleanup entry never rejoins the loop, so every retrace
+        // aborts here and the loop is interpreted (5 aborts, 0.34s vs 0.17s
+        // once inlined).  It cannot become `Ok(None)` in place like the seed
+        // preconditions below: by here the seed block has already recorded
+        // `GETFIELD_GC_R` + `emit_new_pyframe_inline_with_params` and stamped a
+        // concrete `FrameBox` onto that op, so returning would leave dead IR
+        // behind.
+        //
+        // Hoisting the decline (`decline_inline_caller_frame_for_catch_marker`
+        // is caller-side, so it answers before the seed) is mechanical, but the
+        // abort is masking two defects on the residual path it would open, both
+        // reproduced by doing exactly that:
+        //   * `synth/exception_inline_callee_tb_frames` panics in the dynasm
+        //     backend with `RegisterManager.loc: box RefOp(N) not found`;
+        //   * `synth/gc_bug_bridge_flavor_traceback_names` prints traceback
+        //     tuples missing their outermost frame — the caller's own
+        //     `PyTraceback` node is never recorded once its try-block CALL goes
+        //     residual (that fixture pins its expected output in its header).
+        // Fix those two first; the hoist is then a two-line change.
         match compute_inline_caller_frame(ctx, op.pc) {
             Ok(pf) => Some(pf),
             Err(InlineCallerFrameDecline::TryBlockCatchMarker) => {

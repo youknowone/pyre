@@ -1394,12 +1394,13 @@ fn dispatch_op(
                 "instance_ptr_ne" => majit_ir::OpCode::InstancePtrNe,
                 _ => unreachable!(),
             };
-            state.builder.record_binop_r(
-                dst,
-                opcode,
-                expect_reg(&args[0], Kind::Ref),
-                expect_reg(&args[1], Kind::Ref),
-            );
+            // Either side may be a constant — `x is None` compares against the
+            // `None` singleton — so route a `ConstRef` through the jitcode
+            // `constants_r` pool the same way `setarrayitem_gc_r` does for its
+            // value operand, rather than demanding a materialized register.
+            let lhs = expect_ref_reg_or_pool(state, &args[0]);
+            let rhs = expect_ref_reg_or_pool(state, &args[1]);
+            state.builder.record_binop_r(dst, opcode, lhs, rhs);
         }
         "ptr_iszero" => {
             let dst = expect_result_reg(result, Kind::Int, "ptr_iszero needs result");

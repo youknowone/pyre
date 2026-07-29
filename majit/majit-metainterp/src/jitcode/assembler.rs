@@ -1918,7 +1918,7 @@ impl JitCodeBuilder {
 
     /// RPython `blackhole.py:527-533` `bhimpl_int_{neg,invert}` per-opname
     /// handlers. See `record_binop_i` for the keying rationale.
-    /// Byte layout follows `assembler.py:165-174`: each `Register` is
+    /// Byte layout follows `assembler.py`: each `Register` is
     /// emitted in argcode order, so `int_neg/i>i` stores `[src][dst]`
     /// matching the canonical `bhhandler_i_i!` decoder.
     pub fn record_unary_i(&mut self, dst: u16, opcode: OpCode, src: u16) {
@@ -1936,8 +1936,14 @@ impl JitCodeBuilder {
 
     /// RPython `blackhole.py:584-610` ref comparisons returning int:
     /// `ptr_eq`, `ptr_ne`, `instance_ptr_eq`, `instance_ptr_ne`.
-    /// Byte layout follows `assembler.py:165-174`: `[lhs][rhs][dst]`
+    /// Byte layout follows `assembler.py`: `[lhs][rhs][dst]`
     /// matching the canonical `bhhandler_rr_i!` decoder.
+    ///
+    /// Either comparand may be a constant — `x is None` compares against the
+    /// `None` singleton — and `assembler.py emit_const` gives such an
+    /// argument a constant-pool slot in place of a register index, so both
+    /// operands take the pool-aware toucher/pusher rather than the
+    /// real-register-only pair.
     pub fn record_binop_r(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
         let key = match opcode {
             OpCode::PtrEq => "ptr_eq/rr>i",
@@ -1947,11 +1953,11 @@ impl JitCodeBuilder {
             other => panic!("record_binop_r: unsupported opcode {other:?}"),
         };
         self.touch_reg(dst);
-        self.touch_ref_reg(lhs);
-        self.touch_ref_reg(rhs);
+        self.touch_ref_reg_or_pool_slot(lhs);
+        self.touch_ref_reg_or_pool_slot(rhs);
         self.write_insn(key);
-        self.push_u8(lhs as u8);
-        self.push_u8(rhs as u8);
+        self.push_reg_u8(lhs, "ptr binop lhs");
+        self.push_reg_u8(rhs, "ptr binop rhs");
         self.push_u8(dst as u8);
     }
 
@@ -4177,7 +4183,7 @@ impl JitCodeBuilder {
     }
 
     /// RPython `blackhole.py:638-640` `bhimpl_int_copy(a) returns=i`.
-    /// Byte layout follows `assembler.py:165-174`: each `Register` is
+    /// Byte layout follows `assembler.py`: each `Register` is
     /// emitted in argcode order, so `int_copy/i>i` stores `[src][dst]`
     /// and the `>i` result byte is the last operand.
     pub fn move_i(&mut self, dst: u16, src: u16) {
