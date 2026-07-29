@@ -1567,31 +1567,54 @@ fn save_set(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result
         pyre_object::setobject::w_set_items(pyre_object::gc_roots::shadow_stack_get(set_slot))
     };
     let items_slot = pin_items(items);
-    let result = save_set_items(ctx, buf, items_slot);
+    let result = save_set_items(ctx, buf, items_slot, set_slot);
     fast_save_leave(ctx, fast_token, set_slot);
     result
 }
 
 /// Emit the ADDITEMS batches for the members of a proto >= 4 set already opened
 /// with EMPTY_SET. `items_slot` pins the member snapshot, re-read per save.
-fn save_set_items(ctx: &mut PickleCtx, buf: &mut Framer, items_slot: usize) -> Result<(), PyError> {
+fn save_set_items(
+    ctx: &mut PickleCtx,
+    buf: &mut Framer,
+    items_slot: usize,
+    owner_slot: usize,
+) -> Result<(), PyError> {
     let length = pinned_len(items_slot);
     if length == 0 {
         return Ok(());
     }
     buf.push(op::MARK);
-    save(ctx, buf, pinned_get(items_slot, 0))?;
+    save(ctx, buf, pinned_get(items_slot, 0)).map_err(|error| {
+        add_serializing_note(
+            error,
+            pyre_object::gc_roots::shadow_stack_get(owner_slot),
+            "element",
+        )
+    })?;
     let mut i = 1;
     while i + 1 < length {
         if i % BATCHSIZE == 0 {
             buf.push(op::ADDITEMS);
             buf.push(op::MARK);
         }
-        save(ctx, buf, pinned_get(items_slot, i))?;
+        save(ctx, buf, pinned_get(items_slot, i)).map_err(|error| {
+            add_serializing_note(
+                error,
+                pyre_object::gc_roots::shadow_stack_get(owner_slot),
+                "element",
+            )
+        })?;
         i += 1;
     }
     if length > 1 {
-        save(ctx, buf, pinned_get(items_slot, length - 1))?;
+        save(ctx, buf, pinned_get(items_slot, length - 1)).map_err(|error| {
+            add_serializing_note(
+                error,
+                pyre_object::gc_roots::shadow_stack_get(owner_slot),
+                "element",
+            )
+        })?;
     }
     buf.push(op::ADDITEMS);
     Ok(())
@@ -1627,7 +1650,13 @@ fn save_frozenset(
     buf.push(op::MARK);
     let n = pinned_len(slot);
     for i in 0..n {
-        save(ctx, buf, pinned_get(slot, i))?;
+        save(ctx, buf, pinned_get(slot, i)).map_err(|error| {
+            add_serializing_note(
+                error,
+                pyre_object::gc_roots::shadow_stack_get(fs_slot),
+                "element",
+            )
+        })?;
     }
     if let Some(idx) = ctx.memo_get(pyre_object::gc_roots::shadow_stack_get(fs_slot)) {
         buf.push(op::POP);
