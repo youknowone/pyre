@@ -2965,31 +2965,28 @@ impl GcRewriter for GcRewriterImpl {
         // carry producerless constant boxes as allocation lengths; reusing
         // such a raw position would alias an Int box with the new Ref box in
         // backend SSA.
+        // The `VoidOp(u32::MAX)` sentinel is the one raw payload that must not
+        // enter the high-water mark: it would pin `next_pos` at `u32::MAX`,
+        // which the first `+= 1` in `emit` overflows — a panic where overflow
+        // checks are on, and a silent wrap to 0 in release, handing every
+        // rewritten op a position that aliases a live operand. Every other
+        // non-constant payload still counts, `TempVar` included: its sentinel
+        // range sits above the body positions, and lowering the mark past it
+        // lets a new box collide with a position that reaches the backend
+        // through resume data rather than through `pos`/args/failargs.
+        let counts_toward_high_water =
+            |pos: OpRef| !pos.is_none() && !pos.is_constant() && pos.ty() != Some(Type::Void);
         let max_result_pos = ops
             .iter()
             .filter_map(|op| {
                 let pos = op.pos.get();
-                (!pos.is_constant()
-                    && matches!(pos.ty(), Some(Type::Int | Type::Float | Type::Ref)))
-                .then(|| pos.raw())
+                counts_toward_high_water(pos).then(|| pos.raw())
             })
             .max();
         let mut max_raw_pos = max_result_pos;
         if let Some(result_high_water) = max_result_pos {
             let mut reserve_later_box = |pos: OpRef| {
-                // Only the typed body variants `emit` draws from `next_pos`
-                // count. `ty()` is None for `None`/`TempVar` and `Void` for the
-                // `VoidOp(u32::MAX)` sentinel — reserving that sentinel would
-                // pin `next_pos` at `u32::MAX`, which the first `+= 1` in
-                // `emit` overflows: a panic where overflow checks are on, and a
-                // silent wrap to 0 in release, handing every rewritten op a
-                // position that aliases a live operand. That is why the result
-                // scan above skips Void as well. The constant test comes first:
-                // `raw()` panics on an inline Const.
-                if !pos.is_constant()
-                    && matches!(pos.ty(), Some(Type::Int | Type::Float | Type::Ref))
-                    && pos.raw() > result_high_water
-                {
+                if counts_toward_high_water(pos) && pos.raw() > result_high_water {
                     max_raw_pos =
                         Some(max_raw_pos.map_or(pos.raw(), |old: u32| old.max(pos.raw())));
                 }
