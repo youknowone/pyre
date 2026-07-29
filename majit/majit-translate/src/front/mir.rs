@@ -15155,6 +15155,31 @@ fn charon_const_generic_to_string(cg: &serde_json::Value) -> String {
         return s.to_string();
     }
     if let Some(obj) = cg.as_object() {
+        // Current Charon `ConstGeneric::Value` schema:
+        //
+        // {"kind":{"Literal":{"Scalar":{"Unsigned":["Usize","624"]}}},
+        //  "ty": ...}
+        //
+        // Preserve the literal's decimal spelling.  This is the concrete N
+        // in Rust `[T; N]`, and therefore part of the exact ARRAY identity
+        // RPython would keep in `op.args[0].concretetype`.
+        if let Some(scalar) = obj
+            .get("kind")
+            .and_then(|v| v.get("Literal"))
+            .and_then(|v| v.get("Scalar"))
+            .and_then(serde_json::Value::as_object)
+            && let Some(n) = scalar.values().find_map(|v| {
+                v.as_array().and_then(|parts| parts.last()).and_then(|n| {
+                    n.as_str()
+                        .map(str::to_string)
+                        .or_else(|| n.as_u64().map(|n| n.to_string()))
+                })
+            })
+        {
+            return n;
+        }
+        // Older serialized Charon schema retained for frozen LLBC
+        // compatibility.
         if let Some(val) = obj.get("Value") {
             if let Some(scalar) = val
                 .as_object()
@@ -18257,7 +18282,7 @@ mod tests {
     use super::harden_duplicate_leaf_metadata;
     use super::{
         DecodedConst, cast_kind_is_raw_ptr, cast_pointer_marker_op,
-        charon_type_value_to_ast_string, decode_literal,
+        charon_const_generic_to_string, charon_type_value_to_ast_string, decode_literal,
     };
     use majit_charon_reader::Llbc;
 
@@ -18282,6 +18307,23 @@ mod tests {
             decode_literal(&unsigned).expect("decode U128"),
             DecodedConst::UInt128(value) if value == u128::MAX
         ));
+    }
+
+    #[test]
+    fn current_charon_const_generic_scalar_preserves_array_length() {
+        let value = serde_json::json!({
+            "kind": {
+                "Literal": {
+                    "Scalar": {
+                        "Unsigned": ["Usize", "624"]
+                    }
+                }
+            },
+            "ty": {
+                "Literal": "Usize"
+            }
+        });
+        assert_eq!(charon_const_generic_to_string(&value), "624");
     }
 
     #[test]
