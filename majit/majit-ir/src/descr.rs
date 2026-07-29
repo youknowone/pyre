@@ -1240,7 +1240,10 @@ impl GcCache {
         //
         // The vtable is the reliable discriminator between the two: only the
         // runtime publish has one, because a build-time spec has no runtime
-        // type object to point at. Losing it is separately fatal —
+        // type object to point at. It decides in both directions, so the
+        // surviving descr is the same whichever producer registers first —
+        // the closest this can get to upstream's single owner per STRUCT.
+        // Losing the vtable is separately fatal —
         // `new_with_vtable` skips its typeptr store (`majit-gc/src/rewrite.rs`
         // gates `gen_initialize_vtable` on `vtable != 0`) over zeroed nursery
         // memory, so the fresh object reads back with a null `ob_type`.
@@ -1267,10 +1270,17 @@ impl GcCache {
                     .unwrap_or(0);
                 let existing_vtable = existing.as_size_descr().map_or(0, |sd| sd.vtable());
                 let new_vtable = descr.as_size_descr().map_or(0, |sd| sd.vtable());
-                if existing_vtable != 0 && new_vtable == 0 {
-                    false
-                } else {
-                    new_count > existing_count
+                // Both directions, so the surviving descr does not depend on
+                // which producer happened to register first. The 18
+                // module-scope groups are published before the build-time
+                // specs, but the per-exception-class groups behind
+                // `W_BASE_EXCEPTION_DESCR_CACHE` are not — they arrive after,
+                // and a one-sided rule would reject their vtable exactly the
+                // way the other order loses it.
+                match (existing_vtable != 0, new_vtable != 0) {
+                    (true, false) => false,
+                    (false, true) => true,
+                    _ => new_count > existing_count,
                 }
             }
         };
@@ -5443,6 +5453,46 @@ mod register_keyed_size_authority_tests {
                 .collect::<Vec<_>>(),
             vec![16, 24, 32],
             "the header words must not enter the positional list",
+        );
+    }
+
+    /// The mirror order. The 18 module-scope groups publish before the
+    /// build-time specs, but the per-exception-class groups do not — they
+    /// arrive after a `vtable: 0` spec is already cached, and a one-sided rule
+    /// would reject their vtable, losing it exactly the way the other order
+    /// does.
+    #[test]
+    fn a_vtable_bearing_publish_still_wins_when_it_arrives_second() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(0x8463ec159694d229);
+        gc.register_keyed_size(
+            key.clone(),
+            size_descr_at(0x9694d229, 0, &[0, 8, 16, 24, 32]),
+        );
+        gc.register_keyed_size(key.clone(), size_descr_at(7, 0x1000, &[16, 24, 32]));
+        let cached = gc._cache_size.get(&key).unwrap().as_size_descr().unwrap();
+        assert_eq!(cached.type_id(), 7);
+        assert_ne!(cached.vtable(), 0, "the vtable must win from either side");
+    }
+
+    /// The two orders above must agree; upstream has one owner per `STRUCT`
+    /// and never arbitrates, so an order-dependent answer is a defect by
+    /// itself.
+    #[test]
+    fn the_surviving_descr_does_not_depend_on_registration_order() {
+        let runtime = || size_descr_at(7, 0x1000, &[16, 24, 32]);
+        let analyzer = || size_descr_at(0x9694d229, 0, &[0, 8, 16, 24, 32]);
+        let survivor = |first: DescrRef, second: DescrRef| {
+            let mut gc = GcCache::new();
+            let key = LLType::Struct(3);
+            gc.register_keyed_size(key.clone(), first);
+            gc.register_keyed_size(key.clone(), second);
+            let sd = gc._cache_size.get(&key).unwrap().as_size_descr().unwrap();
+            (sd.type_id(), sd.vtable(), sd.all_fielddescrs().len())
+        };
+        assert_eq!(
+            survivor(runtime(), analyzer()),
+            survivor(analyzer(), runtime())
         );
     }
 
