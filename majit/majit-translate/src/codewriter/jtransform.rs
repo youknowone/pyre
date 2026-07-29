@@ -4436,6 +4436,25 @@ impl<'a> Transformer<'a> {
         }
         match key {
             JitMarkerKey::LoopHeader | JitMarkerKey::CanEnterJit => {
+                // `support.py:77-80` runs its `assert methname ==
+                // 'jit_merge_point'` over every marker of a reds='auto'
+                // driver, so a `can_enter_jit` on such a driver is a hard
+                // error: the auto-detected red set is computed from the
+                // jit_merge_point's own block and is not valid for a
+                // marker sitting in another block.
+                if let Some(cc) = self.callcontrol.as_deref()
+                    && let Some(jd) = cc.jitdriver_sd_from_jitdriver(jitdriver_index)
+                {
+                    assert!(
+                        !jd.autoreds,
+                        "reds='auto' is supported only for jit drivers which \
+                         calls only jit_merge_point. Found a call to {}",
+                        match key {
+                            JitMarkerKey::CanEnterJit => "can_enter_jit",
+                            _ => "loop_header",
+                        },
+                    );
+                }
                 // jtransform.py:1723 `handle_jit_marker__can_enter_jit =
                 // handle_jit_marker__loop_header`.
                 Some(self.handle_jit_marker__loop_header(jitdriver_index))
@@ -8382,6 +8401,32 @@ mod tests {
             OpKind::LoopHeader { jitdriver_index } => assert_eq!(*jitdriver_index, 2),
             other => panic!("expected LoopHeader, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "reds='auto' is supported only for jit drivers")]
+    fn try_handle_jit_marker_rejects_can_enter_jit_on_an_autoreds_driver() {
+        // `support.py:77-80` — the auto-detected red set comes from the
+        // jit_merge_point's own block, so a second marker kind on the same
+        // driver has no consistent red set and upstream refuses to translate.
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        cc.setup_jitdriver(
+            crate::parse::CallPath::from_segments(["autoreds_portal"]),
+            vec!["greenkey".to_string()],
+            Vec::new(),
+            true,
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut transformer = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_portal_jd(Some(0));
+        let _ = transformer.try_handle_jit_marker(
+            JitMarkerKey::CanEnterJit,
+            &[],
+            &crate::model::FunctionGraph::new("fixture"),
+        );
     }
 
     #[test]

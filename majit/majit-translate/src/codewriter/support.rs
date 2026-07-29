@@ -702,8 +702,13 @@ pub fn builtin_func_for_spec(
     extra: Option<&[String]>,
     extrakey: Option<&str>,
 ) -> BuiltinFuncSpec {
-    // `support.py:769`: assert (extra is None) == (extrakey is None)
-    debug_assert_eq!(
+    // `support.py:769`: assert (extra is None) == (extrakey is None).
+    // The workspace defines no `[profile.release]`, so `debug_assertions`
+    // is off in the profile that actually runs the codewriter (the
+    // `pyre-jit-trace` build script) — a `debug_assert_eq!` here would be
+    // compiled out of every shipping build, unlike the sibling
+    // `support.py:708` port below, which panics unconditionally.
+    assert_eq!(
         extra.is_none(),
         extrakey.is_none(),
         "support.py:769 — extra and extrakey must be supplied together",
@@ -1069,7 +1074,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(debug_assertions)]
     #[should_panic(expected = "extra and extrakey must be supplied together")]
     fn builtin_func_for_spec_rejects_mismatched_extra_extrakey() {
         // `support.py:769 assert (extra is None) == (extrakey is None)`
