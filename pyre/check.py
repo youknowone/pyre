@@ -421,6 +421,11 @@ def _jit_stats_snapshot(stderr):
     because the newcomer displaces the counters. The bare-name lines need no
     special case here: their name token carries no `=` and is skipped with
     every other non-assignment token.
+
+    The merged set is then narrowed to `JITSTATS_SNAPSHOT_FIELDS`, because what
+    a run may read and what a committed baseline may contain are two different
+    questions: merging arms the floor, the filter keeps the recorded surface
+    host-stable.
     """
     fields = {}
     seen = False
@@ -434,9 +439,26 @@ def _jit_stats_snapshot(stderr):
                 fields[key] = value
     if not seen:
         return None
+    fields = {k: v for k, v in fields.items() if k in JITSTATS_SNAPSHOT_FIELDS}
     # This watches what the JIT compiles, never how well. A regression that
     # changes no structure (for example, an extra spill) is invisible here.
     return "".join(f"{key}={fields[key]}\n" for key in sorted(fields))
+
+
+def _jit_stats_fields_equal(saved, current):
+    """Whether two snapshots agree on every `JITSTATS_SNAPSHOT_FIELDS` key,
+    reading a field missing from either side as "0"."""
+    def parse(snapshot):
+        if snapshot is None:
+            return {}
+        return dict(line.split("=", 1) for line in snapshot.splitlines())
+
+    old_fields = parse(saved)
+    new_fields = parse(current)
+    return all(
+        old_fields.get(field, "0") == new_fields.get(field, "0")
+        for field in JITSTATS_SNAPSHOT_FIELDS
+    )
 
 
 def _jit_stats_diff(saved, current, limit=6):
@@ -492,6 +514,31 @@ JITSTATS_BADNESS_FIELDS = (
     "descr_set_absent",
     "descr_set_ambiguous",
     "descr_set_stale_absent",
+)
+
+# What a committed `.jitstats` baseline is allowed to contain. `_jit_stats_snapshot`
+# merges every `[jit-stats]` line so the floor above cannot be disarmed by
+# reshuffling them, but the merged set also carries keys that are not comparable
+# against a file checked into the repo:
+#
+# * `all_descrs` and `descr_set_resolved` are HOST-DEPENDENT — the Charon/LLBC
+#   extraction runs per host, so the same commit reads `all_descrs` 1168 on
+#   macOS, 1396 on ubuntu and 1365 on windows. Committing either makes every
+#   host but one disagree.
+# * the `mc_diag` tallies include contention counters (`busy_skip`,
+#   `stfe_cell_busy`, `stfe_tick`) that move with machine load.
+# * `PYRE_WASM_JIT_STATS=1` adds wall-clock (`compile_ms`) and repeated
+#   `exec_hist` lines whose keys collide across lines; check.py never sets it,
+#   but a developer who has it exported would otherwise poison a `--snapshot`
+#   re-record.
+#
+# The badness fields are all zero in a healthy run and the three structural
+# counts are host-stable, so this surface needs no re-record when a new
+# diagnostic line is added.
+JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
+    "loops_compiled",
+    "bridges_compiled",
+    "guard_failures",
 )
 
 
@@ -872,7 +919,12 @@ class Check:
                 self.jitstats_missing.append(f"{backend}/{name}")
             else:
                 saved_jitstats = jitstats_path.read_text(encoding="utf-8")
-                if jitstats != saved_jitstats:
+                # Compare key-wise with a missing field read as "0", the same
+                # semantics `_jit_stats_regression_floor` documents. A baseline
+                # recorded before a counter existed is then still equal to a
+                # run that reports it as 0, so adding an invariant counter
+                # costs no re-record — only a real change diffs.
+                if not _jit_stats_fields_equal(saved_jitstats, jitstats):
                     self.jitstats_diffs.append(f"{backend}/{name}")
                     delta = _jit_stats_diff(saved_jitstats, jitstats)
                     return "fail", f"jit-stats diff: {delta}"

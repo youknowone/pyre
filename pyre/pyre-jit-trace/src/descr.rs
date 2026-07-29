@@ -4395,10 +4395,22 @@ pub(crate) fn publish_runtime_descr_groups() {
 /// so re-deriving would land on a different slot than the one the member
 /// names.
 ///
-/// Ordering is the same as for the runtime groups above — after them, before
-/// the `make_descr_from_bh` loop — and for the same reason: these specs carry
-/// no vtable, and `register_keyed_size`'s authority rule keeps whichever
-/// registration does.
+/// Runs **last**, after both the runtime groups and the `make_descr_from_bh`
+/// loop (`jitcode_runtime.rs rehydrate_build_descr_raw_sets`), and writes only
+/// into slots those left empty.  Going first would pre-fill a slot the loop
+/// then asks for, with the analyzer's `index_in_parent` numbering rather than
+/// the established producer's — the two disagree on any `#[pyre_class]`
+/// struct, by the two injected header words.  Publishing the leftovers keeps
+/// the established answers untouched.
+///
+/// The slots left empty are the ones no opcode names, which is why
+/// `descrs.bin` — RPython's `opcode_descrs`, not its `all_descrs` — does not
+/// carry them.  Upstream has that population too: `effectinfo.py:300-322`
+/// builds every raw set through `cpu.fielddescrof` / `arraydescrof` /
+/// `interiorfielddescrof`, a cache-or-mint into the gccache that runs whether
+/// or not any operation names the field, and `descr.py:25-47 setup_descrs`
+/// then snapshots that gccache into `all_descrs`.  So a raw-set-only descr
+/// referenced by no trace op is normal, not a sign of a mis-keyed publish.
 pub(crate) fn publish_effect_info_descr_mints(entries: &[majit_ir::effectinfo::DescrMintEntry]) {
     use majit_ir::descr::LLType;
     use majit_ir::effectinfo::{DescrMintSpec, DescrSetMember};
