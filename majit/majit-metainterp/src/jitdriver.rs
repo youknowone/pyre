@@ -5950,6 +5950,16 @@ impl<S: JitState> JitDriver<S> {
             // blackhole.py:1794 `_prepare_resume_from_failure(deadframe)`:
             // seed the blackhole resume with the exception grabbed at guard
             // failure so an exception guard unwinds into its handler.
+            //
+            // `cpu.grab_exc_value` (llmodel.py:240) reads `jf_guard_exc` and
+            // drops the deadframe, which was the collector's only handle on the
+            // exception, and everything between here and the two consumers
+            // allocates: `prepare_exit_resume_heap_with_blackhole_allocator`
+            // before `start_bridge_tracing`, and `blackhole_from_resumedata`
+            // before `prepare_resume_from_failure`.  Park it where the
+            // frontend's root walker can reach it for the rest of the function,
+            // exactly as `back_edge_internal` does around its own handoff.
+            let _guard_exc_root = crate::blackhole::GuardExcRoot::park(result_exc);
 
             if is_finish || fail_index == u32::MAX {
                 if guardlog_enabled() {
