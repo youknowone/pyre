@@ -2,6 +2,7 @@
 
 import copy
 import pickle
+import weakref
 from array import array
 from collections import deque
 from types import GenericAlias
@@ -44,6 +45,13 @@ assert array_alias.__args__ == (T,)
 assert array_alias("i", [1, 2]) == array("i", [1, 2])
 assert copy.copy(array_alias) == array_alias
 assert copy.deepcopy(array_alias) == array_alias
+
+weakref_alias = weakref.ReferenceType[T]
+assert weakref_alias.__origin__ is weakref.ReferenceType
+assert weakref_alias.__args__ == (T,)
+assert weakref.ref[T] == weakref_alias
+assert copy.copy(weakref_alias) == weakref_alias
+assert copy.deepcopy(weakref_alias) == weakref_alias
 
 nested = GenericAlias(list, ([T, [U]],))
 assert nested.__parameters__ == (T, U)

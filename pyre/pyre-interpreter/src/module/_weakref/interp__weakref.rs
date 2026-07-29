@@ -204,6 +204,18 @@ fn init_weakref_type(ns: PyObjectRef) {
             ),
         )
     };
+    // CPython 3.14 Objects/weakrefobject.c:493 — Py_GenericAlias with
+    // METH_CLASS.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__class_getitem__",
+            pyre_object::function::w_classmethod_new(make_builtin_function(
+                "__class_getitem__",
+                crate::_pypy_generic_alias::generic_alias_class_getitem,
+            )),
+        )
+    };
 }
 
 pub fn weakref_type() -> PyObjectRef {
