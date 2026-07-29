@@ -7573,4 +7573,33 @@ for constructor in (bytes, bytearray):
             assert!(crate::baseobjspace::is_true(result).unwrap());
         }
     }
+
+    #[test]
+    fn test_bytes_constructors_fall_back_after_index_type_error() {
+        let source = "\
+class BufferWithIndex(bytes):
+    def __index__(self):
+        raise TypeError
+
+class IterableWithIndex:
+    def __index__(self):
+        raise TypeError
+    def __iter__(self):
+        return iter((102, 111, 111))
+
+buffer = BufferWithIndex(b'foobar')
+result = (
+    bytes(buffer) == b'foobar'
+    and bytearray(buffer) == bytearray(b'foobar')
+    and bytes(IterableWithIndex()) == b'foo'
+    and bytearray(IterableWithIndex()) == bytearray(b'foo')
+)
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytes-like constructor index TypeError fallback failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
 }

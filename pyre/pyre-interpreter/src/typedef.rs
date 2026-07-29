@@ -16843,6 +16843,38 @@ fn bytes_codec_arg_w(
     Ok(value)
 }
 
+/// `bytesobject.py:newbytesdata_w_tail` — interpret the source as a count,
+/// but treat a `TypeError` from `__index__` as "not an index" and continue to
+/// the buffer/iterable conversion path.
+///
+/// CPython 3.14's `bytes` and `bytearray` constructors have the same fallback:
+/// `_PyIndex_Check` may be true while `PyNumber_AsSsize_t` raises `TypeError`,
+/// in which case that error is cleared before trying the buffer API.
+fn bytes_count_from_index(arg: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
+    let w_index = match crate::baseobjspace::space_index(arg) {
+        Ok(w_index) => w_index,
+        Err(error) if error.kind == crate::PyErrorKind::TypeError => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let count = match crate::baseobjspace::int_w(w_index) {
+        Ok(count) => count,
+        Err(error) if error.kind == crate::PyErrorKind::OverflowError => {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::OverflowError,
+                format!(
+                    "cannot fit '{}' into an index-sized integer",
+                    crate::baseobjspace::object_functionstr_type_name(arg)
+                ),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    if count < 0 {
+        return Err(crate::PyError::value_error("negative count"));
+    }
+    Ok(Some(count as usize))
+}
+
 fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // args[0] = cls (ignored — bytearray subclasses still allocate the
     // primitive layout). bytearrayobject.py descr_new accepts:
@@ -16922,29 +16954,12 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 type_name_of(arg)
             )));
         }
-        // newbytesdata_w_tail: `getindex_w(source, OverflowError)` — any object
-        // exposing __index__ is a count of NUL bytes.  (bytearray does NOT
-        // honour __bytes__, so there is no invoke_bytes_method here.)
-        if pyre_object::pyobject::is_int_or_long(arg)
-            || crate::baseobjspace::lookup(arg, "__index__").is_some()
-        {
-            let n = match crate::baseobjspace::int_w(crate::baseobjspace::space_index(arg)?) {
-                Ok(n) => n,
-                Err(e) if e.kind == crate::PyErrorKind::OverflowError => {
-                    return Err(crate::PyError::new(
-                        crate::PyErrorKind::OverflowError,
-                        format!(
-                            "cannot fit '{}' into an index-sized integer",
-                            crate::baseobjspace::object_functionstr_type_name(arg)
-                        ),
-                    ));
-                }
-                Err(e) => return Err(e),
-            };
-            if n < 0 {
-                return Err(crate::PyError::value_error("negative count"));
-            }
-            return Ok(pyre_object::bytearrayobject::w_bytearray_new(n as usize));
+        // newbytesdata_w_tail: `getindex_w(source, OverflowError)` — any
+        // successful `__index__` is a count of NUL bytes. A TypeError falls
+        // through to the buffer path below. (bytearray does NOT honour
+        // `__bytes__`, so there is no invoke_bytes_method here.)
+        if let Some(count) = bytes_count_from_index(arg)? {
+            return Ok(pyre_object::bytearrayobject::w_bytearray_new(count));
         }
         // `_convert_from_buffer_or_iterable`: any buffer exporter — bytes,
         // bytearray, `array.array`, memoryview — yields its raw buffer bytes
@@ -19971,31 +19986,13 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             }
             return Ok(w_bytes);
         }
-        // newbytesdata_w_tail: `getindex_w(source, OverflowError)` — any object
-        // exposing __index__ (not just an exact int) is a count of NUL bytes.
-        if pyre_object::pyobject::is_int_or_long(arg)
-            || crate::baseobjspace::lookup(arg, "__index__").is_some()
-        {
-            let n = match crate::baseobjspace::int_w(crate::baseobjspace::space_index(arg)?) {
-                Ok(n) => n,
-                Err(e) if e.kind == crate::PyErrorKind::OverflowError => {
-                    return Err(crate::PyError::new(
-                        crate::PyErrorKind::OverflowError,
-                        format!(
-                            "cannot fit '{}' into an index-sized integer",
-                            crate::baseobjspace::object_functionstr_type_name(arg)
-                        ),
-                    ));
-                }
-                Err(e) => return Err(e),
-            };
-            // bytesobject.py:797 — negative count raises ValueError
-            if n < 0 {
-                return Err(crate::PyError::value_error("negative count"));
-            }
-            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(
-                &vec![0u8; n as usize],
-            ));
+        // newbytesdata_w_tail: a successful `__index__` supplies a count of
+        // NUL bytes; TypeError falls through to the buffer/iterable path.
+        if let Some(count) = bytes_count_from_index(arg)? {
+            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&vec![
+                0u8;
+                count
+            ]));
         }
         // `_convert_from_buffer_or_iterable`: any buffer exporter — bytes,
         // bytearray, `array.array`, memoryview — yields its raw buffer bytes
