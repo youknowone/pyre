@@ -3651,6 +3651,25 @@ impl _interior_ptr {
         ob
     }
 
+    /// Materialise this interior pointer into a plain container `_ptr` over
+    /// the same shared object. `_expose` chooses the interior form for an
+    /// inlined Raw container under a Gc parent (e.g. `rpy_string.chars`);
+    /// callers that only need to read/write through the container — the
+    /// interpreter's `getsubstruct`/`setarrayitem` handlers — take the plain
+    /// pointer over the identical `_container`, so writes still persist.
+    pub fn _as_container_ptr(&self, solid: bool) -> Result<_ptr, String> {
+        let ptr_obj = match self._obj() {
+            LowLevelValue::Array(a) => _ptr_obj::Array(*a),
+            LowLevelValue::Struct(s) => _ptr_obj::Struct(*s),
+            other => {
+                return Err(format!(
+                    "interior pointer target is not a container: {other:?}"
+                ))
+            }
+        };
+        Ok(ptr_obj._as_ptr(solid))
+    }
+
     pub fn _TYPE(&self) -> InteriorPtr {
         InteriorPtr {
             PARENTTYPE: Box::new(typeOf_value(&self._parent)),

@@ -31,7 +31,7 @@ use crate::tool::ansi_print::AnsiLogger;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _address, _ptr, direct_fieldptr, malloc, LowLevelType, LowLevelValue, MallocFlavor,
+    _address, _ptr, malloc, LowLevelType, LowLevelValue, MallocFlavor,
 };
 use crate::translator::rtyper::rtyper::RPythonTyper;
 use crate::translator::tool::taskengine::TaskError;
@@ -866,6 +866,10 @@ impl LLFrame {
             // reinterpret the unsigned word's bits as Signed. The carrier
             // already stores the word as `i64`, so this is the identity.
             "cast_uint_to_int" => Ok(LLValue::Int(vals[0].as_i64(opname)?)),
+            // `op_cast_primitive` between integer types reinterprets the
+            // machine word; the Signed carrier already holds it, so the
+            // Signed<->Unsigned cast is the identity on the i64 word.
+            "cast_primitive" => Ok(LLValue::Int(vals[0].as_i64(opname)?)),
             // `op_cast_int_to_char(b) = chr(b)` (opimpl.py:411-413): the char
             // carrier is the one-char `Str`.
             "cast_int_to_char" => {
@@ -929,8 +933,27 @@ impl LLFrame {
                         message: format!("{opname}: arg1 must be a field name"),
                     });
                 };
-                let sub = direct_fieldptr(&**p, field)
-                    .map_err(|e| TaskError { message: format!("{opname}: {e}") })?;
+                // `op_getsubstruct` = `getattr(obj, field)` on the pointer,
+                // yielding a pointer to the inlined sub-container. `_expose`
+                // returns it as an interior pointer when the field is a Raw
+                // container inlined into a Gc parent (`rpy_string.chars`);
+                // materialise that into a plain container `_ptr` so the
+                // array op handlers can read/write through it.
+                let sub = match p
+                    .getattr(field)
+                    .map_err(|e| TaskError { message: format!("{opname}: {e}") })?
+                {
+                    LowLevelValue::Ptr(pt) => *pt,
+                    LowLevelValue::InteriorPtr(ip) => {
+                        ip._as_container_ptr(p._solid)
+                            .map_err(|e| TaskError { message: format!("{opname}: {e}") })?
+                    }
+                    other => {
+                        return Err(TaskError {
+                            message: format!("{opname}: field {field:?} is not a container: {other:?}"),
+                        })
+                    }
+                };
                 Ok(LLValue::Ptr(Box::new(sub)))
             }
             "setarrayitem" => {
@@ -1430,6 +1453,77 @@ mod tests {
                 LowLevelValue::Char(c) => assert_eq!(c, expected, "char at {idx}"),
                 other => panic!("expected Char at {idx}, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn build_ll_int2dec_executes_to_decimal_strings() {
+        // Slice C: run the synthesised `ll_int2dec` helper graph
+        // (`lltypesystem/rstr.rs`) end-to-end through the interpreter and read
+        // the decimal string back out of the returned STR pointer. This is the
+        // executing correctness gate the hex builder's shape-only test lacks —
+        // it catches an off-by-one in the reversed `total_len - j - 1` slot or a
+        // swapped link argument that a BFS-of-opnames assertion cannot.
+        use crate::translator::rtyper::lltypesystem::rstr::build_ll_int2dec_helper_graph;
+
+        fn read_rpy_string(strptr: &_ptr) -> String {
+            // Read `strptr.chars` the same way `getsubstruct` does: `getattr`
+            // yields an interior pointer for the inlined array, materialised
+            // into a plain container `_ptr` to index through.
+            let chars = match strptr.getattr("chars").expect("chars field") {
+                LowLevelValue::Ptr(p) => *p,
+                LowLevelValue::InteriorPtr(ip) => {
+                    ip._as_container_ptr(true).expect("materialise chars ptr")
+                }
+                other => panic!("chars is not a container: {other:?}"),
+            };
+            let mut s = String::new();
+            let mut i = 0usize;
+            while let Ok(LowLevelValue::Char(c)) = chars.getitem(i) {
+                s.push(c);
+                i += 1;
+            }
+            s
+        }
+
+        let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
+        let run = |helper: &crate::flowspace::pygraph::PyGraph, input: i64| -> String {
+            let out = interp
+                .eval_graph(
+                    helper.graph.clone() as Rc<dyn Any>,
+                    vec![Rc::new(input) as Rc<dyn Any>],
+                    false,
+                )
+                .expect("int2dec helper graph should run");
+            let LowLevelValue::Ptr(p) = &*out.downcast::<LowLevelValue>().expect("Ptr return")
+            else {
+                panic!("expected a STR pointer return");
+            };
+            read_rpy_string(p)
+        };
+
+        // Unsigned specialisation: -1 arrives as the full u64 word.
+        let unsigned = build_ll_int2dec_helper_graph("ll_int2dec", false).expect("build unsigned");
+        for (input, expected) in [
+            (0_i64, "0"),
+            (7, "7"),
+            (12345, "12345"),
+            (-1, "18446744073709551615"),
+        ] {
+            assert_eq!(run(&unsigned, input), expected, "uint2dec({input})");
+        }
+
+        // Signed specialisation: the `val < 0` branch takes the magnitude.
+        let signed =
+            build_ll_int2dec_helper_graph("ll_int2dec_signed", true).expect("build signed");
+        for (input, expected) in [
+            (0_i64, "0"),
+            (7, "7"),
+            (-42, "-42"),
+            (12345, "12345"),
+            (-12345, "-12345"),
+        ] {
+            assert_eq!(run(&signed, input), expected, "int2dec({input})");
         }
     }
 
