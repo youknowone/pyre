@@ -10268,10 +10268,13 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
             pyre_object::w_type_get_weakrefable(w_newcls),
         );
         if !layouts_compatible {
+            // `objectobject.py:179-181` names the pair in the opposite order
+            // (`w_oldcls, w_newcls`); 3.14 `object_set_class` reports
+            // `newto->tp_name` first.
             return Err(crate::PyError::type_error(format!(
                 "__class__ assignment: '{}' object layout differs from '{}'",
-                pyre_object::w_type_get_name(w_oldcls.as_ptr()),
                 pyre_object::w_type_get_name(w_newcls),
+                pyre_object::w_type_get_name(w_oldcls.as_ptr()),
             )));
         }
         // objectobject.py:150 — w_obj.setclass(space, w_newcls).  For a mapdict
