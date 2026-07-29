@@ -19953,7 +19953,9 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     };
     let has_codec = w_encoding.is_some() || w_errors.is_some();
     unsafe {
-        if pyre_object::is_str(arg) {
+        // CPython 3.14 bytes_new: an explicit codec selects the unicode
+        // encoding path before special-method lookup.
+        if has_codec && pyre_object::is_str(arg) {
             let encoding = match w_encoding {
                 Some(e) => crate::baseobjspace::str_utf8_w(e)?,
                 _ => {
@@ -20002,6 +20004,14 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 )));
             }
             return Ok(w_bytes);
+        }
+        // With no codec, `_PyObject_LookupSpecial(__bytes__)` precedes the
+        // unicode rejection.  A str subclass can therefore define
+        // `__bytes__`; supplying an encoding still uses its string payload.
+        if pyre_object::is_str(arg) {
+            return Err(crate::PyError::type_error(
+                "string argument without an encoding",
+            ));
         }
         // newbytesdata_w_tail: a successful `__index__` supplies a count of
         // NUL bytes; TypeError falls through to the buffer/iterable path.

@@ -7817,4 +7817,26 @@ for value in (bytes(b'hello'), bytearray(b'hello')):
             assert!(crate::baseobjspace::is_true(result).unwrap());
         }
     }
+
+    #[test]
+    fn test_bytes_prefers_dunder_bytes_without_codec() {
+        let source = "\
+class StringWithBytes(str):
+    def __new__(cls, value):
+        self = str.__new__(cls, '\\u20ac')
+        self.value = value
+        return self
+    def __bytes__(self):
+        return self.value
+
+source = StringWithBytes(b'abc')
+result = bytes(source) == b'abc'
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytes str-subclass __bytes__ precedence failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
 }
