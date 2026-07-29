@@ -4521,6 +4521,243 @@ mod tests {
         assert_eq!(result[3].opcode, OpCode::Jump);
     }
 
+    #[test]
+    fn test_setfield_on_distinct_array_loads_forces_prior_lazy_set() {
+        // Same shape as `test_setfield_different_objects`, but the two structs
+        // arrive as loads out of one array instead of as separate inputargs:
+        //
+        //   p2 = getarrayitem_gc_r(p0, 7)
+        //   p3 = getarrayitem_gc_r(p0, 16)
+        //   setfield_gc(p2, i1, descr=d1)   <- lazy
+        //   setfield_gc(p3, i2, descr=d1)   <- heap.py:81-83 possible_aliasing:
+        //                                      p2 != p3, so p2's lazy set must
+        //                                      be forced before this one takes
+        //                                      the descr's single `_lazy_set`
+        //                                      slot
+        //   guard_true(i_cond)              <- heap.py:608-637 forces p3's
+        //
+        // Dropping the p2 store instead loses a write the trace recorded.
+        let d_arr = descr(0);
+        let d_field = descr(1);
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::GetarrayitemGcR,
+                &[
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    Operand::const_from_value(majit_ir::Value::Int(7)),
+                ],
+                d_arr.clone(),
+            ),
+            Op::with_descr(
+                OpCode::GetarrayitemGcR,
+                &[
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    Operand::const_from_value(majit_ir::Value::Int(16)),
+                ],
+                d_arr.clone(),
+            ),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    rooted_resop_operand(Type::Ref, 0),
+                    rooted_inputarg_operand(Type::Int, 101),
+                ],
+                d_field.clone(),
+            ),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    rooted_resop_operand(Type::Ref, 1),
+                    rooted_inputarg_operand(Type::Int, 201),
+                ],
+                d_field.clone(),
+            ),
+            Op::new(
+                OpCode::GuardTrue,
+                &[rooted_inputarg_operand(Type::Int, 200)],
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt_typed(&mut ops, &[101, 200, 201]);
+
+        let setfields: Vec<&Op> = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::SetfieldGc)
+            .collect();
+        assert_eq!(
+            setfields.len(),
+            2,
+            "both stores must survive; emitted = {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>(),
+        );
+        let guard_at = result
+            .iter()
+            .position(|o| o.opcode == OpCode::GuardTrue)
+            .expect("guard must be emitted");
+        let last_setfield_at = result
+            .iter()
+            .rposition(|o| o.opcode == OpCode::SetfieldGc)
+            .unwrap();
+        assert!(
+            last_setfield_at < guard_at,
+            "both stores must be emitted before the guard they precede",
+        );
+    }
+
+    /// A `SizeDescr` for a `NEW` whose result stays virtual: `OptVirtualize`
+    /// indexes `VirtualInfo._fields` by `field_slot_index(descr)` and asserts
+    /// the slot is inside `all_fielddescrs()`, so the bare `TestSizeDescr`
+    /// (empty list) cannot host a field.
+    #[derive(Debug)]
+    struct TestVirtualSizeDescr {
+        index: u32,
+        all_fielddescrs: Vec<Arc<dyn FieldDescr>>,
+    }
+
+    impl Descr for TestVirtualSizeDescr {
+        fn index(&self) -> u32 {
+            self.index
+        }
+        fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
+            Some(self)
+        }
+    }
+
+    impl SizeDescr for TestVirtualSizeDescr {
+        fn size(&self) -> usize {
+            64
+        }
+        fn type_id(&self) -> u32 {
+            self.index
+        }
+        fn is_immutable(&self) -> bool {
+            false
+        }
+        fn is_object(&self) -> bool {
+            false
+        }
+        fn all_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
+            &self.all_fielddescrs
+        }
+    }
+
+    fn virtual_size_descr(index: u32, fields: u32) -> DescrRef {
+        Arc::new(TestVirtualSizeDescr {
+            index,
+            all_fielddescrs: (0..fields)
+                .map(|i| {
+                    Arc::new(TestDescr {
+                        index: i,
+                        ei_index: AtomicU32::new(u32::MAX),
+                    }) as Arc<dyn FieldDescr>
+                })
+                .collect(),
+        })
+    }
+
+    /// Like `run_heap_opt_typed`, but the whole `__init__.py:15-22` chain, so
+    /// `OptVirtualize` is present and a `NEW` result can still be virtual when
+    /// the heap pass reaches the guard.
+    fn run_default_pipeline_typed(ops: &mut [Op], int_slots: &[u32]) -> Vec<Op> {
+        assign_positions(ops);
+        let mut opt = Optimizer::default_pipeline();
+        let mut types = vec![Type::Ref; 1024];
+        for &idx in int_slots {
+            types[idx as usize] = Type::Int;
+        }
+        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&types);
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
+        opt.snapshot_boxes = snapshots;
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 1024)
+    }
+
+    #[test]
+    fn test_guard_forces_size_store_paired_with_virtual_head_store() {
+        // heap.py:617-621 splits the two lazy sets a linked-list push leaves
+        // pending, by whether the stored VALUE is virtual:
+        //
+        //   p2 = new(descr=size)
+        //   setfield_gc(p2, i_val, descr=d_value)
+        //   setfield_gc(p0, p2, descr=d_head)   <- value is still VIRTUAL, so
+        //                                          heap.py:618-619 routes it to
+        //                                          pendingfields and leaves the
+        //                                          lazy set in place
+        //   i1 = getfield_gc_i(p0, descr=d_size)
+        //   i2 = int_add(i1, 1)
+        //   setfield_gc(p0, i2, descr=d_size)   <- non-virtual, so heap.py:621
+        //                                          FORCES it at the guard
+        //   guard_true(i_cond)
+        //
+        // Deopt reconstructs `head` from the guard's pendingfields, so the
+        // emitted heap only has to carry the non-virtual half; this pins that
+        // half being emitted BEFORE the guard rather than left lazy past it.
+        let sd = virtual_size_descr(1, 4);
+        let d_value = descr(10);
+        let d_head = descr(11);
+        let d_size = descr(12);
+        let mut ops = vec![
+            Op::with_descr(OpCode::New, &[], sd.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    rooted_resop_operand(Type::Ref, 0),
+                    rooted_inputarg_operand(Type::Int, 101),
+                ],
+                d_value.clone(),
+            ),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_resop_operand(Type::Ref, 0),
+                ],
+                d_head.clone(),
+            ),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[rooted_inputarg_operand(Type::Ref, 100)],
+                d_size.clone(),
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    rooted_resop_operand(Type::Int, 3),
+                    Operand::const_from_value(majit_ir::Value::Int(1)),
+                ],
+            ),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_resop_operand(Type::Int, 4),
+                ],
+                d_size.clone(),
+            ),
+            Op::new(
+                OpCode::GuardTrue,
+                &[rooted_inputarg_operand(Type::Int, 200)],
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_default_pipeline_typed(&mut ops, &[101, 200]);
+
+        let guard_at = result
+            .iter()
+            .position(|o| o.opcode == OpCode::GuardTrue)
+            .expect("guard must be emitted");
+        let size_store_at = result.iter().position(|o| {
+            o.opcode == OpCode::SetfieldGc
+                && o.getdescr().as_ref().is_some_and(|d| {
+                    majit_ir::descr::descr_identity(d) == majit_ir::descr::descr_identity(&d_size)
+                })
+        });
+        assert!(
+            size_store_at.is_some_and(|at| at < guard_at),
+            "the size store must be forced before the guard; emitted = {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>(),
+        );
+    }
+
     // ── Test 6: Array items: SETARRAYITEM then GETARRAYITEM → cached ──
 
     #[test]
