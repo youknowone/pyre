@@ -2938,6 +2938,49 @@ impl MiniMarkGC {
         }
     }
 
+    /// incminimark.py:1792-1799 turns every old object modified since the cycle
+    /// began back to gray — "precisely the old objects that have been modified
+    /// and need rescanning" — before the sweep decides survivors, and
+    /// :2478-2481 rescans the roots that can grow after the cycle's opening
+    /// snapshot. Upstream needs only the non-stack half there, because its
+    /// stack roots are covered by two invariants pyre does not share: a
+    /// JITFRAME is nursery-allocated, so every minor re-traces it and a
+    /// promotion during MARKING re-queues it (:2079-2083), and the objects a
+    /// mutator stores into a stack slot mid-cycle were promoted during MARKING
+    /// and are therefore born black.
+    ///
+    /// pyre's stack root sets are mutated with no write barrier and hold
+    /// pre-cycle objects: a JitFrame lives in the old gen so its pointer stays
+    /// valid across a collecting call while compiled code stores Refs into its
+    /// gcmap slots, the blackhole register banks and resume-construction roots
+    /// are plain slices, and `seed_major_root` arms a newly seeded old root
+    /// into the remembered set only once — the next minor drains that set and
+    /// nothing re-arms it. A black root can therefore come to hold the only
+    /// reference to a white object. Walk the root sets once more here and turn
+    /// the black ones gray again; this can only add survivors, never free a
+    /// reachable object.
+    fn rescan_major_stack_roots_black_and_drain(&mut self) {
+        for gcref in self.enumerate_root_walker_values() {
+            if gcref.is_null() {
+                continue;
+            }
+            // incminimark.py:1322-1340 keeps nursery objects out of a marking
+            // worklist, so a nursery root goes through the seeding path, which
+            // marks it without queueing it.
+            let regray = !self.is_in_nursery(gcref.0)
+                && self.is_managed_heap_object(gcref.0)
+                && unsafe { (*header_of(gcref.0)).has_flag(flags::VISITED) };
+            if regray {
+                self.incr_state.gray_stack.push(gcref.0);
+            } else {
+                self.seed_major_root(gcref);
+            }
+        }
+        while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
+            self.mark_object(obj_addr);
+        }
+    }
+
     /// incminimark.py:2473-2533: finish MARKING and freeze this cycle's sweep
     /// candidates.  Every VISITED-dependent consumer runs before either raw or
     /// arena memory is freed.
@@ -2947,6 +2990,10 @@ impl MiniMarkGC {
         // modified since the last minor) before the sweep, or a cycle finished
         // between minors frees reachable old->old targets.
         self.rescan_remembered_black_and_drain();
+        // Barrier-less stack-root stores (JitFrame gcmap slots, blackhole
+        // register banks, resume-construction roots): re-gray the black roots
+        // before the sweep freezes survivors.
+        self.rescan_major_stack_roots_black_and_drain();
         // incminimark.py:2478-2481: process-global/non-stack roots can grow
         // after the cycle's initial snapshot.  Rescan and trace them before
         // finalizers, weakrefs, and sweep inspect VISITED.
