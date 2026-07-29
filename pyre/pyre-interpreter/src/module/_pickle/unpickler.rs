@@ -217,8 +217,27 @@ impl W_Unpickler {
                 crate::baseobjspace::object_functionstr_type_name(w_name)
             )));
         }
-        let module = unsafe { pyre_object::unicodeobject::w_str_get_value(w_module) }.to_string();
-        let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) }.to_string();
+        let module = unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_module) };
+        let name = unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) };
+        let (Some(module), Some(name)) = (module, name) else {
+            audit_find_class_objects(w_module, w_name)?;
+            let module_obj = if let Some(module) = module {
+                import_module(module)?
+            } else {
+                let modules = crate::importing::sys_modules_dict();
+                unsafe { pyre_object::w_dict_lookup(modules, w_module) }.ok_or_else(|| {
+                    PyError::new(
+                        crate::PyErrorKind::ModuleNotFoundError,
+                        "No module named by surrogate identifier",
+                    )
+                })?
+            };
+            let (resolved, _) =
+                crate::module::_pickle::getattribute_dotted_obj(module_obj, w_name)?;
+            return Ok(resolved);
+        };
+        let module = module.to_string();
+        let name = name.to_string();
         audit_find_class(&module, &name)?;
         // protocol < 3 with `fix_imports` applies the py2 → py3 `_compat_pickle`
         // forward map before resolution; otherwise the name resolves literally.
@@ -1263,6 +1282,27 @@ fn audit_find_class(module: &str, name: &str) -> Result<(), PyError> {
                     pyre_object::w_str_new("pickle.find_class"),
                     pyre_object::w_str_new(module),
                     pyre_object::w_str_new(name),
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn audit_find_class_objects(w_module: PyObjectRef, w_name: PyObjectRef) -> Result<(), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_module);
+    let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(w_name);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    if let Ok(sys) = import_module("sys") {
+        if let Ok(audit) = crate::baseobjspace::getattr_str(sys, "audit") {
+            call_fn(
+                audit,
+                &[
+                    pyre_object::w_str_new("pickle.find_class"),
+                    pyre_object::gc_roots::shadow_stack_get(module_slot),
+                    pyre_object::gc_roots::shadow_stack_get(name_slot),
                 ],
             )?;
         }

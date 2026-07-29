@@ -426,6 +426,61 @@ pub(crate) fn getattribute_dotted(
     Ok((cur, parent))
 }
 
+/// Wrapped-string variant of `_getattribute`, used when a qualname contains a
+/// lone surrogate and therefore has no Rust `&str` view.
+pub(crate) fn getattribute_dotted_obj(
+    obj: PyObjectRef,
+    w_qualname: PyObjectRef,
+) -> Result<(PyObjectRef, PyObjectRef), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(obj);
+    let mut cur_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(w_qualname);
+    let qualname_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_dot = pyre_object::w_str_new(".");
+    pyre_object::gc_roots::pin_root(w_dot);
+    let dot_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_parts = call_meth(
+        pyre_object::gc_roots::shadow_stack_get(qualname_slot),
+        "split",
+        &[pyre_object::gc_roots::shadow_stack_get(dot_slot)],
+    )?;
+    pyre_object::gc_roots::pin_root(w_parts);
+    let parts_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let n = unsafe {
+        pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(parts_slot))
+    };
+    let mut parent_slot = cur_slot;
+    for i in 0..n {
+        let w_part = unsafe {
+            pyre_object::listobject::w_list_getitem(
+                pyre_object::gc_roots::shadow_stack_get(parts_slot),
+                i as i64,
+            )
+            .unwrap()
+        };
+        if unsafe { pyre_object::w_str_get_wtf8(w_part) }.as_bytes() == b"<locals>" {
+            let qualname_repr =
+                unsafe { crate::py_repr(pyre_object::gc_roots::shadow_stack_get(qualname_slot)) }
+                    .unwrap_or_else(|_| "<qualname>".to_string());
+            return Err(PyError::attribute_error(format!(
+                "Can't get local attribute {qualname_repr}"
+            )));
+        }
+        parent_slot = cur_slot;
+        let next = crate::baseobjspace::getattr(
+            pyre_object::gc_roots::shadow_stack_get(cur_slot),
+            w_part,
+        )?;
+        pyre_object::gc_roots::pin_root(next);
+        cur_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    }
+    Ok((
+        pyre_object::gc_roots::shadow_stack_get(cur_slot),
+        pyre_object::gc_roots::shadow_stack_get(parent_slot),
+    ))
+}
+
 /// Resolve `module_name.name` to the live object, importing the module
 /// first. `builtins` names resolve through the execution context (whose
 /// `getattr` wrapper does not see builtins on the underlying storage); other

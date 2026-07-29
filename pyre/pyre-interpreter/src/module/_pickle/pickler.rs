@@ -2147,12 +2147,15 @@ fn save_global(
     pyre_object::gc_roots::pin_root(w_name);
     let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
-    let name = unsafe {
-        pyre_object::unicodeobject::w_str_get_value(pyre_object::gc_roots::shadow_stack_get(
-            name_slot,
-        ))
+    let w_name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+    if !unsafe { pyre_object::is_str(w_name) } {
+        return Err(PyError::type_error("global name must be a string"));
     }
-    .to_string();
+    let Some(name) =
+        (unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) }).map(str::to_string)
+    else {
+        return save_global_surrogate_name(ctx, buf, obj_slot, name_slot);
+    };
     let w_module_name = whichmodule(pyre_object::gc_roots::shadow_stack_get(obj_slot), &name)?;
     let module_name =
         unsafe { pyre_object::unicodeobject::w_str_get_value(w_module_name) }.to_string();
@@ -2204,6 +2207,128 @@ fn save_global(
     Ok(())
 }
 
+/// CPython 3.14 `save_global` path for a name containing a lone surrogate.
+///
+/// Attribute lookup keeps the name as a wrapped Python string, matching
+/// `PyObject_GetOptionalAttr(module, name)`. Protocols before STACK_GLOBAL
+/// then fail while strictly encoding the GLOBAL identifier; protocol >= 4
+/// serializes the surrogatepass UTF-8 through `save_str`.
+fn save_global_surrogate_name(
+    ctx: &mut PickleCtx,
+    buf: &mut Framer,
+    obj_slot: usize,
+    name_slot: usize,
+) -> Result<(), PyError> {
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let w_module_name = match crate::baseobjspace::findattr_result(w_obj, "__module__")? {
+        Some(module) if !unsafe { pyre_object::is_none(module) } => {
+            if !unsafe { pyre_object::is_str(module) } {
+                return Err(PyError::type_error("module name must be a string"));
+            }
+            module
+        }
+        _ => pyre_object::w_str_new("__main__"),
+    };
+    pyre_object::gc_roots::pin_root(w_module_name);
+    let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let module_name = unsafe {
+        pyre_object::unicodeobject::w_str_get_value_opt(pyre_object::gc_roots::shadow_stack_get(
+            module_slot,
+        ))
+    };
+    let module = if let Some(module_name) = module_name {
+        import_module(module_name)?
+    } else {
+        let modules = crate::importing::sys_modules_dict();
+        unsafe {
+            pyre_object::w_dict_lookup(
+                modules,
+                pyre_object::gc_roots::shadow_stack_get(module_slot),
+            )
+        }
+        .ok_or_else(|| pickling_error("Can't pickle object: module is not in sys.modules"))?
+    };
+    let (resolved, _) = crate::module::_pickle::getattribute_dotted_obj(
+        module,
+        pyre_object::gc_roots::shadow_stack_get(name_slot),
+    )?;
+    if !crate::baseobjspace::is_w(resolved, pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
+        return Err(pickling_error(
+            "Can't pickle object: global identity mismatch",
+        ));
+    }
+
+    if ctx.proto < 4 {
+        let encoding = if ctx.proto < 3 { "ascii" } else { "utf-8" };
+        if let Err(error) = crate::type_methods::encode_object(
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
+            encoding,
+            "strict",
+        ) {
+            return Err(identifier_encoding_error(
+                error,
+                pyre_object::gc_roots::shadow_stack_get(module_slot),
+                "module",
+                ctx.proto,
+            ));
+        }
+        return match crate::type_methods::encode_object(
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
+            encoding,
+            "strict",
+        ) {
+            Ok(_) => Err(pickling_error(
+                "surrogate global identifier unexpectedly encoded",
+            )),
+            Err(error) => Err(identifier_encoding_error(
+                error,
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
+                "global",
+                ctx.proto,
+            )),
+        };
+    }
+
+    save(
+        ctx,
+        buf,
+        pyre_object::gc_roots::shadow_stack_get(module_slot),
+    )?;
+    save(ctx, buf, pyre_object::gc_roots::shadow_stack_get(name_slot))?;
+    buf.push(op::STACK_GLOBAL);
+    memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(obj_slot));
+    Ok(())
+}
+
+fn identifier_encoding_error(
+    mut context: PyError,
+    w_identifier: PyObjectRef,
+    kind: &str,
+    proto: i64,
+) -> PyError {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_identifier);
+    let identifier_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let context_obj = context.to_exc_object();
+    pyre_object::gc_roots::pin_root(context_obj);
+    let context_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let identifier_repr =
+        unsafe { crate::py_repr(pyre_object::gc_roots::shadow_stack_get(identifier_slot)) }
+            .unwrap_or_else(|_| "<identifier>".to_string());
+    let mut error = pickling_error(format!(
+        "can't pickle {kind} identifier {identifier_repr} using pickle protocol {proto}"
+    ));
+    let exc = error.to_exc_object();
+    pyre_object::gc_roots::pin_root(exc);
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    crate::error::chain_context(
+        pyre_object::gc_roots::shadow_stack_get(exc_slot),
+        pyre_object::gc_roots::shadow_stack_get(context_slot),
+    );
+    error.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    error
+}
+
 /// `_save_toplevel_by_name` — emit a GLOBAL opcode for a top-level name,
 /// applying the protocol-< 3 `fix_imports` py3 → py2 reverse map.
 fn save_toplevel_by_name(
@@ -2217,10 +2342,44 @@ fn save_toplevel_by_name(
     } else {
         (module_name.to_string(), name.to_string())
     };
+    let encoding = if ctx.proto < 3 { "ascii" } else { "utf-8" };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_module_name = pyre_object::w_str_new(&module_name);
+    pyre_object::gc_roots::pin_root(w_module_name);
+    let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_name = pyre_object::w_str_new(&name);
+    pyre_object::gc_roots::pin_root(w_name);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let module_bytes = crate::type_methods::encode_object(
+        pyre_object::gc_roots::shadow_stack_get(module_slot),
+        encoding,
+        "strict",
+    )
+    .map_err(|error| {
+        identifier_encoding_error(
+            error,
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
+            "module",
+            ctx.proto,
+        )
+    })?;
+    let name_bytes = crate::type_methods::encode_object(
+        pyre_object::gc_roots::shadow_stack_get(name_slot),
+        encoding,
+        "strict",
+    )
+    .map_err(|error| {
+        identifier_encoding_error(
+            error,
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
+            "global",
+            ctx.proto,
+        )
+    })?;
     buf.push(op::GLOBAL);
-    buf.extend_from_slice(module_name.as_bytes());
+    buf.extend_from_slice(&module_bytes);
     buf.push(b'\n');
-    buf.extend_from_slice(name.as_bytes());
+    buf.extend_from_slice(&name_bytes);
     buf.push(b'\n');
     Ok(())
 }
