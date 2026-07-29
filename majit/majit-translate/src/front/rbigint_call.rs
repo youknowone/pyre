@@ -466,6 +466,20 @@ mod tests {
             pow_nomod_residual_path(&segs(&["pyre_object", "rbigint", "RBigInt", "pow",]))
                 .is_none()
         );
+        assert_eq!(
+            pow_nomod_residual_path(&segs(&[
+                "pyre_interpreter",
+                "objspace",
+                "descroperation",
+                "bigint_int_pow_nomod",
+            ])),
+            Some(segs(&[
+                "pyre_interpreter",
+                "objspace",
+                "descroperation",
+                "jit_bigint_int_pow_nomod",
+            ]))
+        );
     }
 
     #[test]
@@ -527,6 +541,7 @@ mod tests {
         for (source, residual) in [
             ("bigint_floordiv_nonzero", "jit_bigint_div_floor"),
             ("bigint_modulo_nonzero", "jit_bigint_mod_floor"),
+            ("bigint_int_floordiv_nonzero", "jit_bigint_int_div_floor"),
         ] {
             assert_eq!(
                 divmod_projection_residual_path(&segs(&[
