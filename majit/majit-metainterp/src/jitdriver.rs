@@ -5517,7 +5517,7 @@ impl<S: JitState> JitDriver<S> {
         // `pyjitpl.py:3424 rebuild_state_after_failure` parity status:
         //
         //   * `ResumeDataResult.virtualref_values` (vref pair stream) is
-        //     restored into `sym.virtualref_boxes` and each pair fires
+        //     restored into `TraceCtx.virtualref_boxes` and each pair fires
         //     `vrefinfo.continue_tracing(vref, virtual)`
         //     (`virtualref.py:122-129`) inside
         //     `pyre-jit-trace::state::setup_bridge_sym` — matches the
