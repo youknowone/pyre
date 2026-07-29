@@ -434,6 +434,15 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                     .map_or(false, |d| d.is_resume_guard() || d.is_resume_guard_copied())
                 {
                     fd.set_fail_index_per_trace(fail_index);
+                    // `ops` is the optimized frontend trace retained by
+                    // `CompiledTrace`.  The backend GC rewriter inserts
+                    // operations before code generation, so the assembler's
+                    // prepared-op index is not a valid index into this slice.
+                    // Re-stamp the canonical descr from the frontend op,
+                    // matching RPython where the ResumeGuardDescr remains
+                    // attached to the live ResOperation rather than carrying
+                    // an index into a separate rewritten array.
+                    fd.set_source_op_index(op_idx);
                 }
             }
         }
@@ -2710,6 +2719,33 @@ mod tests {
             exit.resolve_exit_types(),
             &[Type::Ref, Type::Ref, Type::Int, Type::Int][..]
         );
+    }
+
+    #[test]
+    fn test_build_guard_metadata_restamps_frontend_source_op_index() {
+        let inputargs = vec![InputArg::new_int(0)];
+        let value = rooted_inputarg_operand(Type::Int, 0);
+        let prefix = Op::new(OpCode::SameAsI, std::slice::from_ref(&value));
+        let descr = make_fail_descr_with_index(0, 1);
+        let fd = descr.as_fail_descr().unwrap();
+        // The GC-rewritten backend trace can insert operations before a
+        // guard and temporarily stamp its prepared-op index on the shared
+        // descr.  That index is not valid in the retained frontend trace.
+        fd.set_source_op_index(99);
+        let mut guard = Op::with_descr(
+            OpCode::GuardTrue,
+            std::slice::from_ref(&value),
+            descr.clone(),
+        );
+        guard.setfailargs(smallvec::smallvec![value]);
+        guard.set_fail_arg_types(vec![Type::Int]);
+
+        let (_resume_data, exit_layouts) =
+            build_guard_metadata(&inputargs, &[prefix, guard], 0, None);
+        let exit = exit_layouts.get(&0).expect("guard exit layout");
+
+        assert_eq!(exit.source_op_index, Some(1));
+        assert_eq!(fd.source_op_index(), Some(1));
     }
 
     #[test]
