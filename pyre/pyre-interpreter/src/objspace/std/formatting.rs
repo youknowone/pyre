@@ -386,9 +386,13 @@ unsafe fn bytes_char_arg(obj: PyObjectRef) -> Result<u8, PyError> {
     } else if has_dunder(obj, "__index__") {
         crate::builtins::obj_to_bigint(crate::baseobjspace::space_index(obj)?)
     } else {
+        let type_name = match crate::typedef::r#type(obj) {
+            Some(w_type) => crate::baseobjspace::type_fully_qualified_name(w_type.as_ptr()),
+            None => crate::baseobjspace::object_functionstr_type_name(obj),
+        };
         return Err(PyError::type_error(format!(
             "%c requires an integer in range(256) or a single byte, not {}",
-            crate::baseobjspace::object_functionstr_type_name(obj)
+            type_name
         )));
     };
     let overflow = || PyError::new(PyErrorKind::OverflowError, "%c arg not in range(256)");
@@ -551,7 +555,7 @@ unsafe fn char_arg(obj: PyObjectRef) -> Result<CodePoint, PyError> {
         crate::builtins::obj_to_bigint(crate::baseobjspace::space_index(obj)?)
     } else {
         let tn = match crate::typedef::r#type(obj) {
-            Some(w_type) => crate::baseobjspace::type_repr_qualified_name(w_type.as_ptr()),
+            Some(w_type) => crate::baseobjspace::type_fully_qualified_name(w_type.as_ptr()),
             None => crate::baseobjspace::object_functionstr_type_name(obj),
         };
         return Err(PyError::type_error(format!(

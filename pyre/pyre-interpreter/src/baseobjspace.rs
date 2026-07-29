@@ -8782,6 +8782,33 @@ pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef,
     Ok(bound)
 }
 
+/// CPython 3.14 `PyType_GetFullyQualifiedName` — the `%T` formatting name.
+/// Heap types use `<module>.<qualname>`, except that `builtins` and
+/// `__main__` are omitted.  Static types retain their registered name.
+///
+/// # Safety
+/// `w_type` must be a valid `W_TypeObject`.
+pub unsafe fn type_fully_qualified_name(w_type: PyObjectRef) -> String {
+    if !pyre_object::w_type_is_heaptype(w_type) {
+        return w_type_get_name(w_type).to_string();
+    }
+    let qualname = pyre_object::w_type_get_qualname(w_type).to_string();
+    // typeobject.c:type_module reads the heap type's own namespace, not an
+    // inherited `__module__`.
+    let dict = pyre_object::w_type_get_dict_ptr(w_type) as PyObjectRef;
+    let module = (!dict.is_null())
+        .then(|| pyre_object::w_dict_getitem_str(dict, "__module__"))
+        .flatten()
+        .filter(|m| is_str(*m))
+        .map(|m| w_str_get_value(m).to_string());
+    match module.as_deref() {
+        Some(module) if module != "builtins" && module != "__main__" => {
+            format!("{module}.{qualname}")
+        }
+        _ => qualname,
+    }
+}
+
 /// `callmethod.py:25-85 LOAD_METHOD` fast-path decision, shared by the
 /// interpreter (`eval::load_method`) and the JIT tracer
 /// (`jitcode_dispatch::try_walker_specialize_load_method_attr`) so both produce the

@@ -7708,4 +7708,37 @@ result = (
             assert!(crate::baseobjspace::is_true(result).unwrap());
         }
     }
+
+    #[test]
+    fn test_percent_c_uses_fully_qualified_type_name() {
+        let source = "\
+class Qualified:
+    pass
+Qualified.__module__ = 'package.module'
+
+class Main:
+    pass
+
+messages = []
+for format_string in (b'%c', '%c'):
+    for value in (Qualified(), Main()):
+        try:
+            format_string % value
+        except TypeError as exc:
+            messages.append(str(exc))
+
+result = (
+    messages[0].endswith('not package.module.Qualified')
+    and messages[1].endswith('not Main')
+    and messages[2].endswith('not package.module.Qualified')
+    and messages[3].endswith('not Main')
+)
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("%c fully-qualified type names failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
 }
