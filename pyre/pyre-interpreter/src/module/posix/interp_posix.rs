@@ -36,11 +36,7 @@ pub(crate) fn walk_fork_callback_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)
         parent_w,
         child_w,
     } = &mut *callbacks;
-    for callbacks in [
-        before_w,
-        parent_w,
-        child_w,
-    ] {
+    for callbacks in [before_w, parent_w, child_w] {
         for callback in callbacks {
             visitor(unsafe { &mut *(callback as *mut usize as *mut PyObjectRef) });
         }
@@ -75,8 +71,7 @@ fn run_fork_callbacks(kind: &str) {
             .copied()
         };
         let Some(callback) = callback else { continue };
-        if let Err(mut error) =
-            crate::call::call_function_impl_result(callback as PyObjectRef, &[])
+        if let Err(mut error) = crate::call::call_function_impl_result(callback as PyObjectRef, &[])
         {
             error.write_unraisable(pyre_object::w_none(), "fork hook", callback as PyObjectRef);
         }
@@ -141,60 +136,60 @@ fn register_at_fork(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 fn stat_result_seq_type() -> PyObjectRef {
     static STAT_RESULT_SEQ_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *STAT_RESULT_SEQ_TYPE.get_or_init(|| {
-            crate::_structseq::make_struct_seq_with_extra(
-                // Dotted name → `__name__` "stat_result", repr "os.stat_result(...)".
-                "os.stat_result",
-                // `app_posix.py:20-37` — slots 7..10 are the hidden integer
-                // timestamps; the float `st_atime`/`st_mtime`/`st_ctime` are
-                // named-only extras, never indexable.
-                &[
-                    "st_mode",
-                    "st_ino",
-                    "st_dev",
-                    "st_nlink",
-                    "st_uid",
-                    "st_gid",
-                    "st_size",
-                    "_integer_atime",
-                    "_integer_mtime",
-                    "_integer_ctime",
-                ],
-                // `app_posix.py:38-69` — named-only extras ordered by their
-                // `structseqfield` index (11..13, 20..23, 40..42, 50..52).
-                // `structseq_descr_new` fills surplus sequence items into
-                // this list in order, so the list order must match PyPy's
-                // index sort, not the build-time population order.
-                &[
-                    // float times, indices 11..13.
-                    "st_atime",
-                    "st_mtime",
-                    "st_ctime",
-                    // `app_posix.py:45-52` — present where the platform's
-                    // `struct stat` carries them (every Unix target),
-                    // indices 20..23.
-                    #[cfg(unix)]
-                    "st_blksize",
-                    #[cfg(unix)]
-                    "st_blocks",
-                    #[cfg(unix)]
-                    "st_rdev",
-                    // `rposix_stat.py` exposes `st_flags` where the C
-                    // `struct stat` carries it (BSD family / macOS).
-                    #[cfg(target_os = "macos")]
-                    "st_flags",
-                    // `build_stat_result` (interp_posix.py:554-557) +
-                    // `rposix_stat.py STAT_FIELDS += ALL_STAT_FIELDS[-3:]`
-                    // — the sub-second nanosecond remainders, indices 40..42.
-                    "nsec_atime",
-                    "nsec_mtime",
-                    "nsec_ctime",
-                    // full nanosecond timestamps, indices 50..52.
-                    "st_atime_ns",
-                    "st_mtime_ns",
-                    "st_ctime_ns",
-                ],
-            ) as usize
-        }) as PyObjectRef
+        crate::_structseq::make_struct_seq_with_extra(
+            // Dotted name → `__name__` "stat_result", repr "os.stat_result(...)".
+            "os.stat_result",
+            // `app_posix.py:20-37` — slots 7..10 are the hidden integer
+            // timestamps; the float `st_atime`/`st_mtime`/`st_ctime` are
+            // named-only extras, never indexable.
+            &[
+                "st_mode",
+                "st_ino",
+                "st_dev",
+                "st_nlink",
+                "st_uid",
+                "st_gid",
+                "st_size",
+                "_integer_atime",
+                "_integer_mtime",
+                "_integer_ctime",
+            ],
+            // `app_posix.py:38-69` — named-only extras ordered by their
+            // `structseqfield` index (11..13, 20..23, 40..42, 50..52).
+            // `structseq_descr_new` fills surplus sequence items into
+            // this list in order, so the list order must match PyPy's
+            // index sort, not the build-time population order.
+            &[
+                // float times, indices 11..13.
+                "st_atime",
+                "st_mtime",
+                "st_ctime",
+                // `app_posix.py:45-52` — present where the platform's
+                // `struct stat` carries them (every Unix target),
+                // indices 20..23.
+                #[cfg(unix)]
+                "st_blksize",
+                #[cfg(unix)]
+                "st_blocks",
+                #[cfg(unix)]
+                "st_rdev",
+                // `rposix_stat.py` exposes `st_flags` where the C
+                // `struct stat` carries it (BSD family / macOS).
+                #[cfg(target_os = "macos")]
+                "st_flags",
+                // `build_stat_result` (interp_posix.py:554-557) +
+                // `rposix_stat.py STAT_FIELDS += ALL_STAT_FIELDS[-3:]`
+                // — the sub-second nanosecond remainders, indices 40..42.
+                "nsec_atime",
+                "nsec_mtime",
+                "nsec_ctime",
+                // full nanosecond timestamps, indices 50..52.
+                "st_atime_ns",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            ],
+        ) as usize
+    }) as PyObjectRef
 }
 
 /// `os.terminal_size` structseq — `(columns, lines)`.
@@ -211,9 +206,9 @@ fn uname_result_seq_type() -> PyObjectRef {
     static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
         crate::_structseq::make_struct_seq(
-                "posix.uname_result",
-                &["sysname", "nodename", "release", "version", "machine"],
-            ) as usize
+            "posix.uname_result",
+            &["sysname", "nodename", "release", "version", "machine"],
+        ) as usize
     }) as PyObjectRef
 }
 
@@ -223,21 +218,21 @@ fn statvfs_result_seq_type() -> PyObjectRef {
     static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
         crate::_structseq::make_struct_seq_with_extra(
-                "os.statvfs_result",
-                &[
-                    "f_bsize",
-                    "f_frsize",
-                    "f_blocks",
-                    "f_bfree",
-                    "f_bavail",
-                    "f_files",
-                    "f_ffree",
-                    "f_favail",
-                    "f_flag",
-                    "f_namemax",
-                ],
-                &["f_fsid"],
-            ) as usize
+            "os.statvfs_result",
+            &[
+                "f_bsize",
+                "f_frsize",
+                "f_blocks",
+                "f_bfree",
+                "f_bavail",
+                "f_files",
+                "f_ffree",
+                "f_favail",
+                "f_flag",
+                "f_namemax",
+            ],
+            &["f_fsid"],
+        ) as usize
     }) as PyObjectRef
 }
 
@@ -247,15 +242,15 @@ fn times_result_seq_type() -> PyObjectRef {
     static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
         crate::_structseq::make_struct_seq(
-                "posix.times_result",
-                &[
-                    "user",
-                    "system",
-                    "children_user",
-                    "children_system",
-                    "elapsed",
-                ],
-            ) as usize
+            "posix.times_result",
+            &[
+                "user",
+                "system",
+                "children_user",
+                "children_system",
+                "elapsed",
+            ],
+        ) as usize
     }) as PyObjectRef
 }
 
@@ -492,7 +487,9 @@ mod win_nt {
 
     /// os._supports_virtual_terminal — whether stderr's console mode carries
     /// ENABLE_VIRTUAL_TERMINAL_PROCESSING.
-    pub fn _supports_virtual_terminal(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    pub fn _supports_virtual_terminal(
+        _args: &[PyObjectRef],
+    ) -> Result<PyObjectRef, crate::PyError> {
         Ok(pyre_object::w_bool_from(
             host_nt::supports_virtual_terminal(),
         ))
@@ -584,11 +581,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "_create_environ",
-        crate::make_builtin_function_with_arity(
-            "_create_environ",
-            |_args| Ok(create_environ()),
-            0,
-        ),
+        crate::make_builtin_function_with_arity("_create_environ", |_args| Ok(create_environ()), 0),
     );
 
     // ── posix.putenv(name, value) / posix.unsetenv(name) ──
@@ -676,8 +669,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "HAVE_FCHMOD",
         #[cfg(not(feature = "sandbox"))]
         "HAVE_FCHOWN",
-        #[cfg(not(feature = "sandbox"))]
-        "HAVE_FEXECVE",
+        // Do not advertise HAVE_FEXECVE until execve() accepts an open file
+        // descriptor.  os.py uses this bit to add execve to supports_fd, and
+        // test_posix then runs a fork+fexecve path whose child must never
+        // return to the libregrtest worker.
         #[cfg(not(feature = "sandbox"))]
         "HAVE_FPATHCONF",
         #[cfg(not(feature = "sandbox"))]
@@ -1428,7 +1423,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 Some(v) if !unsafe { pyre_object::is_none(v) } => {
                     if !unsafe { pyre_object::is_int(v) } {
                         let type_name = crate::typedef::r#type(v)
-                            .map(|t| unsafe { pyre_object::typeobject::w_type_get_name(t.as_ptr()) })
+                            .map(|t| unsafe {
+                                pyre_object::typeobject::w_type_get_name(t.as_ptr())
+                            })
                             .unwrap_or("object");
                         return Err(crate::PyError::type_error(format!(
                             "argument should be integer or None, not {type_name}"
@@ -1501,7 +1498,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 pos.len()
             )));
         }
-        crate::builtins::kwarg_reject_unknown(kwargs, &["ns", "dir_fd", "follow_symlinks"], "utime")?;
+        crate::builtins::kwarg_reject_unknown(
+            kwargs,
+            &["ns", "dir_fd", "follow_symlinks"],
+            "utime",
+        )?;
         let path = extract_path(pos[0])?;
 
         let present = |v: PyObjectRef| (!unsafe { pyre_object::is_none(v) }).then_some(v);
@@ -1525,7 +1526,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
         let unpack_two =
             |obj: PyObjectRef, what: &str| -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
-                if !unsafe { pyre_object::is_tuple(obj) } || unsafe { pyre_object::w_tuple_len(obj) } != 2
+                if !unsafe { pyre_object::is_tuple(obj) }
+                    || unsafe { pyre_object::w_tuple_len(obj) } != 2
                 {
                     return Err(crate::PyError::type_error(format!(
                         "utime: '{what}' must be a tuple of two ints"
@@ -1605,7 +1607,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ))
         }
     }
-    crate::module_ns_store(ns, "utime", crate::make_builtin_function("utime", utime_impl));
+    crate::module_ns_store(
+        ns,
+        "utime",
+        crate::make_builtin_function("utime", utime_impl),
+    );
 
     // ── posix._path_splitroot(path) → (root, tail) ──
     // Registered only where `sys.platform` is `win32`, the same condition
@@ -1774,28 +1780,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "get_terminal_size",
-        crate::make_builtin_function(
-            "get_terminal_size",
-            |_args| {
-                let (cols, rows) = {
-                    #[cfg(unix)]
-                    {
-                        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-                        let ret = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) };
-                        if ret == 0 && ws.ws_col > 0 {
-                            (ws.ws_col as i64, ws.ws_row as i64)
-                        } else {
-                            (80, 24)
-                        }
-                    }
-                    #[cfg(not(unix))]
-                    {
+        crate::make_builtin_function("get_terminal_size", |_args| {
+            let (cols, rows) = {
+                #[cfg(unix)]
+                {
+                    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+                    let ret = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) };
+                    if ret == 0 && ws.ws_col > 0 {
+                        (ws.ws_col as i64, ws.ws_row as i64)
+                    } else {
                         (80, 24)
                     }
-                };
-                Ok(make_terminal_size(cols, rows))
-            },
-        ),
+                }
+                #[cfg(not(unix))]
+                {
+                    (80, 24)
+                }
+            };
+            Ok(make_terminal_size(cols, rows))
+        }),
     );
     // os.fspath() — posixmodule.c posix_fspath / PyOS_FSPath.  str/bytes
     // pass through unchanged (the protocol's identity case); any other
@@ -2245,7 +2248,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     ("__fspath__", dir_entry_fspath),
                     ("__repr__", dir_entry_repr),
                 ] {
-                    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, crate::make_builtin_function(name, f)) };
+                    unsafe {
+                        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                            ns,
+                            name,
+                            crate::make_builtin_function(name, f),
+                        )
+                    };
                 }
             });
             unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
@@ -2280,13 +2289,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         *CELL.get_or_init(|| {
             let tp = crate::typedef::make_builtin_type("ScandirIterator", |ns| {
                 for (name, f) in [
-                    ("__iter__", scandir_iter_self as crate::gateway::BuiltinCodeFn),
+                    (
+                        "__iter__",
+                        scandir_iter_self as crate::gateway::BuiltinCodeFn,
+                    ),
                     ("__next__", scandir_iter_next),
                     ("__enter__", scandir_iter_self),
                     ("__exit__", scandir_iter_close),
                     ("close", scandir_iter_close),
                 ] {
-                    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, crate::make_builtin_function(name, f)) };
+                    unsafe {
+                        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                            ns,
+                            name,
+                            crate::make_builtin_function(name, f),
+                        )
+                    };
                 }
             });
             unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
@@ -2638,6 +2656,128 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     {
         use rustpython_host_env::posix as host_posix;
 
+        fn exec_argv(
+            w_argv: PyObjectRef,
+            function: &str,
+        ) -> Result<Vec<std::ffi::CString>, crate::PyError> {
+            // PyPy interp_posix.execv: `space.unpackiterable(w_argv)` followed
+            // by `space.fsencode_w` for every argument.
+            let items = crate::baseobjspace::unpackiterable(w_argv, -1).map_err(|error| {
+                if error.kind == crate::PyErrorKind::TypeError {
+                    crate::PyError::type_error(format!(
+                        "{function}() arg 2 must be an iterable of strings"
+                    ))
+                } else {
+                    error
+                }
+            })?;
+            if items.is_empty() {
+                return Err(crate::PyError::value_error(format!(
+                    "{function}() arg 2 must not be empty"
+                )));
+            }
+            let mut argv = Vec::with_capacity(items.len());
+            for item in items {
+                let value = extract_path(item)?;
+                argv.push(std::ffi::CString::new(value.as_bytes()).map_err(|_| {
+                    crate::PyError::value_error(format!(
+                        "{function}() arg 2 contains an embedded null byte"
+                    ))
+                })?);
+            }
+            if argv[0].as_bytes().is_empty() {
+                return Err(crate::PyError::value_error(format!(
+                    "{function}() arg 2 first element cannot be empty"
+                )));
+            }
+            Ok(argv)
+        }
+
+        fn exec_pointer_array(values: &[std::ffi::CString]) -> Vec<*const libc::c_char> {
+            let mut pointers: Vec<_> = values.iter().map(|value| value.as_ptr()).collect();
+            pointers.push(std::ptr::null());
+            pointers
+        }
+
+        // PyPy interp_posix.execv: this call replaces the current process and
+        // returns only to translate the host errno into OSError.
+        crate::module_ns_store(
+            ns,
+            "execv",
+            crate::make_builtin_function_with_arity(
+                "execv",
+                |args| {
+                    let command = extract_path(args[0])?;
+                    let command_c = std::ffi::CString::new(command.as_bytes()).map_err(|_| {
+                        crate::PyError::value_error("execv() path contains an embedded null byte")
+                    })?;
+                    let argv = exec_argv(args[1], "execv")?;
+                    let argv_ptrs = exec_pointer_array(&argv);
+                    let errno =
+                        host_posix::exec_replace(&[command_c], argv_ptrs.as_ptr(), None) as i32;
+                    Err(errno_err(errno, &command))
+                },
+                2,
+            ),
+        );
+
+        // PyPy interp_posix.execve/_env2interp: accept a mapping, fsencode
+        // names and values, reject illegal names, then replace the process.
+        crate::module_ns_store(
+            ns,
+            "execve",
+            crate::make_builtin_function_with_arity(
+                "execve",
+                |args| {
+                    let command = extract_path(args[0])?;
+                    let command_c = std::ffi::CString::new(command.as_bytes()).map_err(|_| {
+                        crate::PyError::value_error("execve() path contains an embedded null byte")
+                    })?;
+                    let argv = exec_argv(args[1], "execve")?;
+                    let argv_ptrs = exec_pointer_array(&argv);
+
+                    let keys_obj = crate::baseobjspace::call_method(args[2], "keys", &[]);
+                    if keys_obj.is_null() {
+                        return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                            crate::PyError::type_error("execve: env must be a mapping")
+                        }));
+                    }
+                    let keys = crate::baseobjspace::unpackiterable(keys_obj, -1)?;
+                    let mut env = Vec::with_capacity(keys.len());
+                    for key_obj in keys {
+                        let value_obj = crate::baseobjspace::getitem(args[2], key_obj)?;
+                        let key = extract_path(key_obj)?;
+                        let value = extract_path(value_obj)?;
+                        if key.is_empty()
+                            || key
+                                .as_bytes()
+                                .get(1..)
+                                .is_some_and(|tail| tail.contains(&b'='))
+                        {
+                            return Err(crate::PyError::value_error(
+                                "illegal environment variable name",
+                            ));
+                        }
+                        env.push(std::ffi::CString::new(format!("{key}={value}")).map_err(
+                            |_| {
+                                crate::PyError::value_error(
+                                    "execve() environment contains an embedded null byte",
+                                )
+                            },
+                        )?);
+                    }
+                    let env_ptrs = exec_pointer_array(&env);
+                    let errno = host_posix::exec_replace(
+                        &[command_c],
+                        argv_ptrs.as_ptr(),
+                        Some(env_ptrs.as_ptr()),
+                    ) as i32;
+                    Err(errno_err(errno, &command))
+                },
+                3,
+            ),
+        );
+
         // os.strerror(code) -> str
         crate::module_ns_store(
             ns,
@@ -2937,6 +3077,30 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 "getppid",
                 |_| Ok(pyre_object::w_int_new(unsafe { libc::getppid() } as i64)),
                 0,
+            ),
+        );
+
+        // PyPy interp_posix.getsid(pid) -> rposix.getsid(pid).
+        #[cfg(not(feature = "sandbox"))]
+        crate::module_ns_store(
+            ns,
+            "getsid",
+            crate::make_builtin_function_with_arity(
+                "getsid",
+                |args| {
+                    let pid = match args.first() {
+                        Some(&obj) => (unsafe { pyre_object::w_int_get_value(obj) }) as libc::pid_t,
+                        None => {
+                            return Err(crate::PyError::type_error("getsid() requires 1 argument"));
+                        }
+                    };
+                    let sid = unsafe { libc::getsid(pid) };
+                    if sid == -1 {
+                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    }
+                    Ok(pyre_object::w_int_new(sid as i64))
+                },
+                1,
             ),
         );
 
