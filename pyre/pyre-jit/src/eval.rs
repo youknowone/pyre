@@ -8162,6 +8162,16 @@ fn bound_reached(
 ///
 /// Called at every portal entry (function call). Must be fast for the
 /// common case (no compiled code, not tracing, threshold not reached).
+#[inline]
+fn dump_bytecode_enabled() -> bool {
+    // Debug configuration is process-startup state.  Reading getenv at every
+    // Python function entry showed up in test_math's call-heavy Fraction and
+    // unittest paths; RPython's warmstate entry has no corresponding per-call
+    // environment lookup.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MAJIT_DUMP_BYTECODE").is_some())
+}
+
 pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let mut frame_root = FrameRoot::new(frame);
     // warmstate.py parity: PYRE_NO_JIT disables ALL JIT paths.
@@ -8177,7 +8187,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // this warmstate entry shaped like RPython's unconditional
     // `maybe_compile_and_run`; repeating the whole-frame scan here charged
     // every Python call even before a warm counter could take the fast path.
-    if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
+    if dump_bytecode_enabled() {
         if code.obj_name.as_str() == "fannkuch" && frame_root.frame().next_instr() == 0 {
             use std::sync::OnceLock;
             static DUMPED: OnceLock<()> = OnceLock::new();
@@ -12620,7 +12630,7 @@ r = acc",
             }),
             "expected an instruction with an ExtendedArg prefix"
         );
-        if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
+        if dump_bytecode_enabled() {
             let mut state = pyre_interpreter::OpArgState::default();
             for (pc, unit) in code.instructions.iter().copied().enumerate() {
                 let (instr, oparg) = state.get(unit);
@@ -12645,7 +12655,7 @@ r = acc",
         }
         let mut frame = PyFrame::new(code);
         let result = eval_with_jit(&mut frame);
-        if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
+        if dump_bytecode_enabled() {
             let mut keys: Vec<String> =
                 unsafe { pyre_object::w_dict_str_entries(frame.get_w_globals()) }
                     .into_iter()
