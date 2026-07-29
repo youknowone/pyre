@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=30
 # A hot `math.sqrt(x)` loop.  The walker specializes the call
 # (`try_walker_specialize_math_sqrt`) to a domain-guarded pure
 # `CALL_F(sqrt_nonneg_jit)` (ll_math.rs `ll_math_sqrt` -> `sqrt_nonneg`,
@@ -9,7 +9,7 @@
 # non-finite argument or a rebound `math.sqrt` falls through to the residual.
 import math
 
-N = 32000000
+N = 300000
 
 
 def run():

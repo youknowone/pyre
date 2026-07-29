@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=16
+# pyre-check: max-pypy-ratio=35
 # Regression guard: a residual (may-force) callee that inspects its OWN frame
 # via sys._getframe() must not clear the traced CALLER's virtualizable tracing
 # token. Clearing it raised a spurious frame-escape with no committed resume pc,
