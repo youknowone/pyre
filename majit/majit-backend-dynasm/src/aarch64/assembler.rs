@@ -6067,15 +6067,24 @@ impl<'a> AssemblerARM64<'a> {
 
     /// aarch64/opassembler.py:912 _write_barrier_fastpath parity.
     fn emit_write_barrier_fastpath(&mut self, op: &Op, arglocs: &[Loc]) {
+        // opassembler.py:934 `mc.LDRB_ri(r.ip0.value, loc_base.value, ...)`
+        // indexes the base as a core register; upstream guarantees that in
+        // `ARMRegisterManager.return_constant` (aarch64/regalloc.py:70), which
+        // materializes every Const into a scratch register. The shared
+        // `RegisterManager::return_constant` follows the llsupport spelling
+        // (llsupport/regalloc.py:625) and can hand back a bare `Loc::Immed`,
+        // so state the contract instead of emitting nothing — a barrier that
+        // assembles to zero bytes stays invisible until it corrupts memory.
         let loc_base = match arglocs.first() {
             Some(Loc::Reg(r)) => *r,
-            _ => return,
+            other => {
+                panic!("write barrier base loc must be Loc::Reg (regalloc contract), got {other:?}")
+            }
         };
         let is_array = op.opcode == majit_ir::OpCode::CondCallGcWbArray;
-        let loc_index = match arglocs.get(1) {
-            Some(Loc::Reg(r)) => Some(*r),
-            _ => None,
-        };
+        // opassembler.py:996 `loc_index = arglocs[1]` — the location kind is
+        // discriminated at the card-marking block, not here.
+        let loc_index = arglocs.get(1).copied();
         self.emit_write_barrier_fastpath_for_base(loc_base, is_array, loc_index);
     }
 
@@ -6083,12 +6092,14 @@ impl<'a> AssemblerARM64<'a> {
         &mut self,
         loc_base: crate::regloc::RegLoc,
         is_array: bool,
-        loc_index: Option<crate::regloc::RegLoc>,
+        loc_index: Option<Loc>,
     ) {
-        let wb = match crate::runner::dynasm_write_barrier_descr() {
-            Some(wb) => wb,
-            None => return,
-        };
+        // opassembler.py:917-919 asserts the descriptor is the collector's
+        // write-barrier class. `COND_CALL_GC_WB` only exists because the GC
+        // rewriter emitted it, so a missing descriptor here means the two
+        // disagree; returning would drop the barrier without a trace.
+        let wb = crate::runner::dynasm_write_barrier_descr()
+            .expect("COND_CALL_GC_WB emitted without a write barrier descriptor");
         let card_marking = is_array && wb.jit_wb_cards_set != 0;
 
         // opassembler.py:922-929: build mask
@@ -6137,20 +6148,46 @@ impl<'a> AssemblerARM64<'a> {
 
             // opassembler.py:996-1015: card marking inline
             dynasm!(self.mc ; .arch aarch64 ; =>card_mark);
-            if let Some(loc_index) = loc_index {
-                let shift = 3 + wb.jit_wb_card_page_shift;
-                dynasm!(self.mc ; .arch aarch64
-                    ; lsr x16, X(loc_index.value), shift
-                    ; mvn x30, x16
-                    ; lsr x16, X(loc_index.value), wb.jit_wb_card_page_shift
-                    ; and x17, x16, 7
-                    ; mov x16, 1
-                    ; lsl x17, x16, x17
-                    ; sub x30, x30, majit_gc::header::GcHeader::SIZE as u32
-                    ; ldrb w16, [X(loc_base.value), x30]
-                    ; orr w16, w16, w17
-                    ; strb w16, [X(loc_base.value), x30]
-                );
+            match loc_index {
+                // opassembler.py:997 `assert loc_index.is_core_reg()`
+                Some(Loc::Reg(loc_index)) => {
+                    let shift = 3 + wb.jit_wb_card_page_shift;
+                    dynasm!(self.mc ; .arch aarch64
+                        ; lsr x16, X(loc_index.value), shift
+                        ; mvn x30, x16
+                        ; lsr x16, X(loc_index.value), wb.jit_wb_card_page_shift
+                        ; and x17, x16, 7
+                        ; mov x16, 1
+                        ; lsl x17, x16, x17
+                        ; sub x30, x30, majit_gc::header::GcHeader::SIZE as u32
+                        ; ldrb w16, [X(loc_base.value), x30]
+                        ; orr w16, w16, w17
+                        ; strb w16, [X(loc_base.value), x30]
+                    );
+                }
+                // x86/assembler.py:2382-2386 `elif isinstance(loc_index, ImmedLoc)`:
+                // byte offset and bit mask are both assembly-time constants, so
+                // the sequence collapses to one load/or/store at a fixed
+                // displacement. A64 has no or-to-memory form, so the OR8 there
+                // becomes ldrb/orr/strb here. `byte_ofs` carries the same
+                // `- GcHeader::SIZE` bias the register form applies with
+                // `sub x30, x30, ...`: the base addresses the payload while the
+                // card bytes sit before the header.
+                Some(Loc::Immed(loc_index)) => {
+                    let byte_index = loc_index.value >> wb.jit_wb_card_page_shift;
+                    let byte_ofs = !(byte_index >> 3) - majit_gc::header::GcHeader::SIZE as i64;
+                    let byte_val = (1_i64 << (byte_index & 7)) as u32;
+                    self.emit_mov_imm64(30, byte_ofs);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; mov w17, byte_val
+                        ; ldrb w16, [X(loc_base.value), x30]
+                        ; orr w16, w16, w17
+                        ; strb w16, [X(loc_base.value), x30]
+                    );
+                }
+                // x86/assembler.py:2387-2388
+                // `raise AssertionError("index is neither RegLoc nor ImmedLoc")`
+                _ => panic!("index is neither RegLoc nor ImmedLoc"),
             }
         } else {
             // opassembler.py:968-976: non-array slow path

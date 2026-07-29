@@ -7617,13 +7617,24 @@ impl<'a> Assembler386<'a> {
     }
 
     fn emit_write_barrier_fastpath_kind(&mut self, arglocs: &[Loc], is_array: bool) {
-        let wb = match crate::runner::dynasm_write_barrier_descr() {
-            Some(wb) => wb,
-            None => return,
-        };
+        // x86/assembler.py:2399-2401 asserts the descriptor is the collector's
+        // write-barrier class. `COND_CALL_GC_WB` only exists because the GC
+        // rewriter emitted it, so a missing descriptor here means the two
+        // disagree; returning would drop the barrier without a trace.
+        let wb = crate::runner::dynasm_write_barrier_descr()
+            .expect("COND_CALL_GC_WB emitted without a write barrier descriptor");
+        // x86/assembler.py:2415-2420 feeds `loc_base = arglocs[0]` into
+        // `addr_add_const`, and `AddressLoc` (x86/regloc.py:213) accepts an
+        // immediate base, so upstream needs no assertion here. This backend
+        // addresses the flag byte only through a core register, and the paired
+        // lowered `GcStore` already contracts for one, so state the contract
+        // instead of emitting nothing — a barrier that assembles to zero bytes
+        // stays invisible until it corrupts memory.
         let loc_base = match arglocs.first() {
             Some(Loc::Reg(r)) => *r,
-            _ => return,
+            other => {
+                panic!("write barrier base loc must be Loc::Reg (regalloc contract), got {other:?}")
+            }
         };
         let card_marking = is_array && wb.jit_wb_cards_set != 0;
         let mut mask = wb.jit_wb_if_flag_singlebyte as i64;
@@ -7719,7 +7730,9 @@ impl<'a> Assembler386<'a> {
                         ; or BYTE [Rq(loc_base.value as u8) + byte_ofs as i32], byte_val as i8
                     );
                 }
-                _ => {}
+                // x86/assembler.py:2387-2388
+                // `raise AssertionError("index is neither RegLoc nor ImmedLoc")`
+                _ => panic!("index is neither RegLoc nor ImmedLoc"),
             }
         } else {
             // Non-array: generic barrier
