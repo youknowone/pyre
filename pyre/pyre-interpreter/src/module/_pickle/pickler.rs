@@ -2421,18 +2421,36 @@ fn save_reduce(
     }
     if has_state {
         if has_state_setter {
-            save(ctx, buf, rv_get(5))?;
+            save(ctx, buf, rv_get(5)).map_err(|error| {
+                add_serializing_note(
+                    error,
+                    pyre_object::gc_roots::shadow_stack_get(w_obj_slot.unwrap()),
+                    "state setter",
+                )
+            })?;
             save(
                 ctx,
                 buf,
                 pyre_object::gc_roots::shadow_stack_get(w_obj_slot.unwrap()),
             )?;
-            save(ctx, buf, rv_get(2))?;
+            save(ctx, buf, rv_get(2)).map_err(|error| {
+                add_serializing_note(
+                    error,
+                    pyre_object::gc_roots::shadow_stack_get(w_obj_slot.unwrap()),
+                    "state",
+                )
+            })?;
             buf.push(op::TUPLE2);
             buf.push(op::REDUCE);
             buf.push(op::POP);
         } else {
-            save(ctx, buf, rv_get(2))?;
+            save(ctx, buf, rv_get(2)).map_err(|error| {
+                add_serializing_note(
+                    error,
+                    pyre_object::gc_roots::shadow_stack_get(w_obj_slot.unwrap()),
+                    "state",
+                )
+            })?;
             buf.push(op::BUILD);
         }
     }
