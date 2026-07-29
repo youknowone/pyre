@@ -195,6 +195,17 @@ const BCOND_FORWARD_RANGE: usize = 1 << 20;
 /// full argument list; 1KB leaves roughly an 8x margin.
 const MAX_BYTES_PER_OP: usize = 1024;
 
+/// Ceiling assumed for one guard's failure-recovery stub, which
+/// [`AssemblerARM64::write_pending_failure_recoveries`] emits after the body a
+/// guard's `b.cond` has to reach across.  The fixed part is a `bl`, the
+/// optional exception block, the descriptor `mov`+`str`, the gcmap push and
+/// the call footer — under 128 bytes; the rest is `const_stores`, which costs
+/// a `mov` plus a `str` per entry and is not bounded by the operation count.
+/// The exact span is still checked in [`AssemblerARM64::check_guard_reach`]
+/// once every stub is written, so this only has to be right often enough to
+/// keep large traces off the two-instruction form.
+const MAX_BYTES_PER_GUARD_STUB: usize = 512;
+
 fn invert_cc(cc: u8) -> u8 {
     match cc {
         CC_O => CC_NO,
@@ -1821,6 +1832,7 @@ impl<'a> AssemblerARM64<'a> {
 
         // assembler.py:553 write_pending_failure_recoveries
         let stub_offsets = self.write_pending_failure_recoveries();
+        self.check_guard_reach()?;
 
         // assembler.py:556 materialize_loop — finalize to executable memory
         let buffer = self
@@ -1980,6 +1992,7 @@ impl<'a> AssemblerARM64<'a> {
         let entry = self.mc.offset();
         self._assemble(false)?;
         let stub_offsets = self.write_pending_failure_recoveries();
+        self.check_guard_reach()?;
 
         let buffer = self
             .mc
@@ -2048,7 +2061,17 @@ impl<'a> AssemblerARM64<'a> {
         let inputargs: &'a [InputArg] = self.inputargs;
         let ops: &'a [Op] = self.operations;
         self.trace_start_offset = self.mc.offset().0;
-        self.long_guard_branch = ops.len().saturating_mul(MAX_BYTES_PER_OP) >= BCOND_FORWARD_RANGE;
+        // A guard's `b.cond` has to reach a stub that is written after the
+        // whole body, so the budget is the body plus every stub — not the body
+        // alone.  `const_stores` makes a stub grow independently of the
+        // operation count, so charge it separately instead of leaving it to
+        // `MAX_BYTES_PER_OP`.
+        let guard_count = ops.iter().filter(|op| op.opcode.is_guard()).count();
+        self.long_guard_branch = ops
+            .len()
+            .saturating_mul(MAX_BYTES_PER_OP)
+            .saturating_add(guard_count.saturating_mul(MAX_BYTES_PER_GUARD_STUB))
+            >= BCOND_FORWARD_RANGE;
         if emit_prologue {
             self._call_header(inputargs);
         } else {
@@ -2233,22 +2256,6 @@ impl<'a> AssemblerARM64<'a> {
                 fail_index
             );
         }
-
-        // The `MAX_BYTES_PER_OP` estimate that let this trace use
-        // single-instruction guard branches has to have held: every guard's
-        // stub is written after this point, so the body plus the stubs must
-        // stay inside `b.cond`'s forward reach.  One stub is a handful of
-        // instructions per guard, so charge 64 bytes each.
-        debug_assert!(
-            self.long_guard_branch
-                || (self.mc.offset().0 - self.trace_start_offset)
-                    + self.pending_guard_tokens.len() * 64
-                    < BCOND_FORWARD_RANGE,
-            "trace emitted {} bytes with {} guards but used single-instruction \
-             guard branches; MAX_BYTES_PER_OP is too small",
-            self.mc.offset().0 - self.trace_start_offset,
-            self.pending_guard_tokens.len(),
-        );
 
         // assembler.py:1167-1171 `_assemble`: grow the frame to fit a
         // cross-loop JUMP target.  The closing `br` jumps into the target
@@ -4207,6 +4214,30 @@ impl<'a> AssemblerARM64<'a> {
     ///
     /// RPython parity: the quick-failure stub saves managed registers into the
     /// fixed jitframe prefix before publishing jf_descr and returning.
+    /// Every guard that took the single-instruction form has to reach its
+    /// failure-recovery stub with a `b.cond`, whose signed 19-bit word
+    /// displacement spans [`BCOND_FORWARD_RANGE`].  The stubs are written after
+    /// the body, so the span is only exact once
+    /// [`Self::write_pending_failure_recoveries`] has run — and by then the
+    /// branches are already emitted, so an overflow can no longer be answered
+    /// by re-emitting them in the two-instruction form.  Refuse the trace
+    /// instead: the up-front `MAX_BYTES_PER_OP` / `MAX_BYTES_PER_GUARD_STUB`
+    /// estimate is a heuristic, and letting a relocation that cannot be encoded
+    /// reach the assembler is not an acceptable way to find that out.
+    fn check_guard_reach(&self) -> Result<(), BackendError> {
+        let span = self.mc.offset().0 - self.trace_start_offset;
+        if self.long_guard_branch || span < BCOND_FORWARD_RANGE {
+            return Ok(());
+        }
+        Err(BackendError::CompilationFailed(format!(
+            "trace emitted {} bytes of body and guard stubs with {} guards, past \
+             b.cond's {BCOND_FORWARD_RANGE}-byte forward reach, but the up-front \
+             estimate chose single-instruction guard branches",
+            span,
+            self.pending_guard_tokens.len(),
+        )))
+    }
+
     fn generate_quick_failure(
         &mut self,
         guard_token: GuardToken,
