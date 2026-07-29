@@ -142,7 +142,11 @@ pub fn pyre_debug_call_enabled() -> bool {
     // go through the seam, so report disabled rather than touch the host env.
     #[cfg(not(feature = "sandbox"))]
     {
-        std::env::var("PYRE_DEBUG_CALL").is_ok()
+        // Cached: this sits on the per-call path and is also reachable from
+        // compiled code through the fnaddr registry, so an uncached read would
+        // pay a `getenv` plus a `String` allocation on every call.
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("PYRE_DEBUG_CALL").is_some())
     }
     #[cfg(feature = "sandbox")]
     {

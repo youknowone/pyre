@@ -598,6 +598,15 @@ fn gc_prebuilt_remember_enabled() -> bool {
     })
 }
 
+/// Whether the per-return diagnostic dump is enabled
+/// (`PYRE_INTERP_RETURN_LOG`). The probe sits on the RETURN_VALUE path, so an
+/// uncached read would pay a `getenv` on every Python return.
+#[cfg(not(feature = "sandbox"))]
+fn interp_return_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_INTERP_RETURN_LOG").is_some())
+}
+
 pub fn capture_pyframe_root_area() -> *const () {
     PYFRAME_ROOT_AREA.with(|area| area as *const _ as *const ())
 }
@@ -2705,7 +2714,7 @@ impl ControlFlowOpcodeHandler for PyFrame {
     /// when the returning path exits the frame (matched by StepResult::Return).
     fn finish_value(&mut self, value: Self::Value) -> Result<StepResult<Self::Value>, PyError> {
         #[cfg(not(feature = "sandbox"))]
-        if std::env::var_os("PYRE_INTERP_RETURN_LOG").is_some() {
+        if interp_return_log_enabled() {
             unsafe {
                 let code_ptr = crate::pyframe::pyframe_get_pycode(self);
                 let name = if !code_ptr.is_null() {
