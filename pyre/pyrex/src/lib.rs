@@ -545,7 +545,10 @@ pub fn main_entry(binary_name: &'static str) {
     // stack. A child that raises the limit far past that, or shrinks the stack
     // via ulimit, gets a SIGSEGV reaped by the trusted controller, not an escape.
     #[cfg(feature = "sandbox")]
-    real_main(binary_name);
+    {
+        real_main(binary_name);
+        post_run_diagnostics();
+    }
 
     // Block async signals on this (the process's original) thread so the
     // kernel delivers process-directed signals to the interpreter thread
@@ -559,17 +562,27 @@ pub fn main_entry(binary_name: &'static str) {
             .stack_size(256 * 1024 * 1024)
             .spawn(|| {
                 real_main(binary_name);
-                if std::env::var_os("PYRE_FIELD_IDENTITY_CENSUS").is_some() {
-                    pyre_jit::field_descr_identity_census_now();
-                }
-                if std::env::var_os("PYRE_DESCR_SPELLING_GATE").is_some() {
-                    pyre_jit::descr_spelling_gate_recheck_now();
-                }
+                post_run_diagnostics();
             })
             .expect("spawn main thread")
             .join()
             .unwrap();
     }
+}
+
+/// Diagnostics that have to read the descr universe *after* it has finished
+/// growing, so they run once `real_main` returns rather than inside it. Each is
+/// gated on its own environment variable internally.
+///
+/// The counts these name are already on the `[jit-stats]` line, which
+/// `maybe_print_jit_stats` emits from `real_main`'s exit paths and so survives
+/// a `process::exit` this hook does not reach. These print *which* members,
+/// never whether the gate holds.
+fn post_run_diagnostics() {
+    if std::env::var_os("PYRE_FIELD_IDENTITY_CENSUS").is_some() {
+        pyre_jit::field_descr_identity_census_now();
+    }
+    pyre_jit::descr_spelling_gate_recheck_now();
 }
 
 fn real_main(binary_name: &str) {
@@ -916,10 +929,12 @@ fn maybe_print_jit_stats() {
     // per trace while `descr.py:47` asserts it stays under 2**15 — upstream
     // fills it once at translation time, so only pyre can run into that bound.
     //
-    // Printed BEFORE the structural summary: `check.py` `_jit_stats_snapshot`
-    // keeps the LAST `[jit-stats]` line, so the structural counters have to be
-    // last or the baseline compare reads these tallies instead and the
-    // loops_aborted / internal_compile_panics floor silently stops firing.
+    // Printed BEFORE the structural summary, which is where it used to have to
+    // be: `check.py` `_jit_stats_snapshot` once kept only the LAST
+    // `[jit-stats]` line, so a diag line emitted after the counters displaced
+    // them and the loops_aborted / internal_compile_panics floor silently
+    // stopped firing. That snapshot now merges every line, so the order is no
+    // longer load-bearing — but the reading stays grouped diag-then-summary.
     // The wasm runner orders its diag lines the same way.
     let all_descrs_len = pyre_jit::eval::driver_pair()
         .0
@@ -943,6 +958,10 @@ fn maybe_print_jit_stats() {
         stats.guard_failures,
         stats.internal_compile_panics,
     );
+    // The descr-universe invariants. `descr_set_stale_absent` re-asks the
+    // `AbsentContainer` question against the universe as it stands now, so it
+    // has to be read here, after the run published everything it is going to.
+    eprintln!("[jit-stats] {}", pyre_jit::descr_set_jit_stats());
 }
 
 /// Shared top-level launcher bootstrap for `run_source` and `run_module`:

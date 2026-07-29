@@ -4710,3 +4710,69 @@ pub fn make_interior_field_descr(
     majit_ir::descr_registry::register_interior_field(interior.clone());
     interior
 }
+
+#[cfg(test)]
+mod set_member_lookup_tests {
+    use super::*;
+    use majit_ir::effectinfo::DescrSetMember;
+
+    /// Distinguishing the two non-resolving outcomes is the whole gate:
+    /// `AbsentContainer` is the projection onto a universe that never named the
+    /// container, `Ambiguous` is the container being named under a different
+    /// key. Only the second is a defect, and it is the one `check.py` gates at
+    /// zero.
+    ///
+    /// Both assertions turn on one key each, so they hold whatever else the
+    /// process-global gccache already carries.
+    #[test]
+    fn an_unnamed_container_is_absent_and_a_named_one_missing_the_field_is_ambiguous() {
+        let published = 0x7e57_0000_0000_0001u64;
+        let never_named = 0x7e57_0000_0000_0002u64;
+
+        majit_ir::descr::gc_cache()
+            .lock()
+            .unwrap()
+            .register_keyed_size(
+                majit_ir::descr::LLType::Struct(published),
+                Arc::new(majit_ir::descr::SimpleSizeDescr::with_vtable(
+                    u32::MAX,
+                    32,
+                    0,
+                    0,
+                )) as DescrRef,
+            );
+
+        let member = |struct_id| DescrSetMember::Field {
+            struct_id,
+            field_name: "no_such_field".to_string(),
+        };
+        assert!(matches!(
+            descr_from_set_member(&member(never_named)),
+            SetMemberLookup::AbsentContainer
+        ));
+        assert!(matches!(
+            descr_from_set_member(&member(published)),
+            SetMemberLookup::Ambiguous
+        ));
+    }
+
+    /// The label is what `PYRE_DESCR_SPELLING_GATE` prints, and it has to name
+    /// the container in the same hex form `descrs.bin` keys on so an entry can
+    /// be grepped straight back to a producer.
+    #[test]
+    fn labels_carry_the_container_key_and_member_name() {
+        assert_eq!(
+            set_member_label(&DescrSetMember::Field {
+                struct_id: 0xa3af111df5325ac5,
+                field_name: "items".to_string(),
+            }),
+            "Struct(0xa3af111df5325ac5).items"
+        );
+        assert_eq!(
+            set_member_label(&DescrSetMember::Array {
+                array_id: 0x0000000000000010
+            }),
+            "Array(0x0000000000000010)"
+        );
+    }
+}

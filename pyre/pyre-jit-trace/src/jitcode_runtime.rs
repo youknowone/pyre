@@ -505,24 +505,22 @@ pub fn rehydrate_build_descr_raw_sets() {
     });
 }
 
-/// Print the [`crate::descr::set_member_ledger`] under
+/// Name every member the ledger could not join, under
 /// `PYRE_DESCR_SPELLING_GATE=1`.
+///
+/// The counts themselves ride the `[jit-stats]` line
+/// ([`descr_set_jit_stats`]), which is what gates in CI. This is the detail
+/// behind them — the counterpart of `effectinfo.py:474-499`, where
+/// `compute_bitstrings` logs its per-key descr tallies through
+/// `policy.log` while expressing the impossible cases as bare `assert`s.
 ///
 /// The whole serialized raw-set universe is resolved inside the `Once` above
 /// and nowhere else, so this runs exactly once with the ledger complete.
-/// Green is `ambiguous=0` **with** a `resolved` count that shows the join
-/// actually happened; `ambiguous=0, resolved=0` is vacuous.
 fn report_descr_spelling_gate() {
     if std::env::var_os("PYRE_DESCR_SPELLING_GATE").is_none() {
         return;
     }
     let ledger = crate::descr::set_member_ledger();
-    eprintln!(
-        "[descr-spelling-gate] resolved={} absent={} ambiguous={}",
-        ledger.resolved,
-        ledger.absent.len(),
-        ledger.ambiguous.len()
-    );
     for label in &ledger.ambiguous {
         eprintln!("[descr-spelling-gate] ambiguous {label}");
     }
@@ -531,19 +529,42 @@ fn report_descr_spelling_gate() {
     }
 }
 
-/// Re-ask the `AbsentContainer` question once the run is over, and report
-/// every member whose container has since been registered.
+/// The descr-universe invariants, as `[jit-stats]` key/value tokens.
 ///
-/// Called from the same post-`real_main` hook as
-/// [`field_descr_identity_census_now`], so it sees the fully grown universe
-/// rather than the one the `Once` above resolved against. Each entry is a live
-/// instance of the gap documented on `SetMemberLookup::AbsentContainer`: an
-/// `EffectInfo` frozen while its container was unregistered still claims the
-/// callee does not touch it.
+/// `ambiguous` and `stale_absent` are the two upstream cannot reach, so
+/// `check.py` lists them in `JITSTATS_BADNESS_FIELDS` and fails the run if
+/// either rises off zero. `absent` is the divergence itself rather than a
+/// benign projection — `effectinfo.py:492-494` builds its sets out of descr
+/// objects `cpu.*descrof` just minted, so upstream has no member that fails to
+/// resolve — and it is carried as a ratchet: the committed baseline pins what
+/// this `descrs.bin` still drops, and it may fall but never rise.
+///
+/// `stale_absent` re-asks the `AbsentContainer` question against the universe
+/// as it stands now, so it must be read at process exit, after the run has
+/// published everything it is going to.
+pub fn descr_set_jit_stats() -> String {
+    let ledger = crate::descr::set_member_ledger();
+    format!(
+        "descr_set_resolved={} descr_set_absent={} descr_set_ambiguous={} descr_set_stale_absent={}",
+        ledger.resolved,
+        ledger.absent.len(),
+        ledger.ambiguous.len(),
+        crate::descr::stale_absent_containers().len(),
+    )
+}
+
+/// Name every member whose container has been registered since its raw set was
+/// frozen, under `PYRE_DESCR_SPELLING_GATE=1`.
+///
+/// Each one is a live instance of the gap documented on
+/// `SetMemberLookup::AbsentContainer`: an `EffectInfo` frozen while its
+/// container was unregistered still claims the callee does not touch it. The
+/// count is gated through [`descr_set_jit_stats`]; this is the detail.
 pub fn descr_spelling_gate_recheck_now() {
-    let stale = crate::descr::stale_absent_containers();
-    eprintln!("[descr-spelling-gate] stale_absent={}", stale.len());
-    for label in &stale {
+    if std::env::var_os("PYRE_DESCR_SPELLING_GATE").is_none() {
+        return;
+    }
+    for label in &crate::descr::stale_absent_containers() {
         eprintln!("[descr-spelling-gate] stale_absent {label}");
     }
 }

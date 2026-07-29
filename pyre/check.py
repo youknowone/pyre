@@ -466,7 +466,23 @@ def _jit_stats_diff(saved, current, limit=6):
 # (guard_failures, loops_compiled, bridges_compiled) are deliberately excluded:
 # they move in both directions under ordinary tuning and their absolute value is
 # not yet confirmed stable across runners, so they stay informational.
-JITSTATS_BADNESS_FIELDS = ("loops_aborted", "internal_compile_panics")
+#
+# `descr_set_ambiguous` and `descr_set_stale_absent` are the descr-universe
+# invariants. Upstream cannot reach either state — `effectinfo.py:492-494`
+# builds its sets out of the descr objects `cpu.*descrof` just created in the
+# same process — so upstream expresses this class of condition with a plain
+# `assert` (`descr.py:47`, `effectinfo.py:486,525`). Pyre resolves the sets
+# across a build-time/runtime split where both are reachable in principle and
+# the runtime answer is a sound degradation rather than a crash, so the
+# assertion is expressed as a counter that must not rise off zero. A field
+# absent from a baseline reads as 0, so these gate from the first run without
+# re-recording anything.
+JITSTATS_BADNESS_FIELDS = (
+    "loops_aborted",
+    "internal_compile_panics",
+    "descr_set_ambiguous",
+    "descr_set_stale_absent",
+)
 
 
 def _jit_stats_regression_floor(saved, current):
