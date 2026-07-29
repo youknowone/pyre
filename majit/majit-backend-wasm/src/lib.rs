@@ -1184,6 +1184,38 @@ impl WasmBackend {
         .unwrap_or_default()
     }
 
+    /// Pull every reference constant out of `ops` into a per-loop `GcTable`
+    /// and replace it with a `LoadFromGcTable` of its slot
+    /// (`majit_gc::rewrite::remove_ref_constants`, rewrite.py:106-116).
+    ///
+    /// A `GcRef` baked as a code immediate is invisible to the moving
+    /// collector: the first minor collection that promotes the referenced
+    /// object out of the nursery leaves the immediate pointing into nursery
+    /// space that is later reused or zeroed by `reset`. The table slot is a
+    /// GC root the collector forwards in place, so the emitted load always
+    /// reads the object at its current address. Returns `None` for a trace
+    /// with no reference constant, leaving the module byte-identical.
+    fn intern_ref_constants(
+        inputargs: &[InputArg],
+        ops: Vec<Op>,
+    ) -> (Vec<Op>, Option<Arc<majit_gc::GcTable>>) {
+        let next_pos = codegen::next_value_pos(inputargs, &ops);
+        let (ops, gcrefs) = majit_gc::rewrite::remove_ref_constants(&ops, next_pos);
+        let table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
+        (ops, table)
+    }
+
+    /// `x86/assembler.py:823` `gcreftracers.append(tracer)` — keep the
+    /// per-loop table alive for as long as the compiled trace that bakes its
+    /// base address. `LIVE_GC_TABLES` holds only a `Weak`, so this strong
+    /// reference is what keeps the slots rooted and forwardable.
+    fn register_gc_table(token: &JitCellToken, table: Arc<majit_gc::GcTable>) {
+        if let Some(clt) = token.compiled_loop_token() {
+            let tracer: Arc<dyn std::any::Any + Send + Sync> = table;
+            clt.asmmemmgr_gcreftracers.lock().push(tracer);
+        }
+    }
+
     /// Validate that every constant OpRef appearing as an arg is resolvable.
     ///
     /// Inline-Const variants (`ConstInt`/`ConstFloat`/
@@ -1726,6 +1758,8 @@ impl majit_backend::Backend for WasmBackend {
             majit_backend::record_compiled_loop_token(&self.cpu_tracker, &clt);
         }
         let ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
+        let (ops_owned, gc_table) = Self::intern_ref_constants(inputargs, ops_owned);
+        let gc_table_base = gc_table.as_ref().map_or(0, |t| t.base_addr() as u32);
         let ops: &[Op] = &ops_owned;
         // Freeze this token's generated frame layout before CA resolution.  A
         // self-recursive CALL_ASSEMBLER reaches this point while its token is
@@ -1804,6 +1838,7 @@ impl majit_backend::Backend for WasmBackend {
                 wb_fn_ptr,
                 nursery_alloc_params(ops).as_ref(),
                 Arc::as_ptr(&token.invalidated) as usize as u32,
+                gc_table_base,
                 fail_index_base,
                 0, // external_jump_slot: a loop's JUMP is a local back-edge `br`
                 0, // external_jump_key: unused without an external JUMP
@@ -1847,6 +1882,9 @@ impl majit_backend::Backend for WasmBackend {
             })
             .collect();
         register_fail_descrs(&fail_descrs);
+        if let Some(table) = gc_table {
+            Self::register_gc_table(token, table);
+        }
 
         let max_output_slots = guard_exits
             .iter()
@@ -2110,6 +2148,9 @@ impl majit_backend::Backend for WasmBackend {
         // argument-recovery layout is needed — hence `caller_recovery_layout`
         // and `previous_tokens` are unused.
         let ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
+        // A bridge gets its own table, like `compile_loop`'s.
+        let (ops_owned, gc_table) = Self::intern_ref_constants(inputargs, ops_owned);
+        let gc_table_base = gc_table.as_ref().map_or(0, |t| t.base_addr() as u32);
         let ops: &[Op] = &ops_owned;
         diag_bump(0); // compile_bridge entered
 
@@ -2515,6 +2556,7 @@ impl majit_backend::Backend for WasmBackend {
                 wb_fn_ptr,
                 nursery_alloc_params(ops).as_ref(),
                 Arc::as_ptr(&bridge_flag) as usize as u32,
+                gc_table_base,
                 base,
                 // A loop-closing bridge's terminal JUMP re-enters the target
                 // loop (own or sibling, resolved via `LABEL_TARGETS`) through
@@ -2540,6 +2582,9 @@ impl majit_backend::Backend for WasmBackend {
             })
             .collect();
         register_fail_descrs(&bridge_descrs);
+        if let Some(table) = gc_table {
+            Self::register_gc_table(original_token, table);
+        }
 
         // Register the bridge module into the shared table, then publish its
         // descrs and flip the source guard's cell. Order matters: the descrs

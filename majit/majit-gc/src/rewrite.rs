@@ -28,6 +28,82 @@ fn mk_op_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Op {
     Op::with_descr(opcode, args, descr)
 }
 
+/// rewrite.py:106-116 `emit_op`'s reference-constant loop, run on its own.
+///
+/// The full rewrite ([`GcRewriterImpl`]) also lowers mallocs, GC
+/// loads/stores and write barriers. A backend that lowers those itself —
+/// wasm emits its own inline nursery bump, its own barriers, and has no
+/// descr-driven `GC_LOAD` model — still needs this half: a raw `GcRef`
+/// baked as a code immediate is a pointer the moving collector can
+/// neither find nor update, so the first minor collection that promotes
+/// the referenced object out of the nursery leaves the immediate
+/// dangling at an address the nursery later reuses or zeroes. Running
+/// just this pass gives such a backend the same `LoadFromGcTable` +
+/// [`GcTable`](crate::GcTable) contract the native backends get from the
+/// full rewrite.
+///
+/// `next_pos` is the first free value position; the emitted loads take
+/// positions from there upward, so the caller's existing operand
+/// numbering is untouched. Returns the rewritten ops and the
+/// `gcrefs_output_list` (rewrite.py:352) the caller turns into the
+/// per-loop table.
+pub fn remove_ref_constants(ops: &[Op], mut next_pos: u32) -> (Vec<Op>, Vec<GcRef>) {
+    // rewrite.py:352-354 `gcrefs_output_list` / `gcrefs_map` /
+    // `gcrefs_recently_loaded`.
+    let mut gcrefs: Vec<GcRef> = Vec::new();
+    let mut gcrefs_map: IndexMap<usize, u32> = IndexMap::default();
+    let mut recently_loaded: IndexMap<u32, Operand> = IndexMap::default();
+    let mut out: Vec<Op> = Vec::with_capacity(ops.len());
+
+    for op in ops {
+        // rewrite.py:1005 — the per-basic-block CSE cache is dropped at
+        // every Label. A load emitted in the preamble must not be reused
+        // after the header: a resume entry jumps straight to the label
+        // and would read an unwritten slot.
+        if op.opcode == OpCode::Label {
+            recently_loaded.clear();
+        }
+        let op = op.clone();
+        // rewrite.py:105 `keep` — JIT_DEBUG keeps its constants inline.
+        if op.opcode != OpCode::JitDebug {
+            for i in 0..op.num_args() {
+                // rewrite.py:109 `bool(arg.value)` — null stays inline.
+                let Some(Value::Ref(gcref)) = op.arg(i).const_value() else {
+                    continue;
+                };
+                if gcref.is_null() {
+                    continue;
+                }
+                // rewrite.py:1033-1043 `_gcref_index`.
+                let index = *gcrefs_map.entry(gcref.0).or_insert_with(|| {
+                    let index = gcrefs.len() as u32;
+                    gcrefs.push(gcref);
+                    index
+                });
+                // rewrite.py:1100-1115 `remove_constptr`.
+                let load = match recently_loaded.get(&index) {
+                    Some(load) => load.clone(),
+                    None => {
+                        let load_op = std::rc::Rc::new(mk_op(
+                            OpCode::LoadFromGcTable,
+                            &[Operand::const_from_value(Value::Int(index as i64))],
+                        ));
+                        load_op.pos.set(OpRef::ref_op(next_pos));
+                        next_pos += 1;
+                        out.push((*load_op).clone());
+                        let load = Operand::from_bound_op(&load_op);
+                        recently_loaded.insert(index, load.clone());
+                        load
+                    }
+                };
+                op.setarg(i, load);
+            }
+        }
+        out.push(op);
+    }
+    (out, gcrefs)
+}
+
 /// Alignment for nursery allocations (8 bytes).
 const NURSERY_ALIGN: usize = 8;
 

@@ -450,6 +450,16 @@ pub fn count_ref_homes(inputargs: &[InputArg], ops: &[Op]) -> usize {
     RefHomes::collect(inputargs, ops, true).len()
 }
 
+/// First free value position — one past the highest id any input arg or op
+/// result occupies. `majit_gc::rewrite::remove_ref_constants` numbers the
+/// `LoadFromGcTable` results it emits from here upward, so the operand
+/// numbering the optimizer produced stays untouched. Same id set
+/// `collect_guards_and_vars` sizes `num_vars` from, so the loads land inside
+/// the locals the function declares.
+pub fn next_value_pos(inputargs: &[InputArg], ops: &[Op]) -> u32 {
+    collect_guards_and_vars(inputargs, ops).1
+}
+
 /// Positional frame slots required for a token's inputs and guard spills.
 /// Slot zero is the fail index; the returned count therefore also gives the
 /// first free slot for the call trampoline.
@@ -1311,6 +1321,11 @@ pub fn build_wasm_module(
     // linear memory. GUARD_NOT_INVALIDATED reads this byte at runtime, like
     // the native backends bake the same Arc allocation's address.
     invalidated_flag_addr: u32,
+    // Base address of this trace's per-loop `GcTable` slot array in shared
+    // linear memory (`gcreftracer.py:9` `array_base_addr`), baked as the
+    // `LoadFromGcTable` base immediate exactly as the native backends bake
+    // it. `0` when the trace holds no reference constant.
+    gc_table_base: u32,
     fail_index_base: u32,
     // Table slot of the loop a JUMP-with-no-local-LABEL re-enters (a loop-closing
     // bridge). `0` for a loop trace (its JUMP is a local back-edge `br`) and for a
@@ -1602,6 +1617,7 @@ pub fn build_wasm_module(
         cells_base,
         bridge_dispatch,
         invalidated_flag_addr,
+        gc_table_base,
         fail_index_base,
         external_jump_slot,
         external_jump_key,
@@ -1643,6 +1659,7 @@ fn build_function(
     cells_base: u32,
     bridge_dispatch: bool,
     invalidated_flag_addr: u32,
+    gc_table_base: u32,
     fail_index_base: u32,
     external_jump_slot: u32,
     // Resume-at-LABEL dispatch key the terminal external JUMP writes before
@@ -2740,18 +2757,19 @@ fn build_function(
                     op.opcode
                 )));
             }
-            // The bare GC_LOAD/GC_STORE forms are produced only by the GC rewrite
-            // (majit-gc/src/rewrite.rs): the true semantics are offset=arg1,
-            // size=arg2 (load) / value=arg2, size=arg3 (store), with no FieldDescr
-            // attached. The wasm backend does not run the GC rewrite, so these
-            // never reach here. The prior lowering read a nonexistent
-            // field_offset_from_descr (→ 0) and, for GcStore, stored arg(1) (the
-            // offset operand) as the value — a silent miscompile. Panic loudly like
-            // LoadFromGcTable rather than emit a wrong memory access.
+            // The bare GC_LOAD/GC_STORE forms are produced only by the GC rewrite's
+            // load/store lowering (majit-gc/src/rewrite.rs): the true semantics are
+            // offset=arg1, size=arg2 (load) / value=arg2, size=arg3 (store), with no
+            // FieldDescr attached. The wasm backend runs only the rewrite's
+            // reference-constant half (`remove_ref_constants`) and lowers loads,
+            // stores, allocations and barriers itself, so these never reach here.
+            // The prior lowering read a nonexistent field_offset_from_descr (→ 0)
+            // and, for GcStore, stored arg(1) (the offset operand) as the value — a
+            // silent miscompile. Panic loudly rather than emit a wrong memory access.
             OpCode::GcLoadI | OpCode::GcLoadR | OpCode::GcLoadF | OpCode::GcStore => {
                 panic!(
                     "wasm backend: {:?} is unsupported (GC_LOAD/GC_STORE); \
-                     the GC rewrite must not run for wasm",
+                     the load/store GC rewrite must not run for wasm",
                     op.opcode
                 );
             }
@@ -3118,19 +3136,27 @@ fn build_function(
                 // Zero-initialize array region — skip for MVP
             }
             OpCode::LoadFromGcTable => {
-                // `assembler.py:1545` `genop_load_from_gc_table`: this op is
-                // produced only by the GC rewrite's `remove_constptr`
-                // (`rewrite.py:1100`), whose arg is a `ConstInt(index)` into
-                // a per-loop `GcTable` whose base is baked absolute. The
-                // wasm backend does not run the GC rewrite and has no
-                // host-address gc_table model (linear memory), so this op
-                // never reaches here. Panic loudly rather than emit the old
-                // SAME_AS pass-through, which after the rewrite flip would
-                // load the raw index in place of the reference constant.
-                panic!(
-                    "wasm backend: LoadFromGcTable is unsupported (no gc_table model); \
-                     the GC rewrite must not run for wasm"
-                );
+                // `assembler.py:1545` `genop_load_from_gc_table`: the arg is a
+                // `ConstInt(index)` into the per-loop `GcTable`
+                // (`remove_ref_constants`, rewrite.py:1100 `remove_constptr`)
+                // whose base is baked absolute. The table is a plain guest heap
+                // allocation, so `base + index*WORD` is an ordinary linear-memory
+                // address; the collector forwards the slot in place, so the load
+                // reads the reference at its current address.
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    let index = resolve_const_bits(constants, op.arg(0).to_opref());
+                    let slot = gc_table_base as u64
+                        + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
+                    sink.i32_const(slot as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.i64_extend_i32_u();
+                    sink.local_set(1 + vi);
+                }
             }
 
             // ── CALL_ASSEMBLER ──
