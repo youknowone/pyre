@@ -853,6 +853,9 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // getitem / setitem -> `[IndexError, KeyError, Exception]`
         // (operation.py:727-730).
         OpKind::ArrayRead { .. } | OpKind::ArrayWrite { .. } => true,
+        // `len` is a pure flowspace operation; the rtyper routes it through
+        // the receiver repr (`rtype_len`) without an exception edge.
+        OpKind::ArrayLen { .. } => false,
         // `InteriorField*` unfolds in `translate_op` into a chained
         // `getitem(base, index)` followed by `getattr` / `setattr`, so it
         // carries the getitem's `[IndexError, KeyError, Exception]`
@@ -1324,7 +1327,7 @@ pub fn translate_op(
             )])
         }
 
-        // ─── ArrayRead / ArrayWrite ports ───
+        // ─── ArrayRead / ArrayLen / ArrayWrite ports ───
         // RPython `flowspace/operation.py: GetItem.opname = 'getitem'`
         // and `setitem`. The base[index] form maps directly to
         // `getitem(base, index)` / `setitem(base, index, value)`; the
@@ -1341,6 +1344,11 @@ pub fn translate_op(
                 vec![base_hl, index_hl],
                 result,
             )])
+        }
+        OpKind::ArrayLen { base, .. } => {
+            let base_hl = lookup_operand(value_map, base, op, "base")?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new("len", vec![base_hl], result)])
         }
         OpKind::ArrayWrite {
             base, index, value, ..
@@ -2502,6 +2510,7 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
         OpKind::FieldRead { .. } => "FieldRead",
         OpKind::FieldWrite { .. } => "FieldWrite",
         OpKind::ArrayRead { .. } => "ArrayRead",
+        OpKind::ArrayLen { .. } => "ArrayLen",
         OpKind::ArrayWrite { .. } => "ArrayWrite",
         OpKind::InteriorFieldRead { .. } => "InteriorFieldRead",
         OpKind::InteriorFieldWrite { .. } => "InteriorFieldWrite",
@@ -5143,6 +5152,29 @@ mod tests {
         let lowered = &translated[0];
         assert_eq!(lowered.opname, "getitem");
         assert_eq!(lowered.args.len(), 2);
+    }
+
+    #[test]
+    fn translate_op_array_len_lowers_to_len() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::ArrayLen {
+                base: vars[1].clone(),
+                array_type_id: Some("[PyObjectRef]".to_string()),
+                nolength: false,
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &empty_call_registry()).expect("ArrayLen arm must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "len");
+        assert_eq!(translated[0].args.len(), 1);
+        assert!(!op_canraise(&op.kind));
     }
 
     #[test]

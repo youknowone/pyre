@@ -180,8 +180,10 @@ mod tests {
     /// unit test.
     #[test]
     fn jd1_build_time_descrs_resolve_through_global_pool() {
-        let canonical = crate::jitcode_runtime::get_jitcode_by_index(0)
-            .expect("jd1's extracted main JitCode must occupy index 0");
+        let canonical = crate::jitcode_runtime::portal_jitcode_for_key(
+            "baseobjspace::_unpackiterable_unknown_length",
+        )
+        .expect("jd1's extracted main JitCode must be registered");
         // The extracted body is the walkable unpack loop: exactly one merge
         // point, whose byte offset depends on the drain body's op layout
         // (`UnpackSym::loop_header_pc` discovers it rather than hardcoding).

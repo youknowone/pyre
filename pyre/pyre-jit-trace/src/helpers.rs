@@ -1056,7 +1056,10 @@ pub fn emit_box_float_inline(
 /// already-boxed positional argument refs.  Same field-complete frame shape as
 /// [`emit_new_pyframe_inline_self_recursive`] but seeds `locals[0..nparams]`
 /// from `param_boxes` (Ref boxes at the Python call boundary) instead of
-/// boxing a single raw int.  The frame is the callee MIFrame's `frame` red —
+/// boxing a single raw int. Existing closure cells are placed at
+/// `freevar_start..`, matching `PyFrame::finish_for_call_with_globals_obj`;
+/// callers that need fresh cellvars remain on the residual path. The frame is
+/// the callee MIFrame's `frame` red —
 /// `_opimpl_inline_call*` / `perform_call`+`setup_call` create a fresh frame
 /// per inlined call (`pyjitpl.py:2445-2476,1862-1874`); the box stays virtual
 /// on the hot path (the optimizer folds `NewWithVtable`+`SetfieldGc`) and is
@@ -1066,6 +1069,8 @@ pub fn emit_box_float_inline(
 pub fn emit_new_pyframe_inline_with_params(
     ctx: &mut TraceCtx,
     param_boxes: &[OpRef],
+    freevar_cells: &[OpRef],
+    freevar_start: usize,
     array_size: usize,
     valuestackdepth: usize,
     pycode: OpRef,
@@ -1117,6 +1122,18 @@ pub fn emit_new_pyframe_inline_with_params(
             array_descr.clone(),
         );
         ctx.heapcache_setarrayitem(locals_array, idx, heapcache_item_descr_index, p);
+    }
+    // PyFrame.finish_for_call_with_globals_obj: a closure contributes the
+    // existing cell objects themselves after locals + pure cellvars. LOAD_DEREF
+    // must therefore read the live cell, not a snapshot of its contents.
+    for (i, &cell) in freevar_cells.iter().enumerate() {
+        let idx = ctx.const_int((freevar_start + i) as i64);
+        ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[locals_array, idx, cell],
+            array_descr.clone(),
+        );
+        ctx.heapcache_setarrayitem(locals_array, idx, heapcache_item_descr_index, cell);
     }
 
     let new_frame = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], pyframe_size_descr());

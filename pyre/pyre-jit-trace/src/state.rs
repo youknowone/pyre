@@ -12552,6 +12552,8 @@ pub(crate) fn setup_reconstructed_callee_frame(
     let frame_vable = crate::helpers::emit_new_pyframe_inline_with_params(
         ctx,
         &locals_boxes,
+        &[],
+        0,
         frame_array_size,
         nlocals,
         pycode_const,

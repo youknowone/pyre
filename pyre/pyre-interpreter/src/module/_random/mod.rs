@@ -20,7 +20,7 @@ const MAGIC_CONSTANT_B: u32 = 19650218;
 const MAGIC_CONSTANT_C: u32 = 1664525;
 const MAGIC_CONSTANT_D: u32 = 1566083941;
 
-struct Random {
+pub(crate) struct Random {
     state: [u32; N],
     index: usize,
 }
@@ -86,7 +86,7 @@ impl Random {
         if y & 1 != 0 { val ^ MATRIX_A } else { val }
     }
 
-    fn genrand32(&mut self) -> u32 {
+    pub(crate) fn genrand32(&mut self) -> u32 {
         if self.index >= N {
             let mt = &mut self.state;
             for kk in 0..(N - M) {

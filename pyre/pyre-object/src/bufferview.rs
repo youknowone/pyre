@@ -251,8 +251,9 @@ impl BufferView {
                 // step (`strides[0] *= step`, buffer.py:332).
                 BufferView::Slice { parent, step, .. } => {
                     let mut strides = parent.native_strides();
-                    if let Some(s0) = strides.first_mut() {
-                        *s0 *= *step;
+                    if !strides.is_empty() {
+                        let stride0 = strides[0] * *step;
+                        strides[0] = stride0;
                     }
                     strides
                 }

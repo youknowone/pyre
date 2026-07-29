@@ -892,6 +892,8 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     let callee_frame = crate::helpers::emit_new_pyframe_inline_with_params(
         ctx.trace_ctx,
         &param_boxes,
+        &[],
+        0,
         nlocals + max_stack,
         nlocals,
         pycode_const,
@@ -1905,6 +1907,33 @@ pub(crate) fn walker_ec_leave(
     }
     // `jit.virtual_ref_finish(frame_vref, frame)`.
     ctx.opimpl_virtual_ref_finish(callee_frame);
+}
+
+/// Resolve the generated builtin-wrapper argument slice's array-item
+/// descriptor. The first instruction's arraylen descriptor is deliberately
+/// not interchangeable with the later getarrayitem descriptor.
+pub(super) fn wrapper_args_item_descr_index(code: &[u8]) -> Option<u32> {
+    let mut wrapper_ops = crate::jitcode_runtime::decoded_ops(code);
+    let wrapper_abi_matches = wrapper_ops.next().is_some_and(|first| {
+        first.key == "arraylen_gc/rd>i" && code.get(first.pc + 1).copied() == Some(0)
+    });
+    if !wrapper_abi_matches {
+        return None;
+    }
+    crate::jitcode_runtime::decoded_ops(code)
+        .find(|decoded| {
+            decoded.key == "getarrayitem_gc_r/rid>r" && code.get(decoded.pc + 1).copied() == Some(0)
+        })
+        .and_then(|decoded| {
+            let lo = *code.get(decoded.pc + 3)? as usize;
+            let hi = *code.get(decoded.pc + 4)? as usize;
+            let pool_index = lo | (hi << 8);
+            crate::jitcode_runtime::all_descr_refs()
+                .get(pool_index)
+                .map(|descr| descr.index())
+        })
+}
+
 /// `BuiltinCode.func` is an RPython PBC: the codewriter turns its finite
 /// target family into an indirect call whose address is resolved back to the
 /// generated target JitCode by `MetaInterpStaticData.bytecode_for_address`
@@ -2056,26 +2085,13 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // The generated builtin-wrapper ABI takes its `&[PyObjectRef]` argument
     // in r0 and begins by checking its length.  Resolve that instruction's
     // descriptor operand now, before switching the sub-walk to the global
-    // descriptor pool below.  The synthetic array must remain allocated with
-    // `state::pyobject_gcarray_descr()` because that descriptor carries the
-    // runtime GC type id; the build-time slice descriptor deliberately has a
-    // translation-time placeholder type id.  Heapcache lookup, however, is
-    // keyed by the descriptor index used by the generated getarrayitem, so
-    // seed the contents under this exact codewriter descriptor index.
-    let Some(wrapper_args_descr_index) = crate::jitcode_runtime::decoded_ops(body.code)
-        .next()
-        .filter(|first| {
-            first.key == "arraylen_gc/rd>i" && body.code.get(first.pc + 1).copied() == Some(0)
-        })
-        .and_then(|first| {
-            let lo = *body.code.get(first.pc + 2)? as usize;
-            let hi = *body.code.get(first.pc + 3)? as usize;
-            let pool_index = lo | (hi << 8);
-            crate::jitcode_runtime::all_descr_refs()
-                .get(pool_index)
-                .map(|descr| descr.index())
-        })
-    else {
+    // descriptor pool below. The wrapper starts with arraylen(r0), but Charon
+    // emits a distinct descriptor for slice length (header metadata) and
+    // slice item access (element metadata). Heapcache array-item keys use the
+    // latter, exactly like RPython `_do_getarrayitem_gc_any(arraydescr)`;
+    // seeding under the arraylen descriptor makes the later getitem miss and
+    // manufactures a Box without its recording-time `.value`.
+    let Some(wrapper_args_descr_index) = wrapper_args_item_descr_index(body.code) else {
         return Ok(None);
     };
 
@@ -2334,10 +2350,48 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     } else {
         None
     };
-    // Closure/vararg/over-arity calls still use the ordinary residual path.
-    if has_closure || callee_args.len() != nparams {
+    // Vararg/over-arity calls still use the ordinary residual path. A closure
+    // is admissible when it has freevars only: the existing cell objects can
+    // be threaded into this callee's own frame exactly as
+    // PyFrame::finish_for_call_with_globals_obj does. A callee with cellvars
+    // needs fresh cell allocation and stays residual until that constructor
+    // half is ported too.
+    if callee_args.len() != nparams {
         return Ok(None);
     }
+    let raw_callee_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw_callee_code.is_null() {
+        return Ok(None);
+    }
+    let callee_code = unsafe { &*raw_callee_code };
+    let mut concrete_freevar_cells = Vec::new();
+    let concrete_closure = if has_closure {
+        if !callee_code.cellvars.is_empty() {
+            return Ok(None);
+        }
+        let closure = unsafe { pyre_interpreter::function_get_closure(callable) };
+        if closure.is_null()
+            || !unsafe { pyre_object::is_tuple(closure) }
+            || unsafe { pyre_object::w_tuple_len(closure) } != callee_code.freevars.len()
+        {
+            return Ok(None);
+        }
+        for i in 0..callee_code.freevars.len() {
+            let Some(cell) = (unsafe { pyre_object::w_tuple_getitem(closure, i as i64) }) else {
+                return Ok(None);
+            };
+            concrete_freevar_cells.push(cell);
+        }
+        closure
+    } else {
+        if !callee_code.freevars.is_empty() {
+            return Ok(None);
+        }
+        pyre_object::PY_NULL
+    };
     // Bound recursive inlining at `max_unroll_recursion`: a callee already
     // this deep on the FBW inline stack falls back to a residual call rather
     // than unrolling its (exponentially branching) call tree at trace time.
@@ -2980,19 +3034,9 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // note at that site.
     if try_multiframe || strict_seed {
         'seed: {
-            // Branch-A frame shape only (mirror REC_CA): no cells.
-            let raw = unsafe {
-                pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                    as *const pyre_interpreter::CodeObject
-            };
-            if raw.is_null() {
-                if try_multiframe {
-                    return Ok(None);
-                }
-                break 'seed;
-            }
-            let callee_code = unsafe { &*raw };
-            if pyre_interpreter::ncells(callee_code) != 0 {
+            // Branch-A frame shape only (mirror REC_CA): existing freevar
+            // cells are admissible, while fresh cellvar allocation is not.
+            if !callee_code.cellvars.is_empty() {
                 if try_multiframe {
                     return Ok(None);
                 }
@@ -3040,7 +3084,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 break 'seed;
             }
             let nlocals = callee_code.varnames.len();
-            let frame_array_size = nlocals + callee_code.max_stackdepth as usize;
+            let ncells = pyre_interpreter::ncells(callee_code);
+            let frame_array_size = nlocals + ncells + callee_code.max_stackdepth as usize;
 
             let Some(callee_jitcode_index) =
                 crate::state::ensure_jitcode_index(callee_code_key as *const ())
@@ -3086,11 +3131,17 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
             let w_globals_obj_const = ctx.trace_ctx.const_ref(inline_consts.w_globals as i64);
             let param_boxes: Vec<OpRef> = (0..nparams).map(|i| callee_args[i]).collect();
+            let freevar_cells: Vec<OpRef> = concrete_freevar_cells
+                .iter()
+                .map(|&cell| ctx.trace_ctx.const_ref(cell as i64))
+                .collect();
             let callee_frame = crate::helpers::emit_new_pyframe_inline_with_params(
                 ctx.trace_ctx,
                 &param_boxes,
-                frame_array_size,
+                &freevar_cells,
                 nlocals,
+                frame_array_size,
+                nlocals + ncells,
                 pycode_const,
                 w_globals_obj_const,
                 callee_ec,
@@ -3124,7 +3175,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                     &concrete_args,
                     inline_consts.w_globals as pyre_object::PyObjectRef,
                     concrete_ec,
-                    pyre_object::PY_NULL,
+                    concrete_closure,
                     pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
                 ),
             );
@@ -3146,7 +3197,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             // Retain for a possible `SubLoopCalleeCallAssembler` emit.
             ca_callee_frame = callee_frame;
             ca_callee_ec = callee_ec;
-            ca_nlocals = nlocals;
+            ca_nlocals = nlocals + ncells;
             ca_concrete_frame = concrete_frame_ptr;
             callee_frame_seeded = true;
         }
@@ -4266,9 +4317,52 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
     )
 }
 
-/// Inline a plain Python `__add__` after the numeric BINARY_OP
-/// specializations decline. The receiver class and its version tag pin the
-/// descriptor lookup, matching `try_dispatch_binary_special`'s forward arm.
+/// Forward dunder selected by `try_dispatch_binary_special` for a non-inplace
+/// BINARY_OP. In-place operators have a distinct `__i*__` then binary fallback
+/// protocol and therefore stay on the generic path until that protocol is
+/// ported as a unit.
+pub(super) fn user_binop_forward_dunder(
+    op: pyre_interpreter::bytecode::BinaryOperator,
+) -> Option<&'static str> {
+    use pyre_interpreter::bytecode::BinaryOperator;
+
+    match op {
+        BinaryOperator::Add => Some("__add__"),
+        BinaryOperator::And => Some("__and__"),
+        BinaryOperator::FloorDivide => Some("__floordiv__"),
+        BinaryOperator::Lshift => Some("__lshift__"),
+        BinaryOperator::MatrixMultiply => Some("__matmul__"),
+        BinaryOperator::Multiply => Some("__mul__"),
+        BinaryOperator::Or => Some("__or__"),
+        BinaryOperator::Power => Some("__pow__"),
+        BinaryOperator::Remainder => Some("__mod__"),
+        BinaryOperator::Rshift => Some("__rshift__"),
+        BinaryOperator::Subtract => Some("__sub__"),
+        BinaryOperator::TrueDivide => Some("__truediv__"),
+        BinaryOperator::Xor => Some("__xor__"),
+        BinaryOperator::Subscr
+        | BinaryOperator::InplaceAdd
+        | BinaryOperator::InplaceAnd
+        | BinaryOperator::InplaceFloorDivide
+        | BinaryOperator::InplaceLshift
+        | BinaryOperator::InplaceMatrixMultiply
+        | BinaryOperator::InplaceMultiply
+        | BinaryOperator::InplaceOr
+        | BinaryOperator::InplacePower
+        | BinaryOperator::InplaceRemainder
+        | BinaryOperator::InplaceRshift
+        | BinaryOperator::InplaceSubtract
+        | BinaryOperator::InplaceTrueDivide
+        | BinaryOperator::InplaceXor => None,
+    }
+}
+
+/// Inline a plain Python forward arithmetic dunder after the exact numeric
+/// BINARY_OP specializations decline. The receiver class and its version tag
+/// pin the descriptor lookup, matching `try_dispatch_binary_special`'s
+/// forward arm. A proper-subclass rhs still declines below so reflected-method
+/// priority is preserved; a traced `NotImplemented` result guards and deopts
+/// to the generic dispatcher.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -4284,12 +4378,12 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let Some(pyre_interpreter::bytecode::BinaryOperator::Add) =
-        pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag)
-    else {
+    let Some(op_kind) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) else {
         return Ok(None);
     };
-    let dunder = "__add__";
+    let Some(dunder) = user_binop_forward_dunder(op_kind) else {
+        return Ok(None);
+    };
 
     let lhs = r_args[0];
     let rhs = r_args[1];

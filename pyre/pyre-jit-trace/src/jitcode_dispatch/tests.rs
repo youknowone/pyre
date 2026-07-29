@@ -62,6 +62,89 @@ fn fresh_trace_ctx() -> TraceCtx {
     TraceCtx::for_test_types(&[Type::Ref])
 }
 
+#[test]
+fn builtin_wrapper_heapcache_uses_item_not_length_descr() {
+    let wrapper = named_jitcode("__pyre_wrap_random").expect("random builtin wrapper jitcode");
+    let first = crate::jitcode_runtime::decoded_ops(&wrapper.code)
+        .next()
+        .expect("wrapper first op");
+    assert_eq!(first.key, "arraylen_gc/rd>i");
+    let len_pool_index =
+        wrapper.code[first.pc + 2] as usize | ((wrapper.code[first.pc + 3] as usize) << 8);
+    let len_descr_index = crate::jitcode_runtime::all_descr_refs()[len_pool_index].index();
+
+    let item_descr_index =
+        wrapper_args_item_descr_index(&wrapper.code).expect("wrapper item descriptor");
+    assert_ne!(
+        item_descr_index, len_descr_index,
+        "Charon slice length and element descriptors are distinct cache keys"
+    );
+
+    let getitem = crate::jitcode_runtime::decoded_ops(&wrapper.code)
+        .find(|op| {
+            op.key == "getarrayitem_gc_r/rid>r" && wrapper.code.get(op.pc + 1).copied() == Some(0)
+        })
+        .expect("wrapper getarrayitem(r0)");
+    let item_pool_index =
+        wrapper.code[getitem.pc + 3] as usize | ((wrapper.code[getitem.pc + 4] as usize) << 8);
+    assert_eq!(
+        item_descr_index,
+        crate::jitcode_runtime::all_descr_refs()[item_pool_index].index()
+    );
+}
+
+#[test]
+fn random_core_residuals_use_registered_genrand32_address() {
+    let expected = pyre_interpreter::jit_trace_fnaddrs()
+        .into_iter()
+        .find_map(|(path, address)| {
+            (path == "module::_random::Random::genrand32").then_some(address)
+        })
+        .expect("genrand32 runtime fnaddr");
+    let random = crate::jitcode_runtime::all_jitcodes()
+        .iter()
+        .find(|jitcode| {
+            jitcode.name == "random"
+                && crate::jitcode_runtime::decoded_ops(&jitcode.code)
+                    .filter(|op| op.key == "residual_call_r_i/iRd>i")
+                    .count()
+                    == 2
+        })
+        .expect("rrandom Random::random jitcode");
+
+    assert_eq!(
+        random
+            .constants_i
+            .iter()
+            .filter(|&&address| address == expected)
+            .count(),
+        1,
+        "the two genrand32 calls share one runtime-patched constant-pool address"
+    );
+}
+
+#[test]
+fn user_binop_forward_dunder_covers_fraction_arithmetic_without_inplace_shortcuts() {
+    use pyre_interpreter::bytecode::BinaryOperator;
+
+    assert_eq!(
+        user_binop_forward_dunder(BinaryOperator::Subtract),
+        Some("__sub__")
+    );
+    assert_eq!(
+        user_binop_forward_dunder(BinaryOperator::TrueDivide),
+        Some("__truediv__")
+    );
+    assert_eq!(
+        user_binop_forward_dunder(BinaryOperator::InplaceSubtract),
+        None
+    );
+    assert_eq!(
+        user_binop_forward_dunder(BinaryOperator::InplaceTrueDivide),
+        None
+    );
+}
+
 /// Build a `done_with_this_frame_descr_ref` for tests. Mirrors the
 /// production fallback at `pyjitpl.rs` (`make_fail_descr_typed`)
 /// when the staticdata singleton was never attached.
