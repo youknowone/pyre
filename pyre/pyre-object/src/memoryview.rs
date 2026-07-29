@@ -42,11 +42,29 @@ pub struct W_MemoryView {
     /// to this exact view and dies with it; it must not live in a global
     /// side-table.
     pub w_weakreflifeline: PyObjectRef,
+    /// CPython 3.14 `_Py_MEMORYVIEW_RESTRICTED`: a temporary view handed to
+    /// a Python `__release_buffer__` implementation for a native buffer
+    /// slot.  It remains readable during the callback, but may not be used
+    /// to manufacture another view that outlives the release.
+    pub restricted: bool,
     /// `owns_export` (`memoryobject.py`).  True for a view built directly over
     /// an exporter (holds one `_exports` count on the backing); false for a
     /// slice or a copy that shares the original's export.  Only an owning view
     /// releases the underlying export.
     pub owns_export: bool,
+}
+
+/// CPython 3.14 `PyBufferWrapper` (`Objects/typeobject.c`): the owner placed
+/// in a `Py_buffer` when a Python `__buffer__` method supplies the actual
+/// memoryview.  Keeping this as a real GC object (rather than a side table or
+/// fields flattened onto `W_MemoryView`) preserves both `.obj` identity and
+/// the upstream `mv`/`obj` lifetime shape.
+#[pyre_class("_buffer_wrapper", static_name = "BUFFER_WRAPPER")]
+pub struct W_BufferWrapper {
+    /// The exact memoryview returned by `obj.__buffer__(flags)`.
+    pub w_mv: PyObjectRef,
+    /// The original Python buffer exporter.
+    pub w_obj: PyObjectRef,
 }
 
 /// Allocate a [`BufferView`] off the GC heap (a stationary `Box`, like a
@@ -80,6 +98,7 @@ pub fn w_memoryview_alloc_header(released: bool, owns_export: bool) -> PyObjectR
         released,
         exports: 0,
         w_weakreflifeline: PY_NULL,
+        restricted: false,
         owns_export,
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(
@@ -91,6 +110,48 @@ pub fn w_memoryview_alloc_header(released: bool, owns_export: bool) -> PyObjectR
         raw as PyObjectRef
     } else {
         crate::lltype::malloc_typed(payload) as PyObjectRef
+    }
+}
+
+/// Allocate CPython's `_buffer_wrapper(mv, obj)`, rooting both constructor
+/// arguments across the managed allocation.
+pub fn w_buffer_wrapper_new(w_mv: PyObjectRef, w_obj: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let sp = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(w_mv);
+    crate::gc_roots::pin_root(w_obj);
+    W_BufferWrapper::allocate(W_BufferWrapper {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_mv: crate::gc_roots::shadow_stack_get(sp),
+        w_obj: crate::gc_roots::shadow_stack_get(sp + 1),
+    })
+}
+
+#[inline]
+pub unsafe fn is_w_buffer_wrapper(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &BUFFER_WRAPPER_TYPE) }
+}
+
+#[inline]
+pub unsafe fn w_buffer_wrapper_mv(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_BufferWrapper)).w_mv }
+}
+
+#[inline]
+pub unsafe fn w_buffer_wrapper_obj(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_BufferWrapper)).w_obj }
+}
+
+/// `Py_CLEAR(bw->mv); Py_CLEAR(bw->obj)` after the wrapper's single release.
+#[inline]
+pub unsafe fn w_buffer_wrapper_clear(obj: PyObjectRef) {
+    unsafe {
+        let wrapper = obj as *mut W_BufferWrapper;
+        (*wrapper).w_mv = PY_NULL;
+        (*wrapper).w_obj = PY_NULL;
     }
 }
 
@@ -173,6 +234,18 @@ mv_view_scalar!(w_memoryview_readonly, readonly, bool);
 #[inline]
 pub unsafe fn w_memoryview_released(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const W_MemoryView)).released }
+}
+
+#[inline]
+pub unsafe fn w_memoryview_restricted(obj: PyObjectRef) -> bool {
+    unsafe { (*(obj as *const W_MemoryView)).restricted }
+}
+
+#[inline]
+pub unsafe fn w_memoryview_set_restricted(obj: PyObjectRef, restricted: bool) {
+    unsafe {
+        (*(obj as *mut W_MemoryView)).restricted = restricted;
+    }
 }
 
 /// Number of buffers currently exported by this memoryview.

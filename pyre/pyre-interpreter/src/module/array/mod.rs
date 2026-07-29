@@ -723,8 +723,12 @@ fn array_clear_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_release_buffer(args: &[PyObjectRef]) -> PyResult {
-    unsafe { arr::w_array_exports_decref(args[0]) };
-    Ok(pyre_object::w_none())
+    crate::builtins::buffer_exporter_release_view(args[0], args[1])
+}
+
+fn array_buffer(args: &[PyObjectRef]) -> PyResult {
+    let flags = crate::baseobjspace::c_int_w(args[1])?;
+    crate::builtins::w_memoryview_new_native_with_flags(args[0], flags)
 }
 
 fn array_count_method(args: &[PyObjectRef]) -> PyResult {
@@ -1416,6 +1420,7 @@ pub fn init_array_type(ns: PyObjectRef) {
     m(ns, "count", array_count_method, 2);
     m(ns, "clear", array_clear_method, 1);
     m(ns, "__release_buffer__", array_release_buffer, 2);
+    m(ns, "__buffer__", array_buffer, 2);
     m(ns, "reverse", array_reverse_method, 1);
     m(ns, "tolist", array_tolist_method, 1);
     m(ns, "fromlist", array_fromlist_method, 2);

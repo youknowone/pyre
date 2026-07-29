@@ -152,6 +152,76 @@ pub enum BufferView {
 }
 
 impl BufferView {
+    /// Clone this `Py_buffer` geometry while replacing only its immediate
+    /// owner.  CPython `slot_bf_getbuffer` copies the returned memoryview's
+    /// `Py_buffer` and then replaces `buffer->obj` with `_buffer_wrapper`;
+    /// its underlying storage and nested geometry remain unchanged.
+    pub fn clone_with_obj(&self, new_obj: PyObjectRef) -> BufferView {
+        match self {
+            BufferView::Simple {
+                backing, length, ..
+            } => BufferView::Simple {
+                backing: backing.clone(),
+                w_obj: new_obj,
+                length: *length,
+            },
+            BufferView::Raw {
+                backing,
+                w_fmt,
+                itemsize,
+                length,
+                ..
+            } => BufferView::Raw {
+                backing: backing.clone(),
+                w_obj: new_obj,
+                w_fmt: *w_fmt,
+                itemsize: *itemsize,
+                length: *length,
+            },
+            BufferView::Slice {
+                parent,
+                start,
+                step,
+                length,
+                ..
+            } => BufferView::Slice {
+                parent: parent.clone(),
+                w_obj: new_obj,
+                start: *start,
+                step: *step,
+                length: *length,
+            },
+            BufferView::View1D {
+                parent,
+                w_fmt,
+                itemsize,
+                ..
+            } => BufferView::View1D {
+                parent: parent.clone(),
+                w_obj: new_obj,
+                w_fmt: *w_fmt,
+                itemsize: *itemsize,
+            },
+            BufferView::ViewND {
+                parent,
+                ndim,
+                w_shape,
+                w_strides,
+                ..
+            } => BufferView::ViewND {
+                parent: parent.clone(),
+                w_obj: new_obj,
+                ndim: *ndim,
+                w_shape: *w_shape,
+                w_strides: *w_strides,
+            },
+            BufferView::Readonly { view, .. } => BufferView::Readonly {
+                view: view.clone(),
+                w_obj: new_obj,
+            },
+        }
+    }
+
     /// The backing byte storage (the root exporter's [`Buffer`]).
     #[inline]
     pub fn backing(&self) -> &Buffer {

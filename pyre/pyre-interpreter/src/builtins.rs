@@ -444,17 +444,163 @@ unsafe fn memoryview_buffer_params(obj: PyObjectRef) -> Option<(String, i64, boo
     }
 }
 
+/// Is `descr` one of pyre's native `bf_getbuffer` wrappers?
+///
+/// CPython installs `slot_bf_getbuffer` only when the descriptor selected by
+/// the concrete type's MRO is Python-defined.  Comparing the selected object
+/// with each native base descriptor preserves that slot decision for mixed
+/// inheritance: `class C(bytearray, A)` stays native, while
+/// `class C(A, bytearray)` reaches `A.__buffer__`.
+unsafe fn memoryview_is_native_buffer_descr(descr: PyObjectRef) -> bool {
+    unsafe {
+        for base in [
+            crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE),
+            crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
+            crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
+            crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE),
+        ] {
+            if crate::baseobjspace::lookup_in_type(base, "__buffer__")
+                .is_some_and(|native| std::ptr::eq(native, descr))
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// The Python `__buffer__` descriptor selected for `obj`, or `None` when the
+/// type uses a native buffer slot (or has no Python-visible descriptor).
+unsafe fn memoryview_python_buffer_descr(obj: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe {
+        let descr = crate::baseobjspace::lookup(obj, "__buffer__")?;
+        (!memoryview_is_native_buffer_descr(descr)).then_some(descr)
+    }
+}
+
+/// CPython 3.14 `slot_bf_getbuffer`: call Python `__buffer__(flags)`, acquire
+/// the returned memoryview, allocate `_buffer_wrapper(mv, obj)`, and copy its
+/// geometry while replacing only `Py_buffer.obj` with that wrapper.
+unsafe fn w_memoryview_new_python_buffer(
+    w_obj: PyObjectRef,
+    w_descr: PyObjectRef,
+    flags: i32,
+) -> Result<PyObjectRef, crate::PyError> {
+    unsafe {
+        use pyre_object::memoryview::*;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_obj);
+        pyre_object::gc_roots::pin_root(w_descr);
+        pyre_object::gc_roots::pin_root(w_int_new(flags as i64));
+
+        let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
+        let w_type = crate::typedef::r#type(r_obj).map_or(r_obj, |p| p.as_ptr());
+        let w_ret = crate::baseobjspace::get_and_call_function(
+            pyre_object::gc_roots::shadow_stack_get(sp + 1),
+            r_obj,
+            w_type,
+            &[pyre_object::gc_roots::shadow_stack_get(sp + 2)],
+        )?;
+        if !is_w_memoryview(w_ret) {
+            return Err(crate::PyError::type_error(
+                "__buffer__ returned non-memoryview object",
+            ));
+        }
+        pyre_object::gc_roots::pin_root(w_ret);
+        let ret_slot = sp + 3;
+        let r_ret = pyre_object::gc_roots::shadow_stack_get(ret_slot);
+        memoryview_check_released(r_ret)?;
+        if w_memoryview_restricted(r_ret) {
+            return Err(crate::PyError::value_error(
+                "cannot create a new view from a restricted memoryview",
+            ));
+        }
+        if flags & 0x0001 != 0 && w_memoryview_readonly(r_ret) {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::BufferError,
+                "Object is not writable.",
+            ));
+        }
+
+        // PyObject_GetBuffer(ret, buffer, flags): the returned memoryview may
+        // not be released while this copied Py_buffer is outstanding.
+        w_memoryview_exports_incref(r_ret);
+        let wrapper = w_buffer_wrapper_new(
+            pyre_object::gc_roots::shadow_stack_get(ret_slot),
+            pyre_object::gc_roots::shadow_stack_get(sp),
+        );
+        pyre_object::gc_roots::pin_root(wrapper);
+        let wrapper_slot = sp + 4;
+        let outer = w_memoryview_alloc_header(false, true);
+        let r_ret = pyre_object::gc_roots::shadow_stack_get(ret_slot);
+        let r_wrapper = pyre_object::gc_roots::shadow_stack_get(wrapper_slot);
+        let copied = w_memoryview_view(r_ret).clone_with_obj(r_wrapper);
+        w_memoryview_set_view(outer, bufferview_alloc(copied));
+        Ok(outer)
+    }
+}
+
 /// `memoryview(obj)` — acquire a 1-D byte view over a buffer-providing
 /// exporter.  Sharing another memoryview copies its view parameters (and
 /// reports the original exporter as `.obj`); a non-buffer raises TypeError.
 pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    // `PyMemoryView_FromObject` requests the full read-only buffer interface.
+    w_memoryview_new_with_flags(w_obj, 0x011c)
+}
+
+/// `memoryview._from_flags` / native `bf_getbuffer` entry with an explicit
+/// CPython `PyBUF_*` mask.
+pub(crate) fn w_memoryview_new_with_flags(
+    w_obj: PyObjectRef,
+    flags: i32,
+) -> Result<PyObjectRef, crate::PyError> {
+    w_memoryview_new_with_flags_impl(w_obj, flags, true)
+}
+
+/// Invoke a built-in exporter's native `bf_getbuffer` implementation.
+///
+/// Python `super().__buffer__(flags)` reaches the base slot directly; it must
+/// not redispatch to the concrete subclass's Python `__buffer__`, which would
+/// recurse back into the method that called `super()`.
+pub(crate) fn w_memoryview_new_native_with_flags(
+    w_obj: PyObjectRef,
+    flags: i32,
+) -> Result<PyObjectRef, crate::PyError> {
+    w_memoryview_new_with_flags_impl(w_obj, flags, false)
+}
+
+fn w_memoryview_new_with_flags_impl(
+    w_obj: PyObjectRef,
+    flags: i32,
+    allow_python_slot: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    // CPython abstract.c:PyBuffer_FillInfo — PyBUF_READ and PyBUF_WRITE are
+    // request kinds for PyMemoryView_GetContiguous, not valid standalone
+    // getbuffer flags.  (Their bits may still appear in valid composite
+    // masks such as PyBUF_FULL_RO.)
+    if flags == 0x0100 || flags == 0x0200 {
+        return Err(crate::PyError::system_error(
+            "bad argument to internal function",
+        ));
+    }
     use pyre_object::memoryview::*;
     if let Some(target) = crate::module::__pypy__::interp_buffer::forwarded_exporter(w_obj) {
-        return w_memoryview_new(target?);
+        return w_memoryview_new_with_flags_impl(target?, flags, allow_python_slot);
     }
     unsafe {
+        if allow_python_slot {
+            if let Some(w_descr) = memoryview_python_buffer_descr(w_obj) {
+                return w_memoryview_new_python_buffer(w_obj, w_descr, flags);
+            }
+        }
         if is_w_memoryview(w_obj) {
             memoryview_check_released(w_obj)?;
+            if w_memoryview_restricted(w_obj) {
+                return Err(crate::PyError::value_error(
+                    "cannot create a new view from a restricted memoryview",
+                ));
+            }
             // `W_MemoryView.copy` shares the source's (immutable) view; the
             // clone preserves the variant, so copying a sliced / plain view
             // keeps its zero-copy window and derived geometry.
@@ -511,7 +657,7 @@ pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate:
             pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
             return Ok(mv);
         }
-        let (fmt, itemsize, _readonly, byte_len) = match memoryview_buffer_params(w_obj) {
+        let (fmt, itemsize, readonly, byte_len) = match memoryview_buffer_params(w_obj) {
             Some(p) => p,
             None => {
                 let tname = crate::typedef::r#type(w_obj)
@@ -522,6 +668,12 @@ pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate:
                 )));
             }
         };
+        if flags & 0x0001 != 0 && readonly {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::BufferError,
+                "Object is not writable.",
+            ));
+        }
         // A plain view derives its geometry: a bytes / bytearray backing builds
         // a `SimpleView`, an array.array a `RawBufferView` (readonly follows the
         // backing kind).
@@ -751,6 +903,11 @@ unsafe fn memoryview_slice_view(
 ) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::memoryview::*;
     unsafe {
+        if w_memoryview_restricted(mv) {
+            return Err(crate::PyError::value_error(
+                "cannot create a new view from a restricted memoryview",
+            ));
+        }
         let ndim = w_memoryview_ndim(mv);
         let count = if ndim >= 1 {
             w_memoryview_native_shape(mv).first().copied().unwrap_or(0)
@@ -1356,6 +1513,11 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     unsafe {
         use pyre_object::memoryview::*;
         memoryview_check_released(mv)?;
+        if w_memoryview_restricted(mv) {
+            return Err(crate::PyError::value_error(
+                "cannot create a new view from a restricted memoryview",
+            ));
+        }
         if !pyre_object::is_str(fmt_obj) {
             return Err(crate::PyError::type_error(
                 "memoryview: format argument must be a string",
@@ -1478,6 +1640,11 @@ fn memoryview_toreadonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     unsafe {
         use pyre_object::memoryview::*;
         memoryview_check_released(mv)?;
+        if w_memoryview_restricted(mv) {
+            return Err(crate::PyError::value_error(
+                "cannot create a new view from a restricted memoryview",
+            ));
+        }
         // `ReadonlyWrapper(self.view)` (memoryobject.py:256).
         Ok(w_memoryview_new_derived(mv, |v| {
             pyre_object::bufferview::BufferView::Readonly {
@@ -1517,6 +1684,177 @@ unsafe fn release_external_backing(_backing: PyObjectRef) -> bool {
     false
 }
 
+/// Invoke the native `bf_releasebuffer` paired with a root memoryview's
+/// acquisition.  Python-visible `__release_buffer__` is a slot wrapper in
+/// CPython 3.14: it calls `memoryview.release()`, which in turn reaches this
+/// native slot.  Calling the Python wrapper again here would recurse.
+unsafe fn release_native_backing(backing: PyObjectRef) -> bool {
+    unsafe {
+        if pyre_object::bytearrayobject::is_bytearray(backing) {
+            pyre_object::bytearrayobject::w_bytearray_exports_decref(backing);
+            return true;
+        }
+        if pyre_object::interp_array::is_array(backing) {
+            pyre_object::interp_array::w_array_exports_decref(backing);
+            return true;
+        }
+        if pyre_object::bytesobject::is_bytes(backing) {
+            // `bytes` has no `bf_releasebuffer`; its immutable export needs no
+            // accounting and has no Python-visible release wrapper.
+            return true;
+        }
+        release_external_backing(backing)
+    }
+}
+
+/// Is `descr` a native `bf_releasebuffer` wrapper rather than a Python slot?
+unsafe fn memoryview_is_native_release_descr(descr: PyObjectRef) -> bool {
+    unsafe {
+        for base in [
+            crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
+            crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
+            crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE),
+        ] {
+            if crate::baseobjspace::lookup_in_type(base, "__release_buffer__")
+                .is_some_and(|native| std::ptr::eq(native, descr))
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Python `slot_bf_releasebuffer` selected by the concrete type's MRO.
+unsafe fn memoryview_python_release_descr(obj: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe {
+        let descr = crate::baseobjspace::lookup(obj, "__release_buffer__")?;
+        (!memoryview_is_native_release_descr(descr)).then_some(descr)
+    }
+}
+
+/// `releasebuffer_call_python`: the C slot returns `void`, so callback
+/// exceptions are reported as unraisable and never replace an active error.
+unsafe fn memoryview_call_python_release_unraisable(
+    exporter: PyObjectRef,
+    view: PyObjectRef,
+    descr: PyObjectRef,
+) {
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(exporter);
+        pyre_object::gc_roots::pin_root(view);
+        pyre_object::gc_roots::pin_root(descr);
+        let r_exporter = pyre_object::gc_roots::shadow_stack_get(sp);
+        let w_type = crate::typedef::r#type(r_exporter).map_or(r_exporter, |p| p.as_ptr());
+        if let Err(mut error) = crate::baseobjspace::get_and_call_function(
+            pyre_object::gc_roots::shadow_stack_get(sp + 2),
+            r_exporter,
+            w_type,
+            &[pyre_object::gc_roots::shadow_stack_get(sp + 1)],
+        ) {
+            let r_exporter = pyre_object::gc_roots::shadow_stack_get(sp);
+            error.write_unraisable(
+                w_none(),
+                &format!(
+                    "Exception ignored in __release_buffer__ of {}:",
+                    crate::baseobjspace::object_functionstr_type_name(r_exporter)
+                ),
+                r_exporter,
+            );
+        }
+    }
+}
+
+/// `PyMemoryView_FromBuffer(buffer)` in `releasebuffer_call_python`, followed
+/// by `_Py_MEMORYVIEW_RESTRICTED`.  The snapshot owns no second native export:
+/// it exists only for the duration of the release callback.
+unsafe fn w_memoryview_new_restricted_snapshot(source: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(source);
+        let restricted = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
+        let r_source = pyre_object::gc_roots::shadow_stack_get(sp);
+        let snapshot = pyre_object::memoryview::w_memoryview_view(r_source).clone();
+        pyre_object::memoryview::w_memoryview_set_view(
+            restricted,
+            pyre_object::memoryview::bufferview_alloc(snapshot),
+        );
+        pyre_object::memoryview::w_memoryview_set_restricted(restricted, true);
+        restricted
+    }
+}
+
+/// Run a Python release override for a native exporter with the temporary
+/// restricted view used by CPython, then make that temporary unusable even
+/// when user code retained it.
+unsafe fn memoryview_release_native_python_slot(exporter: PyObjectRef, source: PyObjectRef) {
+    unsafe {
+        let Some(descr) = memoryview_python_release_descr(exporter) else {
+            return;
+        };
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(exporter);
+        pyre_object::gc_roots::pin_root(source);
+        pyre_object::gc_roots::pin_root(descr);
+        let restricted =
+            w_memoryview_new_restricted_snapshot(pyre_object::gc_roots::shadow_stack_get(sp + 1));
+        pyre_object::gc_roots::pin_root(restricted);
+        memoryview_call_python_release_unraisable(
+            pyre_object::gc_roots::shadow_stack_get(sp),
+            pyre_object::gc_roots::shadow_stack_get(sp + 3),
+            pyre_object::gc_roots::shadow_stack_get(sp + 2),
+        );
+        let r_restricted = pyre_object::gc_roots::shadow_stack_get(sp + 3);
+        if !pyre_object::memoryview::w_memoryview_released(r_restricted) {
+            pyre_object::memoryview::w_memoryview_set_released(r_restricted);
+        }
+    }
+}
+
+/// CPython `bufferwrapper_releasebuf`.
+///
+/// The returned memoryview's `bf_releasebuffer` first ends the temporary
+/// `PyObject_GetBuffer` export.  If it exposes another owner, call the
+/// original Python exporter with that exact memoryview.  If it exposes the
+/// exporter itself (the `super().__buffer__` native-subclass case), release
+/// the native view now; CPython's refcounted `Py_CLEAR(bw->mv)` performs this
+/// immediately when the wrapper held the last reference.
+unsafe fn memoryview_release_buffer_wrapper(wrapper: PyObjectRef) {
+    unsafe {
+        use pyre_object::memoryview::*;
+        let w_mv = w_buffer_wrapper_mv(wrapper);
+        let w_obj = w_buffer_wrapper_obj(wrapper);
+        if w_mv.is_null() || w_obj.is_null() {
+            return;
+        }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(wrapper);
+        pyre_object::gc_roots::pin_root(w_mv);
+        pyre_object::gc_roots::pin_root(w_obj);
+
+        let r_mv = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+        w_memoryview_exports_decref(r_mv);
+        let returned_owner = w_memoryview_obj(r_mv);
+        let r_obj = pyre_object::gc_roots::shadow_stack_get(sp + 2);
+        if !std::ptr::eq(returned_owner, r_obj) {
+            if let Some(descr) = memoryview_python_release_descr(r_obj) {
+                memoryview_call_python_release_unraisable(r_obj, r_mv, descr);
+            }
+        } else if !w_memoryview_released(r_mv) {
+            memoryview_release_native_python_slot(r_obj, r_mv);
+            let backing = w_memoryview_backing(r_mv);
+            let _ = release_native_backing(backing);
+            w_memoryview_set_released(r_mv);
+        }
+        w_buffer_wrapper_clear(pyre_object::gc_roots::shadow_stack_get(sp));
+    }
+}
+
 /// `memoryview.release` — drop the view; subsequent access raises ValueError.
 /// Idempotent (a second `release` on an already-released view is a no-op),
 /// matching `descr_release`.
@@ -1543,24 +1881,31 @@ pub(crate) fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
             // `_release_underlying`.  A slice / copy (`owns_export == false`)
             // shares the export and must not release it.
             if pyre_object::memoryview::w_memoryview_owns_export(mv) {
+                let owner = pyre_object::memoryview::w_memoryview_obj(mv);
                 let backing = pyre_object::memoryview::w_memoryview_backing(mv);
                 // Mark the view released before invoking the exporter hook so a
                 // re-entrant release is a no-op, but keep the view box until
                 // the hook returns: it is handed this memoryview and reads the
                 // backing back off it to identify the export it is undoing.
                 pyre_object::memoryview::w_memoryview_mark_released(mv);
-                // An `mmap` mapping keeps its count internally — it exposes no
-                // Python-callable release, so the drop cannot be forged from
-                // user code.  Every other exporter runs `__release_buffer__`.
-                let released = if release_external_backing(backing) {
+                let released = if pyre_object::memoryview::is_w_buffer_wrapper(owner) {
+                    memoryview_release_buffer_wrapper(owner);
                     Ok(())
                 } else {
-                    match crate::baseobjspace::lookup(backing, "__release_buffer__") {
-                        Some(release_fn) => {
-                            crate::call::call_function_impl_result(release_fn, &[backing, mv])
-                                .map(|_| ())
+                    // `slot_bf_releasebuffer`: call a Python override with a
+                    // restricted snapshot, then unconditionally invoke the
+                    // first native base release slot.
+                    memoryview_release_native_python_slot(owner, mv);
+                    if release_native_backing(backing) {
+                        Ok(())
+                    } else {
+                        match crate::baseobjspace::lookup(backing, "__release_buffer__") {
+                            Some(release_fn) => {
+                                crate::call::call_function_impl_result(release_fn, &[backing, mv])
+                                    .map(|_| ())
+                            }
+                            None => Ok(()),
                         }
-                        None => Ok(()),
                     }
                 };
                 pyre_object::memoryview::w_memoryview_drop_view(mv);
@@ -1573,13 +1918,35 @@ pub(crate) fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
     Ok(w_none())
 }
 
-/// `memoryview.__release_buffer__` — a no-op (`descr_release_buffer`): a
-/// consumer releasing a buffer it obtained from this memoryview has nothing
-/// to undo, because acquiring a buffer from a memoryview does not increment
-/// the underlying exporter's export count.  It must NOT release the view
-/// itself.
-fn memoryview_release_buffer(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_none())
+/// CPython 3.14 `wrap_releasebuffer`: validate that `view` belongs to the
+/// exporter, then release the memoryview itself.  The native
+/// `bf_releasebuffer` reached by [`memoryview_release`] performs the single
+/// matching export decrement.
+pub(crate) fn buffer_exporter_release_view(
+    exporter: PyObjectRef,
+    view: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    unsafe {
+        if !pyre_object::memoryview::is_w_memoryview(view) {
+            return Err(crate::PyError::type_error("expected a memoryview object"));
+        }
+        if pyre_object::memoryview::w_memoryview_released(view) {
+            return Ok(w_none());
+        }
+        if !std::ptr::eq(
+            pyre_object::memoryview::w_memoryview_backing(view),
+            exporter,
+        ) {
+            return Err(crate::PyError::value_error(
+                "memoryview's buffer is not this object",
+            ));
+        }
+    }
+    memoryview_release(&[view])
+}
+
+fn memoryview_release_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    buffer_exporter_release_view(args[0], args[1])
 }
 
 /// `memoryview.__enter__` — check-released, then return the view itself.
@@ -1753,20 +2120,7 @@ fn memoryview_ge(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn memoryview_from_flags(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let object = args.get(1).copied().unwrap_or(w_none());
     let flags = crate::baseobjspace::c_int_w(args.get(2).copied().unwrap_or(w_none()))?;
-    let view = w_memoryview_new(object)?;
-    unsafe {
-        if !pyre_object::memoryview::is_w_memoryview(object)
-            && flags & 0x0001 != 0
-            && pyre_object::memoryview::w_memoryview_readonly(view)
-        {
-            memoryview_release(&[view])?;
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::BufferError,
-                "Object is not writable.",
-            ));
-        }
-    }
-    Ok(view)
+    w_memoryview_new_with_flags(object, flags)
 }
 
 /// `memoryview.hex` — the view's bytes as a hex string, reusing the
@@ -2095,7 +2449,14 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__buffer__",
-            make_builtin_function_with_arity("__buffer__", |args| w_memoryview_new(args[0]), 2),
+            make_builtin_function_with_arity(
+                "__buffer__",
+                |args| {
+                    let flags = crate::baseobjspace::c_int_w(args[1])?;
+                    w_memoryview_new_native_with_flags(args[0], flags)
+                },
+                2,
+            ),
         );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,

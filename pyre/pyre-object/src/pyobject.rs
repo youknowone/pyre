@@ -603,6 +603,7 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (148, Some(0)),
     (149, Some(0)),
     (150, Some(0)),
+    (152, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every
@@ -1135,6 +1136,9 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
             typed::<crate::interp_itertools::W_TeeChainedListNode>(),
         ),
         subclass_range_alias(150, typed::<crate::interp_itertools::W_TeeIterable>()),
+        // `_buffer_wrapper` follows the deque's internal non-object Block
+        // (151) at the append-only GC registration tail.
+        subclass_range_alias(152, typed::<crate::memoryview::W_BufferWrapper>()),
     ]
 }
 

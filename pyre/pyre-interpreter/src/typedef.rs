@@ -953,6 +953,18 @@ pub fn init_typeobjects() {
             &pyre_object::memoryview::MEMORYVIEW_TYPE as *const PyType as usize,
             memoryview_type as usize,
         );
+        // CPython `PyBufferWrapper`: private owner installed in the copied
+        // `Py_buffer` returned by a Python-level `__buffer__` slot.
+        let buffer_wrapper_type =
+            new_typeobject_with_base("_buffer_wrapper", init_buffer_wrapper_type, object_type);
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(buffer_wrapper_type);
+            pyre_object::w_type_set_acceptable_as_base_class(buffer_wrapper_type, false);
+        }
+        reg.insert(
+            &pyre_object::memoryview::BUFFER_WRAPPER_TYPE as *const PyType as usize,
+            buffer_wrapper_type as usize,
+        );
         let seq_iterator_type =
             new_typeobject_with_base("iterator", init_sequence_iterator_type, object_type);
         // `Py_TPFLAGS_DISALLOW_INSTANTIATION` — an iterator is produced only by
@@ -16965,14 +16977,13 @@ fn bytearray_descr_init_value(
         if let Some(count) = bytes_count_from_index(arg)? {
             return Ok(pyre_object::bytearrayobject::w_bytearray_new(count));
         }
-        // `_convert_from_buffer_or_iterable`: any buffer exporter — bytes,
-        // bytearray, `array.array`, memoryview — yields its raw buffer bytes
-        // (`buffer_w(BUF_FULL_RO).as_str()`) before the iterable path; a
-        // released memoryview raises first.
-        if let Some(b) = crate::typedef::buffer_as_bytes_like(arg)? {
-            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
-                pyre_object::bytesobject::bytes_like_data(b),
-            ));
+        // `_convert_from_buffer_or_iterable`: acquire a read-only buffer
+        // before trying the iterable path.  This includes Python 3.14's
+        // `__buffer__` slot, not only the native built-in exporters.
+        if let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(arg)? {
+            let data = buffer.as_bytes().to_vec();
+            buffer.release();
+            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&data));
         }
     }
     // CPython 3.14 bytearray___init___impl's iterable slow path appends each
@@ -17047,7 +17058,10 @@ fn init_bytes_type(ns: PyObjectRef) {
             "__buffer__",
             make_builtin_function_with_arity(
                 "__buffer__",
-                |args| crate::builtins::w_memoryview_new(args[0]),
+                |args| {
+                    let flags = crate::baseobjspace::c_int_w(args[1])?;
+                    crate::builtins::w_memoryview_new_native_with_flags(args[0], flags)
+                },
                 2,
             ),
         )
@@ -20063,15 +20077,13 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 count
             ]));
         }
-        // `_convert_from_buffer_or_iterable`: any buffer exporter — bytes,
-        // bytearray, `array.array`, memoryview — yields its raw buffer bytes
-        // (`buffer_w(BUF_FULL_RO).as_str()`) before the iterable path; a
-        // released memoryview raises first.
-        if let Some(b) = crate::typedef::buffer_as_bytes_like(arg)? {
-            return Ok(new_bytes_like(
-                args[0],
-                pyre_object::bytesobject::bytes_like_data(b),
-            ));
+        // `_convert_from_buffer_or_iterable`: acquire a read-only buffer
+        // before trying the iterable path.  This includes Python 3.14's
+        // `__buffer__` slot, not only the native built-in exporters.
+        if let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(arg)? {
+            let data = buffer.as_bytes().to_vec();
+            buffer.release();
+            return Ok(new_bytes_like(args[0], &data));
         }
     }
     // `_from_byte_sequence_loop`: iterate the source, coercing each element
@@ -20318,24 +20330,7 @@ fn bytearray_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// `bytearrayobject.py descr_releasebuffer` — the Python 3.12
 /// `__release_buffer__` protocol entry for a released bytearray export.
 fn bytearray_method_release_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `bytearray_releasebuffer` drops one export, so the view handed back has
-    // to be one this bytearray exported — the export count is an invariant
-    // the accessor asserts, and Python may pass anything.
-    unsafe {
-        if !pyre_object::memoryview::is_w_memoryview(args[1]) {
-            return Err(crate::PyError::type_error("expected a memoryview object"));
-        }
-        if !std::ptr::eq(
-            pyre_object::memoryview::w_memoryview_backing(args[1]),
-            args[0],
-        ) {
-            return Err(crate::PyError::value_error(
-                "memoryview's buffer is not this object",
-            ));
-        }
-        pyre_object::bytearrayobject::w_bytearray_exports_decref(args[0]);
-    }
-    Ok(pyre_object::w_none())
+    crate::builtins::buffer_exporter_release_view(args[0], args[1])
 }
 
 /// CPython 3.14 `bytearray___init___impl` — clear `self` before converting the
@@ -20515,7 +20510,10 @@ fn init_bytearray_type(ns: PyObjectRef) {
             "__buffer__",
             make_builtin_function_with_arity(
                 "__buffer__",
-                |args| crate::builtins::w_memoryview_new(args[0]),
+                |args| {
+                    let flags = crate::baseobjspace::c_int_w(args[1])?;
+                    crate::builtins::w_memoryview_new_native_with_flags(args[0], flags)
+                },
                 2,
             ),
         )
@@ -23333,6 +23331,10 @@ fn init_async_generator_type(ns: PyObjectRef) {
 }
 
 fn init_async_gen_value_wrapper_type(ns: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
+}
+
+fn init_buffer_wrapper_type(ns: PyObjectRef) {
     unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
 }
 

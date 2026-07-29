@@ -963,7 +963,20 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
     let view_ptr = unsafe { (*mv).view } as *mut pyre_object::bufferview::BufferView;
     if !view_ptr.is_null() {
         if unsafe { (*mv).owns_export } {
-            unsafe { (&*view_ptr).backing().release_export() };
+            let owner = unsafe { (&*view_ptr).w_obj() };
+            if unsafe { pyre_object::memoryview::is_w_buffer_wrapper(owner) } {
+                // `bufferwrapper_releasebuf` without a Python execution
+                // context: end the returned memoryview's active Py_buffer
+                // export and drop the wrapper edges.  The returned view owns
+                // (and eventually releases) its own native backing export.
+                let returned = unsafe { pyre_object::memoryview::w_buffer_wrapper_mv(owner) };
+                if !returned.is_null() {
+                    unsafe { pyre_object::memoryview::w_memoryview_exports_decref(returned) };
+                }
+                unsafe { pyre_object::memoryview::w_buffer_wrapper_clear(owner) };
+            } else {
+                unsafe { (&*view_ptr).backing().release_export() };
+            }
         }
         drop(unsafe { Box::from_raw(view_ptr) });
     }
@@ -3193,6 +3206,15 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         deque_block_descr.ptr_offsets.to_vec(),
     ));
     deque_block_descr.gc_type_id.set(deque_block_tid);
+    // CPython `_buffer_wrapper`: two ordinary inline GC edges (`mv`, `obj`).
+    // Append it after every pre-existing object and the deque's internal
+    // block so no fixed payload or Python-visible AUTO-ID is renumbered.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::memoryview::W_BufferWrapper
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
     // `PYRE_CLASS_DESCRIPTORS` slice.  A type with inline managed children
