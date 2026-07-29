@@ -7520,6 +7520,20 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "abort_permanent/".to_string(),
         majit_translate::insns::BC_ABORT_PERMANENT,
     );
+    // `vtable_method_ptr/rd>i` — the dyn-trait method-pointer reification.
+    // Routing `dyn Trait` calls through `CallTarget::Indirect` is the
+    // default, so the codewriter now emits this byte into real jitcodes and
+    // this builder's dispatch table has to span it: `setup_insns(asm.insns)`
+    // (`blackhole.py:58-59`) resolves every opname the assembler emitted, and
+    // a byte outside the curated set reaches the unwired-opcode placeholder
+    // instead of the handler.  The handler it binds is deliberately
+    // `handler_vtable_method_ptr_unimplemented` — no layer executes this op
+    // yet, so the point of the entry is that a resume landing here says which
+    // op is missing rather than reporting an unwired byte.
+    insns.insert(
+        "vtable_method_ptr/rd>i".to_string(),
+        majit_translate::insns::BC_VTABLE_METHOD_PTR,
+    );
     // blackhole.py:954-960 bhimpl_switch. `handler_switch` is wired in
     // `wire_bhimpl_handlers` but the byte was absent from this builder's
     // insns map, so a deopt through a `switch/id` op landed on the
@@ -8628,12 +8642,19 @@ fn handler_guard_class(
     Ok(p + 2)
 }
 /// `vtable_method_ptr` reaches the blackhole only when a `dyn Trait`
-/// indirect call survives unfrozen into a metainterp resume.  pyre's hot
-/// path does not currently emit this pattern; intentionally panic so any
-/// future regression is loud rather than silent.  The codewriter still
-/// emits the op + descriptor (TODO of
-/// `rpython/rtyper/rclass.py:371-377 getclsfield()`) so the IR survives
-/// serialization for the next integration step.
+/// indirect call survives unfrozen into a metainterp resume.
+///
+/// The codewriter does emit the op + descriptor (TODO of
+/// `rpython/rtyper/rclass.py:371-377 getclsfield()`) now that indirect
+/// routing is the default, but no layer consumes it: there is no backend
+/// lowering (`codewriter/assembler.rs`, "backend lowering of the actual
+/// vtable slot read is not yet implemented"), the walker answers
+/// `DispatchError::UnsupportedOpname`, and `PyreVtableMethodDescr` carries
+/// the `(trait_root, method_name)` pair as strings with nothing that
+/// resolves them to an address.  The walker's abort is what keeps this
+/// unreachable in practice — a trace meeting the op never compiles, so no
+/// resume can land past it.  Panic intentionally so that if one ever does,
+/// it is loud rather than a silent miscompile.
 fn handler_vtable_method_ptr_unimplemented(
     _bh: &mut BlackholeInterpreter,
     _code: &[u8],

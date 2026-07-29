@@ -1807,6 +1807,11 @@ mod tests {
     /// pinned so that an opname MOVING out of this list (because the codewriter
     /// started emitting it) shows up as a test failure to be classified,
     /// instead of silently becoming a live `dispatch_step` panic.
+    ///
+    /// `vtable_method_ptr/rd>i` left the list exactly that way: routing
+    /// `dyn Trait` calls through `CallTarget::Indirect` became the default, so
+    /// the codewriter emits it and it is now registered in
+    /// `build_inline_call_only_bh_builder` instead.
     #[test]
     fn production_bh_builder_overlay_only_gap_snapshot() {
         let builder = build_pyre_production_bh_builder();
@@ -1853,7 +1858,6 @@ mod tests {
             "record_known_result_r_ir_v/riIRd",
             "record_quasiimmut_field/rdd",
             "rvmprof_code/ii",
-            "vtable_method_ptr/rd>i",
         ];
         assert_eq!(
             gap, expected,
