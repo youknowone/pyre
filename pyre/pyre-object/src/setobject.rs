@@ -896,6 +896,15 @@ unsafe fn w_set_contains_key_for_update(
     probe: PyObjectRef,
     mut key: crate::dictmultiobject::ObjectKey,
 ) -> Result<bool, SetUpdateError> {
+    // Bucket probe first, as in `w_set_contains_key_checked`.  The walk below
+    // is the reentrant fallback and visits every entry, so without this a
+    // whole-set difference probes linearly per element and runs quadratic.
+    if let Some(result) = callback_free_set_op(|| {
+        let s = &*(probe as *const W_SetObject);
+        (*s.items).contains_key(&key)
+    }) {
+        return result.map_err(SetUpdateError::Key);
+    }
     'restart: loop {
         let items = (*(probe as *const W_SetObject)).items;
         let len = (*items).len();
@@ -942,6 +951,26 @@ unsafe fn w_set_remove_key_for_update(
     dst: PyObjectRef,
     mut key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(), SetUpdateError> {
+    // Locate the bucket callback-free before falling back to the entry walk,
+    // which is linear in the set's size.  The index is resolved inside the
+    // probe and the removal withheld when a comparison leaves the builtin
+    // ladder, so the walk below can redo the whole operation.  The removal
+    // itself still shifts the tail, as in the fallback.
+    if let Some(result) = callback_free_set_op(|| {
+        let items = (*(dst as *const W_SetObject)).items;
+        let index = (*items).get_index_of(&key);
+        if crate::dict_eq_hook::callback_free_probe_broken() {
+            return;
+        }
+        if let Some(index) = index {
+            (*items).shift_remove_index(index);
+            let set = &mut *(dst as *mut W_SetObject);
+            set.len -= 1;
+            set.hash = -1;
+        }
+    }) {
+        return result.map_err(SetUpdateError::Key);
+    }
     'restart: loop {
         let items = (*(dst as *const W_SetObject)).items;
         let len = (*items).len();
