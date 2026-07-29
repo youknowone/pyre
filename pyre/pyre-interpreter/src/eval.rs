@@ -7741,4 +7741,32 @@ result = (
             assert!(crate::baseobjspace::is_true(result).unwrap());
         }
     }
+
+    #[test]
+    fn test_bytearray_percent_format_holds_receiver_export() {
+        let source = "\
+format_string = bytearray(b'%a end')
+
+class Value:
+    def __repr__(self):
+        format_string.clear()
+        return 'value'
+
+try:
+    format_string % Value()
+except BufferError:
+    preserved = format_string == bytearray(b'%a end')
+    format_string.clear()
+    released = format_string == bytearray()
+    result = preserved and released
+else:
+    result = False
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytearray percent formatting export lifetime failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
 }

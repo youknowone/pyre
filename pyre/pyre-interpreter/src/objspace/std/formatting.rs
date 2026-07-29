@@ -110,6 +110,22 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
 }
 
 pub(crate) unsafe fn bytes_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
+    // CPython 3.14 bytearray_mod_lock_held increments `ob_exports` before
+    // `_PyBytes_FormatEx` observes the receiver and decrements it after every
+    // success/error return.  Re-entrant formatting callbacks may overwrite
+    // bytes, but cannot resize and invalidate the live pointer/length pair.
+    let receiver_exported = pyre_object::bytearrayobject::is_bytearray(fmt);
+    if receiver_exported {
+        pyre_object::bytearrayobject::w_bytearray_exports_incref(fmt);
+    }
+    let formatted = bytes_format_percent_inner(fmt, args);
+    if receiver_exported {
+        pyre_object::bytearrayobject::w_bytearray_exports_decref(fmt);
+    }
+    formatted
+}
+
+unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
     let fmt_bytes = pyre_object::bytesobject::bytes_like_data(fmt);
     let format = CFormatBytes::parse_from_bytes(fmt_bytes)
         .map_err(|err| PyError::value_error(err.to_string()))?;
