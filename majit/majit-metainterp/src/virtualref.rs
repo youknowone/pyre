@@ -69,17 +69,18 @@ pub struct ObjectHeader {
 /// `optimizeopt/virtualize.rs`) agree on the slot type.
 ///
 /// TODO (GC trace).  Upstream traces both fields as
-/// real GC pointers; pyre traces only `forced`.  `eval.rs:241-247`
-/// registers JIT_VIRTUAL_REF with `gc_ptr_offsets = [16]` (forced
-/// only).  The reason is that every value `virtual_token` ever holds
-/// at runtime falls outside the GC heap:
+/// real GC pointers; pyre traces only `forced` — the type registration
+/// in `eval.rs` derives that one entry from `offset_of!(JitVirtualRef,
+/// forced)`, so it follows the target's pointer width.  The reason
+/// `virtual_token` is left out is that every value it ever holds at
+/// runtime falls outside the GC heap:
 ///   - `TOKEN_NONE` — null, safe to walk.
 ///   - `token_tracing_rescall()` — program-lifetime leaked
 ///     `Box<ObjectHeader>` (see `allocate_tracing_rescall_dummy` /
 ///     `TRACING_RESCALL_DUMMY_PTR` below), host-heap allocated and
 ///     never freed; not a GC-allocated `_dummy` GcStruct.
 ///   - an active JITFRAME address — `libc::calloc`'d on a host-side
-///     pool (eval.rs:232-240), not nursery/oldgen.
+///     pool, not nursery/oldgen.
 /// Routing it through `trace_and_update_object` would either be a
 /// no-op or trip a poison-address check.  The optimizer-side
 /// `Type::Ref` is intentionally retained so that
@@ -114,8 +115,8 @@ pub const JIT_VIRTUAL_REF_VTABLE: usize = 0x4A56_5221; // "JVR!"
 /// `virtualref.py:94-98 is_virtual_ref(gcref)`.
 ///
 /// # Safety
-/// `ptr` must be null or point to a valid object whose first 8 bytes are the
-/// `('super', rclass.OBJECT)` typeptr word.
+/// `ptr` must be null or point to a valid object whose leading
+/// pointer-sized word is the `('super', rclass.OBJECT)` typeptr.
 #[inline]
 pub unsafe fn ptr_is_virtual_ref(ptr: *const u8) -> bool {
     unsafe {
@@ -157,8 +158,8 @@ pub use crate::jit::InvalidVirtualRef;
 /// Returns raw pointer; caller owns the allocation.
 ///
 /// `lltype.malloc(self.JIT_VIRTUAL_REF)` is a GC allocation, and it has to be
-/// one here too: `forced` is a traced slot (`gc_ptr_offsets = [16]`, registered
-/// with [`set_vref_gc_type_id`]), so once `ExecutionContext.topframeref` holds
+/// one here too: `forced` is the sole traced slot of the type registered with
+/// [`set_vref_gc_type_id`], so once `ExecutionContext.topframeref` holds
 /// the vref instead of the frame, this object is the only edge keeping the
 /// frame it wraps reachable.  A host-heap allocation is invisible to the
 /// collector — the root walker's `gc_current_object_address` early-out returns
@@ -427,7 +428,7 @@ impl VirtualRefInfo {
     ///
     /// # Safety
     /// `vref_ptr` must be null or point to a valid GCREF object
-    /// whose first 8 bytes are the type-tag word.
+    /// whose leading pointer-sized word is the type-tag.
     pub unsafe fn tracing_before_residual_call(&self, vref_ptr: *mut u8) {
         unsafe {
             if !self.is_virtual_ref(vref_ptr) {
@@ -448,7 +449,7 @@ impl VirtualRefInfo {
     ///
     /// # Safety
     /// `vref_ptr` must be null or point to a valid GCREF object
-    /// whose first 8 bytes are the type-tag word.
+    /// whose leading pointer-sized word is the type-tag.
     pub unsafe fn tracing_after_residual_call(&self, vref_ptr: *mut u8) -> bool {
         unsafe {
             if !self.is_virtual_ref(vref_ptr) {
@@ -481,7 +482,7 @@ impl VirtualRefInfo {
     ///
     /// # Safety
     /// `vref_ptr` must be null or point to a valid GCREF object
-    /// whose first 8 bytes are the type-tag word.
+    /// whose leading pointer-sized word is the type-tag.
     pub unsafe fn continue_tracing(&self, vref_ptr: *mut u8, real_object: *mut u8) {
         unsafe {
             if !self.is_virtual_ref(vref_ptr) {
@@ -537,8 +538,8 @@ impl VirtualRefInfo {
     /// `JIT_VIRTUAL_REF_VTABLE`.
     ///
     /// # Safety
-    /// `ptr` must point to a valid GCREF object whose first 8 bytes
-    /// are the typeptr word, or be null.
+    /// `ptr` must point to a valid GCREF object whose leading
+    /// pointer-sized word is the typeptr, or be null.
     pub unsafe fn is_virtual_ref(&self, ptr: *const u8) -> bool {
         unsafe { ptr_is_virtual_ref(ptr) }
     }
@@ -671,7 +672,7 @@ mod tests {
     /// `virtualref.py:101-102`: `tracing_before_residual_call`
     /// returns silently when the gcref is not a JitVirtualRef.
     /// pyre's `is_virtual_ref` guard mirrors the shape — a
-    /// non-vref pointer (here a `u64` whose first 8 bytes are NOT
+    /// non-vref pointer (here a word whose leading bytes are NOT
     /// `JIT_VIRTUAL_REF_VTABLE`) must be left untouched.
     #[test]
     fn tracing_before_residual_call_skips_non_vref() {

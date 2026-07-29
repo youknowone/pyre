@@ -1268,19 +1268,20 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // collections triggered by CallMallocNursery slow paths.
     majit_gc::shadow_stack::register_libc_jitframe_tracer(pyre_libc_jitframe_tracer);
     // virtualref.py — JIT_VIRTUAL_REF as a proper GC type.
-    // Layout: super_.typeptr(u64, offset 0) | virtual_token(*mut u8, offset 8) | forced(*mut u8, offset 16)
+    // Layout: three pointer-sized words — super_.typeptr | virtual_token |
+    // forced — so the size and the traced offset below are both derived from
+    // the struct rather than spelled out for one word width.
     //
     // Note (GC trace divergence).  Upstream
     // `virtualref.py:17-20` declares both `virtual_token` and
     // `forced` as GC slots (`llmemory.GCREF` / `OBJECTPTR`); pyre
-    // registers only `forced` (offset 16) in `gc_ptr_offsets`.
+    // registers only `forced` in `gc_ptr_offsets`.
     // The `virtual_token` slot is intentionally outside the GC's
     // view because every runtime value it can hold lives outside
     // any GC heap: TOKEN_NONE (null), `token_tracing_rescall()`
     // (program-lifetime leaked `Box<ObjectHeader>` dummy lazily
     // allocated by `allocate_tracing_rescall_dummy` and cached in
-    // `TRACING_RESCALL_DUMMY_PTR`, see `majit-metainterp/src/
-    // virtualref.rs:140-180`), and active JITFRAME addresses
+    // `TRACING_RESCALL_DUMMY_PTR`), and active JITFRAME addresses
     // (libc::calloc'd, see `register_libc_jitframe_tracer` above).
     // The optimizer-side descriptor at
     // `majit-metainterp/src/optimizeopt/virtualize.rs:make_vref_field_descr`

@@ -2980,9 +2980,12 @@ impl GcRewriter for GcRewriterImpl {
                 // Only the typed body variants `emit` draws from `next_pos`
                 // count. `ty()` is None for `None`/`TempVar` and `Void` for the
                 // `VoidOp(u32::MAX)` sentinel — reserving that sentinel would
-                // pin `next_pos` at `u32::MAX` and overflow the first `+= 1`,
-                // which is why the result scan above skips Void as well. The
-                // constant test comes first: `raw()` panics on an inline Const.
+                // pin `next_pos` at `u32::MAX`, which the first `+= 1` in
+                // `emit` overflows: a panic where overflow checks are on, and a
+                // silent wrap to 0 in release, handing every rewritten op a
+                // position that aliases a live operand. That is why the result
+                // scan above skips Void as well. The constant test comes first:
+                // `raw()` panics on an inline Const.
                 if !pos.is_constant()
                     && matches!(pos.ty(), Some(Type::Int | Type::Float | Type::Ref))
                     && pos.raw() > result_high_water
