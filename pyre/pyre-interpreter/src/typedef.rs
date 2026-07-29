@@ -17699,16 +17699,19 @@ fn bytes_search(args: &[PyObjectRef], forward: bool) -> Result<i64, crate::PyErr
 
 fn bytes_method_find(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_at_least(args, "find", 1)?;
+    crate::type_methods::arity_at_most(args, "find", 3)?;
     Ok(pyre_object::w_int_new(bytes_search(args, true)?))
 }
 
 fn bytes_method_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_at_least(args, "rfind", 1)?;
+    crate::type_methods::arity_at_most(args, "rfind", 3)?;
     Ok(pyre_object::w_int_new(bytes_search(args, false)?))
 }
 
 fn bytes_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_at_least(args, "index", 1)?;
+    crate::type_methods::arity_at_most(args, "index", 3)?;
     let res = bytes_search(args, true)?;
     if res < 0 {
         return Err(crate::PyError::value_error("subsection not found"));
@@ -17718,6 +17721,7 @@ fn bytes_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 
 fn bytes_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_at_least(args, "rindex", 1)?;
+    crate::type_methods::arity_at_most(args, "rindex", 3)?;
     let res = bytes_search(args, false)?;
     if res < 0 {
         return Err(crate::PyError::value_error("subsection not found"));
@@ -17727,6 +17731,7 @@ fn bytes_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 
 fn bytes_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_at_least(args, "count", 1)?;
+    crate::type_methods::arity_at_most(args, "count", 3)?;
     let bounds = bytes_idx_args(args)?;
     let receiver = crate::baseobjspace::simple_buffer_bytes(args[0])?
         .expect("bytes/bytearray receiver always exports a buffer");
@@ -17813,6 +17818,7 @@ fn bytes_prefix_match(
 
 fn bytes_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_at_least(args, "startswith", 1)?;
+    crate::type_methods::arity_at_most(args, "startswith", 3)?;
     Ok(pyre_object::w_bool_from(bytes_prefix_match(
         args,
         "startswith",
@@ -17822,6 +17828,7 @@ fn bytes_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 
 fn bytes_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_at_least(args, "endswith", 1)?;
+    crate::type_methods::arity_at_most(args, "endswith", 3)?;
     Ok(pyre_object::w_bool_from(bytes_prefix_match(
         args, "endswith", false,
     )?))

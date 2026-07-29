@@ -7551,4 +7551,26 @@ for constructor in (bytes, bytearray):
             assert!(crate::baseobjspace::is_true(result).unwrap());
         }
     }
+
+    #[test]
+    fn test_bytes_search_methods_reject_extra_arguments() {
+        let source = "\
+result = True
+for constructor in (bytes, bytearray):
+    value = constructor(b'hello')
+    for name in ('find', 'rfind', 'index', 'rindex', 'count', 'startswith', 'endswith'):
+        try:
+            getattr(value, name)(constructor(b'x'), None, None, None)
+        except TypeError as exc:
+            result = result and name in str(exc)
+        else:
+            result = False
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytes-like search method arity validation failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
 }
