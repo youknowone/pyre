@@ -4912,11 +4912,13 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
     // `__getattribute__` for builtin W_Roots, so the delegation is wired
     // here; the exception names fall through to the normal lookup that
     // serves the `__origin__`/`__args__`/`__parameters__` getsets.
-    if unsafe { pyre_object::is_generic_alias(obj) }
-        && !crate::_pypy_generic_alias::is_attr_exception(name)
-    {
-        let origin = unsafe { pyre_object::w_generic_alias_get_origin(obj) };
-        return getattr_str(origin, name);
+    if unsafe { pyre_object::is_generic_alias(obj) } {
+        if !crate::_pypy_generic_alias::is_attr_exception(name)
+            && !crate::_pypy_generic_alias::is_attr_blocked(name)
+        {
+            let origin = unsafe { pyre_object::w_generic_alias_get_origin(obj) };
+            return getattr_str(origin, name);
+        }
     }
 
     // super proxy — PyPy: pypy/module/__builtin__/descriptor.py W_Super.getattribute

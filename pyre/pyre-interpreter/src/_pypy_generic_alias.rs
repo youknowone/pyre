@@ -16,8 +16,6 @@ use pyre_object::*;
 pub(crate) const ATTR_EXCEPTIONS: &[&str] = &[
     "__args__",
     "__class__",
-    "__copy__",
-    "__deepcopy__",
     "__mro_entries__",
     "__origin__",
     "__parameters__",
@@ -37,8 +35,6 @@ pub(crate) fn is_attr_exception(name: &str) -> bool {
         name,
         "__args__"
             | "__class__"
-            | "__copy__"
-            | "__deepcopy__"
             | "__mro_entries__"
             | "__origin__"
             | "__parameters__"
@@ -47,6 +43,12 @@ pub(crate) fn is_attr_exception(name: &str) -> bool {
             | "__typing_unpacked_tuple_args__"
             | "__unpacked__"
     )
+}
+
+/// CPython 3.14 `attr_blocked` (`Objects/genericaliasobject.c`) — these
+/// attributes are neither proxied to the origin nor exposed by the alias.
+pub(crate) fn is_attr_blocked(name: &str) -> bool {
+    matches!(name, "__bases__" | "__copy__" | "__deepcopy__")
 }
 
 /// `generic_alias_class_getitem(space, w_cls, w_item)` (util.py:99).
@@ -105,10 +107,19 @@ fn collect_parameters_one(
             // A bare class exposes no `__parameters__` descriptor of its own.
             return Ok(());
         }
-        if is_tuple(t) {
-            let n = w_tuple_len(t);
+        if is_tuple(t) || is_list(t) {
+            let n = if is_tuple(t) {
+                w_tuple_len(t)
+            } else {
+                w_list_len(t)
+            };
             for i in 0..n {
-                if let Some(x) = w_tuple_getitem(t, i as i64) {
+                let x = if is_tuple(t) {
+                    w_tuple_getitem(t, i as i64)
+                } else {
+                    w_list_getitem(t, i as i64)
+                };
+                if let Some(x) = x {
                     collect_parameters_one(x, params)?;
                 }
             }
@@ -399,13 +410,34 @@ pub(crate) fn subs_parameters(
         w_tuple_new(vec![items])
     };
     let mut newargs: Vec<PyObjectRef> = Vec::new();
-    let nargs = unsafe { w_tuple_len(args) };
+    let args_are_tuple = unsafe { is_tuple(args) };
+    let nargs = if args_are_tuple {
+        unsafe { w_tuple_len(args) }
+    } else {
+        unsafe { w_list_len(args) }
+    };
     for i in 0..nargs {
-        let Some(old_arg) = (unsafe { w_tuple_getitem(args, i as i64) }) else {
+        let old_arg = if args_are_tuple {
+            unsafe { w_tuple_getitem(args, i as i64) }
+        } else {
+            unsafe { w_list_getitem(args, i as i64) }
+        };
+        let Some(old_arg) = old_arg else {
             continue;
         };
         if unsafe { is_type(old_arg) } {
             newargs.push(old_arg);
+            continue;
+        }
+        // CPython 3.14 `_Py_subs_parameters`: lists and tuples containing
+        // parameters are recursively substituted, preserving their shape.
+        if unsafe { is_tuple(old_arg) || is_list(old_arg) } {
+            let subargs = subs_parameters(self_, old_arg, params, items)?;
+            newargs.push(if unsafe { is_tuple(old_arg) } {
+                w_tuple_new(subargs)
+            } else {
+                w_list_new(subargs)
+            });
             continue;
         }
         // `unpack = _is_unpacked_typevartuple(old_arg)` decides whether the
@@ -926,7 +958,11 @@ pub(crate) unsafe fn repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
         let mut parts = Vec::with_capacity(n);
         for i in 0..n {
             if let Some(item) = w_tuple_getitem(args, i as i64) {
-                parts.push(repr_item(item)?);
+                parts.push(if is_list(item) {
+                    repr_items_list(item)?
+                } else {
+                    repr_item(item)?
+                });
             }
         }
         parts.join(", ")
@@ -937,6 +973,21 @@ pub(crate) unsafe fn repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
         ""
     };
     Ok(format!("{star}{}[{inner}]", repr_item(origin)?))
+}
+
+/// CPython 3.14 `ga_repr_items_list` — ParamSpec substitutions retain a
+/// list, whose type items use typing-style rendering.  Fetch each element
+/// after its predecessor's repr so mutation during a callback raises
+/// `IndexError` rather than reading stale storage.
+unsafe fn repr_items_list(list: PyObjectRef) -> Result<String, crate::PyError> {
+    let n = w_list_len(list);
+    let mut parts = Vec::with_capacity(n);
+    for i in 0..n {
+        let item = w_list_getitem(list, i as i64)
+            .ok_or_else(|| crate::PyError::index_error("list index out of range"))?;
+        parts.push(repr_item(item)?);
+    }
+    Ok(format!("[{}]", parts.join(", ")))
 }
 
 /// `_repr_item(it)` (`_pypy_generic_alias.py:124`) — a class renders as its
