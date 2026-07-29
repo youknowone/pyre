@@ -397,30 +397,35 @@ def _jit_panic_reason(stderr):
 # ── Helpers ──────────────────────────────────────────────────────────
 
 def _jit_stats_snapshot(stderr):
-    """Return the last structural jit-stats line as normalized key/value text.
+    """Return every jit-stats line merged into normalized key/value text.
 
-    The diagnostic lines (mc_diag, heap_buckets, bridge_diag, fbw_diag,
-    exec_hist) share the `[jit-stats]` prefix but name themselves in a bare
-    first token; only the structural summary starts straight into key=value.
-    Reading one of those instead leaves loops_aborted and
-    internal_compile_panics missing, which the regression floor below reads as
-    0 — the gate would then never fire again, silently."""
-    stats_line = None
+    The interpreter emits more than one `[jit-stats]` line — the counters, the
+    mc_diag tallies, the descr-set universe. Keeping only the last one dropped
+    `loops_aborted` and `internal_compile_panics` from the snapshot, which
+    silently disarmed `_jit_stats_regression_floor`: it read both counters as
+    absent on the current side, so `cur > base` could never hold no matter how
+    far they rose. Later lines still win on a repeated key.
+
+    Merging is what keeps that true as lines are added. Selecting one line
+    instead — the last whose first token is not a bare diagnostic name like
+    `mc_diag` / `heap_buckets` / `bridge_diag` / `fbw_diag` / `exec_hist` —
+    re-disarms the floor the moment a second key=value line joins the first,
+    because the newcomer displaces the counters. The bare-name lines need no
+    special case here: their name token carries no `=` and is skipped with
+    every other non-assignment token.
+    """
+    fields = {}
+    seen = False
     for line in stderr.splitlines():
         if not line.startswith("[jit-stats]"):
             continue
-        head = line[len("[jit-stats]") :].split()
-        if head and "=" not in head[0]:
-            continue
-        stats_line = line
-    if stats_line is None:
+        seen = True
+        for token in line[len("[jit-stats]") :].split():
+            if "=" in token:
+                key, value = token.split("=", 1)
+                fields[key] = value
+    if not seen:
         return None
-
-    fields = {}
-    for token in stats_line[len("[jit-stats]") :].split():
-        if "=" in token:
-            key, value = token.split("=", 1)
-            fields[key] = value
     # This watches what the JIT compiles, never how well. A regression that
     # changes no structure (for example, an extra spill) is invisible here.
     return "".join(f"{key}={fields[key]}\n" for key in sorted(fields))
