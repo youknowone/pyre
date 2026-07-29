@@ -608,34 +608,92 @@ pub extern "C" fn try_gc_write_barrier(obj: *mut u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // The hook cells are process-global. These tests are the only hook
-    // *installers* in this binary, so they take this lock first to serialize
-    // against each other — that keeps every "unregistered/cleared -> None/false"
-    // assertion sound (no other test installs a hook concurrently).
+    // The hook cells are process-global, and every allocator in this crate
+    // reads them with no gate — `malloc_typed_managed`, `alloc_dict_object`,
+    // `w_weakref_new`, `alloc_items_block_gc`,
+    // `try_alloc_typed_items_block_nursery`, `alloc_rbigint_nursery_impl`, …
+    // So from `register_*` until the matching `clear_*` an installed mock
+    // answers *every* thread in this binary, and libtest runs the other tests
+    // on their own threads concurrently. That shapes the mocks twice over:
     //
-    // Assertions on a mock's *invocation* are a separate concern: the alloc and
-    // root hooks are read only behind `gc_interp::enabled()` / a registered
-    // backend type id, both off by default in this binary, so no concurrent
-    // production path invokes those mocks — their arg-recording statics are safe
-    // under `cargo test`. (They are NOT safe under `PYRE_GC_INTERP=1`, which is
-    // never set for a pyre-object test run.) The write-barrier hook has ungated
-    // production callers, so its test asserts on the `try_*` return value rather
-    // than a shared counter.
+    //   * a mock must return memory the caller can build its object in.
+    //     A synthetic pointer value took the process down:
+    //     `try_alloc_typed_items_block_nursery` writes the capacity header
+    //     through whatever the hook returns, so a concurrent
+    //     `try_gc_alloc(tid, 24)` stored to address 0x18.
+    //   * a mock must record its arguments per thread. A concurrent allocation
+    //     calls the same mock with its own type id and size, and a shared cell
+    //     would carry that call's values into the installing test's assertions.
+    //
+    // The lock below only serializes the installers against each other; that is
+    // what keeps the "unregistered/cleared -> None/false" assertions sound.
     static HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn hook_test_guard() -> std::sync::MutexGuard<'static, ()> {
         HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    static LAST_TYPE_ID: AtomicUsize = AtomicUsize::new(0);
-    static LAST_SIZE: AtomicUsize = AtomicUsize::new(0);
+    /// What the mock allocator was last asked for on this thread, and what it
+    /// handed back.
+    #[derive(Clone, Copy)]
+    struct MockCall {
+        type_id: u32,
+        payload_size: usize,
+        ptr: *mut u8,
+    }
+
+    thread_local! {
+        static LAST_MOCK_CALL: std::cell::Cell<Option<MockCall>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    fn last_mock_call() -> MockCall {
+        LAST_MOCK_CALL
+            .with(|cell| cell.get())
+            .expect("the mock allocator was not invoked on this thread")
+    }
+
+    /// Alignment of the mock's blocks.
+    ///
+    /// `ItemsBlock` / `TypedItemsBlock` are the only payloads this crate hands
+    /// back to `std::alloc::dealloc` (`dealloc_items_block` /
+    /// `dealloc_typed_items_block`, reached here because no owns-object hook is
+    /// installed), and both lead with a `usize` capacity header — so matching
+    /// that alignment makes those frees exact instead of layout-mismatched.
+    /// Every other payload routed through these hooks is a `repr(C)` struct of
+    /// pointer / `usize` / `u64` / `f64` fields, which this covers too.
+    const MOCK_ALIGN: usize = std::mem::align_of::<usize>();
+
+    const _: () = assert!(MOCK_ALIGN == std::mem::align_of::<crate::object_array::ItemsBlock>());
+    const _: () =
+        assert!(MOCK_ALIGN == std::mem::align_of::<crate::object_array::TypedItemsBlock>());
+
+    /// Real, zeroed memory of exactly `payload_size` bytes — what a GC
+    /// allocator returns — or null when the request cannot be served, which is
+    /// the failure [`GcAllocHookFn`] specifies. Reporting that faithfully is
+    /// load-bearing: `RBigInt::lshift(i64::MAX)` asks for a block no allocator
+    /// can hand out and expects `RBigIntError::Memory` back.
+    ///
+    /// A block whose caller does not free it stays leaked for the rest of the
+    /// run, which is what the collector this stands in for would do with it.
+    fn mock_alloc(payload_size: usize) -> *mut u8 {
+        let Ok(layout) = std::alloc::Layout::from_size_align(payload_size.max(1), MOCK_ALIGN)
+        else {
+            return std::ptr::null_mut();
+        };
+        unsafe { std::alloc::alloc_zeroed(layout) }
+    }
 
     fn mock_hook(type_id: u32, payload_size: usize) -> *mut u8 {
-        LAST_TYPE_ID.store(type_id as usize, Ordering::Relaxed);
-        LAST_SIZE.store(payload_size, Ordering::Relaxed);
-        // Return a non-null dummy pointer. Tests don't dereference it.
-        payload_size as *mut u8
+        let ptr = mock_alloc(payload_size);
+        LAST_MOCK_CALL.with(|cell| {
+            cell.set(Some(MockCall {
+                type_id,
+                payload_size,
+                ptr,
+            }))
+        });
+        ptr
     }
 
     fn null_hook(_type_id: u32, _payload_size: usize) -> *mut u8 {
@@ -673,10 +731,10 @@ mod tests {
         let _hook_lock = hook_test_guard();
         register_gc_alloc_hook(mock_hook);
         let ptr = try_gc_alloc(7, 24);
-        assert!(ptr.is_some());
-        assert_eq!(ptr.unwrap() as usize, 24);
-        assert_eq!(LAST_TYPE_ID.load(Ordering::Relaxed), 7);
-        assert_eq!(LAST_SIZE.load(Ordering::Relaxed), 24);
+        let call = last_mock_call();
+        assert_eq!(ptr, Some(call.ptr));
+        assert_eq!(call.type_id, 7);
+        assert_eq!(call.payload_size, 24);
         clear_gc_alloc_hook();
     }
 
@@ -713,15 +771,20 @@ mod tests {
         clear_gc_alloc_hook();
     }
 
-    static LAST_ROOT_PTR: AtomicUsize = AtomicUsize::new(0);
-    static REMOVE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    // Per-thread for the same reason the allocation record is: while these
+    // hooks are installed, `try_gc_alloc_collecting_rooted`'s fallback pins and
+    // unpins the caller's slot, and that runs on whichever thread allocates.
+    thread_local! {
+        static LAST_ROOT_PTR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static REMOVE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     unsafe fn mock_add_root(slot: *mut *mut u8) {
-        LAST_ROOT_PTR.store(slot as usize, Ordering::Relaxed);
+        LAST_ROOT_PTR.with(|cell| cell.set(slot as usize));
     }
     fn mock_remove_root(slot: *mut *mut u8) {
         let _ = slot;
-        REMOVE_CALLS.fetch_add(1, Ordering::Relaxed);
+        REMOVE_CALLS.with(|cell| cell.set(cell.get() + 1));
     }
 
     fn mock_write_barrier(_obj: *mut u8) {}
@@ -734,15 +797,15 @@ mod tests {
         assert!(!unsafe { try_gc_add_root(&mut slot as *mut *mut u8) });
         assert!(!try_gc_remove_root(&mut slot as *mut *mut u8));
 
-        LAST_ROOT_PTR.store(0, Ordering::Relaxed);
-        REMOVE_CALLS.store(0, Ordering::Relaxed);
+        LAST_ROOT_PTR.with(|cell| cell.set(0));
+        REMOVE_CALLS.with(|cell| cell.set(0));
         register_gc_root_hooks(mock_add_root, mock_remove_root);
 
         let slot_ptr = &mut slot as *mut *mut u8;
         assert!(unsafe { try_gc_add_root(slot_ptr) });
-        assert_eq!(LAST_ROOT_PTR.load(Ordering::Relaxed), slot_ptr as usize);
+        assert_eq!(LAST_ROOT_PTR.with(|cell| cell.get()), slot_ptr as usize);
         assert!(try_gc_remove_root(slot_ptr));
-        assert_eq!(REMOVE_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(REMOVE_CALLS.with(|cell| cell.get()), 1);
 
         clear_gc_root_hooks();
         assert!(!unsafe { try_gc_add_root(slot_ptr) });
@@ -764,10 +827,10 @@ mod tests {
 
         register_gc_alloc_stable_hook(mock_hook);
         let ptr = try_gc_alloc_stable(3, 32);
-        assert!(ptr.is_some());
-        assert_eq!(ptr.unwrap() as usize, 32);
-        assert_eq!(LAST_TYPE_ID.load(Ordering::Relaxed), 3);
-        assert_eq!(LAST_SIZE.load(Ordering::Relaxed), 32);
+        let call = last_mock_call();
+        assert_eq!(ptr, Some(call.ptr));
+        assert_eq!(call.type_id, 3);
+        assert_eq!(call.payload_size, 32);
 
         clear_gc_alloc_hook();
         clear_gc_alloc_stable_hook();
@@ -782,12 +845,12 @@ mod tests {
 
         register_gc_alloc_hook(mock_hook);
         let result = try_gc_alloc_with_placement(7, 24, &mut needs_write_barrier);
-        assert_eq!(result, Some(24usize as *mut u8));
+        assert_eq!(result, Some(last_mock_call().ptr));
         assert!(needs_write_barrier);
 
         register_gc_alloc_with_placement_hook(nursery_placement_hook);
         let result = try_gc_alloc_with_placement(7, 24, &mut needs_write_barrier);
-        assert_eq!(result, Some(24usize as *mut u8));
+        assert_eq!(result, Some(last_mock_call().ptr));
         assert!(!needs_write_barrier);
 
         clear_gc_alloc_hook();
@@ -806,14 +869,14 @@ mod tests {
         register_gc_alloc_collecting_hook(mock_hook);
         let result =
             unsafe { try_gc_alloc_collecting_rooted(7, 24, &mut root, &mut needs_write_barrier) };
-        assert_eq!(result, Some(24usize as *mut u8));
+        assert_eq!(result, Some(last_mock_call().ptr));
         assert!(needs_write_barrier);
 
         register_gc_alloc_collecting_rooted_hook(nursery_rooted_hook);
         needs_write_barrier = true;
         let result =
             unsafe { try_gc_alloc_collecting_rooted(7, 24, &mut root, &mut needs_write_barrier) };
-        assert_eq!(result, Some(24usize as *mut u8));
+        assert_eq!(result, Some(last_mock_call().ptr));
         assert!(!needs_write_barrier);
 
         clear_gc_alloc_collecting_hook();
