@@ -397,11 +397,22 @@ def _jit_panic_reason(stderr):
 # ── Helpers ──────────────────────────────────────────────────────────
 
 def _jit_stats_snapshot(stderr):
-    """Return the last jit-stats line as normalized key/value text."""
+    """Return the last structural jit-stats line as normalized key/value text.
+
+    The diagnostic lines (mc_diag, heap_buckets, bridge_diag, fbw_diag,
+    exec_hist) share the `[jit-stats]` prefix but name themselves in a bare
+    first token; only the structural summary starts straight into key=value.
+    Reading one of those instead leaves loops_aborted and
+    internal_compile_panics missing, which the regression floor below reads as
+    0 — the gate would then never fire again, silently."""
     stats_line = None
     for line in stderr.splitlines():
-        if line.startswith("[jit-stats]"):
-            stats_line = line
+        if not line.startswith("[jit-stats]"):
+            continue
+        head = line[len("[jit-stats]") :].split()
+        if head and "=" not in head[0]:
+            continue
+        stats_line = line
     if stats_line is None:
         return None
 
