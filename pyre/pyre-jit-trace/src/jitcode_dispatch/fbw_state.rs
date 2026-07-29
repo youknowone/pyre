@@ -1077,6 +1077,17 @@ thread_local! {
     /// its own trace instead of staying a plain residual forever.  Since
     /// residual calls re-enter the JIT the callee does reach its own threshold,
     /// just on the ordinary counter rather than at once.
+    ///
+    /// A raw address is a sound permanent key only because `w_code_new`
+    /// (`pycode.rs`) allocates every `PyCode` with `Box::into_raw` and nothing
+    /// frees it: the address is unique for the process and never moves.
+    /// Upstream can key on the object because a `JitCell` holds its greens and
+    /// `should_remove_jitcell` (`warmstate.py:212`) prunes dead ones; this set
+    /// has neither, so it relies on that immortality.  `eval.rs`'s `PyCode`
+    /// registration names the change that would end it — switching `w_code_new`
+    /// to `try_gc_alloc_stable`.  At that point a reclaimed address can be
+    /// handed to a later code object and this set must gain a removal path or
+    /// a key that outlives the allocation.
     static FBW_HAZARDOUS_INLINE_DENY: std::cell::RefCell<std::collections::HashSet<usize>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
 }

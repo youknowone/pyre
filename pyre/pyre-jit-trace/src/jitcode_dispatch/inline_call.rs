@@ -1420,6 +1420,16 @@ thread_local! {
     /// assembled body, so it is computed once per code object instead of once
     /// per inline attempt — the scan is O(body) and the callsite is reached on
     /// every retrace of every caller.
+    ///
+    /// The raw address is a sound permanent key only because `w_code_new`
+    /// (`pycode.rs`) allocates every `PyCode` with `Box::into_raw` and nothing
+    /// frees it, so the address is unique for the process and never moves.
+    /// `eval.rs`'s `PyCode` registration names the change that would end that —
+    /// switching `w_code_new` to `try_gc_alloc_stable` — after which a
+    /// reclaimed address could return another code object's answer, and here
+    /// a stale `false` would admit an inline whose body does carry
+    /// `abort_permanent`.  Same invariant as `FBW_HAZARDOUS_INLINE_DENY`
+    /// (`fbw_state.rs`).
     static CALLEE_ABORT_PERMANENT_SEEN: std::cell::RefCell<std::collections::BTreeMap<usize, bool>> =
         const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
 }
