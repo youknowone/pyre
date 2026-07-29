@@ -3614,6 +3614,14 @@ fn install_pyre_object_hooks() {
     );
     pyre_object::register_gc_write_barrier_hook(pyre_object_gc_write_barrier_trampoline);
     pyre_object::gc_hook::register_gc_identity_hash_hook(pyre_object_gc_identity_hash_trampoline);
+    // Let a born-old allocation that crosses the next-major threshold request
+    // a collection, the check `external_malloc` (incminimark.py:987-994) makes
+    // in the allocator. `gc_interp::safepoint` — installed just above, through
+    // the collect-oldgen hook — is what consumes the request, so arm it only
+    // where that safepoint will act on one.
+    majit_gc::collector::set_deferred_major_request_enabled(
+        pyre_object::gc_interp::enabled() && pyre_object::gc_interp::collect_enabled(),
+    );
 }
 
 /// Build the GC once and store it in `gc_sync::GC_STORE`.

@@ -9,7 +9,7 @@
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::GcRef;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::address_dict::AddressMap;
 use crate::flags;
@@ -18,6 +18,32 @@ use crate::nursery::{DEFAULT_NURSERY_SIZE, Nursery};
 use crate::oldgen::OldGen;
 use crate::trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout, TypeRegistry};
 use crate::{FinalizerTriggerFn, GcAllocator};
+
+/// Whether a born-old allocation that crosses the next-major threshold may
+/// request a collection through the eval-breaker word.
+///
+/// The request is only useful where something consumes it: the interpreter
+/// dispatch-loop safepoint. Left off, the threshold is answered the way it
+/// always was — by the major progress every minor collection drives. Armed
+/// with no consumer, the request would re-fail every compiled back-edge poll
+/// until a major completed, since `threshold_reached` stays true across the
+/// whole span. The host turns it on when it installs that safepoint.
+static DEFERRED_MAJOR_REQUEST: AtomicBool = AtomicBool::new(false);
+
+/// Let born-old allocations request a major collection at the next
+/// root-complete point. See [`DEFERRED_MAJOR_REQUEST`].
+pub fn set_deferred_major_request_enabled(on: bool) {
+    DEFERRED_MAJOR_REQUEST.store(on, Ordering::Relaxed);
+}
+
+/// Consume a pending request, reporting whether one was armed.
+///
+/// Clear it whether or not the caller goes on to collect: a request left armed
+/// fails every compiled back-edge poll until it is taken, so the loop would
+/// deopt once per iteration rather than once per request.
+pub fn take_deferred_major_request() -> bool {
+    majit_ir::eval_breaker_word::take_gc()
+}
 
 /// Configuration for the MiniMarkGC.
 pub struct GcConfig {
@@ -1171,6 +1197,17 @@ impl MiniMarkGC {
             if info.is_weakref {
                 self.old_objects_with_weakrefs.push(obj_addr);
             }
+        }
+        // external_malloc (incminimark.py:987-994) tests the same threshold
+        // here and drives `minor_collection_with_major_progress` before
+        // handing the block back. Collecting at this point is what pyre cannot
+        // do: the caller is holding the raw pointer on the Rust stack, which
+        // is not a root, and so is whatever else it had live. Ask the question
+        // where upstream asks it and defer only the answer — the request rides
+        // the eval-breaker word to the interpreter dispatch loop, where the
+        // frame walker sees the whole root set.
+        if DEFERRED_MAJOR_REQUEST.load(Ordering::Relaxed) && self.threshold_reached(total_size) {
+            majit_ir::eval_breaker_word::set_gc();
         }
         GcRef(obj_addr)
     }
@@ -4428,6 +4465,34 @@ mod tests {
             large_object_threshold: nursery_size / 2,
             ..GcConfig::default()
         })
+    }
+
+    /// A born-old allocation that crosses the next-major threshold asks for a
+    /// collection the way `external_malloc` (incminimark.py:987-994) does — and
+    /// only where a safepoint is there to answer, since a request no one takes
+    /// re-fails every compiled back-edge poll.
+    #[test]
+    fn born_old_allocation_past_the_threshold_requests_a_major() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::object(64));
+        // Put the threshold within reach of any single allocation.
+        gc.next_major_collection_threshold = gc.get_total_memory_used() as f64;
+        let size = GcHeader::SIZE + 64;
+        majit_ir::eval_breaker_word::take_gc();
+
+        set_deferred_major_request_enabled(false);
+        gc.alloc_in_oldgen(tid, size);
+        assert!(
+            !majit_ir::eval_breaker_word::take_gc(),
+            "no consumer installed, so no request should be armed"
+        );
+
+        set_deferred_major_request_enabled(true);
+        gc.alloc_in_oldgen(tid, size);
+        assert!(majit_ir::eval_breaker_word::take_gc());
+
+        set_deferred_major_request_enabled(false);
+        majit_ir::eval_breaker_word::take_gc();
     }
 
     #[test]

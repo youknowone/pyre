@@ -212,6 +212,16 @@ pub fn enabled() -> bool {
 /// that remembered to report, and would answer for a heap that is not the one
 /// being collected.
 ///
+/// Born-old allocations ask it in the allocator too, as `external_malloc`
+/// (incminimark.py:987-994) does, and hand the answer here through the
+/// eval-breaker word (`majit_gc::collector::take_deferred_major_request`).
+/// That path is what reaches compiled code: a trace runs its loop without
+/// returning to this dispatch loop, so a poll placed here alone is never
+/// executed while one is hot, and old-gen allocations made from inside it
+/// would go unanswered until the loop exited. The armed bit fails the trace's
+/// back-edge poll instead, which deopts to this loop and lands on the taker
+/// above.
+///
 /// The collection is `try_gc_collect_oldgen` — it seeds roots, marks, and
 /// sweeps ONLY the old generation, never touching the nursery (not moved, not
 /// freed). So unlike `do_collect_full` (whose leading moving minor would
@@ -241,11 +251,19 @@ pub fn safepoint() {
     if !enabled() {
         return;
     }
-    if collect_enabled()
-        && at_outermost_activation()
-        && poll_due()
-        && crate::gc_hook::try_gc_major_threshold_reached()
-    {
+    // Take any request the old-gen allocator armed, and take it before the
+    // decisions below: a request left armed fails every compiled back-edge
+    // poll, so a safepoint that declined to collect but kept the bit would
+    // deopt the loop once per iteration.
+    let requested = majit_gc::collector::take_deferred_major_request();
+    if !collect_enabled() || !at_outermost_activation() {
+        return;
+    }
+    // The request already carries the collector's answer — it was armed by
+    // `threshold_reached` in the allocator — so it does not wait for the poll
+    // interval. The poll remains for the allocations that reach the collector
+    // without passing the born-old path.
+    if requested || (poll_due() && crate::gc_hook::try_gc_major_threshold_reached()) {
         crate::gc_hook::try_gc_collect_oldgen();
     }
 }

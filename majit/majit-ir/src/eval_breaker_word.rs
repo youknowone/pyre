@@ -11,6 +11,9 @@
 //!                       is masked out of compiled back-edge polls: it avoids
 //!                       a second per-opcode atomic load in the interpreter,
 //!                       but is not itself a reason to leave machine code.
+//!   bit4 EB_GC    — the old-gen allocator reached the next-major threshold;
+//!                   OR'd in by the collector, consumed by the interpreter
+//!                   dispatch-loop GC safepoint.
 //! A compiled loop loads the whole word at the back-edge and deopts to the
 //! interpreter when it is non-zero. The interpreter/warm-up loop and the STW
 //! park gate remain authoritative; this word is only the JIT's deopt trigger.
@@ -34,8 +37,15 @@ pub const EB_STW: usize = 2;
 pub const EB_FINALIZING: usize = 4;
 /// bit3 — interpreter-path allocation/collection integration is enabled.
 pub const EB_GC_INTERP: usize = 8;
+/// bit4 — the old-gen allocator crossed the next-major threshold and a
+/// collection is owed at the next root-complete point.
+pub const EB_GC: usize = 16;
 /// Bits that require a compiled loop to deopt to the interpreter.
-pub const JIT_BREAKER_MASK: usize = EB_ASYNC | EB_STW | EB_FINALIZING;
+///
+/// `EB_GC` belongs here: the allocator only arms the request, and the
+/// collection itself runs at the dispatch-loop safepoint, so a compiled loop
+/// has to leave machine code for the request to be serviced at all.
+pub const JIT_BREAKER_MASK: usize = EB_ASYNC | EB_STW | EB_FINALIZING | EB_GC;
 
 /// The shared eval-breaker word (see module docs).
 static EVAL_BREAKER_WORD: AtomicUsize = AtomicUsize::new(0);
@@ -95,9 +105,69 @@ pub fn set_gc_interp() {
     EVAL_BREAKER_WORD.fetch_or(EB_GC_INTERP, Ordering::Release);
 }
 
+// --- gc (bit4): armed by the old-gen allocator, consumed by the safepoint ---
+
+/// Request a major collection at the next root-complete point.
+///
+/// `external_malloc` (incminimark.py:987-994) tests `threshold_reached` in the
+/// allocator and drives `minor_collection_with_major_progress` there. pyre
+/// cannot collect at an arbitrary allocation site — a Rust caller's locals are
+/// not roots — so the check stays in the allocator and only the action is
+/// deferred: this bit fails the next back-edge poll, and the interpreter
+/// dispatch loop, where the frame walker sees the whole root set, performs the
+/// collection.
+pub fn set_gc() {
+    EVAL_BREAKER_WORD.fetch_or(EB_GC, Ordering::Relaxed);
+}
+
+/// Consume the pending-collection request, reporting whether one was armed.
+///
+/// The caller must clear unconditionally — before any decision about whether it
+/// can service the request. A bit left armed by a safepoint that declined to
+/// collect fails every subsequent back edge, so a compiled loop would deopt on
+/// each iteration instead of once.
+pub fn take_gc() -> bool {
+    // The taker runs on every eligible bytecode dispatch, the armer only when
+    // the threshold is crossed; read before the read-modify-write so the
+    // common case is a plain load.
+    if EVAL_BREAKER_WORD.load(Ordering::Relaxed) & EB_GC == 0 {
+        return false;
+    }
+    EVAL_BREAKER_WORD.fetch_and(!EB_GC, Ordering::Relaxed) & EB_GC != 0
+}
+
 /// Every flag must fit in the word the poll actually loads. Checked per target,
 /// so a flag too wide for a 32-bit `usize` fails the wasm32 build rather than
 /// silently reading as unarmed there.
 const _: () = assert!(
-    (EB_ASYNC | EB_STW | EB_FINALIZING | EB_GC_INTERP) < (1 << (EVAL_BREAKER_WORD_SIZE * 8 - 1))
+    (EB_ASYNC | EB_STW | EB_FINALIZING | EB_GC_INTERP | EB_GC)
+        < (1 << (EVAL_BREAKER_WORD_SIZE * 8 - 1))
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One request arms the poll once: the taker reports it, clears it, and the
+    /// next taker sees nothing. A taker that failed to clear would keep failing
+    /// the back-edge guard and deopt the loop on every iteration. Taking it
+    /// must also leave the other two bits alone — they address disjoint parts
+    /// of the same word.
+    ///
+    /// The word is a process-global, so this is deliberately the only test in
+    /// the crate that touches it.
+    #[test]
+    fn gc_request_is_taken_exactly_once_and_leaves_the_other_bits() {
+        assert!(!take_gc(), "no request armed at the start of the test");
+        set_async();
+        set_stw();
+        set_gc();
+        assert_ne!(load() & EB_GC, 0);
+        assert!(take_gc());
+        assert_eq!(load() & EB_GC, 0);
+        assert!(!take_gc());
+        assert_eq!(load() & (EB_ASYNC | EB_STW), EB_ASYNC | EB_STW);
+        clear_async();
+        clear_stw();
+    }
+}
