@@ -1232,7 +1232,11 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     // aborts before the hazardous body is committed.  Every other nested
     // residual inlines.  The hazard scan is last so the cheap checks
     // short-circuit it.
-    let nested = !in_selfrec_fold
+    // A carrier-resume sub-walk starts at the failed guard; it does not replay
+    // an enclosing CALL. RPython resumes residual calls at every rebuilt
+    // framestack depth, so this forward-capture hazard excludes the carrier.
+    let nested = !ctx.fbw_mode.carrier_resume
+        && !in_selfrec_fold
         && !in_exception_string_inline
         && !ctx.session.borrow().framestack.is_empty();
     let hazardous_callee = if nested && foriter_deferred_inline.is_none() {

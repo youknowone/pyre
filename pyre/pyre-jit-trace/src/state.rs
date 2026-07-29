@@ -6519,6 +6519,59 @@ fn rd_virtual_at(
     rd_virtuals.and_then(|v| v.get(vidx)).map(|rc| &**rc)
 }
 
+/// Rebuild the semantic Ref slots of a forced inline frame from its own
+/// `locals_cells_stack_w` array.
+///
+/// The returned OpRefs are heap reads rooted at `frame_box`, not constants
+/// made from the current concrete frame.  A compiled bridge therefore reloads
+/// the frame image on every guard hit (resume.py:1042-1057 consume_boxes).
+fn reconstruct_materialized_frame_slots(
+    ctx: &mut majit_metainterp::TraceCtx,
+    frame_box: OpRef,
+    frame_ref: majit_ir::GcRef,
+    valuestackdepth: usize,
+    pending_result_abs_slot: Option<usize>,
+) -> Option<(Vec<OpRef>, Vec<majit_ir::Value>)> {
+    if frame_ref.is_null() || frame_ref == majit_ir::GcRef::NO_CONCRETE {
+        return None;
+    }
+    let concrete_frame =
+        unsafe { &*(frame_ref.as_usize() as *const pyre_interpreter::pyframe::PyFrame) };
+    let arr_ptr = concrete_frame.locals_cells_stack_w;
+    if arr_ptr.is_null() {
+        return None;
+    }
+    let arr = unsafe { &*arr_ptr };
+    if valuestackdepth > arr.len() {
+        return None;
+    }
+
+    let array_box = frame_locals_cells_stack_array(ctx, frame_box);
+    // `frame_locals_cells_stack_array` currently emits GetfieldRawI for
+    // backend compatibility, but the field is a GC array Ref
+    // (virtualizable.py:94). Preserve that boxed-pointer view for the
+    // following GETARRAYITEM_GC_R operations and executor-side loads.
+    ctx.try_set_opref_concrete(
+        array_box,
+        majit_ir::Value::Ref(majit_ir::GcRef(arr_ptr as usize)),
+    );
+
+    let mut registers_r = vec![OpRef::NONE; valuestackdepth];
+    let mut concrete_r = vec![majit_ir::Value::Void; valuestackdepth];
+    for k in 0..valuestackdepth {
+        if Some(k) == pending_result_abs_slot {
+            continue;
+        }
+        let index = ctx.const_int(k as i64);
+        let value = trace_array_getitem_value(ctx, array_box, index);
+        registers_r[k] = value;
+        concrete_r[k] = ctx
+            .box_value(value)
+            .unwrap_or_else(|| majit_ir::Value::Ref(majit_ir::GcRef(arr.as_slice()[k] as usize)));
+    }
+    Some((registers_r, concrete_r))
+}
+
 /// Decode one suspended inline-callee frame's resume section into a
 /// [`ReconstructRecipe`], or `None` to decline the multi-frame inline rebuild.
 ///
@@ -6710,6 +6763,57 @@ fn reconstruct_inline_recipe(
         }
         use majit_ir::resumedata::{RebuiltValue, TAGVIRTUAL, UNINITIALIZED_TAG, untag};
         let frame_pos = reg_indices.ref_.iter().position(|&c| c == pframe_reg)?;
+        // resume.py:1042-1057 rebuild_from_resumedata consumes the saved boxes
+        // for every frame without requiring the frame object itself to remain
+        // virtual.  A Pyre callee frame can be forced before the guard (for
+        // example Random.shuffle's loop frame), in which case the frame red is
+        // a Box failarg rather than TAGVIRTUAL.  Its semantic locals/stack are
+        // still recoverable from that frame's own locals_cells_stack_w array.
+        //
+        // Load them symbolically from the failarg-owned frame instead of
+        // baking the first guard hit's concrete values as constants.  The
+        // reconstructed bridge therefore reads the current frame image on
+        // every execution, exactly as consume_boxes rebuilds a fresh MIFrame
+        // from the current deadframe.
+        if !matches!(values[frame_pos], RebuiltValue::Virtual(_)) {
+            let (frame_box, frame_value) = bridge_decode_box(
+                ctx,
+                values[frame_pos],
+                Type::Ref,
+                rd_virtuals,
+                resume_data,
+                fail_values,
+                fail_types,
+                backend,
+                cache,
+            );
+            let majit_ir::Value::Ref(frame_ref) = frame_value else {
+                return None;
+            };
+            ctx.try_set_opref_concrete(frame_box, frame_value);
+
+            let valuestackdepth = nlocals + stack_only;
+            let (registers_r, concrete_r) = reconstruct_materialized_frame_slots(
+                ctx,
+                frame_box,
+                frame_ref,
+                valuestackdepth,
+                pending_result_abs_slot,
+            )?;
+            crate::jitcode_dispatch::census_record("P2Recipe::MaterializedFrameAdmit");
+            return Some(ReconstructRecipe {
+                code_ptr: raw_code as *const (),
+                jitcode_index: frame.jitcode_index,
+                jitcode_pc: frame.pc,
+                nlocals,
+                valuestackdepth,
+                registers_i: Vec::new(),
+                registers_r,
+                registers_f: Vec::new(),
+                concrete_r,
+                nargs: nlocals,
+            });
+        }
         let RebuiltValue::Virtual(frame_vidx) = values[frame_pos] else {
             return None;
         };
@@ -10287,6 +10391,59 @@ mod tests {
             driver.set_virtualizable_info(info.clone());
             (driver, info)
         });
+    }
+
+    #[test]
+    fn materialized_inline_frame_slots_are_symbolic_heap_reads() {
+        let code = compile_function_body("def f(a, b, c):\n    return a if b is None else c\n");
+        let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
+        let values = [w_int_new(11), pyre_object::w_none(), w_int_new(33)];
+        for (index, value) in values.iter().copied().enumerate() {
+            frame.locals_w_mut()[index] = value;
+        }
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let frame_box = OpRef::input_arg_ref(0);
+        ctx.try_set_opref_concrete(frame_box, Value::Ref(majit_ir::GcRef(frame_ptr)));
+
+        let (registers_r, concrete_r) = reconstruct_materialized_frame_slots(
+            &mut ctx,
+            frame_box,
+            majit_ir::GcRef(frame_ptr),
+            values.len(),
+            Some(1),
+        )
+        .expect("forced frame slots should be reconstructable");
+
+        assert!(!registers_r[0].is_none());
+        assert!(registers_r[1].is_none());
+        assert!(!registers_r[2].is_none());
+        assert!(
+            !matches!(registers_r[0], OpRef::ConstPtr(_))
+                && !matches!(registers_r[2], OpRef::ConstPtr(_)),
+            "bridge slots must reload from the current frame, not bake constants"
+        );
+        assert_eq!(
+            concrete_r[0],
+            Value::Ref(majit_ir::GcRef(values[0] as usize))
+        );
+        assert_eq!(concrete_r[1], Value::Void);
+        assert_eq!(
+            concrete_r[2],
+            Value::Ref(majit_ir::GcRef(values[2] as usize))
+        );
+
+        let tree_loop = ctx.into_tree_loop();
+        assert_eq!(
+            tree_loop
+                .ops
+                .iter()
+                .filter(|op| op.opcode == OpCode::GetarrayitemGcR)
+                .count(),
+            2
+        );
     }
 
     #[test]

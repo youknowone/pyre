@@ -1958,6 +1958,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     if !ctx.is_authoritative_executor
+        || ctx.fbw_mode.inline_subwalk
         || !matches!(
             pyre_helper,
             majit_ir::PyreHelperKind::CallFn | majit_ir::PyreHelperKind::CallKw
@@ -2565,6 +2566,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // declines — `helper(i)` calling `add(i, 1, 2)` residualizes both calls
     // per iteration, though each body on its own is pure arithmetic.
     let mut foriter_deferred_admit = false;
+    let mut foriter_dirty_bound = false;
     if fbw_foriter_inflight_active() {
         let safety = fbw_callee_body_replay_safety(
             body.code,
@@ -2581,7 +2583,17 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 foriter_deferred_admit = !fbw_foriter_deferred_call_denied(callee_code_key);
                 foriter_deferred_admit
             }
-            CalleeReplaySafety::Dirty => false,
+            CalleeReplaySafety::Dirty => {
+                // A stored bound method has an explicit receiver and can use
+                // the multi-frame red-frame path below. Keep loop-bearing and
+                // recursive callees residual: either requires another loop
+                // header rather than one bounded callee walk.
+                foriter_dirty_bound = bound_method.is_some()
+                    && !method_form
+                    && !pyre_interpreter::code_has_for_iter(callee_code)
+                    && !pyre_interpreter::code_is_self_recursive(callee_code);
+                foriter_dirty_bound
+            }
         };
         if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
             eprintln!(
@@ -2736,6 +2748,9 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             ctx,
             callee_frame_reg,
         );
+    if foriter_dirty_bound && !try_multiframe {
+        return Ok(None);
+    }
     if !strict_inlinable && !try_multiframe {
         // A non-self-recursive loop/branch callee that neither the strict nor
         // the multiframe fast path can serve declines to interpretation
@@ -3068,16 +3083,18 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             // `PyTraceback` node on the compiled exception path, not preventing
             // one.  Restore `Ok(None)` here once that node is recorded; it is the
             // largest single win left in this function.
-            if (0..callee_code.instructions.len()).any(|pc| {
-                matches!(
-                    pyre_interpreter::decode_instruction_at(callee_code, pc),
-                    Some((
-                        pyre_interpreter::bytecode::Instruction::PopJumpIfNone { .. }
-                            | pyre_interpreter::bytecode::Instruction::PopJumpIfNotNone { .. },
-                        _
-                    ))
-                )
-            }) {
+            if (bound_method.is_none() || method_form)
+                && (0..callee_code.instructions.len()).any(|pc| {
+                    matches!(
+                        pyre_interpreter::decode_instruction_at(callee_code, pc),
+                        Some((
+                            pyre_interpreter::bytecode::Instruction::PopJumpIfNone { .. }
+                                | pyre_interpreter::bytecode::Instruction::PopJumpIfNotNone { .. },
+                            _
+                        ))
+                    )
+                })
+            {
                 if try_multiframe {
                     return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
