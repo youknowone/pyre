@@ -7531,8 +7531,12 @@ mod tests {
     use std::time::Duration;
 
     use majit_backend::{Backend, JitCellToken};
+    use majit_ir::forwarding::bound_operand_from_opref;
     use majit_ir::operand::Operand;
-    use majit_ir::{Op, OpCode, OpRef, Type, make_array_descr_signed, make_loop_target_descr};
+    use majit_ir::{
+        GcRef, InputArg, Op, OpCode, OpRef, Type, Value, make_array_descr_signed,
+        make_loop_target_descr,
+    };
 
     use crate::runner::DynasmBackend;
 
@@ -7755,5 +7759,166 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the compiled-loop worker must resume cleanly");
         worker.join().unwrap();
+    }
+
+    // ── COND_CALL_GC_WB_ARRAY inline card marking ──────────────────────
+
+    /// Array length large enough that indices land in more than one card
+    /// byte at the default `card_page_indices = 128` (incminimark.py:275):
+    /// eight cards per byte means index 1024 is the first index in card
+    /// byte 1.
+    const CARD_ARRAY_LENGTH: usize = 2048;
+
+    /// incminimark.py:1017-1030 `external_malloc` with card bits: an
+    /// old-gen varsize array whose items are GC pointers gets GCFLAG_HAS_CARDS
+    /// and a run of zeroed card bytes in front of the header.
+    fn alloc_old_card_array(gc: &mut majit_gc::collector::MiniMarkGC, type_id: u32) -> GcRef {
+        let item_size = std::mem::size_of::<GcRef>();
+        let total_size = majit_gc::header::GcHeader::SIZE + 8 + item_size * CARD_ARRAY_LENGTH;
+        let obj = gc.alloc_in_oldgen_with_cards(type_id, total_size, CARD_ARRAY_LENGTH, true);
+        // `dirty_cards` reads the length out of the array's own length field.
+        unsafe { *(obj.0 as *mut usize) = CARD_ARRAY_LENGTH };
+        obj
+    }
+
+    /// Compile and run a one-operation trace holding a single
+    /// `COND_CALL_GC_WB_ARRAY` against `obj`.
+    ///
+    /// `index_in_register` selects which argloc kind the emitter sees:
+    /// a non-constant `InputArg` is forced into a core register, while a
+    /// `ConstInt` reaches `RegisterManager::return_constant`
+    /// (llsupport/regalloc.py:625) with no selected register and comes back
+    /// as a bare `Loc::Immed`.
+    fn run_cond_call_gc_wb_array(trace_id: u64, obj: GcRef, index: i64, index_in_register: bool) {
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+
+        let mut inputargs = vec![InputArg::new_ref(0)];
+        let mut values = vec![Value::Ref(obj)];
+        let index_operand = if index_in_register {
+            inputargs.push(InputArg::new_int(1));
+            values.push(Value::Int(index));
+            bound_operand_from_opref(OpRef::input_arg_int(1))
+        } else {
+            bound_operand_from_opref(OpRef::const_int(index))
+        };
+
+        let barrier = Op::new(
+            OpCode::CondCallGcWbArray,
+            &[
+                bound_operand_from_opref(OpRef::input_arg_ref(0)),
+                index_operand,
+            ],
+        );
+        barrier.pos.set(OpRef::void_op(2));
+
+        let finish = Op::new(OpCode::Finish, &[]);
+        finish.pos.set(OpRef::void_op(3));
+        finish.set_fail_arg_types(vec![]);
+        finish.setfailargs(vec![].into());
+
+        let mut token = JitCellToken::new(trace_id);
+        backend
+            .compile_loop(&inputargs, &[Rc::new(barrier), Rc::new(finish)], &mut token)
+            .expect("compile COND_CALL_GC_WB_ARRAY trace");
+        let frame = backend.execute_token(&token, &values);
+        assert!(
+            backend.get_latest_descr(&frame).is_finish(),
+            "the barrier trace must run to its FINISH"
+        );
+    }
+
+    /// opassembler.py:996-1015 inline card marking, immediate-index arm.
+    ///
+    /// The register arm shifts the index at runtime; the immediate arm folds
+    /// the same two quantities — card byte displacement and card bit — at
+    /// assembly time (x86/assembler.py:2382-2386). Both must dirty exactly
+    /// the card `mark_card` (incminimark.py:1574-1598) would dirty.
+    ///
+    /// Regression cover: while the whole card sequence sat under a match that
+    /// only admitted `Loc::Reg`, an immediate index assembled to zero bytes
+    /// and the array kept a clean card across a barrier that was supposed to
+    /// dirty one.
+    #[test]
+    fn cond_call_gc_wb_array_immed_index_marks_same_card_as_reg_index() {
+        // gc.py:273 JIT_WB_CARDS_SET — zero means the backend emits no card
+        // sequence at all, which would leave this test asserting nothing.
+        let wb = crate::runner::dynasm_write_barrier_descr()
+            .expect("a write barrier descriptor must be resolvable");
+        assert_ne!(
+            wb.jit_wb_cards_set, 0,
+            "card marking must be enabled for this test to exercise the card arms"
+        );
+        let card_page_shift = wb.jit_wb_card_page_shift;
+
+        let mut gc = majit_gc::collector::MiniMarkGC::new();
+        let item_size = std::mem::size_of::<GcRef>();
+        let type_id = gc.register_type(majit_gc::TypeInfo::varsize(
+            8,
+            item_size,
+            0,
+            true,
+            Vec::new(),
+        ));
+        let obj_immed = alloc_old_card_array(&mut gc, type_id);
+        let obj_reg = alloc_old_card_array(&mut gc, type_id);
+        let obj_interp = alloc_old_card_array(&mut gc, type_id);
+
+        // opassembler.py:943-949 branches straight to the inline card block
+        // when GCFLAG_CARDS_SET is already set, so the compiled arms never
+        // reach the `jit_remember_young_pointer_from_array` helper.
+        // `mark_card` sets the same flag on the interpreter's object itself.
+        for obj in [obj_immed, obj_reg] {
+            unsafe {
+                (*majit_gc::header::header_of(obj.0)).set_flag(majit_gc::flags::CARDS_SET);
+            }
+        }
+        for obj in [obj_immed, obj_reg, obj_interp] {
+            assert!(
+                gc.dirty_cards(obj).is_empty(),
+                "a freshly allocated card array starts with every card clean"
+            );
+        }
+
+        // Indices chosen to span two card bytes and several bits within them.
+        const INDICES: [i64; 5] = [0, 5, 200, 1152, 2047];
+        for (n, &index) in INDICES.iter().enumerate() {
+            let trace_id = 9100 + 2 * n as u64;
+            run_cond_call_gc_wb_array(trace_id, obj_immed, index, false);
+            run_cond_call_gc_wb_array(trace_id + 1, obj_reg, index, true);
+            gc.do_write_barrier_card(obj_interp, index as usize, card_page_shift);
+            // Compare after every index, not only at the end: an aggregate
+            // comparison would accept two arms that dirty the same set of
+            // cards while pairing them with different indices.
+            assert_eq!(
+                gc.dirty_cards(obj_immed),
+                gc.dirty_cards(obj_reg),
+                "index {index} must dirty the same cards through both arms"
+            );
+        }
+
+        let mut expected: Vec<usize> = INDICES
+            .iter()
+            .map(|&index| (index as usize) >> card_page_shift)
+            .collect();
+        expected.sort_unstable();
+        expected.dedup();
+
+        let immed_cards = gc.dirty_cards(obj_immed);
+        let reg_cards = gc.dirty_cards(obj_reg);
+        let interp_cards = gc.dirty_cards(obj_interp);
+
+        assert_eq!(
+            immed_cards, reg_cards,
+            "an immediate index must dirty the same cards as the register arm"
+        );
+        assert_eq!(
+            immed_cards, interp_cards,
+            "the compiled card bits must match remember_young_pointer_from_array2"
+        );
+        assert_eq!(
+            immed_cards, expected,
+            "each index must dirty exactly its own card, and nothing else"
+        );
     }
 }

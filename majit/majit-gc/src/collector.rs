@@ -3243,6 +3243,24 @@ impl MiniMarkGC {
     /// the barrier must ignore any address the GC does not own rather than read
     /// its non-header word. This centralizes the `try_gc_owns_object` guard that
     /// `object_array.rs` / `list_write_barrier` already apply per call site.
+    ///
+    /// The guard is equally load-bearing on the JIT path, which is why this
+    /// entry point — not `jit_remember_young_pointer` — is what the backends'
+    /// non-array COND_CALL_GC_WB helper calls. `_reload_frame_if_necessary`
+    /// (aarch64/assembler.py:967-980) re-applies the non-array barrier fast
+    /// path to the *current jitframe* after every collecting helper call.
+    /// Most jitframes are nursery-allocated and carry a GcHeader, but not
+    /// all: the JITFRAME slow path falls back to `libc::calloc` when no
+    /// allocator is active, and CALL_ASSEMBLER builds some callee frames the
+    /// same way — the class `shadow_stack::register_libc_jitframe` exists to
+    /// track. Those have no GcHeader, so the inline flag test reads
+    /// `jit_wb_if_flag_byteofs` (negative, where a header would be) out of
+    /// bytes whose contents are unspecified. When they happen to carry
+    /// TRACK_YOUNG_PTRS' bit the helper is entered in earnest, and only
+    /// `is_managed_heap_object` keeps the unmanaged block out of
+    /// `remembered_set`, where the next minor would decode a type id from it.
+    /// `write_barrier_ignores_unmanaged_jitframe_with_flag_byte_set` pins
+    /// that case.
     pub fn do_write_barrier(&mut self, obj: GcRef) {
         // incminimark's write_barrier receives a typed, non-null struct pointer.
         // pyre's GcRef is nullable (GcRef::NULL is the sentinel) and reaches the
@@ -5115,6 +5133,62 @@ mod tests {
         let mut gc = test_gc(1024);
         gc.do_write_barrier(GcRef(0));
         assert_eq!(gc.remembered_set.len(), 0);
+    }
+
+    #[test]
+    fn write_barrier_ignores_unmanaged_jitframe_with_flag_byte_set() {
+        // `_reload_frame_if_necessary` (aarch64/assembler.py:967-980,
+        // x86/assembler.py:1369) re-applies the NON-array write-barrier fast
+        // path to the current jitframe after a collecting helper call, so a
+        // plain COND_CALL_GC_WB on the frame reaches the generic barrier at
+        // runtime.
+        //
+        // A jitframe that came from the `libc::calloc` fallback rather than
+        // the nursery has no GcHeader, so the byte the inline test reads
+        // (`jit_wb_if_flag_byteofs`, negative — where a header would be) is
+        // not a header and its contents are unspecified. Whether it carries
+        // TRACK_YOUNG_PTRS' bit is a property of the host allocator and the
+        // heap's history, so the bit is set by hand here rather than waited
+        // for. Without the `is_managed_heap_object` guard in
+        // `do_write_barrier`, that block would enter `remembered_set` and the
+        // next minor would decode a type id from those bytes.
+        let mut gc = test_gc(1024);
+
+        // Same shape the JITFRAME slow path calloc's: the fixed `JitFrame`
+        // words plus the trailing slot array, zero-filled. One extra leading
+        // word keeps the negative flag-byte read inside this allocation,
+        // standing in for whatever precedes a real malloc'd frame.
+        let slots = 32usize;
+        let frame_size = std::mem::size_of::<usize>() * (7 + 1 + slots);
+        let layout =
+            std::alloc::Layout::from_size_align(GcHeader::SIZE + frame_size, GcHeader::SIZE)
+                .unwrap();
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!base.is_null());
+        let frame = unsafe { base.add(GcHeader::SIZE) };
+        let obj = frame as usize;
+
+        // The frame is a fresh host allocation, so it cannot overlap either
+        // managed generation — that is precisely what the guard detects.
+        assert!(!gc.nursery.contains(obj));
+        assert!(!gc.oldgen.contains(obj));
+
+        // Set the bit the inline COND_CALL_GC_WB test reads, so the helper is
+        // entered exactly as it is when the bytes before a real malloc'd
+        // frame happen to carry TRACK_YOUNG_PTRS.
+        let descr = crate::WriteBarrierDescr::for_current_gc();
+        let flag_byte = unsafe { frame.offset(descr.jit_wb_if_flag_byteofs as isize) };
+        unsafe { *flag_byte |= descr.jit_wb_if_flag_singlebyte };
+        let flag_byte_before = unsafe { *flag_byte };
+
+        gc.do_write_barrier(GcRef(obj));
+
+        assert_eq!(gc.remembered_set.len(), 0);
+        // `remember_young_pointer` clears TRACK_YOUNG_PTRS, so an unchanged
+        // byte also proves the barrier never wrote through the fake header.
+        assert_eq!(unsafe { *flag_byte }, flag_byte_before);
+
+        unsafe { std::alloc::dealloc(base, layout) };
     }
 
     #[test]
