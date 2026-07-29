@@ -289,10 +289,18 @@ def pyre_env():
     falling back to the interpreter, so a JIT bug surfaces as a crash here
     rather than as correct-but-uncompiled output. MAJIT_STATS=1 prints the
     `[jit-stats]` line that `_jit_panic_reason` inspects.
+
+    PYRE_DESCR_SPELLING_GATE=1 makes the descr-universe counters in that line
+    name their members. The counters are gated at zero
+    (JITSTATS_BADNESS_FIELDS), and a bare `descr_set_ambiguous 0 -> 1` says
+    nothing about which container disagreed — on a platform the developer
+    cannot reproduce, the name is the whole diagnosis. Naming costs one stderr
+    line per member and only ever prints when a member fails to resolve.
     """
     env = dict(os.environ)
     env["MAJIT_STRICT"] = "1"
     env["MAJIT_STATS"] = "1"
+    env["PYRE_DESCR_SPELLING_GATE"] = "1"
     # Pin the vendored, `_sre.MAGIC`-matched stdlib so pyre never picks up a
     # version-mismatched host `python3` off the PATH. An explicit PYRE_STDLIB
     # in the environment wins.
