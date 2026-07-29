@@ -1204,6 +1204,16 @@ impl BlackholeInterpreter {
             return false;
         }
         let target = (code[catch_pos + 1] as usize) | ((code[catch_pos + 2] as usize) << 8);
+        // Take the exception into this frame's walked slot before anything
+        // below can allocate.  `record` builds a traceback node, and on the
+        // inline-callee path this slot is the exception's ONLY root at that
+        // moment: `handler_inline_call_pyre_nested` reads
+        // `callee.exception_last_value` after `callee.run()` returned, which
+        // popped the callee's `push_bh_regs` entry, and a callee-local `raise`
+        // never went through `BH_LAST_EXC_VALUE`.  Exception objects do not
+        // move (`w_exception_new_empty` allocates in the stable old gen), but
+        // old gen is mark-sweep, so an unrooted one is collectable.
+        self.exception_last_value = exc_value;
         // pyopcode.py raise_varargs records the raising instruction before
         // handler lookup; RaiseWithExplicitTraceback skips it for bare
         // reraise.
@@ -1217,7 +1227,6 @@ impl BlackholeInterpreter {
                 self.last_opcode_position as i64,
             );
         }
-        self.exception_last_value = exc_value;
         self.position = target;
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
         // A residual `bh_call` that raised published the exception into BOTH
@@ -4118,6 +4127,78 @@ mod tests {
                 "caught path must run; fallthrough sentinel is {FALLTHROUGH_SENTINEL}"
             );
             assert_eq!(bh.return_type, BhReturnType::Int);
+        }
+
+        thread_local! {
+            /// Address of the interpreter's `exception_last_value` slot, read
+            /// back by [`probe_exception_slot_at_record_time`].
+            static PROBE_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+            /// What that slot held when the recorder ran.
+            static PROBE_SEEN: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+        }
+
+        /// Stand-in for pyre's `record_caught_blackhole_traceback`.  The real
+        /// one allocates a `PyTraceback`, i.e. it is a GC safepoint; this one
+        /// just samples the slot that has to be covering the exception by then.
+        extern "C" fn probe_exception_slot_at_record_time(
+            _exc: i64,
+            _frame: i64,
+            _jitcode_index: i64,
+            _opcode_position: i64,
+        ) {
+            let slot = PROBE_SLOT.with(|c| c.get()) as *const i64;
+            let seen = if slot.is_null() { -1 } else { unsafe { *slot } };
+            PROBE_SEEN.with(|c| c.set(seen));
+        }
+
+        /// `route_to_catch` must publish the exception into the walked
+        /// `exception_last_value` slot BEFORE it invokes the traceback
+        /// recorder.
+        ///
+        /// The recorder allocates, and on this path — a `raise` inside an
+        /// inlined callee, caught by the caller — that slot is the exception's
+        /// only root: `handler_inline_call_pyre_nested` reads
+        /// `callee.exception_last_value` after `callee.run()` popped the
+        /// callee's `push_bh_regs` entry, and a callee-local raise never went
+        /// through `BH_LAST_EXC_VALUE`.  Exceptions do not move but old gen is
+        /// mark-sweep, so an unrooted one there is collectable.
+        #[test]
+        fn test_bh_route_to_catch_roots_the_exception_before_recording() {
+            const EXC_VAL: i64 = 0xCAFE_F00D;
+
+            let mut sub = JitCodeBuilder::default();
+            sub.load_const_r_value(0, EXC_VAL);
+            sub.emit_raise(0);
+            let sub_jitcode = sub.finish();
+
+            let mut b = JitCodeBuilder::default();
+            let sub_idx = b.add_sub_jitcode(sub_jitcode);
+            b.inline_call_ir_v(sub_idx, &[], &[], None);
+            let handler_lbl = b.new_label();
+            b.catch_exception(handler_lbl);
+            b.load_const_i_value(2, 999);
+            b.int_return(2);
+            b.mark_label(handler_lbl);
+            b.load_const_i_value(2, 42);
+            b.int_return(2);
+            let jitcode = b.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
+            bh.record_caught_exception = Some(probe_exception_slot_at_record_time);
+
+            PROBE_SEEN.with(|c| c.set(-1));
+            PROBE_SLOT.with(|c| c.set(std::ptr::addr_of!(bh.exception_last_value) as usize));
+            let _ = bh.run();
+            PROBE_SLOT.with(|c| c.set(0));
+
+            assert_eq!(
+                PROBE_SEEN.with(|c| c.get()),
+                EXC_VAL,
+                "the recorder is a GC safepoint, so `exception_last_value` must \
+                 already carry the exception when it runs"
+            );
         }
 
         /// Tier 2.2: exception raised inside the callee
