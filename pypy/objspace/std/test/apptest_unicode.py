@@ -827,6 +827,21 @@ def test_count_unicode():
     assert u'aaa'.count(u'a', 0, -10) == 0
     assert u'ababa'.count(u'aba') == 1
 
+    # Non-ASCII receivers.  The empty string matches between code points, so
+    # the answer is a code point count; it must not follow the width of the
+    # encoded form.
+    assert u'\xe9\xe8\xe9\xe8\xe9'.count(u'') == 6
+    assert u'\u4e00\u4e8c'.count(u'') == 3
+    assert u'\U0001f600'.count(u'') == 2
+    assert u'a\xe9\u4e00\U0001f600'.count(u'') == 5
+    assert u'\xe9\xe8\xe9\xe8\xe9'.count(u'', 1, 3) == 3
+    for s in [u'aaa', u'\xe9\xe8\xe9', u'\u4e00\u4e8c', u'\U0001f600',
+              u'a\xe9\u4e00\U0001f600']:
+        assert s.count(u'') == len(s) + 1
+        # find/rfind already report the first and last empty match as code
+        # point indices, so the count between them has to agree.
+        assert s.count(u'') == s.rfind(u'') - s.find(u'') + 1
+
 def test_swapcase():
     assert '\xe4\xc4\xdf'.swapcase() == '\xc4\xe4SS'
     # sigma-little becomes sigma-little-final
