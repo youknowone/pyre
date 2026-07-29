@@ -1536,7 +1536,7 @@ fn save_dict(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resul
         buf.push(op::DICT);
     }
     memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(dict_slot));
-    let result = batch_setitems(ctx, buf, items_slot);
+    let result = batch_setitems(ctx, buf, items_slot, dict_slot);
     fast_save_leave(ctx, fast_token, dict_slot);
     result
 }
@@ -1864,14 +1864,21 @@ fn batch_appends(
 /// `interp_pickle.py _batch_setitems` (bin path). Single pair → SETITEM;
 /// otherwise MARK … SETITEMS in batches of `BATCHSIZE`. `slot` pins a flat
 /// `[k0, v0, k1, v1, …]` Python `list`, re-read per access (see
-/// `batch_appends`).
-fn batch_setitems(ctx: &mut PickleCtx, buf: &mut Framer, slot: usize) -> Result<(), PyError> {
+/// `batch_appends`); `owner_slot` is the dict or reduce owner named by
+/// CPython 3.14's `batch_dict` exception note.
+fn batch_setitems(
+    ctx: &mut PickleCtx,
+    buf: &mut Framer,
+    slot: usize,
+    owner_slot: usize,
+) -> Result<(), PyError> {
     let npairs = pinned_len(slot) / 2;
     if !ctx.bin {
         // proto 0 — no SETITEMS, one SETITEM per pair.
         for p in 0..npairs {
             save(ctx, buf, pinned_get(slot, 2 * p))?;
-            save(ctx, buf, pinned_get(slot, 2 * p + 1))?;
+            save(ctx, buf, pinned_get(slot, 2 * p + 1))
+                .map_err(|error| add_dict_item_note(error, owner_slot, slot, 2 * p))?;
             buf.push(op::SETITEM);
         }
         return Ok(());
@@ -1881,7 +1888,8 @@ fn batch_setitems(ctx: &mut PickleCtx, buf: &mut Framer, slot: usize) -> Result<
         if p + 1 == npairs {
             // Exactly one pair left.
             save(ctx, buf, pinned_get(slot, 2 * p))?;
-            save(ctx, buf, pinned_get(slot, 2 * p + 1))?;
+            save(ctx, buf, pinned_get(slot, 2 * p + 1))
+                .map_err(|error| add_dict_item_note(error, owner_slot, slot, 2 * p))?;
             buf.push(op::SETITEM);
             return Ok(());
         }
@@ -1889,13 +1897,29 @@ fn batch_setitems(ctx: &mut PickleCtx, buf: &mut Framer, slot: usize) -> Result<
         let mut cnt = 0;
         while p < npairs && cnt < BATCHSIZE {
             save(ctx, buf, pinned_get(slot, 2 * p))?;
-            save(ctx, buf, pinned_get(slot, 2 * p + 1))?;
+            save(ctx, buf, pinned_get(slot, 2 * p + 1))
+                .map_err(|error| add_dict_item_note(error, owner_slot, slot, 2 * p))?;
             p += 1;
             cnt += 1;
         }
         buf.push(op::SETITEMS);
     }
     Ok(())
+}
+
+fn add_dict_item_note(
+    error: PyError,
+    owner_slot: usize,
+    items_slot: usize,
+    key_index: usize,
+) -> PyError {
+    let key_repr = unsafe { crate::py_repr(pinned_get(items_slot, key_index)) }
+        .unwrap_or_else(|_| "<key>".to_string());
+    add_serializing_note(
+        error,
+        pyre_object::gc_roots::shadow_stack_get(owner_slot),
+        &format!("item {key_repr}"),
+    )
 }
 
 /// `interp_pickle.py W_Pickler.write_get` — emit a GET back-reference.
@@ -2440,7 +2464,7 @@ fn save_reduce(
     }
     if has_dictitems {
         let pairs_slot = drain_iter_pairs_pinned(rv_get(4))?;
-        batch_setitems(ctx, buf, pairs_slot)?;
+        batch_setitems(ctx, buf, pairs_slot, w_obj_slot.unwrap())?;
     }
     if has_state {
         if has_state_setter {
