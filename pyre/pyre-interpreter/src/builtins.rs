@@ -8830,7 +8830,7 @@ pub fn compile_err_to_syntax_error(
     source: &str,
 ) -> crate::PyError {
     let msg = e.to_string();
-    let subclass = syntax_error_subclass(&e);
+    let subclass = syntax_error_subclass(&e, source);
     let (lineno, offset) = e.python_location();
     if lineno == 0 {
         return crate::PyError::syntax_error(msg);
@@ -8854,17 +8854,46 @@ pub fn compile_err_to_syntax_error(
     err
 }
 
+/// `tokenizer.c tok_get_normal_mode` measures indentation twice, with tabs
+/// expanded to 8 and to 1 columns, and raises `TabError` when the two
+/// measures disagree.  The parser reports one column, so the tab/space clash
+/// is recovered from the source: an indent that mixes both characters, or one
+/// block indented with tabs while another uses spaces.
+fn indentation_mixes_tabs_and_spaces(source: &str) -> bool {
+    let mut has_space_indent = false;
+    let mut has_tab_indent = false;
+    for line in source.lines() {
+        let indent = line
+            .as_bytes()
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .collect::<Vec<_>>();
+        let spaces = indent.contains(&&b' ');
+        let tabs = indent.contains(&&b'\t');
+        if spaces && tabs {
+            return true;
+        }
+        has_space_indent |= spaces;
+        has_tab_indent |= tabs;
+    }
+    has_space_indent && has_tab_indent
+}
+
 /// The `SyntaxError` subclass a compile failure belongs to.  3.14 raises
-/// `IndentationError` for every indentation-shaped tokenizer failure and
-/// plain `SyntaxError` for the rest; `TabError` needs the tokenizer's
-/// tabsize-8 vs tabsize-1 column pair, which the parser does not surface,
-/// so a tab/space clash still lands on `IndentationError`.
-fn syntax_error_subclass(e: &crate::compile::CompileError) -> Option<&'static str> {
+/// `IndentationError` for every indentation-shaped tokenizer failure,
+/// `TabError` when that failure comes from mixing tabs and spaces, and plain
+/// `SyntaxError` for the rest.
+fn syntax_error_subclass(e: &crate::compile::CompileError, source: &str) -> Option<&'static str> {
     use rustpython_compiler::parser::{LexicalErrorType, ParseErrorType};
     let crate::compile::CompileError::Parse(parse_err) = e else {
         return None;
     };
     match &parse_err.error {
+        ParseErrorType::Lexical(LexicalErrorType::IndentationError)
+            if indentation_mixes_tabs_and_spaces(source) =>
+        {
+            Some("TabError")
+        }
         ParseErrorType::UnexpectedIndentation
         | ParseErrorType::Lexical(LexicalErrorType::IndentationError) => Some("IndentationError"),
         // `pegen`'s "expected an indented block after <clause> on line N",
