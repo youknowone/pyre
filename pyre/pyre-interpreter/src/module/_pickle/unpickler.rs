@@ -1051,20 +1051,14 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         x if x == op::NEWOBJ => {
             let w_args = pop(slot)?;
             let w_cls = pop(slot)?;
-            let w_obj = new_instance(w_cls, &tuple_items(w_args))?;
+            let w_obj = load_newobj(w_cls, w_args, None)?;
             push(slot, w_obj);
         }
         x if x == op::NEWOBJ_EX => {
             let w_kwargs = pop(slot)?;
             let w_args = pop(slot)?;
             let w_cls = pop(slot)?;
-            let kw_items = unsafe { pyre_object::dictmultiobject::w_dict_items(w_kwargs) };
-            let args = tuple_items(w_args);
-            let w_obj = if kw_items.is_empty() {
-                new_instance(w_cls, &args)?
-            } else {
-                new_instance_kw(w_cls, &args, &kw_items)?
-            };
+            let w_obj = load_newobj(w_cls, w_args, Some(w_kwargs))?;
             push(slot, w_obj);
         }
         x if x == op::BUILD => {
@@ -1493,6 +1487,50 @@ fn instantiate(w_cls: PyObjectRef, w_args: PyObjectRef) -> Result<PyObjectRef, P
     } else {
         new_instance(w_cls, &[])
     }
+}
+
+/// CPython 3.14 `load_newobj` — validate the three wire operands before
+/// interpreting their concrete layouts, then call `cls.__new__`.
+fn load_newobj(
+    w_cls: PyObjectRef,
+    w_args: PyObjectRef,
+    w_kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, PyError> {
+    let opname = if w_kwargs.is_some() {
+        "NEWOBJ_EX"
+    } else {
+        "NEWOBJ"
+    };
+    if !unsafe { pyre_object::typeobject::is_type(w_cls) } {
+        let message = format!(
+            "{opname} class argument must be a type, not {}",
+            crate::type_methods::arg_type_name(w_cls),
+        );
+        return Err(unpickling_error(&message));
+    }
+    if !unsafe { pyre_object::is_tuple(w_args) } {
+        let message = format!(
+            "{opname} args argument must be a tuple, not {}",
+            crate::type_methods::arg_type_name(w_args),
+        );
+        return Err(unpickling_error(&message));
+    }
+    if let Some(w_kwargs) = w_kwargs {
+        if !unsafe { pyre_object::is_dict(w_kwargs) } {
+            let message = format!(
+                "{opname} kwargs argument must be a dict, not {}",
+                crate::type_methods::arg_type_name(w_kwargs),
+            );
+            return Err(unpickling_error(&message));
+        }
+        let args = tuple_items(w_args);
+        let kw_items = unsafe { pyre_object::dictmultiobject::w_dict_items(w_kwargs) };
+        if !kw_items.is_empty() {
+            return new_instance_kw(w_cls, &args, &kw_items);
+        }
+        return new_instance(w_cls, &args);
+    }
+    new_instance(w_cls, &tuple_items(w_args))
 }
 
 /// `cls.__new__(cls, *args)`.
