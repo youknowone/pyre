@@ -162,6 +162,25 @@ pub trait Optimization {
     ) {
     }
 
+    /// shortpreamble.py:62-85 `HeapOp.produce_op` passes the owning
+    /// `CachedField` / `ArrayCachedItem` into `PtrInfo.setfield/setitem`, which
+    /// immediately calls `register_info`.  This hook preserves that ownership
+    /// while the Rust import driver dispatches across optimizer passes.
+    fn register_preamble_cached_field(
+        &mut self,
+        _struct_box: &majit_ir::operand::Operand,
+        _descr: &majit_ir::DescrRef,
+    ) {
+    }
+
+    fn register_preamble_cached_arrayitem(
+        &mut self,
+        _array_box: &majit_ir::operand::Operand,
+        _descr: &majit_ir::DescrRef,
+        _index: i64,
+    ) {
+    }
+
     /// rewrite.py:828-834 serialize_optrewrite
     fn serialize_optrewrite(&self) -> Vec<(i64, OpRef)> {
         Vec::new()
@@ -645,6 +664,27 @@ pub(crate) enum ImportedVirtualKind {
 }
 
 impl Optimizer {
+    pub(crate) fn register_preamble_cached_field(
+        &mut self,
+        struct_box: &majit_ir::operand::Operand,
+        descr: &majit_ir::DescrRef,
+    ) {
+        for pass in &mut self.passes {
+            pass.register_preamble_cached_field(struct_box, descr);
+        }
+    }
+
+    pub(crate) fn register_preamble_cached_arrayitem(
+        &mut self,
+        array_box: &majit_ir::operand::Operand,
+        descr: &majit_ir::DescrRef,
+        index: i64,
+    ) {
+        for pass in &mut self.passes {
+            pass.register_preamble_cached_arrayitem(array_box, descr, index);
+        }
+    }
+
     fn is_constant_placeholder_op(op: &Op, ctx: &OptContext) -> bool {
         if !matches!(
             op.opcode,

@@ -1411,6 +1411,7 @@ impl ProducedShortOp {
     pub fn produce_op(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
+        optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         exported_infos: &indexmap::IndexMap<
             majit_ir::operand::Operand,
             crate::optimizeopt::info::OpInfo,
@@ -1436,6 +1437,7 @@ impl ProducedShortOp {
                 OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF => self
                     .produce_heap_field(
                         ctx,
+                        optimizer,
                         exported_infos,
                         short_inputargs,
                         short_args,
@@ -1447,6 +1449,7 @@ impl ProducedShortOp {
                 OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcF => self
                     .produce_heap_array_item(
                         ctx,
+                        optimizer,
                         exported_infos,
                         short_inputargs,
                         short_args,
@@ -1635,6 +1638,7 @@ impl ProducedShortOp {
     fn produce_heap_field(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
+        optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         exported_infos: &indexmap::IndexMap<
             majit_ir::operand::Operand,
             crate::optimizeopt::info::OpInfo,
@@ -1666,14 +1670,9 @@ impl ProducedShortOp {
             crate::optimizeopt::ImportedShortPureArg::OpRef(r) => r,
             crate::optimizeopt::ImportedShortPureArg::Const(_, r) => r,
         };
-        // Cat-2.2 alignment: forward `source -> result_opref` so body refs
-        // after `force_op_from_preamble_op` resolve to the body-visible
-        // OpRef without relying on the use-before-def assembly adaptation.
-        // PyPy `HeapOp.produce_op` stores `PreambleOp(op=self.res,
-        // preamble_op, invented_name)` in field cache; self.res is the
-        // canonical body Box (Box identity makes it body-visible). pyre's
-        // flat-OpRef analog uses `result_opref = result_map[source]` as the
-        // body-visible slot.
+        // shortpreamble.py:62-75 keeps two distinct Boxes: `self.res` is
+        // body-visible, while `preamble_op` is the freshly replayed GETFIELD
+        // result.  `result_opref` belongs only to that replay operation.
         let result_opref = *result_map.get(&source)?;
         let _ = result_type;
         let descr_idx = descr.index();
@@ -1689,14 +1688,10 @@ impl ProducedShortOp {
             &[ctx.materialize_operand_at(obj_resolved)],
         );
         getfield_op.setdescr(descr.clone());
-        // Cat-2.2 dual-slot rule (mod.rs:1817 replay_pos): replay.pos =
-        // result_opref because `make_equal_to(source, result_opref)` installed
-        // below clobbers source's slot. Seed info at result_opref's slot
-        // (set_preamble_forwarded_info via replay_pos) so
+        // The replay operation owns `result_opref`; the carried source Box
+        // remains distinct. Seed info at the replay slot so
         // `take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos)`
-        // reads it back. PyPy `preamble_op.set_forwarded(info)` lives on a
-        // distinct Op object, so this slot juggling is the pyre adaptation
-        // of that Box-identity invariant.
+        // reads it back, matching `preamble_op.set_forwarded(info)`.
         getfield_op.pos.set(result_opref);
         // shortpreamble.py:75 `PreambleOp(self.res, preamble_op, ...)` —
         // the stored replay is the builder's object (one ResOperation per
@@ -1738,9 +1733,11 @@ impl ProducedShortOp {
                 info.set_preamble_field(descr_idx, pop_for_field);
             }
         });
-        // Cat-2.2 alignment: forward `source -> result_opref` after the
-        // PtrInfo / const-info side tables have been seeded (so the seeds
-        // see the unforwarded source key consistent with `pop.op = source`).
+        // The replay operation owns `result_opref`, but body references
+        // reached through `force_op_from_preamble_op` still name `source`.
+        // Forward `source -> result_opref` once the PtrInfo / const-info side
+        // tables have been seeded, so those reads resolve to the replayed
+        // value instead of re-deriving it on every import.
         let op_source = ctx
             .get_box_replacement_operand_opt(source)
             .unwrap_or_else(|| ctx.materialize_operand_at(source));
@@ -1748,6 +1745,8 @@ impl ProducedShortOp {
             .get_box_replacement_operand_opt(result_opref)
             .unwrap_or_else(|| ctx.materialize_operand_at(result_opref));
         ctx.make_equal_to(&op_source, &op_result);
+        let imported_base = ctx.get_box_replacement_operand(obj_resolved);
+        optimizer.register_preamble_cached_field(&imported_base, &descr);
         // see produce_pure: extra_same_as collected lazily by
         // imported_short_preamble_builder; eager push would be a dual-write.
         Some(source)
@@ -1757,6 +1756,7 @@ impl ProducedShortOp {
     fn produce_heap_array_item(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
+        optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         exported_infos: &indexmap::IndexMap<
             majit_ir::operand::Operand,
             crate::optimizeopt::info::OpInfo,
@@ -1804,10 +1804,8 @@ impl ProducedShortOp {
             crate::optimizeopt::ImportedShortPureArg::Const(majit_ir::Value::Int(v), _) => v,
             _ => return None,
         };
-        // Cat-2.2 alignment: symmetric to produce_heap_field. Forward
-        // `source -> result_opref` so body refs after
-        // `force_op_from_preamble_op` resolve to the body-visible OpRef
-        // without relying on the use-before-def assembly adaptation.
+        // shortpreamble.py:80-85 preserves the same source/replay Box
+        // distinction for GETARRAYITEM.
         let result_opref = *result_map.get(&source)?;
         let _ = result_type;
         let obj_resolved = ctx.get_replacement_opref(obj);
@@ -1827,9 +1825,8 @@ impl ProducedShortOp {
             ],
         );
         getarrayitem_op.setdescr(descr.clone());
-        // Cat-2.2 dual-slot rule (mod.rs:1817 replay_pos): replay.pos =
-        // result_opref. See produce_heap_field for the Box-identity-vs-flat-OpRef
-        // adaptation rationale.
+        // The replay GETARRAYITEM owns `result_opref`; `source` stays the
+        // body-visible Box.
         getarrayitem_op.pos.set(result_opref);
         // shortpreamble.py:84 `PreambleOp(self.res, preamble_op, ...)` —
         // stored replay is the builder's object; see produce_pure.
@@ -1885,8 +1882,11 @@ impl ProducedShortOp {
                 }
             });
         }
-        // Cat-2.2 alignment: forward `source -> result_opref` after the
-        // const-info / ArrayPtrInfo side tables have been seeded.
+        // The replay operation owns `result_opref`, but body references
+        // reached through `force_op_from_preamble_op` still name `source`.
+        // Forward `source -> result_opref` once the PtrInfo / const-info side
+        // tables have been seeded, so those reads resolve to the replayed
+        // value instead of re-deriving it on every import.
         let op_source = ctx
             .get_box_replacement_operand_opt(source)
             .unwrap_or_else(|| ctx.materialize_operand_at(source));
@@ -1894,6 +1894,8 @@ impl ProducedShortOp {
             .get_box_replacement_operand_opt(result_opref)
             .unwrap_or_else(|| ctx.materialize_operand_at(result_opref));
         ctx.make_equal_to(&op_source, &op_result);
+        let imported_base = ctx.get_box_replacement_operand(obj_resolved);
+        optimizer.register_preamble_cached_arrayitem(&imported_base, &descr, index);
         // see produce_pure: extra_same_as collected lazily by
         // imported_short_preamble_builder; eager push would be a dual-write.
         Some(source)
