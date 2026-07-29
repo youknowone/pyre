@@ -1404,9 +1404,7 @@ fn escape_decode(data: &[u8]) -> Result<Vec<u8>, PyError> {
         }
         i += 1;
         if i >= data.len() {
-            // Trailing backslash — kept verbatim.
-            out.push(b'\\');
-            break;
+            return Err(PyError::value_error("Trailing \\ in string"));
         }
         let e = data[i];
         i += 1;
