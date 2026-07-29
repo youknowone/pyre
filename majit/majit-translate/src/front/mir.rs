@@ -10170,8 +10170,8 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// `true` when `ty` is a niche-optimised `Option<NonNull<T>>`,
-    /// `Option<&T>`, or `Option<&mut T>`. Rust encodes each in ONE pointer
+    /// `true` when `ty` is a niche-optimised `Option<NonNull<T>>` or
+    /// `Option<&mut T>`. Rust encodes each in ONE pointer
     /// word (`None` = null, `Some(p)` = the non-null pointer), so
     /// `Discriminant` on it is a pointer-null test (`base != null`) and the
     /// `Some` payload read is the identity on that pointer — no aggregate
@@ -10182,9 +10182,10 @@ impl<'a> Lowering<'a> {
     /// payload (`Option<*mut PyObject>`) has NO null niche — Rust lays it
     /// out as a two-word tagged aggregate (discriminant word + pointer
     /// word), so folding it to a one-word pointer would read the tag word
-    /// as the payload. References are included explicitly: Rust guarantees
-    /// their non-null representation, and generated
-    /// `#[pyre_class]::from_obj` returns `Option<&mut Self>`.
+    /// as the payload. Mutable references are included explicitly: Rust
+    /// guarantees their non-null representation, and generated
+    /// `#[pyre_class]::from_obj` returns `Option<&mut Self>`. Shared
+    /// references are not — see [`type_node_is_mut_ref`].
     fn tyref_is_niche_option_ptr(&self, ty: &TyRef) -> bool {
         if !crate::front::result_exc::tyref_is_option(ty, self.llbc) {
             return false;
@@ -10202,7 +10203,7 @@ impl<'a> Lowering<'a> {
         else {
             return false;
         };
-        if type_node_is_ref(payload, self.llbc) {
+        if type_node_is_mut_ref(payload, self.llbc) {
             return true;
         }
         let Some(payload) = strip_ty_wrappers(payload, self.llbc) else {
@@ -14010,12 +14011,20 @@ fn cast_pointer_marker_op(root: String, arg: Variable) -> OpKind {
     }
 }
 
-/// Whether a Charon type node's top-level constructor is `Ref`, after
-/// following only serialization indirections. Unlike [`strip_ty_wrappers`],
-/// this deliberately does not peel the reference itself: callers use the
-/// result to distinguish Rust's guaranteed non-null `&T` / `&mut T`
-/// representation from nullable raw pointers.
-fn type_node_is_ref<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> bool {
+/// Whether a Charon type node's top-level constructor is a MUTABLE reference,
+/// after following only serialization indirections. Unlike
+/// [`strip_ty_wrappers`], this deliberately does not peel the reference
+/// itself: callers use the result to distinguish Rust's guaranteed non-null
+/// `&mut T` representation from nullable raw pointers.
+///
+/// Shared references carry the same null niche, but are deliberately excluded.
+/// `Option<&T>` is the `Iterator::next` result shape, and `front::iter_next`
+/// rewrites its `__discriminant` match diamond into the `[__iter_next]` op —
+/// folding that discriminant to a pointer null test leaves the rewrite with no
+/// diamond to match, so the residual `Iterator::next()` call survives as the
+/// unregistered callee the rewrite exists to remove. Teach `front::iter_next`
+/// the null-test shape before widening this to shared references.
+fn type_node_is_mut_ref<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> bool {
     for _ in 0..24 {
         let Some(obj) = node.as_object() else {
             return false;
@@ -14035,7 +14044,13 @@ fn type_node_is_ref<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> bool
             node = &arr[1];
             continue;
         }
-        return obj.contains_key("Ref");
+        // `{"Ref": [region, ty, kind]}` — `kind` is `"Shared" | "Mut" | …`.
+        return obj
+            .get("Ref")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|arr| arr.get(2))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.to_ascii_lowercase().contains("mut"));
     }
     false
 }
