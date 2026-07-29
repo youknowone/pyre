@@ -2969,13 +2969,24 @@ impl GcRewriter for GcRewriterImpl {
             .iter()
             .filter_map(|op| {
                 let pos = op.pos.get();
-                (!pos.is_none() && !pos.is_constant()).then_some(pos.raw())
+                (!pos.is_constant()
+                    && matches!(pos.ty(), Some(Type::Int | Type::Float | Type::Ref)))
+                .then(|| pos.raw())
             })
             .max();
         let mut max_raw_pos = max_result_pos;
         if let Some(result_high_water) = max_result_pos {
             let mut reserve_later_box = |pos: OpRef| {
-                if !pos.is_none() && !pos.is_constant() && pos.raw() > result_high_water {
+                // Only the typed body variants `emit` draws from `next_pos`
+                // count. `ty()` is None for `None`/`TempVar` and `Void` for the
+                // `VoidOp(u32::MAX)` sentinel — reserving that sentinel would
+                // pin `next_pos` at `u32::MAX` and overflow the first `+= 1`,
+                // which is why the result scan above skips Void as well. The
+                // constant test comes first: `raw()` panics on an inline Const.
+                if !pos.is_constant()
+                    && matches!(pos.ty(), Some(Type::Int | Type::Float | Type::Ref))
+                    && pos.raw() > result_high_water
+                {
                     max_raw_pos =
                         Some(max_raw_pos.map_or(pos.raw(), |old: u32| old.max(pos.raw())));
                 }
