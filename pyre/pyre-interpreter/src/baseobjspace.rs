@@ -11522,6 +11522,15 @@ fn _unpackiterable_unknown_length(
         // baseobjspace.py:1012
         // `unpackiterable_driver.jit_merge_point(greenkey=greenkey)`.
         unpackiterable_driver.jit_merge_point(greenkey, w_iterator, items);
+        // `warmspot.py:998-1005` re-raises `ExitFrameWithExceptionRef` out of
+        // `ll_portal_runner`, so upstream's merge point is an raising call.
+        // The hook returns unit, so a drain that ran the raising `next()` for
+        // real parks the error instead; surface it here, at the same point the
+        // portal's raise would have landed. Deferring to the `next()` below
+        // loses it whenever the iterator is not exhaustion-stable: it reports
+        // StopIteration on the retry and this drain returns a truncated list
+        // with the error still parked for an unrelated later call.
+        crate::stack_check::drain_jit_pending_exception()?;
         match next(w_iterator) {
             Ok(w_item) => unsafe { pyre_object::listobject::drain_list_append(items, w_item) },
             // `except OperationError as e: if not e.match(space,
