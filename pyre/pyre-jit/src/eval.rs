@@ -6627,6 +6627,13 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // ≥ 3 (a callback re-entry from FOR_ITER→__getitem__, exception
     // handler, etc., where the outer opcode handler holds a PyObjectRef
     // on the Rust stack that walk_pyframe_roots cannot reach).
+    // `gc_interp::enabled` is process-stable after its first env read.  Keep
+    // the untranslated native interpreter's equivalent of RPython's
+    // translation-time configuration constant on the activation, rather than
+    // crossing the `dont_look_inside` gate and reloading its atomic for every
+    // bytecode.  The wasm/default-on arm still executes the identical
+    // safepoint below.
+    let gc_interp_enabled = pyre_object::gc_interp::enabled();
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     // `semantic_loop_headers` is consumed only on the `CloseLoop` arm below (a
@@ -6648,7 +6655,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // pyframe root walker; no bytecode handler holds a Rust-stack temporary
         // here. A no-op unless the flag is on and enough interpreter objects
         // have accumulated to warrant a collection.
-        pyre_object::gc_interp::safepoint();
+        if gc_interp_enabled {
+            pyre_object::gc_interp::safepoint();
+        }
 
         // Stop-the-world safepoint: a compiled loop's back-edge poll deopts
         // here when a collector has requested STW; park until it completes.
