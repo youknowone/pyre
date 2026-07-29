@@ -7428,6 +7428,59 @@ pub fn read_frame_liveness_reg_indices(
 }
 
 /// RAII guard that pops every resume-construction ref-slice root pushed
+/// `warmstate.py:416-422 handle_fail(deadframe, ...)` reads a failing guard's
+/// exit values out of the JITFRAME, and the JITFRAME stays a GC root — the
+/// collector forwards its `jf_gcmap` slots in place — for the whole deopt.
+/// That matters because both halves of the deopt allocate: bridge tracing
+/// (`compile.py:701-717`) and blackhole reconstruction (`resume.py:1312`), and
+/// a minor collection in either moves exactly the objects those exit values
+/// name. `decode_ref`'s `TAGBOX` arm then reads the moved-from address.
+///
+/// pyre has no host-visible JITFRAME: the backend copies the exit values into
+/// a host `Vec<i64>` when `execute_token` returns and hands that buffer down
+/// through `handle_fail`. This scope gives the copy the rooting the JITFRAME
+/// provided — registering the `Ref`-typed slots only, matching the gcmap's
+/// precision rather than scanning the whole array (an `Int` slot whose value
+/// happened to equal a nursery object start would otherwise be "forwarded"
+/// into a different integer).
+pub struct DeadFrameRefRoots {
+    base_depth: usize,
+}
+
+impl DeadFrameRefRoots {
+    /// Root every `Ref`-typed slot of `values` until the returned scope drops.
+    /// `is_ref` selects the slots, and each is pushed as its own one-element
+    /// slice so the non-`Ref` slots in between stay untouched.
+    ///
+    /// # Safety
+    /// `values` must stay alive and at a fixed address for the scope's whole
+    /// lifetime; the collector writes forwarded addresses back through the
+    /// registered pointers.
+    pub unsafe fn enter(values: &[i64], is_ref: impl Fn(usize) -> bool) -> Self {
+        let base_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+        let base = values.as_ptr() as *mut i64;
+        for index in 0..values.len() {
+            if is_ref(index) {
+                // SAFETY: `index < values.len()`, and the caller pins the
+                // buffer for the scope. The collector is the only writer.
+                unsafe {
+                    majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_raw_parts_mut(
+                        base.add(index),
+                        1,
+                    ));
+                }
+            }
+        }
+        DeadFrameRefRoots { base_depth }
+    }
+}
+
+impl Drop for DeadFrameRefRoots {
+    fn drop(&mut self) {
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(self.base_depth);
+    }
+}
+
 /// during `blackhole_from_resumedata` back to the depth captured at entry.
 /// Drop runs on ordinary return, `?` propagation, and panic unwind, so the
 /// `virtuals_cache` / `registers_r` slices never outlive the construction

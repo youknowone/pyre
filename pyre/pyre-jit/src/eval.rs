@@ -7777,6 +7777,16 @@ fn handle_fail(
     // already gone, and bridge setup decodes resume data (allocating) before
     // `setup_bridge_sym` copies it onto the sym. Park it for the walker first.
     let _guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
+    // The exit values are a host copy of the JITFRAME slots; the JITFRAME's
+    // own gcmap rooting ended when `execute_token` returned. Bridge tracing
+    // below allocates, so root the Ref slots for this whole call
+    // (`DeadFrameRefRoots`).
+    let _deadframe_roots = unsafe {
+        majit_metainterp::resume::DeadFrameRefRoots::enter(raw_values, |index| {
+            exit_layout.exit_types.get(index) == Some(&majit_ir::Type::Ref)
+                || exit_layout.gc_ref_slots.contains(&index)
+        })
+    };
 
     // A failure reported through a retired/inlined source descr can belong to
     // an invalidated JitCellToken even while the outer entry token is still
@@ -7996,6 +8006,14 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     // decode must not consume one. jd0 guards pass `false`.
     novable: bool,
 ) -> crate::call_jit::BlackholeResult {
+    // Same deadframe rooting as `handle_fail`: `decode_ref`'s TAGBOX arm reads
+    // these slots after the resume construction has already allocated.
+    let _deadframe_roots = unsafe {
+        majit_metainterp::resume::DeadFrameRefRoots::enter(raw_values, |index| {
+            exit_layout.exit_types.get(index) == Some(&majit_ir::Type::Ref)
+                || exit_layout.gc_ref_slots.contains(&index)
+        })
+    };
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[dynasm-debug] resume_in_blackhole: raw_values.len={} exit_types.len={} rd_numb={:?}",
