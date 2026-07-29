@@ -1846,7 +1846,8 @@ fn batch_appends(
     let n = pinned_len(slot);
     if !ctx.bin {
         // proto 0 — no APPENDS, one APPEND per item.
-        for i in 0..n {
+        let mut i = 0;
+        while i < pinned_len(slot) {
             save(ctx, buf, pinned_get(slot, i)).map_err(|error| {
                 add_serializing_note(
                     error,
@@ -1855,6 +1856,7 @@ fn batch_appends(
                 )
             })?;
             buf.push(op::APPEND);
+            i += 1;
         }
         return Ok(());
     }
@@ -1874,7 +1876,7 @@ fn batch_appends(
         }
         buf.push(op::MARK);
         let mut cnt = 0;
-        while i < n && cnt < BATCHSIZE {
+        while i < pinned_len(slot) && cnt < BATCHSIZE {
             save(ctx, buf, pinned_get(slot, i)).map_err(|error| {
                 add_serializing_note(
                     error,
@@ -1886,6 +1888,9 @@ fn batch_appends(
             cnt += 1;
         }
         buf.push(op::APPENDS);
+        if pinned_len(slot) != n {
+            return Err(PyError::runtime_error("list changed size during iteration"));
+        }
     }
     Ok(())
 }
