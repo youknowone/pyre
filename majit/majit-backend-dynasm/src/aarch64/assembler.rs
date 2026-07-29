@@ -2285,8 +2285,11 @@ impl<'a> AssemblerARM64<'a> {
                 }
             }
             OpCode::IntMulOvf => {
-                // aarch64/opassembler.py emit_comp_op_int_mul_ovf: smulh+mul+asr+cmp
-                // against the 64-bit sign-extended high half.
+                // `opassembler.py:94 emit_comp_op_int_mul_ovf`: the product
+                // overflowed iff the high half differs from the low half's
+                // sign extension.  `CMP_rr_shifted(ip0, res, 63)` is
+                // `cmp Xn, Xm, asr #63`, which does the shift as part of the
+                // compare rather than through a scratch register.
                 if let (Some(Loc::Reg(dst)), Some(lhs), Some(src)) =
                     (result_loc, arglocs.first(), arglocs.get(1))
                 {
@@ -2294,8 +2297,7 @@ impl<'a> AssemblerARM64<'a> {
                     dynasm!(self.mc ; .arch aarch64
                         ; smulh x15, X(lhs_reg as u8), X(src_reg as u8)
                         ; mul X(dst.value), X(lhs_reg as u8), X(src_reg as u8)
-                        ; asr x14, X(dst.value), 63
-                        ; cmp x15, x14
+                        ; cmp x15, X(dst.value), asr #63
                     );
                     self.guard_success_cc = Some(CC_E);
                 }
