@@ -80,6 +80,16 @@ thread_local! {
     /// from `ContinueRunningNormally` mirrors `_exit_frame_with_exception`.
     static WALK_END_PROPAGATED_EXCEPTION: std::cell::RefCell<Option<pyre_interpreter::PyError>> =
         const { std::cell::RefCell::new(None) };
+    /// Stable address for the in-flight walk-end exception carrier above.
+    ///
+    /// RPython keeps this value in the translated MIFrame / exception object
+    /// graph, which its root walker visits for every mutator. Pyre's
+    /// trace→portal seam is genuinely per-thread, but its raw TLS is outside
+    /// that graph, so the owning mutator publishes its address to the
+    /// collector's STW root-area registry.
+    static WALK_END_ROOT_AREA: WalkEndRootArea = WalkEndRootArea {
+        propagated_exception: WALK_END_PROPAGATED_EXCEPTION.with(|value| value as *const _),
+    };
     /// True at portal trace sites that can consume
     /// `WALK_END_PROPAGATED_EXCEPTION`. Bridge tracing leaves this false and
     /// conservatively retains its legacy preflight.
@@ -89,6 +99,10 @@ thread_local! {
     /// merge point's green pc, but the interpreter fallback must resume at
     /// the opcode whose entry stack matches the restored live boxes.
     static WALK_END_RESTART_PC: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+struct WalkEndRootArea {
+    propagated_exception: *const std::cell::RefCell<Option<pyre_interpreter::PyError>>,
 }
 
 /// Take-and-reset the walk-end flush flag for the trace that just
@@ -263,21 +277,34 @@ pub fn take_walk_end_propagated_exception() -> Option<pyre_interpreter::PyError>
     WALK_END_PROPAGATED_EXCEPTION.with(|c| c.borrow_mut().take())
 }
 
-/// Root the no-handler exception parked in `WALK_END_PROPAGATED_EXCEPTION`
-/// across the trace→portal boundary until `take_walk_end_propagated_exception`
-/// consumes it. The parked `PyError`'s GC refs are unreachable through the raw
-/// `RefCell`; forward them in place via `PyError::walk_gc_refs`. Never
-/// materialises the lazy-null `exc_object`.
+/// Capture this mutator's raw walk-end carrier address for STW root walking.
+pub fn capture_walk_end_root_area() -> *const () {
+    WALK_END_ROOT_AREA.with(|area| area as *const _ as *const ())
+}
+
+/// Root the no-handler exception parked across the trace→portal boundary until
+/// `take_walk_end_propagated_exception` consumes it. Forward its GC refs in
+/// place without materialising the lazy-null `exc_object`.
 pub fn walk_walk_end_propagated_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    WALK_END_PROPAGATED_EXCEPTION.with(|c| {
-        // SAFETY: `as_ptr` yields the `Option<PyError>` interior; this closure
-        // holds the only reference for its duration and does not re-borrow the
-        // cell, so no borrow-flag conflict with a walker-triggered path.
-        let opt = unsafe { &mut *c.as_ptr() };
-        if let Some(err) = opt.as_mut() {
-            err.walk_gc_refs(visitor);
-        }
-    });
+    let data = capture_walk_end_root_area();
+    unsafe { walk_walk_end_roots_area(data, visitor) };
+}
+
+/// # Safety
+/// `data` must come from [`capture_walk_end_root_area`], and the owning
+/// mutator must be quiesced when a foreign collector thread calls this.
+pub unsafe fn walk_walk_end_roots_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let area = unsafe { &*(data as *const WalkEndRootArea) };
+    let exception_cell = unsafe { &*area.propagated_exception };
+    // SAFETY: the owner is either synchronously collecting or STW-quiesced;
+    // no Rust borrow is live while the collector forwards these raw slots.
+    let opt = unsafe { &mut *exception_cell.as_ptr() };
+    if let Some(err) = opt.as_mut() {
+        err.walk_gc_refs(visitor);
+    }
 }
 
 thread_local! {
@@ -4921,6 +4948,46 @@ mod tests {
     use pyre_interpreter::bytecode::Instruction;
     use pyre_interpreter::compile_exec;
     use pyre_interpreter::decode_instruction_at;
+
+    #[test]
+    fn walk_end_root_area_forwards_a_quiesced_foreign_mutator() {
+        let (area_tx, area_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (roots_tx, roots_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let mut err = pyre_interpreter::PyError::new(
+                pyre_interpreter::PyErrorKind::RuntimeError,
+                "foreign mutator root",
+            );
+            err.w_name_context = 0x3000 as pyre_object::PyObjectRef;
+            err.w_obj_context = 0x4000 as pyre_object::PyObjectRef;
+            super::WALK_END_PROPAGATED_EXCEPTION.with(|slot| {
+                *slot.borrow_mut() = Some(err);
+            });
+            area_tx
+                .send(super::capture_walk_end_root_area() as usize)
+                .unwrap();
+            resume_rx.recv().unwrap();
+            super::WALK_END_PROPAGATED_EXCEPTION.with(|slot| {
+                let err = slot.borrow_mut().take().unwrap();
+                roots_tx
+                    .send((err.w_name_context as usize, err.w_obj_context as usize))
+                    .unwrap();
+            });
+        });
+
+        let area = area_rx.recv().unwrap() as *const ();
+        // The owner is blocked after publishing its stable TLS addresses,
+        // matching the mutator quiescence required by the STW registry.
+        unsafe {
+            super::walk_walk_end_roots_area(area, &mut |root| {
+                *root = majit_ir::GcRef(root.as_usize() + 0x20);
+            });
+        }
+        resume_tx.send(()).unwrap();
+        assert_eq!(roots_rx.recv().unwrap(), (0x3020, 0x4020));
+        owner.join().unwrap();
+    }
 
     /// The walk-end commit contract: only a resume pc that does not precede
     /// something the walk already applied may keep the store journal.

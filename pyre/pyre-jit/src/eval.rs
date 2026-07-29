@@ -3437,18 +3437,14 @@ fn install_gc_root_walkers() {
     // Children of the off-GC exception singletons, which no carrier and no
     // collection phase reaches on its own.
     majit_gc::shadow_stack::register_extra_root_walker(walk_immortal_exception_singleton_roots);
-    // Stored `PyError` carriers whose GC refs the precise collector cannot
-    // reach through their raw TLS cells: the call-assembler FFI stash and the
-    // no-handler trace→portal stash. Mirrors `walk_pending_call_error`.
+    // Stored `PyError` carrier whose GC refs the precise collector cannot
+    // reach through its raw TLS cell. Mirrors `walk_pending_call_error`.
     majit_gc::shadow_stack::register_extra_root_walker(crate::call_jit::walk_last_ca_exception);
     // Exception parked for the next interpreter call boundary (JIT prologue
     // overflow, or a jd1 drain error handed back to the caller loop): live in
     // a raw TLS cell across the collecting code that runs before the drain.
     majit_gc::shadow_stack::register_extra_root_walker(
         pyre_interpreter::stack_check::walk_jit_pending_exception,
-    );
-    majit_gc::shadow_stack::register_extra_root_walker(
-        pyre_jit_trace::trace::walk_walk_end_propagated_exception,
     );
     // Trace-time exception carriers held only in the active `PyreSym`
     // (`trace_built_exc` / `last_exc_value` / `current_exc_value`): a
@@ -3485,6 +3481,10 @@ fn register_thread_root_areas() {
         register(
             fbw_finish_concrete_root_walker_area,
             pyre_jit_trace::jitcode_dispatch::capture_fbw_finish_concrete_root_area(),
+        );
+        register(
+            walk_end_root_walker_area,
+            pyre_jit_trace::trace::capture_walk_end_root_area(),
         );
         register(
             mapdict_root_walker_area,
@@ -4070,6 +4070,13 @@ unsafe fn fbw_finish_concrete_root_walker_area(
     unsafe {
         pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_root_walker_area(data, visitor)
     };
+}
+
+unsafe fn walk_end_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe { pyre_jit_trace::trace::walk_walk_end_roots_area(data, visitor) };
 }
 
 unsafe fn mapdict_root_walker_area(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
