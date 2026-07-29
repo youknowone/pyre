@@ -316,10 +316,16 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
         // reach object-reduce with unreconstructable C-level state: `module`
         // (native name + dict payload) and `memoryview` (private buffer view
         // geometry/export state).  This is the `_PyObject_GetState(required)`
-        // refusal used by CPython 3.14 for every pickle protocol.
+        // `staticmethod` / `classmethod` likewise keep their wrapped function
+        // in native descriptor storage that an empty `__newobj__` cannot
+        // restore. This is the `_PyObject_GetState(required)` refusal used by
+        // CPython 3.14 for every pickle protocol.
         if !hasargs
             && unsafe {
-                pyre_object::is_module(w_obj) || pyre_object::memoryview::is_w_memoryview(w_obj)
+                pyre_object::is_module(w_obj)
+                    || pyre_object::memoryview::is_w_memoryview(w_obj)
+                    || pyre_object::function::is_staticmethod(w_obj)
+                    || pyre_object::function::is_classmethod(w_obj)
             }
         {
             return Err(PyError::type_error(format!(
