@@ -981,6 +981,25 @@ impl<'a> Transformer<'a> {
                 });
                 RewriteResult::Keep
             }
+            // `jtransform.py:384-392` `rewrite_op_int_add_ovf` (aliased to
+            // `rewrite_op_int_mul_ovf`) and `rewrite_op_int_sub_ovf` both
+            // return `[SpaceOperation('-live-', [], None), op]`.  `flatten`
+            // pops the overflow-checked op back off the emitted line and
+            // re-spells it as `int_*_jump_if_ovf`, a guard that resumes at
+            // this point — the `-live-` in front is what makes that a valid
+            // resume point rather than one that merely happens to inherit a
+            // marker from the preceding operation.
+            OpKind::BinOp { op: binop_name, .. }
+                if matches!(binop_name.as_str(), "add_ovf" | "sub_ovf" | "mul_ovf") =>
+            {
+                RewriteResult::Replace(vec![
+                    SpaceOperation {
+                        result: None,
+                        kind: OpKind::Live,
+                    },
+                    op.clone(),
+                ])
+            }
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
@@ -2443,14 +2462,23 @@ impl<'a> Transformer<'a> {
                 OpKind::FieldRead { base, .. } => base.clone(),
                 _ => unreachable!("rewrite_op_getfield called on non-FieldRead op"),
             };
-            return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::VableFieldRead {
-                    base: base_var,
-                    field_index: vable_field.index,
-                    ty: typed_ty.clone(),
+            // `jtransform.py:845-847` returns a two-element list led by
+            // `-live-`: a virtualizable access is a valid resume point, so
+            // the liveness marker belongs in front of it.
+            return RewriteResult::Replace(vec![
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
                 },
-            }]);
+                SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::VableFieldRead {
+                        base: base_var,
+                        field_index: vable_field.index,
+                        ty: typed_ty.clone(),
+                    },
+                },
+            ]);
         }
         // `jtransform.py:867-903` — immutable and quasi-immutable
         // field reads both become `getfield_*_pure`; the quasi variant
@@ -2581,20 +2609,28 @@ impl<'a> Transformer<'a> {
                 OpKind::FieldWrite { base, .. } => base.clone(),
                 _ => unreachable!("rewrite_op_setfield called on non-FieldWrite op"),
             };
-            return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::VableFieldWrite {
-                    base: base_var,
-                    field_index: vable_field.index,
-                    // `rewrite_op_setfield` forwards `v_value` unchanged to
-                    // `setfield_vable_%s` (`jtransform.py:921-927`); a
-                    // constant operand stays inline.  `setfield_vable_i`
-                    // is not in USE_C_FORM, so the assembler encodes it as
-                    // a pool `i` slot rather than the short `c` byte.
-                    value: value.clone(),
-                    ty: typed_ty,
+            // `jtransform.py:926-928` — `-live-` leads the virtualizable
+            // write for the same reason as the read.
+            return RewriteResult::Replace(vec![
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
                 },
-            }]);
+                SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::VableFieldWrite {
+                        base: base_var,
+                        field_index: vable_field.index,
+                        // `rewrite_op_setfield` forwards `v_value` unchanged to
+                        // `setfield_vable_%s` (`jtransform.py:921-927`); a
+                        // constant operand stays inline.  `setfield_vable_i`
+                        // is not in USE_C_FORM, so the assembler encodes it as
+                        // a pool `i` slot rather than the short `c` byte.
+                        value: value.clone(),
+                        ty: typed_ty,
+                    },
+                },
+            ]);
         }
         if &typed_ty != ty {
             let base_var = match &op.kind {
@@ -2636,17 +2672,25 @@ impl<'a> Transformer<'a> {
                 detail: format!("rewrite: array[idx] → VableArrayRead[{arr_idx}]"),
             });
             self.vable_rewrites += 1;
-            return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::VableArrayRead {
-                    base: vable_base,
-                    array_index: arr_idx,
-                    elem_index: index.clone(),
-                    item_ty: typed_item_ty,
-                    array_itemsize: itemsize,
-                    array_is_signed: is_signed,
+            // `jtransform.py:764-767` — `-live-` leads the virtualizable
+            // array read.
+            return RewriteResult::Replace(vec![
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
                 },
-            }]);
+                SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::VableArrayRead {
+                        base: vable_base,
+                        array_index: arr_idx,
+                        elem_index: index.clone(),
+                        item_ty: typed_item_ty,
+                        array_itemsize: itemsize,
+                        array_is_signed: is_signed,
+                    },
+                },
+            ]);
         }
         if &typed_item_ty != item_ty {
             return RewriteResult::Replace(vec![SpaceOperation {
@@ -2698,24 +2742,32 @@ impl<'a> Transformer<'a> {
                 detail: format!("rewrite: array[idx] = v → VableArrayWrite[{arr_idx}]"),
             });
             self.vable_rewrites += 1;
-            return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::VableArrayWrite {
-                    base: vable_base,
-                    array_index: arr_idx,
-                    elem_index: index.clone(),
-                    // The vable rewrite only fires for virtualizable
-                    // arrays, which never carry an inline-const store; a
-                    // VableArrayWrite value is always a register.
-                    value: value
-                        .as_variable()
-                        .expect("vable array writes carry a Variable value")
-                        .clone(),
-                    item_ty: typed_item_ty,
-                    array_itemsize: itemsize,
-                    array_is_signed: is_signed,
+            // `jtransform.py:798-801` — `-live-` leads the virtualizable
+            // array write.
+            return RewriteResult::Replace(vec![
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
                 },
-            }]);
+                SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::VableArrayWrite {
+                        base: vable_base,
+                        array_index: arr_idx,
+                        elem_index: index.clone(),
+                        // The vable rewrite only fires for virtualizable
+                        // arrays, which never carry an inline-const store; a
+                        // VableArrayWrite value is always a register.
+                        value: value
+                            .as_variable()
+                            .expect("vable array writes carry a Variable value")
+                            .clone(),
+                        item_ty: typed_item_ty,
+                        array_itemsize: itemsize,
+                        array_is_signed: is_signed,
+                    },
+                },
+            ]);
         }
         if &typed_item_ty != item_ty {
             return RewriteResult::Replace(vec![SpaceOperation {
@@ -3087,6 +3139,12 @@ impl<'a> Transformer<'a> {
         if let Some(base) = user_oopspec.as_deref() {
             // jtransform.py:497 — jit.* oopspecs → __handle_jit_call
             if base.starts_with("jit.") {
+                // `jit.not_in_trace` discards the decoded args (see
+                // `_handle_jit_call`), so the ops materialising their
+                // constants have no consumer left.
+                if base == "jit.not_in_trace" {
+                    const_prefix_ops.clear();
+                }
                 let result =
                     self._handle_jit_call(base, op, target, args, result_ty, graph_name, graph);
                 return prepend_const_prefix(&mut const_prefix_ops, result);
@@ -4115,11 +4173,18 @@ impl<'a> Transformer<'a> {
                     *result_ty == ValueType::Void,
                     "jit.not_in_trace() function must return None"
                 );
+                // jtransform.py:1749 "ignore 'args' and use the original
+                // 'op.args'": the residual call carries the arguments the
+                // call site actually passes, not the oopspec-decoded list.
+                let original_args = match &op.kind {
+                    OpKind::Call { args, .. } => args.clone(),
+                    _ => unreachable!("_handle_jit_call reached on non-Call op"),
+                };
                 self._handle_oopspec_call(
                     graph,
                     op,
                     target,
-                    args,
+                    &original_args,
                     result_ty,
                     graph_name,
                     OopSpecIndex::NotInTrace,
@@ -6827,8 +6892,15 @@ mod tests {
         };
         let result = transform_graph(&graph, &config);
         assert_eq!(result.vable_rewrites, 1);
-        // Should be rewritten to VableFieldRead
-        let rewritten_op = &result.graph.block(graph.startblock).operations[0];
+        // Should be rewritten to `-live-` + VableFieldRead
+        // (`jtransform.py:845-847`).
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(
+            matches!(ops[0].kind, OpKind::Live),
+            "virtualizable read must be led by -live-, got {:?}",
+            ops[0].kind
+        );
+        let rewritten_op = &ops[1];
         let OpKind::VableFieldRead {
             base: rewritten_base,
             field_index,
@@ -6888,7 +6960,14 @@ mod tests {
         };
         let result = transform_graph(&graph, &config);
         assert_eq!(result.vable_rewrites, 1);
-        let rewritten_op = &result.graph.block(graph.startblock).operations[1];
+        // `jtransform.py:764-767` — `-live-` leads the vable array read.
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(
+            matches!(ops[1].kind, OpKind::Live),
+            "virtualizable array read must be led by -live-, got {:?}",
+            ops[1].kind
+        );
+        let rewritten_op = &ops[2];
         let OpKind::VableArrayRead {
             base: rewritten_base,
             array_index,
@@ -7604,8 +7683,14 @@ mod tests {
             },
         );
 
-        assert_eq!(result.graph.block(graph.startblock).operations.len(), 1);
-        match &result.graph.block(graph.startblock).operations[0].kind {
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert_eq!(ops.len(), 2);
+        assert!(
+            matches!(ops[0].kind, OpKind::Live),
+            "virtualizable read must be led by -live-, got {:?}",
+            ops[0].kind
+        );
+        match &ops[1].kind {
             OpKind::VableFieldRead { field_index, .. } => assert_eq!(*field_index, 0),
             other => panic!("expected VableFieldRead after hint suppression, got {other:?}"),
         }
@@ -7661,10 +7746,104 @@ mod tests {
             panic!("expected ops[0] to be VableForce, got {:?}", ops[0].kind);
         };
         assert_eq!(base, &frame_var);
+        assert!(
+            matches!(ops[1].kind, OpKind::Live),
+            "virtualizable read must be led by -live-, got {:?}",
+            ops[1].kind
+        );
         assert!(matches!(
-            ops[1].kind,
+            ops[2].kind,
             OpKind::VableFieldRead { field_index: 0, .. }
         ));
+    }
+
+    /// `jtransform.py:384-392` — `rewrite_op_int_add_ovf` (aliased to
+    /// `rewrite_op_int_mul_ovf`) and `rewrite_op_int_sub_ovf` both return
+    /// `[SpaceOperation('-live-', [], None), op]`.  `flatten` pops the
+    /// overflow-checked op back off the emitted line and re-spells it as
+    /// `int_*_jump_if_ovf`, a guard that resumes at this point, so the
+    /// marker must be established here rather than inherited from whatever
+    /// operation happens to precede it.
+    #[test]
+    fn transform_graph_leads_overflow_checked_binops_with_live() {
+        for opname in ["add_ovf", "sub_ovf", "mul_ovf"] {
+            let mut graph = FunctionGraph::new("ovf");
+            let entry = graph.startblock;
+            let lhs = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+            let rhs = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
+            graph.push_op_var(
+                entry,
+                OpKind::BinOp {
+                    op: opname.into(),
+                    lhs,
+                    rhs,
+                    result_ty: crate::model::ValueType::Int,
+                },
+                true,
+            );
+
+            let result = transform_graph(&graph, &GraphTransformConfig::default());
+            let ops = &result.graph.block(entry).operations;
+            let ovf_idx = ops
+                .iter()
+                .position(|o| matches!(&o.kind, OpKind::BinOp { op, .. } if op == opname))
+                .unwrap_or_else(|| panic!("{opname} did not survive the rewrite: {ops:?}"));
+            assert!(
+                ovf_idx > 0 && matches!(ops[ovf_idx - 1].kind, OpKind::Live),
+                "{opname} must be led by -live-, got {ops:?}"
+            );
+        }
+    }
+
+    /// `jtransform.py:1748-1755` — `jit.not_in_trace`'s registered spec is
+    /// `"jit.not_in_trace()"` (`rlib/jit.py:260`), an empty argtuple, so the
+    /// decoded arg list comes back empty.  Upstream ignores it ("use the
+    /// original 'op.args'") and the residual call keeps the arguments the
+    /// call site passes.
+    #[test]
+    fn not_in_trace_residual_call_keeps_the_original_arguments() {
+        let path = crate::parse::CallPath::from_segments(["helper", "trace_hook"]);
+        let target = CallTarget::function_path(["helper", "trace_hook"]);
+
+        let mut cc = crate::call::CallControl::new();
+        cc.mark_oopspec(path.clone(), "jit.not_in_trace()".to_string());
+        // A non-empty argname list is what routes the decode through
+        // `parse_oopspec` + `normalize_opargs` rather than the positional
+        // pass-through fallback.
+        cc.mark_oopspec_argnames(path, vec!["x".into(), "y".into()]);
+
+        let mut graph = FunctionGraph::new("caller");
+        let x = graph.alloc_value_var();
+        let y = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&x, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&y, ConcreteType::Signed);
+        let startblock = graph.startblock;
+        graph.push_op_var(
+            startblock,
+            OpKind::Call {
+                target,
+                args: vec![x.clone(), y.clone()],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+
+        let args_i = transformed
+            .graph
+            .block(startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual { args_i, .. } => Some(args_i.clone()),
+                _ => None,
+            })
+            .expect("not_in_trace must lower to a residual call");
+        assert_eq!(args_i, vec![x, y]);
     }
 
     /// `rpython/jit/codewriter/jtransform.py:608-614 rewrite_op_hint`
