@@ -13617,6 +13617,19 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     if tyref_is_fieldless_enum_free(ty, llbc) {
         return ValueType::Int;
     }
+    // A `str`/`String`/`Wtf8`/`Wtf8Buf` value is the single immutable
+    // rpy_string in the value model (`tyref_is_string_value`), matching
+    // upstream's one string type (`rstr.py`).  A bare string-family value
+    // (parameter, return, local) seeds `SomeString` so it stays the string
+    // lattice node at every site instead of a classdef-carrying
+    // `SomeInstance(Wtf8Buf)`: a `Wtf8Buf` value stored into a `*mut Wtf8Buf`
+    // field flows `SomeString` through `malloc_raw` (which round-trips a
+    // non-`Instance` payload unchanged), keeping the field repr
+    // `Ptr(rpy_string)` consistent with the `getattr` + deref-to-`&Wtf8`
+    // read that reports the field as a string.
+    if tyref_is_string_value(ty, llbc) {
+        return ValueType::Str;
+    }
     ValueType::Ref(None)
 }
 
