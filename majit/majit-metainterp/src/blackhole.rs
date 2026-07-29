@@ -1118,6 +1118,20 @@ impl BlackholeInterpreter {
     pub(crate) fn bhimpl_abort_permanent(&mut self) -> Result<(), DispatchError> {
         let exc = BH_LAST_EXC_VALUE.with(|c| c.get());
         if exc != 0 {
+            // Hand the exception to the other walked root before dropping this
+            // one.  A residual-call raise is reachable *only* through this cell
+            // (`walk_bh_last_exc_value`) until something stores it, and the
+            // `RaiseException` arm below routes it into
+            // `handle_exception_in_frame` → `route_to_catch`, which records a
+            // traceback node — an allocation — before it performs that store.
+            // Exception objects are non-moving (`w_exception_new_empty` uses
+            // the stable old gen), but old gen is mark-sweep, so an unrooted
+            // one in that window is collectable.  `route_to_catch` clears the
+            // cell only *after* the record for the same reason
+            // (blackhole.py:407 parity); `exception_last_value` is a
+            // `walk_bh_regs` root, so writing it first keeps the value covered
+            // across the handoff.
+            self.exception_last_value = exc;
             BH_LAST_EXC_VALUE.with(|c| c.set(0));
             return Err(DispatchError::RaiseException(exc));
         }
@@ -4181,6 +4195,43 @@ mod tests {
                 !bh.got_exception,
                 "abort_permanent without pending TLS exception must not set got_exception"
             );
+        }
+
+        /// `bhimpl_abort_permanent` must re-home the exception into a walked
+        /// root before it clears `BH_LAST_EXC_VALUE`.
+        ///
+        /// The cell is the only root over a residual-call raise
+        /// (`walk_bh_last_exc_value`), and the `RaiseException` handoff runs
+        /// `handle_exception_in_frame` → `route_to_catch`, which records a
+        /// traceback node — an allocation — before it stores the value itself.
+        /// Exceptions are non-moving but old gen is mark-sweep, so clearing the
+        /// cell first leaves the exception collectable across that allocation.
+        /// `exception_last_value` is a `walk_bh_regs` root, so it must already
+        /// carry the exception at the moment the cell goes to zero.
+        #[test]
+        fn test_bh_abort_permanent_rehomes_exception_into_walked_root() {
+            const EXC: i64 = 0x5eed_0001;
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            super::BH_LAST_EXC_VALUE.with(|c| c.set(EXC));
+
+            let outcome = bh.bhimpl_abort_permanent();
+
+            assert!(
+                matches!(outcome, Err(super::DispatchError::RaiseException(e)) if e == EXC),
+                "a pending TLS exception must route through RaiseException"
+            );
+            assert_eq!(
+                bh.exception_last_value, EXC,
+                "the cell is cleared here, so the walked `exception_last_value` \
+                 slot must already carry the exception"
+            );
+            assert_eq!(
+                super::BH_LAST_EXC_VALUE.with(|c| c.get()),
+                0,
+                "the cell is drained once the value has another root"
+            );
+            super::BH_LAST_EXC_VALUE.with(|c| c.set(0));
         }
 
         /// Tier 2.3: callee `abort/` propagates aborted=true.
