@@ -2135,6 +2135,10 @@ where
         let mut step_count: u64 = 0;
         let mut last_num_ops = ctx.num_recorded_ops();
         let mut steps_since_growth: u64 = 0;
+        // Set once `is_too_long()` first trips; the abort itself waits for the
+        // next merge point (see the check at the bottom of the loop).
+        let mut too_long = false;
+        ctx.abort_at_next_merge_point = false;
         while !self.frames.is_empty() {
             step_count += 1;
             let n = ctx.num_recorded_ops();
@@ -2209,6 +2213,11 @@ where
                         ctx.trace_limit()
                     );
                 }
+                // The walk can still end on its own (a `Finish`) between the
+                // overflow and the merge point that was going to cash it in.
+                // A trace past `trace_limit` must not be committed, so the
+                // pending overflow outranks the closing step's action.
+                let action = if too_long { TraceAction::Abort } else { action };
                 match action {
                     TraceAction::CloseLoop | TraceAction::Finish { .. } => sym.commit_portal_op(),
                     _ => sym.abort_portal_op(),
@@ -2219,22 +2228,43 @@ where
             // executing the step, matching RPython's _interpret() loop:
             //   self.framestack[-1].run_one_step()
             //   self.blackhole_if_trace_too_long()
-            if ctx.is_too_long() {
+            //
+            // RPython answers the overflow with `SwitchToBlackhole(
+            // ABORT_TOO_LONG)`, and its handler (pyjitpl.py:2949
+            // `run_blackhole_interp_to_cancel_tracing` → blackhole.py:1799
+            // `convert_and_run_from_pyjitpl`) finishes the *current* jitcode
+            // frame in the blackhole before control returns to the
+            // interpreter.  Pyre has no such consumer: the abort hands a
+            // source-level pc back to the merge-point hook
+            // (jitdriver.rs `TraceAction::Abort` → `single_pass_outcome`),
+            // taken from the walk's root frame i0 — which dispatch advances
+            // *before* running the opcode arm.  Returning here mid-opcode
+            // would therefore resume the interpreter past an opcode whose
+            // side effects only partly ran: aheui's `pi.jinseo` lost the
+            // `size += 1` half of a push whose `head = node` had already run,
+            // leaving a list whose chain is one node longer than its size.
+            // Defer to the next merge point instead — the walk is between
+            // opcodes there, so i0 names a resume position with nothing half
+            // applied.  The extra ops land in a trace that is discarded
+            // anyway, and the runaway backstops above still bound the work.
+            if ctx.is_too_long() && !too_long {
+                too_long = true;
+                ctx.abort_at_next_merge_point = true;
                 if crate::majit_log_enabled() {
                     eprintln!(
-                        "[jit] trace_jitcode aborting: trace too long at portal pc={}",
+                        "[jit] trace_jitcode aborting: trace too long at portal pc={} \
+                         (deferred to the next merge point)",
                         portal_pc
                     );
                 }
-                sym.abort_portal_op();
-                return TraceAction::Abort;
             }
         }
 
         // Post-loop overflow check: the jitcode ran to completion (all
-        // frames empty) but may have exceeded the limit on the last step.
-        if ctx.is_too_long() {
-            if crate::majit_log_enabled() {
+        // frames empty) but may have exceeded the limit on the last step, or
+        // tripped it mid-portal-op and deferred the abort to here.
+        if too_long || ctx.is_too_long() {
+            if !too_long && crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] trace_jitcode aborting: trace too long at portal pc={}",
                     portal_pc
@@ -4390,6 +4420,14 @@ where
                 // swap (dispatch.rs:850) finds that `-live-` at
                 // `mp_opcode_pc - SIZE_LIVE_OP`.
                 let mp_opcode_pc = frame.code_cursor - 1;
+                // A merge point is the one position where no source opcode is
+                // half-executed, so it is where `run_to_end` cashes in a
+                // deferred `trace_limit` overflow (see the `is_too_long`
+                // check there).
+                if ctx.abort_at_next_merge_point {
+                    ctx.abort_at_next_merge_point = false;
+                    return TraceAction::Abort;
+                }
                 let jdindex_byte = frame.next_reg();
                 // RPython `blackhole.py:112-123` argcode discrimination:
                 //

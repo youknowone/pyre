@@ -413,6 +413,11 @@ pub struct TraceCtx {
     /// `MetaInterp::single_pass_outcome` (set before `compile_loop` drains the
     /// ctx) to the merge-point hook.
     pub walk_final_pc: Option<usize>,
+    /// Set when `run_to_end` sees the trace pass `trace_limit` in the middle of
+    /// an opcode: the abort waits for the next merge point, where no opcode is
+    /// half-executed and `walk_final_pc` names a real resume position. Cleared
+    /// by `run_to_end` at walk start and by the merge point that consumes it.
+    pub abort_at_next_merge_point: bool,
     /// Single-pass tracing: the walk-final concrete RED values captured from
     /// the closing merge point's red operands (their live `int_values` /
     /// `ref_values` / `float_values` shadow), in operand order (slot 3 ints,
@@ -1394,6 +1399,7 @@ impl TraceCtx {
             last_traced_pc: 0,
             initial_inputarg_consts: vec![],
             walk_final_pc: None,
+            abort_at_next_merge_point: false,
             walk_final_reds: Vec::new(),
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
@@ -1474,6 +1480,7 @@ impl TraceCtx {
             last_traced_pc: 0,
             initial_inputarg_consts: vec![],
             walk_final_pc: None,
+            abort_at_next_merge_point: false,
             walk_final_reds: Vec::new(),
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
