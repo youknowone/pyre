@@ -1752,6 +1752,7 @@ fn analyze_pipeline_from_module_paths(
         insns: indexmap::IndexMap::new(),
         descrs: Vec::new(),
         all_liveness: Vec::new(),
+        ei_descr_mints: Vec::new(),
         total_blocks: 0,
         total_ops: 0,
         total_vable_rewrites: 0,
@@ -1786,6 +1787,11 @@ fn analyze_pipeline_from_module_paths(
     // "".join(asm.all_liveness)`) so the runtime can resolve the `BC_LIVE`
     // offsets baked into `JitCode.code`.
     pipeline.all_liveness = all_liveness;
+    // Taken after `make_jitcodes`, when every `EffectInfo` has been built and
+    // so every raw-set member has passed through its `get_*_descr` mint site.
+    // The equivalent of what `descr.py:25-47 setup_descrs` would have picked up
+    // for free had the analyzer and the runtime shared one gccache.
+    pipeline.ei_descr_mints = majit_ir::descr::ei_descr_mints_snapshot();
 
     pipeline
 }

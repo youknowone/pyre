@@ -4266,39 +4266,33 @@ enum SetMemberLookup {
     /// The gccache holds the slot the analyzer minted through.
     Resolved(majit_ir::DescrRef),
     /// The *container* (`STRUCT` / `ARRAY`) is absent from this process's
-    /// descr universe entirely, so no operation recorded here can carry a
-    /// descr for it and the member cannot participate in any
-    /// `check_*_descr_*` answer.  Dropping it is the faithful projection of
-    /// the analyzer's frozenset onto the runtime universe — the analyzer
-    /// walks the whole translated program, the runtime only registers what
-    /// it actually traces.  Upstream has no counterpart because
-    /// `cpu.*descrof` and `compute_bitstrings` share one process.
+    /// descr universe entirely, so the member is dropped from the raw set.
     ///
-    /// KNOWN GAP: "absent" is evaluated once, when the `BhCallDescr` is
-    /// materialised (`jitcode_runtime.rs rehydrated_call_descr_ref`), but the
-    /// runtime universe keeps growing after that.  A container registered
-    /// later — under the same `path_hash` key — leaves this EI permanently
-    /// claiming "not written" for a field the callee does write, so the
-    /// heapcache would not invalidate a read across the call.
+    /// **Upstream cannot reach this.** `cpu.*descrof` and `compute_bitstrings`
+    /// share one gccache in one process, so `setup_descrs` (`descr.py:25-47`)
+    /// snapshots the very cache the raw-set descrs were minted into and
+    /// `effectinfo.py:465-499` only ever unions descrs that are already there.
+    /// A member that fails to resolve is therefore not a legitimate projection
+    /// but a divergence, and its count is a badness counter held at zero
+    /// (`descr_set_absent` on the `[jit-stats]` line) — pyre's form of the bare
+    /// `assert`s upstream states this class of condition with.
     ///
-    /// `publish_runtime_descr_groups` closes the gap for the module-scope
-    /// groups by forcing all of them before the first lookup;
-    /// `W_IntObject.intval` was landing here until it did.  What is still
-    /// published on demand, and so can still fall into this arm: the
-    /// per-exception-class groups behind `W_BASE_EXCEPTION_DESCR_CACHE`, and
-    /// the `ARRAY_DESCR_REGISTRY` entries minted per element layout.
+    /// Two publishes are what hold it at zero, both inside the `Once` in
+    /// `jitcode_runtime::rehydrate_build_descr_raw_sets` and both ahead of the
+    /// first lookup: `publish_runtime_descr_groups` for the module-scope
+    /// groups (`W_IntObject.intval` was landing here until it did), and
+    /// `publish_effect_info_descr_mints` for the slots no opcode names, which
+    /// `descrs.bin` — upstream's `opcode_descrs`, not its `all_descrs` — does
+    /// not carry.
     ///
-    /// The conservative repair (treat this like [`Self::Ambiguous`] and
-    /// degrade the EI to `EF_RANDOM_EFFECTS`) is not taken here: a probe over
-    /// `bench/synth/comprehension_object_append_hot` counts 211 drops across
-    /// ~40 distinct containers (`W_TupleObject.wrappeditems`,
-    /// `PyFrame.w_globals`, `intval`, rbigint `_digits`/`_size`, …), so it
-    /// would turn most residual calls into whole-heap barriers.  The
-    /// convergence path is to stop freezing the sets at materialisation and
-    /// re-resolve from the retained `ei.descr_set_keys` as the universe grows
-    /// (i.e. inside `compute_bitstrings`, which already re-runs); that is
-    /// blocked on the descr-universe work and on `compute_bitstrings`' own
-    /// per-`jitcode_for` cost.
+    /// The arm stays because the answer is still reachable in principle, and a
+    /// dropped member is a real hazard when it is: "absent" is evaluated once,
+    /// when the `BhCallDescr` is materialised
+    /// (`jitcode_runtime.rs rehydrated_call_descr_ref`), so a container
+    /// registered afterwards would leave that EI permanently claiming "not
+    /// written" for a field the callee does write, and the heapcache would not
+    /// invalidate a read across the call. [`stale_absent_containers`] re-asks
+    /// the question at exit and gates that residue at zero too.
     AbsentContainer,
     /// The container IS published but not under this member's key.  A real
     /// runtime descr for the field may exist under a different spelling, so
@@ -4325,15 +4319,14 @@ enum SetMemberLookup {
 /// process's descr universe, just not under the key the analyzer minted
 /// through.
 ///
-/// `Ambiguous` is the two-spellings defect by construction, and it is the only
-/// one of the three outcomes that is never a legitimate projection:
-/// `Resolved` joined, `AbsentContainer` means the runtime never named the
-/// container at all (the analyzer walks the whole translated program, the
-/// runtime only registers what it actually traces), but `Ambiguous` means both
-/// sides named the same container and disagreed on how to spell it.  Its
-/// consumer degrades the whole `EffectInfo` to `EF_RANDOM_EFFECTS`, so every
-/// entry below is a residual call that stopped invalidating precisely and
-/// became a whole-heap barrier.
+/// `Ambiguous` is the two-spellings defect by construction: both sides named
+/// the same container and disagreed on how to spell it.  Its consumer degrades
+/// the whole `EffectInfo` to `EF_RANDOM_EFFECTS`, so every entry below is a
+/// residual call that stopped invalidating precisely and became a whole-heap
+/// barrier.  `AbsentContainer` is the other non-answer and is equally a
+/// divergence rather than a projection — see [`SetMemberLookup`] — but it is
+/// the *missing table* defect, not the *two spellings* one, so the two are
+/// counted apart.
 ///
 /// This is the gate for struct-identity work; a converged-field-descr count is
 /// not.  A field-descr census only counts the descrs a particular run happens
@@ -4383,11 +4376,181 @@ pub(crate) fn publish_runtime_descr_groups() {
     ];
 }
 
+/// Fill the gccache slots that only an `EffectInfo` raw set names, from the
+/// mint arguments the analyzer recorded at its own `get_*_descr` call.
+///
+/// This is the far half of `descr.py`'s mint-or-hit: `get_field_descr`
+/// (`:218-239`), `get_array_descr` (`:348-378`) and `get_interiorfield_descr`
+/// (`:404-437`) all *construct* on a cache miss, and upstream reaches every one
+/// of these slots because `compute_bitstrings` (`effectinfo.py:465-499`) unions
+/// descr objects out of the same gccache `setup_descrs` (`descr.py:25-47`) then
+/// snapshots.  Pyre carries only the assembler's opcode table across the
+/// build/runtime split (`pyjitpl.py:2261 setup_descrs(asm.descrs)`), so a descr
+/// minted purely to fill a raw set — named by no opcode — arrives with nothing
+/// to resolve against.
+///
+/// Each entry is published under **the member's own key**, never a key
+/// re-derived from a struct name: the analyzer prefers a source-attached
+/// identity token over `path_hash(canonical_struct_name(..))` when it has one,
+/// so re-deriving would land on a different slot than the one the member
+/// names.
+///
+/// Ordering is the same as for the runtime groups above — after them, before
+/// the `make_descr_from_bh` loop — and for the same reason: these specs carry
+/// no vtable, and `register_keyed_size`'s authority rule keeps whichever
+/// registration does.
+pub(crate) fn publish_effect_info_descr_mints(entries: &[majit_ir::effectinfo::DescrMintEntry]) {
+    use majit_ir::descr::LLType;
+    use majit_ir::effectinfo::{DescrMintSpec, DescrSetMember};
+
+    for entry in entries {
+        match (&entry.member, &entry.spec) {
+            (
+                DescrSetMember::Field {
+                    struct_id,
+                    field_name,
+                },
+                spec,
+            ) => {
+                mint_field(LLType::Struct(*struct_id), field_name, spec);
+            }
+            (DescrSetMember::Array { array_id }, spec) => {
+                mint_array(LLType::Array(*array_id), spec);
+            }
+            (
+                DescrSetMember::InteriorField { array_id, name },
+                DescrMintSpec::InteriorField {
+                    array,
+                    field_struct_id,
+                    field_name,
+                    field,
+                },
+            ) => {
+                let array_key = LLType::Array(*array_id);
+                let Some(array_descr) = mint_array(array_key.clone(), array)
+                    .and_then(majit_ir::descr::descr_arc_as_array_descr)
+                else {
+                    continue;
+                };
+                // `descr.py:435 fielddescr = get_field_descr(gc_ll_descr,
+                // REALARRAY.OF, name)` — the element struct's own slot, then
+                // `:436 InteriorFieldDescr(arraydescr, fielddescr)`.
+                let Some(field_descr) =
+                    mint_field(LLType::Struct(*field_struct_id), field_name, field)
+                else {
+                    continue;
+                };
+                let _ = majit_ir::descr::gc_cache()
+                    .lock()
+                    .unwrap()
+                    .get_interiorfield_descr(
+                        array_key,
+                        name.clone(),
+                        String::new(),
+                        array_descr,
+                        field_descr,
+                    );
+            }
+            // A member paired with a spec of another shape cannot describe its
+            // own slot; leaving it unpublished keeps it counted as absent
+            // rather than filling the slot with the wrong layout.
+            _ => {}
+        }
+    }
+}
+
+/// `descr.py:234-238` — bind the parent size descr, then mint the field.
+fn mint_field(
+    struct_key: majit_ir::descr::LLType,
+    field_name: &str,
+    spec: &majit_ir::effectinfo::DescrMintSpec,
+) -> Option<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> {
+    let majit_ir::effectinfo::DescrMintSpec::Field {
+        struct_size,
+        offset,
+        field_size,
+        field_type,
+        flag,
+        is_immutable,
+        is_quasi_immutable,
+        index_in_parent,
+    } = spec
+    else {
+        return None;
+    };
+    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+    // Only an empty slot is this function's business: an unresolvable member is
+    // by definition one nothing has filled, and a filled slot already belongs
+    // to whoever published it. `get_field_descr` would return that owner's
+    // descr anyway (`descr.py:220-221`), so taking the hit through it changes
+    // nothing except to offer a second opinion on the layout — and the two
+    // producers do not agree on one field of it. `index_in_parent` here is the
+    // analyzer's `field_pos`, which counts the header words at offsets 0 and 8
+    // that `heaptracker.py:60-71 all_fielddescrs` skips, so it reads two higher
+    // than the runtime publish's for the same field.
+    if let Some(existing) = gc
+        ._cache_field
+        .get(&struct_key)
+        .and_then(|inner| inner.get(field_name))
+    {
+        return Some(existing.clone() as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
+    }
+    // `descr.py:238 fielddescr.parent_descr = get_size_descr(gccache, STRUCT,
+    // vtable)`; the analyzer has no vtable surface, so 0 — a runtime publish
+    // that carries one wins the slot either way.
+    let _parent = gc.get_size_descr(struct_key.clone(), *struct_size, 0, false);
+    Some(gc.get_field_descr(
+        struct_key,
+        field_name,
+        None,
+        *offset,
+        *field_size,
+        *field_type,
+        *is_immutable,
+        *is_quasi_immutable,
+        *flag,
+        u32::MAX,
+        false,
+        *index_in_parent,
+    ))
+}
+
+/// `descr.py:353-370` — mint the array descr, including its lendescr.
+fn mint_array(
+    array_key: majit_ir::descr::LLType,
+    spec: &majit_ir::effectinfo::DescrMintSpec,
+) -> Option<majit_ir::DescrRef> {
+    let majit_ir::effectinfo::DescrMintSpec::Array {
+        base_size,
+        item_size,
+        flag,
+        item_type,
+        nolength,
+        length_offset,
+        is_pure,
+        concrete_type,
+    } = spec
+    else {
+        return None;
+    };
+    Some(majit_ir::descr::gc_cache().lock().unwrap().get_array_descr(
+        array_key,
+        *base_size,
+        *item_size,
+        *flag,
+        *item_type,
+        *nolength,
+        *length_offset,
+        *is_pure,
+        *concrete_type,
+    ))
+}
+
 /// `ambiguous` empty alone is not enough to call the gate green: a member
-/// whose container is not registered *yet* answers `AbsentContainer`, which
-/// looks identical to the legitimate projection.  So the ledger carries all
-/// three outcomes — a run where `absent` dwarfs `resolved` has an empty
-/// `ambiguous` set vacuously, because nothing was ever joined.
+/// whose container is not registered answers `AbsentContainer` instead, so a
+/// run where `absent` dwarfs `resolved` has an empty `ambiguous` set
+/// vacuously, because nothing was ever joined.  The ledger carries all three
+/// outcomes so the denominator is visible next to the two failures.
 #[derive(Default)]
 pub struct SetMemberLedger {
     pub resolved: usize,
@@ -4774,5 +4937,52 @@ mod set_member_lookup_tests {
             }),
             "Array(0x0000000000000010)"
         );
+    }
+
+    /// The point of carrying the mint arguments across the build/runtime split:
+    /// a container this process would never otherwise name resolves anyway,
+    /// because the publish takes the same `descr.py:224-238` miss branch the
+    /// analyzer took. Without it the member reads `AbsentContainer` — which is
+    /// the pre-state this asserts first, on the same key.
+    #[test]
+    fn publishing_the_recorded_mint_turns_an_absent_member_into_a_resolved_one() {
+        use majit_ir::effectinfo::{DescrMintEntry, DescrMintSpec};
+
+        let struct_id = 0x7e57_0000_0000_0003u64;
+        let member = DescrSetMember::Field {
+            struct_id,
+            field_name: "carried".to_string(),
+        };
+        assert!(
+            matches!(
+                descr_from_set_member(&member),
+                SetMemberLookup::AbsentContainer
+            ),
+            "nothing has named this container yet"
+        );
+
+        publish_effect_info_descr_mints(&[DescrMintEntry {
+            member: member.clone(),
+            spec: DescrMintSpec::Field {
+                struct_size: 24,
+                offset: 16,
+                field_size: 8,
+                field_type: majit_ir::value::Type::Int,
+                flag: majit_ir::descr::ArrayFlag::Signed,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 1,
+            },
+        }]);
+
+        let SetMemberLookup::Resolved(descr) = descr_from_set_member(&member) else {
+            panic!("the published slot must resolve");
+        };
+        let field = descr
+            .as_field_descr()
+            .expect("a Field member resolves to a FieldDescr");
+        assert_eq!(field.offset(), 16);
+        assert_eq!(field.field_size(), 8);
+        assert_eq!(field.index_in_parent(), 1);
     }
 }

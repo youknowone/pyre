@@ -401,10 +401,34 @@ static ALL_DESCRS: LazyLock<Vec<BhDescr>> = LazyLock::new(|| {
     })
 });
 
-/// RPython: `metainterp_sd.all_descrs` — full shared descr pool.
+/// RPython: `metainterp_sd.opcode_descrs` (`pyjitpl.py:2245-2246`) — the
+/// bytecode constant pool, not `metainterp_sd.all_descrs`.
+///
+/// `all_descrs` upstream is `cpu.setup_descrs()` (`pyjitpl.py:2289`), the full
+/// gccache walk of `descr.py:25-47`; pyre's counterpart of *that* is
+/// `MetaInterpStaticData::finish_setup_descrs`, which enumerates the live
+/// `descr_registry`. The gap between the two tables is what
+/// [`ALL_EI_DESCR_MINTS`] carries.
 pub fn all_descrs() -> &'static [BhDescr] {
     &ALL_DESCRS
 }
+
+/// Deserialized `pipeline.ei_descr_mints` — the gccache slots that only an
+/// `EffectInfo` raw set names, paired with the arguments their mint took.
+///
+/// See `descr::publish_effect_info_descr_mints` for why the opcode table alone
+/// leaves these slots empty on this side of the build/runtime split.
+static ALL_EI_DESCR_MINTS: LazyLock<Vec<majit_ir::effectinfo::DescrMintEntry>> =
+    LazyLock::new(|| {
+        const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ei_descr_mints.bin"));
+        bincode::deserialize(BYTES).unwrap_or_else(|e| {
+            panic!(
+                "pyre-jit-trace: failed to deserialize ei_descr_mints.bin \
+                 ({} bytes): {e}",
+                BYTES.len(),
+            )
+        })
+    });
 
 /// Deserialized `pipeline.all_liveness` — RPython `Assembler.all_liveness`
 /// (assembler.py), the target of `pyjitpl.py:2264 self.liveness_info =
@@ -492,6 +516,18 @@ pub fn rehydrate_build_descr_raw_sets() {
                 crate::descr::make_descr_from_bh(bh);
             }
         }
+        // Last, and only into what is still empty: the slots no opcode names,
+        // which `descrs.bin` — RPython's `opcode_descrs`, not its `all_descrs`
+        // — therefore does not carry.  Without them a raw-set member whose
+        // container appears in no bytecode reads as `AbsentContainer` even
+        // though the analyzer minted it.
+        //
+        // After the loop above rather than before it, because both are
+        // build-time producers that disagree on `index_in_parent` for a shared
+        // field, and going first would mean pre-filling a slot the loop then
+        // asks for with its own numbering.  Publishing what the established
+        // producers left over keeps their answers untouched.
+        crate::descr::publish_effect_info_descr_mints(&ALL_EI_DESCR_MINTS);
         let mut refs = vec![None; all.len()];
         for (i, bh) in all.iter().enumerate() {
             let calldescr = match bh {
@@ -531,13 +567,17 @@ fn report_descr_spelling_gate() {
 
 /// The descr-universe invariants, as `[jit-stats]` key/value tokens.
 ///
-/// `ambiguous` and `stale_absent` are the two upstream cannot reach, so
-/// `check.py` lists them in `JITSTATS_BADNESS_FIELDS` and fails the run if
-/// either rises off zero. `absent` is the divergence itself rather than a
-/// benign projection — `effectinfo.py:492-494` builds its sets out of descr
-/// objects `cpu.*descrof` just minted, so upstream has no member that fails to
-/// resolve — and it is carried as a ratchet: the committed baseline pins what
-/// this `descrs.bin` still drops, and it may fall but never rise.
+/// All three of `absent`, `ambiguous` and `stale_absent` are answers upstream
+/// cannot reach — `effectinfo.py:492-494` builds its sets out of descr objects
+/// `cpu.*descrof` just minted, so no member of a raw set can fail to resolve —
+/// so `check.py` lists them in `JITSTATS_BADNESS_FIELDS` and fails the run if
+/// any rises off zero. That is pyre's form of the bare `assert` upstream states
+/// this class of condition with (`descr.py:47`, `effectinfo.py:486`, `:525`),
+/// which the build-time/runtime split makes reachable and therefore
+/// unassertable.
+///
+/// `resolved` is the denominator, and rides along so a run that resolves
+/// nothing cannot look identical to one that resolves everything.
 ///
 /// `stale_absent` re-asks the `AbsentContainer` question against the universe
 /// as it stands now, so it must be read at process exit, after the run has

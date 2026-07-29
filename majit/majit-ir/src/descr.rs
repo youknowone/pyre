@@ -103,6 +103,7 @@ use std::sync::Weak;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use crate::OpRef;
+use crate::effectinfo::{DescrMintEntry, DescrMintSpec, DescrSetMember};
 use crate::resoperation::{GuardPendingFieldEntry, RdVirtualInfo};
 use crate::value::{Const, Type};
 use serde::{Deserialize, Serialize};
@@ -1563,6 +1564,51 @@ static GC_CACHE: OnceLock<Mutex<GcCache>> = OnceLock::new();
 pub fn gc_cache() -> &'static Mutex<GcCache> {
     GC_CACHE.get_or_init(|| Mutex::new(GcCache::new()))
 }
+
+/// The mint arguments behind every `GcCache` slot an `EffectInfo` raw set
+/// names — the projection of this cache that has to survive the
+/// analyzer→runtime process split.
+///
+/// Upstream needs no such table: `setup_descrs` (`descr.py:25-47`) snapshots
+/// the one gccache the raw-set descrs were minted into, so
+/// `compute_bitstrings` (`effectinfo.py:465-499`) unions descrs that are
+/// already present. Pyre carries only the assembler's opcode table across
+/// (`pyjitpl.py:2261 setup_descrs(asm.descrs)`), so a descr minted *solely* for
+/// a raw set — referenced by no opcode — would otherwise have no slot to
+/// resolve against on the far side.
+///
+/// Insertion-ordered and keyed by the member, so a repeated mint of the same
+/// `(STRUCT, fieldname)` records once, exactly as the cache itself dedups.
+static EI_DESCR_MINTS: OnceLock<Mutex<indexmap::IndexMap<DescrSetMember, DescrMintSpec>>> =
+    OnceLock::new();
+
+fn ei_descr_mints() -> &'static Mutex<indexmap::IndexMap<DescrSetMember, DescrMintSpec>> {
+    EI_DESCR_MINTS.get_or_init(|| Mutex::new(indexmap::IndexMap::new()))
+}
+
+/// Record how a raw-set member's slot was filled, at the mint site where the
+/// layout is in scope. First writer wins, matching the cache-or-mint order in
+/// `descr.py:220-233`.
+pub fn record_ei_descr_mint(member: DescrSetMember, spec: DescrMintSpec) {
+    ei_descr_mints()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(member)
+        .or_insert(spec);
+}
+
+/// Every recorded `(member, mint spec)` pair, in mint order.
+pub fn ei_descr_mints_snapshot() -> Vec<DescrMintEntry> {
+    ei_descr_mints()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(member, spec)| DescrMintEntry {
+            member: member.clone(),
+            spec: spec.clone(),
+        })
+        .collect()
+}
 /// history.py: TargetToken / JitCellToken identity. PyPy keys
 /// `target_tokens_currently_compiling` and `consider_jump`'s
 /// `jump_target_descr` by descriptor object identity (Python's default
@@ -3001,6 +3047,23 @@ pub trait FieldDescr: Descr {
         true
     }
 
+    /// `descr.py:151 FieldDescr.flag` — `get_type_flag(FIELDTYPE)`
+    /// (`descr.py:240-252`).
+    ///
+    /// The default reconstructs the classification from the IR type the way
+    /// `get_type_flag` does, which is exact for the pointer / float / integer
+    /// cases; implementations that store the flag verbatim override it and so
+    /// also keep `FLAG_STRUCT` and `FLAG_VOID`.
+    fn field_flag(&self) -> ArrayFlag {
+        match self.field_type() {
+            Type::Ref => ArrayFlag::Pointer,
+            Type::Float => ArrayFlag::Float,
+            Type::Void => ArrayFlag::Void,
+            Type::Int if self.is_field_signed() => ArrayFlag::Signed,
+            Type::Int => ArrayFlag::Unsigned,
+        }
+    }
+
     /// Whether this field is immutable (never written after object creation).
     ///
     /// Immutable field reads from a constant object can be folded to constants,
@@ -4020,6 +4083,11 @@ impl FieldDescr for SimpleFieldDescr {
     /// descr.py:179: is_field_signed() → self.flag == FLAG_SIGNED
     fn is_field_signed(&self) -> bool {
         self.flag == ArrayFlag::Signed
+    }
+    /// descr.py:151: the stored `FieldDescr.flag`, so `FLAG_STRUCT` /
+    /// `FLAG_VOID` survive instead of being re-derived from the IR type.
+    fn field_flag(&self) -> ArrayFlag {
+        self.flag
     }
     fn is_immutable(&self) -> bool {
         self.is_immutable

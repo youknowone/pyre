@@ -32,9 +32,9 @@ impl std::error::Error for UnsupportedFieldExc {}
 /// key can — both halves of the split agree on it by construction, since
 /// `cpu.fielddescrof(STRUCT, fieldname)` / `cpu.arraydescrof(ARRAY)` /
 /// `cpu.interiorfielddescrof(ARRAY, fieldname)` are cache lookups on exactly
-/// these tuples.  The key alone is enough because the member is resolved by
-/// lookup only, never by minting (see `descr_from_set_member` in
-/// `pyre-jit-trace`).
+/// these tuples.  The key alone identifies the slot; what it does *not* carry
+/// is the layout needed to create the descr when the slot is empty, which is
+/// what [`DescrMintSpec`] adds.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DescrSetMember {
     /// `descr.py:218-239 get_field_descr(gccache, STRUCT, fieldname)` —
@@ -46,6 +46,86 @@ pub enum DescrSetMember {
     /// `descr.py:404-437 get_interiorfield_descr(gccache, ARRAY, fieldname)` —
     /// `_cache_interiorfield[(Array(array_id), name, "")]`.
     InteriorField { array_id: u64, name: String },
+}
+
+/// The layout arguments `descr.py`'s three getters pass to the descr
+/// constructor on a cache miss.
+///
+/// `get_field_descr` (`descr.py:218-239`), `get_array_descr`
+/// (`descr.py:348-378`) and `get_interiorfield_descr` (`descr.py:404-437`) are
+/// all `try: return cache[key] / except KeyError: <construct>; cache[key] = d`
+/// — they **mint** when the slot is empty.  Upstream never has to serialize
+/// those arguments because there is one gccache in one process: the raw sets
+/// hold the descr objects themselves, and `setup_descrs` (`descr.py:25-47`)
+/// snapshots the same cache they were minted into, so
+/// `compute_bitstrings` (`effectinfo.py:465-499`) only ever unions descrs that
+/// are already present.
+///
+/// Pyre mints in the analyzer process and resolves in the runtime one, and only
+/// the assembler's opcode table (`pyjitpl.py:2261 setup_descrs(asm.descrs)`)
+/// crosses between them.  A descr the analyzer minted *solely* to fill a raw
+/// set is referenced by no opcode, so it does not cross, and the runtime lookup
+/// finds an empty slot.  Pairing each member with the arguments its cache miss
+/// would need restores upstream's mint-or-hit at the far end.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum DescrMintSpec {
+    /// `descr.py:224-231` — the `FieldDescr(name, offset, size, flag,
+    /// index_in_parent, is_pure)` arguments, plus `descr.py:234-238
+    /// parent_descr = get_size_descr(gccache, STRUCT, vtable)`'s `STRUCT` size.
+    ///
+    /// No vtable: the analyzer has no vtable surface, and a runtime publish
+    /// under the same key carries the real one — the authority rule in
+    /// `descr::GcCache::register_keyed_size` keeps that one whichever side
+    /// registers first.
+    Field {
+        struct_size: usize,
+        offset: usize,
+        field_size: usize,
+        field_type: crate::value::Type,
+        flag: crate::descr::ArrayFlag,
+        is_immutable: bool,
+        is_quasi_immutable: bool,
+        index_in_parent: usize,
+    },
+    /// `descr.py:353-370` — the `ArrayDescr(basesize, itemsize, lendescr, flag,
+    /// is_pure, concrete_type)` arguments. `length_offset` is what
+    /// `get_field_arraylen_descr` (`descr.py:256-267`) needs, and is read only
+    /// when `!nolength`, matching `descr.py:359-362`.
+    Array {
+        base_size: usize,
+        item_size: usize,
+        flag: crate::descr::ArrayFlag,
+        item_type: crate::value::Type,
+        nolength: bool,
+        length_offset: usize,
+        is_pure: bool,
+        concrete_type: char,
+    },
+    /// `descr.py:429-436` — an interior field is minted out of the array descr
+    /// and the element-struct field descr, so it carries both halves rather
+    /// than a flat layout.
+    ///
+    /// `field_struct_id` is the `REALARRAY.OF` cache key
+    /// (`descr.py:435 get_field_descr(gc_ll_descr, REALARRAY.OF, name)`).
+    /// Upstream recovers it from the ARRAY lltype; the serialized member names
+    /// only the array, so the element struct's key travels explicitly.
+    InteriorField {
+        array: Box<DescrMintSpec>,
+        field_struct_id: u64,
+        field_name: String,
+        field: Box<DescrMintSpec>,
+    },
+}
+
+/// One `(slot key, how to fill it)` pair, as serialized alongside the jitcodes.
+///
+/// The union over every `EffectInfo`'s six raw sets — the same union
+/// `compute_bitstrings` builds in `descrs = {'fields': set(), ...}`
+/// (`effectinfo.py:478-495`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DescrMintEntry {
+    pub member: DescrSetMember,
+    pub spec: DescrMintSpec,
 }
 
 /// `effectinfo.py:128-145 frozenset_or_none`: serializable projection of

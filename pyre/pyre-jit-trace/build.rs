@@ -24,6 +24,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "jit_drivers.bin",
     "insns.bin",
     "descrs.bin",
+    "ei_descr_mints.bin",
     "liveness.bin",
     "fnaddr_bindings.bin",
     "static_pytype_bindings.bin",
@@ -100,6 +101,11 @@ fn emit_llbc_extraction_placeholders() {
     std::fs::write(
         format!("{out_dir}/descrs.bin"),
         bincode::serialize(&Vec::<majit_translate::jitcode::BhDescr>::new()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        format!("{out_dir}/ei_descr_mints.bin"),
+        bincode::serialize(&Vec::<majit_ir::effectinfo::DescrMintEntry>::new()).unwrap(),
     )
     .unwrap();
     std::fs::write(
@@ -545,6 +551,18 @@ fn real_main() {
     // by `acquire_interp`).
     let descrs_bin = bincode::serialize(&pipeline.descrs).unwrap();
     std::fs::write(format!("{out_dir}/descrs.bin"), &descrs_bin).unwrap();
+
+    // The table above is RPython's `opcode_descrs` (`pyjitpl.py:2261
+    // setup_descrs(asm.descrs)`), not its `all_descrs` (`pyjitpl.py:2289
+    // self.cpu.setup_descrs()` = the full gccache walk at `descr.py:25-47`).
+    // Upstream never has to distinguish them here because one gccache serves
+    // one process, so `compute_bitstrings` unions descrs that are already
+    // present. Pyre mints in this process and resolves in another, so the
+    // raw-set members no opcode names would have no slot on the far side;
+    // persist their mint arguments and let the runtime cache take the same
+    // `descr.py:224-238` miss branch this one did.
+    let ei_descr_mints_bin = bincode::serialize(&pipeline.ei_descr_mints).unwrap();
+    std::fs::write(format!("{out_dir}/ei_descr_mints.bin"), &ei_descr_mints_bin).unwrap();
 
     // RPython `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`.
     // Persist the build-time assembler's shared `all_liveness` byte stream so a

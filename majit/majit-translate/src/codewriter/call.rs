@@ -1782,6 +1782,22 @@ impl CallControl {
                 let key = majit_ir::effectinfo::DescrSetMember::Array {
                     array_id: path_hash_u64,
                 };
+                // The same arguments the `get_array_descr` call above passed,
+                // so a runtime cache that has never seen this ARRAY can take
+                // `descr.py:353-370`'s miss branch rather than find nothing.
+                majit_ir::descr::record_ei_descr_mint(
+                    key.clone(),
+                    majit_ir::effectinfo::DescrMintSpec::Array {
+                        base_size,
+                        item_size,
+                        flag,
+                        item_type: ir_type,
+                        nolength,
+                        length_offset,
+                        is_pure,
+                        concrete_type,
+                    },
+                );
                 (ad_arc, Some(key))
             }
             None => {
@@ -2111,6 +2127,24 @@ impl CallControl {
                         let stored = fd.field_name();
                         if stored == field_name || stored.ends_with(&needle) {
                             fd.set_index(idx);
+                            // This slot is filled in *this* process; the
+                            // runtime's own cache is a different one, so the
+                            // layout still has to travel. Read it back off the
+                            // descr rather than off the locals below, which
+                            // describe the mint that did not happen.
+                            majit_ir::descr::record_ei_descr_mint(
+                                member.clone(),
+                                majit_ir::effectinfo::DescrMintSpec::Field {
+                                    struct_size,
+                                    offset: fd.offset(),
+                                    field_size: fd.field_size(),
+                                    field_type: fd.field_type(),
+                                    flag: fd.field_flag(),
+                                    is_immutable: fd.is_immutable(),
+                                    is_quasi_immutable: fd.is_quasi_immutable(),
+                                    index_in_parent: fd.index_in_parent(),
+                                },
+                            );
                             return Some((fd.clone() as majit_ir::descr::DescrRef, member));
                         }
                     }
@@ -2146,6 +2180,22 @@ impl CallControl {
                     field_pos,
                 );
                 descr.set_index(idx);
+                // Same arguments this `get_field_descr` miss just used, kept so
+                // the runtime's own cache can take the same miss branch
+                // (`descr.py:224-238`) instead of finding an empty slot.
+                majit_ir::descr::record_ei_descr_mint(
+                    member.clone(),
+                    majit_ir::effectinfo::DescrMintSpec::Field {
+                        struct_size,
+                        offset: field_offset,
+                        field_size,
+                        field_type: ir_type,
+                        flag,
+                        is_immutable,
+                        is_quasi_immutable,
+                        index_in_parent: field_pos,
+                    },
+                );
                 return Some((descr as majit_ir::descr::DescrRef, member));
             }
             offset = offset.saturating_add(field_size);
@@ -2325,6 +2375,36 @@ impl CallControl {
                 let array_descr: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
                     majit_ir::descr::descr_arc_as_array_descr(cached)
                         .expect("gc_cache._cache_array slot held a non-ArrayDescr Arc");
+                // `descr.py:429-436` builds an interior field out of the array
+                // descr and the element-struct field descr, so both halves
+                // travel — the runtime miss branch has to rebuild the same two.
+                majit_ir::descr::record_ei_descr_mint(
+                    member.clone(),
+                    majit_ir::effectinfo::DescrMintSpec::InteriorField {
+                        array: Box::new(majit_ir::effectinfo::DescrMintSpec::Array {
+                            base_size,
+                            item_size,
+                            flag: ArrayFlag::Struct,
+                            item_type: majit_ir::value::Type::Ref,
+                            nolength: false,
+                            length_offset: 0,
+                            is_pure: false,
+                            concrete_type: '\x00',
+                        }),
+                        field_struct_id: majit_ir::descr::path_hash(&elem_canonical),
+                        field_name: field_name.to_string(),
+                        field: Box::new(majit_ir::effectinfo::DescrMintSpec::Field {
+                            struct_size,
+                            offset: field_descr.offset(),
+                            field_size: field_descr.field_size(),
+                            field_type: field_descr.field_type(),
+                            flag: field_descr.field_flag(),
+                            is_immutable: field_descr.is_immutable(),
+                            is_quasi_immutable: field_descr.is_quasi_immutable(),
+                            index_in_parent: field_descr.index_in_parent(),
+                        }),
+                    },
+                );
                 let descr = majit_ir::descr::gc_cache()
                     .lock()
                     .unwrap()

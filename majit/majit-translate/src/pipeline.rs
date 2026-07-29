@@ -158,6 +158,18 @@ pub struct ProgramPipelineResult {
     /// self.liveness_info = "".join(asm.all_liveness)`.
     #[serde(default)]
     pub all_liveness: Vec<u8>,
+    /// The `(gccache slot key, mint arguments)` pairs behind every descr an
+    /// `EffectInfo` raw set names — see `majit_ir::descr::ei_descr_mints_snapshot`.
+    ///
+    /// `descrs` above is upstream's `opcode_descrs` (`pyjitpl.py:2261
+    /// setup_descrs(asm.descrs)`), not its `all_descrs` (`pyjitpl.py:2289
+    /// self.cpu.setup_descrs()`, the full gccache walk at `descr.py:25-47`).
+    /// A descr the analyzer minted only to fill a raw set is named by no
+    /// opcode, so it is absent from `descrs` and would have no slot to resolve
+    /// against once the process boundary is crossed. Upstream never needs this
+    /// because there is one gccache in one process.
+    #[serde(default)]
+    pub ei_descr_mints: Vec<majit_ir::effectinfo::DescrMintEntry>,
     pub total_blocks: usize,
     pub total_ops: usize,
     pub total_vable_rewrites: usize,
@@ -200,6 +212,7 @@ mod tests {
             insns: indexmap::IndexMap::new(),
             descrs: Vec::new(),
             all_liveness: Vec::new(),
+            ei_descr_mints: Vec::new(),
             total_blocks: 1,
             total_ops: 1,
             total_vable_rewrites: 0,
