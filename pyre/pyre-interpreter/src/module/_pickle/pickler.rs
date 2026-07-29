@@ -1504,7 +1504,7 @@ fn save_list(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resul
         buf.push(op::LIST);
     }
     memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot));
-    let result = batch_appends(ctx, buf, slot);
+    let result = batch_appends(ctx, buf, slot, slot);
     fast_save_leave(ctx, fast_token, slot);
     result
 }
@@ -1808,12 +1808,23 @@ fn pinned_get(slot: usize, i: usize) -> PyObjectRef {
 /// `interp_pickle.py _batch_appends`. `slot` pins a Python `list` of the
 /// items; each is re-read from the (GC-walked) list right before saving so a
 /// mid-batch collection cannot leave a stale element behind.
-fn batch_appends(ctx: &mut PickleCtx, buf: &mut Framer, slot: usize) -> Result<(), PyError> {
+fn batch_appends(
+    ctx: &mut PickleCtx,
+    buf: &mut Framer,
+    slot: usize,
+    owner_slot: usize,
+) -> Result<(), PyError> {
     let n = pinned_len(slot);
     if !ctx.bin {
         // proto 0 — no APPENDS, one APPEND per item.
         for i in 0..n {
-            save(ctx, buf, pinned_get(slot, i))?;
+            save(ctx, buf, pinned_get(slot, i)).map_err(|error| {
+                add_serializing_note(
+                    error,
+                    pyre_object::gc_roots::shadow_stack_get(owner_slot),
+                    &format!("item {i}"),
+                )
+            })?;
             buf.push(op::APPEND);
         }
         return Ok(());
@@ -1822,14 +1833,26 @@ fn batch_appends(ctx: &mut PickleCtx, buf: &mut Framer, slot: usize) -> Result<(
     while i < n {
         if i + 1 == n {
             // Exactly one item left.
-            save(ctx, buf, pinned_get(slot, i))?;
+            save(ctx, buf, pinned_get(slot, i)).map_err(|error| {
+                add_serializing_note(
+                    error,
+                    pyre_object::gc_roots::shadow_stack_get(owner_slot),
+                    &format!("item {i}"),
+                )
+            })?;
             buf.push(op::APPEND);
             return Ok(());
         }
         buf.push(op::MARK);
         let mut cnt = 0;
         while i < n && cnt < BATCHSIZE {
-            save(ctx, buf, pinned_get(slot, i))?;
+            save(ctx, buf, pinned_get(slot, i)).map_err(|error| {
+                add_serializing_note(
+                    error,
+                    pyre_object::gc_roots::shadow_stack_get(owner_slot),
+                    &format!("item {i}"),
+                )
+            })?;
             i += 1;
             cnt += 1;
         }
@@ -2413,7 +2436,7 @@ fn save_reduce(
 
     if has_listitems {
         let items_slot = drain_iter_pinned(rv_get(3))?;
-        batch_appends(ctx, buf, items_slot)?;
+        batch_appends(ctx, buf, items_slot, w_obj_slot.unwrap())?;
     }
     if has_dictitems {
         let pairs_slot = drain_iter_pairs_pinned(rv_get(4))?;
