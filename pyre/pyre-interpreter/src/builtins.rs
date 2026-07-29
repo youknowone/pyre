@@ -9121,7 +9121,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// the supplied namespaces.  When the namespaces are dicts, pyre converts
 /// them into `DictStorage`s before invocation and copies the post-run
 /// namespace contents back so that callers see the new bindings.
-fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `exec(source, /, globals=None, locals=None, *, closure=None)`: source is
     // positional-only; globals/locals are positional-or-keyword; `closure` is
     // keyword-only.  `closure` supplies the cell objects that bind a code

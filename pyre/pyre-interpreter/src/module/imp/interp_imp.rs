@@ -591,11 +591,53 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "init_frozen",
         crate::make_builtin_function_with_arity(
             "init_frozen",
-            // interp_imp.py:74 — frozen modules are served through the meta
-            // path, never re-initialized by this legacy entry point.
+            // `import.c _imp_init_frozen_impl` — run the frozen module's code
+            // in a fresh namespace registered under its name and hand the
+            // module back, or None when the name is not frozen.  A name
+            // already in sys.modules keeps its module.
+            // `interp_imp.py:74 init_frozen` instead always answers None,
+            // leaving frozen modules to the meta path.
             |args| {
-                let _ = frozen_name(args, "init_frozen")?;
-                Ok(pyre_object::w_none())
+                let name = frozen_name(args, "init_frozen")?;
+                let Some(entry) = served_frozen_module(&name) else {
+                    return Ok(pyre_object::w_none());
+                };
+                // A frozen name is ASCII by construction (the table's keys),
+                // so the lossy view is the name itself.
+                let name = name.to_string_lossy().into_owned();
+                if let Some(module) = crate::importing::get_sys_module(&name) {
+                    return Ok(module);
+                }
+                let code = frozen_code(entry)?;
+                let _roots = pyre_object::gc_roots::push_roots();
+                let code_slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(code);
+                let ec = crate::call::getexecutioncontext();
+                let w_globals = unsafe { &*ec }.fresh_module_globals();
+                let globals_slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(w_globals);
+                unsafe {
+                    pyre_object::w_dict_setitem_str(
+                        w_globals,
+                        "__name__",
+                        pyre_object::w_str_new(&name),
+                    );
+                };
+                let module = pyre_object::w_module_new_aliasing_dict(
+                    &name,
+                    pyre_object::gc_roots::shadow_stack_get(globals_slot),
+                );
+                crate::importing::set_sys_module(&name, module);
+                let module_slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(module);
+                if let Err(error) = crate::builtins::builtin_exec(&[
+                    pyre_object::gc_roots::shadow_stack_get(code_slot),
+                    pyre_object::gc_roots::shadow_stack_get(globals_slot),
+                ]) {
+                    crate::importing::remove_sys_module(&name);
+                    return Err(error);
+                }
+                Ok(pyre_object::gc_roots::shadow_stack_get(module_slot))
             },
             1,
         ),
