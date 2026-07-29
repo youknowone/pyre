@@ -289,6 +289,10 @@ pub struct ExecutionContext {
     /// context (thread-specific), never by a process-global side table.
     pub w_asyncgen_firstiter_fn: PyObjectRef,
     pub w_asyncgen_finalizer_fn: PyObjectRef,
+    /// `executioncontext.py:52` — the current PEP 567 Context object for this
+    /// execution context.  This is execution-context-owned, not a process
+    /// global or an independent Rust TLS side table.
+    pub contextvar_context: PyObjectRef,
 }
 
 pub type PyExecutionContext = ExecutionContext;
@@ -352,6 +356,7 @@ impl ExecutionContext {
             current_gen_or_coroutine: pyre_object::PY_NULL,
             w_asyncgen_firstiter_fn: pyre_object::PY_NULL,
             w_asyncgen_finalizer_fn: pyre_object::PY_NULL,
+            contextvar_context: pyre_object::PY_NULL,
         }
     }
 
@@ -384,6 +389,7 @@ impl ExecutionContext {
         ec.current_gen_or_coroutine = pyre_object::PY_NULL;
         ec.w_asyncgen_firstiter_fn = pyre_object::PY_NULL;
         ec.w_asyncgen_finalizer_fn = pyre_object::PY_NULL;
+        ec.contextvar_context = pyre_object::PY_NULL;
         ec
     }
 
@@ -400,6 +406,9 @@ impl ExecutionContext {
         for wref in &mut self.thread_local_refs {
             visitor(unsafe { &mut *(wref as *mut PyObjectRef as *mut majit_ir::GcRef) });
         }
+        visitor(unsafe {
+            &mut *(&mut self.contextvar_context as *mut PyObjectRef as *mut majit_ir::GcRef)
+        });
     }
 
     pub fn __init__(&mut self, space: PyObjectRef) {

@@ -2,6 +2,11 @@
 
 from contextvars import ContextVar
 
+try:
+    from __pypy__ import get_contextvar_context, set_contextvar_context
+except ImportError:
+    get_contextvar_context = set_contextvar_context = None
+
 
 var = ContextVar("name")
 assert var.name == "name"
@@ -27,3 +32,10 @@ except TypeError as exc:
     assert "unhashable type" in str(exc)
 else:
     raise AssertionError("an unhashable str subclass must be rejected")
+
+if get_contextvar_context is not None:
+    previous = get_contextvar_context()
+    marker = object()
+    set_contextvar_context(marker)
+    assert get_contextvar_context() is marker
+    set_contextvar_context(previous)

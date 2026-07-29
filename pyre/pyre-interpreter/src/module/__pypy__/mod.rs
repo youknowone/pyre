@@ -19,6 +19,40 @@ pub mod interp_buffer;
 
 pub use interp_buffer::W_PickleBuffer;
 
+/// `interp_magic.get_contextvar_context` — read the value from the live
+/// PyPy-style ExecutionContext, returning None before the first Context is
+/// installed.
+fn get_contextvar_context(_: &[pyre_object::PyObjectRef]) -> crate::PyResult {
+    let ec = crate::call::getexecutioncontext();
+    if ec.is_null() {
+        return Ok(pyre_object::w_none());
+    }
+    let context = unsafe { (*ec).contextvar_context };
+    if context.is_null() {
+        Ok(pyre_object::w_none())
+    } else {
+        Ok(context)
+    }
+}
+
+/// `interp_magic.set_contextvar_context` — replace the current
+/// ExecutionContext's PEP 567 Context slot.
+fn set_contextvar_context(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
+    let Some(&context) = args.first() else {
+        return Err(crate::PyError::type_error(
+            "set_contextvar_context() missing required argument",
+        ));
+    };
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    if ec.is_null() {
+        return Err(crate::PyError::runtime_error(
+            "no current execution context",
+        ));
+    }
+    unsafe { (*ec).contextvar_context = context };
+    Ok(pyre_object::w_none())
+}
+
 crate::py_module! {
     "__pypy__",
     // `PickleBuffer` wraps a bytes-like object for proto-5 out-of-band
@@ -30,6 +64,10 @@ crate::py_module! {
     appleveldefs: {
         "identity_dict_app.py" =>
             ["identity_dict", "reversed_dict", "move_to_end", "objects_in_repr"],
+    },
+    functions: {
+        "get_contextvar_context" / 0 = get_contextvar_context,
+        "set_contextvar_context" / 1 = set_contextvar_context,
     },
     extra_init: |ns| {
         // Mark as a package so `from __pypy__.builders import ...`
