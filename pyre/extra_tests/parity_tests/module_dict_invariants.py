@@ -61,4 +61,57 @@ del g["_bbb"]
 del g["_ccc"]
 
 
+# (6) A store that raises mid-probe leaves the module dict untouched.
+#
+# `ll_dict_lookup` propagates at the first raising comparison
+# (`rordereddict.py:1055`), so nothing later in the bucket is found and the
+# store never lands.  Reproduce the shape that stresses it: one key whose
+# `__eq__` raises and, in the SAME bucket, the incoming key's own object —
+# so the raise is seen before the entry that would otherwise match.
+_armed = False
+
+
+class _Raiser:
+    def __hash__(self):
+        return 7
+
+    def __eq__(self, other):
+        if _armed:
+            raise ValueError("boom")
+        return self is other
+
+
+class _Quiet:
+    def __hash__(self):
+        return 7
+
+    def __eq__(self, other):
+        return self is other
+
+
+def _store_must_not_mutate_on_raise():
+    global _armed
+    quiet = _Quiet()
+    g[_Raiser()] = "raiser"
+    g[quiet] = "quiet-old"
+    before = list(g.items())
+    _armed = True
+    try:
+        g[quiet] = "quiet-new"
+    except ValueError:
+        pass
+    else:
+        assert False, "raising __eq__ must propagate out of the store"
+    finally:
+        _armed = False
+    live = {id(k) for k, _ in g.items()}
+    dropped = [k for k, _ in before if id(k) not in live]
+    assert not dropped, f"store dropped unrelated keys: {dropped!r}"
+    assert len(g) == len(before), f"len {len(before)} -> {len(g)}"
+    assert g[quiet] == "quiet-old", f"value applied despite raise: {g[quiet]!r}"
+
+
+_store_must_not_mutate_on_raise()
+
+
 print("OK")

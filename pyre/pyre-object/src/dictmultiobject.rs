@@ -1920,20 +1920,29 @@ unsafe fn key_equality_is_builtin(key: PyObjectRef) -> bool {
 /// to the limited-type builtin equality below — sufficient for the
 /// hashable-builtin smoke tests but not for arbitrary user types.
 pub(crate) unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
+    // Once `space.eq_w` has raised earlier in this probe, nothing may match —
+    // not by user comparison and not by identity.  The Rust `Eq` callback
+    // cannot abort the `IndexMap` scan, so answering `false` for the rest of it
+    // is how a raised probe is made to look like the `r_dict(space.eq_w,
+    // space.hash_w)` lookup it stands for: `ll_dict_lookup` propagates at the
+    // first comparison, so no later key — however it would have compared — can
+    // still be found.  The flag is cleared per op in
+    // `object_key_for(_checked)`, so this only fires after a raise within the
+    // current probe.
+    //
+    // This has to sit above the identity shortcut, not below it.  A bucket can
+    // hold both a key whose `__eq__` raises and the incoming key's own object;
+    // if the raising one is probed first and identity still answered `true`
+    // afterwards, `insert` would REPLACE rather than append, and the checked
+    // store's `dict_entries_pop_last` undo would then drop an unrelated last
+    // entry while leaving the replaced value overwritten.
+    if crate::dict_eq_hook::eq_error_pending() {
+        return false;
+    }
     if std::ptr::eq(a, b) {
         return true;
     }
     if a.is_null() || b.is_null() {
-        return false;
-    }
-    // Once `space.eq_w` has raised earlier in this probe, skip every
-    // remaining user comparison.  The Rust `Eq` callback cannot abort the
-    // `IndexMap` scan, but suppressing further `__eq__` calls means no extra
-    // comparison runs and the first exception is the one that propagates —
-    // matching `r_dict(space.eq_w, space.hash_w)` raising at the first
-    // comparison.  The flag is cleared per op in `object_key_for(_checked)`,
-    // so this only fires after a raise within the current probe.
-    if crate::dict_eq_hook::eq_error_pending() {
         return false;
     }
     if crate::dict_eq_hook::callback_free_probe_active() {
