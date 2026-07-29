@@ -84,11 +84,36 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
             ob_type: &INSTANCE_TYPE as *const PyType,
             w_class: w_type,
         },
-        // `_mapdict_init_empty` (`mapdict.py:908-910`): `storage = None`.
-        // The map terminator lives in the `pyre-interpreter` mapdict
-        // layer and is installed there on first attribute access; a null
-        // map is the not-yet-initialized empty state.
-        map: std::ptr::null(),
+        // `mapdict.py:758-761 user_setup` → `_mapdict_init_empty(
+        // w_subtype.terminator)` (`mapdict.py:908-910`): the instance map is
+        // the owning type's terminator from construction, and `storage = None`.
+        //
+        // Reading it here rather than installing it on first attribute access
+        // is what makes `_get_mapdict_map`'s `jit.promote(self.map)` promotable.
+        // A deferred install leaves every fresh instance at null until the
+        // first access, so the promoted map guard the JIT bakes — recorded
+        // AFTER that install, hence naming the terminator — cannot hold on the
+        // next iteration's fresh instance. It then fails on every pass through
+        // a loop that constructs an object and touches an attribute, and each
+        // failure is a full deopt.
+        //
+        // Null stays legal: `pyre-object` cannot build a terminator (it lives
+        // in the interpreter's mapdict layer and `pyre-object` must not depend
+        // on it), so a type whose terminator has not been created yet still
+        // gets one from `ensure_mapdict_initialized` on first access — which
+        // also stores it on the type, so every later instance is eager.
+        //
+        // The `is_type` test is what makes reading the field safe: `w_type` is
+        // a `W_TypeObject` on every interpreter path, but the allocator is also
+        // driven with a sentinel that has no type layout behind it, and the
+        // terminator field would be read off whatever that address points at.
+        map: unsafe {
+            if crate::typeobject::is_type(w_type) {
+                crate::typeobject::w_type_get_terminator(w_type)
+            } else {
+                std::ptr::null()
+            }
+        },
         storage: std::ptr::null_mut(),
     });
     // objspace.py `allocate_instance`: types with `hasuserdel` register the
