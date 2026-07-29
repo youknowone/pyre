@@ -15,6 +15,8 @@
 //! distinct `ob_type` (the JIT-visible "RPython vtable" equivalent —
 //! see `pyobject.rs:25-38`) while the user-visible `w_class` field
 //! always resolves to `get_instantiate(&TUPLE_TYPE)`.
+//! Each variant also carries Python 3.14's mutable-once tuple hash cache;
+//! this is the requested 3.14 delta from PyPy's specialized layouts.
 //!
 //! Data structures are landed. Construction
 //! dispatch (`makespecialisedtuple2`) and JIT specialisation are
@@ -23,6 +25,7 @@
 #![allow(non_camel_case_types)]
 
 use crate::pyobject::*;
+use std::sync::atomic::AtomicI64;
 
 /// Specialised tuple holding two raw `i64` values
 /// (`Cls_ii = make_specialised_class((int, int))`).
@@ -32,6 +35,8 @@ use crate::pyobject::*;
 #[repr(C)]
 pub struct W_SpecialisedTupleObject_ii {
     pub ob_header: PyObject,
+    /// CPython 3.14 tuple hash cache; `-1` means not computed.
+    pub hash: AtomicI64,
     pub value0: i64,
     pub value1: i64,
 }
@@ -41,6 +46,8 @@ pub struct W_SpecialisedTupleObject_ii {
 #[repr(C)]
 pub struct W_SpecialisedTupleObject_ff {
     pub ob_header: PyObject,
+    /// CPython 3.14 tuple hash cache; `-1` means not computed.
+    pub hash: AtomicI64,
     pub value0: f64,
     pub value1: f64,
 }
@@ -50,6 +57,8 @@ pub struct W_SpecialisedTupleObject_ff {
 #[repr(C)]
 pub struct W_SpecialisedTupleObject_oo {
     pub ob_header: PyObject,
+    /// CPython 3.14 tuple hash cache; `-1` means not computed.
+    pub hash: AtomicI64,
     pub value0: PyObjectRef,
     pub value1: PyObjectRef,
 }
@@ -118,6 +127,7 @@ pub fn w_specialised_tuple_ii_new(value0: i64, value1: i64) -> PyObjectRef {
                 raw as *mut W_SpecialisedTupleObject_ii,
                 W_SpecialisedTupleObject_ii {
                     ob_header: header,
+                    hash: AtomicI64::new(-1),
                     value0,
                     value1,
                 },
@@ -127,6 +137,7 @@ pub fn w_specialised_tuple_ii_new(value0: i64, value1: i64) -> PyObjectRef {
     }
     Box::into_raw(Box::new(W_SpecialisedTupleObject_ii {
         ob_header: header,
+        hash: AtomicI64::new(-1),
         value0,
         value1,
     })) as PyObjectRef
@@ -150,6 +161,7 @@ pub fn w_specialised_tuple_ff_new(value0: f64, value1: f64) -> PyObjectRef {
                 raw as *mut W_SpecialisedTupleObject_ff,
                 W_SpecialisedTupleObject_ff {
                     ob_header: header,
+                    hash: AtomicI64::new(-1),
                     value0,
                     value1,
                 },
@@ -159,6 +171,7 @@ pub fn w_specialised_tuple_ff_new(value0: f64, value1: f64) -> PyObjectRef {
     }
     Box::into_raw(Box::new(W_SpecialisedTupleObject_ff {
         ob_header: header,
+        hash: AtomicI64::new(-1),
         value0,
         value1,
     })) as PyObjectRef
@@ -199,6 +212,7 @@ pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> P
                 raw as *mut W_SpecialisedTupleObject_oo,
                 W_SpecialisedTupleObject_oo {
                     ob_header: header,
+                    hash: AtomicI64::new(-1),
                     value0,
                     value1,
                 },
@@ -217,6 +231,7 @@ pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> P
     }
     Box::into_raw(Box::new(W_SpecialisedTupleObject_oo {
         ob_header: header,
+        hash: AtomicI64::new(-1),
         value0,
         value1,
     })) as PyObjectRef
@@ -350,10 +365,10 @@ mod tests {
     }
 
     #[test]
-    fn test_struct_sizes_match_three_word_inline_layout() {
-        // 16 bytes header + 2 * 8 bytes inline = 32 bytes.
-        assert_eq!(std::mem::size_of::<W_SpecialisedTupleObject_ii>(), 32);
-        assert_eq!(std::mem::size_of::<W_SpecialisedTupleObject_ff>(), 32);
-        assert_eq!(std::mem::size_of::<W_SpecialisedTupleObject_oo>(), 32);
+    fn test_struct_sizes_include_python_314_hash_cache() {
+        // 16-byte header + 8-byte hash + 2 * 8-byte inline values.
+        assert_eq!(std::mem::size_of::<W_SpecialisedTupleObject_ii>(), 40);
+        assert_eq!(std::mem::size_of::<W_SpecialisedTupleObject_ff>(), 40);
+        assert_eq!(std::mem::size_of::<W_SpecialisedTupleObject_oo>(), 40);
     }
 }

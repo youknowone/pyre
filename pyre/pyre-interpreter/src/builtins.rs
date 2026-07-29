@@ -9209,6 +9209,12 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             }
         }
         if is_tuple(obj) {
+            // CPython 3.14 `tuple_hash`: a successful aggregate hash is
+            // retained on the tuple.  Check before the recursive stack guard
+            // so repeated dict probes do not touch the elements at all.
+            if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
+                return Ok(hash);
+            }
             // The element walk is the one recursive step here, and the scalar
             // fast path above no longer reaches the call protocol's own
             // guard, so a nest deep enough to exhaust the C stack has to be
@@ -9221,7 +9227,9 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
                     hashes.push(try_hash_value(item)?);
                 }
             }
-            return Ok(_hash_tuple_xx(&hashes));
+            let hash = _hash_tuple_xx(&hashes);
+            pyre_object::w_tuple_set_cached_hash(obj, hash);
+            return Ok(hash);
         }
         if pyre_object::is_frozenset(obj) {
             return Ok(frozenset_hash_from_storage(obj));
@@ -9612,13 +9620,18 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             return 0xFCA8_6420;
         }
         if is_tuple(obj) {
-            // `tupleobject.py:409-420 _descr_hash_unroll` folds the element
-            // digests straight into the accumulator; collecting them into a
-            // list first would allocate one per hashed tuple.
+            // CPython 3.14 `tuple_hash`: cache the successful aggregate after
+            // the first element walk. This supersedes PyPy's otherwise
+            // structurally equivalent `_descr_hash_unroll` for the requested
+            // 3.14 observable semantics.
+            if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
+                return hash;
+            }
             let n = w_tuple_len(obj) as i64;
-            return _hash_tuple_xx_iter(
-                (0..n).filter_map(|i| w_tuple_getitem(obj, i).map(hash_value)),
-            );
+            let hash =
+                _hash_tuple_xx_iter((0..n).filter_map(|i| w_tuple_getitem(obj, i).map(hash_value)));
+            pyre_object::w_tuple_set_cached_hash(obj, hash);
+            return hash;
         }
         if pyre_object::is_frozenset(obj) {
             return frozenset_hash_from_storage(obj);
@@ -13339,6 +13352,24 @@ mod tests {
         assert_eq!(_hash_frozenset(&[1, 2, 3]), -272375401224217160);
         assert_eq!(_hash_frozenset(&[-2, 0, 1]), 8868930259606097796); // {-1, 0, 1}
         assert_eq!(_hash_frozenset(&[fs1, fs2]), 304806268181062474); // {fs{1}, fs{2}}
+    }
+
+    #[test]
+    fn tuple_hash_is_cached_for_general_and_specialised_layouts() {
+        crate::typedef::init_typeobjects();
+        for value in [
+            w_tuple_new(vec![w_int_new(1), w_int_new(2)]),
+            w_tuple_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]),
+        ] {
+            unsafe {
+                assert_eq!(pyre_object::w_tuple_cached_hash(value), None);
+            }
+            let first = try_hash_value(value).unwrap();
+            unsafe {
+                assert_eq!(pyre_object::w_tuple_cached_hash(value), Some(first));
+            }
+            assert_eq!(try_hash_value(value).unwrap(), first);
+        }
     }
 
     #[test]

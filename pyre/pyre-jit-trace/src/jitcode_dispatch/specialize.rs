@@ -3583,6 +3583,11 @@ fn walker_emit_specialised_tuple_ii<Sym: WalkSym>(
         crate::descr::specialised_tuple_ii_size_descr(),
     );
     ctx.trace_ctx.heap_cache_mut().new_object(tuple);
+    crate::helpers::emit_tuple_hash_sentinel(
+        ctx.trace_ctx,
+        tuple,
+        crate::descr::specialised_tuple_ii_hash_descr(),
+    );
     // `ob_type` is the JIT vtable; Python-level `type()` reads `w_class`,
     // which all specialised tuple variants share at the public `tuple`
     // typedef.

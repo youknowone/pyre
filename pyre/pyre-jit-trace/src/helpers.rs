@@ -694,6 +694,16 @@ pub fn emit_empty_list_inline(ctx: &mut TraceCtx) -> OpRef {
     list
 }
 
+/// Initialize CPython 3.14's tuple hash cache on a trace-visible allocation.
+/// `NewWithVtable` clears memory to zero, but the tuple sentinel is `-1`, so
+/// every virtual/materializable tuple constructor must emit this store.
+pub fn emit_tuple_hash_sentinel(ctx: &mut TraceCtx, tuple: OpRef, hash_descr: majit_ir::DescrRef) {
+    let uncomputed = ctx.const_int(-1);
+    let descr_index = hash_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[tuple, uncomputed], hash_descr);
+    ctx.heapcache_setfield_cached(tuple, descr_index, uncomputed);
+}
+
 /// Trace-visible `W_SpecialisedTupleObject_oo` construction from two boxed
 /// items — the shape `makespecialisedtuple2` builds for an arity-2 tuple whose
 /// elements are not both plain ints or both plain floats.
@@ -715,6 +725,7 @@ pub fn emit_specialised_tuple_oo_inline(ctx: &mut TraceCtx, value0: OpRef, value
         crate::descr::specialised_tuple_oo_size_descr(),
     );
     ctx.heap_cache_mut().new_object(tuple);
+    emit_tuple_hash_sentinel(ctx, tuple, crate::descr::specialised_tuple_oo_hash_descr());
     let w_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
     if !w_class.is_null() {
         let w_class = ctx.const_ref(w_class as i64);
@@ -753,6 +764,7 @@ pub fn emit_object_tuple_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
         crate::descr::w_tuple_size_descr(),
     );
     ctx.heap_cache_mut().new_object(tuple);
+    emit_tuple_hash_sentinel(ctx, tuple, crate::descr::tuple_hash_descr());
     let w_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
     let w_class = ctx.const_ref(w_class as i64);
     let class_descr = crate::descr::tuple_w_class_descr();
