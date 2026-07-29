@@ -175,6 +175,19 @@ pub struct MergePoint {
     /// Bytecode PC of this loop header. Used by cut_trace_from to update
     /// meta when the trace closes at a different loop.
     pub header_pc: usize,
+    /// The virtualizable `green_boxes` was snapshotted against, as a raw
+    /// address (0 when none was live at registration).
+    ///
+    /// RPython's `original_boxes` are Boxes that carry their concrete value
+    /// inline, so `compile.py:510
+    /// orig_inpargs[index_of_virtualizable].getref_base()` reads the frame
+    /// belonging to the very list that becomes `loop.inputargs`. A
+    /// [`GreenBox`] is symbolic, so the address is paired with the snapshot
+    /// here to keep that read exact — the trace-level
+    /// `virtualizable_heap_ptr` tracks the walk and names a different frame
+    /// once the trace is cut to a header the walk reached later
+    /// (compile.py:269).
+    pub vable_ptr: usize,
 }
 
 /// Tracing context: wraps the recorder Trace with a convenience API.
@@ -1372,6 +1385,7 @@ impl TraceCtx {
                     .map(|(&opref, &ty)| GreenBox::new(opref, ty))
                     .collect(),
                 header_pc: 0,
+                vable_ptr: 0,
             }],
             header_greens: None,
             close_greens: None,
@@ -1451,6 +1465,7 @@ impl TraceCtx {
                     .map(|(&opref, &ty)| GreenBox::new(opref, ty))
                     .collect(),
                 header_pc: 0,
+                vable_ptr: 0,
             }],
             header_greens: None,
             close_greens: None,
@@ -2485,6 +2500,22 @@ impl TraceCtx {
         self.virtualizable_boxes
             .as_ref()
             .and_then(|boxes| boxes.last().copied())
+    }
+
+    /// `vinfo.unwrap_virtualizable_box(virtualizable_boxes[-1])` — the concrete
+    /// object the identity box carries, as a raw address.
+    ///
+    /// This is the frame the shadow was expanded against, which is not the
+    /// same as [`Self::virtualizable_heap_ptr`]: that one is the
+    /// synchronization target, and a root portal seed deliberately points it
+    /// at the `snapshot_for_tracing` copy while baking the identity against
+    /// the live frame the compiled loop runs on.  Readers that need "which
+    /// object do these boxes describe" — `compile.py:510` — want the identity.
+    pub fn standard_virtualizable_ptr(&self) -> Option<usize> {
+        match self.virtualizable_values.as_ref()?.last()? {
+            Value::Ref(gcref) if gcref.as_usize() != 0 => Some(gcref.as_usize()),
+            _ => None,
+        }
     }
 
     /// Length of the symbolic virtualizable shadow, or `None` when no
@@ -4985,6 +5016,56 @@ mod tests {
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+    }
+
+    /// `add_merge_point` must stamp the header snapshot with the virtualizable
+    /// IDENTITY, not the synchronization target.
+    ///
+    /// A root portal seed points `virtualizable_heap_ptr` at the
+    /// `snapshot_for_tracing` copy while baking the identity against the live
+    /// frame, so the two name different objects. `compile.py:510` wants the one the
+    /// boxes describe; taking the sync target instead hands
+    /// `patch_new_loop_to_load_virtualizable_fields` a frame whose array field
+    /// is unrelated to the snapshot, and its `assert i == len(inputargs)`
+    /// (compile.py:458) fires on the arity that comes back.
+    #[test]
+    fn merge_point_records_the_vable_identity_not_the_sync_target() {
+        const LIVE_FRAME: usize = 0x5000;
+        const SNAPSHOT_COPY: usize = 0x9000;
+
+        let info = make_test_vable_info();
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box0 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.set_virtualizable_heap_ptr(SNAPSHOT_COPY as *const u8);
+
+        // Before the seed there is no snapshot to describe, so a header
+        // registered here records nothing and the compile step keeps its
+        // trace-start resolution.
+        ctx.add_merge_point(1, vec![GreenBox::new(box0, Type::Int)], 7);
+        assert_eq!(ctx.current_merge_points.last().unwrap().vable_ptr, 0);
+
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            Value::Ref(majit_ir::GcRef(LIVE_FRAME)),
+            &[box0],
+            &[ph(Type::Int)],
+            &[],
+        );
+        ctx.add_merge_point(2, vec![GreenBox::new(box0, Type::Int)], 9);
+
+        assert_eq!(ctx.standard_virtualizable_ptr(), Some(LIVE_FRAME));
+        assert_eq!(
+            ctx.current_merge_points.last().unwrap().vable_ptr,
+            LIVE_FRAME,
+            "merge point took the sync target instead of the identity",
+        );
     }
 
     #[test]

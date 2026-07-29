@@ -5230,11 +5230,18 @@ impl TraceCtx {
         // would report `snapshot_data_len: 0`, causing `cut_trace` to
         // truncate valid snapshots when this merge point is restored).
         let position = self.get_trace_position();
+        // `green_boxes` describes the virtualizable that is live right now, so
+        // pair the snapshot with its address: `compile.py:510` reads the frame
+        // out of the same list it hands to the backend as `loop.inputargs`, and
+        // the trace-level pointer has moved on by the time a cut selects this
+        // entry.
+        let vable_ptr = self.standard_virtualizable_ptr().unwrap_or(0);
         self.current_merge_points.push(MergePoint {
             green_key: key,
             position,
             green_boxes,
             header_pc,
+            vable_ptr,
         });
     }
 

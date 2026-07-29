@@ -5212,6 +5212,30 @@ impl<M: Clone> MetaInterp<M> {
         // unconditional `send_loop_to_backend` wiring (compile.py:504-511).
     }
 
+    /// compile.py:510 `vable = orig_inpargs[index_of_virtualizable].getref_base()`
+    /// for a loop that may be re-labelled from a merge point the walk reached
+    /// later (the cross-loop cut, compile.py:269).
+    ///
+    /// `orig_inpargs` is the very list `compile.py:264 part.inputargs =
+    /// inputargs[:]` builds the loop from, so the frame has to come from
+    /// whichever snapshot supplies those inputargs. Under a cut that is the
+    /// merge point, whose header can belong to a different frame than the one
+    /// the trace started in — resolving from the trace instead names a frame
+    /// whose `locals_cells_stack_w` is a different length, and the field-load
+    /// preamble then expands to an arity the inputargs never had
+    /// (compile.py:458).
+    fn orig_vable_ptr_for_cut(
+        &self,
+        cut: Option<&crate::trace_ctx::MergePoint>,
+        ctx: &TraceCtx,
+        driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
+    ) -> *const u8 {
+        match cut.filter(|mp| mp.vable_ptr != 0) {
+            Some(mp) => mp.vable_ptr as *const u8,
+            None => self.orig_vable_ptr_from_trace_ctx(ctx, driver_descriptor),
+        }
+    }
+
     fn orig_vable_ptr_from_trace_ctx(
         &self,
         ctx: &TraceCtx,
@@ -5483,13 +5507,6 @@ impl<M: Clone> MetaInterp<M> {
         // Cache driver descriptor before ctx is partially consumed below;
         // mirrors the FINISH-path capture pattern (see `finish_and_compile`).
         let driver_descriptor = ctx.driver_descriptor().cloned();
-        // compile.py:510 `vable = orig_inpargs[index_of_virtualizable].getref_base()`.
-        // Resolve while `ctx` is still whole (before `ctx.constants` is moved
-        // out below) so `patch_new_loop_to_load_virtualizable_fields` can
-        // read the heap object via `vinfo.get_array_length(vable, i)`
-        // (compile.py:443).
-        let orig_vable_ptr_loop =
-            self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
         // pyjitpl.py:3018-3030: compile_loop(original_boxes, live_arg_boxes,
         // start) always compiles from the merge point registered by the
         // first header visit — `start` and `original_boxes` come from
@@ -5501,15 +5518,21 @@ impl<M: Clone> MetaInterp<M> {
         // prefix from the guard to the header must be cut off — otherwise
         // the root entry contract pairs the guard's fail-arg inputargs
         // with the merge point's full-shape JUMP and aborts on arity.
-        let cross_loop_cut = ctx
+        let cut_merge_point = ctx
             .get_merge_point_at(green_key, ctx.header_pc)
-            .filter(|mp| mp.position._pos > 0)
-            .map(|mp| {
-                (
-                    mp.green_boxes.clone(),
-                    crate::history::TreeLoopCutPosition::new(mp.position._pos),
-                )
-            });
+            .filter(|mp| mp.position._pos > 0);
+        // Resolve while `ctx` is still whole (before `ctx.constants` is moved
+        // out below) so `patch_new_loop_to_load_virtualizable_fields` can
+        // read the heap object via `vinfo.get_array_length(vable, i)`
+        // (compile.py:443).
+        let orig_vable_ptr_loop =
+            self.orig_vable_ptr_for_cut(cut_merge_point, &ctx, driver_descriptor.as_ref());
+        let cross_loop_cut = cut_merge_point.map(|mp| {
+            (
+                mp.green_boxes.clone(),
+                crate::history::TreeLoopCutPosition::new(mp.position._pos),
+            )
+        });
 
         // compile.py:221: call_pure_results = metainterp.call_pure_results
         let call_pure_results = ctx.take_call_pure_results();
@@ -6963,18 +6986,18 @@ impl<M: Clone> MetaInterp<M> {
             let green_key = ctx.green_key;
             let header_pc = ctx.header_pc;
             let driver_descriptor = ctx.driver_descriptor().cloned();
-            let retrace_cut = retracing_from.and_then(|retrace_pos| {
+            let retrace_merge_point = retracing_from.and_then(|retrace_pos| {
                 ctx.get_merge_point_at(green_key, header_pc)
                     .filter(|mp| mp.position == retrace_pos && mp.position._pos > 0)
-                    .map(|mp| {
-                        (
-                            mp.green_boxes.clone(),
-                            crate::history::TreeLoopCutPosition::new(mp.position._pos),
-                        )
-                    })
+            });
+            let retrace_cut = retrace_merge_point.map(|mp| {
+                (
+                    mp.green_boxes.clone(),
+                    crate::history::TreeLoopCutPosition::new(mp.position._pos),
+                )
             });
             let orig_vable_ptr_retrace =
-                self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
+                self.orig_vable_ptr_for_cut(retrace_merge_point, &ctx, driver_descriptor.as_ref());
             // The recorder carries Const values inline on the OpRef variants
             // (history.py:227/268/314), so there is no legacy TraceCtx
             // ConstantPool to snapshot — this typed-constant map starts fresh.
