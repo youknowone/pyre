@@ -217,6 +217,12 @@ pub(crate) fn all_thread_hooks_current(ec: &crate::PyExecutionContext) -> bool {
         && ec.profile_all_generation == PROFILE_ALL_GENERATION.load(Ordering::Acquire)
 }
 
+/// `dont_look_inside`: the per-thread trace/profile safepoint reads the
+/// process-wide generation counters and hook mutexes and applies any change
+/// to this thread's `ExecutionContext`.  The JIT does not trace this cold
+/// hook-application path; a caller (`ExecutionContext::bytecode_trace`)
+/// residualizes the call.
+#[majit_macros::dont_look_inside]
 pub(crate) fn apply_all_thread_hooks(
     ec: &mut crate::PyExecutionContext,
 ) -> Result<(), crate::PyError> {
