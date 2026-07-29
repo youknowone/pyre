@@ -2280,6 +2280,12 @@ impl BlackholeInterpBuilder {
         interp.virtualizable_ptr = 0;
         interp.virtualizable_info = std::ptr::null();
         interp.virtualizable_stack_base = 0;
+        // Same footing: the layout describes the register file of the machine
+        // this run resumed, so it must not outlive it.  A stale one does not
+        // fail loudly — `StateFieldLayout::default()` is all-zero and the
+        // `scalar_slot`/`array_elem_slot` range checks are `debug_assert!`, so
+        // a release build reads whatever slot the arithmetic lands on.
+        interp.state_field_layout = StateFieldLayout::default();
         self.pool.push(interp);
     }
 
@@ -3895,6 +3901,30 @@ mod tests {
             assert!(
                 builder.acquire_interp().jitdrivers_sd.is_empty(),
                 "a pooled interp must not carry the previous run's table",
+            );
+        }
+
+        /// `state_field_layout` describes the register file of the machine one
+        /// resume belongs to, so it must not survive into the pool.  The
+        /// range checks in `scalar_slot`/`ref_scalar_slot`/`array_elem_slot`
+        /// are `debug_assert!`, so a release build given the all-zero default
+        /// silently returns `0 + field_idx` — aliasing the dispatch JitCode's
+        /// own argument registers rather than the identity slots
+        /// `ref_scalar_base` exists to keep clear of them.
+        #[test]
+        fn released_interp_does_not_leak_its_state_field_layout_to_the_next_user() {
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.state_field_layout =
+                super::StateFieldLayout::with_ref_scalars(1, vec![4], 0, 2, 8, 0);
+            assert_eq!(bh.state_field_layout.ref_scalar_slot(0), 8);
+
+            builder.release_interp(bh);
+            let reused = builder.acquire_interp();
+            assert_eq!(
+                reused.state_field_layout,
+                super::StateFieldLayout::default(),
+                "a pooled interp must not carry the previous resume's layout",
             );
         }
 

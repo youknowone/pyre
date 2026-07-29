@@ -3762,7 +3762,6 @@ impl<S: JitState> JitDriver<S> {
                     // and the loop's state load/store) does, so it must hold the
                     // layout before it runs.
                     let sf_layout = state.state_field_layout();
-                    bh.state_field_layout = sf_layout.clone();
                     // Seed the reconstructed blackhole chain with the registered
                     // virtualizable info + identity pointer so a mid-body
                     // vable-array opcode (`getarrayitem_vable_*` /
@@ -3781,9 +3780,16 @@ impl<S: JitState> JitDriver<S> {
                     // walk (`resume_mainloop`) dereferences `virtualizable_ptr`
                     // whenever `virtualizable_info` is non-null.
                     let seed_vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
-                    if !seed_vinfo_ptr.is_null() {
-                        bh.virtualizable_info = seed_vinfo_ptr;
-                        bh.virtualizable_ptr = vable_ptr;
+                    {
+                        let mut current = Some(&mut bh);
+                        while let Some(frame) = current {
+                            frame.state_field_layout = sf_layout.clone();
+                            if !seed_vinfo_ptr.is_null() {
+                                frame.virtualizable_info = seed_vinfo_ptr;
+                                frame.virtualizable_ptr = vable_ptr;
+                            }
+                            current = frame.nextblackholeinterp.as_deref_mut();
+                        }
                     }
                     let exc = crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(
                         guard_exc,
@@ -3807,12 +3813,9 @@ impl<S: JitState> JitDriver<S> {
                     let outcome = loop {
                         match bh.resume_mainloop(cur_exc) {
                             Ok(next_exc) => match bh.nextblackholeinterp.take() {
-                                Some(mut caller) => {
-                                    caller.state_field_layout = sf_layout.clone();
-                                    if !seed_vinfo_ptr.is_null() {
-                                        caller.virtualizable_info = seed_vinfo_ptr;
-                                        caller.virtualizable_ptr = vable_ptr;
-                                    }
+                                Some(caller) => {
+                                    // Layout + vinfo were seeded across the
+                                    // whole chain before the loop started.
                                     bh_builder.release_interp(bh);
                                     bh = *caller;
                                     cur_exc = next_exc;
@@ -6169,18 +6172,36 @@ impl<S: JitState> JitDriver<S> {
                     allocator,
                 );
                 if let Some((mut bh, vable_ptr)) = bh {
-                    // Thread the state-field register layout so the
-                    // `state_field` handlers map a logical scalar/array index
-                    // to the flat register slot the resume reader seeded.
-                    bh.state_field_layout = state.state_field_layout();
-                    // Seed vinfo + identity for a state-field machine so a
-                    // mid-body vable-array op resolves during resume (see the
-                    // chain-resume path above for the full rationale). Real heap
-                    // virtualizables (`token_offset > 0`) are left untouched.
+                    // Thread the state-field register layout onto every frame
+                    // so the `state_field` handlers map a logical scalar/array
+                    // index to the flat register slot the resume reader seeded.
+                    // The chain tail is the root dispatch frame — it owns the
+                    // merge point and the loop's state load/store — so it is
+                    // exactly the frame that needs the layout, and
+                    // `run_forever_with_portal` consumes the chain with no
+                    // per-frame hook to seed it later.  A missing layout does
+                    // not fail loudly: `StateFieldLayout::default()` is
+                    // all-zero, so `scalar_slot`/`ref_scalar_slot` return
+                    // `0 + field_idx` and silently address the dispatch
+                    // JitCode's own argument registers in a release build.
+                    //
+                    // Seed vinfo + identity on the same walk for a state-field
+                    // machine, so a mid-body vable-array op resolves during
+                    // resume (see the chain-resume path above for the full
+                    // rationale). Real heap virtualizables (`token_offset > 0`)
+                    // are left untouched.
+                    let sf_layout = state.state_field_layout();
                     let seed_vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
-                    if !seed_vinfo_ptr.is_null() {
-                        bh.virtualizable_info = seed_vinfo_ptr;
-                        bh.virtualizable_ptr = vable_ptr;
+                    {
+                        let mut current = Some(&mut bh);
+                        while let Some(frame) = current {
+                            frame.state_field_layout = sf_layout.clone();
+                            if !seed_vinfo_ptr.is_null() {
+                                frame.virtualizable_info = seed_vinfo_ptr;
+                                frame.virtualizable_ptr = vable_ptr;
+                            }
+                            current = frame.nextblackholeinterp.as_deref_mut();
+                        }
                     }
                     let exc = crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(
                         result_exc,
