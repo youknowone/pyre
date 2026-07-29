@@ -5,8 +5,8 @@ use pyre_object::PyObjectRef;
 use crate::PyError;
 
 use super::{
-    HIGHEST_PROTOCOL, call_fn, call_meth, decode_long, import_module, op, parse_int_text,
-    read_int_le, str_from_utf8, unpickling_error,
+    HIGHEST_PROTOCOL, call_fn, call_meth, decode_long, eof_error, import_module, op,
+    parse_int_text, read_int_le, str_from_utf8, unpickling_error,
 };
 
 #[crate::pyre_class("_pickle.Unpickler")]
@@ -173,7 +173,21 @@ impl W_Unpickler {
         me.proto = 0;
 
         loop {
-            let opcode = read1(slot)?;
+            // `interp_pickle.py:2048-2053`: an UnpicklingError while fetching
+            // the next opcode means the stream ended between pickle objects.
+            // Errors raised while dispatching a fetched opcode remain
+            // UnpicklingError and propagate unchanged.
+            let opcode = match read1(slot) {
+                Ok(opcode) => opcode,
+                Err(error) => {
+                    if let Some(cls) = crate::builtins::lookup_exc_class("_pickle.UnpicklingError")
+                        && crate::eval::check_exc_match_against(error.exc_object, cls)
+                    {
+                        return Err(eof_error("Ran out of input"));
+                    }
+                    return Err(error);
+                }
+            };
             if opcode == op::STOP {
                 let me = cur(slot);
                 return unsafe { pyre_object::listobject::w_list_pop_end(me.w_stack) }

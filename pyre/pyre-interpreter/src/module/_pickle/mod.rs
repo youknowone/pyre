@@ -150,10 +150,9 @@ pub(crate) fn call_meth(
     Ok(r)
 }
 
-/// Build a `PyError` whose raised object is an instance of the named
-/// `_pickle` exception class (registered by the `exceptions:` block), with
-/// `msg` as the single argument. Falls back to a generic ValueError carrying
-/// the same text if the class is somehow unavailable.
+/// Build a `PyError` whose raised object is an instance of the named exception
+/// class, with `msg` as the single argument. Falls back to a generic ValueError
+/// carrying the same text if the class is somehow unavailable.
 fn pickle_exc(class_name: &str, msg: String) -> PyError {
     let mut err = PyError::value_error(msg.clone());
     if let Some(cls) = crate::builtins::lookup_exc_class(class_name) {
@@ -171,6 +170,10 @@ pub(crate) fn unpickling_error(msg: &str) -> PyError {
 
 pub(crate) fn pickling_error(msg: impl Into<String>) -> PyError {
     pickle_exc("_pickle.PicklingError", msg.into())
+}
+
+pub(crate) fn eof_error(msg: &str) -> PyError {
+    pickle_exc("EOFError", msg.to_string())
 }
 
 // ── import / dotted attribute resolution (save_global / find_class) ───
