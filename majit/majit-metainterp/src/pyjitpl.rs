@@ -5256,7 +5256,9 @@ impl<M: Clone> MetaInterp<M> {
         // Bridge traces start from rebuilt resume state, not a fresh portal
         // entry, so `initial_inputarg_consts` is not seeded with the
         // virtualizable inputarg's ConstPtr.  The TraceCtx pointer is the
-        // trace-bound equivalent of `orig_inpargs[idx].getref_base()`.
+        // trace-bound equivalent of `orig_inpargs[idx].getref_base()`
+        // (compile.py:510), which reads a value belonging to the trace being
+        // compiled and never an ambient one.
         //
         // Prefer it over MetaInterp's ambient pointer: an inlined residual
         // callee can temporarily update `self.vable_ptr`, while the residual
