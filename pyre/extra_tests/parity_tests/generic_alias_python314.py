@@ -1,6 +1,7 @@
 """CPython 3.14 GenericAlias list-parameter and attribute parity."""
 
 import copy
+import pickle
 from types import GenericAlias
 from typing import TypeVar
 
@@ -34,3 +35,8 @@ specialized = nested[str, int]
 assert specialized.__args__ == ([str, [int]],)
 assert specialized.__parameters__ == ()
 assert repr(GenericAlias(Origin, [int, str])).endswith("Origin[[int, str]]")
+
+starred = (*tuple[int, str],)[0]
+for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+    restored = pickle.loads(pickle.dumps(starred, protocol))
+    assert restored == starred

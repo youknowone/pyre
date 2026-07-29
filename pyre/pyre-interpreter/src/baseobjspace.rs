@@ -12878,11 +12878,12 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             return Ok(pyre_object::w_tuple_iter_new(obj));
         }
         if pyre_object::is_generic_alias(obj) {
-            // GenericAlias.__iter__ (`_pypy_generic_alias.py:108`) — `yield
-            // _make_starred(self)`, a one-shot iterator over the starred copy.
-            let starred = crate::_pypy_generic_alias::make_starred(obj)?;
-            let list = w_list_new(vec![starred]);
-            return Ok(pyre_object::w_seq_iter_new(list, 1));
+            // CPython 3.14 `ga_iter`: the iterator retains the unstarred alias
+            // and creates its single starred result lazily in `next`.  Keeping
+            // the producer, rather than an eager `[starred]` list, also gives
+            // iterator reduction the non-recursive `(iter, (alias,), index)`
+            // shape required by starred GenericAlias pickling.
+            return Ok(pyre_object::w_seq_iter_new(obj, 1));
         }
         if is_str(obj) {
             // Code-point count (not byte count) seeds the sequence
@@ -13389,6 +13390,12 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 pyre_object::w_list_getitem(seq, idx)
             } else if is_tuple(seq) {
                 pyre_object::w_tuple_getitem(seq, idx)
+            } else if pyre_object::is_generic_alias(seq) {
+                if idx == 0 {
+                    Some(crate::_pypy_generic_alias::make_starred(seq)?)
+                } else {
+                    None
+                }
             } else if is_str(seq) {
                 // Box the idx-th code point as a one-character str,
                 // reading the WTF-8 view so a lone surrogate is yielded

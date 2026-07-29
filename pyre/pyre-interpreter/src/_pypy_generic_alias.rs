@@ -531,46 +531,22 @@ pub(crate) fn make_starred(ga: PyObjectRef) -> crate::PyResult {
     Ok(res)
 }
 
-/// The `_make_starred` callable referenced by an unpacked alias's
-/// `__reduce__`.
-fn ga_make_starred(args: &[PyObjectRef]) -> crate::PyResult {
-    let ga = args.first().copied().unwrap_or_else(w_none);
-    if !unsafe { is_generic_alias(ga) } {
-        return Err(crate::PyError::type_error(
-            "_make_starred() argument must be a types.GenericAlias",
-        ));
-    }
-    make_starred(ga)
-}
-
-/// The shared `_make_starred` callable, lazily built then cached.
-///
-/// The single `_make_starred` callable (`_pypy_generic_alias.py:118`),
-/// kept reachable by the GenericAlias type namespace it is also stored in
-/// (`init_generic_alias_type`) and never reallocated, so an unpacked
-/// alias's `__reduce__` returns the same object every time — PyPy returns
-/// the module-level function.  pyre houses it on the type as the stand-in
-/// for PyPy's `_pypy_generic_alias._make_starred` module global; the
-/// stable-address (old-gen) allocation makes the cached pointer safe to
-/// hold across collections.  Process-global so every thread observes the
-/// same callable identity.
-pub(crate) fn make_starred_fn() -> PyObjectRef {
-    static MAKE_STARRED_FN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAKE_STARRED_FN
-        .get_or_init(|| make_builtin_function("_make_starred", ga_make_starred) as usize)
-        as PyObjectRef
-}
-
-/// `GenericAlias.__reduce__` (`_pypy_generic_alias.py:96`).
+/// `GenericAlias.__reduce__` (CPython 3.14
+/// `Objects/genericaliasobject.c:ga_reduce`).
 fn ga_reduce(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
     let origin = unsafe { w_generic_alias_get_origin(self_) };
     let ga_args = unsafe { w_generic_alias_get_args(self_) };
     if unsafe { w_generic_alias_get_unpacked(self_) } {
-        // `orig = GenericAlias(origin, args); (_make_starred, (orig,))`.
+        // 3.14 reconstructs a starred alias as `next(iter(orig))`.  This
+        // replaces PyPy's app-level `_make_starred` reduce target and keeps
+        // the callable globally pickleable without a synthetic module.
         let orig = make_generic_alias(origin, ga_args)?;
-        let callable = make_starred_fn();
-        return Ok(w_tuple_new(vec![callable, w_tuple_new(vec![orig])]));
+        let iterator = crate::baseobjspace::iter(orig)?;
+        return Ok(w_tuple_new(vec![
+            crate::baseobjspace::builtin_callable("next"),
+            w_tuple_new(vec![iterator]),
+        ]));
     }
     // `(type(self), (origin, args))`.
     let ga_type = crate::typedef::gettypeobject(&pyre_object::GENERIC_ALIAS_TYPE);
@@ -922,17 +898,6 @@ pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
                 ),
                 "__typing_unpacked_tuple_args__",
             ),
-        )
-    };
-    // `_make_starred` (`_pypy_generic_alias.py:118`) — the module-level reduce
-    // target.  pyre has no app-level `_pypy_generic_alias` Python module, so
-    // the single shared callable lives on the type namespace; storing it here keeps it reachable
-    // for the collector and gives `__reduce__` a stable callable identity.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "_make_starred",
-            make_starred_fn(),
         )
     };
     // `__iter__` and `__dir__` are intercepted directly by `baseobjspace::iter`
