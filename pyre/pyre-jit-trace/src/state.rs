@@ -545,7 +545,20 @@ pub fn blackhole_control_opcodes() -> (i32, i32, i32) {
 /// `Assembler::indirectcalltargets_vec` in `pyre-jit`.
 pub fn setup_indirectcalltargets(targets: Vec<std::sync::Arc<majit_metainterp::jitcode::JitCode>>) {
     ensure_finish_setup();
-    METAINTERP_SD.with(|r| r.borrow_mut().setup_indirectcalltargets(targets));
+    // The source translator and runtime per-CodeObject writer are two Rust
+    // assembler objects standing in for one RPython CodeWriter assembler.
+    // Keep the frozen source-translation PBC family when runtime targets are
+    // published instead of replacing it with the latest runtime-only batch.
+    let mut merged = crate::jitcode_runtime::build_indirectcalltargets();
+    for target in targets {
+        if !merged
+            .iter()
+            .any(|existing| existing.fnaddr == target.fnaddr)
+        {
+            merged.push(target);
+        }
+    }
+    METAINTERP_SD.with(|r| r.borrow_mut().setup_indirectcalltargets(merged));
 }
 
 /// pyjitpl.py:2326-2343 module-level entry point for

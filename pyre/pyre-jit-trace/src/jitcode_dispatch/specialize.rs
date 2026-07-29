@@ -5125,8 +5125,12 @@ pub(crate) fn try_walker_specialize_math_frexp<Sym: WalkSym>(
         exponent_box,
         box_int_concrete(exponent_value, exponent_obj as i64),
     );
+    // `space.newtuple2` selects `W_SpecialisedTupleObject_oo` for the
+    // float/int pair.  The traced allocation must use that same layout:
+    // UNPACK_SEQUENCE specializes from the record-time concrete object's
+    // class and reads the two inline `value*` fields.
     let tuple =
-        crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &[mantissa_box, exponent_box]);
+        crate::helpers::emit_specialised_tuple_oo_inline(ctx.trace_ctx, mantissa_box, exponent_box);
     ctx.trace_ctx.set_opref_concrete(
         tuple,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
@@ -5243,6 +5247,104 @@ pub(crate) fn try_walker_specialize_math_ldexp<Sym: WalkSym>(
         boxed,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
     );
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+    Ok(Some(()))
+}
+
+/// `math.isqrt(n)` on an exact nonnegative machine integer.
+///
+/// PyPy exposes `isqrt` from `app_math.py`, so tracing its `W_IntObject` arm
+/// carries `n` unboxed through the integer algorithm and virtualizes the
+/// result.  Pyre's native module wrapper otherwise materializes an `RBigInt`
+/// before the walker can see that arm.  Recreate the translated shape as an
+/// exact-class guard, unbox, pure non-raising integer call, and `wrapint`.
+/// Longs, subclasses, negative values, rebound callables, and `__index__`
+/// objects retain the generic residual path.
+pub(crate) fn try_walker_specialize_math_isqrt<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(arg_obj),
+    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    else {
+        return Ok(None);
+    };
+    if concrete_callable.is_null()
+        || !null_or_self.is_null()
+        || arg_obj.is_null()
+        || !pyre_interpreter::module::math::interp_math::is_math_isqrt_function(concrete_callable)
+    {
+        return Ok(None);
+    }
+    let value = unsafe {
+        if !pyre_object::is_exact_builtin_instance(arg_obj) || !pyre_object::is_int(arg_obj) {
+            return Ok(None);
+        }
+        pyre_object::w_int_get_value(arg_obj)
+    };
+    if value < 0 {
+        return Ok(None);
+    }
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &[arg_obj])
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_int(boxed_result) } {
+        return Ok(None);
+    }
+    let result_value = unsafe { pyre_object::w_int_get_value(boxed_result) };
+
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    let arg_op = r_args[2];
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let raw_int = walker_unbox_int(ctx, op.pc, arg_op, int_type_addr)?;
+    walker_guard_exact_w_class(
+        ctx,
+        op.pc,
+        arg_op,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE),
+    )?;
+    ctx.trace_ctx
+        .set_opref_concrete(raw_int, majit_ir::Value::Int(value));
+    let zero = ctx.trace_ctx.const_int(0);
+    let nonnegative = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw_int, zero]);
+    ctx.trace_ctx
+        .set_opref_concrete(nonnegative, majit_ir::Value::Int(1));
+    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[nonnegative])?;
+
+    let raw_result = ctx.trace_ctx.call_int_typed_with_effect(
+        pyre_interpreter::module::math::interp_math::jit_math_isqrt_i64 as *const (),
+        &[raw_int],
+        &[majit_ir::Type::Int],
+        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(raw_result, majit_ir::Value::Int(result_value));
+    let boxed = walker_box_int(ctx, op.pc, raw_result, result_value)?;
+    ctx.trace_ctx
+        .set_opref_concrete(boxed, box_int_concrete(result_value, boxed_result as i64));
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
     Ok(Some(()))
 }

@@ -111,6 +111,10 @@ pub struct ProgramPipelineResult {
     /// `JitDriverStaticData.mainjitcode` or `IndirectCallTargets`) share
     /// identity with the values appearing here.
     pub jitcodes: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
+    /// RPython `Assembler.indirectcalltargets`, encoded by identity as dense
+    /// indices into `jitcodes`.
+    #[serde(default)]
+    pub indirectcalltarget_indices: Vec<usize>,
     /// RPython: `rpython/jit/codewriter/call.py:87 self.jitcodes`
     /// (graph-keyed dict). Pyre uses `CallPath` as graph identity at the
     /// module boundary. Paired with `jitcodes` (which mirrors
@@ -196,6 +200,7 @@ mod tests {
                 main_jitcode_index: 0,
             }],
             jitcodes: vec![Arc::new(JitCode::new("consts"))],
+            indirectcalltarget_indices: Vec::new(),
             jitcodes_by_path: indexmap::IndexMap::new(),
             insns: indexmap::IndexMap::new(),
             descrs: Vec::new(),

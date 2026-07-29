@@ -335,6 +335,34 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
 
     push_alias_pair(
         &mut entries,
+        "pyre_interpreter::gateway::method_arity_failure",
+        "gateway::method_arity_failure",
+        crate::gateway::method_arity_failure as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::gateway::method_noarg_failure",
+        "gateway::method_noarg_failure",
+        crate::gateway::method_noarg_failure as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::builtins::builtin_kwargs_marker_dict",
+        "builtins::builtin_kwargs_marker_dict",
+        crate::builtins::builtin_kwargs_marker_dict as *const (),
+    );
+
+    // RPython annotator PBC parity for `BuiltinCode.func`: every generated
+    // interp2app wrapper is a possible value of the indirect function-pointer
+    // field.  `#[pyre_methods]` contributes these process-global descriptors
+    // through the same link-time census used for pyre class descriptors.
+    #[cfg(not(target_arch = "wasm32"))]
+    for wrapper in crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS {
+        push_fnaddr(&mut entries, wrapper.path, wrapper.func as *const ());
+    }
+
+    push_alias_pair(
+        &mut entries,
         "pyre_interpreter::runtime_ops::jit_make_function_from_globals",
         "pyre_interpreter::jit_make_function_from_globals",
         crate::runtime_ops::jit_make_function_from_globals as *const (),

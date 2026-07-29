@@ -62,10 +62,10 @@
 //!   - `Goto { target }` — direct edge.
 //!   - `Switch { discr, targets }` — `ExitSwitch::Value` + per-arm
 //!     `Link` with `ExitCase::Bool` / `ExitCase::Const`.
-//!   - `Call` — Direct / Trait → `Call(FunctionPath)`; Dynamic →
-//!     synthetic `Call(__dyn_call)` threading the fat-pointer
-//!     receiver. (A faithful `IndirectCall` lowering needs vtable
-//!     metadata Charon does not yet surface.)
+//!   - `Call` — Direct / Trait → `Call(FunctionPath)`; Dynamic vtable calls
+//!     use the trait-family indirect pipeline, plain function pointers become
+//!     `IndirectCall`, and the remaining closure shims use synthetic
+//!     `Call(__dyn_call)`.
 //!   - `Drop` — pass-through `Goto` (JIT does not model destructor
 //!     semantics).
 //!   - `Assert` — strip and forward to the success target.
@@ -924,6 +924,13 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // like a free function to the canonical registration loop and
         // the impl-key return-type / hint registrations get dropped.
         let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
+        let graph = if let Some(owner) = &self_ty_root {
+            graph
+                .with_owner_root(owner.clone())
+                .with_source_identity(format!("{module_path}::{owner}::{name}"))
+        } else {
+            graph.with_source_identity(fn_path.clone())
+        };
         // Surface trait identity for trait-impl methods so the
         // canonical registration loop can call `register_trait_method`
         // instead of routing through `extract_trait_impls`.  Inherent
@@ -6695,7 +6702,70 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `<[T]>::len` / `Vec::len` returns the container element
+                // `<[T]>::is_empty` is `arraylen_gc(s) == 0`.  Keep both
+                // operations in the graph instead of residualizing the
+                // graph-less std helper.
+                if args.len() == 1 && self.is_slice_is_empty(&reg) {
+                    let len = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(len.clone()),
+                        kind: OpKind::ArrayLen {
+                            base: args[0].clone(),
+                            array_type_id: None,
+                            nolength: false,
+                        },
+                    });
+                    let zero = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(zero.clone()),
+                        kind: OpKind::ConstInt(0),
+                    });
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: "eq".to_string(),
+                            lhs: len,
+                            rhs: zero,
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `<[T]>::len` is already a low-level GcArray operation in
+                // the translated type model.  Emit ArrayLen directly, just
+                // as `Rvalue::Len(place)` eventually does, so a gateway
+                // wrapper's red `&[PyObjectRef]` argument never detours
+                // through an unregistered host residual.
+                if args.len() == 1 && self.is_slice_len(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ArrayLen {
+                            base: args[0].clone(),
+                            array_type_id: None,
+                            nolength: false,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `Vec::len` returns the container element
                 // count.  Emit the `__len` operation on the receiver — the
                 // rtyper routes it through the `len` op
                 // (`flowspace_adapter`), which on a `SomeList` receiver
@@ -7198,6 +7268,7 @@ impl<'a> Lowering<'a> {
                 // fn-ptr / `FnOnce`, not a vtable slot; it keeps the
                 // synthetic `__dyn_call` path (the fat-pointer receiver
                 // threaded into `args[0]`).
+                let is_fn_ptr = operand_is_fn_ptr(&dyn_operand, self.llbc);
                 let indirect = dyn_indirect_enabled()
                     .then(|| self.dyn_indirect_target(&dyn_operand))
                     .flatten();
@@ -7205,6 +7276,22 @@ impl<'a> Lowering<'a> {
                     OpKind::Call {
                         target: CallTarget::indirect(trait_root, method_name),
                         args,
+                        result_ty,
+                    }
+                } else if is_fn_ptr {
+                    // RPython `BuiltinCode.func` (and any other plain ll
+                    // function-pointer field) is a PBC.  Its rtyped call is
+                    // `indirect_call(funcptr, *args, c_graphs)`, not a
+                    // synthetic opaque helper.  `Some([])` is the
+                    // pre-CallControl marker for the generated builtin
+                    // wrapper family; `rpbc::lower_indirect_calls` fills the
+                    // candidate list once all registered graphs/fnaddrs are
+                    // available.
+                    let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
+                    OpKind::IndirectCall {
+                        funcptr,
+                        args,
+                        graphs: Some(Vec::new()),
                         result_ty,
                     }
                 } else {
@@ -8943,13 +9030,30 @@ impl<'a> Lowering<'a> {
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
                 fd.item_meta.name_path().as_str(),
-                "core::slice::<Impl>::len"
-                    | "alloc::vec::<Impl>::len"
+                "alloc::vec::<Impl>::len"
                     | "pyre_object::object_array::<Impl>::len"
                     | "pyre_object::int_array::<Impl>::len"
                     | "pyre_object::float_array::<Impl>::len"
             )
         })
+    }
+
+    fn is_slice_len(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::<Impl>::len")
+    }
+
+    fn is_slice_is_empty(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::<Impl>::is_empty")
     }
 
     /// `Vec::as_slice` / `<[T]>::as_slice` — a borrowed slice view of the
@@ -10066,22 +10170,21 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// `true` when `ty` is a niche-optimised `Option<NonNull<T>>` — an
-    /// `Option` whose sole payload is a `core::ptr::non_null::NonNull`
-    /// wrapper.  Rust encodes such an Option in ONE pointer word (`None`
-    /// = null, `Some(p)` = the non-null pointer), so `Discriminant` on it
-    /// is a pointer-null test (`base != null`) and the `Some` payload read
-    /// is the identity on that pointer — no aggregate `__discriminant` /
-    /// `__pos_0` field exists.  This mirrors the fieldless-enum by-value
-    /// model ([`Self::tyref_is_fieldless_enum`]).
+    /// `true` when `ty` is a niche-optimised `Option<NonNull<T>>`,
+    /// `Option<&T>`, or `Option<&mut T>`. Rust encodes each in ONE pointer
+    /// word (`None` = null, `Some(p)` = the non-null pointer), so
+    /// `Discriminant` on it is a pointer-null test (`base != null`) and the
+    /// `Some` payload read is the identity on that pointer — no aggregate
+    /// `__discriminant` / `__pos_0` field exists. This mirrors the
+    /// fieldless-enum by-value model ([`Self::tyref_is_fieldless_enum`]).
     ///
     /// Gated strictly to the `NonNull` payload: a raw `*mut T` / `*const T`
     /// payload (`Option<*mut PyObject>`) has NO null niche — Rust lays it
     /// out as a two-word tagged aggregate (discriminant word + pointer
     /// word), so folding it to a one-word pointer would read the tag word
-    /// as the payload.  A `&T` payload is also niche, but the object
-    /// pointers this models are spelled `NonNull`, so only that shape
-    /// matches.
+    /// as the payload. References are included explicitly: Rust guarantees
+    /// their non-null representation, and generated
+    /// `#[pyre_class]::from_obj` returns `Option<&mut Self>`.
     fn tyref_is_niche_option_ptr(&self, ty: &TyRef) -> bool {
         if !crate::front::result_exc::tyref_is_option(ty, self.llbc) {
             return false;
@@ -10096,8 +10199,13 @@ impl<'a> Lowering<'a> {
             .and_then(|g| g.get("types"))
             .and_then(|t| t.as_array())
             .and_then(|t| t.first())
-            .and_then(|p| strip_ty_wrappers(p, self.llbc))
         else {
+            return false;
+        };
+        if type_node_is_ref(payload, self.llbc) {
+            return true;
+        }
+        let Some(payload) = strip_ty_wrappers(payload, self.llbc) else {
             return false;
         };
         let Some(def_id) = adt_node_def_id(payload) else {
@@ -11525,6 +11633,53 @@ impl<'a> Lowering<'a> {
             self.block_entry_positional_aggregate_locals[target_bb].remove(&local_idx);
         }
     }
+}
+
+fn operand_is_fn_ptr(operand: &Operand, llbc: &Llbc) -> bool {
+    let ty = match operand {
+        Operand::Copy(place) | Operand::Move(place) => &place.ty,
+        Operand::Const(_) => return false,
+    };
+    let Some(fnptr) = tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_wrappers(node, llbc))
+        .and_then(|node| node.get("FnPtr"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    let Some(signature) = fnptr
+        .get("skip_binder")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    if signature
+        .get("is_unsafe")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        return false;
+    }
+    let Some(inputs) = signature
+        .get("inputs")
+        .and_then(serde_json::Value::as_array)
+        .filter(|inputs| inputs.len() == 1)
+    else {
+        return false;
+    };
+    let input = charon_type_value_to_ast_string(&inputs[0], llbc, 0);
+    let output = signature
+        .get("output")
+        .map(|value| charon_type_value_to_ast_string(value, llbc, 0))
+        .unwrap_or_default();
+    // Exact source signature of `gateway::BuiltinCodeFn`:
+    // `fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>`.  Keep other
+    // one-argument callbacks in their existing residual `__dyn_call` family.
+    input.starts_with('[')
+        && input.contains("PyObject")
+        && output.starts_with("Result<")
+        && output.contains("PyObject")
+        && output.contains("PyError")
 }
 
 // ---------------------------------------------------------------------------
@@ -13853,6 +14008,36 @@ fn cast_pointer_marker_op(root: String, arg: Variable) -> OpKind {
         args: vec![arg],
         result_ty: ValueType::Ref(Some(root)),
     }
+}
+
+/// Whether a Charon type node's top-level constructor is `Ref`, after
+/// following only serialization indirections. Unlike [`strip_ty_wrappers`],
+/// this deliberately does not peel the reference itself: callers use the
+/// result to distinguish Rust's guaranteed non-null `&T` / `&mut T`
+/// representation from nullable raw pointers.
+fn type_node_is_ref<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> bool {
+    for _ in 0..24 {
+        let Some(obj) = node.as_object() else {
+            return false;
+        };
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            let Some(body) = llbc.dedup_body(id) else {
+                return false;
+            };
+            node = body;
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        return obj.contains_key("Ref");
+    }
+    false
 }
 
 /// Strip the indirection wrappers a Charon type node can carry —

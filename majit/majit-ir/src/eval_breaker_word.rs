@@ -5,6 +5,12 @@
 //!                   OR'd in by the OS signal handler and the action dispatcher.
 //!   bit1 EB_STW   — mirrors `GC_SYNC.stw_requested`; OR'd in by the collector
 //!                   while it drains mutators to safepoints.
+//!   bit2 EB_FINALIZING — mirrors interpreter finalization; once armed,
+//!                        non-owner mutators park before their next opcode.
+//!   bit3 EB_GC_INTERP — process-stable `PYRE_GC_INTERP` dispatch gate.  This
+//!                       is masked out of compiled back-edge polls: it avoids
+//!                       a second per-opcode atomic load in the interpreter,
+//!                       but is not itself a reason to leave machine code.
 //! A compiled loop loads the whole word at the back-edge and deopts to the
 //! interpreter when it is non-zero. The interpreter/warm-up loop and the STW
 //! park gate remain authoritative; this word is only the JIT's deopt trigger.
@@ -24,6 +30,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub const EB_ASYNC: usize = 1;
 /// bit1 — GC stop-the-world requested (mirrors `GC_SYNC.stw_requested`).
 pub const EB_STW: usize = 2;
+/// bit2 — interpreter finalization has begun (terminal, never cleared).
+pub const EB_FINALIZING: usize = 4;
+/// bit3 — interpreter-path allocation/collection integration is enabled.
+pub const EB_GC_INTERP: usize = 8;
+/// Bits that require a compiled loop to deopt to the interpreter.
+pub const JIT_BREAKER_MASK: usize = EB_ASYNC | EB_STW | EB_FINALIZING;
 
 /// The shared eval-breaker word (see module docs).
 static EVAL_BREAKER_WORD: AtomicUsize = AtomicUsize::new(0);
@@ -75,7 +87,17 @@ pub fn clear_stw() {
     EVAL_BREAKER_WORD.fetch_and(!EB_STW, Ordering::Release);
 }
 
+pub fn set_finalizing() {
+    EVAL_BREAKER_WORD.fetch_or(EB_FINALIZING, Ordering::Release);
+}
+
+pub fn set_gc_interp() {
+    EVAL_BREAKER_WORD.fetch_or(EB_GC_INTERP, Ordering::Release);
+}
+
 /// Every flag must fit in the word the poll actually loads. Checked per target,
 /// so a flag too wide for a 32-bit `usize` fails the wasm32 build rather than
 /// silently reading as unarmed there.
-const _: () = assert!((EB_ASYNC | EB_STW) < (1 << (EVAL_BREAKER_WORD_SIZE * 8 - 1)));
+const _: () = assert!(
+    (EB_ASYNC | EB_STW | EB_FINALIZING | EB_GC_INTERP) < (1 << (EVAL_BREAKER_WORD_SIZE * 8 - 1))
+);

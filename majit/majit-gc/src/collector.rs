@@ -113,12 +113,19 @@ fn get_darwin_sysctl_signed(name: &[u8]) -> i64 {
     }
 }
 
-/// env.py:413-433 `get_L2cache_darwin`. Returns the L2+L3 cache size in
-/// bytes via `sysctl`, or -1 when it cannot be determined.
+/// env.py:413-455 `get_L2cache_darwin`. Returns the performance-cluster
+/// L2 plus the legacy L3 cache size via `sysctl`, or -1 when it cannot be
+/// determined.  Apple documents lower performance-level indices as faster
+/// cores, so `hw.perflevel0.l2cachesize` is the cache relevant to the cores
+/// running the mutator.  Intel Macs do not expose that key and retain the
+/// legacy `hw.l2cachesize` fallback.
 #[cfg(target_os = "macos")]
 fn get_l2cache() -> i64 {
-    let mangled = get_darwin_sysctl_signed(b"hw.l2cachesize\0")
-        + get_darwin_sysctl_signed(b"hw.l3cachesize\0");
+    let mut l2cache = get_darwin_sysctl_signed(b"hw.perflevel0.l2cachesize\0");
+    if l2cache <= 0 {
+        l2cache = get_darwin_sysctl_signed(b"hw.l2cachesize\0");
+    }
+    let mangled = l2cache + get_darwin_sysctl_signed(b"hw.l3cachesize\0");
     if mangled > 0 { mangled } else { -1 }
 }
 

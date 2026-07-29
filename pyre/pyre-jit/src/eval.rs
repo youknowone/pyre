@@ -6650,14 +6650,12 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // ≥ 3 (a callback re-entry from FOR_ITER→__getitem__, exception
     // handler, etc., where the outer opcode handler holds a PyObjectRef
     // on the Rust stack that walk_pyframe_roots cannot reach).
-    // `gc_interp::enabled` is process-stable after its first env read.  Keep
-    // the untranslated native interpreter's equivalent of RPython's
-    // translation-time configuration constant on the activation, rather than
-    // crossing the `dont_look_inside` gate and reloading its atomic for every
-    // bytecode.  The wasm/default-on arm still executes the identical
-    // safepoint below.
-    let gc_interp_enabled = pyre_object::gc_interp::enabled();
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
+    if _eval_activation.armed() {
+        // Share the interpreter-path GC configuration through the dispatch
+        // breaker load; the compiled back-edge mask deliberately excludes it.
+        majit_ir::eval_breaker_word::set_gc_interp();
+    }
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     // `semantic_loop_headers` is consumed only on the `CloseLoop` arm below (a
     // back-edge event).  Loopless frames — the overwhelming majority during
@@ -6672,13 +6670,20 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
     loop {
-        pyre_interpreter::module::thread::park_if_finalizing();
+        // PyPy's ActionFlag is one process breaker.  Keep pyre's free-threaded
+        // finalization and STW extensions on the same already-established
+        // breaker word, so the ordinary dispatch pays one relaxed load rather
+        // than polling two process-global atomics independently.
+        let dispatch_breaker = majit_ir::eval_breaker_word::load();
+        if dispatch_breaker & majit_ir::eval_breaker_word::EB_FINALIZING != 0 {
+            pyre_interpreter::module::thread::park_if_finalizing();
+        }
         // Interpreter-path GC safepoint (PYRE_GC_INTERP). Between opcodes the
         // only live refs are in the frame, reachable through the registered
         // pyframe root walker; no bytecode handler holds a Rust-stack temporary
         // here. A no-op unless the flag is on and enough interpreter objects
         // have accumulated to warrant a collection.
-        if gc_interp_enabled {
+        if dispatch_breaker & majit_ir::eval_breaker_word::EB_GC_INTERP != 0 {
             pyre_object::gc_interp::safepoint();
         }
 
@@ -6686,7 +6691,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // here when a collector has requested STW; park until it completes.
         // Between opcodes no bytecode handler holds a Rust-stack ref (see the
         // note above), so this is a walkable safepoint.
-        majit_gc::gc_sync::safepoint_poll();
+        if dispatch_breaker & majit_ir::eval_breaker_word::EB_STW != 0 {
+            majit_gc::gc_sync::safepoint_poll();
+        }
 
         // Seed the frame pointer once after the two top-of-loop safepoints.
         // The frame is GC-managed and can move only at a collection point; this

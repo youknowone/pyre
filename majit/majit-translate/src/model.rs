@@ -4355,6 +4355,16 @@ impl FuncEffects {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionGraph {
     pub name: String,
+    /// Stable identity of the source function object.
+    ///
+    /// RPython keys graph metadata by the Python function object's identity,
+    /// not by `FunctionGraph.name`.  Charon can emit many distinct generated
+    /// gateway functions with the same leaf name in different modules, so the
+    /// qualified declaration path is carried here to keep those funcobjs
+    /// distinct while aliases of one declaration continue to share a graph.
+    /// Synthetic/test graphs leave this as `None` and retain the historical
+    /// `(owner_root, name)` identity fallback.
+    pub source_identity: Option<String>,
     /// Impl-block self-type root for graphs produced from `impl <T> { fn m(&self, ...) }`.
     /// Mirrors PyPy's `graph.func.im_class` access (the bound-method's class
     /// reference): RPython lifts `self` as `SomeInstance(getuniqueclassdef(im_class))`
@@ -4465,6 +4475,7 @@ impl FunctionGraph {
             notes: Vec::new(),
             return_type: None,
             owner_root: None,
+            source_identity: None,
             hints: Vec::new(),
             func: FuncEffects::default(),
         }
@@ -4498,6 +4509,11 @@ impl FunctionGraph {
     /// inputarg as `SomeInstance(Some(getuniqueclassdef(im_class)))`.
     pub fn with_owner_root(mut self, owner: impl Into<String>) -> Self {
         self.owner_root = Some(owner.into());
+        self
+    }
+
+    pub fn with_source_identity(mut self, identity: impl Into<String>) -> Self {
+        self.source_identity = Some(identity.into());
         self
     }
 

@@ -1905,6 +1905,356 @@ pub(crate) fn walker_ec_leave(
     }
     // `jit.virtual_ref_finish(frame_vref, frame)`.
     ctx.opimpl_virtual_ref_finish(callee_frame);
+/// `BuiltinCode.func` is an RPython PBC: the codewriter turns its finite
+/// target family into an indirect call whose address is resolved back to the
+/// generated target JitCode by `MetaInterpStaticData.bytecode_for_address`
+/// (`pyjitpl.py:2174-2186`).  The interpreter-level `call_fn` helper hides
+/// that indirect call behind `Function -> BuiltinCode -> func`, so recover
+/// the same target here and enter the generated wrapper with its one red
+/// `&[PyObjectRef]` argument.
+///
+/// The slice is represented to the translated body as a GC array.  Build that
+/// array in trace IR and seed its heap-cache entries from the live CALL
+/// operands; this preserves a distinct red receiver for every method call.
+/// In particular, a bound Method's receiver is read from its immutable
+/// `w_self` field rather than baked from the recording-time object.
+pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    ref_operand_offset: usize,
+    r_args: &[OpRef],
+    pyre_helper: majit_ir::PyreHelperKind,
+    dst_bank: char,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor
+        || !matches!(
+            pyre_helper,
+            majit_ir::PyreHelperKind::CallFn | majit_ir::PyreHelperKind::CallKw
+        )
+        || r_args.len() < 2
+        || dst_bank != 'r'
+    {
+        return Ok(None);
+    }
+
+    let mut arg_concretes = read_ref_var_list_concrete(code, op, ref_operand_offset, ctx);
+    for i in 0..2 {
+        if matches!(arg_concretes.get(i), Some(ConcreteValue::Null)) {
+            if let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(r_args[i]) {
+                if r != majit_ir::GcRef::NO_CONCRETE && r.as_usize() != 0 {
+                    arg_concretes[i] = ConcreteValue::Ref(r.as_usize() as pyre_object::PyObjectRef);
+                }
+            }
+        }
+    }
+    let ConcreteValue::Ref(callable_operand) = arg_concretes[0] else {
+        return Ok(None);
+    };
+    if callable_operand.is_null() {
+        return Ok(None);
+    }
+    let null_or_self = match arg_concretes[1] {
+        ConcreteValue::Ref(value) => value,
+        ConcreteValue::Null => pyre_object::PY_NULL,
+        _ => return Ok(None),
+    };
+    let method_form = !null_or_self.is_null() && null_or_self != pyre_object::PY_NULL;
+    let bound_method = !method_form && unsafe { pyre_object::is_method(callable_operand) };
+    let (callable, receiver) = if bound_method {
+        let function = unsafe { pyre_object::w_method_get_func(callable_operand) };
+        let receiver = unsafe { pyre_object::w_method_get_self(callable_operand) };
+        if function.is_null() || receiver.is_null() {
+            return Ok(None);
+        }
+        (function, Some(receiver))
+    } else {
+        (callable_operand, method_form.then_some(null_or_self))
+    };
+    if !unsafe { pyre_interpreter::is_function(callable) } {
+        return Ok(None);
+    }
+    let builtin_code =
+        unsafe { pyre_interpreter::function_get_code(callable) } as pyre_object::PyObjectRef;
+    if builtin_code.is_null() || !unsafe { pyre_interpreter::is_builtin_code(builtin_code) } {
+        return Ok(None);
+    }
+    let fnaddr = unsafe { pyre_interpreter::builtin_code_get(builtin_code) as usize };
+    let Some(jitcode) = crate::state::bytecode_for_address(fnaddr) else {
+        return Ok(None);
+    };
+    let Some(body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode.index()) else {
+        return Ok(None);
+    };
+    if body.num_regs_r < 1 {
+        return Ok(None);
+    }
+    // Guards inside the generated wrapper must resume at the outer Python
+    // CALL, because helper JitCodes have no blackhole entry point of their
+    // own.  The full-body symbol is the authority for that caller frame's
+    // liveness and resume coordinate (the same setup used by the orthodox
+    // w_list_append descent below).  Resolve it before recording any guards
+    // or synthetic allocations so a missing coordinate is a clean decline.
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: snapshot_sym is installed for the lifetime of the enclosing
+    // full-body walk and is read-only here.
+    let sym = unsafe { &*sym_ptr };
+    if sym.jitcode().is_null() {
+        return Ok(None);
+    }
+    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = unsafe {
+        let jc = &*sym.jitcode();
+        let jc_index = jc.index as u32;
+        let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
+        let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
+        if jc.payload.code_ptr.is_null() {
+            (py, sym.valuestackdepth() as i64, jc_index, marker)
+        } else {
+            let codeobj = &*jc.payload.code_ptr;
+            py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+            let depth = if jc.payload.depth_trivia_populated() {
+                jc.payload.depth_trivia_for_jitcode_pc(op.pc)
+            } else {
+                crate::liveness::liveness_for(jc.payload.code_ptr)
+                    .depth_at_py_pc()
+                    .get(py as usize)
+                    .copied()
+            };
+            let vsd = depth
+                .map(|d| (sym.nlocals() + d as usize) as i64)
+                .unwrap_or(sym.valuestackdepth() as i64);
+            (py, vsd, jc_index, marker)
+        }
+    };
+    let call_site_word = call_site_marker
+        .map(|marker| marker as i32)
+        .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
+    let call_site_active = collect_outer_active_boxes(
+        sym,
+        ctx.trace_ctx,
+        ctx.registers_i,
+        ctx.registers_r,
+        ctx.registers_f,
+        outer_jitcode_index,
+        false,
+        call_site_word,
+        op.pc as i32,
+        OuterActiveBoxesEntryTwin::Plain,
+        "builtin_wrapper_call_site",
+        None,
+        &[],
+    );
+
+    // The generated builtin-wrapper ABI takes its `&[PyObjectRef]` argument
+    // in r0 and begins by checking its length.  Resolve that instruction's
+    // descriptor operand now, before switching the sub-walk to the global
+    // descriptor pool below.  The synthetic array must remain allocated with
+    // `state::pyobject_gcarray_descr()` because that descriptor carries the
+    // runtime GC type id; the build-time slice descriptor deliberately has a
+    // translation-time placeholder type id.  Heapcache lookup, however, is
+    // keyed by the descriptor index used by the generated getarrayitem, so
+    // seed the contents under this exact codewriter descriptor index.
+    let Some(wrapper_args_descr_index) = crate::jitcode_runtime::decoded_ops(body.code)
+        .next()
+        .filter(|first| {
+            first.key == "arraylen_gc/rd>i" && body.code.get(first.pc + 1).copied() == Some(0)
+        })
+        .and_then(|first| {
+            let lo = *body.code.get(first.pc + 2)? as usize;
+            let hi = *body.code.get(first.pc + 3)? as usize;
+            let pool_index = lo | (hi << 8);
+            crate::jitcode_runtime::all_descr_refs()
+                .get(pool_index)
+                .map(|descr| descr.index())
+        })
+    else {
+        return Ok(None);
+    };
+
+    let mut callable_guard_op = r_args[0];
+    let mut receiver_op = method_form.then_some(r_args[1]);
+    if bound_method {
+        // pypy/interpreter/function.py `_Method._immutable_fields_`:
+        // guard the carrier layout, read both fields live, and only promote
+        // the immutable function identity used to select BuiltinCode.func.
+        let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
+        walker_guard_class(ctx, op.pc, r_args[0], method_type_addr)?;
+        callable_guard_op = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            r_args[0],
+            crate::descr::method_w_function_descr(),
+        );
+        let live_receiver = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            r_args[0],
+            crate::descr::method_w_self_descr(),
+        );
+        ctx.trace_ctx.try_set_opref_concrete(
+            live_receiver,
+            majit_ir::Value::Ref(majit_ir::GcRef(receiver.unwrap() as usize)),
+        );
+        receiver_op = Some(live_receiver);
+    }
+    if !callable_guard_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_guard_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_guard_op, expected);
+    }
+
+    let mut wrapper_items = Vec::with_capacity(r_args.len().saturating_sub(1));
+    let mut wrapper_item_concretes = Vec::with_capacity(arg_concretes.len().saturating_sub(1));
+    if let Some(receiver_op) = receiver_op {
+        wrapper_items.push(receiver_op);
+        wrapper_item_concretes.push(ConcreteValue::Ref(receiver.unwrap()));
+    }
+    wrapper_items.extend_from_slice(&r_args[2..]);
+    wrapper_item_concretes.extend_from_slice(&arg_concretes[2..]);
+    for (&item, concrete) in wrapper_items.iter().zip(&wrapper_item_concretes) {
+        if let ConcreteValue::Ref(value) = concrete
+            && !value.is_null()
+        {
+            // Box.value is the recording-time shadow, not a compile-time
+            // constant.  The generated wrapper's getarrayitem returns this
+            // same live box; seeding it lets py_type_check choose its observed
+            // arm and emit the corresponding guards while retaining `self`
+            // as a red input.
+            ctx.trace_ctx.try_set_opref_concrete(
+                item,
+                majit_ir::Value::Ref(majit_ir::GcRef(*value as usize)),
+            );
+        }
+    }
+
+    let array_descr = crate::state::pyobject_gcarray_descr();
+    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
+    let args_array =
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .new_array(args_array, len, true);
+    for (index, &item) in wrapper_items.iter().enumerate() {
+        let index = ctx.trace_ctx.const_int(index as i64);
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[args_array, index, item],
+            array_descr.clone(),
+        );
+        ctx.trace_ctx
+            .heapcache_setarrayitem(args_array, index, wrapper_args_descr_index, item);
+    }
+
+    if sym.owns_virtualizable_shadow() {
+        let last_instr = call_site_py_pc as i64 - 1;
+        let last_instr_op = ctx.trace_ctx.const_int(last_instr);
+        crate::trace_opcode::mirror_vable_static_to_boxes(
+            ctx.trace_ctx,
+            "last_instr",
+            last_instr_op,
+            Value::Int(last_instr),
+        );
+        let vsd_op = ctx.trace_ctx.const_int(vsd_value);
+        crate::trace_opcode::mirror_vable_static_to_boxes(
+            ctx.trace_ctx,
+            "valuestackdepth",
+            vsd_op,
+            Value::Int(vsd_value),
+        );
+    }
+
+    // Build-time canonical helper JitCodes use the one global Assembler
+    // descriptor pool.  Temporarily give the wrapper sub-frame that pool;
+    // its nested inline_call descriptors then resolve the generated child
+    // JitCodes (e.g. W_Random::random -> Random::random) by global index.
+    let saved_entry = ctx.entry_py_pc;
+    let saved_marker = ctx.outer_resume_marker_jit_pc;
+    let saved_oji = ctx.outer_jitcode_index;
+    let saved_active = std::mem::take(&mut ctx.outer_active_boxes);
+    let saved_descr_refs = ctx.descr_refs;
+    let saved_raw_descrs = ctx.raw_descrs;
+    let saved_lookup = ctx.sub_jitcode_lookup;
+    let saved_fbw_mode = ctx.fbw_mode;
+    ctx.entry_py_pc = EntryPyPc::Jit(op.pc);
+    ctx.outer_resume_marker_jit_pc = call_site_marker;
+    ctx.outer_jitcode_index = outer_jitcode_index;
+    ctx.outer_active_boxes = call_site_active;
+    ctx.descr_refs = crate::jitcode_runtime::all_descr_refs();
+    ctx.raw_descrs = RawDescrPool::Global;
+    ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
+    ctx.fbw_mode.inline_subwalk = true;
+    let walk_result = run_sub_jitcode_walk(
+        ctx,
+        op.pc,
+        &body,
+        &[],
+        &[],
+        &[args_array],
+        &[ConcreteValue::Null],
+        &[],
+    );
+    ctx.fbw_mode = saved_fbw_mode;
+    ctx.entry_py_pc = saved_entry;
+    ctx.outer_resume_marker_jit_pc = saved_marker;
+    ctx.outer_jitcode_index = saved_oji;
+    ctx.outer_active_boxes = saved_active;
+    ctx.descr_refs = saved_descr_refs;
+    ctx.raw_descrs = saved_raw_descrs;
+    ctx.sub_jitcode_lookup = saved_lookup;
+
+    let walk_result = walk_result?;
+    match walk_result {
+        DispatchOutcome::SubReturn {
+            result: Some(value),
+        } => {
+            let concrete = concrete_from_recorded_opref(ctx, value);
+            write_ref_reg(ctx, op.pc, dst, value, concrete)?;
+            Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+        }
+        DispatchOutcome::SubReturn { result: None } => {
+            Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
+        }
+        DispatchOutcome::SubRaise { exc, exc_concrete } => {
+            if let Some(target) = try_catch_exception_at(code, op.next_pc) {
+                ctx.last_exc_value = Some(exc);
+                ctx.last_exc_value_concrete = exc_concrete;
+                Ok(Some((DispatchOutcome::Continue, target)))
+            } else {
+                Ok(Some((
+                    DispatchOutcome::SubRaise { exc, exc_concrete },
+                    op.next_pc,
+                )))
+            }
+        }
+        DispatchOutcome::Terminate => Ok(Some((DispatchOutcome::Terminate, op.next_pc))),
+        DispatchOutcome::SwitchToBlackhole {
+            reason,
+            raising_exception,
+        } => Ok(Some((
+            DispatchOutcome::SwitchToBlackhole {
+                reason,
+                raising_exception,
+            },
+            op.next_pc,
+        ))),
+        DispatchOutcome::CloseLoop { .. }
+        | DispatchOutcome::CompileTracePending { .. }
+        | DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        }
+        DispatchOutcome::Continue => {
+            unreachable!(
+                "walk() only exits on Terminate / SubReturn / SubRaise / SwitchToBlackhole"
+            )
+        }
+    }
 }
 
 /// Shared post-resolution half of the FBW inline lever. Ordinary Python calls
@@ -4428,8 +4778,9 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
     let (args, arg_width) = read_ref_var_list(code, op, 2, ctx)?;
     let arg_concretes = read_ref_var_list_concrete(code, op, 2, ctx);
 
-    let callee_outcome =
-        run_sub_jitcode_walk(ctx, op.pc, &sub_body, &[], &[], &args, &arg_concretes, &[])?;
+    let callee_result =
+        run_sub_jitcode_walk(ctx, op.pc, &sub_body, &[], &[], &args, &arg_concretes, &[]);
+    let callee_outcome = callee_result?;
 
     match callee_outcome {
         DispatchOutcome::SubReturn {
@@ -4763,7 +5114,7 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
     let (float_args, float_width) = read_float_var_list(code, op, 2 + int_width + ref_width, ctx)?;
 
-    let callee_outcome = run_sub_jitcode_walk(
+    let callee_result = run_sub_jitcode_walk(
         ctx,
         op.pc,
         &sub_body,
@@ -4772,7 +5123,8 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
         &ref_args,
         &ref_arg_concretes,
         &float_args,
-    )?;
+    );
+    let callee_outcome = callee_result?;
 
     match callee_outcome {
         DispatchOutcome::SubReturn {

@@ -3321,22 +3321,32 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// kwargs through `Arguments::_match_signature` into named slots, this helper
 /// and the `__pyre_kw__` marker can be removed.
 pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Option<PyObjectRef>) {
-    if let Some(&last) = args.last() {
+    if !args.is_empty() {
+        let last = args[args.len() - 1];
         // The marker dict stores an unforgeable sentinel under `__pyre_kw__`
         // (`call_with_kwargs`), so detection is by value identity.  A dict
         // passed positionally that merely contains a `__pyre_kw__` string key
         // (`float({'__pyre_kw__': True})`) carries a different value and is a
         // value, not the marker, so it must not be stripped.
-        let is_marker = unsafe {
-            is_dict(last)
-                && pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
-                    .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
-        };
+        let is_marker = (unsafe { is_dict(last) }) && builtin_kwargs_marker_dict(last);
         if is_marker {
             return (&args[..args.len() - 1], Some(last));
         }
     }
     (args, None)
+}
+
+/// Cold dictionary-strategy half of the flat builtin-keyword ABI.
+///
+/// The caller first proves `last` is a dict.  Keeping the strategy dispatch
+/// residual lets the trace-visible non-dict path reject the marker test
+/// without entering `w_dict_getitem_str`'s dynamic strategy function.
+#[majit_macros::dont_look_inside]
+pub fn builtin_kwargs_marker_dict(last: PyObjectRef) -> bool {
+    unsafe {
+        pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
+            .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
+    }
 }
 
 /// True when the kwargs dict from [`split_builtin_kwargs`] carries a real
@@ -3450,11 +3460,11 @@ pub(crate) fn bind_pos_or_kw(
 /// `true` when the last argument is the `__pyre_kw__`-tagged dict the
 /// CALL_KW builtin dispatch appends — i.e. the call carried keywords.
 pub(crate) fn has_builtin_kwargs(args: &[PyObjectRef]) -> bool {
-    matches!(args.last(), Some(&last) if unsafe {
-        is_dict(last)
-            && pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
-                .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
-    })
+    if args.is_empty() {
+        return false;
+    }
+    let last = args[args.len() - 1];
+    (unsafe { is_dict(last) }) && builtin_kwargs_marker_dict(last)
 }
 
 /// Resolve a single positional-or-keyword builtin argument: prefer the

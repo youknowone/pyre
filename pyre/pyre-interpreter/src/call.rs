@@ -757,14 +757,32 @@ fn set_orig_class(result: PyObjectRef, alias: PyObjectRef) -> Result<(), crate::
     }
 }
 
-// `dont_look_inside`: a builtin is invoked through a runtime `BuiltinCodeFn`
-// value (`func(args)`), a call through a fn-pointer the tracer has no lowering
-// for (only static `CallPath`s lower). The builtin body is the residual
-// boundary — the JIT residualizes the whole dispatch (signature-aware kwarg
-// packing + the C-level call) instead of tracing into it, mirroring
-// `cpu.bh_call_*`. This also keeps `builtin_code_get_signature`'s raw-ptr
-// `as_ref` read out of any traced graph.
+fn finish_builtin_code_positional(
+    current_code: PyObjectRef,
+    current_args: &[PyObjectRef],
+) -> PyResult {
+    if let Some(sig) = unsafe { crate::builtin_code_get_signature(current_code) } {
+        // Every HOPELESS signature needs `_match_signature`, not only
+        // *args/**kwargs/kw-only shapes.  A plain optional positional
+        // parameter also has HOPELESS fast arity; bypassing the binder let
+        // excess positionals reach the typed wrapper, which consumes its
+        // declared prefix and silently ignores the rest.
+        if unsafe { crate::builtin_code_get_fast_natural_arity(current_code) } == crate::HOPELESS {
+            let fname = unsafe { crate::builtin_code_name(current_code) };
+            let bound = bind_kwargs_to_signature(sig, fname, current_args, &[])?;
+            return unsafe { crate::builtin_code_call(current_code, &bound) };
+        }
+    }
+    unsafe { crate::builtin_code_call(current_code, current_args) }
+}
+
 #[majit_macros::dont_look_inside]
+fn call_builtin_code_many_from_roots(root_base: usize, nargs: usize) -> PyResult {
+    let mut rooted = vec![pyre_object::PY_NULL; 1 + nargs];
+    pyre_object::gc_roots::shadow_stack_copy_range(root_base, &mut rooted);
+    finish_builtin_code_positional(rooted[0], &rooted[1..])
+}
+
 fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
     // `gateway.py:824 BuiltinCode.funcrun` is translated with both its code
     // object and `Arguments.arguments_w` live across gateway dispatch.  A
@@ -778,29 +796,37 @@ fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyRe
     for &arg in args {
         pyre_object::gc_roots::pin_root(arg);
     }
-    let current_code = || pyre_object::gc_roots::shadow_stack_get(root_base);
-    let current_args = || {
-        (0..args.len())
-            .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i))
-            .collect::<Vec<_>>()
-    };
-
-    if let Some(sig) = unsafe { crate::builtin_code_get_signature(current_code()) } {
-        // Every HOPELESS signature needs `_match_signature`, not only
-        // *args/**kwargs/kw-only shapes.  A plain optional positional
-        // parameter also has HOPELESS fast arity; bypassing the binder let
-        // excess positionals reach the typed wrapper, which consumes its
-        // declared prefix and silently ignores the rest.
-        if unsafe { crate::builtin_code_get_fast_natural_arity(current_code()) } == crate::HOPELESS
-        {
-            let fname = unsafe { crate::builtin_code_name(current_code()) };
-            let args = current_args();
-            let bound = bind_kwargs_to_signature(sig, fname, &args, &[])?;
-            return unsafe { crate::builtin_code_call(current_code(), &bound) };
+    // RPython's pop-roots reload produces ordinary live variables.  Spell the
+    // common fixed-arity cases the same way so source translation sees no Rust
+    // array slicing/indexing helpers between the live roots and the gateway
+    // indirect call.  The uncommon variadic case stays a residual helper.
+    let current_code = pyre_object::gc_roots::shadow_stack_get(root_base);
+    match args.len() {
+        0 => finish_builtin_code_positional(current_code, &[]),
+        1 => {
+            let a0 = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+            finish_builtin_code_positional(current_code, &[a0])
         }
+        2 => {
+            let a0 = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+            let a1 = pyre_object::gc_roots::shadow_stack_get(root_base + 2);
+            finish_builtin_code_positional(current_code, &[a0, a1])
+        }
+        3 => {
+            let a0 = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+            let a1 = pyre_object::gc_roots::shadow_stack_get(root_base + 2);
+            let a2 = pyre_object::gc_roots::shadow_stack_get(root_base + 3);
+            finish_builtin_code_positional(current_code, &[a0, a1, a2])
+        }
+        4 => {
+            let a0 = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+            let a1 = pyre_object::gc_roots::shadow_stack_get(root_base + 2);
+            let a2 = pyre_object::gc_roots::shadow_stack_get(root_base + 3);
+            let a3 = pyre_object::gc_roots::shadow_stack_get(root_base + 4);
+            finish_builtin_code_positional(current_code, &[a0, a1, a2, a3])
+        }
+        nargs => call_builtin_code_many_from_roots(root_base, nargs),
     }
-    let args = current_args();
-    unsafe { crate::builtin_code_call(current_code(), &args) }
 }
 
 /// Leaf execution mode for a user-function call reached through

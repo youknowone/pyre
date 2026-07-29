@@ -120,6 +120,34 @@ pub fn get_jitcode_by_index(index: usize) -> Option<Arc<JitCode>> {
     all_jitcodes().get(index).cloned()
 }
 
+/// Restore the source translator's exact
+/// `Assembler.indirectcalltargets` set as references into `all_jitcodes`.
+pub fn build_indirectcalltargets() -> Vec<Arc<majit_metainterp::jitcode::JitCode>> {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/indirectcalltargets.bin"));
+    let indices: Vec<usize> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
+        panic!(
+            "pyre-jit-trace: failed to deserialize indirectcalltargets.bin \
+             ({} bytes): {e}",
+            BYTES.len(),
+        )
+    });
+    indices
+        .into_iter()
+        .map(|index| {
+            let canonical = get_jitcode_by_index(index).unwrap_or_else(|| {
+                panic!(
+                    "pyre-jit-trace: indirect-call target index {index} is \
+                     outside all_jitcodes (len={})",
+                    all_jitcodes().len()
+                )
+            });
+            Arc::new(majit_metainterp::jitcode::JitCode::from_canonical(
+                (*canonical).clone(),
+            ))
+        })
+        .collect()
+}
+
 // Cached index of the build-time portal jitcode within `ALL_JITCODES`.
 //
 // RPython `warmspot.py:281-282` + `call.py:147-148`:

@@ -498,6 +498,65 @@ pub const BUILTIN_CODE_GC_TYPE_ID: u32 = 13;
 /// pyre equivalent: returns Result so errors propagate through the call stack.
 pub type BuiltinCodeFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
 
+/// Cold interp2app arity-error formatter.
+///
+/// RPython's gateway constructs this exception only on the rejected-call
+/// branch.  Keep formatting out of generated wrapper JitCodes; valid calls
+/// retain the argument-count guards but never execute this residual helper.
+#[majit_macros::dont_look_inside]
+pub fn method_arity_failure(
+    name: &str,
+    expected: &str,
+    given: usize,
+) -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::type_error(format!(
+        "{name}() takes {expected} ({given} given)"
+    )))
+}
+
+/// Cold zero-user-argument gateway failure.
+///
+/// Valid generated wrappers guard their exact total arity before entering
+/// this helper.  The rejected branch still distinguishes CALL_KW's trailing
+/// marker from surplus positional arguments, preserving the public gateway
+/// error while keeping keyword classification out of the hot JitCode.
+#[majit_macros::dont_look_inside]
+pub fn method_noarg_failure(
+    args: &[PyObjectRef],
+    name: &str,
+    receiver_slots: usize,
+) -> Result<PyObjectRef, crate::PyError> {
+    if crate::builtins::has_builtin_kwargs(args) {
+        Err(crate::PyError::type_error(format!(
+            "{name}() takes no keyword arguments"
+        )))
+    } else {
+        method_arity_failure(
+            name,
+            "no arguments",
+            args.len().saturating_sub(receiver_slots),
+        )
+    }
+}
+
+/// Translation-visible registry of generated interp2app gateway bodies.
+///
+/// RPython's `BuiltinCode.func` is a PBC whose possible function values are
+/// discovered by the annotator and become the candidate graph list on the
+/// eventual `indirect_call`.  Rust erases that family to the bare
+/// [`BuiltinCodeFn`] type, so `#[pyre_methods]` publishes the same set here.
+/// The registry is process-global, matching the immutable generated function
+/// objects; it is not runtime interpreter state.
+#[derive(Clone, Copy)]
+pub struct BuiltinWrapperDescriptor {
+    pub path: &'static str,
+    pub func: BuiltinCodeFn,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice]
+pub static BUILTIN_WRAPPER_DESCRIPTORS: [BuiltinWrapperDescriptor];
+
 /// The type a method descriptor belongs to, and the layout test its receiver
 /// must satisfy — `PyDescrObject.d_type`, and the `self` entry of PyPy's
 /// `interp2app` unwrap_spec.

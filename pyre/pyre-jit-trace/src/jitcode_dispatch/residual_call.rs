@@ -3017,6 +3017,15 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // linear `catch_exception/L`.
     clear_walk_exception(ctx);
 
+    // BuiltinCode.func is an indirect PBC target exactly like RPython's
+    // gateway wrappers.  Enter its generated JitCode before considering the
+    // user-function-only full-body walk below.
+    if let Some(inlined) =
+        try_walker_inline_builtin_call(ctx, op, code, 1, &r_args, ei.pyre_helper, dst_bank, dst)?
+    {
+        return Ok(inlined);
+    }
+
     // #62 slice (3c): attempt full-body-walk inline of a user-function call
     // unconditionally. Eligible exact-positional closure-free
     // calls sub-walk the callee body in place of the residual; ineligible
@@ -3473,6 +3482,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && try_walker_specialize_math_ldexp(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && try_walker_specialize_math_isqrt(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
@@ -4015,6 +4031,19 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // arity in the Int list).  Share the same user-function inline gate as the
     // plain Ref-only residual, but read the concrete Ref shadows from the
     // shifted R-list offset.
+    if let Some(inlined) = try_walker_inline_builtin_call(
+        ctx,
+        op,
+        code,
+        1 + i_width,
+        &r_args,
+        ei.pyre_helper,
+        dst_bank,
+        dst,
+    )? {
+        return Ok(inlined);
+    }
+
     if let Some(inlined) = try_walker_inline_user_call(
         ctx,
         op,

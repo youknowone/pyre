@@ -1792,6 +1792,12 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
     // a nested `eval_loop_jit` running under this one observes depth > 1 and
     // skips collection. No-op when the flag is off.
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
+    if _eval_activation.armed() {
+        // Publish the process-stable configuration in the breaker word once
+        // per activation, before the first dispatch. Compiled back-edges mask
+        // this bit out.
+        majit_ir::eval_breaker_word::set_gc_interp();
+    }
     let _current_frame_guard = if frame.execution_context.is_null() {
         install_current_frame(frame)
     } else {
@@ -1801,7 +1807,14 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
     let mut next_instr = frame.next_instr();
 
     loop {
-        crate::module::thread::park_if_finalizing();
+        // PyPy's ActionFlag is one process breaker.  Keep pyre's free-threaded
+        // finalization and STW extensions on the same already-established
+        // breaker word, so the ordinary dispatch pays one relaxed load rather
+        // than polling two process-global atomics independently.
+        let dispatch_breaker = majit_ir::eval_breaker_word::load();
+        if dispatch_breaker & majit_ir::eval_breaker_word::EB_FINALIZING != 0 {
+            crate::module::thread::park_if_finalizing();
+        }
         // Interpreter-path GC safepoint (PYRE_GC_INTERP), mirroring the JIT
         // eval loop. Between opcodes the only live refs are in the frame,
         // reachable through the installed `current_frame` root walker; no
@@ -1809,13 +1822,17 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         // the flag is on and enough interpreter objects have accumulated.
         // Without it, a JIT-off run reclaims interpreter-routed old-gen
         // allocations only at explicit `gc.collect`, so RSS grows unbounded.
-        pyre_object::gc_interp::safepoint();
+        if dispatch_breaker & majit_ir::eval_breaker_word::EB_GC_INTERP != 0 {
+            pyre_object::gc_interp::safepoint();
+        }
         // Free-threaded stop-the-world rendezvous.  Worker threads deliberately
         // execute this plain evaluator (their JitDriver state is thread-owned),
         // so they must poll the same process breaker as compiled/JIT-warm
         // loops; otherwise a non-allocating Python loop can prevent collection
         // and fork/finalization STW forever.
-        majit_gc::gc_sync::safepoint_poll();
+        if dispatch_breaker & majit_ir::eval_breaker_word::EB_STW != 0 {
+            majit_gc::gc_sync::safepoint_poll();
+        }
 
         if next_instr >= code.instructions.len() {
             return Ok(w_none());

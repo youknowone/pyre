@@ -2063,7 +2063,9 @@ impl MIFrame {
         // load a process-global raw word through a baked constant address,
         // compare it, then guard the result. The folded eval-breaker word is a
         // bitmask, so this uses a nonzero test rather than upstream's
-        // `int_lt(ticker, 0)`.
+        // `int_lt(ticker, 0)`.  EB_GC_INTERP is a process-stable dispatch
+        // configuration bit sharing the word to avoid another interpreter
+        // load; mask it out because it is not a compiled-loop breaker.
         //
         // Load-bearing invariant: RawLoadI must remain outside the always-pure
         // range and this descriptor must remain non-pure. Otherwise CSE can
@@ -2083,7 +2085,9 @@ impl MIFrame {
                 &[base, offset],
                 eval_breaker_word_descr(),
             );
-            let armed = ctx.record_op(OpCode::IntIsTrue, &[word]);
+            let mask = ctx.const_int(majit_ir::eval_breaker_word::JIT_BREAKER_MASK as i64);
+            let breaker_bits = ctx.record_op(OpCode::IntAnd, &[word, mask]);
+            let armed = ctx.record_op(OpCode::IntIsTrue, &[breaker_bits]);
             self.generate_guard(ctx, OpCode::GuardFalse, &[armed]);
         }
         // pyjitpl.py:2954-2965 reached_loop_header: virtualizable_boxes

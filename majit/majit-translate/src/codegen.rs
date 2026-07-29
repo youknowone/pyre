@@ -172,6 +172,7 @@ mod tests {
             }],
             jitcodes: vec![main_jitcode],
             jitcodes_by_path: indexmap::IndexMap::new(),
+            indirectcalltarget_indices: Vec::new(),
             insns: indexmap::IndexMap::new(),
             descrs: Vec::new(),
             all_liveness: Vec::new(),

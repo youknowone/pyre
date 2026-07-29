@@ -222,6 +222,7 @@ pm1_edom!(sqrt, "expected a nonnegative input");
 static MATH_SQRT_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MATH_FREXP_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MATH_LDEXP_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MATH_ISQRT_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// Record the checked-arity wrapper pointers installed by `py_module!`.
 ///
@@ -235,6 +236,7 @@ pub fn register_jit_builtin_wrappers(ns: PyObjectRef) {
         ("sqrt", &MATH_SQRT_WRAPPER),
         ("frexp", &MATH_FREXP_WRAPPER),
         ("ldexp", &MATH_LDEXP_WRAPPER),
+        ("isqrt", &MATH_ISQRT_WRAPPER),
     ] {
         let callable = crate::module_ns_get(ns, name)
             .unwrap_or_else(|| panic!("math.{name} missing after module registration"));
@@ -285,6 +287,10 @@ pub fn is_math_ldexp_function(callable: PyObjectRef) -> bool {
     unsafe { math_builtin_wrapper_matches(callable, &MATH_LDEXP_WRAPPER) }
 }
 
+pub fn is_math_isqrt_function(callable: PyObjectRef) -> bool {
+    unsafe { math_builtin_wrapper_matches(callable, &MATH_ISQRT_WRAPPER) }
+}
+
 /// Raw, allocation-free counterparts of RPython's `ll_math_frexp` result
 /// components.  The translated PyPy trace carries the pair as two unboxed
 /// values before `space.newtuple2` virtualizes; pyre's walker emits one pure
@@ -318,6 +324,31 @@ pub extern "C" fn jit_math_ldexp_raw(x: f64, exp: i64) -> f64 {
         Err(_) => f64::INFINITY.copysign(x),
     }
 }
+
+/// Allocation-free exact machine-integer arm of `app_math.isqrt`.
+///
+/// PyPy meta-traces the app-level implementation with an unboxed Signed when
+/// the argument is a `W_IntObject`.  The native wrapper otherwise promotes
+/// that value to `rbigint` before running the same algorithm, hiding the
+/// unboxed arm from pyre's walker.  Use a hardware square-root estimate and
+/// exact division-based corrections; the latter preserve integer semantics
+/// even where `f64` cannot represent every input.
+pub extern "C" fn jit_math_isqrt_i64(n: i64) -> i64 {
+    debug_assert!(n >= 0);
+    if n == 0 {
+        return 0;
+    }
+    let n = n as u64;
+    let mut root = (n as f64).sqrt() as u64;
+    while root + 1 <= n / (root + 1) {
+        root += 1;
+    }
+    while root > n / root {
+        root -= 1;
+    }
+    root as i64
+}
+
 pm1!(cbrt);
 pm1!(exp);
 pm1!(exp2);
@@ -954,12 +985,105 @@ pub fn isqrt(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn fsum(args: &[PyObjectRef]) -> PyResult {
-    let items = crate::builtins::collect_iterable(args[0])?;
-    let floats: Vec<f64> = items
-        .iter()
-        .map(|&a| try_get_double(a))
-        .collect::<Result<Vec<_>, _>>()?;
-    map_err(pymath::math::fsum(floats))
+    // interp_math.py:572-633: consume the iterator once while maintaining the
+    // partials array.  The old port first materialized every boxed element and
+    // then built a second Vec<f64>; besides diverging from upstream, that kept
+    // one shadow-stack root per input alive until the entire iterable had been
+    // consumed.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let iterable_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let w_iter = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?;
+    let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_iter);
+
+    let mut inf_sum = 0.0;
+    let mut special_sum = 0.0;
+    let mut partials: Vec<f64> = Vec::new();
+    loop {
+        let w_value =
+            match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
+                Ok(value) => value,
+                Err(err) if err.kind == crate::PyErrorKind::StopIteration => break,
+                Err(err) => return Err(err),
+            };
+        // `_get_double` can invoke user code.  Keep the yielded object rooted
+        // only across that conversion, exactly like the translated livevar at
+        // this point in the upstream loop.
+        let original = {
+            let _value_root = pyre_object::gc_roots::push_roots();
+            let value_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(w_value);
+            try_get_double(pyre_object::gc_roots::shadow_stack_get(value_slot))?
+        };
+        let mut value = original;
+        let mut added = 0;
+        for index in 0..partials.len() {
+            let mut partial = partials[index];
+            if value.abs() < partial.abs() {
+                std::mem::swap(&mut value, &mut partial);
+            }
+            let hi = value + partial;
+            let yr = hi - value;
+            let lo = partial - yr;
+            if lo != 0.0 {
+                partials[added] = lo;
+                added += 1;
+            }
+            value = hi;
+        }
+        partials.truncate(added);
+        if value != 0.0 {
+            if !value.is_finite() {
+                if original.is_finite() {
+                    return map_err(Err(pymath::Error::ERANGE));
+                }
+                if original.is_infinite() {
+                    inf_sum += original;
+                }
+                special_sum += original;
+                partials.clear();
+            } else {
+                partials.push(value);
+            }
+        }
+    }
+
+    if special_sum != 0.0 {
+        if inf_sum.is_nan() {
+            return map_err(Err(pymath::Error::EDOM));
+        }
+        return Ok(floatobject::w_float_new(special_sum));
+    }
+    let mut hi = 0.0;
+    let mut lo = 0.0;
+    let mut index = partials.len();
+    if index > 0 {
+        index -= 1;
+        hi = partials[index];
+        while index > 0 {
+            index -= 1;
+            let value = hi;
+            let partial = partials[index];
+            hi = value + partial;
+            let yr = hi - value;
+            lo = partial - yr;
+            if lo != 0.0 {
+                break;
+            }
+        }
+        if index > 0
+            && ((lo < 0.0 && partials[index - 1] < 0.0) || (lo > 0.0 && partials[index - 1] > 0.0))
+        {
+            let doubled = lo * 2.0;
+            let value = hi + doubled;
+            let yr = value - hi;
+            if doubled == yr {
+                hi = value;
+            }
+        }
+    }
+    Ok(floatobject::w_float_new(hi))
 }
 
 pub fn prod(args: &[PyObjectRef]) -> PyResult {

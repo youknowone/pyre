@@ -324,6 +324,25 @@ pub(crate) fn select_call_family_row(
 /// RPython's `convert_to_concrete_llfn` materialises the funcptr but the
 /// eventual `indirect_call` still receives `self, ...` as ordinary args.
 pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallControl) {
+    // Generated gateway wrappers enter the MIR graph as a plain function-
+    // pointer `IndirectCall` with `Some([])` as a deferred PBC-family marker.
+    // At rtype time CallControl owns both the translated graphs and the
+    // linker-resolved wrapper addresses, so fill the same `c_graphs` list
+    // `FunctionReprBase.call()` appends in rpbc.py:216.
+    let builtin_wrappers = call_control.builtin_wrapper_indirect_graphs();
+    for block in &mut graph.blocks {
+        for op in &mut block.operations {
+            if let OpKind::IndirectCall {
+                graphs: Some(graphs),
+                ..
+            } = &mut op.kind
+                && graphs.is_empty()
+            {
+                *graphs = builtin_wrappers.clone();
+            }
+        }
+    }
+
     // Collect the (block, op_index) sites first so the rewrite below
     // can mutate the graph without aliasing the borrow.
     let sites: Vec<(usize, usize)> = graph

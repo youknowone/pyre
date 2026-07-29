@@ -1716,6 +1716,7 @@ fn expand_pyre_methods(
         }
         let mname = &m.sig.ident;
         let wrapper_name = format_ident!("__pyre_wrap_{}", mname);
+        let wrapper_target_name = format_ident!("__majit_builtin_wrapper_target_{}", mname);
         let kind = classify_method(m)?;
 
         // Build per-kind wrapper preamble (self extraction) + call form,
@@ -1859,6 +1860,25 @@ fn expand_pyre_methods(
             );
             if has_varargs || is_property {
                 quote! {}
+            } else if param_names.is_empty() {
+                let receiver_slots = usize::from(matches!(kind, MethodKind::Instance));
+                let expected_total = receiver_slots;
+                let fn_name = mname.to_string();
+                quote! {
+                    // A method with no user-visible parameters has no keyword
+                    // slots to bind.  Its valid-call fast path is the exact
+                    // total arity; only a mismatch enters the cold classifier
+                    // that distinguishes CALL_KW's marker from surplus
+                    // positional arguments.
+                    if args.len() != #expected_total {
+                        return crate::gateway::method_noarg_failure(
+                            args,
+                            #fn_name,
+                            #receiver_slots,
+                        );
+                    }
+                    let __pyre_positional_count = args.len();
+                }
             } else {
                 let mut all_names: Vec<String> = Vec::new();
                 let mut all_required: Vec<bool> = Vec::new();
@@ -1942,10 +1962,14 @@ fn expand_pyre_methods(
                 let expected_min = receiver_slots + visible_required;
                 let too_few = if visible_required == visible_max {
                     quote! {
-                        format!(
-                            "{}() takes {} ({} given)",
-                            #fn_name, #expected,
-                            args.len().saturating_sub(#receiver_slots),
+                        crate::gateway::method_arity_failure(
+                            #fn_name,
+                            #expected,
+                            if args.len() >= #receiver_slots {
+                                args.len() - #receiver_slots
+                            } else {
+                                0
+                            },
                         )
                     }
                 } else {
@@ -1954,19 +1978,23 @@ fn expand_pyre_methods(
                         fn_name,
                         if visible_required == 1 { "" } else { "s" },
                     );
-                    quote! { format!(#text, args.len().saturating_sub(#receiver_slots)) }
+                    quote! {
+                        ::std::result::Result::Err(crate::PyError::type_error(format!(
+                            #text,
+                            args.len().saturating_sub(#receiver_slots),
+                        )))
+                    }
                 };
                 quote! {
                     if args.len() < #expected_min {
-                        return ::std::result::Result::Err(crate::PyError::type_error(#too_few));
+                        return #too_few;
                     }
                     if __pyre_positional_count > #expected_total {
-                        return ::std::result::Result::Err(crate::PyError::type_error(format!(
-                            "{}() takes {} ({} given)",
+                        return crate::gateway::method_arity_failure(
                             #fn_name,
                             #expected,
-                            args.len().saturating_sub(#receiver_slots),
-                        )));
+                            args.len() - #receiver_slots,
+                        );
                     }
                 }
             }
@@ -2037,6 +2065,16 @@ fn expand_pyre_methods(
                 #preamble
                 #body
             }
+        });
+        wrappers.push(quote! {
+            #[cfg(not(target_arch = "wasm32"))]
+            #[::linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+            #[allow(non_upper_case_globals)]
+            static #wrapper_target_name: crate::gateway::BuiltinWrapperDescriptor =
+                crate::gateway::BuiltinWrapperDescriptor {
+                    path: concat!(module_path!(), "::", stringify!(#wrapper_name)),
+                    func: #wrapper_name,
+                };
         });
         let raw_fn = quote! { crate::make_builtin_function(#py_name, #wrapper_name) };
         match &kind {

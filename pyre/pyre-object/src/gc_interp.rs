@@ -85,6 +85,11 @@ impl EvalActivationGuard {
         }
         Self { armed }
     }
+
+    #[inline]
+    pub fn armed(&self) -> bool {
+        self.armed
+    }
 }
 
 impl Drop for EvalActivationGuard {

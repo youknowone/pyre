@@ -11,7 +11,7 @@ use walkdir::WalkDir;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v3";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v4";
 /// Retained cache entries. Each is ~6 MB, and a handful covers the
 /// configurations one checkout switches between (native/wasm × release/dev).
 const CODEGEN_CACHE_MAX_ENTRIES: usize = 8;
@@ -21,6 +21,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "jit_trace_gen.rs",
     "jit_metadata.json",
     "jitcodes.bin",
+    "indirectcalltargets.bin",
     "jit_drivers.bin",
     "insns.bin",
     "descrs.bin",
@@ -85,6 +86,11 @@ fn emit_llbc_extraction_placeholders() {
         format!("{out_dir}/jitcodes.bin"),
         bincode::serialize(&Vec::<std::sync::Arc<majit_translate::jitcode::JitCode>>::new())
             .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        format!("{out_dir}/indirectcalltargets.bin"),
+        bincode::serialize(&Vec::<usize>::new()).unwrap(),
     )
     .unwrap();
     std::fs::write(
@@ -500,6 +506,12 @@ fn real_main() {
     // codewriter.make_jitcodes()`.
     let jitcodes_bin = bincode::serialize(&pipeline.jitcodes).unwrap();
     std::fs::write(format!("{out_dir}/jitcodes.bin"), &jitcodes_bin).unwrap();
+    let indirectcalltargets_bin = bincode::serialize(&pipeline.indirectcalltarget_indices).unwrap();
+    std::fs::write(
+        format!("{out_dir}/indirectcalltargets.bin"),
+        &indirectcalltargets_bin,
+    )
+    .unwrap();
 
     // Persist the explicit portal → main-JitCode mapping. Runtime consumes
     // this directly instead of rediscovering the portal through name or flag

@@ -166,22 +166,35 @@ pub fn shadow_stack_len() -> usize {
 }
 
 /// Read a single shadow-stack slot by index, panicking if the index
-/// is out of bounds. Used by tests and ad-hoc host-side debugging to
-/// confirm the slot contents survive across nested brackets — the GC
-/// itself uses [`walk_shadow_stack`] for the collection-time visit.
+/// is out of bounds.  RPython's `pop_roots` reads the root-stack slot
+/// directly: a moving collection has already rewritten it in place through
+/// [`walk_shadow_stack`] (or [`walk_shadow_stack_area`] for another mutator).
+/// The initial [`pin_root`] still normalizes a copied pointer that may have
+/// become stale before it was published.
 ///
 /// Reads the thread-local `SHADOW_STACK` the tracer cannot type; the JIT
 /// residualises the read instead of tracing into it (`@dont_look_inside`,
 /// `rlib/jit.py:139`), the [`shadow_stack_len`] twin.
 #[majit_macros::dont_look_inside]
 pub fn shadow_stack_get(index: usize) -> PyObjectRef {
+    SHADOW_STACK.with(|s| s.borrow()[index])
+}
+
+/// Copy a contiguous range of rooted values out of the shadow stack.
+///
+/// RPython's `pop_roots` reloads all livevars from the root stack as one
+/// generated block after the potentially-collecting call.  Host-side callers
+/// that need several adjacent roots should use this equivalent bulk shape
+/// instead of repeatedly entering TLS through [`shadow_stack_get`].
+///
+/// Panics when `base..base + dst.len()` is outside the live root stack, just
+/// like indexing the corresponding slots individually.
+#[majit_macros::dont_look_inside]
+pub fn shadow_stack_copy_range(base: usize, dst: &mut [PyObjectRef]) {
     SHADOW_STACK.with(|s| {
-        let mut stack = s.borrow_mut();
-        let root = stack[index];
-        let current = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
-        stack[index] = current;
-        current
-    })
+        let stack = s.borrow();
+        dst.copy_from_slice(&stack[base..base + dst.len()]);
+    });
 }
 
 /// Visit every pinned root in the shadow stack with mutable access.

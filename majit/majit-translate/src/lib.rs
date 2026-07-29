@@ -1748,6 +1748,7 @@ fn analyze_pipeline_from_module_paths(
         functions: Vec::new(),
         jit_drivers: Vec::new(),
         jitcodes: Vec::new(),
+        indirectcalltarget_indices: Vec::new(),
         jitcodes_by_path: indexmap::IndexMap::new(),
         insns: indexmap::IndexMap::new(),
         descrs: Vec::new(),
@@ -1758,7 +1759,7 @@ fn analyze_pipeline_from_module_paths(
     };
 
     mark_phase!("call_control + canonical_trait_impls + register graphs");
-    let (jitcodes, insns, descrs, all_liveness) =
+    let (jitcodes, indirectcalltarget_indices, insns, descrs, all_liveness) =
         make_jitcodes(&config.pipeline, &mut call_control, &mut prof);
     mark_phase!("make_jitcodes");
     pipeline.jit_drivers = call_control
@@ -1774,6 +1775,7 @@ fn analyze_pipeline_from_module_paths(
         })
         .collect();
     pipeline.jitcodes = jitcodes;
+    pipeline.indirectcalltarget_indices = indirectcalltarget_indices;
     // Mirror of `CallControl::jitcodes` (RPython `call.py:87 self.jitcodes`)
     // captured before `call_control` is dropped. Needed because consumers
     // that look up a JitCode by graph identity cannot reconstruct the key
@@ -1861,6 +1863,7 @@ fn make_jitcodes(
     prof: &mut PhaseProfiler,
 ) -> (
     Vec<std::sync::Arc<jitcode::JitCode>>,
+    Vec<usize>,
     indexmap::IndexMap<String, u8>,
     Vec<jitcode::BhDescr>,
     Vec<u8>,
@@ -1903,6 +1906,24 @@ fn make_jitcodes(
     codewriter.drain_pending_graphs(call_control, &pipeline_config.transform);
     prof.mark("  drain_pending_graphs");
 
+    // `BuiltinCode.func` is a SomePBC function-pointer field.  The ordinary
+    // translated indirect-call op contributes this family through
+    // `IndirectCallTargets`; pyre's interpreter call boundary hides that op
+    // behind the runtime `call_fn` helper, so publish the annotator's same
+    // finite wrapper family on the shared Assembler explicitly.  The handles
+    // are the exact `CallControl.jitcodes` objects materialized by
+    // `grab_initial_jitcodes`, preserving RPython object identity.
+    let builtin_wrapper_targets: Vec<jitcode::JitCodeHandle> = call_control
+        .builtin_wrapper_indirect_graphs()
+        .into_iter()
+        .filter_map(|path| call_control.jitcodes().get(&path).cloned())
+        .map(jitcode::JitCodeHandle::from)
+        .collect();
+    codewriter
+        .assembler
+        .indirectcalltargets
+        .extend(builtin_wrapper_targets);
+
     // RPython codewriter.py:85: self.assembler.finished(callinfocollection).
     codewriter
         .assembler
@@ -1913,6 +1934,14 @@ fn make_jitcodes(
     // jitcode receives its dense index when appended, matching RPython
     // `make_jitcodes()`.
     let jitcodes = call_control.collect_jitcodes_in_alloc_order();
+    let mut indirectcalltarget_indices: Vec<usize> = codewriter
+        .assembler
+        .indirectcalltargets
+        .iter()
+        .map(|target| target.index())
+        .collect();
+    indirectcalltarget_indices.sort_unstable();
+    indirectcalltarget_indices.dedup();
 
     // RPython codewriter.py + assembler.py: `Assembler.insns` grows as
     // `write_insn` encounters new keys.  We snapshot the final table
@@ -1931,7 +1960,13 @@ fn make_jitcodes(
     // can resolve the `BC_LIVE` offsets baked into `JitCode.code`.
     let all_liveness = codewriter.assembler.all_liveness().to_vec();
 
-    (jitcodes, insns, descrs, all_liveness)
+    (
+        jitcodes,
+        indirectcalltarget_indices,
+        insns,
+        descrs,
+        all_liveness,
+    )
 }
 
 /// Generate tracing code directly from the canonical pipeline result.
@@ -2016,7 +2051,7 @@ mod portal_driver_tests {
         let mut policy = policy::DefaultJitPolicy::new();
         call_control.find_all_graphs(&mut policy);
 
-        let (jitcodes, _, _, _) =
+        let (jitcodes, _, _, _, _) =
             make_jitcodes(&config, &mut call_control, &mut PhaseProfiler::new());
         assert_eq!(jitcodes.len(), 1);
         assert_eq!(jitcodes[0].index(), 0);
@@ -2085,7 +2120,7 @@ mod portal_driver_tests {
         let mut policy = policy::DefaultJitPolicy::new();
         call_control.find_all_graphs(&mut policy);
 
-        let (jitcodes, _, _, _) =
+        let (jitcodes, _, _, _, _) =
             make_jitcodes(&config, &mut call_control, &mut PhaseProfiler::new());
         let merge = jitcodes[0]
             .body()

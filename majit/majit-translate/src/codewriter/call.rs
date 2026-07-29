@@ -570,7 +570,13 @@ impl GraphStore {
     /// signature stays that of the shared graph, which the aliases resolve
     /// to anyway.
     pub(crate) fn insert(&mut self, path: CallPath, graph: FunctionGraph) {
-        let key = (graph.owner_root.clone(), graph.name.clone());
+        let key = (
+            graph
+                .source_identity
+                .clone()
+                .or_else(|| graph.owner_root.clone()),
+            graph.name.clone(),
+        );
         match self.graphs.get_mut(&key) {
             Some(existing) => {
                 existing.graph.func.merge_from(&graph.func);
@@ -3111,6 +3117,17 @@ impl CallControl {
         for path in &todo {
             self.candidate_graphs.insert(path.clone());
         }
+        // PyPy's portal reaches `BuiltinCode.funcrun`, whose `self.func` PBC
+        // contributes every gateway body to the indirect-call candidate set.
+        // Pyre's opcode walker lowers the equivalent Python CALL directly to
+        // `bh_call_fn`, bypassing that source-level dispatch graph, so seed the
+        // same generated-wrapper PBC family explicitly.  This is the builtin
+        // gateway analogue of call.py:59-64's oopspec helper seeds below.
+        for path in self.builtin_wrapper_indirect_graphs() {
+            if self.candidate_graphs.insert(path.clone()) {
+                todo.push(path);
+            }
+        }
         // call.py:59-64 — seed the BFS with builtin oopspec helpers so
         // `int_abs` / `int_floordiv` / `int_mod` / `ll_math.ll_math_sqrt`
         // are reachable even when the portal does not call them
@@ -3252,6 +3269,9 @@ impl CallControl {
                         // `c_graphs` family, `None` meaning "unknown
                         // family" and classifying the site as residual.
                         OpKind::IndirectCall { graphs, .. } => match graphs {
+                            Some(graphs) if graphs.is_empty() => {
+                                self.builtin_wrapper_indirect_graphs()
+                            }
                             Some(graphs) => graphs.clone(),
                             None => continue,
                         },
@@ -3673,6 +3693,16 @@ impl CallControl {
             // RPython: jd.mainjitcode = self.get_jitcode(jd.portal_graph)
             let arc = self.get_jitcode(&portal);
             self.jitdrivers_sd[jd_index].mainjitcode = Some(arc);
+        }
+        // RPython reaches `BuiltinCode.func` as an indirect SomePBC call
+        // while transforming the portal closure; handling that call invokes
+        // `get_jitcode()` for each candidate graph.  Pyre's opcode walker
+        // emits `bh_call_fn` directly and therefore has no source-level
+        // indirect op to perform the allocation.  Materialise the same PBC
+        // family here so runtime fnaddr dispatch can resolve each generated
+        // gateway body to its JitCode.
+        for wrapper in self.builtin_wrapper_indirect_graphs() {
+            self.get_jitcode(&wrapper);
         }
     }
 
@@ -4503,6 +4533,35 @@ impl CallControl {
             .flatten()
             .map(|impl_type| CallPath::for_impl_method(impl_type.as_str(), method_name))
             .collect()
+    }
+
+    /// Candidate PBC family for the generated `BuiltinCode.func`
+    /// function-pointer field.
+    ///
+    /// RPython obtains this list from the annotator's `SomePBC`
+    /// descriptions.  Pyre's generated wrappers publish real fnaddrs through
+    /// `jit_trace_fnaddrs`; pair those addresses with their registered source
+    /// graphs here. Aliases sharing an address name the same wrapper; select
+    /// the most-qualified source identity for the one graph object entered
+    /// into the PBC family.
+    pub fn builtin_wrapper_indirect_graphs(&self) -> Vec<CallPath> {
+        let mut by_address: std::collections::BTreeMap<i64, Vec<CallPath>> =
+            std::collections::BTreeMap::new();
+        for (path, &fnaddr) in &self.function_fnaddrs {
+            let Some(leaf) = path.last_segment() else {
+                continue;
+            };
+            if !leaf.starts_with("__pyre_wrap_") || !self.function_graphs.contains_key(path) {
+                continue;
+            }
+            by_address.entry(fnaddr).or_default().push(path.clone());
+        }
+        let mut result = Vec::new();
+        for mut aliases in by_address.into_values() {
+            aliases.sort_by_key(|path| std::cmp::Reverse(path.segments.len()));
+            result.push(aliases.remove(0));
+        }
+        result
     }
 
     /// RPython `call.py:259-280` — family-wide validation for indirect_call.

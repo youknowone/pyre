@@ -58,6 +58,7 @@ pub fn set_finalizing() {
     majit_gc::gc_sync::request_stw(|_| {
         FINALIZING_THREAD.store(ident, Ordering::Release);
         FINALIZING.store(true, Ordering::Release);
+        majit_ir::eval_breaker_word::set_finalizing();
     });
 }
 

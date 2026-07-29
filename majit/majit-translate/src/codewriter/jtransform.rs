@@ -2826,6 +2826,31 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::ConstRefNull,
             }]);
         }
+        // `rbuiltin.py:412-418 rtype_const_result` /
+        // `translator/rtyper/rbuiltin.rs::rtype_ptr_null`: by the time
+        // jtransform runs, `ptr::null[_mut]()` is a typed null pointer
+        // constant, not a residual host call. Pyre's rtyper currently types an
+        // ephemeral oracle rather than rewriting the surviving model graph,
+        // so apply that literal rewrite here. This is the null half of the
+        // niche `Option<NonNull<T>>` / `Option<&T>` representation emitted by
+        // `front::mir`; leaving it as a call would bake an unregistered
+        // symbolic fnaddr into every generated nullity test.
+        if let CallTarget::FunctionPath { segments } = target
+            && args.is_empty()
+            && matches!(result_ty, ValueType::Ref(_))
+            && matches!(
+                segments.as_slice(),
+                [owner, ptr, leaf]
+                    if matches!(owner.as_str(), "core" | "std")
+                        && ptr == "ptr"
+                        && matches!(leaf.as_str(), "null" | "null_mut")
+            )
+        {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::ConstRefNull,
+            }]);
+        }
         // `rewrite_op_cast_pointer` → `rewrite_op_same_as`
         // (jtransform.py:254-257): the JIT does not distinguish a
         // down-cast pointer from its source, so the
@@ -8669,6 +8694,36 @@ mod tests {
             &[arg],
             &ValueType::Ref(None),
         ));
+    }
+
+    #[test]
+    fn ptr_null_builtin_rewrites_to_null_ref_constant() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("ptr_null_constant");
+        let entry = graph.startblock;
+        let result_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["core", "ptr", "null_mut"]),
+                    args: vec![],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+        graph.set_return(entry, Some(result_var.clone()));
+
+        let result = transform_graph(&graph, &config);
+        let folded = result
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find(|op| op.result.as_ref() == Some(&result_var))
+            .expect("null result must survive as a constant definition");
+        assert!(matches!(folded.kind, OpKind::ConstRefNull));
     }
 
     /// PyPy parity regression guard: the qualified spellings
