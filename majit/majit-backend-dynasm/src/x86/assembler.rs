@@ -5115,14 +5115,18 @@ impl<'a> Assembler386<'a> {
     /// value for non-guard consumers (e.g. boolean stored into a
     /// frame slot).
     fn flush_cc(&mut self, cond: u8, result_loc: Option<&Loc>) {
+        // `assembler.py:1293 flush_cc` opens with
+        // `assert self.guard_success_cc == rx86.cond_none` — a condition
+        // still pending here was published by an earlier op and never
+        // consumed, which would make the following guard branch on it.
+        debug_assert!(
+            self.guard_success_cc.is_none(),
+            "flush_cc: guard_success_cc already set",
+        );
         let frame_reg_value = crate::x86::regalloc::frame_reg().value;
         if let Some(Loc::Reg(r)) = result_loc {
             if r.value == frame_reg_value {
                 // Sentinel: the next op accepts cc.
-                debug_assert!(
-                    self.guard_success_cc.is_none(),
-                    "flush_cc: guard_success_cc already set",
-                );
                 self.guard_success_cc = Some(cond);
                 return;
             }
