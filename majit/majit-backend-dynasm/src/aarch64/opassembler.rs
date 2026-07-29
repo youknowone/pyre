@@ -188,9 +188,11 @@ impl<'a> AssemblerARM64<'a> {
             // (regalloc.py:161) admits 0..4095 for ADD_ri; anything else
             // falls back to `mov x16, #ofs; add x16, x16, index`.
             if (0..4096).contains(&ofs) {
-                dynasm!(self.mc ; .arch aarch64
-                    ; mov x16, X(index.value)
-                    ; add x16, x16, ofs as u32);
+                // `opassembler.py:403 ADD_ri(ip0, index, ofs)` is a single
+                // instruction; dynasm's `add Xd|SP, Xn|SP, #uimm` form rejects a
+                // dynamic register operand, so encode the word directly
+                // (`codebuilder.py:113 ADD_ri`).
+                self.emit_add_ri(16, index.value, ofs as u32);
             } else {
                 self.emit_mov_imm64(16, ofs);
                 dynasm!(self.mc ; .arch aarch64

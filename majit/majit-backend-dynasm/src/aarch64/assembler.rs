@@ -1101,6 +1101,15 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// Emit: CMP loc0, loc1
+    /// `codebuilder.py:113 ADD_ri` — `add Xd, Xn, #imm12`.  Encoded directly
+    /// because dynasm's immediate form cannot take a dynamic register (it
+    /// cannot tell whether the register is SP).
+    pub(crate) fn emit_add_ri(&mut self, rd: u8, rn: u8, imm: u32) {
+        debug_assert!(imm <= MAX_CMP_IMM12, "add immediate {imm} exceeds 12 bits");
+        let word: u32 = (0b1001000100u32 << 22) | (imm << 10) | ((rn as u32) << 5) | (rd as u32);
+        dynasm!(self.mc ; .arch aarch64 ; .u32 word);
+    }
+
     fn emit_cmp_loc_loc(&mut self, loc0: &Loc, loc1: &Loc) {
         // Load loc0 into x16 if needed, loc1 into x17 if needed
         let r0 = match loc0 {
@@ -1124,7 +1133,8 @@ impl<'a> AssemblerARM64<'a> {
                     // dynasm's `cmp Xn|SP, #uimm` form cannot take a dynamic
                     // register operand, so encode it the way
                     // `codebuilder.py:389 CMP_ri` does: SUBS with Rd = xzr.
-                    let word: u32 = (0b1111000100u32 << 22) | (imm << 10) | ((r0 as u32) << 5) | 0b11111;
+                    let word: u32 =
+                        (0b1111000100u32 << 22) | (imm << 10) | ((r0 as u32) << 5) | 0b11111;
                     dynasm!(self.mc ; .arch aarch64 ; .u32 word);
                     return;
                 }
@@ -2038,8 +2048,7 @@ impl<'a> AssemblerARM64<'a> {
         let inputargs: &'a [InputArg] = self.inputargs;
         let ops: &'a [Op] = self.operations;
         self.trace_start_offset = self.mc.offset().0;
-        self.long_guard_branch =
-            ops.len().saturating_mul(MAX_BYTES_PER_OP) >= BCOND_FORWARD_RANGE;
+        self.long_guard_branch = ops.len().saturating_mul(MAX_BYTES_PER_OP) >= BCOND_FORWARD_RANGE;
         if emit_prologue {
             self._call_header(inputargs);
         } else {
@@ -2968,9 +2977,11 @@ impl<'a> AssemblerARM64<'a> {
                     // to load(ip0, ofs_loc) + ADD_rr. ip0 = x16 (reserved scratch).
                     let combined_index = if ofs != 0 {
                         if (0..4096).contains(&ofs) {
-                            dynasm!(self.mc ; .arch aarch64
-                                ; mov x16, X(index.value)
-                                ; add x16, x16, ofs as u32);
+                            // `opassembler.py:403 ADD_ri(ip0, index, ofs)` is a single
+                            // instruction; dynasm's `add Xd|SP, Xn|SP, #uimm` form rejects a
+                            // dynamic register operand, so encode the word directly
+                            // (`codebuilder.py:113 ADD_ri`).
+                            self.emit_add_ri(16, index.value, ofs as u32);
                         } else {
                             self.emit_mov_imm64(16, ofs);
                             dynasm!(self.mc ; .arch aarch64
