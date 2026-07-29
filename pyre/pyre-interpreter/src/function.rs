@@ -951,6 +951,32 @@ pub unsafe fn function_get_qualname(obj: PyObjectRef) -> String {
     }
 }
 
+/// Return the application-level `__qualname__` object.
+///
+/// PyPy keeps the qualified name on the `Function` itself rather than in a
+/// side table.  CPython 3.14 additionally preserves the exact unicode object:
+/// `func_get_qualname` returns `func_qualname`, and `func_set_qualname` stores
+/// the supplied object with `Py_NewRef`.  Thus, after `f.__qualname__ = value`,
+/// `f.__qualname__ is value` must hold, including for a `str` subclass.
+///
+/// Legacy construction paths leave `w_qualname` as `PY_NULL`; materialise the
+/// `qualname or self.name` fallback once and retain it in the same owner field.
+///
+/// # Safety
+/// `obj` must point to a valid `Function`.
+pub unsafe fn function_get_qualname_obj(obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let func = obj as *mut Function;
+        if !(*func).w_qualname.is_null() {
+            return (*func).w_qualname;
+        }
+        let w_qualname = pyre_object::w_str_new(function_get_name(obj));
+        function_write_barrier(obj);
+        (*func).w_qualname = w_qualname;
+        w_qualname
+    }
+}
+
 /// `function.py:54 self.qualname = qualname or self.name` setter —
 /// used by MAKE_FUNCTION (`runtime_ops::make_function_from_code_obj_with_globals_obj`)
 /// to freeze the qualified name immediately after `function_new`.
@@ -2935,6 +2961,22 @@ mod tests {
             assert_eq!(function_get_name(obj), "myfunc");
             assert_eq!(function_get_globals_obj(obj), w_globals);
             assert!(function_get_closure(obj).is_null());
+        }
+    }
+
+    #[test]
+    fn function_qualname_getter_preserves_the_stored_object() {
+        crate::test_hooks::install_hash_hook();
+        let raw_code = 0xDEAD_BEEF as *const ();
+        let w_code = crate::w_code_new(raw_code);
+        let w_globals = pyre_object::w_module_dict_new();
+        let obj = function_new(w_code as *const (), "myfunc".to_string(), w_globals);
+        let w_qualname = pyre_object::w_str_new("pkg.myfunc");
+
+        unsafe {
+            function_set_qualname(obj, w_qualname);
+            assert_eq!(function_get_qualname_obj(obj), w_qualname);
+            assert_eq!(function_get_qualname_obj(obj), w_qualname);
         }
     }
 

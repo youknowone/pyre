@@ -58,11 +58,15 @@ for bad in (1, None, [1], (1,), object()):
         assert False, f"setting __name__ to {bad!r} must raise TypeError"
 
 # (4) __qualname__ same protocol.
-_f.__qualname__ = "qual"
+qualname = "".join(("qual",))
+_f.__qualname__ = qualname
 assert _f.__qualname__ == "qual"
+assert _f.__qualname__ is qualname
 
-_f.__qualname__ = MyStr("subqual")
+subqualname = MyStr("subqual")
+_f.__qualname__ = subqualname
 assert _f.__qualname__ == "subqual"
+assert _f.__qualname__ is subqualname
 
 for bad in (1, None, [1], (1,), object()):
     try:

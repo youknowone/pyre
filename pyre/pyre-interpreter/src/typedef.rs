@@ -10467,8 +10467,7 @@ fn init_function_type_common(ns: PyObjectRef) {
             args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
             "__qualname__",
         )?;
-        let s = unsafe { crate::function::function_get_qualname(func) };
-        Ok(pyre_object::w_str_new(&s))
+        Ok(unsafe { crate::function::function_get_qualname_obj(func) })
     });
     let qualname_setter = make_builtin_function("__qualname__", |args| {
         let func = function_receiver(
