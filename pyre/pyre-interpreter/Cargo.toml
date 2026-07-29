@@ -58,6 +58,7 @@ rustpython-host_env = { workspace = true, optional = true }
 pyre-sandbox = { workspace = true, optional = true }
 libc = { workspace = true }
 siphasher = { workspace = true }
+getrandom = { workspace = true }
 base64 = { workspace = true }
 crc32fast = { workspace = true }
 indexmap = { workspace = true }

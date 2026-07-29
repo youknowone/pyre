@@ -2146,7 +2146,7 @@ fn memoryview_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `descr_hash` (memoryobject.py:476) — a writable view is unhashable; a
 /// read-only view hashes its raw bytes (so `hash(mv) == hash(bytes)`),
-/// cached in `self._hash` with the `-1` sentinel (`_hash_str` never returns
+/// cached in `self._hash` with the `-1` sentinel (`_hash_bytes` never returns
 /// `-1`) — the release / readonly checks run only on the first call, and a
 /// view hashed before `release()` keeps hashing afterwards.
 unsafe fn memoryview_hash_value(mv: PyObjectRef) -> Result<i64, crate::PyError> {
@@ -2170,7 +2170,7 @@ unsafe fn memoryview_hash_value(mv: PyObjectRef) -> Result<i64, crate::PyError> 
             backing_hash?;
             // `compute_hash(self.view.as_str())` — the same content digest the
             // bytes path uses, so `hash(memoryview(b)) == hash(b)`.
-            hash = hash_str_bytes(&memoryview_gather_bytes(mv));
+            hash = _hash_bytes(&memoryview_gather_bytes(mv));
             pyre_object::memoryview::w_memoryview_set_hash(mv, hash);
         }
         Ok(hash)
@@ -9818,58 +9818,96 @@ fn _hash_tuple_xx_iter(items: impl Iterator<Item = i64>) -> i64 {
         .expect("element hashes are precomputed, so the fold cannot fail")
 }
 
-/// `pypy/objspace/std/unicodeobject.py:341-345 W_UnicodeObject.hash_w`
-/// parity:
-///
-/// ```python
-/// def hash_w(self):
-///     x = compute_hash(self._utf8)
-///     x -= (x == -1)
-///     return x
-/// ```
-///
-/// `compute_hash` is `rpython.rlib.objectmodel.compute_hash` —
-/// on 64-bit hosts it delegates to `rpython.rlib.rsiphash.siphash24`
-/// with a 16-byte secret key set via `rsiphash.choose_initial_seed`
-/// (rpython/rlib/rsiphash.py:48).  The seed is read from
-/// `PYTHONHASHSEED`, defaulting to a randomised value at process
-/// start (CPython parity: `Random_Hash_Function_Seed_String`).
-///
-/// Pyre uses a fixed 16-byte key here so test runs are deterministic
-/// (matching `PYTHONHASHSEED=0`).  Switching to a randomised seed
-/// is straight-forward (`OnceLock<[u8; 16]>` seeded from
-/// `getrandom` or the env var) once tests are robust to it.
-/// Hash a string by its WTF-8 bytes — `unicodeobject.py descr_hash` hashes
-/// `self._utf8`, so a lone-surrogate string hashes by its byte sequence
-/// instead of panicking on the `&str` view.
-fn _hash_str(bytes: &[u8]) -> i64 {
+/// CPython/PyPy's deterministic seed expansion
+/// (`Python/bootstrap_hash.c` / `rsiphash.py:lcg_urandom`).
+fn hash_secret_from_seed(mut seed: u32) -> [u8; 16] {
+    let mut secret = [0u8; 16];
+    for byte in &mut secret {
+        seed = seed.wrapping_mul(214013).wrapping_add(2531011);
+        *byte = ((seed >> 16) & 0xff) as u8;
+    }
+    secret
+}
+
+/// Process-global CPython 3.14 hash secret.  RPython's `rsiphash.seed` is
+/// likewise a single process-global owner initialized from `PYTHONHASHSEED`;
+/// it is not interpreter-thread-local state.
+fn hash_secret() -> &'static [u8; 16] {
+    static SECRET: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+    SECRET.get_or_init(|| match std::env::var("PYTHONHASHSEED") {
+        Ok(value) if !value.is_empty() && value != "random" => {
+            let seed = value.parse::<u32>().unwrap_or_else(|_| {
+                eprintln!(
+                    "PYTHONHASHSEED must be \"random\" or an integer in range [0; 4294967295]"
+                );
+                std::process::exit(1);
+            });
+            if seed == 0 {
+                [0; 16]
+            } else {
+                hash_secret_from_seed(seed)
+            }
+        }
+        _ => {
+            let mut secret = [0u8; 16];
+            getrandom::fill(&mut secret)
+                .expect("failed to get random numbers to initialize Python hash secret");
+            secret
+        }
+    })
+}
+
+/// CPython 3.14 `_Py_HashBytes`: empty input hashes to zero; every other byte
+/// sequence uses SipHash-1-3 with the process-global 128-bit secret.
+fn _hash_bytes_with_key(bytes: &[u8], secret: &[u8; 16]) -> i64 {
+    if bytes.is_empty() {
+        return 0;
+    }
     use core::hash::Hasher;
-    // `rpython/rlib/rsiphash.py _build_key_from_seed` — when
-    // `PYTHONHASHSEED=0` the key is the 16-byte all-zero buffer.
-    // Pyre runs with the deterministic seed for reproducibility,
-    // matching PyPy's `PYTHONHASHSEED=0` byte-for-byte.  Wiring a
-    // user-overridable seed is straight-forward (`OnceLock<[u8; 16]>`
-    // sampled from `getrandom` or the env var) once tests are
-    // robust to it.
-    //
-    // Not delegated to `rustpython_common::hash::hash_str`: that path
-    // needs a `HashSecret`, whose all-zero key is un-constructable at
-    // the pinned rev (private `k0`/`k1`, only a seeded `new`), and it
-    // hashes through the slice `Hash` impl (length prefix) plus a
-    // `mod_int` reduction that this raw siphash24 digest omits.
-    static SECRET: [u8; 16] = [0u8; 16];
-    let mut hasher = siphasher::sip::SipHasher24::new_with_key(&SECRET);
+    let mut hasher = siphasher::sip::SipHasher13::new_with_key(secret);
     hasher.write(bytes);
     let raw = hasher.finish() as i64;
-    let raw = raw - ((raw == -1) as i64);
-    // `rstr.py _ll_strhash` — a string caches its digest in a slot that
-    // `malloc` zeroed, so zero doubles as "not computed yet" and a digest that
-    // lands on it is replaced by this fixed substitute.  Applied here rather
-    // than at the caching str caller so every digest consumer (bytes,
-    // memoryview) agrees with the cached one on the same bytes.  Empty input
-    // is NOT special-cased: `ll_strhash`'s `return 0` arm is a null-pointer
-    // check, and upstream digests `b""` like any other value.
-    if raw == 0 { 29872897 } else { raw }
+    raw - ((raw == -1) as i64)
+}
+
+#[inline]
+fn _hash_bytes(bytes: &[u8]) -> i64 {
+    _hash_bytes_with_key(bytes, hash_secret())
+}
+
+/// CPython 3.14 `unicode_hash`: hash the PEP 393 canonical code-unit storage,
+/// selecting one-, two-, or four-byte native-endian units from the maximum
+/// code point.  Pyre stores WTF-8, so materialize only this hash input.
+fn _hash_unicode_with_key(wtf8: &rustpython_wtf8::Wtf8, secret: &[u8; 16]) -> i64 {
+    let codepoints: Vec<u32> = wtf8.code_points().map(|cp| cp.to_u32()).collect();
+    let maxchar = codepoints.iter().copied().max().unwrap_or(0);
+    let mut bytes = Vec::with_capacity(
+        codepoints.len()
+            * if maxchar <= 0xff {
+                1
+            } else if maxchar <= 0xffff {
+                2
+            } else {
+                4
+            },
+    );
+    if maxchar <= 0xff {
+        bytes.extend(codepoints.into_iter().map(|cp| cp as u8));
+    } else if maxchar <= 0xffff {
+        for cp in codepoints {
+            bytes.extend_from_slice(&(cp as u16).to_ne_bytes());
+        }
+    } else {
+        for cp in codepoints {
+            bytes.extend_from_slice(&cp.to_ne_bytes());
+        }
+    }
+    _hash_bytes_with_key(&bytes, secret)
+}
+
+#[inline]
+fn _hash_unicode(wtf8: &rustpython_wtf8::Wtf8) -> i64 {
+    _hash_unicode_with_key(wtf8, hash_secret())
 }
 
 /// `space.hash_w` digest for a `str` computed directly from its WTF-8 bytes
@@ -9878,7 +9916,8 @@ fn _hash_str(bytes: &[u8]) -> i64 {
 /// without a `W_UnicodeObject`.
 #[inline]
 pub fn hash_str_bytes(bytes: &[u8]) -> i64 {
-    _hash_str(bytes)
+    let wtf8 = rustpython_wtf8::Wtf8::from_bytes(bytes).expect("str storage is valid WTF-8");
+    _hash_unicode(wtf8)
 }
 
 /// `setobject.py W_FrozensetObject.descr_hash` — the order-independent
@@ -9925,11 +9964,9 @@ fn frozenset_hash_from_storage(obj: PyObjectRef) -> i64 {
 /// - `hash((1, 2)) == hash((1, 2))` regardless of allocation identity
 /// - `hash(frozenset(...))` is deterministic and order-independent
 ///
-/// `unicodeobject.py W_UnicodeObject.descr_hash` routes through
-/// RPython's `compute_hash(self._utf8)` which is siphash on 64-bit;
-/// pyre keeps an FNV-style multiplicative mix here (functional but
-/// not bit-identical to CPython/PyPy).  Convergence target: import
-/// siphash24 from a workspace dep.
+/// CPython 3.14's `_Py_HashBytes` uses SipHash-1-3 and returns zero for empty
+/// input. Strings hash their PEP 393 canonical code-unit representation rather
+/// than pyre's internal WTF-8 bytes, keeping all seeded values bit-identical.
 pub fn hash_value(obj: PyObjectRef) -> i64 {
     unsafe {
         // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
@@ -9962,24 +9999,19 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             );
         }
         if is_str(obj) {
-            // `unicodeobject.py hash_w` digests `self._utf8`, and
-            // `compute_hash` on an RPython string is `ll_strhash`, which keeps
-            // the result in the string and recomputes only while the slot
-            // still reads zero.  `_hash_str` already substitutes a zero
-            // digest, so the value cached here is never the "not computed"
-            // sentinel.
+            // CPython `unicode_hash` caches the PEP 393 content digest.
             let cached = pyre_object::w_str_get_hash(obj);
             if cached != 0 {
                 return cached;
             }
-            let hash = _hash_str(pyre_object::w_str_get_wtf8(obj).as_bytes());
+            let hash = _hash_unicode(pyre_object::w_str_get_wtf8(obj));
             pyre_object::w_str_set_hash(obj, hash);
             return hash;
         }
-        // `bytesobject.py descr_hash` — `compute_hash(self._value)`, the same
-        // byte-string digest str uses (bytearray is mutable / unhashable).
+        // CPython `bytes_hash` — the same `_Py_HashBytes` primitive, over the
+        // bytes payload itself (bytearray is mutable / unhashable).
         if pyre_object::is_bytes(obj) {
-            return _hash_str(pyre_object::bytesobject::w_bytes_data(obj));
+            return _hash_bytes(pyre_object::bytesobject::w_bytes_data(obj));
         }
         // `memoryobject.py descr_hash` — `compute_hash(self.view.as_str())`;
         // a released or writable view is unhashable, so this infallible
@@ -9990,7 +10022,7 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             if memoryview_check_released(obj).is_ok()
                 && pyre_object::memoryview::w_memoryview_readonly(obj)
             {
-                return _hash_str(&memoryview_gather_bytes(obj));
+                return _hash_bytes(&memoryview_gather_bytes(obj));
             }
         }
         if pyre_object::is_none(obj) {
@@ -13697,15 +13729,27 @@ mod tests {
         }
     }
 
-    /// Empty input is digested like any other: SipHash-2-4 under the all-zero
-    /// key gives `0x1e924b9d737700d7`, which is what PyPy reports for
-    /// `hash("")` under `PYTHONHASHSEED=0`.  A digest never reads back as the
-    /// zero "not computed yet" sentinel.
+    /// CPython 3.14 uses SipHash-1-3, treats empty input specially as zero, and
+    /// expands numeric `PYTHONHASHSEED` values with its deterministic LCG.
     #[test]
-    fn empty_str_and_bytes_digest_like_pypy() {
-        assert_eq!(_hash_str(b""), 0x1e92_4b9d_7377_00d7);
-        assert_eq!(hash_str_bytes(b""), 0x1e92_4b9d_7377_00d7);
-        assert_ne!(_hash_str(b"a"), 0);
+    fn string_and_bytes_hash_match_cpython_seed_vectors() {
+        let zero = [0; 16];
+        assert_eq!(_hash_bytes_with_key(b"", &zero), 0);
+        assert_eq!(_hash_bytes_with_key(b"abc", &zero), -4594863902769663758);
+
+        let seed_42 = hash_secret_from_seed(42);
+        assert_eq!(_hash_bytes_with_key(b"abc", &seed_42), 3869580338025362921);
+        assert_eq!(
+            _hash_bytes_with_key(b"abcdefghijk", &seed_42),
+            7764564197781545852
+        );
+
+        let non_ascii =
+            rustpython_wtf8::Wtf8Buf::from_string("\u{e4}\u{fa}\u{2211}\u{2107}".to_owned());
+        assert_eq!(
+            _hash_unicode_with_key(&non_ascii, &zero),
+            -2810468059467891395
+        );
     }
 
     /// Tuple and frozenset hashes delegate to `rustpython_common::hash`
