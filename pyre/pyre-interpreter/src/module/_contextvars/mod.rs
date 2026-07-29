@@ -1,36 +1,12 @@
-//! _contextvars module — PyPy: `lib_pypy/_contextvars.py`.
+//! `_contextvars` module — PyPy: `lib_pypy/_contextvars.py`.
 //!
-//! Stub providing ContextVar / Context / Token shells.  Full contextvar
-//! propagation across tasks is not modelled yet.
+//! `Context` is the app-level line-by-line port because its persistent Map
+//! operations and `run()`'s try/finally are already expressed exactly there.
+//! ContextVar and Token remain interpreter-level while their state operations
+//! are ported incrementally.
 
 use pyre_object::*;
 use std::sync::OnceLock;
-
-fn context_type() -> PyObjectRef {
-    // PyPy exposes one interpreter-level Context typedef; the type identity
-    // must not split when the importing thread changes.
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    *TYPE.get_or_init(|| {
-        crate::typedef::make_builtin_type("Context", |ns| {
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
-                    "run",
-                    crate::make_builtin_function("run", |args| {
-                        let callable = args.get(1).copied().ok_or_else(|| {
-                            crate::PyError::type_error("run() missing callable argument")
-                        })?;
-                        crate::call::call_function_impl_result(callable, &args[2..])
-                    }),
-                )
-            };
-        }) as usize
-    }) as PyObjectRef
-}
-
-fn new_context(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_instance_new(context_type()))
-}
 
 pub(crate) fn context_var_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
@@ -186,8 +162,15 @@ crate::py_module! {
         "ContextVar" => context_var_type(),
         "Token" => token_type(),
     },
-    functions: {
-        "Context"      / 0 = new_context,
-        "copy_context" / 0 = new_context,
+    extra_init: |ns| {
+        let context_var = crate::module_ns_get(ns, "ContextVar")
+            .expect("_contextvars.ContextVar must be installed first");
+        crate::importing::appleveldef_install_seeded(
+            ns,
+            include_str!("_contextvars_app.py"),
+            "_contextvars_app.py",
+            &["Context", "copy_context"],
+            &[("ContextVar", context_var)],
+        );
     },
 }
