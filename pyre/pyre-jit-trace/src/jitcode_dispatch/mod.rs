@@ -10097,6 +10097,27 @@ fn handle<Sym: WalkSym>(
                             op.next_pc,
                         ));
                     }
+                    // The jump did not take. Closing here anyway lands on
+                    // `compile_loop`'s own `has_compiled_targets` check
+                    // (pyjitpl.py:3185-3189), which gives the whole trace up
+                    // with SwitchToBlackhole; and the cut would store the loop
+                    // under `cut_inner_green_key`, replacing reachable code
+                    // with code stored where nothing enters. Keep tracing
+                    // instead, so the trace closes at its own header with this
+                    // loop's body inlined — the interpreter front end declines
+                    // the same case for the same reason. Only a cross-loop cut
+                    // is declined: a trace that started at these greens still
+                    // closes on its own back-edge below.
+                    if key != ctx.trace_ctx.root_green_key() {
+                        if majit_metainterp::majit_log_enabled() {
+                            eprintln!(
+                                "[jit][walker-reached-loop-header] merge point pc={} already \
+                                 has a compiled loop key={} — declining the cross-loop cut",
+                                next_instr, key
+                            );
+                        }
+                        return Ok((DispatchOutcome::Continue, op.next_pc));
+                    }
                 }
             }
 
@@ -10107,54 +10128,41 @@ fn handle<Sym: WalkSym>(
                 .trace_ctx
                 .has_merge_point_with_shape_assert(key, live_args.len())
             {
-                // `reached_loop_header` closes the trace
-                // only at the loop whose green key MATCHES the one tracing
-                // started from. A top-level walk that re-arrives at a
-                // NON-primary header (an enclosing/sibling loop the recorded
-                // path crossed) must NOT close there: closing at a non-root
-                // header is the cross-loop cut (a pyre-only deviation) that
-                // retargets the green key and leaks the outer loop's
-                // exit-prediction guard into the cut inner-loop body
-                // (miscompiling a triangular nested loop). Continue the walk
-                // instead so it closes at the primary loop's own back-edge;
-                // an inner loop that is itself hot compiles as its OWN token
-                // and is reached via the compiled-target JUMP path above. Only
-                // the top-level walk is gated — a sub-walk keeps the prior
-                // close-on-match behaviour.
-                if !ctx.is_top_level || key == ctx.trace_ctx.root_green_key() {
-                    let loop_header_marker_jit_pc = {
-                        let sym_ptr = ctx.fbw_mode.snapshot_sym;
-                        if sym_ptr.is_null() {
+                // The matched merge point need not be the one tracing started
+                // from: `reached_loop_header` scans every registered merge
+                // point in reverse and closes at the first same_greenkey hit,
+                // whichever loop that is, and `compile_loop` re-derives the
+                // green key from the merge point it closed at.
+                let loop_header_marker_jit_pc = {
+                    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+                    if sym_ptr.is_null() {
+                        None
+                    } else {
+                        let sym = unsafe { &*sym_ptr };
+                        if sym.jitcode().is_null() {
                             None
                         } else {
-                            let sym = unsafe { &*sym_ptr };
-                            if sym.jitcode().is_null() {
-                                None
-                            } else {
-                                unsafe {
-                                    (&*sym.jitcode())
-                                        .payload
-                                        .resume_marker_for_jitcode_pc(op.pc)
-                                }
+                            unsafe {
+                                (&*sym.jitcode())
+                                    .payload
+                                    .resume_marker_for_jitcode_pc(op.pc)
                             }
                         }
-                    };
-                    Ok((
-                        DispatchOutcome::CloseLoop {
-                            jump_args: live_args,
-                            loop_header_pc: next_instr,
-                            loop_header_marker_jit_pc,
-                        },
-                        op.next_pc,
-                    ))
-                } else {
-                    Ok((DispatchOutcome::Continue, op.next_pc))
-                }
+                    }
+                };
+                Ok((
+                    DispatchOutcome::CloseLoop {
+                        jump_args: live_args,
+                        loop_header_pc: next_instr,
+                        loop_header_marker_jit_pc,
+                    },
+                    op.next_pc,
+                ))
             } else {
-                // This merge point registers (does not close) — the walk
-                // crossed a loop-boundary that did not match the primary
-                // loop's green key, i.e. an enclosing or sibling loop whose
-                // header is `next_instr`.  The intermediate merge-point
+                // This merge point registers (does not close) — no already
+                // registered merge point carries this green key and red-bank
+                // shape, so this is the first arrival at the loop whose header
+                // is `next_instr`.  The intermediate merge-point
                 // vable→heap writeback (#62 / #67-remaining) already ran
                 // above, before the live-args build, mirroring
                 // `close_loop_args_at`'s ordering.

@@ -1176,9 +1176,8 @@ impl TraceCtx {
 
     /// Like [`for_test_types`] but seeds the trace green key (and thus
     /// `root_green_key`).  A unit test that drives a loop-closing
-    /// `jit_merge_point` must model the trace as having STARTED at that
-    /// loop header: the close fires only when the arriving green key
-    /// matches `root_green_key` (the primary loop).
+    /// `jit_merge_point` uses this to model the trace as having STARTED at
+    /// that loop header.
     pub fn for_test_types_with_green_key(types: &[majit_ir::Type], green_key: u64) -> Self {
         let mut recorder = Trace::new();
         for &tp in types {

@@ -9845,23 +9845,18 @@ impl<M: Clone> MetaInterp<M> {
             .expect("must_compile_with_values: descr_arc must be a FailDescr");
         let trace_id = descr_fd.trace_id();
         let fail_index = descr_fd.fail_index_per_trace();
-        // quasiimmut.py:97-100 `QuasiImmut.invalidate()` marks the owning
-        // JitCellToken invalid before `cpu.invalidate_loop()` patches every
-        // GUARD_NOT_INVALIDATED.  The failed guard remains usable only as
-        // resume data; warmstate.py:191-196 no longer returns that token as a
-        // procedure token, and PyPy never traces a bridge onto it.  Preserve
-        // that object ownership here: a stale machine-code activation may
-        // still report the descr, but it must go straight to blackhole
-        // resume instead of ticking the bridge counter and repeatedly
-        // attaching bridges to the permanently invalidated loop.
-        let owning_jct = majit_backend::descr_owning_jct(descr_fd);
-        let owning_key = owning_jct
-            .as_ref()
+        // `must_compile` ticks the counter for every reported guard failure,
+        // including one whose owning JitCellToken has since been invalidated by
+        // `QuasiImmut.invalidate()` (quasiimmut.py:97-100).  That tick is the
+        // recovery path, not a leak: warmstate.py:191-196 stops returning the
+        // dead token as a procedure token, so once the counter fires, the walk
+        // reaches `reached_loop_header` (pyjitpl.py:3005-3007) with no compiled
+        // target, falls through to `compile_loop` and installs a live
+        // replacement for the key.  Suppressing the tick strands every later
+        // activation of the dead trace in blackhole resume forever.
+        let owning_key = majit_backend::descr_owning_jct(descr_fd)
             .map(|jct| jct.green_key())
             .unwrap_or(fallback_green_key);
-        if owning_jct.as_ref().is_some_and(|jct| jct.is_invalidated()) {
-            return (false, owning_key);
-        }
         // A guard whose bridge was refused by a terminal-declining backend
         // (`bridge_decline_is_terminal()`, currently wasm) or by a structural
         // full-body-walk decline must not re-fire: re-tracing rebuilds the same
