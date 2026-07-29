@@ -817,6 +817,35 @@ impl LLFrame {
             )),
             "bool_not" => Ok(LLValue::Bool(!vals[0].as_bool(opname)?)),
             "cast_bool_to_int" => Ok(LLValue::Int(i64::from(vals[0].as_bool(opname)?))),
+            // `op_uint_*` (opimpl.py, generated from the `r_uint` template):
+            // the Signed carrier holds the machine word; reinterpret its
+            // bits as `u64` for the unsigned operation, then store the
+            // result word back as `i64`.
+            "uint_floordiv" => {
+                let divisor = vals[1].as_i64(opname)? as u64;
+                if divisor == 0 {
+                    return Err(TaskError {
+                        message: "opimpl.py op_uint_floordiv: unsigned division by zero".to_string(),
+                    });
+                }
+                Ok(LLValue::Int(((vals[0].as_i64(opname)? as u64) / divisor) as i64))
+            }
+            "uint_mod" => {
+                let divisor = vals[1].as_i64(opname)? as u64;
+                if divisor == 0 {
+                    return Err(TaskError {
+                        message: "opimpl.py op_uint_mod: unsigned modulo by zero".to_string(),
+                    });
+                }
+                Ok(LLValue::Int(((vals[0].as_i64(opname)? as u64) % divisor) as i64))
+            }
+            // `op_uint_is_true` (opimpl.py, `is_true` template): the word is
+            // true iff nonzero — sign-interpretation-independent.
+            "uint_is_true" => Ok(LLValue::Bool(vals[0].truth())),
+            // `op_cast_uint_to_int(b) = intmask(b)` (opimpl.py:465-467):
+            // reinterpret the unsigned word's bits as Signed. The carrier
+            // already stores the word as `i64`, so this is the identity.
+            "cast_uint_to_int" => Ok(LLValue::Int(vals[0].as_i64(opname)?)),
             _ => Err(TaskError {
                 message: format!(
                     "llinterp.py:273 LLFrame.getoperationhandler — op_{opname} not yet ported"
@@ -1159,6 +1188,81 @@ mod tests {
         // thread-local pointer while running. After return the local
         // mirror is restored to the prior (empty) Weak.
         assert!(LLInterpreter::current_interpreter().is_none());
+    }
+
+    #[test]
+    fn getoperationhandler_folds_uint_div_mod_and_casts() {
+        // Covers the `op_uint_floordiv` / `op_uint_mod` / `op_uint_is_true`
+        // / `op_cast_uint_to_int` folds (opimpl.py, `r_uint` templates +
+        // :465-467), chained straight-line so one eval_graph run exercises
+        // all four: 12345 //u 10 = 1234; 1234 %u 10 = 4; intmask(4) = 4;
+        // is_true(4) = True; cast_bool_to_int(True) = 1.
+        use crate::flowspace::model::Constant as FlowConstant;
+        let ten = || Hlvalue::Constant(FlowConstant::new(ConstValue::Int(10)));
+
+        let x = Variable::named("x");
+        x.set_concretetype(Some(LowLevelType::Signed));
+        let a = Variable::named("a");
+        a.set_concretetype(Some(LowLevelType::Unsigned));
+        let b = Variable::named("b");
+        b.set_concretetype(Some(LowLevelType::Unsigned));
+        let s = Variable::named("s");
+        s.set_concretetype(Some(LowLevelType::Signed));
+        let t = Variable::named("t");
+        t.set_concretetype(Some(LowLevelType::Bool));
+        let c = Variable::named("c");
+        c.set_concretetype(Some(LowLevelType::Signed));
+
+        let start = Block::shared(vec![x.clone().into()]);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "uint_floordiv",
+            vec![x.into(), ten()],
+            a.clone().into(),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "uint_mod",
+            vec![a.into(), ten()],
+            b.clone().into(),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_uint_to_int",
+            vec![b.into()],
+            s.clone().into(),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "uint_is_true",
+            vec![s.into()],
+            t.clone().into(),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_bool_to_int",
+            vec![t.into()],
+            c.clone().into(),
+        ));
+
+        let retvar = Hlvalue::Variable(Variable::named("ret"));
+        if let Hlvalue::Variable(v) = &retvar {
+            v.set_concretetype(Some(LowLevelType::Signed));
+        }
+        let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "uint_chain",
+            start.clone(),
+            retvar,
+        )));
+        let returnblock = graph.borrow().returnblock.clone();
+        start.closeblock(vec![
+            Link::new(vec![c.into()], Some(returnblock), None).into_ref(),
+        ]);
+
+        let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
+        let out = interp
+            .eval_graph(
+                graph as Rc<dyn Any>,
+                vec![Rc::new(12345_i64) as Rc<dyn Any>],
+                false,
+            )
+            .expect("uint fold chain should run");
+        assert_eq!(*out.downcast::<i64>().expect("Signed return"), 1);
     }
 
     #[test]
