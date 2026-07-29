@@ -1641,11 +1641,28 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     let Some((w_code, nparams, has_closure)) =
         (unsafe { resolve_inlinable_callee(resolved_callable) })
     else {
-        decline!("callee not inlinable");
+        // The callable's type is the whole answer here: `resolve_inlinable_callee`
+        // takes plain `function` only, so a `builtin_function_or_method` or a
+        // `method` reads as "not inlinable" for a reason no pc can convey.
+        decline!(format_args!(
+            "callee not inlinable (callable type {})",
+            unsafe { pyre_object::type_name_of(callable) }
+        ));
     };
     if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+        // Name the callee: a pc alone does not say which function a decline
+        // cost, and one trace reaches several.
+        let name = unsafe {
+            let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject;
+            if raw.is_null() {
+                String::new()
+            } else {
+                (*raw).qualname.clone()
+            }
+        };
         eprintln!(
-            "[inline-resolved] pc={} nparams={nparams} has_closure={has_closure} method_form={method_form}",
+            "[inline-resolved] pc={} callee={name} nparams={nparams} has_closure={has_closure} method_form={method_form}",
             op.pc,
         );
     }
