@@ -3694,6 +3694,42 @@ fn snapshot_root_entries(
         .collect()
 }
 
+/// Drop every entry whose owner did not survive the collection.
+///
+/// These tables are keyed by owner address and hold their value as a root, so
+/// without this an owner's `__dict__` / `__weakref__` outlives it: the tables
+/// only grow, and every major collection marks the whole accumulation.
+/// Upstream has no equivalent table — `typedef.py`'s generated subclass carries
+/// `w_dict` as a field of the object, which dies with it — so the entries have
+/// to be given the same ephemeron semantics explicitly.
+///
+/// Registered with `majit_gc::shadow_stack::register_ephemeron_pruner`, which
+/// runs it from a major collection only.  `classify` returns the owner's
+/// current address, or `None` if it died; a major is mark-and-sweep and moves
+/// nothing, so a surviving owner always answers with the key it was asked
+/// about and the surviving entries keep their keys.
+pub fn prune_dead_owner_entries(classify: &mut dyn FnMut(usize) -> Option<usize>) {
+    for (table, pending) in [
+        (&INSTANCE_DICT, &INSTANCE_DICT_PENDING),
+        (&WEAKREF_TABLE, &WEAKREF_TABLE_PENDING),
+    ] {
+        let mut table = table.lock().unwrap();
+        let dead: Vec<usize> = table
+            .keys()
+            .copied()
+            .filter(|&key| classify(key) != Some(key))
+            .collect();
+        if dead.is_empty() {
+            continue;
+        }
+        let mut pending = pending.lock().unwrap();
+        for key in dead {
+            table.remove(&key);
+            pending.remove(&key);
+        }
+    }
+}
+
 /// Re-key and re-point the entries a root walk moved, as `(old, new, value)`.
 ///
 /// Collected during the walk and applied in one pass because the walk must not

@@ -2773,6 +2773,24 @@ impl MiniMarkGC {
             .retain(|&addr| unsafe { (*header_of(addr)).has_flag(flags::VISITED) });
         self.old_objects_with_cards_set
             .retain(|&addr| unsafe { (*header_of(addr)).has_flag(flags::VISITED) });
+        // Embedder side tables keyed by owner address hold their value as a
+        // root, so an entry outlives its owner unless it is dropped here —
+        // the same "the target died" question `invalidate_old_weakrefs` just
+        // answered, asked on behalf of a table the collector cannot see.
+        // An owner outside old-gen is either immortal (`malloc_typed`, no
+        // header to read) or, under a non-moving major, still in the live
+        // nursery; neither can be proven dead here, so both are kept.
+        crate::shadow_stack::prune_ephemeron_tables(&mut |owner| {
+            if owner == 0 || !self.oldgen.contains(owner) {
+                return Some(owner);
+            }
+            let hdr = unsafe { header_of(owner) };
+            if unsafe { (*hdr).has_flag(flags::VISITED) } {
+                Some(owner)
+            } else {
+                None
+            }
+        });
         // incminimark.py:2510-2511 — run destructors of dying old objects
         // before the sweep frees them (VISITED still distinguishes
         // survivors from the dying at this point).

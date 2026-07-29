@@ -1064,6 +1064,67 @@ pub fn walk_extra_roots(mut visitor: impl FnMut(&mut GcRef)) {
     }
 }
 
+// ── Ephemeron side tables ───────────────────────────────────────
+//
+// An embedder side table keyed by owner address holds its value as a root, so
+// the value outlives the owner and the table only grows.  Upstream has no such
+// table — `typedef.py`'s generated subclass carries the field on the object,
+// which dies with it — so the entries need the ephemeron semantics that
+// layout gives for free: the value is kept only while the key is alive.
+
+/// Signature expected by [`register_ephemeron_pruner`].
+///
+/// The registered function walks its own table and asks the supplied
+/// classifier about each owner address: `Some(addr)` means the owner survived
+/// and now lives at `addr`, `None` means it died and the entry must be
+/// dropped.
+pub type EphemeronPrunerFn = fn(&mut dyn FnMut(usize) -> Option<usize>);
+
+const MAX_EPHEMERON_PRUNERS: usize = 4;
+
+static EPHEMERON_PRUNERS: std::sync::RwLock<[Option<EphemeronPrunerFn>; MAX_EPHEMERON_PRUNERS]> =
+    std::sync::RwLock::new([None; MAX_EPHEMERON_PRUNERS]);
+
+/// Register a side table whose entries must be dropped when their owner dies.
+///
+/// Duplicate registrations are tolerated — the pruner is only appended if not
+/// already present.
+pub fn register_ephemeron_pruner(pruner: EphemeronPrunerFn) {
+    let mut guard = EPHEMERON_PRUNERS.write().unwrap();
+    for slot in guard.iter_mut() {
+        match slot {
+            Some(existing) if std::ptr::fn_addr_eq(*existing, pruner) => return,
+            None => {
+                *slot = Some(pruner);
+                return;
+            }
+            _ => {}
+        }
+    }
+    panic!(
+        "register_ephemeron_pruner: capacity exceeded ({MAX_EPHEMERON_PRUNERS} pruners already \
+         registered)"
+    );
+}
+
+/// Invoke every registered pruner with a classifier that answers whether an
+/// owner survived this collection.
+///
+/// Called by `MiniMarkGC::finish_incremental_marking` once marking has settled
+/// and before the sweep, where VISITED still tells a survivor from a dying
+/// object.  Only a major collection prunes: it already costs O(live heap), so
+/// an O(table) pass adds no asymptotic term, whereas doing it per minor would
+/// put the whole table back on the minor path.
+pub fn prune_ephemeron_tables(classify: &mut dyn FnMut(usize) -> Option<usize>) {
+    let pruners = {
+        let guard = EPHEMERON_PRUNERS.read().unwrap();
+        *guard
+    };
+    for slot in pruners.iter().flatten() {
+        slot(classify);
+    }
+}
+
 // ── Extern "C" interface for compiled code ──────────────────────
 
 /// Push a GC reference from compiled code.

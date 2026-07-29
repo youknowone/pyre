@@ -3512,6 +3512,12 @@ fn install_gc_root_walkers() {
     majit_gc::shadow_stack::register_extra_root_walker(
         pyre_jit_trace::trace::walk_active_sym_exc_roots,
     );
+    // The mapdict side tables are keyed by owner address and root their
+    // values, so a major collection has to drop the entries whose owner it is
+    // about to sweep.
+    majit_gc::shadow_stack::register_ephemeron_pruner(
+        pyre_interpreter::objspace::std::mapdict::prune_dead_owner_entries,
+    );
 }
 
 fn register_thread_root_areas() {
