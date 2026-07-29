@@ -2454,10 +2454,19 @@ pub fn run_forever_with_portal(
                     terminal_out.as_deref_mut(),
                 ) {
                     Ok((new_bh, exc)) => {
-                        // Handled at recursive portal level — continue
+                        // Handled at a recursive portal level.  `new_bh` is
+                        // that portal frame (blackhole.py:1780 returns
+                        // `blackholeinterp`), and its caller already holds the
+                        // re-entered portal's result
+                        // (`_handle_jitexception_in_portal` →
+                        // warmspot.py:1041-1050), so the frame is finished.
+                        // Fall through to the shared release + step below —
+                        // blackhole.py:1759-1760 sit outside the `try`, so
+                        // they run on this arm too.  Re-entering `new_bh`
+                        // instead would execute its tail a second time and
+                        // overwrite the installed result.
                         bh = new_bh;
                         current_exc = exc;
-                        continue;
                     }
                     Err(propagated_exc) => {
                         // Bottommost or unhandled — propagate out
@@ -3635,6 +3644,90 @@ mod tests {
             let _ = bh.run();
 
             assert_eq!(bh.registers_i[1], 42);
+        }
+
+        /// `_run_forever` steps to `nextblackholeinterp` after the
+        /// iteration whose `JitException` was resolved at a recursive
+        /// portal level, not only after a plain return.
+        ///
+        /// `blackhole.py:1752-1760`:
+        ///
+        /// ```python
+        /// while True:
+        ///     try:
+        ///         current_exc = blackholeinterp._resume_mainloop(current_exc)
+        ///     except jitexc.JitException as e:
+        ///         blackholeinterp, current_exc = _handle_jitexception(
+        ///             blackholeinterp, e)
+        ///     blackholeinterp.builder.release_interp(blackholeinterp)
+        ///     blackholeinterp = blackholeinterp.nextblackholeinterp
+        /// ```
+        ///
+        /// The release + step sit BELOW the `try`, so they run on both
+        /// arms.  `_handle_jitexception` returns the portal frame
+        /// (`blackhole.py:1780`) after
+        /// `_handle_jitexception_in_portal` has already installed the
+        /// re-entered portal's result as the CALLER's return value
+        /// (`blackhole.py:1772` → `warmspot.py:1039-1050`), so that
+        /// frame is finished and the loop must continue in its caller.
+        ///
+        /// The chain here is `inner -> caller`.  `inner` carries the
+        /// portal `jitdriver_sd` and inline-calls a sub-jitcode whose
+        /// `jit_merge_point` is bottommost (the callee interpreter
+        /// `for_inline_callee` builds has no `nextblackholeinterp`), so
+        /// the `ContinueRunningNormally` reaches `_run_forever` from a
+        /// frame that DOES have a caller — the recursive-portal arm.
+        /// Re-entering `inner` instead would run its tail a second time
+        /// and overwrite the portal runner's result with `inner`'s own.
+        #[test]
+        fn run_forever_steps_past_the_portal_frame_after_handle_jitexception() {
+            let mut sub = JitCodeBuilder::default();
+            sub.jit_merge_point(0, &[], &[], &[], &[], &[], &[]);
+            let sub_jitcode = sub.finish();
+
+            let mut inner_b = JitCodeBuilder::default();
+            let sub_idx = inner_b.add_sub_jitcode(sub_jitcode);
+            inner_b.inline_call_ir_v(sub_idx, &[], &[], None);
+            // The tail the bug re-executes: it would hand the caller `7`.
+            inner_b.load_const_i_value(1, 7);
+            inner_b.int_return(1);
+            let inner_jitcode = inner_b.finish();
+            inner_jitcode.set_jitdriver_sd(0);
+
+            // `_setup_return_value_i` writes `registers_i[code[position-1]]`
+            // (`blackhole.py:1655`), so the caller resumes at an
+            // `int_return` whose preceding byte is the `int_copy`
+            // destination register 0.
+            let mut caller_b = JitCodeBuilder::default();
+            caller_b.load_const_i_value(0, 42);
+            let caller_resume = caller_b.current_pos();
+            caller_b.int_return(0);
+            let caller_jitcode = caller_b.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut caller = builder.acquire_interp();
+            caller.setposition(std::sync::Arc::new(caller_jitcode), caller_resume);
+            let mut inner = builder.acquire_interp();
+            inner.setposition(std::sync::Arc::new(inner_jitcode), 0);
+            inner.nextblackholeinterp = Some(Box::new(caller));
+
+            let portal_runner =
+                |_exc: &crate::jitexc::JitException| Ok((super::BhReturnType::Int, 999));
+            let outcome = super::run_forever_with_portal(
+                &mut builder,
+                inner,
+                0,
+                Some(&portal_runner),
+                None,
+                None,
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    crate::jitexc::JitException::DoneWithThisFrameInt(999)
+                ),
+                "the caller must return the portal runner's result, got {outcome:?}",
+            );
         }
 
         /// Tier 2.1: ref-typed return propagation through
