@@ -23225,6 +23225,16 @@ fn init_coroutine_type(ns: PyObjectRef) {
             "throw",
             make_builtin_function("throw", crate::baseobjspace::generator_throw_method),
         );
+        // CPython 3.14 Objects/genobject.c coro_methods — Py_GenericAlias
+        // with METH_CLASS.
+        pyre_object::w_dict_setitem_str(
+            ns,
+            "__class_getitem__",
+            pyre_object::function::w_classmethod_new(make_builtin_function(
+                "__class_getitem__",
+                crate::_pypy_generic_alias::generic_alias_class_getitem,
+            )),
+        );
     }
     for (name, getter) in [
         ("cr_running", coroutine_get_running as DunderFn),

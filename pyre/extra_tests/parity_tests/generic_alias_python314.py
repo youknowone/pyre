@@ -53,6 +53,20 @@ assert weakref.ref[T] == weakref_alias
 assert copy.copy(weakref_alias) == weakref_alias
 assert copy.deepcopy(weakref_alias) == weakref_alias
 
+
+async def coroutine_sample():
+    pass
+
+
+coroutine = coroutine_sample()
+coroutine_type = type(coroutine)
+coroutine.close()
+coroutine_alias = coroutine_type[T]
+assert coroutine_alias.__origin__ is coroutine_type
+assert coroutine_alias.__args__ == (T,)
+assert copy.copy(coroutine_alias) == coroutine_alias
+assert copy.deepcopy(coroutine_alias) == coroutine_alias
+
 nested = GenericAlias(list, ([T, [U]],))
 assert nested.__parameters__ == (T, U)
 specialized = nested[str, int]
