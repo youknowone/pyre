@@ -218,19 +218,42 @@ fn array_frombytes(obj: PyObjectRef, bytes: &[u8]) -> Result<(), PyError> {
 
 /// `array.__new__(cls, typecode, [initializer])` — `interp_array.py w_array`.
 fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
-    if args.len() < 2 {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if pos.len() < 2 {
         return Err(PyError::type_error(
             "array() takes at least 1 argument (0 given)",
         ));
     }
-    if args.len() > 3 {
+    if pos.len() > 3 {
         return Err(PyError::type_error(format!(
             "array() takes at most 2 arguments ({} given)",
-            args.len() - 1
+            pos.len() - 1
         )));
     }
-    let cls = args[0];
-    let w_typecode = args[1];
+    let cls = pos[0];
+    let canonical = crate::typedef::gettypefor(&pyre_object::interp_array::ARRAY_TYPE)
+        .map_or(PY_NULL, |ty| ty.as_ptr());
+    // PyPy's interp2app gateway leaves keywords available to a subtype's
+    // overridden __init__.  The exact array type (and a subtype inheriting
+    // array.__init__) rejects them later; __new__ itself must not mistake the
+    // flat ABI's kwargs marker for the optional initializer.
+    let init_matches = std::ptr::eq(cls, canonical)
+        || unsafe {
+            match (
+                crate::baseobjspace::lookup_in_type(cls, "__init__"),
+                crate::baseobjspace::lookup_in_type(canonical, "__init__"),
+            ) {
+                (Some(sub), Some(base)) => std::ptr::eq(sub, base),
+                (None, None) => true,
+                _ => false,
+            }
+        };
+    if init_matches && crate::builtins::has_real_kwargs(kwargs) {
+        return Err(PyError::type_error(
+            "array.array() takes no keyword arguments",
+        ));
+    }
+    let w_typecode = pos[1];
     // typecode must be a 1-character str.
     if !unsafe { pyre_object::is_str(w_typecode) } {
         return Err(PyError::type_error(format!(
@@ -263,16 +286,13 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     let obj = arr::w_array_new(typecode, itemsize);
     // Subclass: retag the fresh array with the requested class.
     if !cls.is_null() && unsafe { pyre_object::is_type(cls) } {
-        if let Some(canonical) = crate::typedef::gettypefor(&pyre_object::interp_array::ARRAY_TYPE)
-        {
-            if !std::ptr::eq(cls, canonical.as_ptr()) {
-                crate::typedef::tag_subclass_instance(obj, cls);
-            }
+        if !std::ptr::eq(cls, canonical) {
+            crate::typedef::tag_subclass_instance(obj, cls);
         }
     }
     // Optional initializer.
-    if args.len() >= 3 {
-        let w_init = args[2];
+    if pos.len() >= 3 {
+        let w_init = pos[2];
         if unsafe { pyre_object::is_str(w_init) } {
             if matches!(typecode, b'u' | b'w') {
                 array_fromunicode(obj, w_init)?;
