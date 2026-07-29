@@ -2848,11 +2848,24 @@ impl Optimizer {
             let mut force_needed: Vec<usize> = Vec::new();
             // optimizer.py:651-652 force_box loop parity:
             //   for i in range(op.numargs()): op.setarg(i, force_box(...))
+            //
+            // `trace_inputargs` names the positions this JUMP writes into only
+            // on the unroll paths, where unroll.py:454 builds `end_args` from
+            // `original_label_args`: the preamble closes back to the loop start,
+            // and the peeled body closes back to the LABEL made from those same
+            // args. A bridge's JUMP targets a different trace's label while
+            // `trace_inputargs` holds the guard's failargs — two unrelated
+            // lists, so a positional Ref check reads arbitrary positions. There
+            // the type contract belongs to virtual-state matching
+            // (virtualstate.py:646-653 `generate_guards`), and what applies here
+            // is the plain force_box loop.
+            let inputargs_are_the_jump_target = !self.building_bridge;
             for i in 0..terminal_op.num_args() {
                 let arg = terminal_op.arg(i);
                 let resolved = ctx.resolve_operand_operand(&arg).to_opref();
-                let expected_ref =
-                    i < inputargs.len() && inputargs[i].ty() == Some(majit_ir::Type::Ref);
+                let expected_ref = inputargs_are_the_jump_target
+                    && i < inputargs.len()
+                    && inputargs[i].ty() == Some(majit_ir::Type::Ref);
                 // setup_optimizations seeds `trace_inputargs` into
                 // ctx.inputargs (optimizer.py:34), and `opref_type`
                 // consults it via the inputarg-slot fallback after the
@@ -2888,6 +2901,12 @@ impl Optimizer {
                         // the non-ref replacement. This matches the upstream
                         // force_box_for_end_of_preamble contract more closely than
                         // allowing Ref -> Float/Int type substitution at the JUMP.
+                        if crate::majit_log_enabled() {
+                            eprintln!(
+                                "[jump-type] arg {i}: label position is Ref, replacement is not; \
+                                 keeping the original arg"
+                            );
+                        }
                     }
                 } else {
                     let arg = ctx.materialize_operand_at(resolved);

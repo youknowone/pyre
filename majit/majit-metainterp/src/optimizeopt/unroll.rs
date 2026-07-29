@@ -1855,15 +1855,10 @@ impl UnrollOptimizer {
         if !jump_to_self {
             // unroll.py:170-171: jump_to_preamble — body JUMP → preamble Label
             //
-            // RPython parity: force_box_for_end_of_preamble (unroll.py:126-127)
-            // re-boxes unboxed values before the JUMP so types match the
-            // preamble inputargs. Without force_box, the body JUMP may pass
-            // Float/Int values at Ref-typed positions, causing the preamble's
-            // guard checks to dereference non-pointer values → segfault.
-            //
-            // Until force_box_for_end_of_preamble is implemented, reject
-            // traces where the body JUMP types don't match preamble inputarg
-            // types. The metainterp falls back to interpretation.
+            // force_box_for_end_of_preamble (unroll.py:126-127) has already run
+            // over the body JUMP's args above, so they carry the types the
+            // preamble's Label declares and the retarget below is a plain
+            // send_extra_operation.
             let preamble_target = self
                 .target_tokens
                 .first()
