@@ -4132,8 +4132,10 @@ impl<'a> RegAlloc<'a> {
         if !vx_in_reg && !vy_in_reg && !vx.is_constant() {
             arglocs[0] = self.make_sure_var_in_reg(vx, Type::Float, &[], None, false);
         }
-        let result_loc =
-            Loc::Reg(self.force_allocate_reg(op.pos.get(), Type::Int, &[], None, false));
+        // x86/regalloc.py:682 — a float comparison whose only consumer is the
+        // next guard leaves its answer in the flags, like the integer one.
+        let ops_ref: &[Op] = self.operations;
+        let result_loc = self.force_allocate_reg_or_cc(op.pos.get(), ops_ref, i);
         self.perform(i, arglocs, Some(result_loc), output);
     }
 
@@ -4151,7 +4153,8 @@ impl<'a> RegAlloc<'a> {
         if !lhs_in_reg && !rhs_in_reg && !lhs.is_constant() {
             arglocs[0] = self.make_sure_var_in_reg(lhs, Type::Float, &[], None, false);
         }
-        let result_loc = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[], None, false));
+        let ops_ref: &[Op] = self.operations;
+        let result_loc = self.force_allocate_reg_or_cc(dst, ops_ref, i);
         self.perform(i, arglocs, Some(result_loc), output);
     }
 

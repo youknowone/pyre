@@ -2566,10 +2566,11 @@ impl<'a> AssemblerARM64<'a> {
                         scratch
                     };
                     dynasm!(self.mc ; .arch aarch64 ; fcmp D(a.value), D(b.value));
-                    if let Some(Loc::Reg(r)) = result_loc {
-                        let cc = Self::float_opcode_to_cc(op.opcode);
-                        self.emit_setcc(cc, r.value);
-                    }
+                    // `opassembler.py:138 emit_comp_op_float_*` returns the
+                    // condition instead of materialising a boolean, so an
+                    // adjacent guard branches straight off `fcmp`'s NZCV.
+                    let cc = Self::float_opcode_to_cc(op.opcode);
+                    self.flush_cc(cc, result_loc);
                 }
             }
             // ── Casts ──

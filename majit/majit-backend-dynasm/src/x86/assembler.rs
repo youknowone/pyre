@@ -3332,11 +3332,11 @@ impl<'a> Assembler386<'a> {
                     if need_parity {
                         self.emit_if_parity_clear_zero_and_carry();
                     }
-                    if let Some(Loc::Reg(r)) = result_loc {
-                        // `emit_setcc` already zero-extends, so the
-                        // `flush_cc` MOV-zero would be redundant here.
-                        self.emit_setcc(cc, r.value);
-                    }
+                    // `assembler.py:1345 genop_cmp_float` ends in `flush_cc`, so
+                    // a comparison whose only consumer is the next guard keeps
+                    // its answer in the flags instead of materialising a
+                    // boolean the guard would immediately re-test.
+                    self.flush_cc(cc, result_loc);
                 }
             }
             // ── Casts ──
@@ -5130,7 +5130,11 @@ impl<'a> Assembler386<'a> {
                 self.guard_success_cc = Some(cond);
                 return;
             }
-            dynasm!(self.mc ; .arch x64 ; mov Rq(r.value), 0);
+            // `assembler.py:1300` clears the destination with `MOV imm0`
+            // before `SET_ir` because `SETcc` writes only the low byte.
+            // `emit_setcc` ends in `movzx r32, r8`, which zeroes bits 8..63
+            // on its own, so the same two-instruction sequence is spelled
+            // without the leading MOV.
             self.emit_setcc(cond, r.value);
         }
     }
