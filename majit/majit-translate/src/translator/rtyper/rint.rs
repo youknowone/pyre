@@ -427,6 +427,35 @@ impl Repr for IntegerRepr {
             GenopResult::LLType(LowLevelType::UniChar),
         ))
     }
+
+    /// `IntegerRepr` inherits `Repr.rtype_str` (`rmodel.py:195-197`), which
+    /// calls `hop.gendirectcall(self.ll_str, v_self)`. `IntegerRepr.ll_str`
+    /// (`rint.py:150-152`, `@jit.elidable`) is `ll_int2dec(i)`. The default
+    /// `Repr::rtype_str` raises `MissingRTypeOperation`, so this override
+    /// supplies the per-width `ll_int2dec` helper graph and calls it.
+    fn rtype_str(&self, hop: &HighLevelOp) -> RTypeResult {
+        use crate::translator::rtyper::lltypesystem::rstr::{
+            build_ll_int2dec_helper_graph, STRPTR,
+        };
+        let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        // The helper graph's input block is Signed for the signed
+        // specialisation and Unsigned for the unsigned one; that must equal
+        // this repr's lowleveltype (the type `gendirectcall` passes and the
+        // declared helper signature). The 64-bit-target int reprs are exactly
+        // Signed/Unsigned; the long-long widths keep the default raise.
+        let (name, signed_input) = match &self.lltype {
+            LowLevelType::Unsigned => ("ll_uint2dec", false),
+            LowLevelType::Signed => ("ll_int2dec", true),
+            _ => return Err(self.missing_rtype_operation("str")),
+        };
+        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+            name.to_string(),
+            vec![self.lltype.clone()],
+            STRPTR.clone(),
+            move |_rtyper, _args, _result| build_ll_int2dec_helper_graph(name, signed_input),
+        )?;
+        hop.gendirectcall(&helper, vlist)
+    }
 }
 
 // ____________________________________________________________
