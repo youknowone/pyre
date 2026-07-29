@@ -263,6 +263,15 @@ pub const MEMBER_MODULE_DICT: u32 = MEMBER_DIRECT_FLAG | 5;
 /// CPython 3.14 `complex_members`: `Py_T_DOUBLE`, `Py_READONLY`.
 pub const MEMBER_COMPLEX_REAL: u32 = MEMBER_DIRECT_FLAG | 6;
 pub const MEMBER_COMPLEX_IMAG: u32 = MEMBER_DIRECT_FLAG | 7;
+/// `descrobject.c descr_members`, shared by every descriptor type: the owning
+/// class (`PyDescrObject.d_type`) and the attribute name (`d_name`), both
+/// read-only.  PyPy publishes the same two values as GetSetProperty
+/// (`typedef.py:470-472`, `:538-539`); the descriptor kind is the 3.14
+/// difference.  The descriptor payloads here — GetSetProperty, Member and the
+/// Function carrier — do not share a header, so the reader dispatches on the
+/// receiver instead of reading one fixed offset.
+pub const MEMBER_DESCR_OBJCLASS: u32 = MEMBER_DIRECT_FLAG | 8;
+pub const MEMBER_DESCR_NAME: u32 = MEMBER_DIRECT_FLAG | 9;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {

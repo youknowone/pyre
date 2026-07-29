@@ -9474,32 +9474,16 @@ fn patch_getset_descriptor_metadata() {
     if !crate::type_dict_has_storage(tp) {
         return;
     }
-    // typedef.py:470 __name__
-    crate::type_dict_store(
-        tp,
-        "__name__",
-        copy_for_type(
-            make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "__name__",
-                    |args| {
-                        let descr = args[1];
-                        if descr.is_null() {
-                            return Ok(pyre_object::w_none());
-                        }
-                        let name = unsafe { pyre_object::typedef::w_getset_get_name(descr) };
-                        if name.is_null() {
-                            return Ok(pyre_object::w_none());
-                        }
-                        Ok(name)
-                    },
-                    2,
-                ),
-                "__name__",
-            ),
+    // `descrobject.c descr_members` supplies __objclass__ and __name__.  This
+    // post-init pass runs with the type object already built, so `w_cls` is
+    // bound here rather than by `stamp_new_descr_self`.
+    for (name, kind) in DESCR_MEMBERS {
+        crate::type_dict_store(
             tp,
-        ),
-    );
+            name,
+            pyre_object::w_member_new_direct(kind, name.to_owned(), tp),
+        );
+    }
     // typedef.py:471 __qualname__ = GetSetProperty(descr_get_qualname)
     //
     // ```python
@@ -9576,52 +9560,6 @@ fn patch_getset_descriptor_metadata() {
                     2,
                 ),
                 "__qualname__",
-            ),
-            tp,
-        ),
-    );
-    // typedef.py:472 __objclass__ = GetSetProperty(descr_get_objclass)
-    //
-    // ```python
-    // def descr_get_objclass(self, space):
-    //     if self.w_objclass is not None:
-    //         return self.w_objclass
-    //     if self.reqcls is not None:
-    //         return space.gettypeobject(self.reqcls.typedef)
-    //     raise oefmt(space.w_AttributeError,
-    //                 "generic self has no __objclass__")
-    // ```
-    crate::type_dict_store(
-        tp,
-        "__objclass__",
-        copy_for_type(
-            make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "__objclass__",
-                    |args| {
-                        let descr = args[1];
-                        if descr.is_null() {
-                            return Err(crate::PyError::attribute_error(
-                                "generic self has no __objclass__",
-                            ));
-                        }
-                        unsafe {
-                            let w_objclass = pyre_object::typedef::w_getset_get_objclass(descr);
-                            if !w_objclass.is_null() {
-                                return Ok(w_objclass);
-                            }
-                            let reqcls = pyre_object::typedef::w_getset_get_reqcls(descr);
-                            if !reqcls.is_null() {
-                                return Ok(reqcls);
-                            }
-                            Err(crate::PyError::attribute_error(
-                                "generic self has no __objclass__",
-                            ))
-                        }
-                    },
-                    2,
-                ),
-                "__objclass__",
             ),
             tp,
         ),
@@ -11167,6 +11105,8 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
         pyre_object::MEMBER_COMPLEX_IMAG => Ok(pyre_object::w_float_new(unsafe {
             pyre_object::w_complex_get_imag(obj)
         })),
+        pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
+        pyre_object::MEMBER_DESCR_NAME => unsafe { descr_member_name(obj) },
         _ => Err(crate::PyError::attribute_error(unsafe {
             pyre_object::w_member_get_name(member)
         })),
@@ -11223,6 +11163,84 @@ pub(crate) unsafe fn direct_member_delete(
             Ok(pyre_object::w_none())
         }
         _ => Err(crate::PyError::attribute_error("readonly attribute")),
+    }
+}
+
+/// `descrobject.c descr_members` names one `PyDescrObject` offset per entry
+/// because every descriptor type shares that header.  The payloads here —
+/// GetSetProperty, Member, and the Function carrier behind `method_descriptor`
+/// and `wrapper_descriptor` — keep the owner in their own field, so the two
+/// readers below dispatch on the receiver and then use the accessor the
+/// matching typedef already exposes.
+unsafe fn descr_member_objclass(obj: PyObjectRef) -> crate::PyResult {
+    unsafe {
+        if pyre_object::typedef::is_getset_property(obj) {
+            // typedef.py:405-411 descr_get_objclass — w_objclass, else reqcls,
+            // else AttributeError.
+            let owner = getset_descriptor_owner(obj);
+            if owner.is_null() {
+                return Err(crate::PyError::attribute_error(
+                    "generic self has no __objclass__",
+                ));
+            }
+            return Ok(owner);
+        }
+        if pyre_object::is_member(obj) {
+            // typedef.py:539 interp_attrproperty_w('w_cls') — None when unset.
+            let owner = pyre_object::w_member_get_cls(obj);
+            return Ok(if owner.is_null() {
+                pyre_object::w_none()
+            } else {
+                owner
+            });
+        }
+        if crate::function::is_function_carrier(obj) {
+            return crate::function::fget_func_objclass(obj);
+        }
+        Err(crate::PyError::attribute_error("__objclass__"))
+    }
+}
+
+unsafe fn descr_member_name(obj: PyObjectRef) -> crate::PyResult {
+    unsafe {
+        if pyre_object::typedef::is_getset_property(obj) {
+            // typedef.py:470 interp_attrproperty('name', wrapfn="newtext_or_none")
+            let name = pyre_object::typedef::w_getset_get_name(obj);
+            return Ok(if name.is_null() {
+                pyre_object::w_none()
+            } else {
+                name
+            });
+        }
+        if pyre_object::is_member(obj) {
+            // typedef.py:538 interp_attrproperty('name')
+            return Ok(pyre_object::w_str_new(pyre_object::w_member_get_name(obj)));
+        }
+        if crate::function::is_function_carrier(obj) {
+            return Ok(crate::function::fget_func_name(obj));
+        }
+        Err(crate::PyError::attribute_error("__name__"))
+    }
+}
+
+/// The `descr_members` pair, in `descrobject.c` order.
+const DESCR_MEMBERS: [(&str, u32); 2] = [
+    ("__objclass__", pyre_object::MEMBER_DESCR_OBJCLASS),
+    ("__name__", pyre_object::MEMBER_DESCR_NAME),
+];
+
+/// Install `descr_members` into a descriptor type's namespace dict.  `w_cls`
+/// is left for `stamp_new_descr_self`, which fills every Member in a builtin
+/// namespace once the type object exists.
+fn install_descr_members(ns: PyObjectRef) {
+    for (name, kind) in DESCR_MEMBERS {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                pyre_object::w_member_new_direct(kind, name.to_owned(), pyre_object::PY_NULL),
+            );
+        }
     }
 }
 
@@ -12095,34 +12113,24 @@ fn init_slot_wrapper_type(ns: PyObjectRef) {
     // its owner in Function.w_objclass.
     for (name, getter) in [
         (
-            "__name__",
+            "__qualname__",
             (|args: &[PyObjectRef]| {
-                let descr = slot_wrapper_receiver(args[1], "__name__")?;
-                Ok(pyre_object::w_str_new(unsafe {
-                    crate::function::function_get_name(descr)
-                }))
+                let descr = slot_wrapper_receiver(args[1], "__qualname__")?;
+                let owner = unsafe { crate::function::fget_func_objclass(descr)? };
+                let owner_qualname = crate::baseobjspace::getattr_str(owner, "__qualname__")?;
+                let Some(owner_qualname) =
+                    (unsafe { pyre_object::w_str_get_value_opt(owner_qualname) })
+                else {
+                    return Err(crate::PyError::type_error(
+                        "descriptor owner __qualname__ is not a string",
+                    ));
+                };
+                let method_name = unsafe { crate::function::function_get_name(descr) };
+                Ok(pyre_object::w_str_new(&format!(
+                    "{owner_qualname}.{method_name}"
+                )))
             }) as crate::gateway::BuiltinCodeFn,
         ),
-        ("__objclass__", |args: &[PyObjectRef]| {
-            let descr = slot_wrapper_receiver(args[1], "__objclass__")?;
-            unsafe { crate::function::fget_func_objclass(descr) }
-        }),
-        ("__qualname__", |args: &[PyObjectRef]| {
-            let descr = slot_wrapper_receiver(args[1], "__qualname__")?;
-            let owner = unsafe { crate::function::fget_func_objclass(descr)? };
-            let owner_qualname = crate::baseobjspace::getattr_str(owner, "__qualname__")?;
-            let Some(owner_qualname) =
-                (unsafe { pyre_object::w_str_get_value_opt(owner_qualname) })
-            else {
-                return Err(crate::PyError::type_error(
-                    "descriptor owner __qualname__ is not a string",
-                ));
-            };
-            let method_name = unsafe { crate::function::function_get_name(descr) };
-            Ok(pyre_object::w_str_new(&format!(
-                "{owner_qualname}.{method_name}"
-            )))
-        }),
         ("__doc__", |args: &[PyObjectRef]| {
             let descr = slot_wrapper_receiver(args[1], "__doc__")?;
             Ok(unsafe { crate::function::fget_func_doc(descr) })
@@ -12146,6 +12154,10 @@ fn init_slot_wrapper_type(ns: PyObjectRef) {
             )
         };
     }
+    // `descrobject.c descr_members` — the carrier keeps `d_type` in
+    // `Function.w_objclass` and `d_name` in `Function.name`, both published as
+    // members rather than getsets.
+    install_descr_members(ns);
 }
 
 fn method_descriptor_receiver(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
@@ -12207,34 +12219,24 @@ fn init_method_descriptor_type(ns: PyObjectRef) {
     // the corresponding immutable BuiltinCode carrier in Function fields.
     for (name, getter) in [
         (
-            "__name__",
+            "__qualname__",
             (|args: &[PyObjectRef]| {
-                let descr = method_descriptor_receiver(args[1], "__name__")?;
-                Ok(pyre_object::w_str_new(unsafe {
-                    crate::function::function_get_name(descr)
-                }))
+                let descr = method_descriptor_receiver(args[1], "__qualname__")?;
+                let owner = unsafe { crate::function::fget_func_objclass(descr)? };
+                let owner_qualname = crate::baseobjspace::getattr_str(owner, "__qualname__")?;
+                let Some(owner_qualname) =
+                    (unsafe { pyre_object::w_str_get_value_opt(owner_qualname) })
+                else {
+                    return Err(crate::PyError::type_error(
+                        "descriptor owner __qualname__ is not a string",
+                    ));
+                };
+                let method_name = unsafe { crate::function::function_get_name(descr) };
+                Ok(pyre_object::w_str_new(&format!(
+                    "{owner_qualname}.{method_name}"
+                )))
             }) as crate::gateway::BuiltinCodeFn,
         ),
-        ("__objclass__", |args: &[PyObjectRef]| {
-            let descr = method_descriptor_receiver(args[1], "__objclass__")?;
-            unsafe { crate::function::fget_func_objclass(descr) }
-        }),
-        ("__qualname__", |args: &[PyObjectRef]| {
-            let descr = method_descriptor_receiver(args[1], "__qualname__")?;
-            let owner = unsafe { crate::function::fget_func_objclass(descr)? };
-            let owner_qualname = crate::baseobjspace::getattr_str(owner, "__qualname__")?;
-            let Some(owner_qualname) =
-                (unsafe { pyre_object::w_str_get_value_opt(owner_qualname) })
-            else {
-                return Err(crate::PyError::type_error(
-                    "descriptor owner __qualname__ is not a string",
-                ));
-            };
-            let method_name = unsafe { crate::function::function_get_name(descr) };
-            Ok(pyre_object::w_str_new(&format!(
-                "{owner_qualname}.{method_name}"
-            )))
-        }),
         ("__doc__", |args: &[PyObjectRef]| {
             let descr = method_descriptor_receiver(args[1], "__doc__")?;
             Ok(unsafe { crate::function::fget_func_doc(descr) })
@@ -12258,6 +12260,10 @@ fn init_method_descriptor_type(ns: PyObjectRef) {
             )
         };
     }
+    // `descrobject.c descr_members` — the carrier keeps `d_type` in
+    // `Function.w_objclass` and `d_name` in `Function.name`, both published as
+    // members rather than getsets.
+    install_descr_members(ns);
 
     unsafe {
         pyre_object::w_dict_setitem_str_no_proxy(
@@ -12934,58 +12940,13 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
             }),
         )
     };
-    // typedef.py:538 __name__ = interp_attrproperty('name', ...)
-    let name_getter = make_builtin_function_with_arity(
-        "__name__",
-        |args| {
-            let member = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            if member.is_null() || !unsafe { pyre_object::typedef::is_member(member) } {
-                return Ok(pyre_object::w_none());
-            }
-            Ok(pyre_object::w_str_new(unsafe {
-                pyre_object::w_member_get_name(member)
-            }))
-        },
-        2,
-    );
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__name__",
-            make_getset_descriptor(name_getter),
-        )
-    };
-    // typedef.py:539 `__objclass__ = interp_attrproperty_w('w_cls',
-    // cls=Member)` — read-only.  `interp_attrproperty_w`
-    // (typedef.py:465-474) fetches the attribute and substitutes
-    // `space.w_None` when the slot is `None`; mirror that fget shape
-    // arm-for-arm.  The `is_member` guard stays as a defensive type
-    // check at the builtin-function boundary (PyPy's
-    // `descr_property_get` rejects non-Member instances before
-    // reaching fget; pyre's GetSetProperty path is less strict).
-    let objclass_getter = make_builtin_function_with_arity(
-        "__objclass__",
-        |args| {
-            let member = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-            if !unsafe { pyre_object::typedef::is_member(member) } {
-                return Ok(pyre_object::w_none());
-            }
-            let w_value = unsafe { pyre_object::w_member_get_cls(member) };
-            if w_value.is_null() {
-                Ok(pyre_object::w_none())
-            } else {
-                Ok(w_value)
-            }
-        },
-        2,
-    );
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__objclass__",
-            make_getset_descriptor(objclass_getter),
-        )
-    };
+    // typedef.py:538-539 `__name__ = interp_attrproperty('name', ...)` and
+    // `__objclass__ = interp_attrproperty_w('w_cls', cls=Member)`, both
+    // read-only.  `descrobject.c descr_members` publishes the same two values
+    // as members, which is also what makes them reachable on a Member whose
+    // `w_cls` is still unset: the reader substitutes None the way
+    // `interp_attrproperty_w` (typedef.py:465-474) does.
+    install_descr_members(ns);
     // CPython 3.14 `PyMemberDescr_Type` metadata.  PyPy's Member typedef
     // stops at __name__/__objclass__; these four entries are the selected
     // 3.14 surface.
