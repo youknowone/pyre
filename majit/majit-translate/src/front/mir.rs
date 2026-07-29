@@ -13875,6 +13875,17 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
         return inner;
     }
+    // A fieldless (C-like) enum field is represented by-value as its
+    // discriminant integer, matching `tyref_to_value_type` which colors
+    // the same enum `Int` at every value site (construction, field read,
+    // `Discriminant`).  Seed the attr as `Int` so the forced class
+    // attribute agrees with the discriminant write; otherwise the field
+    // seeds a classdef-less `SomeInstance(None)` shell and the first typed
+    // write (`err.kind = PyErrorKind::…`) unions `Integer ∪ Instance` with
+    // no `pair(SomeInteger, SomeInstance).union()` handler and walls.
+    if tyref_is_fieldless_enum_free(ty, llbc) {
+        return ValueType::Int;
+    }
     ValueType::Ref(None)
 }
 
