@@ -264,10 +264,22 @@ fn cformat_rbigint(spec: &CFormatSpec, num: &BigInt) -> Result<String, PyError> 
         _ => unreachable!("percent integer formats use radix 8, 10, or 16"),
     };
     let negative = num.int_lt(0);
-    let mut magnitude = num.format(digits, "", "", 0).map_err(|error| match error {
-        pyre_object::rbigint::RBigIntError::Memory => PyError::memory_error(""),
-        _ => unreachable!("validated radix formatting returned an unrelated error"),
-    })?;
+    // Only the decimal conversion is quadratic, so only it carries the
+    // `sys.set_int_max_str_digits` limit; `%o`/`%x`/`%X` are exempt.
+    let maxdigits = if radix == 10 {
+        crate::module::sys::state::int_max_str_digits()
+    } else {
+        0
+    };
+    let mut magnitude =
+        num.format(digits, "", "", maxdigits as i64)
+            .map_err(|error| match error {
+                pyre_object::rbigint::RBigIntError::Memory => PyError::memory_error(""),
+                pyre_object::rbigint::RBigIntError::MaxStrDigits => {
+                    crate::builtins::int_max_str_digits_error(maxdigits)
+                }
+                _ => unreachable!("validated radix formatting returned an unrelated error"),
+            })?;
     if negative {
         let Some(unsigned) = magnitude.strip_prefix('-') else {
             return Err(PyError::system_error(

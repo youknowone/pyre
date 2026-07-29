@@ -2290,10 +2290,22 @@ fn format_rbigint(num: &BigInt, spec: &Wtf8, type_name: &str) -> Result<Wtf8Buf,
         _ => unreachable!("integer format uses radix 2, 8, 10, or 16"),
     };
     let negative = num.int_lt(0);
-    let mut magnitude = num.format(digits, "", "", 0).map_err(|error| match error {
-        pyre_object::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
-        _ => unreachable!("validated radix formatting returned an unrelated error"),
-    })?;
+    // Only the decimal conversion is quadratic, so only it carries the
+    // `sys.set_int_max_str_digits` limit; the power-of-two radices are exempt.
+    let maxdigits = if radix == 10 {
+        crate::module::sys::state::int_max_str_digits()
+    } else {
+        0
+    };
+    let mut magnitude =
+        num.format(digits, "", "", maxdigits as i64)
+            .map_err(|error| match error {
+                pyre_object::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
+                pyre_object::rbigint::RBigIntError::MaxStrDigits => {
+                    crate::builtins::int_max_str_digits_error(maxdigits)
+                }
+                _ => unreachable!("validated radix formatting returned an unrelated error"),
+            })?;
     if negative {
         debug_assert!(magnitude.starts_with('-'));
         magnitude.remove(0);

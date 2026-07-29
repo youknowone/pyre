@@ -7816,6 +7816,14 @@ pub(crate) fn parse_int_from_str(
     Ok(w_long_new(value))
 }
 
+/// The error every decimal `int` conversion raises once the result would
+/// exceed `sys.get_int_max_str_digits()` digits.
+pub(crate) fn int_max_str_digits_error(maxdigits: i32) -> crate::PyError {
+    crate::PyError::value_error(format!(
+        "Exceeds the limit ({maxdigits} digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit"
+    ))
+}
+
 /// PyPy `W_AbstractLongObject.descr_str` / Python 3.14 integer-to-decimal
 /// conversion guard. The bit-length lower bound rejects enormous values
 /// before the quadratic decimal conversion; the resulting string supplies
@@ -7833,11 +7841,7 @@ pub(crate) unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, c
         pyre_object::w_long_get_value(obj)
     };
     let maxdigits = crate::module::sys::state::int_max_str_digits();
-    let too_long = |maxdigits: i32| {
-        crate::PyError::value_error(format!(
-            "Exceeds the limit ({maxdigits} digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit"
-        ))
-    };
+    let too_long = int_max_str_digits_error;
     if maxdigits != 0 {
         let bits = value.bits();
         let decimal_digits_lower_bound = if bits == 0 {
