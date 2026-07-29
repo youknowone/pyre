@@ -337,6 +337,7 @@ pub(crate) fn after_fork_child() {
     SHUTDOWN_HANDLES.lock().clear();
     THREAD_COUNT.store(0, Ordering::SeqCst);
     pyre_object::listobject::list_locks_after_fork_child();
+    pyre_object::setobject::set_locks_after_fork_child();
     crate::objspace::std::mapdict::after_fork_child();
     pyre_object::dictmultiobject::module_dict_locks_after_fork_child();
     majit_gc::shadow_stack::after_fork_child();

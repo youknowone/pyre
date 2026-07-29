@@ -12,7 +12,9 @@
 use crate::pyobject::*;
 use indexmap::map::{RawEntryApiV1, raw_entry_v1::RawEntryMut};
 use pyre_macros::pyre_class;
+use std::cell::UnsafeCell;
 use std::hash::BuildHasher;
+use std::sync::LazyLock;
 
 pub static SET_TYPE: PyType = crate::pyobject::new_pytype("set");
 pub static FROZENSET_TYPE: PyType = crate::pyobject::new_pytype("frozenset");
@@ -100,6 +102,80 @@ pub const W_SET_GC_TYPE_ID: u32 = 30;
 
 /// GC-managed element table shared by `set` and `frozenset` bodies.
 pub type SetItemsStorage = indexmap::IndexMap<crate::dictmultiobject::ObjectKey, ()>;
+
+// PyPy serializes set strategy/storage operations with the GIL. Pyre is
+// free-threaded, so use the same narrow address-striped reentrant-lock
+// adaptation as listobject and dictmultiobject. Semantic state remains on
+// W_SetObject; the stripes only restore the indivisible operation boundary
+// supplied by PyPy's GIL. Stripes are reset in a fork child because a vanished
+// thread may have held one at fork time.
+struct ForkSetLock(UnsafeCell<parking_lot::ReentrantMutex<()>>);
+unsafe impl Sync for ForkSetLock {}
+
+impl ForkSetLock {
+    fn new() -> Self {
+        Self(UnsafeCell::new(parking_lot::ReentrantMutex::new(())))
+    }
+
+    fn get(&self) -> &parking_lot::ReentrantMutex<()> {
+        unsafe { &*self.0.get() }
+    }
+
+    unsafe fn reinit_after_fork(&self) {
+        unsafe { self.0.get().write(parking_lot::ReentrantMutex::new(())) };
+    }
+}
+
+static SET_LOCKS: LazyLock<Vec<ForkSetLock>> =
+    LazyLock::new(|| (0..256).map(|_| ForkSetLock::new()).collect());
+
+type SetGuard = parking_lot::lock_api::ReentrantMutexGuard<
+    'static,
+    parking_lot::RawMutex,
+    parking_lot::RawThreadId,
+    (),
+>;
+
+#[inline]
+fn set_lock_index(obj: PyObjectRef) -> usize {
+    (obj as usize >> 4) & (SET_LOCKS.len() - 1)
+}
+
+/// Acquire a set's stripe without letting a contending mutator prevent a GC
+/// stop-the-world. Only the acquire is opaque; the guarded set operation stays
+/// visible to source translation, matching listobject/dictmultiobject.
+#[majit_macros::dont_look_inside]
+unsafe fn w_set_lock(obj: PyObjectRef) -> SetGuard {
+    let lock = SET_LOCKS[set_lock_index(obj)].get();
+    if let Some(guard) = lock.try_lock() {
+        return guard;
+    }
+    let blocked = majit_gc::gc_sync::before_external_block();
+    let guard = lock.lock();
+    drop(blocked);
+    guard
+}
+
+/// Lock two sets in stripe order. A shared stripe is acquired once.
+#[majit_macros::dont_look_inside]
+unsafe fn w_set_lock_pair(left: PyObjectRef, right: PyObjectRef) -> (SetGuard, Option<SetGuard>) {
+    let left_index = set_lock_index(left);
+    let right_index = set_lock_index(right);
+    if left_index == right_index {
+        return (w_set_lock(left), None);
+    }
+    if left_index < right_index {
+        (w_set_lock(left), Some(w_set_lock(right)))
+    } else {
+        (w_set_lock(right), Some(w_set_lock(left)))
+    }
+}
+
+pub fn set_locks_after_fork_child() {
+    for lock in SET_LOCKS.iter() {
+        unsafe { lock.reinit_after_fork() };
+    }
+}
 
 /// Runtime-assigned GC type id for [`SetItemsStorage`]. Like the bigint
 /// payload id, this is published by `pyre-jit::eval` after the fixed-constant
@@ -402,6 +478,7 @@ pub unsafe fn w_set_insert_key_checked(
     obj: PyObjectRef,
     key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(), SetUpdateError> {
+    let _set_guard = w_set_lock(obj);
     w_set_insert_key_reentrant(obj, key)
 }
 
@@ -419,6 +496,7 @@ pub unsafe fn w_set_contains_key_checked(
     obj: PyObjectRef,
     key: crate::dictmultiobject::ObjectKey,
 ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
+    let _set_guard = w_set_lock(obj);
     if let Some(result) = callback_free_set_op(|| {
         let s = &*(obj as *const W_SetObject);
         (*s.items).contains_key(&key)
@@ -441,6 +519,7 @@ pub unsafe fn w_set_discard_key_checked(
     obj: PyObjectRef,
     key: crate::dictmultiobject::ObjectKey,
 ) -> Result<bool, crate::dictmultiobject::DictKeyError> {
+    let _set_guard = w_set_lock(obj);
     if let Some(result) = callback_free_set_op(|| {
         let s = &mut *(obj as *mut W_SetObject);
         let index = (*s.items).get_index_of(&key);
@@ -534,6 +613,7 @@ pub unsafe fn w_set_discard_checked(
 /// # Safety
 /// `obj` must point to a valid `W_SetObject`.
 pub unsafe fn w_set_clear(obj: PyObjectRef) {
+    let _set_guard = w_set_lock(obj);
     let s = &mut *(obj as *mut W_SetObject);
     s.items =
         crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::new(), set_items_gc_type_id());
@@ -551,6 +631,7 @@ pub unsafe fn w_set_clear(obj: PyObjectRef) {
 /// # Safety
 /// `obj` must point to a valid mutable `W_SetObject`.
 pub unsafe fn w_set_popitem(obj: PyObjectRef) -> Option<PyObjectRef> {
+    let _set_guard = w_set_lock(obj);
     let s = &mut *(obj as *mut W_SetObject);
     let entries = &mut *s.items;
     let (key, ()) = entries.pop()?;
@@ -587,6 +668,7 @@ pub unsafe fn w_set_popitem(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// `dst` and `src` must point to valid `W_SetObject`s.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_set_copy_storage_from(dst: PyObjectRef, src: PyObjectRef) {
+    let (_first_guard, _second_guard) = w_set_lock_pair(dst, src);
     let d = &mut *(dst as *mut W_SetObject);
     let copied = (*(*(src as *const W_SetObject)).items).clone();
     d.items = crate::gc_storage::gc_alloc_storage_box(copied, set_items_gc_type_id());
@@ -612,6 +694,7 @@ pub unsafe fn w_set_difference_update_from_set(
     dst: PyObjectRef,
     src: PyObjectRef,
 ) -> Result<(), SetUpdateError> {
+    let (_first_guard, _second_guard) = w_set_lock_pair(dst, src);
     if std::ptr::eq(
         (*(dst as *const W_SetObject)).items,
         (*(src as *const W_SetObject)).items,
@@ -684,6 +767,7 @@ pub unsafe fn w_set_update_from_set(
     dst: PyObjectRef,
     src: PyObjectRef,
 ) -> Result<(), SetUpdateError> {
+    let (_first_guard, _second_guard) = w_set_lock_pair(dst, src);
     if std::ptr::eq(
         (*(dst as *const W_SetObject)).items,
         (*(src as *const W_SetObject)).items,
@@ -880,11 +964,13 @@ unsafe fn w_set_remove_key_for_update(
 /// # Safety
 /// `obj` must point to a valid `W_SetObject`.
 pub unsafe fn w_set_len(obj: PyObjectRef) -> usize {
+    let _set_guard = w_set_lock(obj);
     (*(obj as *const W_SetObject)).len
 }
 
 #[inline]
 pub unsafe fn w_set_capacity(obj: PyObjectRef) -> usize {
+    let _set_guard = w_set_lock(obj);
     let s = &*(obj as *const W_SetObject);
     (*s.items).capacity()
 }
@@ -892,18 +978,21 @@ pub unsafe fn w_set_capacity(obj: PyObjectRef) -> usize {
 /// Cached frozenset hash; `-1` is the uncomputed sentinel.
 #[inline]
 pub unsafe fn w_frozenset_cached_hash(obj: PyObjectRef) -> Option<i64> {
+    let _set_guard = w_set_lock(obj);
     let hash = (*(obj as *const W_SetObject)).hash;
     (hash != -1).then_some(hash)
 }
 
 #[inline]
 pub unsafe fn w_frozenset_set_cached_hash(obj: PyObjectRef, hash: i64) {
+    let _set_guard = w_set_lock(obj);
     (*(obj as *mut W_SetObject)).hash = hash;
 }
 
 /// Digests already carried by the r_dict keys. Python 3.14 frozenset hashing
 /// consumes these instead of invoking each element's `__hash__` again.
 pub unsafe fn w_set_stored_hashes(obj: PyObjectRef) -> Vec<i64> {
+    let _set_guard = w_set_lock(obj);
     let s = &*(obj as *const W_SetObject);
     (*s.items).keys().map(|key| key.hash).collect()
 }
@@ -925,6 +1014,7 @@ pub unsafe fn w_set_key_at(
     obj: PyObjectRef,
     index: usize,
 ) -> Option<crate::dictmultiobject::ObjectKey> {
+    let _set_guard = w_set_lock(obj);
     let s = &*(obj as *const W_SetObject);
     (*s.items).get_index(index).map(|(&key, _)| key)
 }
@@ -934,6 +1024,7 @@ pub unsafe fn w_set_key_at(
 /// # Safety
 /// `obj` must point to a valid `W_SetObject`.
 pub unsafe fn w_set_items(obj: PyObjectRef) -> Vec<PyObjectRef> {
+    let _set_guard = w_set_lock(obj);
     let s = &*(obj as *const W_SetObject);
     (*s.items).keys().map(|key| key.obj).collect()
 }
