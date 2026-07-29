@@ -1933,11 +1933,36 @@ pub(crate) fn fbw_callee_body_replay_safety(
                 // residual writes — is not a property of this body.  Defer it;
                 // the backstop aborts before executing one that did not
                 // inline.
+                // `RAISE_VARARGS` lowers to the same shape: its
+                // `normalize_raise_varargs_fn` residual instantiates a raised
+                // CLASS and normalizes an optional `from` cause, so what it
+                // touches is a runtime value exactly like a CALL's callee.  For
+                // the shape a loop actually repeats — an exception the walk
+                // built itself, no `from` cause — the three walker-native folds
+                // (`try_walker_trace_exception_new`,
+                // `try_walker_trace_raise_builtin`,
+                // `try_walker_trace_raise_bare_class`) erase the residual before
+                // the backstop is reached, and each writes only into the object
+                // it just allocated.  Anything else reaches
+                // `fbw_abort_nested_unjournaled_residual` and aborts before the
+                // helper runs, since the decline there covers every residual
+                // that is not elidable / loop-invariant / `ForIterNext`.
+                // `set_current_exception` is the same shape once more, and it
+                // is the one every `try`/`except` body carries (the
+                // PUSH_EXC_INFO store and the POP_EXCEPT restore).  Its fold
+                // [`try_walker_lower_exc_info_residual`] journals the displaced
+                // `sys_exc_value` through [`fbw_sys_exc_journal_push`] BEFORE
+                // applying the concrete store, and
+                // [`fbw_store_journal_rollback`] replays the journal in reverse
+                // on a non-committed exit — so a folded store is undone for the
+                // replay, and an unfolded one never runs.
                 if matches!(
                     ei.pyre_helper,
                     majit_ir::PyreHelperKind::CallFn
                         | majit_ir::PyreHelperKind::CallKw
                         | majit_ir::PyreHelperKind::CallFunctionEx
+                        | majit_ir::PyreHelperKind::RaiseVarargs
+                        | majit_ir::PyreHelperKind::SetCurrentException
                 ) {
                     deferred_call = true;
                     // The callee this resolves to is a runtime value, so what it
