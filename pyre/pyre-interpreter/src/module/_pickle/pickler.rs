@@ -1095,22 +1095,64 @@ fn save_reduce_value(
     w_obj: PyObjectRef,
     w_rv: PyObjectRef,
 ) -> Result<(), PyError> {
-    if unsafe { pyre_object::is_str(w_rv) } {
-        return save_global(ctx, buf, w_obj, Some(w_rv));
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(w_rv);
+    let rv_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let rooted_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let rooted_rv = || pyre_object::gc_roots::shadow_stack_get(rv_slot);
+
+    if unsafe { pyre_object::is_str(rooted_rv()) } {
+        return save_global(ctx, buf, rooted_obj(), Some(rooted_rv()));
     }
-    if unsafe { pyre_object::is_tuple(w_rv) } {
-        let n = unsafe { pyre_object::tupleobject::w_tuple_len(w_rv) };
+
+    let result = if unsafe { pyre_object::is_tuple(rooted_rv()) } {
+        let n = unsafe { pyre_object::tupleobject::w_tuple_len(rooted_rv()) };
         if !(2..=6).contains(&n) {
-            return Err(pickling_error(
-                "Tuple returned by __reduce__ must have two to six elements",
-            ));
+            Err(pickling_error(
+                "tuple returned by __reduce__ must contain 2 through 6 elements",
+            ))
+        } else {
+            let rv: Vec<PyObjectRef> = (0..n)
+                .map(|i| unsafe {
+                    pyre_object::tupleobject::w_tuple_getitem(rooted_rv(), i as i64).unwrap()
+                })
+                .collect();
+            save_reduce(ctx, buf, &rv, Some(rooted_obj()))
         }
-        let rv: Vec<PyObjectRef> = (0..n)
-            .map(|i| unsafe { pyre_object::tupleobject::w_tuple_getitem(w_rv, i as i64).unwrap() })
-            .collect();
-        return save_reduce(ctx, buf, &rv, Some(w_obj));
+    } else {
+        Err(pickling_error(format!(
+            "__reduce__ must return a string or tuple, not {}",
+            crate::baseobjspace::object_functionstr_type_name(rooted_rv()),
+        )))
+    };
+    result.map_err(|error| add_serializing_note(error, rooted_obj(), "object"))
+}
+
+/// CPython 3.14 `Pickler.save` exception-note wrapper.
+fn add_serializing_note(mut error: PyError, w_obj: PyObjectRef, what: &str) -> PyError {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let exc = error.to_exc_object();
+    pyre_object::gc_roots::pin_root(exc);
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let type_name = crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+        .map(|w_type| unsafe { crate::baseobjspace::type_fully_qualified_name(w_type.as_ptr()) })
+        .unwrap_or_else(|| "object".to_string());
+    let note = pyre_object::w_str_new(&format!("when serializing {type_name} {what}"));
+    pyre_object::gc_roots::pin_root(note);
+    let note_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let rooted_exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    if let Ok(add_note) = crate::baseobjspace::getattr_str(rooted_exc, "add_note") {
+        let _ = call_fn(
+            add_note,
+            &[pyre_object::gc_roots::shadow_stack_get(note_slot)],
+        );
     }
-    Err(pickling_error("__reduce__ must return string or tuple"))
+    error.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    error
 }
 
 /// Look up `type(w_obj)` in the effective `dispatch_table` and, if registered,
@@ -2155,11 +2197,17 @@ fn save_reduce(
     let rv_get = |i: usize| pinned_get(rv_slot, i);
     let present = |i: usize| i < rv_len && !unsafe { pyre_object::is_none(pinned_get(rv_slot, i)) };
 
-    if !unsafe { pyre_object::is_tuple(rv_get(1)) } {
-        return Err(pickling_error("args from save_reduce() must be a tuple"));
-    }
     if !crate::baseobjspace::callable_w(rv_get(0)) {
-        return Err(pickling_error("func from save_reduce() must be callable"));
+        return Err(pickling_error(format!(
+            "first item of the tuple returned by __reduce__ must be callable, not {}",
+            crate::baseobjspace::object_functionstr_type_name(rv_get(0)),
+        )));
+    }
+    if !unsafe { pyre_object::is_tuple(rv_get(1)) } {
+        return Err(pickling_error(format!(
+            "second item of the tuple returned by __reduce__ must be a tuple, not {}",
+            crate::baseobjspace::object_functionstr_type_name(rv_get(1)),
+        )));
     }
 
     let has_state = present(2);
@@ -2185,11 +2233,13 @@ fn save_reduce(
 
     if ctx.proto >= 2 && func_name.as_deref() == Some("__newobj_ex__") {
         if args_len != 3 {
-            return Err(pickling_error("__newobj_ex__ requires three args"));
+            return Err(pickling_error(format!(
+                "__newobj_ex__ expected 3 arguments, got {args_len}"
+            )));
         }
         if crate::baseobjspace::findattr_result(args_get(0), "__new__")?.is_none() {
             return Err(pickling_error(
-                "args[0] from __newobj_ex__ args has no __new__",
+                "first argument to __newobj_ex__() has no __new__",
             ));
         }
         if let Some(slot) = w_obj_slot {
@@ -2208,6 +2258,18 @@ fn save_reduce(
                     "first argument to __newobj_ex__() must be {obj_class_repr}, not {cls_repr}"
                 )));
             }
+        }
+        if !unsafe { pyre_object::is_tuple(args_get(1)) } {
+            return Err(pickling_error(format!(
+                "second argument to __newobj_ex__() must be a tuple, not {}",
+                crate::baseobjspace::object_functionstr_type_name(args_get(1)),
+            )));
+        }
+        if !unsafe { pyre_object::is_dict(args_get(2)) } {
+            return Err(pickling_error(format!(
+                "third argument to __newobj_ex__() must be a dict, not {}",
+                crate::baseobjspace::object_functionstr_type_name(args_get(2)),
+            )));
         }
         if ctx.proto >= 4 {
             save(ctx, buf, args_get(0))?;
@@ -2264,11 +2326,13 @@ fn save_reduce(
         }
     } else if ctx.proto >= 2 && func_name.as_deref() == Some("__newobj__") {
         if args_len == 0 {
-            return Err(pickling_error("__newobj__ requires at least one arg"));
+            return Err(pickling_error(
+                "__newobj__ expected at least 1 argument, got 0",
+            ));
         }
         if crate::baseobjspace::findattr_result(args_get(0), "__new__")?.is_none() {
             return Err(pickling_error(
-                "args[0] from __newobj__ args has no __new__",
+                "first argument to __newobj__() has no __new__",
             ));
         }
         if let Some(slot) = w_obj_slot {
