@@ -4225,6 +4225,7 @@ impl OptUnroll {
         targetargs: &[OpRef],
         label_args: &[OpRef],
         exported_state: &ExportedState,
+        optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
     ) {
         // self.short_preamble_producer = ShortPreambleBuilder(
@@ -4344,6 +4345,7 @@ impl OptUnroll {
         for (_, produced) in &exported_state.short_boxes {
             let produced_result = produced.produce_op(
                 ctx,
+                optimizer,
                 &exported_state.exported_infos,
                 &exported_state.short_inputargs,
                 &short_args,
@@ -4546,9 +4548,16 @@ pub(crate) fn import_short_preamble_state(
     targetargs: &[OpRef],
     label_args: &[OpRef],
     exported_state: &ExportedState,
+    optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ctx: &mut OptContext,
 ) {
-    OptUnroll::new().import_short_preamble_state(targetargs, label_args, exported_state, ctx)
+    OptUnroll::new().import_short_preamble_state(
+        targetargs,
+        label_args,
+        exported_state,
+        optimizer,
+        ctx,
+    )
 }
 
 /// RPython unroll.py:479-504 `import_state(targetargs, exported_state)`
@@ -4585,7 +4594,13 @@ pub(crate) fn import_state_full(
     if !optimizer.imported_virtuals.is_empty() {
         optimizer.install_imported_virtuals(ctx);
     }
-    OptUnroll::new().import_short_preamble_state(targetargs, &label_args, exported_state, ctx);
+    OptUnroll::new().import_short_preamble_state(
+        targetargs,
+        &label_args,
+        exported_state,
+        optimizer,
+        ctx,
+    );
     label_args
 }
 
@@ -5366,18 +5381,22 @@ fn assemble_peeled_trace_with_jump_args(
                 // Pad if JUMP is shorter than the target label.
                 while jump_args.len() < target_label_args.len() {
                     let extra_idx = jump_args.len().saturating_sub(target_base_len);
-                    let extra_arg = if current_inner_label_index.is_some() {
-                        target_label_args[jump_args.len()]
-                    } else {
-                        filtered_extra_jump_args
-                            .get(extra_idx)
-                            .copied()
-                            .unwrap_or(target_label_args[jump_args.len()])
-                    };
-                    // Extra args are assembly-allocated label positions;
-                    // body-scoped remaps never contain them. Probe across 14
-                    // benchmarks × 2 backends showed the prior lookup chain
-                    // returned identity in 100% of fires. Pass through.
+                    // shortpreamble.py:465-476
+                    // ExtendedShortPreambleBuilder.add_preamble_op:
+                    //
+                    //   self.label_args.append(op)
+                    //   self.jump_args.append(preamble_op.preamble_op)
+                    //
+                    // The extra LABEL slot receives the value produced by
+                    // replaying the short-preamble op on the back edge.  This
+                    // is equally true when the target is an inner/self LABEL;
+                    // passing `target_label_args[jump_args.len()]` there feeds
+                    // the LABEL's own input box back to itself and freezes the
+                    // entry value instead of re-reading a mutable field/array.
+                    let extra_arg = filtered_extra_jump_args
+                        .get(extra_idx)
+                        .copied()
+                        .unwrap_or(target_label_args[jump_args.len()]);
                     jump_args.push(extra_arg);
                 }
             }
@@ -7104,7 +7123,13 @@ mod tests {
             crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Int, Type::Int]);
         let targetargs = [OpRef::input_arg_int(0), OpRef::input_arg_int(1)];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
-        import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
+        import_short_preamble_state(
+            &targetargs,
+            &label_args,
+            &exported,
+            &mut optimizer,
+            &mut ctx2,
+        );
         assert_eq!(label_args, vec![OpRef::int_op(10), OpRef::int_op(11)]);
         // RPython PreambleOp parity: PreambleOp stored in PtrInfo._fields.
         // No imported_short_fields for heap fields — PtrInfo is the single
@@ -7168,7 +7193,13 @@ mod tests {
             crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Int, Type::Int]);
         let targetargs = [OpRef::input_arg_int(0), OpRef::input_arg_int(1)];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
-        import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
+        import_short_preamble_state(
+            &targetargs,
+            &label_args,
+            &exported,
+            &mut optimizer,
+            &mut ctx2,
+        );
         assert_eq!(label_args, vec![OpRef::int_op(12), OpRef::int_op(11)]);
         // history.py:314 ConstPtr.value inline: the imported constant
         // lands at `OpRef::ConstPtr(ptr)`, carrying the pointer
@@ -7235,7 +7266,13 @@ mod tests {
             crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Int, Type::Int]);
         let targetargs = [OpRef::input_arg_int(0), OpRef::input_arg_int(1)];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
-        import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
+        import_short_preamble_state(
+            &targetargs,
+            &label_args,
+            &exported,
+            &mut optimizer,
+            &mut ctx2,
+        );
 
         assert_eq!(
             ctx2.imported_loop_invariant_results
@@ -7255,6 +7292,7 @@ mod tests {
 
     #[test]
     fn test_import_short_loopinvariant_result_uses_short_inputarg_slot() {
+        let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         // history.py:227 — the CallLoopinvariant func address is an inline
         // `ConstInt` arg; the value rides on the OpRef and the import path
         // keys `imported_loop_invariant_results` by that value.
@@ -7293,7 +7331,13 @@ mod tests {
         let func_box = ctx.materialize_operand_at(func);
         ctx.seed_constant(&func_box, Value::Int(func_ptr));
 
-        import_short_preamble_state(&[OpRef::int_op(0)], &[phase2_result], &exported, &mut ctx);
+        import_short_preamble_state(
+            &[OpRef::int_op(0)],
+            &[phase2_result],
+            &exported,
+            &mut optimizer,
+            &mut ctx,
+        );
 
         // imported_loop_invariant_results stores the
         // Phase 1 source directly (RPython `shortpreamble.py:120 op = self.res`).
@@ -7562,7 +7606,13 @@ mod tests {
             OpRef::input_arg_int(2),
         ];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
-        import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
+        import_short_preamble_state(
+            &targetargs,
+            &label_args,
+            &exported,
+            &mut optimizer,
+            &mut ctx2,
+        );
         let imported_result = ctx2.imported_short_pure_ops[0].result;
         assert_ne!(imported_result, OpRef::int_op(30));
         let pop = ctx2.imported_short_pure_ops[0].pop.clone();

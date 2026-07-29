@@ -10175,6 +10175,33 @@ impl JitState for PyreJitState {
         Self::pypyjit_collect_jump_args(sym)
     }
 
+    fn collect_jump_args_with_boxes(sym: &Self::Sym, boxes: &[(OpRef, Type)]) -> Vec<OpRef> {
+        // pyjitpl.py:2957-2965 reached_loop_header:
+        //
+        //   live_arg_boxes = greenboxes + redboxes
+        //   live_arg_boxes += self.virtualizable_boxes
+        //   live_arg_boxes.pop()
+        //
+        // PyFrame's reds are [frame, ec].  The TraceCtx shadow is the
+        // authoritative `virtualizable_boxes` list in upstream order
+        // [static fields..., locals_cells_stack_w..., frame], with the
+        // standard-virtualizable identity last.  Portal local/stack writes
+        // update that shadow directly; `sym.registers_r` is only pyre's
+        // semantic/color-bank adaptation and may still contain the loop-entry
+        // boxes.  Splice the live shadow exactly as RPython does instead of
+        // delegating to the no-context register-mirror fallback.
+        let mut args = Vec::with_capacity(2 + boxes.len().saturating_sub(1));
+        args.push(sym.frame);
+        args.push(sym.execution_context);
+        args.extend(
+            boxes
+                .iter()
+                .take(boxes.len().saturating_sub(1))
+                .map(|&(opref, _)| opref),
+        );
+        args
+    }
+
     fn collect_typed_jump_args(sym: &Self::Sym) -> Vec<(OpRef, Type)> {
         Self::pypyjit_collect_typed_jump_args(sym)
     }
@@ -11530,6 +11557,59 @@ mod tests {
         assert_eq!(&with_ec[2..], &base[1..]);
         assert_eq!(typed_with_ec[0], (frame_ref, Type::Ref));
         assert_eq!(typed_with_ec[1], (ec_ref, Type::Ref));
+    }
+
+    #[test]
+    fn test_pypyjit_collect_jump_args_with_boxes_uses_live_vable_shadow() {
+        let mut ctx = crate::trace_ctx_for_test(0);
+        let frame_ref = ctx.const_ref(0x1000);
+        let ec_ref = ctx.const_ref(0x2000);
+        let stale_local = ctx.const_ref(0x3000);
+        let live_last_instr = ctx.const_int(41);
+        let live_pycode = ctx.const_ref(0x4000);
+        let live_vsd = ctx.const_int(2);
+        let live_debugdata = ctx.const_ref(0x5000);
+        let live_lastblock = ctx.const_ref(0x6000);
+        let live_globals = ctx.const_ref(0x7000);
+        let live_local = ctx.const_ref(0x8000);
+        let live_stack = ctx.const_ref(0x9000);
+
+        let mut sym = PyreSym::new_uninit(frame_ref);
+        sym.execution_context = ec_ref;
+        sym.registers_r = vec![stale_local];
+
+        // TraceCtx::collect_virtualizable_typed_boxes order:
+        // static fields, array items, trailing standard-vable identity.
+        let boxes = vec![
+            (live_last_instr, Type::Int),
+            (live_pycode, Type::Ref),
+            (live_vsd, Type::Int),
+            (live_debugdata, Type::Ref),
+            (live_lastblock, Type::Ref),
+            (live_globals, Type::Ref),
+            (live_local, Type::Ref),
+            (live_stack, Type::Ref),
+            (frame_ref, Type::Ref),
+        ];
+
+        let args = <PyreJitState as JitState>::collect_jump_args_with_boxes(&sym, &boxes);
+
+        assert_eq!(
+            args,
+            vec![
+                frame_ref,
+                ec_ref,
+                live_last_instr,
+                live_pycode,
+                live_vsd,
+                live_debugdata,
+                live_lastblock,
+                live_globals,
+                live_local,
+                live_stack,
+            ]
+        );
+        assert!(!args.contains(&stale_local));
     }
 
     #[test]
