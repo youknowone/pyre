@@ -8464,6 +8464,16 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 crate::baseobjspace::object_functionstr_type_name(cls)
             )));
         }
+        // descriptor.py:28-30 — `None` for the second argument builds the
+        // *unbound* super object (`super_init_impl`'s `if (obj == Py_None)
+        // obj = NULL`), so `_super_check` never runs on it.
+        if unsafe { pyre_object::is_none(obj) } {
+            return Ok(pyre_object::descriptor::w_super_new(
+                cls,
+                pyre_object::PY_NULL,
+                pyre_object::PY_NULL,
+            ));
+        }
         let obj_type = super_check(cls, obj)?;
         return Ok(pyre_object::descriptor::w_super_new(cls, obj_type, obj));
     }
@@ -9643,13 +9653,21 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         if w_locals_dict.is_null() {
             return Ok(w_list_new(vec![]));
         }
-        // app_inspect.py:50 calls `sorted(_caller_locals().keys())`, not
-        // `sorted(locals)`.  This distinction is observable for a general
-        // eval locals mapping which implements `keys()` and sequence-style
-        // `__getitem__` but no `__iter__`.
-        let keys_method = crate::baseobjspace::getattr_str(w_locals_dict, "keys")?;
-        let keys = crate::call_and_check(keys_method, &[])?;
-        return builtin_sorted(&[keys]);
+        // `_dir_locals` reads the key set through `PyMapping_Keys(locals)`,
+        // so a locals mapping that overrides `keys()` (`eval(src, {}, A())`
+        // with `A(dict)`) is honoured; only an exact dict takes the
+        // `PyDict_Keys` fast path that iterates the storage directly.
+        let w_keys = if unsafe {
+            pyre_object::pyobject::is_exact_type(w_locals_dict, &pyre_object::pyobject::DICT_TYPE)
+        } {
+            w_locals_dict
+        } else {
+            let keys_meth = crate::baseobjspace::getattr_str(w_locals_dict, "keys")?;
+            crate::call_and_check(keys_meth, &[])?
+        };
+        let keys_iter = crate::baseobjspace::iter(w_keys)?;
+        let keys = collect_iterable(keys_iter)?;
+        return builtin_sorted(&[w_list_new(keys)]);
     }
     if args.len() > 1 {
         return Err(crate::PyError::type_error(format!(
