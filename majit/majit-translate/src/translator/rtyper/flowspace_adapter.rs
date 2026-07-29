@@ -751,9 +751,11 @@ fn nonraising_core_bridge_opname(segments: &[String], arg_count: usize) -> Optio
         ("cmp", "eq" | "ne" | "lt" | "le" | "gt" | "ge") if arg_count == 2 => Some(leaf),
         ("slice", "len") if arg_count == 1 => Some("len"),
         ("slice", "iter") if arg_count == 1 => Some("iter"),
-        // `wrapping_mul` is the Rust spelling of upstream's plain `*`
-        // (lltype `int_mul` wraps); plain `mul` raises nothing.
+        // `wrapping_mul` / `wrapping_sub` are the Rust spelling of
+        // upstream's plain `*` / `-` (lltype `int_mul` / `int_sub`
+        // wrap); the plain `mul` / `sub` ops raise nothing.
         ("num", "wrapping_mul") if arg_count == 2 => Some("mul"),
+        ("num", "wrapping_sub") if arg_count == 2 => Some("sub"),
         _ => None,
     }
 }
