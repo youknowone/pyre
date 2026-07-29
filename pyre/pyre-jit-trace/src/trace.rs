@@ -2141,7 +2141,11 @@ fn try_adopt_single_frame_blackhole(
         &mut latched.miframe,
         majit_metainterp::blackhole::StateFieldLayout::default(),
         virtualizable_info,
-        cf_addr as i64,
+        // RPython threads the current MIFrame's own red virtualizable through
+        // blackhole execution. Keep the explicit driver field aligned with
+        // the same live frame carried in the MIFrame register; the tracing
+        // snapshot is only the epilogue's committed copy.
+        committed_root_addr as i64,
         stack_base,
         ctx.metainterp_sd().as_ref(),
         latched.last_exc_value,

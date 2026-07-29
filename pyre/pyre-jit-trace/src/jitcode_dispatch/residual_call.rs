@@ -148,6 +148,9 @@ pub(crate) fn latch_trace_too_long_blackhole<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     resume_pc: usize,
 ) -> bool {
+    if !ctx.is_authoritative_executor {
+        return false;
+    }
     let last_exc_value = match ctx.last_exc_value_concrete {
         ConcreteValue::Ref(value) => value as i64,
         _ => 0,
