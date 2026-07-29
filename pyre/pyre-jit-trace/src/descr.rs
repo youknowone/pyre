@@ -1852,6 +1852,12 @@ pub fn w_class_obj_for_vtable(vtable: usize) -> Option<i64> {
     if vtable == 0 {
         return None;
     }
+    // A `JitVirtualRef` names itself with a type tag, not a `PyType` address,
+    // and has no `w_class` to answer with — reading the tag as a type would
+    // dereference a constant.
+    if vtable == majit_metainterp::virtualref::JIT_VIRTUAL_REF_VTABLE as usize {
+        return None;
+    }
     let tp = vtable as *const pyre_object::pyobject::PyType;
     let w_class = unsafe { pyre_object::pyobject::get_instantiate(&*tp) };
     if w_class.is_null() {
