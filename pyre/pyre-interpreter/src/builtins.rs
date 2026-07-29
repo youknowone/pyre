@@ -6290,6 +6290,141 @@ fn exception_repr_method(args: &[PyObjectRef]) -> crate::PyResult {
     }))
 }
 
+/// `interp_exceptions.py` typedef `GetSetProperty` entries, per class.
+///
+/// Each class declares only the attributes its own `TypeDef` adds; a
+/// subclass reaches the rest through the MRO the way
+/// `ModuleNotFoundError` reaches `ImportError.msg`.
+fn exception_typedef_attrs(class_name: &str) -> &'static [&'static str] {
+    match class_name {
+        "BaseException" => &[
+            "args",
+            "__cause__",
+            "__context__",
+            "__suppress_context__",
+            "__traceback__",
+        ],
+        "SystemExit" => &["code"],
+        "StopIteration" => &["value"],
+        "OSError" => &[
+            "characters_written",
+            "errno",
+            "filename",
+            "filename2",
+            "strerror",
+        ],
+        "ImportError" => &["msg", "name", "name_from", "path"],
+        "NameError" => &["name"],
+        "AttributeError" => &["name", "obj"],
+        "SyntaxError" => &[
+            "end_lineno",
+            "end_offset",
+            "filename",
+            "lineno",
+            "msg",
+            "offset",
+            "print_file_and_line",
+            "text",
+        ],
+        "UnicodeDecodeError" | "UnicodeEncodeError" | "UnicodeTranslateError" => {
+            &["encoding", "end", "object", "reason", "start"]
+        }
+        "BaseExceptionGroup" => &["exceptions", "message"],
+        _ => &[],
+    }
+}
+
+/// The attribute name a descriptor built by [`make_exception_getset`] carries.
+fn exception_getset_name(w_descr: PyObjectRef) -> String {
+    let w_name = unsafe { pyre_object::typedef::w_getset_get_name(w_descr) };
+    if w_name.is_null() || !unsafe { pyre_object::is_str(w_name) } {
+        return String::new();
+    }
+    unsafe { pyre_object::w_str_get_value(w_name) }.to_string()
+}
+
+/// A name the receiving exception kind does not declare — `OSError`'s
+/// `characters_written` on anything but a `BlockingIOError`, say.  The
+/// descriptor is inherited but reads back as absent.
+fn exception_getset_absent(w_obj: PyObjectRef, name: &str) -> crate::PyError {
+    crate::PyError::attribute_error_with_context(
+        format!(
+            "'{}' object has no attribute '{name}'",
+            crate::baseobjspace::object_functionstr_type_name(w_obj)
+        ),
+        w_obj,
+        name,
+    )
+}
+
+fn exception_getset_fget(args: &[PyObjectRef]) -> crate::PyResult {
+    let (w_descr, w_obj) = (args[0], args[1]);
+    let name = exception_getset_name(w_descr);
+    let found = crate::baseobjspace::exception_attr_get(w_obj, &name)?;
+    if found.is_null() {
+        return Err(exception_getset_absent(w_obj, &name));
+    }
+    Ok(found)
+}
+
+fn exception_getset_fset(args: &[PyObjectRef]) -> crate::PyResult {
+    let (w_descr, w_obj, w_value) = (args[0], args[1], args[2]);
+    let name = exception_getset_name(w_descr);
+    let handled = crate::baseobjspace::exception_attr_set(w_obj, &name, w_value)?;
+    if handled.is_null() {
+        return Err(exception_getset_absent(w_obj, &name));
+    }
+    Ok(handled)
+}
+
+fn exception_getset_fdel(args: &[PyObjectRef]) -> crate::PyResult {
+    let (w_descr, w_obj) = (args[0], args[1]);
+    let name = exception_getset_name(w_descr);
+    let handled = crate::baseobjspace::exception_attr_delete(w_obj, &name)?;
+    if handled.is_null() {
+        return Err(exception_getset_absent(w_obj, &name));
+    }
+    Ok(handled)
+}
+
+/// The three ends of every exception `GetSetProperty`.  One function object
+/// backs all of them, so `exception_attr_slot_fold` recognises a descriptor
+/// it may look through by comparing the `fget` it found against this one.
+fn exception_getset_ends() -> (PyObjectRef, PyObjectRef, PyObjectRef) {
+    static ENDS: std::sync::OnceLock<(usize, usize, usize)> = std::sync::OnceLock::new();
+    let (fget, fset, fdel) = *ENDS.get_or_init(|| {
+        (
+            make_builtin_function_with_arity("__get__", exception_getset_fget, 2) as usize,
+            make_builtin_function_with_arity("__set__", exception_getset_fset, 3) as usize,
+            make_builtin_function_with_arity("__delete__", exception_getset_fdel, 2) as usize,
+        )
+    });
+    (
+        fget as PyObjectRef,
+        fset as PyObjectRef,
+        fdel as PyObjectRef,
+    )
+}
+
+/// The shared `fget` every exception `GetSetProperty` carries.
+pub(crate) fn exception_getset_fget_obj() -> PyObjectRef {
+    exception_getset_ends().0
+}
+
+/// Install the class's `interp_exceptions.py` typedef getsets into `ns`.
+fn install_exception_getsets(ns: PyObjectRef, class_name: &str) {
+    let (fget, fset, fdel) = exception_getset_ends();
+    for attr in exception_typedef_attrs(class_name) {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                attr,
+                crate::typedef::make_getset_property_named(fget, fset, fdel, attr),
+            )
+        };
+    }
+}
+
 /// Build a builtin exception type with the given name, base, and __new__ wrapper.
 pub(crate) fn make_exc_type(
     name: &'static str,
@@ -6340,6 +6475,9 @@ fn make_exc_type_with_init(
                     )
                 };
             }
+            // `interp_exceptions.py` declares each class's typed attributes
+            // as `GetSetProperty` entries on its own `TypeDef`.
+            install_exception_getsets(ns, name);
             // `interp_exceptions.py:291-292` registers `__str__` /
             // `__repr__` on `BaseException`'s typedef, and each of the
             // classes below registers a `descr_str` of its own on top.  A

@@ -6487,6 +6487,381 @@ pub(crate) fn type_del_doc(obj: PyObjectRef) -> PyResult {
     )))
 }
 
+/// The `W_BaseException` typedef's attribute reads, shared by the
+/// per-class `GetSetProperty` descriptors and the instance-attribute miss
+/// path.  `PY_NULL` means the name is not one this exception kind
+/// declares, so the caller continues its own lookup.
+pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
+    match name {
+        "__traceback__" => {
+            // `interp_exceptions.py:196-201 W_BaseException.descr_gettraceback`
+            // returns the `w_traceback` slot stamped by
+            // `descr_settraceback` and the `raise` machinery's
+            // `record_application_traceback`; `None` when none has
+            // been set.  The traceback reaches app level here, so its
+            // frame is marked escaped.
+            let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(obj) };
+            unsafe { crate::pytraceback::mark_traceback_escaped(stored) };
+            return Ok(if stored.is_null() { w_none() } else { stored });
+        }
+        "__cause__" => {
+            // `interp_exceptions.py:163-164 descr_getcause`.
+            let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_cause(obj) };
+            return Ok(if stored.is_null() { w_none() } else { stored });
+        }
+        "__context__" => {
+            // `interp_exceptions.py:180-181 descr_getcontext`.
+            let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_context(obj) };
+            return Ok(if stored.is_null() { w_none() } else { stored });
+        }
+        "__suppress_context__" => {
+            // `interp_exceptions.py:212-213 descr_getsuppresscontext`
+            // returns `space.newbool(self.suppress_context)`.
+            // Defaults to False per `:117 W_BaseException` class
+            // default; `descr_setcause` flips to True.
+            let b =
+                unsafe { pyre_object::interp_exceptions::w_exception_get_suppress_context(obj) };
+            return Ok(pyre_object::w_bool_from(b));
+        }
+        "args" => {
+            // `pypy/module/exceptions/interp_exceptions.py:153
+            // W_BaseException.descr_getargs` returns
+            // `space.newtuple(self.args_w)` — a freshly-built
+            // tuple per call.  `w_exception_get_args` does the
+            // same: it walks the internal list slot and rebuilds
+            // a `W_TupleObject`, returning the empty tuple when
+            // the slot was never stamped.
+            return Ok(unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) });
+        }
+        "message" | "exceptions" => {
+            if let Some(base_group) = crate::builtins::lookup_exc_class("BaseExceptionGroup")
+                && isinstance(obj, base_group)?
+            {
+                let w_dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) };
+                let key = if name == "message" {
+                    "__pyre_exception_group_message"
+                } else {
+                    "__pyre_exception_group_exceptions"
+                };
+                if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, key) } {
+                    return Ok(value);
+                }
+            }
+        }
+        "value" => {
+            // `pypy/module/exceptions/interp_exceptions.py
+            // W_StopIteration.descr_init` stores `value = w_args[0]`,
+            // exposed as `fget_value`.  `generator_send_ex` stamps
+            // the generator's return value into the exception's
+            // `args` tuple; mirror PyPy by returning `args[0]` and
+            // defaulting to `None`.  Only StopIteration uses this
+            // attribute — other exception kinds keep the regular
+            // attribute lookup fall-through.
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if kind == pyre_object::interp_exceptions::ExcKind::StopIteration {
+                // `readwrite_attrproperty_w('w_value')` is a slot of its
+                // own, so an explicit `e.value = x` wins over the
+                // constructor-time `args_w[0]`.  Pyre keeps no dedicated
+                // slot and lands that write in the hasdict instance dict,
+                // so read it first — the same shape as
+                // `syntax_error_attr`.
+                let w_dict = getdict_backing_native(obj);
+                if !w_dict.is_null() {
+                    if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, "value") } {
+                        return Ok(v);
+                    }
+                }
+                let args_tuple =
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
+                // `w_exception_get_args` always returns a real
+                // tuple — empty tuple when `args_w` was never
+                // stamped — so the null-check above is unneeded.
+                let len = unsafe { pyre_object::w_tuple_len(args_tuple) };
+                if len > 0 {
+                    if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args_tuple, 0) } {
+                        return Ok(v);
+                    }
+                }
+                return Ok(w_none());
+            }
+        }
+        "code" => {
+            // `interp_exceptions.py:986-1006 W_SystemExit`: `code` is a
+            // writable `readwrite_attrproperty_w('w_code')` slot
+            // (`:1006`) set by `descr_init` to `args_w[0]` for a single
+            // argument, `newtuple(args_w)` for several, and the
+            // `__init__` default `None` when the instance carries no
+            // arguments.  Read the slot first so an explicit
+            // `e.code = x` write persists, then derive from `args_w`
+            // (the internal-constructor path that bypasses the public
+            // setter), mirroring the OSError `errno` arm.
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if kind == pyre_object::interp_exceptions::ExcKind::SystemExit {
+                let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_code(obj) };
+                if !stored.is_null() {
+                    return Ok(stored);
+                }
+                let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
+                let len = unsafe { pyre_object::w_tuple_len(args) };
+                if len == 1 {
+                    if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, 0) } {
+                        return Ok(v);
+                    }
+                } else if len > 1 {
+                    return Ok(args);
+                }
+                return Ok(w_none());
+            }
+        }
+        // `interp_exceptions.py:739-742 W_OSError` exposes
+        // `errno` / `strerror` / `filename` / `filename2` as
+        // `readwrite_attrproperty_w('w_errno', ...)` slots, populated
+        // by the 2..=5-argument constructor (`errno = args[0]`,
+        // `strerror = args[1]`, `filename = args[2]`,
+        // `filename2 = args[4]`).  Read the writable slot first so a
+        // `e.errno = ...` assignment (`object_setattr`) persists; when
+        // the slot is `PY_NULL` (the internal-constructor path that
+        // never goes through the public setter) fall back to deriving
+        // the value from `args_w` with the same argument-count gate.
+        // Fewer than two arguments leaves all four `None` (the class
+        // defaults).
+        "errno" | "strerror" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::OSError
+                    | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
+            ) {
+                let stored = if name == "errno" {
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_errno(obj) }
+                } else {
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_strerror(obj) }
+                };
+                if !stored.is_null() {
+                    return Ok(stored);
+                }
+                let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
+                let n = unsafe { pyre_object::w_tuple_len(args) };
+                if (2..=5).contains(&n) {
+                    let idx = if name == "errno" { 0 } else { 1 };
+                    if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, idx) } {
+                        return Ok(v);
+                    }
+                }
+                return Ok(w_none());
+            }
+        }
+        "filename" | "filename2" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::OSError
+                    | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
+            ) {
+                let stored = if name == "filename" {
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_filename(obj) }
+                } else {
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_filename2(obj) }
+                };
+                if !stored.is_null() {
+                    return Ok(stored);
+                }
+                // A `BlockingIOError` keeps `characters_written` (a number)
+                // in `args_w[2]`; it is not a filename (`_init_error`).
+                if name == "filename" && exc_blocking_written(obj) {
+                    return Ok(w_none());
+                }
+                let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
+                let n = unsafe { pyre_object::w_tuple_len(args) };
+                let idx: usize = if name == "filename" { 2 } else { 4 };
+                if (3..=5).contains(&n) && idx < n {
+                    if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, idx as i64) } {
+                        return Ok(v);
+                    }
+                }
+                return Ok(w_none());
+            }
+            // `W_SyntaxError` also exposes `filename`, derived from its
+            // `(filename, lineno, ...)` details tuple (`filename2` is OSError-only).
+            if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError && name == "filename" {
+                return Ok(syntax_error_attr(obj, name));
+            }
+        }
+        // `interp_exceptions.py:704-707 descr_get_written` — a
+        // `BlockingIOError` constructed with a numeric third argument keeps
+        // it in `args_w[2]` as `characters_written`; otherwise the slot is
+        // unset (`written == -1`) and the attribute raises `AttributeError`.
+        "characters_written" if exc_blocking_written(obj) => {
+            let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
+            if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, 2) } {
+                return Ok(v);
+            }
+        }
+        // `interp_exceptions.py:409-411 W_ImportError` exposes
+        // `msg` / `path` / `name_from` as `readwrite_attrproperty_w`
+        // slots stamped by `descr_init` from the keyword/positional
+        // arguments, with class default `None` (`:360`).  Each is a
+        // plain slot read: an instance allocated via `__new__` (which
+        // never touches the slot) reads `None`.  Gated on the
+        // ImportError-family kind (ImportError / ModuleNotFoundError).
+        // `name` is handled by the shared arm below since NameError /
+        // AttributeError expose it too.
+        "msg" | "path" | "name_from" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::ImportError
+                    | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
+            ) {
+                let stored = unsafe {
+                    match name {
+                        "msg" => pyre_object::interp_exceptions::w_exception_get_import_msg(obj),
+                        "path" => pyre_object::interp_exceptions::w_exception_get_import_path(obj),
+                        _ => pyre_object::interp_exceptions::w_exception_get_import_name_from(obj),
+                    }
+                };
+                if !stored.is_null() {
+                    return Ok(stored);
+                }
+                return Ok(w_none());
+            }
+            // `W_SyntaxError.msg` — the first constructor argument.
+            if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError && name == "msg" {
+                return Ok(syntax_error_attr(obj, name));
+            }
+        }
+        // Shared `name` attribute for the kinds that expose it —
+        // `W_ImportError` (and `W_ModuleNotFoundError`), `W_NameError`
+        // (and `W_UnboundLocalError`, which subclasses it and so inherits
+        // the descriptor), and `W_AttributeError` (Python 3.10+).  Read
+        // from the shared `w_exc_name` slot (default `None`); falls
+        // through to normal attribute lookup on every other exception
+        // kind.
+        "name" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::ImportError
+                    | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
+                    | pyre_object::interp_exceptions::ExcKind::NameError
+                    | pyre_object::interp_exceptions::ExcKind::UnboundLocalError
+                    | pyre_object::interp_exceptions::ExcKind::AttributeError
+            ) {
+                let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_name(obj) };
+                if !stored.is_null() {
+                    return Ok(stored);
+                }
+                return Ok(w_none());
+            }
+        }
+        // `W_AttributeError.obj` (Python 3.10+) — the object whose
+        // attribute lookup failed; default `None`.
+        "obj" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if kind == pyre_object::interp_exceptions::ExcKind::AttributeError {
+                let stored =
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_attr_obj(obj) };
+                if !stored.is_null() {
+                    return Ok(stored);
+                }
+                return Ok(w_none());
+            }
+        }
+        // `interp_exceptions.py:468-471`
+        // `readwrite_attrproperty_w('w_object', W_UnicodeTranslateError)`
+        // (and `:1081-1083` / `:1201-1203` for Decode / Encode).
+        // PyPy surfaces these as direct slot reads — `None` when the
+        // exception was constructed without going through
+        // `descr_init`.  Pyre stores `PY_NULL` in that case and
+        // resolves to `space.w_None` here, matching PyPy's
+        // class-default `w_object = None`.
+        //
+        // Gated on the three Unicode*Error kinds because PyPy
+        // attaches these `attrproperty_w` descriptors only on
+        // those typedefs — other exception kinds keep the regular
+        // attribute lookup fall-through.
+        "object" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+            ) {
+                let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_object(obj) };
+                return Ok(if stored.is_null() { w_none() } else { stored });
+            }
+        }
+        "start" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+            ) {
+                let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_start(obj) };
+                return Ok(if stored.is_null() { w_none() } else { stored });
+            }
+        }
+        "end" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+            ) {
+                let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_end(obj) };
+                return Ok(if stored.is_null() { w_none() } else { stored });
+            }
+        }
+        "reason" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+            ) {
+                let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_reason(obj) };
+                return Ok(if stored.is_null() { w_none() } else { stored });
+            }
+        }
+        "encoding" => {
+            // `interp_exceptions.py:1080 W_UnicodeDecodeError.encoding`
+            // / `:1200 W_UnicodeEncodeError.encoding`.  Python 3.14
+            // declares `encoding` on `UnicodeError` itself, so a
+            // `UnicodeTranslateError` — which never stamps the slot —
+            // reports `None` rather than raising; PyPy's typedef
+            // (`:461-471`) omits the attrproperty there.
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+            ) {
+                let stored =
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_encoding(obj) };
+                return Ok(if stored.is_null() { w_none() } else { stored });
+            }
+        }
+        // `W_SyntaxError` location attributes, derived from the
+        // `(filename, lineno, offset, text[, end_lineno, end_offset])`
+        // details tuple; `print_file_and_line` is a vestigial slot.
+        // `filename` / `msg` are handled by the shared arms above.
+        "lineno" | "offset" | "text" | "end_lineno" | "end_offset" | "print_file_and_line" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError {
+                return Ok(syntax_error_attr(obj, name));
+            }
+        }
+        _ => {}
+    }
+    Ok(pyre_object::PY_NULL)
+}
+
 fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResult {
     if name == "__dict__" && unsafe { is_module(obj) } {
         let dict = unsafe { pyre_object::w_module_get_w_dict(obj) };
@@ -7140,391 +7515,9 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     }
     // Exception attributes — PyPy: W_BaseException attributes
     if unsafe { pyre_object::is_exception(obj) } {
-        match name {
-            "__traceback__" => {
-                // `interp_exceptions.py:196-201 W_BaseException.descr_gettraceback`
-                // returns the `w_traceback` slot stamped by
-                // `descr_settraceback` and the `raise` machinery's
-                // `record_application_traceback`; `None` when none has
-                // been set.  The traceback reaches app level here, so its
-                // frame is marked escaped.
-                let stored =
-                    unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(obj) };
-                unsafe { crate::pytraceback::mark_traceback_escaped(stored) };
-                return Ok(if stored.is_null() { w_none() } else { stored });
-            }
-            "__cause__" => {
-                // `interp_exceptions.py:163-164 descr_getcause`.
-                let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_cause(obj) };
-                return Ok(if stored.is_null() { w_none() } else { stored });
-            }
-            "__context__" => {
-                // `interp_exceptions.py:180-181 descr_getcontext`.
-                let stored =
-                    unsafe { pyre_object::interp_exceptions::w_exception_get_context(obj) };
-                return Ok(if stored.is_null() { w_none() } else { stored });
-            }
-            "__suppress_context__" => {
-                // `interp_exceptions.py:212-213 descr_getsuppresscontext`
-                // returns `space.newbool(self.suppress_context)`.
-                // Defaults to False per `:117 W_BaseException` class
-                // default; `descr_setcause` flips to True.
-                let b = unsafe {
-                    pyre_object::interp_exceptions::w_exception_get_suppress_context(obj)
-                };
-                return Ok(pyre_object::w_bool_from(b));
-            }
-            "args" => {
-                // `pypy/module/exceptions/interp_exceptions.py:153
-                // W_BaseException.descr_getargs` returns
-                // `space.newtuple(self.args_w)` — a freshly-built
-                // tuple per call.  `w_exception_get_args` does the
-                // same: it walks the internal list slot and rebuilds
-                // a `W_TupleObject`, returning the empty tuple when
-                // the slot was never stamped.
-                return Ok(unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) });
-            }
-            "message" | "exceptions" => {
-                if let Some(base_group) = crate::builtins::lookup_exc_class("BaseExceptionGroup")
-                    && isinstance(obj, base_group)?
-                {
-                    let w_dict =
-                        unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) };
-                    let key = if name == "message" {
-                        "__pyre_exception_group_message"
-                    } else {
-                        "__pyre_exception_group_exceptions"
-                    };
-                    if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, key) } {
-                        return Ok(value);
-                    }
-                }
-            }
-            "value" => {
-                // `pypy/module/exceptions/interp_exceptions.py
-                // W_StopIteration.descr_init` stores `value = w_args[0]`,
-                // exposed as `fget_value`.  `generator_send_ex` stamps
-                // the generator's return value into the exception's
-                // `args` tuple; mirror PyPy by returning `args[0]` and
-                // defaulting to `None`.  Only StopIteration uses this
-                // attribute — other exception kinds keep the regular
-                // attribute lookup fall-through.
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::interp_exceptions::ExcKind::StopIteration {
-                    // `readwrite_attrproperty_w('w_value')` is a slot of its
-                    // own, so an explicit `e.value = x` wins over the
-                    // constructor-time `args_w[0]`.  Pyre keeps no dedicated
-                    // slot and lands that write in the hasdict instance dict,
-                    // so read it first — the same shape as
-                    // `syntax_error_attr`.
-                    let w_dict = getdict_backing_native(obj);
-                    if !w_dict.is_null() {
-                        if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, "value") }
-                        {
-                            return Ok(v);
-                        }
-                    }
-                    let args_tuple =
-                        unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
-                    // `w_exception_get_args` always returns a real
-                    // tuple — empty tuple when `args_w` was never
-                    // stamped — so the null-check above is unneeded.
-                    let len = unsafe { pyre_object::w_tuple_len(args_tuple) };
-                    if len > 0 {
-                        if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args_tuple, 0) } {
-                            return Ok(v);
-                        }
-                    }
-                    return Ok(w_none());
-                }
-            }
-            "code" => {
-                // `interp_exceptions.py:986-1006 W_SystemExit`: `code` is a
-                // writable `readwrite_attrproperty_w('w_code')` slot
-                // (`:1006`) set by `descr_init` to `args_w[0]` for a single
-                // argument, `newtuple(args_w)` for several, and the
-                // `__init__` default `None` when the instance carries no
-                // arguments.  Read the slot first so an explicit
-                // `e.code = x` write persists, then derive from `args_w`
-                // (the internal-constructor path that bypasses the public
-                // setter), mirroring the OSError `errno` arm.
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::interp_exceptions::ExcKind::SystemExit {
-                    let stored =
-                        unsafe { pyre_object::interp_exceptions::w_exception_get_code(obj) };
-                    if !stored.is_null() {
-                        return Ok(stored);
-                    }
-                    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
-                    let len = unsafe { pyre_object::w_tuple_len(args) };
-                    if len == 1 {
-                        if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, 0) } {
-                            return Ok(v);
-                        }
-                    } else if len > 1 {
-                        return Ok(args);
-                    }
-                    return Ok(w_none());
-                }
-            }
-            // `interp_exceptions.py:739-742 W_OSError` exposes
-            // `errno` / `strerror` / `filename` / `filename2` as
-            // `readwrite_attrproperty_w('w_errno', ...)` slots, populated
-            // by the 2..=5-argument constructor (`errno = args[0]`,
-            // `strerror = args[1]`, `filename = args[2]`,
-            // `filename2 = args[4]`).  Read the writable slot first so a
-            // `e.errno = ...` assignment (`object_setattr`) persists; when
-            // the slot is `PY_NULL` (the internal-constructor path that
-            // never goes through the public setter) fall back to deriving
-            // the value from `args_w` with the same argument-count gate.
-            // Fewer than two arguments leaves all four `None` (the class
-            // defaults).
-            "errno" | "strerror" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if matches!(
-                    kind,
-                    pyre_object::interp_exceptions::ExcKind::OSError
-                        | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
-                ) {
-                    let stored = if name == "errno" {
-                        unsafe { pyre_object::interp_exceptions::w_exception_get_errno(obj) }
-                    } else {
-                        unsafe { pyre_object::interp_exceptions::w_exception_get_strerror(obj) }
-                    };
-                    if !stored.is_null() {
-                        return Ok(stored);
-                    }
-                    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
-                    let n = unsafe { pyre_object::w_tuple_len(args) };
-                    if (2..=5).contains(&n) {
-                        let idx = if name == "errno" { 0 } else { 1 };
-                        if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, idx) } {
-                            return Ok(v);
-                        }
-                    }
-                    return Ok(w_none());
-                }
-            }
-            "filename" | "filename2" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if matches!(
-                    kind,
-                    pyre_object::interp_exceptions::ExcKind::OSError
-                        | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
-                ) {
-                    let stored = if name == "filename" {
-                        unsafe { pyre_object::interp_exceptions::w_exception_get_filename(obj) }
-                    } else {
-                        unsafe { pyre_object::interp_exceptions::w_exception_get_filename2(obj) }
-                    };
-                    if !stored.is_null() {
-                        return Ok(stored);
-                    }
-                    // A `BlockingIOError` keeps `characters_written` (a number)
-                    // in `args_w[2]`; it is not a filename (`_init_error`).
-                    if name == "filename" && exc_blocking_written(obj) {
-                        return Ok(w_none());
-                    }
-                    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
-                    let n = unsafe { pyre_object::w_tuple_len(args) };
-                    let idx: usize = if name == "filename" { 2 } else { 4 };
-                    if (3..=5).contains(&n) && idx < n {
-                        if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, idx as i64) } {
-                            return Ok(v);
-                        }
-                    }
-                    return Ok(w_none());
-                }
-                // `W_SyntaxError` also exposes `filename`, derived from its
-                // `(filename, lineno, ...)` details tuple (`filename2` is OSError-only).
-                if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError
-                    && name == "filename"
-                {
-                    return Ok(syntax_error_attr(obj, name));
-                }
-            }
-            // `interp_exceptions.py:704-707 descr_get_written` — a
-            // `BlockingIOError` constructed with a numeric third argument keeps
-            // it in `args_w[2]` as `characters_written`; otherwise the slot is
-            // unset (`written == -1`) and the attribute raises `AttributeError`.
-            "characters_written" if exc_blocking_written(obj) => {
-                let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
-                if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, 2) } {
-                    return Ok(v);
-                }
-            }
-            // `interp_exceptions.py:409-411 W_ImportError` exposes
-            // `msg` / `path` / `name_from` as `readwrite_attrproperty_w`
-            // slots stamped by `descr_init` from the keyword/positional
-            // arguments, with class default `None` (`:360`).  Each is a
-            // plain slot read: an instance allocated via `__new__` (which
-            // never touches the slot) reads `None`.  Gated on the
-            // ImportError-family kind (ImportError / ModuleNotFoundError).
-            // `name` is handled by the shared arm below since NameError /
-            // AttributeError expose it too.
-            "msg" | "path" | "name_from" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if matches!(
-                    kind,
-                    pyre_object::interp_exceptions::ExcKind::ImportError
-                        | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
-                ) {
-                    let stored = unsafe {
-                        match name {
-                            "msg" => {
-                                pyre_object::interp_exceptions::w_exception_get_import_msg(obj)
-                            }
-                            "path" => {
-                                pyre_object::interp_exceptions::w_exception_get_import_path(obj)
-                            }
-                            _ => pyre_object::interp_exceptions::w_exception_get_import_name_from(
-                                obj,
-                            ),
-                        }
-                    };
-                    if !stored.is_null() {
-                        return Ok(stored);
-                    }
-                    return Ok(w_none());
-                }
-                // `W_SyntaxError.msg` — the first constructor argument.
-                if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError && name == "msg" {
-                    return Ok(syntax_error_attr(obj, name));
-                }
-            }
-            // Shared `name` attribute for the kinds that expose it —
-            // `W_ImportError` (and `W_ModuleNotFoundError`), `W_NameError`
-            // (and `W_UnboundLocalError`, which subclasses it and so inherits
-            // the descriptor), and `W_AttributeError` (Python 3.10+).  Read
-            // from the shared `w_exc_name` slot (default `None`); falls
-            // through to normal attribute lookup on every other exception
-            // kind.
-            "name" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if matches!(
-                    kind,
-                    pyre_object::interp_exceptions::ExcKind::ImportError
-                        | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
-                        | pyre_object::interp_exceptions::ExcKind::NameError
-                        | pyre_object::interp_exceptions::ExcKind::UnboundLocalError
-                        | pyre_object::interp_exceptions::ExcKind::AttributeError
-                ) {
-                    let stored =
-                        unsafe { pyre_object::interp_exceptions::w_exception_get_name(obj) };
-                    if !stored.is_null() {
-                        return Ok(stored);
-                    }
-                    return Ok(w_none());
-                }
-            }
-            // `W_AttributeError.obj` (Python 3.10+) — the object whose
-            // attribute lookup failed; default `None`.
-            "obj" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::interp_exceptions::ExcKind::AttributeError {
-                    let stored =
-                        unsafe { pyre_object::interp_exceptions::w_exception_get_attr_obj(obj) };
-                    if !stored.is_null() {
-                        return Ok(stored);
-                    }
-                    return Ok(w_none());
-                }
-            }
-            // `interp_exceptions.py:468-471`
-            // `readwrite_attrproperty_w('w_object', W_UnicodeTranslateError)`
-            // (and `:1081-1083` / `:1201-1203` for Decode / Encode).
-            // PyPy surfaces these as direct slot reads — `None` when the
-            // exception was constructed without going through
-            // `descr_init`.  Pyre stores `PY_NULL` in that case and
-            // resolves to `space.w_None` here, matching PyPy's
-            // class-default `w_object = None`.
-            //
-            // Gated on the three Unicode*Error kinds because PyPy
-            // attaches these `attrproperty_w` descriptors only on
-            // those typedefs — other exception kinds keep the regular
-            // attribute lookup fall-through.
-            "object" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if matches!(
-                    kind,
-                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
-                ) {
-                    let stored =
-                        unsafe { pyre_object::interp_exceptions::w_exception_get_object(obj) };
-                    return Ok(if stored.is_null() { w_none() } else { stored });
-                }
-            }
-            "start" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if matches!(
-                    kind,
-                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
-                ) {
-                    let stored =
-                        unsafe { pyre_object::interp_exceptions::w_exception_get_start(obj) };
-                    return Ok(if stored.is_null() { w_none() } else { stored });
-                }
-            }
-            "end" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if matches!(
-                    kind,
-                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
-                ) {
-                    let stored =
-                        unsafe { pyre_object::interp_exceptions::w_exception_get_end(obj) };
-                    return Ok(if stored.is_null() { w_none() } else { stored });
-                }
-            }
-            "reason" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if matches!(
-                    kind,
-                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
-                ) {
-                    let stored =
-                        unsafe { pyre_object::interp_exceptions::w_exception_get_reason(obj) };
-                    return Ok(if stored.is_null() { w_none() } else { stored });
-                }
-            }
-            "encoding" => {
-                // `interp_exceptions.py:1080 W_UnicodeDecodeError.encoding`
-                // / `:1200 W_UnicodeEncodeError.encoding`.  Python 3.14
-                // declares `encoding` on `UnicodeError` itself, so a
-                // `UnicodeTranslateError` — which never stamps the slot —
-                // reports `None` rather than raising; PyPy's typedef
-                // (`:461-471`) omits the attrproperty there.
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if matches!(
-                    kind,
-                    pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
-                ) {
-                    let stored =
-                        unsafe { pyre_object::interp_exceptions::w_exception_get_encoding(obj) };
-                    return Ok(if stored.is_null() { w_none() } else { stored });
-                }
-            }
-            // `W_SyntaxError` location attributes, derived from the
-            // `(filename, lineno, offset, text[, end_lineno, end_offset])`
-            // details tuple; `print_file_and_line` is a vestigial slot.
-            // `filename` / `msg` are handled by the shared arms above.
-            "lineno" | "offset" | "text" | "end_lineno" | "end_offset" | "print_file_and_line" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError {
-                    return Ok(syntax_error_attr(obj, name));
-                }
-            }
-            _ => {}
+        let found = exception_attr_get(obj, name)?;
+        if !found.is_null() {
+            return Ok(found);
         }
     }
     // __dict__: use getdict() — only returns a dict for hasdict objects,
@@ -10396,6 +10389,303 @@ pub fn type_immutable_attr_raise_is_stable(obj: PyObjectRef, name: &str, is_dele
     }
 }
 
+/// The `W_BaseException` typedef's attribute writes, shared by the
+/// per-class `GetSetProperty` descriptors and the instance-attribute store
+/// path.  `PY_NULL` means the name is not one this exception kind
+/// declares, so the caller falls back to the instance dict.
+pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
+    if matches!(name, "message" | "exceptions")
+        && crate::builtins::lookup_exc_class("BaseExceptionGroup")
+            .is_some_and(|base_group| isinstance(obj, base_group).unwrap_or(false))
+    {
+        return Err(PyError::attribute_error("readonly attribute"));
+    }
+    // `pypy/module/exceptions/interp_exceptions.py:156-157
+    // W_BaseException.descr_setargs` →
+    //   self.args_w = space.fixedview(w_newargs)
+    // `space.fixedview` materialises any iterable into a list of
+    // wrapped objects; pyre stores `args_w` as a tuple `PyObjectRef`,
+    // so coerce the incoming value into a tuple shape (tuple stays
+    // as-is, list wraps into tuple, anything else iterates).
+    if name == "args" {
+        let coerced = unsafe { coerce_to_list_for_args(value)? };
+        unsafe { pyre_object::interp_exceptions::w_exception_set_args(obj, coerced) };
+        return Ok(w_none());
+    }
+    // `interp_exceptions.py:165-219` — the four special exception
+    // attributes (`__cause__`, `__context__`, `__traceback__`,
+    // `__suppress_context__`) are registered as `GetSetProperty`
+    // setters on `W_BaseException.typedef` and each validates its
+    // input before storing into the matching typed slot
+    // (`w_cause`/`w_context`/`w_traceback`/`suppress_context`,
+    // line 113-117).  Storage lives on `W_BaseException`
+    // directly — no side store for these four names.
+    match name {
+        "__dict__" => {
+            // `interp_exceptions.py:293` registers
+            // `__dict__ = GetSetProperty(descr_get_dict, descr_set_dict)`
+            // whose setter routes to `setdict` (typedef.py
+            // descr_set_dict) — replaces the whole instance dict.
+            setdict(obj, value)?;
+            return Ok(w_none());
+        }
+        "__cause__" => {
+            // `interp_exceptions.py:166-174 descr_setcause` — None
+            // OR an instance whose type derives from `BaseException`,
+            // and always flips `suppress_context` to True.
+            if !unsafe { pyre_object::is_none(value) } {
+                let value_type =
+                    crate::typedef::r#type(value).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+                if value_type.is_null() || !unsafe { exception_is_valid_class_w(value_type) } {
+                    return Err(PyError::type_error(
+                        "exception cause must be None or derive from BaseException",
+                    ));
+                }
+            }
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_cause(obj, value);
+                pyre_object::interp_exceptions::w_exception_set_suppress_context(obj, true);
+            };
+            return Ok(w_none());
+        }
+        "__context__" => {
+            // `interp_exceptions.py:183-190 descr_setcontext` — None
+            // OR an instance whose type derives from `BaseException`.
+            if !unsafe { pyre_object::is_none(value) } {
+                let value_type =
+                    crate::typedef::r#type(value).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+                if value_type.is_null() || !unsafe { exception_is_valid_class_w(value_type) } {
+                    return Err(PyError::type_error(
+                        "exception context must be None or derive from BaseException",
+                    ));
+                }
+            }
+            unsafe { pyre_object::interp_exceptions::w_exception_set_context(obj, value) };
+            return Ok(w_none());
+        }
+        "__traceback__" => {
+            // `interp_exceptions.py:202-206 descr_settraceback` —
+            // accept None or PyTraceback only.  Now that real
+            // PyTraceback exists, narrow the type check to the
+            // exact pair PyPy accepts; reject everything else as
+            // TypeError per PyPy.
+            let accept =
+                unsafe { pyre_object::is_none(value) || crate::pytraceback::is_pytraceback(value) };
+            if !accept {
+                return Err(PyError::type_error(
+                    "__traceback__ must be a traceback or None",
+                ));
+            }
+            let stored = if unsafe { pyre_object::is_none(value) } {
+                pyre_object::PY_NULL
+            } else {
+                value
+            };
+            unsafe { pyre_object::interp_exceptions::w_exception_set_traceback(obj, stored) };
+            return Ok(w_none());
+        }
+        "__suppress_context__" => {
+            // `interp_exceptions.py:215-216 descr_setsuppresscontext`
+            // — `space.bool_w(w_value)` coerces via `__bool__`.
+            let b = is_true(value)?;
+            unsafe { pyre_object::interp_exceptions::w_exception_set_suppress_context(obj, b) };
+            return Ok(w_none());
+        }
+        // `interp_exceptions.py:468-471`
+        // `readwrite_attrproperty_w('w_object', W_UnicodeTranslateError)`
+        // and `:1081-1083` / `:1201-1203` for Decode / Encode.
+        // PyPy's `attrproperty_w` writer stores the raw `w_value`
+        // into the slot with no type coercion — that matches the
+        // direct slot write here.  Gated on the three Unicode*Error
+        // kinds because PyPy installs these descriptors only on
+        // those typedefs.
+        "object" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+            ) {
+                unsafe { pyre_object::interp_exceptions::w_exception_set_object(obj, value) };
+                return Ok(w_none());
+            }
+        }
+        "start" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+            ) {
+                unsafe { pyre_object::interp_exceptions::w_exception_set_start(obj, value) };
+                return Ok(w_none());
+            }
+        }
+        "end" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+            ) {
+                unsafe { pyre_object::interp_exceptions::w_exception_set_end(obj, value) };
+                return Ok(w_none());
+            }
+        }
+        "reason" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+            ) {
+                unsafe { pyre_object::interp_exceptions::w_exception_set_reason(obj, value) };
+                return Ok(w_none());
+            }
+        }
+        "encoding" => {
+            // `interp_exceptions.py:1080 W_UnicodeDecodeError.encoding`
+            // / `:1200 W_UnicodeEncodeError.encoding`.  Translate has
+            // no encoding attrproperty per `:461-471` typedef.
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+            ) {
+                unsafe { pyre_object::interp_exceptions::w_exception_set_encoding(obj, value) };
+                return Ok(w_none());
+            }
+        }
+        // `interp_exceptions.py:739-742` —
+        // `readwrite_attrproperty_w('w_errno' / 'w_strerror' /
+        // 'w_filename' / 'w_filename2', W_OSError)`.  The
+        // `attrproperty_w` writer stores the raw `w_value` into the
+        // slot; the matching getattr arm reads it back ahead of the
+        // `args_w`-derived fallback.  Gated on the OSError family
+        // (OSError / FileNotFoundError) because PyPy installs these
+        // descriptors only on `W_OSError.typedef`.
+        "errno" | "strerror" | "filename" | "filename2" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::OSError
+                    | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
+            ) {
+                unsafe {
+                    match name {
+                        "errno" => {
+                            pyre_object::interp_exceptions::w_exception_set_errno(obj, value)
+                        }
+                        "strerror" => {
+                            pyre_object::interp_exceptions::w_exception_set_strerror(obj, value)
+                        }
+                        "filename" => {
+                            pyre_object::interp_exceptions::w_exception_set_filename(obj, value)
+                        }
+                        _ => pyre_object::interp_exceptions::w_exception_set_filename2(obj, value),
+                    }
+                };
+                return Ok(w_none());
+            }
+        }
+        // `interp_exceptions.py:1006
+        // readwrite_attrproperty_w('w_code', W_SystemExit)` — the
+        // writer stores the raw `w_value` into the slot; the matching
+        // getattr arm reads it back ahead of the `args_w`-derived
+        // fallback.  Gated on SystemExit because PyPy installs the
+        // descriptor only on `W_SystemExit.typedef`.
+        "code" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if kind == pyre_object::interp_exceptions::ExcKind::SystemExit {
+                unsafe { pyre_object::interp_exceptions::w_exception_set_code(obj, value) };
+                return Ok(w_none());
+            }
+        }
+        // `interp_exceptions.py:679-681 W_ImportError` writable
+        // `msg` / `name` / `path` (plus `name_from`) slots; the
+        // matching getattr arm reads them back.  Gated on the
+        // ImportError-family kind (ImportError / ModuleNotFoundError).
+        // `name` is handled by the shared arm below.
+        "msg" | "path" | "name_from" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::ImportError
+                    | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
+            ) {
+                unsafe {
+                    match name {
+                        "msg" => {
+                            pyre_object::interp_exceptions::w_exception_set_import_msg(obj, value)
+                        }
+                        "path" => {
+                            pyre_object::interp_exceptions::w_exception_set_import_path(obj, value)
+                        }
+                        _ => pyre_object::interp_exceptions::w_exception_set_import_name_from(
+                            obj, value,
+                        ),
+                    }
+                };
+                return Ok(w_none());
+            }
+        }
+        // Shared writable `name` slot for ImportError / ModuleNotFoundError
+        // / NameError (and its UnboundLocalError subclass) / AttributeError;
+        // the matching getattr arm reads it back.
+        "name" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::ImportError
+                    | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
+                    | pyre_object::interp_exceptions::ExcKind::NameError
+                    | pyre_object::interp_exceptions::ExcKind::UnboundLocalError
+                    | pyre_object::interp_exceptions::ExcKind::AttributeError
+            ) {
+                unsafe { pyre_object::interp_exceptions::w_exception_set_name(obj, value) };
+                return Ok(w_none());
+            }
+        }
+        // Writable `obj` slot (W_AttributeError).
+        "obj" => {
+            let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
+            if kind == pyre_object::interp_exceptions::ExcKind::AttributeError {
+                unsafe { pyre_object::interp_exceptions::w_exception_set_attr_obj(obj, value) };
+                return Ok(w_none());
+            }
+        }
+        _ => {}
+    }
+    // `W_SyntaxError`'s writable location slots.  `syntax_error_attr` reads
+    // the instance dict before deriving from the `(filename, lineno, offset,
+    // text[, end_lineno, end_offset])` details tuple, so the store lands
+    // there; the `msg` / `filename` arms above belong to other kinds and fall
+    // through to here.
+    if matches!(
+        name,
+        "msg"
+            | "filename"
+            | "lineno"
+            | "offset"
+            | "text"
+            | "end_lineno"
+            | "end_offset"
+            | "print_file_and_line"
+    ) && unsafe { pyre_object::w_exception_get_kind(obj) }
+        == pyre_object::interp_exceptions::ExcKind::SyntaxError
+        && setdictvalue(obj, name, value)?
+    {
+        return Ok(w_none());
+    }
+    Ok(pyre_object::PY_NULL)
+}
+
 /// `objectobject.py descr__setattr__` — the terminal implementation
 /// that bypasses user `__setattr__` overrides and writes directly
 /// through the descriptor / instance-dict path.  Called by
@@ -10585,276 +10875,9 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     // Non-special names land in the lazily allocated instance dict on
     // `W_BaseException.w_dict` (interp_exceptions.py:113, 222-225).
     if unsafe { pyre_object::is_exception(obj) } {
-        if matches!(name, "message" | "exceptions")
-            && crate::builtins::lookup_exc_class("BaseExceptionGroup")
-                .is_some_and(|base_group| isinstance(obj, base_group).unwrap_or(false))
-        {
-            return Err(PyError::attribute_error("readonly attribute"));
-        }
-        // `pypy/module/exceptions/interp_exceptions.py:156-157
-        // W_BaseException.descr_setargs` →
-        //   self.args_w = space.fixedview(w_newargs)
-        // `space.fixedview` materialises any iterable into a list of
-        // wrapped objects; pyre stores `args_w` as a tuple `PyObjectRef`,
-        // so coerce the incoming value into a tuple shape (tuple stays
-        // as-is, list wraps into tuple, anything else iterates).
-        if name == "args" {
-            let coerced = unsafe { coerce_to_list_for_args(value)? };
-            unsafe { pyre_object::interp_exceptions::w_exception_set_args(obj, coerced) };
-            return Ok(w_none());
-        }
-        // `interp_exceptions.py:165-219` — the four special exception
-        // attributes (`__cause__`, `__context__`, `__traceback__`,
-        // `__suppress_context__`) are registered as `GetSetProperty`
-        // setters on `W_BaseException.typedef` and each validates its
-        // input before storing into the matching typed slot
-        // (`w_cause`/`w_context`/`w_traceback`/`suppress_context`,
-        // line 113-117).  Storage lives on `W_BaseException`
-        // directly — no side store for these four names.
-        match name {
-            "__dict__" => {
-                // `interp_exceptions.py:293` registers
-                // `__dict__ = GetSetProperty(descr_get_dict, descr_set_dict)`
-                // whose setter routes to `setdict` (typedef.py
-                // descr_set_dict) — replaces the whole instance dict.
-                setdict(obj, value)?;
-                return Ok(w_none());
-            }
-            "__cause__" => {
-                // `interp_exceptions.py:166-174 descr_setcause` — None
-                // OR an instance whose type derives from `BaseException`,
-                // and always flips `suppress_context` to True.
-                if !unsafe { pyre_object::is_none(value) } {
-                    let value_type =
-                        crate::typedef::r#type(value).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
-                    if value_type.is_null() || !unsafe { exception_is_valid_class_w(value_type) } {
-                        return Err(PyError::type_error(
-                            "exception cause must be None or derive from BaseException",
-                        ));
-                    }
-                }
-                unsafe {
-                    pyre_object::interp_exceptions::w_exception_set_cause(obj, value);
-                    pyre_object::interp_exceptions::w_exception_set_suppress_context(obj, true);
-                };
-                return Ok(w_none());
-            }
-            "__context__" => {
-                // `interp_exceptions.py:183-190 descr_setcontext` — None
-                // OR an instance whose type derives from `BaseException`.
-                if !unsafe { pyre_object::is_none(value) } {
-                    let value_type =
-                        crate::typedef::r#type(value).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
-                    if value_type.is_null() || !unsafe { exception_is_valid_class_w(value_type) } {
-                        return Err(PyError::type_error(
-                            "exception context must be None or derive from BaseException",
-                        ));
-                    }
-                }
-                unsafe { pyre_object::interp_exceptions::w_exception_set_context(obj, value) };
-                return Ok(w_none());
-            }
-            "__traceback__" => {
-                // `interp_exceptions.py:202-206 descr_settraceback` —
-                // accept None or PyTraceback only.  Now that real
-                // PyTraceback exists, narrow the type check to the
-                // exact pair PyPy accepts; reject everything else as
-                // TypeError per PyPy.
-                let accept = unsafe {
-                    pyre_object::is_none(value) || crate::pytraceback::is_pytraceback(value)
-                };
-                if !accept {
-                    return Err(PyError::type_error(
-                        "__traceback__ must be a traceback or None",
-                    ));
-                }
-                let stored = if unsafe { pyre_object::is_none(value) } {
-                    pyre_object::PY_NULL
-                } else {
-                    value
-                };
-                unsafe { pyre_object::interp_exceptions::w_exception_set_traceback(obj, stored) };
-                return Ok(w_none());
-            }
-            "__suppress_context__" => {
-                // `interp_exceptions.py:215-216 descr_setsuppresscontext`
-                // — `space.bool_w(w_value)` coerces via `__bool__`.
-                let b = is_true(value)?;
-                unsafe { pyre_object::interp_exceptions::w_exception_set_suppress_context(obj, b) };
-                return Ok(w_none());
-            }
-            // `interp_exceptions.py:468-471`
-            // `readwrite_attrproperty_w('w_object', W_UnicodeTranslateError)`
-            // and `:1081-1083` / `:1201-1203` for Decode / Encode.
-            // PyPy's `attrproperty_w` writer stores the raw `w_value`
-            // into the slot with no type coercion — that matches the
-            // direct slot write here.  Gated on the three Unicode*Error
-            // kinds because PyPy installs these descriptors only on
-            // those typedefs.
-            "object" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if matches!(
-                    kind,
-                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
-                ) {
-                    unsafe { pyre_object::interp_exceptions::w_exception_set_object(obj, value) };
-                    return Ok(w_none());
-                }
-            }
-            "start" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if matches!(
-                    kind,
-                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
-                ) {
-                    unsafe { pyre_object::interp_exceptions::w_exception_set_start(obj, value) };
-                    return Ok(w_none());
-                }
-            }
-            "end" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if matches!(
-                    kind,
-                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
-                ) {
-                    unsafe { pyre_object::interp_exceptions::w_exception_set_end(obj, value) };
-                    return Ok(w_none());
-                }
-            }
-            "reason" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if matches!(
-                    kind,
-                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
-                ) {
-                    unsafe { pyre_object::interp_exceptions::w_exception_set_reason(obj, value) };
-                    return Ok(w_none());
-                }
-            }
-            "encoding" => {
-                // `interp_exceptions.py:1080 W_UnicodeDecodeError.encoding`
-                // / `:1200 W_UnicodeEncodeError.encoding`.  Translate has
-                // no encoding attrproperty per `:461-471` typedef.
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if matches!(
-                    kind,
-                    pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
-                ) {
-                    unsafe { pyre_object::interp_exceptions::w_exception_set_encoding(obj, value) };
-                    return Ok(w_none());
-                }
-            }
-            // `interp_exceptions.py:739-742` —
-            // `readwrite_attrproperty_w('w_errno' / 'w_strerror' /
-            // 'w_filename' / 'w_filename2', W_OSError)`.  The
-            // `attrproperty_w` writer stores the raw `w_value` into the
-            // slot; the matching getattr arm reads it back ahead of the
-            // `args_w`-derived fallback.  Gated on the OSError family
-            // (OSError / FileNotFoundError) because PyPy installs these
-            // descriptors only on `W_OSError.typedef`.
-            "errno" | "strerror" | "filename" | "filename2" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if matches!(
-                    kind,
-                    pyre_object::interp_exceptions::ExcKind::OSError
-                        | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
-                ) {
-                    unsafe {
-                        match name {
-                            "errno" => {
-                                pyre_object::interp_exceptions::w_exception_set_errno(obj, value)
-                            }
-                            "strerror" => {
-                                pyre_object::interp_exceptions::w_exception_set_strerror(obj, value)
-                            }
-                            "filename" => {
-                                pyre_object::interp_exceptions::w_exception_set_filename(obj, value)
-                            }
-                            _ => pyre_object::interp_exceptions::w_exception_set_filename2(
-                                obj, value,
-                            ),
-                        }
-                    };
-                    return Ok(w_none());
-                }
-            }
-            // `interp_exceptions.py:1006
-            // readwrite_attrproperty_w('w_code', W_SystemExit)` — the
-            // writer stores the raw `w_value` into the slot; the matching
-            // getattr arm reads it back ahead of the `args_w`-derived
-            // fallback.  Gated on SystemExit because PyPy installs the
-            // descriptor only on `W_SystemExit.typedef`.
-            "code" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::interp_exceptions::ExcKind::SystemExit {
-                    unsafe { pyre_object::interp_exceptions::w_exception_set_code(obj, value) };
-                    return Ok(w_none());
-                }
-            }
-            // `interp_exceptions.py:679-681 W_ImportError` writable
-            // `msg` / `name` / `path` (plus `name_from`) slots; the
-            // matching getattr arm reads them back.  Gated on the
-            // ImportError-family kind (ImportError / ModuleNotFoundError).
-            // `name` is handled by the shared arm below.
-            "msg" | "path" | "name_from" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if matches!(
-                    kind,
-                    pyre_object::interp_exceptions::ExcKind::ImportError
-                        | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
-                ) {
-                    unsafe {
-                        match name {
-                            "msg" => pyre_object::interp_exceptions::w_exception_set_import_msg(
-                                obj, value,
-                            ),
-                            "path" => pyre_object::interp_exceptions::w_exception_set_import_path(
-                                obj, value,
-                            ),
-                            _ => pyre_object::interp_exceptions::w_exception_set_import_name_from(
-                                obj, value,
-                            ),
-                        }
-                    };
-                    return Ok(w_none());
-                }
-            }
-            // Shared writable `name` slot for ImportError / ModuleNotFoundError
-            // / NameError (and its UnboundLocalError subclass) / AttributeError;
-            // the matching getattr arm reads it back.
-            "name" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if matches!(
-                    kind,
-                    pyre_object::interp_exceptions::ExcKind::ImportError
-                        | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
-                        | pyre_object::interp_exceptions::ExcKind::NameError
-                        | pyre_object::interp_exceptions::ExcKind::UnboundLocalError
-                        | pyre_object::interp_exceptions::ExcKind::AttributeError
-                ) {
-                    unsafe { pyre_object::interp_exceptions::w_exception_set_name(obj, value) };
-                    return Ok(w_none());
-                }
-            }
-            // Writable `obj` slot (W_AttributeError).
-            "obj" => {
-                let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
-                if kind == pyre_object::interp_exceptions::ExcKind::AttributeError {
-                    unsafe { pyre_object::interp_exceptions::w_exception_set_attr_obj(obj, value) };
-                    return Ok(w_none());
-                }
-            }
-            _ => {}
+        let handled = exception_attr_set(obj, name, value)?;
+        if !handled.is_null() {
+            return Ok(handled);
         }
     }
     // descroperation.py:121-122 `if w_obj.setdictvalue(space, name, w_value):
@@ -10887,6 +10910,18 @@ pub enum ExceptionAttrSlot {
     UnicodeEnd,
     UnicodeReason,
     UnicodeEncoding,
+}
+
+/// True for a `GetSetProperty` `make_exc_type` installed from the class's
+/// `interp_exceptions.py` typedef.  Every one shares a single `fget`
+/// function object, so identity on that slot separates them from a user
+/// override of the same name on a heap subclass.
+fn is_exception_typedef_getset(descr: PyObjectRef) -> bool {
+    if descr.is_null() || !unsafe { pyre_object::typedef::is_getset_property(descr) } {
+        return false;
+    }
+    let fget = unsafe { pyre_object::typedef::w_getset_get_fget(descr) };
+    !fget.is_null() && std::ptr::eq(fget, crate::builtins::exception_getset_fget_obj())
 }
 
 /// Ingredients for the full-body walker's mirror of the typed exception-slot
@@ -11068,9 +11103,14 @@ pub unsafe fn exception_attr_slot_fold(
         return None;
     }
     let w_type = crate::typedef::r#type(obj)?;
-    // Any hit precedes the hard-coded exception arm.  The version-tag guard
-    // below pins this miss across later heap-subclass mutations.
-    if unsafe { lookup_in_type_where(w_type.as_ptr(), name) }.is_some() {
+    // Any hit other than the class's own `interp_exceptions.py` typedef
+    // getset precedes the slot; that one *is* the slot, reached through
+    // `exception_attr_get`, so folding past it keeps the same value.  The
+    // version-tag guard below pins this decision across later heap-subclass
+    // mutations.
+    if let Some(descr) = unsafe { lookup_in_type_where(w_type.as_ptr(), name) }
+        && !is_exception_typedef_getset(descr)
+    {
         return None;
     }
     let version_tag = unsafe { w_type_version_tag(w_type.as_ptr()) };
@@ -11333,6 +11373,35 @@ unsafe fn exception_deletable_slot(obj: PyObjectRef, name: &str) -> bool {
     }
 }
 
+/// The `W_BaseException` typedef's attribute deletes, shared by the per-class
+/// `GetSetProperty` descriptors and the instance-attribute delete path.
+/// `PY_NULL` means the name is not one this exception kind declares.
+pub(crate) fn exception_attr_delete(obj: PyObjectRef, name: &str) -> PyResult {
+    match name {
+        "args" | "__cause__" | "__context__" | "__traceback__" => {
+            return Err(PyError::type_error(format!("{name} may not be deleted")));
+        }
+        "__suppress_context__" => {
+            return Err(PyError::type_error("can't delete numeric/char attribute"));
+        }
+        "start" | "end"
+            if matches!(
+                unsafe { pyre_object::w_exception_get_kind(obj) },
+                pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
+                    | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
+            ) =>
+        {
+            return Err(PyError::type_error("can't delete numeric/char attribute"));
+        }
+        _ if unsafe { exception_deletable_slot(obj, name) } => {
+            return object_setattr(obj, name, w_none());
+        }
+        _ => {}
+    }
+    Ok(pyre_object::PY_NULL)
+}
+
 /// Terminal `object.__delattr__` — bypasses user override.
 pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
@@ -11459,27 +11528,9 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     // removal below, which would otherwise silently succeed on a name that
     // happens to have an entry there.
     if unsafe { pyre_object::is_exception(obj) } {
-        match name {
-            "args" | "__cause__" | "__context__" | "__traceback__" => {
-                return Err(PyError::type_error(format!("{name} may not be deleted")));
-            }
-            "__suppress_context__" => {
-                return Err(PyError::type_error("can't delete numeric/char attribute"));
-            }
-            "start" | "end"
-                if matches!(
-                    unsafe { pyre_object::w_exception_get_kind(obj) },
-                    pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError
-                        | pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError
-                ) =>
-            {
-                return Err(PyError::type_error("can't delete numeric/char attribute"));
-            }
-            _ if unsafe { exception_deletable_slot(obj, name) } => {
-                return object_setattr(obj, name, w_none());
-            }
-            _ => {}
+        let handled = exception_attr_delete(obj, name)?;
+        if !handled.is_null() {
+            return Ok(handled);
         }
     }
     // Instance/general: remove from the instance dict.
