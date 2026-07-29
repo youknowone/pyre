@@ -5,6 +5,7 @@ import pickle
 import weakref
 from array import array
 from collections import deque
+from os import DirEntry
 from types import GenericAlias
 from typing import TypeVar
 
@@ -66,6 +67,12 @@ assert coroutine_alias.__origin__ is coroutine_type
 assert coroutine_alias.__args__ == (T,)
 assert copy.copy(coroutine_alias) == coroutine_alias
 assert copy.deepcopy(coroutine_alias) == coroutine_alias
+
+dir_entry_alias = DirEntry[T]
+assert dir_entry_alias.__origin__ is DirEntry
+assert dir_entry_alias.__args__ == (T,)
+assert copy.copy(dir_entry_alias) == dir_entry_alias
+assert copy.deepcopy(dir_entry_alias) == dir_entry_alias
 
 nested = GenericAlias(list, ([T, [U]],))
 assert nested.__parameters__ == (T, U)

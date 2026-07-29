@@ -2256,6 +2256,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         )
                     };
                 }
+                // CPython 3.14 Modules/posixmodule.c DirEntry_methods —
+                // Py_GenericAlias with METH_CLASS.
+                unsafe {
+                    pyre_object::w_dict_setitem_str(
+                        ns,
+                        "__class_getitem__",
+                        pyre_object::function::w_classmethod_new(crate::make_builtin_function(
+                            "__class_getitem__",
+                            crate::_pypy_generic_alias::generic_alias_class_getitem,
+                        )),
+                    )
+                };
             });
             unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
             tp as usize
