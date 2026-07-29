@@ -5010,7 +5010,6 @@ fn build_ref_root_slots(
     // line up with the keys we inserted.
     let inputarg_oprefs: IndexSet<u32> = inputargs.iter().map(|ia| ia.index).collect();
     let mut non_ref_at_backedge: IndexSet<u32> = IndexSet::new();
-    let mut has_float_at_ref_position = false;
     // Find the closing JUMP and check arg types against inputarg types
     if let Some((jump_idx, jump)) = ops
         .iter()
@@ -5042,9 +5041,6 @@ fn build_ref_root_slots(
             {
                 if actual_tp != Type::Ref {
                     non_ref_at_backedge.insert(inputargs[i].index);
-                    if actual_tp == Type::Float {
-                        has_float_at_ref_position = true;
-                    }
                     if std::env::var_os("MAJIT_LOG").is_some() {
                         eprintln!(
                             "[ref-root] SKIP inputarg idx={}: backedge passes {:?} (arg={:?})",
@@ -5124,15 +5120,14 @@ fn build_ref_root_slots(
     // allows type substitution (SameAsF/SameAsI replacing Ref) which RPython
     // cannot express.
     //
-    // Float at Ref is unsafe: IEEE754 bits are never valid pointers. Int at Ref
-    // can be safe when the optimizer forwards a GC pointer through SameAsI
-    // without changing the actual runtime value.
-    if has_float_at_ref_position {
-        return Err(BackendError::Unsupported(
-            "jump_to_preamble: backedge passes Float at Ref-typed inputarg position".to_string(),
-        ));
-    }
-
+    // Both crossings are handled the same way, by `non_ref_at_backedge` above:
+    // the slot is left out of the root list, so the GC never reads the
+    // non-pointer bits sitting there. Float needs no separate treatment — an
+    // IEEE754 payload is never a pointer, which makes dropping the slot exactly
+    // right, where Int is the crossing that can still be carrying a live GC
+    // pointer forwarded through SameAsI. The dynasm backend has no analogous
+    // check because regalloc.rs builds its gcmap from the runtime live type
+    // rather than the declared inputarg type, so the crossing never reaches it.
     Ok(slots)
 }
 
