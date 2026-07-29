@@ -142,8 +142,8 @@ fn socket_converted_error(
 ) -> crate::PyError {
     let cls = match applevelerrcls {
         "timeout" => crate::builtins::lookup_exc_class("TimeoutError"),
-        "gaierror" => crate::builtins::lookup_exc_class("_socket.gaierror"),
-        "herror" => crate::builtins::lookup_exc_class("_socket.herror"),
+        "gaierror" => crate::builtins::lookup_exc_class("socket.gaierror"),
+        "herror" => crate::builtins::lookup_exc_class("socket.herror"),
         _ => crate::builtins::lookup_exc_class("OSError"),
     }
     .or_else(|| crate::builtins::lookup_exc_class("OSError"))
@@ -1052,6 +1052,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     //   herror   = new_exception_class("_socket.herror",   w_OSError)
     //   gaierror = new_exception_class("_socket.gaierror", w_OSError)
     //   timeout  = new_exception_class("_socket.timeout",  w_OSError)
+    // `socketmodule.c` names them `socket.herror` / `socket.gaierror`
+    // instead, and `type.__module__` reads the qualified prefix back, so
+    // `socket.gaierror.__module__` is `"socket"` rather than `"_socket"`.
     let w_os_error = crate::builtins::lookup_exc_class("OSError")
         .expect("OSError must be installed before _socket init");
     crate::module_ns_store(ns, "error", w_os_error);
@@ -1059,7 +1062,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "herror",
         crate::builtins::make_exc_type(
-            "_socket.herror",
+            "socket.herror",
             crate::builtins::exc_exception_new,
             w_os_error,
         ),
@@ -1068,7 +1071,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "gaierror",
         crate::builtins::make_exc_type(
-            "_socket.gaierror",
+            "socket.gaierror",
             crate::builtins::exc_exception_new,
             w_os_error,
         ),
@@ -1077,7 +1080,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "timeout",
         crate::builtins::make_exc_type(
-            "_socket.timeout",
+            "socket.timeout",
             crate::builtins::exc_exception_new,
             w_os_error,
         ),
@@ -2123,10 +2126,17 @@ fn pack_inet_addr(
             "AF_INET address must be a (host, port) tuple",
         ));
     }
+    // `getsockaddrarg` parses the AF_INET form with `"O&i"` — exactly two
+    // items — and the AF_INET6 form with `"O&i|II"` — two to four.
     let len = unsafe { pyre_object::w_tuple_len(addr) };
-    if family == libc::AF_INET && len < 2 {
+    if family == libc::AF_INET && len != 2 {
         return Err(crate::PyError::type_error(
-            "AF_INET address must be a (host, port) tuple",
+            "AF_INET address must be a pair (host, port)",
+        ));
+    }
+    if family == libc::AF_INET6 && !(2..=4).contains(&len) {
+        return Err(crate::PyError::type_error(
+            "AF_INET6 address must be a tuple (host, port[, flowinfo[, scopeid]])",
         ));
     }
     let host_obj = unsafe { pyre_object::w_tuple_getitem(addr, 0) }
