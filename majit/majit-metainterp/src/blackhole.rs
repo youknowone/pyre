@@ -716,6 +716,17 @@ impl BlackholeInterpreter {
                 self.registers_r[i] = 0;
             }
         }
+        // `tmpreg_r` is a reference slot on the same footing as `registers_r`:
+        // `run()` hands both to `push_bh_regs`, and `walk_bh_regs` visits the
+        // tmpreg word as a `GcRef` root.  Its live window is one opcode — the
+        // gap between a call helper returning and the `registers_r[dst]` store
+        // — but nothing resets it, so a released interp carries the last ref
+        // return value into the pool.  Nothing roots it there, so the object
+        // can be collected; the next `run()` on that pooled interp then pushes
+        // the dead address as a root and the collector reads a header off it.
+        // Upstream's `cleanup_registers` (`blackhole.py:385`) has no such slot
+        // to clear: RPython's tmpreg is a traced field of a GC object.
+        self.tmpreg_r = 0;
         self.exception_last_value = 0;
     }
 
@@ -3583,6 +3594,36 @@ mod tests {
             assert_eq!(reused.virtualizable_ptr, 0);
             assert!(reused.virtualizable_info.is_null());
             assert_eq!(reused.virtualizable_stack_base, 0);
+        }
+
+        /// A pooled interp must expose no reference word as a GC root.
+        ///
+        /// `run()` roots `registers_r` AND `tmpreg_r` through
+        /// `push_bh_regs`, and `walk_bh_regs` visits the tmpreg word as a
+        /// `GcRef`.  `cleanup_registers` cleared the bank but not the tmpreg,
+        /// so a released interp carried the last ref return value into the
+        /// pool, where nothing roots it — and the next `run()` on that interp
+        /// pushed the by-then-collectable address back as a root.
+        #[test]
+        fn released_interp_exposes_no_reference_word_to_the_root_walker() {
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
+            bh.tmpreg_r = 0x7f00_0000_5678;
+
+            builder.release_interp(bh);
+            let mut reused = builder.acquire_interp();
+            assert_eq!(reused.tmpreg_r, 0);
+
+            let depth = unsafe {
+                majit_gc::shadow_stack::push_bh_regs(&mut reused.registers_r, &mut reused.tmpreg_r)
+            };
+            let mut roots: Vec<usize> = Vec::new();
+            majit_gc::shadow_stack::walk_bh_regs(|slot| roots.push(slot.0));
+            majit_gc::shadow_stack::pop_bh_regs_to(depth);
+            assert!(
+                roots.iter().all(|&word| word == 0),
+                "pooled interp handed the root walker stale references: {roots:x?}",
+            );
         }
 
         #[test]
