@@ -5649,6 +5649,7 @@ pub fn init_jit_hooks() {
     );
 }
 
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UnsupportedJitShape {
     None,
@@ -5664,6 +5665,27 @@ enum UnsupportedJitShape {
     /// module body with thousands of literal constants) genuinely exceeds
     /// it. Such a frame cannot be encoded and must run in the interpreter.
     ConstEncodingOverflow,
+}
+
+/// Return the immutable frame-shape classification for an immortal user-code
+/// graph.  RPython decides the analogous graph facts once while populating
+/// `CallControl.jitcodes`; pyre's temporary runtime gate must have the same
+/// computed-once lifetime rather than scanning on every Python call.
+fn cached_unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitShape {
+    let key = code as *const _ as usize;
+    let callcontrol = crate::jit::codewriter::CodeWriter::instance().callcontrol();
+    if let Some(&raw) = callcontrol.graph_jit_shapes.get(&key) {
+        return match raw {
+            0 => UnsupportedJitShape::None,
+            1 => UnsupportedJitShape::CurrentFrameOnly,
+            2 => UnsupportedJitShape::NestedBreakBridgeResume,
+            3 => UnsupportedJitShape::ConstEncodingOverflow,
+            _ => unreachable!("invalid cached UnsupportedJitShape discriminant"),
+        };
+    }
+    let shape = unsupported_jit_shape(code);
+    callcontrol.graph_jit_shapes.insert(key, shape as u8);
+    shape
 }
 
 /// True for opcodes that may appear in a `FOR_ITER` loop body without ever
@@ -6293,7 +6315,8 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     majit_backend_cranelift::register_recovery_layout(
         crate::call_jit::cranelift_recovery_layout_for_descr,
     );
-    match unsupported_jit_shape(code) {
+    let jit_shape = cached_unsupported_jit_shape(code);
+    match jit_shape {
         UnsupportedJitShape::None => {}
         UnsupportedJitShape::CurrentFrameOnly => {
             // Run frames with unsupported current-frame bytecode shapes in the
@@ -7045,10 +7068,13 @@ fn maybe_compile_and_run(
     if *NO_JIT.get_or_init(|| std::env::var_os("PYRE_NO_JIT").is_some()) {
         return None;
     }
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
-    if unsupported_jit_shape(code) != UnsupportedJitShape::None {
-        return None;
-    }
+    // `eval_with_jit_inner` classifies the frame once, before entering
+    // `eval_loop_jit`.  Consequently every back-edge reaching this helper is
+    // already known traceable.  Do not repeat `unsupported_jit_shape` here:
+    // that pyre-only safety gate walks the constant tree and the complete
+    // bytecode, while RPython's `can_enter_jit` is unconditional.  Re-running
+    // it at every back-edge made the classification scan itself one of
+    // test_math's hottest native functions.
     if let Some(expected_vsd) =
         pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, loop_header_pc)
     {
@@ -8137,9 +8163,13 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
-    if unsupported_jit_shape(code) != UnsupportedJitShape::None {
-        return None;
-    }
+    // The ordinary caller is `eval_with_jit_inner`, immediately after its
+    // one authoritative `unsupported_jit_shape` check.  The other caller,
+    // `portal_runner_dispatch`, is recursive re-entry for a portal that could
+    // only have obtained compiled code after passing that same check.  Keep
+    // this warmstate entry shaped like RPython's unconditional
+    // `maybe_compile_and_run`; repeating the whole-frame scan here charged
+    // every Python call even before a warm counter could take the fast path.
     if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
         if code.obj_name.as_str() == "fannkuch" && frame_root.frame().next_instr() == 0 {
             use std::sync::OnceLock;

@@ -208,6 +208,20 @@ pub struct CallControl {
     /// with (call.py:29 `self.jitcodes = {}` is a plain instance dict on
     /// `CallControl`, filled on miss by call.py:155-172 `get_jitcode`).
     pub loop_header_pcs: HashMap<usize, std::sync::Arc<VecSet<usize>>>,
+
+    /// Pyre-only per-graph result of `eval::unsupported_jit_shape`.
+    ///
+    /// RPython has no runtime frame-shape gate: policy and encodability are
+    /// decided once while `CallControl.jitcodes` is populated.  Until pyre's
+    /// remaining gate arms are removed, keep their likewise immutable result
+    /// under the same per-graph owner and raw graph key as `jitcodes`, rather
+    /// than re-walking a user code object's constants and bytecode on every
+    /// invocation.  This is deliberately a `HashMap` because the corresponding
+    /// upstream owner is `CallControl.jitcodes`, a graph-keyed Python dict; it
+    /// is not a per-box optimizer side table.  Values are the private
+    /// `UnsupportedJitShape` discriminants, kept as `u8` to avoid making the
+    /// codewriter layer depend on the portal evaluator.
+    pub graph_jit_shapes: HashMap<usize, u8>,
 }
 
 impl CallControl {
@@ -225,6 +239,7 @@ impl CallControl {
             unfinished_graphs: Vec::new(),
             callinfocollection: CallInfoCollection::new(),
             loop_header_pcs: HashMap::new(),
+            graph_jit_shapes: HashMap::new(),
         }
     }
 
