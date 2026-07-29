@@ -1718,8 +1718,19 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let is_bytes = pyre_object::bytesobject::is_bytes(obj);
     if is_slice(index) {
+        // stringmethods.py / bytearrayobject.py `descr_getitem`: unpack the
+        // slice before reading the sequence length (an `__index__` method may
+        // mutate a bytearray), then use `adjust_indices`' explicit slice
+        // length.  Iterating by that count also avoids overflowing on the
+        // final `start + step` for a step near `sys.maxsize`.
+        let (rs, rp, st) = crate::sliceobject::slice_unpack(
+            w_slice_get_start(index),
+            w_slice_get_stop(index),
+            w_slice_get_step(index),
+        )?;
         let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
-        let (start, stop, step) = normalize_slice(index, len)?;
+        let (start, _stop, step, slicelength) =
+            crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
         // `_new(self._value[start:stop])` (stringmethods.py descr_getslice)
         // runs through `ll_stringslice_startstop` (rstr.py:867-869), which
         // hands the source string back unchanged for `start == 0 and
@@ -1729,7 +1740,7 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         // and a subclass keeps pointer identity through `is_w`.
         if step == 1
             && start == 0
-            && stop >= len
+            && slicelength == len
             && is_bytes
             && pyre_object::pyobject::is_exact_type(obj, &pyre_object::bytesobject::BYTES_TYPE)
         {
@@ -1737,18 +1748,11 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         }
         let mut result = Vec::new();
         let mut i = start;
-        if step > 0 {
-            while i < stop {
-                result.push(pyre_object::bytesobject::bytes_like_getitem(
-                    obj, i as usize,
-                ));
-                i += step;
-            }
-        } else {
-            while i > stop {
-                result.push(pyre_object::bytesobject::bytes_like_getitem(
-                    obj, i as usize,
-                ));
+        for n in 0..slicelength {
+            result.push(pyre_object::bytesobject::bytes_like_getitem(
+                obj, i as usize,
+            ));
+            if n + 1 < slicelength {
                 i += step;
             }
         }
@@ -3789,21 +3793,13 @@ unsafe fn setitem_bytearray_slice(
     }
     // Extended slice: `descr_setitem` forbids resizing — the source length
     // must equal the slice length; positions are written in order.
-    let mut indices = Vec::new();
-    let mut i = start;
-    while (step > 0 && i < stop) || (step < 0 && i > stop) {
-        if i >= 0 && i < len {
-            indices.push(i as usize);
-        }
-        i += step;
-    }
-    if sequence2.len() != indices.len() {
+    if sequence2.len() != slicelength as usize {
         return Err(PyError::new(
             PyErrorKind::ValueError,
             format!(
                 "attempt to assign bytes of size {} to extended slice of size {}",
                 sequence2.len(),
-                indices.len()
+                slicelength
             ),
         ));
     }
@@ -17461,7 +17457,7 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                     w_slice_get_step(index),
                 )?;
                 let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
-                let (start, stop, step, _) =
+                let (start, stop, step, slicelength) =
                     crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
                 let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
                 if step == 1 {
@@ -17470,16 +17466,14 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                     vec.drain(s..e);
                     return Ok(());
                 }
-                let mut indices: Vec<i64> = Vec::new();
+                let mut indices: Vec<i64> = Vec::with_capacity(slicelength as usize);
                 let mut i = start;
-                if step > 0 {
-                    while i < stop {
-                        indices.push(i);
-                        i += step;
-                    }
-                } else {
-                    while i > stop {
-                        indices.push(i);
+                for n in 0..slicelength {
+                    indices.push(i);
+                    // `_delitem_slice_helper` consumes the explicit slice
+                    // length. Do not form an unused successor after the final
+                    // selected byte when `step` is i64::MAX.
+                    if n + 1 < slicelength {
                         i += step;
                     }
                 }

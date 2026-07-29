@@ -7501,4 +7501,54 @@ result = (
             assert!(crate::baseobjspace::is_true(result).unwrap());
         }
     }
+
+    #[test]
+    fn test_bytes_like_slice_does_not_advance_past_last_item() {
+        let source = "\
+step = 2**63 - 1
+b = bytearray(b'abc')
+b[1::step] = b'x'
+assigned = b == bytearray(b'axc')
+del b[1::step]
+result = (
+    b'abc'[1::step] == b'b'
+    and bytearray(b'abc')[1::step] == bytearray(b'b')
+    and assigned
+    and b == bytearray(b'ac')
+)
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("large-step bytes-like slice failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytes_constructors_validate_codec_arguments_first() {
+        let source = "\
+result = True
+for constructor in (bytes, bytearray):
+    for args, argument, received in (
+        (('', b'ascii'), 'encoding', 'bytes'),
+        (('', 'ascii', b'ignore'), 'errors', 'bytes'),
+        (('', None), 'encoding', 'None'),
+        (('', 'ascii', None), 'errors', 'None'),
+    ):
+        try:
+            constructor(*args)
+        except TypeError as exc:
+            expected = f\"{constructor.__name__}() argument '{argument}' must be str, not {received}\"
+            result = result and str(exc) == expected
+        else:
+            result = False
+";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("bytes-like constructor codec validation failed");
+        unsafe {
+            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert!(crate::baseobjspace::is_true(result).unwrap());
+        }
+    }
 }

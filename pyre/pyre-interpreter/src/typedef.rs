@@ -16815,6 +16815,34 @@ fn bytearray_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     Ok(value)
 }
 
+/// CPython 3.14 `bytes.__new__` / `bytearray.__init__` Argument Clinic
+/// converters: a supplied encoding or errors argument must be a `str`.
+///
+/// This intentionally differs from the older PyPy `text_or_none` unwrap spec:
+/// Python 3.14 rejects an explicit `None`, and performs both conversions before
+/// entering the constructor implementation.
+fn bytes_codec_arg_w(
+    constructor: &str,
+    argument: &str,
+    value: Option<PyObjectRef>,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    if let Some(w_value) = value {
+        if !unsafe { pyre_object::is_str(w_value) } {
+            // `_PyArg_BadArgument` renders the None singleton as `None`,
+            // rather than its class name `NoneType`.
+            let type_name = if unsafe { pyre_object::is_none(w_value) } {
+                "None"
+            } else {
+                unsafe { pyre_object::type_name_of(w_value) }
+            };
+            return Err(crate::PyError::type_error(format!(
+                "{constructor}() argument '{argument}' must be str, not {type_name}"
+            )));
+        }
+    }
+    Ok(value)
+}
+
 fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // args[0] = cls (ignored — bytearray subclasses still allocate the
     // primitive layout). bytearrayobject.py descr_new accepts:
@@ -16838,18 +16866,22 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     crate::builtins::kwarg_reject_unknown(kwargs, &["source", "encoding", "errors"], "bytearray")?;
     let source =
         crate::builtins::resolve_pos_or_kw(pos.get(1).copied(), kwargs, "source", "bytearray", 1)?;
-    let w_encoding = crate::builtins::resolve_pos_or_kw(
-        pos.get(2).copied(),
-        kwargs,
-        "encoding",
+    let w_encoding = bytes_codec_arg_w(
         "bytearray",
-        2,
+        "encoding",
+        crate::builtins::resolve_pos_or_kw(
+            pos.get(2).copied(),
+            kwargs,
+            "encoding",
+            "bytearray",
+            2,
+        )?,
     )?;
-    let w_errors =
-        crate::builtins::resolve_pos_or_kw(pos.get(3).copied(), kwargs, "errors", "bytearray", 3)?;
-    // `text_or_none` unwrap_spec treats an explicit `None` as absent.
-    let w_encoding = w_encoding.filter(|&e| !unsafe { pyre_object::is_none(e) });
-    let w_errors = w_errors.filter(|&e| !unsafe { pyre_object::is_none(e) });
+    let w_errors = bytes_codec_arg_w(
+        "bytearray",
+        "errors",
+        crate::builtins::resolve_pos_or_kw(pos.get(3).copied(), kwargs, "errors", "bytearray", 3)?,
+    )?;
     let Some(arg) = source else {
         if w_encoding.is_some() || w_errors.is_some() {
             return Err(crate::PyError::type_error(
@@ -16863,7 +16895,7 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         // bytearrayobject.py:217 — str source shares bytesobject.newbytesdata_w
         if pyre_object::is_str(arg) {
             let encoding = match w_encoding {
-                Some(e) if pyre_object::is_str(e) => crate::baseobjspace::str_utf8_w(e)?,
+                Some(e) => crate::baseobjspace::str_utf8_w(e)?,
                 _ => {
                     return Err(crate::PyError::type_error(
                         "string argument without an encoding",
@@ -16871,7 +16903,7 @@ fn bytearray_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 }
             };
             let errors = match w_errors {
-                Some(e) if pyre_object::is_str(e) => crate::baseobjspace::str_utf8_w(e)?,
+                Some(e) => crate::baseobjspace::str_utf8_w(e)?,
                 _ => "strict",
             };
             let encoded = crate::type_methods::encode_object(arg, encoding, errors)?;
@@ -19860,13 +19892,16 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     crate::builtins::kwarg_reject_unknown(kwargs, &["source", "encoding", "errors"], "bytes")?;
     let source =
         crate::builtins::resolve_pos_or_kw(pos.get(1).copied(), kwargs, "source", "bytes", 1)?;
-    let w_encoding =
-        crate::builtins::resolve_pos_or_kw(pos.get(2).copied(), kwargs, "encoding", "bytes", 2)?;
-    let w_errors =
-        crate::builtins::resolve_pos_or_kw(pos.get(3).copied(), kwargs, "errors", "bytes", 3)?;
-    // `text_or_none` unwrap_spec treats an explicit `None` as absent.
-    let w_encoding = w_encoding.filter(|&e| !unsafe { pyre_object::is_none(e) });
-    let w_errors = w_errors.filter(|&e| !unsafe { pyre_object::is_none(e) });
+    let w_encoding = bytes_codec_arg_w(
+        "bytes",
+        "encoding",
+        crate::builtins::resolve_pos_or_kw(pos.get(2).copied(), kwargs, "encoding", "bytes", 2)?,
+    )?;
+    let w_errors = bytes_codec_arg_w(
+        "bytes",
+        "errors",
+        crate::builtins::resolve_pos_or_kw(pos.get(3).copied(), kwargs, "errors", "bytes", 3)?,
+    )?;
     let Some(arg) = source else {
         // No source → `bytes()` is empty; a stray encoding/errors with no
         // source is the "encoding or errors without sequence argument" error.
@@ -19881,7 +19916,7 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     unsafe {
         if pyre_object::is_str(arg) {
             let encoding = match w_encoding {
-                Some(e) if pyre_object::is_str(e) => crate::baseobjspace::str_utf8_w(e)?,
+                Some(e) => crate::baseobjspace::str_utf8_w(e)?,
                 _ => {
                     return Err(crate::PyError::type_error(
                         "string argument without an encoding",
@@ -19889,7 +19924,7 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 }
             };
             let errors = match w_errors {
-                Some(e) if pyre_object::is_str(e) => crate::baseobjspace::str_utf8_w(e)?,
+                Some(e) => crate::baseobjspace::str_utf8_w(e)?,
                 _ => "strict",
             };
             let encoded = crate::type_methods::encode_object(arg, encoding, errors)?;
