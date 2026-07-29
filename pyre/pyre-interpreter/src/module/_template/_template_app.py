@@ -8,6 +8,7 @@ BUILD_INTERPOLATION opcodes construct through `_build_template` /
 """
 
 import itertools
+from types import GenericAlias
 
 # The BUILD_INTERPOLATION conversion oparg field: 0 means no conversion.
 _CONVERSIONS = (None, 's', 'r', 'a')
@@ -15,6 +16,12 @@ _CONVERSIONS = (None, 's', 'r', 'a')
 
 class Interpolation:
     __match_args__ = ('value', 'expression', 'conversion', 'format_spec')
+
+    # CPython 3.14 Objects/interpolationobject.c: interpolation_methods —
+    # Py_GenericAlias with METH_CLASS.
+    @classmethod
+    def __class_getitem__(cls, item):
+        return GenericAlias(cls, item)
 
     def __init__(self, value, expression='', conversion=None, format_spec=''):
         # `expression` / `format_spec` are typed `str` and `conversion` is
@@ -59,6 +66,12 @@ class Interpolation:
 
 
 class Template:
+    # CPython 3.14 Objects/templateobject.c: template_methods —
+    # Py_GenericAlias with METH_CLASS.
+    @classmethod
+    def __class_getitem__(cls, item):
+        return GenericAlias(cls, item)
+
     def __new__(cls, *args):
         # Public constructor: interleaved strings and Interpolations.  Adjacent
         # strings are merged and the result always begins and ends with a

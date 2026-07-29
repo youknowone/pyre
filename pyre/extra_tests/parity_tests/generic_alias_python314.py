@@ -7,6 +7,7 @@ from array import array
 from collections import deque
 from ctypes import Array as CTypesArray
 from os import DirEntry
+from string.templatelib import Interpolation, Template
 from types import GenericAlias
 from typing import TypeVar
 
@@ -80,6 +81,13 @@ assert ctypes_array_alias.__origin__ is CTypesArray
 assert ctypes_array_alias.__args__ == (T,)
 assert copy.copy(ctypes_array_alias) == ctypes_array_alias
 assert copy.deepcopy(ctypes_array_alias) == ctypes_array_alias
+
+for template_type in (Template, Interpolation):
+    template_alias = template_type[T]
+    assert template_alias.__origin__ is template_type
+    assert template_alias.__args__ == (T,)
+    assert copy.copy(template_alias) == template_alias
+    assert copy.deepcopy(template_alias) == template_alias
 
 nested = GenericAlias(list, ([T, [U]],))
 assert nested.__parameters__ == (T, U)
