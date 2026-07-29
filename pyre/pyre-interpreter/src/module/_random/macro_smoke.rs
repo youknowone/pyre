@@ -83,6 +83,18 @@ fn _unwrap_alias_probe(
     acc
 }
 
+/// A Signature-bound scope includes keyword-only slots in its flat argument
+/// array.  The typed wrapper must not recount those slots as positionals.
+#[crate::pyre_function]
+fn _kwonly_bound_probe(
+    value: i64,
+    #[kwonly]
+    #[default(0i64)]
+    adjustment: i64,
+) -> i64 {
+    value + adjustment
+}
+
 crate::py_module! {
     "_pyre_smoke",
     interpleveldefs: {
@@ -141,6 +153,21 @@ mod tests {
         crate::typedef::init_typeobjects();
         let err = _seed_from_path(&[]).expect_err("missing path should error");
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+    }
+
+    #[test]
+    fn keyword_only_bound_slot_is_not_counted_as_positional() {
+        crate::typedef::init_typeobjects();
+        let signature = _kwonly_bound_probe_pyre_sig().expect("derived signature");
+        let bound = crate::call::bind_kwargs_to_signature(
+            &signature,
+            "_kwonly_bound_probe",
+            &[w_int_new(40)],
+            &[(rustpython_wtf8::Wtf8Buf::from("adjustment"), w_int_new(2))],
+        )
+        .expect("signature binding");
+        let result = _kwonly_bound_probe(&bound).expect("bound keyword-only scope");
+        assert_eq!(unsafe { w_int_get_value(result) }, 42);
     }
 
     /// `Vec<i64>` return auto-wraps to a list.

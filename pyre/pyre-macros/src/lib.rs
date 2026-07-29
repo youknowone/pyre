@@ -183,13 +183,33 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         let fn_name = user_name.to_string();
         let too_few = arity_message(&fn_name, required, total, false);
         let too_many = arity_message(&fn_name, required, total, true);
+        let too_many_guard = if has_kw_markers {
+            // `gateway.py:BuiltinCode.funcrun` first resolves a Signature
+            // into one slot per positional / keyword-only parameter (plus
+            // the **kwargs tail).  Such a bound scope has
+            // `__PYRE_PARAM_NAMES.len()` entries even though only `total`
+            // of them are positional.  Do not count those trailing slots as
+            // supplied positionals; the Signature binder has already
+            // rejected genuine positional overflow before entering here.
+            quote! {
+                if __pyre_positional_count > #total
+                    && args.len() != __PYRE_PARAM_NAMES.len()
+                {
+                    return ::std::result::Result::Err(crate::PyError::type_error(#too_many));
+                }
+            }
+        } else {
+            quote! {
+                if __pyre_positional_count > #total {
+                    return ::std::result::Result::Err(crate::PyError::type_error(#too_many));
+                }
+            }
+        };
         quote! {
             if args.len() < #required {
                 return ::std::result::Result::Err(crate::PyError::type_error(#too_few));
             }
-            if __pyre_positional_count > #slot_total {
-                return ::std::result::Result::Err(crate::PyError::type_error(#too_many));
-            }
+            #too_many_guard
         }
     };
 
