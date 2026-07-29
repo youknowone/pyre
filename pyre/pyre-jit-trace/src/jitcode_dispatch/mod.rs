@@ -1466,6 +1466,10 @@ impl PartialEq for DispatchOutcome {
     }
 }
 
+fn trace_too_long_blackhole_snapshot_safe(outcome: &DispatchOutcome) -> bool {
+    matches!(outcome, DispatchOutcome::Continue)
+}
+
 /// Errors surfaced by the trace-side walker.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum DispatchError {
@@ -2209,7 +2213,15 @@ pub fn walk<Sym: WalkSym>(
         // The remaining overshoot is tallied so an unsupported multi-frame
         // shape cannot silently become unbounded.
         if ctx.trace_ctx.is_too_long() {
-            let blackhole_latched = latch_trace_too_long_blackhole(ctx, pc);
+            // `step` has advanced the register banks for `Continue`. The
+            // other outcomes still need the match below to perform their
+            // frame transition: in particular, `SubRaise` may enter this
+            // frame's handler and `SubReturn` is delivered to its caller by
+            // the inline-call boundary. RPython checks the length only after
+            // those transitions have happened, so never publish the
+            // pre-transition callee image here.
+            let blackhole_latched = trace_too_long_blackhole_snapshot_safe(&outcome)
+                && latch_trace_too_long_blackhole(ctx, pc);
             if blackhole_latched || fbw_executed_effect_count() == 0 {
                 let ops = ctx.trace_ctx.num_recorded_ops();
                 crate::state::note_root_trace_too_long(

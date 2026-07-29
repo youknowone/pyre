@@ -149,6 +149,22 @@ fn switch_descr_pool(entries: &[(i64, usize)]) -> Vec<DescrRef> {
     vec![std::sync::Arc::new(crate::descr::PyreSwitchDescr::new(dict)) as DescrRef]
 }
 
+#[test]
+fn trace_too_long_snapshot_waits_for_frame_transition_outcomes() {
+    assert!(trace_too_long_blackhole_snapshot_safe(
+        &DispatchOutcome::Continue
+    ));
+    assert!(!trace_too_long_blackhole_snapshot_safe(
+        &DispatchOutcome::SubReturn { result: None }
+    ));
+    assert!(!trace_too_long_blackhole_snapshot_safe(
+        &DispatchOutcome::SubRaise {
+            exc: OpRef::input_arg_ref(0),
+            exc_concrete: ConcreteValue::Ref(0xCAFEusize as _),
+        }
+    ));
+}
+
 /// Concrete-shadow round-trip: a `WalkContext` built with
 /// `concrete_registers_r` exposes each slot's `ConcreteValue` via
 /// `read_ref_reg_concrete` indexed by the same byte the symbolic
@@ -243,6 +259,26 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
         super::vable_ops::vable_value_concrete(&code, &op, 0, &wc, 'r', wc.registers_r[1]),
         Some(Value::Ref(majit_ir::GcRef(exc_obj_ptr as usize))),
         "vable writes must preserve the concrete half of a non-constant register Box",
+    );
+
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("trace_too_long_arbitrary_pc");
+    runtime_jc.set_body(majit_translate::jitcode::JitCodeBody {
+        code: vec![0, 0],
+        c_num_regs_r: 3,
+        startpoints: Some([0_usize].into_iter().collect()),
+        ..Default::default()
+    });
+    let miframe = super::residual_call::build_trace_too_long_single_frame_miframe(
+        &wc,
+        std::sync::Arc::new(runtime_jc),
+        1,
+    )
+    .expect("an arbitrary post-step pc must not require a -live- marker");
+    assert_eq!(miframe.pc, 1);
+    assert_eq!(
+        miframe.ref_values[1],
+        Some(exc_obj_ptr as i64),
+        "the complete-bank image must retain non-constant register concrete values",
     );
 }
 
