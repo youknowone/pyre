@@ -16,6 +16,57 @@
 
 use super::*;
 
+#[derive(Clone, Copy)]
+struct BoundMethodInline {
+    method_op: OpRef,
+    function: pyre_object::PyObjectRef,
+    receiver: pyre_object::PyObjectRef,
+}
+
+struct PositionalDefaultsInline {
+    tuple: pyre_object::PyObjectRef,
+    /// `(parameter index, tuple index, concrete value)`.
+    values: Vec<(usize, usize, pyre_object::PyObjectRef)>,
+}
+
+/// `function.py:188-193,217-231` — determine the tail of `defs_w` used by a
+/// flat positional call with missing arguments.  The trace currently accepts
+/// the ordinary translated `W_TupleObject` representation only: its
+/// `wrappeditems[*]` storage has the exact immutable-array shape upstream's
+/// `defs_w?[*]` lowers to.  Specialised numeric tuples are a different
+/// unboxed representation and safely remain on the residual call path.
+unsafe fn positional_defaults_for_inline(
+    callable: pyre_object::PyObjectRef,
+    nargs: usize,
+    nparams: usize,
+) -> Option<PositionalDefaultsInline> {
+    if nargs >= nparams {
+        return None;
+    }
+    let tuple = unsafe { pyre_interpreter::function_get_defaults(callable) };
+    if tuple.is_null()
+        || !std::ptr::eq(
+            unsafe { (*tuple).ob_type },
+            &pyre_object::pyobject::TUPLE_TYPE,
+        )
+    {
+        return None;
+    }
+    let ndefaults = unsafe { pyre_object::w_tuple_len(tuple) };
+    let missing = nparams - nargs;
+    if missing > ndefaults {
+        return None;
+    }
+    let start = ndefaults - missing;
+    let mut values = Vec::with_capacity(missing);
+    for offset in 0..missing {
+        let tuple_index = start + offset;
+        let value = unsafe { pyre_object::w_tuple_getitem(tuple, tuple_index as i64) }?;
+        values.push((nargs + offset, tuple_index, value));
+    }
+    Some(PositionalDefaultsInline { tuple, values })
+}
+
 /// Path-1 (#68): resolve a scalar `getfield_vable_r` read off an inlined
 /// callee's OWN (unseeded) portal frame to the callee's compile-time
 /// constant.  This is the walk-time mirror of the codewriter's non-portal
@@ -1249,7 +1300,9 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
 ///
 /// `r_args` layout is `[callable, self_or_null, kwnames, arg0..argN-1]`; the
 /// trailing `nkw` args are the keyword values, `kwnames[j]` naming
-/// `arg[n_pos + j]` where `n_pos = nargs - nkw`.
+/// `arg[n_pos + j]` where `n_pos = nargs - nkw`.  `receiver`, when present,
+/// is the implicit leading argument inserted by `call_kw` for method-form
+/// calls (`Arguments.prepend` / `funcrun_obj` upstream).
 ///
 /// Returns `None` (declining to the residual call, no behavior change) for any
 /// shape the plain positional seeding cannot serve: a non-constant / non-tuple
@@ -1285,6 +1338,7 @@ unsafe fn fbw_reorder_call_kw_args(
     arg_concretes: &[ConcreteValue],
     w_code: *const (),
     nparams: usize,
+    receiver: Option<(OpRef, ConcreteValue)>,
 ) -> Option<(Vec<OpRef>, Vec<ConcreteValue>)> {
     if r_args.len() < 3 || arg_concretes.len() < 3 {
         return None;
@@ -1305,7 +1359,8 @@ unsafe fn fbw_reorder_call_kw_args(
     // Every positional parameter must be filled exactly once from a passed arg:
     // no defaults, no *args/**kwargs/keyword-only slots the seeding would leave
     // unbound.
-    if nparams == 0 || nkw > nargs || nargs != nparams {
+    let receiver_count = usize::from(receiver.is_some());
+    if nparams == 0 || nkw > nargs || nargs + receiver_count != nparams {
         return None;
     }
     let raw = unsafe {
@@ -1325,9 +1380,14 @@ unsafe fn fbw_reorder_call_kw_args(
     let n_pos = nargs - nkw;
     let mut slot_args: Vec<Option<OpRef>> = vec![None; nparams];
     let mut slot_conc: Vec<Option<ConcreteValue>> = vec![None; nparams];
+    if let Some((receiver_arg, receiver_concrete)) = receiver {
+        slot_args[0] = Some(receiver_arg);
+        slot_conc[0] = Some(receiver_concrete);
+    }
     for k in 0..n_pos {
-        slot_args[k] = Some(args[k]);
-        slot_conc[k] = Some(arg_conc[k]);
+        let pi = receiver_count + k;
+        slot_args[pi] = Some(args[k]);
+        slot_conc[pi] = Some(arg_conc[k]);
     }
     for j in 0..nkw {
         let name_obj = unsafe { pyre_object::w_tuple_getitem(kwnames, j as i64) }?;
@@ -1345,7 +1405,9 @@ unsafe fn fbw_reorder_call_kw_args(
         // argument").  A name in the positional-only range is not bindable by
         // keyword at all — `def f(x, /)` called as `f(x=1)` is a TypeError, so
         // binding slot 0 here would inline a call the interpreter rejects.
-        if pi < n_pos || pi < unsafe { (*raw).posonlyarg_count } as usize || slot_args[pi].is_some()
+        if pi < receiver_count + n_pos
+            || pi < unsafe { (*raw).posonlyarg_count } as usize
+            || slot_args[pi].is_some()
         {
             return None;
         }
@@ -1540,8 +1602,30 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         ConcreteValue::Null => pyre_object::PY_NULL,
         _ => return Ok(None),
     };
-    let method_form = !null_or_self.is_null() && null_or_self != pyre_object::PY_NULL;
-    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(callable) })
+    let mut method_form = !null_or_self.is_null() && null_or_self != pyre_object::PY_NULL;
+    // baseobjspace.py:1254-1259 unwraps `_Method` before the Function
+    // valuestack fast path.  CALLs through a stored bound method (notably the
+    // module aliases in random.py) arrive as `[Method, PY_NULL, args...]`, so
+    // recover its immutable function/receiver fields and feed the same
+    // method-form callee shape used by LOAD_METHOD.
+    let bound_method = if !method_form && unsafe { pyre_object::is_method(callable) } {
+        let function = unsafe { pyre_object::w_method_get_func(callable) };
+        let receiver = unsafe { pyre_object::w_method_get_self(callable) };
+        if function.is_null() || receiver.is_null() {
+            return Ok(None);
+        }
+        method_form = true;
+        Some(BoundMethodInline {
+            method_op: r_args[0],
+            function,
+            receiver,
+        })
+    } else {
+        None
+    };
+    let resolved_callable = bound_method.map_or(callable, |bound| bound.function);
+    let Some((w_code, nparams, has_closure)) =
+        (unsafe { resolve_inlinable_callee(resolved_callable) })
     else {
         if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
             eprintln!("[inline-decline] pc={} callee not inlinable", op.pc);
@@ -1557,14 +1641,20 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     let (callee_args, callee_arg_concretes) = if is_call_kw {
         // A keyword call folds its `kwnames`->parameter permutation at trace
         // time (`fbw_reorder_call_kw_args`) so the reordered param-order args
-        // seed the callee exactly like a positional call.  A bound-method-form
-        // keyword call is not yet folded.
-        if method_form {
-            return Ok(None);
-        }
-        let Some(reordered) =
-            (unsafe { fbw_reorder_call_kw_args(r_args, &arg_concretes, w_code, nparams) })
-        else {
+        // seed the callee exactly like a positional call.  Method form
+        // prepends its receiver before that permutation, matching
+        // `call_kw`'s `Arguments.prepend` / `funcrun_obj` path.
+        let receiver = if let Some(bound) = bound_method {
+            // Placeholder until the resolved half reads Method.w_self live.
+            Some((bound.method_op, ConcreteValue::Ref(bound.receiver)))
+        } else if method_form {
+            Some((r_args[1], arg_concretes[1]))
+        } else {
+            None
+        };
+        let Some(reordered) = (unsafe {
+            fbw_reorder_call_kw_args(r_args, &arg_concretes, w_code, nparams, receiver)
+        }) else {
             return Ok(None);
         };
         reordered
@@ -1590,7 +1680,12 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     } else {
         let mut callee_args = Vec::with_capacity(r_args.len().saturating_sub(1));
         let mut callee_arg_concretes = Vec::with_capacity(arg_concretes.len().saturating_sub(1));
-        if method_form {
+        if let Some(bound) = bound_method {
+            // Placeholder until the non-emitting eligibility checks finish;
+            // the resolved half replaces it with GetfieldGcR(Method.w_self).
+            callee_args.push(bound.method_op);
+            callee_arg_concretes.push(ConcreteValue::Ref(bound.receiver));
+        } else if method_form {
             callee_args.push(r_args[1]);
             callee_arg_concretes.push(arg_concretes[1]);
         }
@@ -1607,13 +1702,14 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         call_descr,
         dst_bank,
         dst,
-        callable,
+        resolved_callable,
         r_args[0],
-        callable,
+        resolved_callable,
         arg_concretes,
         callee_args,
         callee_arg_concretes,
         method_form,
+        bound_method,
         w_code,
         nparams,
         has_closure,
@@ -1829,9 +1925,10 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     callable_guard_op: OpRef,
     callable_guard_value: pyre_object::PyObjectRef,
     arg_concretes: Vec<ConcreteValue>,
-    callee_args: Vec<OpRef>,
-    callee_arg_concretes: Vec<ConcreteValue>,
+    mut callee_args: Vec<OpRef>,
+    mut callee_arg_concretes: Vec<ConcreteValue>,
     method_form: bool,
+    bound_method: Option<BoundMethodInline>,
     w_code: *const (),
     nparams: usize,
     has_closure: bool,
@@ -1840,8 +1937,25 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     allow_method_load_attr: bool,
     require_str_result: bool,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    // Only exact-positional, closure-free calls: every callee local [0..nparams]
-    // is bound from a passed arg, none from defaults/varargs/cells.
+    // `Function.funccall_valuestack` fills a missing positional tail from
+    // `defs_w` before entering the frame (`function.py:188-193,217-231`).
+    // Mirror that frame shape here.  Placeholder boxes are replaced by live
+    // guarded tuple-item reads after all non-emitting eligibility checks.
+    let positional_defaults = if callee_args.len() < nparams {
+        let Some(defaults) =
+            (unsafe { positional_defaults_for_inline(callable, callee_args.len(), nparams) })
+        else {
+            return Ok(None);
+        };
+        for &(_, _, value) in &defaults.values {
+            callee_args.push(OpRef::NONE);
+            callee_arg_concretes.push(ConcreteValue::Ref(value));
+        }
+        Some(defaults)
+    } else {
+        None
+    };
+    // Closure/vararg/over-arity calls still use the ordinary residual path.
     if has_closure || callee_args.len() != nparams {
         return Ok(None);
     }
@@ -1903,34 +2017,31 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // will not happen and admits a body whose real residual a replay would
     // double.
     //
-    // The two widths are folded in one pass because the accepted tag set
-    // depends on which one holds: only the int table covers `And` / `Or` /
-    // `Xor`, so those need every argument to be an exact plain int, while
-    // `Add` / `Subtract` / `Multiply` are in both tables and take either.
-    // `bool` is excluded from both: `is_plain_int1` rejects it, so an
-    // argument list carrying one stays on the conservative side.
-    let (args_all_exact_plain_int, args_all_exact_numeric) =
-        callee_arg_concretes
-            .iter()
-            .fold((true, true), |(all_int, all_numeric), concrete| {
-                let (exact_int, exact_float) = match concrete {
-                    ConcreteValue::Int(_) => (true, false),
-                    ConcreteValue::Float(_) => (false, true),
-                    ConcreteValue::Ref(obj) if !obj.is_null() => unsafe {
-                        (
-                            pyre_object::is_plain_int1(*obj),
-                            pyre_object::is_plain_float_strict(*obj),
-                        )
-                    },
-                    ConcreteValue::Bool(_) | ConcreteValue::Ref(_) | ConcreteValue::Null => {
-                        (false, false)
-                    }
-                };
-                (
-                    all_int && exact_int,
-                    all_numeric && (exact_int || exact_float),
-                )
-            });
+    // Preserve exactness per argument.  Method-form calls put a usually
+    // nonnumeric `self` in slot 0; folding all arguments into one boolean
+    // incorrectly made that erase the proof for an independent numeric `x`.
+    let exact_numeric_args: Vec<ExactNumericArg> = callee_arg_concretes
+        .iter()
+        .map(|concrete| {
+            let (plain_int, exact_float) = match concrete {
+                ConcreteValue::Int(_) => (true, false),
+                ConcreteValue::Float(_) => (false, true),
+                ConcreteValue::Ref(obj) if !obj.is_null() => unsafe {
+                    (
+                        pyre_object::is_plain_int1(*obj),
+                        pyre_object::is_plain_float_strict(*obj),
+                    )
+                },
+                ConcreteValue::Bool(_) | ConcreteValue::Ref(_) | ConcreteValue::Null => {
+                    (false, false)
+                }
+            };
+            ExactNumericArg {
+                numeric: plain_int || exact_float,
+                plain_int,
+            }
+        })
+        .collect();
     let args_all_builtin_integer = callee_arg_concretes.iter().all(|concrete| match concrete {
         ConcreteValue::Int(_) | ConcreteValue::Bool(_) => true,
         ConcreteValue::Ref(obj) if !obj.is_null() => unsafe { pyre_object::is_int_or_long(*obj) },
@@ -2008,11 +2119,12 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     if !bridge_rec_root_selfrec && fbw_hazardous_inline_denied(callee_code_key) {
         return Ok(None);
     }
-    // An inline sub-walk inside a FOR_ITER body resumes a guard at the
-    // caller's CALL boundary, so deopt re-executes the whole callee.  Replaying
-    // a live-heap mutation would double it; the nested-residual decline catches
-    // that only after an abort storm.  A callee whose body commits nothing
-    // replays benignly, so admit it.
+    // A legacy, unseeded inline sub-walk inside a FOR_ITER body resumes a guard
+    // at the caller's CALL boundary, so deopt re-executes the whole callee.
+    // Replaying a live-heap mutation would double it.  Keep classifying that
+    // shape here, but do not reject Dirty yet: the per-frame path below now
+    // builds a real red callee frame and snapshots its own resume coordinate.
+    // Dirty is accepted only if that frame seed actually succeeds.
     //
     // A body whose only unproven ops are Python-level CALL residuals is
     // admitted too: this same gate re-runs for each callee the lever resolves
@@ -2022,19 +2134,17 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // declines — `helper(i)` calling `add(i, 1, 2)` residualizes both calls
     // per iteration, though each body on its own is pure arithmetic.
     let mut foriter_deferred_admit = false;
-    if fbw_foriter_inflight_active() {
+    let foriter_replay_safety = if fbw_foriter_inflight_active() {
         let safety = fbw_callee_body_replay_safety(
             body.code,
-            nparams,
-            args_all_exact_numeric,
-            args_all_exact_plain_int,
+            &exact_numeric_args,
             body.num_regs_i,
             body.constants_i,
             body.num_regs_r,
             body.constants_r,
             callee_descr_refs,
         );
-        let admit = match safety {
+        let legacy_admit = match safety {
             CalleeReplaySafety::Clean => true,
             CalleeReplaySafety::DeferredCall => {
                 foriter_deferred_admit = !fbw_foriter_deferred_call_denied(callee_code_key);
@@ -2044,18 +2154,45 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         };
         if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
             eprintln!(
-                "[inline-foriter-gate] pc={} admit={admit} exact_numeric={args_all_exact_numeric} \
+                "[inline-foriter-gate] pc={} legacy_admit={legacy_admit} exact_numeric_args={} \
                  safety={safety:?} deferred_admit={foriter_deferred_admit}",
                 op.pc,
+                exact_numeric_args.iter().filter(|arg| arg.numeric).count(),
             );
         }
-        if !admit {
+        if safety == CalleeReplaySafety::DeferredCall && !legacy_admit {
+            return Ok(None);
+        }
+        Some(safety)
+    } else {
+        None
+    };
+    let requires_seeded_callee_frame = foriter_replay_safety == Some(CalleeReplaySafety::Dirty);
+    if requires_seeded_callee_frame {
+        // Keep the two explicit multi-frame hazards
+        // `fbw_inline_callee_hazardous` documents out of this newly admitted
+        // path.  A callee-owned FOR_ITER still lacks reliable Option-C item
+        // delivery, and self-recursion must fold through CALL_ASSEMBLER rather
+        // than recursively seed dirty frames.  `random.gauss` has neither;
+        // recursive `partial_product` in test_math has the latter and must
+        // remain on its established residual/assembler path.
+        let raw = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject
+        };
+        if raw.is_null()
+            || unsafe {
+                pyre_interpreter::code_has_for_iter(&*raw)
+                    || pyre_interpreter::code_is_self_recursive(&*raw)
+            }
+        {
             return Ok(None);
         }
     }
     if method_form
         && !allow_method_load_attr
         && !method_form_callee_body_supported(body.code, callee_descr_refs)
+        && !requires_seeded_callee_frame
     {
         return Ok(None);
     }
@@ -2209,6 +2346,35 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         return Ok(None);
     }
 
+    let mut callable_guard_op = callable_guard_op;
+    let mut callable_guard_value = callable_guard_value;
+    if let Some(bound) = bound_method {
+        // `_Method._immutable_fields_ = ['w_function', 'w_instance']`
+        // (pypy/interpreter/function.py:567).  Preserve those as red field
+        // reads: guard only the Method layout and underlying function, then
+        // pass the live receiver field into the callee.  Baking the receiver
+        // concrete would collapse bound methods with different `self` values.
+        let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
+        walker_guard_class(ctx, op.pc, bound.method_op, method_type_addr)?;
+        let function_op = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            bound.method_op,
+            crate::descr::method_w_function_descr(),
+        );
+        let receiver_op = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            bound.method_op,
+            crate::descr::method_w_self_descr(),
+        );
+        ctx.trace_ctx.try_set_opref_concrete(
+            receiver_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(bound.receiver as usize)),
+        );
+        callee_args[0] = receiver_op;
+        callable_guard_op = function_op;
+        callable_guard_value = bound.function;
+    }
+
     // Path-1 (#68): the inlined callee's compile-time-constant frame fields,
     // so a scalar `getfield_vable_r` off its own (unseeded) portal frame —
     // the `w_globals` namespace for a LOAD_GLOBAL, the promote-to-const
@@ -2283,6 +2449,39 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             0,
         );
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+
+    if let Some(defaults) = positional_defaults {
+        // `defs_w?`: read the live field on every compiled iteration, then
+        // guard the tuple identity used while tracing.  Reassigning
+        // `f.__defaults__` therefore deopts at the caller's CALL boundary.
+        let defaults_op = ctx.trace_ctx.record_op_with_descr(
+            OpCode::GetfieldGcR,
+            &[callable_guard_op],
+            crate::descr::function_defs_w_descr(),
+        );
+        ctx.trace_ctx.try_set_opref_concrete(
+            defaults_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(defaults.tuple as usize)),
+        );
+        let defaults_expected = ctx.trace_ctx.const_ref(defaults.tuple as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[defaults_op, defaults_expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+
+        // `defs_w?[*]`: once the field guard pins the tuple, its
+        // `wrappeditems` pointer and contents are immutable.  Preserve the
+        // actual Ref boxes instead of baking one anchor's concrete value.
+        let items = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            defaults_op,
+            crate::descr::tuple_wrappeditems_descr(),
+        );
+        for (param_index, tuple_index, _) in defaults.values {
+            let index = ctx.trace_ctx.const_int(tuple_index as i64);
+            callee_args[param_index] =
+                crate::state::trace_items_block_getitem_value_pure(ctx.trace_ctx, items, index);
+        }
     }
 
     let (
@@ -2385,6 +2584,9 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // single-frame collapse — a 3-frame snapshot the resume path is sound for
     // only one paused caller frame.
     let strict_seed = strict_inlinable && inline_depth < fbw_max_multiframe_depth();
+    if requires_seeded_callee_frame && !(try_multiframe || strict_seed) {
+        return Ok(None);
+    }
     // True once the callee frame reds are actually seeded (all preconditions
     // below met).  For a strict callee this gates routing its guards through the
     // multi-frame snapshot vs. falling back to collapse.
@@ -2595,6 +2797,9 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             ca_concrete_frame = concrete_frame_ptr;
             callee_frame_seeded = true;
         }
+    }
+    if requires_seeded_callee_frame && !callee_frame_seeded {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
     }
 
     // gh#467 forward-flush inputs are captured AT the CALL, after this
@@ -3481,6 +3686,7 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
         vec![r_args[2]],
         vec![ConcreteValue::Ref(concrete_receiver)],
         true,
+        None,
         w_code,
         nparams,
         has_closure,
@@ -3599,6 +3805,7 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
         vec![obj],
         vec![ConcreteValue::Ref(concrete_obj)],
         true,
+        None,
         w_code,
         nparams,
         has_closure,
@@ -3699,6 +3906,7 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
             ConcreteValue::Ref(concrete_value),
         ],
         true,
+        None,
         w_code,
         nparams,
         has_closure,
@@ -3810,6 +4018,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             ConcreteValue::Ref(concrete_rhs),
         ],
         true,
+        None,
         w_code,
         nparams,
         has_closure,
@@ -3954,6 +4163,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
             ConcreteValue::Ref(concrete_rhs),
         ],
         true,
+        None,
         w_code,
         nparams,
         has_closure,

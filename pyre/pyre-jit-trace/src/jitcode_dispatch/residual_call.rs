@@ -2850,32 +2850,23 @@ pub(crate) fn residual_call_descr_index_in_body(body_code: &[u8], d: &DecodedOp)
 ///   `_pow` but keeps a cold-path residual for nan/inf/negative-base operands.
 /// - `Subscr`, `MatrixMultiply` (+ in-place) — no arm in either table.
 ///
-/// Both flags describe the callee's INCOMING arguments, so on their own they
-/// say nothing about the operands of any particular binop.  A body reaches an
-/// operand they do not cover through the residuals this scan treats as
-/// replay-safe reads: in `def f(x): return G - x` the left operand is whatever
-/// `G` names, and a numeric subclass there defines its own `__sub__`, declines
-/// the specialization, and leaves behind a live-heap effect a replay would
-/// double.  `binop_safe_ref_regs` carries the missing proof — the caller sets
-/// a register only while it provably holds an immutable builtin — and both
-/// operand registers must be in it.
+/// The two provenance sets describe the actual operands of each binop.  This
+/// admits `def f(self, x): return x + 1` when only `x` is numeric, while still
+/// rejecting `self + x` and global numeric subclasses with user dunders.
 pub(crate) fn residual_call_is_specialized_plain_numeric_binop(
     body_code: &[u8],
-    args_all_exact_numeric: bool,
-    args_all_exact_plain_int: bool,
-    binop_safe_ref_regs: &[bool; u8::MAX as usize + 1],
+    numeric_ref_regs: &[bool; u8::MAX as usize + 1],
+    plain_int_ref_regs: &[bool; u8::MAX as usize + 1],
     d: &DecodedOp,
     num_regs_i: usize,
     constants_i: &[i64],
     callee_descr_refs: &[DescrRef],
 ) -> bool {
-    if !args_all_exact_numeric
-        || !matches!(
-            d.key,
-            "residual_call_ir_r/iIRd>r" | "residual_call_ir_i/iIRd>i" | "residual_call_ir_v/iIRd"
-        )
-        || residual_call_helper_kind_in_body(body_code, d, callee_descr_refs)
-            != Some(majit_ir::PyreHelperKind::BinaryOp)
+    if !matches!(
+        d.key,
+        "residual_call_ir_r/iIRd>r" | "residual_call_ir_i/iIRd>i" | "residual_call_ir_v/iIRd"
+    ) || residual_call_helper_kind_in_body(body_code, d, callee_descr_refs)
+        != Some(majit_ir::PyreHelperKind::BinaryOp)
     {
         return false;
     }
@@ -2895,7 +2886,7 @@ pub(crate) fn residual_call_is_specialized_plain_numeric_binop(
     else {
         return false;
     };
-    if !binop_safe_ref_regs[lhs_reg as usize] || !binop_safe_ref_regs[rhs_reg as usize] {
+    if !numeric_ref_regs[lhs_reg as usize] || !numeric_ref_regs[rhs_reg as usize] {
         return false;
     }
     // The first I-list item is the BINARY_OP tag.  It must be in the callee's
@@ -2930,9 +2921,44 @@ pub(crate) fn residual_call_is_specialized_plain_numeric_binop(
             | BinaryOperator::InplaceAnd
             | BinaryOperator::InplaceOr
             | BinaryOperator::InplaceXor,
-        ) => args_all_exact_plain_int,
+        ) => plain_int_ref_regs[lhs_reg as usize] && plain_int_ref_regs[rhs_reg as usize],
         _ => false,
     }
+}
+
+pub(crate) fn residual_call_is_specialized_plain_int_binop(
+    body_code: &[u8],
+    d: &DecodedOp,
+    num_regs_i: usize,
+    constants_i: &[i64],
+) -> bool {
+    let Some(&i_len) = body_code.get(d.pc + 2) else {
+        return false;
+    };
+    if i_len == 0 {
+        return false;
+    }
+    let Some(&tag_reg) = body_code.get(d.pc + 3) else {
+        return false;
+    };
+    let Some(&tag) = (tag_reg as usize)
+        .checked_sub(num_regs_i)
+        .and_then(|constant_index| constants_i.get(constant_index))
+    else {
+        return false;
+    };
+    use pyre_interpreter::bytecode::BinaryOperator;
+    matches!(
+        pyre_interpreter::runtime_ops::binary_op_from_tag(tag),
+        Some(
+            BinaryOperator::And
+                | BinaryOperator::Or
+                | BinaryOperator::Xor
+                | BinaryOperator::InplaceAnd
+                | BinaryOperator::InplaceOr
+                | BinaryOperator::InplaceXor
+        )
+    )
 }
 
 pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(

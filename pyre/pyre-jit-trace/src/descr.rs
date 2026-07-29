@@ -913,6 +913,36 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
+/// `Function.defs_w` — PyPy `function.py:47`
+/// `_immutable_fields_ = [..., 'defs_w?[*]', ...]`.
+///
+/// The `?` makes the field quasi-immutable upstream and `[*]` makes the
+/// selected defaults immutable after the field has been promoted.  Pyre's
+/// `function_set_defaults` does not yet call `do_force_quasi_immutable`, so
+/// marking this descriptor quasi-immutable would leave compiled loops alive
+/// after `f.__defaults__ = ...`.  Keep the field live/mutable for now; the
+/// inline-call path pairs its read with a `GuardValue`, which is the sound
+/// pre-invalidation equivalent.  The tuple's backing array has its own
+/// immutable descriptor and is read with `GetarrayitemGcPureR`.
+static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        pyre_interpreter::function::FUNCTION_OBJECT_SIZE,
+        FUNCTION_GC_TYPE_ID,
+        &pyre_interpreter::FUNCTION_TYPE as *const _ as usize,
+        &[(
+            "defs_w",
+            pyre_interpreter::function::FUNCTION_DEFS_W_OFFSET,
+            std::mem::size_of::<usize>(),
+            Type::Ref,
+            false,
+            false,
+            false,
+        )],
+        "Function",
+        "function::Function",
+    )
+});
+
 /// `W_DictObject.keys_version` is pyre's explicit representation of the live
 /// strategy-iterator state PyPy carries implicitly
 /// (`dictmultiobject.py:807-845`).  Key insertion/removal/strategy replacement
@@ -1873,6 +1903,13 @@ pub fn range_length_descr() -> DescrRef {
 /// bound-method specialization in `call_callable_value`.
 pub fn method_w_function_descr() -> DescrRef {
     field_descr_from_group(&W_METHOD_DESCR_GROUP, 0)
+}
+
+/// Live `Function.defs_w` field used by the positional-default inline path.
+/// See [`FUNCTION_DESCR_GROUP`] for why this is deliberately mutable until
+/// pyre wires the upstream quasi-immutable invalidation hook.
+pub fn function_defs_w_descr() -> DescrRef {
+    field_descr_from_group(&FUNCTION_DESCR_GROUP, 0)
 }
 
 pub fn dict_keys_version_descr() -> DescrRef {

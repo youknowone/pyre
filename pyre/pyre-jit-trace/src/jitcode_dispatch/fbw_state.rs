@@ -1734,15 +1734,22 @@ pub(crate) enum CalleeReplaySafety {
 /// register reaching a join can hold whichever allocation the taken path put
 /// there, which this straight-line scan cannot name.
 ///
+/// Exact numeric provenance for one positional parameter of an inline callee.
+/// The two facts stay separate because bitwise specialization accepts only
+/// exact ints, while add/subtract/multiply also accept exact floats.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ExactNumericArg {
+    pub(crate) numeric: bool,
+    pub(crate) plain_int: bool,
+}
+
 /// The `BINARY_OP` exemption needs the mirror-image fact — which values came
-/// FROM the caller, the only ones `args_all_exact_numeric` /
-/// `args_all_exact_plain_int` describe — so parameter provenance is tracked
-/// alongside freshness; see `arg_backed_ref_regs` below.
+/// FROM exact-numeric caller arguments — so parameter provenance is tracked
+/// slot-by-slot alongside freshness.  This matters for method-form calls:
+/// `self` is commonly nonnumeric while a later argument is an exact int.
 pub(crate) fn fbw_callee_body_replay_safety(
     body_code: &[u8],
-    nparams: usize,
-    args_all_exact_numeric: bool,
-    args_all_exact_plain_int: bool,
+    exact_numeric_args: &[ExactNumericArg],
     num_regs_i: usize,
     constants_i: &[i64],
     num_regs_r: usize,
@@ -1759,8 +1766,8 @@ pub(crate) fn fbw_callee_body_replay_safety(
     // can neither dispatch to a user `__add__` nor be mutated in place, so the
     // op commits nothing a replay could double.  Three sources close over it:
     //
-    // - an incoming argument, which the caller checked is an exact int or float
-    //   (`args_all_exact_*`).  A body does not receive parameters in registers;
+    // - an incoming argument, which the caller checked is an exact int or float.
+    //   A body does not receive parameters in registers;
     //   it reads them out of its own frame, whose `localsplus` slots
     //   `[0, nparams)` the exact-positional entry convention binds from the
     //   passed args (`callee_args.len() == nparams`, closure-free).  So the
@@ -1784,27 +1791,34 @@ pub(crate) fn fbw_callee_body_replay_safety(
     // freshness does: a slot or register reaching a join holds whatever the
     // taken path put there, which this straight-line scan cannot name.  The
     // constant pool is re-seeded across that reset, being immutable.
-    let mut seed_ref_regs = [false; u8::MAX as usize + 1];
+    let mut seed_numeric_ref_regs = [false; u8::MAX as usize + 1];
+    let mut seed_plain_int_ref_regs = [false; u8::MAX as usize + 1];
     for (index, &raw) in constants_r.iter().enumerate() {
         let Some(reg) = num_regs_r
             .checked_add(index)
-            .filter(|r| *r < seed_ref_regs.len())
+            .filter(|r| *r < seed_numeric_ref_regs.len())
         else {
             break;
         };
         let obj = raw as usize as pyre_object::PyObjectRef;
-        seed_ref_regs[reg] = !obj.is_null()
-            && unsafe {
-                pyre_object::is_plain_int1(obj) || pyre_object::is_plain_float_strict(obj)
-            };
+        if !obj.is_null() {
+            let exact_int = unsafe { pyre_object::is_plain_int1(obj) };
+            seed_plain_int_ref_regs[reg] = exact_int;
+            seed_numeric_ref_regs[reg] =
+                exact_int || unsafe { pyre_object::is_plain_float_strict(obj) };
+        }
     }
-    let mut binop_safe_ref_regs = seed_ref_regs;
-    let mut binop_safe_slots = [false; BODY_TRACKED_FRAME_SLOTS];
-    for slot in binop_safe_slots
-        .iter_mut()
-        .take(nparams.min(BODY_TRACKED_FRAME_SLOTS))
+    let mut numeric_ref_regs = seed_numeric_ref_regs;
+    let mut plain_int_ref_regs = seed_plain_int_ref_regs;
+    let mut numeric_slots = [false; BODY_TRACKED_FRAME_SLOTS];
+    let mut plain_int_slots = [false; BODY_TRACKED_FRAME_SLOTS];
+    for (slot, exact) in exact_numeric_args
+        .iter()
+        .take(BODY_TRACKED_FRAME_SLOTS)
+        .enumerate()
     {
-        *slot = true;
+        numeric_slots[slot] = exact.numeric;
+        plain_int_slots[slot] = exact.plain_int;
     }
     // The frame register every vable op in this body has used so far.  A second
     // one would mean the slot bookkeeping above is tracking two different
@@ -1815,15 +1829,18 @@ pub(crate) fn fbw_callee_body_replay_safety(
     while pc < body_code.len() {
         if branch_targets.contains(&pc) {
             fresh_ref_regs = [false; u8::MAX as usize + 1];
-            binop_safe_ref_regs = seed_ref_regs;
-            binop_safe_slots = [false; BODY_TRACKED_FRAME_SLOTS];
+            numeric_ref_regs = seed_numeric_ref_regs;
+            plain_int_ref_regs = seed_plain_int_ref_regs;
+            numeric_slots = [false; BODY_TRACKED_FRAME_SLOTS];
+            plain_int_slots = [false; BODY_TRACKED_FRAME_SLOTS];
         }
         let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
             return CalleeReplaySafety::Dirty;
         };
         // Set by the arms below when this op's `>r` result is itself an
         // immutable builtin.
-        let mut dst_binop_safe = false;
+        let mut dst_exact_numeric = false;
+        let mut dst_exact_plain_int = false;
 
         // The ref-slot accessors name the frame in operand 0 and the slot in
         // operand 1, both one byte wide.  The `_i` / `_f` variants address a
@@ -1846,14 +1863,21 @@ pub(crate) fn fbw_callee_body_replay_safety(
             // resolve could name any of them, so it drops the lot.
             match vable_slot {
                 Some(slot) if slot < BODY_TRACKED_FRAME_SLOTS => {
-                    binop_safe_slots[slot] = d.argcodes.starts_with("rir")
-                        && body_code
-                            .get(d.pc + 3)
-                            .is_some_and(|src| binop_safe_ref_regs[*src as usize]);
+                    let src = d
+                        .argcodes
+                        .starts_with("rir")
+                        .then(|| body_code.get(d.pc + 3))
+                        .flatten()
+                        .copied();
+                    numeric_slots[slot] = src.is_some_and(|src| numeric_ref_regs[src as usize]);
+                    plain_int_slots[slot] = src.is_some_and(|src| plain_int_ref_regs[src as usize]);
                 }
                 // Past the tracked window: cannot alias a slot inside it.
                 Some(_) => {}
-                None => binop_safe_slots = [false; BODY_TRACKED_FRAME_SLOTS],
+                None => {
+                    numeric_slots = [false; BODY_TRACKED_FRAME_SLOTS];
+                    plain_int_slots = [false; BODY_TRACKED_FRAME_SLOTS];
+                }
             }
         }
 
@@ -1888,35 +1912,35 @@ pub(crate) fn fbw_callee_body_replay_safety(
                     | majit_ir::PyreHelperKind::NewtupleFromArray
                     | majit_ir::PyreHelperKind::NewlistFromArray
             );
-            // A code constant is compiler-produced, and `box_int` builds a
-            // brand-new `W_IntObject`; neither can be an instance of a user
-            // class, so both are usable as a proven binop operand.  The two
-            // array consumers build a tuple and a LIST — the list is mutable,
-            // so only the tuple qualifies — and `load_global` reads whatever
-            // the module namespace holds, which is the very hole being closed.
-            let dst_immutable_builtin = matches!(
-                ei.pyre_helper,
-                majit_ir::PyreHelperKind::LoadConst
-                    | majit_ir::PyreHelperKind::BoxInt
-                    | majit_ir::PyreHelperKind::NewtupleFromArray
-            );
+            // `box_int` is the only generic replay-safe helper here whose
+            // result is necessarily numeric.  `load_const` may return a str,
+            // tuple, or another nonnumeric immutable value, while the typed
+            // jitcode constant pool was classified exactly above.
+            let dst_boxed_int = ei.pyre_helper == majit_ir::PyreHelperKind::BoxInt;
             let provably_side_effect_free = replay_safe_read
                 || ei.check_is_elidable()
                 || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant;
             let accepted_binop = !provably_side_effect_free
                 && residual_call_is_specialized_plain_numeric_binop(
                     body_code,
-                    args_all_exact_numeric,
-                    args_all_exact_plain_int,
-                    &binop_safe_ref_regs,
+                    &numeric_ref_regs,
+                    &plain_int_ref_regs,
                     &d,
                     num_regs_i,
                     constants_i,
                     callee_descr_refs,
                 );
-            // A builtin binary op over immutable builtin operands returns one,
-            // so its result may serve as an operand of the next.
-            dst_binop_safe = dst_immutable_builtin || accepted_binop;
+            // An accepted arithmetic op over exact numeric operands returns an
+            // exact numeric.  Bitwise ops require and return exact ints.
+            dst_exact_numeric = dst_boxed_int || accepted_binop;
+            dst_exact_plain_int = dst_boxed_int
+                || (accepted_binop
+                    && residual_call_is_specialized_plain_int_binop(
+                        body_code,
+                        &d,
+                        num_regs_i,
+                        constants_i,
+                    ));
             if !provably_side_effect_free && !accepted_binop {
                 // A Python-level CALL is the one shape this scan cannot
                 // settle: the inline lever binds its callee only at the call,
@@ -1933,7 +1957,8 @@ pub(crate) fn fbw_callee_body_replay_safety(
                     deferred_call = true;
                     // The callee this resolves to is a runtime value, so what it
                     // can reach through this frame is unknown here.
-                    binop_safe_slots = [false; BODY_TRACKED_FRAME_SLOTS];
+                    numeric_slots = [false; BODY_TRACKED_FRAME_SLOTS];
+                    plain_int_slots = [false; BODY_TRACKED_FRAME_SLOTS];
                 } else {
                     return CalleeReplaySafety::Dirty;
                 }
@@ -1999,15 +2024,24 @@ pub(crate) fn fbw_callee_body_replay_safety(
             // frame slot, from the residual arm above, or through a verbatim
             // copy.  Every other producer overwrites the register with an
             // unproven value.
-            binop_safe_ref_regs[dst as usize] = dst_binop_safe
+            numeric_ref_regs[dst as usize] = dst_exact_numeric
                 || vable_slot.is_some_and(|slot| {
                     d.opname.starts_with("getarrayitem_vable_r")
-                        && binop_safe_slots.get(slot).copied().unwrap_or(false)
+                        && numeric_slots.get(slot).copied().unwrap_or(false)
                 })
                 || (d.key == "ref_copy/r>r"
                     && body_code
                         .get(d.pc + 1)
-                        .is_some_and(|src| binop_safe_ref_regs[*src as usize]));
+                        .is_some_and(|src| numeric_ref_regs[*src as usize]));
+            plain_int_ref_regs[dst as usize] = dst_exact_plain_int
+                || vable_slot.is_some_and(|slot| {
+                    d.opname.starts_with("getarrayitem_vable_r")
+                        && plain_int_slots.get(slot).copied().unwrap_or(false)
+                })
+                || (d.key == "ref_copy/r>r"
+                    && body_code
+                        .get(d.pc + 1)
+                        .is_some_and(|src| plain_int_ref_regs[*src as usize]));
         }
         pc = d.next_pc;
     }
