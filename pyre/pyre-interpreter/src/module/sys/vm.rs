@@ -1073,29 +1073,43 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function("_getframemodulename", |args| {
             let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
             crate::builtins::kwarg_reject_unknown(kwargs, &["depth"], "_getframemodulename")?;
-            if positional.len() > 1 {
+            // The arity is judged on the total argument count, so supplying
+            // `depth` both ways is "takes at most 1 argument (2 given)" rather
+            // than the duplicate-binding report.
+            let supplied = positional.len() + crate::builtins::real_kwarg_count(kwargs);
+            if supplied > 1 {
                 return Err(crate::PyError::type_error(format!(
-                    "_getframemodulename() takes at most 1 argument ({} given)",
-                    positional.len()
+                    "_getframemodulename() takes at most 1 argument ({supplied} given)"
                 )));
             }
-            let depth = match positional
-                .first()
-                .copied()
-                .or(crate::builtins::kwarg_get(kwargs, "depth"))
-            {
+            let depth = match crate::builtins::bind_pos_or_kw(
+                positional,
+                kwargs,
+                0,
+                "depth",
+                "_getframemodulename",
+                1,
+            )? {
                 Some(v) => crate::baseobjspace::int_w(crate::baseobjspace::space_index(v)?)?,
                 None => 0,
             };
-            if depth < 0 {
-                return Ok(pyre_object::w_none());
-            }
             let ec = current_execution_context();
             if ec.is_null() {
                 return Ok(pyre_object::w_none());
             }
-            let mut current = unsafe { (*ec).gettopframe_nohidden() };
-            let mut remaining = depth;
+            // Force the frame `topframeref` names before walking, for the same
+            // reason `sys._getframe` above does: a JIT-inlined callee has no
+            // frame until the force materialises one, so an unforced walk would
+            // start at the caller and report the caller's module.
+            let mut current = unsafe {
+                (*ec).gettopframe();
+                (*ec).gettopframe_nohidden()
+            };
+            // `while (f && (_PyFrame_IsIncomplete(f) || depth-- > 0))` — the
+            // post-decrement test fails immediately for a negative depth, so a
+            // negative walks zero frames and reports the current module rather
+            // than `None`.
+            let mut remaining = depth.max(0);
             while !current.is_null() && remaining > 0 {
                 current = crate::executioncontext::ExecutionContext::getnextframe_nohidden(current);
                 remaining -= 1;
