@@ -1644,6 +1644,54 @@ fn body_int_operand_constant(ireg: u8, num_regs_i: usize, constants_i: &[i64]) -
         .copied()
 }
 
+/// Which of the tracked frame slots this body can store into.
+///
+/// A slot the body never writes still holds exactly the argument the
+/// exact-positional entry convention bound from the caller, on every path
+/// through the body — so unlike a register, its provenance is not something a
+/// join can invalidate.  `def leaf(i): if i % 3 == 1: ... ; return i % 5` needs
+/// this: the second `i` is read after a branch target, and without it the slot
+/// reset drops the caller's exact-int proof and the second `BINARY_OP`
+/// residualizes the whole callee.
+///
+/// A store this scan cannot resolve to a slot number could name any of them, so
+/// it gives the whole window up.  Same for an undecodable body — the main scan
+/// answers `Dirty` on it anyway.
+fn body_stored_frame_slots(
+    body_code: &[u8],
+    num_regs_i: usize,
+    constants_i: &[i64],
+) -> [bool; BODY_TRACKED_FRAME_SLOTS] {
+    let mut written = [false; BODY_TRACKED_FRAME_SLOTS];
+    let mut pc = 0usize;
+    while pc < body_code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            return [true; BODY_TRACKED_FRAME_SLOTS];
+        };
+        if d.key.starts_with("setarrayitem_vable_r") {
+            // `ri…`: the frame is operand 0 and the slot operand 1.  The frame
+            // register is deliberately not matched against the scan's
+            // `vable_reg` here — a store this pass cannot attribute is treated
+            // as reaching every slot, which is the conservative direction.
+            let slot = d
+                .argcodes
+                .starts_with("ri")
+                .then(|| body_code.get(d.pc + 2))
+                .flatten()
+                .and_then(|ireg| body_int_operand_constant(*ireg, num_regs_i, constants_i))
+                .and_then(|slot| usize::try_from(slot).ok());
+            match slot {
+                Some(slot) if slot < BODY_TRACKED_FRAME_SLOTS => written[slot] = true,
+                // Past the tracked window: cannot alias a slot inside it.
+                Some(_) => {}
+                None => return [true; BODY_TRACKED_FRAME_SLOTS],
+            }
+        }
+        pc = d.next_pc;
+    }
+    written
+}
+
 fn body_branch_targets(body_code: &[u8]) -> Option<std::collections::HashSet<usize>> {
     let mut targets = std::collections::HashSet::new();
     let mut pc = 0usize;
@@ -1791,8 +1839,11 @@ pub(crate) fn fbw_callee_body_replay_safety(
     //
     // Everything the body computes drops at a branch target for the reason
     // freshness does: a slot or register reaching a join holds whatever the
-    // taken path put there, which this straight-line scan cannot name.  The
-    // constant pool is re-seeded across that reset, being immutable.
+    // taken path put there, which this straight-line scan cannot name.  Two
+    // things are re-seeded across that reset instead of dropped, because
+    // neither is something a path could have changed: the constant pool, being
+    // immutable, and any frame slot the body never stores into, which still
+    // holds the caller's argument.
     let mut seed_numeric_ref_regs = [false; u8::MAX as usize + 1];
     let mut seed_plain_int_ref_regs = [false; u8::MAX as usize + 1];
     for (index, &raw) in constants_r.iter().enumerate() {
@@ -1812,6 +1863,11 @@ pub(crate) fn fbw_callee_body_replay_safety(
     }
     let mut numeric_ref_regs = seed_numeric_ref_regs;
     let mut plain_int_ref_regs = seed_plain_int_ref_regs;
+    // A never-stored parameter slot keeps the caller's proof across a join, so
+    // it is re-seeded rather than dropped — see [`body_stored_frame_slots`].
+    let stored_slots = body_stored_frame_slots(body_code, num_regs_i, constants_i);
+    let mut seed_numeric_slots = [false; BODY_TRACKED_FRAME_SLOTS];
+    let mut seed_plain_int_slots = [false; BODY_TRACKED_FRAME_SLOTS];
     let mut numeric_slots = [false; BODY_TRACKED_FRAME_SLOTS];
     let mut plain_int_slots = [false; BODY_TRACKED_FRAME_SLOTS];
     for (slot, exact) in exact_numeric_args
@@ -1821,6 +1877,10 @@ pub(crate) fn fbw_callee_body_replay_safety(
     {
         numeric_slots[slot] = exact.numeric;
         plain_int_slots[slot] = exact.plain_int;
+        if !stored_slots[slot] {
+            seed_numeric_slots[slot] = exact.numeric;
+            seed_plain_int_slots[slot] = exact.plain_int;
+        }
     }
     // The frame register every vable op in this body has used so far.  A second
     // one would mean the slot bookkeeping above is tracking two different
@@ -1834,8 +1894,8 @@ pub(crate) fn fbw_callee_body_replay_safety(
             bool_ref_regs = [false; u8::MAX as usize + 1];
             numeric_ref_regs = seed_numeric_ref_regs;
             plain_int_ref_regs = seed_plain_int_ref_regs;
-            numeric_slots = [false; BODY_TRACKED_FRAME_SLOTS];
-            plain_int_slots = [false; BODY_TRACKED_FRAME_SLOTS];
+            numeric_slots = seed_numeric_slots;
+            plain_int_slots = seed_plain_int_slots;
         }
         let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
             replay_dirty!("DecodeOpFailed", pc, "-");

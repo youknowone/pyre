@@ -3057,13 +3057,20 @@ pub(crate) fn residual_call_descr_index_in_body(body_code: &[u8], d: &DecodedOp)
 ///   unconditional, but *int-only*: the float table falls through to
 ///   `_ => return Ok(None)` for them.  Hence the separate
 ///   `args_all_exact_plain_int`.
+/// - `FloorDivide` / `Remainder` (+ in-place) — `IntFloorDiv` / `IntMod`,
+///   int-only for the same reason (neither has a `FLOAT_*` opcode).  These two
+///   are the one accepted pair whose lowering *can* decline — on a zero divisor
+///   or on `i64::MIN` by `-1` — but a surviving residual is still replay-safe
+///   on its own merits: `int.__floordiv__` / `int.__mod__` read two immutable
+///   boxes and either allocate a fresh result or raise `ZeroDivisionError`,
+///   which commits nothing a replay would double.  The `plain_int` proof is
+///   what rules out a user `__mod__`.  `i % k` in an `if` is the common shape
+///   that would otherwise residualize the whole callee
+///   (`bench/synth/gc_bug_bridge_flavor_traceback_names`).
 ///
 /// Every other tag is excluded because its lowering can still decline and
-/// leave the residual in place:
+/// leave a residual that is NOT replay-safe on its own:
 ///
-/// - `FloorDivide` / `Remainder` (+ in-place) — int-table `needs_concrete_check`
-///   declines a zero or `i64::MIN / -1` divisor; the float table has no
-///   `FLOAT_*` opcode for either.
 /// - `TrueDivide` (+ in-place) — float-table only, and it declines a zero
 ///   divisor so the raising `descr_truediv` stays recorded.
 /// - `Lshift` (+ in-place) — the int table declines it outright (the reused
@@ -3157,7 +3164,11 @@ pub(crate) fn residual_call_is_specialized_plain_numeric_op(
             | BinaryOperator::Xor
             | BinaryOperator::InplaceAnd
             | BinaryOperator::InplaceOr
-            | BinaryOperator::InplaceXor,
+            | BinaryOperator::InplaceXor
+            | BinaryOperator::FloorDivide
+            | BinaryOperator::Remainder
+            | BinaryOperator::InplaceFloorDivide
+            | BinaryOperator::InplaceRemainder,
         ) => plain_int_ref_regs[lhs_reg as usize] && plain_int_ref_regs[rhs_reg as usize],
         _ => false,
     }
