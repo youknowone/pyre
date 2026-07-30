@@ -159,6 +159,10 @@ impl OldGen {
             + self.raw_malloc_might_sweep.len()
     }
 
+    pub(crate) fn debug_validate_freeblocks(&self, site: &str) {
+        self.ac.debug_validate_freeblocks(site);
+    }
+
     /// incminimark.py:2512-2514 and :2688-2694: freeze the arena pages and
     /// rawmalloc stack belonging to this major cycle.  Allocations made while
     /// sweeping go to the fresh active page lists and

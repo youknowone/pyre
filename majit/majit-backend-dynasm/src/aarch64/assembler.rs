@@ -4267,6 +4267,26 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64 ; =>fail_label);
 
         dynasm!(self.mc ; .arch aarch64 ; bl =>save_regs_label);
+        if std::env::var("PYRE_TRACE_CALL_DIAG")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            == Some(self.trace_id)
+        {
+            let fail_index = guard_token
+                .fail_descr
+                .as_fail_descr()
+                .map(|fd| fd.fail_index_per_trace())
+                .unwrap_or(u32::MAX);
+            self.emit_push_all_volatile_regs();
+            self.emit_mov_imm64(0, 1_000_000 + i64::from(fail_index) * 10);
+            dynasm!(self.mc ; .arch aarch64 ; mov x1, x29);
+            self.emit_mov_imm64(
+                2,
+                crate::runner::dynasm_debug_validate_oldgen_freeblocks as *const () as usize as i64,
+            );
+            dynasm!(self.mc ; .arch aarch64 ; blr x2);
+            self.emit_pop_all_volatile_regs();
+        }
 
         // llsupport/assembler.py:236 store_info_on_descr — must_save_exception
         // guards run the exc=True failure-recovery variant: stage pos_exc_value
@@ -5880,6 +5900,21 @@ impl<'a> AssemblerARM64<'a> {
             } else {
                 self.store_rax_to_result(op.pos.get());
             }
+        }
+        if std::env::var("PYRE_TRACE_CALL_DIAG")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            == Some(self.trace_id)
+        {
+            self.emit_push_all_volatile_regs();
+            self.emit_mov_imm64(0, op.pos.get().raw() as i64);
+            dynasm!(self.mc ; .arch aarch64 ; mov x1, x29);
+            self.emit_mov_imm64(
+                2,
+                crate::runner::dynasm_debug_validate_oldgen_freeblocks as *const () as usize as i64,
+            );
+            dynasm!(self.mc ; .arch aarch64 ; blr x2);
+            self.emit_pop_all_volatile_regs();
         }
     }
 

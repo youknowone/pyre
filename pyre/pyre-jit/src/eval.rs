@@ -8390,6 +8390,17 @@ fn compile_and_run_once(
     );
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
     let tracing_finished = !driver.is_tracing();
+    if tracing_finished
+        && std::env::var_os("PYRE_DYNASM_EXEC_DIAG").is_some()
+        && let Some(trace_id) = driver
+            .meta_interp()
+            .compiled_root_trace_id(compiled_key)
+    {
+        eprintln!(
+            "[dynasm-compile] trace={trace_id} key={compiled_key} function={} file={}",
+            code.qualname, code.source_path
+        );
+    }
     if tracing_finished {
         // warmstate.py:437-444 `finally`: the starting cell owns JC_TRACING
         // even when a cross-loop cut attaches the token to another key.

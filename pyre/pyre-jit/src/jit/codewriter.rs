@@ -13027,7 +13027,7 @@ impl CodeWriter {
                 ref_alloc.coloring.insert(ec_var.id, ec_color);
                 ref_alloc.num_colors = ec_color + 1;
             }
-            let ssarepr = super::flatten::flatten_graph(
+            let ssarepr = super::flatten::flatten_graph_after_input_enforcement(
                 &graph,
                 &mut splice_regallocs,
                 false,

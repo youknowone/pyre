@@ -441,6 +441,50 @@ impl ArenaCollection {
         self.live_objects
     }
 
+    pub(crate) fn debug_validate_freeblocks(&self, site: &str) {
+        for size_class in 1..self.page_for_size.len() {
+            let block_size = size_class * WORD;
+            for (kind, mut page) in [
+                ("partial", self.page_for_size[size_class]),
+                ("full", self.full_page_for_size[size_class]),
+                ("old-partial", self.old_page_for_size[size_class]),
+                ("old-full", self.old_full_page_for_size[size_class]),
+            ] {
+                while !page.is_null() {
+                    unsafe {
+                        let page_start = page as usize;
+                        let first = page_start + self.hdrsize;
+                        let end = page_start + self.page_size;
+                        let mut free = (*page).freeblock as usize;
+                        assert!(
+                            free >= first && free <= end,
+                            "{site}: {kind} size={block_size} page={page_start:#x} free={free:#x} outside [{first:#x}, {end:#x}]"
+                        );
+                        assert_eq!(
+                            (free - first) % block_size,
+                            0,
+                            "{site}: {kind} size={block_size} page={page_start:#x} free={free:#x} unaligned"
+                        );
+                        for index in 0..(*page).nfree {
+                            let next = *(free as *const usize);
+                            assert!(
+                                next > free && next <= end,
+                                "{site}: {kind} size={block_size} page={page_start:#x} free[{index}]={free:#x} next={next:#x}"
+                            );
+                            assert_eq!(
+                                (next - first) % block_size,
+                                0,
+                                "{site}: {kind} size={block_size} page={page_start:#x} next={next:#x} unaligned"
+                            );
+                            free = next;
+                        }
+                        page = (*page).nextpage;
+                    }
+                }
+            }
+        }
+    }
+
     /// Arena-owned address-range membership, matching the answer available to
     /// incminimark from its arena pages.  It intentionally does not distinguish
     /// live blocks from free/uninitialized bytes inside a live arena.  The
@@ -456,6 +500,29 @@ impl ArenaCollection {
     unsafe fn free_arena(&mut self, arena: *mut ArenaReference) {
         unsafe {
             let base = (*arena).base as usize;
+            if std::env::var_os("PYRE_GC_FREELIST_DIAG").is_some() {
+                let end = base + (*arena).layout.size();
+                for size_class in 1..self.page_for_size.len() {
+                    for (kind, mut page) in [
+                        ("partial", self.page_for_size[size_class]),
+                        ("full", self.full_page_for_size[size_class]),
+                        ("old-partial", self.old_page_for_size[size_class]),
+                        ("old-full", self.old_full_page_for_size[size_class]),
+                    ] {
+                        while !page.is_null() {
+                            let addr = page as usize;
+                            assert!(
+                                addr < base || addr >= end,
+                                "free_arena base={base:#x} nfree={} total={} still owns {kind} size={} page={addr:#x}",
+                                (*arena).nfreepages,
+                                (*arena).totalpages,
+                                size_class * WORD,
+                            );
+                            page = (*page).nextpage;
+                        }
+                    }
+                }
+            }
             let index = self
                 .arena_ranges
                 .binary_search_by_key(&base, |&(start, _)| start)

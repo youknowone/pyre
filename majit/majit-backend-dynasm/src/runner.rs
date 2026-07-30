@@ -569,6 +569,35 @@ fn dynasm_collect_full() {
     majit_gc::gc_sync::gc_op(|g| g.collect_full());
 }
 
+fn debug_validate_oldgen_freeblocks(site: &str) {
+    if std::env::var_os("PYRE_GC_FREELIST_DIAG").is_none() {
+        return;
+    }
+    if DYNASM_ACTIVE_GC
+        .with(|c| {
+            c.borrow()
+                .as_deref()
+                .map(|g| g.debug_validate_oldgen_freeblocks(site))
+        })
+        .is_some()
+    {
+        return;
+    }
+    majit_gc::gc_sync::gc_op(|g| g.debug_validate_oldgen_freeblocks(site));
+}
+
+pub extern "C" fn dynasm_debug_validate_oldgen_freeblocks(site: u64, frame: usize) {
+    if site >= 1_000_000 {
+        let top = majit_gc::shadow_stack::jf_top_ptr().0;
+        eprintln!(
+            "[failure-frame] site={site} frame={frame:#x} top={top:#x} registered={} top_registered={}",
+            majit_gc::shadow_stack::is_libc_jitframe(frame),
+            majit_gc::shadow_stack::is_libc_jitframe(top),
+        );
+    }
+    debug_validate_oldgen_freeblocks(&format!("after residual site {site}"));
+}
+
 fn dynasm_get_objects(generation: i8, visitor: majit_gc::GetObjectsVisitorFn) {
     let mut visit = visitor;
     if DYNASM_ACTIVE_GC
@@ -823,6 +852,13 @@ pub extern "C" fn dynasm_nursery_slowpath(total_size: u64) -> u64 {
         let raw = libc::calloc(1, total_size as usize) as u64;
         if raw == 0 { 0 } else { raw + gc_hdr as u64 }
     });
+    if std::env::var_os("PYRE_GC_FREELIST_DIAG").is_some() {
+        let nursery = dynasm_gc_is_nursery_object(ptr as usize);
+        eprintln!(
+            "[malloc-slow] total={total_size} payload={ptr:#x} nursery={nursery}"
+        );
+        debug_validate_oldgen_freeblocks("after malloc slowpath");
+    }
     if majit_ir::debug::have_debug_prints() {
         majit_ir::debug::log_one(
             "jit-backend",
@@ -2134,6 +2170,20 @@ impl Backend for DynasmBackend {
         // The assembler stores the typed `Const` pool directly; each box
         // variant carries its own type (`Const::get_type`).
         let const_pool = std::mem::take(&mut self.constants);
+        if std::env::var("PYRE_TRACE_OPS_DIAG")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            == Some(trace_id)
+        {
+            let constants: indexmap::IndexMap<u32, i64> = const_pool
+                .iter()
+                .map(|(&key, value)| (key, value.as_raw_i64()))
+                .collect();
+            eprintln!(
+                "--- dynasm loop prepared ops trace={trace_id} header={header_pc} ---\n{}",
+                majit_ir::format_trace(&prepared_ops, &constants),
+            );
+        }
         let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &const_pool);
         let guard_gc_type_info = self.collect_guard_gc_type_info();
         let subclass_range_table = self.collect_classptr_subclass_range_table(&prepared_ops);
@@ -2449,6 +2499,13 @@ impl Backend for DynasmBackend {
 
         let bridge_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_size = compiled.buffer.len();
+        if std::env::var_os("PYRE_DYNASM_EXEC_DIAG").is_some() {
+            eprintln!(
+                "[dynasm-bridge] trace={trace_id} source={}:{} addr={bridge_addr:#x} len={code_size}",
+                fail_descr.trace_id(),
+                fail_descr.fail_index_per_trace(),
+            );
+        }
         // `rpython/jit/backend/x86/assembler.py:691-693` `assemble_bridge`:
         // `frame_depth = max(current_clt.frame_info.jfi_frame_depth,
         //                    frame_depth_no_fixed_size + JITFRAME_FIXED_SIZE)`
@@ -2671,7 +2728,17 @@ impl Backend for DynasmBackend {
         // manual push_jf/pop_jf_to around the call.
         let func: unsafe extern "C" fn(*mut JitFrame) -> *mut JitFrame =
             unsafe { std::mem::transmute(entry) };
+        if std::env::var_os("PYRE_DYNASM_EXEC_DIAG").is_some() {
+            eprintln!(
+                "[dynasm-exec] trace={} header={} entry={entry:p} len={} args={args:?}",
+                compiled.trace_id,
+                compiled.header_pc,
+                compiled.buffer.len(),
+            );
+        }
+        debug_validate_oldgen_freeblocks(&format!("before trace {}", compiled.trace_id));
         let result_jf = unsafe { func(jf_ptr) };
+        debug_validate_oldgen_freeblocks(&format!("after trace {}", compiled.trace_id));
 
         if crate::majit_log_enabled() {
             eprintln!(

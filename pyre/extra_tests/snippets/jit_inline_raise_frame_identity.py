@@ -35,3 +35,17 @@ class Dispatcher:
 # immediately before raising the exception caught by the caller.
 for iteration in range(10_000):
     assert Dispatcher().load() == 42, iteration
+
+
+# The stdlib implementation has the same shape, but its STOP handler ends in
+# `raise _Stop(value)`.  Its terminal RAISE_VARARGS has no following Python
+# instruction from which to synthesize a resume pivot: the JitCode's exact
+# post-residual `live` marker must keep the already executed stack.pop() from
+# being replayed after a trace abort.
+import io
+import pickle
+
+
+payload = pickle.dumps(b"x", protocol=0)
+for iteration in range(5_000):
+    assert pickle._Unpickler(io.BytesIO(payload)).load() == b"x", iteration

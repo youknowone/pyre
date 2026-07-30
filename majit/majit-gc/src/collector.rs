@@ -4006,6 +4006,10 @@ impl Default for MiniMarkGC {
 }
 
 impl GcAllocator for MiniMarkGC {
+    fn debug_validate_oldgen_freeblocks(&self, site: &str) {
+        self.oldgen.debug_validate_freeblocks(site);
+    }
+
     fn alloc_nursery(&mut self, size: usize) -> GcRef {
         self.alloc_with_type(0, size)
     }

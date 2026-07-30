@@ -11,6 +11,20 @@
 
 use super::*;
 
+/// Exact `jtransform.py handle_residual_call` trailing `-live-` marker.
+///
+/// The codewriter emits this immediately after every may-force/can-raise
+/// residual.  Runtime per-Code metadata normally carries the same coordinate;
+/// a terminal opcode immediately after the call (`RAISE_VARARGS`, for example)
+/// may have no first-insn pivot, so retain the bytecode-local identity as the
+/// authoritative fallback rather than rewinding to the call.
+fn trailing_live_marker(payload: &crate::PyJitCode, call_pc: usize) -> Option<usize> {
+    let call = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), call_pc)?;
+    let marker =
+        crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), call.next_pc)?;
+    (marker.opname == "live").then_some(marker.pc)
+}
+
 /// Read the Python PC paired with a native resume word.  The codewriter builds
 /// this table from Python-PC keys, including the same forward trivia skip as
 /// `backxlat_py_pc`; capture deliberately never projects the word backwards.
@@ -386,7 +400,16 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     // handler instead of escaping the frame.
                     if after_residual_call {
                         let call_py_pc = py;
-                        py = crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32;
+                        let exact_after_marker = jc
+                            .payload
+                            .after_residual_marker_for_jitcode_pc(op_pc)
+                            .or_else(|| jc.payload.after_residual_call_resume_for_jitcode_pc(op_pc))
+                            .or_else(|| trailing_live_marker(&jc.payload, op_pc));
+                        py = exact_after_marker
+                            .and_then(|marker| jc.payload.forward_py_pc_for_jitcode_pc(marker))
+                            .unwrap_or_else(|| {
+                                crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32
+                            });
                         let call_pc_has_catch = pyre_interpreter::pycode::lookup_exceptiontable(
                             &code.exceptiontable,
                             call_py_pc * 2,
@@ -442,6 +465,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 } else if after_residual_call {
                     jc.payload
                         .after_residual_marker_for_jitcode_pc(op_pc)
+                        .or_else(|| jc.payload.after_residual_call_resume_for_jitcode_pc(op_pc))
+                        .or_else(|| trailing_live_marker(&jc.payload, op_pc))
                         .and_then(|marker| jc.payload.depth_trivia_for_jitcode_pc(marker))
                 } else {
                     jc.payload.depth_trivia_for_jitcode_pc(op_pc)
@@ -864,7 +889,12 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                             // Every plain post-call guard capture is emitted
                             // after its fallthrough `-live-` marker, so this
                             // populated twin is total at the capture point.
-                            jc.payload.after_residual_marker_for_jitcode_pc(op_pc)
+                            jc.payload
+                                .after_residual_marker_for_jitcode_pc(op_pc)
+                                .or_else(|| {
+                                    jc.payload.after_residual_call_resume_for_jitcode_pc(op_pc)
+                                })
+                                .or_else(|| trailing_live_marker(&jc.payload, op_pc))
                         }
                     }
                 };

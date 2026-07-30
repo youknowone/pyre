@@ -1989,7 +1989,6 @@ impl<M: Clone> MetaInterp<M> {
     /// Production code reaches the same value via the resume guard descr's
     /// `descr.trace_id()` (set at backend compile time) or via
     /// `bridge_info().trace_id` after `start_retrace_from_guard`.
-    #[cfg(test)]
     pub fn compiled_root_trace_id(&self, green_key: u64) -> Option<u64> {
         self.compiled_loops.get(&green_key).map(|c| c.root_trace_id)
     }

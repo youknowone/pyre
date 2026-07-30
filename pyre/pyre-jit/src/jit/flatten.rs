@@ -2974,6 +2974,33 @@ pub fn flatten_graph<'a>(
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
+    flatten_graph_impl(graph, regallocs, include_all_exc_links, cpu, true)
+}
+
+/// Canonical flattening after the caller has already run
+/// `flatten.py:88-100 enforce_input_args`.
+///
+/// The per-code Python graph uses the ordinary upstream input convention for
+/// its Python arguments, then reserves distinct colors for the always-live
+/// `(frame, ec)` reds. Re-running `enforce_input_args` after that reservation
+/// would rotate those reds back onto body colors. The codewriter therefore
+/// calls this entry so the upstream enforcement still happens exactly once.
+pub(crate) fn flatten_graph_after_input_enforcement<'a>(
+    graph: &super::flow::FunctionGraph,
+    regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
+    include_all_exc_links: bool,
+    cpu: Option<&'a super::cpu::Cpu>,
+) -> SSARepr {
+    flatten_graph_impl(graph, regallocs, include_all_exc_links, cpu, false)
+}
+
+fn flatten_graph_impl<'a>(
+    graph: &super::flow::FunctionGraph,
+    regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
+    include_all_exc_links: bool,
+    cpu: Option<&'a super::cpu::Cpu>,
+    enforce_input_args: bool,
+) -> SSARepr {
     let lowering_ctx = cpu.and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));
     let mut ssarepr = SSARepr::new(graph.name.clone());
     // `flatten.py:67 flattener = GraphFlattener(graph, regallocs,
@@ -2988,8 +3015,12 @@ pub fn flatten_graph<'a>(
     // `flatten.py:75 GraphFlattener.__init__ ._include_all_exc_links =
     // _include_all_exc_links`.
     flattener.include_all_exc_links = include_all_exc_links;
-    // `flatten.py:68 flattener.enforce_input_args()`.
-    flattener.enforce_input_args();
+    // `flatten.py:68 flattener.enforce_input_args()`. The codewriter's
+    // post-enforcement red-color reservation takes the `false` leg because it
+    // already performed this exact pass before reserving `(frame, ec)`.
+    if enforce_input_args {
+        flattener.enforce_input_args();
+    }
     // pyre-only: color leaked `abort_permanent` operand-stack Refs before
     // serialization (no upstream counterpart — upstream flowgraphs are
     // always well-formed).  See `color_leaked_arg_variables`.

@@ -458,6 +458,24 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     let obj = read_ref_reg(code, op, 0, ctx)?;
     let descr = read_descr(code, op, 1, ctx)?;
     let descr_index = descr.index();
+    // RPython's MIFrame register contains the FrontendOp itself, whose
+    // `.value` is the concrete pointer used by executor.do_getfield_gc_*.
+    // Pyre also has a typed register shadow because some canonical/inlined
+    // helper args are OpRefs allocated outside the active recorder and cannot
+    // be stamped there.  Treat that shadow as the same MIFrame box value,
+    // after preferring the ordinary OpRef carrier.
+    let concrete_obj_ptr = ctx
+        .trace_ctx
+        .box_value(obj)
+        .and_then(|value| match value {
+            majit_ir::Value::Ref(reference) => Some(reference.0 as i64),
+            _ => None,
+        })
+        .or_else(|| match read_ref_reg_concrete(code, op, 0, ctx) {
+            ConcreteValue::Ref(reference) => Some(reference as usize as i64),
+            _ => None,
+        })
+        .filter(|&ptr| ptr != 0 && ptr != usize::MAX as i64);
 
     // ConstPtr + always-pure fast path (pyjitpl.py): a constant
     // source through an immutable descr loads the field now and
@@ -469,13 +487,7 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
             OpCode::GetfieldGcF => Some(majit_ir::Type::Float),
             _ => None,
         };
-        let struct_ptr = match ctx.trace_ctx.box_value(obj) {
-            Some(majit_ir::Value::Ref(struct_ref)) => {
-                let p = struct_ref.0 as i64;
-                (p != 0 && p != usize::MAX as i64).then_some(p)
-            }
-            _ => None,
-        };
+        let struct_ptr = concrete_obj_ptr;
         match (load_type, struct_ptr) {
             (Some(ty), Some(p)) => {
                 ctx.trace_ctx
@@ -571,31 +583,6 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
         let resbox = ctx
             .trace_ctx
             .record_op_with_descr(opcode, &[obj], descr.clone());
-        let load_type = match opcode {
-            OpCode::GetfieldGcI => Some(majit_ir::Type::Int),
-            OpCode::GetfieldGcR => Some(majit_ir::Type::Ref),
-            OpCode::GetfieldGcF => Some(majit_ir::Type::Float),
-            _ => None,
-        };
-        let live_value = if let (Some(ty), Some(majit_ir::Value::Ref(struct_ref))) =
-            (load_type, ctx.trace_ctx.box_value(obj))
-        {
-            let struct_ptr = struct_ref.0 as i64;
-            if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
-                ctx.trace_ctx.field_sanity_load(struct_ptr, &descr, ty)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        // Stamp the loaded value as the Box.value of the recorded
-        // result so subsequent reads (cache hits + non-Const
-        // `concrete_of_opref` consumers) see the real runtime
-        // concrete instead of the GcRef(usize::MAX) sentinel.
-        if let Some(live_value) = live_value {
-            ctx.trace_ctx.set_opref_concrete(resbox, live_value);
-        }
         ctx.trace_ctx
             .heapcache_getfield_now_known(obj, descr_index, resbox);
         resbox
@@ -609,7 +596,36 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     // stamps `box.value` post-exec; pyre's `concrete_of_opref` reads
     // that channel.  Null fallback preserves the prior unknown-result
     // behaviour for cache-miss recorded ops.
-    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+    let mut concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+    if matches!(concrete_for_shadow, ConcreteValue::Null) {
+        // A heapcache hit returns the original FrontendOp.  In RPython that
+        // object still carries the concrete `.value` installed when the field
+        // op executed.  Pyre can encounter an equivalent OpRef allocated
+        // outside the active recorder (canonical helper splice), where its
+        // typed register shadow survives but the recorder-local value carrier
+        // does not.  Re-read the observed field through the concrete receiver,
+        // stamp when the OpRef belongs to this recorder, and always propagate
+        // the value into this MIFrame register shadow.
+        let load_type = match opcode {
+            OpCode::GetfieldGcI => Some(majit_ir::Type::Int),
+            OpCode::GetfieldGcR => Some(majit_ir::Type::Ref),
+            OpCode::GetfieldGcF => Some(majit_ir::Type::Float),
+            _ => None,
+        };
+        if let (Some(ty), Some(struct_ptr)) = (load_type, concrete_obj_ptr)
+            && let Some(live_value) = ctx.trace_ctx.field_sanity_load(struct_ptr, &descr, ty)
+        {
+            ctx.trace_ctx.try_set_opref_concrete(result, live_value);
+            concrete_for_shadow = match live_value {
+                majit_ir::Value::Int(value) => ConcreteValue::Int(value),
+                majit_ir::Value::Ref(reference) if reference != majit_ir::GcRef::NO_CONCRETE => {
+                    ConcreteValue::Ref(reference.as_usize() as pyre_object::PyObjectRef)
+                }
+                majit_ir::Value::Float(value) => ConcreteValue::Float(value),
+                majit_ir::Value::Ref(_) | majit_ir::Value::Void => ConcreteValue::Null,
+            };
+        }
+    }
     match dst_bank {
         'i' => {
             write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;

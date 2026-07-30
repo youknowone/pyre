@@ -1907,11 +1907,10 @@ pub(crate) fn const_ref_slots_from_pc(jitcode_index: i32, pc: i32) -> Vec<(u16, 
 /// (`pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`) for
 /// the registered jitcode at `jitcode_index`. Both are `u16::MAX` for skeletons.
 ///
-/// Used by bridge resume to thread the ec OpRef from
-/// `sym.registers_r[portal_ec_reg]` (populated by the liveness-driven
-/// `consume_boxes` fill) back into `sym.execution_context`, mirroring
-/// `resume.py:1077-1081 _callback_r` which writes the same slot in
-/// RPython's BH register bank.
+/// Used by per-code dispatch and reconstructed inline callees to seed the
+/// frame/ec colors from the current MIFrame's own red inputs. Root bridge
+/// setup keeps `ec` in its second root inputarg, outside the resumed
+/// MIFrame's semantic register bank.
 pub fn portal_red_regs_at(jitcode_index: i32) -> (u16, u16) {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
@@ -9483,58 +9482,14 @@ impl JitState for PyreJitState {
         // of synthesizing parent OpRefs.
         sym.clear_active_vable();
         // `pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`:
-        // ec is a portal red arg, hence a JitCode inputarg present in
-        // every `-live-` op's R-bank. Because the codewriter
-        // (jit/codewriter.rs:2364 `filter_liveness_in_place`) seeds
-        // `portal_ec_reg` into `lv_live`, bridge resume's liveness-
-        // driven `consume_boxes` fill at lines 4880-4893 has already
-        // written the resolved ec OpRef into
-        // `bridge_registers_r[portal_ec_reg]` — the same slot
-        // `_callback_r(register_index)` (resume.py:1077-1081) writes
-        // in RPython's BH register bank.
-        //
-        // Thread that slot back into the dedicated `sym.execution_context`
-        // field so the symbolic state retains pyre's split shape (ec
-        // accessed through a named field rather than by register index).
-        // The OpRef value is identical to what RPython's ec inputarg
-        // OpRef would be after resume.
-        // `portal_ec_reg` is an abstract-register COLOR with no semantic
-        // `locals_cells_stack_w` slot (it is a portal red, not a local/stack
-        // value), so read it from the color-indexed decode `bridge_registers_r`
-        // — `sym.registers_r` is now the slot-indexed mirror and does not carry
-        // portal-red colors.
-        //
-        // At PCs where the register allocator reuses the ec color for a real
-        // frame slot (a call result live across a later call), the snapshot
-        // encoder recorded the SLOT value in this register, not the ec
-        // (`collect_outer_active_boxes` portal-red scratch gate); seeding
-        // `sym.execution_context` from it would hand a frame value to every
-        // downstream ec consumer.  Detect the collision through the same
-        // per-PC color→slot table the encoder consulted and leave ec to the
-        // `ensure_execution_context` frame-field recovery instead.
-        let (_pfr, portal_ec_reg) = crate::state::portal_red_regs_at(frame0.jitcode_index);
-        if portal_ec_reg != u16::MAX {
-            let ec_color_names_frame_slot = pyjitcode_for_jitcode_index(frame0.jitcode_index)
-                .is_some_and(|payload| {
-                    payload
-                        .pcdep_trivia_for_jitcode_pc(frame0.pc as usize)
-                        .is_some_and(|entries| {
-                            entries
-                                .iter()
-                                .any(|&(bank, color, _)| bank == 1 && color == portal_ec_reg)
-                        })
-                });
-            if !ec_color_names_frame_slot {
-                let slot = portal_ec_reg as usize;
-                assert!(
-                    slot < bridge_registers_r.len(),
-                    "setup_bridge_sym: portal_ec_reg={} out of bridge_registers_r range (len={})",
-                    slot,
-                    bridge_registers_r.len(),
-                );
-                sym.execution_context = bridge_registers_r[slot];
-            }
-        }
+        // `ec` is the second root inputarg, not a PyFrame semantic register.
+        // `create_sym` has already bound it to `OpRef::input_arg_ref(1)`;
+        // `resume.rebuild_from_resumedata` rebuilds only each MIFrame's
+        // `registers_i/r/f`, while the root reds remain the bridge inputargs.
+        // Keep those two stores separate exactly as upstream does. In
+        // particular, do not recover `ec` from `bridge_registers_r`: that bank
+        // is sized and populated from the current MIFrame liveness and has no
+        // slot for a distinct root-red color.
         // pyjitpl.py:3400-3430 rebuild_state_after_failure parity: after
         // a guard failure the tracing-time `virtualizable_boxes` mirror
         // must be rebuilt from the resume data so subsequent vable

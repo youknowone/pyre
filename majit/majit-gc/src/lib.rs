@@ -174,6 +174,8 @@ impl WriteBarrierDescr {
 ///
 /// Provides allocation and collection primitives.
 pub trait GcAllocator: Send {
+    fn debug_validate_oldgen_freeblocks(&self, _site: &str) {}
+
     /// Allocate a fixed-size object in the nursery.
     fn alloc_nursery(&mut self, size: usize) -> GcRef;
 
