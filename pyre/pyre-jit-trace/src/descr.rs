@@ -662,6 +662,33 @@ fn build_object_descr_group_with_def_path(
     simple_name: &str,
     def_path: &str,
 ) -> PyreObjectDescrGroup {
+    build_object_descr_group_with_extra_gc_edges(
+        obj_size,
+        type_id,
+        vtable,
+        fields,
+        simple_name,
+        def_path,
+        &[],
+    )
+}
+
+/// `build_object_descr_group_with_def_path` plus GC edges that the
+/// positional `fields` census does not name.  `extra_gc_edges` join the
+/// `PyObject.w_class` edge every group already carries: they land in
+/// `gc_fielddescrs` — which is what `rewrite.py:498-504 clear_gc_fields`
+/// walks to zero a fresh object's GC-pointer slots — while staying out of
+/// the positional `all_fielddescrs` list that `field_descr_from_group`
+/// indexes.
+fn build_object_descr_group_with_extra_gc_edges(
+    obj_size: usize,
+    type_id: u32,
+    vtable: usize,
+    fields: &[(&'static str, usize, usize, Type, bool, bool, bool)],
+    simple_name: &str,
+    def_path: &str,
+    extra_gc_edges: &[Arc<dyn FieldDescr>],
+) -> PyreObjectDescrGroup {
     let cache_key = if !def_path.is_empty() {
         majit_ir::descr::path_hash(def_path)
     } else if !simple_name.is_empty() {
@@ -695,6 +722,8 @@ fn build_object_descr_group_with_def_path(
             },
         )
         .collect();
+    let mut gc_edges: Vec<Arc<dyn FieldDescr>> = vec![W_CLASS_FIELD_DESCR.clone()];
+    gc_edges.extend(extra_gc_edges.iter().cloned());
     let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
         SIZE_DESCR_TAG | (obj_size as u32 & 0x0FFF_FFFF),
         obj_size,
@@ -704,7 +733,7 @@ fn build_object_descr_group_with_def_path(
         true,
         false,
         &specs,
-        &[W_CLASS_FIELD_DESCR.clone()],
+        &gc_edges,
     );
     let field_descrs = group.field_descrs;
     let size_descr = group.size_descr;
@@ -1420,8 +1449,31 @@ static W_SLICE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
+/// `rvirtualizable.py:29` appends `('vable_token', llmemory.GCREF)` to the
+/// virtualizable's own fields, so upstream's `gc_fielddescrs` names it and
+/// `clear_gc_fields` zeroes the slot on every `new`.  pyre declares
+/// `PyFrame.vable_token` as a plain `usize` and the positional census below
+/// does not list it, so without this edge a JIT-inlined
+/// `NewWithVtable(pyframe_size_descr())` leaves the slot holding recycled
+/// nursery bytes — which `emit_force_virtualizable`'s `GETFIELD_GC_R` then
+/// reads as a live GC reference (`pyjitpl.py:1148-1158`).
+static PYFRAME_VABLE_TOKEN_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(|| {
+    Arc::new(PyreFieldDescr {
+        offset: crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET,
+        field_size: std::mem::size_of::<usize>(),
+        field_type: Type::Ref,
+        signed: false,
+        immutable: false,
+        quasi_immutable: false,
+        name: "vable_token",
+        index_in_parent: 0,
+        parent_descr: None,
+        ei_index: AtomicU32::new(u32::MAX),
+    })
+});
+
 static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group_with_def_path(
+    build_object_descr_group_with_extra_gc_edges(
         std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
         PYFRAME_GC_TYPE_ID,
         // `NewWithVtable` writes this typeptr at `cpu.vtable_offset`
@@ -1567,6 +1619,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         ],
         "PyFrame",
         "pyframe::PyFrame",
+        &[PYFRAME_VABLE_TOKEN_FIELD_DESCR.clone()],
     )
 });
 
@@ -2977,6 +3030,19 @@ mod tests {
                 .iter()
                 .any(|fd| fd.offset() == W_CLASS_OFFSET),
             "malloc_zero_filled=False requires the inherited PyObject.w_class edge"
+        );
+    }
+
+    #[test]
+    fn pyframe_size_descr_clears_the_vable_token_slot() {
+        let descr = pyframe_size_descr();
+        let size = descr.as_size_descr().expect("PyFrame SizeDescr");
+        assert!(
+            size.gc_fielddescrs()
+                .iter()
+                .any(|fd| fd.offset() == crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET),
+            "emit_force_virtualizable reads vable_token with GETFIELD_GC_R, so \
+             clear_gc_fields must zero it on a JIT-inlined frame allocation"
         );
     }
 
