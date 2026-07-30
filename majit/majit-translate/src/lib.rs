@@ -724,6 +724,51 @@ fn live_rss_bytes() -> u64 {
     0
 }
 
+/// Give every `struct_fields` spelling of a declared struct the same
+/// `_immutable_fields_` entry list.
+///
+/// `rclass.py:644-678 _parse_field_list` reads the declaration off the class
+/// object, which has one identity. Pyre's registry keys layouts by name and
+/// carries several names for one struct — the bare leaf (`PyType`) and the
+/// crate-qualified path (`pyre_object::pyobject::PyType`) — while the harvester
+/// registers only the leaf and the crate-stripped path. Since layouts are
+/// stored per [`majit_ir::descr::StructId`], an undeclared spelling could
+/// overwrite the declared one's layout and silently drop `is_immutable`, and
+/// which spelling won depended on `HashMap` iteration order, so the
+/// declaration took effect on some builds and not others.
+///
+/// Declared keys are visited in sorted order so that a struct reachable under
+/// several declared spellings resolves to the same entry list on every run.
+fn expand_immutable_fields_to_all_spellings(
+    declared: &std::collections::HashMap<String, Vec<(String, model::ImmutableRank)>>,
+    struct_fields: &front::StructFieldRegistry,
+) -> std::collections::HashMap<String, Vec<(String, model::ImmutableRank)>> {
+    let mut by_struct_id: std::collections::HashMap<
+        majit_ir::descr::StructId,
+        &Vec<(String, model::ImmutableRank)>,
+    > = std::collections::HashMap::new();
+    let mut declared_names: Vec<&String> = declared.keys().collect();
+    declared_names.sort();
+    for name in declared_names {
+        if let Some(sid) = majit_ir::descr::struct_id_for_name(name) {
+            by_struct_id.entry(sid).or_insert(&declared[name]);
+        }
+    }
+    let mut out = declared.clone();
+    for name in struct_fields.fields.keys() {
+        if out.contains_key(name) {
+            continue;
+        }
+        let Some(entries) =
+            majit_ir::descr::struct_id_for_name(name).and_then(|sid| by_struct_id.get(&sid))
+        else {
+            continue;
+        };
+        out.insert(name.clone(), (*entries).clone());
+    }
+    out
+}
+
 fn analyze_pipeline_from_module_paths(
     module_paths: &[&str],
     explicit_llbc_paths: Option<&[&str]>,
@@ -1026,6 +1071,16 @@ fn analyze_pipeline_from_module_paths(
     // RPython: symbolic.get_field_token / get_size — resolve struct layouts
     // through the LayoutProvider. If no provider is given, use the heuristic
     // (type-string-based approximation of #[repr(C)] layout).
+    // `_immutable_fields_` is declared on the class (`rclass.py:644-678`
+    // reads it off the class object, which has exactly one identity), but
+    // `struct_fields` carries several spellings of the same struct —
+    // `PyType` and `pyre_object::pyobject::PyType` both resolve to one
+    // `StructId`. The layout loop below stores a single layout per
+    // `StructId`, so the spelling `HashMap` iteration happens to reach last
+    // decides whether that layout carries `is_immutable`. Give every
+    // spelling of a declared struct the declaration first.
+    let immutable_fields =
+        expand_immutable_fields_to_all_spellings(&program.immutable_fields, &program.struct_fields);
     let heuristic;
     let provider: &dyn layout::LayoutProvider = match layout_provider {
         Some(p) => p,
@@ -1033,7 +1088,7 @@ fn analyze_pipeline_from_module_paths(
             heuristic = layout::HeuristicLayoutProvider::from_struct_fields(
                 &program.struct_fields.fields,
                 &program.known_struct_names,
-                &program.immutable_fields,
+                &immutable_fields,
             );
             &heuristic
         }
@@ -1042,7 +1097,7 @@ fn analyze_pipeline_from_module_paths(
     // `FieldDescr.is_pure` for the heuristic-fallback path inside
     // `all_interiorfielddescrs` (the layout-provider path already carries
     // `is_immutable` on `StructFieldLayout`).
-    call_control.immutable_fields_by_struct = program.immutable_fields.clone();
+    call_control.immutable_fields_by_struct = immutable_fields;
     // `descr.py:364 ARRAY_INSIDE._immutable_field(None)` parity.
     // Summarise `field[*]` annotations into the array-type-keyed set so
     // `arraydescrof_concrete` can fold field-level immutability into the
