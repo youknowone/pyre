@@ -650,18 +650,24 @@ pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
 /// wrapper plus the `strategy` store, mirroring `w_list_new(vec![])` /
 /// `w_list_new_with_strategy(vec![], Empty)`.
 ///
-/// `length` (0) and `items` (null) stay zero-filled by `NewWithVtable`, as the
-/// non-Object strategies leave them.  The typed `int_items` / `float_items`
-/// blocks also stay null: the Empty strategy reads neither (its first append
-/// installs fresh typed storage via `switch_to_correct_strategy`), and
-/// `list_object_custom_trace` forwards a typed block only when the GC owns it,
-/// so a null slot is inert.  OptVirtualize folds the whole wrapper when the
-/// list never escapes.
+/// `items` and the typed `int_items` / `float_items` blocks stay null because
+/// they are GC-pointer fields of the size descr, so `rewrite.py:498-504
+/// clear_gc_fields` zeroes them behind the `NewWithVtable`.  `length` gets no
+/// such pending zero — the recycled nursery bytes a `CALL_MALLOC_NURSERY`
+/// hands back are not zero-filled (`incminimark.py:211 malloc_zero_filled =
+/// False`) — so it is stored explicitly here, as `rlist.py ll_newlist` does.
+/// OptVirtualize folds the whole wrapper when the list never escapes.
 pub fn emit_empty_list_inline(ctx: &mut TraceCtx) -> OpRef {
-    use crate::descr::{list_strategy_descr, w_list_size_descr};
+    use crate::descr::{list_length_descr, list_strategy_descr, w_list_size_descr};
 
     let list = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], w_list_size_descr());
     ctx.heap_cache_mut().new_object(list);
+
+    let zero = ctx.const_int(0);
+    let length_descr = list_length_descr();
+    let length_idx = length_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, zero], length_descr);
+    ctx.heapcache_setfield_cached(list, length_idx, zero);
 
     let strategy_const = ctx.const_int(pyre_object::listobject::ListStrategy::Empty as i64);
     let strategy_descr = list_strategy_descr();

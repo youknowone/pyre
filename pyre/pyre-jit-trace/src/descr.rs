@@ -2078,8 +2078,12 @@ pub fn int_mutable_cell_value_descr() -> DescrRef {
 
 /// Size descriptor for `W_ListObject` allocation via NewWithVtable.
 /// vtable = &LIST_TYPE; the Object-strategy fields `length` / `items` /
-/// `strategy` are SetField'd after; `int_items` / `float_items` stay at the
-/// NewWithVtable memzero (== empty, never read under the Object strategy).
+/// `strategy` are SetField'd after.  `int_items.block` / `float_items.block`
+/// are GC-pointer fields of this descr, so `rewrite.py:498-504
+/// clear_gc_fields` zeroes them behind the allocation (== empty, never read
+/// under the Object strategy); their `len` halves are plain ints and stay at
+/// whatever the recycled nursery bytes held, which no strategy reads while the
+/// block slot is null.
 pub fn w_list_size_descr() -> DescrRef {
     W_LIST_DESCR_GROUP.size_descr.clone()
 }
