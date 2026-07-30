@@ -2135,10 +2135,6 @@ where
         let mut step_count: u64 = 0;
         let mut last_num_ops = ctx.num_recorded_ops();
         let mut steps_since_growth: u64 = 0;
-        // Set once `is_too_long()` first trips; the abort itself waits for the
-        // next merge point (see the check at the bottom of the loop).
-        let mut too_long = false;
-        ctx.abort_at_next_merge_point = false;
         while !self.frames.is_empty() {
             step_count += 1;
             let n = ctx.num_recorded_ops();
@@ -2216,70 +2212,47 @@ where
                         ctx.trace_limit()
                     );
                 }
-                // The walk can still end on its own (a `Finish`) between the
-                // overflow and the merge point that was going to cash it in.
-                // A trace past `trace_limit` must not be committed, so the
-                // pending overflow outranks the closing step's action.
-                let action = if too_long { TraceAction::Abort } else { action };
                 match action {
                     TraceAction::CloseLoop | TraceAction::Finish { .. } => sym.commit_portal_op(),
                     _ => sym.abort_portal_op(),
                 }
                 return action;
             }
-            // pyjitpl.py:2843 blackhole_if_trace_too_long — check AFTER
-            // executing the step, matching RPython's _interpret() loop:
-            //   self.framestack[-1].run_one_step()
-            //   self.blackhole_if_trace_too_long()
+            // pyjitpl.py:2861-2867 `_interpret`:
             //
-            // RPython answers the overflow with `SwitchToBlackhole(
-            // ABORT_TOO_LONG)` right here, mid-opcode, because its handler
-            // (pyjitpl.py:2949 `run_blackhole_interp_to_cancel_tracing` →
-            // blackhole.py:1799 `convert_and_run_from_pyjitpl`) finishes the
-            // *current* jitcode frame in the blackhole before control returns
-            // to the interpreter.  `JitDriver::run_pending_abort_blackhole` is
-            // that consumer, but it declines for state shapes it cannot seed;
-            // the abort then falls back to a source-level pc taken from the
-            // walk's root frame i0, which dispatch advances *before* running
-            // the opcode arm.  Returning mid-opcode on that fallback resumes the
-            // interpreter past an opcode whose side effects only partly ran.
-            // A push that stores its element and then bumps the length can
-            // commit the store and lose the bump, leaving a container whose
-            // contents and length disagree.  Deferring to the next merge point
-            // keeps the fallback sound — the walk is between opcodes there, so
-            // i0 names a resume position with nothing half applied — and costs
-            // the conversion nothing when it does run.  The extra ops land in a
-            // trace that is discarded anyway, and the runaway backstops above
-            // still bound the work.
-            if ctx.is_too_long() && !too_long {
-                too_long = true;
-                ctx.abort_at_next_merge_point = true;
+            //     while True:
+            //         self.framestack[-1].run_one_step()
+            //         self.blackhole_if_trace_too_long()
+            //
+            // The overflow is answered right here — `pyjitpl.py:2831 raise
+            // SwitchToBlackhole(ABORT_TOO_LONG)` — even though a source opcode
+            // may be half-executed, because its handler (pyjitpl.py:2949
+            // `run_blackhole_interp_to_cancel_tracing` → blackhole.py:1799
+            // `convert_and_run_from_pyjitpl`) finishes the current jitcode
+            // frames in the blackhole before control returns to the
+            // interpreter, so the opcode's remaining effects still run.
+            //
+            // The check sits below the action test for the same reason it sits
+            // after `run_one_step()` upstream: a step that raises its own
+            // terminal exception never reaches `blackhole_if_trace_too_long`,
+            // so a closing step commits its trace even when that step pushed
+            // the recorded op count past `trace_limit`.
+            if ctx.is_too_long() {
                 if crate::majit_log_enabled() {
                     eprintln!(
-                        "[jit] trace_jitcode aborting: trace too long at portal pc={} \
-                         (deferred to the next merge point)",
+                        "[jit] trace_jitcode aborting: trace too long at portal pc={}",
                         portal_pc
                     );
                 }
+                sym.abort_portal_op();
+                return TraceAction::Abort;
             }
         }
 
-        // Post-loop overflow check: the jitcode ran to completion (all
-        // frames empty) but may have exceeded the limit on the last step, or
-        // tripped it mid-portal-op and deferred the abort to here.
-        if too_long || ctx.is_too_long() {
-            if !too_long && crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] trace_jitcode aborting: trace too long at portal pc={}",
-                    portal_pc
-                );
-            }
-            sym.abort_portal_op();
-            TraceAction::Abort
-        } else {
-            sym.commit_portal_op();
-            TraceAction::Continue
-        }
+        // The jitcode ran to completion (all frames empty).  The overflow check
+        // above ran on every step that got here, so the trace is within budget.
+        sym.commit_portal_op();
+        TraceAction::Continue
     }
 
     /// Execute a `BC_RECURSIVE_CALL_*` opcode (pyjitpl.py:1376
@@ -4424,21 +4397,6 @@ where
                 // swap (dispatch.rs:850) finds that `-live-` at
                 // `mp_opcode_pc - SIZE_LIVE_OP`.
                 let mp_opcode_pc = frame.code_cursor - 1;
-                // A merge point is the one position where no source opcode is
-                // half-executed, so it is where `run_to_end` cashes in a
-                // deferred `trace_limit` overflow (see the `is_too_long`
-                // check there).
-                if ctx.abort_at_next_merge_point {
-                    ctx.abort_at_next_merge_point = false;
-                    // The cursor already stepped past the opcode byte, so it
-                    // sits inside this instruction's operands.  Name the
-                    // instruction itself: `blackhole.py:1799
-                    // convert_and_run_from_pyjitpl` resumes each level at
-                    // `frame.pc`, and re-executing the merge point is what
-                    // reports the resume greens (`blackhole.py:1068-1069`).
-                    ctx.abort_resume_jitcode_pc = Some(mp_opcode_pc);
-                    return TraceAction::Abort;
-                }
                 let jdindex_byte = frame.next_reg();
                 // RPython `blackhole.py:112-123` argcode discrimination:
                 //
@@ -8019,13 +7977,14 @@ where
         // before pushing the callee.  The top frame's is still the last guard's
         // `orgpc` swap, so publish the position the walk actually stopped at —
         // `copy_data_from_miframe` (`blackhole.py:1804`) reads `frame.pc` as
-        // each level's `setposition`.  An abort taken between steps leaves the
-        // cursor on an instruction boundary; one taken from inside an opcode
-        // arm names its own boundary through `abort_resume_jitcode_pc`.
-        let resume_jitcode_pc = ctx.abort_resume_jitcode_pc.take();
+        // each level's `setposition`.  `code_cursor` is that position: the walk
+        // decodes an instruction's operands before running its arm, so a
+        // completed step leaves the cursor just past them — where RPython's
+        // `self.pc = position` (`pyjitpl.py:3863`, in the `_get_opimpl_method`
+        // handler) leaves `MIFrame.pc`.
         if !std::mem::replace(&mut ctx.abort_after_panic, false) {
             if let Some(top) = standalone.frames.frames.last_mut() {
-                top.pc = resume_jitcode_pc.unwrap_or(top.code_cursor);
+                top.pc = top.code_cursor;
             }
             ctx.aborted_framestack = Some(std::mem::take(&mut standalone.frames));
         }

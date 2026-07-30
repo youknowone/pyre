@@ -413,19 +413,6 @@ pub struct TraceCtx {
     /// `MetaInterp::single_pass_outcome` (set before `compile_loop` drains the
     /// ctx) to the merge-point hook.
     pub walk_final_pc: Option<usize>,
-    /// Set when `run_to_end` sees the trace pass `trace_limit` in the middle of
-    /// an opcode: the abort waits for the next merge point, where no opcode is
-    /// half-executed and `walk_final_pc` names a real resume position. Cleared
-    /// by `run_to_end` at walk start and by the merge point that consumes it.
-    pub abort_at_next_merge_point: bool,
-    /// Jitcode position the aborting walk's TOP frame should resume at, when
-    /// the abort came from inside an opcode arm and the frame's `code_cursor`
-    /// therefore sits in the middle of that instruction's operands.  `None`
-    /// for an abort taken between steps, where the cursor is already an
-    /// instruction boundary.  Consumed by
-    /// `trace_jitcode_with_args_and_runtime` when it publishes
-    /// [`Self::aborted_framestack`].
-    pub abort_resume_jitcode_pc: Option<usize>,
     /// Set when the abort came out of a panic caught around `run_one_step`
     /// rather than a decision the walk took.  The unwind can leave the frame's
     /// `code_cursor` anywhere inside the panicking instruction, so the frames
@@ -1425,8 +1412,6 @@ impl TraceCtx {
             last_traced_pc: 0,
             initial_inputarg_consts: vec![],
             walk_final_pc: None,
-            abort_at_next_merge_point: false,
-            abort_resume_jitcode_pc: None,
             abort_after_panic: false,
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
@@ -1509,8 +1494,6 @@ impl TraceCtx {
             last_traced_pc: 0,
             initial_inputarg_consts: vec![],
             walk_final_pc: None,
-            abort_at_next_merge_point: false,
-            abort_resume_jitcode_pc: None,
             abort_after_panic: false,
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
