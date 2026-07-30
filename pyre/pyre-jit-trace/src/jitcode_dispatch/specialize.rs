@@ -4800,6 +4800,11 @@ fn is_builtin_dict_get_function(callable: pyre_object::PyObjectRef) -> bool {
 /// as `W_DictObject.keys_version`, so guard it and issue a live nth-value read.
 /// Value-only replacement is intentionally visible without invalidation.
 ///
+/// The emitted `keys_version` guard is an unlocked field read, which is a
+/// pre-filter only — `jit_dict_nth_value_versioned` re-checks the version
+/// under the dict's own lock, and a `guard_nonnull` on its result side-exits
+/// when a concurrent key-set mutation detached the index from the key.
+///
 /// Equal-but-nonidentical keys and misses remain residual because reproducing
 /// their hash/equality effects requires the complete r_dict probe.
 pub(crate) fn try_walker_specialize_builtin_dict_get<Sym: WalkSym>(
@@ -4945,14 +4950,22 @@ pub(crate) fn try_walker_specialize_builtin_dict_get<Sym: WalkSym>(
 
     let index_op = ctx.trace_ctx.const_int(index as i64);
     let value = ctx.trace_ctx.call_ref_typed_with_effect(
-        crate::helpers::jit_dict_nth_value as *const (),
-        &[dict_op, index_op],
-        &[majit_ir::Type::Ref, majit_ir::Type::Int],
+        crate::helpers::jit_dict_nth_value_versioned as *const (),
+        &[dict_op, index_op, expected_version],
+        &[
+            majit_ir::Type::Ref,
+            majit_ir::Type::Int,
+            majit_ir::Type::Int,
+        ],
         majit_ir::EffectInfo::new(
             majit_ir::ExtraEffect::CannotRaise,
             majit_ir::OopSpecIndex::None,
         ),
     );
+    // A key set that moved after the unlocked version guard, or an index the
+    // compacted table no longer holds, comes back as `PY_NULL`: side-exit to
+    // the generic `dict.get` residual instead of writing it to a Ref register.
+    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[value])?;
     ctx.trace_ctx.set_opref_concrete(
         value,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete_value as usize)),
