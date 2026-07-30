@@ -1125,9 +1125,11 @@ impl OptHeap {
     /// force_lazy_set (heap.py:122-145) emits unconditionally; the
     /// virtual-rhs skip belongs only to force_lazy_sets_for_guard
     /// (heap.py:610-639), which routes those ops to rd_pendingfields
-    /// before they ever reach this fn. A virtual rhs here is
-    /// materialized first, the way Optimizer._emit_operation forces
-    /// every emitted arg (optimizer.py:345-364 force_box).
+    /// before they ever reach this fn. A virtual rhs is left virtual
+    /// here: force_lazy_set never forces its rhs, and the queued op
+    /// carries it to `Optimizer::emit_operation`, whose force_box loop
+    /// (optimizer.py:641-665) is the single force point that appends
+    /// the materialization directly ahead of the store.
     ///
     /// `get_rhs`: polymorphic RHS extractor matching
     /// `AbstractCachedEntry._get_rhs_from_set_op` (heap.py:169-170 /
@@ -1171,8 +1173,9 @@ impl OptHeap {
 
     fn emit_lazy_setfield(op: &mut Op, ctx: &mut OptContext, get_rhs: fn(&Op) -> Operand) {
         let rhs = get_rhs(op);
-        let resolved_box = ctx.resolve_operand_operand_opt(&rhs);
-        let rhs_is_virtual = resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b));
+        let rhs_is_virtual = ctx
+            .resolve_operand_operand_opt(&rhs)
+            .map_or(false, |b| ctx.is_virtual(&b));
         // A virtual value stored into the standard virtualizable frame is
         // deferred, not flushed: the frame is a tracked existing object whose
         // fields are reconstructed at resume (guard pendingfields, via
@@ -1184,17 +1187,6 @@ impl OptHeap {
         if rhs_is_virtual && Self::writes_into_virtualizable(op, ctx) {
             return;
         }
-        // Virtualizable exemption mirrors Optimizer::force_box: a
-        // virtualizable tracks an existing heap object, not a deferred
-        // allocation; forcing it would destroy the tracked field state.
-        if rhs_is_virtual
-            && !resolved_box
-                .as_ref()
-                .map_or(false, |b| ctx.is_virtualizable(b))
-        {
-            ctx.force_box_inline(rhs.to_opref());
-        }
-
         // Resolve forwarding and route after heap
         // optimizer.py:651-652 setarg loop parity.
         for i in 0..op.num_args() {
