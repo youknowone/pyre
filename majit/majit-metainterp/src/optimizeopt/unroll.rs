@@ -4070,14 +4070,40 @@ impl OptUnroll {
             }
         }
 
-        // RPython: get_box_replacement follows forwarding after mapping
-        current_short_jump_args(short_preamble, ctx)
-            .iter()
-            .map(|&jump_arg| {
-                let mapped = mapping.get(&jump_arg).copied().unwrap_or(jump_arg);
-                ctx.get_replacement_opref(mapped)
-            })
-            .collect()
+        // unroll.py:438-439 `return [get_box_replacement(box) for box in
+        // self._map_args(mapping, short_jump_args)]`.
+        //
+        // `_map_args` (unroll.py:364-370) is STRICT for non-Const boxes:
+        // `box = mapping[box]` raises KeyError when the short op that produces
+        // this jump arg was never replayed into the peeled body. Substituting
+        // the unmapped arg instead hands the JUMP the PREAMBLE's box — the
+        // loop-entry value — so the back edge re-supplies the entry value every
+        // iteration and a field the body mutates reads as loop-invariant. Treat
+        // it as the InvalidLoop that KeyError amounts to and fall back to
+        // jump_to_preamble; the loop still compiles, it just declines to inline
+        // this short preamble.
+        let final_jump_args = current_short_jump_args(short_preamble, ctx);
+        let mut mapped_args = Vec::with_capacity(final_jump_args.len());
+        for jump_arg in final_jump_args {
+            if jump_arg.is_constant() {
+                mapped_args.push(ctx.get_replacement_opref(jump_arg));
+                continue;
+            }
+            let Some(&mapped) = mapping.get(&jump_arg) else {
+                if crate::optimizeopt::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] inline_short_preamble: unmapped short jump arg {jump_arg:?} \
+                         (short op never replayed into the peeled body) — InvalidLoop"
+                    );
+                }
+                ctx.signal_invalid_loop(
+                    "inline_short_preamble: unmapped short jump arg at end of inlining",
+                );
+                return Vec::new();
+            };
+            mapped_args.push(ctx.get_replacement_opref(mapped));
+        }
+        mapped_args
     }
 
     /// unroll.py:479-504 import_state — line-by-line port.
