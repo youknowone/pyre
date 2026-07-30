@@ -266,6 +266,16 @@ pub struct PendingAbortBlackhole {
     pub scalar_values: Vec<i64>,
     /// `JitState::collect_ref_scalar_state_field_values`.
     pub ref_scalar_values: Vec<i64>,
+    /// The walk's `[.. ; virt]` array elements
+    /// (`TraceCtx::collect_virtualizable_element_values`).  The walk mutates
+    /// the array on the trace-ctx shadow, never on the live struct, so these
+    /// have to be pushed into native `state` before the chain runs — the
+    /// blackhole's `getarrayitem_vable_*` read the real object.  `None` when
+    /// the state has no virtualizable array.
+    pub virt_array_values: Option<Vec<i64>>,
+    /// The trace's virtualizable identity (`MetaInterp::set_vable_ptr`, mirrored
+    /// onto the ctx at trace entry).  `0` when the state has none.
+    pub virtualizable_ptr: i64,
     /// `metainterp.last_exc_value` as `blackhole.py:1811-1814` reads it —
     /// snapshotted at the abort because the accounting that follows clears the
     /// tracing state it lives on.  `0` for a null exception.
@@ -1917,35 +1927,61 @@ impl<S: JitState> JitDriver<S> {
     /// **Seeding.** The walk keeps state fields on the sym; the blackhole reads
     /// them out of the identity registers `StateFieldLayout` names.  The abort
     /// arm captured the sym's image, and this places it into the root frame's
-    /// banks before the conversion.  Two shapes have no counterpart yet and
-    /// decline: a virtualizable array (`num_vable_identity_slots != 0` — pyre's
-    /// own frame-blackhole path owns that case, `trace.rs`
-    /// `drive_multi_frame_blackhole`) and a flattened fixed `[int]` array
-    /// (`array_lens`), whose per-element slots have no sym collector.
+    /// banks before the conversion.  A `[.. ; virt]` array needs two more
+    /// things, both done here: its elements pushed into native `state` (they
+    /// live on the trace-ctx shadow during the walk, and the chain's
+    /// `getarrayitem_vable_*` read the real object), and the virtualizable
+    /// identity seeded into its own slot plus handed to the chain alongside the
+    /// vinfo pointer `seed_deopt_vinfo_ptr` allows.
+    ///
+    /// One shape still declines: a flattened fixed `[int]` array (`array_lens`),
+    /// whose per-element slots have no sym-side collector.  No frontend
+    /// currently declares one — the supported loop-carried form is
+    /// `[.. ; virt]`.
     pub fn run_pending_abort_blackhole(&mut self, state: &mut S, env: &S::Env) -> Option<usize> {
         let pending = self.meta.pending_abort_blackhole.take()?;
         let PendingAbortBlackhole {
             mut framestack,
             scalar_values,
             ref_scalar_values,
+            virt_array_values,
+            virtualizable_ptr,
             last_exc_value,
             raising_exception,
         } = pending;
         let layout = state.state_field_layout();
-        if layout.num_vable_identity_slots != 0 || !layout.array_lens.is_empty() {
+        if !layout.array_lens.is_empty() {
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[bh] abort-blackhole declined: unseeded state shape \
-                     (vable_identity={} arrays={})",
-                    layout.num_vable_identity_slots,
+                    "[bh] abort-blackhole declined: unseeded state shape (arrays={})",
                     layout.array_lens.len(),
                 );
             }
             return None;
         }
+        // `writeback_virt_array_state_fields_from_values`, run here rather than
+        // by the `jit_merge_point!` hook's own virt-array writeback: the chain
+        // is about to re-execute the tail of the aborted opcodes against the
+        // live struct, so it has to see the walk's elements, not the
+        // trace-start ones.
+        if let Some(values) = virt_array_values {
+            state.writeback_virt_array_state_fields_from_values(&values);
+            self.meta.single_pass_virt_array_values = None;
+        }
+        // `jitdriver.rs seed_deopt_vinfo_ptr`: a state-field machine's
+        // `bh_clear_vable_token` is inert, so a non-null vinfo is safe and lets
+        // mid-body vable-array opcodes resolve; a real heap virtualizable
+        // (`token_offset > 0`, e.g. PyFrame) keeps the null-vinfo resume
+        // contract and reaches the chain with `virtualizable_info` unset.
+        let vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
         let Some(root) = framestack.frames.first_mut() else {
             return None;
         };
+        if let Some(slot) = layout.vable_identity_slot() {
+            if slot < root.int_values.len() {
+                root.int_values[slot] = Some(virtualizable_ptr);
+            }
+        }
         // `scalar_values` is `[int scalars.., float scalars..]` — the order
         // `collect_scalar_state_field_values` builds and
         // `writeback_scalar_state_fields_from_values` consumes.
@@ -1974,8 +2010,11 @@ impl<S: JitState> JitDriver<S> {
             &mut bh_builder,
             &mut framestack,
             layout.clone(),
-            std::ptr::null(),
-            0,
+            vinfo_ptr,
+            virtualizable_ptr,
+            // PyFrame's operand-stack base; a state-field machine's
+            // `[.. ; virt]` array starts at 0 and a heap virtualizable reaches
+            // here with a null vinfo, so the base is never read.
             0,
             staticdata,
             last_exc_value,
@@ -2025,7 +2064,19 @@ impl<S: JitState> JitDriver<S> {
             // (`blackhole.py:1068-1069`): resume the interpreter at the green
             // pc it reported.  Every `greens` declaration puts `pc` first.
             crate::jitexc::JitException::ContinueRunningNormally { ref green_int, .. } => {
-                let resume_pc = green_int.first().map(|&pc| pc as usize)?;
+                let Some(&resume_pc) = green_int.first() else {
+                    // Unreachable for any declared jitdriver.  Say so loudly
+                    // rather than fall back: the chain has already run the
+                    // aborted opcodes' tails against the real heap, so resuming
+                    // at the walk's source pc would execute them a second time.
+                    debug_assert!(false, "merge point reported no green pc");
+                    eprintln!(
+                        "[bh] abort-blackhole: ContinueRunningNormally with no green pc — \
+                         falling back to the source pc AFTER the chain ran"
+                    );
+                    return None;
+                };
+                let resume_pc = resume_pc as usize;
                 writeback(state, resume_pc);
                 Some(resume_pc)
             }
@@ -3351,8 +3402,9 @@ impl<S: JitState> JitDriver<S> {
                 // `do_not_in_trace_call`).  The `ABORT_TOO_LONG` path below has
                 // no `stb` at all and defaults to false, as upstream's
                 // `SwitchToBlackhole(ABORT_TOO_LONG)` does.
-                let abort_raising_exception =
-                    pending_stb.as_ref().is_some_and(|stb| stb.raising_exception);
+                let abort_raising_exception = pending_stb
+                    .as_ref()
+                    .is_some_and(|stb| stb.raising_exception);
                 let reason_int = match pending_stb.map(|stb| stb.reason) {
                     Some(r) => r,
                     None => self
@@ -3398,15 +3450,25 @@ impl<S: JitState> JitDriver<S> {
                     // finish the half-executed opcodes in the blackhole and take
                     // the resume position from the merge point they reach.
                     if abort_blackhole_enabled() {
-                        let framestack = self
-                            .meta
-                            .trace_ctx()
-                            .and_then(|ctx| ctx.aborted_framestack.take());
-                        if let (Some(framestack), Some(sym)) = (framestack, self.sym.as_ref()) {
+                        let staged = self.meta.trace_ctx().and_then(|ctx| {
+                            let framestack = ctx.aborted_framestack.take()?;
+                            Some((
+                                framestack,
+                                ctx.collect_virtualizable_element_values(),
+                                ctx.virtualizable_heap_ptr().map_or(0, |p| p as i64),
+                            ))
+                        });
+                        if let (
+                            Some((framestack, virt_array_values, virtualizable_ptr)),
+                            Some(sym),
+                        ) = (staged, self.sym.as_ref())
+                        {
                             self.meta.pending_abort_blackhole = Some(PendingAbortBlackhole {
                                 framestack,
                                 scalar_values: S::collect_scalar_state_field_values(sym),
                                 ref_scalar_values: S::collect_ref_scalar_state_field_values(sym),
+                                virt_array_values,
+                                virtualizable_ptr,
                                 // `blackhole.py:1811-1814` reads
                                 // `metainterp.last_exc_value` at conversion
                                 // time; snapshot it here because

@@ -5451,6 +5451,14 @@ impl StateFieldLayout {
         );
         self.array_base(array_idx) + elem
     }
+
+    /// Flat slot of the virtualizable identity, which follows every scalar and
+    /// every flattened array element — `virtualizable.py:139-144` names the
+    /// virtualizable exactly once, however many `[.. ; virt]` arrays the state
+    /// declares.  `None` when the state has no virtualizable.
+    pub fn vable_identity_slot(&self) -> Option<usize> {
+        (self.num_vable_identity_slots != 0).then(|| self.array_base(self.array_lens.len()))
+    }
 }
 
 // pyre-only: `state_field` family. RPython has no opcode counterpart — the
