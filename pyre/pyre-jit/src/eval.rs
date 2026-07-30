@@ -7253,13 +7253,19 @@ fn maybe_compile_and_run(
     if *NO_JIT.get_or_init(|| std::env::var_os("PYRE_NO_JIT").is_some()) {
         return None;
     }
-    // `eval_with_jit_inner` classifies the frame once, before entering
-    // `eval_loop_jit`.  Consequently every back-edge reaching this helper is
-    // already known traceable.  Do not repeat `unsupported_jit_shape` here:
-    // that pyre-only safety gate walks the constant tree and the complete
-    // bytecode, while RPython's `can_enter_jit` is unconditional.  Re-running
-    // it at every back-edge made the classification scan itself one of
-    // test_math's hottest native functions.
+    // Not every back-edge reaching this helper passed `eval_with_jit_inner`'s
+    // classification: `portal_runner_dispatch` enters `eval_loop_jit` for a
+    // frame forced through the portal, and that route exists precisely for a
+    // callee with no compiled loop (`compile_tmp_callback` bakes
+    // `portal_runner_adr` as the callee body, and the `!is_resolved`
+    // CALL_ASSEMBLER force leg calls the same shim).  The classification is
+    // cached per code object in `CallControl.graph_jit_shapes`, so consulting
+    // it here is a pointer-keyed lookup rather than the constant-tree plus
+    // whole-bytecode walk that used to run on every back-edge.
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    if cached_unsupported_jit_shape(code) != UnsupportedJitShape::None {
+        return None;
+    }
     if let Some(expected_vsd) =
         pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, loop_header_pc)
     {
@@ -8417,13 +8423,18 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
-    // The ordinary caller is `eval_with_jit_inner`, immediately after its
-    // one authoritative `unsupported_jit_shape` check.  The other caller,
-    // `portal_runner_dispatch`, is recursive re-entry for a portal that could
-    // only have obtained compiled code after passing that same check.  Keep
-    // this warmstate entry shaped like RPython's unconditional
-    // `maybe_compile_and_run`; repeating the whole-frame scan here charged
-    // every Python call even before a warm counter could take the fast path.
+    // The other caller, `portal_runner_dispatch`, does not imply a frame that
+    // already passed `eval_with_jit_inner`'s classification: the portal entry
+    // points are reached when the callee has *no* compiled loop —
+    // `compile_tmp_callback` bakes `portal_runner_adr` as the whole callee body
+    // and the `!is_resolved` CALL_ASSEMBLER force leg calls the same shim — and
+    // the counter tick below starts a trace for such a frame.  Consult the
+    // frame-shape gate here as well.  The classification is cached per code
+    // object in `CallControl.graph_jit_shapes`, so this is a pointer-keyed
+    // lookup, not the whole-frame scan that charged every Python call.
+    if cached_unsupported_jit_shape(code) != UnsupportedJitShape::None {
+        return None;
+    }
     if dump_bytecode_enabled() {
         if code.obj_name.as_str() == "fannkuch" && frame_root.frame().next_instr() == 0 {
             use std::sync::OnceLock;
