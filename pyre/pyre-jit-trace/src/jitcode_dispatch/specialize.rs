@@ -498,9 +498,8 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     // pyjitpl.py:1881 handle_possible_overflow_error follows the concrete
     // Add/Sub/Mul outcome. The overflowing arm mirrors intobject.py:494
     // _make_ovf2long: guard_overflow, call the elidable raw-int bigint helper
-    // (rbigint.py:717/788/873), guard the newlong demote attempt, and inline
-    // the W_LongObject box instead of falling through to the generic
-    // CallMayForceR BINARY_OP leg.
+    // (rbigint.py:717/788/873), and inline the W_LongObject box instead of
+    // falling through to the generic CallMayForceR BINARY_OP leg.
     let overflows = has_overflow
         && match op_code {
             OpCode::IntAddOvf => la.checked_add(rb).is_none(),
@@ -570,19 +569,14 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
             walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
         }
 
-        let fits_fn = pyre_object::longobject::jit_bigint_fits_int as *const ();
-        let fits = ctx.trace_ctx.call_typed_with_effect(
-            OpCode::CallI,
-            fits_fn,
-            &[payload],
-            &[majit_ir::Type::Ref],
-            majit_ir::Type::Int,
-            majit_metainterp::cannot_raise_effect_info(),
-        );
-        ctx.trace_ctx
-            .set_opref_concrete(fits, majit_ir::Value::Int(0));
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[fits])?;
-
+        // The box needs no preceding fits_int guard. `newlong_from_rbigint`
+        // (objspace.py:316-320) demotes through `rbigint.toint()`, whose
+        // `numdigits() > MAX_DIGITS_THAT_CAN_FIT_IN_INT` test (rbigint.py:470)
+        // the GuardOverflow above already answers: the helper is the *exact*
+        // int-pair sum / difference / product, so a value that just overflowed
+        // a machine int cannot fit one back. The same fold is what lets
+        // `try_walker_specialize_binary_op_long_int_pow` skip its result-fits
+        // guard.
         let result = crate::helpers::emit_box_long_inline(
             ctx.trace_ctx,
             payload,
