@@ -2243,10 +2243,10 @@ where
             // then falls back to a source-level pc taken from the walk's root
             // frame i0, which dispatch advances *before* running the opcode
             // arm.  Returning mid-opcode on that fallback resumes the
-            // interpreter past an opcode whose side effects only partly ran:
-            // aheui's `pi.jinseo` lost the `size += 1` half of a push whose
-            // `head = node` had already run, leaving a list whose chain is one
-            // node longer than its size.  Deferring to the next merge point
+            // interpreter past an opcode whose side effects only partly ran.
+            // A push that stores its element and then bumps the length can
+            // commit the store and lose the bump, leaving a container whose
+            // contents and length disagree.  Deferring to the next merge point
             // keeps the fallback sound — the walk is between opcodes there, so
             // i0 names a resume position with nothing half applied — and costs
             // the conversion nothing when it does run.  The extra ops land in a
