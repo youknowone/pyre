@@ -94,6 +94,7 @@ pub fn w_method_new(
 /// preserving PyPy's raw `METHOD_TYPE` payload and GC descriptor.
 #[inline]
 pub unsafe fn w_method_set_public_class(obj: PyObjectRef, w_class: PyObjectRef) {
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     (*obj).w_class = w_class;
 }
 

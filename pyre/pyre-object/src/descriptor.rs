@@ -111,6 +111,10 @@ pub unsafe fn w_super_set_fields(
     bound_obj: PyObjectRef,
 ) {
     unsafe {
+        // `super().__init__(...)` re-initialises a proxy that may already be
+        // old-gen, so grey it before the stores the way `w_super_new` does for
+        // the freshly allocated one.
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
         let super_obj = obj as *mut W_Super;
         (*super_obj).super_type = super_type;
         (*super_obj).obj_type = obj_type;
