@@ -94,6 +94,42 @@ fn builtin_wrapper_heapcache_uses_item_not_length_descr() {
 }
 
 #[test]
+fn keyword_builtin_wrapper_finds_colored_argument_slice_item_descr() {
+    let wrapper =
+        named_jitcode("__pyre_wrap_getrandbits").expect("getrandbits builtin wrapper jitcode");
+    let mut ops = crate::jitcode_runtime::decoded_ops(&wrapper.code);
+    let first = ops.next().expect("wrapper first op");
+    assert_eq!(
+        first.key, "inline_call_r_r/dR>r",
+        "keyword wrapper starts by splitting positional and keyword arguments"
+    );
+
+    let arraylen = crate::jitcode_runtime::decoded_ops(&wrapper.code)
+        .find(|op| op.key == "arraylen_gc/rd>i")
+        .expect("keyword wrapper argument-slice length");
+    assert_ne!(
+        wrapper.code[arraylen.pc + 1],
+        0,
+        "register coloring moves the positional slice away from wrapper r0"
+    );
+    let getitem = crate::jitcode_runtime::decoded_ops(&wrapper.code)
+        .find(|op| op.pc > arraylen.pc && op.key == "getarrayitem_gc_r/rid>r")
+        .expect("keyword wrapper argument-slice item read");
+    assert_ne!(
+        wrapper.code[getitem.pc + 1],
+        0,
+        "register coloring keeps the argument slice off r0 at extraction"
+    );
+
+    let item_pool_index =
+        wrapper.code[getitem.pc + 3] as usize | ((wrapper.code[getitem.pc + 4] as usize) << 8);
+    assert_eq!(
+        wrapper_args_item_descr_index(&wrapper.code),
+        Some(crate::jitcode_runtime::all_descr_refs()[item_pool_index].index())
+    );
+}
+
+#[test]
 fn random_core_residuals_use_registered_genrand32_address() {
     let expected = pyre_interpreter::jit_trace_fnaddrs()
         .into_iter()

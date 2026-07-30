@@ -1939,17 +1939,18 @@ pub(crate) fn walker_ec_leave(
 /// descriptor. The first instruction's arraylen descriptor is deliberately
 /// not interchangeable with the later getarrayitem descriptor.
 pub(super) fn wrapper_args_item_descr_index(code: &[u8]) -> Option<u32> {
-    let mut wrapper_ops = crate::jitcode_runtime::decoded_ops(code);
-    let wrapper_abi_matches = wrapper_ops.next().is_some_and(|first| {
-        first.key == "arraylen_gc/rd>i" && code.get(first.pc + 1).copied() == Some(0)
-    });
-    if !wrapper_abi_matches {
-        return None;
-    }
+    // Keyword-capable generated wrappers first call
+    // `split_builtin_kwargs(args)` before their arity/unwrap code.  Its
+    // positional-slice result can therefore occupy a register other than the
+    // wrapper input r0, and register colouring can move it again between the
+    // arity check and unwrap.  Generated gateways perform their argument
+    // extraction before entering the typed body, so the first Ref item read
+    // after the first slice-length read is the wrapper-argument descriptor.
+    let arraylen_pc = crate::jitcode_runtime::decoded_ops(code)
+        .find(|decoded| decoded.key == "arraylen_gc/rd>i")
+        .map(|decoded| decoded.pc)?;
     crate::jitcode_runtime::decoded_ops(code)
-        .find(|decoded| {
-            decoded.key == "getarrayitem_gc_r/rid>r" && code.get(decoded.pc + 1).copied() == Some(0)
-        })
+        .find(|decoded| decoded.pc > arraylen_pc && decoded.key == "getarrayitem_gc_r/rid>r")
         .and_then(|decoded| {
             let lo = *code.get(decoded.pc + 3)? as usize;
             let hi = *code.get(decoded.pc + 4)? as usize;
@@ -1984,7 +1985,6 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     if !ctx.is_authoritative_executor
-        || ctx.fbw_mode.inline_subwalk
         || !matches!(
             pyre_helper,
             majit_ir::PyreHelperKind::CallFn | majit_ir::PyreHelperKind::CallKw
@@ -2046,6 +2046,14 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     if body.num_regs_r < 1 {
         return Ok(None);
     }
+    let nested_helper_entry = if ctx.fbw_mode.inline_subwalk {
+        match compute_inline_helper_call_entry_frame(ctx, op.pc) {
+            Ok(frame) => Some(frame),
+            Err(_) => return Ok(None),
+        }
+    } else {
+        None
+    };
     // Guards inside the generated wrapper must resume at the outer Python
     // CALL, because helper JitCodes have no blackhole entry point of their
     // own.  The full-body symbol is the authority for that caller frame's
@@ -2062,30 +2070,40 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     if sym.jitcode().is_null() {
         return Ok(None);
     }
-    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = unsafe {
-        let jc = &*sym.jitcode();
-        let jc_index = jc.index as u32;
-        let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
-        let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
-        if jc.payload.code_ptr.is_null() {
-            (py, sym.valuestackdepth() as i64, jc_index, marker)
+    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) =
+        if nested_helper_entry.is_some() {
+            (
+                ctx.entry_py_pc(),
+                0,
+                ctx.outer_jitcode_index,
+                ctx.outer_resume_marker_jit_pc,
+            )
         } else {
-            let codeobj = &*jc.payload.code_ptr;
-            py = skip_python_trivia_forward(codeobj, py as usize) as u32;
-            let depth = if jc.payload.depth_trivia_populated() {
-                jc.payload.depth_trivia_for_jitcode_pc(op.pc)
-            } else {
-                crate::liveness::liveness_for(jc.payload.code_ptr)
-                    .depth_at_py_pc()
-                    .get(py as usize)
-                    .copied()
-            };
-            let vsd = depth
-                .map(|d| (sym.nlocals() + d as usize) as i64)
-                .unwrap_or(sym.valuestackdepth() as i64);
-            (py, vsd, jc_index, marker)
-        }
-    };
+            unsafe {
+                let jc = &*sym.jitcode();
+                let jc_index = jc.index as u32;
+                let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
+                let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
+                if jc.payload.code_ptr.is_null() {
+                    (py, sym.valuestackdepth() as i64, jc_index, marker)
+                } else {
+                    let codeobj = &*jc.payload.code_ptr;
+                    py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+                    let depth = if jc.payload.depth_trivia_populated() {
+                        jc.payload.depth_trivia_for_jitcode_pc(op.pc)
+                    } else {
+                        crate::liveness::liveness_for(jc.payload.code_ptr)
+                            .depth_at_py_pc()
+                            .get(py as usize)
+                            .copied()
+                    };
+                    let vsd = depth
+                        .map(|d| (sym.nlocals() + d as usize) as i64)
+                        .unwrap_or(sym.valuestackdepth() as i64);
+                    (py, vsd, jc_index, marker)
+                }
+            }
+        };
     let call_site_word = call_site_marker
         .map(|marker| marker as i32)
         .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
@@ -2093,21 +2111,25 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // this line records IR or touches the heap cache, so cutting back to it
     // leaves the caller's trace exactly as the ordinary residual call found it.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let call_site_active = collect_outer_active_boxes(
-        sym,
-        ctx.trace_ctx,
-        ctx.registers_i,
-        ctx.registers_r,
-        ctx.registers_f,
-        outer_jitcode_index,
-        false,
-        call_site_word,
-        op.pc as i32,
-        OuterActiveBoxesEntryTwin::Plain,
-        "builtin_wrapper_call_site",
-        None,
-        &[],
-    );
+    let call_site_active = if nested_helper_entry.is_some() {
+        ctx.outer_active_boxes.clone()
+    } else {
+        collect_outer_active_boxes(
+            sym,
+            ctx.trace_ctx,
+            ctx.registers_i,
+            ctx.registers_r,
+            ctx.registers_f,
+            outer_jitcode_index,
+            false,
+            call_site_word,
+            op.pc as i32,
+            OuterActiveBoxesEntryTwin::Plain,
+            "builtin_wrapper_call_site",
+            None,
+            &[],
+        )
+    };
 
     // The generated builtin-wrapper ABI takes its `&[PyObjectRef]` argument
     // in r0 and begins by checking its length.  Resolve that instruction's
@@ -2199,7 +2221,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             .heapcache_setarrayitem(args_array, index, wrapper_args_descr_index, item);
     }
 
-    if sym.owns_virtualizable_shadow() {
+    if nested_helper_entry.is_none() && sym.owns_virtualizable_shadow() {
         let last_instr = call_site_py_pc as i64 - 1;
         let last_instr_op = ctx.trace_ctx.const_int(last_instr);
         crate::trace_opcode::mirror_vable_static_to_boxes(
@@ -2239,6 +2261,9 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     ctx.raw_descrs = RawDescrPool::Global;
     ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
     ctx.fbw_mode.inline_subwalk = true;
+    ctx.fbw_mode.transparent_helper_subwalk = nested_helper_entry.is_some();
+    let _helper_frame =
+        nested_helper_entry.map(|frame| InlineFrameGuard::enter(ctx.session, 0, Some(frame)));
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,

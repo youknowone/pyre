@@ -1748,6 +1748,176 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     })
 }
 
+/// Capture the current inlined Python frame at a translated helper call's
+/// entry boundary. The helper has no blackhole frame, so a guard inside it
+/// must rebuild this frame at the CALL and re-execute the helper, while the
+/// already-paused outer frames remain below it.
+pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    call_jit_pc: usize,
+) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
+    let caller_code = ctx
+        .session
+        .borrow()
+        .framestack
+        .last()
+        .map(|frame| frame.w_code)
+        .ok_or(InlineCallerFrameDecline::Unavailable)?;
+    let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())
+        .ok_or(InlineCallerFrameDecline::Unavailable)? as u32;
+    let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
+        .ok_or(InlineCallerFrameDecline::Unavailable)?;
+    if !pjc.is_populated() || pjc.code_ptr.is_null() {
+        return Err(InlineCallerFrameDecline::Unavailable);
+    }
+    let resume_marker_jit_pc = pjc
+        .resume_marker_for_jitcode_pc(call_jit_pc)
+        .ok_or(InlineCallerFrameDecline::Unavailable)?;
+    let boxes = collect_callee_active_boxes(
+        ctx.registers_i,
+        ctx.registers_r,
+        ctx.registers_f,
+        jitcode_index,
+        call_jit_pc,
+        resume_marker_jit_pc as i32,
+    )
+    .map_err(|_| InlineCallerFrameDecline::Unavailable)?;
+    Ok(InlineParentFrame {
+        jitcode_index,
+        call_jitcode_pc: None,
+        call_stack_overrides: Vec::new(),
+        blackhole: None,
+        resume_coord: ParentResumeCoord::Backxlat(resume_marker_jit_pc),
+        resume_marker_jit_pc: Some(resume_marker_jit_pc),
+        boxes,
+    })
+}
+
+fn publish_outermost_parent_vable_scalars<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    parent_frames: &[InlineParentFrame],
+    op_pc: usize,
+) -> Result<(), DispatchError> {
+    let Some(outer) = parent_frames.first() else {
+        return Err(DispatchError::callee_inline_unsupported(op_pc));
+    };
+    let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if caller_sym_ptr.is_null() {
+        return Ok(());
+    }
+    let caller_sym = unsafe { &*caller_sym_ptr };
+    if !caller_sym.owns_virtualizable_shadow() || caller_sym.jitcode().is_null() {
+        return Ok(());
+    }
+
+    let resume_py_pc = resolve_parent_resume_py_pc(outer)
+        .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?;
+    let last_instr_value = resume_py_pc as i64 - 1;
+    let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
+    crate::trace_opcode::mirror_vable_static_to_boxes(
+        ctx.trace_ctx,
+        "last_instr",
+        last_instr_op,
+        Value::Int(last_instr_value),
+    );
+    let vsd_value = unsafe {
+        let jc = &*caller_sym.jitcode();
+        if jc.payload.code_ptr.is_null() {
+            caller_sym.valuestackdepth() as i64
+        } else {
+            let raw = || {
+                crate::liveness::liveness_for(jc.payload.code_ptr)
+                    .depth_at_py_pc()
+                    .get(resume_py_pc as usize)
+                    .copied()
+            };
+            let twin: Option<Option<u16>> = if outer.jitcode_index != jc.index as u32 {
+                None
+            } else {
+                match outer.resume_coord {
+                    ParentResumeCoord::Backxlat(jitcode_pc) => jc
+                        .payload
+                        .depth_trivia_populated()
+                        .then(|| jc.payload.depth_trivia_for_jitcode_pc(jitcode_pc)),
+                    ParentResumeCoord::CallFallthrough(call_jit_pc) => jc
+                        .payload
+                        .depth_after_residual_populated()
+                        .then(|| jc.payload.depth_after_residual_for_jitcode_pc(call_jit_pc)),
+                }
+            };
+            let depth = match twin {
+                Some(d) => {
+                    if pcmap_afterresidual_audit_enabled() {
+                        assert_eq!(
+                            d,
+                            raw(),
+                            "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: multiframe vsd depth twin diverged (py {resume_py_pc})"
+                        );
+                    }
+                    d
+                }
+                None => raw(),
+            };
+            match depth {
+                Some(d) => (caller_sym.nlocals() + d as usize) as i64,
+                None => caller_sym.valuestackdepth() as i64,
+            }
+        }
+    };
+    let vsd_op = ctx.trace_ctx.const_int(vsd_value);
+    crate::trace_opcode::mirror_vable_static_to_boxes(
+        ctx.trace_ctx,
+        "valuestackdepth",
+        vsd_op,
+        Value::Int(vsd_value),
+    );
+    Ok(())
+}
+
+fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    parent_frames: Vec<InlineParentFrame>,
+    stamp_last_guard_op: bool,
+) -> Result<(), DispatchError> {
+    if parent_frames.is_empty() || !ctx.trace_ctx.vable_snapshot_buildable() {
+        return Err(DispatchError::callee_inline_unsupported(op_pc));
+    }
+    publish_outermost_parent_vable_scalars(ctx, &parent_frames, op_pc)?;
+    let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+    let mut frames: Vec<(u32, u32, u32, &[OpRef])> = Vec::with_capacity(parent_frames.len());
+    for frame in &parent_frames {
+        let word = frame
+            .resume_marker_jit_pc
+            .map(|marker| marker as i32)
+            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
+        let pc_word = crate::state::pyjitcode_for_jitcode_index(frame.jitcode_index as i32)
+            .and_then(|payload| {
+                payload.resolve_resume_pc_with_jitcode_pc(word, crate::state::op_live())
+            })
+            .map(|offset| offset as u32)
+            .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?;
+        let py_pc = forward_snapshot_py_pc(frame.jitcode_index, pc_word)?;
+        frames.push((frame.jitcode_index, pc_word, py_pc, frame.boxes.as_slice()));
+    }
+    if stamp_last_guard_op {
+        ctx.trace_ctx
+            .capture_snapshot_for_last_guard_op_multi_frame_with_vable_vref(
+                &frames,
+                &vable_boxes,
+                &vref_boxes,
+            );
+    } else {
+        ctx.trace_ctx
+            .capture_snapshot_for_last_guard_multi_frame_with_vable_vref(
+                &frames,
+                &vable_boxes,
+                &vref_boxes,
+            );
+    }
+    Ok(())
+}
+
 /// Emit a multi-frame inline guard snapshot (#68): the inlined callee's OWN
 /// (top/innermost) frame built from the live sub-walk register banks, plus the
 /// pre-computed paused caller frame(s) on the walk framestack. Frame
@@ -1767,6 +1937,14 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     // Straight-line / branch inline guards ARE the last op and pass `false`.
     stamp_last_guard_op: bool,
 ) -> Result<(), DispatchError> {
+    if ctx.fbw_mode.transparent_helper_subwalk {
+        return walker_capture_transparent_helper_snapshot(
+            ctx,
+            callee_op_pc,
+            parent_frames,
+            stamp_last_guard_op,
+        );
+    }
     if !ctx.trace_ctx.vable_snapshot_buildable() {
         return Err(DispatchError::GuardSnapshotVableUntyped { pc: callee_op_pc });
     }
@@ -1916,85 +2094,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     // the resume reader restores the caller's `PyFrame` at the CALL return
     // point rather than the stale loop-header seed the walker never crosses
     // `set_orgpc` to update (mirror of the single-frame path above, 6366-6426).
-    let outer = &parent_frames[0];
-    let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if !caller_sym_ptr.is_null() {
-        let caller_sym = unsafe { &*caller_sym_ptr };
-        if caller_sym.owns_virtualizable_shadow() && !caller_sym.jitcode().is_null() {
-            let resume_py_pc = resolve_parent_resume_py_pc(outer)
-                .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: callee_op_pc })?;
-            let last_instr_value = resume_py_pc as i64 - 1;
-            let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
-            crate::trace_opcode::mirror_vable_static_to_boxes(
-                ctx.trace_ctx,
-                "last_instr",
-                last_instr_op,
-                Value::Int(last_instr_value),
-            );
-            let resume_py_pc = resolve_parent_resume_py_pc(outer)
-                .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: callee_op_pc })?;
-            let vsd_value = unsafe {
-                let jc = &*caller_sym.jitcode();
-                if jc.payload.code_ptr.is_null() {
-                    caller_sym.valuestackdepth() as i64
-                } else {
-                    // Raw py_pc-keyed static-liveness read: the fallback where the
-                    // twin does not apply (cross-jitcode parent, or empty twin),
-                    // and the audit oracle.
-                    let raw = || {
-                        crate::liveness::liveness_for(jc.payload.code_ptr)
-                            .depth_at_py_pc()
-                            .get(resume_py_pc as usize)
-                            .copied()
-                    };
-                    // The raw read resolves `resume_py_pc` against
-                    // `outer.jitcode_index`'s tables but indexes THIS jitcode's
-                    // liveness; the twins key one jitcode, so cut only when both
-                    // are the same jitcode. `Some(inner)` = twin applies (inner is
-                    // its Option<u16> depth); `None` = not applicable -> raw.
-                    let twin: Option<Option<u16>> = if outer.jitcode_index != jc.index as u32 {
-                        None
-                    } else {
-                        match outer.resume_coord {
-                            ParentResumeCoord::Backxlat(jitcode_pc) => jc
-                                .payload
-                                .depth_trivia_populated()
-                                .then(|| jc.payload.depth_trivia_for_jitcode_pc(jitcode_pc)),
-                            ParentResumeCoord::CallFallthrough(call_jit_pc) => {
-                                jc.payload.depth_after_residual_populated().then(|| {
-                                    jc.payload.depth_after_residual_for_jitcode_pc(call_jit_pc)
-                                })
-                            }
-                        }
-                    };
-                    let depth = match twin {
-                        Some(d) => {
-                            if pcmap_afterresidual_audit_enabled() {
-                                assert_eq!(
-                                    d,
-                                    raw(),
-                                    "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: multiframe vsd depth twin diverged (py {resume_py_pc})"
-                                );
-                            }
-                            d
-                        }
-                        None => raw(),
-                    };
-                    match depth {
-                        Some(d) => (caller_sym.nlocals() + d as usize) as i64,
-                        None => caller_sym.valuestackdepth() as i64,
-                    }
-                }
-            };
-            let vsd_op = ctx.trace_ctx.const_int(vsd_value);
-            crate::trace_opcode::mirror_vable_static_to_boxes(
-                ctx.trace_ctx,
-                "valuestackdepth",
-                vsd_op,
-                Value::Int(vsd_value),
-            );
-        }
-    }
+    publish_outermost_parent_vable_scalars(ctx, &parent_frames, callee_op_pc)?;
 
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
 

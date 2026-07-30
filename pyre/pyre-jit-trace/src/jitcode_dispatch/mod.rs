@@ -906,6 +906,11 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// boundary rather than mapping the callee `op_pc` through the outer
     /// jitcode in `walker_capture_snapshot_for_last_guard`.
     pub inline_subwalk: bool,
+    /// The current sub-walk is a translated builtin gateway helper, which has
+    /// no Python blackhole frame of its own. Guard snapshots therefore encode
+    /// only the precomputed Python caller chain on `framestack`, omitting the
+    /// helper JitCode itself.
+    pub transparent_helper_subwalk: bool,
     /// A bridge-carrier resume folds nested self-recursive calls directly to
     /// `CALL_ASSEMBLER` (`opimpl_recursive_call_assembler`) rather than
     /// re-unrolling the call tree to the multi-frame depth cap.
@@ -971,6 +976,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
         Self {
             snapshot_sym: std::ptr::null(),
             inline_subwalk: false,
+            transparent_helper_subwalk: false,
             carrier_resume: false,
             current_exception_seed: None,
             current_exception_seed_concrete: pyre_object::PY_NULL,
