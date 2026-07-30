@@ -32,9 +32,14 @@ fn inplace_dunder_name(op: BinaryOperator) -> Option<&'static str> {
 /// operand with no `__index__` never reaches `__imul__`: the in-place multiply
 /// falls through to `sequence_repeat`, which reports the multiplier rather
 /// than running the slot's own converter.
+///
+/// A sequence *subclass* that defines its own `__imul__` is exempt — that
+/// override is a real numeric slot and runs whatever the multiplier is, so
+/// `x = LI([1]); x *= "s"` is `LI.__imul__`, not the multiplier TypeError.
 fn skips_inplace_special(a: PyObjectRef, b: PyObjectRef, op: BinaryOperator) -> bool {
     matches!(op, BinaryOperator::InplaceMultiply)
         && unsafe { crate::objspace::descroperation::is_repeat_sequence(a) }
+        && !unsafe { crate::objspace::descroperation::seq_repeat_override(a, &["__imul__"]) }
         && unsafe { crate::baseobjspace::lookup(b, "__index__").is_none() }
 }
 

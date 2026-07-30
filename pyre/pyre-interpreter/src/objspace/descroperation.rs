@@ -2906,6 +2906,49 @@ unsafe fn bytes_operand_overrides(obj: PyObjectRef, fwd: &str, rev: &str) -> boo
     dunder_overridden(obj, fwd, t) || dunder_overridden(obj, rev, t)
 }
 
+/// `needs_seq_binop_dispatch` for the `sq_repeat` branches of [`mul`], where
+/// only one operand is the sequence: a subclass that overrides the multiply
+/// specials relative to its own builtin base has to run that override instead
+/// of repeating, exactly as the concat branches of [`add`] are gated.
+///
+/// Judged one operand at a time rather than as a pair, because a repeat's other
+/// operand is the multiplier — an `int`, whose own `__mul__` lives on `int` and
+/// would read as an override against any sequence base.  A *non*-overriding
+/// subclass keeps the repeat path, which is what makes `L([1]) * 2` still a
+/// plain list repetition.
+///
+/// `dont_look_inside`: the builtin-base type statics are loaded here, so a
+/// traced caller emits a residual call rather than an unresolvable
+/// `LoadStatic`.
+#[majit_macros::dont_look_inside]
+pub(crate) unsafe fn seq_repeat_override(obj: PyObjectRef, dunders: &[&str]) -> bool {
+    if pyre_object::is_exact_builtin_instance(obj) {
+        return false;
+    }
+    let tp: *const pyre_object::PyType = if is_str(obj) {
+        &pyre_object::STR_TYPE
+    } else if is_list(obj) {
+        &pyre_object::LIST_TYPE
+    } else if is_tuple(obj) {
+        &pyre_object::TUPLE_TYPE
+    } else if pyre_object::bytesobject::is_bytes_like(obj) {
+        if pyre_object::bytesobject::is_bytes(obj) {
+            &pyre_object::bytesobject::BYTES_TYPE
+        } else {
+            &pyre_object::bytearrayobject::BYTEARRAY_TYPE
+        }
+    } else {
+        return false;
+    };
+    let Some(t) = crate::typedef::gettypefor(tp) else {
+        return false;
+    };
+    let t = t.as_ptr();
+    dunders
+        .iter()
+        .any(|dunder| dunder_overridden(obj, dunder, t))
+}
+
 /// True when `obj` is an exact builtin numeric instance
 /// (`int`/`long`/`float`/`complex`/`bool`, not a subclass).  These types
 /// define no in-place special method (`__iadd__` etc.), so
@@ -3194,6 +3237,16 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if is_complex_pair(a, b) {
             return complex_mul(a, b);
+        }
+        // The `sq_repeat` fast paths below are valid for exact builtin
+        // sequences.  A sequence subclass that overrides `__mul__`/`__rmul__`
+        // must reach its override first — `LM([1]) * 2` is `LM.__mul__`, not a
+        // list repetition — the same gate the concat branches of `add` apply.
+        const MUL_SPECIALS: &[&str] = &["__mul__", "__rmul__"];
+        if seq_repeat_override(a, MUL_SPECIALS) || seq_repeat_override(b, MUL_SPECIALS) {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__mul__", "__rmul__")? {
+                return Ok(result);
+            }
         }
         if is_str(a) && is_int_or_long(b) {
             return str_repeat(a, b);
