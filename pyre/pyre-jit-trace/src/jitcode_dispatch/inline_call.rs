@@ -1692,12 +1692,11 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         // built: its element boxes are still in the heap cache, so the callee
         // seeds from them and the tuple keeps no consumer.
         //
-        // The seeding fills `registers_r[0..nparams]` and nothing else, so a
-        // callee owning a local the arity check cannot see must stay residual:
-        // `co_argcount` counts neither `*args` nor `**kwargs` nor keyword-only
-        // params, so `def f(a, *, b=5)` accepts a 1-tuple here while `b` is
-        // never bound.  Same decline the keyword fold applies.
-        if method_form || !fbw_callee_scope_is_positional_only(w_code) {
+        // The unpacked arguments come from the star tuple alone, so a
+        // method-form call — whose receiver is an implicit leading argument the
+        // unpack never sees — stays residual.  The callee-scope decline this
+        // seeding also needs is applied once in the resolved half.
+        if method_form {
             return Ok(None);
         }
         let Some(unpacked) = fbw_unpack_call_function_ex_args(ctx, r_args, &arg_concretes, nparams)
@@ -2412,6 +2411,15 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     allow_method_load_attr: bool,
     require_str_result: bool,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    // `_compute_flatcall` (`pycode.py:256-268`) leaves `fast_natural_arity`
+    // HOPELESS for a `*args` / `**kwargs` / keyword-only callee, so
+    // `funccall_valuestack` is never entered for one.  Same boundary here: the
+    // seeding fills `locals[0..nparams]` and `co_argcount` counts none of the
+    // three, so a callee owning a local the arity check cannot see must stay
+    // residual.
+    if !fbw_callee_scope_is_positional_only(w_code) {
+        return Ok(None);
+    }
     // `Function.funccall_valuestack` fills a missing positional tail from
     // `defs_w` before entering the frame (`function.py:188-193,217-231`).
     // Mirror that frame shape here.  Placeholder boxes are replaced by live
