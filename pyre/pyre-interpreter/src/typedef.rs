@@ -12356,46 +12356,6 @@ fn init_method_descriptor_type(ns: PyObjectRef) {
     }
 }
 
-/// `methodobject.c meth_get__qualname__`: a bound builtin method names itself
-/// after its receiver, so `dict.fromkeys` and `tuple.mro` report the bound
-/// class and `[].append` reports `type(__self__)`.  A method wrapping a Python
-/// function keeps the function's own `__qualname__`, which already spells the
-/// defining scope.
-fn bound_method_qualname(method: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let function = unsafe { pyre_object::w_method_get_func(method) };
-    let forward = || crate::baseobjspace::getattr_str(function, "__qualname__");
-    if function.is_null() || !unsafe { crate::function::is_function(function) } {
-        return forward();
-    }
-    let code = unsafe { crate::function::getcode(function) } as PyObjectRef;
-    if code.is_null() || !unsafe { crate::gateway::is_builtin_code(code) } {
-        return forward();
-    }
-    let receiver = unsafe { pyre_object::w_method_get_self(method) };
-    if receiver.is_null() || unsafe { pyre_object::module::is_module(receiver) } {
-        return crate::baseobjspace::getattr_str(function, "__name__");
-    }
-    let owner = if unsafe { pyre_object::is_type(receiver) } {
-        receiver
-    } else {
-        let Some(w_type) = crate::typedef::r#type(receiver) else {
-            return forward();
-        };
-        w_type.as_ptr()
-    };
-    let owner_qualname = crate::baseobjspace::getattr_str(owner, "__qualname__")?;
-    let name = crate::baseobjspace::getattr_str(function, "__name__")?;
-    let (Some(owner_qualname), Some(name)) = (unsafe {
-        (
-            pyre_object::w_str_get_value_opt(owner_qualname),
-            pyre_object::w_str_get_value_opt(name),
-        )
-    }) else {
-        return forward();
-    };
-    Ok(pyre_object::w_str_new(&format!("{owner_qualname}.{name}")))
-}
-
 fn init_method_type(ns: PyObjectRef) {
     // typedef.py:833-848 Method.typedef, completed with CPython 3.14's
     // ordering wrappers. Bound methods carry one wrapped callable and one
@@ -12483,24 +12443,6 @@ fn init_method_type(ns: PyObjectRef) {
             ns,
             "__func__",
             make_getset_descriptor(func_getter),
-        )
-    };
-    let qualname_getter = make_builtin_function_with_arity(
-        "__qualname__",
-        |args| {
-            let method = crate::function::require_method(
-                args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
-                "__qualname__",
-            )?;
-            bound_method_qualname(method)
-        },
-        2,
-    );
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__qualname__",
-            make_getset_descriptor(qualname_getter),
         )
     };
     let self_getter = make_builtin_function_with_arity(
