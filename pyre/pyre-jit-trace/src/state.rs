@@ -574,7 +574,8 @@ pub fn setup_indirectcalltargets(targets: Vec<std::sync::Arc<majit_metainterp::j
     // assembler objects standing in for one RPython CodeWriter assembler.
     // Keep the frozen source-translation PBC family when runtime targets are
     // published instead of replacing it with the latest runtime-only batch.
-    let mut merged = crate::jitcode_runtime::build_indirectcalltargets();
+    let frozen = crate::jitcode_runtime::indirectcalltargets();
+    let mut merged = frozen.to_vec();
     for target in targets {
         if !merged
             .iter()

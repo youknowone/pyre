@@ -51,6 +51,13 @@ thread_local! {
 
     /// Explicit build-time JIT-driver metadata for every configured driver.
     static COMPILED_JIT_DRIVERS: OnceCell<&'static [CompiledJitDriver]> = const { OnceCell::new() };
+
+    /// Per-thread cached `&'static` to the frozen source-translation
+    /// indirect-call-target family.  Same storage shape and the same
+    /// `Box::leak` rationale as [`ALL_JITCODES`], which it is derived from;
+    /// see [`indirectcalltargets`] for why the family is built once.
+    static INDIRECTCALLTARGETS: OnceCell<&'static [Arc<majit_metainterp::jitcode::JitCode>]> =
+        const { OnceCell::new() };
 }
 
 fn load_all_jitcodes() -> &'static [Arc<JitCode>] {
@@ -120,9 +127,21 @@ pub fn get_jitcode_by_index(index: usize) -> Option<Arc<JitCode>> {
     all_jitcodes().get(index).cloned()
 }
 
-/// Restore the source translator's exact
-/// `Assembler.indirectcalltargets` set as references into `all_jitcodes`.
-pub fn build_indirectcalltargets() -> Vec<Arc<majit_metainterp::jitcode::JitCode>> {
+/// The source translator's exact `Assembler.indirectcalltargets` set as
+/// references into `all_jitcodes`.
+///
+/// `assembler.indirectcalltargets` is filled once while the graphs are being
+/// assembled and holds the same `JitCode` objects the codewriter already
+/// handed to `metainterp_sd.jitcodes` — one object per graph for the whole
+/// process. The wrapper conversion below still has to own its core, so the
+/// family is materialized once per thread and handed out by reference
+/// afterwards; every publisher then sees the same objects instead of a fresh
+/// deep copy per call.
+pub fn indirectcalltargets() -> &'static [Arc<majit_metainterp::jitcode::JitCode>] {
+    INDIRECTCALLTARGETS.with(|cell| *cell.get_or_init(build_indirectcalltargets))
+}
+
+fn build_indirectcalltargets() -> &'static [Arc<majit_metainterp::jitcode::JitCode>] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/indirectcalltargets.bin"));
     let indices: Vec<usize> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
         panic!(
@@ -131,7 +150,7 @@ pub fn build_indirectcalltargets() -> Vec<Arc<majit_metainterp::jitcode::JitCode
             BYTES.len(),
         )
     });
-    indices
+    let vec: Vec<Arc<majit_metainterp::jitcode::JitCode>> = indices
         .into_iter()
         .map(|index| {
             let canonical = get_jitcode_by_index(index).unwrap_or_else(|| {
@@ -145,7 +164,8 @@ pub fn build_indirectcalltargets() -> Vec<Arc<majit_metainterp::jitcode::JitCode
                 (*canonical).clone(),
             ))
         })
-        .collect()
+        .collect();
+    Box::leak(vec.into_boxed_slice())
 }
 
 // Cached index of the build-time portal jitcode within `ALL_JITCODES`.
