@@ -3933,7 +3933,7 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
                 majit_metainterp::virtualizable::VableToken::TracingRescall
             )
         });
-        // `virtualizable.py:214-217 force_virtualizable_if_necessary` decides
+        // `virtualizable.py:282-284 force_virtualizable_if_necessary` decides
         // this from the frame's OWN `vable_token` and nothing else.  An inlined
         // callee materialized through a virtual reference is an ordinary frame,
         // not the standard virtualizable, and its token slot is not part of its

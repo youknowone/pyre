@@ -2000,7 +2000,7 @@ pub fn blackhole_resume_via_rd_numb(
     // consume a phantom vable and dereference garbage; a novable resume passes
     // `None` for both the vinfo and the per-frame virtualizable handle.
     novable: bool,
-    // compile.py:706-709 — the cache `handle_async_forcing` already
+    // compile.py:956-958 — the cache `handle_async_forcing` already
     // materialized, when this resume is the GUARD_NOT_FORCED that follows a
     // force. `None` for every other guard.
     all_virtuals: Option<(Vec<i64>, Vec<i64>)>,

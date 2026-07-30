@@ -7399,7 +7399,7 @@ pub fn blackhole_from_resumedata<'a>(
     // resume.py:1312 `blackhole_from_resumedata(..., all_virtuals=None)`.
     // `Some` only when resuming from a GUARD_NOT_FORCED whose
     // `handle_async_forcing` already materialized the virtuals
-    // (compile.py:706-709): the reader then runs with
+    // (compile.py:956-958): the reader then runs with
     // `resume_after_guard_not_forced == 2`, reuses this cache and leaves
     // the already-forced virtualizable alone.
     all_virtuals: Option<(Vec<i64>, Vec<i64>)>,

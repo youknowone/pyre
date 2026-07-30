@@ -11785,7 +11785,7 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// `compile.py:706-709` — `handle_fail` of a `GUARD_NOT_FORCED` fishes
+    /// `compile.py:956-958` — `handle_fail` of a `GUARD_NOT_FORCED` fishes
     /// the cache `handle_async_forcing` left on the deadframe and hands it
     /// to `resume_in_blackhole`, which is what makes the blackhole reuse
     /// the objects the force already materialized instead of building a

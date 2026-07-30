@@ -623,7 +623,15 @@ def synth_skip_backends(path):
     This is not a way to park a failure: the header line must be followed by
     a comment saying which mechanism is missing, so the exemption is
     reviewable next to the workload. Unknown backend names are an error, not
-    a silent no-op — a typo would otherwise read as "exempted".
+    a silent no-op — a typo would otherwise read as "exempted". A directive
+    below the 20-line window is likewise not silently honored: the fixture
+    simply runs everywhere and goes red, which is the safe direction.
+
+    The exemption covers a backend's *execution* only. It deliberately does
+    NOT cover the three baseline-failure paths below (cpython crash, pypy
+    crash, cpython/pypy output mismatch): those mean the fixture itself is
+    broken, and that must stay loud on every backend rather than be hidden
+    behind an exemption written for a different reason.
     """
     prefix = "# pyre-check: skip-backends="
     with open(path, encoding="utf-8") as source:
