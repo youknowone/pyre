@@ -3668,7 +3668,9 @@ pub fn capture_mapdict_root_area() -> *const () {
 /// own contents are reached through its write barrier and custom trace
 /// (`dict_write_barrier` / `dict_object_custom_trace`), never from here.  A
 /// non-moving major (`do_collect_oldgen`) leaves the nursery intact, so only
-/// the minor walk may drain the pending set.
+/// the minor walk may drain the pending set.  A value the GC does not own has
+/// neither of those two paths, so [`walk_mapdict_roots_area`] puts its key
+/// straight back.
 ///
 /// Without this split each collection cloned and walked the whole table, whose
 /// entries are roots and therefore outlive their owners: the per-collection
@@ -3767,12 +3769,23 @@ pub unsafe fn walk_mapdict_roots_area(_data: *const (), mut visitor: impl FnMut(
     // and w_dict_walk_entries_mut may re-enter mapdict/dict APIs; every write
     // back into the table is deferred to `apply_root_rekeys`.
     let mut dict_rekeys = Vec::new();
+    let mut dict_offgc = Vec::new();
     for (key, mut dict) in dict_values {
         let old_dict = dict;
         visitor(&mut dict);
         let new_key = current_owner_key(key);
         if new_key != key || dict != old_dict {
             dict_rekeys.push((key, new_key, dict as usize));
+        }
+        // A value the GC does not own — `alloc_dict_object` falls back to
+        // `malloc_typed` when no allocation hook is installed — carries no
+        // header, so `do_write_barrier` drops it (it admits only a nursery or
+        // old-generation address) and no custom trace ever reaches its entries.
+        // The entry walk below is the only thing that traces them, so such a
+        // key stays pending: a minor has to revisit it after every store into
+        // the dict, not once when the table entry was first created.
+        if !pyre_object::gc_hook::try_gc_owns_object(dict as *mut u8) {
+            dict_offgc.push(new_key);
         }
         // Trace the dict's own r_dict entries. INSTANCE_DICT now holds only
         // non-instance hasdict wrappers (property/member) — never a
@@ -3804,7 +3817,13 @@ pub unsafe fn walk_mapdict_roots_area(_data: *const (), mut visitor: impl FnMut(
         // So no instance is walked here.
     }
     apply_root_rekeys(&INSTANCE_DICT, dict_rekeys);
+    if !dict_offgc.is_empty() {
+        INSTANCE_DICT_PENDING.lock().unwrap().extend(dict_offgc);
+    }
 
+    // The weakref walk visits the lifeline pointer and stops there, so it needs
+    // no such re-arming: an off-GC lifeline never moves, and its own fields are
+    // outside what this walk ever traced.
     let weakref_values = snapshot_root_entries(&WEAKREF_TABLE, &WEAKREF_TABLE_PENDING, minor);
     let mut weakref_rekeys = Vec::new();
     for (key, mut value) in weakref_values {
@@ -4965,5 +4984,71 @@ mod tests {
                 10
             );
         }
+    }
+
+    // The side-table root bookkeeping below takes its table and pending set as
+    // arguments, so these exercise the real functions on local tables — the
+    // process-global `INSTANCE_DICT` / `WEAKREF_TABLE` are shared with every
+    // other test running concurrently and must not be touched here.
+    fn table(entries: &[(usize, usize)]) -> Mutex<HashMap<usize, usize>> {
+        Mutex::new(entries.iter().copied().collect())
+    }
+    fn pending(keys: &[usize]) -> Mutex<HashSet<usize>> {
+        Mutex::new(keys.iter().copied().collect())
+    }
+    fn keys_of(snapshot: &[(usize, PyObjectRef)]) -> Vec<usize> {
+        let mut keys: Vec<usize> = snapshot.iter().map(|&(key, _)| key).collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    #[test]
+    fn major_snapshot_takes_the_whole_table_and_keeps_the_pending_set() {
+        let table = table(&[(0x10, 0xA0), (0x20, 0xB0), (0x30, 0xC0)]);
+        let pending = pending(&[0x20]);
+        let snapshot = snapshot_root_entries(&table, &pending, false);
+        assert_eq!(keys_of(&snapshot), [0x10, 0x20, 0x30]);
+        // A major moves nothing, so it must not retire the keys a later minor
+        // still owes a visit to.
+        assert_eq!(pending.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn minor_snapshot_drains_the_pending_set() {
+        let table = table(&[(0x10, 0xA0), (0x20, 0xB0), (0x30, 0xC0)]);
+        let pending = pending(&[0x20, 0x30]);
+        let snapshot = snapshot_root_entries(&table, &pending, true);
+        assert_eq!(keys_of(&snapshot), [0x20, 0x30]);
+        assert!(pending.lock().unwrap().is_empty());
+        // Drained: the entries are old by now and reached through their own
+        // write barrier, so the next minor visits nothing.
+        assert!(snapshot_root_entries(&table, &pending, true).is_empty());
+    }
+
+    #[test]
+    fn minor_snapshot_drops_a_pending_key_whose_entry_is_gone() {
+        let table = table(&[(0x10, 0xA0)]);
+        let pending = pending(&[0x10, 0x99]);
+        let snapshot = snapshot_root_entries(&table, &pending, true);
+        assert_eq!(keys_of(&snapshot), [0x10]);
+    }
+
+    #[test]
+    fn rekey_moves_a_promoted_owner_and_repoints_a_moved_value() {
+        let table = table(&[(0x10, 0xA0), (0x20, 0xB0)]);
+        // 0x10's owner moved to 0x11 and its value to 0xA1; 0x20 stayed put but
+        // its value moved.
+        apply_root_rekeys(&table, vec![(0x10, 0x11, 0xA1), (0x20, 0x20, 0xB1)]);
+        let table = table.lock().unwrap();
+        assert_eq!(table.get(&0x10), None);
+        assert_eq!(table.get(&0x11), Some(&0xA1));
+        assert_eq!(table.get(&0x20), Some(&0xB1));
+    }
+
+    #[test]
+    fn rekey_of_an_entry_deleted_during_the_walk_reinserts_nothing() {
+        let table = table(&[]);
+        apply_root_rekeys(&table, vec![(0x10, 0x11, 0xA1), (0x20, 0x20, 0xB1)]);
+        assert!(table.lock().unwrap().is_empty());
     }
 }
