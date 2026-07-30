@@ -10243,37 +10243,16 @@ fn handle<Sym: WalkSym>(
                             op.next_pc,
                         ));
                     }
-                    // The jump did not take. Closing here anyway lands on
-                    // `compile_loop`'s own `has_compiled_targets` check
-                    // (pyjitpl.py:3185-3189), which gives the whole trace up
-                    // with SwitchToBlackhole; and the cut would store the loop
-                    // under `cut_inner_green_key`, replacing reachable code
-                    // with code stored where nothing enters. Keep tracing
-                    // instead, so the trace closes at its own header with this
-                    // loop's body inlined — the interpreter front end declines
-                    // the same case for the same reason. Only a cross-loop cut
-                    // is declined: a trace that started at these greens still
-                    // closes on its own back-edge below.
-                    // One decline is not a plain "keep tracing": compile.py:1079
-                    // `metainterp.retrace_needed` leaves `partial_trace` and
-                    // `retracing_from` pointing at this header's position. The
-                    // return below skips the merge-point registration further
-                    // down, so the later close at the root header would compare
-                    // the root merge point against a `retracing_from` no merge
-                    // point was ever recorded for, and abort instead of
-                    // retracing. `has_partial` was false above, so a partial
-                    // trace here is the one this attempt just requested.
-                    let retrace_requested = driver.meta_interp().partial_trace().is_some();
-                    if !retrace_requested && key != ctx.trace_ctx.root_green_key() {
-                        if majit_metainterp::majit_log_enabled() {
-                            eprintln!(
-                                "[jit][walker-reached-loop-header] merge point pc={} already \
-                                 has a compiled loop key={} — declining the cross-loop cut",
-                                next_instr, key
-                            );
-                        }
-                        return Ok((DispatchOutcome::Continue, op.next_pc));
-                    }
+                    // The jump did not take (`compile.compile_trace` returns
+                    // None when none of the existing loop tokens match). Fall
+                    // through to the merge-point scan below, exactly as
+                    // `reached_loop_header` does after its own
+                    // `self.compile_trace(...)` call returns (pyjitpl.py:3003-3018):
+                    // the scan closes at the first same-greenkey merge point, and
+                    // `compile_loop` gives that trace up at its own
+                    // `has_compiled_targets` (pyjitpl.py:3185-3189); a first visit
+                    // registers a merge point (pyjitpl.py:3057-3059) and keeps
+                    // tracing.
                 }
             }
 
