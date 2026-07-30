@@ -4968,6 +4968,18 @@ thread_local! {
     static FBW_SYS_EXC_JOURNAL: std::cell::RefCell<Vec<pyre_object::PyObjectRef>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
+    /// Undo entry for the concrete traceback-head store performed while a
+    /// bridge-entry exception arm is recorded: `(exception, attached_node)`.
+    /// The two arms are mutually exclusive and each is entered at most once
+    /// per walk session, so one slot covers the concrete attach.  It shares
+    /// the store journal's lifecycle: a committing walk keeps the node and
+    /// clears the entry, while a discarded walk removes the node only when it
+    /// is still the exception's current traceback head.  Both refs are GC
+    /// roots via [`fbw_store_journal_root_walker`].
+    static FBW_TRACEBACK_STORE_JOURNAL:
+        std::cell::RefCell<Option<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>> =
+        const { std::cell::RefCell::new(None) };
+
     /// In-flight FOR_ITER continuation (#57 Option C): `(consumed_item,
     /// body coordinate)` stashed when the FOR_ITER `for_iter_next` residual
     /// ([`PyreHelperKind::ForIterNext`]) runs concretely on the
@@ -5156,6 +5168,8 @@ struct FbwStoreJournalRootArea {
     abort_overrides: *const std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>>,
     cell_stores: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64)>>,
     sys_exc: *const std::cell::RefCell<Vec<pyre_object::PyObjectRef>>,
+    traceback_store:
+        *const std::cell::RefCell<Option<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>>,
     foriter: *const std::cell::RefCell<Vec<InflightForiter>>,
     bridge_iter: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64, i64)>>,
     abort_resume: *const std::cell::RefCell<Option<InlineAbortCarrier>>,
@@ -5173,6 +5187,7 @@ thread_local! {
         abort_overrides: FBW_ABORT_OUTER_STACK_OVERRIDES.with(|value| value as *const _),
         cell_stores: FBW_CELL_STORE_JOURNAL.with(|value| value as *const _),
         sys_exc: FBW_SYS_EXC_JOURNAL.with(|value| value as *const _),
+        traceback_store: FBW_TRACEBACK_STORE_JOURNAL.with(|value| value as *const _),
         foriter: FBW_FORITER_INFLIGHT.with(|value| value as *const _),
         bridge_iter: FBW_BRIDGE_ITER_JOURNAL.with(|value| value as *const _),
         abort_resume: FBW_ABORT_CALL_RESUME.with(|value| value as *const _),
@@ -5476,6 +5491,14 @@ pub unsafe fn fbw_store_journal_root_walker_area(
         // SAFETY: `PyObjectRef` and `GcRef` share the usize repr; the
         // borrowed area keeps the Vec storage alive for the visit.
         visitor(unsafe { &mut *(displaced as *mut pyre_object::PyObjectRef).cast() });
+    }
+    // The exception and freshly attached traceback node remain live until the
+    // walk commits or rolls back.  The entry may be their only scanned owner
+    // after later concrete execution changes the exception's head.
+    let traceback_store = unsafe { &mut *(*area.traceback_store).as_ptr() };
+    if let Some((exception, node)) = traceback_store.as_mut() {
+        visitor(unsafe { &mut *(exception as *mut pyre_object::PyObjectRef).cast() });
+        visitor(unsafe { &mut *(node as *mut pyre_object::PyObjectRef).cast() });
     }
     // #57 Option C: each captured in-flight FOR_ITER item is nursery-resident
     // across the rest of the walk (subsequent residual calls allocate and a

@@ -346,6 +346,7 @@ pub(crate) fn fbw_store_journal_reset() {
     FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_SYS_EXC_JOURNAL.with(|j| j.borrow_mut().clear());
+    FBW_TRACEBACK_STORE_JOURNAL.with(|j| *j.borrow_mut() = None);
     FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(false));
     FBW_UNJOURNALED_SYMBOLIC.with(|c| c.set(false));
     FBW_EXECUTED_RESIDUAL_VOID.with(|c| c.set(0));
@@ -464,6 +465,47 @@ pub(crate) fn fbw_sys_exc_journal_push(displaced: pyre_object::PyObjectRef) {
     FBW_SYS_EXC_JOURNAL.with(|j| j.borrow_mut().push(displaced));
 }
 
+/// Read an exception's concrete traceback head before a bridge-entry recording
+/// helper runs.  `None` means the concrete is not an exception and therefore
+/// cannot receive a host-side attach.
+pub(crate) fn fbw_traceback_journal_head(
+    exception: pyre_object::PyObjectRef,
+) -> Option<pyre_object::PyObjectRef> {
+    if exception.is_null() || unsafe { !pyre_object::is_exception(exception) } {
+        return None;
+    }
+    Some(unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exception) })
+}
+
+/// Journal the node a bridge-entry recording helper concretely prepended.
+/// An unchanged head means the helper declined the host attach.
+pub(crate) fn fbw_traceback_journal_push_if_attached(
+    exception: pyre_object::PyObjectRef,
+    previous_head: Option<pyre_object::PyObjectRef>,
+) {
+    let Some(previous_head) = previous_head else {
+        return;
+    };
+    let node = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exception) };
+    if node == previous_head {
+        return;
+    }
+    debug_assert!(!node.is_null());
+    debug_assert!(unsafe { pyre_interpreter::pytraceback::is_pytraceback(node) });
+    debug_assert_eq!(
+        unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_w_next(node) },
+        previous_head
+    );
+    FBW_TRACEBACK_STORE_JOURNAL.with(|j| {
+        let mut entry = j.borrow_mut();
+        assert!(
+            entry.is_none(),
+            "bridge-entry traceback attach ran more than once in one walk session"
+        );
+        *entry = Some((exception, node));
+    });
+}
+
 /// Commit-path epilogue: the walk's eager stores and appends stand; drop
 /// the undo logs.
 pub(crate) fn fbw_store_journal_commit() {
@@ -475,6 +517,9 @@ pub(crate) fn fbw_store_journal_commit() {
     // trace or the adopted end state carries the same exception state), so
     // drop the undo log without re-applying it.
     FBW_SYS_EXC_JOURNAL.with(|j| j.borrow_mut().clear());
+    // The compiled trace owns the recorded attach and the authoritative walk
+    // already applied this iteration's concrete node, so keep it in place.
+    FBW_TRACEBACK_STORE_JOURNAL.with(|j| *j.borrow_mut() = None);
     // #57 Option C: a committed walk's end-flush adopts the advanced
     // iterator + the body that consumed it (counted once), so the in-flight
     // items must NOT also be delivered — drop the stash (and with it the
@@ -904,6 +949,22 @@ pub(crate) fn fbw_store_journal_rollback() {
         let mut entries = j.borrow_mut();
         while let Some(displaced) = entries.pop() {
             pyre_interpreter::eval::set_current_exception(displaced);
+        }
+    });
+    // Remove the bridge-entry node only while it remains the exact head the
+    // recording helper installed.  If later concrete execution replaced the
+    // head, discarding this walk must not overwrite that newer state.
+    FBW_TRACEBACK_STORE_JOURNAL.with(|j| {
+        let Some((exception, node)) = j.borrow_mut().take() else {
+            return;
+        };
+        let current =
+            unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exception) };
+        if current == node {
+            let previous = unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_w_next(node) };
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_traceback(exception, previous);
+            }
         }
     });
 }
