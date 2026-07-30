@@ -17135,14 +17135,21 @@ mod tests {
     }
 
     /// `bound_method_attr_fast_path` must admit every descriptor kind the
-    /// `get()` it reproduces binds through `w_method_new` — otherwise the
-    /// `LOAD_ATTR`-method fold declines and the walker emits an opaque
-    /// may-force `getattr` residual per iteration instead.
+    /// `get()` it reproduces binds — otherwise the `LOAD_ATTR`-method fold
+    /// declines and the walker emits an opaque may-force `getattr` residual per
+    /// iteration instead.
     ///
     /// `TypeDef` methods are retagged `method_descriptor`
     /// (`function_retag_method_descriptor`), not `function`, so a predicate
     /// testing `FUNCTION_TYPE` alone silently declines `lst.append` and every
     /// sibling. Both types take the SAME arm in `get()`.
+    ///
+    /// What that arm *produces* differs by descriptor kind: `descrobject.c
+    /// method_get` returns `PyCMethod_New(descr->d_method, obj, NULL, d_type)`,
+    /// so binding a `tp_methods` descriptor yields a
+    /// `builtin_function_or_method` carrying the receiver — `type([].append) is
+    /// type(len)` — where a Python `def` binds to a `method`. The predicate has
+    /// to admit both, so this pins the builtin arm.
     #[test]
     fn bound_method_fast_path_admits_the_same_kinds_get_binds() {
         crate::typedef::init_typeobjects();
@@ -17162,14 +17169,20 @@ mod tests {
         );
 
         // `get()` is the behaviour the fold reproduces: it binds this descriptor
-        // into a Method carrying (w_function = descr, w_self = the receiver).
+        // into a builtin carrier holding the receiver.
         let bound = unsafe { get(w_descr, w_list, w_type) }
             .expect("get() must not raise")
             .expect("get() binds a method_descriptor");
-        assert!(unsafe { pyre_object::function::is_method(bound) });
+        assert!(
+            std::ptr::eq(
+                unsafe { (*bound).ob_type },
+                &crate::function::BUILTIN_FUNCTION_TYPE as *const _,
+            ),
+            "binding a tp_methods descriptor yields a builtin_function_or_method",
+        );
         assert!(std::ptr::eq(
-            unsafe { pyre_object::function::w_method_get_func(bound) },
-            w_descr,
+            unsafe { crate::function::builtin_bound_receiver(bound) },
+            w_list,
         ));
 
         // So the predicate must admit it, naming the very same descriptor.
