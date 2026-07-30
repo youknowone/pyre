@@ -474,14 +474,12 @@ fn math_unary_int(
             crate::baseobjspace::object_functionstr_type_name(args[0])
         )));
     }
-    // Fall back to `__float__` coercion — `try_get_double` raises TypeError
-    // when the operand has no numeric interpretation.
-    let v = try_get_double(args[0]).map_err(|_| {
-        crate::PyError::type_error(format!(
-            "must be real number, not {}",
-            crate::baseobjspace::object_functionstr_type_name(args[0])
-        ))
-    })?;
+    // Fall back to `__float__` coercion.  `try_get_double` already reports
+    // "must be real number, not X" for an operand with no numeric
+    // interpretation, and its contract is that everything else — a raising
+    // `__float__`, or the `OverflowError` for an int too wide for an f64 —
+    // propagates; relabelling here would swallow exactly those.
+    let v = try_get_double(args[0])?;
     Ok(w_int_new(match dunder {
         "__ceil__" => v.ceil() as i64,
         "__floor__" => v.floor() as i64,

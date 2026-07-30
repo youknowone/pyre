@@ -44,7 +44,13 @@ pub fn adapt_lower_bound(size: i64, w_index: PyObjectRef) -> Result<i64, crate::
 /// even though `[1, 2][None:]` is not.  The message drops the `or None` the
 /// slicing form offers.
 pub(crate) fn eval_slice_index_not_none(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
-    if unsafe { is_none(w_int) } || crate::builtins::getindex_w(w_int).is_err() {
+    // `_PyIndex_Check` gates the substituted message and is a type test, so a
+    // bound that has `__index__` is converted exactly once, by
+    // `eval_slice_index`.  Probing with a conversion instead would run a user
+    // slot twice and relabel everything it raises — an `OverflowError` for a
+    // result too wide for a word, or the slot's own exception — as this
+    // TypeError, which upstream reserves for a type with no `__index__` at all.
+    if unsafe { is_none(w_int) || !crate::builtins::index_check(w_int) } {
         return Err(crate::PyError::type_error(
             "slice indices must be integers or have an __index__ method",
         ));
