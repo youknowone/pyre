@@ -1386,6 +1386,31 @@ pub fn supports_guard_gc_type() -> bool {
     ACTIVE_SUPPORTS_GUARD_GC_TYPE.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Set once any thread has installed a per-thread GC box on any backend. That
+/// path is test-only: production installs the backend standalone, leaving the
+/// process-global [`gc_sync`] singleton as the sole allocator on every thread.
+///
+/// Set-only, never cleared: a backend can drop one thread's box while another
+/// thread still owns one, and clearing the flag would route past that live box.
+///
+/// RPython has no per-thread allocator — the GC transformer weaves every
+/// `malloc` against the single translation-time `gcdata`
+/// (`gctransform/framework.py`) — so the box is pyre-side test scaffolding, and
+/// the queries below let the allocation path it does not serve skip it.
+static GC_BOX_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record that a backend has installed a per-thread GC box. Called from each
+/// backend's box-installing entry point.
+pub fn note_gc_box_installed() {
+    GC_BOX_INSTALLED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether any thread may own a per-thread GC box. See [`GC_BOX_INSTALLED`].
+#[inline]
+pub fn gc_box_installed() -> bool {
+    GC_BOX_INSTALLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 // ── Host-side nursery allocation hook ───────────────────────────────
 //
 // Separate from `ActiveGcGuardHooks` because allocation is not a
@@ -1394,6 +1419,47 @@ pub fn supports_guard_gc_type() -> bool {
 // …) can route through the real GC without taking a backend-specific
 // dependency. Mirrors how RPython host code reaches `gc.malloc(TYPE)`
 // through the global GC instance.
+//
+// When no thread owns a per-thread GC box, a backend's hook does nothing but
+// forward to `gc_sync` — the same process-global singleton this crate owns. The
+// `standalone_*` functions below are that forwarding, spelled once here and
+// called from both sides: the backend trampolines fall through to them, and the
+// entry points take them directly instead of going out through the hook. Same
+// work, one fewer indirect call and stack frame per allocation. The hook is
+// still consulted for its presence, so "no backend installed" keeps returning
+// null exactly as before.
+
+/// The nursery allocation a backend's `AllocNurseryTypedFn` performs once no
+/// per-thread box owns the request.
+///
+/// Non-collecting on purpose: the caller holds a raw pointer that is not a
+/// registered GC root, so a collection here would move the fresh object out
+/// from under it. Falling back to old-gen on a full nursery keeps the result
+/// stable across any minor collection before the caller stores it into a
+/// tracked slot.
+#[inline]
+pub fn standalone_alloc_nursery_typed(type_id: u32, payload_size: usize) -> GcRef {
+    gc_sync::gc_op(|g| g.try_alloc_nursery_no_collect_typed(type_id, payload_size))
+}
+
+/// The rooted collecting nursery allocation a backend's
+/// `AllocNurseryCollectingTypedRootedFn` performs once no per-thread box owns
+/// the request.
+///
+/// # Safety
+/// Same contract as [`alloc_nursery_collecting_typed_rooted`]: `root` and
+/// `needs_write_barrier` must stay valid for the call.
+#[inline]
+pub unsafe fn standalone_alloc_nursery_collecting_typed_rooted(
+    type_id: u32,
+    payload_size: usize,
+    root: *mut GcRef,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    gc_sync::gc_op(|g| unsafe {
+        g.alloc_nursery_collecting_typed_rooted(type_id, payload_size, root, needs_write_barrier)
+    })
+}
 
 /// Process-global callback that performs a nursery allocation for the
 /// currently active backend. The callback returns `GcRef(0)` (i.e.
@@ -1414,6 +1480,7 @@ pub fn set_active_alloc_nursery_typed(hook: Option<AllocNurseryTypedFn>) {
 /// null pointer and fall back to their non-GC path).
 pub fn alloc_nursery_typed(type_id: u32, payload_size: usize) -> GcRef {
     match ACTIVE_ALLOC_NURSERY_TYPED.get() {
+        Some(_) if !gc_box_installed() => standalone_alloc_nursery_typed(type_id, payload_size),
         Some(f) => f(type_id, payload_size),
         None => GcRef(0),
     }
@@ -1576,6 +1643,14 @@ pub unsafe fn alloc_nursery_collecting_typed_rooted(
     needs_write_barrier: *mut bool,
 ) -> GcRef {
     match ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTED.get() {
+        Some(_) if !gc_box_installed() => unsafe {
+            standalone_alloc_nursery_collecting_typed_rooted(
+                type_id,
+                payload_size,
+                root,
+                needs_write_barrier,
+            )
+        },
         Some(f) => unsafe { f(type_id, payload_size, root, needs_write_barrier) },
         None => {
             // No backend installed placement reporting, so keep the

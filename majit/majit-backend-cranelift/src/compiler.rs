@@ -1433,27 +1433,8 @@ thread_local! {
     static CRANELIFT_JITFRAME_TYPE_ID: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
-/// Set once any thread has installed a per-thread GC box through
-/// `set_cranelift_active_gc(Some(..))`. That path is test-only: production
-/// calls [`install_gc_standalone`], which leaves `CRANELIFT_ACTIVE_GC` `None`
-/// on every thread, so the flag stays `false` and [`with_cranelift_gc`] reaches
-/// `gc_sync` without two thread-local reads plus a `RefCell` borrow first.
-/// RPython weaves every `malloc` against the single translation-time `gcdata`
-/// (`gctransform/framework.py`) and has no per-thread allocator at all.
-///
-/// Set-only, never cleared: `set_cranelift_active_gc(None)` can run on one
-/// thread while another still owns a box.
-static GC_BOX_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Whether any thread may hold a `CRANELIFT_ACTIVE_GC` box. `false` means no
-/// thread can have one; `true` only means "probe it".
-#[inline]
-fn gc_box_possible() -> bool {
-    GC_BOX_INSTALLED.load(std::sync::atomic::Ordering::Acquire)
-}
-
 fn with_cranelift_gc<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Option<R> {
-    if gc_box_possible() && CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
+    if majit_gc::gc_box_installed() && CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
         return CRANELIFT_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
             let raw: *mut dyn GcAllocator = guard.as_deref_mut()?;
@@ -1475,7 +1456,7 @@ fn with_cranelift_gc_required<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R
 
 fn set_cranelift_active_gc(gc: Option<Box<dyn GcAllocator>>) {
     if gc.is_some() {
-        GC_BOX_INSTALLED.store(true, std::sync::atomic::Ordering::Release);
+        majit_gc::note_gc_box_installed();
     }
     CRANELIFT_ACTIVE_GC.with(|cell| {
         let mut guard = cell.borrow_mut();
@@ -1504,7 +1485,7 @@ fn set_cranelift_jitframe_type_id(type_id: Option<u32>) {
 }
 
 fn cranelift_gc_active() -> bool {
-    (gc_box_possible() && CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some()))
+    (majit_gc::gc_box_installed() && CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some()))
         || majit_gc::gc_sync::is_initialized()
 }
 
@@ -1713,7 +1694,7 @@ fn gc_remove_root_via_active_runtime(slot: *mut GcRef) {
 /// Host-side write-barrier trampoline for GC-managed objects updated
 /// outside compiled code.
 fn gc_write_barrier_via_active_runtime(obj: GcRef) {
-    if gc_box_possible() && CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
+    if majit_gc::gc_box_installed() && CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
         with_cranelift_gc(|gc| gc.write_barrier(obj));
     } else if majit_gc::gc_sync::is_initialized() {
         majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.write_barrier(obj));
@@ -1725,7 +1706,7 @@ fn gc_write_barrier_via_active_runtime(obj: GcRef) {
 /// `try_gc_alloc_stable`-allocated blocks from `std::alloc`-backed
 /// fallback blocks during the L1/L2 stepping-stone window.
 fn id_or_identityhash_via_active_runtime(addr: usize) -> usize {
-    let via_box = gc_box_possible().then(|| {
+    let via_box = majit_gc::gc_box_installed().then(|| {
         CRANELIFT_ACTIVE_GC.with(|cell| {
             let mut guard = match cell.try_borrow_mut() {
                 Ok(guard) => guard,
@@ -1752,7 +1733,7 @@ fn gc_owns_object_via_active_runtime(addr: usize) -> bool {
     // `gc_sync` read only for this immutable ownership query, matching the
     // read-only nature of RPython's descriptor call, instead of panicking
     // across the extern slowpath.
-    if !gc_box_possible() {
+    if !majit_gc::gc_box_installed() {
         return majit_gc::gc_sync::is_initialized()
             && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr));
     }
@@ -1782,7 +1763,7 @@ fn gc_owns_object_via_active_runtime(addr: usize) -> bool {
 }
 
 fn gc_is_nursery_object_via_active_runtime(addr: usize) -> bool {
-    let via_box = gc_box_possible()
+    let via_box = majit_gc::gc_box_installed()
         .then(|| {
             CRANELIFT_ACTIVE_GC.with(|cell| match cell.try_borrow() {
                 Ok(guard) => guard.as_deref().map(|gc| gc.is_nursery_object(addr)),
