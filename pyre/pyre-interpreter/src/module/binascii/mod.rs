@@ -14,20 +14,18 @@ mod transforms;
 use pyre_object::*;
 
 /// The required first parameter of the hex entry points, which is
-/// positional-or-keyword and reported by name when absent.
+/// positional-or-keyword: reported by name when absent, and rejected when
+/// supplied both ways.
 fn arg_data(
     pos: &[PyObjectRef],
     kwargs: Option<PyObjectRef>,
     fn_name: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
-    pos.first()
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "data"))
-        .ok_or_else(|| {
-            crate::PyError::type_error(format!(
-                "{fn_name}() missing required argument 'data' (pos 1)"
-            ))
-        })
+    crate::builtins::bind_pos_or_kw(pos, kwargs, 0, "data", fn_name, 1)?.ok_or_else(|| {
+        crate::PyError::type_error(format!(
+            "{fn_name}() missing required argument 'data' (pos 1)"
+        ))
+    })
 }
 
 /// `ascii_buffer_converter` — accept a str (ASCII) or any bytes-like and
