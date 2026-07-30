@@ -129,17 +129,30 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
 /// installed (single-crate tests / pre-init snapshot tools).
 ///
 /// PRE-EXISTING-ADAPTATION: PyPy instances live in the movable nursery
-/// (`rclass`/`gctypelayout` standard `GcStruct`). Pyre uses the stable
-/// (non-moving) old-gen allocator instead of `try_gc_alloc`, because the
-/// JIT trace GC-safepoint gcmap does not yet forward a transient
-/// instance ref held across an in-trace minor collection — a movable
-/// instance read from e.g. `objs[i % 3]` and carried into a method-call
-/// guard reads a stale (relocated) pointer out of the deadframe and
-/// SIGSEGVs (`synth/inheritance_dispatch`; the interpreter path is fine,
-/// `PYRE_NO_JIT=1` and stable allocation both pass). Convergence path:
-/// extend the trace GC-safepoint liveness/gcmap (the `op_live`
-/// subsystem) to cover transient Ref slots, then switch this call back
-/// to `try_gc_alloc` for the movable nursery.
+/// (`rclass`/`gctypelayout` standard `GcStruct`). Pyre allocates them
+/// through the stable (non-moving) old-gen allocator instead.
+///
+/// This note used to record a SIGSEGV as the reason — a movable instance
+/// read from `objs[i % 3]` and carried into a method-call guard reading a
+/// stale pointer out of the deadframe, reproduced by
+/// `synth/inheritance_dispatch` — and named "extend the trace GC-safepoint
+/// gcmap to cover transient Ref slots" as the convergence path. That crash
+/// no longer reproduces: with this call switched to `try_gc_alloc`,
+/// `inheritance_dispatch` passes at the default, 256 KB and 128 KB nursery
+/// sizes, the whole `check.py` corpus passes on both backends, and seven
+/// GC-sensitive fixtures produce byte-identical output under a 128 KB
+/// nursery.
+///
+/// The switch is not made because it measures nothing. Allocation is about
+/// a twentieth of what instantiating an object costs — the rest is call
+/// dispatch — and the host-side "nursery" allocator is non-collecting and
+/// falls back to old-gen once the nursery is full
+/// (`majit-backend-dynasm/src/runner.rs` `dynasm_alloc_nursery_typed`), so
+/// the flip only reorders "try nursery, else old-gen" against "always
+/// old-gen": minor and major collection counts and peak RSS come out
+/// unchanged, and every non-microbenchmark fixture moves within noise.
+/// Real convergence needs host-side allocation that may collect, which in
+/// turn needs every allocation site to root the raw pointers it holds.
 fn alloc_instance_object(value: W_ObjectObject) -> PyObjectRef {
     let raw =
         crate::gc_hook::try_gc_alloc_stable_raw(W_OBJECT_OBJECT_GC_TYPE_ID, W_OBJECT_OBJECT_SIZE);
