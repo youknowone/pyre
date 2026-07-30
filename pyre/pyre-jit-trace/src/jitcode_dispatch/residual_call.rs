@@ -83,6 +83,16 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// The concrete red frame owned by the current inlined MIFrame.
+///
+/// RPython carries this identity directly on every `MIFrame`; pyre's walker
+/// brackets the corresponding per-thread execution state with
+/// [`InlineConcreteFrameGuard`].  Vable writes use this accessor to keep that
+/// frame's own heap image coherent for a later multi-frame blackhole handoff.
+pub(crate) fn current_inline_concrete_frame() -> usize {
+    INLINE_CONCRETE_FRAME.with(|slot| slot.get() as usize)
+}
+
 pub(crate) struct EscapeFlushUndo {
     frame: usize,
     last_instr: isize,
@@ -100,6 +110,11 @@ pub(crate) struct LatchedMultiFrameBlackhole {
     pub(crate) framestack: majit_metainterp::MIFrameStack,
     pub(crate) last_exc_value: i64,
     pub(crate) raising_exception: bool,
+    /// `ABORT_TOO_LONG` stops at an arbitrary post-step coordinate, so frame
+    /// 0's active operand stack must cross from the detached tracing snapshot
+    /// to the live red frame before the blackhole runs.  The vable-force path
+    /// stops at a call resume marker and retains its existing handoff.
+    pub(crate) publish_root_stack: bool,
 }
 
 pub(crate) fn single_frame_blackhole_cell_ptr()
@@ -229,13 +244,90 @@ pub(crate) fn latch_trace_too_long_blackhole<Sym: WalkSym>(
             });
         });
         true
+    } else if ctx.fbw_mode.inline_subwalk {
+        let Some(framestack) =
+            build_multi_frame_miframe(ctx, resume_pc, InnermostMiframeBuild::TraceTooLong)
+        else {
+            return false;
+        };
+        if !multi_frame_blackhole_preflight(ctx, &framestack) {
+            return false;
+        }
+        FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
+            *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
+                framestack,
+                last_exc_value,
+                raising_exception: false,
+                publish_root_stack: true,
+            });
+        });
+        true
     } else {
-        // An inlined trace needs one independently materialized locals image
-        // per MIFrame. The opt-in multi-frame vable-force experiment still
-        // lacks that shape, so it cannot serve ABORT_TOO_LONG: this abort has
-        // already executed effects and has no safe entry-replay fallback.
         false
     }
+}
+
+/// Read-only counterpart of every adopter gate that can reject a latched
+/// multi-frame image.  `ABORT_TOO_LONG` runs after the opcode's effects, so it
+/// may publish the image only when the later handoff cannot fall back to entry
+/// replay.  RPython needs no split preflight: its per-frame red virtualizable
+/// is already the live MIFrame state copied by
+/// `convert_and_run_from_pyjitpl`.
+fn multi_frame_blackhole_preflight<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    framestack: &majit_metainterp::MIFrameStack,
+) -> bool {
+    if ctx.trace_ctx.virtualizable_info().is_none() || ctx.fbw_mode.snapshot_sym.is_null() {
+        return false;
+    }
+    let sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
+    let snapshot = sym.tracing_vable_frame_addr();
+    let live_root = match ctx.trace_ctx.lookup_opref_concrete(sym.frame()) {
+        Some(majit_ir::Value::Ref(value)) if value.0 != 0 => value.0,
+        _ => sym.live_vable_frame_addr(),
+    };
+    let root = if live_root != 0 { live_root } else { snapshot };
+    if crate::state::concrete_nlocals(snapshot).is_none()
+        || crate::state::capture_frame_locals(root).is_none()
+        || !crate::state::can_write_back_outer_locals(ctx.trace_ctx, root)
+        || !crate::state::can_publish_frame_stack(snapshot, root)
+    {
+        return false;
+    }
+
+    let mut seen = Vec::with_capacity(framestack.frames.len());
+    for (index, frame) in framestack.frames.iter().enumerate() {
+        let Ok(jitcode_index) = i32::try_from(frame.jitcode.index()) else {
+            return false;
+        };
+        let frame_reg = crate::state::portal_red_regs_at(jitcode_index).0;
+        if frame_reg == u16::MAX {
+            return false;
+        }
+        let Some(frame_ptr) = frame.ref_values.get(frame_reg as usize).copied().flatten() else {
+            return false;
+        };
+        let frame_ptr = frame_ptr as usize;
+        let Some(stack_base) = crate::state::concrete_nlocals(frame_ptr) else {
+            return false;
+        };
+        let Some(stack_depth) = crate::state::concrete_stack_depth(frame_ptr) else {
+            return false;
+        };
+        let Some(array_len) = crate::state::concrete_frame_array_len(frame_ptr) else {
+            return false;
+        };
+        if stack_depth < stack_base
+            || stack_depth > array_len
+            || (index == 0 && frame_ptr != root)
+            || (index > 0 && frame_ptr == root)
+            || seen.contains(&frame_ptr)
+        {
+            return false;
+        }
+        seen.push(frame_ptr);
+    }
+    true
 }
 
 fn build_single_frame_miframe<Sym: WalkSym>(
@@ -2516,6 +2608,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                             framestack,
                             last_exc_value,
                             raising_exception,
+                            publish_root_stack: false,
                         });
                     });
                 }

@@ -1,5 +1,5 @@
 # Coverage for the multi-frame blackhole build path: an INLINED callee that
-# forces an outer frame while the walk is already inside a residual call.
+# forces an outer frame through `sys._getframe(2)`.
 #
 # The walker executes a residual call concretely, so that level gets a real
 # frame from the interpreter's own call sequence; an inline push did not run

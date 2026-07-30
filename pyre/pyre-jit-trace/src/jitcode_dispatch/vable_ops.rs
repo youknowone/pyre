@@ -241,6 +241,24 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
 ///
 /// `value_bank` selects the value register bank (`'i'`/`'r'`/`'f'`),
 /// mirroring `setfield_gc_via_heapcache`'s parameter shape.
+fn current_inline_vable_target<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    vable: OpRef,
+) -> Option<usize> {
+    let inline = current_inline_concrete_frame();
+    if inline == 0 {
+        return None;
+    }
+    match ctx
+        .trace_ctx
+        .lookup_opref_concrete(vable)
+        .or_else(|| ctx.trace_ctx.recover_ref_value(vable, 8))
+    {
+        Some(Value::Ref(value)) if value.as_usize() == inline => Some(inline),
+        _ => None,
+    }
+}
+
 pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -270,6 +288,10 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     };
     let descr = read_descr(code, op, 2, ctx)?;
     let concrete = vable_value_concrete(code, op, 1, ctx, value_bank, value);
+    let inline_field_index = ctx
+        .trace_ctx
+        .virtualizable_info()
+        .and_then(|info| info.static_field_by_descr(&descr));
     // R7 parity: pyjitpl.py `_opimpl_setfield_vable(box,
     // valuebox, fielddescr, pc)` threads orgpc through
     // `_nonstandard_virtualizable(pc, ...)`; walker has `op.pc` for the
@@ -277,6 +299,17 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     let guards_before = ctx.trace_ctx.num_guards();
     ctx.trace_ctx
         .vable_setfield(op.pc, obj, descr, value, concrete);
+    // `MIFrame` owns one red frame per inlined call.  The trace shadow remains
+    // authoritative for optimization, while the matching concrete frame is
+    // its blackhole-resume image; mirror only own-frame standard-vable writes,
+    // never an outer/nonstandard virtualizable.
+    if let (Some(frame), Some(Value::Int(value)), Some(field_index)) = (
+        current_inline_vable_target(ctx, obj),
+        concrete,
+        inline_field_index,
+    ) {
+        crate::state::store_live_frame_static_int(frame, field_index, value);
+    }
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
@@ -650,6 +683,11 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         value,
         concrete,
     );
+    if index_value >= 0
+        && let Some(frame) = current_inline_vable_target(ctx, vable)
+    {
+        crate::state::store_live_frame_array_slot(frame, index_value as usize, concrete);
+    }
     // Keep the inline concrete-locals shadow current so a later read of this
     // slot (after a may-force op clears the heapcache) recovers the concrete.
     // Seed BOTH maps: the read fallback prefers re-resolving the slot's OpRef

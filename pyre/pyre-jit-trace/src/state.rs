@@ -4156,7 +4156,7 @@ pub(crate) fn frame_array_write_barrier(
 /// vable image after the guard-failure vsd correction cleared root slots
 /// in callee coordinates.  A no-op for a null frame/array, an out-of-range
 /// slot, or a non-Ref value.
-fn store_live_frame_array_slot(vable_ptr: usize, slot: usize, value: majit_ir::Value) {
+pub(crate) fn store_live_frame_array_slot(vable_ptr: usize, slot: usize, value: majit_ir::Value) {
     let majit_ir::Value::Ref(r) = value else {
         return;
     };
@@ -4174,6 +4174,30 @@ fn store_live_frame_array_slot(vable_ptr: usize, slot: usize, value: majit_ir::V
     }
     arr.as_mut_slice()[slot] = r.as_usize() as pyre_object::PyObjectRef;
     frame_array_write_barrier(vable_ptr as *mut u8, lp);
+}
+
+/// Keep the scalar half of an inlined frame's red virtualizable coherent with
+/// its MIFrame walk.  Static-field indices are the `PyFrame`
+/// `VirtualizableInfo` order used by the codewriter: 0 = `last_instr`, 2 =
+/// `valuestackdepth`.  Other fields are immutable frame identity/state and are
+/// deliberately not mirrored here.
+pub(crate) fn store_live_frame_static_int(vable_ptr: usize, field_index: usize, value: i64) {
+    if vable_ptr == 0 {
+        return;
+    }
+    match field_index {
+        0 => unsafe {
+            *((vable_ptr + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize) =
+                value as isize;
+        },
+        2 if value >= 0 => {
+            let depth = value as usize;
+            if concrete_frame_array_len(vable_ptr).is_some_and(|len| depth <= len) {
+                set_concrete_stack_depth(vable_ptr, depth);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// pyframe.py:107-110: `locals_cells_stack_w` length =

@@ -2068,17 +2068,19 @@ fn try_adopt_single_frame_blackhole(
             return false;
         }
     };
-    let virtualizable_info = ctx
-        .virtualizable_info()
-        .map(std::sync::Arc::as_ptr)
-        .unwrap_or(std::ptr::null());
-    if virtualizable_info.is_null() {
+    if ctx.virtualizable_info().is_none() {
         assert!(
             !trace_too_long,
             "preflighted trace-too-long virtualizable info disappeared"
         );
         return false;
     }
+    // The resumed jitcodes operate on `PyFrame`, regardless of which
+    // translator-state vinfo happens to remain installed on `TraceCtx` at the
+    // walk epilogue.  RPython gets this from each vable field descriptor's
+    // `get_vinfo()`; retain the canonical PyFrame Arc for the whole drive.
+    let pyframe_vinfo = crate::frame_layout::build_pyframe_virtualizable_info();
+    let virtualizable_info = std::sync::Arc::as_ptr(&pyframe_vinfo);
     let Some(stack_base) = crate::state::concrete_nlocals(cf_addr) else {
         assert!(
             !trace_too_long,
@@ -2406,14 +2408,12 @@ fn try_adopt_multi_frame_blackhole(
         return false;
     };
     let depth = latched.framestack.len();
-    let virtualizable_info = ctx
-        .virtualizable_info()
-        .map(std::sync::Arc::as_ptr)
-        .unwrap_or(std::ptr::null());
-    if virtualizable_info.is_null() {
+    if ctx.virtualizable_info().is_none() {
         mfdbg!("no virtualizable_info");
         return false;
     }
+    let pyframe_vinfo = crate::frame_layout::build_pyframe_virtualizable_info();
+    let virtualizable_info = std::sync::Arc::as_ptr(&pyframe_vinfo);
     let Some(stack_base) = crate::state::concrete_nlocals(cf_addr) else {
         mfdbg!("cf_addr {cf_addr:#x} has no concrete nlocals");
         return false;
@@ -2500,10 +2500,14 @@ fn try_adopt_multi_frame_blackhole(
     // itself the escaping residual read the wrong frame at walk time, and
     // adopting committed that answer where the legacy escape/replay path
     // discarded it.  `walker_ec_enter` / `walker_ec_leave` publish the callee
-    // frame on the execution context at the inlined-call push, which closes
-    // that hole; a `sys._getframe` executed later, inside the blackhole, was
-    // already correct because each level is published as it runs.
+    // frame on the execution context at the inlined-call push, and
+    // `ResidualFrameChainGuard` brackets the residual itself, which closes that
+    // hole; a `sys._getframe` executed later, inside the blackhole, was already
+    // correct because each level is published as it runs.
     // `synth/getframe_while_escaping_read_frame_identity` guards both readings.
+    // The root gate stays regardless: a residual-intermediate chain is not an
+    // MIFrame stack rooted at this portal and cannot reuse this walk's restart
+    // coordinate.
     mfdbg!(
         "chain root={root_addr:#x} cf_addr={cf_addr:#x} levels=[{}]",
         per_frame
@@ -2582,26 +2586,64 @@ fn try_adopt_multi_frame_blackhole(
     // it the level reads what the live frame held before the walk began.  Same
     // publish and same withdrawal as the single-frame arm.
     //
-    // The INNER levels get no counterpart, and that is a second thing standing
-    // between this path and its flip.  The walk's virtualizable shadow covers
-    // the walked frame only, so an inlined callee's frame array keeps its
-    // pre-sub-walk contents while the values the sub-walk assigned sit in that
-    // level's register image; a local assigned inside the callee and read back
-    // after the escape therefore reads null.  Measured on
-    // `scratchpad/exc_virt/s21_sigsegv.py` with the gate on: an inlined callee
-    // that stores `e.__traceback__` and then reads an attribute off it faults
-    // in `object_getattr_miss`, where the same shape through the single-frame
-    // arm is correct.  Publishing them needs a per-level slot→value map — what
-    // the retired register-image rebuild built from `pcdep_trivia_at` — run
-    // before the drive rather than after it.
+    // Every INNER level already owns the concrete red frame created at the
+    // inline push.  Its standard-vable writes are mirrored directly onto that
+    // frame while walking, matching RPython's one-red-frame-per-MIFrame shape;
+    // no slot side-table or root-frame anchor is involved.  Frame 0 remains
+    // the sole detached-snapshot case and therefore needs the explicit publish
+    // below.
     let Some(mut locals_undo) = crate::state::capture_frame_locals(root_addr) else {
         mfdbg!("frame 0: {root_addr:#x} locals not capturable");
         restore_links(&saved_links);
         return false;
     };
+    let mut root_stack = if latched.publish_root_stack {
+        let Some(stack) = crate::state::capture_frame_stack_for_publish(cf_addr, root_addr) else {
+            mfdbg!("frame 0: active stack not capturable");
+            restore_links(&saved_links);
+            return false;
+        };
+        Some(stack)
+    } else {
+        None
+    };
+    // Taking the latch removes it from the TLS extra-root walker.  Root every
+    // MIFrame Ref bank and the pending exception across root-locals boxing,
+    // then copy forwarding updates back before the blackhole copies the banks.
+    // This is the multi-frame counterpart of the packed image roots in
+    // `try_adopt_single_frame_blackhole`.
+    let image_ref_locations: Vec<(usize, usize)> = latched
+        .framestack
+        .frames
+        .iter()
+        .enumerate()
+        .flat_map(|(frame_index, frame)| {
+            frame
+                .ref_values
+                .iter()
+                .enumerate()
+                .filter_map(move |(reg_index, value)| value.map(|_| (frame_index, reg_index)))
+        })
+        .collect();
+    let mut image_ref_roots: Vec<i64> = image_ref_locations
+        .iter()
+        .map(|&(frame_index, reg_index)| {
+            latched.framestack.frames[frame_index].ref_values[reg_index]
+                .expect("location came from Some")
+        })
+        .collect();
+    let image_exception_root = (latched.last_exc_value != 0).then(|| {
+        let index = image_ref_roots.len();
+        image_ref_roots.push(latched.last_exc_value);
+        index
+    });
     let undo_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
     unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(image_ref_roots.as_mut_slice());
         majit_gc::shadow_stack::push_resume_ref_roots(locals_undo.as_mut_slice());
+        if let Some(stack) = root_stack.as_mut() {
+            majit_gc::shadow_stack::push_resume_ref_roots(stack.roots_mut());
+        }
     }
     if !crate::state::write_back_outer_locals(ctx, root_addr) {
         crate::state::restore_frame_locals(root_addr, &locals_undo);
@@ -2610,11 +2652,29 @@ fn try_adopt_multi_frame_blackhole(
         mfdbg!("frame 0: {root_addr:#x} locals publish declined");
         return false;
     }
+    for (&(frame_index, reg_index), &forwarded) in image_ref_locations.iter().zip(&image_ref_roots)
+    {
+        latched.framestack.frames[frame_index].ref_values[reg_index] = Some(forwarded);
+    }
+    if let Some(index) = image_exception_root {
+        latched.last_exc_value = image_ref_roots[index];
+    }
+    if let Some(stack) = root_stack.as_ref()
+        && !crate::state::publish_captured_frame_stack(root_addr, stack)
+    {
+        crate::state::restore_frame_locals(root_addr, &locals_undo);
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
+        restore_links(&saved_links);
+        mfdbg!("frame 0: active stack publish declined");
+        return false;
+    }
     // As in the single-frame path, locals publication is the final recoverable
     // gate. Once the roots are released and the chain starts running, adoption
     // is irrevocable.
     majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
     drop(locals_undo);
+    drop(image_ref_roots);
+    drop(root_stack);
     let ec = unsafe {
         (*(cf_addr as *mut pyre_interpreter::PyFrame)).execution_context
             as *mut pyre_interpreter::PyExecutionContext
