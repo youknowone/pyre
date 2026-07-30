@@ -5501,6 +5501,11 @@ fn drive_unpack_iterable_trace(
         {
             pending_err.get_or_insert(err);
         }
+        // The backend `_store_exception` cells are a compiled-side slot too:
+        // a guard exit that carried the drain's exception leaves them set even
+        // after the two clears above. See the walk's finish arm for what a
+        // survivor does to the next compiled trace.
+        crate::call_jit::drain_backend_jit_exc();
         // Parked last, so the clears above cannot swallow it.
         if let Some(err) = pending_err {
             pyre_interpreter::stack_check::park_jit_pending_error(err);
@@ -5632,6 +5637,21 @@ fn drive_unpack_iterable_trace(
         // (`walk_jit_pending_exception`).
         if exit_with_exception && let Some(err) = drain_error_from_exc_ref(exc_value) {
             pyre_interpreter::stack_check::park_jit_pending_error(err);
+        }
+        // The `next()` that ended the drain raised for real, and the shared
+        // `bh_*` residual helper published its exception into the backend
+        // `_store_exception` cells as well as `BH_LAST_EXC_VALUE`
+        // (`publish_residual_call_exception`). The trace exit consumed it just
+        // above — the loop-exit `StopIteration` is dropped so `ln` re-derives
+        // its own, anything else is parked — but the cells still hold it, and
+        // tracing must leave them pristine (`drain_backend_jit_exc`). A
+        // survivor is read by the next compiled trace's `must_save_exception`
+        // guard, whose recovery stub stages it into `jf_guard_exc`: the
+        // blackhole then unwinds an exception no one raised and the call
+        // returns NULL, surfacing much later as a `StopIteration` out of an
+        // unrelated operator.
+        if exit_with_exception {
+            crate::call_jit::drain_backend_jit_exc();
         }
         match meta.compile_finish_from_active_session(
             &finish_args,
