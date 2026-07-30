@@ -202,6 +202,7 @@ fn terminal_size_seq_type() -> PyObjectRef {
 
 /// `os.uname_result` structseq — `(sysname, nodename, release, version,
 /// machine)`; repr renders "posix.uname_result(...)".
+#[cfg(unix)]
 fn uname_result_seq_type() -> PyObjectRef {
     static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
@@ -1782,6 +1783,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(ns, "terminal_size", terminal_size_seq_type());
     crate::module_ns_store(ns, "statvfs_result", statvfs_result_seq_type());
     crate::module_ns_store(ns, "times_result", times_result_seq_type());
+    // `uname_result` names `posix` as its module, which is what pickle imports
+    // to resolve it; only the POSIX hosts have that module, and only they
+    // register `uname` below.
+    #[cfg(unix)]
     crate::module_ns_store(ns, "uname_result", uname_result_seq_type());
 
     // ── posix.get_terminal_size(fd=1) → os.terminal_size(columns, lines) ──
@@ -2369,6 +2374,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // result reports the host's real POSIX strings ("Darwin", "Linux",
     // node hostname, kernel release, etc.) instead of Rust's compile-time
     // `std::env::consts::OS` ("macos"/"linux"/...).
+    //
+    // POSIX only, the way `HAVE_UNAME` gates it. Its callers read presence as
+    // "the POSIX identification is available": `platform.uname` falls back to
+    // `sys.platform` on AttributeError, and `sysconfig.get_platform` tests
+    // `hasattr(os, 'uname')` directly. A build with no host strings to report
+    // would answer both with the compile-time constants instead.
+    #[cfg(unix)]
     crate::module_ns_store(
         ns,
         "uname",

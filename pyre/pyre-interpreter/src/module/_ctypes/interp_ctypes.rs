@@ -65,11 +65,12 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
             let name = unsafe {
                 if pyre_object::is_none(args[0]) {
                     // dlopen(None) → process handle
-                    let mode = if args.len() >= 2 {
-                        crate::baseobjspace::int_w(args[1])? as libc::c_int
+                    let load_flags = if args.len() >= 2 {
+                        Some(crate::baseobjspace::int_w(args[1])? as libc::c_int)
                     } else {
-                        libc::RTLD_NOW
+                        None
                     };
+                    let mode = host_ctypes::dlopen_mode(load_flags);
                     let ptr = rustpython_host_env::ctypes::dlopen_self(mode)
                         .map_err(|e| crate::PyError::os_error(format!("dlopen(None): {e}")))?;
                     let h = rustpython_host_env::ctypes::insert_raw_library_handle(ptr);
@@ -86,11 +87,12 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                     ));
                 }
             };
-            let mode = if args.len() >= 2 {
-                crate::baseobjspace::int_w(args[1])? as i32
+            let load_flags = if args.len() >= 2 {
+                Some(crate::baseobjspace::int_w(args[1])? as i32)
             } else {
-                rustpython_host_env::ctypes::dlopen_mode(None)
+                None
             };
+            let mode = host_ctypes::dlopen_mode(load_flags);
             let h = rustpython_host_env::ctypes::open_library_with_mode(&name, mode)
                 .map_err(|e| crate::PyError::os_error(format!("dlopen({name}): {e}")))?;
             Ok(pyre_object::w_int_new(h as i64))
