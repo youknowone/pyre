@@ -650,7 +650,12 @@ pub fn descr_set_jit_stats() -> String {
 pub fn field_position_jit_stats() -> String {
     let [parent_absent, parent_empty, rederived, unresolved] =
         majit_ir::descr::GcCache::field_position_census();
-    let ([published, fieldless, shadowing, aliased, aliased_multi], sample) = {
+    let (
+        [published, fieldless, shadowing, aliased, aliased_multi],
+        [slots, misplaced],
+        [key_compared, key_conflicting],
+        sample,
+    ) = {
         let gc = majit_ir::descr::gc_cache();
         let guard = gc.lock().unwrap_or_else(|e| e.into_inner());
         let sample = if std::env::var_os("PYRE_SIZE_SHELL_OWNERS").is_some() {
@@ -659,14 +664,21 @@ pub fn field_position_jit_stats() -> String {
         } else {
             String::new()
         };
-        (guard.size_shell_census(), sample)
+        (
+            guard.size_shell_census(),
+            guard.positional_invariant_census(),
+            guard.identity_collision_census(),
+            sample,
+        )
     };
     format!(
         "field_pos_parent_absent={parent_absent} field_pos_parent_empty={parent_empty} \
          field_pos_rederived={rederived} field_pos_unresolved={unresolved} \
          size_shell_published={published} size_shell_fieldless={fieldless} \
          size_shell_shadowing={shadowing} size_shell_aliased={aliased} \
-         size_shell_aliased_multi={aliased_multi}{sample}"
+         size_shell_aliased_multi={aliased_multi} \
+         positional_slots={slots} positional_misplaced={misplaced} \
+         key_compared={key_compared} key_conflicting={key_conflicting}{sample}"
     )
 }
 

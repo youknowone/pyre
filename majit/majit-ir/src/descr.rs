@@ -1005,6 +1005,79 @@ impl GcCache {
         ]
     }
 
+    /// The upstream invariant, counted: `all_fielddescrs(S)[i].get_index() == i`.
+    ///
+    /// `heaptracker.py:60-72 get_fielddescr_index_in` and `:96-112
+    /// all_fielddescrs` are one walker sharing one skip set, so upstream this
+    /// holds by construction and there is nothing to check. pyre builds the
+    /// positional list from cache-or-mint results
+    /// (`make_simple_descr_group_keyed_with_headerless`), so a descr minted
+    /// EARLIER by a header-counting producer keeps its own number while this
+    /// producer places it at its own position — and the two need not agree.
+    ///
+    /// Returns `[checked, disagreeing]` over every populated `_cache_size` entry.
+    /// `disagreeing` is the count of slots where the descr sitting at position
+    /// `i` reports some other `index_in_parent`, which is precisely the state
+    /// `optimizeopt/info.rs force_box` cannot survive: it indexes the list by the
+    /// descr's own number.
+    pub fn positional_invariant_census(&self) -> [usize; 2] {
+        let mut checked = 0;
+        let mut disagreeing = 0;
+        for descr in self._cache_size.values() {
+            let Some(sd) = descr.as_size_descr() else {
+                continue;
+            };
+            for (i, fd) in sd.all_fielddescrs().iter().enumerate() {
+                checked += 1;
+                if fd.index_in_parent() != i {
+                    disagreeing += 1;
+                }
+            }
+        }
+        [checked, disagreeing]
+    }
+
+    /// Whether one identity key is carrying more than one struct.
+    ///
+    /// `descr.py` keys `_cache_size` / `_cache_field` on the lltype STRUCT
+    /// object, so a key means exactly one struct and `id(STRUCT)` never aliases.
+    /// pyre keys on `path_hash(<some spelling>)`, and the spellings are minted by
+    /// several producers, so two different structs can land on one key while one
+    /// struct lands on several.
+    ///
+    /// Returns `[compared, conflicting]` over fields that are cached under a key
+    /// whose parent also lists them: `conflicting` is the count naming the same
+    /// field at a DIFFERENT offset. A field cannot be at two offsets in one
+    /// struct, so every one of those is two structs sharing a key — the failure
+    /// `last_instr` was caught in (offset 48 from one producer, 32 from another).
+    ///
+    /// This is the question `positional_invariant_census` cannot ask: that one
+    /// checks a list against itself and passes as long as each producer is
+    /// internally consistent, which two colliding structs both are.
+    pub fn identity_collision_census(&self) -> [usize; 2] {
+        let mut compared = 0;
+        let mut conflicting = 0;
+        for (key, cached) in &self._cache_field {
+            let Some(sd) = self._cache_size.get(key).and_then(|d| d.as_size_descr()) else {
+                continue;
+            };
+            for fd in cached.values() {
+                let Some(listed) = sd
+                    .all_fielddescrs()
+                    .iter()
+                    .find(|f| f.field_key() == fd.field_key)
+                else {
+                    continue;
+                };
+                compared += 1;
+                if listed.offset() != fd.offset {
+                    conflicting += 1;
+                }
+            }
+        }
+        [compared, conflicting]
+    }
+
     /// The owner names behind [`size_shell_census`]'s `shadowing` and
     /// `populated` groups, so `aliased=0` can be read as a finding rather than
     /// taken on faith.
@@ -1042,9 +1115,48 @@ impl GcCache {
         let take = |s: &std::collections::BTreeSet<&str>| {
             s.iter().take(limit).copied().collect::<Vec<_>>().join(",")
         };
+        // The `unresolved` population, named. A field cached under a key whose
+        // parent lists OTHER fields but not this one means the two sides
+        // disagree about what the struct contains — either the field belongs to
+        // a different struct that shares the key, or the parent's list is short.
+        // The counter alone cannot tell those apart; the names can.
+        let mut orphans: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (key, cached) in &self._cache_field {
+            let Some(sd) = self._cache_size.get(key).and_then(|d| d.as_size_descr()) else {
+                continue;
+            };
+            let listed = sd.all_fielddescrs();
+            if listed.is_empty() {
+                continue;
+            }
+            for fd in cached.values() {
+                if !listed.iter().any(|f| f.field_key() == fd.field_key) {
+                    orphans.insert(format!(
+                        "{}@{}~[{}]",
+                        fd.field_key,
+                        fd.offset,
+                        listed
+                            .iter()
+                            .map(|f| f.field_key())
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    ));
+                }
+            }
+        }
         vec![
             format!("shell_owners({}) {}", shell.len(), take(&shell)),
             format!("populated_owners({}) {}", populated.len(), take(&populated)),
+            format!(
+                "orphan_fields({}) {}",
+                orphans.len(),
+                orphans
+                    .iter()
+                    .take(limit)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            ),
         ]
     }
 
