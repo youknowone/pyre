@@ -5891,14 +5891,27 @@ impl<'a> Lowering<'a> {
         if !saw_return {
             return None;
         }
-        let adt = self.resolve_tyexpr_to_adt_def_id(&ty)?;
-        let layout = self.llbc.type_by_id(adt)?.layout_for_target("")?;
-        let value = if want_align {
-            layout.align
-        } else {
-            layout.size
-        }?;
-        Some(OpKind::ConstInt(value as i64))
+        Some(OpKind::ConstInt(
+            self.size_align_const_from_tyexpr(want_align, &ty)?,
+        ))
+    }
+
+    /// The build-time byte size / alignment Charon resolved for an ADT type
+    /// expression's layout, shared by [`Self::fold_size_const_global`] (the
+    /// NamedConst-initializer form) and the inline `size_of`/`align_of` call
+    /// fold in [`Self::lower_call`].  `None` for a non-ADT type argument
+    /// (primitive / pointer / tuple, which has no `TypeDecl` layout to read)
+    /// or a layout Charon left unresolved.
+    fn size_align_const_from_tyexpr(&self, want_align: bool, ty: &serde_json::Value) -> Option<i64> {
+        let adt = self.resolve_tyexpr_to_adt_def_id(ty)?;
+        // Read the layout for the build's `TARGET` (empty for the host
+        // extraction target), matching the target-aware field-offset lookup
+        // in `record_struct_id`. A wasm32 cross-build folds the wasm32 byte
+        // size, not the host's.
+        let target = std::env::var("TARGET").unwrap_or_default();
+        let layout = self.llbc.type_by_id(adt)?.layout_for_target(&target)?;
+        let value = if want_align { layout.align } else { layout.size }?;
+        Some(value as i64)
     }
 
     // -----------------------------------------------------------------------
@@ -6146,6 +6159,48 @@ impl<'a> Lowering<'a> {
         let op_kind = match (class, call.func) {
             (CallClass::Direct, CallFunc::Regular(reg))
             | (CallClass::Trait, CallFunc::Regular(reg)) => {
+                // Fold an inline `core::mem::size_of::<T>()` /
+                // `align_of::<T>()` call with a layout-resolvable ADT type
+                // argument to its build-time byte size / alignment — the same
+                // constant `fold_size_const_global` produces for the
+                // NamedConst-initializer form, applied here to the inline
+                // call shape (`gc_alloc_storage_box`'s
+                // `try_gc_alloc_stable_raw(tid, size_of::<T>())`,
+                // `struct::__sizeof__`'s `size_of::<W_Struct>()`).  Removes the
+                // residual `<host std.mem.size_of>` call the rtyper cannot
+                // register.  Declines (falls through to the ordinary call
+                // path) for a non-ADT type argument, whose size is not read
+                // from a `TypeDecl` layout.
+                if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+                    && let Some(fd) = self.llbc.fn_by_id(*id)
+                {
+                    let want_align = match fd.item_meta.name_path().as_str() {
+                        "core::mem::size_of" => Some(false),
+                        "core::mem::align_of" => Some(true),
+                        _ => None,
+                    };
+                    if let Some(want_align) = want_align
+                        && let Some(ty) = reg
+                            .generics
+                            .get("types")
+                            .and_then(serde_json::Value::as_array)
+                            .and_then(|a| a.first())
+                        && let Some(size) = self.size_align_const_from_tyexpr(want_align, ty)
+                    {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::ConstInt(size),
+                        });
+                        self.local_var[dest_local] = Some(res);
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                }
                 // Reflexive blanket `into` — the callsite selected
                 // `impl<T> From<T> for T`, a pure `T -> T` identity
                 // conversion.  Bind the destination local to the
