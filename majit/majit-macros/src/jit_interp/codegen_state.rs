@@ -2597,7 +2597,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             ) {
                 use majit_ir::resumedata::RebuiltValue;
                 use majit_metainterp::JitCodeSym as _;
-                if std::env::var_os("AHEUI_BRIDGE_DIAG").is_some() {
+                if std::env::var_os("MAJIT_BRIDGE_DIAG").is_some() {
                     eprintln!(
                         "[setup_bridge_sym] CALLED frames={} rd_virtuals={}",
                         resume_data.frames.len(),

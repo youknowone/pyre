@@ -908,7 +908,7 @@ pub fn replay_pending_fields(
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     cache: &mut BridgeVirtualCache,
 ) {
-    let __diag = std::env::var_os("AHEUI_BRIDGE_DIAG").is_some();
+    let __diag = std::env::var_os("MAJIT_BRIDGE_DIAG").is_some();
     let Some(storage) = resume_data.storage.as_ref() else {
         if __diag {
             eprintln!("[replay] storage=None (no pendingfields replayed)");
