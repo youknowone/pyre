@@ -2329,6 +2329,32 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     }
 }
 
+/// Whether any level already on the inline stack is a recursion unroll — the
+/// snapshot root's own code re-entered, or one code appearing twice in the
+/// chain (a mutual cycle).
+///
+/// Such a chain's levels are suspended copies of the same frame, so an unwind
+/// through it is the shape `fbw_max_rec_unroll_depth` bounds rather than the
+/// straight-line chain `fbw_max_multiframe_depth` covers.
+fn inline_chain_unrolls_recursion<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> bool {
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    let root_code = if sym_ptr.is_null() {
+        0
+    } else {
+        unsafe {
+            pyre_interpreter::live_code_wrapper((*(*sym_ptr).jitcode()).raw_code() as *const ())
+                as *const () as usize
+        }
+    };
+    let session = ctx.session.borrow();
+    session.framestack.iter().enumerate().any(|(i, frame)| {
+        frame.w_code == root_code
+            || session.framestack[..i]
+                .iter()
+                .any(|outer| outer.w_code == frame.w_code)
+    })
+}
+
 /// Shared post-resolution half of the FBW inline lever. Ordinary Python calls
 /// resolve their callee from the CALL operand; builtin-dispatch specializers
 /// resolve an app-level descriptor first and enter here with that function as
@@ -2758,12 +2784,30 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         u16::MAX
     };
     let inline_depth = ctx.session.borrow().framestack.len();
-    // A callee that raises inline is inlinable only at the top level: below an
-    // intermediate frame its unwind needs the cross-frame bridge (gh#343 /
-    // gh#467) the drain cannot yet build (`callee_body_contains_raise`).  A
-    // value-returning chain (no raise) inlines to the full depth.
+    // A callee that raises inline needs the cross-frame bridge (gh#343 /
+    // gh#467) the drain cannot yet build, but only when the raise has to come
+    // back INTO the traced region — i.e. when some frame already on the
+    // framestack catches it.  Measured: admitting such a callee below an
+    // intermediate frame takes `guard_failures` from 1203 to 19654 and drops
+    // `bridges_compiled` from 6 to 2 on a caught-in-loop shape, because the
+    // guards it emits keep failing with no bridge to land on.
+    //
+    // When no modelled frame catches, the raise leaves the traced region
+    // entirely and takes the guard-exception exit, which needs no such bridge —
+    // `bench/synth/exception_escape_caller_frame_tb_node`'s `d_no_try` shape.
+    // A value-returning chain (no raise) inlines to the full depth either way.
+    //
+    // The lift is one level, not the full chain depth: the shape it unlocks is
+    // a single intermediate frame between the loop and the raise, and a chain
+    // whose levels are self-recursive unrolls keeps the recursion bound
+    // instead. The unwind out of such a chain crosses suspended copies of the
+    // same frame, which is what `fbw_max_rec_unroll_depth` bounds above;
+    // letting the raising leaf inline below one costs 1.9x on
+    // `bench/synth/selfrec_tail_exception_unwind`.
     let effective_multiframe_depth = if callee_body_contains_raise(body.code) {
-        1
+        let bounded = crate::jitcode_dispatch::inline_chain_catches_a_raise(ctx.session)
+            || inline_chain_unrolls_recursion(ctx);
+        if bounded { 1 } else { 2 }
     } else {
         fbw_max_multiframe_depth()
     };
