@@ -338,7 +338,7 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
             } = &mut op.kind
                 && graphs.is_empty()
             {
-                *graphs = builtin_wrappers.clone();
+                *graphs = builtin_wrappers.to_vec();
             }
         }
     }

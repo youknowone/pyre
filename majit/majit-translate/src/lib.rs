@@ -1921,8 +1921,8 @@ fn make_jitcodes(
     // `grab_initial_jitcodes`, preserving RPython object identity.
     let builtin_wrapper_targets: Vec<jitcode::JitCodeHandle> = call_control
         .builtin_wrapper_indirect_graphs()
-        .into_iter()
-        .filter_map(|path| call_control.jitcodes().get(&path).cloned())
+        .iter()
+        .filter_map(|path| call_control.jitcodes().get(path).cloned())
         .map(jitcode::JitCodeHandle::from)
         .collect();
     codewriter

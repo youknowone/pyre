@@ -760,6 +760,18 @@ pub struct CallControl {
     /// the stable symbolic address shim.
     function_fnaddrs: HashMap<CallPath, i64>,
 
+    /// Memoised [`Self::builtin_wrapper_indirect_graphs`] family.
+    ///
+    /// Derived from `function_fnaddrs` + `function_graphs`, both of which
+    /// are written only in the setup phase that precedes `make_jitcodes`
+    /// (`register_function_fnaddr` is the single `function_fnaddrs` insert
+    /// site).  The readers — the `find_all_graphs` BFS seed,
+    /// `grab_initial_jitcodes` and `lower_indirect_calls`, the last of
+    /// which runs once per drained graph — all see those frozen inputs, so
+    /// the family is computed once.  `OnceCell` for the same shared-`&self`
+    /// reason as `builtin_func_for_spec_cache`.
+    builtin_wrapper_family: std::cell::OnceCell<Vec<CallPath>>,
+
     /// RPython `rtyper._builtin_func_for_spec_cache` (`support.py:805-807`).
     ///
     /// Memoises the `(c_func, LIST_OR_DICT)` pair upstream computes
@@ -1342,6 +1354,7 @@ impl CallControl {
             jitdrivers_sd: Vec::new(),
             jitcodes: indexmap::IndexMap::new(),
             function_fnaddrs: HashMap::new(),
+            builtin_wrapper_family: std::cell::OnceCell::new(),
             builtin_func_for_spec_cache: std::cell::RefCell::new(HashMap::new()),
             need_result_type_registry: std::cell::RefCell::new(HashMap::new()),
             builtin_factory_registry: std::cell::RefCell::new(HashMap::new()),
@@ -3203,9 +3216,10 @@ impl CallControl {
         // `bh_call_fn`, bypassing that source-level dispatch graph, so seed the
         // same generated-wrapper PBC family explicitly.  This is the builtin
         // gateway analogue of call.py:59-64's oopspec helper seeds below.
-        for path in self.builtin_wrapper_indirect_graphs() {
+        let builtin_wrappers = self.builtin_wrapper_indirect_graphs().to_vec();
+        for path in &builtin_wrappers {
             if self.candidate_graphs.insert(path.clone()) {
-                todo.push(path);
+                todo.push(path.clone());
             }
         }
         // call.py:59-64 — seed the BFS with builtin oopspec helpers so
@@ -3349,9 +3363,7 @@ impl CallControl {
                         // `c_graphs` family, `None` meaning "unknown
                         // family" and classifying the site as residual.
                         OpKind::IndirectCall { graphs, .. } => match graphs {
-                            Some(graphs) if graphs.is_empty() => {
-                                self.builtin_wrapper_indirect_graphs()
-                            }
+                            Some(graphs) if graphs.is_empty() => builtin_wrappers.clone(),
                             Some(graphs) => graphs.clone(),
                             None => continue,
                         },
@@ -3794,7 +3806,8 @@ impl CallControl {
         // indirect op to perform the allocation.  Materialise the same PBC
         // family here so runtime fnaddr dispatch can resolve each generated
         // gateway body to its JitCode.
-        for wrapper in self.builtin_wrapper_indirect_graphs() {
+        let wrappers = self.builtin_wrapper_indirect_graphs().to_vec();
+        for wrapper in wrappers {
             self.get_jitcode(&wrapper);
         }
     }
@@ -4636,8 +4649,16 @@ impl CallControl {
     /// `jit_trace_fnaddrs`; pair those addresses with their registered source
     /// graphs here. Aliases sharing an address name the same wrapper; select
     /// the most-qualified source identity for the one graph object entered
-    /// into the PBC family.
-    pub fn builtin_wrapper_indirect_graphs(&self) -> Vec<CallPath> {
+    /// into the PBC family.  The family is memoised in
+    /// `builtin_wrapper_family`; its inputs are frozen before the first
+    /// reader runs.  Members are ordered by wrapper address (the
+    /// `by_address` key), i.e. by the link-time layout of the host binary.
+    pub fn builtin_wrapper_indirect_graphs(&self) -> &[CallPath] {
+        self.builtin_wrapper_family
+            .get_or_init(|| self.compute_builtin_wrapper_indirect_graphs())
+    }
+
+    fn compute_builtin_wrapper_indirect_graphs(&self) -> Vec<CallPath> {
         let mut by_address: std::collections::BTreeMap<i64, Vec<CallPath>> =
             std::collections::BTreeMap::new();
         for (path, &fnaddr) in &self.function_fnaddrs {
@@ -4649,10 +4670,28 @@ impl CallControl {
             }
             by_address.entry(fnaddr).or_default().push(path.clone());
         }
+        // Most-qualified spelling wins.  `register_macro_helper_trace_fnaddr`
+        // binds one address under both a `crate`-prefixed alias and the
+        // crate-root-qualified spelling, which tie at maximal length, so the
+        // pick resolves on a total order rather than on `function_fnaddrs`
+        // iteration order: demote the `crate` placeholder, leaving the
+        // spelling `target_to_path` returns for a direct call to the wrapper,
+        // then compare the segment sequences.
+        let crate_placeholder =
+            |path: &CallPath| path.segments.first().is_some_and(|seg| seg == "crate");
         let mut result = Vec::new();
-        for mut aliases in by_address.into_values() {
-            aliases.sort_by_key(|path| std::cmp::Reverse(path.segments.len()));
-            result.push(aliases.remove(0));
+        for aliases in by_address.into_values() {
+            let pick = aliases
+                .into_iter()
+                .min_by(|a, b| {
+                    b.segments
+                        .len()
+                        .cmp(&a.segments.len())
+                        .then_with(|| crate_placeholder(a).cmp(&crate_placeholder(b)))
+                        .then_with(|| a.segments.cmp(&b.segments))
+                })
+                .expect("address bucket holds at least one alias");
+            result.push(pick);
         }
         result
     }
