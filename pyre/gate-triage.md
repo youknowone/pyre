@@ -222,7 +222,7 @@ upstream lines:
 | gate | orthodox side | outcome |
 |---|---|---|
 | PYRE_FBW_VABLE_SCALAR_CA | **OFF** | **RETIRED** — the ON design contradicts upstream |
-| PYRE_FBW_MULTIFRAME | **ON** | keep default-OFF; the ON path is the port and the adopt now works, but §1d measures one remaining wrong answer under it — a `sys._getframe` that is itself the escaping residual reads the caller frame |
+| PYRE_FBW_MULTIFRAME | **ON** | **FLIPPED default-ON** — the ON path is the port and the adopt works; §1d's one remaining wrong answer (a `sys._getframe` that is itself the escaping residual reading the caller frame) was closed by `walker_ec_enter` / `walker_ec_leave` publishing the callee frame at the inlined-call push |
 | PYRE_FBW_CALLEE_VSTACK | NEITHER | keep OFF; see §5 |
 
 The walker's default-ON `PYRE_FBW_*` cluster was retired separately in #757.
@@ -478,7 +478,7 @@ OFF path is a needed safety net. Retire at the listed trigger (A7).
 
 | var | subsystem | retire when |
 |---|---|---|
-| PYRE_FBW_BLACKHOLE_RESUME | single-frame resume-past-escape (#754) | flipped default-ON 2026-07-25; retirement is conditioned on the multi-frame twin (`_MULTIFRAME`) flipping, and the multi-frame latch is nested inside `single_frame_blackhole_resume_enabled()`, so this gate has to stay ON while that one is in play. Both earlier premises are spent: the root-mismatch decline is resolved (§1d) and the twin's corpus coverage is no longer zero (20 adopts, 10 pinned declines). What blocks the twin now is the escaping `sys._getframe` identity answer, not this gate |
+| PYRE_FBW_BLACKHOLE_RESUME | single-frame resume-past-escape (#754) | flipped default-ON 2026-07-25; retirement was conditioned on the multi-frame twin (`_MULTIFRAME`) flipping, and **that condition is now met** — the twin flipped once `walker_ec_enter` / `walker_ec_leave` closed the escaping `sys._getframe` identity answer. Both gates are now default-ON with the multi-frame latch nested inside `single_frame_blackhole_resume_enabled()`, so retiring the pair (deleting both readers and the OFF paths) is the next step for this row |
 | PYRE_TWO_PHASE_RTYPE, PYRE_TUPLE_PER_SHAPE_CLASSDEF | rtyper prepass / per-shape tuple classdef | WS2 / #346 rtyper epic |
 | PYRE_ORIGINAL_BOXES | greens++reds original_boxes index shape | box-identity #202 / resume F1 |
 | PYRE_MIR_FRAMESTATE | framestate-threaded MIR lowering | MIR front-end #176/#181/#346 |
@@ -503,15 +503,16 @@ Kept as-is; listed for completeness.
   `_GIN`, `_INLINE_RECOG`, `PYRE_WASM_DUMP_ALL_TRACES`, `_DUMP_BAD_TRACE`,
   `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`, `PYRE_NBODY_DEBUG`,
   `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`.
-- **Default-OFF experiments (3 remaining)** — triaged in §1b/§1c (4 retired
+- **Default-OFF experiments (2 remaining)** — triaged in §1b/§1c (4 retired
   in the 2026-07-05 pass, 8 retired since then; `PYRE_P2_DRAIN` retired with
   the framestack-walk deletion; `_VABLE_SCALAR_CA` retired 2026-07-25, see
-  §1d).  Kept: `_MULTIFRAME` (multi-frame blackhole image — the ON path IS the
-  upstream structure, see §1d), `_CALLEE_VSTACK` (callee-local operand-stack
-  mirror), and `PYRE_CARRIER_EXC_RESUME`.  For these the *ON* path is the
-  unattested one, so they are adoption targets rather than retirement targets.
+  §1d).  Kept: `_CALLEE_VSTACK` (callee-local operand-stack mirror) and
+  `PYRE_CARRIER_EXC_RESUME`.  For these the *ON* path is the unattested one, so
+  they are adoption targets rather than retirement targets.
   `_BLACKHOLE_RESUME` graduated out of this bucket on 2026-07-25 (flipped
-  default-ON, now in §4).
+  default-ON, now in §4); `_MULTIFRAME` graduated the same way once
+  `walker_ec_enter` / `walker_ec_leave` closed the escaping-`sys._getframe`
+  identity answer.
 
   `_CALLEE_VSTACK` was evaluated for a flip on 2026-07-25 and **declined —
   the ON path is a half-finished port with no consumer**.  Parity first:

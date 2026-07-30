@@ -1,29 +1,28 @@
-# The frame-identity read that the multi-frame blackhole adopt gets wrong, and
-# the acceptance test for flipping `PYRE_FBW_MULTIFRAME` default-ON.
+# The frame-identity read the multi-frame blackhole adopt commits, and the
+# regression guard for `PYRE_FBW_MULTIFRAME` being default-ON.
 #
 # The walk executes the forcing residual CONCRETELY, and an inline push never
-# runs the interpreter's call sequence, so `ec.topframeref` still names the
-# CALLER while the inlined callee body runs. A `sys._getframe` that is itself
-# the escaping call therefore reads the caller's frame at walk time, and the
-# adopt commits that answer instead of discarding it the way the legacy
-# escape/replay path does.
+# runs the interpreter's call sequence. Before `walker_ec_enter` /
+# `walker_ec_leave` published the callee frame on the execution context,
+# `ec.topframeref` still named the CALLER while the inlined callee body ran, so
+# a `sys._getframe` that is itself the escaping call read the caller's frame at
+# walk time and the adopt committed that answer instead of discarding it the way
+# the legacy escape/replay path does. Measured then as one wrong iteration per
+# multi-frame adopt, in each part:
 #
-# Measured 2026-07-26 with the gate forced on -- one wrong iteration per
-# multi-frame adopt, 5 adopts and 5 wrong in each part:
-#
-#   part_a  `_gf()`  names `main`, not `leaf`
-#   part_b  `_gf(1)` names `<module>`, not `main` -- one level too far up, which
+#   part_a  `_gf()`  named `main`, not `leaf`
+#   part_b  `_gf(1)` named `<module>`, not `main` -- one level too far up, which
 #           is the same error seen through the argument
 #
-# A `_gf(1)` reading `f_locals` on that shape raises `KeyError` for any caller
+# A `_gf(1)` reading `f_locals` on that shape raised `KeyError` for any caller
 # local, for the same reason and not because outer locals go unmaterialized.
 #
-# Both are correct with the gate off, which is the default, so this fixture
-# passes today. It exists to fail loudly if the gate is flipped before the
-# inlined-call push publishes the callee frame on the execution context. Note
-# the read has to be the ESCAPING call: once the escape has happened, a
-# `sys._getframe(1)` executed inside the blackhole is correct, because the chain
-# publishes each level's frame as it runs.
+# Both answers are correct now, with the adopt committing rather than declining
+# (`PYRE_FBW_DEBUG_ABORT=1` prints one `adopted multi-frame terminal` per
+# iteration that latches, and no `chain rooted at` decline). Note the read has
+# to be the ESCAPING call: once the escape has happened, a `sys._getframe(1)`
+# executed inside the blackhole was always correct, because the chain publishes
+# each level's frame as it runs.
 import sys
 
 _gf = sys._getframe

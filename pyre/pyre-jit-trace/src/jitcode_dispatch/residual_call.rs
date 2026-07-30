@@ -259,19 +259,36 @@ fn single_frame_blackhole_resume_enabled() -> bool {
     })
 }
 
-/// Opt-in for adopting the MULTI-frame (inlined sub-walk) blackhole image.
-/// The build side (`build_multi_frame_miframe`, the input-arg `_resref` seed,
-/// and the getfield-chain `recover_ref_value`) reconstructs the frame stack
-/// correctly, but the resume side (`drive_multi_frame_blackhole` →
-/// `convert_and_run_from_pyjitpl`) does not yet materialize an OUTER frame's
-/// locals into its live frame before the innermost frame re-reads them (an
-/// inner `sys._getframe(1).f_locals[...]` runs first in the blackhole chain and
-/// sees the not-yet-restored caller frame).  Until that materialization lands,
-/// keep the multi-frame image from being latched so an inline-sub-walk force
-/// declines to the legacy escape/replay path (correct output) instead of
-/// resuming into an incomplete caller frame.
+/// `PYRE_FBW_MULTIFRAME` (default ON) — adopt the MULTI-frame (inlined
+/// sub-walk) blackhole image rather than declining an inline-sub-walk vable
+/// force to the legacy escape/replay path.  The build side
+/// (`build_multi_frame_miframe`, the input-arg `_resref` seed, and the
+/// getfield-chain `recover_ref_value`) reconstructs the frame stack; the resume
+/// side (`drive_multi_frame_blackhole` → `convert_and_run_from_pyjitpl`)
+/// publishes each level as the chain reaches it.  Blast radius is exactly
+/// `inline_subwalk` at a vable escape: the latch is an `if`/`else if` whose
+/// single-frame arm requires `framestack.is_empty() && !inline_subwalk`.
+///
+/// This was opt-in for as long as an inline push did not run the interpreter's
+/// call sequence.  `ec.topframeref` still named the CALLER while an inlined
+/// callee body ran, so a `sys._getframe` that was itself the escaping residual
+/// read the wrong frame at walk time, and adopting committed that answer where
+/// the legacy path discarded it.  `walker_ec_enter` / `walker_ec_leave`
+/// (`executioncontext.py:85-107`) publish the callee frame at the inlined-call
+/// push, which closes it; a `sys._getframe` executed later, inside the
+/// blackhole, was always correct.
+/// `synth/getframe_while_escaping_read_frame_identity` is the regression guard
+/// and reports zero wrong frames with the adopt committing.  `=0`/`false` opts
+/// back out.
 fn multi_frame_blackhole_resume_enabled() -> bool {
-    std::env::var_os("PYRE_FBW_MULTIFRAME").as_deref() == Some(std::ffi::OsStr::new("1"))
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_MULTIFRAME") {
+        Some(v) => {
+            let v = v.to_string_lossy();
+            v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        None => true,
+    })
 }
 
 fn build_single_frame_miframe<Sym: WalkSym>(

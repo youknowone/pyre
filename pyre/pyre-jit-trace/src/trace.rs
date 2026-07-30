@@ -2481,18 +2481,17 @@ fn try_adopt_multi_frame_blackhole(
     // unconditionally, and its `frames[0]` is always the portal frame, so this
     // shape cannot arise there.
     //
-    // Passing this gate is NOT sufficient for the adopt to be right, and the
-    // remaining gap is why `PYRE_FBW_MULTIFRAME` is still opt-in.  The walker
-    // executes residuals CONCRETELY while an inline push never runs the
-    // interpreter's call sequence, so `ec.topframeref` still names the CALLER
-    // while an inlined callee body runs.  A `sys._getframe` that is itself the
-    // escaping residual therefore already read the wrong frame at walk time,
-    // and adopting commits that answer where the legacy escape/replay path
-    // discards it — measured as one wrong iteration per adopt
-    // (`synth/getframe_while_escaping_read_frame_identity`).  Closing it needs
-    // the inlined-call push to publish the callee frame on the execution
-    // context; a `sys._getframe` executed later, inside the blackhole, is
+    // Passing this gate is not by itself sufficient for the adopt to be right.
+    // The walker executes residuals CONCRETELY while an inline push never runs
+    // the interpreter's call sequence, so `ec.topframeref` used to still name
+    // the CALLER while an inlined callee body ran: a `sys._getframe` that is
+    // itself the escaping residual read the wrong frame at walk time, and
+    // adopting committed that answer where the legacy escape/replay path
+    // discarded it.  `walker_ec_enter` / `walker_ec_leave` publish the callee
+    // frame on the execution context at the inlined-call push, which closes
+    // that hole; a `sys._getframe` executed later, inside the blackhole, was
     // already correct because each level is published as it runs.
+    // `synth/getframe_while_escaping_read_frame_identity` guards both readings.
     mfdbg!(
         "chain root={root_addr:#x} cf_addr={cf_addr:#x} levels=[{}]",
         per_frame
