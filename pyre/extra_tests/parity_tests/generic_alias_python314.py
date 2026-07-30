@@ -108,3 +108,5 @@ starred = (*tuple[int, str],)[0]
 for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
     restored = pickle.loads(pickle.dumps(starred, protocol))
     assert restored == starred
+
+print("OK")
