@@ -322,9 +322,16 @@ pub struct AssemblerARM64<'a> {
     /// inversion and `b`.  Decided once per trace in `_assemble`.
     long_guard_branch: bool,
 
-    /// Offset of the current trace's first emitted byte, for the
-    /// `long_guard_branch` range check.
-    trace_start_offset: usize,
+    /// Buffer offset of the first single-instruction `b.cond` emitted to each
+    /// label, so `write_pending_failure_recoveries` can measure the real
+    /// displacement to the recovery stub it binds that label to.  The earliest
+    /// branch is the one that has to reach furthest, and a label with no entry
+    /// was never branched to in the short form.
+    short_guard_branch_offsets: IndexMap<DynamicLabel, usize>,
+    /// `(branch offset, stub offset)` for every short guard branch whose stub
+    /// landed outside `b.cond`'s forward reach.  Read by `check_guard_reach`.
+    guard_reach_violations: Vec<(usize, usize)>,
+
     /// x86/assembler.py:93 target_tokens_currently_compiling parity.
     /// Keyed by descriptor pointer identity (PyPy uses Python `is`).
     target_tokens_currently_compiling: IndexMap<usize, DynamicLabel>,
@@ -523,7 +530,8 @@ impl<'a> AssemblerARM64<'a> {
             guard_success_cc: None,
             pending_cmp_cc: None,
             long_guard_branch: false,
-            trace_start_offset: 0,
+            short_guard_branch_offsets: IndexMap::new(),
+            guard_reach_violations: Vec::new(),
             target_tokens_currently_compiling: IndexMap::new(),
             compiled_target_tokens: Vec::new(),
             vtable_offset,
@@ -2060,7 +2068,8 @@ impl<'a> AssemblerARM64<'a> {
     fn _assemble(&mut self, emit_prologue: bool) -> Result<(), BackendError> {
         let inputargs: &'a [InputArg] = self.inputargs;
         let ops: &'a [Op] = self.operations;
-        self.trace_start_offset = self.mc.offset().0;
+        self.short_guard_branch_offsets.clear();
+        self.guard_reach_violations.clear();
         // A guard's `b.cond` has to reach a stub that is written after the
         // whole body, so the budget is the body plus every stub — not the body
         // alone.  `const_stores` makes a stub grow independently of the
@@ -4216,25 +4225,28 @@ impl<'a> AssemblerARM64<'a> {
     /// fixed jitframe prefix before publishing jf_descr and returning.
     /// Every guard that took the single-instruction form has to reach its
     /// failure-recovery stub with a `b.cond`, whose signed 19-bit word
-    /// displacement spans [`BCOND_FORWARD_RANGE`].  The stubs are written after
-    /// the body, so the span is only exact once
-    /// [`Self::write_pending_failure_recoveries`] has run — and by then the
-    /// branches are already emitted, so an overflow can no longer be answered
-    /// by re-emitting them in the two-instruction form.  Refuse the trace
-    /// instead: the up-front `MAX_BYTES_PER_OP` / `MAX_BYTES_PER_GUARD_STUB`
-    /// estimate is a heuristic, and letting a relocation that cannot be encoded
-    /// reach the assembler is not an acceptable way to find that out.
+    /// displacement spans [`BCOND_FORWARD_RANGE`].  A stub is bound in
+    /// [`Self::write_pending_failure_recoveries`], which measures each such
+    /// branch against the stub it actually has to reach — by then the branches
+    /// are emitted, so an overflow can no longer be answered by re-emitting
+    /// them in the two-instruction form.  Refuse the trace instead: the
+    /// up-front `MAX_BYTES_PER_OP` / `MAX_BYTES_PER_GUARD_STUB` estimate is a
+    /// heuristic, and letting a relocation that cannot be encoded reach the
+    /// assembler is not an acceptable way to find that out.  A trace that took
+    /// the two-instruction form everywhere records no branches and so always
+    /// passes.
     fn check_guard_reach(&self) -> Result<(), BackendError> {
-        let span = self.mc.offset().0 - self.trace_start_offset;
-        if self.long_guard_branch || span < BCOND_FORWARD_RANGE {
+        let Some(&(branch, stub)) = self.guard_reach_violations.first() else {
             return Ok(());
-        }
+        };
         Err(BackendError::CompilationFailed(format!(
-            "trace emitted {} bytes of body and guard stubs with {} guards, past \
-             b.cond's {BCOND_FORWARD_RANGE}-byte forward reach, but the up-front \
-             estimate chose single-instruction guard branches",
-            span,
-            self.pending_guard_tokens.len(),
+            "{} of {} single-instruction guard branches cannot reach their \
+             recovery stub; the first branches at offset {branch} to a stub at \
+             {stub}, {} bytes past b.cond's {BCOND_FORWARD_RANGE}-byte forward \
+             reach, but the up-front estimate chose that form",
+            self.guard_reach_violations.len(),
+            self.short_guard_branch_offsets.len(),
+            stub - branch - BCOND_FORWARD_RANGE,
         )))
     }
 
@@ -4325,7 +4337,16 @@ impl<'a> AssemblerARM64<'a> {
         }
         let mut stub_offsets = Vec::new();
         for guard_token in std::mem::take(&mut self.pending_guard_tokens) {
-            stub_offsets.push(self.generate_quick_failure(guard_token, save_regs_label));
+            let fail_label = guard_token.fail_label;
+            let entry = self.generate_quick_failure(guard_token, save_regs_label);
+            // The stub is bound here, so this is the first point at which the
+            // displacement each `b.cond` to that label has to encode is known.
+            if let Some(&branch) = self.short_guard_branch_offsets.get(&fail_label)
+                && entry.1 >= branch + BCOND_FORWARD_RANGE
+            {
+                self.guard_reach_violations.push((branch, entry.1));
+            }
+            stub_offsets.push(entry);
         }
         if majit_ir::debug::have_debug_prints() {
             majit_ir::debug::log_one(
@@ -4701,6 +4722,12 @@ impl<'a> AssemblerARM64<'a> {
     /// guard.  logo's 70000-op trace needs it.
     fn emit_bcond_to_label(&mut self, cc: u8, label: DynamicLabel) {
         if !self.long_guard_branch {
+            // Keep the earliest branch to this label: it is the one furthest
+            // from the recovery stub the label is later bound to.
+            let offset = self.mc.offset().0;
+            self.short_guard_branch_offsets
+                .entry(label)
+                .or_insert(offset);
             match cc {
                 CC_L => dynasm!(self.mc ; .arch aarch64 ; b.lt =>label),
                 CC_LE => dynasm!(self.mc ; .arch aarch64 ; b.le =>label),
