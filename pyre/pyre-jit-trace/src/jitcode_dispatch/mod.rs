@@ -2100,17 +2100,21 @@ pub(crate) fn census_dump() {
 
 /// Carrier-boundary raise seed (`finishframe_exception` at the bridge carrier):
 /// set by [`crate::trace::drive_bridge_carrier_walk`] when a depth-2 inlined
-/// callee's sub-walk ended in `SubRaise` and the ROOT frame's `except` handler
-/// covers the CALL.  [`crate::jitcode_dispatch::dispatch_via_miframe`] reads it
-/// once when it sets up the root walk and enters at `catch_target` with the
-/// caught exception seeded — the same handler-entry reconstruction the
-/// walk-level SubRaise routing performs, but at the carrier boundary the
-/// sub-walk crossed on its own.
+/// callee's sub-walk ended in `SubRaise`.
+/// [`crate::jitcode_dispatch::dispatch_via_miframe`] reads it once when it sets
+/// up the root walk.  With `catch_target` set the root frame's `except` handler
+/// covers the CALL and the walk enters at that handler with the caught
+/// exception seeded — the same handler-entry reconstruction the walk-level
+/// SubRaise routing performs, but at the carrier boundary the sub-walk crossed
+/// on its own.  `None` means the root frame has no covering handler: the
+/// framestack this trace models is exhausted, so the walk ends immediately with
+/// `compile_exit_frame_with_exception` and the interpreter unwinds the
+/// remaining Python frames.
 #[derive(Clone, Copy)]
 pub(crate) struct CarrierRaiseSeed {
     pub exc: OpRef,
     pub exc_concrete: crate::state::ConcreteValue,
-    pub catch_target: usize,
+    pub catch_target: Option<usize>,
 }
 
 thread_local! {

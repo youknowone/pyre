@@ -414,6 +414,10 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         // inlined callee's sub-walk raised and the root frame's handler covers
         // the CALL (set by `drive_bridge_carrier_walk`).  Consumed once here.
         let carrier_raise_seed = crate::jitcode_dispatch::take_carrier_raise_seed();
+        // Set by the carrier seed's no-handler arm: the root frame lets the
+        // exception through, so the trace ends at bridge entry and the walk is
+        // skipped entirely.
+        let mut carrier_raise_escapes = false;
         let walk_position = if let Some(catch_target) = exc_edge_catch_target {
             // RPython `pyjitpl.py:3125-3173` exception-guard resumption, emitted
             // at the bridge-entry frame state so the GUARD_EXCEPTION captures a
@@ -505,9 +509,41 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // a reraise in the handler mis-reads the standing exception.
             wc.fbw_mode.class_of_last_exc_is_const = true;
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
-            record_bridge_handler_entry_traceback(&mut wc, seed.exc, seed.exc_concrete, position);
-            vstack_enter_exception_handler(&mut wc, seed.catch_target, seed.exc);
-            seed.catch_target
+            if let Some(catch_target) = seed.catch_target {
+                record_bridge_handler_entry_traceback(
+                    &mut wc,
+                    seed.exc,
+                    seed.exc_concrete,
+                    position,
+                );
+                vstack_enter_exception_handler(&mut wc, catch_target, seed.exc);
+                catch_target
+            } else {
+                // No handler in the root frame: `finishframe_exception` ran out
+                // of frames to scan and reaches
+                // `compile_exit_frame_with_exception`.  Same shape as the
+                // walk-level top-level arm — record this frame's node for the
+                // recording pass only (`emit_runtime = false`: at runtime the
+                // interpreter records it when the trace hands the exception
+                // back), publish the raise coordinate the interpreter reads it
+                // from, and stash the exception as the FINISH payload.  The
+                // remaining Python frames unwind interpreted, exactly as they
+                // do when the raise surfaces from a residual call.
+                if !recording_instruction_is_bare_reraise(&mut wc, position) {
+                    record_top_level_application_traceback(
+                        &mut wc,
+                        seed.exc,
+                        seed.exc_concrete,
+                        position,
+                        true,
+                        false,
+                    );
+                }
+                fbw_publish_exit_last_instr(&mut wc, position);
+                fbw_terminate_with_raise(seed.exc, seed.exc_concrete);
+                carrier_raise_escapes = true;
+                position
+            }
         } else {
             // `_prepare_exception_resumption` null-exception arm +
             // `prepare_resume_from_failure` (pyjitpl.py): every exception-guard
@@ -556,7 +592,11 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             seed_vstack_mirror(&mut wc, sym, position);
             position
         };
-        let outcome = walk(jitcode_code, walk_position, &mut wc);
+        let outcome = if carrier_raise_escapes {
+            Ok((DispatchOutcome::Terminate, walk_position))
+        } else {
+            walk(jitcode_code, walk_position, &mut wc)
+        };
         // Read final last_exc_value before wc drops so the borrow
         // checker can release sym for the writeback below.
         let final_last_exc = wc.last_exc_value;
