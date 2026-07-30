@@ -1732,6 +1732,20 @@ pub(crate) struct ExactNumericArg {
 /// FROM exact-numeric caller arguments — so parameter provenance is tracked
 /// slot-by-slot alongside freshness.  This matters for method-form calls:
 /// `self` is commonly nonnumeric while a later argument is an exact int.
+/// Name the body op that made [`fbw_callee_body_replay_safety`] answer
+/// [`CalleeReplaySafety::Dirty`], under `PYRE_FBW_INLINE_DIAG`.  Without it the
+/// declining instruction is invisible: the caller only sees `safety=Dirty` on
+/// the `[inline-foriter-gate]` line and every one of the return sites below
+/// looks alike.
+macro_rules! replay_dirty {
+    ($why:expr, $pc:expr, $opname:expr) => {{
+        if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+            eprintln!("[replay-dirty] pc={} op={} why={}", $pc, $opname, $why);
+        }
+        return CalleeReplaySafety::Dirty;
+    }};
+}
+
 pub(crate) fn fbw_callee_body_replay_safety(
     body_code: &[u8],
     exact_numeric_args: &[ExactNumericArg],
@@ -1742,9 +1756,12 @@ pub(crate) fn fbw_callee_body_replay_safety(
     callee_descr_refs: &[DescrRef],
 ) -> CalleeReplaySafety {
     let Some(branch_targets) = body_branch_targets(body_code) else {
-        return CalleeReplaySafety::Dirty;
+        replay_dirty!("BranchTargetsUndecodable", 0, "-");
     };
     let mut fresh_ref_regs = [false; u8::MAX as usize + 1];
+    // Ref registers holding the `bool` an accepted `COMPARE_OP` produced.  A
+    // truth residual over one of them is a read, not a live-heap write.
+    let mut bool_ref_regs = [false; u8::MAX as usize + 1];
     // The dual of freshness, for the opposite question: which ref registers hold
     // a value whose Python-visible class is provably an IMMUTABLE BUILTIN.  That
     // is what the `BINARY_OP` exemption below actually needs — such an operand
@@ -1814,18 +1831,20 @@ pub(crate) fn fbw_callee_body_replay_safety(
     while pc < body_code.len() {
         if branch_targets.contains(&pc) {
             fresh_ref_regs = [false; u8::MAX as usize + 1];
+            bool_ref_regs = [false; u8::MAX as usize + 1];
             numeric_ref_regs = seed_numeric_ref_regs;
             plain_int_ref_regs = seed_plain_int_ref_regs;
             numeric_slots = [false; BODY_TRACKED_FRAME_SLOTS];
             plain_int_slots = [false; BODY_TRACKED_FRAME_SLOTS];
         }
         let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
-            return CalleeReplaySafety::Dirty;
+            replay_dirty!("DecodeOpFailed", pc, "-");
         };
         // Set by the arms below when this op's `>r` result is itself an
         // immutable builtin.
         let mut dst_exact_numeric = false;
         let mut dst_exact_plain_int = false;
+        let mut dst_exact_bool = false;
 
         // The ref-slot accessors name the frame in operand 0 and the slot in
         // operand 1, both one byte wide.  The `_i` / `_f` variants address a
@@ -1868,13 +1887,13 @@ pub(crate) fn fbw_callee_body_replay_safety(
 
         if d.opname.starts_with("residual_call") {
             let Some(descr_index) = residual_call_descr_index_in_body(body_code, &d) else {
-                return CalleeReplaySafety::Dirty;
+                replay_dirty!("ResidualCallDescrIndexMissing", d.pc, d.opname);
             };
             let Some(call_descr) = callee_descr_refs
                 .get(descr_index)
                 .and_then(|descr| descr.as_call_descr())
             else {
-                return CalleeReplaySafety::Dirty;
+                replay_dirty!("ResidualCallDescrNotACall", d.pc, d.opname);
             };
             let ei = call_descr.get_extra_info();
             // `ForIterNext` is deliberately not accepted here: it advances the
@@ -1905,14 +1924,28 @@ pub(crate) fn fbw_callee_body_replay_safety(
             let provably_side_effect_free = replay_safe_read
                 || ei.check_is_elidable()
                 || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant;
-            let accepted_binop = !provably_side_effect_free
-                && residual_call_is_specialized_plain_numeric_binop(
+            let accepted_numeric_op = !provably_side_effect_free
+                && residual_call_is_specialized_plain_numeric_op(
                     body_code,
                     &numeric_ref_regs,
                     &plain_int_ref_regs,
                     &d,
                     num_regs_i,
                     constants_i,
+                    callee_descr_refs,
+                );
+            // A `COMPARE_OP` over the same proven operands is accepted for the
+            // same reason, but its result is a `bool`, not an operand the
+            // numeric provenance below may chain on.
+            let accepted_binop = accepted_numeric_op
+                && ei.pyre_helper == majit_ir::PyreHelperKind::BinaryOp;
+            dst_exact_bool = accepted_numeric_op && !accepted_binop;
+            let accepted_truth = !provably_side_effect_free
+                && crate::jitcode_dispatch::residual_call::residual_call_is_proven_truth(
+                    body_code,
+                    &numeric_ref_regs,
+                    &bool_ref_regs,
+                    &d,
                     callee_descr_refs,
                 );
             // An accepted arithmetic op over exact numeric operands returns an
@@ -1926,7 +1959,7 @@ pub(crate) fn fbw_callee_body_replay_safety(
                         num_regs_i,
                         constants_i,
                     ));
-            if !provably_side_effect_free && !accepted_binop {
+            if !provably_side_effect_free && !accepted_numeric_op && !accepted_truth {
                 // A Python-level CALL is the one shape this scan cannot
                 // settle: the inline lever binds its callee only at the call,
                 // so whether it leaves a residual behind — and what that
@@ -1970,7 +2003,7 @@ pub(crate) fn fbw_callee_body_replay_safety(
                     numeric_slots = [false; BODY_TRACKED_FRAME_SLOTS];
                     plain_int_slots = [false; BODY_TRACKED_FRAME_SLOTS];
                 } else {
-                    return CalleeReplaySafety::Dirty;
+                    replay_dirty!("ResidualCallWritesLiveHeap", d.pc, d.opname);
                 }
             }
         } else if d.opname.starts_with("setfield_gc") {
@@ -1982,10 +2015,10 @@ pub(crate) fn fbw_callee_body_replay_safety(
             // reading operand 0 as one would index the freshness set with an
             // int register number.
             if !d.argcodes.starts_with('r') {
-                return CalleeReplaySafety::Dirty;
+                replay_dirty!("SetfieldGcTargetNotRefReg", d.pc, d.opname);
             }
             let Some(&target_reg) = body_code.get(d.pc + 1) else {
-                return CalleeReplaySafety::Dirty;
+                replay_dirty!("SetfieldGcTargetRegMissing", d.pc, d.opname);
             };
             let descr_index = decode_descr_index(body_code, &d, 2);
             let immutable_field = callee_descr_refs
@@ -1993,7 +2026,7 @@ pub(crate) fn fbw_callee_body_replay_safety(
                 .and_then(|descr| descr.as_field_descr())
                 .is_some_and(|field| field.is_immutable());
             if !fresh_ref_regs[target_reg as usize] || !immutable_field {
-                return CalleeReplaySafety::Dirty;
+                replay_dirty!("SetfieldGcTargetNotFreshOrMutable", d.pc, d.opname);
             }
         } else if d.opname.starts_with("setarrayitem_gc") {
             // The dual of the `setfield_gc` rule: a store into an array this
@@ -2006,7 +2039,7 @@ pub(crate) fn fbw_callee_body_replay_safety(
                     .get(d.pc + 1)
                     .is_some_and(|reg| fresh_ref_regs[*reg as usize]);
             if !target_fresh {
-                return CalleeReplaySafety::Dirty;
+                replay_dirty!("SetarrayitemGcTargetNotFresh", d.pc, d.opname);
             }
         } else if d.opname.starts_with("setinteriorfield_gc")
             || d.opname.starts_with("raw_store")
@@ -2016,13 +2049,13 @@ pub(crate) fn fbw_callee_body_replay_safety(
         {
             // Interior/raw stores and non-residual call forms cannot be proven
             // replay-safe from this single callee body.
-            return CalleeReplaySafety::Dirty;
+            replay_dirty!("UnprovableStoreOrCallForm", d.pc, d.opname);
         }
 
         // The result byte is always the final operand for `>r` forms.
         if d.argcodes.ends_with(">r") {
             let Some(&dst) = body_code.get(d.next_pc.saturating_sub(1)) else {
-                return CalleeReplaySafety::Dirty;
+                replay_dirty!("ResultRegisterByteMissing", d.pc, d.opname);
             };
             fresh_ref_regs[dst as usize] = d.key == "new_with_vtable/d>r"
                 || d.opname.starts_with("new_array")
@@ -2043,6 +2076,11 @@ pub(crate) fn fbw_callee_body_replay_safety(
                     && body_code
                         .get(d.pc + 1)
                         .is_some_and(|src| numeric_ref_regs[*src as usize]));
+            bool_ref_regs[dst as usize] = dst_exact_bool
+                || (d.key == "ref_copy/r>r"
+                    && body_code
+                        .get(d.pc + 1)
+                        .is_some_and(|src| bool_ref_regs[*src as usize]));
             plain_int_ref_regs[dst as usize] = dst_exact_plain_int
                 || vable_slot.is_some_and(|slot| {
                     d.opname.starts_with("getarrayitem_vable_r")
