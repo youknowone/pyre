@@ -6212,4 +6212,92 @@ mod tests {
             "rd_virtuals should encode the virtual array"
         );
     }
+
+    #[test]
+    fn test_guard_fail_args_virtual_array_with_nested_virtual_item() {
+        // RPython resume.py:_number_virtuals recursively numbers a virtual
+        // stored in a virtual array item.  The array and the item remain
+        // TAGVIRTUAL; only the item's scalar payload is a TAGBOX live value.
+        let array_sd = array_descr(40);
+        let item_sd = size_descr(41);
+        let item_value_fd = field_descr(42);
+        let mut guard = Op::new(
+            OpCode::GuardTrue,
+            &[crate::history::test_support::rooted_inputarg_operand(
+                Type::Int,
+                30,
+            )],
+        );
+        guard.setfailargs(
+            vec![crate::history::test_support::rooted_resop_operand(
+                Type::Ref,
+                0,
+            )]
+            .into(),
+        );
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::NewArray,
+                &[crate::history::test_support::rooted_resop_operand(
+                    Type::Int,
+                    10,
+                )],
+                array_sd.clone(),
+            ),
+            Op::with_descr(OpCode::NewWithVtable, &[], item_sd),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 1),
+                    crate::history::test_support::rooted_inputarg_operand(Type::Int, 40),
+                ],
+                item_value_fd,
+            ),
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 11),
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 1),
+                ],
+                array_sd,
+            ),
+            guard,
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_pass_with_constants(
+            &ops,
+            &[
+                (OpRef::int_op(10), Value::Int(1)),
+                (OpRef::int_op(11), Value::Int(0)),
+            ],
+        );
+        let guard_op = result
+            .iter()
+            .find(|o| o.opcode == OpCode::GuardTrue)
+            .expect("guard should be emitted");
+        assert_eq!(
+            result
+                .iter()
+                .filter(|op| matches!(op.opcode, OpCode::NewArray | OpCode::NewWithVtable))
+                .count(),
+            0,
+            "nested virtual array item should remain virtual; got {result:?}"
+        );
+        let failargs = guard_op.getfailargs().unwrap();
+        assert!(
+            failargs
+                .iter()
+                .any(|arg| arg.to_opref() == OpRef::input_arg_int(40)),
+            "nested item payload should be a live TAGBOX; got {failargs:?}"
+        );
+        let virtuals = guard_op
+            .resolved_rd_virtuals()
+            .expect("rd_virtuals should encode the array and nested item");
+        assert!(
+            virtuals.len() >= 2,
+            "rd_virtuals should recursively number both virtuals; got {virtuals:?}"
+        );
+    }
 }
