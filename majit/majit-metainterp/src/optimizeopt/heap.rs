@@ -2091,6 +2091,20 @@ impl OptHeap {
         // canonical OpRef.
         let obj = ctx.get_replacement_opref(raw_obj);
         let _ = ctx.ensure_ptr_info_arg0(op);
+        // heap.py:649 `cf = self.field_cache(descr)` — get-or-CREATE
+        // (heap.py:392-397), so the aliasing check and the cache consult below
+        // run even for a descr this pass has not touched yet.
+        //
+        // That matters at the head of the peeled loop, where every
+        // `cached_fields` entry starts empty while the imported short box's
+        // `PreambleOp` already sits on the STRUCT's ptr_info (`_getfield` reads
+        // `info.getfield(field_idx)`). Looking the cache up read-only skipped
+        // the `FieldEntry::Preamble` arm for every first-touch field, so
+        // `force_op_from_preamble_op` — and with it `use_box`, which appends the
+        // re-executed op to the short preamble — never ran: `used_boxes` and
+        // the short jump args stayed empty and the peeled LABEL never grew the
+        // hoisted field slots.
+        self.field_cache(&descr);
         let mut force_lazy = false;
         if let Some(cf) = self.get_cached_field(&descr) {
             if let Some(lazy_op) = &cf.lazy_set {
@@ -3926,6 +3940,16 @@ mod tests {
         fn get_parent_descr(&self) -> Option<DescrRef> {
             Some(test_parent_descr())
         }
+        // The declared `offset()` already places this descr at slot `index` of
+        // `test_parent_descr()`; `index_in_parent` must agree, because
+        // `info.py:212-214 _fields[fielddescr.get_index()]` indexes the
+        // struct's PtrInfo by it. Leaving the trait default (0) made every
+        // fixture descr claim slot 0 of the SAME parent, so two distinct
+        // descrs aliased one PtrInfo field slot — a layout no real struct can
+        // have.
+        fn index_in_parent(&self) -> usize {
+            self.index as usize
+        }
         fn offset(&self) -> usize {
             self.index as usize * 8
         }
@@ -4003,6 +4027,10 @@ mod tests {
     impl FieldDescr for ImmutableDescr {
         fn get_parent_descr(&self) -> Option<DescrRef> {
             Some(test_parent_descr())
+        }
+        // See TestDescr::index_in_parent.
+        fn index_in_parent(&self) -> usize {
+            self.index as usize
         }
         fn offset(&self) -> usize {
             self.index as usize * 8
