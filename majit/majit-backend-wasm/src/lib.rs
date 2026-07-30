@@ -2578,9 +2578,6 @@ impl majit_backend::Backend for WasmBackend {
             })
             .collect();
         register_fail_descrs(&bridge_descrs);
-        if let Some(table) = gc_table {
-            Self::register_gc_table(original_token, table);
-        }
 
         // Register the bridge module into the shared table, then publish its
         // descrs and flip the source guard's cell. Order matters: the descrs
@@ -2601,6 +2598,13 @@ impl majit_backend::Backend for WasmBackend {
                  or invalid module)"
                     .to_string(),
             ));
+        }
+        // Only a bridge that survived the decline above gets its reference
+        // constants rooted. The table is attached to the long-lived original
+        // loop token, so rooting a rejected bridge's table would keep its
+        // constants alive permanently, once per rejected attempt.
+        if let Some(table) = gc_table {
+            Self::register_gc_table(original_token, table);
         }
         diag_bump(5); // bridge compiled — chained in-module
 
