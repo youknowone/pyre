@@ -1981,16 +1981,12 @@ fn expand_pyre_methods(
                         )
                     }
                 } else {
-                    let text = format!(
-                        "{} expected at least {visible_required} argument{}, got {{}}",
-                        fn_name,
-                        if visible_required == 1 { "" } else { "s" },
-                    );
                     quote! {
-                        ::std::result::Result::Err(crate::PyError::type_error(format!(
-                            #text,
+                        crate::gateway::method_min_arity_failure(
+                            #fn_name,
+                            #visible_required,
                             args.len().saturating_sub(#receiver_slots),
-                        )))
+                        )
                     }
                 };
                 quote! {

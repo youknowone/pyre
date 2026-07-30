@@ -347,6 +347,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_interpreter::gateway::method_min_arity_failure",
+        "gateway::method_min_arity_failure",
+        crate::gateway::method_min_arity_failure as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_interpreter::builtins::builtin_kwargs_marker_dict",
         "builtins::builtin_kwargs_marker_dict",
         crate::builtins::builtin_kwargs_marker_dict as *const (),

@@ -539,6 +539,23 @@ pub fn method_noarg_failure(
     }
 }
 
+/// Cold gateway failure for a missing required argument.
+///
+/// A wrapper whose optional trailing parameters turn the accepted count into a
+/// range reports the PyArg_UnpackTuple `expected at least N arguments, got M`
+/// form.  The wrapper keeps the count guard; the message is built only here.
+#[majit_macros::dont_look_inside]
+pub fn method_min_arity_failure(
+    name: &str,
+    min: usize,
+    given: usize,
+) -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::type_error(format!(
+        "{name} expected at least {min} argument{}, got {given}",
+        if min == 1 { "" } else { "s" },
+    )))
+}
+
 /// Translation-visible registry of generated interp2app gateway bodies.
 ///
 /// RPython's `BuiltinCode.func` is a PBC whose possible function values are
