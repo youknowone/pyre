@@ -5198,9 +5198,14 @@ mod tests {
     }
 
     #[test]
-    fn default_someshell_for_lltype_address_yields_none() {
-        // SomeAddress not yet ported (model.rs:21 TODO).
-        assert!(default_someshell_for_lltype(&LowLevelType::Address).is_none());
+    fn default_someshell_for_lltype_address_yields_someaddress() {
+        use crate::annotator::model::SomeValue;
+        // `Address` maps to the untyped `SomeAddress` shell (llmemory.py:573
+        // `SomeAddress`) — the projection a raw `*const T` / `*mut T` result
+        // takes.
+        let s = default_someshell_for_lltype(&LowLevelType::Address)
+            .expect("Address must project to SomeAddress");
+        assert!(matches!(s, SomeValue::Address(_)), "got {s:?}");
     }
 
     #[test]
