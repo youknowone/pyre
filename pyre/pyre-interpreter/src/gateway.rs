@@ -1467,37 +1467,41 @@ mod tests {
 // `#[pyre_function]` / `#[pyre_methods]` `PyPath` typed-receiver alias
 // (gateway.py visit_fsencode line 365) and by posix call sites that
 // previously inlined the same extraction.
-/// `posixmodule.c path_converter`: a path given as `bytes` (directly or from
-/// `__fspath__`) makes the names the call reports back `bytes` as well.
-pub fn fspath_is_bytes(obj: pyre_object::PyObjectRef) -> bool {
-    if obj.is_null() {
-        return false;
-    }
-    if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
-        return true;
-    }
-    if unsafe { pyre_object::is_str(obj) } {
-        return false;
-    }
-    crate::typedef::r#type(obj)
-        .and_then(|pt| unsafe { crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__") })
-        .and_then(|fspath_fn| crate::call::call_function_impl_result(fspath_fn, &[obj]).ok())
-        .is_some_and(|result| unsafe { pyre_object::bytesobject::is_bytes_like(result) })
+pub fn fsencode_w(obj: pyre_object::PyObjectRef) -> Result<String, crate::PyError> {
+    Ok(fsencode_w_with_kind(obj)?.0)
 }
 
-pub fn fsencode_w(obj: pyre_object::PyObjectRef) -> Result<String, crate::PyError> {
-    let data = fsencode_bytes_w(obj)?;
-    Ok(String::from_utf8_lossy(&data).into_owned())
+/// [`fsencode_w`] paired with the discriminator `posixmodule.c
+/// path_converter` derives from the same resolution: `true` when the path
+/// resolved to `bytes`, which makes the names the call reports back `bytes`
+/// too.  Callers that need both must use this rather than re-resolving,
+/// because `path_converter` calls `__fspath__` exactly **once** — a second
+/// call would let a stateful implementation observe duplicate side effects, or
+/// answer `str` first and `bytes` second and leave the reported names
+/// describing a different path than the one that was listed.
+pub fn fsencode_w_with_kind(
+    obj: pyre_object::PyObjectRef,
+) -> Result<(String, bool), crate::PyError> {
+    let (data, is_bytes) = fsencode_bytes_w_with_kind(obj)?;
+    Ok((String::from_utf8_lossy(&data).into_owned(), is_bytes))
 }
 
 pub fn fsencode_bytes_w(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+    Ok(fsencode_bytes_w_with_kind(obj)?.0)
+}
+
+/// [`fsencode_bytes_w`] paired with the `bytes`-ness of the resolved object;
+/// see [`fsencode_w_with_kind`] for why the two are produced together.
+pub fn fsencode_bytes_w_with_kind(
+    obj: pyre_object::PyObjectRef,
+) -> Result<(Vec<u8>, bool), crate::PyError> {
     unsafe {
         if pyre_object::is_str(obj) {
-            return fsencode_str_bytes(obj);
+            return Ok((fsencode_str_bytes(obj)?, false));
         }
         if pyre_object::bytesobject::is_bytes_like(obj) {
             let data = pyre_object::bytesobject::bytes_like_data(obj);
-            return Ok(data.to_vec());
+            return Ok((data.to_vec(), true));
         }
     }
     // `type(path).__fspath__(path)` — the descriptor read off the type is
@@ -1508,11 +1512,11 @@ pub fn fsencode_bytes_w(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate:
         let result = crate::call::call_function_impl_result(fspath_fn, &[obj])?;
         unsafe {
             if pyre_object::is_str(result) {
-                return fsencode_str_bytes(result);
+                return Ok((fsencode_str_bytes(result)?, false));
             }
             if pyre_object::bytesobject::is_bytes_like(result) {
                 let data = pyre_object::bytesobject::bytes_like_data(result);
-                return Ok(data.to_vec());
+                return Ok((data.to_vec(), true));
             }
         }
     }

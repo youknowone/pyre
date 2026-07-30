@@ -616,20 +616,42 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let w_globals = unsafe { &*ec }.fresh_module_globals();
                 let globals_slot = pyre_object::gc_roots::shadow_stack_len();
                 pyre_object::gc_roots::pin_root(w_globals);
+                // The name string is allocated before the store so the mapping
+                // it writes into is read after that allocation, not before it.
+                let w_name = pyre_object::w_str_new(&name);
                 unsafe {
                     pyre_object::w_dict_setitem_str(
-                        w_globals,
+                        pyre_object::gc_roots::shadow_stack_get(globals_slot),
                         "__name__",
-                        pyre_object::w_str_new(&name),
+                        w_name,
                     );
                 };
-                let module = pyre_object::w_module_new_aliasing_dict(
+                // `PyImport_ImportFrozenModuleObject`: a frozen *package* gets
+                // `__path__` set to the empty list before its code runs, which
+                // is what makes `import __phello__.spam` resolve through it
+                // instead of reporting that `__phello__` is not a package.
+                if entry.is_package {
+                    let w_path = pyre_object::w_list_new(Vec::new());
+                    unsafe {
+                        pyre_object::w_dict_setitem_str(
+                            pyre_object::gc_roots::shadow_stack_get(globals_slot),
+                            "__path__",
+                            w_path,
+                        );
+                    };
+                }
+                let module_slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(pyre_object::w_module_new_aliasing_dict(
                     &name,
                     pyre_object::gc_roots::shadow_stack_get(globals_slot),
+                ));
+                // `set_sys_module` inserts into `sys.modules` and so allocates:
+                // publish the module from its rooted slot rather than from a
+                // pointer captured before the insert.
+                crate::importing::set_sys_module(
+                    &name,
+                    pyre_object::gc_roots::shadow_stack_get(module_slot),
                 );
-                crate::importing::set_sys_module(&name, module);
-                let module_slot = pyre_object::gc_roots::shadow_stack_len();
-                pyre_object::gc_roots::pin_root(module);
                 if let Err(error) = crate::builtins::builtin_exec(&[
                     pyre_object::gc_roots::shadow_stack_get(code_slot),
                     pyre_object::gc_roots::shadow_stack_get(globals_slot),
