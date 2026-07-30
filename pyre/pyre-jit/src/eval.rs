@@ -5973,7 +5973,20 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
                 let mut scan_pc = pc + 1;
                 let mut has_call = false;
                 while scan_pc < exit && scan_pc < instructions.len() {
-                    let (scan_instr, _) = scan_state.get(instructions[scan_pc]);
+                    let (scan_instr, scan_arg) = scan_state.get(instructions[scan_pc]);
+                    if let I::ForIter { delta } = scan_instr {
+                        // A nested loop owns its body.  It is validated when
+                        // the outer instruction walk reaches that FOR_ITER;
+                        // calls inside it must not taint a LIST_APPEND owned by
+                        // this lexical loop (and vice versa).
+                        scan_pc = pyre_interpreter::jump_target_forward(
+                            instructions,
+                            scan_pc + 1,
+                            delta.get(scan_arg).as_usize(),
+                        );
+                        scan_state = pyre_interpreter::OpArgState::default();
+                        continue;
+                    }
                     if matches!(
                         scan_instr,
                         I::Call { .. }
@@ -5991,7 +6004,20 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
             let mut body_state = pyre_interpreter::OpArgState::default();
             let mut body_pc = pc + 1;
             while body_pc < exit && body_pc < instructions.len() {
-                let (body_instr, _) = body_state.get(instructions[body_pc]);
+                let (body_instr, body_arg) = body_state.get(instructions[body_pc]);
+                if let I::ForIter { delta } = body_instr {
+                    // Validate the nested body exactly once, under its own
+                    // lexical FOR_ITER.  Scanning it again as part of the
+                    // outer body conflates unrelated calls with its
+                    // LIST_APPEND and declines safe PEP 709 comprehensions.
+                    body_pc = pyre_interpreter::jump_target_forward(
+                        instructions,
+                        body_pc + 1,
+                        delta.get(body_arg).as_usize(),
+                    );
+                    body_state = pyre_interpreter::OpArgState::default();
+                    continue;
+                }
                 let permitted = for_iter_body_op_is_jit_safe(body_instr)
                     || matches!(
                         body_instr,
@@ -11480,6 +11506,23 @@ mod tests {
         let code = function_code_from_module(&module, "f");
 
         assert!(!nested_break_bridge_resume_hazard(&code));
+    }
+
+    #[test]
+    fn nested_comprehension_calls_after_it_stays_jit_safe() {
+        // The inner comprehension owns its call-free LIST_APPEND. Calls after
+        // that loop belong to the outer body and must not retroactively turn
+        // the inner append into a call-bearing comprehension. This is the
+        // nested-loop shape used by test_math.testDist.
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def f(rows, pred, sink):\n    for p in rows:\n        for q in rows:\n            diffs = [x for x in q]\n            if pred(diffs):\n                sink(diffs)\n            elif pred(q):\n                sink(q)\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+
+        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
     }
 
     #[test]

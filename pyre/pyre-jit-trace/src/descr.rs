@@ -3198,6 +3198,54 @@ mod tests {
     }
 
     #[test]
+    fn make_descr_from_bh_items_block_capacity_with_parent_is_canonical() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_translate::jitcode::{BhDescr, BhFieldSpec, BhSizeSpec};
+
+        let capacity = BhFieldSpec {
+            index: 0,
+            field_key: "capacity".into(),
+            name: "ItemsBlock.capacity".into(),
+            offset: 0,
+            field_size: std::mem::size_of::<usize>(),
+            field_type: Type::Int,
+            field_flag: ArrayFlag::Unsigned,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 0,
+        };
+        let parent = BhSizeSpec {
+            size: std::mem::size_of::<usize>(),
+            type_id: 3938139489201595032,
+            vtable: 0,
+            is_gc_managed: true,
+            headerless: false,
+            all_fielddescrs: vec![capacity.clone()],
+        };
+        let descr = make_descr_from_bh(&BhDescr::Field {
+            offset: capacity.offset,
+            field_size: capacity.field_size,
+            field_type: capacity.field_type,
+            field_flag: capacity.field_flag,
+            is_field_signed: capacity.is_field_signed,
+            is_immutable: capacity.is_immutable,
+            is_quasi_immutable: capacity.is_quasi_immutable,
+            index_in_parent: capacity.index_in_parent,
+            parent: Some(parent),
+            name: "capacity".into(),
+            owner: "ItemsBlock".into(),
+        });
+        let canonical = items_block_capacity_descr();
+
+        assert!(
+            std::sync::Arc::ptr_eq(&descr, &canonical),
+            "the build-time parent must not mint a second capacity FieldDescr",
+        );
+        assert_eq!(descr.index(), canonical.index());
+    }
+
+    #[test]
     fn make_descr_from_bh_bridges_codewriter_int_items_leaves_to_group() {
         use majit_ir::descr::ArrayFlag;
         use majit_translate::jitcode::BhDescr;
@@ -4070,6 +4118,20 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     _ => {}
                 }
             }
+            // #171 object-strategy capacity read: `list.obj_capacity` lowers
+            // to getfield_gc_r(items) + getfield_gc_i(block.capacity). The
+            // block's offset-0 GcArray length header IS the allocated
+            // capacity (immutable for the block's lifetime).
+            //
+            // This must precede the generic parent-group lookup. Charon gives
+            // `ItemsBlock.capacity` a real parent, whose local field index is
+            // zero; rebuilding that group would therefore return a distinct
+            // index-0 descriptor. Walker-native list promotion seeds the
+            // capacity under the canonical descriptor's stable index, and
+            // RPython has only one FieldDescr identity for this field.
+            if owner.as_str() == "ItemsBlock" && name.as_str() == "capacity" {
+                return items_block_capacity_descr();
+            }
             if let Some(parent) = parent {
                 if parent.type_id != 0 {
                     let key = majit_ir::descr::LLType::Struct(parent.type_id);
@@ -4093,13 +4155,6 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                         }
                     }
                 }
-            }
-            // #171 object-strategy capacity read: `list.obj_capacity` lowers
-            // to getfield_gc_r(items) + getfield_gc_i(block.capacity). The
-            // block's offset-0 GcArray length header IS the allocated
-            // capacity (immutable for the block's lifetime).
-            if owner.as_str() == "ItemsBlock" && name.as_str() == "capacity" {
-                return items_block_capacity_descr();
             }
             // #171 codewriter descr-bridge: a codewriter-lowered body reads a
             // box payload (`W_IntObject.intval` / `W_BoolObject.intval` /
