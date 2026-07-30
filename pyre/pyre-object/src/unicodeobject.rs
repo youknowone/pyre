@@ -521,13 +521,15 @@ static STRING_INTERN_TABLE: LazyLock<Mutex<HashMap<Wtf8Buf, Box<usize>, Fnv1aBui
 #[majit_macros::dont_look_inside]
 pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
     debug_assert!(unsafe { is_exact_type(obj, &STR_TYPE) });
-    let value = unsafe { w_str_get_wtf8(obj) }.to_owned();
     let mut table = STRING_INTERN_TABLE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(slot) = table.get(&value) {
+    // Look the value up borrowed; only a first-time intern pays for the owned
+    // key.  Re-interning an already-canonical value is the common case.
+    if let Some(slot) = table.get(unsafe { w_str_get_wtf8(obj) }) {
         return **slot as PyObjectRef;
     }
+    let value = unsafe { w_str_get_wtf8(obj) }.to_owned();
 
     let mut slot = Box::new(obj as usize);
     let root_slot = (&mut *slot) as *mut usize as *mut *mut u8;
