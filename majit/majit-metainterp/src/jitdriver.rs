@@ -2666,6 +2666,15 @@ impl<S: JitState> JitDriver<S> {
                                     self.meta.take_bridge_info();
                                     // Fall through — do NOT return.
                                 }
+                                // pyjitpl.py:3220 raise_if_successful() does not
+                                // raise on a None target token, so the trace is
+                                // not given up: fall through to compile_loop the
+                                // way reached_loop_header falls into its
+                                // merge-point scan.
+                                crate::pyjitpl::BridgeCompileResult::Declined => {
+                                    self.meta.take_bridge_info();
+                                    // Fall through — do NOT return.
+                                }
                                 crate::pyjitpl::BridgeCompileResult::Failed => {
                                     self.meta.abort_trace(false);
                                     self.sym = None;
@@ -2830,6 +2839,15 @@ impl<S: JitState> JitDriver<S> {
                             // partial_trace is set on MetaInterp. Fall through
                             // to compile_loop → compile_retrace in same call.
                             crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
+                                self.meta.take_bridge_info();
+                                // Fall through — do NOT return.
+                            }
+                            // pyjitpl.py:3220 raise_if_successful() does not
+                            // raise on a None target token, so the trace is not
+                            // given up: fall through to compile_loop the way
+                            // reached_loop_header falls into its merge-point
+                            // scan.
+                            crate::pyjitpl::BridgeCompileResult::Declined => {
                                 self.meta.take_bridge_info();
                                 // Fall through — do NOT return.
                             }
