@@ -1548,7 +1548,11 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     // scoped to the top-level caller (`compute_inline_caller_frame`) for now, so
     // pass an empty jitcode here — a nested try-block CALL keeps declining
     // (its catch-marker resume is not yet routed through the deeper snapshot).
-    decline_inline_caller_frame_for_catch_marker(after_residual_call_resume, &[], callee_has_freevars)?;
+    decline_inline_caller_frame_for_catch_marker(
+        after_residual_call_resume,
+        &[],
+        callee_has_freevars,
+    )?;
     let legacy_fallthrough_py_pc = || unsafe {
         let call_py = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
         let code = &*pjc.code_ptr;

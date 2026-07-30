@@ -1551,6 +1551,19 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // `pyframe.py:80 escaped` and its neighbours live in one `u8`, so
+            // the traced `mark_as_escaped` is a byte-wide read-or-write, not a
+            // word store.  Appended last: the accessors above address this
+            // group by index.
+            (
+                "PyFrame.flags",
+                crate::frame_layout::PYFRAME_FLAGS_OFFSET,
+                std::mem::size_of::<u8>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
         ],
         "PyFrame",
         "pyframe::PyFrame",
@@ -2719,6 +2732,17 @@ pub fn pytraceback_field_descr(index: usize) -> DescrRef {
     field_descr_from_group(&PYTRACEBACK_DESCR_GROUP, index)
 }
 
+/// Field descriptor for `PyTraceback.frame`, the node's own frame slot read by
+/// `descr_get_tb_frame`.
+pub fn pytraceback_frame_descr() -> DescrRef {
+    let index = PYTRACEBACK_DESCR_GROUP
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == pyre_interpreter::pytraceback::PYTRACEBACK_FRAME_OFFSET)
+        .expect("PyTraceback descr group has no frame field");
+    field_descr_from_group(&PYTRACEBACK_DESCR_GROUP, index)
+}
+
 /// Field descriptor for `PyTraceback.w_next`, the chain link `descr_get_next`
 /// reads.  Located by offset rather than by a hand-counted position, so a
 /// later edit to the field list above cannot silently repoint this at a
@@ -2926,6 +2950,18 @@ pub fn pyframe_w_yielding_from_descr() -> DescrRef {
 
 pub fn pyframe_f_backref_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 10)
+}
+
+/// `PyFrame.flags` — the byte carrying `FLAG_ESCAPED`.  Read-or-written by the
+/// traced `tb_frame` fold to reproduce the getter's `mark_as_escaped()`.
+/// Located by offset, so appending another field cannot repoint it.
+pub fn pyframe_flags_descr() -> DescrRef {
+    let index = PYFRAME_DESCR_GROUP
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == crate::frame_layout::PYFRAME_FLAGS_OFFSET)
+        .expect("PyFrame descr group has no flags field");
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, index)
 }
 
 #[cfg(test)]

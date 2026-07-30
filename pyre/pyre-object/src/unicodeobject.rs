@@ -497,7 +497,11 @@ pub struct Fnv1aHasher(u64);
 
 impl std::hash::Hasher for Fnv1aHasher {
     fn write(&mut self, bytes: &[u8]) {
-        let mut h = if self.0 == 0 { 0xcbf2_9ce4_8422_2325 } else { self.0 };
+        let mut h = if self.0 == 0 {
+            0xcbf2_9ce4_8422_2325
+        } else {
+            self.0
+        };
         for b in bytes {
             h ^= *b as u64;
             h = h.wrapping_mul(0x0000_0100_0000_01b3);

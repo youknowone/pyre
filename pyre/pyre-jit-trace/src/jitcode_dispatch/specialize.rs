@@ -1884,6 +1884,159 @@ fn walker_guard_specialised_pair_class<Sym: WalkSym>(
     Ok(())
 }
 
+/// One hop of a `while tb is not None: names.append(tb.tb_frame.f_code.co_name);
+/// tb = tb.tb_next` traceback walk.
+///
+/// Each of these is a `GetSetProperty` whose getter body is a single slot read
+/// on a receiver [`walker_specialize_traceback_walk_field`] pins by class:
+/// `pytraceback.py descr_get_next` / `descr_get_tb_frame` and `pyframe.py`
+/// `fget_code`.  None of them dispatches anywhere or can raise.  Left residual,
+/// every hop of the walk costs a forcing call, which is what makes each
+/// traceback fixture dominated by the walk rather than by the raise.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TracebackWalkField {
+    /// `tb.tb_next` — the chain link; a null slot is the terminator and
+    /// surfaces as `None`.
+    TbNext,
+    /// `tb.tb_frame` — the node's frame.  Unlike its two siblings the getter
+    /// ALSO runs `mark_as_escaped()`; see the escape emit.
+    TbFrame,
+    /// `frame.f_code` — `fget_f_code` is `self.pycode as PyObjectRef`.
+    FCode,
+}
+
+/// Which walk hop, if any, this `(receiver, attribute)` pair is.
+fn traceback_walk_field(
+    concrete_obj: pyre_object::PyObjectRef,
+    name: &str,
+) -> Option<TracebackWalkField> {
+    let ob_type = unsafe { (*concrete_obj).ob_type };
+    if std::ptr::eq(ob_type, &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE) {
+        return match name {
+            "tb_next" => Some(TracebackWalkField::TbNext),
+            "tb_frame" => Some(TracebackWalkField::TbFrame),
+            _ => None,
+        };
+    }
+    if std::ptr::eq(ob_type, &pyre_interpreter::pyframe::FRAME_TYPE) && name == "f_code" {
+        return Some(TracebackWalkField::FCode);
+    }
+    None
+}
+
+/// Emit one traceback-walk hop as a guarded inline field read instead of the
+/// opaque `getattr_fn` residual.
+///
+/// Returns `None` (fall through to the residual) BEFORE recording any guard for
+/// every shape it cannot settle — an uncacheable `version_tag`, or a null slot
+/// on a hop whose null is not a documented value.  A bail-out after a guard
+/// would leave the caller reading the attribute as already pinned.
+fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    field: TracebackWalkField,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    use pyre_interpreter::pyframe::PyFrame;
+
+    let (receiver_type, descr, stored) = match field {
+        TracebackWalkField::TbNext => (
+            &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE,
+            crate::descr::pytraceback_w_next_descr(),
+            unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_w_next(concrete_obj) },
+        ),
+        TracebackWalkField::TbFrame => (
+            &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE,
+            crate::descr::pytraceback_frame_descr(),
+            unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_frame(concrete_obj) }
+                as pyre_object::PyObjectRef,
+        ),
+        TracebackWalkField::FCode => (
+            &pyre_interpreter::pyframe::FRAME_TYPE,
+            crate::descr::pyframe_code_descr(),
+            unsafe { (*(concrete_obj as *const PyFrame)).pycode } as pyre_object::PyObjectRef,
+        ),
+    };
+    // Only `tb_next` has a null with a defined meaning.  A null frame is a
+    // torn-down traceback and a null `pycode` a half-built frame; both are
+    // answered by a `sys.namespace` stub or `None` the residual owns.
+    if stored.is_null() && field != TracebackWalkField::TbNext {
+        return Ok(None);
+    }
+    let w_type = pyre_interpreter::typedef::gettypeobject(receiver_type);
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
+    if version_tag == 0 {
+        return Ok(None);
+    }
+    // The slot guard pins the receiver's `w_class` against `w_type`.  A frame
+    // built before `init_typeobjects` carries a null `w_class`, which would
+    // make that guard fail on its first execution, so decline instead of
+    // recording a doomed trace.
+    if unsafe { (*concrete_obj).w_class } != w_type {
+        return Ok(None);
+    }
+
+    walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+    let raw_value = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, descr);
+    let value = if stored.is_null() {
+        // End of the chain.  There is no is-null guard opcode, so pin the
+        // slot against the null constant the way the exception `w_dict`
+        // shadow guard does, then produce the None the getter returns.
+        let null_const = ctx.trace_ctx.const_ref(0);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op_pc,
+            OpCode::GuardValue,
+            &[raw_value, null_const],
+        )?;
+        ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
+    } else {
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[raw_value])?;
+        ctx.trace_ctx.set_opref_concrete(
+            raw_value,
+            majit_ir::Value::Ref(majit_ir::GcRef(stored as usize)),
+        );
+        raw_value
+    };
+
+    if field == TracebackWalkField::TbFrame {
+        // `descr_get_tb_frame` also runs `frame.mark_as_escaped()`
+        // (`pyframe.py:176 mark_as_escaped`): the reference it hands out has to
+        // keep the frame materialised.  `set_escaped` ORs `FLAG_ESCAPED` into
+        // the `flags` byte, so the trace reads that byte, sets the bit, and
+        // stores it back.
+        //
+        // The bit has to be set BY THE TRACE, not only stamped now: the trace
+        // is reused, and each replay walks a different traceback naming a
+        // different frame, so a trace-time-only mark would leave every later
+        // frame unmarked.  The concrete write below is the one the
+        // authoritative walk's residual executor would have performed, applied
+        // here for the same reason `try_walker_lower_exc_info_residual` applies
+        // its own.
+        let flags_descr = crate::descr::pyframe_flags_descr();
+        let live_flags =
+            crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, raw_value, flags_descr.clone());
+        let escaped_bit = ctx.trace_ctx.const_int(i64::from(PyFrame::FLAG_ESCAPED));
+        let new_flags = ctx
+            .trace_ctx
+            .record_op(OpCode::IntOr, &[live_flags, escaped_bit]);
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetfieldGc,
+            &[raw_value, new_flags],
+            flags_descr.clone(),
+        );
+        ctx.trace_ctx
+            .heapcache_setfield_cached(raw_value, flags_descr.index(), new_flags);
+        unsafe { (*(stored as *mut PyFrame)).mark_as_escaped() };
+    }
+
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+    Ok(Some(()))
+}
+
 /// `mapdict.py LOAD_ATTR_caching` full-body-walker fast path for a
 /// plain (non-method) instance attribute.  When the concrete receiver is a
 /// monomorphic instance whose attribute resolves to a boxed plain storage slot
@@ -1958,53 +2111,18 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
-    // `pytraceback.py:51-53 descr_get_next` reads `w_next` and surfaces the
-    // null chain terminator as None; it marks nothing escaped and cannot
-    // raise, so the whole getter is the field read below.  Left residual, one
-    // `tb.tb_next` step costs two forcing calls, which is what makes a
-    // `while tb is not None: tb = tb.tb_next` walk dominate every traceback
-    // fixture.
-    if name == "tb_next"
-        && std::ptr::eq(
-            unsafe { (*concrete_obj).ob_type },
-            &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE,
-        )
-    {
-        let w_type =
-            pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::pytraceback::PYTRACEBACK_TYPE);
-        let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
-        if version_tag == 0 {
-            return Ok(None);
-        }
-        let stored = unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_w_next(concrete_obj) };
-        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
-        let raw_value = crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
+    if let Some(walk_field) = traceback_walk_field(concrete_obj, &name) {
+        if let Some(()) = walker_specialize_traceback_walk_field(
+            ctx,
+            op_pc,
             obj,
-            crate::descr::pytraceback_w_next_descr(),
-        );
-        let value = if stored.is_null() {
-            // End of the chain.  There is no is-null guard opcode, so pin the
-            // slot against the null constant the way the exception `w_dict`
-            // shadow guard does, then produce the None the getter returns.
-            let null_const = ctx.trace_ctx.const_ref(0);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardValue,
-                &[raw_value, null_const],
-            )?;
-            ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
-        } else {
-            walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[raw_value])?;
-            ctx.trace_ctx.set_opref_concrete(
-                raw_value,
-                majit_ir::Value::Ref(majit_ir::GcRef(stored as usize)),
-            );
-            raw_value
-        };
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
-        return Ok(Some(()));
+            concrete_obj,
+            walk_field,
+            dst,
+            dst_bank,
+        )? {
+            return Ok(Some(()));
+        }
     }
 
     if let Some((slot, kind, w_type, version_tag, stored)) = unsafe {
@@ -2421,7 +2539,11 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
             ctx.trace_ctx.const_int(map as i64),
         ),
         ShadowGuard::ExceptionDictIsNull(kind) => (
-            walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_exception_dict_descr(kind)),
+            walker_record_getfield_gc_r_uncached(
+                ctx,
+                obj,
+                crate::descr::w_exception_dict_descr(kind),
+            ),
             ctx.trace_ctx.const_ref(0),
         ),
     };

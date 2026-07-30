@@ -2004,8 +2004,8 @@ pub(crate) fn fbw_callee_body_replay_safety(
             // A `COMPARE_OP` over the same proven operands is accepted for the
             // same reason, but its result is a `bool`, not an operand the
             // numeric provenance below may chain on.
-            let accepted_binop = accepted_numeric_op
-                && ei.pyre_helper == majit_ir::PyreHelperKind::BinaryOp;
+            let accepted_binop =
+                accepted_numeric_op && ei.pyre_helper == majit_ir::PyreHelperKind::BinaryOp;
             // `CHECK_EXC_MATCH` shares the `COMPARE_OP` shape but reads only
             // types, so it needs no operand proof at all.
             let accepted_exc_match = !provably_side_effect_free
@@ -2077,6 +2077,7 @@ pub(crate) fn fbw_callee_body_replay_safety(
                         | majit_ir::PyreHelperKind::CallFunctionEx
                         | majit_ir::PyreHelperKind::RaiseVarargs
                         | majit_ir::PyreHelperKind::SetCurrentException
+                        | majit_ir::PyreHelperKind::LoadAttr
                 ) {
                     deferred_call = true;
                     // The callee this resolves to is a runtime value, so what it

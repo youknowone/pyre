@@ -7035,9 +7035,10 @@ fn reconstruct_inline_recipe(
             else {
                 decline!("FrameVirtualNotStruct");
             };
-            let Some(arr_field_idx) = fielddescrs.iter().position(|fd| {
-                fd.offset == crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET
-            }) else {
+            let Some(arr_field_idx) = fielddescrs
+                .iter()
+                .position(|fd| fd.offset == crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            else {
                 decline!("NoLocalsArrayField");
             };
             let Some(&arr_fieldnum) = fieldnums.get(arr_field_idx) else {

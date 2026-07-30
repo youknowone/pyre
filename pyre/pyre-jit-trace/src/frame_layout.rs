@@ -17,6 +17,11 @@ pub const PYFRAME_LOCALS_CELLS_STACK_OFFSET: usize =
 /// Byte offset of `pycode` in `PyFrame`.
 pub const PYFRAME_PYCODE_OFFSET: usize = std::mem::offset_of!(PyFrame, pycode);
 
+/// Byte offset of `flags` in `PyFrame` — the `u8` holding `FLAG_ESCAPED`
+/// (`pyframe.py:80 escaped`).  A traced `tb_frame` read has to set that bit
+/// the way the getter's `mark_as_escaped()` does.
+pub const PYFRAME_FLAGS_OFFSET: usize = std::mem::offset_of!(PyFrame, flags);
+
 /// Byte offset of `debugdata` in `PyFrame`.
 pub const PYFRAME_DEBUGDATA_OFFSET: usize = std::mem::offset_of!(PyFrame, debugdata);
 

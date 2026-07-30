@@ -2688,10 +2688,7 @@ pub(crate) fn find_catch_for_exc_resume(code: &[u8], resume_live_pos: usize) -> 
 /// that coordinate, so the same scan walks straight past the catch. Read
 /// forward for those callers: when `resume_live_pos` is a `-live-` whose very
 /// next op is a `catch_exception`, that catch is the one guarding the op.
-pub(crate) fn catch_target_after_resume_live(
-    code: &[u8],
-    resume_live_pos: usize,
-) -> Option<usize> {
+pub(crate) fn catch_target_after_resume_live(code: &[u8], resume_live_pos: usize) -> Option<usize> {
     let live = decode_op_at(code, resume_live_pos)?;
     if live.key != "live/" {
         return None;
