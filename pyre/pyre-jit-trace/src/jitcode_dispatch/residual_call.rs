@@ -238,27 +238,6 @@ pub(crate) fn latch_trace_too_long_blackhole<Sym: WalkSym>(
     }
 }
 
-/// `PYRE_FBW_BLACKHOLE_RESUME` (default ON) — a top-level one-frame walk whose
-/// residual forced the vable and writes live heap resumes PAST the escaping
-/// opcode through the blackhole instead of falling back to escape/replay.  Both
-/// the latch (`writes_live_heap`, odometer unchanged, non-bridge, empty
-/// framestack, no committed escape pc, resolvable snapshot sym) and the adopt
-/// (`try_adopt_single_frame_blackhole` → `apply_single_frame_blackhole_crn`,
-/// which validates every mapped color and every live operand-stack slot before
-/// writing anything) decline to the pre-existing path on any unmet condition,
-/// so the flip only ever replaces a replay that would have produced the same
-/// state.  `=0`/`false` opts back out.
-fn single_frame_blackhole_resume_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_BLACKHOLE_RESUME") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
 fn build_single_frame_miframe<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     jitcode: std::sync::Arc<majit_metainterp::jitcode::JitCode>,
@@ -2445,10 +2424,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             }
             if fbw_debug_abort_enabled() && ctx.fbw_mode.inline_subwalk {
                 eprintln!(
-                    "[s2-gate] inline_subwalk fs={} flag={} writes_live={} odo_unchanged={} \
+                    "[s2-gate] inline_subwalk fs={} writes_live={} odo_unchanged={} \
                      committed_none={} not_bridge={} bh_result_some={} sym_nonnull={}",
                     ctx.session.borrow().framestack.len(),
-                    single_frame_blackhole_resume_enabled(),
                     writes_live_heap,
                     odometer_unchanged,
                     committed_frame_escape_pc().is_none(),
@@ -2457,8 +2435,18 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     !ctx.fbw_mode.snapshot_sym.is_null(),
                 );
             }
-            if single_frame_blackhole_resume_enabled()
-                && writes_live_heap
+            // A top-level one-frame walk whose residual forced the vable and
+            // writes live heap resumes PAST the escaping opcode through the
+            // blackhole instead of falling back to escape/replay. Both the
+            // latch (`writes_live_heap`, odometer unchanged, non-bridge, empty
+            // framestack, no committed escape pc, resolvable snapshot sym) and
+            // the adopt (`try_adopt_single_frame_blackhole` →
+            // `apply_single_frame_blackhole_crn`, which validates every mapped
+            // color and every live operand-stack slot before writing anything)
+            // decline to the pre-existing path on any unmet condition, so this
+            // only ever replaces a replay that would have produced the same
+            // state.
+            if writes_live_heap
                 && odometer_unchanged
                 && !ctx.trace_ctx.is_bridge_trace
                 && let Some((resume_pc, result_bank, result_color)) = blackhole_result
