@@ -1951,6 +1951,19 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         } else {
             crate::front::bool_then::rewire_bool_then_call_sites(&mut lo.graph, &lo.bool_then_sites)
         };
+        // The `<[T]>::first(slice)` length-checked `Option<&T>` diamond rewrite
+        // (`front::slice_first`) splits the residual `first` call block into a
+        // guarded `Some`/`None` diamond (`if len(slice) > 0`), same post-lowering
+        // shape and fail-safe contract as `bool::then`; gate the reachability
+        // sweep on an actual rewrite.
+        let slice_first_rewritten = if lo.slice_first_sites.is_empty() {
+            0
+        } else {
+            crate::front::slice_first::rewire_slice_first_call_sites(
+                &mut lo.graph,
+                &lo.slice_first_sites,
+            )
+        };
         // The `Option::unwrap_or` value-select rewrite
         // (`front::option_unwrap_or`) splits the residual `unwrap_or` call
         // block into a `__discriminant` diamond, same post-lowering shape and
@@ -2039,6 +2052,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || checked_arith_rewritten > 0
             || option_try_stats.rewritten > 0
             || bool_then_rewritten > 0
+            || slice_first_rewritten > 0
             || unwrap_or_rewritten > 0
             || unwrap_rewritten > 0
             || map_or_rewritten > 0
@@ -2423,6 +2437,11 @@ struct Lowering<'a> {
     /// resolved ctor/method owners the arms need (see
     /// [`crate::front::bool_then::BoolThenSite`]).
     bool_then_sites: Vec<crate::front::bool_then::BoolThenSite>,
+    /// `<[T]>::first(slice)` call sites recorded for the length-checked
+    /// `Option<&T>` diamond the `front::slice_first` post-pass synthesizes
+    /// after the body lowering completes (see
+    /// [`crate::front::slice_first::SliceFirstSite`]).
+    slice_first_sites: Vec<crate::front::slice_first::SliceFirstSite>,
     /// `RangeInclusive::new(lo, hi)` call sites recorded for the
     /// `(a..=b).contains(&x)` → `bitand(le, ge)` fold the
     /// `front::range_contains` post-pass synthesizes (see
@@ -2646,6 +2665,7 @@ impl<'a> Lowering<'a> {
             checked_arith_call_results: Vec::new(),
             option_try_sites: Vec::new(),
             bool_then_sites: Vec::new(),
+            slice_first_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
             range_contains_sites: Vec::new(),
@@ -5902,7 +5922,11 @@ impl<'a> Lowering<'a> {
     /// fold in [`Self::lower_call`].  `None` for a non-ADT type argument
     /// (primitive / pointer / tuple, which has no `TypeDecl` layout to read)
     /// or a layout Charon left unresolved.
-    fn size_align_const_from_tyexpr(&self, want_align: bool, ty: &serde_json::Value) -> Option<i64> {
+    fn size_align_const_from_tyexpr(
+        &self,
+        want_align: bool,
+        ty: &serde_json::Value,
+    ) -> Option<i64> {
         let adt = self.resolve_tyexpr_to_adt_def_id(ty)?;
         // Read the layout for the build's `TARGET` (empty for the host
         // extraction target), matching the target-aware field-offset lookup
@@ -5910,7 +5934,11 @@ impl<'a> Lowering<'a> {
         // size, not the host's.
         let target = std::env::var("TARGET").unwrap_or_default();
         let layout = self.llbc.type_by_id(adt)?.layout_for_target(&target)?;
-        let value = if want_align { layout.align } else { layout.size }?;
+        let value = if want_align {
+            layout.align
+        } else {
+            layout.size
+        }?;
         Some(value as i64)
     }
 
@@ -8117,6 +8145,23 @@ impl<'a> Lowering<'a> {
         {
             self.bool_then_sites.push(site);
         }
+        // Capture `<[T]>::first(slice)` sites for the length-checked
+        // `Option<&T>` diamond `front::slice_first` synthesizes.  `first` is a
+        // foreign leaf (its `Self` is the primitive slice `[T]`, so `lower_call`
+        // keeps the raw `FunctionPath` segments), residualized as an
+        // unregistered callee the rtyper census Skips; a resolution miss leaves
+        // the residual call.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && fmt_path_ends_with(segments, &["slice", "<Impl>", "first"])
+            && let Some(site) = self.recognize_slice_first_site(&call.dest.ty, &result_var)
+        {
+            self.slice_first_sites.push(site);
+        }
         // Capture `RangeInclusive::new(lo, hi)` sites for the
         // `(a..=b).contains(&x)` fold `front::range_contains` synthesizes.
         // `new` is an inherent-impl associated function whose owner
@@ -10091,6 +10136,31 @@ impl<'a> Lowering<'a> {
         Some(crate::front::bool_then::BoolThenSite {
             result_var: result_var.clone(),
             call_once_owner: None,
+            option_owner,
+            some_owner,
+            payload_ty,
+        })
+    }
+
+    /// Resolve a recognized `<[T]>::first(slice)` call into a
+    /// [`crate::front::slice_first::SliceFirstSite`] — the `Option` enum root +
+    /// `Some` variant owners the length-checked diamond post-pass spells its
+    /// arms with.  Gated on [`Self::option_residual_narrow_root`] returning
+    /// `Some`: that is exactly the shape `lower_call` appends a trailing
+    /// `__pyre_cast_instance` narrowing to (the cast the post-pass absorbs and
+    /// re-applies per arm), and it declines a value-slice `Option<u8>` /
+    /// `Option<i64>` (no registered pointee root) cleanly, leaving the residual
+    /// call for the census Skip.  `None` when the destination is not a
+    /// resolvable narrow-root `Option`.
+    fn recognize_slice_first_site(
+        &self,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::slice_first::SliceFirstSite> {
+        self.option_residual_narrow_root(dest_ty)?;
+        let (option_owner, some_owner, payload_ty) = self.resolve_bool_then_option_dest(dest_ty)?;
+        Some(crate::front::slice_first::SliceFirstSite {
+            result_var: result_var.clone(),
             option_owner,
             some_owner,
             payload_ty,

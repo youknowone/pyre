@@ -1749,7 +1749,14 @@ fn pair_abstract_string_rtype_compare(
         ConvertedTo::Repr(r0_arc.as_ref()),
         ConvertedTo::Repr(r1_arc.as_ref()),
     ])?;
-    string_compare_tail(hop, func, vlist, ptr_lltype, eq_helper_name, cmp_helper_name)
+    string_compare_tail(
+        hop,
+        func,
+        vlist,
+        ptr_lltype,
+        eq_helper_name,
+        cmp_helper_name,
+    )
 }
 
 /// Lower an already-coerced `(v_str1, v_str2)` string pair to the compare

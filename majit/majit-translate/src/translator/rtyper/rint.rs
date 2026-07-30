@@ -435,7 +435,7 @@ impl Repr for IntegerRepr {
     /// supplies the per-width `ll_int2dec` helper graph and calls it.
     fn rtype_str(&self, hop: &HighLevelOp) -> RTypeResult {
         use crate::translator::rtyper::lltypesystem::rstr::{
-            build_ll_int2dec_helper_graph, STRPTR,
+            STRPTR, build_ll_int2dec_helper_graph,
         };
         let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
         // The helper graph's input block is Signed for the signed

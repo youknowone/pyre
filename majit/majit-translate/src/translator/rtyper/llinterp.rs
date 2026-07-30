@@ -31,7 +31,7 @@ use crate::tool::ansi_print::AnsiLogger;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _address, _ptr, malloc, LowLevelType, LowLevelValue, MallocFlavor,
+    _address, _ptr, LowLevelType, LowLevelValue, MallocFlavor, malloc,
 };
 use crate::translator::rtyper::rtyper::RPythonTyper;
 use crate::translator::tool::taskengine::TaskError;
@@ -845,10 +845,13 @@ impl LLFrame {
                 let divisor = vals[1].as_i64(opname)? as u64;
                 if divisor == 0 {
                     return Err(TaskError {
-                        message: "opimpl.py op_uint_floordiv: unsigned division by zero".to_string(),
+                        message: "opimpl.py op_uint_floordiv: unsigned division by zero"
+                            .to_string(),
                     });
                 }
-                Ok(LLValue::Int(((vals[0].as_i64(opname)? as u64) / divisor) as i64))
+                Ok(LLValue::Int(
+                    ((vals[0].as_i64(opname)? as u64) / divisor) as i64,
+                ))
             }
             "uint_mod" => {
                 let divisor = vals[1].as_i64(opname)? as u64;
@@ -857,7 +860,9 @@ impl LLFrame {
                         message: "opimpl.py op_uint_mod: unsigned modulo by zero".to_string(),
                     });
                 }
-                Ok(LLValue::Int(((vals[0].as_i64(opname)? as u64) % divisor) as i64))
+                Ok(LLValue::Int(
+                    ((vals[0].as_i64(opname)? as u64) % divisor) as i64,
+                ))
             }
             // `op_uint_is_true` (opimpl.py, `is_true` template): the word is
             // true iff nonzero — sign-interpretation-independent.
@@ -902,8 +907,9 @@ impl LLFrame {
                     _ => MallocFlavor::Gc,
                 };
                 let n = vals[2].as_i64(opname)? as usize;
-                let ptr = malloc((**t).clone(), Some(n), flavor, false)
-                    .map_err(|e| TaskError { message: format!("{opname}: {e}") })?;
+                let ptr = malloc((**t).clone(), Some(n), flavor, false).map_err(|e| TaskError {
+                    message: format!("{opname}: {e}"),
+                })?;
                 Ok(LLValue::Ptr(Box::new(ptr)))
             }
             "setfield" => {
@@ -919,7 +925,9 @@ impl LLFrame {
                 };
                 let mut ptr = (**p).clone();
                 ptr.setattr(field, llvalue_to_lowlevel(&vals[2], opname)?)
-                    .map_err(|e| TaskError { message: format!("{opname}: {e}") })?;
+                    .map_err(|e| TaskError {
+                        message: format!("{opname}: {e}"),
+                    })?;
                 Ok(LLValue::Void)
             }
             "getsubstruct" => {
@@ -939,19 +947,21 @@ impl LLFrame {
                 // container inlined into a Gc parent (`rpy_string.chars`);
                 // materialise that into a plain container `_ptr` so the
                 // array op handlers can read/write through it.
-                let sub = match p
-                    .getattr(field)
-                    .map_err(|e| TaskError { message: format!("{opname}: {e}") })?
-                {
+                let sub = match p.getattr(field).map_err(|e| TaskError {
+                    message: format!("{opname}: {e}"),
+                })? {
                     LowLevelValue::Ptr(pt) => *pt,
                     LowLevelValue::InteriorPtr(ip) => {
-                        ip._as_container_ptr(p._solid)
-                            .map_err(|e| TaskError { message: format!("{opname}: {e}") })?
+                        ip._as_container_ptr(p._solid).map_err(|e| TaskError {
+                            message: format!("{opname}: {e}"),
+                        })?
                     }
                     other => {
                         return Err(TaskError {
-                            message: format!("{opname}: field {field:?} is not a container: {other:?}"),
-                        })
+                            message: format!(
+                                "{opname}: field {field:?} is not a container: {other:?}"
+                            ),
+                        });
                     }
                 };
                 Ok(LLValue::Ptr(Box::new(sub)))
@@ -965,7 +975,9 @@ impl LLFrame {
                 let index = vals[1].as_i64(opname)? as usize;
                 let mut ptr = (**p).clone();
                 ptr.setitem(index, llvalue_to_lowlevel(&vals[2], opname)?)
-                    .map_err(|e| TaskError { message: format!("{opname}: {e}") })?;
+                    .map_err(|e| TaskError {
+                        message: format!("{opname}: {e}"),
+                    })?;
                 Ok(LLValue::Void)
             }
             _ => Err(TaskError {
@@ -1402,8 +1414,11 @@ mod tests {
                 char_array.clone(),
             ))))
         };
-        let flavor_c =
-            || Hlvalue::Constant(FlowConstant::new(ConstValue::Dict(std::collections::HashMap::new())));
+        let flavor_c = || {
+            Hlvalue::Constant(FlowConstant::new(ConstValue::Dict(
+                std::collections::HashMap::new(),
+            )))
+        };
         let int_c = |n: i64| Hlvalue::Constant(FlowConstant::new(ConstValue::Int(n)));
 
         let arr = Variable::named("arr");

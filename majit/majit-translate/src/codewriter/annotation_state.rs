@@ -69,9 +69,9 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
         // seeds a string attr that unions cleanly with the value written
         // to it instead of the classdef-less `SomeInstance(None)` the
         // `Ref` fallback yields.
-        ValueType::Str => Some(SomeValue::String(
-            crate::annotator::model::SomeString::new(false, false),
-        )),
+        ValueType::Str => Some(SomeValue::String(crate::annotator::model::SomeString::new(
+            false, false,
+        ))),
         ValueType::Ref(_) => {
             // RPython typed pointers lift to `SomePtr(ll_ptrtype)`
             // (`llannotation.py:64-70`), but the correct Ptr must come

@@ -729,7 +729,9 @@ impl<'a> Transformer<'a> {
             ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => {
                 crate::codewriter::type_state::ConcreteType::Signed
             }
-            ValueType::Ref(_) | ValueType::Str => crate::codewriter::type_state::ConcreteType::GcRef,
+            ValueType::Ref(_) | ValueType::Str => {
+                crate::codewriter::type_state::ConcreteType::GcRef
+            }
             ValueType::Float => crate::codewriter::type_state::ConcreteType::Float,
             ValueType::Void => crate::codewriter::type_state::ConcreteType::Void,
             ValueType::Unknown | ValueType::Int128 | ValueType::UInt128 => return,

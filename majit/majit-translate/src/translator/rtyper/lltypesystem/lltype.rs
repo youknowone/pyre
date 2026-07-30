@@ -3664,7 +3664,7 @@ impl _interior_ptr {
             other => {
                 return Err(format!(
                     "interior pointer target is not a container: {other:?}"
-                ))
+                ));
             }
         };
         Ok(ptr_obj._as_ptr(solid))
