@@ -605,12 +605,14 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     }
     // Emit the sign-stable badness counters under MAJIT_STATS (the same env
     // check.py sets for every backend), so the regression floor gates wasm on
-    // loops_aborted / internal_compile_panics like the native backends. Kept
-    // separate from the verbose PYRE_WASM_JIT_STATS block above and emitted
-    // last, so under check.py (MAJIT_STATS only) this is the single [jit-stats]
-    // line the snapshot picks up. The exports read 0 on an old module that
-    // predates them, which is the healthy value, so a stale runner degrades
-    // safely rather than reporting a false regression.
+    // the same fields as the native backends. Kept separate from the verbose
+    // PYRE_WASM_JIT_STATS block above; which line they land on no longer
+    // matters, since check.py merges every [jit-stats] line into one snapshot.
+    // The exports read 0 on an old module that predates them, which is the
+    // healthy value, so a stale runner degrades safely rather than reporting a
+    // false regression — but that also means this line is the ONLY thing
+    // standing between a wasm-only descr-universe regression and a green gate,
+    // because a field absent from the current run is read as zero.
     if std::env::var_os("MAJIT_STATS").is_some() {
         let loops_aborted = instance
             .get_typed_func::<(), u64>(&mut store, "pyre_jit_loops_aborted")
@@ -620,9 +622,23 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
             .get_typed_func::<(), u64>(&mut store, "pyre_jit_internal_compile_panics")
             .and_then(|f| f.call(&mut store, ()))
             .unwrap_or(0);
+        let mut counter = |name| {
+            instance
+                .get_typed_func::<(), u64>(&mut store, name)
+                .and_then(|f| f.call(&mut store, ()))
+                .unwrap_or(0)
+        };
+        let descr_set_resolved = counter("pyre_jit_descr_set_resolved");
+        let descr_set_absent = counter("pyre_jit_descr_set_absent");
+        let descr_set_ambiguous = counter("pyre_jit_descr_set_ambiguous");
+        let descr_set_stale_absent = counter("pyre_jit_descr_set_stale_absent");
         eprintln!(
             "[jit-stats] loops_aborted={loops_aborted} \
-             internal_compile_panics={internal_compile_panics}"
+             internal_compile_panics={internal_compile_panics} \
+             descr_set_resolved={descr_set_resolved} \
+             descr_set_absent={descr_set_absent} \
+             descr_set_ambiguous={descr_set_ambiguous} \
+             descr_set_stale_absent={descr_set_stale_absent}"
         );
     }
     let packed = match run_result {

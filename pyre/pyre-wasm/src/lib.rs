@@ -355,6 +355,43 @@ pub extern "C" fn pyre_jit_internal_compile_panics() -> u64 {
         .internal_compile_panics as u64
 }
 
+/// The descr-universe invariants, the remaining `JITSTATS_BADNESS_FIELDS`. The
+/// native backends print these from `descr_set_jit_stats`; the guest has no
+/// stderr, so it exports the counts and the runner prints the line. Without
+/// these the regression floor read every one as 0 on wasm — a missing field is
+/// read as absent-and-therefore-zero — so a wasm-only rise passed the gate.
+///
+/// `stale_absent` re-asks the `AbsentContainer` question against the universe as
+/// it now stands, so it is only meaningful once the run has published
+/// everything; the runner calls these after the guest's entry point returns.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_descr_set_absent() -> u64 {
+    pyre_jit::descr_set_counts().absent
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_descr_set_ambiguous() -> u64 {
+    pyre_jit::descr_set_counts().ambiguous
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_descr_set_stale_absent() -> u64 {
+    pyre_jit::descr_set_counts().stale_absent
+}
+
+/// The denominator, so a wasm run that resolves nothing cannot read the same as
+/// one that resolves everything. Host-dependent, hence excluded from the
+/// committed snapshot (`JITSTATS_SNAPSHOT_FIELDS`) — it is reported for
+/// diagnosis, not gated.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_descr_set_resolved() -> u64 {
+    pyre_jit::descr_set_counts().resolved
+}
+
 #[cfg(any(feature = "web", feature = "wasm-host"))]
 static PANIC_HOOK: Once = Once::new();
 
