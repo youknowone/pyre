@@ -1260,34 +1260,56 @@ impl GcCache {
         let expected_index_in_parent =
             Self::find_index_in_parent(parent.as_ref(), field_name).unwrap_or(index_in_parent);
         // descr.py:220-221: cache[STRUCT][fieldname]
-        if let Some(inner) = self._cache_field.get(&struct_key) {
-            if let Some(descr) = inner.get(field_name) {
-                debug_assert!(
-                    descr.describes_same_field(
-                        offset,
-                        field_size,
-                        field_type,
-                        is_immutable,
-                        is_quasi_immutable,
-                        virtualizable,
-                        expected_index_in_parent,
-                    ),
-                    "get_field_descr cache hit for {field_name} disagrees with the caller: \
-                     cached (offset {}, size {}, type {:?}, immutable {}, quasi {}, vable {}, \
-                     index_in_parent {}) vs requested (offset {offset}, size {field_size}, \
-                     type {field_type:?}, immutable {is_immutable}, quasi {is_quasi_immutable}, \
-                     vable {virtualizable}, index_in_parent {expected_index_in_parent} \
-                     [caller said {index_in_parent}])",
-                    descr.offset,
-                    descr.field_size,
-                    descr.field_type,
-                    descr.is_immutable,
-                    descr.is_quasi_immutable(),
-                    descr.virtualizable,
-                    descr.index_in_parent,
-                );
-                return descr.clone();
-            }
+        let cached = self
+            ._cache_field
+            .get(&struct_key)
+            .and_then(|inner| inner.get(field_name))
+            .cloned();
+        if let Some(descr) = cached {
+            // `front/mir.rs` leaves `SemanticProgram::immutable_fields`
+            // empty for the whole LLBC pipeline — Charon serializes doc
+            // comments but not the `#[jit_immutable_fields]` hint — so
+            // every spec built from that side reports the pair
+            // `(false, false)` for a field no matter what
+            // `_immutable_fields_` says about it. That pair is the absence
+            // of the declaration channel, not a claim the field is mutable,
+            // and the hit path resolves it by keeping the cached descr's
+            // flags. Compare what is kept. The opposite direction — a
+            // caller claiming purity a cached descr denies — is a real
+            // disagreement and still trips.
+            let (expected_immutable, expected_quasi_immutable) =
+                if !is_immutable && !is_quasi_immutable {
+                    (descr.is_immutable, descr.is_quasi_immutable())
+                } else {
+                    (is_immutable, is_quasi_immutable)
+                };
+            debug_assert!(
+                descr.describes_same_field(
+                    offset,
+                    field_size,
+                    field_type,
+                    expected_immutable,
+                    expected_quasi_immutable,
+                    virtualizable,
+                    expected_index_in_parent,
+                ),
+                "get_field_descr cache hit for {field_name} disagrees with the caller: \
+                     cached {:?} (offset {}, size {}, type {:?}, immutable {}, quasi {}, vable {}, \
+                     index_in_parent {}) vs requested {display_name:?} (offset {offset}, \
+                     size {field_size}, type {field_type:?}, immutable \
+                     {expected_immutable}, quasi {expected_quasi_immutable}, \
+                     vable {virtualizable}, index_in_parent \
+                     {expected_index_in_parent} [caller said {index_in_parent}])",
+                descr.name,
+                descr.offset,
+                descr.field_size,
+                descr.field_type,
+                descr.is_immutable,
+                descr.is_quasi_immutable(),
+                descr.virtualizable,
+                descr.index_in_parent,
+            );
+            return descr;
         }
         // descr.py:227: name = '%s.%s' % (STRUCT._name, fieldname)
         let name = match display_name {
