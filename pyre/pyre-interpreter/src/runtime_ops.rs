@@ -524,6 +524,12 @@ pub fn binary_op_tag_is_inplace(tag: i64) -> bool {
     (13..=24).contains(&tag)
 }
 
+/// The `compare_fn` tag `CHECK_EXC_MATCH` passes for its
+/// `isinstance(exc, match_type)` check.  It is outside the 0..=5 range
+/// [`compare_op_from_tag`] decodes, so a `CompareOp` residual carrying it is
+/// the exception-match shape and nothing else.
+pub const ISINSTANCE_OP_TAG: i64 = 10;
+
 pub fn compare_op_tag(op: ComparisonOperator) -> i64 {
     match op {
         ComparisonOperator::Less => 0,

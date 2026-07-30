@@ -3174,6 +3174,47 @@ pub(crate) fn residual_call_is_specialized_plain_numeric_op(
     }
 }
 
+/// Is this body op the `CHECK_EXC_MATCH` residual — `compare_fn(exc,
+/// match_type, ISINSTANCE_OP)`?
+///
+/// Unlike the arithmetic tags, this one needs no operand proof.  The helper
+/// validates the match target and then walks the exception class MRO
+/// (`validate_check_exc_match_class` + `check_exc_match_against` →
+/// `exception_match`), reading `is_tuple` / `is_type` / the MRO array and
+/// nothing else: it reaches no user code for any operand, mutates nothing, and
+/// returns one of the two immortal `bool` singletons.  Its single failure mode
+/// — `TypeError` for a target that is not an exception class — allocates a
+/// fresh exception exactly the way the `CanRaise`-tagged members of the
+/// `replay_safe_read` set can, so a replay commits nothing new.
+///
+/// `iIRd>r`: the tag is the first I-list entry, and it must live in the
+/// callee's immutable constant window — a runtime tag could select one of the
+/// six ordinary comparisons, which do dispatch to user `__eq__`.
+pub(crate) fn residual_call_is_exception_match(
+    body_code: &[u8],
+    d: &DecodedOp,
+    num_regs_i: usize,
+    constants_i: &[i64],
+    callee_descr_refs: &[DescrRef],
+) -> bool {
+    if d.key != "residual_call_ir_r/iIRd>r"
+        || residual_call_helper_kind_in_body(body_code, d, callee_descr_refs)
+            != Some(majit_ir::PyreHelperKind::CompareOp)
+    {
+        return false;
+    }
+    if body_code.get(d.pc + 2).is_none_or(|i_len| *i_len == 0) {
+        return false;
+    }
+    let Some(&tag_reg) = body_code.get(d.pc + 3) else {
+        return false;
+    };
+    (tag_reg as usize)
+        .checked_sub(num_regs_i)
+        .and_then(|constant_index| constants_i.get(constant_index))
+        .is_some_and(|tag| *tag == pyre_interpreter::runtime_ops::ISINSTANCE_OP_TAG)
+}
+
 /// Is this body op a `TO_BOOL` / `POP_JUMP_IF_*` truth residual whose single
 /// Ref operand is a proven immutable builtin — an exact numeric, or the `bool`
 /// an accepted `COMPARE_OP` in the same body produced?

@@ -5757,7 +5757,7 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     // function match specs and fell through to an unconditional `true` for a
     // proper exception type object, which made every `except SomeError:`
     // appear to match — wrong for any clause beyond the first.
-    if op_code == 10 {
+    if op_code == pyre_interpreter::runtime_ops::ISINSTANCE_OP_TAG {
         // Validate the match target is an exception class / tuple of exception
         // classes first (`cmp_exc_match`, pyopcode.py:1034-1039), raising
         // TypeError otherwise.  The BC handler runs

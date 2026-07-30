@@ -1968,6 +1968,12 @@ pub(crate) fn fbw_callee_body_replay_safety(
             // nothing to the live heap.  The BUILD_TUPLE / BUILD_LIST array
             // consumers are the same shape one level up: they read a
             // freshly-built backing array and return a brand-new container.
+            // `get_current_exception` is the PUSH_EXC_INFO `prev` save, which
+            // `try_walker_lower_exc_info_residual` lowers to a bare
+            // `GETFIELD_GC_R(ec, sys_exc_value)`: a field read, so a replay
+            // reads the same value again.  Its writing twin
+            // `SetCurrentException` is not here — it is journalled, and so
+            // reaches the `deferred_call` arm below instead.
             let replay_safe_read = matches!(
                 ei.pyre_helper,
                 majit_ir::PyreHelperKind::LoadConst
@@ -1975,6 +1981,7 @@ pub(crate) fn fbw_callee_body_replay_safety(
                     | majit_ir::PyreHelperKind::BoxInt
                     | majit_ir::PyreHelperKind::NewtupleFromArray
                     | majit_ir::PyreHelperKind::NewlistFromArray
+                    | majit_ir::PyreHelperKind::GetCurrentException
             );
             // `box_int` is the only generic replay-safe helper here whose
             // result is necessarily numeric.  `load_const` may return a str,
@@ -1999,7 +2006,17 @@ pub(crate) fn fbw_callee_body_replay_safety(
             // numeric provenance below may chain on.
             let accepted_binop = accepted_numeric_op
                 && ei.pyre_helper == majit_ir::PyreHelperKind::BinaryOp;
-            dst_exact_bool = accepted_numeric_op && !accepted_binop;
+            // `CHECK_EXC_MATCH` shares the `COMPARE_OP` shape but reads only
+            // types, so it needs no operand proof at all.
+            let accepted_exc_match = !provably_side_effect_free
+                && crate::jitcode_dispatch::residual_call::residual_call_is_exception_match(
+                    body_code,
+                    &d,
+                    num_regs_i,
+                    constants_i,
+                    callee_descr_refs,
+                );
+            dst_exact_bool = (accepted_numeric_op && !accepted_binop) || accepted_exc_match;
             let accepted_truth = !provably_side_effect_free
                 && crate::jitcode_dispatch::residual_call::residual_call_is_proven_truth(
                     body_code,
@@ -2019,7 +2036,11 @@ pub(crate) fn fbw_callee_body_replay_safety(
                         num_regs_i,
                         constants_i,
                     ));
-            if !provably_side_effect_free && !accepted_numeric_op && !accepted_truth {
+            if !provably_side_effect_free
+                && !accepted_numeric_op
+                && !accepted_truth
+                && !accepted_exc_match
+            {
                 // A Python-level CALL is the one shape this scan cannot
                 // settle: the inline lever binds its callee only at the call,
                 // so whether it leaves a residual behind — and what that
@@ -2063,7 +2084,11 @@ pub(crate) fn fbw_callee_body_replay_safety(
                     numeric_slots = [false; BODY_TRACKED_FRAME_SLOTS];
                     plain_int_slots = [false; BODY_TRACKED_FRAME_SLOTS];
                 } else {
-                    replay_dirty!("ResidualCallWritesLiveHeap", d.pc, d.opname);
+                    replay_dirty!(
+                        format!("ResidualCallWritesLiveHeap/{:?}", ei.pyre_helper),
+                        d.pc,
+                        d.opname
+                    );
                 }
             }
         } else if d.opname.starts_with("setfield_gc") {

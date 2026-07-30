@@ -9454,7 +9454,12 @@ impl CodeWriter {
                                 compare_fn_idx,
                                 CallFlavor::MayForce,
                                 majit_ir::PyreHelperKind::CompareOp,
-                                vec![super::flow::Constant::signed(10).into()],
+                                vec![
+                                    super::flow::Constant::signed(
+                                        pyre_interpreter::runtime_ops::ISINSTANCE_OP_TAG,
+                                    )
+                                    .into(),
+                                ],
                                 vec![exc_value, match_type_value],
                                 vec![],
                                 vec![Kind::Ref, Kind::Ref, Kind::Int],
