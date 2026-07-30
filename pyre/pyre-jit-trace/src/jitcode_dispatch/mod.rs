@@ -740,25 +740,6 @@ fn emit_traceback_node<Sym: WalkSym>(
             .heapcache_setfield_cached(traceback, descr.index(), value);
     }
 
-    // `f_lineno` resolves through `offset2lineno(pycode, last_instr)` on every
-    // read, so the frame itself has to carry the coordinate — the node's own
-    // `tb_lasti` answers a different question and is frozen. The interpreter
-    // gets this for free from `pyopcode.py`'s per-opcode `last_instr` store;
-    // compiled code does not run it, and `fbw_publish_exit_last_instr` only
-    // reaches the virtualizable, so an inlined callee frame would keep the `-1`
-    // initialization sentinel and report its `def` line. A frame that goes on
-    // running has this overwritten by its own later publish, exactly as the
-    // per-opcode store would.
-    let last_instr_value = ctx.trace_ctx.const_int(i64::from(site.last_instruction));
-    let last_instr_descr = crate::descr::pyframe_next_instr_descr();
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[site.frame, last_instr_value],
-        last_instr_descr.clone(),
-    );
-    ctx.trace_ctx
-        .heapcache_setfield_cached(site.frame, last_instr_descr.index(), last_instr_value);
-
     let traceback_descr = crate::descr::w_exception_traceback_descr(kind);
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
@@ -2754,6 +2735,69 @@ fn label_operand_offset(key: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Does the `except` handler at `catch_target` flow back into this frame's loop
+/// (reaching a `jit_merge_point` back-edge), rather than returning out of the
+/// frame (`*_return`)?
+///
+/// Sole caller: [`decline_inline_caller_frame_for_catch_marker`].  The
+/// exception-edge bridge router itself does NOT consult this — it routes on the
+/// `catch_exception` alone, the way `finishframe_exception`
+/// (`pyjitpl.py:2530-2546`) does, and a handler that returns out of the frame is
+/// `finishframe`'s ordinary case (`pyjitpl.py:2503-2525`).
+///
+/// What the predicate still gates is INLINING a caller whose in-try CALL would
+/// deliver a raise across the inline boundary: with a non-rejoining handler that
+/// delivery drops the catching frame's traceback node, so
+/// `exception_traceback_frame_lineno` reports the raising frame twice and at the
+/// wrong lineno (both backends).
+///
+/// Bounded forward reachability from `catch_target`, following `goto`/
+/// `goto_if_not` successors: `true` as soon as any path reaches a
+/// `jit_merge_point`; `false` if every reachable path terminates at a `*_return`
+/// (or the scan hits an un-followed control op / the bound, which conservatively
+/// declines).
+pub(crate) fn exc_handler_rejoins_loop(code: &[u8], catch_target: usize) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    let mut work = vec![catch_target];
+    let mut budget = 4096usize;
+    while let Some(pc) = work.pop() {
+        if budget == 0 {
+            return false;
+        }
+        budget -= 1;
+        if !visited.insert(pc) {
+            continue;
+        }
+        let Some(op) = decode_op_at(code, pc) else {
+            continue;
+        };
+        if op.key.starts_with("jit_merge_point") {
+            return true;
+        }
+        if matches!(
+            op.key,
+            "ref_return/r" | "int_return/i" | "float_return/f" | "void_return/"
+        ) {
+            // Frame-return terminal on this path; do not enqueue successors.
+            continue;
+        }
+        match op.key {
+            "goto/L" => work.push(read_label(code, &op, 0)),
+            "goto_if_not/iL" => {
+                // `iL`: 1B int register + 2B LE label.
+                work.push(read_label(code, &op, 1));
+                work.push(op.next_pc);
+            }
+            key if key.starts_with("switch") => {
+                // Multi-target dispatch not followed; leave this path un-proven
+                // (routing declines unless another path rejoins the loop).
+            }
+            _ => work.push(op.next_pc),
+        }
+    }
+    false
 }
 
 /// True when a path reachable from `position` reads the walker's active
