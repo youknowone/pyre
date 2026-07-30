@@ -13,19 +13,94 @@ mod transforms;
 
 use pyre_object::*;
 
-/// The required first parameter of the hex entry points, which is
-/// positional-or-keyword: reported by name when absent, and rejected when
-/// supplied both ways.
-fn arg_data(
-    pos: &[PyObjectRef],
-    kwargs: Option<PyObjectRef>,
+/// `PyArg_UnpackTuple` for the entries that declare no keyword at all
+/// (`crc32(data, crc=0, /)`, `crc_hqx(data, crc, /)`).  A keyword is refused
+/// under the module-qualified name; the arity message names the function bare
+/// and is the only one in this module that carries no `()`.
+fn unpack_positional<'a>(
+    args: &'a [PyObjectRef],
     fn_name: &str,
-) -> Result<PyObjectRef, crate::PyError> {
-    crate::builtins::bind_pos_or_kw(pos, kwargs, 0, "data", fn_name, 1)?.ok_or_else(|| {
-        crate::PyError::type_error(format!(
-            "{fn_name}() missing required argument 'data' (pos 1)"
-        ))
-    })
+    min: usize,
+    max: usize,
+) -> Result<&'a [PyObjectRef], crate::PyError> {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::real_kwarg_count(kwargs) != 0 {
+        return Err(crate::PyError::type_error(format!(
+            "binascii.{fn_name}() takes no keyword arguments"
+        )));
+    }
+    if pos.len() < min {
+        return Err(crate::PyError::type_error(format!(
+            "{fn_name} expected {}{min} argument{}, got {}",
+            if min == max { "" } else { "at least " },
+            if min == 1 { "" } else { "s" },
+            pos.len(),
+        )));
+    }
+    if pos.len() > max {
+        return Err(crate::PyError::type_error(format!(
+            "{fn_name} expected {}{max} arguments, got {}",
+            if min == max { "" } else { "at most " },
+            pos.len(),
+        )));
+    }
+    Ok(pos)
+}
+
+/// The entries whose `data` is positional-only and whose remaining slots are
+/// keyword-only (`a2b_base64`, `b2a_base64`, `b2a_uu`).  A positional-only
+/// parameter is never reported by name, so both an omitted and a surplus
+/// positional read as the one positional slot; `_PyArg_UnpackKeywords` holds
+/// an unrecognized keyword back until then, which is why `f(data=…)` is a
+/// missing positional rather than an unexpected keyword.
+fn arg_data_posonly(
+    args: &[PyObjectRef],
+    fn_name: &str,
+    kwonly: &[&str],
+) -> Result<(PyObjectRef, Option<PyObjectRef>), crate::PyError> {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::clinic_arity(
+        fn_name,
+        pos.len(),
+        crate::builtins::real_kwarg_count(kwargs),
+        1,
+        1,
+        kwonly.len(),
+    )?;
+    if pos.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "{fn_name}() takes exactly 1 positional argument (0 given)"
+        )));
+    }
+    if let Some(dict) = kwargs {
+        for (key, _) in unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }.iter() {
+            let name = key.to_string_lossy();
+            if name != "__pyre_kw__" && !kwonly.contains(&name.as_ref()) {
+                return Err(crate::PyError::type_error(format!(
+                    "{fn_name}() got an unexpected keyword argument '{name}'"
+                )));
+            }
+        }
+    }
+    Ok((pos[0], kwargs))
+}
+
+/// A keyword-only flag: absent or `None` keeps `default`.
+fn kwonly_bool(kwargs: Option<PyObjectRef>, name: &str, default: bool) -> bool {
+    slot_bool(
+        crate::builtins::kwarg_get(kwargs, name).unwrap_or(PY_NULL),
+        default,
+    )
+}
+
+/// A slot [`crate::builtins::bind_builtin_kwargs`] resolved: `PY_NULL` for an
+/// omitted optional argument, and `None` for one passed explicitly, both keep
+/// `default`.
+fn slot_bool(w: PyObjectRef, default: bool) -> bool {
+    if w.is_null() || unsafe { is_none(w) } {
+        return default;
+    }
+    crate::baseobjspace::is_true(w).unwrap_or(default)
 }
 
 /// `ascii_buffer_converter` — accept a str (ASCII) or any bytes-like and
@@ -120,60 +195,30 @@ fn transform_error(e: transforms::Error) -> crate::PyError {
 
 // ── argument helpers ────────────────────────────────────────────────────
 
-/// Optional flag argument, read from `name=` or the positional slot `index`.
-/// A missing or `None` value yields `default`; anything else is truth-tested.
-fn arg_bool(
-    pos: &[PyObjectRef],
-    kwargs: Option<PyObjectRef>,
-    name: &str,
-    index: usize,
-    default: bool,
-) -> bool {
-    match crate::builtins::kwarg_get(kwargs, name).or_else(|| pos.get(index).copied()) {
-        Some(o) if unsafe { is_none(o) } => default,
-        Some(o) => crate::baseobjspace::is_true(o).unwrap_or(default),
-        None => default,
-    }
-}
-
-/// The `sep` / `bytes_per_sep` separator for `hexlify` / `b2a_hex`, validated
-/// exactly as the C accelerator: length-1, ASCII.
-fn arg_sep(
-    pos: &[PyObjectRef],
-    kwargs: Option<PyObjectRef>,
+/// The `sep` / `bytes_per_sep` separator slots of `hexlify` / `b2a_hex`,
+/// validated exactly as the C accelerator: length-1, ASCII.
+fn sep_args(
+    w_sep: PyObjectRef,
+    w_bytes_per_sep: PyObjectRef,
 ) -> Result<(Option<u8>, isize), crate::PyError> {
-    let sep = match crate::builtins::kwarg_get(kwargs, "sep").or_else(|| pos.get(1).copied()) {
-        Some(o) if !unsafe { is_none(o) } => {
-            let bytes = as_bytes(o)?;
-            if bytes.len() != 1 {
-                return Err(crate::PyError::value_error("sep must be length 1."));
-            }
-            if !bytes[0].is_ascii() {
-                return Err(crate::PyError::value_error("sep must be ASCII."));
-            }
-            Some(bytes[0])
+    let sep = if w_sep.is_null() || unsafe { is_none(w_sep) } {
+        None
+    } else {
+        let bytes = as_bytes(w_sep)?;
+        if bytes.len() != 1 {
+            return Err(crate::PyError::value_error("sep must be length 1."));
         }
-        _ => None,
+        if !bytes[0].is_ascii() {
+            return Err(crate::PyError::value_error("sep must be ASCII."));
+        }
+        Some(bytes[0])
     };
-    let bytes_per_sep =
-        match crate::builtins::kwarg_get(kwargs, "bytes_per_sep").or_else(|| pos.get(2).copied()) {
-            Some(o) if !unsafe { is_none(o) } => crate::builtins::space_index_w(o)? as isize,
-            _ => 1,
-        };
+    let bytes_per_sep = if w_bytes_per_sep.is_null() || unsafe { is_none(w_bytes_per_sep) } {
+        1
+    } else {
+        crate::builtins::space_index_w(w_bytes_per_sep)? as isize
+    };
     Ok((sep, bytes_per_sep))
-}
-
-fn arg_u32(
-    pos: &[PyObjectRef],
-    kwargs: Option<PyObjectRef>,
-    name: &str,
-    index: usize,
-    default: u32,
-) -> Result<u32, crate::PyError> {
-    match crate::builtins::kwarg_get(kwargs, name).or_else(|| pos.get(index).copied()) {
-        Some(o) if !unsafe { is_none(o) } => Ok(crate::baseobjspace::int_w(o)? as u32),
-        _ => Ok(default),
-    }
 }
 
 crate::py_module! {
@@ -185,16 +230,20 @@ crate::py_module! {
         "Incomplete" => crate::builtins::lookup_exc_class("Exception").expect("Exception installed"),
     },
     functions: {
+        // `(data, sep=<unrepresentable>, bytes_per_sep=1)` — three
+        // positional-or-keyword slots.
         "b2a_hex" / * = |args| {
-            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_buffer_bytes(arg_data(pos, kwargs, "b2a_hex")?)?;
-            let (sep, bytes_per_sep) = arg_sep(pos, kwargs)?;
+            let scope = crate::builtins::bind_builtin_kwargs(
+                args, &["data", "sep", "bytes_per_sep"], &[true, false, false], "b2a_hex")?;
+            let data = as_buffer_bytes(scope[0])?;
+            let (sep, bytes_per_sep) = sep_args(scope[1], scope[2])?;
             Ok(w_bytes_from_bytes(&transforms::hexlify(&data, sep, bytes_per_sep)))
         },
         "hexlify" / * = |args| {
-            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_buffer_bytes(arg_data(pos, kwargs, "hexlify")?)?;
-            let (sep, bytes_per_sep) = arg_sep(pos, kwargs)?;
+            let scope = crate::builtins::bind_builtin_kwargs(
+                args, &["data", "sep", "bytes_per_sep"], &[true, false, false], "hexlify")?;
+            let data = as_buffer_bytes(scope[0])?;
+            let (sep, bytes_per_sep) = sep_args(scope[1], scope[2])?;
             Ok(w_bytes_from_bytes(&transforms::hexlify(&data, sep, bytes_per_sep)))
         },
         "a2b_hex" / 1 = |args| {
@@ -207,48 +256,57 @@ crate::py_module! {
             let out = transforms::unhexlify(&data).map_err(transform_error)?;
             Ok(w_bytes_from_bytes(&out))
         },
+        // `(data, crc=0, /)` and `(data, crc, /)` — positional-only throughout.
         "crc32" / * = |args| {
-            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_buffer_bytes(pos.first().copied().unwrap_or(w_none()))?;
-            let init = arg_u32(pos, kwargs, "crc", 1, 0)?;
+            let pos = unpack_positional(args, "crc32", 1, 2)?;
+            let data = as_buffer_bytes(pos[0])?;
+            let init = match pos.get(1) {
+                Some(&o) => crate::baseobjspace::int_w(o)? as u32,
+                None => 0,
+            };
             Ok(w_int_new(transforms::crc32(&data, init) as i64))
         },
         "crc_hqx" / * = |args| {
-            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_buffer_bytes(pos.first().copied().unwrap_or(w_none()))?;
-            let init = match crate::builtins::kwarg_get(kwargs, "crc").or_else(|| pos.get(1).copied()) {
-                Some(o) => crate::baseobjspace::int_w(o)? as u32,
-                None => return Err(crate::PyError::type_error(
-                    "crc_hqx() missing required argument 'crc' (pos 2)",
-                )),
-            };
+            let pos = unpack_positional(args, "crc_hqx", 2, 2)?;
+            let data = as_buffer_bytes(pos[0])?;
+            let init = crate::baseobjspace::int_w(pos[1])? as u32;
             Ok(w_int_new(transforms::crc_hqx(&data, init) as i64))
         },
+        // `(data, /, *, flag=…)` — one positional-only slot, the rest
+        // keyword-only.
         "a2b_base64" / * = |args| {
-            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_bytes(pos.first().copied().unwrap_or(w_none()))?;
-            let strict_mode = arg_bool(pos, kwargs, "strict_mode", 1, false);
+            let (w_data, kwargs) = arg_data_posonly(args, "a2b_base64", &["strict_mode"])?;
+            let data = as_bytes(w_data)?;
+            let strict_mode = kwonly_bool(kwargs, "strict_mode", false);
             let out = transforms::a2b_base64(&data, strict_mode).map_err(transform_error)?;
             Ok(w_bytes_from_bytes(&out))
         },
         "b2a_base64" / * = |args| {
-            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_buffer_bytes(pos.first().copied().unwrap_or(w_none()))?;
-            let newline = arg_bool(pos, kwargs, "newline", 1, true);
+            let (w_data, kwargs) = arg_data_posonly(args, "b2a_base64", &["newline"])?;
+            let data = as_buffer_bytes(w_data)?;
+            let newline = kwonly_bool(kwargs, "newline", true);
             Ok(w_bytes_from_bytes(&transforms::b2a_base64(&data, newline)))
         },
+        // `(data, header=False)` / `(data, quotetabs, istext, header)` — every
+        // slot positional-or-keyword.
         "a2b_qp" / * = |args| {
-            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_bytes(pos.first().copied().unwrap_or(w_none()))?;
-            let header = arg_bool(pos, kwargs, "header", 1, false);
+            let scope = crate::builtins::bind_builtin_kwargs(
+                args, &["data", "header"], &[true, false], "a2b_qp")?;
+            let data = as_bytes(scope[0])?;
+            let header = slot_bool(scope[1], false);
             Ok(w_bytes_from_bytes(&transforms::a2b_qp(&data, header)))
         },
         "b2a_qp" / * = |args| {
-            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_buffer_bytes(pos.first().copied().unwrap_or(w_none()))?;
-            let quotetabs = arg_bool(pos, kwargs, "quotetabs", 1, false);
-            let istext = arg_bool(pos, kwargs, "istext", 2, true);
-            let header = arg_bool(pos, kwargs, "header", 3, false);
+            let scope = crate::builtins::bind_builtin_kwargs(
+                args,
+                &["data", "quotetabs", "istext", "header"],
+                &[true, false, false, false],
+                "b2a_qp",
+            )?;
+            let data = as_buffer_bytes(scope[0])?;
+            let quotetabs = slot_bool(scope[1], false);
+            let istext = slot_bool(scope[2], true);
+            let header = slot_bool(scope[3], false);
             Ok(w_bytes_from_bytes(&transforms::b2a_qp(&data, quotetabs, istext, header)))
         },
         "a2b_uu" / 1 = |args| {
@@ -257,9 +315,9 @@ crate::py_module! {
             Ok(w_bytes_from_bytes(&out))
         },
         "b2a_uu" / * = |args| {
-            let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            let data = as_buffer_bytes(pos.first().copied().unwrap_or(w_none()))?;
-            let backtick = arg_bool(pos, kwargs, "backtick", 1, false);
+            let (w_data, kwargs) = arg_data_posonly(args, "b2a_uu", &["backtick"])?;
+            let data = as_buffer_bytes(w_data)?;
+            let backtick = kwonly_bool(kwargs, "backtick", false);
             let out = transforms::b2a_uu(&data, backtick).map_err(transform_error)?;
             Ok(w_bytes_from_bytes(&out))
         },

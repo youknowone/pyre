@@ -4051,7 +4051,8 @@ pub(crate) fn bind_builtin_kwargs(
                 Some(idx) => {
                     if filled[idx] {
                         return Err(crate::PyError::type_error(format!(
-                            "{fn_name}() got multiple values for argument '{key}'"
+                            "argument for {fn_name}() given by name ('{key}') and position ({})",
+                            idx + 1,
                         )));
                     }
                     scope[idx] = *val;
