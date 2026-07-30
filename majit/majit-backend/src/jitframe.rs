@@ -181,6 +181,82 @@ pub const UNSIGN_SIZE: usize = std::mem::size_of::<usize>();
 // jitframe.py:138
 pub type JitFramePtr = *mut JitFrame;
 
+/// An off-GC jitframe's block starts with the total size, so the frame
+/// pointer alone is enough to free it, and then the header word the JIT's
+/// negative reads land in. See [`alloc_off_gc_jitframe`].
+///
+/// ```text
+///   base            base+8            base+16 == the frame pointer
+///   [ total size ]  [ header word ]   [ JitFrame … ]
+/// ```
+const OFF_GC_SIZE_SLOT: usize = majit_gc::header::GcHeader::SIZE;
+const OFF_GC_HEADER: usize = majit_gc::header::GcHeader::SIZE;
+const OFF_GC_PREFIX: usize = OFF_GC_SIZE_SLOT + OFF_GC_HEADER;
+const _: () = assert!(OFF_GC_SIZE_SLOT >= std::mem::size_of::<u64>());
+
+fn off_gc_layout(total: usize) -> Option<std::alloc::Layout> {
+    std::alloc::Layout::from_size_align(total, majit_gc::header::GcHeader::SIZE).ok()
+}
+
+/// Allocate a JITFRAME outside the GC, with the header word in front of it.
+///
+/// `jitframe.py:48` allocates every frame through the GC, so upstream's
+/// compiled code always holds a frame that has a header behind it. Pyre also
+/// builds frames off the GC — the runner's entry frame, the realloc slowpath,
+/// and the JITFRAME nursery slowpath's fallback, the class
+/// `shadow_stack::register_libc_jitframe` tracks — and compiled code cannot
+/// tell the two apart. `_reload_frame_if_necessary`
+/// (`aarch64/assembler.py:967-980`) re-applies the non-array write-barrier
+/// fast path to the current frame after every collecting call, and that fast
+/// path loads the flag byte at `jit_wb_if_flag_byteofs`, which is *negative*
+/// (`gc.py:285-293` measures it from the object pointer, and the flags sit in
+/// the header at `obj-4`).
+///
+/// Handing out a bare allocation base therefore puts that load outside the
+/// block: usually it reads unrelated bytes and, when they happen to carry
+/// TRACK_YOUNG_PTRS, enters the barrier helper for nothing; when the block
+/// lands at the start of a mapped region it faults outright. Reserving the
+/// header word makes the read in-bounds, and the zeroed flags give it the
+/// same answer a freshly nursery-allocated frame gives — no barrier.
+///
+/// Returns null when the allocation fails.
+pub fn alloc_off_gc_jitframe(size_bytes: usize) -> *mut JitFrame {
+    let Some(total) = OFF_GC_PREFIX.checked_add(size_bytes) else {
+        return std::ptr::null_mut();
+    };
+    let Some(layout) = off_gc_layout(total) else {
+        return std::ptr::null_mut();
+    };
+    let base = unsafe { std::alloc::alloc_zeroed(layout) };
+    if base.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        *(base as *mut u64) = total as u64;
+        base.add(OFF_GC_PREFIX) as *mut JitFrame
+    }
+}
+
+/// Release a frame from [`alloc_off_gc_jitframe`].
+///
+/// The frame pointer is not the block base — the size slot and the header word
+/// precede it — so this must be used instead of freeing the frame pointer.
+///
+/// # Safety
+/// `frame` must have come from [`alloc_off_gc_jitframe`] and must no longer be
+/// reachable from compiled code or the shadow stack.
+pub unsafe fn free_off_gc_jitframe(frame: *mut JitFrame) {
+    if frame.is_null() {
+        return;
+    }
+    unsafe {
+        let base = (frame as *mut u8).sub(OFF_GC_PREFIX);
+        let total = *(base as *const u64) as usize;
+        let layout = off_gc_layout(total).expect("off-GC jitframe size slot was corrupted");
+        std::alloc::dealloc(base, layout);
+    }
+}
+
 // ── JitFrame methods ────────────────────────────────────────────────
 
 impl JitFrame {
@@ -443,5 +519,39 @@ where
         write_barrier(new_jf);
 
         new_jf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The emitted write-barrier fast path loads one byte at
+    /// `jit_wb_if_flag_byteofs` from the frame pointer, and that offset is
+    /// negative. An off-GC frame must answer that load the way a nursery
+    /// frame does — in-bounds, and with the flag clear so the barrier helper
+    /// is not entered — which is the whole reason `alloc_off_gc_jitframe`
+    /// reserves a header word instead of handing out the block base.
+    #[test]
+    fn off_gc_jitframe_reserves_the_negative_flag_byte() {
+        let descr = majit_gc::WriteBarrierDescr::for_current_gc();
+        assert!(
+            descr.jit_wb_if_flag_byteofs < 0,
+            "the flag byte is expected behind the object pointer"
+        );
+        assert!(
+            (-descr.jit_wb_if_flag_byteofs) as usize <= majit_gc::header::GcHeader::SIZE,
+            "the reserved header word must cover the flag byte offset"
+        );
+
+        let frame = alloc_off_gc_jitframe(JitFrame::alloc_size(8));
+        assert!(!frame.is_null());
+        let flag = unsafe { *(frame as *const u8).offset(descr.jit_wb_if_flag_byteofs as isize) };
+        assert_eq!(
+            flag & descr.jit_wb_if_flag_singlebyte,
+            0,
+            "a fresh off-GC frame must not look like it tracks young pointers"
+        );
+        unsafe { free_off_gc_jitframe(frame) };
     }
 }

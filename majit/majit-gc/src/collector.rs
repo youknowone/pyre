@@ -3256,18 +3256,18 @@ impl MiniMarkGC {
     /// non-array COND_CALL_GC_WB helper calls. `_reload_frame_if_necessary`
     /// (aarch64/assembler.py:967-980) re-applies the non-array barrier fast
     /// path to the *current jitframe* after every collecting helper call.
-    /// Most jitframes are nursery-allocated and carry a GcHeader, but not
-    /// all: the JITFRAME slow path falls back to `libc::calloc` when no
-    /// allocator is active, and CALL_ASSEMBLER builds some callee frames the
-    /// same way — the class `shadow_stack::register_libc_jitframe` exists to
-    /// track. Those have no GcHeader, so the inline flag test reads
-    /// `jit_wb_if_flag_byteofs` (negative, where a header would be) out of
-    /// bytes whose contents are unspecified. When they happen to carry
-    /// TRACK_YOUNG_PTRS' bit the helper is entered in earnest, and only
-    /// `is_managed_heap_object` keeps the unmanaged block out of
-    /// `remembered_set`, where the next minor would decode a type id from it.
-    /// `write_barrier_ignores_unmanaged_jitframe_with_flag_byte_set` pins
-    /// that case.
+    /// Not every jitframe is nursery-allocated: the runner's entry frame, the
+    /// realloc slowpath, and the JITFRAME nursery slowpath's fallback build
+    /// frames off the GC — the class `shadow_stack::register_libc_jitframe`
+    /// exists to track. Those go through `jitframe::alloc_libc_jitframe`,
+    /// which reserves a zeroed header word so the inline test's read at
+    /// `jit_wb_if_flag_byteofs` (negative, where a header would be) stays
+    /// inside the allocation and finds the flag clear. Reaching this helper
+    /// with such a frame therefore takes a set flag bit the allocator did not
+    /// write; `is_managed_heap_object` is what still keeps the unmanaged block
+    /// out of `remembered_set`, where the next minor would decode a type id
+    /// from it. `write_barrier_ignores_unmanaged_jitframe_with_flag_byte_set`
+    /// pins that case.
     pub fn do_write_barrier(&mut self, obj: GcRef) {
         // incminimark's write_barrier receives a typed, non-null struct pointer.
         // pyre's GcRef is nullable (GcRef::NULL is the sentinel) and reaches the
@@ -5150,21 +5150,20 @@ mod tests {
         // plain COND_CALL_GC_WB on the frame reaches the generic barrier at
         // runtime.
         //
-        // A jitframe that came from the `libc::calloc` fallback rather than
-        // the nursery has no GcHeader, so the byte the inline test reads
-        // (`jit_wb_if_flag_byteofs`, negative — where a header would be) is
-        // not a header and its contents are unspecified. Whether it carries
-        // TRACK_YOUNG_PTRS' bit is a property of the host allocator and the
-        // heap's history, so the bit is set by hand here rather than waited
-        // for. Without the `is_managed_heap_object` guard in
-        // `do_write_barrier`, that block would enter `remembered_set` and the
-        // next minor would decode a type id from those bytes.
+        // A jitframe allocated off the GC is not in any managed generation,
+        // so the word in front of it is not a header this collector owns.
+        // `jitframe::alloc_libc_jitframe` keeps that word reserved and zeroed,
+        // which is what stops the inline test from entering the helper at all;
+        // this test covers the residue — the helper being entered anyway, with
+        // the flag bit set, for a block the GC does not manage. Without the
+        // `is_managed_heap_object` guard in `do_write_barrier`, that block
+        // would enter `remembered_set` and the next minor would decode a type
+        // id from those bytes.
         let mut gc = test_gc(1024);
 
-        // Same shape the JITFRAME slow path calloc's: the fixed `JitFrame`
-        // words plus the trailing slot array, zero-filled. One extra leading
-        // word keeps the negative flag-byte read inside this allocation,
-        // standing in for whatever precedes a real malloc'd frame.
+        // Same shape the off-GC jitframe allocator produces: one reserved
+        // leading word, then the fixed `JitFrame` words plus the trailing slot
+        // array, zero-filled.
         let slots = 32usize;
         let frame_size = std::mem::size_of::<usize>() * (7 + 1 + slots);
         let layout =

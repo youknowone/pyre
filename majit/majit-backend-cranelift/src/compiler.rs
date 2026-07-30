@@ -3779,10 +3779,11 @@ pub unsafe extern "C" fn cranelift_realloc_frame(old_jf: *mut i64, new_depth: us
             gcref.0 as *mut i64
         }
         None => {
-            let layout = std::alloc::Layout::from_size_align(new_bytes, 8)
-                .expect("cranelift_realloc_frame: invalid layout");
-            let p = unsafe { std::alloc::alloc_zeroed(layout) as *mut i64 };
-            assert!(!p.is_null(), "cranelift_realloc_frame: alloc_zeroed failed");
+            // Reserves the header word the emitted write-barrier fast path
+            // reads at a negative offset, so this frame answers that read the
+            // way the nursery-allocated one above does.
+            let p = majit_backend::jitframe::alloc_off_gc_jitframe(new_bytes) as *mut i64;
+            assert!(!p.is_null(), "cranelift_realloc_frame: alloc failed");
             // Host-test fallback only — register with the libc-jitframe
             // tracer so any interior Ref scan still works.
             majit_gc::shadow_stack::register_libc_jitframe(p as usize);
@@ -7260,8 +7261,14 @@ fn run_compiled_code_inner(
         }
         (gcref, None)
     } else {
-        let mut buf = vec![0i64; jf_total];
-        let gcref = GcRef(buf.as_mut_ptr() as usize);
+        // One leading word stands in for the GcHeader the nursery branch
+        // above puts in front of the frame: the emitted write-barrier fast
+        // path loads the flag byte at a negative offset from the frame
+        // pointer, so without it that load reads outside the buffer.
+        const HEADER_WORDS: usize = majit_gc::header::GcHeader::SIZE / 8;
+        const _: () = assert!(HEADER_WORDS * 8 == majit_gc::header::GcHeader::SIZE);
+        let mut buf = vec![0i64; HEADER_WORDS + jf_total];
+        let gcref = GcRef(unsafe { buf.as_mut_ptr().add(HEADER_WORDS) } as usize);
         // jitframe.py:84 parity — `jf_frame.length` is the count of `Signed`
         // payload slots after the length word.  The GC-alloc branch above
         // already does this at line 6282; mirror it here so frame-size

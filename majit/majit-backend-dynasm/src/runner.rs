@@ -862,7 +862,7 @@ pub extern "C" fn dynasm_nursery_slowpath_jitframe(frame_size: u64) -> u64 {
             gc.alloc_nursery(frame_size as usize).0 as u64
         }
     })
-    .unwrap_or_else(|| unsafe { libc::calloc(1, frame_size as usize) as u64 })
+    .unwrap_or_else(|| majit_backend::jitframe::alloc_off_gc_jitframe(frame_size as usize) as u64)
 }
 
 /// `_build_malloc_slowpath(kind='var')` parity: varsize nursery
@@ -1152,8 +1152,8 @@ pub unsafe extern "C" fn dynasm_realloc_frame(
             old_jf,
             expected_depth,
             base_ofs,
-            // `alloc`: libc::calloc to match the runner-allocated frame.
-            |size_bytes| libc::calloc(1, size_bytes as usize) as *mut JitFrame,
+            // `alloc`: off-GC, header-reserving, to match the runner-allocated frame.
+            |size_bytes| majit_backend::jitframe::alloc_off_gc_jitframe(size_bytes as usize),
             // `write_barrier`: register the new frame with the shadow
             // stack tracer.  The old frame stays registered for the
             // duration of the running call; `jf_forward` is followed
@@ -1773,7 +1773,8 @@ impl DynasmBackend {
         while !cur.is_null() {
             let next = unsafe { (*cur).jf_forward };
             majit_gc::shadow_stack::unregister_libc_jitframe(cur as usize);
-            unsafe { libc::free(cur as *mut std::ffi::c_void) };
+            // Frees the block base, which sits one header word behind `cur`.
+            unsafe { majit_backend::jitframe::free_off_gc_jitframe(cur) };
             cur = next;
         }
     }
@@ -2587,8 +2588,9 @@ impl Backend for DynasmBackend {
             Self::input_slot(args.len()),
             args.len()
         );
-        let jf_ptr = unsafe { libc::calloc(1, JitFrame::alloc_size(num_slots)) as *mut JitFrame };
-        assert!(!jf_ptr.is_null(), "execute_token: calloc failed");
+        let jf_ptr =
+            majit_backend::jitframe::alloc_off_gc_jitframe(JitFrame::alloc_size(num_slots));
+        assert!(!jf_ptr.is_null(), "execute_token: frame allocation failed");
         unsafe { JitFrame::init(jf_ptr, fi_ptr, num_slots) };
         // Register this libc-allocated jitframe with the GC so its
         // interior Ref slots (pinned by gcmap bits) remain visible to
@@ -2770,8 +2772,12 @@ impl Backend for DynasmBackend {
             Self::input_slot(args.len()),
             args.len()
         );
-        let jf_ptr = unsafe { libc::calloc(1, JitFrame::alloc_size(num_slots)) as *mut JitFrame };
-        assert!(!jf_ptr.is_null(), "execute_token_ints_raw: calloc failed");
+        let jf_ptr =
+            majit_backend::jitframe::alloc_off_gc_jitframe(JitFrame::alloc_size(num_slots));
+        assert!(
+            !jf_ptr.is_null(),
+            "execute_token_ints_raw: frame allocation failed"
+        );
         unsafe { JitFrame::init(jf_ptr, fi_ptr, num_slots) };
         // Same registration as `execute_token` above: the libc-allocated
         // jitframe must be visible to the minor-collection walker so its
