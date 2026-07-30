@@ -9862,28 +9862,51 @@ fn hash_secret_from_seed(mut seed: u32) -> [u8; 16] {
 /// Process-global CPython 3.14 hash secret.  RPython's `rsiphash.seed` is
 /// likewise a single process-global owner initialized from `PYTHONHASHSEED`;
 /// it is not interpreter-thread-local state.
+static HASH_SECRET: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+
+/// How a `PYTHONHASHSEED` value that names no seed is reported.
+pub const HASH_SEED_ERROR: &str =
+    "PYTHONHASHSEED must be \"random\" or an integer in range [0; 4294967295]";
+
+/// Fix the process-global hash secret from `PYTHONHASHSEED`, leaving it unset
+/// for `"random"` or an absent value so the first digest samples a random one.
+///
+/// The variable is read through the host seam, so under sandbox the value comes
+/// from the controller's environment rather than the child's cleared one.  A
+/// value that names no seed yields [`HASH_SEED_ERROR`] instead of terminating:
+/// the launcher owns the process lifetime, so reporting it is its call.
+///
+/// A digest taken before this runs pins a random secret and the variable is
+/// ignored from then on, so the launcher calls it before anything hashes.
+pub fn init_hash_secret_from_env() -> Result<(), &'static str> {
+    let value = crate::host_seam::ops::getenv(b"PYTHONHASHSEED")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if value.is_empty() || value.as_slice() == b"random" {
+        return Ok(());
+    }
+    let seed = std::str::from_utf8(&value)
+        .ok()
+        .and_then(|text| text.parse::<u32>().ok())
+        .ok_or(HASH_SEED_ERROR)?;
+    // `_build_key_from_seed` gives seed 0 the all-zero key rather than running
+    // the expansion over it.
+    let secret = if seed == 0 {
+        [0; 16]
+    } else {
+        hash_secret_from_seed(seed)
+    };
+    let _ = HASH_SECRET.set(secret);
+    Ok(())
+}
+
 fn hash_secret() -> &'static [u8; 16] {
-    static SECRET: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
-    SECRET.get_or_init(|| match std::env::var("PYTHONHASHSEED") {
-        Ok(value) if !value.is_empty() && value != "random" => {
-            let seed = value.parse::<u32>().unwrap_or_else(|_| {
-                eprintln!(
-                    "PYTHONHASHSEED must be \"random\" or an integer in range [0; 4294967295]"
-                );
-                std::process::exit(1);
-            });
-            if seed == 0 {
-                [0; 16]
-            } else {
-                hash_secret_from_seed(seed)
-            }
-        }
-        _ => {
-            let mut secret = [0u8; 16];
-            getrandom::fill(&mut secret)
-                .expect("failed to get random numbers to initialize Python hash secret");
-            secret
-        }
+    HASH_SECRET.get_or_init(|| {
+        let mut secret = [0u8; 16];
+        getrandom::fill(&mut secret)
+            .expect("failed to get random numbers to initialize Python hash secret");
+        secret
     })
 }
 

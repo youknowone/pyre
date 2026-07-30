@@ -586,6 +586,14 @@ fn post_run_diagnostics() {
 }
 
 fn real_main(binary_name: &str) {
+    // Ahead of everything else: the hash secret is fixed by the first digest
+    // taken in the process, so `PYTHONHASHSEED` has to be resolved before any
+    // Python object exists. `-E` does not reach it — the seed is settled before
+    // command-line flags are, so an ignored environment still supplies it.
+    if let Err(detail) = pyre_interpreter::builtins::init_hash_secret_from_env() {
+        eprintln!("{detail}");
+        std::process::exit(1);
+    }
     // Receive process-directed async signals on this thread (see
     // `main_entry`) so blocking syscalls here are interrupted by Ctrl-C /
     // alarms.  The sandboxed child does not touch the signal mask.
