@@ -11710,10 +11710,13 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Force a running virtualizable identified by its backend force token.
-    pub fn force_virtualizable_token(&mut self, token: u64) {
-        self.force_virtualizable_token_with_allocator(token, &crate::resume::NullAllocator);
-    }
-
+    ///
+    /// `compile.py:966-1000 ResumeGuardForcedDescr.force_now` has no
+    /// allocator-free form: the resume decode it drives materializes every
+    /// virtual a vable slot names.  So there is deliberately no
+    /// `NullAllocator` convenience wrapper here — callers go through
+    /// `JitDriver::force_virtualizable_token`, which supplies the registered
+    /// blackhole allocator.
     pub fn force_virtualizable_token_with_allocator(
         &mut self,
         token: u64,

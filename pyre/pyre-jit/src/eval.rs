@@ -3933,25 +3933,36 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
                 majit_metainterp::virtualizable::VableToken::TracingRescall
             )
         });
-        // `pyjitpl.py:3326-3334` reads the token only from
-        // `virtualizable_boxes[-1]`.  An inlined callee materialized through
-        // a virtual reference is an ordinary frame, not that one standard
-        // virtualizable, and its token slot is not part of its resume image.
-        let standard_frame = driver
-            .meta_interp()
-            .standard_virtualizable_heap_ptr()
-            .cast_mut()
-            .cast::<pyre_interpreter::PyFrame>();
-        let live_frame_armed = std::ptr::eq(frame, standard_frame)
-            && match info.read_token(frame.cast()) {
-                majit_metainterp::virtualizable::VableToken::Active(token) => {
-                    driver.meta_interp_mut().is_force_token_armed(token)
-                }
-                _ => false,
-            };
+        // `virtualizable.py:214-217 force_virtualizable_if_necessary` decides
+        // this from the frame's OWN `vable_token` and nothing else.  An inlined
+        // callee materialized through a virtual reference is an ordinary frame,
+        // not the standard virtualizable, and its token slot is not part of its
+        // resume image: `PyFrame` is built with `vable_token: 0` and the
+        // materialization never writes the slot, so the token read already
+        // excludes it.
+        //
+        // Comparing against `MetaInterp::vable_ptr` as well named the WRONG
+        // frame.  That cell is rewritten by every `sync_before`, including the
+        // entry a callee's own compiled loop takes from inside the caller's
+        // running loop, and nothing restores it when the callee returns — so
+        // the caller stopped matching for the rest of its own activation, and a
+        // callee reading the caller's frame through `sys._getframe(1)` saw
+        // fields the caller's compiled loop was still holding in registers.
+        let live_frame_armed = match info.read_token(frame.cast()) {
+            majit_metainterp::virtualizable::VableToken::Active(token) => {
+                driver.meta_interp_mut().is_force_token_armed(token)
+            }
+            _ => false,
+        };
         let mut force = |ptr: *mut u8| {
             info.force_virtualizable_if_necessary(ptr, |token| {
-                driver.meta_interp_mut().force_virtualizable_token(token);
+                // `compile.py:966-1000 ResumeGuardForcedDescr.force_now` decodes
+                // the resume data with the same allocator ordinary guard failure
+                // uses, so a vable slot whose value is a virtual is materialized.
+                // Decoding it through `NullAllocator` instead wrote a null over
+                // that slot, and `fast2locals` renders a null slot as an absent
+                // name — a live local vanished from `f_locals`.
+                driver.force_virtualizable_token(token);
             });
         };
         // Force the traced frame only when the frame handed to Python belongs
