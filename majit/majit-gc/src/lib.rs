@@ -87,6 +87,18 @@ pub fn gc_stress_enabled() -> bool {
     cfg!(feature = "gc_stress")
 }
 
+/// `MAJIT_GC_LIFETIME_LOG` — trace remembered-set adds and old-gen frees.
+///
+/// Read once.  The gate sits in the write barrier and the old-gen sweep, and
+/// `std::env::var_os` takes the environment lock and scans it linearly on every
+/// call, so asking per event costs whether or not the variable is set.  Same
+/// shape as `majit_metainterp::majit_log_enabled`.
+pub fn gc_lifetime_log_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_GC_LIFETIME_LOG").is_some());
+    *ENABLED
+}
+
 /// Write barrier descriptor — information the JIT needs to emit write barrier checks.
 ///
 /// From rpython/jit/backend/llsupport/gc.py WriteBarrierDescr.

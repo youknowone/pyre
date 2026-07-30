@@ -186,7 +186,7 @@ impl OldGen {
                 hdr.clear_flag(flags::VISITED);
                 self.old_rawmalloced_objects.push(object);
             } else {
-                if std::env::var_os("MAJIT_GC_LIFETIME_LOG").is_some() {
+                if crate::gc_lifetime_log_enabled() {
                     eprintln!(
                         "[gc][free] addr={:#x} type_id={} kind=raw",
                         object.header_addr + GcHeader::SIZE,
@@ -219,7 +219,7 @@ impl OldGen {
                     hdr.clear_flag(flags::VISITED);
                     false
                 } else {
-                    if std::env::var_os("MAJIT_GC_LIFETIME_LOG").is_some() {
+                    if crate::gc_lifetime_log_enabled() {
                         eprintln!(
                             "[gc][free] addr={:#x} type_id={} kind=arena",
                             header_ptr as usize + GcHeader::SIZE,

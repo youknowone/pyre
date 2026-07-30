@@ -1907,7 +1907,7 @@ impl MiniMarkGC {
                 (*(new_header_ptr as *mut GcHeader)).clear_flag(flags::TRACK_YOUNG_PTRS);
             }
             self.remembered_set.push(new_obj_addr);
-            if std::env::var_os("MAJIT_GC_LIFETIME_LOG").is_some() {
+            if crate::gc_lifetime_log_enabled() {
                 eprintln!(
                     "[gc][remember] addr={:#x} type_id={} source=promotion state={:?}",
                     new_obj_addr, type_id, self.gc_state
@@ -2161,7 +2161,7 @@ impl MiniMarkGC {
             if !self.is_in_nursery(gcref.0) && unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
                 unsafe { (*hdr).clear_flag(flags::TRACK_YOUNG_PTRS) };
                 self.remembered_set.push(gcref.0);
-                if std::env::var_os("MAJIT_GC_LIFETIME_LOG").is_some() {
+                if crate::gc_lifetime_log_enabled() {
                     eprintln!(
                         "[gc][remember] addr={:#x} type_id={} source=major_seed state={:?}",
                         gcref.0,
@@ -3395,7 +3395,7 @@ impl MiniMarkGC {
         // mutated and therefore cannot be re-added between sweep steps.
         self.remembered_set.push(obj.0);
         let hdr = unsafe { header_of(obj.0) };
-        if std::env::var_os("MAJIT_GC_LIFETIME_LOG").is_some() {
+        if crate::gc_lifetime_log_enabled() {
             eprintln!(
                 "[gc][remember] addr={:#x} type_id={} source=write_barrier state={:?}",
                 obj.0,
