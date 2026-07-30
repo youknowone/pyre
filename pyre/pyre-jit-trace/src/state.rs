@@ -7256,8 +7256,14 @@ fn reconstruct_inline_recipe(
     // the slot holds a value neither path can reconstruct (an int/float operand
     // constant, or an unsupported shape) — decline to the single-frame bridge
     // rather than seed a NULL operand the re-executed bridge would deref.
+    // This path rebuilds from resumedata colors exactly as the virtual-array
+    // one above does, so it owes the operands a paused call consumed the same
+    // exemption: no callee ever flushed them and the resume collapses them to
+    // the result `make_result_of_lastop` delivers.
     for s in nlocals..valuestackdepth {
-        if Some(s) == pending_result_abs_slot {
+        if Some(s) == pending_result_abs_slot
+            || unreconstructable_operand_floor.is_some_and(|floor| s >= floor)
+        {
             continue;
         }
         if registers_r[s] == OpRef::NONE {
