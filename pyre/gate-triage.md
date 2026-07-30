@@ -222,7 +222,7 @@ upstream lines:
 | gate | orthodox side | outcome |
 |---|---|---|
 | PYRE_FBW_VABLE_SCALAR_CA | **OFF** | **RETIRED** — the ON design contradicts upstream |
-| PYRE_FBW_MULTIFRAME | **ON** | **FLIPPED default-ON** — the ON path is the port and the adopt works; §1d's one remaining wrong answer (a `sys._getframe` that is itself the escaping residual reading the caller frame) was closed by `walker_ec_enter` / `walker_ec_leave` publishing the callee frame at the inlined-call push |
+| `_MULTIFRAME` (retired) | **ON** | **RETIRED** — reader and OFF path deleted after the default-ON verification; the adopt is now unconditional when the multi-frame latch conditions hold. §1d's one remaining wrong answer (a `sys._getframe` that is itself the escaping residual reading the caller frame) was closed by `walker_ec_enter` / `walker_ec_leave` publishing the callee frame at the inlined-call push |
 | PYRE_FBW_CALLEE_VSTACK | NEITHER | keep OFF; see §5 |
 
 The walker's default-ON `PYRE_FBW_*` cluster was retired separately in #757.
@@ -337,8 +337,9 @@ committed image".
 
 **Measured 2026-07-25: the multi-frame path has no corpus coverage.**  The
 vable-escape latch site was instrumented and all **318** benchmarks
-(`pyre/bench` + `pyre/bench/synth`) run under `PYRE_FBW_MULTIFRAME=1`.  The site
-is reached in **3 benches** (`getframe_escape_flush_writethrough_regression`,
+(`pyre/bench` + `pyre/bench/synth`) were historically run with the multi-frame
+gate enabled.  The site was reached in **3 benches**
+(`getframe_escape_flush_writethrough_regression`,
 `synth/getframe_inlined_callee_own_frame`, `synth/getframe_stored_fback_walk`),
 5 events each, and **all 15 have `inline_subwalk=false`** — every one takes the
 single-frame arm and adopts.  `build_multi_frame_miframe` is therefore never
@@ -355,8 +356,8 @@ Under that shape `build_multi_frame_miframe` **succeeds at depth 2**, so the
 build side was never what blocked.  It is landed as
 `synth/getframe_while_inlined_callee_subwalk`; the three shape choices in its
 header are load-bearing and changing any of them silently stops exercising the
-path.  With the comparison fixed, that fixture under `PYRE_FBW_MULTIFRAME=1`
-reports **5 `BUILT multi-frame depth=2` and 5 `adopted multi-frame terminal`,
+path.  With the comparison fixed, that fixture historically reported **5
+`BUILT multi-frame depth=2` and 5 `adopted multi-frame terminal`,
 zero declines** (the other 5 escapes in the run have `inline_subwalk=false` and
 take the single-frame arm, as before), and prints the same result as CPython and
 PyPy.
@@ -430,8 +431,8 @@ nested inside `single_frame_blackhole_resume_enabled()`, so it also requires
 
 **A second coverage benchmark, 2026-07-27.**
 `synth/getframe_inline_subwalk_multiframe` (#798) reaches the latch with
-`inline_subwalk=true` and drives `build_multi_frame_miframe` — under
-`PYRE_FBW_MULTIFRAME=1 PYRE_FBW_DEBUG_ABORT=1` it prints 5 `[s2-gate]
+`inline_subwalk=true` and drives `build_multi_frame_miframe`. In the historical
+gate-enabled measurement with `PYRE_FBW_DEBUG_ABORT=1`, it printed 5 `[s2-gate]
 inline_subwalk` lines each followed by `[s2-build-decline] BUILT multi-frame
 depth=2`.  One `sys._getframe(1)` level does not get there; the chain needs a
 residual level under the walked frame and an inlined level under that, so the
@@ -478,7 +479,7 @@ OFF path is a needed safety net. Retire at the listed trigger (A7).
 
 | var | subsystem | retire when |
 |---|---|---|
-| PYRE_FBW_BLACKHOLE_RESUME | single-frame resume-past-escape (#754) | flipped default-ON 2026-07-25; retirement was conditioned on the multi-frame twin (`_MULTIFRAME`) flipping, and **that condition is now met** — the twin flipped once `walker_ec_enter` / `walker_ec_leave` closed the escaping `sys._getframe` identity answer. Both gates are now default-ON with the multi-frame latch nested inside `single_frame_blackhole_resume_enabled()`, so retiring the pair (deleting both readers and the OFF paths) is the next step for this row |
+| PYRE_FBW_BLACKHOLE_RESUME | single-frame resume-past-escape (#754) | flipped default-ON 2026-07-25; its multi-frame twin is now retired (reader and OFF path deleted) after `walker_ec_enter` / `walker_ec_leave` closed the escaping `sys._getframe` identity answer. The multi-frame latch remains nested inside `single_frame_blackhole_resume_enabled()`, so this row now tracks retirement of the single-frame reader and OFF path alone |
 | PYRE_TWO_PHASE_RTYPE, PYRE_TUPLE_PER_SHAPE_CLASSDEF | rtyper prepass / per-shape tuple classdef | WS2 / #346 rtyper epic |
 | PYRE_ORIGINAL_BOXES | greens++reds original_boxes index shape | box-identity #202 / resume F1 |
 | PYRE_MIR_FRAMESTATE | framestate-threaded MIR lowering | MIR front-end #176/#181/#346 |
@@ -510,9 +511,9 @@ Kept as-is; listed for completeness.
   `PYRE_CARRIER_EXC_RESUME`.  For these the *ON* path is the unattested one, so
   they are adoption targets rather than retirement targets.
   `_BLACKHOLE_RESUME` graduated out of this bucket on 2026-07-25 (flipped
-  default-ON, now in §4); `_MULTIFRAME` graduated the same way once
-  `walker_ec_enter` / `walker_ec_leave` closed the escaping-`sys._getframe`
-  identity answer.
+  default-ON, now in §4); the multi-frame gate later graduated and is now
+  retired, with its reader and OFF path deleted after `walker_ec_enter` /
+  `walker_ec_leave` closed the escaping-`sys._getframe` identity answer.
 
   `_CALLEE_VSTACK` was evaluated for a flip on 2026-07-25 and **declined —
   the ON path is a half-finished port with no consumer**.  Parity first:

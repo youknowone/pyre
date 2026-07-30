@@ -1,5 +1,5 @@
 # The frame-identity read the multi-frame blackhole adopt commits, and the
-# regression guard for `PYRE_FBW_MULTIFRAME` being default-ON.
+# regression guard for making that path unconditional.
 #
 # The walk executes the forcing residual CONCRETELY, and an inline push never
 # runs the interpreter's call sequence. Before `walker_ec_enter` /

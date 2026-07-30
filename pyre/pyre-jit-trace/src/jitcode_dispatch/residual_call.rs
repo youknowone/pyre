@@ -259,38 +259,6 @@ fn single_frame_blackhole_resume_enabled() -> bool {
     })
 }
 
-/// `PYRE_FBW_MULTIFRAME` (default ON) — adopt the MULTI-frame (inlined
-/// sub-walk) blackhole image rather than declining an inline-sub-walk vable
-/// force to the legacy escape/replay path.  The build side
-/// (`build_multi_frame_miframe`, the input-arg `_resref` seed, and the
-/// getfield-chain `recover_ref_value`) reconstructs the frame stack; the resume
-/// side (`drive_multi_frame_blackhole` → `convert_and_run_from_pyjitpl`)
-/// publishes each level as the chain reaches it.  Blast radius is exactly
-/// `inline_subwalk` at a vable escape: the latch is an `if`/`else if` whose
-/// single-frame arm requires `framestack.is_empty() && !inline_subwalk`.
-///
-/// This was opt-in for as long as an inline push did not run the interpreter's
-/// call sequence.  `ec.topframeref` still named the CALLER while an inlined
-/// callee body ran, so a `sys._getframe` that was itself the escaping residual
-/// read the wrong frame at walk time, and adopting committed that answer where
-/// the legacy path discarded it.  `walker_ec_enter` / `walker_ec_leave`
-/// (`executioncontext.py:85-107`) publish the callee frame at the inlined-call
-/// push, which closes it; a `sys._getframe` executed later, inside the
-/// blackhole, was always correct.
-/// `synth/getframe_while_escaping_read_frame_identity` is the regression guard
-/// and reports zero wrong frames with the adopt committing.  `=0`/`false` opts
-/// back out.
-fn multi_frame_blackhole_resume_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_MULTIFRAME") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
 fn build_single_frame_miframe<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     jitcode: std::sync::Arc<majit_metainterp::jitcode::JitCode>,
@@ -2524,8 +2492,31 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                             });
                         });
                     }
+                // An inlined sub-walk adopts the multi-frame blackhole image.
+                // The build side (`build_multi_frame_miframe`, the input-arg
+                // `_resref` seed, and the getfield-chain `recover_ref_value`)
+                // reconstructs the frame stack; the resume side
+                // (`drive_multi_frame_blackhole` →
+                // `convert_and_run_from_pyjitpl`) publishes each level as the
+                // chain reaches it. The blast radius is exactly
+                // `inline_subwalk` at a vable escape: this is an `if`/`else
+                // if`, and the single-frame arm requires
+                // `framestack.is_empty() && !inline_subwalk`.
+                //
+                // This path was once gated because the walker executes
+                // residuals concretely while an inline push does not run the
+                // interpreter's call sequence. `ec.topframeref` therefore
+                // named the CALLER while an inlined callee body ran, so a
+                // `sys._getframe` that was itself the escaping residual read
+                // the wrong frame at walk time. Adopting committed that answer
+                // where legacy escape/replay discarded it. A `sys._getframe`
+                // executed later, inside the blackhole, was always correct.
+                // `walker_ec_enter` / `walker_ec_leave` (the port of
+                // `executioncontext.py:85-107`) publish the callee frame at
+                // the inlined-call push, which closed the gap.
+                // `synth/getframe_while_escaping_read_frame_identity` is the
+                // regression guard.
                 } else if ctx.fbw_mode.inline_subwalk
-                    && multi_frame_blackhole_resume_enabled()
                     && let Some(framestack) = build_multi_frame_miframe(
                         ctx,
                         resume_pc,

@@ -1,4 +1,4 @@
-# Coverage guard for the multi-frame blackhole path (PYRE_FBW_MULTIFRAME).
+# Coverage guard for the unconditional multi-frame blackhole path.
 #
 # A vable escape inside an INLINE sub-walk is what latches a multi-frame
 # blackhole image. The rest of the corpus never produces one: every other
