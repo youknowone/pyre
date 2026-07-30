@@ -8866,14 +8866,21 @@ pub unsafe fn bound_method_attr_fast_path(
         return None;
     }
     let w_descr = lookup_in_type(w_type, name)?;
-    // `get()` binds exactly this shape: a `function` whose code is builtin
-    // (a `BuiltinFunction` returns itself unbound; every other descriptor
-    // kind takes a different arm).  A function is never a data descriptor,
-    // so the data-descriptor arm above it cannot fire either.
+    // The exact shape `get()` binds through `w_method_new`: a `function` OR a
+    // `method_descriptor` whose code is builtin.  Both take the SAME arm there
+    // (the `FUNCTION_TYPE || METHOD_DESCRIPTOR_TYPE` test above `w_method_new`),
+    // so admitting only one of them declines a receiver the fold reproduces
+    // exactly — `list.append` and every other `TypeDef` method are
+    // `method_descriptor`.  `BuiltinFunction` is excluded because `get()`
+    // returns it unbound, i.e. no `Method` to emit.  Neither kind is a data
+    // descriptor, so the data-descriptor arm above cannot fire either.
     if !crate::is_function(w_descr) {
         return None;
     }
-    if !std::ptr::eq((*w_descr).ob_type, &crate::FUNCTION_TYPE as *const _) {
+    let descr_ob_type = (*w_descr).ob_type;
+    if !std::ptr::eq(descr_ob_type, &crate::FUNCTION_TYPE as *const _)
+        && !std::ptr::eq(descr_ob_type, &crate::METHOD_DESCRIPTOR_TYPE as *const _)
+    {
         return None;
     }
     if !crate::is_builtin_code(crate::function_get_code(w_descr) as PyObjectRef) {
@@ -15428,6 +15435,53 @@ mod tests {
         let cls = crate::typedef::make_builtin_type("TestUserClass", |_| {});
         unsafe { pyre_object::w_type_set_hasdict(cls, true) };
         w_instance_new(cls)
+    }
+
+    /// `bound_method_attr_fast_path` must admit every descriptor kind the
+    /// `get()` it reproduces binds through `w_method_new` — otherwise the
+    /// `LOAD_ATTR`-method fold declines and the walker emits an opaque
+    /// may-force `getattr` residual per iteration instead.
+    ///
+    /// `TypeDef` methods are retagged `method_descriptor`
+    /// (`function_retag_method_descriptor`), not `function`, so a predicate
+    /// testing `FUNCTION_TYPE` alone silently declines `lst.append` and every
+    /// sibling. Both types take the SAME arm in `get()`.
+    #[test]
+    fn bound_method_fast_path_admits_the_same_kinds_get_binds() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let w_list = pyre_object::listobject::w_list_new(vec![]);
+        let w_type = crate::typedef::r#type(w_list)
+            .expect("list has a type")
+            .as_ptr();
+
+        let w_descr = unsafe { lookup_in_type(w_type, "append") }.expect("list.append exists");
+        assert!(
+            std::ptr::eq(
+                unsafe { (*w_descr).ob_type },
+                &crate::METHOD_DESCRIPTOR_TYPE as *const _,
+            ),
+            "premise: a TypeDef method is a method_descriptor, not a function",
+        );
+
+        // `get()` is the behaviour the fold reproduces: it binds this descriptor
+        // into a Method carrying (w_function = descr, w_self = the receiver).
+        let bound = unsafe { get(w_descr, w_list, w_type) }
+            .expect("get() must not raise")
+            .expect("get() binds a method_descriptor");
+        assert!(unsafe { pyre_object::function::is_method(bound) });
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::function::w_method_get_func(bound) },
+            w_descr,
+        ));
+
+        // So the predicate must admit it, naming the very same descriptor.
+        let (fp_type, fp_version_tag, fp_descr) =
+            unsafe { bound_method_attr_fast_path(w_list, "append") }
+                .expect("the fold precondition must admit what get() binds");
+        assert!(std::ptr::eq(fp_type, w_type));
+        assert!(std::ptr::eq(fp_descr, w_descr));
+        assert_ne!(fp_version_tag, 0);
     }
 
     /// typeobject.py:293-301 — under the interpreter (`we_are_jitted()`
