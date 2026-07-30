@@ -2081,15 +2081,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 .and_then(|w_size| {
                     // `PyLong_AsSsize_t(res)` — no `__index__` coercion, so a
-                    // non-integer result is the TypeError the default covers.
+                    // non-integer result is the TypeError the default covers,
+                    // while a result too wide for the word is an OverflowError
+                    // it does not.  Both precede the `size < 0` test below, so
+                    // `__sizeof__` returning `-(1 << 100)` overflows rather
+                    // than reporting the negative.
                     let is_integer = unsafe {
                         pyre_object::is_int(w_size) || pyre_object::pyobject::is_long(w_size)
                     };
-                    if is_integer {
-                        Ok(w_size)
-                    } else {
-                        Err(crate::PyError::type_error("an integer is required"))
+                    if !is_integer {
+                        return Err(crate::PyError::type_error("an integer is required"));
                     }
+                    crate::baseobjspace::int_w(w_size).map_err(|_| {
+                        crate::PyError::overflow_error(
+                            "Python int too large to convert to C ssize_t",
+                        )
+                    })?;
+                    Ok(w_size)
                 });
                 match (sized, w_default) {
                     (Ok(w_size), _) => {
