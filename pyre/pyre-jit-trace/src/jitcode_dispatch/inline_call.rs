@@ -2655,7 +2655,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 // recursive callees residual: either requires another loop
                 // header rather than one bounded callee walk.
                 foriter_dirty_bound = bound_method.is_some()
-                    && !method_form
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !pyre_interpreter::code_is_self_recursive(callee_code);
                 foriter_dirty_bound
@@ -2669,16 +2668,18 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 exact_numeric_args.iter().filter(|arg| arg.numeric).count(),
             );
         }
-        // A `Dirty` body is not admitted by seeding its frame.  Its residual
-        // can raise, and the local `except` that catches it is a callee-owned
-        // catch edge the inline path does not compile, so the exception
-        // escapes the caller instead of being handled where the source
-        // handles it.  Keep the ordinary residual call until that edge exists.
+        // An unbound `Dirty` body is not admitted by seeding its frame.  Its
+        // residual can raise, and the local `except` that catches it is a
+        // callee-owned catch edge the inline path does not compile, so the
+        // exception escapes the caller instead of being handled where the
+        // source handles it.  Stored bound methods instead take the explicit
+        // multi-frame red-frame path above.
         if !legacy_admit {
             return Ok(None);
         }
     }
     if method_form
+        && bound_method.is_none()
         && !allow_method_load_attr
         && !method_form_callee_body_supported(body.code, callee_descr_refs)
     {
@@ -3123,6 +3124,51 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             if !callee_code.cellvars.is_empty() {
                 if try_multiframe {
                     return Ok(None);
+                }
+                break 'seed;
+            }
+            // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to an `is`/`is_not`
+            // identity residual call whose operands must be Ref (the codewriter
+            // PopJumpIfNone arm), then a branch guard.  When the multiframe inline
+            // int-specializes the tested local, the mid-body guard resume cannot
+            // source that operand's Ref form from the callee register banks
+            // (`collect_callee_active_boxes` would read a stale/mismatched box), so
+            // the encoded liveness stream disagrees with the decoder
+            // (`resume.rs decode_ref: unexpected tag`) and the caller frame is
+            // corrupted. Decline to the ordinary residual call until
+            // the multi-frame resume reboxes int-specialized identity operands.
+            // POP_JUMP_IF_TRUE/FALSE stay inlinable: their `bool` truth folds in the
+            // int bank, so no Ref rebox is needed.  A strict straight-line callee
+            // has no branch at all, so this scan never fires for it.
+            // Stored bound methods carry their explicit receiver and callee frame,
+            // so their Ref operands remain available to the resume path.
+            //
+            // This is the one precondition here that still aborts instead of
+            // returning `Ok(None)`, and deliberately so.  Residualizing it does
+            // work — `bench/synth/_pending/gc_bug_bridge_flavor_traceback_names`
+            // goes from 98 aborts to 2 and
+            // `_pending/exception_nested_exc_info_restore` from 5 aborts to 0,
+            // both compiling loops they never compiled before — but the loops it
+            // newly compiles then print traceback tuples missing their outermost
+            // frame, diverging from the interpreter (that fixture pins its
+            // expected output in its header).  The abort was masking a lost
+            // `PyTraceback` node on the compiled exception path, not preventing
+            // one.  Restore `Ok(None)` here once that node is recorded; it is the
+            // largest single win left in this function.
+            if bound_method.is_none()
+                && (0..callee_code.instructions.len()).any(|pc| {
+                    matches!(
+                        pyre_interpreter::decode_instruction_at(callee_code, pc),
+                        Some((
+                            pyre_interpreter::bytecode::Instruction::PopJumpIfNone { .. }
+                                | pyre_interpreter::bytecode::Instruction::PopJumpIfNotNone { .. },
+                            _
+                        ))
+                    )
+                })
+            {
+                if try_multiframe {
+                    return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
                 break 'seed;
             }
