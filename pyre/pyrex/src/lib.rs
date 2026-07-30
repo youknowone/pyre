@@ -1114,8 +1114,11 @@ pub(crate) fn init_importlib_bootstrap(
     // standard streams can reach a text codec from here on.  A failed
     // bootstrap leaves the native importer serving imports, so the codec is
     // still reachable and the streams still want it.
-    pyre_interpreter::module::sys::vm::init_stream_codecs();
-    bootstrapped
+    let stream_codecs = pyre_interpreter::module::sys::vm::init_stream_codecs();
+    // A bootstrap failure is the more fundamental of the two, so it wins;
+    // otherwise a codec the streams could not build is reported rather than
+    // leaving a stream that reports itself unreadable.
+    bootstrapped.and(stream_codecs)
 }
 
 fn bootstrap_importlib_modules(

@@ -1004,6 +1004,10 @@ pub unsafe fn walk_pyframe_roots_area(
 pub fn register_pyframe_root_walker() {
     majit_gc::shadow_stack::register_extra_root_walker(walk_global_prebuilt_roots);
     majit_gc::shadow_stack::register_extra_root_walker(crate::module::thread::walk_thread_roots);
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    majit_gc::shadow_stack::register_extra_root_walker(
+        crate::module::faulthandler::handler::walk_fatal_error_file,
+    );
 }
 
 thread_local! {

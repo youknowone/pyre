@@ -220,6 +220,14 @@ thread_local! {
     /// when Rust RAII scopes nest across a `FrameBox`.
     static OWNER_ROOTS: RefCell<Vec<Option<GcRef>>> = const { RefCell::new(Vec::new()) };
 
+    /// Interior `OWNER_ROOTS` slots that have been released but still sit
+    /// below the live tail.  Popping one is what keeps `acquire_owner_root`
+    /// O(1): searching for the first `None` instead is a linear scan, and a
+    /// recursion `depth` frames deep pays O(depth²) just to root its frames.
+    /// Trailing slots never land here — `release_owner_root` shrinks those
+    /// away so an unwound recursion leaves no walked tail behind.
+    static OWNER_ROOTS_FREE: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+
     /// Thread-local flat jitframe root stack. Rust tests run multiple
     /// JIT/GC tests in parallel, so using one process-global root stack lets
     /// one GC walk another test's jitframe. RPython's root stack is per
@@ -454,7 +462,9 @@ pub fn get(index: usize) -> GcRef {
 pub fn acquire_owner_root(root: GcRef) -> usize {
     OWNER_ROOTS.with(|roots| {
         let mut roots = roots.borrow_mut();
-        if let Some(index) = roots.iter().position(Option::is_none) {
+        let reused = OWNER_ROOTS_FREE.with(|free| free.borrow_mut().pop());
+        if let Some(index) = reused {
+            debug_assert!(roots[index].is_none(), "reusing a live owner-root slot");
             roots[index] = Some(root);
             index
         } else {
@@ -474,9 +484,20 @@ pub fn release_owner_root(index: usize) {
             "releasing an inactive owner-root slot"
         );
         roots[index] = None;
+        if index + 1 < roots.len() {
+            // An interior hole: hand it to the next acquire.
+            let _ = OWNER_ROOTS_FREE.try_with(|free| free.borrow_mut().push(index));
+            return;
+        }
+        // The tail — the ordinary case, since these guards nest with the Rust
+        // scopes that own them.  Shrink rather than queueing, so the walked
+        // range tracks the live depth, and drop the queued indices the shrink
+        // just took out of range.
         while roots.last().is_some_and(Option::is_none) {
             roots.pop();
         }
+        let live = roots.len();
+        let _ = OWNER_ROOTS_FREE.try_with(|free| free.borrow_mut().retain(|&i| i < live));
     });
 }
 

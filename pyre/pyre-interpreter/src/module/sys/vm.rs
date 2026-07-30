@@ -2055,15 +2055,16 @@ fn stdio_stdin_readline(args: &[PyObjectRef]) -> crate::PyResult {
 ///
 /// The `__std*__` aliases name the streams this built even after user code
 /// rebinds `sys.stdout`; a rebound one is not this function's to reconfigure.
-pub fn init_stream_codecs() {
+pub fn init_stream_codecs() -> Result<(), crate::PyError> {
     let Some(sys) = crate::importing::get_sys_module("sys") else {
-        return;
+        return Ok(());
     };
     for name in ["__stdout__", "__stderr__", "__stdin__"] {
         if let Ok(stream) = crate::baseobjspace::getattr_str(sys, name) {
-            crate::module::_io::W_TextIOWrapper::attach_stdio_codec(stream);
+            crate::module::_io::W_TextIOWrapper::attach_stdio_codec(stream)?;
         }
     }
+    Ok(())
 }
 
 fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {

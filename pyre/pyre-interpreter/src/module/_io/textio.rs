@@ -496,6 +496,17 @@ impl W_TextIOWrapper {
         }
     }
 
+    /// Record `self` in the remembered set (incminimark.py:1495
+    /// `write_barrier_from_array`).  An already-old wrapper is NOT scanned by a
+    /// minor collection unless the barrier ran since the previous one, so a
+    /// reference field storing a fresh (nursery) object has to be published
+    /// before the next operation that can collect — not once at the end of a
+    /// sequence that allocates and calls back into Python between the stores.
+    #[inline]
+    fn publish_refs(&mut self) {
+        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+    }
+
     /// PyPy `W_TextIOWrapper._set_encoder_decoder`.
     fn set_encoder_decoder(&mut self, codec: PyObjectRef) -> Result<(), crate::PyError> {
         self.w_encoder = PY_NULL;
@@ -521,14 +532,16 @@ impl W_TextIOWrapper {
                 )?;
             }
             self.w_decoder = decoder;
+            // `writable` below runs arbitrary Python and can collect.
+            self.publish_refs();
         }
 
         if crate::baseobjspace::is_true(super::call_method_result(self.w_buffer, "writable", &[])?)?
         {
             self.w_encoder =
                 super::call_method_result(codec, "incrementalencoder", &[self.w_errors])?;
+            self.publish_refs();
         }
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
         Ok(())
     }
 
@@ -818,10 +831,19 @@ impl W_TextIOWrapper {
         line_buffering: bool,
         write_through: bool,
     ) -> Result<(), crate::PyError> {
+        // Every `w_str_new` here allocates and `set_newline` /
+        // `getattr_str` / `set_encoder_decoder` below run Python, so a
+        // collection can land between any two of these stores.  Publish after
+        // each reference store instead of once at the end, or a store made
+        // before a collection is one the collection never traced.
         self.w_buffer = buffer;
+        self.publish_refs();
         self.w_encoding = w_str_new(encoding);
+        self.publish_refs();
         self.w_errors = w_str_new(errors);
+        self.publish_refs();
         self.w_newline = newline;
+        self.publish_refs();
         self.line_buffering = line_buffering;
         self.write_through = write_through;
         self.decoded.reset();
@@ -838,7 +860,7 @@ impl W_TextIOWrapper {
         self.telling = self.seekable_flag;
         self.state = STATE_OK;
         self.reset_encoder_state();
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        self.publish_refs();
         Ok(())
     }
 
@@ -875,22 +897,34 @@ impl W_TextIOWrapper {
         // hand the import system a second, half built module.
         // [`attach_stdio_codec`] supplies it once the import system is up.
         let payload = unsafe { &mut *(obj as *mut Self) };
-        let _ = payload.attach_buffer(
-            buffer,
-            encoding,
-            errors,
-            newline,
-            newline_value,
-            PY_NULL,
-            line_buffering,
-            write_through,
-        );
-        // `attach_buffer` reaches its fallible calls only once the buffer and
-        // the newline mode are stored, so a stream whose buffer answers no
-        // `seekable` — a descriptor the host refused to open arrives as none at
-        // all — is still the stream this used to build unconditionally.
+        if payload
+            .attach_buffer(
+                buffer,
+                encoding,
+                errors,
+                newline,
+                newline_value,
+                PY_NULL,
+                line_buffering,
+                write_through,
+            )
+            .is_err()
+        {
+            // With a null codec the only fallible step `attach_buffer` reaches
+            // is `buffer.seekable()`, and a descriptor the host refused to open
+            // arrives as no buffer at all.  `create_stdio`
+            // (`app_main.py:495-497`) propagates such a failure, but this runs
+            // inside `sys` module creation — there is no interpreter to raise
+            // into yet, and the streams have to exist for one to start.  Finish
+            // the two fields the early return skipped rather than leaving them
+            // at their `Default`, so the stream below is initialized whichever
+            // path built it.
+            payload.seekable_flag = false;
+            payload.telling = false;
+            payload.reset_encoder_state();
+        }
         payload.state = STATE_OK;
-        pyre_object::gc_hook::try_gc_write_barrier(payload as *mut Self as *mut u8);
+        payload.publish_refs();
         crate::baseobjspace::setdictvalue_native(obj, "name", w_str_new(name));
         obj
     }
@@ -900,29 +934,33 @@ impl W_TextIOWrapper {
     /// reports itself unreadable however readable its buffer is, and only the
     /// methods `make_std_stream` installs as instance overrides work.
     ///
-    /// Ignores anything else — a replaced `sys.stdout`, a stream that already
-    /// has a codec, one whose encoding is unknown to the codec registry.
-    pub fn attach_stdio_codec(stream: PyObjectRef) {
+    /// Skips a stream this did not build — a replaced `sys.stdout`, one that
+    /// already has a codec, one carrying no encoding string.  A codec the
+    /// registry refuses, or an incremental encoder/decoder that will not
+    /// construct, is NOT skipped: `create_stdio` (`app_main.py:495-497`) builds
+    /// the wrapper with its codec in one step and propagates both, and a stream
+    /// left silently without one reports itself unreadable however readable its
+    /// buffer is.
+    pub fn attach_stdio_codec(stream: PyObjectRef) -> Result<(), crate::PyError> {
         if stream.is_null()
             || !std::ptr::eq(
                 unsafe { pyre_object::ll_type(stream) },
                 <Self as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
             )
         {
-            return;
+            return Ok(());
         }
         let payload = unsafe { &mut *(stream as *mut Self) };
         if !payload.w_encoder.is_null() || !payload.w_decoder.is_null() {
-            return;
+            return Ok(());
         }
         let Some(encoding) =
             unsafe { pyre_object::w_str_get_value_opt(payload.w_encoding) }.map(str::to_owned)
         else {
-            return;
+            return Ok(());
         };
-        if let Ok(codec) = Self::lookup_text_codec(&encoding) {
-            let _ = payload.set_encoder_decoder(codec);
-        }
+        let codec = Self::lookup_text_codec(&encoding)?;
+        payload.set_encoder_decoder(codec)
     }
 }
 
