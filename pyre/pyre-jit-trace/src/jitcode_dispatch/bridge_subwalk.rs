@@ -9,6 +9,41 @@
 
 use super::*;
 
+/// Record the catching frame's own `PyTraceback` node at a bridge handler
+/// entry.
+///
+/// `pyopcode.py handle_operation_error` runs
+/// `pytraceback.record_application_traceback` BEFORE `lookup_exceptiontable`
+/// routes to the handler, so the frame that catches contributes a node whether
+/// or not it is the frame that raised.  Upstream meta-traces that interpreter
+/// loop, so the attach lands in the bridge on its own; pyre synthesizes the
+/// loop and has to emit it at each catch entry.
+///
+/// The five in-trace handler-entry paths already did this; these two bridge
+/// arms did not, and the frame they lost is always the OUTERMOST one: on the
+/// bridge leg the raising callee ran as real frames (a residual call), so those
+/// frames attach their own nodes through the interpreted raise machinery, while
+/// the catching frame is the compiled one whose node exists only if the trace
+/// records it.
+///
+/// A delivery that reaches the parent trace's own handler-entry record as well
+/// would get two adjacent nodes for this frame; `record_caught_blackhole_
+/// traceback` drops the later one.
+fn record_bridge_handler_entry_traceback<Sym: WalkSym>(
+    wc: &mut WalkContext<'_, '_, Sym>,
+    exc: OpRef,
+    exc_concrete: ConcreteValue,
+    position: usize,
+) {
+    // The handler is part of the trace, so once this bridge runs compiled it
+    // catches the exception itself and the frame never surfaces an error the
+    // interpreter's `handle_exception` could record a node from — hence the
+    // runtime emit when the IR-virtual prepend declines.
+    let emit_runtime = !record_prepend_application_traceback(wc, exc, exc_concrete, position);
+    record_inline_application_traceback(wc, exc, exc_concrete, position, true, emit_runtime);
+    record_top_level_application_traceback(wc, exc, exc_concrete, position, true, emit_runtime);
+}
+
 /// `executioncontext.py:91-107 leave` for a frame the bridge resumed into
 /// rather than entered.
 ///
@@ -436,6 +471,12 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             wc.last_exc_value = Some(value_op);
             wc.last_exc_value_concrete = ConcreteValue::Ref(exc_edge_concrete);
             wc.fbw_mode.class_of_last_exc_is_const = true;
+            record_bridge_handler_entry_traceback(
+                &mut wc,
+                value_op,
+                ConcreteValue::Ref(exc_edge_concrete),
+                position,
+            );
             // Reconstruct the handler-entry operand stack + push the exc box on
             // the new TOS (mirrors the mid-walk SubRaise catch routing).
             vstack_enter_exception_handler(&mut wc, catch_target, value_op);
@@ -464,6 +505,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // a reraise in the handler mis-reads the standing exception.
             wc.fbw_mode.class_of_last_exc_is_const = true;
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+            record_bridge_handler_entry_traceback(&mut wc, seed.exc, seed.exc_concrete, position);
             vstack_enter_exception_handler(&mut wc, seed.catch_target, seed.exc);
             seed.catch_target
         } else {

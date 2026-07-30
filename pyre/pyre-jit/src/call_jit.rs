@@ -656,6 +656,29 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     let last_instruction =
         pyre_jit_trace::state::python_pc_for_jitcode_pc_public(jitcode_index, opcode_position)
             .map_or(unsafe { (*frame_ptr).last_instr as i64 }, i64::from);
+    // One catch can be reached by two recorders: this hook, emitted into the
+    // loop trace by the in-trace handler-entry arm, and the IR-virtual node the
+    // bridge handler-entry arm builds when the exception edge deopts into a
+    // bridge.  Both then run for the same delivery and the frame gets two
+    // adjacent nodes, so the handler reads its own name twice.  Upstream never
+    // has the pair — `pyopcode.py handle_operation_error` is the single attach
+    // point — so drop the second: `record_application_traceback` prepends, and
+    // this exact node already exists exactly when the chain HEAD carries this
+    // frame at this instruction.  A genuine repeat (the same frame raising
+    // again at the same offset) always attaches to a fresh exception, and a
+    // bare reraise, which does legitimately re-record one frame, is skipped
+    // above.
+    unsafe {
+        let head =
+            pyre_object::interp_exceptions::w_exception_get_traceback(exc_value as PyObjectRef);
+        if !head.is_null()
+            && pyre_interpreter::pytraceback::is_pytraceback(head)
+            && pyre_interpreter::pytraceback::w_pytraceback_get_frame(head) == frame_ptr
+            && pyre_interpreter::pytraceback::w_pytraceback_get_lasti(head) == last_instruction
+        {
+            return;
+        }
+    }
     m73_lastinstr_audit("caught", Some(jitcode_index), opcode_position, frame_ptr);
     unsafe {
         pyre_interpreter::pytraceback::record_application_traceback(
