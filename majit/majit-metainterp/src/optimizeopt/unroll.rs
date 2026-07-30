@@ -1349,39 +1349,10 @@ impl UnrollOptimizer {
                         }
                     }
                 }
-                // TODO (B.6.5): RPython's
-                // `force_op_from_preamble` (unroll.py:26-39) only seeds
-                // `potential_extra_ops`. The orthodox path that fills
-                // `used_boxes` / `short_preamble_jump` / `extra_same_as`
-                // is `force_box -> potential_extra_ops.pop ->
-                // add_preamble_op` (shortpreamble.py:432-440), which
-                // RPython runs in `optimize_op` whenever a body op
-                // forces an imported Box. RPython's Box identity then
-                // keeps that Box live across the loop boundary
-                // implicitly.
-                //
-                // majit's disjoint Phase 1 / Phase 2 OpRef namespaces
-                // strip the Box-identity transparency. Body ops that
-                // CSE-replace through `force_op_from_preamble_op` and
-                // never trigger `force_box` leave their imported entry
-                // in `potential_extra_ops`, so the LABEL is not
-                // extended with the corresponding `used_box`. To
-                // recover orthodox shape, walk body args + fail_args
-                // in body-occurrence order before
-                // `build_imported_short_preamble` and call the
-                // orthodox `force_box` for every body OpRef that has a
-                // pending `potential_extra_ops` entry. `force_box`
-                // routes through `add_preamble_op_from_pop`
-                // (optimizer.rs `force_box`), so used_boxes /
-                // short_preamble_jump / extra_same_as fill via the
-                // canonical RPython path.
                 {
                     let mut visited_force: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
                     for op in p2_ops.iter() {
                         if op.opcode == OpCode::Jump {
-                            // The terminal jump's args are already
-                            // run through `force_box_for_end_of_preamble`
-                            // (unroll.py:126-127) above.
                             continue;
                         }
                         let arg_list = op.getarglist_copy();
@@ -1390,10 +1361,9 @@ impl UnrollOptimizer {
                             .map(|a| a.to_opref())
                             .chain(op.getfailargs().into_iter().flatten().map(|a| a.to_opref()));
                         for arg in arg_iter {
-                            if !is_trace_runtime_ref(arg, &consts_p2) {
-                                continue;
-                            }
-                            if visited_force.contains(&arg) {
+                            if !is_trace_runtime_ref(arg, &consts_p2)
+                                || visited_force.contains(&arg)
+                            {
                                 continue;
                             }
                             visited_force.insert(arg);
@@ -1403,10 +1373,6 @@ impl UnrollOptimizer {
                                 .iter()
                                 .any(|(k, _)| *k == arg || *k == resolved);
                             if !needs_force {
-                                // RPython keeps the exported result and its
-                                // body use as one Box. A forwarded Phase-2
-                                // placeholder needs the preserved exported
-                                // Box to recover the same ownership path.
                                 if let Some((_, produced)) =
                                     exported_short_boxes_produced.iter().find(|(_, produced)| {
                                         let source = produced.res.to_opref();
@@ -4287,19 +4253,6 @@ impl OptUnroll {
             let result = match produced.kind {
                 crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
                 | crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant => {
-                    // The short-box result that coincides with a label/virtual
-                    // slot maps to that slot's body OpRef. For these non-InputArg
-                    // kinds the export records `label_arg_idx` as
-                    // `lookup_label_arg(canonical_result)` (optimizer.rs is
-                    // kind-aware: InputArg keeps the stamped original slot, every
-                    // other kind takes the FORWARDED-result lookup). `source` ==
-                    // `canonical_result` == `preamble_op.pos`, so this slot is the
-                    // position of the FORWARDED `source` within the original
-                    // `label_args + virtuals` — a Pure/LoopInvariant result proven
-                    // equal to a label arg it did not originally occupy still
-                    // reuses that slot's `short_args[slot]`. (The renamed
-                    // `short_inputargs[slot]` is a distinct box and would never
-                    // equal `source` anyway.)
                     if let Some(slot) = produced.label_arg_idx {
                         short_args.get(slot).copied()
                     } else {
@@ -5128,21 +5081,8 @@ fn assemble_peeled_trace_with_jump_args(
         .chain(preamble_defs.iter().copied())
         .collect();
 
-    // shortpreamble.py:436-439 + unroll.py:497-504 parity: when
-    // `sp.used_boxes[i] != sp.jump_args[i]` (Case A/B end-of-preamble
-    // SameAs alias splits identity — preamble JUMP carries `jump_source`,
-    // LABEL takes `source_slot`), register the forwarding chain so body
-    // ops referencing `jump_source` resolve to `source_slot` via
-    // `ctx.get_box_replacement` (`optimizer.py:266 set_forwarded`).
-    // RPython's Box identity makes this implicit — the alias's Box is
-    // the same Python object that body ops already hold. Pyre's flat
-    // OpRef model needs an explicit forwarding registration here.
     let mut assembly_alias_remap: std::collections::HashMap<OpRef, OpRef> =
         std::collections::HashMap::new();
-    // Keep the assembly-only alias map separate from the general `_forwarded`
-    // walk. PyPy has object identity for these short-preamble boxes; pyre needs
-    // the explicit jump_source -> label_arg substitution, but must not follow
-    // later postprocess Const forwarding on unrelated emitted guard args.
     for (i, &source_slot) in filtered_extra_label_args.iter().enumerate() {
         if source_slot.is_none() {
             continue;
@@ -5150,18 +5090,9 @@ fn assemble_peeled_trace_with_jump_args(
         let Some(&extended_label_arg) = full_label_args.get(extra_label_start_idx + i) else {
             continue;
         };
-        debug_assert_eq!(
-            source_slot, extended_label_arg,
-            "full_label_args at extra_label_start_idx + i must equal \
-             filtered_extra_label_args[i] (line 4338 extend invariant)"
-        );
         if let Some(&jump_source) = filtered_extra_jump_args.get(i) {
             if !jump_source.is_none() && jump_source != source_slot {
                 let b_js = ctx.materialize_operand_at(jump_source);
-                // Chain target: resolve-or-materialize the canonical host
-                // (make_equal_to materializes an unbound target internally;
-                // doing it here keeps the target off the position-only
-                // fabrication path).
                 let b_ela = match ctx.get_box_replacement_operand_opt(extended_label_arg) {
                     Some(b) => b,
                     None => ctx.materialize_operand_at(extended_label_arg),
@@ -5287,9 +5218,6 @@ fn assemble_peeled_trace_with_jump_args(
                     // walking ctx.get_box_replacement here would follow Const
                     // forwarding that postprocess installed AFTER the body op
                     // was emitted (corrupting already-emitted trace). The
-                    // short-preamble alias (jump_source -> extended_label_arg)
-                    // is the only assembly-time substitution we want; consult
-                    // the local map directly.
                     let resolved_arg = assembly_alias_remap.get(&arg).copied().unwrap_or(arg);
                     let available_before_label = visible_before_label.contains(&arg)
                         || visible_before_label.contains(&resolved_arg)
@@ -7164,7 +7092,6 @@ mod tests {
         assert!(pop.is_some(), "PreambleOp must be in PtrInfo._fields");
         let pop = pop.unwrap();
         assert_eq!(pop.op.to_opref(), OpRef::int_op(11)); // Phase 1 source — pop.op
-        // forwards via make_equal_to to the body-visible OpRef.
         drop(parent);
     }
 
@@ -7503,15 +7430,7 @@ mod tests {
             .unwrap()
             .produced_short_op(&src19)
             .unwrap();
-        // produce_heap_field no longer installs
-        // make_equal_to, but the test still walks the get_box_replacement
-        // chain inside force_box's add_preamble_op, so install a manual
-        // forwarding to the body-visible OpRef to exercise that path.
         let b_src = ctx.materialize_operand_at(OpRef::ref_op(19));
-        let b_tgt = ctx
-            .get_box_replacement_operand_opt(OpRef::ref_op(14))
-            .unwrap_or_else(|| ctx.materialize_operand_at(OpRef::ref_op(14)));
-        ctx.make_equal_to(&b_src, &b_tgt);
         let pop = crate::optimizeopt::info::PreambleOp {
             op: b_src.clone(),
             invented_name: produced.invented_name,
@@ -7529,19 +7448,15 @@ mod tests {
         // empty until force_box runs add_preamble_op.
         assert!(sp.used_boxes.is_empty());
         assert!(sp.jump_args.is_empty());
-        // `force_op_from_preamble_op` keys potential_extra_ops by the
-        // body-visible box `get_box_replacement(preamble_source)`
-        // (unroll.py:35-37 `op = get_box_replacement(op)`).  This heap
-        // variant forwarded source 19 -> body-visible 14 (produce_heap_field
-        // installs the `make_equal_to` upstream heap.py omits), so the entry
-        // lands on 14, not on the source 19.
+        // `force_op_from_preamble_op` keys potential_extra_ops by
+        // preamble_op.op == short_op.res, the exact body-visible Box.
         assert!(
-            ctx.has_potential_extra_op(OpRef::ref_op(14)),
+            ctx.has_potential_extra_op(OpRef::ref_op(19)),
             "force_op_from_preamble_op must seed potential_extra_ops by the body-visible box"
         );
         assert!(
-            !ctx.has_potential_extra_op(OpRef::ref_op(19)),
-            "the forwarded source box must not carry the potential_extra_ops entry"
+            !ctx.has_potential_extra_op(OpRef::ref_op(14)),
+            "the unrelated replay/body slot must not carry the potential_extra_ops entry"
         );
 
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
@@ -7549,15 +7464,10 @@ mod tests {
 
         let sp = ctx.build_imported_short_preamble().unwrap();
         // shortpreamble.py:436 `op = preamble_op.op.get_box_replacement()`.
-        // pop.op=19 forwards to body-visible 14 via the producer's make_equal_to,
-        // so used_boxes carries the resolved body-visible OpRef while
-        // jump_args carries the unresolved Phase 1 source.
-        assert_eq!(sp.used_boxes.clone(), vec![OpRef::ref_op(14)]);
+        assert_eq!(sp.used_boxes.clone(), vec![OpRef::ref_op(19)]);
         assert_eq!(sp.jump_args.clone(), vec![OpRef::ref_op(19)]);
-        // force_box resolves the body arg forward (19 -> 14) and pops the
-        // entry at the body-visible key 14.
         assert!(
-            !ctx.has_potential_extra_op(OpRef::ref_op(14)),
+            !ctx.has_potential_extra_op(OpRef::ref_op(19)),
             "force_box must consume the potential_extra_ops entry"
         );
     }

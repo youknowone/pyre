@@ -445,25 +445,10 @@ impl ImportedShortPureOp {
         // objects, so `op.set_forwarded(self.res)` and
         // `preamble_op.set_forwarded(info)` never collide.
         //
-        // pyre's flat-OpRef model has only one slot per OpRef. To preserve
-        // PyPy parity we must allocate TWO different OpRefs for the two
-        // identities when they would collide:
-        //
-        //   * non-invented Pure: `op = self.res`. PyPy does NOT install a
-        //     forwarding on `op`, so the slot at `source` is free to hold
-        //     `info`. We can leave `replay.pos = source` — both objects
-        //     point at one slot, which is allowed because only `info`
-        //     occupies it.
-        //   * invented Pure: PyPy installs `op.set_forwarded(self.res)` on
-        //     the alt. In pyre, `produce_pure` calls
-        //     `make_equal_to(source, canonical)` (shortpreamble.rs:1279) which
-        //     overwrites the source box's `_forwarded` slot with
-        //     a forwarding redirect to `canonical_box`.
-        //     If `replay.pos` also pointed at `source`, the alt's
-        //     replacement chain and the replay's info would share one slot
-        //     and the info would be lost. We move `replay.pos` to the
-        //     pre-allocated body-visible OpRef (`result`) so it has its
-        //     own slot.
+        // The body-visible `op` and the replay `preamble_op` are distinct
+        // RPython Box objects for every PureOp, not only invented aliases.
+        // Keep their OpRef identities distinct as well: `source` names
+        // self.res, while `result` names the replay operation.
         replay.pos.set(if invented_name { result } else { source });
         if let Some(d) = descr.clone() {
             replay.setdescr(d);
@@ -3150,37 +3135,9 @@ impl OptContext {
         // happen to coincide with `next_iteration_args`): only seed
         // when no forwarding is recorded yet.
         //
-        // Replay slot rule, matching `ImportedShortPureOp::new` (mod.rs:194)
-        // and the producer-side `pop.preamble_op.pos` written by
-        // `produce_pure` / `produce_heap_field` / `produce_heap_array_item` /
-        // `produce_loop_invariant` in shortpreamble.rs.
-        //
-        // The rule reduces to: `replay slot = result_opref` iff the producer
-        // installs `make_equal_to(source, result_opref)`, otherwise `source`.
-        // PyPy `shortpreamble.py:401, 414` calls `preamble_op.set_forwarded(info)`
-        // on the replay Op object — distinct from `PreambleOp.op = self.res`.
-        // pyre's flat-OpRef model collapses the two onto one slot per OpRef,
-        // so when `make_equal_to` is installed at `source`, the replay's
-        // `_forwarded` slot must be moved to `result_opref` to avoid the
-        // op-forwarding chain clobbering the seeded info.
-        //
-        //   * invented Pure → result_opref. `produce_pure` installs
-        //     `make_equal_to(source, result_opref)` (Fix #3).
-        //   * Heap (field + array) → result_opref. `produce_heap_field` /
-        //     `produce_heap_array_item` install `make_equal_to` (Cat-2.2 B/C).
-        //   * LoopInvariant → result_opref. `produce_loop_invariant` installs
-        //     `make_equal_to` (Cat-2.2 A); the synthetic `SameAsI` replay built
-        //     by `optimize_CALL_LOOPINVARIANT_*` in `rewrite.rs` writes
-        //     `replay.pos = ctx.get_box_replacement(source)` to land on the
-        //     same slot.
-        //   * non-invented Pure → source. PyPy `shortpreamble.py:120 op = self.res`
-        //     with no forwarding installed; pyre keeps source's slot free for
-        //     the seeded info.
-        //
-        // The same rule drives `seed_at` (`set_preamble_forwarded_info`),
-        // the BUILDER's `replay.pos`, and the builder-side `produced_results`
-        // dependency map so all four sources of replay identity stay in
-        // lockstep with PyPy `shortpreamble.py:414-426` (`__init__`).
+        // Every ProducedShortOp carries two Boxes: `short_op.res` (source)
+        // and `preamble_op` (replay). `result_map[source]` is the replay Box
+        // allocated before the constructor, so all emit-capable kinds use it.
         let replay_pos = |source: OpRef, produced_op: &ProducedShortOp| -> OpRef {
             let installs_replace_op = match produced_op.kind {
                 PreambleOpKind::Pure => produced_op.invented_name,
@@ -3491,12 +3448,6 @@ impl OptContext {
     ) -> OpRef {
         let preamble_source = preamble_op.op.to_opref();
         // RPython `return preamble_op.op` returns the carried Box. In majit,
-        // `pop.op` carries the Phase 1 source box; `make_equal_to(source,
-        // body_visible)` is called by the producer for invented Pure / Heap /
-        // LoopInvariant, so walking the forwarding chain reaches the
-        // body-visible OpRef. Non-invented Pure has no forwarding installed,
-        // so `get_box_replacement(source) == source` and the body references
-        // source directly (RPython parity for non-invented `op = self.res`).
         // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()` —
         // walk the box's own `_forwarded` chain (total; identity on a miss),
         // object-native rather than positional.
@@ -3559,22 +3510,9 @@ impl OptContext {
             let _ = result_type;
             // unroll.py:34-37: potential_extra_ops[op] = preamble_op
             if !is_constant {
-                // unroll.py:29/37 `op = preamble_op.op; potential_extra_ops[op]
-                // = preamble_op` — upstream keys by the Box the BODY holds:
-                // heap.py's `_getfield` hands `self.res` (== preamble_op.op)
-                // to body ops directly, so `force_box`'s `pop(get_box_
-                // replacement(arg))` lands on that same object. majit's
-                // Cat-2.2 heap production reverses the chain — `produce_heap_
-                // field` forwards `source → result_opref`, so the terminal
-                // body-visible OpRef is `result`, NOT `preamble_source`.
-                // Key by `result` for every kind: non-invented Pure installs
-                // no forwarding (result == preamble_source, behavior
-                // unchanged), invented already used it, and Heap/LoopInvariant
-                // need it — keying those by `preamble_source` left the entry
-                // unreachable from every consumer (force_box resolves body
-                // args forward, never back), silently dropping the short
-                // box from `used_boxes`/`short_preamble_jump` and emitting a
-                // bridge JUMP one arg short of the target label.
+                // unroll.py:29/37 keys by `preamble_op.op`, which is
+                // short_op.res: the exact Box returned to and held by the
+                // body. The replay result is deliberately a different Box.
                 let key = result;
                 if crate::optimizeopt::majit_log_enabled() {
                     eprintln!(

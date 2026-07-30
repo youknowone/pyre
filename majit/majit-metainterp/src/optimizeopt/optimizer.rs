@@ -3353,10 +3353,11 @@ impl Optimizer {
                             return None;
                         }
                         let preamble_op = produced.preamble_op.clone();
-                        // RPython parity: key and preamble_op.pos must be the
-                        // same resolved value. Independent get_box_replacement
-                        // calls can diverge when forwarding chains differ.
-                        // Use canonical_result (resolved key) for both.
+                        // For ShortInputArg, RPython keeps two identities:
+                        // short_op.res is the original label Box and
+                        // preamble_op is the fresh renamed InputArg.  Preserve
+                        // the renamed replay position. Other short-op kinds
+                        // replay into the canonical result position.
                         preamble_op.pos.set(canonical_result);
                         // optimizer.py:651-652 force_box loop parity.
                         //

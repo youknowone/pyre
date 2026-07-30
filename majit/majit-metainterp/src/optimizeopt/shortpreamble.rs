@@ -757,6 +757,10 @@ impl ShortBoxes {
         // `materialize_operand_at(arg)` lookup returns the same key (ptr_eq).
         let arg_res = ctx.materialize_operand_at(arg);
         let mut same_as = Op::new(OpCode::same_as_for_type(arg_type), &[arg_res.clone()]);
+        // ShortInputArg.preamble_op is the freshly renamed InputArg in
+        // RPython.  `ProducedShortOp` stores an OpRc, so majit uses a
+        // non-emitted SAME_AS stand-in whose result position is that renamed
+        // box; `res` above remains the original label box.
         same_as.pos.set(arg);
         // shortpreamble.py:259 `self.potential_ops[box] = ShortInputArg(...)`
         // — keyed by the label-arg Box itself; `arg_res` is its canonical
@@ -1733,11 +1737,10 @@ impl ProducedShortOp {
                 info.set_preamble_field(descr_idx, pop_for_field);
             }
         });
-        // The replay operation owns `result_opref`, but body references
-        // reached through `force_op_from_preamble_op` still name `source`.
-        // Forward `source -> result_opref` once the PtrInfo / const-info side
-        // tables have been seeded, so those reads resolve to the replayed
-        // value instead of re-deriving it on every import.
+        // shortpreamble.py:62-75 keeps `self.res` (the body-visible Box)
+        // distinct from `preamble_op` (the replayed GETFIELD result).  Do not
+        // forward one to the other: `force_op_from_preamble` returns
+        // `PreambleOp.op` and records the replay operation separately.
         let op_source = ctx
             .get_box_replacement_operand_opt(source)
             .unwrap_or_else(|| ctx.materialize_operand_at(source));
@@ -1882,11 +1885,9 @@ impl ProducedShortOp {
                 }
             });
         }
-        // The replay operation owns `result_opref`, but body references
-        // reached through `force_op_from_preamble_op` still name `source`.
-        // Forward `source -> result_opref` once the PtrInfo / const-info side
-        // tables have been seeded, so those reads resolve to the replayed
-        // value instead of re-deriving it on every import.
+        // shortpreamble.py:80-85 has the same two-Box shape as GETFIELD:
+        // the carried body result and replayed GETARRAYITEM result remain
+        // distinct and are joined only by PreambleOp bookkeeping.
         let op_source = ctx
             .get_box_replacement_operand_opt(source)
             .unwrap_or_else(|| ctx.materialize_operand_at(source));
@@ -1931,16 +1932,9 @@ impl ProducedShortOp {
             crate::optimizeopt::ImportedShortPureArg::Const(majit_ir::Value::Int(v), _) => v,
             _ => return None,
         };
-        // Cat-2.2 alignment probe: forward `source -> result_opref` so body
-        // refs after `force_op_from_preamble_op` resolve to the body-visible
-        // OpRef without relying on the use-before-def assembly adaptation.
-        // PyPy `LoopInvariantOp.produce_op` stores `PreambleOp(op=self.res,
-        // preamble_op, invented_name)` in `loop_invariant_results`; self.res
-        // is the canonical body Box. pyre's flat-OpRef analog uses
-        // `result_opref = result_map[source]` as the body-visible slot and
-        // installs the `source -> result_opref` forwarding here so the
-        // consumer at `rewrite.rs:2809` resolves source to result_opref via
-        // get_box_replacement uniformly.
+        // shortpreamble.py:152-159 stores `self.res` as the body-visible Box
+        // and the replay call separately in PreambleOp.  As with HeapOp, the
+        // two identities must not be collapsed.
         let result_opref = *result_map.get(&source)?;
         let _ = result_type;
         let op_source = ctx
@@ -3369,6 +3363,67 @@ mod tests {
             op.pos
                 .set(OpRef::op_typed(base + i as u32, op.result_type()));
         }
+    }
+
+    /// Direct port of RPython test_short.py::TestShortBoxes::test_pure_ops.
+    #[test]
+    fn test_rpython_pure_ops_contract() {
+        let mut ctx =
+            crate::optimizeopt::OptContext::with_inputarg_types(16, &[Type::Int, Type::Int]);
+        let i0 = OpRef::input_arg_int(0);
+        let i1 = OpRef::input_arg_int(1);
+        let mut add = Op::new(
+            OpCode::IntAdd,
+            &[
+                ctx.materialize_operand_at(i0),
+                ctx.materialize_operand_at(i1),
+            ],
+        );
+        add.pos.set(OpRef::int_op(2));
+
+        let mut sb = ShortBoxes::with_label_args(&[i0, i1]);
+        sb.add_pure_op(&mut ctx, add);
+        let short_boxes = sb.create_short_boxes(&mut ctx, &[i0, i1], &[Type::Int, Type::Int]);
+
+        assert_eq!(short_boxes.len(), 3);
+        let short_inputargs = sb.create_short_inputargs(&[i0, i1]);
+        let pure = short_boxes
+            .iter()
+            .find(|produced| produced.kind == PreambleOpKind::Pure)
+            .expect("reachable IntAdd must be exported");
+        assert_eq!(
+            pure.preamble_op
+                .getarglist()
+                .iter()
+                .map(|arg| arg.to_opref())
+                .collect::<Vec<_>>(),
+            short_inputargs
+        );
+    }
+
+    /// Direct port of
+    /// RPython test_short.py::TestShortBoxes::test_pure_ops_does_not_work.
+    #[test]
+    fn test_rpython_pure_ops_missing_dependency_is_not_exported() {
+        let mut ctx =
+            crate::optimizeopt::OptContext::with_inputarg_types(16, &[Type::Int, Type::Int]);
+        let i0 = OpRef::input_arg_int(0);
+        let i1 = OpRef::input_arg_int(1);
+        let mut add = Op::new(
+            OpCode::IntAdd,
+            &[
+                ctx.materialize_operand_at(i0),
+                ctx.materialize_operand_at(i1),
+            ],
+        );
+        add.pos.set(OpRef::int_op(2));
+
+        let mut sb = ShortBoxes::with_label_args(&[i0]);
+        sb.add_pure_op(&mut ctx, add);
+        let short_boxes = sb.create_short_boxes(&mut ctx, &[i0], &[Type::Int]);
+
+        assert_eq!(short_boxes.len(), 1);
+        assert_eq!(short_boxes[0].kind, PreambleOpKind::InputArg);
     }
 
     #[test]
