@@ -5189,6 +5189,7 @@ mod tests {
             None,
             None,
             None,
+            None, // all_virtuals
             &NullAllocator,
         )
         .expect("runtime-only jitcode should still resume");
@@ -7395,6 +7396,13 @@ pub fn blackhole_from_resumedata<'a>(
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
     virtualizable_identity_override: Option<i64>,
+    // resume.py:1312 `blackhole_from_resumedata(..., all_virtuals=None)`.
+    // `Some` only when resuming from a GUARD_NOT_FORCED whose
+    // `handle_async_forcing` already materialized the virtuals
+    // (compile.py:706-709): the reader then runs with
+    // `resume_after_guard_not_forced == 2`, reuses this cache and leaves
+    // the already-forced virtualizable alone.
+    all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
     allocator: &'a dyn BlackholeAllocator,
 ) -> Option<(BlackholeInterpreter, i64)> {
     // resume.py:1315-1327 The initialization is stack-critical code: it
@@ -7407,18 +7415,28 @@ pub fn blackhole_from_resumedata<'a>(
     // all re-enable the report_error flag.
     let _cc_guard = crate::CriticalCodeGuard::enter();
     // resume.py:1317-1321
+    let resuming_after_guard_not_forced = all_virtuals.is_some();
     let mut resumereader = ResumeDataDirectReader::new(
         rd_numb,
         rd_consts,
         all_liveness,
         deadframe,
         deadframe_types,
-        None,
+        all_virtuals,
         allocator,
     );
 
-    let _resume_roots =
-        prepare_resume_heap_with_roots(&mut resumereader, rd_virtuals, rd_guard_pendingfields);
+    // resume.py:1368-1375: `_prepare` — and so both `_prepare_virtuals` and
+    // `_prepare_pendingfields` — runs only in the `all_virtuals is None`
+    // case. Resuming after a GUARD_NOT_FORCED, the force's own reader
+    // already built the virtuals and applied the pending fields; redoing
+    // either would rebuild the objects it handed to the interpreter and
+    // replay its heap writes.
+    let _resume_roots = if resuming_after_guard_not_forced {
+        prepare_resume_heap_with_roots(&mut resumereader, None, None)
+    } else {
+        prepare_resume_heap_with_roots(&mut resumereader, rd_virtuals, rd_guard_pendingfields)
+    };
 
     // resume.py:1325
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo, virtualizable_identity_override);

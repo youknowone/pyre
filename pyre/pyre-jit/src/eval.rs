@@ -3962,7 +3962,15 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
                 // Decoding it through `NullAllocator` instead wrote a null over
                 // that slot, and `fast2locals` renders a null slot as an absent
                 // name — a live local vanished from `f_locals`.
-                driver.force_virtualizable_token(token);
+                let all_virtuals = driver.force_virtualizable_token(token);
+                // compile.py:999-1000 set_savedata_ref: hold what was
+                // materialized for the GUARD_NOT_FORCED that follows, keyed by
+                // the frame this force ran against.
+                if let Some((ptrs, ints)) = all_virtuals {
+                    driver
+                        .meta_interp_mut()
+                        .save_forced_virtuals(ptr as u64, ptrs, ints);
+                }
             });
         };
         // Force the traced frame only when the frame handed to Python belongs
@@ -5433,7 +5441,14 @@ fn drive_unpack_iterable_trace(
             }
             // compile.py:710-716 resume_in_blackhole: complete the in-flight
             // `next()`/`append` and run forward to the next merge point.
-            let bh = resume_in_blackhole_from_exit_layout(&values, &exit_layout, guard_exc, true);
+            let bh = resume_in_blackhole_from_exit_layout(
+                &values,
+                &exit_layout,
+                guard_exc,
+                // jd1 is novable: it has no virtualizable to force.
+                std::ptr::null(),
+                true,
+            );
             match bh {
                 // Merge point reached: re-enter the compiled drain.
                 crate::call_jit::BlackholeResult::ContinueRunningNormally { .. } => continue,
@@ -7493,6 +7508,57 @@ fn blackhole_result_tag(r: &crate::call_jit::BlackholeResult) -> &'static str {
     }
 }
 
+/// `compile.py:950-958 ResumeGuardForcedDescr.handle_fail` — the frame whose
+/// forced-virtual cache this guard failure may fish, or null.
+///
+/// Only the `GUARD_NOT_FORCED` / `GUARD_NOT_FORCED_2` failure reads the cache
+/// `handle_async_forcing` saved; every other `handle_fail` resumes with
+/// `all_virtuals = None`. `invent_fail_descr_for_op` marks exactly those two
+/// guards (`optimizeopt/mod.rs:6524`), so `is_guard_forced()` is the same
+/// discriminator upstream gets from the descr subtype.
+fn forced_guard_cache_owner(
+    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+    frame: *const pyre_interpreter::PyFrame,
+) -> *const pyre_interpreter::PyFrame {
+    if descr_arc.is_guard_forced() {
+        frame
+    } else {
+        std::ptr::null()
+    }
+}
+
+/// `compile.py:956-957` — `hidden_all_virtuals =
+/// metainterp_sd.cpu.get_savedata_ref(deadframe)`.
+///
+/// Upstream reads the cache straight out of the deadframe it is resuming,
+/// because `handle_fail` receives that deadframe. pyre's guard-failure path
+/// surfaces the running frame instead, so the cache is keyed by the frame the
+/// force ran against (`force_pyframe`) and taken back here by the same frame.
+///
+/// The jitframe address is not usable as the key: only cranelift populates
+/// `FailDescr::force_token_slots`, so on dynasm the failing exit does not name
+/// its own force token at all.
+///
+/// A miss returns `None`, which resumes the ordinary way. Upstream instead
+/// substitutes an empty `VirtualCache` (`compile.py:959-960`) and still runs
+/// the reader with `resume_after_guard_not_forced == 2` — it can, because a
+/// deadframe-local savedata slot cannot miss. A frame-keyed reconstruction
+/// can, and skipping the vable section with an empty virtuals cache would
+/// leave the resumed frame's virtuals unbound; falling back to a full decode
+/// is the same work pyre did before the cache existed.
+///
+// dont_look_inside: post-trace blackhole resume machinery.
+#[majit_macros::dont_look_inside]
+pub(crate) fn take_forced_virtuals_for_frame(
+    frame: *const pyre_interpreter::PyFrame,
+) -> Option<(Vec<i64>, Vec<i64>)> {
+    if frame.is_null() {
+        return None;
+    }
+    let (driver, _) = driver_pair();
+    driver.meta_interp_mut().take_forced_virtuals(frame as u64)
+}
+
 /// compile.py:710-716 resume_in_blackhole parity.
 ///
 /// RPython: resume_in_blackhole → blackhole_from_resumedata →
@@ -7504,6 +7570,10 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
     guard_exc: i64,
+    // `forced_guard_cache_owner` of the failing guard: the frame whose
+    // forced-virtual cache this resume may fish, null for any guard that is
+    // not a GUARD_NOT_FORCED.
+    forced_cache_owner: *const pyre_interpreter::PyFrame,
     // True when the failing guard belongs to a novable jitdriver (jd1
     // `unpackiterable_driver`): its resume data has no vable section, so the
     // decode must not consume one. jd0 guards pass `false`.
@@ -7536,6 +7606,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
                 exit_layout.fail_index,
             )
         };
+        let all_virtuals = take_forced_virtuals_for_frame(forced_cache_owner);
         let result = crate::call_jit::blackhole_resume_via_rd_numb(
             &storage.rd_numb,
             storage.rd_consts(),
@@ -7545,6 +7616,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
             deadframe_types.as_deref(),
             guard_exc,
             novable,
+            all_virtuals,
         );
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
@@ -7835,6 +7907,7 @@ fn execute_assembler(
                         raw_values,
                         exit_layout,
                         guard_exc,
+                        forced_guard_cache_owner(descr_arc, frame_root.frame()),
                         false,
                     );
                     match &bh_result {
@@ -8173,6 +8246,7 @@ fn bound_reached(
                         raw_values,
                         exit_layout,
                         guard_exc,
+                        forced_guard_cache_owner(descr_arc, frame_root.frame()),
                         false,
                     );
                     match &bh_result {
@@ -8385,6 +8459,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                         raw_values,
                         exit_layout,
                         guard_exc,
+                        forced_guard_cache_owner(descr_arc, frame_root.frame()),
                         false,
                     );
                     match &bh_result {

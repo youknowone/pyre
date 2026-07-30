@@ -1157,6 +1157,17 @@ pub struct MetaInterp<M: Clone> {
     /// Used to derive lengths from the actual object when the interpreter
     /// does not provide them explicitly.
     pub(crate) vable_ptr: *const u8,
+    /// `compile.py:999-1000` — the virtual cache `handle_async_forcing`
+    /// produced, kept for the `GUARD_NOT_FORCED` failure that must follow.
+    ///
+    /// Upstream hides an `AllVirtuals` instance in the deadframe's
+    /// `jf_savedata` GCREF slot and `ResumeGuardForcedDescr.handle_fail`
+    /// fishes it back out. pyre cannot put a Rust value there — the GC
+    /// traces `jf_savedata` as a real object reference
+    /// (`jitframe.rs:278`) — so the cache is held here, keyed by the
+    /// virtualizable that was forced. One entry per frame, overwritten on
+    /// re-force, exactly like the single `jf_savedata` word.
+    pub(crate) forced_virtuals: Vec<(u64, Vec<i64>, Vec<i64>)>,
     /// Virtualizable array lengths for trace-entry box layout.
     pub(crate) vable_array_lengths: Vec<usize>,
     /// warmspot.py:449 jd.result_type — per-driver static result type.
@@ -2479,6 +2490,7 @@ impl<M: Clone> MetaInterp<M> {
             pending_token: None,
             stats: JitStatsCounters::default(),
             vable_ptr: std::ptr::null(),
+            forced_virtuals: Vec::new(),
             vable_array_lengths: Vec::new(),
             result_type: Type::Ref,
             max_unroll_recursion: 7, // RPython default from rlib/jit.py
@@ -11721,7 +11733,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         token: u64,
         allocator: &dyn crate::resume::BlackholeAllocator,
-    ) {
+    ) -> Option<(Vec<i64>, Vec<i64>)> {
         let deadframe = self
             .backend
             .force(GcRef(token as usize))
@@ -11746,13 +11758,43 @@ impl<M: Clone> MetaInterp<M> {
                 Type::Void => 0,
             })
             .collect::<Vec<_>>();
-        let _ = self.handle_async_forcing_with_allocator(
+        // compile.py:995-1000: the forced cache is returned so the caller can
+        // attach it to the frame this force belongs to.
+        self.handle_async_forcing_with_allocator(
             green_key,
             trace_id,
             fail_index,
             &fail_values,
             allocator,
-        );
+        )
+    }
+
+    /// `compile.py:1000 cpu.set_savedata_ref(deadframe, obj.hide())`.
+    ///
+    /// `owner` is the forced virtualizable. Upstream can key on the deadframe
+    /// because `handle_fail` receives it; pyre's guard-failure path surfaces
+    /// the frame rather than the jitframe, and the two ends agree on the
+    /// frame: the force runs against a named virtualizable and the
+    /// GUARD_NOT_FORCED that follows deopts that same frame's loop.
+    pub fn save_forced_virtuals(&mut self, owner: u64, ptrs: Vec<i64>, ints: Vec<i64>) {
+        match self.forced_virtuals.iter_mut().find(|e| e.0 == owner) {
+            // A second force of the same frame overwrites, the way a second
+            // `set_savedata_ref` overwrites the one `jf_savedata` word.
+            Some(entry) => *entry = (owner, ptrs, ints),
+            None => self.forced_virtuals.push((owner, ptrs, ints)),
+        }
+    }
+
+    /// `compile.py:706-709` — `handle_fail` of a `GUARD_NOT_FORCED` fishes
+    /// the cache `handle_async_forcing` left on the deadframe and hands it
+    /// to `resume_in_blackhole`, which is what makes the blackhole reuse
+    /// the objects the force already materialized instead of building a
+    /// second set (`resume.py:1373-1374`, and the `vable_size` skip in
+    /// `consume_vref_and_vable`).
+    pub fn take_forced_virtuals(&mut self, owner: u64) -> Option<(Vec<i64>, Vec<i64>)> {
+        let index = self.forced_virtuals.iter().position(|e| e.0 == owner)?;
+        let (_, ptrs, ints) = self.forced_virtuals.swap_remove(index);
+        Some((ptrs, ints))
     }
 
     pub fn is_force_token_armed(&self, token: u64) -> bool {
