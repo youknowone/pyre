@@ -1146,6 +1146,23 @@ pub struct JitDriver<S: JitState> {
     /// successful close-loop edge.
     continue_running_normally_payload: Option<(Vec<Value>, Option<usize>)>,
     descriptor: Option<JitDriverStaticData>,
+    /// Memoized [`Self::driver_descriptor_for`] answer.
+    ///
+    /// `warmspot.py:920-1015 make_driverhook_graphs` builds each
+    /// `JitDriverStaticData` once at translation time and stores it in
+    /// `metainterp_sd.jitdrivers_sd`; every runtime path then reads that one
+    /// object. Here the answer was rebuilt on each consultation instead —
+    /// either by cloning `descriptor` or by calling `JitState::driver_descriptor`
+    /// — which allocates the `vars` Vec plus one `String` per variable and frees
+    /// them again. Entering compiled code consults it, so a call-heavy program
+    /// paid that malloc/free pair per entry.
+    ///
+    /// The outer `Option` is "already resolved", the inner one is the answer.
+    /// Both producers are configuration-time constants: `descriptor` is only
+    /// written by `declare_schema`, `declare_schema_typed` and
+    /// `register_descriptor` (each of which clears this cache), and no
+    /// `JitState::driver_descriptor` implementation reads its `meta` argument.
+    descriptor_cache: Option<Option<std::sync::Arc<JitDriverStaticData>>>,
     /// resume.py:1042: result of rebuild_from_resumedata for bridge tracing.
     /// RPython stores this in MIFrame registers; pyre stores it here
     /// for the caller to initialize PyreSym slot-to-OpRef mapping.
@@ -1345,6 +1362,7 @@ impl<S: JitState> JitDriver<S> {
             compile_trace_success: false,
             continue_running_normally_payload: None,
             descriptor: None,
+            descriptor_cache: None,
             resume_data_result: None,
             last_bridge_is_exception_guard: false,
             bridge_body_start_op_count: None,
@@ -1580,6 +1598,7 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
         self.descriptor = Some(JitDriverStaticData::new(greens, reds));
+        self.descriptor_cache = None;
     }
 
     /// [`Self::declare_schema`] variant whose green list carries the
@@ -1599,6 +1618,7 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
         self.descriptor = Some(JitDriverStaticData::with_green_types(greens, reds));
+        self.descriptor_cache = None;
     }
 
     pub fn with_descriptor(threshold: u32, descriptor: JitDriverStaticData) -> Self {
@@ -1695,6 +1715,7 @@ impl<S: JitState> JitDriver<S> {
         // — A.3.1a's accessor reads through descriptor, not the
         // staticdata Vec, so the stamped clone must live on the driver too.
         self.descriptor = Some(sd_mut.jitdrivers_sd[idx].clone());
+        self.descriptor_cache = None;
         idx
     }
 
@@ -3420,7 +3441,7 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.invalidate_loop(green_key);
                 return None;
             }
-            if !self.sync_before(state, &compiled_meta, descriptor.as_ref()) {
+            if !self.sync_before(state, &compiled_meta, descriptor.as_deref()) {
                 return None;
             }
             let mut live_values = if let Some(values) = direct_live_values {
@@ -3428,7 +3449,7 @@ impl<S: JitState> JitDriver<S> {
             } else {
                 let live_values = state.extract_live_values(&compiled_meta);
                 if !Self::live_values_match_descriptor(
-                    descriptor.as_ref(),
+                    descriptor.as_deref(),
                     &live_values,
                     state.state_field_layout().total_live_values(),
                 ) {
@@ -3438,7 +3459,7 @@ impl<S: JitState> JitDriver<S> {
                     green_key,
                     state,
                     &compiled_meta,
-                    descriptor.as_ref(),
+                    descriptor.as_deref(),
                     live_values,
                 ) else {
                     return None;
@@ -3551,7 +3572,7 @@ impl<S: JitState> JitDriver<S> {
                     state.restore_values(&run_meta, &result.typed_values);
                 }
                 let run_descriptor = self.driver_descriptor_for(state, &run_meta);
-                self.sync_after(state, &run_meta, run_descriptor.as_ref());
+                self.sync_after(state, &run_meta, run_descriptor.as_deref());
                 return Some(target_pc);
             }
 
@@ -3562,7 +3583,7 @@ impl<S: JitState> JitDriver<S> {
                     state.restore_values(&run_meta, &result.typed_values);
                 }
                 let run_descriptor = self.driver_descriptor_for(state, &run_meta);
-                self.sync_after(state, &run_meta, run_descriptor.as_ref());
+                self.sync_after(state, &run_meta, run_descriptor.as_deref());
                 return Some(target_pc);
             }
 
@@ -4105,12 +4126,12 @@ impl<S: JitState> JitDriver<S> {
         self.republish_state_field_fvc();
         let meta = state.build_meta(target_pc, env);
         let descriptor = self.driver_descriptor_for(state, &meta);
-        if !self.sync_before(state, &meta, descriptor.as_ref()) {
+        if !self.sync_before(state, &meta, descriptor.as_deref()) {
             return;
         }
         let live_values = state.extract_live_values(&meta);
         if !Self::live_values_match_descriptor(
-            descriptor.as_ref(),
+            descriptor.as_deref(),
             &live_values,
             state.state_field_layout().total_live_values(),
         ) {
@@ -4120,7 +4141,7 @@ impl<S: JitState> JitDriver<S> {
         match self.meta.force_start_tracing(
             green_key,
             (state.code_ptr(), target_pc),
-            descriptor,
+            descriptor.map(|d| (*d).clone()),
             &live_values,
         ) {
             BackEdgeAction::StartedTracing => {
@@ -4155,12 +4176,12 @@ impl<S: JitState> JitDriver<S> {
         self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
         let meta = state.build_meta(target_pc, env);
         let descriptor = self.driver_descriptor_for(state, &meta);
-        if !self.sync_before(state, &meta, descriptor.as_ref()) {
+        if !self.sync_before(state, &meta, descriptor.as_deref()) {
             return;
         }
         let live_values = state.extract_live_values(&meta);
         if !Self::live_values_match_descriptor(
-            descriptor.as_ref(),
+            descriptor.as_deref(),
             &live_values,
             state.state_field_layout().total_live_values(),
         ) {
@@ -4171,7 +4192,7 @@ impl<S: JitState> JitDriver<S> {
             green_key,
             (state.code_ptr(), target_pc),
             None,
-            descriptor,
+            descriptor.map(|d| (*d).clone()),
             &live_values,
         ) {
             BackEdgeAction::StartedTracing => {
@@ -4205,12 +4226,12 @@ impl<S: JitState> JitDriver<S> {
         }
         let meta = state.build_meta(target_pc, env);
         let descriptor = self.driver_descriptor_for(state, &meta);
-        if !self.sync_before(state, &meta, descriptor.as_ref()) {
+        if !self.sync_before(state, &meta, descriptor.as_deref()) {
             return;
         }
         let live_values = state.extract_live_values(&meta);
         if !Self::live_values_match_descriptor(
-            descriptor.as_ref(),
+            descriptor.as_deref(),
             &live_values,
             state.state_field_layout().total_live_values(),
         ) {
@@ -4221,7 +4242,7 @@ impl<S: JitState> JitDriver<S> {
             green_key,
             (state.code_ptr(), target_pc),
             structured_green_key,
-            descriptor,
+            descriptor.map(|d| (*d).clone()),
             &live_values,
         ) {
             BackEdgeAction::Interpret => {}
@@ -4243,10 +4264,27 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
-    fn driver_descriptor_for(&self, state: &S, meta: &S::Meta) -> Option<JitDriverStaticData> {
-        self.descriptor
+    /// The driver's static data, resolved once and then shared.
+    ///
+    /// See [`Self::descriptor_cache`] for why the answer is memoized rather
+    /// than rebuilt per consultation. Callers that need to hand ownership on
+    /// (the trace-start and bridge-setup paths) clone out of the shared value;
+    /// the per-entry paths only read through it.
+    fn driver_descriptor_for(
+        &mut self,
+        state: &S,
+        meta: &S::Meta,
+    ) -> Option<std::sync::Arc<JitDriverStaticData>> {
+        if let Some(cached) = &self.descriptor_cache {
+            return cached.clone();
+        }
+        let resolved = self
+            .descriptor
             .clone()
             .or_else(|| state.driver_descriptor(meta))
+            .map(std::sync::Arc::new);
+        self.descriptor_cache = Some(resolved.clone());
+        resolved
     }
 
     fn live_values_match_descriptor(
@@ -4629,7 +4667,7 @@ impl<S: JitState> JitDriver<S> {
             };
         };
         let descriptor = self.driver_descriptor_for(state, &meta);
-        if !state.is_compatible(&meta) || !self.sync_before(state, &meta, descriptor.as_ref()) {
+        if !state.is_compatible(&meta) || !self.sync_before(state, &meta, descriptor.as_deref()) {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -4648,7 +4686,7 @@ impl<S: JitState> JitDriver<S> {
             );
         }
         if !Self::live_values_match_descriptor(
-            descriptor.as_ref(),
+            descriptor.as_deref(),
             &live_values,
             state.state_field_layout().total_live_values(),
         ) {
@@ -4661,7 +4699,7 @@ impl<S: JitState> JitDriver<S> {
             green_key,
             state,
             &meta,
-            descriptor.as_ref(),
+            descriptor.as_deref(),
             live_values,
         ) else {
             return DetailedDriverRunOutcome::Abort {
@@ -4726,7 +4764,7 @@ impl<S: JitState> JitDriver<S> {
 
         let exit_meta = result.meta.clone();
         state.restore_values(&exit_meta, &result.typed_values);
-        self.sync_after(state, &exit_meta, descriptor.as_ref());
+        self.sync_after(state, &exit_meta, descriptor.as_deref());
         DetailedDriverRunOutcome::Jump {
             via_blackhole: false,
             continue_running_normally_values: None,
@@ -4781,7 +4819,7 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         }
-        if !self.sync_before(state, &meta, descriptor.as_ref()) {
+        if !self.sync_before(state, &meta, descriptor.as_deref()) {
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit][run-compiled-abort] key={} reason=sync-before target_pc={}",
@@ -4806,7 +4844,7 @@ impl<S: JitState> JitDriver<S> {
             );
         }
         if !Self::live_values_match_descriptor(
-            descriptor.as_ref(),
+            descriptor.as_deref(),
             &live_values,
             state.state_field_layout().total_live_values(),
         ) {
@@ -4828,7 +4866,7 @@ impl<S: JitState> JitDriver<S> {
             green_key,
             state,
             &meta,
-            descriptor.as_ref(),
+            descriptor.as_deref(),
             live_values,
         ) else {
             if crate::majit_log_enabled() {
@@ -4889,7 +4927,7 @@ impl<S: JitState> JitDriver<S> {
         // Normal loop back-edge JUMP, not a guard failure.
         if fail_index == u32::MAX {
             state.restore_values(&exit_meta, &typed_values);
-            self.sync_after(state, &exit_meta, descriptor.as_ref());
+            self.sync_after(state, &exit_meta, descriptor.as_deref());
             return DetailedDriverRunOutcome::Jump {
                 via_blackhole: false,
                 continue_running_normally_values: None,
@@ -5654,7 +5692,7 @@ impl<S: JitState> JitDriver<S> {
             .expect("bridge: tracing context must be live after start_retrace_from_guard");
         ctx.header_pc = resume_pc;
         if let Some(descriptor) = bridge_driver_descriptor {
-            ctx.set_driver_descriptor(descriptor);
+            ctx.set_driver_descriptor((*descriptor).clone());
         }
         // pyjitpl.py:2978 `if not self.partial_trace:` — bridge
         // entry sets the explicit flag so close-loop consumers
@@ -5887,12 +5925,12 @@ impl<S: JitState> JitDriver<S> {
         }
         let meta = meta.clone();
         let descriptor = self.driver_descriptor_for(state, &meta);
-        if !self.sync_before(state, &meta, descriptor.as_ref()) {
+        if !self.sync_before(state, &meta, descriptor.as_deref()) {
             return None;
         }
         let live_values = state.extract_live_values(&meta);
         if !Self::live_values_match_descriptor(
-            descriptor.as_ref(),
+            descriptor.as_deref(),
             &live_values,
             state.state_field_layout().total_live_values(),
         ) {
@@ -5902,7 +5940,7 @@ impl<S: JitState> JitDriver<S> {
             key_hash,
             state,
             &meta,
-            descriptor.as_ref(),
+            descriptor.as_deref(),
             live_values,
         )?;
         let mut live_values = live_values;
@@ -5999,16 +6037,16 @@ impl<S: JitState> JitDriver<S> {
                     );
                 }
                 state.restore_values(&result_meta, &typed_values);
-                self.sync_after(state, &result_meta, descriptor.as_ref());
+                self.sync_after(state, &result_meta, descriptor.as_deref());
                 // Re-enter compiled code if state is still compatible
                 if let Some(meta) = self.meta.get_compiled_meta(key_hash) {
                     if state.is_compatible(meta) {
                         let meta = meta.clone();
                         let nd = self.driver_descriptor_for(state, &meta);
-                        if self.sync_before(state, &meta, nd.as_ref()) {
+                        if self.sync_before(state, &meta, nd.as_deref()) {
                             let nl = state.extract_live_values(&meta);
                             if Self::live_values_match_descriptor(
-                                nd.as_ref(),
+                                nd.as_deref(),
                                 &nl,
                                 state.state_field_layout().total_live_values(),
                             ) {
@@ -6016,7 +6054,7 @@ impl<S: JitState> JitDriver<S> {
                                     key_hash,
                                     state,
                                     &meta,
-                                    nd.as_ref(),
+                                    nd.as_deref(),
                                     nl,
                                 ) {
                                     live_values = v;
@@ -6091,7 +6129,7 @@ impl<S: JitState> JitDriver<S> {
                 // Restore state for bridge tracing start point.
                 let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
                 let resume_pc = resume_pc.unwrap_or(guard_resume_pc);
-                self.sync_after(state, &result_meta, descriptor.as_ref());
+                self.sync_after(state, &result_meta, descriptor.as_deref());
 
                 let bridge_ok = self.start_bridge_tracing(
                     &descr_arc,
@@ -6278,7 +6316,7 @@ impl<S: JitState> JitDriver<S> {
             self.prepare_exit_resume_heap_with_blackhole_allocator(&exit_layout, &raw_values);
             let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
             let resume_pc = resume_pc.unwrap_or(target_pc);
-            self.sync_after(state, &result_meta, descriptor.as_ref());
+            self.sync_after(state, &result_meta, descriptor.as_deref());
             return Some(resume_pc);
         } // end loop { run_compiled ... }
     }
