@@ -178,27 +178,19 @@ pub(crate) fn eof_error(msg: &str) -> PyError {
 
 // ── import / dotted attribute resolution (save_global / find_class) ───
 
-/// Return the named module from `sys.modules`, importing it only if absent.
-/// An already-loaded module is returned directly: re-running `importhook`
-/// for a loaded module (notably `builtins`) can rebind the canonical module
-/// object and corrupt name resolution elsewhere. The `sys.modules` entry
-/// (not the `importhook` return) is authoritative.
+/// PyPy `W_Unpickler.find_class`: call builtin `__import__(name)` first, then
+/// return the authoritative `sys.modules[name]` entry.
+///
+/// The import call is required even when the entry already exists:
+/// `dunder_import` waits on `__spec__._initializing` via the module lock, so a
+/// concurrent unpickler cannot observe a half-executed module.  Its initialized
+/// fast path does not reload or rebind modules such as `builtins`.
 pub(crate) fn import_module(name: &str) -> Result<PyObjectRef, PyError> {
-    if let Some(m) = crate::importing::get_sys_module(name) {
-        return Ok(m);
-    }
-    // The `builtins` module lives on the execution context, not in the
-    // importable `sys.modules` cache; re-running `importhook` on it would
-    // reinitialise builtin state (and orphan the live exception classes).
-    if name == "builtins" {
-        if let Some(b) = ec_builtins_module() {
-            return Ok(b);
-        }
-    }
-    crate::importing::importhook(
+    crate::importing::dunder_import(
         name,
         pyre_object::w_none(),
-        pyre_object::listobject::w_list_new(vec![pyre_object::w_str_new("*")]),
+        pyre_object::w_none(),
+        pyre_object::w_none(),
         0,
         crate::call::getexecutioncontext(),
     )?;
@@ -215,11 +207,6 @@ fn current_ec() -> Option<*const crate::PyExecutionContext> {
     }
     let ec = unsafe { (*frame).execution_context };
     if ec.is_null() { None } else { Some(ec) }
-}
-
-/// The current execution context's `builtins` module, via the live frame.
-fn ec_builtins_module() -> Option<PyObjectRef> {
-    current_ec().map(|ec| unsafe { (*ec).get_builtin() })
 }
 
 /// Resolve a name in the `builtins` module through the execution context's
