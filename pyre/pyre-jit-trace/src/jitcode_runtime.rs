@@ -2008,6 +2008,11 @@ mod tests {
     /// `dyn Trait` calls through `CallTarget::Indirect` became the default, so
     /// the codewriter emits it and it is now registered in
     /// `build_inline_call_only_bh_builder` instead.
+    ///
+    /// `new/d>r` left it the same way: lowering a rebuilt `Result` shell as an
+    /// allocation made `OpKind::New` reachable from the codewriter. Its operand
+    /// shape is `new_with_vtable/d>r`'s — a 2-byte little-endian descr index
+    /// then a 1-byte ref register — and `handler_new` decodes exactly that.
     #[test]
     fn production_bh_builder_overlay_only_gap_snapshot() {
         let builder = build_pyre_production_bh_builder();
@@ -2044,7 +2049,6 @@ mod tests {
             "getlistitem_gc_i/ridd>i",
             "getlistitem_gc_r/ridd>r",
             "int_between/iii>i",
-            "new/d>r",
             "new_array/id>r",
             "newlist/idddd>r",
             "newlist_clear/idddd>r",

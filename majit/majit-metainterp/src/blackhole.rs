@@ -8391,7 +8391,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "int_mul_jump_if_ovf/Lii>i".to_string(),
         majit_translate::insns::BC_INT_MUL_JUMP_IF_OVF,
     );
-    // The three remaining opnames the build-time `pipeline.insns` records as
+    // The remaining opnames the build-time `pipeline.insns` records as
     // actually emitted (`build_emitted_insns()`) that this curated set did not
     // cover.  Upstream never has this gap: `setup_insns(asm.insns)`
     // (`blackhole.py:58-59`) registers exactly what the assembler emitted, so
@@ -8399,18 +8399,19 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // missing entry is a live `dispatch_step` unwired-opcode panic that fires
     // only once a forward resume happens to land on the byte.
     //
-    // All three emit canonical operands matching their wired decoders — a
+    // All of them emit canonical operands matching their wired decoders — a
     // 1-byte register per `r`/`i`, a 2-byte little-endian descr index per `d`
-    // (`assembler.rs` `OpKind::{ArrayLen, NewWithVtable}` and the generic
-    // `UnaryOp` path vs `handler_arraylen_gc`, `handler_new_with_vtable`,
-    // `bhhandler_r_i!`) — and `arraylen_gc` / `new_with_vtable` read
-    // `bh.cpu`, which this builder sets above.
+    // (`assembler.rs` `OpKind::{ArrayLen, New, NewWithVtable}` and the generic
+    // `UnaryOp` path vs `handler_arraylen_gc`, `handler_new`,
+    // `handler_new_with_vtable`, `bhhandler_r_i!`) — and `arraylen_gc` / `new`
+    // / `new_with_vtable` read `bh.cpu`, which this builder sets above.
     for (key, byte) in [
         ("arraylen_gc/rd>i", majit_translate::insns::BC_ARRAYLEN_GC),
         (
             "cast_ptr_to_int/r>i",
             majit_translate::insns::BC_CAST_PTR_TO_INT,
         ),
+        ("new/d>r", majit_translate::insns::BC_NEW),
         (
             "new_with_vtable/d>r",
             majit_translate::insns::BC_NEW_WITH_VTABLE,
