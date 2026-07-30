@@ -806,7 +806,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // Functions with real implementations are registered individually below.
     for name in [
         "fstatat",
+        // Only the POSIX builds reach a real `statvfs` below, and the pair is
+        // probed for presence rather than called blind: `os.py` gates
+        // `supports_fd` on `_exists`, and `shutil` picks its `disk_usage`
+        // implementation on `hasattr(os, 'statvfs')`, falling back to the
+        // Windows one. A stub answering those probes with `None` would win the
+        // POSIX branch on a host that cannot serve it.
+        #[cfg(unix)]
         "statvfs",
+        #[cfg(unix)]
         "fstatvfs",
         "dup",
         "dup2",

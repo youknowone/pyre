@@ -6,11 +6,18 @@ import weakref
 from array import array
 from collections import deque
 from contextvars import ContextVar, Token
-from ctypes import Array as CTypesArray
 from os import DirEntry
 from string.templatelib import Interpolation, Template
 from types import GenericAlias
 from typing import TypeVar
+
+# `_ctypes` only serves the POSIX hosts, so `import ctypes` raises elsewhere.
+# `ctypes.Array` is one sample of the parameterizable extension types below,
+# not the subject, so a host without it checks the rest.
+try:
+    from ctypes import Array as CTypesArray
+except ImportError:
+    CTypesArray = None
 
 
 class Origin:
@@ -77,11 +84,12 @@ assert dir_entry_alias.__args__ == (T,)
 assert copy.copy(dir_entry_alias) == dir_entry_alias
 assert copy.deepcopy(dir_entry_alias) == dir_entry_alias
 
-ctypes_array_alias = CTypesArray[T]
-assert ctypes_array_alias.__origin__ is CTypesArray
-assert ctypes_array_alias.__args__ == (T,)
-assert copy.copy(ctypes_array_alias) == ctypes_array_alias
-assert copy.deepcopy(ctypes_array_alias) == ctypes_array_alias
+if CTypesArray is not None:
+    ctypes_array_alias = CTypesArray[T]
+    assert ctypes_array_alias.__origin__ is CTypesArray
+    assert ctypes_array_alias.__args__ == (T,)
+    assert copy.copy(ctypes_array_alias) == ctypes_array_alias
+    assert copy.deepcopy(ctypes_array_alias) == ctypes_array_alias
 
 for template_type in (Template, Interpolation):
     template_alias = template_type[T]
