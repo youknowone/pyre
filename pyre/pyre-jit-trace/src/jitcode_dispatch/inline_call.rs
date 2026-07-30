@@ -1985,10 +1985,12 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     if !ctx.is_authoritative_executor
-        || !matches!(
-            pyre_helper,
-            majit_ir::PyreHelperKind::CallFn | majit_ir::PyreHelperKind::CallKw
-        )
+        // A `call_kw` residual carries its kwnames tuple in arg index 2, and
+        // keywords reach a builtin as the trailing `__pyre_kw__` marker dict
+        // that `split_builtin_kwargs` strips — a shape the flat
+        // `&[PyObjectRef]` array built below does not construct, so leave those
+        // calls to `bh_call_kw_<n>`.
+        || pyre_helper != majit_ir::PyreHelperKind::CallFn
         || r_args.len() < 2
         || dst_bank != 'r'
     {
