@@ -4904,8 +4904,17 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 // re-walk executes the body's residual calls before failing) —
                 // an unbounded slowdown. Decline it so the location interprets
                 // instead.
+                // A bridge entry is keyed on the guard descr, which the
+                // green-key cell never gates, so the green-key decline alone
+                // leaves `must_compile_with_values` re-firing this
+                // structurally-undecidable bridge every
+                // `DEFAULT_TRACE_EAGERNESS` failures forever — each retry
+                // re-walking the whole body and executing its residual calls
+                // concretely. Record the bridge-guard decline too, the way
+                // `ExcEdgeNoInFrameCatch` below does.
                 DE::GotoIfNotValueNotConcrete { .. } => {
                     fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+                    fbw_bridge_decline(ctx);
                     TraceAction::Abort
                 }
                 // The exc-edge routing decision is `find_catch_for_exc_resume`
