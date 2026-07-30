@@ -2204,7 +2204,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     });
     crate::module_ns_get_or_insert_with(ns, "type", || crate::typedef::w_type());
     crate::module_ns_get_or_insert_with(ns, "isinstance", || {
-        make_module_builtin_function_with_arity("isinstance", builtin_isinstance, 2)
+        make_module_builtin_function_with_arity("isinstance", __pyre_wrap_builtin_isinstance, 2)
     });
     crate::module_ns_get_or_insert_with(ns, "str", || crate::typedef::gettypeobject(&STR_TYPE));
     crate::module_ns_get_or_insert_with(ns, "repr", || {
@@ -4484,6 +4484,24 @@ fn builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         args[0], args[1],
     )?))
 }
+
+/// Manual interp2app gateway for `isinstance`.
+///
+/// `#[pyre_methods]` emits this same wrapper/descriptor pair automatically.
+/// Builtins installed by hand must publish the equivalent `BuiltinCode.func`
+/// PBC member so source translation can discover and codewrite its graph.
+pub fn __pyre_wrap_builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_isinstance(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __pyre_wrap_builtin_isinstance_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__pyre_wrap_builtin_isinstance"),
+        func: __pyre_wrap_builtin_isinstance,
+    };
 
 /// isinstance(obj, cls) for JIT fast path.
 ///

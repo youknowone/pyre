@@ -15092,38 +15092,7 @@ fn init_float_type(ns: PyObjectRef) {
             "as_integer_ratio",
             make_builtin_function_with_arity(
                 "as_integer_ratio",
-                |args| {
-                    if args.is_empty() {
-                        return Err(crate::PyError::type_error(
-                            "as_integer_ratio() requires self",
-                        ));
-                    }
-                    let v = unsafe { pyre_object::w_float_get_value(args[0]) };
-                    // Exact numerator/denominator via the shared rational
-                    // decomposition (full exponent range, reduced to lowest terms).
-                    let (numer, denom) =
-                        rustpython_common::int::float_to_ratio(v).ok_or_else(|| {
-                            if v.is_infinite() {
-                                crate::PyError::overflow_error(
-                                    "cannot convert Infinity to integer ratio",
-                                )
-                            } else {
-                                crate::PyError::value_error("cannot convert NaN to integer ratio")
-                            }
-                        })?;
-                    let to_pyint = |b| {
-                        let b = crate::compiler_bigint_to_rbigint(&b);
-                        if pyre_object::jit_bigint_to_i64_fits(&b) != 0 {
-                            pyre_object::w_int_new(pyre_object::jit_bigint_to_i64_value(&b))
-                        } else {
-                            pyre_object::w_long_new(b)
-                        }
-                    };
-                    Ok(pyre_object::w_tuple_new(vec![
-                        to_pyint(numer),
-                        to_pyint(denom),
-                    ]))
-                },
+                __pyre_wrap_float_descr_as_integer_ratio,
                 1,
             ),
         )
@@ -15375,6 +15344,62 @@ fn init_float_type(ns: PyObjectRef) {
         )
     };
 }
+
+/// `float.as_integer_ratio()` — PyPy
+/// `W_FloatObject.descr_as_integer_ratio`.
+///
+/// Kept as a named function, matching the upstream interp2app target shape,
+/// so source translation can include it in the finite `BuiltinCode.func`
+/// target family.
+fn float_descr_as_integer_ratio(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Err(crate::PyError::type_error(
+            "as_integer_ratio() requires self",
+        ));
+    }
+    let v = unsafe { pyre_object::w_float_get_value(args[0]) };
+    // Exact numerator/denominator via the shared rational decomposition
+    // (full exponent range, reduced to lowest terms).
+    let (numer, denom) = rustpython_common::int::float_to_ratio(v).ok_or_else(|| {
+        if v.is_infinite() {
+            crate::PyError::overflow_error("cannot convert Infinity to integer ratio")
+        } else {
+            crate::PyError::value_error("cannot convert NaN to integer ratio")
+        }
+    })?;
+    let to_pyint = |b| {
+        let b = crate::compiler_bigint_to_rbigint(&b);
+        if pyre_object::jit_bigint_to_i64_fits(&b) != 0 {
+            pyre_object::w_int_new(pyre_object::jit_bigint_to_i64_value(&b))
+        } else {
+            pyre_object::w_long_new(b)
+        }
+    };
+    Ok(pyre_object::w_tuple_new(vec![
+        to_pyint(numer),
+        to_pyint(denom),
+    ]))
+}
+
+/// Manual interp2app gateway for `float.as_integer_ratio`.
+pub fn __pyre_wrap_float_descr_as_integer_ratio(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    float_descr_as_integer_ratio(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __pyre_wrap_float_descr_as_integer_ratio_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            "__pyre_wrap_float_descr_as_integer_ratio"
+        ),
+        func: __pyre_wrap_float_descr_as_integer_ratio,
+    };
 
 #[derive(Copy, Clone)]
 pub(crate) enum FloatToIntMode {
@@ -15777,6 +15802,20 @@ pub(crate) fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     Ok(w_instance_new(cls))
 }
 
+/// Manual interp2app gateway for `object.__new__`.
+pub fn __pyre_wrap_object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    object_descr_new(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __pyre_wrap_object_descr_new_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__pyre_wrap_object_descr_new"),
+        func: __pyre_wrap_object_descr_new,
+    };
+
 /// `object.__init__(self)` — no-op base __init__.  Surplus arguments are
 /// accepted only when __init__ or __new__ is overridden (objectobject.py
 /// descr__init__); otherwise the bare object initializer takes none.
@@ -15847,7 +15886,7 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(object_descr_new),
+            make_new_descr(__pyre_wrap_object_descr_new),
         )
     };
     unsafe {
