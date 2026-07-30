@@ -999,4 +999,31 @@ mod tests {
             "identifier field can't represent 'None' constant"
         );
     }
+
+    #[test]
+    fn named_expr_target_must_be_a_name() {
+        let named = |target| {
+            vec![ast::Stmt::Expr(ast::StmtExpr {
+                node_index: Default::default(),
+                range: Default::default(),
+                value: Box::new(ast::Expr::Named(ast::ExprNamed {
+                    node_index: Default::default(),
+                    range: Default::default(),
+                    target: Box::new(target),
+                    value: Box::new(constant(1)),
+                })),
+            })]
+        };
+
+        // The class is the whole case: a runtime without this check reaches
+        // the code generator and reports the target as an unassignable
+        // expression, a ValueError.
+        let error = validate(named(constant(1))).unwrap_err();
+        assert_eq!(error.kind, crate::error::PyErrorKind::TypeError);
+        assert_eq!(error.message, "NamedExpr target must be a Name");
+
+        // Only the shape is checked here; the context the target carries is
+        // not, so a `Store` name passes the walk.
+        assert!(validate(named(name("x", ast::ExprContext::Store))).is_ok());
+    }
 }

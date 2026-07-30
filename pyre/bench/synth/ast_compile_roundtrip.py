@@ -172,7 +172,6 @@ def handbuilt():
         ("boolop-one-value", ast.BoolOp(op=ast.And(), values=[ast.Constant(1)])),
         ("boolop-no-values", ast.BoolOp(op=ast.And(), values=[])),
         ("comprehension-no-generators", ast.ListComp(elt=ast.Constant(1), generators=[])),
-        ("named-target-not-name", ast.NamedExpr(target=ast.Constant(1), value=ast.Constant(1))),
         ("name-is-a-constant", ast.Name("None", L)),
         ("store-in-load-position", ast.Name("x", S)),
         ("empty-body-functiondef", ast.Module(body=[ast.FunctionDef(
