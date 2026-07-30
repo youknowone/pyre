@@ -608,30 +608,38 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
     // the same fields as the native backends. Kept separate from the verbose
     // PYRE_WASM_JIT_STATS block above; which line they land on no longer
     // matters, since check.py merges every [jit-stats] line into one snapshot.
-    // The exports read 0 on an old module that predates them, which is the
-    // healthy value, so a stale runner degrades safely rather than reporting a
-    // false regression — but that also means this line is the ONLY thing
-    // standing between a wasm-only descr-universe regression and a green gate,
-    // because a field absent from the current run is read as zero.
+    // This line is the ONLY thing standing between a wasm-only descr-universe
+    // regression and a green gate, because `_jit_stats_regression_floor` reads a
+    // field absent from the current run as zero — the healthy value. So a
+    // counter that cannot be read must not resolve to zero: a module that
+    // predates these exports would then look perfectly healthy while gating on
+    // nothing at all, which is the exact hole this block exists to close.
     if std::env::var_os("MAJIT_STATS").is_some() {
-        let loops_aborted = instance
-            .get_typed_func::<(), u64>(&mut store, "pyre_jit_loops_aborted")
+        let mut missing: Vec<&str> = Vec::new();
+        let mut counter = |name: &'static str, missing: &mut Vec<&'static str>| match instance
+            .get_typed_func::<(), u64>(&mut store, name)
             .and_then(|f| f.call(&mut store, ()))
-            .unwrap_or(0);
-        let internal_compile_panics = instance
-            .get_typed_func::<(), u64>(&mut store, "pyre_jit_internal_compile_panics")
-            .and_then(|f| f.call(&mut store, ()))
-            .unwrap_or(0);
-        let mut counter = |name| {
-            instance
-                .get_typed_func::<(), u64>(&mut store, name)
-                .and_then(|f| f.call(&mut store, ()))
-                .unwrap_or(0)
+        {
+            Ok(v) => v,
+            Err(_) => {
+                missing.push(name);
+                0
+            }
         };
-        let descr_set_resolved = counter("pyre_jit_descr_set_resolved");
-        let descr_set_absent = counter("pyre_jit_descr_set_absent");
-        let descr_set_ambiguous = counter("pyre_jit_descr_set_ambiguous");
-        let descr_set_stale_absent = counter("pyre_jit_descr_set_stale_absent");
+        let loops_aborted = counter("pyre_jit_loops_aborted", &mut missing);
+        let internal_compile_panics = counter("pyre_jit_internal_compile_panics", &mut missing);
+        let descr_set_resolved = counter("pyre_jit_descr_set_resolved", &mut missing);
+        let descr_set_absent = counter("pyre_jit_descr_set_absent", &mut missing);
+        let descr_set_ambiguous = counter("pyre_jit_descr_set_ambiguous", &mut missing);
+        let descr_set_stale_absent = counter("pyre_jit_descr_set_stale_absent", &mut missing);
+        if !missing.is_empty() {
+            eprintln!(
+                "pyre-wasm-runner: MAJIT_STATS is set but the module exports no {} — \
+                 refusing to report a gated counter as 0, which reads as healthy",
+                missing.join(", "),
+            );
+            std::process::exit(1);
+        }
         eprintln!(
             "[jit-stats] loops_aborted={loops_aborted} \
              internal_compile_panics={internal_compile_panics} \

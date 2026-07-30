@@ -1056,10 +1056,27 @@ impl GcCache {
     /// that means two producers disagree about which fields the struct has, and
     /// inventing a position would be worse than leaving the caller's, since the
     /// existing `debug_assert!` canaries are what should catch it.
+    /// The lookup itself, with no census side effect.
+    ///
+    /// Separate from [`derive_index_in_parent`] because the cache-hit path has to
+    /// ask the same question and must not be counted: the census measures what
+    /// producers hand in, and a cached field is one producer's answer read back,
+    /// not a second producer disagreeing.
+    ///
+    /// Name only. An offset fallback looks tempting but is unsound while one
+    /// struct is reachable under several identity keys: the parent found may
+    /// belong to a different struct, and a same-offset field of another type
+    /// then reads as this one.
+    ///
+    /// [`derive_index_in_parent`]: Self::derive_index_in_parent
+    fn find_index_in_parent(parent: Option<&DescrRef>, field_name: &str) -> Option<usize> {
+        let fields = parent.and_then(|p| p.as_size_descr())?.all_fielddescrs();
+        fields.iter().position(|f| f.field_key() == field_name)
+    }
+
     fn derive_index_in_parent(
         parent: Option<&DescrRef>,
         field_name: &str,
-        offset: usize,
         caller_index: usize,
     ) -> Option<usize> {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1067,18 +1084,11 @@ impl GcCache {
             FIELD_PARENT_ABSENT.fetch_add(1, Relaxed);
             return None;
         };
-        let fields = size_descr.all_fielddescrs();
-        if fields.is_empty() {
+        if size_descr.all_fielddescrs().is_empty() {
             FIELD_PARENT_EMPTY.fetch_add(1, Relaxed);
             return None;
         }
-        // Name only. An offset fallback looks tempting but is unsound while one
-        // struct is reachable under several identity keys: the parent found may
-        // belong to a different struct, and a same-offset field of another type
-        // then reads as this one.
-        let _ = offset;
-        let found = fields.iter().position(|f| f.field_key() == field_name);
-        match found {
+        match Self::find_index_in_parent(parent, field_name) {
             Some(i) => {
                 if i != caller_index {
                     FIELD_INDEX_REDERIVED.fetch_add(1, Relaxed);
@@ -1123,6 +1133,15 @@ impl GcCache {
         virtualizable: bool,
         index_in_parent: usize,
     ) -> Arc<SimpleFieldDescr> {
+        // descr.py:234-238: parent_descr = get_size_descr(gccache, STRUCT, vtable)
+        let parent = self._cache_size.get(&struct_key).cloned();
+        // What the cached descr's own `index_in_parent` was normalised to when it
+        // was minted. The caller's raw number cannot be compared against it: a
+        // field that was rederived once stays rederived, so asserting the cached
+        // value equals the argument fires on the SECOND lookup of exactly the
+        // fields this normalisation exists for.
+        let expected_index_in_parent =
+            Self::find_index_in_parent(parent.as_ref(), field_name).unwrap_or(index_in_parent);
         // descr.py:220-221: cache[STRUCT][fieldname]
         if let Some(inner) = self._cache_field.get(&struct_key) {
             if let Some(descr) = inner.get(field_name) {
@@ -1134,13 +1153,14 @@ impl GcCache {
                         is_immutable,
                         is_quasi_immutable,
                         virtualizable,
-                        index_in_parent,
+                        expected_index_in_parent,
                     ),
                     "get_field_descr cache hit for {field_name} disagrees with the caller: \
                      cached (offset {}, size {}, type {:?}, immutable {}, quasi {}, vable {}, \
                      index_in_parent {}) vs requested (offset {offset}, size {field_size}, \
                      type {field_type:?}, immutable {is_immutable}, quasi {is_quasi_immutable}, \
-                     vable {virtualizable}, index_in_parent {index_in_parent})",
+                     vable {virtualizable}, index_in_parent {expected_index_in_parent} \
+                     [caller said {index_in_parent}])",
                     descr.offset,
                     descr.field_size,
                     descr.field_type,
@@ -1163,8 +1183,6 @@ impl GcCache {
                 format!("T{type_id}.{field_name}")
             }
         };
-        // descr.py:234-238: parent_descr = get_size_descr(gccache, STRUCT, vtable)
-        let parent = self._cache_size.get(&struct_key).cloned();
         // descr.py:230-231: FieldDescr(name, offset, size, flag, index_in_parent, is_pure)
         let mut fd = SimpleFieldDescr::new_with_name(
             index,
@@ -1196,7 +1214,7 @@ impl GcCache {
         // So take the index from the parent that will actually be indexed,
         // rather than from whoever happened to call.
         fd.index_in_parent =
-            Self::derive_index_in_parent(parent.as_ref(), field_name, offset, index_in_parent)
+            Self::derive_index_in_parent(parent.as_ref(), field_name, index_in_parent)
                 .unwrap_or(index_in_parent);
         // descr.py:229 `is_quasi_immutable = '%s?' in STRUCT._hints.get(
         // '_immutable_fields_', ())` parity.  The analyzer side reads
@@ -5891,6 +5909,44 @@ mod register_keyed_size_authority_tests {
         gc._cache_size.insert(LLType::Struct(2), shell_descr(32));
 
         assert_eq!(gc.size_shell_census(), [1, 1, 0, 0, 0]);
+    }
+
+    /// A rederived field must survive being looked up twice.
+    ///
+    /// `get_field_descr` normalises `index_in_parent` against the parent, so the
+    /// cached descr holds the derived number while the caller keeps handing in
+    /// its own. Validating the cache hit against the raw argument therefore
+    /// fires on the SECOND lookup of exactly the fields the normalisation exists
+    /// for — and only in debug builds, where `debug_assert!` is live, so the
+    /// release gate cannot see it.
+    #[test]
+    fn a_rederived_field_survives_a_second_lookup() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(5);
+        // Parent lists f16, f24, f32 — so `f24` is at index 1.
+        gc._cache_size
+            .insert(key.clone(), size_descr_at(7, 0, &[16, 24, 32]));
+        let mut lookup = |gc: &mut GcCache| {
+            gc.get_field_descr(
+                key.clone(),
+                "f24",
+                None,
+                24,
+                8,
+                Type::Int,
+                false,
+                false,
+                ArrayFlag::Signed,
+                0,
+                false,
+                // A header-counting producer's number, two slots high.
+                3,
+            )
+        };
+        let first = lookup(&mut gc);
+        assert_eq!(first.index_in_parent, 1, "the parent's own list wins");
+        let second = lookup(&mut gc);
+        assert_eq!(second.index_in_parent, 1);
     }
 
     /// The upgrade rule itself is unchanged when both sides carry a vtable.
