@@ -2874,15 +2874,20 @@ pub fn system_exit_code(err: &PyError) -> i32 {
     if unsafe { pyre_object::is_none(code) } {
         return 0;
     }
-    match crate::builtins::builtin_int(&[code]) {
-        Ok(w_int) => unsafe { pyre_object::w_int_get_value(w_int) as i32 },
-        Err(_) => {
-            let text = unsafe { crate::display::py_str(code) }
-                .unwrap_or_else(|_| "<unprintable>".to_string());
-            crate::host_seam::emit_stderr(format!("{text}\n").as_bytes());
-            1
-        }
+    // `pylifecycle.c _Py_HandleSystemExit` tests `PyLong_Check(exc)` — there is
+    // no `int()` coercion, so a float or any other non-integer code is printed
+    // rather than converted.
+    if unsafe { pyre_object::is_int_or_long(code) } {
+        // `exitcode = (int)PyLong_AsLong(exc)`: a value too wide for a machine
+        // word leaves the -1 `PyLong_AsLong` returns on overflow, and the
+        // narrowing to `int` is a plain truncation. So `SystemExit(10**100)`
+        // and `SystemExit(-1)` both exit 255.
+        return crate::baseobjspace::int_w(code).unwrap_or(-1) as i32;
     }
+    let text =
+        unsafe { crate::display::py_str(code) }.unwrap_or_else(|_| "<unprintable>".to_string());
+    crate::host_seam::emit_stderr(format!("{text}\n").as_bytes());
+    1
 }
 
 pub fn get_cleared_operation_error(_space: PyObjectRef) -> OperationError {
