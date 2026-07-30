@@ -527,19 +527,15 @@ pub extern "C" fn jit_w_long_xor_raw(a: i64, b: i64) -> i64 {
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    // Two-limb fast path: when both operands and the sum fit i128 the result
-    // is exact without the general limb machinery.
     unsafe {
+        // `rbigint.add` (rbigint.py:684-687) returns the *other operand itself*
+        // when one side is zero; the raw-pointer ABI spells that identity as
+        // returning the incoming payload instead of re-wrapping an alias.
         if (&*a).get_sign() == 0 {
             return b as i64;
         }
         if (&*b).get_sign() == 0 {
             return a as i64;
-        }
-        if let (Ok(x), Ok(y)) = (i128::try_from(&*a), i128::try_from(&*b)) {
-            if let Some(z) = x.checked_add(y) {
-                return alloc_bigint_nursery_collecting(BigInt::from(z)) as i64;
-            }
         }
         alloc_bigint_nursery_collecting(&*a + &*b) as i64
     }
@@ -551,23 +547,18 @@ pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> i64 {
 /// a freshly heap-allocated `*mut BigInt` payload (as i64).
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_add_int_int(a: i64, b: i64) -> i64 {
-    // Exact in i128 for any i64 pair; skips the general bigint add machinery.
-    alloc_bigint_nursery_collecting(BigInt::from(a as i128 + b as i128)) as i64
+    alloc_bigint_nursery_collecting(BigInt::add_int_int_bigint_result(a, b)) as i64
 }
 
 /// `rbigint.sub` on bare payloads (collecting). See [`jit_bigint_add`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    // Two-limb fast path mirroring `jit_bigint_add`.
     unsafe {
+        // `rbigint.sub` (rbigint.py:758-759) returns `self` itself for a zero
+        // subtrahend; see [`jit_bigint_add`] for the raw-pointer spelling.
         if (&*b).get_sign() == 0 {
             return a as i64;
-        }
-        if let (Ok(x), Ok(y)) = (i128::try_from(&*a), i128::try_from(&*b)) {
-            if let Some(z) = x.checked_sub(y) {
-                return alloc_bigint_nursery_collecting(BigInt::from(z)) as i64;
-            }
         }
         alloc_bigint_nursery_collecting(&*a - &*b) as i64
     }
@@ -578,8 +569,7 @@ pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> i64 {
 /// [`jit_bigint_add_int_int`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_sub_int_int(a: i64, b: i64) -> i64 {
-    // Exact in i128 for any i64 pair; skips the general bigint sub machinery.
-    alloc_bigint_nursery_collecting(BigInt::from(a as i128 - b as i128)) as i64
+    alloc_bigint_nursery_collecting(BigInt::sub_int_int_bigint_result(a, b)) as i64
 }
 
 /// `rbigint.mul` on bare payloads (collecting). See [`jit_bigint_add`].
@@ -594,8 +584,7 @@ pub extern "C" fn jit_bigint_mul(a: i64, b: i64) -> i64 {
 /// [`jit_bigint_add_int_int`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_mul_int_int(a: i64, b: i64) -> i64 {
-    // A 64x64 product is exact in i128; skips the general bigint mul machinery.
-    alloc_bigint_nursery_collecting(BigInt::from(a as i128 * b as i128)) as i64
+    alloc_bigint_nursery_collecting(BigInt::mul_int_int_bigint_result(a, b)) as i64
 }
 
 /// `rbigint.and_` on bare payloads (collecting). See [`jit_bigint_add`].
