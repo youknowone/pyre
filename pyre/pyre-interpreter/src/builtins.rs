@@ -10173,9 +10173,23 @@ fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             positional.len()
         )));
     }
-    let it = crate::baseobjspace::iter(positional[0])?;
+    // `iter` and every `next` run arbitrary Python. Pin the iterable, the
+    // iterator, and a dict view's backing dict for the whole walk, and reload
+    // the iterator from its slot before each call: a moving minor collection
+    // relocates it behind a plain Rust local. The shape `collect_iterator` uses.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let iterable_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(positional[0]);
+    let it = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?;
+    let iterator_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(it);
+    if unsafe { pyre_object::dictmultiobject::is_dict_view_iterator(it) } {
+        let w_dict = unsafe { pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(it) };
+        pyre_object::gc_roots::pin_root(w_dict);
+    }
     loop {
-        match crate::baseobjspace::next(it) {
+        let it_now = pyre_object::gc_roots::shadow_stack_get(iterator_slot);
+        match crate::baseobjspace::next(it_now) {
             Ok(item) if crate::baseobjspace::is_true(item)? => return Ok(w_bool_from(true)),
             Ok(_) => {}
             Err(e) if e.kind == crate::PyErrorKind::StopIteration => return Ok(w_bool_from(false)),
@@ -12267,9 +12281,21 @@ fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             positional.len()
         )));
     }
-    let it = crate::baseobjspace::iter(positional[0])?;
+    // Rooted exactly as `builtin_any`: `iter` and every `next` run arbitrary
+    // Python, so the iterator is reloaded from its slot before each call.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let iterable_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(positional[0]);
+    let it = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?;
+    let iterator_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(it);
+    if unsafe { pyre_object::dictmultiobject::is_dict_view_iterator(it) } {
+        let w_dict = unsafe { pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(it) };
+        pyre_object::gc_roots::pin_root(w_dict);
+    }
     loop {
-        match crate::baseobjspace::next(it) {
+        let it_now = pyre_object::gc_roots::shadow_stack_get(iterator_slot);
+        match crate::baseobjspace::next(it_now) {
             Ok(item) if !crate::baseobjspace::is_true(item)? => return Ok(w_bool_from(false)),
             Ok(_) => {}
             Err(e) if e.kind == crate::PyErrorKind::StopIteration => return Ok(w_bool_from(true)),

@@ -21189,16 +21189,40 @@ pub(crate) fn set_method_union(
         return Ok(pyre_object::w_set_new());
     }
     let result = set_copy_real(args[0]);
+    // `collect_iterable` runs a user `__iter__`/`__next__` and
+    // `builtin_set_add_items` a user `__hash__`/`__eq__`, so the set being
+    // built stays live across every operand — with two non-set operands it
+    // crosses two full drains. `set_init_from_iterable_impl` pins for the same
+    // reason: the set body is non-moving old-gen storage, but it still has to
+    // be marked live instead of swept while Rust holds the only reference.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let result_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(result);
     for other in &args[1..] {
-        if unsafe { pyre_object::is_set_or_frozenset(*other) } {
-            unsafe { pyre_object::w_set_update_from_set(result, *other) }
-                .map_err(crate::baseobjspace::map_set_update_error)?;
+        let _operand_root = pyre_object::gc_roots::push_roots();
+        let operand_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(*other);
+        if unsafe {
+            pyre_object::is_set_or_frozenset(pyre_object::gc_roots::shadow_stack_get(operand_slot))
+        } {
+            unsafe {
+                pyre_object::w_set_update_from_set(
+                    pyre_object::gc_roots::shadow_stack_get(result_slot),
+                    pyre_object::gc_roots::shadow_stack_get(operand_slot),
+                )
+            }
+            .map_err(crate::baseobjspace::map_set_update_error)?;
         } else {
-            let other_items = crate::builtins::collect_iterable(*other)?;
-            crate::builtins::builtin_set_add_items(result, &other_items)?;
+            let other_items = crate::builtins::collect_iterable(
+                pyre_object::gc_roots::shadow_stack_get(operand_slot),
+            )?;
+            crate::builtins::builtin_set_add_items(
+                pyre_object::gc_roots::shadow_stack_get(result_slot),
+                &other_items,
+            )?;
         }
     }
-    Ok(result)
+    Ok(pyre_object::gc_roots::shadow_stack_get(result_slot))
 }
 
 /// A clone of the set, keeping the digest each element was stored under.
@@ -21601,16 +21625,36 @@ fn set_method_update(
     if args.is_empty() {
         return Ok(pyre_object::w_none());
     }
+    // Rooted as `set_method_union`, except that the operands merge into
+    // `args[0]` itself: a raw Rust slice the collector cannot see either.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let set_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
     // `setobject.py _descr_update` — a set operand's storage merges in
     // as it stands; only another iterable is walked and hashed element by
     // element.
     for other in &args[1..] {
-        if unsafe { pyre_object::is_set_or_frozenset(*other) } {
-            unsafe { pyre_object::w_set_update_from_set(args[0], *other) }
-                .map_err(crate::baseobjspace::map_set_update_error)?;
+        let _operand_root = pyre_object::gc_roots::push_roots();
+        let operand_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(*other);
+        if unsafe {
+            pyre_object::is_set_or_frozenset(pyre_object::gc_roots::shadow_stack_get(operand_slot))
+        } {
+            unsafe {
+                pyre_object::w_set_update_from_set(
+                    pyre_object::gc_roots::shadow_stack_get(set_slot),
+                    pyre_object::gc_roots::shadow_stack_get(operand_slot),
+                )
+            }
+            .map_err(crate::baseobjspace::map_set_update_error)?;
         } else {
-            let other_items = crate::builtins::collect_iterable(*other)?;
-            crate::builtins::builtin_set_add_items(args[0], &other_items)?;
+            let other_items = crate::builtins::collect_iterable(
+                pyre_object::gc_roots::shadow_stack_get(operand_slot),
+            )?;
+            crate::builtins::builtin_set_add_items(
+                pyre_object::gc_roots::shadow_stack_get(set_slot),
+                &other_items,
+            )?;
         }
     }
     Ok(pyre_object::w_none())
