@@ -11179,6 +11179,50 @@ mod tests {
             .expect("source should contain a function body")
     }
 
+    #[test]
+    fn trace_too_long_publishes_forwarded_for_iter_stack_and_coordinate() {
+        use pyre_interpreter::pyframe::PyFrame;
+
+        let code = compile_function_body("def f(xs):\n    for x in xs:\n        pass\n");
+        let mut live = PyFrame::new(code);
+        let mut snapshot = live.snapshot_for_tracing();
+        let stack_base = snapshot.stack_base();
+        let iterator = pyre_object::w_none();
+        let item = pyre_object::w_bool_from(true);
+        snapshot.push(iterator);
+        snapshot.push(item);
+        snapshot.last_instr = 37;
+
+        let snapshot_addr = (&mut *snapshot) as *mut PyFrame as usize;
+        let live_addr = (&mut *live) as *mut PyFrame as usize;
+        assert_eq!(live.valuestackdepth, stack_base);
+        assert!(can_publish_frame_stack(snapshot_addr, live_addr));
+
+        let mut captured = capture_frame_stack_for_publish(snapshot_addr, live_addr)
+            .expect("matching snapshot/live frame shapes must be capturable");
+        assert_eq!(captured.stack_base, stack_base);
+        assert_eq!(captured.scalars.valuestackdepth, stack_base + 2);
+        assert_eq!(captured.scalars.last_instr, 37);
+        assert_eq!(captured.roots, vec![iterator as i64, item as i64]);
+
+        // The adoption path roots this slice while publishing locals. Model a
+        // moving collection forwarding both active FOR_ITER stack values and
+        // prove that publication reads the updated roots, not the stale raw
+        // words still held by the detached tracing snapshot.
+        let forwarded_iterator = pyre_object::w_bool_from(false);
+        let forwarded_item = pyre_object::w_none();
+        captured.roots_mut()[0] = forwarded_iterator as i64;
+        captured.roots_mut()[1] = forwarded_item as i64;
+
+        assert!(publish_captured_frame_stack(live_addr, &captured));
+        assert_eq!(live.valuestackdepth, stack_base + 2);
+        assert_eq!(live.last_instr, 37);
+        assert_eq!(live.locals_w()[stack_base], forwarded_iterator);
+        assert_eq!(live.locals_w()[stack_base + 1], forwarded_item);
+        assert_eq!(snapshot.locals_w()[stack_base], iterator);
+        assert_eq!(snapshot.locals_w()[stack_base + 1], item);
+    }
+
     fn contains_instruction(code: &CodeObject, predicate: impl Fn(Instruction) -> bool) -> bool {
         (0..code.instructions.len()).any(|pc| {
             decode_instruction_at(code, pc)
