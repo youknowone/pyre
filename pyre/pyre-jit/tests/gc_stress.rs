@@ -987,6 +987,257 @@ while i < 40:
     );
 }
 
+/// `min_max_sequence` keeps the current best item and key in shadow-stack
+/// slots while the `key=` function runs Python and calls `gc.collect()`.
+#[test]
+fn min_max_key_values_survive_python_callbacks() {
+    run_on_worker(
+        r#"
+import gc
+
+class K:
+    def __init__(self, v):
+        self.v = v
+
+def keyf(o):
+    gc.collect()
+    return o.v
+
+i = 0
+while i < 40:
+    lo = min([K(5), K(3), K(9), K(1), K(7)], key=keyf)
+    assert lo.v == 1, lo.v
+    hi = max([K(5), K(3), K(9), K(1), K(7)], key=keyf)
+    assert hi.v == 9, hi.v
+    i += 1
+"#,
+        "<min_max_key_gc_rooting>",
+        "min/max key callback-root checks",
+        "min/max key callback GC rooting program failed",
+    );
+}
+
+/// `sort_rooted_items` keeps every item and computed key in shadow-stack
+/// slots while the `key=` function runs Python and calls `gc.collect()`.
+#[test]
+fn sorted_key_values_survive_python_callbacks() {
+    run_on_worker(
+        r#"
+import gc
+
+class K:
+    def __init__(self, v):
+        self.v = v
+
+def keyf(o):
+    gc.collect()
+    return o.v
+
+i = 0
+while i < 40:
+    ordered = sorted([K(5), K(3), K(9), K(1), K(7)], key=keyf)
+    values = (ordered[0].v, ordered[1].v, ordered[2].v, ordered[3].v, ordered[4].v)
+    assert values == (1, 3, 5, 7, 9), values
+    i += 1
+"#,
+        "<sorted_key_gc_rooting>",
+        "sorted key callback-root checks",
+        "sorted key callback GC rooting program failed",
+    );
+}
+
+/// The reflected binary-operator helper holds both operands and the reflected
+/// implementation in Rust locals while `L.__add__` / `L.__sub__` run Python
+/// and collect before `R.__radd__` / `R.__rsub__` use those values.
+#[test]
+fn reflected_binary_operands_survive_python_callbacks() {
+    run_on_worker(
+        r#"
+import gc
+
+class L:
+    def __init__(self, v):
+        self.v = v
+    def __add__(self, other):
+        gc.collect()
+        return NotImplemented
+    def __sub__(self, other):
+        gc.collect()
+        return NotImplemented
+
+class R:
+    def __init__(self, v):
+        self.v = v
+    def __radd__(self, other):
+        gc.collect()
+        return (other.v, self.v)
+    def __rsub__(self, other):
+        gc.collect()
+        return (other.v, self.v)
+
+i = 0
+while i < 60:
+    assert L(i) + R(i + 1) == (i, i + 1)
+    assert L(i) - R(i + 1) == (i, i + 1)
+    i += 1
+"#,
+        "<reflected_binary_gc_rooting>",
+        "reflected binary operand callback-root checks",
+        "reflected binary operand callback GC rooting program failed",
+    );
+}
+
+/// The comparison helper holds its two-entry `(ov, recv, other)` order array
+/// in Rust locals while the first `P.__eq__` runs Python and collects before
+/// the second `Q.__eq__` reads both captured operands.
+#[test]
+fn comparison_order_operands_survive_python_callbacks() {
+    run_on_worker(
+        r#"
+import gc
+
+class P:
+    def __init__(self, v):
+        self.v = v
+    def __eq__(self, other):
+        gc.collect()
+        return NotImplemented
+
+class Q:
+    def __init__(self, v):
+        self.v = v
+    def __eq__(self, other):
+        gc.collect()
+        return (self.v, other.v)
+
+i = 0
+while i < 60:
+    assert (P(i) == Q(i + 1)) == (i + 1, i)
+    i += 1
+"#,
+        "<comparison_order_gc_rooting>",
+        "comparison order callback-root checks",
+        "comparison order callback GC rooting program failed",
+    );
+}
+
+/// `_regular_sum` holds its accumulator and the remaining collected elements
+/// in Rust locals while `Addend.__add__` runs Python and collects.
+/// `collect_iterable` / `collect_iterator` root elements only while building
+/// the Vec; their `RootScope` is dropped before `sum` consumes that Vec.
+#[test]
+fn sum_accumulator_and_items_survive_python_callbacks() {
+    run_on_worker(
+        r#"
+import gc
+
+class Addend:
+    def __init__(self, v):
+        self.v = v
+    def __add__(self, other):
+        gc.collect()
+        return Addend(self.v + other.v)
+
+i = 0
+while i < 60:
+    total = sum(
+        [Addend(1), Addend(2), Addend(3), Addend(4),
+         Addend(5), Addend(6), Addend(7), Addend(8)],
+        Addend(0),
+    )
+    assert total.v == 36, total.v
+    i += 1
+"#,
+        "<sum_gc_rooting>",
+        "sum accumulator and item callback-root checks",
+        "sum callback GC rooting program failed",
+    );
+}
+
+/// `any` / `all` hold their iterator in a Rust local while `RootingIter.__next__`
+/// and `CollectingBool.__bool__` run Python and collect. `collect_iterator`
+/// states the required opposite rule: reload the iterator from its
+/// post-relocation shadow-stack slot before every `next` call.
+#[test]
+fn any_all_iterators_survive_python_callbacks() {
+    run_on_worker(
+        r#"
+import gc
+
+class CollectingBool:
+    def __init__(self, value):
+        self.value = value
+    def __bool__(self):
+        gc.collect()
+        return self.value
+
+class RootingIter:
+    def __init__(self, count, true_count):
+        self.i = 0
+        self.count = count
+        self.true_count = true_count
+    def __iter__(self):
+        return self
+    def __next__(self):
+        gc.collect()
+        if self.i >= self.count:
+            raise StopIteration
+        value = self.i < self.true_count
+        self.i += 1
+        return CollectingBool(value)
+
+i = 0
+while i < 60:
+    assert any(RootingIter(8, 0)) is False
+    assert all(RootingIter(8, 3)) is False
+    i += 1
+"#,
+        "<any_all_gc_rooting>",
+        "any/all iterator callback-root checks",
+        "any/all callback GC rooting program failed",
+    );
+}
+
+/// `set_method_union` / `set_method_update` hold their result and each
+/// collected item Vec in Rust locals while `RootingIter.__next__` runs Python
+/// and collects. Unlike these methods, sibling `set_init_from_iterable_impl`
+/// pins its working values for exactly this reason.
+#[test]
+fn set_union_update_values_survive_python_callbacks() {
+    run_on_worker(
+        r#"
+import gc
+
+class RootingIter:
+    def __init__(self, start, stop):
+        self.current = start
+        self.stop = stop
+    def __iter__(self):
+        return self
+    def __next__(self):
+        gc.collect()
+        if self.current >= self.stop:
+            raise StopIteration
+        value = self.current
+        self.current += 1
+        return value
+
+i = 0
+while i < 60:
+    united = {0}.union(RootingIter(1, 5), RootingIter(5, 9))
+    assert united == {0, 1, 2, 3, 4, 5, 6, 7, 8}, united
+
+    updated = {0}
+    updated.update(RootingIter(1, 5), RootingIter(5, 9))
+    assert updated == {0, 1, 2, 3, 4, 5, 6, 7, 8}, updated
+    i += 1
+"#,
+        "<set_union_update_gc_rooting>",
+        "set union/update callback-root checks",
+        "set union/update callback GC rooting program failed",
+    );
+}
+
 /// `PyCode.co_consts_w` owns the one wrapped object for each constant index
 /// (`pycode.py:126`, `pyopcode.py:498-499`). A large integer constant is a
 /// managed `W_LongObject`; the Box-immortal PyCode therefore has to expose the
