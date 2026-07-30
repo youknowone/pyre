@@ -2433,6 +2433,17 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
     // does not model destructors (the `Drop` terminator lowers to a
     // pass-through `Goto`), so a Void no-op stub is faithful.
     (&["core", "mem", "drop"], &["x"], LowLevelType::Void),
+    // `mem::size_of::<T>() -> usize`.  A concrete-type call is folded to a
+    // `ConstInt` in the front end (`Lowering::lower_call` /
+    // `size_align_const_from_tyexpr`); the residual reaching the rtyper is the
+    // generic body (`gc_alloc_storage_box<T>`), whose `T` is an abstract type
+    // parameter with no compile-time size.  Declare it opaque so the generic
+    // body annotates — the monomorphized machine code the JIT actually traces
+    // carries rustc's folded constant, so no residual call runs.  Both
+    // spellings: the FunDecl name resolves `core`, the call site may write the
+    // `std` re-export.
+    (&["core", "mem", "size_of"], &[], LowLevelType::Unsigned),
+    (&["std", "mem", "size_of"], &[], LowLevelType::Unsigned),
     // `handle_alloc_error(layout) -> !` aborts on OOM; it never returns and
     // its result is never consumed. The divergence is carried by the CFG, so
     // a Void stub lets the alloc helpers lift while the residual call aborts.
