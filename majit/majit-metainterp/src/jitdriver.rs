@@ -1924,6 +1924,17 @@ impl<S: JitState> JitDriver<S> {
     /// did not abort, the gate is off, or the state shape has no seed path (see
     /// below).
     ///
+    /// ⚠️ **`None` means "declined before the chain ran", and only that.** Once
+    /// `drive_multi_frame_blackhole` returns, the chain has executed the rest
+    /// of the half-finished opcodes against the real heap; the caller's
+    /// source-pc handoff resumes at a pc dispatch advanced *before* those
+    /// opcodes' arms, so answering `None` there runs them a second time —
+    /// the very double-application this conversion exists to prevent. Every
+    /// post-chain path therefore returns `Some`, using the `single_pass_finish`
+    /// + `usize::MAX` "no forward pc" outcome when it has no merge point to
+    /// resume at. Upstream has no such split: `blackhole.py:1799
+    /// convert_and_run_from_pyjitpl` never returns to its caller at all.
+    ///
     /// **Seeding.** The walk keeps state fields on the sym; the blackhole reads
     /// them out of the identity registers `StateFieldLayout` names.  The abort
     /// arm captured the sym's image, and this places it into the root frame's
@@ -2065,16 +2076,22 @@ impl<S: JitState> JitDriver<S> {
             // pc it reported.  Every `greens` declaration puts `pc` first.
             crate::jitexc::JitException::ContinueRunningNormally { ref green_int, .. } => {
                 let Some(&resume_pc) = green_int.first() else {
-                    // Unreachable for any declared jitdriver.  Say so loudly
-                    // rather than fall back: the chain has already run the
-                    // aborted opcodes' tails against the real heap, so resuming
-                    // at the walk's source pc would execute them a second time.
+                    // Unreachable for any declared jitdriver — every `greens`
+                    // declaration puts `pc` first.  Do NOT return `None`: that
+                    // is the pre-chain decline answer, and the chain has
+                    // already run the aborted opcodes' tails against the real
+                    // heap, so the caller's source-pc handoff would execute
+                    // them a second time.  Ending the dispatch loop is the
+                    // only outcome here that cannot double-apply.
                     debug_assert!(false, "merge point reported no green pc");
                     eprintln!(
-                        "[bh] abort-blackhole: ContinueRunningNormally with no green pc — \
-                         falling back to the source pc AFTER the chain ran"
+                        "[bh] abort-blackhole: ContinueRunningNormally with no green pc \
+                         AFTER the chain ran — ending the dispatch loop rather than \
+                         replaying the aborted opcodes"
                     );
-                    return None;
+                    writeback(state, usize::MAX);
+                    self.meta.single_pass_finish = true;
+                    return Some(usize::MAX);
                 };
                 let resume_pc = resume_pc as usize;
                 writeback(state, resume_pc);
@@ -2099,10 +2116,30 @@ impl<S: JitState> JitDriver<S> {
             }
             // `blackhole.py:1679 _exit_frame_with_exception` → the exception
             // escaped every converted frame.  Hand it to the interpreter's own
-            // machinery; an interpreter with no exception surface returns
-            // `None` and the walk falls back to the source-pc handoff.
+            // machinery.
+            //
+            // `JitState::deliver_blackhole_exception` defaults to `None` — an
+            // interpreter with no exception surface has nothing to hand it to.
+            // That answer must NOT become this function's `None`, which means
+            // "declined before running anything" and sends the caller to the
+            // source-pc handoff: the chain has already executed the aborted
+            // opcodes' tails against the real heap, so that handoff would run
+            // them twice.  Upstream cannot reach this — `blackhole.py:1799
+            // convert_and_run_from_pyjitpl` does not return, it propagates the
+            // exception out to `warmspot.py:961 handle_jitexception` — so
+            // ending the dispatch loop is the closest non-replaying answer.
+            // A frontend that wants the exception implements the hook.
             crate::jitexc::JitException::ExitFrameWithExceptionRef(exc) => {
-                let resume_pc = state.deliver_blackhole_exception(exc)?;
+                let Some(resume_pc) = state.deliver_blackhole_exception(exc) else {
+                    eprintln!(
+                        "[bh] abort-blackhole: exception escaped every converted frame and \
+                         this interpreter has no `deliver_blackhole_exception` — ending the \
+                         dispatch loop rather than replaying the aborted opcodes"
+                    );
+                    writeback(state, usize::MAX);
+                    self.meta.single_pass_finish = true;
+                    return Some(usize::MAX);
+                };
                 writeback(state, resume_pc);
                 Some(resume_pc)
             }
