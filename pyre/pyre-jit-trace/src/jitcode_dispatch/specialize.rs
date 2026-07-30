@@ -2875,7 +2875,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     name_idx: usize,
     original_effect: &majit_ir::EffectInfo,
 ) -> Result<Option<WalkerStoreAttrSpecialization>, DispatchError> {
-    if !ctx.is_authoritative_executor {
+    if !ctx.is_authoritative_executor || w_code_ptr == 0 {
         return Ok(None);
     }
     let (Some(concrete_obj), Some(concrete_value)) = (
@@ -7543,7 +7543,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     w_code_ptr: usize,
     name_idx: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if !ctx.is_authoritative_executor {
+    if !ctx.is_authoritative_executor || w_code_ptr == 0 {
         return Ok(None);
     }
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj_op) else {
@@ -8829,6 +8829,9 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
     frame_ptr: usize,
     namei: i64,
 ) -> Result<bool, DispatchError> {
+    if w_code_ptr == 0 {
+        return Ok(false);
+    }
     let w_globals = ns_ptr as pyre_object::PyObjectRef;
     // `namei` is the raw `LOAD_GLOBAL` oparg; bit 0 is the push-NULL flag,
     // so the `co_names` index is `namei >> 1` (mirror `bh_load_global_fn`).

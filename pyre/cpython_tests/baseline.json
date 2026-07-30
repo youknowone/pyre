@@ -56,7 +56,7 @@
       "dynasm": "CRASH"
     },
     "test.test_asyncio": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_atexit": {
       "dynasm": "IMPORTERROR"

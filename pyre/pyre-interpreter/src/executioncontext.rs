@@ -290,8 +290,10 @@ pub struct ExecutionContext {
     pub w_asyncgen_firstiter_fn: PyObjectRef,
     pub w_asyncgen_finalizer_fn: PyObjectRef,
     /// `executioncontext.py:52` — the current PEP 567 Context object for this
-    /// execution context.  This is execution-context-owned, not a process
-    /// global or an independent Rust TLS side table.
+    /// execution context, reached from `lib_pypy/_contextvars.py` through
+    /// `__pypy__.get_contextvar_context()` and swapped temporarily inside
+    /// `Context.run`.  Execution-context-owned, not a process global or an
+    /// independent Rust TLS side table.
     pub contextvar_context: PyObjectRef,
 }
 
@@ -2224,25 +2226,30 @@ impl UserDelAction {
     }
 
     pub fn _call_finalizer(&mut self, w_obj: PyObjectRef) {
-        crate::module::_weakref::interp__weakref::finalize_weakrefs(w_obj);
-        if let Some(pb) = crate::module::__pypy__::W_PickleBuffer::from_obj(w_obj) {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_obj);
+        let current = || pyre_object::gc_roots::shadow_stack_get(root_base);
+        crate::module::_weakref::interp__weakref::finalize_weakrefs(current());
+        if let Some(pb) = crate::module::__pypy__::W_PickleBuffer::from_obj(current()) {
             pb.release_export();
             return;
         }
-        if let Some(iter) = crate::module::r#struct::unpack_iter::W_UnpackIter::from_obj(w_obj) {
+        if let Some(iter) = crate::module::r#struct::unpack_iter::W_UnpackIter::from_obj(current())
+        {
             iter.release_export();
             return;
         }
-        if unsafe { pyre_object::generator::is_generator_or_coroutine(w_obj) } {
-            if self.gc_disabled(w_obj) {
+        if unsafe { pyre_object::generator::is_generator_or_coroutine(current()) } {
+            if self.gc_disabled(current()) {
                 return;
             }
-            if let Err(error) = crate::baseobjspace::generator_finalize(w_obj) {
-                report_error(self.base.space, &error, "", w_obj);
+            if let Err(error) = crate::baseobjspace::generator_finalize(current()) {
+                report_error(self.base.space, &error, "", current());
             }
             return;
         }
-        let Some(w_type) = crate::typedef::r#type(w_obj) else {
+        let Some(w_type) = crate::typedef::r#type(current()) else {
             return;
         };
         let Some(w_del) =
@@ -2250,13 +2257,13 @@ impl UserDelAction {
         else {
             return;
         };
-        if self.gc_disabled(w_obj) {
+        if self.gc_disabled(current()) {
             return;
         }
         // pyre's combined helper cannot distinguish get-vs-call errors;
         // report through the call arm (executioncontext.py:680-690).
         if let Err(error) = unsafe {
-            crate::baseobjspace::get_and_call_function(w_del, w_obj, w_type.as_ptr(), &[])
+            crate::baseobjspace::get_and_call_function(w_del, current(), w_type.as_ptr(), &[])
         } {
             report_error(self.base.space, &error, "", w_del);
         }

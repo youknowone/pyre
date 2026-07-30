@@ -876,6 +876,12 @@ if hasattr(os, 'fork'):
         if _event_loop_policy is not None:
             _event_loop_policy._local = _BaseDefaultEventLoopPolicy._Local()
         _set_running_loop(None)
+        # The C _asyncio backend resets its per-interpreter current-task
+        # registry after fork.  The pure-Python backend owns the equivalent
+        # state in tasks._current_tasks, so clear the child's copy as well.
+        # Import lazily to avoid the events <-> tasks initialization cycle.
+        from . import tasks
+        tasks._current_tasks.clear()
         signal.set_wakeup_fd(-1)
 
     os.register_at_fork(after_in_child=on_fork)

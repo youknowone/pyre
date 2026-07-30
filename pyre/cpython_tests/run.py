@@ -222,18 +222,27 @@ def is_package(module: str) -> bool:
 # Driver that imports a test *package* with real package context (so its
 # `__init__.py` / `load_tests` discovers the sub-suite) and runs it through
 # unittest, emitting the `Ran N`/`OK`/`FAILED (` markers classify() keys on.
+#
+# The `if __name__ == "__main__"` guard is the "Safe importing of main module"
+# idiom multiprocessing requires: a spawn-started child re-imports this file as
+# `__mp_main__` (`multiprocessing/spawn.py:_fixup_main_from_path`), and without
+# the guard it would re-run the whole suite inside the child. Every test file
+# run directly carries the same guard.
 _DOTTED_DRIVER = (
     "import sys, unittest\n"
     "mod = {module!r}\n"
-    "__import__(mod)\n"
-    "unittest.main(module=sys.modules[mod], argv=['pyre'], verbosity=2)\n"
+    'if __name__ == "__main__":\n'
+    "    __import__(mod)\n"
+    "    unittest.main(module=sys.modules[mod], argv=['pyre'], verbosity=2)\n"
 )
 
+# Same `__mp_main__` guard as _DOTTED_DRIVER.
 _RESOURCE_DRIVER = (
     "import runpy\n"
     "from test import support\n"
-    "support.use_resources = {{}}\n"
-    "runpy.run_path({path!r}, run_name='__main__')\n"
+    'if __name__ == "__main__":\n'
+    "    support.use_resources = {{}}\n"
+    "    runpy.run_path({path!r}, run_name='__main__')\n"
 )
 
 # test_descr asserts fully qualified class names in exception text. Running

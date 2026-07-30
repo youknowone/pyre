@@ -893,16 +893,18 @@ impl PyError {
     /// Raise an OSError carrying the C-level `(errno, strerror)` pair,
     /// matching `OSError.__init__`'s 2-argument form: `args` becomes
     /// `(errno, strerror)`, `str(e)` is `"[Errno N] strerror"`, and
-    /// `e.errno` / `e.strerror` read back the two values.  ENOENT keeps
-    /// the FileNotFoundError subclass mapping of `os_error_with_errno`.
+    /// `e.errno` / `e.strerror` read back the two values.  Like
+    /// `OSError(errno, strerror)`, every errno in CPython's/PyPy's errno map
+    /// selects its concrete subclass (EAGAIN → BlockingIOError, etc.).
     pub fn os_error_errno_strerror(errno: i32, strerror: impl Into<String>) -> Self {
         let strerror = strerror.into();
-        let kind = if errno == 2 {
+        let subclass = crate::builtins::os_error_errno_subclass(errno as i64);
+        let kind = if matches!(subclass, Some("FileNotFoundError")) {
             PyErrorKind::FileNotFoundError
         } else {
             PyErrorKind::OSError
         };
-        let exc_kind = if errno == 2 {
+        let exc_kind = if matches!(subclass, Some("FileNotFoundError")) {
             ExcKind::FileNotFoundError
         } else {
             ExcKind::OSError
@@ -915,11 +917,26 @@ impl PyError {
         let _roots = pyre_object::gc_roots::push_roots();
         let exc = w_exception_new(exc_kind, &message);
         pyre_object::gc_roots::pin_root(exc);
+        if let Some(w_target) = subclass.and_then(crate::builtins::lookup_exc_class) {
+            unsafe {
+                (*(exc as *mut pyre_object::PyObject)).w_class = w_target;
+            }
+        }
         let args_list = pyre_object::w_list_new(vec![
             pyre_object::w_int_new(errno as i64),
             pyre_object::w_str_new(&strerror),
         ]);
-        unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
+            pyre_object::interp_exceptions::w_exception_set_errno(
+                exc,
+                pyre_object::w_int_new(errno as i64),
+            );
+            pyre_object::interp_exceptions::w_exception_set_strerror(
+                exc,
+                pyre_object::w_str_new(&strerror),
+            );
+        }
         PyError {
             kind,
             message,

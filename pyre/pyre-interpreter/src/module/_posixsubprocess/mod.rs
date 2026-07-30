@@ -98,12 +98,35 @@ mod imp {
             .collect()
     }
 
-    fn opt_cstring(o: PyObjectRef, what: &str) -> Result<Option<CString>, PyError> {
+    /// `interp_subprocess.py:185-187`:
+    ///
+    /// ```python
+    /// argv = [space.fsencode_w(space.next(w_iter))
+    ///         for i in range(space.len_w(w_process_args))]
+    /// ```
+    ///
+    /// Process arguments, unlike the already-fsencoded executable/env arrays,
+    /// accept `os.PathLike` entries.
+    fn collect_fsencoded_cstrings(o: PyObjectRef, what: &str) -> Result<Vec<CString>, PyError> {
+        seq_items(o, what)?
+            .into_iter()
+            .map(|x| {
+                let bytes = crate::gateway::fsencode_bytes_w(x)?;
+                CString::new(bytes).map_err(|_| {
+                    PyError::value_error(format!("fork_exec(): embedded null in {what}"))
+                })
+            })
+            .collect()
+    }
+
+    fn opt_fsencoded_cstring(o: PyObjectRef, what: &str) -> Result<Option<CString>, PyError> {
         if is_none_obj(o) {
-            Ok(None)
-        } else {
-            Ok(Some(obj_to_cstring(o, what)?))
+            return Ok(None);
         }
+        let bytes = crate::gateway::fsencode_bytes_w(o)?;
+        CString::new(bytes)
+            .map(Some)
+            .map_err(|_| PyError::value_error(format!("fork_exec(): embedded null in {what}")))
     }
 
     fn collect_fds(o: PyObjectRef) -> Result<Vec<BorrowedFd<'static>>, PyError> {
@@ -271,11 +294,11 @@ mod imp {
 
         // Decode everything (and pre-allocate the argv/envp arrays) before
         // fork(): the child must not allocate before exec.
-        let args_list = collect_cstrings(pos[0], "args")?;
+        let args_list = collect_fsencoded_cstrings(pos[0], "args")?;
         let exec_list = collect_cstrings(pos[1], "executable_list")?;
         let close_fds = crate::baseobjspace::is_true(pos[2])?;
         let fds_to_keep = collect_fds(pos[3])?;
-        let cwd = opt_cstring(pos[4], "cwd")?;
+        let cwd = opt_fsencoded_cstring(pos[4], "cwd")?;
         let env_list = if is_none_obj(pos[5]) {
             None
         } else {

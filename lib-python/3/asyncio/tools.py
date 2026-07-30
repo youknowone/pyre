@@ -4,7 +4,6 @@ from collections import defaultdict, namedtuple
 from itertools import count
 from enum import Enum
 import sys
-from _remote_debugging import RemoteUnwinder, FrameInfo
 
 class NodeType(Enum):
     COROUTINE = 1
@@ -25,7 +24,7 @@ class CycleFoundException(Exception):
 
 
 # ─── indexing helpers ───────────────────────────────────────────
-def _format_stack_entry(elem: str|FrameInfo) -> str:
+def _format_stack_entry(elem) -> str:
     if not isinstance(elem, str):
         if elem.lineno == 0 and elem.filename == "":
             return f"{elem.funcname}"
@@ -141,6 +140,12 @@ def _find_cycles(graph):
 
 # ─── PRINT TREE FUNCTION ───────────────────────────────────────
 def get_all_awaited_by(pid):
+    # `_remote_debugging` is a CPython implementation-detail extension.
+    # PyPy does not provide it, while the indexing/rendering helpers in this
+    # module operate independently on duck-typed FrameInfo records.  Keep the
+    # optional backend at the operation that needs it so importing
+    # `asyncio.tools` remains useful on PyPy-shaped interpreters.
+    from _remote_debugging import RemoteUnwinder
     unwinder = RemoteUnwinder(pid)
     return unwinder.get_all_awaited_by()
 

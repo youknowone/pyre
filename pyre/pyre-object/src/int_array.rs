@@ -50,6 +50,59 @@ impl IntArray {
         arr
     }
 
+    /// Pin `block` on the shadow stack and return its slot, so the block stays
+    /// live across a following GC operation.
+    ///
+    /// `gct_fv_gc_malloc` (`framework.py:853-856`) brackets every malloc with
+    /// `push_roots`/`pop_roots` over the live vars, and that bracket is about
+    /// *liveness*, not only relocation: old-gen here is mark-sweep
+    /// (`incminimark.py` `STATE_SWEEPING` frees every old object that did not
+    /// gain `GCFLAG_VISITED` during this cycle), so **non-moving does not mean
+    /// non-collected**. A block born while the cycle is still scanning gets no
+    /// `VISITED` bit (`collector.rs` `oldgen_birth_flags`), and until the owning
+    /// field store lands it is reachable from a Rust local only — no root, no
+    /// heap edge — so this cycle's sweep is entitled to reclaim it.
+    ///
+    /// Every GC operation in that window is a real safepoint: with more than one
+    /// registered thread `gc_op` takes `gc_op_slow`, which clears `running` and
+    /// blocks on the GC mutex, letting another mutator drive a full cycle to
+    /// completion. `try_gc_alloc_stable_raw` and the `try_gc_owns_object` query
+    /// inside `dealloc_typed_items_block` both qualify.
+    ///
+    /// [`crate::gc_roots::pin_root`] publishes the raw value to the shadow stack
+    /// before it performs its own forwarding query, so no safepoint sits between
+    /// the allocation and the root becoming visible.
+    #[must_use]
+    pub fn pin_block(&self) -> usize {
+        let slot = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::pin_root(self.block as crate::PyObjectRef);
+        slot
+    }
+
+    /// Re-read `block` from the slot [`Self::pin_block`] returned — the
+    /// `pop_roots` half of the bracket.
+    pub fn reload_block(&mut self, slot: usize) {
+        self.block = crate::gc_roots::shadow_stack_get(slot) as *mut TypedItemsBlock;
+    }
+
+    /// Replace the storage in place, keeping the incoming block rooted across
+    /// the teardown of the outgoing one.
+    ///
+    /// `*self = fresh` alone is unsound here: Rust evaluates the right-hand side
+    /// (which allocates `fresh.block`), then drops the value being replaced, and
+    /// [`Drop`] runs `dealloc_typed_items_block` whose `try_gc_owns_object` query
+    /// is a safepoint — with `fresh.block` still unrooted and unreferenced. A
+    /// concurrent cycle reaching `STATE_SWEEPING` in that window frees the cell
+    /// into the arena free list, and the store below then publishes freed memory
+    /// as the list's storage. See [`Self::pin_block`] for why old-gen membership
+    /// is no protection.
+    pub fn install(&mut self, fresh: IntArray) {
+        let _roots = crate::gc_roots::push_roots();
+        let slot = fresh.pin_block();
+        *self = fresh;
+        self.reload_block(slot);
+    }
+
     /// Allocated capacity (`len(l.items)`, rlist.py:251), read from the block
     /// header.
     #[inline]

@@ -807,13 +807,13 @@ impl FrameBox {
         unsafe {
             (*frame_ptr).f_generator_nowref = generator;
         }
-        // generator.py:27 registers the generator so a `finally`/`with` body
-        // still unwinds when it is collected while suspended inside a handler
-        // range. Upstream gates on `co_flags & CO_YIELD_INSIDE_TRY`; that
-        // compile-time flag is unavailable here (external compiler), so
-        // `register_final` gates on a non-empty code exception table — a sound
-        // necessary condition for any reachable `finally`/`except`/`with`.
-        if register_final {
+        // generator.py:24-27: every Coroutine needs its `_finalize_` hook for
+        // the never-awaited warning. Ordinary generators only need one when
+        // collection must unwind a suspended `finally`/`with` body. Upstream
+        // uses `CO_YIELD_INSIDE_TRY` for that second arm; the external
+        // compiler does not expose it, so `register_final` is the existing
+        // exception-table approximation for non-coroutines only.
+        if is_coroutine || register_final {
             crate::executioncontext::register_finalizer(generator);
         }
         Ok(generator)
@@ -1127,6 +1127,11 @@ impl PyFrame {
     #[inline]
     pub fn locals_w_mut(&mut self) -> &mut FixedObjectArray {
         unsafe { &mut *self.locals_cells_stack_w }
+    }
+
+    #[inline]
+    pub fn set_locals_w(&mut self, index: usize, value: PyObjectRef) {
+        unsafe { &mut *self.locals_cells_stack_w }.set_ref(index, value);
     }
 
     /// Restore the per-trace mutable frame state — instruction pointer, value
@@ -2272,12 +2277,13 @@ impl PyFrame {
         // `new_for_call_with_closure` for the call-site mirror.
         let mut index = code.varnames.len();
         for _ in 0..npure {
-            self.locals_w_mut()[index] = pyre_object::w_cell_new(PY_NULL);
+            let cell = pyre_object::w_cell_new(PY_NULL);
+            self.set_locals_w(index, cell);
             index += 1;
         }
         for i in 0..nfreevars {
-            self.locals_w_mut()[index] =
-                unsafe { w_tuple_getitem(closure, i as i64).unwrap_or(PY_NULL) };
+            let cell = unsafe { w_tuple_getitem(closure, i as i64).unwrap_or(PY_NULL) };
+            self.set_locals_w(index, cell);
             index += 1;
         }
         Ok(())
@@ -2505,7 +2511,7 @@ impl PyFrame {
     pub fn push(&mut self, value: PyObjectRef) {
         self.assert_stack_index(self.valuestackdepth);
         let idx = self.valuestackdepth;
-        self.locals_w_mut()[idx] = value;
+        self.set_locals_w(idx, value);
         self.valuestackdepth += 1;
     }
 
@@ -2516,7 +2522,7 @@ impl PyFrame {
         }
         let depth = self.valuestackdepth - 1;
         let value = self.locals_w()[depth];
-        self.locals_w_mut()[depth] = PY_NULL;
+        self.set_locals_w(depth, PY_NULL);
         self.valuestackdepth = depth;
         value
     }
@@ -2594,7 +2600,7 @@ impl PyFrame {
         let depth = self.valuestackdepth - 1;
         self.assert_stack_index(depth);
         let w_object = self.locals_w()[depth];
-        self.locals_w_mut()[depth] = PY_NULL;
+        self.set_locals_w(depth, PY_NULL);
         self.valuestackdepth = depth;
         w_object
     }
@@ -2653,7 +2659,7 @@ impl PyFrame {
         self.assert_stack_index(finaldepth);
         while self.valuestackdepth > finaldepth {
             let idx = self.valuestackdepth - 1;
-            self.locals_w_mut()[idx] = PY_NULL;
+            self.set_locals_w(idx, PY_NULL);
             self.valuestackdepth -= 1;
         }
     }
@@ -2707,7 +2713,7 @@ impl PyFrame {
             .unwrap_or(0);
         self.assert_stack_index(index);
         assert!(index < self.valuestackdepth);
-        self.locals_w_mut()[index] = value;
+        self.set_locals_w(index, value);
     }
 
     /// PyPy-compatible `dropvaluesuntil()`.
@@ -2716,7 +2722,7 @@ impl PyFrame {
         self.assert_stack_index(finaldepth);
         while self.valuestackdepth > finaldepth {
             let idx = self.valuestackdepth - 1;
-            self.locals_w_mut()[idx] = PY_NULL;
+            self.set_locals_w(idx, PY_NULL);
             self.valuestackdepth -= 1;
         }
     }
@@ -3138,7 +3144,7 @@ impl PyFrame {
             } else {
                 pyre_object::PY_NULL
             };
-            self.locals_w_mut()[i] = w_newvalue;
+            self.set_locals_w(i, w_newvalue);
         }
         self.valuestackdepth = 0;
         Ok(())
@@ -3410,7 +3416,7 @@ impl PyFrame {
     pub fn setfastscope(&mut self, scope_w: &[PyObjectRef]) {
         assert!(scope_w.len() <= self.nlocals());
         for (index, value) in scope_w.iter().copied().enumerate() {
-            self.locals_w_mut()[index] = value;
+            self.set_locals_w(index, value);
         }
         // In this port, cell initialization is performed as part of scope load.
         self.init_cells();
@@ -3475,7 +3481,7 @@ impl PyFrame {
                 if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
                     unsafe { pyre_object::w_cell_set(slot, w_value) };
                 } else {
-                    self.locals_w_mut()[idx] = w_value;
+                    self.set_locals_w(idx, w_value);
                 }
             }
         }

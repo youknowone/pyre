@@ -444,11 +444,19 @@ class BaseEagerTaskFactoryTests(BaseTaskCountingTests):
 
 
 class NonEagerTests(BaseNonEagerTaskFactoryTests, test_utils.TestCase):
-    Task = asyncio.tasks._CTask
+    # Exercise the interpreter's default Task backend.  CPython's default is
+    # _CTask; PyPy-shaped interpreters legitimately use the Python backend.
+    Task = asyncio.tasks.Task
+    _current_task_impl = staticmethod(
+        asyncio.tasks._c_current_task
+        if hasattr(asyncio.tasks, '_CTask')
+        and Task is asyncio.tasks._CTask
+        else asyncio.tasks._py_current_task
+    )
 
     def setUp(self):
         self._current_task = asyncio.current_task
-        asyncio.current_task = asyncio.tasks.current_task = asyncio.tasks._c_current_task
+        asyncio.current_task = asyncio.tasks.current_task = self._current_task_impl
         return super().setUp()
 
     def tearDown(self):
@@ -456,11 +464,17 @@ class NonEagerTests(BaseNonEagerTaskFactoryTests, test_utils.TestCase):
         return super().tearDown()
 
 class EagerTests(BaseEagerTaskFactoryTests, test_utils.TestCase):
-    Task = asyncio.tasks._CTask
+    Task = asyncio.tasks.Task
+    _current_task_impl = staticmethod(
+        asyncio.tasks._c_current_task
+        if hasattr(asyncio.tasks, '_CTask')
+        and Task is asyncio.tasks._CTask
+        else asyncio.tasks._py_current_task
+    )
 
     def setUp(self):
         self._current_task = asyncio.current_task
-        asyncio.current_task = asyncio.tasks.current_task = asyncio.tasks._c_current_task
+        asyncio.current_task = asyncio.tasks.current_task = self._current_task_impl
         return super().setUp()
 
     def tearDown(self):

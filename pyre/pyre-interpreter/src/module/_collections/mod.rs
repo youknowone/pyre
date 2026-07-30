@@ -9,6 +9,8 @@
 //! interp-level).
 
 use pyre_object::*;
+use std::cell::UnsafeCell;
+use std::sync::LazyLock;
 
 const BLOCKLEN: i64 = 62;
 const CENTER: i64 = (BLOCKLEN - 1) / 2;
@@ -56,6 +58,57 @@ pub struct W_Deque {
     maxlen: i64,
     /// Lightweight iteration-lock counter (`interp_deque.py` `state`); bumped on every mutation.
     state: i64,
+}
+
+// PyPy's deque block/endpoint transitions execute atomically under its GIL.
+// CPython 3.14's free-threaded deque preserves the same boundary with object
+// critical sections.  Pyre keeps the semantic state on W_Deque and uses the
+// same narrow address-striped reentrant synchronization adaptation as its
+// list/dict/set ports.  The stripes are reset after fork because a vanished
+// thread may have held one in the parent.
+struct ForkDequeLock(UnsafeCell<parking_lot::ReentrantMutex<()>>);
+unsafe impl Sync for ForkDequeLock {}
+
+impl ForkDequeLock {
+    fn new() -> Self {
+        Self(UnsafeCell::new(parking_lot::ReentrantMutex::new(())))
+    }
+
+    fn get(&self) -> &parking_lot::ReentrantMutex<()> {
+        unsafe { &*self.0.get() }
+    }
+
+    unsafe fn reinit_after_fork(&self) {
+        unsafe { self.0.get().write(parking_lot::ReentrantMutex::new(())) };
+    }
+}
+
+static DEQUE_LOCKS: LazyLock<Vec<ForkDequeLock>> =
+    LazyLock::new(|| (0..256).map(|_| ForkDequeLock::new()).collect());
+
+type DequeGuard = parking_lot::lock_api::ReentrantMutexGuard<
+    'static,
+    parking_lot::RawMutex,
+    parking_lot::RawThreadId,
+    (),
+>;
+
+#[majit_macros::dont_look_inside]
+unsafe fn w_deque_lock(obj: PyObjectRef) -> DequeGuard {
+    let lock = DEQUE_LOCKS[(obj as usize >> 4) & (DEQUE_LOCKS.len() - 1)].get();
+    if let Some(guard) = lock.try_lock() {
+        return guard;
+    }
+    let blocked = majit_gc::gc_sync::before_external_block();
+    let guard = lock.lock();
+    drop(blocked);
+    guard
+}
+
+pub fn deque_locks_after_fork_child() {
+    for lock in DEQUE_LOCKS.iter() {
+        unsafe { lock.reinit_after_fork() };
+    }
 }
 
 fn block(block: PyObjectRef) -> &'static mut W_DequeBlock {
@@ -431,7 +484,13 @@ pub mod deque_rev_iter {
 /// `W_Deque.append` + `trimleft`, ported from `interp_deque.py`.
 fn append_right(self_obj: PyObjectRef, item: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_obj);
     pyre_object::gc_roots::pin_root(item);
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let _deque_guard = unsafe { w_deque_lock(self_obj) };
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let item = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     let mut ri = W_Deque::from_obj(self_obj).expect("deque").rightindex + 1;
     if ri >= BLOCKLEN {
         let old_right = W_Deque::from_obj(self_obj).expect("deque").rightblock;
@@ -456,7 +515,13 @@ fn append_right(self_obj: PyObjectRef, item: PyObjectRef) {
 
 fn append_left(self_obj: PyObjectRef, item: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_obj);
     pyre_object::gc_roots::pin_root(item);
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let _deque_guard = unsafe { w_deque_lock(self_obj) };
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let item = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     let mut li = W_Deque::from_obj(self_obj).expect("deque").leftindex - 1;
     if li < 0 {
         let old_left = W_Deque::from_obj(self_obj).expect("deque").leftblock;
@@ -480,6 +545,12 @@ fn append_left(self_obj: PyObjectRef, item: PyObjectRef) {
 }
 
 fn pop_right(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_obj);
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let _deque_guard = unsafe { w_deque_lock(self_obj) };
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     let deque = W_Deque::from_obj(self_obj).expect("deque");
     if deque.len == 0 {
         return Err(crate::PyError::index_error("pop from an empty deque"));
@@ -506,6 +577,12 @@ fn pop_right(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn pop_left(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_obj);
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let _deque_guard = unsafe { w_deque_lock(self_obj) };
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     let deque = W_Deque::from_obj(self_obj).expect("deque");
     if deque.len == 0 {
         return Err(crate::PyError::index_error("pop from an empty deque"));

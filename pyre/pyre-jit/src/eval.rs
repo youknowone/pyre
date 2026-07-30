@@ -504,6 +504,16 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
             // locals/cells/valuestack — keeping both the block and its
             // contents live without sweeping the frame the generator holds.
             f(&mut gen_obj.frame_ptr as *mut *mut u8 as *mut majit_ir::GcRef);
+            // CPython 3.11+ exposes the interpreter frame's live values as
+            // direct coroutine/generator referents while the internal frame
+            // itself is absent from `gc.get_objects()`.  Re-read after the
+            // forwarding visitor and expose the same slots directly from the
+            // owner; the frame's own trace may visit them again for marking.
+            let mut adapter = |slot: &mut majit_ir::GcRef| f(slot as *mut majit_ir::GcRef);
+            pyre_interpreter::eval::walk_suspended_generator_frame(
+                gen_obj.frame_ptr as *mut PyFrame,
+                &mut adapter,
+            );
         } else {
             // `std::alloc` fallback frame (no GC hook at generator birth):
             // the block is never swept, so only its contents need
@@ -1053,17 +1063,15 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
             true
         };
         // Stationary `std::alloc` blocks (never entered by
-        // `trace_and_update_object`) and old-gen GC blocks forward the FULL
-        // fixed-length array, not just the live prefix. The old-gen major
-        // walk is idempotent duplicate marking; the minor walk covers
-        // barrier-less interpreter stores. This matches RPython's
-        // phase-agnostic jitframe.py:104 `jitframe_trace`.
-        // This matches `walk_pyframe_roots` (eval.rs:626), which forwards
-        // popped-in-transit argument slots past `valuestackdepth`.
+        // `trace_and_update_object`) and old-gen GC blocks forward the
+        // locals/cells plus the live operand-stack prefix. PyPy clears every
+        // popped list slot to None; using `valuestackdepth` is the equivalent
+        // boundary for pyre's fixed-capacity array and prevents a stale
+        // resume/exception slot from retaining an otherwise-dead object.
         if walk_items {
             let arr = unsafe { &mut *array };
             let base = arr.items_mut_ptr();
-            for i in 0..arr.len() {
+            for i in 0..frame.valuestackdepth.min(arr.len()) {
                 f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
             }
         }
@@ -2031,11 +2039,14 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
         w_module_tid,
     );
     pytype_to_tid.insert(&pyre_object::MODULE_TYPE as *const _ as usize, w_module_tid);
-    // `pyre-interpreter::pyframe::PyFrame` — execution frame for a
-    // Python code block. NOT an `rclass.OBJECT`-shaped instance
-    // (no `ob_type` header — virtualizable struct laid out for the
-    // JIT virtualize pass), so register with a bare size + trace hook
-    // rather than `object_subclass`.
+    // `pyre-interpreter::pyframe::PyFrame` — PyPy's
+    // `PyFrame(W_Root)`, and therefore an app-level object boundary for
+    // `gc.get_referents`.  Pyre's frame now carries the same `ob_header`
+    // at offset zero; retain the custom trace required by its
+    // virtualizable storage, but register it as an OBJECT subclass.
+    // Registering it as a raw struct makes the referents inspector look
+    // through the frame and incorrectly report every local as a direct
+    // referent of the owning traceback.
     //
     // The trace hook `pyframe_object_custom_trace` forwards exactly
     // the frame-owned GC slots `walk_pyframe_roots` visits per frame.
@@ -2061,11 +2072,24 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // unreachable; `FrameBox::drop` only frees the `std::alloc` snapshot /
     // bootstrap fallback regime.  With no destructor or weakref flag,
     // `type_alloc_is_plain` admits PYFRAME's normal allocation fast paths.
-    let pyframe_tid = gc.register_type(majit_gc::trace::TypeInfo::with_custom_trace(
-        std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
-        pyframe_object_custom_trace,
-    ));
+    let pyframe_tid = gc.register_type(
+        majit_gc::trace::TypeInfo::object_subclass_with_custom_trace(
+            std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
+            object_tid,
+            pyframe_object_custom_trace,
+        )
+        .hidden_from_app_level_inspector(),
+    );
     debug_assert_eq!(pyframe_tid, PYFRAME_GC_TYPE_ID);
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_interpreter::pyframe::FRAME_TYPE as *const _ as usize,
+        pyframe_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_interpreter::pyframe::FRAME_TYPE as *const _ as usize,
+        pyframe_tid,
+    );
     // `W_DictProxyObject` carries a single GC-traceable
     // `w_mapping: PyObjectRef` slot (the wrapped W_DictObject —
     // `pypy/objspace/std/dictproxyobject.py:17 self.w_mapping =
@@ -3659,6 +3683,9 @@ fn install_gc_root_walkers() {
     // `MetaInterp::forced_virtuals` is the same shape but lives in one mutator's
     // `JIT_DRIVER` rather than a global table, so it registers per mutator
     // instead — see `forced_virtuals_pruner_area`.
+    // The GC-managed weakref box holds its referent and callback outside any
+    // traced field, so the boxes' inner slots need their own root area.
+    majit_gc::shadow_stack::register_extra_root_walker(weakref_box_inner_root_walker);
 }
 
 fn register_thread_root_areas() {
@@ -3700,10 +3727,6 @@ fn register_thread_root_areas() {
         register(
             signal_handler_root_walker_area,
             pyre_interpreter::module::signal::interp_signal::capture_signal_handler_root_area(),
-        );
-        register(
-            weakref_box_inner_root_walker_area,
-            pyre_object::weakref::capture_gc_weakref_box_root_area(),
         );
         register(
             sre_pattern_root_walker_area,
@@ -4411,17 +4434,6 @@ unsafe fn signal_handler_root_walker_area(
             data,
             |slot| visit_pyobject_root(slot, visitor),
         );
-    }
-}
-
-unsafe fn weakref_box_inner_root_walker_area(
-    data: *const (),
-    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-) {
-    unsafe {
-        pyre_object::weakref::walk_gc_weakref_box_inner_roots_area(data, |slot| {
-            visit_pyobject_root(slot, visitor);
-        });
     }
 }
 
@@ -5487,6 +5499,15 @@ fn drive_unpack_iterable_trace(
     // shared global build-time pool, so install it before the walk reads the
     // first descr (idempotent OnceLock).
     let dbg = std::env::var_os("PYRE_JD1_DEBUG").is_some();
+    // The walk below executes each residual concretely, so the raise that ends
+    // the unpack is recorded into the residual-call exception cells. Those are
+    // pyre's per-thread stand-in for `metainterp.last_exc_value`, which
+    // upstream owns per MetaInterp instance and drops with the tracing session
+    // (`pyjitpl.py:2763 execute_raised`). Scope them to this drive; otherwise
+    // the value outlives the walk and the next guard failure reads it as its
+    // own pending raise — a `StopIteration` surfacing at code that raised
+    // nothing.
+    let _exc_scope = crate::call_jit::ResidualExceptionScope::park(dbg);
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
     let canonical = match pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
         "baseobjspace::_unpackiterable_unknown_length",

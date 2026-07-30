@@ -293,6 +293,30 @@ pub fn pin_root(root: PyObjectRef) {
     }
 }
 
+/// Publish a complete translated livevar set before performing any
+/// forwarding query.  RPython's `push_roots(hop)` writes every live GCREF to
+/// the root stack as one pre-allocation phase; calling [`pin_root`] repeatedly
+/// would query after the first write and let a foreign collection run before
+/// later values were visible.
+///
+/// Returns the first shadow-stack index occupied by `roots`.
+#[majit_macros::dont_look_inside]
+pub fn pin_roots(roots: &[PyObjectRef]) -> usize {
+    let base = with_shadow_stack_mut(|stack| {
+        let base = stack.len();
+        stack.extend_from_slice(roots);
+        base
+    });
+    for index in base..base + roots.len() {
+        // Read the slot each time: a collection triggered by an earlier query
+        // may already have rewritten every published root in place.
+        let root = with_shadow_stack(|stack| stack[index]);
+        let current = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
+        with_shadow_stack_mut(|stack| stack[index] = current);
+    }
+    base
+}
+
 /// Current length of the thread-local shadow stack. Used by
 /// [`RootScope::new`] to capture the save-point and by tests to
 /// observe pin/pop behaviour.

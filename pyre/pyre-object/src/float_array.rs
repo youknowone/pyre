@@ -46,6 +46,34 @@ impl FloatArray {
         arr
     }
 
+    /// Pin `block` on the shadow stack and return its slot. The
+    /// [`crate::int_array::IntArray::pin_block`] twin — see it for why an
+    /// old-gen, non-moving block still has to be rooted before the next GC
+    /// operation.
+    #[must_use]
+    pub fn pin_block(&self) -> usize {
+        let slot = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::pin_root(self.block as crate::PyObjectRef);
+        slot
+    }
+
+    /// Re-read `block` from the slot [`Self::pin_block`] returned — the
+    /// `pop_roots` half of the bracket.
+    pub fn reload_block(&mut self, slot: usize) {
+        self.block = crate::gc_roots::shadow_stack_get(slot) as *mut TypedItemsBlock;
+    }
+
+    /// Replace the storage in place, keeping the incoming block rooted across
+    /// the teardown of the outgoing one. The
+    /// [`crate::int_array::IntArray::install`] twin — see it for the sweep
+    /// window a bare `*self = fresh` leaves open.
+    pub fn install(&mut self, fresh: FloatArray) {
+        let _roots = crate::gc_roots::push_roots();
+        let slot = fresh.pin_block();
+        *self = fresh;
+        self.reload_block(slot);
+    }
+
     /// Allocated capacity (`len(l.items)`, rlist.py:251), read from the block
     /// header.
     #[inline]

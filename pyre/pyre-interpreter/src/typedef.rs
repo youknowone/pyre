@@ -6979,6 +6979,34 @@ fn init_frame_type(ns: PyObjectRef) {
         )
     };
 
+    // Python 3.14 frame.f_generator — owning generator/coroutine/async
+    // generator, or None for an ordinary frame. PyPy already keeps this
+    // per-frame identity in f_generator_nowref/f_generator_wref and exposes it
+    // internally through get_generator(); surface that exact backlink.
+    let generator_getter = make_builtin_function_with_arity(
+        "f_generator",
+        |args| {
+            let f = frame_ptr(args[1]);
+            if f.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let owner = unsafe { &*f }.get_generator();
+            Ok(if owner.is_null() {
+                pyre_object::w_none()
+            } else {
+                owner
+            })
+        },
+        2,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "f_generator",
+            make_getset_descriptor_named(generator_getter, "f_generator"),
+        )
+    };
+
     // f_lasti — read-only bytecode offset (pyframe.py:770).
     //
     // pyre stores `last_instr` as an instruction-unit index (increments

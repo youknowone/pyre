@@ -370,6 +370,12 @@ pub struct TypeInfo {
     /// reads it through the materialized `TYPE_INFO` table's `infobits`
     /// byte (gc.py:631-642).
     pub is_object: bool,
+    /// CPython-internal object that remains an OBJECT-layout GC boundary but
+    /// is omitted from app-level `gc.get_objects()` enumeration.  This models
+    /// 3.11+ interpreter frames: owning coroutine/traceback objects expose
+    /// their relevant edges, while an unmaterialized execution frame is not
+    /// itself reported as an app-level referrer.
+    pub hide_from_app_level_inspector: bool,
     /// Parent class typeid in the `rclass.OBJECT` hierarchy, or
     /// `None` for `rclass.OBJECT` itself / non-OBJECT types.
     /// Mirrors what `classdef.getmro()` traverses in
@@ -420,6 +426,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: None,
             is_object: false,
+            hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -442,6 +449,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: None,
             is_object: false,
+            hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -461,6 +469,13 @@ impl TypeInfo {
         self
     }
 
+    /// Keep an OBJECT-layout type as a referent boundary while omitting its
+    /// instances from app-level `gc.get_objects()` enumeration.
+    pub fn hidden_from_app_level_inspector(mut self) -> Self {
+        self.hide_from_app_level_inspector = true;
+        self
+    }
+
     /// `gctypelayout.is_weakref_type(WEAKREF)` parity — TypeInfo for
     /// the singleton WEAKREF GcStruct itself (gctypelayout.py:587-589).
     /// The struct payload is one `weakptr: GcRef` slot; the collector
@@ -476,6 +491,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: None,
             is_object: false,
+            hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -504,6 +520,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: None,
             is_object: true,
+            hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -531,6 +548,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: None,
             is_object: true,
+            hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -556,6 +574,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: None,
             is_object: true,
+            hide_from_app_level_inspector: false,
             parent: Some(parent_typeid),
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -590,6 +609,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: None,
             is_object: true,
+            hide_from_app_level_inspector: false,
             parent: Some(parent_typeid),
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -614,6 +634,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: Some(trace_fn),
             is_object: true,
+            hide_from_app_level_inspector: false,
             parent: Some(parent_typeid),
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -635,6 +656,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: None,
             is_object: false,
+            hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -660,6 +682,7 @@ impl TypeInfo {
             items_have_gc_ptrs,
             custom_trace: None,
             is_object: false,
+            hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -681,6 +704,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false,
             custom_trace: Some(trace_fn),
             is_object: false,
+            hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -708,6 +732,7 @@ impl TypeInfo {
             items_have_gc_ptrs: false, // custom_trace handles ref tracing
             custom_trace: Some(trace_fn),
             is_object: false,
+            hide_from_app_level_inspector: false,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,

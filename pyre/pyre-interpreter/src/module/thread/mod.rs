@@ -347,6 +347,8 @@ pub(crate) fn after_fork_child() {
     pyre_object::interp_itertools::count_locks_after_fork_child();
     crate::objspace::std::mapdict::after_fork_child();
     pyre_object::dictmultiobject::module_dict_locks_after_fork_child();
+    pyre_object::setobject::set_locks_after_fork_child();
+    crate::module::_collections::deque_locks_after_fork_child();
     majit_gc::shadow_stack::after_fork_child();
     majit_gc::gc_sync::after_fork_child();
 }
@@ -1432,7 +1434,56 @@ fn spawn_thread(
     let kwargs_addr = kwargs.unwrap_or(PY_NULL) as usize;
     let handle_addr = handle.unwrap_or(PY_NULL) as usize;
     let parent_ec_addr = parent_ec as usize;
-    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+    // `os_thread.py`'s Bootstrapper uses the RPython pthread lock: the new
+    // thread publishes that bootstrap completed and releases the starter.
+    // Do not use Rust's zero-capacity mpsc channel for this hand-off.  On
+    // Darwin its waiting side reaches `std::thread::park`, backed by a
+    // libdispatch semaphore; libdispatch deliberately traps if that primitive
+    // is first created in a child of an ever-multithreaded process.  The
+    // release/acquire word is the same one-value bootstrap rendezvous without
+    // introducing a second owner for any Python state.
+    const START_FAILED: usize = usize::MAX;
+
+    /// The rendezvous word plus the failure detail the starter reports.
+    struct Bootstrap {
+        word: AtomicUsize,
+        error: std::sync::OnceLock<String>,
+    }
+    /// Worker-side handle on the rendezvous.  A dropped `mpsc` sender signalled
+    /// a dead worker for free; a bare word does not, so every exit that never
+    /// reached `publish` has to hand `START_FAILED` over instead — including an
+    /// unwind, which only a destructor can catch.  Otherwise a worker that dies
+    /// during bootstrap leaves the starter spinning forever.
+    struct BootstrapSignal(std::sync::Arc<Bootstrap>);
+    impl BootstrapSignal {
+        fn publish(&self, ident: i64) {
+            self.0.word.store(ident as usize, Ordering::Release);
+        }
+        /// Preserve the diagnostic the starter raises.  `os_thread.py:145`
+        /// reports a bare "can't start new thread", which stays the fallback
+        /// when bootstrap died without recording anything.
+        fn fail(&self, message: String) {
+            let _ = self.0.error.set(message);
+        }
+    }
+    impl Drop for BootstrapSignal {
+        fn drop(&mut self) {
+            // Takes the word only from its initial state, so this is a no-op
+            // once `publish` has run.
+            let _ = self.0.word.compare_exchange(
+                0,
+                START_FAILED,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    let started = std::sync::Arc::new(Bootstrap {
+        word: AtomicUsize::new(0),
+        error: std::sync::OnceLock::new(),
+    });
+    let worker_started = std::sync::Arc::clone(&started);
 
     let mut builder = std::thread::Builder::new();
     let stack_size = STACK_SIZE.load(Ordering::Relaxed);
@@ -1441,6 +1492,9 @@ fn spawn_thread(
     }
     builder
         .spawn(move || {
+            // First statement: from here on every exit path, panic included,
+            // releases the starter.
+            let bootstrap = BootstrapSignal(worker_started);
             crate::call::enter_runtime_thread();
             // The parent holds these in its shadow stack until `started_tx`.
             // Copy them into this mutator's own shadow stack before any
@@ -1471,7 +1525,7 @@ fn spawn_thread(
             if has_handle {
                 let h = W_ThreadHandle::from_obj(handle_addr as PyObjectRef).unwrap();
                 if let Err(e) = h.start(ident) {
-                    let _ = started_tx.send(Err(e.message));
+                    bootstrap.fail(e.message);
                     thread_is_stopping(&mut ec);
                     crate::call::set_last_exec_ctx(std::ptr::null());
                     drop(worker_roots);
@@ -1480,7 +1534,7 @@ fn spawn_thread(
                 }
             }
             THREAD_COUNT.fetch_add(1, Ordering::SeqCst);
-            let _ = started_tx.send(Ok(ident));
+            bootstrap.publish(ident);
 
             let callable = pyre_object::gc_roots::shadow_stack_get(worker_base);
             let args: Vec<PyObjectRef> = (0..nargs)
@@ -1537,12 +1591,24 @@ fn spawn_thread(
 
     let result = {
         let _blocked = before_external_block();
-        started_rx
-            .recv()
-            .map_err(|_| crate::PyError::runtime_error("can't start new thread"))?
+        loop {
+            let value = started.word.load(Ordering::Acquire);
+            if value == START_FAILED {
+                let message = started
+                    .error
+                    .get()
+                    .cloned()
+                    .unwrap_or_else(|| "can't start new thread".to_string());
+                break Err(crate::PyError::runtime_error(message));
+            }
+            if value != 0 {
+                break Ok(value as i64);
+            }
+            std::thread::yield_now();
+        }
     };
     drop(roots);
-    result.map_err(crate::PyError::runtime_error)
+    result
 }
 
 fn start_new_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

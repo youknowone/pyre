@@ -4,6 +4,7 @@ import contextvars
 import traceback
 import unittest
 from asyncio import tasks
+from test import support
 
 
 def tearDownModule():
@@ -46,6 +47,10 @@ class FutureTests:
         loop.set_exception_handler(exc_handler)
         self.cls(task())
         await asyncio.sleep(0)
+        # The unreferenced finished Task is finalized immediately by
+        # CPython's refcounting; force the equivalent point on tracing-GC
+        # interpreters before observing the exception handler.
+        support.gc_collect()
         self.assertTrue(exc_handler_called)
 
     async def test_handle_exc_handler_correct_context(self):
@@ -71,7 +76,11 @@ class FutureTests:
 @unittest.skipUnless(hasattr(tasks, '_CTask'),
                        'requires the C _asyncio module')
 class CFutureTests(FutureTests, unittest.IsolatedAsyncioTestCase):
-    cls = tasks._CTask
+    # The decorator is applied only after the class body has executed.  Use
+    # getattr here like the other C-backend asyncio test classes so an
+    # interpreter without CPython's private _asyncio extension can import this
+    # module and skip the class.
+    cls = getattr(tasks, '_CTask', None)
 
 class PyFutureTests(FutureTests, unittest.IsolatedAsyncioTestCase):
     cls = tasks._PyTask

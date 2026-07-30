@@ -1258,8 +1258,10 @@ pub fn get_awaitable_iter(w_obj: PyObjectRef, context: u32) -> PyResult {
                  implement __await__: {}",
                 object_functionstr_type_name(w_obj),
             ),
+            // Python 3.14 changed the plain-await diagnostic from PyPy's
+            // historical "object X can't be used ..." spelling.
             _ => format!(
-                "object {} can't be used in 'await' expression",
+                "'{}' object can't be awaited",
                 object_functionstr_type_name(w_obj),
             ),
         };
@@ -7591,7 +7593,10 @@ pub(crate) fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         return Err(PyError::type_error("expected integer"));
     };
     // baseobjspace.py:324 `w_result = space.get_and_call_function(w_impl, self)`
-    let w_result = crate::builtins::call_and_check(method, &[obj])?;
+    let w_type = crate::typedef::r#type(obj)
+        .map(|w_type| w_type.as_ptr())
+        .unwrap_or(obj);
+    let w_result = unsafe { get_and_call_function(method, obj, w_type, &[]) }?;
     // baseobjspace.py:326-327 — an exact int returns directly.
     let w_int = crate::typedef::gettypefor(&pyre_object::INT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     if crate::typedef::r#type(w_result).map_or(PY_NULL, |p| p.as_ptr()) == w_int {
@@ -12089,7 +12094,10 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
             object_functionstr_type_name(obj),
         )));
     };
-    let w_result = crate::builtins::call_and_check(method, &[obj])?;
+    let w_type = crate::typedef::r#type(obj)
+        .map(|w_type| w_type.as_ptr())
+        .unwrap_or(obj);
+    let w_result = unsafe { get_and_call_function(method, obj, w_type, &[]) }?;
     let w_int = crate::typedef::gettypefor(&pyre_object::INT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     if crate::typedef::r#type(w_result).map_or(PY_NULL, |p| p.as_ptr()) == w_int {
         return Ok(w_result);
@@ -12170,7 +12178,10 @@ pub fn float_w(obj: PyObjectRef) -> Result<f64, PyError> {
             object_functionstr_type_name(obj)
         )));
     };
-    let w_result = crate::builtins::call_and_check(method, &[obj])?;
+    let w_type = crate::typedef::r#type(obj)
+        .map(|w_type| w_type.as_ptr())
+        .unwrap_or(obj);
+    let w_result = unsafe { get_and_call_function(method, obj, w_type, &[]) }?;
     if unsafe { pyre_object::is_float(w_result) } {
         return Ok(unsafe { pyre_object::w_float_get_value(w_result) });
     }
@@ -16575,6 +16586,17 @@ fn async_gen_athrow_handle_error(closing: bool, err: PyError) -> PyResult {
 
 fn async_gen_athrow_do_send(awaitable: PyObjectRef, arg: PyObjectRef) -> PyResult {
     use pyre_object::generator::*;
+    // generator.py `AsyncGenAThrow.do_send` keeps `self` live across
+    // `self.async_gen.send_ex()` / `.throw()`.  RPython's GC transform roots
+    // that live variable around the nested frame execution.  Preserve the
+    // same lifetime explicitly: the awaitable owns the `async_gen` edge, and
+    // the nested execution may park while another thread performs a major GC.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let awaitable_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(awaitable);
+    pyre_object::gc_roots::pin_root(arg);
+    let awaitable = pyre_object::gc_roots::shadow_stack_get(awaitable_slot);
+    let arg = pyre_object::gc_roots::shadow_stack_get(awaitable_slot + 1);
     let (async_gen, exc_type, exc_value, exc_tb, state) = {
         let payload = AsyncGenAThrow::from_obj(awaitable)
             .ok_or_else(|| PyError::type_error("invalid async_generator_athrow receiver"))?;
@@ -16586,6 +16608,13 @@ fn async_gen_athrow_do_send(awaitable: PyObjectRef, arg: PyObjectRef) -> PyResul
             payload.state,
         )
     };
+    // `async_gen` is also a live local across the nested call below (it is
+    // read again by `unwrap_value` and the error cleanup).  Root it directly,
+    // exactly as the translated livevar set does, rather than depending only
+    // on the edge from `self`.
+    let async_gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(async_gen);
+    let async_gen = pyre_object::gc_roots::shadow_stack_get(async_gen_slot);
     if state == ASYNC_GEN_STATE_CLOSED {
         return Err(PyError::runtime_error(
             "cannot reuse already awaited aclose()/athrow()",
@@ -16643,6 +16672,7 @@ fn async_gen_athrow_do_send(awaitable: PyObjectRef, arg: PyObjectRef) -> PyResul
     };
     if result.is_err() {
         unsafe { w_async_generator_set_running(async_gen, false) };
+        let awaitable = pyre_object::gc_roots::shadow_stack_get(awaitable_slot);
         AsyncGenAThrow::from_obj(awaitable)
             .expect("validated async_generator_athrow")
             .state = ASYNC_GEN_STATE_CLOSED;
@@ -16756,6 +16786,31 @@ pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
         }
         let frame = &*(frame_ptr as *const crate::pyframe::PyFrame);
         let last_instr = frame.last_instr;
+        // generator.py:435-446 Coroutine._finalize_: warn before running the
+        // GeneratorOrCoroutine finalizer. The flag is set before importing or
+        // calling Python code so a failing warning hook cannot warn twice.
+        if is_coroutine(gen_obj)
+            && !w_coroutine_warned_unawaited(gen_obj)
+            && !w_generator_get_pycode(gen_obj).is_null()
+            && last_instr == -1
+        {
+            w_coroutine_set_warned_unawaited(gen_obj);
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(gen_obj);
+            let w_mod = crate::importing::get_sys_module("_warnings")
+                .ok_or_else(|| PyError::runtime_error("_warnings is not initialized"))?;
+            pyre_object::gc_roots::pin_root(w_mod);
+            let w_f = getattr_str(
+                pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                "_warn_unawaited_coroutine",
+            )?;
+            pyre_object::gc_roots::pin_root(w_f);
+            crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(root_base + 2),
+                &[pyre_object::gc_roots::shadow_stack_get(root_base)],
+            )?;
+        }
         if last_instr < 0 {
             return Ok(w_none()); // not started — cannot be inside a handler
         }

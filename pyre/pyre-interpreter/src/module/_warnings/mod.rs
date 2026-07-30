@@ -823,6 +823,26 @@ crate::py_module! {
         "_warnings_context" => w_none(),
     },
     inline_functions: {
+        fn _warn_unawaited_coroutine(coro: PyObjectRef) -> Result<PyObjectRef, PyError> {
+            // module/_warnings/moduledef.py exposes the app-level
+            // `app_warnings._warn_unawaited_coroutine`.  The bundled 3.14
+            // `_py_warnings` implementation is that same app-level body,
+            // including coroutine-origin formatting and `source=coro`.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let coro_slot = pin_root_slot(coro);
+            let w_mod = import_module("_py_warnings")?;
+            let module_slot = pin_root_slot(w_mod);
+            let w_f = crate::baseobjspace::getattr_str(
+                pyre_object::gc_roots::shadow_stack_get(module_slot),
+                "_warn_unawaited_coroutine",
+            )?;
+            let function_slot = pin_root_slot(w_f);
+            crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(function_slot),
+                &[pyre_object::gc_roots::shadow_stack_get(coro_slot)],
+            )
+        }
+
         fn warn(
             message: PyObjectRef,
             #[default(pyre_object::PY_NULL)] category: PyObjectRef,

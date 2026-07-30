@@ -970,6 +970,7 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(14, &crate::function::BUILTIN_FUNCTION_TYPE),
         subclass_range_alias(14, &crate::function::METHOD_DESCRIPTOR_TYPE),
         subclass_range_alias(14, &crate::function::SLOT_WRAPPER_TYPE),
+        subclass_range_alias(37, &crate::pyframe::FRAME_TYPE),
         subclass_range_alias(43, &crate::pycode::CODE_TYPE),
         subclass_range_alias(44, &crate::pytraceback::PYTRACEBACK_TYPE),
         subclass_range_alias(56, typed::<crate::module::_random::W_Random>()),

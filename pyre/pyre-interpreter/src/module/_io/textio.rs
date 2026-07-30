@@ -545,6 +545,28 @@ impl W_TextIOWrapper {
         Ok(())
     }
 
+    /// Interpreter bootstrap creates the three stdio wrappers before importing
+    /// the codec registry is safe, so `allocate_stdio` cannot run the ordinary
+    /// `__init__` codec lookup.  Complete that same initialization on the
+    /// first typed read.  Ordinary TextIOWrapper instances already have a
+    /// decoder and take the fast return; detached and write-only streams keep
+    /// the normal "not readable" result.
+    fn ensure_read_decoder(&mut self) -> Result<(), crate::PyError> {
+        if !self.w_decoder.is_null() || self.state != STATE_OK || self.w_buffer.is_null() {
+            return Ok(());
+        }
+        if !crate::baseobjspace::is_true(super::call_method_result(
+            self.w_buffer,
+            "readable",
+            &[],
+        )?)? {
+            return Ok(());
+        }
+        let encoding = unsafe { pyre_object::w_str_get_value(self.w_encoding) }.to_string();
+        let codec = Self::lookup_text_codec(&encoding)?;
+        self.set_encoder_decoder(codec)
+    }
+
     /// PyPy `_read_chunk` decoder-state validation.
     fn decoder_getstate(&self) -> Result<(Vec<u8>, u64), crate::PyError> {
         let state = super::call_method_result(self.w_decoder, "getstate", &[])?;
@@ -1024,6 +1046,7 @@ impl W_TextIOWrapper {
         #[default(pyre_object::w_none())] w_size: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
         self.check_closed()?;
+        self.ensure_read_decoder()?;
         if self.w_decoder.is_null() {
             return Err(super::unsupported("not readable"));
         }
@@ -1039,6 +1062,7 @@ impl W_TextIOWrapper {
         #[default(pyre_object::w_none())] w_size: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
         self.check_closed()?;
+        self.ensure_read_decoder()?;
         if self.w_decoder.is_null() {
             return Err(super::unsupported("not readable"));
         }

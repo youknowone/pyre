@@ -931,7 +931,7 @@ impl GcAllocator for GcHandle {
         gc_sync::gc_query_reentrant(|gc| gc.get_write_barrier_descr())
     }
     unsafe fn add_root(&mut self, root: *mut GcRef) {
-        gc_sync::gc_op(|gc| unsafe { gc.add_root(root) })
+        unsafe { gc_sync::gc_op_add_root(root) }
     }
     fn remove_root(&mut self, root: *mut GcRef) {
         gc_sync::gc_op(|gc| gc.remove_root(root))

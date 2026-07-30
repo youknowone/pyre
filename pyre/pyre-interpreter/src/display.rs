@@ -758,10 +758,12 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             let name = function_get_name(obj);
             format!("<built-in function {name}>")
         } else if std::ptr::eq(tp, &FUNCTION_TYPE as *const PyType) {
-            // function.py:283 Function.descr_function_repr — `'function %s'
-            // % self.qualname` (FunctionWithFixedCode inherits this).
+            // CPython 3.14 func_repr, selected by `init_function_type`.
+            // Exact builtin values take this fast path instead of dispatching
+            // through that type-dict descriptor, so it must preserve the same
+            // address-bearing representation.
             let name = function_get_qualname(obj);
-            format!("<function {name}>")
+            format!("<function {name} at {obj:p}>")
         } else if unsafe { pyre_object::is_exception(obj) } {
             // A user subclass that overrides `__repr__` shadows the builtin
             // `W_BaseException.descr_repr`; dispatch it before the native

@@ -29,6 +29,143 @@ static APPLEVEL_FORK_CALLBACKS: LazyLock<Mutex<ApplevelForkCallbacks>> =
 // corresponding process operation has its own narrow serializer.
 static FORK_SERIALIZER: Mutex<()> = Mutex::new(());
 
+#[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
+fn sysconf_names() -> &'static [(&'static str, i32)] {
+    &[
+        ("SC_2_CHAR_TERM", libc::_SC_2_CHAR_TERM),
+        ("SC_2_C_BIND", libc::_SC_2_C_BIND),
+        ("SC_2_C_DEV", libc::_SC_2_C_DEV),
+        ("SC_2_FORT_DEV", libc::_SC_2_FORT_DEV),
+        ("SC_2_FORT_RUN", libc::_SC_2_FORT_RUN),
+        ("SC_2_LOCALEDEF", libc::_SC_2_LOCALEDEF),
+        ("SC_2_SW_DEV", libc::_SC_2_SW_DEV),
+        ("SC_2_UPE", libc::_SC_2_UPE),
+        ("SC_2_VERSION", libc::_SC_2_VERSION),
+        ("SC_AIO_LISTIO_MAX", libc::_SC_AIO_LISTIO_MAX),
+        ("SC_AIO_MAX", libc::_SC_AIO_MAX),
+        ("SC_AIO_PRIO_DELTA_MAX", libc::_SC_AIO_PRIO_DELTA_MAX),
+        ("SC_ARG_MAX", libc::_SC_ARG_MAX),
+        ("SC_ASYNCHRONOUS_IO", libc::_SC_ASYNCHRONOUS_IO),
+        ("SC_ATEXIT_MAX", libc::_SC_ATEXIT_MAX),
+        ("SC_BC_BASE_MAX", libc::_SC_BC_BASE_MAX),
+        ("SC_BC_DIM_MAX", libc::_SC_BC_DIM_MAX),
+        ("SC_BC_SCALE_MAX", libc::_SC_BC_SCALE_MAX),
+        ("SC_BC_STRING_MAX", libc::_SC_BC_STRING_MAX),
+        ("SC_CHILD_MAX", libc::_SC_CHILD_MAX),
+        ("SC_CLK_TCK", libc::_SC_CLK_TCK),
+        ("SC_COLL_WEIGHTS_MAX", libc::_SC_COLL_WEIGHTS_MAX),
+        ("SC_DELAYTIMER_MAX", libc::_SC_DELAYTIMER_MAX),
+        ("SC_EXPR_NEST_MAX", libc::_SC_EXPR_NEST_MAX),
+        ("SC_FSYNC", libc::_SC_FSYNC),
+        ("SC_GETGR_R_SIZE_MAX", libc::_SC_GETGR_R_SIZE_MAX),
+        ("SC_GETPW_R_SIZE_MAX", libc::_SC_GETPW_R_SIZE_MAX),
+        ("SC_IOV_MAX", libc::_SC_IOV_MAX),
+        ("SC_JOB_CONTROL", libc::_SC_JOB_CONTROL),
+        ("SC_LINE_MAX", libc::_SC_LINE_MAX),
+        ("SC_LOGIN_NAME_MAX", libc::_SC_LOGIN_NAME_MAX),
+        ("SC_MAPPED_FILES", libc::_SC_MAPPED_FILES),
+        ("SC_MEMLOCK", libc::_SC_MEMLOCK),
+        ("SC_MEMLOCK_RANGE", libc::_SC_MEMLOCK_RANGE),
+        ("SC_MEMORY_PROTECTION", libc::_SC_MEMORY_PROTECTION),
+        ("SC_MESSAGE_PASSING", libc::_SC_MESSAGE_PASSING),
+        ("SC_MQ_OPEN_MAX", libc::_SC_MQ_OPEN_MAX),
+        ("SC_MQ_PRIO_MAX", libc::_SC_MQ_PRIO_MAX),
+        ("SC_NGROUPS_MAX", libc::_SC_NGROUPS_MAX),
+        ("SC_NPROCESSORS_CONF", libc::_SC_NPROCESSORS_CONF),
+        ("SC_NPROCESSORS_ONLN", libc::_SC_NPROCESSORS_ONLN),
+        ("SC_OPEN_MAX", libc::_SC_OPEN_MAX),
+        ("SC_PAGE_SIZE", libc::_SC_PAGE_SIZE),
+        ("SC_PAGESIZE", libc::_SC_PAGE_SIZE),
+        #[cfg(any(
+            target_os = "linux",
+            target_vendor = "apple",
+            target_os = "netbsd",
+            target_os = "fuchsia"
+        ))]
+        ("SC_PASS_MAX", libc::_SC_PASS_MAX),
+        ("SC_PHYS_PAGES", libc::_SC_PHYS_PAGES),
+        ("SC_PRIORITIZED_IO", libc::_SC_PRIORITIZED_IO),
+        ("SC_PRIORITY_SCHEDULING", libc::_SC_PRIORITY_SCHEDULING),
+        ("SC_REALTIME_SIGNALS", libc::_SC_REALTIME_SIGNALS),
+        ("SC_RE_DUP_MAX", libc::_SC_RE_DUP_MAX),
+        ("SC_RTSIG_MAX", libc::_SC_RTSIG_MAX),
+        ("SC_SAVED_IDS", libc::_SC_SAVED_IDS),
+        ("SC_SEMAPHORES", libc::_SC_SEMAPHORES),
+        ("SC_SEM_NSEMS_MAX", libc::_SC_SEM_NSEMS_MAX),
+        ("SC_SEM_VALUE_MAX", libc::_SC_SEM_VALUE_MAX),
+        ("SC_SHARED_MEMORY_OBJECTS", libc::_SC_SHARED_MEMORY_OBJECTS),
+        ("SC_SIGQUEUE_MAX", libc::_SC_SIGQUEUE_MAX),
+        ("SC_STREAM_MAX", libc::_SC_STREAM_MAX),
+        ("SC_SYNCHRONIZED_IO", libc::_SC_SYNCHRONIZED_IO),
+        ("SC_THREADS", libc::_SC_THREADS),
+        ("SC_THREAD_ATTR_STACKADDR", libc::_SC_THREAD_ATTR_STACKADDR),
+        ("SC_THREAD_ATTR_STACKSIZE", libc::_SC_THREAD_ATTR_STACKSIZE),
+        (
+            "SC_THREAD_DESTRUCTOR_ITERATIONS",
+            libc::_SC_THREAD_DESTRUCTOR_ITERATIONS,
+        ),
+        ("SC_THREAD_KEYS_MAX", libc::_SC_THREAD_KEYS_MAX),
+        (
+            "SC_THREAD_PRIORITY_SCHEDULING",
+            libc::_SC_THREAD_PRIORITY_SCHEDULING,
+        ),
+        ("SC_THREAD_PRIO_INHERIT", libc::_SC_THREAD_PRIO_INHERIT),
+        ("SC_THREAD_PRIO_PROTECT", libc::_SC_THREAD_PRIO_PROTECT),
+        (
+            "SC_THREAD_PROCESS_SHARED",
+            libc::_SC_THREAD_PROCESS_SHARED,
+        ),
+        ("SC_THREAD_SAFE_FUNCTIONS", libc::_SC_THREAD_SAFE_FUNCTIONS),
+        ("SC_THREAD_STACK_MIN", libc::_SC_THREAD_STACK_MIN),
+        ("SC_THREAD_THREADS_MAX", libc::_SC_THREAD_THREADS_MAX),
+        ("SC_TIMERS", libc::_SC_TIMERS),
+        ("SC_TIMER_MAX", libc::_SC_TIMER_MAX),
+        ("SC_TTY_NAME_MAX", libc::_SC_TTY_NAME_MAX),
+        ("SC_TZNAME_MAX", libc::_SC_TZNAME_MAX),
+        ("SC_VERSION", libc::_SC_VERSION),
+        ("SC_XOPEN_CRYPT", libc::_SC_XOPEN_CRYPT),
+        ("SC_XOPEN_ENH_I18N", libc::_SC_XOPEN_ENH_I18N),
+        ("SC_XOPEN_LEGACY", libc::_SC_XOPEN_LEGACY),
+        ("SC_XOPEN_REALTIME", libc::_SC_XOPEN_REALTIME),
+        (
+            "SC_XOPEN_REALTIME_THREADS",
+            libc::_SC_XOPEN_REALTIME_THREADS,
+        ),
+        ("SC_XOPEN_SHM", libc::_SC_XOPEN_SHM),
+        ("SC_XOPEN_UNIX", libc::_SC_XOPEN_UNIX),
+        ("SC_XOPEN_VERSION", libc::_SC_XOPEN_VERSION),
+        ("SC_XOPEN_XCU_VERSION", libc::_SC_XOPEN_XCU_VERSION),
+        #[cfg(any(
+            target_os = "linux",
+            target_vendor = "apple",
+            target_os = "netbsd",
+            target_os = "fuchsia"
+        ))]
+        ("SC_XBS5_ILP32_OFF32", libc::_SC_XBS5_ILP32_OFF32),
+        #[cfg(any(
+            target_os = "linux",
+            target_vendor = "apple",
+            target_os = "netbsd",
+            target_os = "fuchsia"
+        ))]
+        ("SC_XBS5_ILP32_OFFBIG", libc::_SC_XBS5_ILP32_OFFBIG),
+        #[cfg(any(
+            target_os = "linux",
+            target_vendor = "apple",
+            target_os = "netbsd",
+            target_os = "fuchsia"
+        ))]
+        ("SC_XBS5_LP64_OFF64", libc::_SC_XBS5_LP64_OFF64),
+        #[cfg(any(
+            target_os = "linux",
+            target_vendor = "apple",
+            target_os = "netbsd",
+            target_os = "fuchsia"
+        ))]
+        ("SC_XBS5_LPBIG_OFFBIG", libc::_SC_XBS5_LPBIG_OFFBIG),
+    ]
+}
+
 pub(crate) fn walk_fork_callback_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     let mut callbacks = APPLEVEL_FORK_CALLBACKS.lock().unwrap();
     let ApplevelForkCallbacks {
@@ -2448,6 +2585,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     return Err(crate::PyError::type_error("fstat() missing argument"));
                 }
                 let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                // `rposix_stat.py:fstat` passes the descriptor to libc, where
+                // `-1` reports EBADF.  Rust's `OwnedFd::from_raw_fd(-1)`
+                // asserts before `File::metadata` can produce that error.
+                if fd == -1 {
+                    return Err(crate::PyError::os_error_with_errno(
+                        libc::EBADF,
+                        std::io::Error::from_raw_os_error(libc::EBADF).to_string(),
+                    ));
+                }
                 #[cfg(feature = "sandbox")]
                 {
                     let buf = crate::host_seam::ops::fstat(fd)
@@ -3073,17 +3219,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         Ok(0) => {
                             crate::module::thread::after_fork_child();
                             run_fork_callbacks("child");
-                            // PyPy's child is now the sole mutator.  Reclaim
-                            // vanished-thread-only objects immediately so
-                            // weak containers such as threading._dangling
-                            // reflect the one surviving MainThread before
-                            // user code resumes.
-                            pyre_object::gc_hook::try_gc_collect();
-                            let ec = crate::call::getexecutioncontext()
-                                as *mut crate::PyExecutionContext;
-                            if !ec.is_null() {
-                                unsafe { (*ec)._run_finalizers_now() };
-                            }
+                            // rposix.py `_exit` from the fork wrapper returns
+                            // directly after `gc_thread_after_fork` and the
+                            // registered child hooks.  Do not introduce a
+                            // full collection/finalizer drain here: arbitrary
+                            // inherited Python objects may be mid-lifecycle,
+                            // and PyPy only runs app-level finalizers at their
+                            // ordinary safe points after the child resumes.
                             drop(fork_serial);
                             Ok(pyre_object::w_int_new(0))
                         }
@@ -3932,7 +4074,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         None,
                         None,
                     );
-                    res.map_err(|e| io_err(e, ""))?;
+                    // rposix.py:3086-3095: BSD sendfile reports a partial
+                    // transfer through sbytes even when the syscall result is
+                    // EAGAIN/EBUSY. Return that progress so asyncio advances
+                    // its file offset instead of resending the same range.
+                    if let Err(error) = res {
+                        if written == 0
+                            || !matches!(
+                                error.raw_os_error(),
+                                Some(libc::EAGAIN) | Some(libc::EBUSY)
+                            )
+                        {
+                            return Err(io_err(error, ""));
+                        }
+                    }
                     return Ok(pyre_object::w_int_new(written));
                 }
             }),
@@ -3962,7 +4117,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     crate::PyError::value_error("posix_spawn: embedded null in path")
                 })?;
                 let argv = collect_cstring_seq(positional[1], "posix_spawn", "argv")?;
-                let env = collect_cstring_seq(positional[2], "posix_spawn", "env")?;
+                // posixmodule.c parses `env` as a mapping.  This is the same
+                // owner/shape as PyPy's `_env2interp` path used by execve:
+                // iterate `keys()`, fetch each value through `getitem`, then
+                // filesystem-encode both sides into `key=value`.
+                let env = collect_spawn_env(positional[2])?;
                 let file_actions_obj = crate::builtins::kwarg_get(kwargs, "file_actions");
                 let actions: Vec<rustpython_host_env::posix::PosixSpawnFileAction> =
                     if let Some(fa) = file_actions_obj {
@@ -3988,6 +4147,58 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 };
                 let pid = host_posix::posix_spawn(config).map_err(|e| io_err(e, ""))?;
                 Ok(pyre_object::w_int_new(pid as i64))
+            }
+            fn collect_spawn_env(
+                mapping: pyre_object::PyObjectRef,
+            ) -> Result<Vec<std::ffi::CString>, crate::PyError> {
+                // CPython's posix_spawn accepts None as "inherit environ";
+                // subprocess._posix_spawn uses exactly this form when Popen
+                // was called without an explicit env mapping.
+                if unsafe { pyre_object::is_none(mapping) } {
+                    let mut env = Vec::new();
+                    for (key, value) in host_os::vars_os() {
+                        let key = key.as_encoded_bytes();
+                        let value = value.as_encoded_bytes();
+                        let mut entry = Vec::with_capacity(key.len() + 1 + value.len());
+                        entry.extend_from_slice(key);
+                        entry.push(b'=');
+                        entry.extend_from_slice(value);
+                        env.push(std::ffi::CString::new(entry).map_err(|_| {
+                            crate::PyError::value_error(
+                                "posix_spawn() environment contains an embedded null byte",
+                            )
+                        })?);
+                    }
+                    return Ok(env);
+                }
+                let keys_obj = crate::baseobjspace::call_method(mapping, "keys", &[]);
+                if keys_obj.is_null() {
+                    return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                        crate::PyError::type_error("posix_spawn: env must be a mapping")
+                    }));
+                }
+                let keys = crate::baseobjspace::unpackiterable(keys_obj, -1)?;
+                let mut env = Vec::with_capacity(keys.len());
+                for key_obj in keys {
+                    let value_obj = crate::baseobjspace::getitem(mapping, key_obj)?;
+                    let key = crate::gateway::fsencode_bytes_w(key_obj)?;
+                    let value = crate::gateway::fsencode_bytes_w(value_obj)?;
+                    if key.is_empty() || key.contains(&b'=') {
+                        return Err(crate::PyError::value_error(
+                            "illegal environment variable name",
+                        ));
+                    }
+                    let mut entry = Vec::with_capacity(key.len() + 1 + value.len());
+                    entry.extend_from_slice(&key);
+                    entry.push(b'=');
+                    entry.extend_from_slice(&value);
+                    env.push(std::ffi::CString::new(entry).map_err(|_| {
+                        crate::PyError::value_error(
+                            "posix_spawn() environment contains an embedded null byte",
+                        )
+                    })?);
+                }
+                Ok(env)
             }
             fn collect_cstring_seq(
                 obj: pyre_object::PyObjectRef,
@@ -4341,11 +4552,47 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("sysconf() requires name"));
                     }
-                    let name = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                    // interp_posix.py:2388-2397 confname_w: symbolic names
+                    // resolve through the same dictionary exported as
+                    // `sysconf_names`; every other value follows space.int_w.
+                    let name = if unsafe { pyre_object::is_str(args[0]) } {
+                        let key = crate::baseobjspace::text_w(args[0])?;
+                        sysconf_names()
+                            .iter()
+                            .find_map(|(name, value)| (*name == key).then_some(*value))
+                            .ok_or_else(|| {
+                                crate::PyError::value_error(
+                                    "unrecognized configuration name",
+                                )
+                            })?
+                    } else {
+                        crate::baseobjspace::int_w(args[0])? as i32
+                    };
                     let v = host_posix::sysconf(name).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_int_new(v as i64))
                 },
                 1,
+            ),
+        );
+        let w_sysconf_names = pyre_object::w_dict_new();
+        let _sysconf_names_root = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(w_sysconf_names);
+        for (name, value) in sysconf_names() {
+            unsafe {
+                pyre_object::w_dict_setitem_str(
+                    pyre_object::gc_roots::shadow_stack_get(
+                        pyre_object::gc_roots::shadow_stack_len() - 1,
+                    ),
+                    name,
+                    pyre_object::w_int_new(*value as i64),
+                );
+            }
+        }
+        crate::module_ns_store(
+            ns,
+            "sysconf_names",
+            pyre_object::gc_roots::shadow_stack_get(
+                pyre_object::gc_roots::shadow_stack_len() - 1,
             ),
         );
 

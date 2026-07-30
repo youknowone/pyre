@@ -287,6 +287,9 @@ class EventLoopTestsMixin:
         ):
             self.assertRaises(
                 RuntimeError, self.loop.run_until_complete, coro2())
+            # Tracing-GC interpreters do not finalize the rejected inner
+            # coroutine at the assignment's refcount transition.
+            support.gc_collect()
 
     # Note: because of the default Windows timing granularity of
     # 15.6 msec, we use fairly long sleep times here (~100 msec).

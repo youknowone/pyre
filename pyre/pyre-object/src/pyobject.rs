@@ -511,6 +511,8 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (34, Some(0)),
     (35, Some(0)),
     (36, Some(0)),
+    // `pypy/interpreter/pyframe.py:PyFrame(W_Root)`.
+    (37, Some(0)),
     (38, Some(0)),
     (39, Some(0)),
     (40, Some(0)),

@@ -558,6 +558,50 @@ fn unpark_residual_call_exception(parked: ParkedResidualException) {
     }
 }
 
+/// [`park_residual_call_exception`] as an RAII scope, for a region with more
+/// than one exit.
+///
+/// A whole tracing session needs this for the same reason a single residual
+/// call does. `pyjitpl.py:2763 execute_raised` records a residual's raise into
+/// `metainterp.last_exc_value` — an instance field, so upstream's dies with the
+/// MetaInterp that owned the session. Pyre's stand-in is one cell per thread,
+/// so a session that ends with a raise still recorded (a walk that executes
+/// residuals concretely ends on the loop-exit `StopIteration`) leaves that
+/// value visible to whatever runs next, and the next guard failure's blackhole
+/// resume reads it as its own pending raise.
+///
+/// Declare the guard before anything else in the scope so it drops last, after
+/// every inner [`pyre_object::gc_roots::RootScope`] has unwound and the shadow
+/// stack is back to the depth [`park_residual_call_exception`] recorded.
+pub(crate) struct ResidualExceptionScope {
+    parked: Option<ParkedResidualException>,
+    dbg: bool,
+}
+
+impl ResidualExceptionScope {
+    pub(crate) fn park(dbg: bool) -> Self {
+        Self {
+            parked: Some(park_residual_call_exception()),
+            dbg,
+        }
+    }
+}
+
+impl Drop for ResidualExceptionScope {
+    fn drop(&mut self) {
+        if self.dbg {
+            let bh = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+            let backend = crate::eval::jit_exc_value_peek_backend();
+            if bh != 0 || backend != 0 {
+                eprintln!("[residual-exc-scope] discarding bh={bh:#x} backend={backend:#x}");
+            }
+        }
+        if let Some(parked) = self.parked.take() {
+            unpark_residual_call_exception(parked);
+        }
+    }
+}
+
 /// Drain the backend `_store_exception` cells (`jit_exc_clear`) without
 /// touching `BH_LAST_EXC_VALUE`.
 ///
@@ -4572,6 +4616,12 @@ bh_call_kw_arity!(bh_call_kw_13; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a1
 /// walks the caller chain, so the parent frame is resolved here from the
 /// execution context's top frame (`space.getexecutioncontext()
 /// .gettopframe()`), matching the upstream frame-less ABI.
+/// Whether the `PYRE_BH_NULL_ARG` residual-argument diagnostic is armed.
+fn bh_null_arg_diag() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| std::env::var_os("PYRE_BH_NULL_ARG").is_some())
+}
+
 fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyObjectRef]) -> i64 {
     // RPython's blackhole residual-call thunk is itself translated, so its
     // incoming GCREF arguments are shadowstack roots for the whole helper
@@ -4625,6 +4675,37 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         );
         publish_residual_call_exception(err.to_exc_object() as i64);
         return 0;
+    }
+    // Diagnostic (`PYRE_BH_NULL_ARG`): only `null_or_self` carries a checked
+    // `PY_NULL` sentinel here (`walker_abort_if_mayforce_null_ref_arg` exempts
+    // exactly that index).  A NULL in a real argument slot means the operand
+    // stack the blackhole read was never published, so the callee dereferences
+    // it — report the Python coordinate before that happens instead of leaving
+    // a SIGSEGV inside the callee as the only evidence.
+    if bh_null_arg_diag() {
+        for i in 0..args.len() {
+            if pyre_object::gc_roots::shadow_stack_get(root_base + 2 + i).is_null() {
+                let frame = unsafe { &*parent_frame_ptr };
+                // A NULL here with a live fastlocal is an unbound blackhole
+                // register (the resume never seeded the slot); a NULL fastlocal
+                // means the frame itself lost the binding.
+                let locals_w = frame.locals_w();
+                let shown = locals_w.len().min(8);
+                let locals: Vec<Option<usize>> = (0..shown)
+                    .map(|i| {
+                        let v = locals_w[i];
+                        (!v.is_null()).then_some(v as usize)
+                    })
+                    .collect();
+                eprintln!(
+                    "[bh-null-arg] arg[{i}]/{} NULL vsd={} base={} locals={locals:?} at {}",
+                    args.len(),
+                    frame.valuestackdepth,
+                    frame.stack_base(),
+                    frame.descr_repr(),
+                );
+            }
+        }
     }
     // llmodel.py:822 bh_call_r — calldescr.call_stub_r is callable-type-agnostic.
     // Hot path: Function callables dispatched directly here (builtin or user
@@ -4942,6 +5023,28 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
             Err(mut err) => {
                 publish_residual_call_exception(err.to_exc_object() as i64);
                 return 0;
+            }
+        }
+    }
+
+    // `load_from_dict_or_globals` (eval.rs) finishes through
+    // `load_global_value`, whose second leg is
+    // `self.get_builtin().getdictvalue(space, varname)` (`pyopcode.py:979`).
+    // This residual stopped after the globals leg, so a builtin name reached
+    // here as a bogus `NameError`.
+    if !parent_frame_ptr.is_null() {
+        let w_builtin = unsafe { (*parent_frame_ptr).get_builtin() };
+        if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
+            let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+            if !w_dict.is_null() {
+                match pyre_interpreter::baseobjspace::finditem_str(w_dict, varname) {
+                    Ok(Some(val)) => return val as i64,
+                    Ok(None) => {}
+                    Err(mut err) => {
+                        publish_residual_call_exception(err.to_exc_object() as i64);
+                        return 0;
+                    }
+                }
             }
         }
     }

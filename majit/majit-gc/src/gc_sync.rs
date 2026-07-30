@@ -648,6 +648,36 @@ pub fn gc_op_with_root<R>(
     })
 }
 
+/// Register a caller-owned root slot without leaving its current value
+/// unprotected while a contended GC operation parks this mutator.
+///
+/// RPython publishes shadow-stack roots before entering a collecting slow
+/// path.  Pyre's host frames additionally register long-lived slots in
+/// [`crate::RootSet`]; the registration itself must use the same ordering or
+/// a collector already holding `gc_mutex` can reclaim the value before the
+/// slot becomes visible in that set.
+///
+/// # Safety
+/// `slot` must remain valid for this call and until the matching
+/// `GcAllocator::remove_root`.
+pub unsafe fn gc_op_add_root(slot: *mut crate::GcRef) {
+    struct RootGuard(usize);
+    impl Drop for RootGuard {
+        fn drop(&mut self) {
+            crate::shadow_stack::try_pop_to(self.0);
+        }
+    }
+
+    let guard = RootGuard(crate::shadow_stack::push(unsafe { *slot }));
+    gc_op(|gc| {
+        let root = crate::shadow_stack::get(guard.0);
+        unsafe {
+            *slot = root;
+            gc.add_root(slot);
+        }
+    });
+}
+
 /// Park the current thread until the ongoing STW finishes.
 fn park_until_stw_done() {
     if !GC_THREAD.with(|t| t.registered.get()) || !GC_THREAD.with(|t| t.running.get()) {

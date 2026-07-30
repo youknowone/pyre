@@ -981,6 +981,10 @@ class BaseTestTaskGroup:
         except* _Done as excs:
             exc = excs.exceptions[0].exceptions[0]
 
+        # Finished Tasks are reclaimed at their last DECREF on CPython.
+        # A tracing-GC interpreter needs an explicit collection before this
+        # referrer-shape assertion observes the equivalent lifetime point.
+        gc.collect()
         self.assertIsInstance(exc, _Done)
         self.assertListEqual(gc.get_referrers(exc), no_other_refs())
 
@@ -1004,6 +1008,9 @@ class BaseTestTaskGroup:
             except* _Done as excs:
                 exc = excs.exceptions[0].exceptions[0]
 
+        # See test_exception_refcycles_parent_task: establish the same
+        # post-finalization observation point on tracing collectors.
+        gc.collect()
         self.assertIsNone(task_wr())
         self.assertIsInstance(exc, _Done)
         self.assertListEqual(gc.get_referrers(exc), no_other_refs())

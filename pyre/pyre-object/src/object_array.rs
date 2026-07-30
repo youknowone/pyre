@@ -198,8 +198,9 @@ pub unsafe fn alloc_tuple_items_block(values: &[PyObjectRef]) -> *mut ItemsBlock
 }
 
 /// Grow an `ItemsBlock` to `new_cap` capacity, copying `live_len`
-/// existing items from `old`, NULL-initialising the rest, and
-/// deallocating `old`. Returns the new block. `old` may be null
+/// existing items from `old` and NULL-initialising the rest. Returns the new
+/// block. The caller swaps the owner field and then deallocates `old`, keeping
+/// the SETFIELD_GC barrier adjacent to the publication. `old` may be null
 /// (fresh allocation). rlist.py:262-267 parity.
 pub unsafe fn grow_list_items_block(
     old: *mut ItemsBlock,
@@ -226,8 +227,10 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
 // mirrors the instance's own `try_gc_alloc_stable` (objectobject.rs) and the
 // `TypedItemsBlock` int/float backing blocks: a non-moving block means the
 // instance's `storage` pointer never needs rewriting on a minor GC, and the
-// `try_gc_alloc_stable` hook does not collect, so no shadow-stack pinning of the
-// incoming values is needed (unlike the collecting-nursery `*_gc` allocators).
+// A stable allocation does not itself start a collection, but it is still a GC
+// operation and can wait behind a collection started by another mutator.
+// Therefore its inputs and fresh result need the same shadow-stack publication
+// as nursery allocation.
 
 /// Allocate a fresh stable `ItemsBlock` holding `values`, tagged
 /// `W_MAPDICT_STORAGE_GC_TYPE_ID` (leaf). Capacity is exactly `values.len()`
@@ -236,23 +239,41 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
 /// the block is safe to expose to the collector immediately. Falls back to the
 /// `std::alloc` [`alloc_items_block`] when no GC hook is installed (pure
 /// interpreter / early startup). A 0-length `values` yields a header-only block.
-pub unsafe fn alloc_instance_items_block(values: &[PyObjectRef]) -> *mut ItemsBlock {
+pub unsafe fn alloc_instance_items_block(
+    values: &[PyObjectRef],
+    boxed_indices: &[usize],
+) -> *mut ItemsBlock {
     let cap = values.len();
+    let _roots = crate::gc_roots::push_roots();
+    let boxed_values: Vec<PyObjectRef> = boxed_indices.iter().map(|&i| values[i]).collect();
+    let values_base = crate::gc_roots::pin_roots(&boxed_values);
     unsafe {
         let block = alloc_mapdict_storage_block(cap);
+        crate::gc_roots::pin_root(block as PyObjectRef);
+        let block =
+            crate::gc_roots::shadow_stack_get(values_base + boxed_values.len()) as *mut ItemsBlock;
         let base = items_block_items_base(block);
-        for (i, v) in values.iter().enumerate() {
-            *base.add(i) = *v;
+        let mut boxed_cursor = 0;
+        for i in 0..values.len() {
+            if boxed_cursor < boxed_indices.len() && boxed_indices[boxed_cursor] == i {
+                *base.add(i) = crate::gc_roots::shadow_stack_get(values_base + boxed_cursor);
+                boxed_cursor += 1;
+            } else {
+                // Erased unboxed `Vec<i64>` pointer: not a GCREF and therefore
+                // deliberately absent from the shadow stack.
+                *base.add(i) = values[i];
+            }
         }
         block
     }
 }
 
 /// Grow (or shrink) an instance storage block to `new_cap`, copying `live_len`
-/// existing items from `old`, NULL-filling any spare tail, and deallocating
-/// `old`. `old` may be null (fresh allocation). Stable allocation keeps `old`'s
-/// address across the (non-collecting) allocation of the new block, so the live
-/// items are copied directly. mapdict.py:942-959 `_add_attr` grow-by-one.
+/// existing items from `old` and NULL-filling any spare tail. The caller keeps
+/// the owning instance rooted, installs and barriers the new block, then
+/// deallocates `old`; dropping it here would introduce a GC operation while the
+/// fresh block is not yet reachable from its owner. `old` may be null.
+/// mapdict.py:942-959 `_add_attr` grow-by-one.
 pub unsafe fn grow_instance_items_block(
     old: *mut ItemsBlock,
     new_cap: usize,
@@ -267,9 +288,6 @@ pub unsafe fn grow_instance_items_block(
         }
         for i in copy..new_cap {
             *new_base.add(i) = PY_NULL;
-        }
-        if !old.is_null() {
-            dealloc_instance_items_block(old);
         }
         fresh
     }
@@ -362,7 +380,15 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
     for &v in values {
         crate::gc_roots::pin_root(v);
     }
+    let block_slot = crate::gc_roots::shadow_stack_len();
     let block = unsafe { alloc_items_block_gc(cap) };
+    // `alloc_items_block_gc` returns a fresh GCREF.  RPython's
+    // gct_fv_gc_malloc pop_roots makes that result live before the next
+    // collecting operation.  Publish it before the ownership query / write
+    // barrier below: either operation can park behind another thread's
+    // collection, which may move the otherwise-unrooted fresh array.
+    crate::gc_roots::pin_root(block as PyObjectRef);
+    let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
     let base = unsafe { items_block_items_base(block) };
     for i in 0..len {
         unsafe { *base.add(i) = crate::gc_roots::shadow_stack_get(save + i) };
@@ -381,7 +407,8 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
 
 /// List-grow allocator on the Phase L2 nursery path. Pins the OLD BLOCK across
 /// the new (collecting) allocation, copies its `live_len` items into the new
-/// one, NULL-fills the spare tail, then hands the old block to
+/// one and NULL-fills the spare tail. The caller installs the new owner edge
+/// through its write barrier and then hands the old block to
 /// [`dealloc_list_items_block`] (which no-ops on a GC-managed block — the
 /// collector reclaims it). `old` may be null with `live_len == 0` (fresh
 /// allocation). Degrades to the `std::alloc` [`grow_list_items_block`] when the
@@ -417,7 +444,10 @@ pub unsafe fn grow_list_items_block_gc(
     if root_old {
         crate::gc_roots::pin_root(old as crate::pyobject::PyObjectRef);
     }
+    let new_block_slot = crate::gc_roots::shadow_stack_len();
     let new_block = unsafe { alloc_items_block_gc(new_cap) };
+    crate::gc_roots::pin_root(new_block as PyObjectRef);
+    let new_block = crate::gc_roots::shadow_stack_get(new_block_slot) as *mut ItemsBlock;
     let new_base = unsafe { items_block_items_base(new_block) };
     let old = if root_old {
         crate::gc_roots::shadow_stack_get(save) as *mut ItemsBlock
@@ -436,7 +466,6 @@ pub unsafe fn grow_list_items_block_gc(
     if crate::gc_hook::try_gc_owns_object(new_block as *mut u8) {
         crate::gc_hook::try_gc_write_barrier(new_block as *mut u8);
     }
-    unsafe { dealloc_list_items_block(old) };
     new_block
 }
 
@@ -456,7 +485,10 @@ pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBl
     for &v in values {
         crate::gc_roots::pin_root(v);
     }
+    let block_slot = crate::gc_roots::shadow_stack_len();
     let block = unsafe { alloc_items_block_gc(cap) };
+    crate::gc_roots::pin_root(block as PyObjectRef);
+    let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
     let base = unsafe { items_block_items_base(block) };
     for i in 0..cap {
         unsafe { *base.add(i) = crate::gc_roots::shadow_stack_get(save + i) };
@@ -588,9 +620,6 @@ unsafe fn grow_items_block(
         for i in live_len..fresh_cap {
             *new_base.add(i) = PY_NULL;
         }
-        if !old.is_null() {
-            dealloc_items_block(old);
-        }
         fresh
     }
 }
@@ -693,10 +722,13 @@ fn try_typed_items_block_layout(cap: usize) -> Option<Layout> {
 /// The block is allocated `stable` (old-gen, mark-sweep, non-moving) — the same
 /// tier as its `W_ListObject` owner (`listobject.rs` `try_gc_alloc_stable`).
 /// The items are plain scalars (no GC pointers), so the block is a varsize leaf
-/// the collector marks (it never relocates and never holds a young pointer, so
-/// the owning list needs no remembered-set barrier when the block changes); its
+/// the collector marks: it never relocates and never holds a young pointer, so
+/// the owning list needs no remembered-set barrier when the block changes. Its
 /// `int_items.block` / `float_items.block` owner slot is marked-live by
-/// `list_object_custom_trace`.
+/// `list_object_custom_trace` — but only once that slot holds the block. Being
+/// old-gen buys immobility, not survival: a block born before this cycle
+/// finished scanning carries no `GCFLAG_VISITED`, so between this call and the
+/// owner store the caller must root it (`IntArray::pin_block`).
 pub unsafe fn alloc_typed_items_block(cap: usize, tid: u32) -> *mut TypedItemsBlock {
     unsafe {
         try_alloc_typed_items_block(cap, tid)
@@ -817,7 +849,9 @@ pub unsafe fn try_alloc_typed_items_block(cap: usize, tid: u32) -> Option<*mut T
 /// zero-filling the rest, and deallocating `old`. `old` may be null.
 /// rlist.py:262-267 parity. `old` is allocated `stable` (old-gen, non-moving),
 /// so it keeps its address across the (possibly collecting) allocation of
-/// `fresh` and the live words are copied directly.
+/// `fresh` and the live words are copied directly; it also stays reachable
+/// through its owner's `block` field for that whole span, since the caller only
+/// overwrites that field with the returned value.
 pub unsafe fn grow_typed_items_block(
     old: *mut TypedItemsBlock,
     new_cap: usize,
@@ -826,6 +860,15 @@ pub unsafe fn grow_typed_items_block(
 ) -> *mut TypedItemsBlock {
     unsafe {
         let fresh = alloc_typed_items_block(new_cap, tid);
+        // `fresh` has no owner field yet, and `dealloc_typed_items_block` below
+        // enters a GC operation (`try_gc_owns_object`) that parks this mutator
+        // while another thread can run a cycle to `STATE_SWEEPING`. Old-gen is
+        // mark-sweep, so an unreachable, not-yet-`VISITED` block is swept —
+        // root it for the span, as `gct_fv_gc_malloc` roots every livevar it
+        // brackets a malloc with (`framework.py:853-856`).
+        let _roots = crate::gc_roots::push_roots();
+        let fresh_root = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::pin_root(fresh as crate::PyObjectRef);
         if !old.is_null() && live_len > 0 {
             std::ptr::copy_nonoverlapping(
                 typed_items_block_items_base(old),
@@ -836,7 +879,7 @@ pub unsafe fn grow_typed_items_block(
         if !old.is_null() {
             dealloc_typed_items_block(old);
         }
-        fresh
+        crate::gc_roots::shadow_stack_get(fresh_root) as *mut TypedItemsBlock
     }
 }
 
@@ -943,6 +986,38 @@ impl FixedObjectArray {
 
     pub fn as_mut_slice(&mut self) -> &mut [PyObjectRef] {
         unsafe { std::slice::from_raw_parts_mut(self.items_mut_ptr(), self.len) }
+    }
+
+    /// Store a GC reference through the host interpreter's equivalent of the
+    /// GC transform's `setarrayitem_gc` rewrite.
+    ///
+    /// RPython keeps the value live in the translated shadow stack, emits the
+    /// conditional array write barrier, then performs the store.  A raw Rust
+    /// local is not part of that generated root map, so publish it explicitly
+    /// and reload it after the barrier's safepoint before writing the slot.
+    pub fn set_ref(&mut self, index: usize, value: PyObjectRef) {
+        assert!(index < self.len);
+        // Clearing a slot cannot create an old-to-young edge.  PyPy's
+        // `popvalue_maybe_none` / `dropvalues*` therefore compile to the
+        // plain `None` store with no collecting write-barrier slow path.
+        if value.is_null() {
+            unsafe { self.items_mut_ptr().add(index).write(value) };
+            return;
+        }
+        let _roots = crate::gc_roots::push_roots();
+        let root_base = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::pin_root(self as *mut Self as PyObjectRef);
+        crate::gc_roots::pin_root(value);
+        let array = crate::gc_roots::shadow_stack_get(root_base) as *mut Self;
+        if crate::gc_hook::try_gc_owns_object(array as *mut u8) {
+            crate::gc_hook::try_gc_write_barrier(array as *mut u8);
+        }
+        // Both ownership lookup and the barrier may wait behind a foreign
+        // collection.  Reload the array as well as the value before the store:
+        // RPython's setarrayitem_gc keeps both live across the barrier.
+        let array = crate::gc_roots::shadow_stack_get(root_base) as *mut Self;
+        let value = crate::gc_roots::shadow_stack_get(root_base + 1);
+        unsafe { (*array).items_mut_ptr().add(index).write(value) };
     }
 
     pub fn to_vec(&self) -> Vec<PyObjectRef> {

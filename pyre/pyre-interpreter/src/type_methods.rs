@@ -467,6 +467,24 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                     w_list_append(list, item);
                 }
             }
+        } else if pyre_object::is_set_or_frozenset(other)
+            && (*other).w_class == pyre_object::get_instantiate(&*(*other).ob_type)
+        {
+            // PyPy's listview optimization snapshots builtin set storage.
+            // In free-threaded pyre this is also the operation boundary that
+            // keeps list(set) from observing a concurrent size transition
+            // between iterator steps.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(list);
+            let items = pyre_object::w_set_items(other);
+            pyre_object::gc_roots::pin_roots(&items);
+            for index in 0..items.len() {
+                w_list_append(
+                    pyre_object::gc_roots::shadow_stack_get(root_base),
+                    pyre_object::gc_roots::shadow_stack_get(root_base + 1 + index),
+                );
+            }
         } else {
             // listobject.py:1052 `_extend_from_iterable` asks for a length
             // hint before `_do_extend_from_iterable` obtains and consumes the

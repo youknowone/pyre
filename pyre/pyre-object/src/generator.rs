@@ -192,8 +192,10 @@ pub fn w_async_generator_new(frame_ptr: *mut u8, pycode: PyObjectRef) -> PyObjec
 
 pub fn w_coroutine_wrapper_new(coroutine: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(coroutine);
-    CoroutineWrapper::allocate(CoroutineWrapper {
+    let coroutine = crate::gc_roots::shadow_stack_get(root_base);
+    CoroutineWrapper::allocate_stable(CoroutineWrapper {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -224,8 +226,10 @@ pub unsafe fn is_generator_or_coroutine(obj: PyObjectRef) -> bool {
 
 pub fn w_async_gen_value_wrapper_new(w_value: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(w_value);
-    AsyncGenValueWrapper::allocate(AsyncGenValueWrapper {
+    let w_value = crate::gc_roots::shadow_stack_get(root_base);
+    AsyncGenValueWrapper::allocate_stable(AsyncGenValueWrapper {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -236,9 +240,12 @@ pub fn w_async_gen_value_wrapper_new(w_value: PyObjectRef) -> PyObjectRef {
 
 pub fn w_async_gen_asend_new(async_gen: PyObjectRef, w_value_to_send: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(async_gen);
     crate::gc_roots::pin_root(w_value_to_send);
-    AsyncGenASend::allocate(AsyncGenASend {
+    let async_gen = crate::gc_roots::shadow_stack_get(root_base);
+    let w_value_to_send = crate::gc_roots::shadow_stack_get(root_base + 1);
+    AsyncGenASend::allocate_stable(AsyncGenASend {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -256,12 +263,15 @@ pub fn w_async_gen_athrow_new(
     w_exc_tb: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
     for value in [async_gen, w_exc_type, w_exc_value, w_exc_tb] {
-        if !value.is_null() {
-            crate::gc_roots::pin_root(value);
-        }
+        crate::gc_roots::pin_root(value);
     }
-    AsyncGenAThrow::allocate(AsyncGenAThrow {
+    let async_gen = crate::gc_roots::shadow_stack_get(root_base);
+    let w_exc_type = crate::gc_roots::shadow_stack_get(root_base + 1);
+    let w_exc_value = crate::gc_roots::shadow_stack_get(root_base + 2);
+    let w_exc_tb = crate::gc_roots::shadow_stack_get(root_base + 3);
+    AsyncGenAThrow::allocate_stable(AsyncGenAThrow {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -318,6 +328,18 @@ pub unsafe fn w_generator_is_started(obj: PyObjectRef) -> bool {
 pub unsafe fn w_generator_set_started(obj: PyObjectRef) {
     unsafe {
         (*(obj as *mut GeneratorIterator)).started = true;
+    }
+}
+
+#[inline]
+pub unsafe fn w_coroutine_warned_unawaited(obj: PyObjectRef) -> bool {
+    unsafe { (*(obj as *const GeneratorIterator)).warned_unawaited }
+}
+
+#[inline]
+pub unsafe fn w_coroutine_set_warned_unawaited(obj: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut GeneratorIterator)).warned_unawaited = true;
     }
 }
 

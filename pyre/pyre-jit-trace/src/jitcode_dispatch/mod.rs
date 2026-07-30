@@ -7235,6 +7235,9 @@ fn walker_guard_exception_attr_slot<Sym: WalkSym>(
 }
 
 fn walker_load_name_from_code(w_code_ptr: usize, name_idx: usize) -> Option<String> {
+    if w_code_ptr == 0 {
+        return None;
+    }
     unsafe {
         let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
         if code_ptr.is_null() {
@@ -7614,7 +7617,7 @@ fn mark_trace_reads_module_global_from_code(
     // A null globals dict cannot be probed for membership; report unresolved so
     // the caller takes the conservative fallback, matching
     // `mark_trace_reads_module_global_from_frame_name`.
-    if w_globals.is_null() {
+    if w_globals.is_null() || w_code_ptr == 0 {
         return false;
     }
     let Some(name) = (unsafe {

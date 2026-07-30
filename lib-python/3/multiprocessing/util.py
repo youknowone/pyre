@@ -544,6 +544,13 @@ def _cleanup_tests():
     # cleanup multiprocessing
     process._cleanup()
 
+    # On tracing-GC interpreters, objects released by a completed executor
+    # need not have run their weakref finalizers yet.  Collect before stopping
+    # the resource tracker so SemLock finalizers can unregister their names
+    # while its pipe is still alive.  CPython's refcounting normally performs
+    # this step implicitly as the executor tears down.
+    support.gc_collect()
+
     # Stop the ForkServer process if it's running
     from multiprocessing import forkserver
     forkserver._forkserver._stop()

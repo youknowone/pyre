@@ -67,8 +67,10 @@ fn enable_finalizers(action: &mut crate::executioncontext::UserDelAction) {
             for &obj in pending.iter() {
                 pyre_object::gc_roots::pin_root(obj);
             }
-            for obj in pending {
-                action._call_finalizer(obj);
+            let root_end = pyre_object::gc_roots::shadow_stack_len();
+            let root_base = root_end - pending.len();
+            for index in 0..pending.len() {
+                action._call_finalizer(pyre_object::gc_roots::shadow_stack_get(root_base + index));
             }
         }
     }

@@ -1949,34 +1949,31 @@ impl MiniMarkGC {
     /// `_trace_drag_out1_marking_phase`, for a nursery object reached
     /// through a *root* slot during minor collection.
     ///
-    /// Copies the object out of the nursery (updating `*gcref` to the new
-    /// address) and, when a major marking cycle is in progress, greys the
-    /// promoted copy. The marking phase scans roots only once at cycle
-    /// start (`seed_major_roots`), so an object first made reachable from a
-    /// root *after* that scan — but before the sweep — would otherwise never
-    /// receive `GCFLAG_VISITED` and be freed while still live. Old objects
-    /// reached through `collect_oldrefs_to_nursery` use plain
-    /// `copy_nursery_object` instead: their reachability is re-established by
-    /// tracing the (already-grey/black) parent, so they must not be greyed
-    /// here (matching `_trace_drag_out1` vs `_trace_drag_out1_marking_phase`).
+    /// Copies a nursery object out (updating `*gcref`) and, while major
+    /// marking is active, greys any white root after that step — including an
+    /// already-old object. This is the literal two-part shape of
+    /// `_trace_drag_out1_marking_phase`: `_trace_drag_out(root, NULL)` first,
+    /// then append `root.address[0]` iff it lacks VISITED/PINNED. The old-root
+    /// half matters because stack roots can change after `collect_roots()`'s
+    /// initial snapshot; every intervening minor reintroduces newly exposed
+    /// white old objects to `more_objects_to_trace`.
     #[inline]
     fn drag_out_root(&mut self, gcref: &mut GcRef) {
         self.assert_traced_slot_initialized(*gcref, gcref as *mut GcRef as usize, 0, "minor_root");
-        if !self.is_nursery_object_start(gcref.0) || self.pinned_objects.contains(&gcref.0) {
-            return;
+        let pinned = self.pinned_objects.contains(&gcref.0);
+        if self.is_nursery_object_start(gcref.0) && !pinned {
+            let slot_addr = gcref as *mut GcRef as usize;
+            *gcref = self.copy_nursery_object(gcref.0, "minor_root_target", 0, slot_addr);
         }
-        let slot_addr = gcref as *mut GcRef as usize;
-        let new_ref = self.copy_nursery_object(gcref.0, "minor_root_target", 0, slot_addr);
-        *gcref = new_ref;
         // incminimark.py:2140-2143: append iff (VISITED | PINNED) == 0. pyre's
         // marking convention sets VISITED at push time (see `seed_major_root`
         // / `mark_object`), so set it here rather than at pop.
-        if self.gc_state == GcState::Marking {
-            let hdr = unsafe { header_of(new_ref.0) };
+        if self.gc_state == GcState::Marking && !pinned && self.is_managed_heap_object(gcref.0) {
+            let hdr = unsafe { header_of(gcref.0) };
             if unsafe { !(*hdr).has_flag(flags::VISITED) } {
                 unsafe { (*hdr).set_flag(flags::VISITED) };
-                self.incr_state.gray_stack.push(new_ref.0);
-                self.note_nonmoving_nursery_mark(new_ref.0);
+                self.incr_state.gray_stack.push(gcref.0);
+                self.note_nonmoving_nursery_mark(gcref.0);
             }
         }
     }
@@ -2431,6 +2428,7 @@ impl MiniMarkGC {
             if is_requested_generation
                 && !unsafe { (*hdr).has_flag(flags::DUMMY) }
                 && self.types.get(type_id).is_object
+                && !self.types.get(type_id).hide_from_app_level_inspector
             {
                 result.push(gcref);
             }
@@ -2464,6 +2462,15 @@ impl MiniMarkGC {
     /// each node out of the walk twice and is restored before returning.
     pub fn do_get_referents(&mut self, obj: GcRef, visitor: &mut dyn FnMut(GcRef)) {
         if obj.is_null() || !self.is_managed_heap_object(obj.0) {
+            return;
+        }
+        // A host-side raw local can still hold a just-forwarded nursery
+        // address, whose header word is a forwarding pointer rather than
+        // flags — toggling GCFLAG_EXTRA on it would write through that word.
+        // Reject exactly that, not every young object: `referents.py:53-78`
+        // does not require an empty nursery, and a live nursery object is an
+        // ordinary app-level referent source.
+        if self.is_in_nursery(obj.0) && unsafe { (*header_of(obj.0)).is_forwarded() } {
             return;
         }
         let _stw = if crate::gc_sync::stw_required() {
@@ -2666,15 +2673,30 @@ impl MiniMarkGC {
             let type_id = unsafe { (*hdr).type_id() };
             if type_id as usize >= self.types.len() {
                 let holder_type_id = unsafe { (*header_of(holder_addr)).type_id() };
+                let mut holder_words = [0usize; 8];
+                for (index, word) in holder_words.iter_mut().enumerate() {
+                    *word = unsafe { *((holder_addr as *const usize).add(index)) };
+                }
+                let mut child_words = [0usize; 8];
+                for (index, word) in child_words.iter_mut().enumerate() {
+                    *word = unsafe { *((addr as *const usize).add(index)) };
+                }
+                let child_vtable_type_id = self.vtable_to_type_id.get(&child_words[0]).copied();
                 panic!(
                     "GC BUG: invalid major child type_id={} at child_addr={:#x} \
-                     holder_addr={:#x} holder_type_id={} holder_offset={:?} site={}",
+                     holder_addr={:#x} holder_type_id={} slot_addr={:#x} \
+                     holder_offset={:?} site={} holder_words={:#x?} \
+                     child_vtable_type_id={:?} child_words={:#x?}",
                     type_id,
                     addr,
                     holder_addr,
                     holder_type_id,
+                    slot_addr,
                     slot_addr.checked_sub(holder_addr),
                     site,
+                    holder_words,
+                    child_vtable_type_id,
+                    child_words,
                 );
             }
             if unsafe { !(*hdr).has_flag(flags::VISITED) } {
@@ -3380,7 +3402,7 @@ impl MiniMarkGC {
         // pyre's GcRef is nullable (GcRef::NULL is the sentinel) and reaches the
         // safe `write_barrier`/`gc_write_barrier` entry points, so guard null
         // before reading `header_of(obj)`; the card variant guards it likewise.
-        if obj.is_null() || !self.is_managed_heap_object(obj.0) {
+        if obj.is_null() || self.is_in_nursery(obj.0) || !self.is_managed_heap_object(obj.0) {
             return;
         }
         let hdr = unsafe { header_of(obj.0) };
@@ -3405,6 +3427,8 @@ impl MiniMarkGC {
         // candidate already known live, a candidate already swept, or a new
         // object on the fresh lists. An unreachable white candidate cannot be
         // mutated and therefore cannot be re-added between sweep steps.
+        let type_id = unsafe { (*header_of(obj.0)).type_id() };
+        self.validate_type_id(type_id, obj.0, "remember_young_pointer_insert");
         self.remembered_set.push(obj.0);
         let hdr = unsafe { header_of(obj.0) };
         if crate::gc_lifetime_log_enabled() {
@@ -5367,6 +5391,29 @@ mod tests {
     }
 
     #[test]
+    fn write_barrier_skips_forwarded_nursery_address() {
+        // incminimark.py:1510-1512: nursery objects never carry
+        // GCFLAG_TRACK_YOUNG_PTRS.  After a moving minor the old nursery
+        // header is a forwarding word, not a live header whose flag bits may
+        // be tested.  A host raw local can briefly retain that old address.
+        let mut gc = test_gc(1024);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let nursery_obj = gc.alloc_with_type(tid, 16);
+        let stale_addr = nursery_obj;
+        let mut root = nursery_obj;
+        unsafe { gc.roots.add(&mut root) };
+
+        gc.do_collect_nursery();
+        assert_ne!(root, stale_addr);
+        assert!(gc.is_in_nursery(stale_addr.0));
+        assert!(!gc.is_in_nursery(root.0));
+
+        gc.do_write_barrier(stale_addr);
+        assert!(gc.remembered_set.is_empty());
+        gc.roots.clear();
+    }
+
+    #[test]
     fn test_nursery_collection_with_pointers() {
         // Object layout: one GcRef field at offset 0 (payload = 8 bytes).
         let mut gc = test_gc(1024);
@@ -5877,6 +5924,27 @@ mod tests {
         assert_eq!(c3, 0x5555_6666_7777_8888);
 
         gc.roots.clear();
+    }
+
+    #[test]
+    fn marking_minor_root_greys_white_old_object() {
+        // incminimark.py:2128-2143 `_trace_drag_out1_marking_phase` checks
+        // the root after `_trace_drag_out` even when it was already old.
+        // This is how a stack root exposed after the major's initial root
+        // snapshot re-enters the marking worklist at the next minor.
+        let mut gc = test_gc(2048);
+        let tid = gc.register_type(TypeInfo::simple(8));
+        let old = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 8);
+        let hdr = unsafe { header_of(old.0) };
+        assert!(!unsafe { (*hdr).has_flag(flags::VISITED) });
+
+        gc.gc_state = GcState::Marking;
+        let mut root = old;
+        gc.drag_out_root(&mut root);
+
+        assert_eq!(root, old);
+        assert!(unsafe { (*hdr).has_flag(flags::VISITED) });
+        assert_eq!(gc.incr_state.gray_stack.pop(), Some(old.0));
     }
 
     // ── Card marking tests ──

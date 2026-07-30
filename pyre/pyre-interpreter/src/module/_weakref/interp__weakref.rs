@@ -983,32 +983,83 @@ fn lifeline_refs(lifeline: PyObjectRef) -> Vec<PyObjectRef> {
 /// `WeakrefLifeline._finalize_` (interp__weakref.py:131-153), invoked
 /// from pyre's shared finalizer queue when the referent becomes unreachable.
 pub fn finalize_weakrefs(w_obj: PyObjectRef) {
-    let Some(lifeline) = crate::baseobjspace::getweakref(w_obj) else {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let Some(lifeline) =
+        crate::baseobjspace::getweakref(pyre_object::gc_roots::shadow_stack_get(root_base))
+    else {
         return;
     };
-    let refs = lifeline_refs(lifeline);
+    pyre_object::gc_roots::pin_root(lifeline);
+
+    // RPython's local `refs` list is GC-transformed together with every
+    // element. A Rust Vec only holds copied raw pointers, so retain the same
+    // collection in shadow-stack slots while reads below can allocate.
+    let mut ref_slots = Vec::new();
+    for name in [ATTR_CACHED_WEAKREF, ATTR_CACHED_PROXY] {
+        let weak = read_attr(pyre_object::gc_roots::shadow_stack_get(root_base + 1), name);
+        let w_ref = unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(weak) };
+        if !w_ref.is_null() {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(w_ref);
+            ref_slots.push(slot);
+        }
+    }
+    let others = read_attr(
+        pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+        ATTR_OTHER_REFS_WEAK,
+    );
+    if !others.is_null() {
+        let others_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(others);
+        let length = unsafe {
+            pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(others_slot))
+        };
+        for i in 0..length {
+            let Some(weak) = (unsafe {
+                pyre_object::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(others_slot),
+                    i as i64,
+                )
+            }) else {
+                continue;
+            };
+            let w_ref = unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(weak) };
+            if !w_ref.is_null() {
+                let slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(w_ref);
+                ref_slots.push(slot);
+            }
+        }
+    }
 
     // `clear_all_weakrefs` / rweakref invalidation must be visible before a
     // callback runs: every callback observes `ref() is None`.
-    for &w_ref in &refs {
+    for &slot in &ref_slots {
+        let w_ref = pyre_object::gc_roots::shadow_stack_get(slot);
         let target = read_attr(w_ref, ATTR_W_OBJ_WEAK);
         unsafe { pyre_object::weakref::w_gc_weakref_box_clear(target) };
-        write_attr(w_ref, ATTR_W_OBJ_WEAK, pyre_object::w_none());
+        write_attr(
+            pyre_object::gc_roots::shadow_stack_get(slot),
+            ATTR_W_OBJ_WEAK,
+            pyre_object::w_none(),
+        );
     }
 
     // PyPy runs `other_refs_weak` in reverse creation order. Cached refs and
     // proxies have no callback and therefore need only the clearing above.
-    for &w_ref in refs.iter().rev() {
+    for &slot in ref_slots.iter().rev() {
+        let w_ref = pyre_object::gc_roots::shadow_stack_get(slot);
         let w_callable = read_attr(w_ref, ATTR_W_CALLABLE);
         if w_callable.is_null() {
             continue;
         }
-        let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_ref);
+        let _call_roots = pyre_object::gc_roots::push_roots();
+        let call_base = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(w_callable);
-        let current_ref = || pyre_object::gc_roots::shadow_stack_get(root_base);
-        let current_callable = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+        let current_ref = || pyre_object::gc_roots::shadow_stack_get(slot);
+        let current_callable = || pyre_object::gc_roots::shadow_stack_get(call_base);
         if let Err(error) =
             crate::call::call_function_impl_result(current_callable(), &[current_ref()])
         {
@@ -1024,7 +1075,7 @@ pub fn finalize_weakrefs(w_obj: PyObjectRef) {
         }
         write_attr(current_ref(), ATTR_W_CALLABLE, pyre_object::w_none());
     }
-    crate::baseobjspace::delweakref(w_obj);
+    crate::baseobjspace::delweakref(pyre_object::gc_roots::shadow_stack_get(root_base));
 }
 
 /// pypy/module/_weakref/interp__weakref.py:260-268 descr__new__weakref

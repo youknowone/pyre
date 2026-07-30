@@ -236,7 +236,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "select",
-        crate::make_builtin_function("select", |args| {
+        // Module functions are non-descriptors. `selectors.SelectSelector`
+        // stores this object directly as its `_select` class attribute; a
+        // descriptor-shaped builtin would bind the selector instance and
+        // shift the three fd-set arguments.
+        crate::make_module_builtin_function("select", |args| {
             #[cfg(all(unix, feature = "host_env"))]
             {
                 use rustpython_host_env::select as host_select;

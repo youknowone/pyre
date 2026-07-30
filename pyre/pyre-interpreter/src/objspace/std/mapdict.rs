@@ -2236,6 +2236,32 @@ fn instance_write_barrier(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
+/// Return the storage indices that contain real GCREFs for `map`; slots owned
+/// by the first `UnboxedPlainAttribute` contain erased `Vec<i64>` pointers and
+/// must never enter the shadow stack.
+unsafe fn boxed_storage_indices(map: MapRef, len: usize) -> Vec<usize> {
+    let mut unboxed = vec![false; len];
+    let mut node = map;
+    while !node.is_null() {
+        match unsafe { &*node } {
+            MapNode::Plain(p) => {
+                if let Some(u) = &p.unboxed {
+                    if u.firstunwrapped && p.storageindex < len {
+                        unboxed[p.storageindex] = true;
+                    }
+                }
+                node = p.back;
+            }
+            MapNode::Terminator(_) => break,
+        }
+    }
+    (0..len).filter(|&i| !unboxed[i]).collect()
+}
+
+unsafe fn storage_index_is_boxed(map: MapRef, index: usize) -> bool {
+    unsafe { boxed_storage_indices(map, index + 1).contains(&index) }
+}
+
 impl MapdictObject for pyre_object::W_ObjectObject {
     fn _get_mapdict_map(&self) -> MapRef {
         // `jit.promote(self.map)` (mapdict.py:905-906).
@@ -2260,11 +2286,33 @@ impl MapdictObject for pyre_object::W_ObjectObject {
         // this instance's `object_object_custom_trace`, which walks the block's
         // boxed slots in place, so remembering the instance keeps a young value
         // stored into an old-gen instance's block forwarded on a minor GC.
+        //
+        // RPython's GC transform emits the barrier before the pointer store.
+        // Publish both operands first because a foreign mutator's collection
+        // can make the barrier wait; storing first would leave the new value
+        // invisible until after that collection had swept it.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let boxed = unsafe { storage_index_is_boxed(self.map as MapRef, storageindex) };
+        let livevars = if boxed {
+            vec![self as *const Self as PyObjectRef, value]
+        } else {
+            vec![self as *const Self as PyObjectRef]
+        };
+        let self_slot = pyre_object::gc_roots::pin_roots(&livevars);
+        let value_slot = self_slot + 1;
+        let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        instance_write_barrier(owner);
+        let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let value = if boxed {
+            pyre_object::gc_roots::shadow_stack_get(value_slot)
+        } else {
+            value
+        };
         unsafe {
-            let base = pyre_object::object_array::items_block_items_base(self.storage);
+            let owner = &mut *(owner as *mut Self);
+            let base = pyre_object::object_array::items_block_items_base(owner.storage);
             *base.add(storageindex) = value;
         }
-        instance_write_barrier(self as *const Self as PyObjectRef);
     }
     fn _mapdict_storage_length(&self) -> usize {
         // mapdict.py:921-924 (= self.map.storage_needed()).
@@ -2298,16 +2346,28 @@ impl MapdictObject for pyre_object::W_ObjectObject {
             // dropped tail slots are gone with the old block. NULL-fill is
             // implicit in `grow_instance_items_block` (new_cap <= live_len here).
             None => {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let self_slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(self as *const Self as PyObjectRef);
                 let storage_needed = unsafe { (*map).storage_needed() };
                 unsafe {
-                    let old_len = pyre_object::object_array::items_block_capacity(self.storage);
-                    self.storage = pyre_object::object_array::grow_instance_items_block(
-                        self.storage,
+                    let owner =
+                        &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
+                    let old = owner.storage;
+                    let old_len = pyre_object::object_array::items_block_capacity(old);
+                    let fresh = pyre_object::object_array::grow_instance_items_block(
+                        old,
                         storage_needed,
                         old_len,
                     );
+                    pyre_object::gc_roots::pin_root(fresh as PyObjectRef);
+                    let fresh_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    let owner =
+                        &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
+                    owner.storage = pyre_object::gc_roots::shadow_stack_get(fresh_slot) as *mut _;
+                    instance_write_barrier(owner as *mut Self as PyObjectRef);
+                    pyre_object::object_array::dealloc_instance_items_block(old);
                 }
-                instance_write_barrier(self as *const Self as PyObjectRef);
             }
         }
         self.map = map as *const u8;
@@ -2316,31 +2376,58 @@ impl MapdictObject for pyre_object::W_ObjectObject {
         // grow storage by one, append value (mapdict.py:942-959). The first
         // grow allocates the storage block (was `None`). The block is exact-size,
         // so `old_len` is the current capacity and the new block has one more slot.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let boxed = unsafe { (*map).as_plain().unboxed.is_none() };
+        let livevars = if boxed {
+            vec![self as *const Self as PyObjectRef, value]
+        } else {
+            vec![self as *const Self as PyObjectRef]
+        };
+        let self_slot = pyre_object::gc_roots::pin_roots(&livevars);
+        let value_slot = self_slot + 1;
         unsafe {
-            let old_len = pyre_object::object_array::items_block_capacity(self.storage);
-            let block = pyre_object::object_array::grow_instance_items_block(
-                self.storage,
-                old_len + 1,
-                old_len,
-            );
+            let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
+            let old = owner.storage;
+            let old_len = pyre_object::object_array::items_block_capacity(old);
+            let block =
+                pyre_object::object_array::grow_instance_items_block(old, old_len + 1, old_len);
+            pyre_object::gc_roots::pin_root(block as PyObjectRef);
+            let block_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let block = pyre_object::gc_roots::shadow_stack_get(block_slot)
+                as *mut pyre_object::object_array::ItemsBlock;
             let base = pyre_object::object_array::items_block_items_base(block);
-            *base.add(old_len) = value;
-            self.storage = block;
+            *base.add(old_len) = if boxed {
+                pyre_object::gc_roots::shadow_stack_get(value_slot)
+            } else {
+                value
+            };
+            let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
+            owner.storage = block;
+            owner.map = map as *const u8;
+            instance_write_barrier(owner as *mut Self as PyObjectRef);
+            pyre_object::object_array::dealloc_instance_items_block(old);
         }
-        self.map = map as *const u8;
-        instance_write_barrier(self as *const Self as PyObjectRef);
     }
     fn _set_mapdict_storage_and_map(&mut self, storage: Vec<PyObjectRef>, map: MapRef) {
         // mapdict.py:961-964. The incoming `Vec` comes from a lightweight
         // `Object` carrier (delete/copy transplant); convert it to a fresh
         // exact-size storage block, freeing any prior block.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let self_slot = pyre_object::gc_roots::pin_roots(&[self as *const Self as PyObjectRef]);
+        let boxed_indices = unsafe { boxed_storage_indices(map, storage.len()) };
         unsafe {
-            let old = self.storage;
-            self.storage = pyre_object::object_array::alloc_instance_items_block(&storage);
+            let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
+            let old = owner.storage;
+            let fresh =
+                pyre_object::object_array::alloc_instance_items_block(&storage, &boxed_indices);
+            pyre_object::gc_roots::pin_root(fresh as PyObjectRef);
+            let fresh_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
+            owner.storage = pyre_object::gc_roots::shadow_stack_get(fresh_slot) as *mut _;
+            owner.map = map as *const u8;
+            instance_write_barrier(owner as *mut Self as PyObjectRef);
             pyre_object::object_array::dealloc_instance_items_block(old);
         }
-        self.map = map as *const u8;
-        instance_write_barrier(self as *const Self as PyObjectRef);
     }
     fn getdict(&self) -> PyObjectRef {
         // mapdict.py:859-860 MapdictDictSupport.getdict → _obj_getdict
@@ -3816,35 +3903,8 @@ pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*m
         // The storage block is exact-size (capacity == map.storage_needed()).
         let len = pyre_object::object_array::items_block_capacity(inst.storage);
         let base = pyre_object::object_array::items_block_items_base(inst.storage);
-        // Build a per-storage-index mask of unboxed (`Vec<i64>`) slots by
-        // walking the map's `PlainAttribute` back-chain. Sized to the block
-        // capacity (robust to a transiently-longer map during a grow); the
-        // `storageindex < len` guard keeps it in bounds.
-        let mut unboxed = vec![false; len];
-        let mut node = inst.map as MapRef;
-        loop {
-            if node.is_null() {
-                break;
-            }
-            match &*node {
-                MapNode::Plain(p) => {
-                    if let Some(u) = &p.unboxed {
-                        if u.firstunwrapped && p.storageindex < unboxed.len() {
-                            unboxed[p.storageindex] = true;
-                        }
-                    }
-                    node = p.back;
-                }
-                MapNode::Terminator(_) => break,
-            }
-        }
-        for i in 0..len {
-            if unboxed[i] {
-                // Erased unboxed `Vec<i64>` slot — an off-GC raw pointer
-                // the collector must not treat as an object; skip it.
-            } else {
-                f(base.add(i));
-            }
+        for i in boxed_storage_indices(inst.map as MapRef, len) {
+            f(base.add(i));
         }
     }
 }

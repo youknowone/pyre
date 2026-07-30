@@ -2680,43 +2680,55 @@ pub fn funccall_valuestack(
             (fast_natural_arity & crate::FLATPYCALL as usize) == 0,
             "FLATPYCALL bit set on arity {fast_natural_arity} — not a builtin code"
         );
-        let builtin_fn =
-            |args: &[PyObjectRef]| unsafe { crate::builtin_code_call(code as PyObjectRef, args) };
         // function.py:154-184 — BuiltinCodeN.fastcall_N dispatch.
-        // Pyre builtins share a single fn(&[PyObjectRef]) signature, so we
-        // build a fixed-size stack array instead of heap-allocating a Vec.
-        let result = match nargs {
-            0 => {
-                frame.dropvalues(dropvalues);
-                builtin_fn(&[])
-            }
+        // RPython translation keeps the BuiltinCode and each peeked argument
+        // live across dropvalues() and the gateway call.  The Python frame
+        // slots cease to be roots when dropvalues() clears them, so publish
+        // the same live-variable set on pyre's shadow stack before doing so.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(code as PyObjectRef);
+        match nargs {
+            0 => {}
             1 => {
-                let a0 = frame.peekvalue(0);
-                frame.dropvalues(dropvalues);
-                builtin_fn(&[a0])
+                pyre_object::gc_roots::pin_root(frame.peekvalue(0));
             }
             2 => {
-                // function.py:168 — peekvalue order: 0=top, 1=below top
-                let a0 = frame.peekvalue(1);
-                let a1 = frame.peekvalue(0);
-                frame.dropvalues(dropvalues);
-                builtin_fn(&[a0, a1])
+                pyre_object::gc_roots::pin_root(frame.peekvalue(1));
+                pyre_object::gc_roots::pin_root(frame.peekvalue(0));
             }
             3 => {
-                let a0 = frame.peekvalue(2);
-                let a1 = frame.peekvalue(1);
-                let a2 = frame.peekvalue(0);
-                frame.dropvalues(dropvalues);
-                builtin_fn(&[a0, a1, a2])
+                pyre_object::gc_roots::pin_root(frame.peekvalue(2));
+                pyre_object::gc_roots::pin_root(frame.peekvalue(1));
+                pyre_object::gc_roots::pin_root(frame.peekvalue(0));
             }
             4 => {
-                let a0 = frame.peekvalue(3);
-                let a1 = frame.peekvalue(2);
-                let a2 = frame.peekvalue(1);
-                let a3 = frame.peekvalue(0);
-                frame.dropvalues(dropvalues);
-                builtin_fn(&[a0, a1, a2, a3])
+                pyre_object::gc_roots::pin_root(frame.peekvalue(3));
+                pyre_object::gc_roots::pin_root(frame.peekvalue(2));
+                pyre_object::gc_roots::pin_root(frame.peekvalue(1));
+                pyre_object::gc_roots::pin_root(frame.peekvalue(0));
             }
+            _ => unreachable!(),
+        }
+        frame.dropvalues(dropvalues);
+
+        let code = pyre_object::gc_roots::shadow_stack_get(root_base);
+        let rooted_arg = |index| pyre_object::gc_roots::shadow_stack_get(root_base + 1 + index);
+        // Pyre builtins share a single fn(&[PyObjectRef]) signature, so use
+        // fixed-size stack arrays instead of heap-allocating a Vec.
+        let result = match nargs {
+            0 => unsafe { crate::builtin_code_call(code, &[]) },
+            1 => unsafe { crate::builtin_code_call(code, &[rooted_arg(0)]) },
+            2 => unsafe { crate::builtin_code_call(code, &[rooted_arg(0), rooted_arg(1)]) },
+            3 => unsafe {
+                crate::builtin_code_call(code, &[rooted_arg(0), rooted_arg(1), rooted_arg(2)])
+            },
+            4 => unsafe {
+                crate::builtin_code_call(
+                    code,
+                    &[rooted_arg(0), rooted_arg(1), rooted_arg(2), rooted_arg(3)],
+                )
+            },
             _ => unreachable!(),
         };
         return match result {
@@ -2830,7 +2842,7 @@ fn _flat_pycall(
     // function.py:210-211 — copy from stack into locals directly
     // peekvalue(nargs-1-i) gives bottom-to-top order (matching local slot order)
     for i in 0..nargs {
-        new_frame.locals_w_mut()[i] = frame.peekvalue(nargs - 1 - i);
+        new_frame.set_locals_w(i, frame.peekvalue(nargs - 1 - i));
     }
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
@@ -2900,7 +2912,7 @@ fn _flat_pycall_defaults(
 
     // function.py:221-222 — copy positional args from stack
     for i in 0..nargs {
-        new_frame.locals_w_mut()[i] = frame.peekvalue(nargs - 1 - i);
+        new_frame.set_locals_w(i, frame.peekvalue(nargs - 1 - i));
     }
 
     // function.py:224-229 — fill remaining from defs_w
@@ -2910,7 +2922,7 @@ fn _flat_pycall_defaults(
         let mut i = nargs;
         for j in start..ndefs {
             if let Some(val) = unsafe { pyre_object::w_tuple_getitem(defs, j as i64) } {
-                new_frame.locals_w_mut()[i] = val;
+                new_frame.set_locals_w(i, val);
             }
             i += 1;
         }

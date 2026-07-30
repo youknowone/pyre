@@ -733,7 +733,7 @@ unsafe fn dynasm_gc_add_root(slot: *mut GcRef) {
     {
         return;
     }
-    majit_gc::gc_sync::gc_op(|g| unsafe { g.add_root(slot) });
+    unsafe { majit_gc::gc_sync::gc_op_add_root(slot) };
 }
 
 /// Companion to [`dynasm_gc_add_root`].

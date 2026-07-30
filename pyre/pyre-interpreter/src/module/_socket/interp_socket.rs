@@ -1601,6 +1601,13 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
             let host: Option<std::ffi::CString> = unsafe {
                 if pyre_object::is_none(host_obj) {
                     None
+                } else if pyre_object::bytesobject::is_bytes(host_obj) {
+                    Some(
+                        std::ffi::CString::new(
+                            pyre_object::bytesobject::bytes_like_data(host_obj),
+                        )
+                        .map_err(|_| crate::PyError::value_error("embedded null in host"))?,
+                    )
                 } else if pyre_object::is_str(host_obj) {
                     let s = crate::baseobjspace::str_utf8_w(host_obj)?.to_string();
                     Some(
@@ -1621,6 +1628,13 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 } else if pyre_object::is_int(port_obj) {
                     let v = pyre_object::w_int_get_value(port_obj);
                     Some(std::ffi::CString::new(format!("{v}")).unwrap())
+                } else if pyre_object::bytesobject::is_bytes(port_obj) {
+                    Some(
+                        std::ffi::CString::new(
+                            pyre_object::bytesobject::bytes_like_data(port_obj),
+                        )
+                        .map_err(|_| crate::PyError::value_error("embedded null in port"))?,
+                    )
                 } else if pyre_object::is_str(port_obj) {
                     let s = crate::baseobjspace::str_utf8_w(port_obj)?.to_string();
                     Some(
@@ -2785,14 +2799,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             }
             let obj = args[0];
             let fd = socket_fd(obj)?;
-            let buf = unsafe {
-                if !pyre_object::bytesobject::is_bytes_like(args[1]) {
-                    return Err(crate::PyError::type_error(
-                        "send: buffer must be bytes-like",
-                    ));
-                }
-                pyre_object::bytesobject::bytes_like_data(args[1])
-            };
+            let buffer = crate::baseobjspace::simple_buffer_bytes(args[1])?.ok_or_else(|| {
+                crate::PyError::type_error("send: buffer must be bytes-like")
+            })?;
+            let buf = buffer.as_bytes();
             let flags = if args.len() >= 3 {
                 (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
             } else {
@@ -2826,14 +2836,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             }
             let obj = args[0];
             let fd = socket_fd(obj)?;
-            let buf = unsafe {
-                if !pyre_object::bytesobject::is_bytes_like(args[1]) {
-                    return Err(crate::PyError::type_error(
-                        "sendall: buffer must be bytes-like",
-                    ));
-                }
-                pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
-            };
+            let buffer = crate::baseobjspace::simple_buffer_bytes(args[1])?.ok_or_else(|| {
+                crate::PyError::type_error("sendall: buffer must be bytes-like")
+            })?;
+            let buf = buffer.as_bytes();
             let flags = if args.len() >= 3 {
                 (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
             } else {
@@ -2921,14 +2927,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             }
             let obj = args[0];
             let fd = socket_fd(obj)?;
-            let buf = unsafe {
-                if !pyre_object::bytesobject::is_bytes_like(args[1]) {
-                    return Err(crate::PyError::type_error(
-                        "sendto: buffer must be bytes-like",
-                    ));
-                }
-                pyre_object::bytesobject::bytes_like_data(args[1])
-            };
+            let buffer = crate::baseobjspace::simple_buffer_bytes(args[1])?.ok_or_else(|| {
+                crate::PyError::type_error("sendto: buffer must be bytes-like")
+            })?;
+            let buf = buffer.as_bytes();
             // 3-arg form: (buf, flags, addr).  4-arg form: (self, buf, flags, addr).
             // We always take self-as-args[0], so 3 args = (self, buf, addr) [no flags]
             // and 4 args = (self, buf, flags, addr).
@@ -3461,41 +3463,27 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let obj = args[0];
             let fd = socket_fd(obj)?;
 
-            // Collect data buffers from args[1] (must be an iterable
-            // of bytes-like).  We borrow the bytes-like data ref into
-            // a Vec<&[u8]> so the iovec can point at it.
-            if !unsafe { pyre_object::is_list(args[1]) || pyre_object::is_tuple(args[1]) } {
-                return Err(crate::PyError::type_error(
-                    "sendmsg: data must be a sequence of bytes-like objects",
-                ));
+            // PyPy `interp_socket.py:793-802`: `space.unpackiterable(w_data)`,
+            // then acquire/release one `BUF_SIMPLE` view per item and retain
+            // the copied strings.  In particular, asyncio passes an
+            // `itertools.islice` of memoryviews here, not a list or tuple.
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(args[1]);
+            let data_items = crate::baseobjspace::unpackiterable(args[1], -1)?;
+            for &item in &data_items {
+                pyre_object::gc_roots::pin_root(item);
             }
-            let data_len = unsafe {
-                if pyre_object::is_list(args[1]) {
-                    pyre_object::w_list_len(args[1])
-                } else {
-                    pyre_object::w_tuple_len(args[1])
-                }
-            };
-            let mut data_refs: Vec<&[u8]> = Vec::with_capacity(data_len);
-            for i in 0..data_len {
-                let item = unsafe {
-                    if pyre_object::is_list(args[1]) {
-                        pyre_object::w_list_getitem(args[1], i as i64)
-                            .unwrap_or(pyre_object::PY_NULL)
-                    } else {
-                        pyre_object::w_tuple_getitem(args[1], i as i64)
-                            .unwrap_or(pyre_object::PY_NULL)
-                    }
-                };
-                if !unsafe { pyre_object::bytesobject::is_bytes_like(item) } {
+            let mut data_buffers: Vec<Vec<u8>> = Vec::with_capacity(data_items.len());
+            for item in data_items {
+                let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(item)? else {
                     return Err(crate::PyError::type_error(
                         "sendmsg: data items must be bytes-like",
                     ));
-                }
-                let slice = unsafe { pyre_object::bytesobject::bytes_like_data(item) };
-                data_refs.push(slice);
+                };
+                data_buffers.push(buffer.as_bytes().to_vec());
+                buffer.release();
             }
-            let mut iovs: Vec<libc::iovec> = data_refs
+            let mut iovs: Vec<libc::iovec> = data_buffers
                 .iter()
                 .map(|s| libc::iovec {
                     iov_base: s.as_ptr() as *mut libc::c_void,
