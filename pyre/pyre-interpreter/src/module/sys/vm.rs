@@ -2539,7 +2539,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
                 // Same seam `print` rides, so an embedder that captures stdout
                 // (wasm32, which has no fd 1) sees `sys.stdout.write` too and
                 // the two stay in order.
-                if !crate::print_hook_emit(&String::from_utf8_lossy(&bytes)) {
+                if !crate::print_hook_emit_bytes(&bytes) {
                     #[cfg(not(feature = "sandbox"))]
                     {
                         use std::io::Write;
