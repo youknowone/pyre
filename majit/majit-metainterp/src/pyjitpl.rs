@@ -11850,6 +11850,19 @@ impl<M: Clone> MetaInterp<M> {
     /// runs against a named virtualizable and the GUARD_NOT_FORCED that follows
     /// deopts that same frame's loop.
     fn save_forced_virtuals(&mut self, owner: u64, ptrs: Vec<i64>, ints: Vec<i64>) {
+        // The key is a bare address, so the mechanism holds only while that
+        // address is stable. It is: the virtualizable is an interpreter-created
+        // frame (`FrameBox::new` → `try_gc_alloc_stable_raw`, "stable across
+        // minor and major collections (MiniMark mark-sweep does not move
+        // old-gen objects)"), never one of the frames a trace builds virtually.
+        // A nursery owner would break both ends — a minor would forward the
+        // frame out from under this key, and the pruner's classifier keeps every
+        // non-old-gen owner, so the entry could never be dropped either.
+        debug_assert!(
+            !majit_gc::gc_is_nursery_object(owner as usize),
+            "forced-virtual cache keyed on a nursery-resident virtualizable \
+             (0x{owner:x}): the key must be a move-stable address",
+        );
         match self.forced_virtuals.iter_mut().find(|e| e.0 == owner) {
             // A second force of the same frame overwrites, the way a second
             // `set_savedata_ref` overwrites the one `jf_savedata` word.

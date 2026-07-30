@@ -3522,10 +3522,9 @@ fn install_gc_root_walkers() {
     majit_gc::shadow_stack::register_ephemeron_pruner(
         pyre_interpreter::objspace::std::mapdict::prune_dead_owner_entries,
     );
-    // `MetaInterp::forced_virtuals` is the same shape: keyed by the forced
-    // frame's address and rooting its values, so an entry the following
-    // `GUARD_NOT_FORCED` never consumes has to go when its owner is swept.
-    majit_gc::shadow_stack::register_ephemeron_pruner(prune_forced_virtuals_for_dead_frames);
+    // `MetaInterp::forced_virtuals` is the same shape but lives in one mutator's
+    // `JIT_DRIVER` rather than a global table, so it registers per mutator
+    // instead — see `forced_virtuals_pruner_area`.
 }
 
 fn register_thread_root_areas() {
@@ -3585,6 +3584,14 @@ fn register_thread_root_areas() {
         register(active_trace_root_walker_area, jit_driver);
         register(compile_snapshot_root_walker_area, jit_driver);
         register(forced_virtuals_root_walker_area, jit_driver);
+        // The ephemeron half of the walker above, on the same `data` so the
+        // prune reaches exactly the drivers the root walk reaches.
+        unsafe {
+            majit_gc::shadow_stack::register_mutator_pruner(
+                forced_virtuals_pruner_area,
+                jit_driver,
+            );
+        }
     }
 }
 
@@ -4104,19 +4111,17 @@ unsafe fn forced_virtuals_root_walker_area(
 /// Both would otherwise pin the materialized virtuals for the process lifetime
 /// and leave a key a recycled `PyFrame` address could match.
 ///
-/// Reads the `JIT_DRIVER` cell directly rather than through `driver_pair()`:
-/// that initializes the GC subsystem and can allocate, which is not allowed
-/// mid-collection.
-fn prune_forced_virtuals_for_dead_frames(classify: &mut dyn FnMut(usize) -> Option<usize>) {
-    JIT_DRIVER.with(|cell| {
-        let data = cell as *const _ as *const ();
-        // SAFETY: same re-derivation and same aliasing caveat as the root
-        // walkers above (`jit_driver_pair_from_root_area`). The pruner runs on
-        // the collecting thread, so it reaches only that thread's driver.
-        if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
-            pair.0.prune_forced_virtuals(classify);
-        }
-    });
+/// Registered per mutator, next to `forced_virtuals_root_walker_area` and with
+/// the same `data`, so the prune reaches every driver the root walk reaches. The
+/// global `register_ephemeron_pruner` cannot: the table lives in this thread's
+/// `JIT_DRIVER`, and a major driven by another thread would leave it pinned.
+unsafe fn forced_virtuals_pruner_area(
+    data: *const (),
+    classify: &mut dyn FnMut(usize) -> Option<usize>,
+) {
+    if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
+        pair.0.prune_forced_virtuals(classify);
+    }
 }
 
 /// Re-derives the thread-local `JitDriverPair` for a GC root walk from the

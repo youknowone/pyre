@@ -2857,7 +2857,7 @@ impl MiniMarkGC {
         // An owner outside old-gen is either immortal (`malloc_typed`, no
         // header to read) or, under a non-moving major, still in the live
         // nursery; neither can be proven dead here, so both are kept.
-        crate::shadow_stack::prune_ephemeron_tables(&mut |owner| {
+        let mut classify_owner = |owner: usize| -> Option<usize> {
             if owner == 0 || !self.oldgen.contains(owner) {
                 return Some(owner);
             }
@@ -2867,7 +2867,19 @@ impl MiniMarkGC {
             } else {
                 None
             }
-        });
+        };
+        crate::shadow_stack::prune_ephemeron_tables(&mut classify_owner);
+        // The same question for tables a single mutator owns in its own TLS.
+        // Those cannot go through the global registration: it names no thread,
+        // so a major driven here would leave every other mutator's dead-owner
+        // entries pinned. Reach exactly as far as this collection's own root
+        // walk did (`enumerate_root_walker_values`) — foreign TLS only while
+        // this thread owns STW.
+        if crate::gc_sync::mutators_quiesced() {
+            crate::shadow_stack::prune_all_mutator_areas(&mut classify_owner);
+        } else {
+            crate::shadow_stack::prune_my_mutator_areas(&mut classify_owner);
+        }
         // incminimark.py:2510-2511 — run destructors of dying old objects
         // before the sweep frees them (VISITED still distinguishes
         // survivors from the dying at this point).

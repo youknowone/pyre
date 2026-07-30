@@ -263,6 +263,7 @@ struct MutatorEntry {
     bh_regs_stack: *const RefCell<Vec<BhRegsEntry>>,
     resume_ref_roots_stack: *const RefCell<Vec<(*mut i64, usize)>>,
     extra_areas: Vec<MutatorExtraArea>,
+    pruners: Vec<MutatorPruner>,
 }
 
 /// Walker for one opaque root area owned by a registered mutator.
@@ -274,6 +275,18 @@ pub type MutatorExtraWalkFn = unsafe fn(*const (), &mut dyn FnMut(&mut GcRef));
 #[derive(Clone, Copy)]
 struct MutatorExtraArea {
     walk: MutatorExtraWalkFn,
+    data: *const (),
+}
+
+/// Pruner for one owner-keyed side table owned by a registered mutator.
+///
+/// Same contract as [`MutatorExtraWalkFn`]: it runs on the collecting thread
+/// and must derive everything from `data`, never from caller TLS.
+pub type MutatorPrunerFn = unsafe fn(*const (), &mut dyn FnMut(usize) -> Option<usize>);
+
+#[derive(Clone, Copy)]
+struct MutatorPruner {
+    prune: MutatorPrunerFn,
     data: *const (),
 }
 
@@ -307,6 +320,7 @@ pub fn register_mutator() {
         bh_regs_stack,
         resume_ref_roots_stack,
         extra_areas: Vec::new(),
+        pruners: Vec::new(),
     });
 }
 
@@ -326,6 +340,72 @@ pub unsafe fn register_mutator_extra_area(walk: MutatorExtraWalkFn, data: *const
         .find(|entry| entry.thread_id == thread_id)
         .expect("register_mutator_extra_area called before register_mutator");
     entry.extra_areas.push(MutatorExtraArea { walk, data });
+}
+
+/// Append an owner-keyed-table pruner to the current registered mutator.
+///
+/// The ephemeron half of [`register_mutator_extra_area`]: a table whose keys are
+/// owner addresses and whose values a walker roots needs its dead-owner entries
+/// dropped, and needs it with the same per-mutator reach the root walk has.
+/// [`register_ephemeron_pruner`] cannot serve TLS-owned state — it hands the
+/// classifier no way to name a thread, so a major driven by one thread would
+/// leave every other thread's dead-owner entries pinned.
+///
+/// # Safety
+///
+/// Same as [`register_mutator_extra_area`]: `data` must stay valid until
+/// [`unregister_mutator`] runs on this thread, and `prune` must derive every
+/// address it dereferences from `data`, never from caller TLS.
+pub unsafe fn register_mutator_pruner(prune: MutatorPrunerFn, data: *const ()) {
+    let thread_id = std::thread::current().id();
+    let mut registry = MUTATOR_REGISTRY.lock().unwrap();
+    let entry = registry
+        .iter_mut()
+        .find(|entry| entry.thread_id == thread_id)
+        .expect("register_mutator_pruner called before register_mutator");
+    entry.pruners.push(MutatorPruner { prune, data });
+}
+
+/// Prune every registered mutator's owner-keyed tables during STW.
+///
+/// Called from the same pre-sweep point as [`prune_ephemeron_tables`] and with
+/// the same classifier; see that function for why only a major prunes. Callers
+/// pick between this and [`prune_my_mutator_areas`] on
+/// `gc_sync::mutators_quiesced()`, exactly as the root walk picks between
+/// [`walk_all_extra_areas`] and [`walk_my_extra_areas`] — so a collection's
+/// prune reach always equals its own root-walk reach.
+pub fn prune_all_mutator_areas(classify: &mut dyn FnMut(usize) -> Option<usize>) {
+    debug_assert!(
+        crate::gc_sync::mutators_quiesced(),
+        "prune_all_mutator_areas reaches foreign mutator TLS; caller must own collector-side STW",
+    );
+    let registry = MUTATOR_REGISTRY.lock().unwrap();
+    for mutator in registry.iter() {
+        for pruner in mutator.pruners.iter() {
+            // SAFETY: gc_sync has quiesced every registered owner, and each
+            // pruner's data remains valid until its MutatorEntry is removed.
+            unsafe { (pruner.prune)(pruner.data, classify) };
+        }
+    }
+}
+
+/// Prune the current mutator's owner-keyed tables.
+///
+/// The single-thread collection path, mirroring [`walk_my_extra_areas`]:
+/// callers without a registered mutator have no per-thread tables and are a
+/// no-op. A collection that only walked its own roots must only prune its own
+/// tables — another mutator's owner was never marked here, so its entries
+/// cannot be classified.
+pub fn prune_my_mutator_areas(classify: &mut dyn FnMut(usize) -> Option<usize>) {
+    let thread_id = std::thread::current().id();
+    let registry = MUTATOR_REGISTRY.lock().unwrap();
+    let Some(mutator) = registry.iter().find(|entry| entry.thread_id == thread_id) else {
+        return;
+    };
+    for pruner in mutator.pruners.iter() {
+        // SAFETY: this is the owning thread's synchronous collection path.
+        unsafe { (pruner.prune)(pruner.data, classify) };
+    }
 }
 
 /// Walk every registered mutator's opaque extra root areas during STW.
