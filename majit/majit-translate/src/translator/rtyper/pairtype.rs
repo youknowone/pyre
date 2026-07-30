@@ -390,6 +390,13 @@ fn dispatch_convert_from_to(
         // `NotImplemented`. The rtyper distinguishes different spec-func
         // Struct pointer types even within the same Repr subclass.
         (FunctionsPBCRepr, FunctionsPBCRepr) => same_lowleveltype_convert_from_to(r_from, r_to, v),
+        // rpbc.py:1220-1224 — pairtype(MethodsPBCRepr,
+        // MethodsPBCRepr).convert_from_to: upstream identity if
+        // `r_mpbc1.lowleveltype == r_mpbc2.lowleveltype`, else
+        // `NotImplemented`. Two structurally identical method families
+        // reach this with the same receiver Ptr lowleveltype (the
+        // instance the bound method carries), so the pass-through applies.
+        (MethodsPBCRepr, MethodsPBCRepr) => same_lowleveltype_convert_from_to(r_from, r_to, v),
         // rpbc.py:517-519 — pairtype(SmallFunctionSetPBCRepr,
         // FunctionRepr).convert_from_to: `return inputconst(Void, None)`.
         //   FunctionRepr is Void-typed; the Char source variable is
