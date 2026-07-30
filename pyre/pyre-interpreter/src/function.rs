@@ -673,12 +673,20 @@ pub unsafe fn builtin_function_set_module_attr(obj: PyObjectRef, value: PyObject
 /// in type dicts, never reach this, and keep `Function.__get__` to bind as
 /// methods.  App-level functions carry globals and are left alone.
 ///
+/// A function carrying instance attributes (`w_func_dict` populated) is also
+/// left alone: `BUILTIN_FUNCTION_TYPE` has no instance `__dict__` surface, so
+/// retagging would hide those attributes.  `itertools.chain` is a function-
+/// shaped constructor whose `from_iterable` alternate constructor is attached
+/// as an attribute (`itertools::register_module`), so demoting it would drop
+/// `chain.from_iterable` — kept binding here rather than lose the attribute.
+///
 /// # Safety
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 pub unsafe fn demote_module_function_to_builtin(obj: PyObjectRef) {
     unsafe {
         if py_type_check(obj, &FUNCTION_TYPE)
             && (*(obj as *const Function)).w_func_globals_obj.is_null()
+            && (*(obj as *const Function)).w_func_dict.is_null()
         {
             (*obj).ob_type = &BUILTIN_FUNCTION_TYPE as *const PyType;
             (*obj).w_class = pyre_object::pyobject::get_instantiate(&BUILTIN_FUNCTION_TYPE);
