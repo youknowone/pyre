@@ -991,11 +991,13 @@ pub fn all_immortal_w_class_only_descriptors()
     #[allow(unused_imports)]
     use pyre_object::lltype::PyreClassPyTypeOf;
     vec![
-        #[cfg(all(unix, feature = "host_env"))]
+        // `select` is compiled out of a sandbox build (`module/mod.rs:93`), so
+        // its descriptors carry that gate too.
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         <crate::module::select::interp_select::Poll as PyreClassPyTypeOf>::DESCRIPTOR,
-        #[cfg(all(target_os = "macos", feature = "host_env"))]
+        #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
         <crate::module::select::interp_kqueue::W_Kqueue as PyreClassPyTypeOf>::DESCRIPTOR,
-        #[cfg(all(target_os = "macos", feature = "host_env"))]
+        #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
         <crate::module::select::interp_kevent::W_Kevent as PyreClassPyTypeOf>::DESCRIPTOR,
     ]
 }

@@ -291,11 +291,13 @@ mod tests {
 
     #[test]
     fn w_array_gc_descriptor_traces_subclass_state() {
-        // Elements remain unboxed in the raw buffer; only the mapdict,
-        // weakref, and indexed-slot fields are traced.
+        // Elements remain unboxed in the raw buffer; the traced edges are the
+        // header `w_class` one every `#[pyre_class]` type reports plus the
+        // mapdict, weakref, and indexed-slot fields.
         assert_eq!(
             W_ARRAY_GC_PTR_OFFSETS,
             [
+                std::mem::offset_of!(W_Array, ob.w_class),
                 std::mem::offset_of!(W_Array, w_dict),
                 std::mem::offset_of!(W_Array, w_weakreflifeline),
                 std::mem::offset_of!(W_Array, w_slots),

@@ -63,7 +63,7 @@ pub mod sys {
     pub use ::libc::winsize;
     // Constants (added as sandbox-reachable modules need them).
     pub use ::libc::{
-        CODESET, EBADF, EINTR, EINVAL, F_OK, LC_ALL, LC_COLLATE, LC_CTYPE, LC_MESSAGES,
+        AT_FDCWD, CODESET, EBADF, EINTR, EINVAL, F_OK, LC_ALL, LC_COLLATE, LC_CTYPE, LC_MESSAGES,
         LC_MONETARY, LC_NUMERIC, LC_TIME, O_APPEND, O_CREAT, O_DSYNC, O_EXCL, O_NONBLOCK, O_RDONLY,
         O_RDWR, O_SYNC, O_TRUNC, O_WRONLY, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, R_OK, RUSAGE_SELF,
         S_IFDIR, S_IFMT, S_IFREG, SEEK_CUR, SEEK_END, SEEK_SET, TIOCGWINSZ, W_OK, WCONTINUED,
@@ -94,6 +94,16 @@ pub mod sys {
         _SC_XOPEN_CRYPT, _SC_XOPEN_ENH_I18N, _SC_XOPEN_LEGACY, _SC_XOPEN_REALTIME,
         _SC_XOPEN_REALTIME_THREADS, _SC_XOPEN_SHM, _SC_XOPEN_UNIX, _SC_XOPEN_VERSION,
         _SC_XOPEN_XCU_VERSION,
+    };
+    // `posix.pathconf_names`' `_PC_*` table. `libc` exports these on the BSD
+    // family only, so the table names them there and spells the glibc values
+    // out for Linux — this re-export carries the same gate.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub use ::libc::{
+        _PC_ALLOC_SIZE_MIN, _PC_ASYNC_IO, _PC_CHOWN_RESTRICTED, _PC_FILESIZEBITS, _PC_LINK_MAX,
+        _PC_MAX_CANON, _PC_MAX_INPUT, _PC_MIN_HOLE_SIZE, _PC_NAME_MAX, _PC_NO_TRUNC, _PC_PATH_MAX,
+        _PC_PIPE_BUF, _PC_PRIO_IO, _PC_REC_INCR_XFER_SIZE, _PC_REC_MAX_XFER_SIZE,
+        _PC_REC_MIN_XFER_SIZE, _PC_REC_XFER_ALIGN, _PC_SYMLINK_MAX, _PC_SYNC_IO, _PC_VDISABLE,
     };
 }
 

@@ -211,6 +211,7 @@ fn build_module(
         0,
         None, // nursery
         0,    // invalidated_flag_addr
+        0,    // gc_table_base
         0,    // fail_index_base
         0,    // external_jump_slot
         0,    // external_jump_key
@@ -583,10 +584,11 @@ fn test_guard_not_invalidated_loads_runtime_flag() {
         codegen::AllocHelpers::default(),
         0,
         None,
-        0x1000,
-        0,
-        0,
-        0,
+        0x1000, // invalidated_flag_addr
+        0,      // gc_table_base
+        0,      // fail_index_base
+        0,      // external_jump_slot
+        0,      // external_jump_key
         codegen::FrameGeometry::fixed(),
         codegen::CaParams::default(),
     )
