@@ -314,7 +314,7 @@ pub extern "C" fn pyre_stack_set_length_fraction(frac: f64) {
     let os_limit = stack_os_limit();
     if os_limit > 0 {
         let cap = os_limit - (os_limit >> 2);
-        if length > cap {
+        if cap > 0 && length > cap {
             length = cap;
         }
     }
