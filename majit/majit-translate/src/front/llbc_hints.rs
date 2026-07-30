@@ -142,6 +142,79 @@ pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> 
     out
 }
 
+/// Marker-const prefix `#[jit_immutable_fields]` leaves next to the
+/// annotated struct.  The const leaf with the prefix stripped is the
+/// struct name; the value is the comma-joined entry list.
+const IMMUTABLE_FIELDS_PREFIX: &str = "_immutable_fields_";
+
+/// Build a `{struct_name → [(field_name, rank)]}` map from the
+/// `_immutable_fields_<Struct>` marker consts present in `llbcs`.
+///
+/// RPython reads `cls._immutable_fields_` off the class object
+/// (`rclass.py:644-678 _parse_field_list`); the marker const is the
+/// ullbc-visible carrier for the same declaration, since the
+/// proc-macro attribute is consumed at expansion time and never
+/// reaches Charon's `attr_info`.
+///
+/// Both the bare struct name and the crate-stripped qualified path are
+/// inserted, mirroring `SemanticProgram.struct_fields`: the codewriter
+/// looks the declaration up by the analyzer's `owner_root`, which is
+/// the bare use-site identifier today and the qualified path once the
+/// use-import resolver lands.
+pub fn harvest_immutable_fields_from_llbcs(
+    llbcs: &[Llbc],
+) -> HashMap<String, Vec<(String, crate::model::ImmutableRank)>> {
+    let mut out: HashMap<String, Vec<(String, crate::model::ImmutableRank)>> = HashMap::new();
+    for llbc in llbcs {
+        for gd in llbc.iter_global_decls() {
+            let path = gd.item_meta.name_path();
+            let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+            let Some(struct_name) = leaf.strip_prefix(IMMUTABLE_FIELDS_PREFIX) else {
+                continue;
+            };
+            // Fail fast like the `oopspec_` arm: the macro emits a literal
+            // string, so an undecodable initializer is a marker
+            // encoding/decoder drift, not an absent declaration.  Silently
+            // dropping it would quietly demote every listed field back to
+            // mutable.
+            let joined = global_marker_str(llbc, gd).unwrap_or_else(|| {
+                panic!(
+                    "_immutable_fields_ marker `{path}` has an undecodable string \
+                     initializer; this signals a marker encoding/decoder drift"
+                )
+            });
+            let fields = parse_immutable_entry_list(&joined);
+            if fields.is_empty() {
+                continue;
+            }
+            let qualified = {
+                let stripped = strip_crate_prefix(&path);
+                match stripped.rsplit_once("::") {
+                    Some((module, _)) => format!("{module}::{struct_name}"),
+                    None => struct_name.to_string(),
+                }
+            };
+            for key in [struct_name.to_string(), qualified] {
+                out.entry(key).or_insert_with(|| fields.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Split the marker's comma-joined payload into `(field_name, rank)`
+/// pairs — `rclass.py:644-678 _parse_field_list` over the declared
+/// `_immutable_fields_` list.  The suffix grammar lives entirely in
+/// [`crate::model::ImmutableRank::parse`].
+fn parse_immutable_entry_list(joined: &str) -> Vec<(String, crate::model::ImmutableRank)> {
+    joined
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(crate::model::ImmutableRank::parse)
+        .collect()
+}
+
 fn should_skip_generated_elidable_helper(fn_name: &str) -> bool {
     fn_name.starts_with("_orig_") && fn_name.ends_with("_unlikely_name")
 }
@@ -310,7 +383,8 @@ fn decode_bool_const(value: &serde_json::Value) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_str_const, marker_path_to_fn_path};
+    use super::{decode_str_const, marker_path_to_fn_path, parse_immutable_entry_list};
+    use crate::model::ImmutableRank;
     use std::collections::HashSet;
 
     #[test]
@@ -337,6 +411,34 @@ mod tests {
             ),
             "rbigint::RBigInt::mul"
         );
+    }
+
+    #[test]
+    fn immutable_entry_list_parses_every_rank_suffix() {
+        // The payload shape `#[jit_immutable_fields]` writes into
+        // `_immutable_fields_<Struct>`: the declared entries joined by
+        // commas, each still carrying its `rclass.py:649-661` suffix.
+        assert_eq!(
+            parse_immutable_entry_list("_digits[*],_size,version?,defs_w?[*]"),
+            vec![
+                ("_digits".to_string(), ImmutableRank::ImmutableArray),
+                ("_size".to_string(), ImmutableRank::Immutable),
+                ("version".to_string(), ImmutableRank::QuasiImmutable),
+                ("defs_w".to_string(), ImmutableRank::QuasiImmutableArray),
+            ]
+        );
+    }
+
+    #[test]
+    fn immutable_entry_list_drops_blanks() {
+        assert_eq!(
+            parse_immutable_entry_list(" name , , instantiate "),
+            vec![
+                ("name".to_string(), ImmutableRank::Immutable),
+                ("instantiate".to_string(), ImmutableRank::Immutable),
+            ]
+        );
+        assert!(parse_immutable_entry_list("").is_empty());
     }
 
     #[test]

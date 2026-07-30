@@ -24,7 +24,21 @@ use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU64, Ordering};
 /// mirroring `assign_inheritance_ids` (normalizecalls.py:373-389).
 /// The JIT backend reads them at raw offsets — atomics are layout-
 /// compatible with their inner types (same size and alignment).
+/// `rclass.py:173-174` gives OBJECT_VTABLE `hints={'immutable': True,
+/// 'static_immutable': True}`, and `lltype.py:372-374 _immutable_field`
+/// answers `True` for *every* field of a struct carrying that hint, so
+/// each vtable slot reaches `descr.py:231 is_pure = STRUCT.
+/// _immutable_field(fieldname) != False` as a pure field.  Pyre's
+/// per-field spelling of the same declaration: all four slots are
+/// written once during startup (`assign_subclass_range` /
+/// `set_instantiate`, both before any bytecode runs) and never again.
 #[repr(C)]
+#[majit_macros::jit_immutable_fields(
+    "subclassrange_min",
+    "subclassrange_max",
+    "name",
+    "instantiate"
+)]
 pub struct PyType {
     pub subclassrange_min: AtomicI64,
     pub subclassrange_max: AtomicI64,

@@ -190,6 +190,15 @@ fn build_semantic_program_via_active_frontend(
             // RPython's translator reading `func._elidable_function_` off
             // the function object.
             merge_hints_from_llbcs(&mut program, &llbcs);
+            // Same carrier for the struct-level declaration:
+            // `#[jit_immutable_fields(...)]` leaves
+            // `_immutable_fields_<Struct>` next to the struct, which is
+            // read back here into the field the layout provider and
+            // `CallControl::field_immutability` consume — the analog of
+            // RPython reading `cls._immutable_fields_` off the class
+            // (`rclass.py:644-678 _parse_field_list`).
+            program.immutable_fields =
+                front::llbc_hints::harvest_immutable_fields_from_llbcs(&llbcs);
             // Re-source the unsafe-fn stub carrier from Charon: walk the
             // full LLBC set for every local `unsafe fn` / unsafe
             // impl-method projecting to a unit/bool return.  The consumer

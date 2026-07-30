@@ -1523,21 +1523,75 @@ fn parse_release_gil_save_err(attr: proc_macro2::TokenStream) -> syn::Result<i32
 ///
 /// Usage:
 /// ```ignore
-/// #[majit_macros::jit_immutable_fields(pools)]
+/// #[majit_macros::jit_immutable_fields("pools", "size?", "digits[*]")]
 /// pub struct Storage {
 ///     pub pools: [*mut Stack; STORAGE_COUNT],
 ///     ...
 /// }
 /// ```
 ///
-/// The proc-macro is a pass-through: it leaves the struct definition
-/// untouched and exists solely so `rustc` accepts the attribute. The
-/// codewriter front-end reads the struct's field list from the lowered
-/// MIR type metadata (`majit-translate::front::mir` `struct_field_attrs`)
-/// and feeds it into the struct layout / descr pipeline.
+/// Entries carry the `rclass.py:644-678 _parse_field_list` suffixes
+/// (`?` quasi-immutable, `[*]` immutable array); a bare identifier is
+/// accepted as shorthand for a plain immutable field.
+///
+/// The struct definition itself is left untouched.  Like the other
+/// `majit_macros` attributes, the attribute is consumed at expansion
+/// time and does not survive in Charon's `attr_info`, so the macro
+/// leaves a `#[doc(hidden)]` marker const
+/// `_immutable_fields_<Struct>: &str` next to the struct holding the
+/// comma-joined entry list.  Charon extracts it into `global_decls`,
+/// and `majit-translate::front::llbc_hints::
+/// harvest_immutable_fields_from_llbcs` reads it back into
+/// `SemanticProgram.immutable_fields` — the analog of RPython's
+/// translator reading `cls._immutable_fields_` off the class object.
 #[proc_macro_attribute]
-pub fn jit_immutable_fields(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    item
+pub fn jit_immutable_fields(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let entries = parse_macro_input!(attr as ImmutableFieldList);
+    let item_struct = parse_macro_input!(item as syn::ItemStruct);
+    let vis = &item_struct.vis;
+    let const_name = format_ident!("_immutable_fields_{}", item_struct.ident);
+    // `rclass.py:644-678 _parse_field_list` splits the declared list into
+    // (name, rank) pairs; the marker carries the list verbatim and the
+    // harvester does the splitting, so the suffix grammar stays in one
+    // place (`majit_translate::model::ImmutableRank::parse`).
+    let joined = entries.0.join(",");
+    quote! {
+        #item_struct
+
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals, dead_code)]
+        #vis const #const_name: &'static str = #joined;
+    }
+    .into()
+}
+
+/// `_immutable_fields_` entry list as written in the attribute —
+/// either string literals (`"size?"`, `"digits[*]"`) or bare
+/// identifiers for plain immutable fields.
+struct ImmutableFieldList(Vec<String>);
+
+impl Parse for ImmutableFieldList {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut entries = Vec::new();
+        while !input.is_empty() {
+            if input.peek(syn::LitStr) {
+                entries.push(input.parse::<syn::LitStr>()?.value());
+            } else {
+                entries.push(input.parse::<Ident>()?.to_string());
+            }
+            if input.is_empty() {
+                break;
+            }
+            input.parse::<Token![,]>()?;
+        }
+        if entries.is_empty() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "#[jit_immutable_fields] needs at least one field entry",
+            ));
+        }
+        Ok(Self(entries))
+    }
 }
 
 /// Mark a method (or free function) as elidable / pure.

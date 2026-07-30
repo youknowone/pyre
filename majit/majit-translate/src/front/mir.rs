@@ -298,8 +298,12 @@ fn normalize_module_filter(module_paths: &[&str]) -> Option<std::collections::Ha
 /// `known_trait_names`, `struct_fields`) is populated from
 /// `type_decls` / `trait_decls`; struct field-type strings are resolved
 /// by [`tyref_to_ast_string`] from Charon's type IR.  `immutable_fields`
-/// stays empty until the `#[majit_macros::immutable]` attribute is
-/// surfaced by Charon.
+/// is left empty here and filled by
+/// [`crate::front::llbc_hints::harvest_immutable_fields_from_llbcs`],
+/// which reads the `_immutable_fields_<Struct>` marker consts
+/// `#[majit_macros::jit_immutable_fields]` leaves in `global_decls` —
+/// the attribute itself is consumed at expansion time and never
+/// reaches Charon's `attr_info`.
 ///
 /// Functions Charon could not extract (opaque body / `null` entry) or
 /// global-initializer bodies are skipped silently — they are not JIT
