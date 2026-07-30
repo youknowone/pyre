@@ -659,15 +659,6 @@ pub fn next_call_descr_heapcache_index() -> u32 {
     NEXT_CALL_DESCR_HEAPCACHE_INDEX.fetch_add(1, Ordering::Relaxed)
 }
 
-/// descr.py:14-23 GcCache.
-///
-/// Per-type descriptor caches keyed by LLType (structural equality).
-/// Factory functions (get_size_descr, get_field_descr, etc.) check
-/// the cache first and return the existing object on hit.
-///
-/// setup_descrs() iterates caches in RPython's fixed order:
-///   _cache_size, _cache_field, _cache_array, _cache_arraylen,
-///   _cache_call, _cache_interiorfield
 /// Counters behind [`GcCache::field_position_census`]. Process-global like the
 /// gccache itself; only ever incremented under its lock.
 static FIELD_PARENT_ABSENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -677,6 +668,15 @@ static FIELD_INDEX_REDERIVED: std::sync::atomic::AtomicUsize =
 static FIELD_INDEX_UNRESOLVED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// descr.py:14-23 GcCache.
+///
+/// Per-type descriptor caches keyed by LLType (structural equality).
+/// Factory functions (get_size_descr, get_field_descr, etc.) check
+/// the cache first and return the existing object on hit.
+///
+/// setup_descrs() iterates caches in RPython's fixed order:
+///   _cache_size, _cache_field, _cache_array, _cache_arraylen,
+///   _cache_call, _cache_interiorfield
 pub struct GcCache {
     /// descr.py:18: _cache_size[STRUCT]
     pub _cache_size: HashMap<LLType, DescrRef>,
@@ -889,22 +889,6 @@ impl GcCache {
         descr
     }
 
-    /// descr.py:218-239 get_field_descr(gccache, STRUCT, fieldname).
-    ///
-    /// `struct_key`: LLType::Struct — the owning type identity.
-    /// `index_in_parent`: descr.py:228 heaptracker.get_fielddescr_index_in(STRUCT, fieldname).
-    ///   The structural slot number within the parent struct's field list.
-    ///   Caller must provide this — Rust has no heaptracker auto-discovery.
-    /// `flag`: descr.py:226 get_type_flag(FIELDTYPE).
-    ///
-    /// descr.py:234-238: parent_descr = get_size_descr(gccache, STRUCT, vtable).
-    /// Looked up from _cache_size[STRUCT]. Caller must ensure get_size_descr
-    /// was called first (matches RPython's call at descr.py:238).
-    ///
-    /// `display_name`: descr.py:227 `'%s.%s' % (STRUCT._name, fieldname)`.
-    /// Callers that know the owning struct's source name pass the full
-    /// `Owner.field` spelling; `None` falls back to the `T<type_id>.` stand-in
-    /// for the mint sites that only carry the numeric struct identity.
     /// Census of what `get_field_descr` found when it bound a field to a parent.
     ///
     /// `descr_set_absent` / `descr_set_ambiguous` cannot see any of this: they
@@ -923,6 +907,144 @@ impl GcCache {
             FIELD_PARENT_EMPTY.load(Relaxed),
             FIELD_INDEX_REDERIVED.load(Relaxed),
             FIELD_INDEX_UNRESOLVED.load(Relaxed),
+        ]
+    }
+
+    /// How many published parents still list no fields, and how many of those
+    /// are shadowing a layout this same cache already knows.
+    ///
+    /// `get_size_descr` returns on cache hit (`descr.py:108-109`), so whoever
+    /// publishes a key FIRST decides what every later consumer sees. Upstream
+    /// that is harmless because `descr.py:111-127` is the only producer and it
+    /// always builds the full `SizeDescr` before inserting. A pyre mint that
+    /// publishes a caller-sized, vtable-less shell — a shape `descr.py:111-116`
+    /// cannot produce — therefore silently outranks the real layout a later
+    /// producer would have installed.
+    ///
+    /// Returns `[published, fieldless, shadowing, aliased]`:
+    /// - `published` — `_cache_size` entries, the denominator.
+    /// - `fieldless` — entries whose `all_fielddescrs()` is empty. Benign on its
+    ///   own: a struct may legitimately have nothing the JIT indexes.
+    /// - `shadowing` — fieldless entries for which `_cache_field` holds fields
+    ///   under the SAME key. Not benign: the cache simultaneously knows the
+    ///   struct has fields and answers "it has none" to
+    ///   `all_fielddescrs_from_descr`, which is what `force_box` indexes.
+    /// - `aliased` — shadowing entries whose struct ALSO reaches this cache under
+    ///   some other key that did get a populated list. These are the ones the
+    ///   layout exists for; they are shells only because one struct is reachable
+    ///   under several identity keys. The rest are structs no producer ever
+    ///   published a layout for at all.
+    ///
+    /// The `shadowing` / `aliased` split is what decides where the fix belongs:
+    /// canonicalizing the identity keys fixes the first group and cannot fix the
+    /// second. `field_position_census`'s `parent_empty` cannot answer this — it
+    /// counts mint attempts, so one shell hit by many fields reads as many.
+    ///
+    /// `aliased` matches on SHAPE, not on name. The mint sites that publish
+    /// shells carry only the numeric struct identity, so their fields get
+    /// `get_field_descr`'s `T<type_id>.` stand-in display name; comparing those
+    /// against real `Owner.field` spellings can only ever report zero, which
+    /// would read as "no aliasing" when it means "nothing was compared". Same
+    /// declared size, and every cached field landing on a matching
+    /// `(offset, field_size)` slot, is a statement about the struct itself.
+    /// `aliased_multi` is the same match restricted to shells carrying at least
+    /// two cached fields. A one-field shell matches any populated struct of the
+    /// same size that happens to own that one slot, so `aliased` alone overstates
+    /// its case; the gap between the two is how much of the finding rests on
+    /// single-slot evidence.
+    pub fn size_shell_census(&self) -> [usize; 5] {
+        let mut populated: Vec<(usize, std::collections::HashSet<(usize, usize)>)> = Vec::new();
+        for descr in self._cache_size.values() {
+            let Some(sd) = descr.as_size_descr() else {
+                continue;
+            };
+            let slots = sd.all_fielddescrs();
+            if slots.is_empty() {
+                continue;
+            }
+            populated.push((
+                sd.size(),
+                slots.iter().map(|f| (f.offset(), f.field_size())).collect(),
+            ));
+        }
+
+        let mut fieldless = 0;
+        let mut shadowing = 0;
+        let mut aliased = 0;
+        let mut aliased_multi = 0;
+        for (key, descr) in &self._cache_size {
+            let Some(sd) = descr.as_size_descr() else {
+                continue;
+            };
+            if !sd.all_fielddescrs().is_empty() {
+                continue;
+            }
+            fieldless += 1;
+            let Some(cached) = self._cache_field.get(key).filter(|m| !m.is_empty()) else {
+                continue;
+            };
+            shadowing += 1;
+            let want: Vec<(usize, usize)> =
+                cached.values().map(|f| (f.offset, f.field_size)).collect();
+            if populated
+                .iter()
+                .any(|(size, slots)| *size == sd.size() && want.iter().all(|w| slots.contains(w)))
+            {
+                aliased += 1;
+                if want.len() > 1 {
+                    aliased_multi += 1;
+                }
+            }
+        }
+        [
+            self._cache_size.len(),
+            fieldless,
+            shadowing,
+            aliased,
+            aliased_multi,
+        ]
+    }
+
+    /// The owner names behind [`size_shell_census`]'s `shadowing` and
+    /// `populated` groups, so `aliased=0` can be read as a finding rather than
+    /// taken on faith.
+    ///
+    /// `get_field_descr` falls back to a `T<type_id>.` stand-in when a mint site
+    /// carries only the numeric struct identity, and a stand-in can never match a
+    /// real struct name. Without seeing the strings, an `aliased` of zero is
+    /// indistinguishable from an owner comparison that had nothing to compare.
+    ///
+    /// [`size_shell_census`]: Self::size_shell_census
+    pub fn size_shell_owner_sample(&self, limit: usize) -> Vec<String> {
+        fn owner_of(display_name: &str) -> &str {
+            display_name
+                .rsplit_once('.')
+                .map_or(display_name, |(o, _)| o)
+        }
+        let mut shell: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut populated: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for (key, descr) in &self._cache_size {
+            match descr.as_size_descr() {
+                Some(sd) if !sd.all_fielddescrs().is_empty() => {
+                    populated.extend(
+                        sd.all_fielddescrs()
+                            .iter()
+                            .map(|f| owner_of(f.field_name())),
+                    );
+                }
+                _ => {
+                    if let Some(m) = self._cache_field.get(key) {
+                        shell.extend(m.values().map(|f| owner_of(f.field_name())));
+                    }
+                }
+            }
+        }
+        let take = |s: &std::collections::BTreeSet<&str>| {
+            s.iter().take(limit).copied().collect::<Vec<_>>().join(",")
+        };
+        vec![
+            format!("shell_owners({}) {}", shell.len(), take(&shell)),
+            format!("populated_owners({}) {}", populated.len(), take(&populated)),
         ]
     }
 
@@ -970,6 +1092,22 @@ impl GcCache {
         }
     }
 
+    /// descr.py:218-239 get_field_descr(gccache, STRUCT, fieldname).
+    ///
+    /// `struct_key`: LLType::Struct — the owning type identity.
+    /// `index_in_parent`: descr.py:228 heaptracker.get_fielddescr_index_in(STRUCT, fieldname).
+    ///   The structural slot number within the parent struct's field list.
+    ///   Caller must provide this — Rust has no heaptracker auto-discovery.
+    /// `flag`: descr.py:226 get_type_flag(FIELDTYPE).
+    ///
+    /// descr.py:234-238: parent_descr = get_size_descr(gccache, STRUCT, vtable).
+    /// Looked up from _cache_size[STRUCT]. Caller must ensure get_size_descr
+    /// was called first (matches RPython's call at descr.py:238).
+    ///
+    /// `display_name`: descr.py:227 `'%s.%s' % (STRUCT._name, fieldname)`.
+    /// Callers that know the owning struct's source name pass the full
+    /// `Owner.field` spelling; `None` falls back to the `T<type_id>.` stand-in
+    /// for the mint sites that only carry the numeric struct identity.
     pub fn get_field_descr(
         &mut self,
         struct_key: LLType,
@@ -1056,9 +1194,7 @@ impl GcCache {
         // store against it.
         //
         // So take the index from the parent that will actually be indexed,
-        // rather than from whoever happened to call. Match on the cache key
-        // first and fall back to the offset, which identifies a field even when
-        // two producers spell its name differently.
+        // rather than from whoever happened to call.
         fd.index_in_parent =
             Self::derive_index_in_parent(parent.as_ref(), field_name, offset, index_in_parent)
                 .unwrap_or(index_in_parent);
@@ -5657,6 +5793,104 @@ mod register_keyed_size_authority_tests {
             survivor(runtime(), analyzer()),
             survivor(analyzer(), runtime())
         );
+    }
+
+    /// A published parent that lists nothing — what a mint installs when it
+    /// calls `get_size_descr(key, size, 0, false)`.
+    fn shell_descr(size: usize) -> DescrRef {
+        Arc::new(SimpleSizeDescr::new(u32::MAX, size, 0)) as DescrRef
+    }
+
+    /// `_cache_field[key]`, spelled the way a mint site spells it: the
+    /// `T<type_id>.` stand-in `get_field_descr` falls back to when the caller
+    /// carries only the numeric struct identity.
+    fn shell_fields(slots: &[(&str, usize)]) -> HashMap<String, Arc<SimpleFieldDescr>> {
+        slots
+            .iter()
+            .enumerate()
+            .map(|(i, (name, offset))| {
+                let fd = SimpleFieldDescr::new_with_name(
+                    i as u32,
+                    *offset,
+                    8,
+                    Type::Int,
+                    false,
+                    ArrayFlag::Signed,
+                    format!("T99.{name}"),
+                    (*name).to_string(),
+                );
+                ((*name).to_string(), Arc::new(fd))
+            })
+            .collect()
+    }
+
+    /// `size_shell_census` must match an aliased twin by SHAPE, never by name.
+    ///
+    /// The shells come from mint sites that carry only the numeric struct
+    /// identity, so their fields get the `T<type_id>.` stand-in spelling. An
+    /// owner-name comparison against the real `Owner.field` spellings can only
+    /// ever report zero, and a vacuous zero reads exactly like "no aliasing" —
+    /// which is how the first version of this census got the answer backwards.
+    #[test]
+    fn size_shell_census_matches_an_aliased_twin_by_shape_not_by_name() {
+        let mut gc = GcCache::new();
+        // One key that did get a layout, under real `Owner.field` names.
+        gc._cache_size
+            .insert(LLType::Struct(1), size_descr_at(7, 0, &[16, 24, 32]));
+        // A second key for the same struct: fields known, never listed.
+        let shell = LLType::Struct(2);
+        gc._cache_size.insert(shell.clone(), shell_descr(32));
+        gc._cache_field
+            .insert(shell, shell_fields(&[("a", 16), ("b", 24)]));
+
+        assert_eq!(
+            gc.size_shell_census(),
+            [2, 1, 1, 1, 1],
+            "the twin owns both cached slots at the same size, and two slots \
+             is more than single-slot evidence",
+        );
+    }
+
+    /// A shell whose slots no populated list owns is a producer gap, not an
+    /// aliasing artifact — the layout was never published anywhere. Conflating
+    /// the two would point the fix at the wrong task.
+    #[test]
+    fn size_shell_census_claims_no_twin_for_a_layout_nobody_published() {
+        let mut gc = GcCache::new();
+        gc._cache_size
+            .insert(LLType::Struct(1), size_descr_at(7, 0, &[16, 24, 32]));
+        let shell = LLType::Struct(2);
+        gc._cache_size.insert(shell.clone(), shell_descr(32));
+        gc._cache_field
+            .insert(shell, shell_fields(&[("a", 40), ("b", 48)]));
+
+        assert_eq!(gc.size_shell_census(), [2, 1, 1, 0, 0]);
+    }
+
+    /// One cached field matches any same-size struct that happens to own that
+    /// slot, so `aliased` alone overstates its case. `aliased_multi` is the
+    /// share that does not rest on single-slot evidence.
+    #[test]
+    fn size_shell_census_separates_single_slot_evidence() {
+        let mut gc = GcCache::new();
+        gc._cache_size
+            .insert(LLType::Struct(1), size_descr_at(7, 0, &[16, 24, 32]));
+        let shell = LLType::Struct(2);
+        gc._cache_size.insert(shell.clone(), shell_descr(32));
+        gc._cache_field.insert(shell, shell_fields(&[("a", 16)]));
+
+        assert_eq!(gc.size_shell_census(), [2, 1, 1, 1, 0]);
+    }
+
+    /// A fieldless parent with nothing cached under its key is just a struct
+    /// the JIT never indexed. It is `fieldless` but not `shadowing`, because
+    /// nothing is being contradicted.
+    #[test]
+    fn size_shell_census_does_not_call_an_unused_struct_a_shell() {
+        let mut gc = GcCache::new();
+        gc._cache_size.insert(LLType::Struct(2), shell_descr(32));
+
+        assert_eq!(gc.size_shell_census(), [1, 1, 0, 0, 0]);
     }
 
     /// The upgrade rule itself is unchanged when both sides carry a vtable.

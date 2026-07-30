@@ -623,13 +623,6 @@ pub fn descr_set_jit_stats() -> String {
     )
 }
 
-/// The same four numbers [`descr_set_jit_stats`] formats, as numbers.
-///
-/// Backends that cannot print a line reach the counters through here rather than
-/// re-deriving them, so the gated values cannot drift from the printed ones. The
-/// wasm guest has no stderr and exports these individually
-/// (`pyre_jit_descr_set_*` in `pyre-wasm`), which the runner prints on its
-/// behalf.
 /// The field-position census, as `[jit-stats]` key/value tokens.
 ///
 /// This sits next to `descr_set_*` because it answers the question those
@@ -647,15 +640,43 @@ pub fn descr_set_jit_stats() -> String {
 /// `optimizeopt/info.rs force_box`. Every one of those was, before this was
 /// derived rather than transported, either an out-of-range panic or a store
 /// emitted against a DIFFERENT field.
+///
+/// `size_shell_*` is the producer-side companion. `parent_empty` counts mint
+/// attempts that found a fieldless parent, so one shell hit by many fields reads
+/// as many; `size_shell_shadowing` counts the shells themselves, and only those
+/// for which this same cache already holds fields under the key. That is the
+/// state `descr.py` cannot reach: `get_size_descr` returns on cache hit, so a
+/// shell published first outranks the real layout for the rest of the run.
 pub fn field_position_jit_stats() -> String {
     let [parent_absent, parent_empty, rederived, unresolved] =
         majit_ir::descr::GcCache::field_position_census();
+    let ([published, fieldless, shadowing, aliased, aliased_multi], sample) = {
+        let gc = majit_ir::descr::gc_cache();
+        let guard = gc.lock().unwrap_or_else(|e| e.into_inner());
+        let sample = if std::env::var_os("PYRE_SIZE_SHELL_OWNERS").is_some() {
+            let lines = guard.size_shell_owner_sample(24);
+            format!("\n[jit-stats] {}", lines.join("\n[jit-stats] "))
+        } else {
+            String::new()
+        };
+        (guard.size_shell_census(), sample)
+    };
     format!(
         "field_pos_parent_absent={parent_absent} field_pos_parent_empty={parent_empty} \
-         field_pos_rederived={rederived} field_pos_unresolved={unresolved}"
+         field_pos_rederived={rederived} field_pos_unresolved={unresolved} \
+         size_shell_published={published} size_shell_fieldless={fieldless} \
+         size_shell_shadowing={shadowing} size_shell_aliased={aliased} \
+         size_shell_aliased_multi={aliased_multi}{sample}"
     )
 }
 
+/// The same four numbers [`descr_set_jit_stats`] formats, as numbers.
+///
+/// Backends that cannot print a line reach the counters through here rather than
+/// re-deriving them, so the gated values cannot drift from the printed ones. The
+/// wasm guest has no stderr and exports these individually
+/// (`pyre_jit_descr_set_*` in `pyre-wasm`), which the runner prints on its
+/// behalf.
 pub fn descr_set_counts() -> DescrSetCounts {
     let ledger = crate::descr::set_member_ledger();
     DescrSetCounts {
