@@ -106,6 +106,29 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Set once any thread has installed a per-thread GC box through
+/// [`install_gc_box`]. That path is test-only: production calls
+/// [`install_gc_standalone`], which leaves `DYNASM_ACTIVE_GC` `None` on every
+/// thread, so the flag stays `false` and the trampolines below reach
+/// `gc_sync` without a thread-local read plus a `RefCell` borrow first.
+///
+/// RPython has no per-thread allocator — the GC transformer weaves every
+/// `malloc` against the single translation-time `gcdata`
+/// (`gctransform/framework.py`) — so the box is pyre-side scaffolding and does
+/// not belong on the allocation path it does not serve.
+///
+/// Set-only, never cleared: [`clear_gc_allocator`] can run on one thread while
+/// another still owns a box, and clearing the flag would skip that live box.
+static GC_BOX_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether any thread may hold a `DYNASM_ACTIVE_GC` box. `false` means no
+/// thread can have one, so the read is skippable; `true` only means "probe it",
+/// never "this thread has one".
+#[inline]
+fn gc_box_possible() -> bool {
+    GC_BOX_INSTALLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Read-only GC query for the guard hooks and codegen helpers.
 ///
 /// - **Test box present** (`DYNASM_ACTIVE_GC` is `Some`): a test owns the
@@ -119,7 +142,9 @@ thread_local! {
 ///   returns `None` so callers keep their existing `.unwrap_or(default)`
 ///   / `.flatten()` behaviour.
 pub(crate) fn with_dynasm_active_gc<R>(f: impl Fn(&dyn majit_gc::GcAllocator) -> R) -> Option<R> {
-    if let Some(r) = DYNASM_ACTIVE_GC.with(|cell| cell.borrow().as_deref().map(&f)) {
+    if gc_box_possible()
+        && let Some(r) = DYNASM_ACTIVE_GC.with(|cell| cell.borrow().as_deref().map(&f))
+    {
         return Some(r);
     }
     if majit_gc::gc_sync::is_initialized() {
@@ -235,6 +260,7 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     // nursery is not the singleton's, so the process-wide published range can
     // no longer stand in for `is_nursery_object`.
     majit_gc::disarm_published_nursery();
+    GC_BOX_INSTALLED.store(true, std::sync::atomic::Ordering::Release);
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     DYNASM_ACTIVE_GC.with(|cell| {
         let mut guard = cell.borrow_mut();
@@ -369,16 +395,20 @@ pub(crate) fn new_via_gc_enabled() -> bool {
 /// `gc_alloc_nursery_shim`), including the process-global singleton; falls back
 /// to `malloc` when no GC is installed.
 pub(crate) extern "C" fn dynasm_new_alloc(size: usize) -> *mut u8 {
-    DYNASM_ACTIVE_GC.with(|cell| match cell.borrow_mut().as_deref_mut() {
-        Some(gc) => gc.alloc_nursery(size).0 as *mut u8,
-        None => {
-            if majit_gc::gc_sync::is_initialized() {
-                majit_gc::gc_sync::gc_op(|g| g.alloc_nursery(size).0 as *mut u8)
-            } else {
-                unsafe { libc::malloc(size) as *mut u8 }
-            }
-        }
-    })
+    if gc_box_possible()
+        && let Some(r) = DYNASM_ACTIVE_GC.with(|cell| {
+            cell.borrow_mut()
+                .as_deref_mut()
+                .map(|gc| gc.alloc_nursery(size))
+        })
+    {
+        return r.0 as *mut u8;
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        majit_gc::gc_sync::gc_op(|g| g.alloc_nursery(size).0 as *mut u8)
+    } else {
+        unsafe { libc::malloc(size) as *mut u8 }
+    }
 }
 
 /// Headerless no-collect nursery trampoline for backend-agnostic callers.
@@ -388,11 +418,13 @@ pub(crate) extern "C" fn dynasm_new_alloc(size: usize) -> *mut u8 {
 /// rather than the host heap, where its collector could not see it. Returns
 /// null when no GC is bound, leaving the caller on its own path.
 fn dynasm_alloc_nursery_headerless_no_collect(size: usize) -> GcRef {
-    if let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
-        c.borrow_mut()
-            .as_deref_mut()
-            .map(|g| g.alloc_nursery_headerless_no_collect(size))
-    }) {
+    if gc_box_possible()
+        && let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
+            c.borrow_mut()
+                .as_deref_mut()
+                .map(|g| g.alloc_nursery_headerless_no_collect(size))
+        })
+    {
         return r;
     }
     if majit_gc::gc_sync::is_initialized() {
@@ -416,11 +448,13 @@ fn dynasm_alloc_nursery_typed(type_id: u32, size: usize) -> GcRef {
     // collections that fire between here and the caller's store into a
     // tracked slot — and returns NULL when rawmalloc fails so the host helper
     // can raise `MemoryError`.
-    if let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
-        c.borrow_mut()
-            .as_deref_mut()
-            .map(|g| g.try_alloc_nursery_no_collect_typed(type_id, size))
-    }) {
+    if gc_box_possible()
+        && let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
+            c.borrow_mut()
+                .as_deref_mut()
+                .map(|g| g.try_alloc_nursery_no_collect_typed(type_id, size))
+        })
+    {
         return r;
     }
     majit_gc::gc_sync::gc_op(|g| g.try_alloc_nursery_no_collect_typed(type_id, size))
@@ -436,11 +470,17 @@ unsafe fn dynasm_alloc_nursery_typed_with_placement(
     size: usize,
     needs_write_barrier: *mut bool,
 ) -> GcRef {
-    if let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
-        c.borrow_mut().as_deref_mut().map(|g| unsafe {
-            g.try_alloc_nursery_no_collect_typed_with_placement(type_id, size, needs_write_barrier)
+    if gc_box_possible()
+        && let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
+            c.borrow_mut().as_deref_mut().map(|g| unsafe {
+                g.try_alloc_nursery_no_collect_typed_with_placement(
+                    type_id,
+                    size,
+                    needs_write_barrier,
+                )
+            })
         })
-    }) {
+    {
         return r;
     }
     majit_gc::gc_sync::gc_op(|g| unsafe {
@@ -456,11 +496,13 @@ unsafe fn dynasm_alloc_nursery_typed_with_placement(
 /// allocation — so the embedded minor cycle is safe and dead bigints are
 /// reclaimed instead of accumulating in old-gen.
 fn dynasm_alloc_nursery_collecting_typed(type_id: u32, size: usize) -> GcRef {
-    if let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
-        c.borrow_mut()
-            .as_deref_mut()
-            .map(|g| g.alloc_nursery_typed(type_id, size))
-    }) {
+    if gc_box_possible()
+        && let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
+            c.borrow_mut()
+                .as_deref_mut()
+                .map(|g| g.alloc_nursery_typed(type_id, size))
+        })
+    {
         return r;
     }
     majit_gc::gc_sync::gc_op(|g| g.alloc_nursery_typed(type_id, size))
@@ -480,11 +522,13 @@ unsafe fn dynasm_alloc_nursery_collecting_typed_rooted(
     root: *mut GcRef,
     needs_write_barrier: *mut bool,
 ) -> GcRef {
-    if let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
-        c.borrow_mut().as_deref_mut().map(|g| unsafe {
-            g.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
+    if gc_box_possible()
+        && let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
+            c.borrow_mut().as_deref_mut().map(|g| unsafe {
+                g.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
+            })
         })
-    }) {
+    {
         return r;
     }
     majit_gc::gc_sync::gc_op(|g| unsafe {
@@ -499,11 +543,13 @@ unsafe fn dynasm_alloc_nursery_collecting_typed_rooted(
 /// (non-moving), so the returned pointer is stable across minor and
 /// major collections.
 fn dynasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
-    if let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
-        c.borrow_mut()
-            .as_deref_mut()
-            .map(|g| g.alloc_oldgen_typed(type_id, size))
-    }) {
+    if gc_box_possible()
+        && let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
+            c.borrow_mut()
+                .as_deref_mut()
+                .map(|g| g.alloc_oldgen_typed(type_id, size))
+        })
+    {
         return r;
     }
     majit_gc::gc_sync::gc_op(|g| g.alloc_oldgen_typed(type_id, size))
@@ -676,11 +722,13 @@ fn dynasm_heap_stats() -> (usize, usize) {
 /// Report whether the GC wants a major collection, for the interpreter GC
 /// safepoint (incminimark.py:1288-1290 `threshold_reached`).
 fn dynasm_major_threshold_reached() -> bool {
-    if let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
-        c.borrow_mut()
-            .as_deref_mut()
-            .map(|g| g.major_threshold_reached())
-    }) {
+    if gc_box_possible()
+        && let Some(r) = DYNASM_ACTIVE_GC.with(|c| {
+            c.borrow_mut()
+                .as_deref_mut()
+                .map(|g| g.major_threshold_reached())
+        })
+    {
         return r;
     }
     majit_gc::gc_sync::gc_op(|g| g.major_threshold_reached())
@@ -733,14 +781,16 @@ fn dynasm_id_or_identityhash(addr: usize) -> usize {
     // Keep the defensive `try_borrow_mut`: a borrow already held by an
     // in-progress alloc means the test box is busy, so fall back to the
     // raw `addr` (this is a top-level op, never reentrant).
-    let via_box = DYNASM_ACTIVE_GC.with(|cell| {
-        let mut guard = match cell.try_borrow_mut() {
-            Ok(guard) => guard,
-            Err(_) => return Some(addr),
-        };
-        guard.as_deref_mut().map(|gc| gc.id_or_identityhash(addr))
+    let via_box = gc_box_possible().then(|| {
+        DYNASM_ACTIVE_GC.with(|cell| {
+            let mut guard = match cell.try_borrow_mut() {
+                Ok(guard) => guard,
+                Err(_) => return Some(addr),
+            };
+            guard.as_deref_mut().map(|gc| gc.id_or_identityhash(addr))
+        })
     });
-    if let Some(r) = via_box {
+    if let Some(Some(r)) = via_box {
         return r;
     }
     majit_gc::gc_sync::gc_op(|g| g.id_or_identityhash(addr))
@@ -764,6 +814,10 @@ fn dynasm_gc_owns_object(addr: usize) -> bool {
     //   - `Err`: the test box's mutable borrow is held by an in-progress
     //     alloc → reach it through the raw mirror (read-only), or fall
     //     back to `gc_sync` if there is no box at all.
+    if !gc_box_possible() {
+        return majit_gc::gc_sync::is_initialized()
+            && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr));
+    }
     match DYNASM_ACTIVE_GC.with(|c| {
         c.try_borrow()
             .map(|g| g.as_deref().map(|gc| gc.is_managed_heap_object(addr)))
@@ -790,13 +844,17 @@ fn dynasm_gc_owns_object(addr: usize) -> bool {
 }
 
 fn dynasm_gc_is_nursery_object(addr: usize) -> bool {
-    let via_box = DYNASM_ACTIVE_GC.with(|cell| match cell.try_borrow() {
-        Ok(guard) => guard.as_deref().map(|gc| gc.is_nursery_object(addr)),
-        Err(_) => DYNASM_ACTIVE_GC_RAW.with(|raw| {
-            raw.get()
-                .map(|ptr| unsafe { (&*ptr).is_nursery_object(addr) })
-        }),
-    });
+    let via_box = gc_box_possible()
+        .then(|| {
+            DYNASM_ACTIVE_GC.with(|cell| match cell.try_borrow() {
+                Ok(guard) => guard.as_deref().map(|gc| gc.is_nursery_object(addr)),
+                Err(_) => DYNASM_ACTIVE_GC_RAW.with(|raw| {
+                    raw.get()
+                        .map(|ptr| unsafe { (&*ptr).is_nursery_object(addr) })
+                }),
+            })
+        })
+        .flatten();
     via_box.unwrap_or_else(|| {
         if majit_gc::gc_sync::is_initialized() {
             majit_gc::gc_sync::gc_query_reentrant(|g| g.is_nursery_object(addr))

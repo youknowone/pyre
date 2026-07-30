@@ -254,7 +254,30 @@ thread_local! {
 /// - **No box, `gc_sync` uninitialized** (no GC at all — unit tests):
 ///   returns `None` so callers keep their existing `.unwrap_or(default)`
 ///   / `.flatten()` behaviour.
+/// Set once any thread has installed a per-thread GC box through
+/// [`install_gc_box`]. That path is test-only: production calls
+/// [`install_gc_standalone`], which leaves `WASM_ACTIVE_GC` `None` on every
+/// thread, so the flag stays `false` and the helpers below reach `gc_sync`
+/// without a thread-local read plus a `RefCell` borrow first. RPython weaves
+/// every `malloc` against the single translation-time `gcdata`
+/// (`gctransform/framework.py`) and has no per-thread allocator at all.
+///
+/// Set-only, never cleared: a clear can run on one thread while another still
+/// owns a box.
+static GC_BOX_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether any thread may hold a `WASM_ACTIVE_GC` box. `false` means no thread
+/// can have one; `true` only means "probe it".
+#[inline]
+fn gc_box_possible() -> bool {
+    GC_BOX_INSTALLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 fn with_wasm_active_gc<R>(f: impl Fn(&dyn GcAllocator) -> R) -> Option<R> {
+    if !gc_box_possible() {
+        return majit_gc::gc_sync::is_initialized()
+            .then(|| majit_gc::gc_sync::gc_query_reentrant(f));
+    }
     match WASM_ACTIVE_GC.with(|cell| cell.try_borrow().map(|g| g.as_deref().map(|gc| f(gc)))) {
         Ok(Some(r)) => return Some(r),
         Ok(None) => {}
@@ -279,7 +302,7 @@ fn with_wasm_active_gc<R>(f: impl Fn(&dyn GcAllocator) -> R) -> Option<R> {
 /// `None` so callers keep their non-GC fallback. Top-level mutator/
 /// blackhole trampolines, never inside a collection, so `gc_op` is correct.
 fn with_wasm_active_gc_mut<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Option<R> {
-    if WASM_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
+    if gc_box_possible() && WASM_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
         return WASM_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
             let raw: *mut dyn GcAllocator = guard.as_deref_mut()?;
@@ -349,6 +372,7 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     // Per-thread allocator: its nursery is not the singleton's, so the
     // process-wide published range can no longer answer `is_nursery_object`.
     majit_gc::disarm_published_nursery();
+    GC_BOX_INSTALLED.store(true, std::sync::atomic::Ordering::Release);
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     WASM_ACTIVE_GC.with(|cell| {
         let mut guard = cell.borrow_mut();
@@ -825,6 +849,10 @@ fn wasm_active_gc_write_barrier(obj: GcRef) {
 ///     mutation → reach it through the raw mirror (read-only), or fall
 ///     back to `gc_sync` if there is no box at all.
 fn wasm_gc_owns_object(addr: usize) -> bool {
+    if !gc_box_possible() {
+        return majit_gc::gc_sync::is_initialized()
+            && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr));
+    }
     match WASM_ACTIVE_GC.with(|cell| {
         cell.try_borrow()
             .map(|g| g.as_deref().map(|gc| gc.is_managed_heap_object(addr)))
