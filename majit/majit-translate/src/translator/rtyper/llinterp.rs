@@ -31,7 +31,7 @@ use crate::tool::ansi_print::AnsiLogger;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _address, _ptr, malloc, LowLevelType, LowLevelValue, MallocFlavor,
+    _address, _ptr, LowLevelType, LowLevelValue, MallocFlavor, malloc,
 };
 use crate::translator::rtyper::rtyper::RPythonTyper;
 use crate::translator::tool::taskengine::TaskError;
