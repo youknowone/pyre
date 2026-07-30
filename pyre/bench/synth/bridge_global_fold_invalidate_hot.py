@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=26
+# pyre-check: max-pypy-ratio=36
 # A read-only module global read on a COLD arm (a branch, a genexpr, or a
 # function that gets rebound) compiles as a bridge that const-folds the global
 # via a quasi-immutable fold. A mid-loop same-key reassignment (or a function

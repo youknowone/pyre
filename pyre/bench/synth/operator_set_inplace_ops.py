@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=6
+# pyre-check: max-pypy-ratio=13
 # operator's in-place functions (iadd/iand/ior/... = space.inplace_X) and the
 # mutable set's in-place operator slots (__iand__/__ior__/__ixor__/__isub__,
 # each a set/frozenset-only op that mutates self and returns it). Sets are

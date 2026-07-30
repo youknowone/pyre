@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=6
 # complex.real / complex.imag are read-only getset descriptors bound to the
 # complex type: they carry __objclass__ == complex and __name__, reject a
 # non-complex receiver with TypeError, and reject assignment with

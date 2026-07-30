@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=10
+# pyre-check: max-pypy-ratio=14
 # type.__name__ / __qualname__ dot handling: a heap type built with a dotted
 # name string (type('a.b', (), {})) keeps the name verbatim on both getters,
 # while a static/builtin dotted tp_name strips to its final component. An

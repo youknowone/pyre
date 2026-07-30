@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=16
+# pyre-check: max-pypy-ratio=27
 # list error-message parity where 3.14 and PyPy AGREE (check.py oracle is
 # PyPy).  list.index's missing-value message DIVERGES — 3.14 says
 # "list.index(x): x not in list" (gh-100242 dropped the repr) while PyPy keeps

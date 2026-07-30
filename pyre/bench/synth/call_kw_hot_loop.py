@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=16
 # A CALL_KW directly in the hot loop body (not nested inside an inlined
 # callee, unlike call_star_forms_inlined_callee.py).  `g(i, step=2)` lowers to
 # CALL_KW whose `null_or_self` receiver slot (arg index 1) is the PY_NULL

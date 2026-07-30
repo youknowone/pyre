@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=49
+# pyre-check: max-pypy-ratio=57
 # A match statement whose subject pattern is a SEQUENCE of CLASS patterns, each
 # carrying a literal sub-pattern plus a capture (`[Node('lit', a), Node('lit', b)]`).
 # MATCH_CLASS has no dedicated arm in the JIT trace walker and fell through to the

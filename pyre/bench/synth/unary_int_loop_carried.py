@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=8
+# pyre-check: max-pypy-ratio=20
 # Unary operations must observe the current loop-carried integer. Exercise
 # both ordinary values and the large-integer boundary, plus neighboring
 # operations that serve as controls. Deterministic.

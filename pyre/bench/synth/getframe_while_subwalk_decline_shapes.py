@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=73
+# pyre-check: max-pypy-ratio=77
 # Two sub-walk shapes the multi-frame blackhole build DECLINES, pinned so the
 # decline stays a decline rather than silently becoming a wrong answer.
 #

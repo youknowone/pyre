@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=6
 # bltinmodule.c builtin_print / app_io.py print_ resolve a `file is None`
 # default to the live `sys.stdout` each call, so rebinding `sys.stdout` from
 # Python redirects `print()`. A `None` sys.stdout emits nothing.

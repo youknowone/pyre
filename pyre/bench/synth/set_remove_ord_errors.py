@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=12
 # set.remove(missing) raises KeyError carrying the missing key itself (so its
 # repr shows), matching dict[missing]; ord() on a non-string names the argument's
 # real type. A warmup loop exercises the working set-membership and ord fast

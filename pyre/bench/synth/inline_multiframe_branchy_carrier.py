@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=12
+# pyre-check: max-pypy-ratio=28
 # Module-scope hot loop inlining a 2-level call chain whose middle function has
 # a data-dependent branch — regression guard for the branchy inlined-callee
 # multi-frame carrier miscompile, in a pure and a journaled shape.

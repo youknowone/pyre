@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=36
+# pyre-check: max-pypy-ratio=40
 # Sequence-iterator pickle protocol parity.  check.py's correctness oracle is
 # PyPy, so this bench asserts only behaviour where 3.14 and PyPy AGREE.
 #

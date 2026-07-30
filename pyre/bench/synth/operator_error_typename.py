@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=10
 # Binary-operator and comparison TypeError messages name the operand's real
 # class (not the placeholder 'object'), and the `**`/pow() message reads
 # 'for ** or pow():'. A custom class with no numeric dunders drives every

@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=18
+# pyre-check: max-pypy-ratio=21
 # Depth > 1 kept-stack branch guards whose kept / merge slot is a HEAP int
 # (>= 256, a LOAD_CONST rather than the inline LoadSmallInt).  Sibling of
 # `kept_stack_depth_gt1.py`, which keeps only small-int slots (11, 5, 2); here

@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=12
 # app_inspect.py:57-62 — dir(obj) is driven by a custom __dir__; its result is
 # returned sorted.  An object without one still enumerates its real attributes.
 

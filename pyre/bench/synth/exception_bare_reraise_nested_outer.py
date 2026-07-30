@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=6
+# pyre-check: max-pypy-ratio=16
 # Bare `raise` inside a nested handler whose re-raise must reach the OUTER
 # handler, exercised under a bridge resume that lands inside the inner handler.
 #

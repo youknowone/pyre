@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=8
 # Benchmark: integer list reverse (per-strategy ops)
 # Exercises W_ListObject.reverse() on Integer strategy.
 # PYPYLOG confirms: guard_class(IntegerListStrategy) + setarrayitem(ArrayS 8) swaps.

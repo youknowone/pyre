@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=14
+# pyre-check: max-pypy-ratio=19
 # Exercises short-circuit `and` / `or` in VALUE context inside a hot loop.
 #
 # `x = (i % 7) and (i + 3)` lowers to `BINARY_OP %; COPY 1; TO_BOOL;

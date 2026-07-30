@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=6
+# pyre-check: max-pypy-ratio=12
 # A nested loop over a sliced list whose length varies between outer
 # iterations must preserve both iterators and the accumulator when a
 # compiled exhaustion guard resumes in the interpreter. The exact

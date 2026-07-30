@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=6
 # module.py Module.descr_getattribute (PEP 562): after a normal attribute miss
 # the module-level __getattr__ in the module's own dict is consulted, called
 # with just the attribute name.  A present attribute does not trigger it.

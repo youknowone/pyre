@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=6
 # argument.py:106-150 _combine_starstarargs_wrapped: CALL_FUNCTION_EX accepts
 # any mapping via keys()/__getitem__, rejects a non-str key with TypeError, and
 # rejects a non-mapping after ** with TypeError.

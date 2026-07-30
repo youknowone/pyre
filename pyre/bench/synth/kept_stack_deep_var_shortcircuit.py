@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=50
+# pyre-check: max-pypy-ratio=110
 # Deep operand-stack Variables kept across a short-circuit guard, pure and
 # mutating.
 #

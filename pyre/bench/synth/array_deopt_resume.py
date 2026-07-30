@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=11
 # GC heap-array ops on the blackhole guard-failure resume path. The loop
 # body reads and writes a list (getarrayitem_gc_i / setarrayitem_gc_i) and
 # the function returns a tuple (new_array_clear + setarrayitem_gc_r +

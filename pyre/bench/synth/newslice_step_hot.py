@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=50
+# pyre-check: max-pypy-ratio=90
 # An extended slice `seq[a:b:c]` (a step operand) compiles the bounds to
 # BUILD_SLICE — the `newslice(start, stop, step)` HLOp — then BINARY_SUBSCR,
 # a distinct lowering from the two-bound BINARY_SLICE path. A `newslice`

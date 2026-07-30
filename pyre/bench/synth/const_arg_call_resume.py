@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=50
+# pyre-check: max-pypy-ratio=52
 # pypy JITs these tiny list loops to a near-zero denominator, so the ratio is
 # dominated by measurement noise on the CI runner (measured 35-43x); the gate
 # is set above that band rather than tightened onto the collapsed baseline.

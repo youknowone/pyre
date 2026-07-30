@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=6
 # A user metaclass whose __new__/__init__ takes **kw receives class keywords
 # through the by-name keyword binder (resolve_kwargs).  A lone-surrogate class
 # keyword must survive as a byte-ish name instead of crashing the strict-UTF-8

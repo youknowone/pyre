@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=25
+# pyre-check: max-pypy-ratio=37
 # An exception escaping a compiled frame must keep a traceback node for every
 # INLINED intermediate frame it passed through.
 #

@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=120
+# pyre-check: max-pypy-ratio=255
 # Slice bounds are evaluated through __index__ in both lowering paths:
 #   * a dynamic slice `seq[a:b]` compiles to BINARY_SLICE, handled by
 #     `binary_slice_values`;

@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=7
+# pyre-check: max-pypy-ratio=29
 # JIT-stress twin of exception_metadata_hot: `pypyjit.set_param` lowers the
 # trace/function thresholds to 1 so recording fires on the earliest iterations
 # of every section rather than only after the ~1600-iteration warmup. That

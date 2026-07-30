@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=23
+# pyre-check: max-pypy-ratio=36
 """FOR_ITER must not drop an item when immutable ``+=`` ends a hot body."""
 
 

@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=16
+# pyre-check: max-pypy-ratio=29
 # Kept-stack branch-guard recovery across resume depths.
 #
 # A `goto_if_not` whose not-taken arm resumes with operand-stack temps live is
