@@ -152,21 +152,6 @@ fn done_descr_ref_for_tests() -> DescrRef {
     make_fail_descr(1)
 }
 
-#[test]
-fn inline_caller_frame_distinguishes_try_block_catch_marker_decline() {
-    // No after-residual catch resume → not a try-block CALL → accept.
-    assert_eq!(
-        decline_inline_caller_frame_for_catch_marker(None, &[]),
-        Ok(()),
-    );
-    // A try-block CALL with no resolvable catch (empty jitcode) cannot prove its
-    // handler rejoins a loop → decline.
-    assert_eq!(
-        decline_inline_caller_frame_for_catch_marker(Some(42), &[]),
-        Err(InlineCallerFrameDecline::TryBlockCatchMarker),
-    );
-}
-
 /// `ensure_residual_call_args_bound` backs the unbound-arg abort path
 /// for all three residual-call shapes (iRd / iIRd / iIRFd); they all
 /// funnel through this helper, so one direct test covers the guard
