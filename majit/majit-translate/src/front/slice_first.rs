@@ -231,8 +231,14 @@ fn rewire_one_slice_first_site(
         result: Some(elem.clone()),
         kind: OpKind::ArrayRead {
             base: slice_in_then,
+            // The element read and the `Some::__pos_0` field write below
+            // consume the same `elem`, so the read's declared element type
+            // must be the payload type the field carries (`site.payload_ty`,
+            // `Ref(None)` for `Option<&PyObjectRef>`) — a hardcoded `Ref(None)`
+            // would disagree for any instantiation whose payload projects to
+            // another `ValueType`.
+            item_ty: site.payload_ty.clone(),
             index: idx0,
-            item_ty: ValueType::Ref(None),
             array_type_id: None,
             nolength: false,
             pure: false,
