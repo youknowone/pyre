@@ -266,6 +266,15 @@ pub struct PendingAbortBlackhole {
     pub scalar_values: Vec<i64>,
     /// `JitState::collect_ref_scalar_state_field_values`.
     pub ref_scalar_values: Vec<i64>,
+    /// `metainterp.last_exc_value` as `blackhole.py:1811-1814` reads it —
+    /// snapshotted at the abort because the accounting that follows clears the
+    /// tracing state it lives on.  `0` for a null exception.
+    pub last_exc_value: i64,
+    /// `SwitchToBlackhole.raising_exception` (`history.py:37-43`): true when the
+    /// abort was raised at a point where `last_exc_value` is still *supposed to
+    /// be raised*, so the conversion hands it to the chain instead of merely
+    /// copying it into the first frame's `exception_last_value`.
+    pub raising_exception: bool,
 }
 
 /// Run a tracing MIFrame chain through the structured multi-frame blackhole
@@ -1526,18 +1535,27 @@ impl<S: JitState> JitDriver<S> {
                 }
             }
         }
-        // call.py:147 `jd.mainjitcode = self.get_jitcode(jd.portal_graph)` — the
-        // portal JitCode belongs to the driver's static data, not to the runtime
-        // driver. The back-pointer of call.py:148 has no counterpart here: the
-        // metainterp-side `JitCode` carries no `jitdriver_sd` slot (only the
-        // translate-side one does, via `set_jitdriver_sd`), so the slot index
-        // below is the link in that direction.
+        // call.py:147-148 `grab_initial_jitcodes`:
+        //
+        //     jd.mainjitcode = self.get_jitcode(jd.portal_graph)
+        //     jd.mainjitcode.jitdriver_sd = jd
+        //
+        // Both directions, as upstream sets them: the driver's static data owns
+        // the portal JitCode, and the portal JitCode names its driver back.
         // `call.py:46-47 jd.index = idx` is this driver's own slot — the macro's
         // install pipeline runs `ensure_descriptor_registered` before reaching
         // here, so it is assigned. Fall back to the single-portal slot 0 only
         // when a consumer skipped that step.
         self.ensure_descriptor_registered();
         let portal_jd_index = self.index().unwrap_or(0);
+        // The back-pointer is what makes this jitcode a *portal* jitcode to
+        // every reader of `JitCode::jitdriver_sd`: `pyjitpl.py:2451
+        // is_main_jitcode`, `pyjitpl.py:1279 _try_tco`'s portal-frame opt-out,
+        // and `blackhole.py:1764`'s walk up a blackhole chain, which without it
+        // runs off the bottom of a `#[jit_interp]` frontend's chain instead of
+        // stopping at its root.  Translation-side jitcodes get it from
+        // `codewriter.rs:1036`; this is the macro frontend's equivalent.
+        dispatch_arc.set_jitdriver_sd(portal_jd_index);
         self.meta
             .jitdriver_sd_mut(portal_jd_index)
             .expect("register_dispatch_jitcode: this driver's jitdrivers_sd slot is vacant")
@@ -1910,6 +1928,8 @@ impl<S: JitState> JitDriver<S> {
             mut framestack,
             scalar_values,
             ref_scalar_values,
+            last_exc_value,
+            raising_exception,
         } = pending;
         let layout = state.state_field_layout();
         if layout.num_vable_identity_slots != 0 || !layout.array_lens.is_empty() {
@@ -1958,11 +1978,8 @@ impl<S: JitState> JitDriver<S> {
             0,
             0,
             staticdata,
-            // `stb.raising_exception` is not carried across the abort boundary
-            // yet (see the `merge_point` Abort arm), so the chain starts with
-            // no pending exception.
-            0,
-            false,
+            last_exc_value,
+            raising_exception,
             None,
             None,
         );
@@ -3320,22 +3337,23 @@ impl<S: JitState> JitDriver<S> {
                 // `convert_and_run_from_pyjitpl(self, stb.raising_exception)`
                 // — is staged below into `MetaInterp::pending_abort_blackhole`
                 // and run by [`JitDriver::run_pending_abort_blackhole`], which
-                // is the first point that also holds native `state`.
-                //
-                // `stb.raising_exception` (`pyjitpl.py:3391-3393`: a
-                // virtualizable-escape abort carries the forcing residual's
-                // pending exception into the blackhole) is not staged with it
-                // yet: `TraceCtx::pending_switch_to_blackhole` records the
-                // reason but no exception value, so the conversion runs with
-                // `raising_exception = false` and an escape abort still drops
-                // the helper-side exception at this boundary.
-                let pending_reason = self
+                // is the first point that also holds native `state`.  Both
+                // halves read the same drained `stb`, so take it whole rather
+                // than just its reason.
+                let pending_stb = self
                     .meta
                     .tracing
                     .as_mut()
-                    .and_then(|t| t.pending_switch_to_blackhole.take())
-                    .map(|stb| stb.reason);
-                let reason_int = match pending_reason {
+                    .and_then(|t| t.pending_switch_to_blackhole.take());
+                // `history.py:37-43`: false unless the abort site raised at a
+                // point where `last_exc_value` still has to be raised
+                // (`pyjitpl.py:3389-3390` vable escape, `pyjitpl.py:3714-3716`
+                // `do_not_in_trace_call`).  The `ABORT_TOO_LONG` path below has
+                // no `stb` at all and defaults to false, as upstream's
+                // `SwitchToBlackhole(ABORT_TOO_LONG)` does.
+                let abort_raising_exception =
+                    pending_stb.as_ref().is_some_and(|stb| stb.raising_exception);
+                let reason_int = match pending_stb.map(|stb| stb.reason) {
                     Some(r) => r,
                     None => self
                         .meta
@@ -3389,6 +3407,13 @@ impl<S: JitState> JitDriver<S> {
                                 framestack,
                                 scalar_values: S::collect_scalar_state_field_values(sym),
                                 ref_scalar_values: S::collect_ref_scalar_state_field_values(sym),
+                                // `blackhole.py:1811-1814` reads
+                                // `metainterp.last_exc_value` at conversion
+                                // time; snapshot it here because
+                                // `abort_trace_live` below tears down the
+                                // tracing state it belongs to.
+                                last_exc_value: self.meta.last_exc_value,
+                                raising_exception: abort_raising_exception,
                             });
                         }
                     }

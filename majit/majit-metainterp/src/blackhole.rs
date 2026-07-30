@@ -2470,32 +2470,15 @@ fn handle_jitexception(
     mut bh: BlackholeInterpreter,
     exc: JitException,
     portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
-    mut terminal_out: Option<&mut Option<BlackholeTerminalImage>>,
+    terminal_out: Option<&mut Option<BlackholeTerminalImage>>,
 ) -> Result<(BlackholeInterpreter, i64), JitException> {
     // blackhole.py:1764: while blackholeinterp.jitcode.jitdriver_sd is None
     while bh.jitcode.jitdriver_sd().is_none() {
         let next = bh.nextblackholeinterp.take();
+        builder.release_interp(bh);
         match next.map(|b| *b) {
-            Some(caller) => {
-                builder.release_interp(bh);
-                bh = caller;
-            }
-            None => {
-                // No frame in the chain names a jitdriver.  Upstream cannot
-                // reach this: `call.py:147` pairs `jd.mainjitcode` with
-                // `jitcode.jitdriver_sd`, so the portal frame always stops the
-                // walk.  A `#[jit_interp]` dispatch JitCode carries no such
-                // slot (`JitDriver::register_dispatch_jitcode` links only the
-                // `mainjitcode` direction), so its chain runs off the end here.
-                // The frame reached last is still the one the exception escaped
-                // from, which is what the terminal image means — take it before
-                // the release recycles the banks.
-                if let Some(terminal_out) = terminal_out.take() {
-                    *terminal_out = Some(BlackholeTerminalImage::take_from(&mut bh));
-                }
-                builder.release_interp(bh);
-                return Err(exc);
-            }
+            Some(caller) => bh = caller,
+            None => return Err(exc), // no portal found
         }
     }
 
@@ -3947,6 +3930,58 @@ mod tests {
         /// frame that DOES have a caller — the recursive-portal arm.
         /// Re-entering `inner` instead would run its tail a second time
         /// and overwrite the portal runner's result with `inner`'s own.
+        /// `blackhole.py:1764-1769`: the walk up the chain stops at the frame
+        /// whose jitcode names a jitdriver, and a bottommost such frame
+        /// publishes its terminal image before the exception propagates.
+        ///
+        /// That only holds because `call.py:148` gives every portal jitcode its
+        /// `jitdriver_sd` back-pointer.  Without it the walk runs off the end of
+        /// the chain and returns through the "no portal found" arm, where the
+        /// image is never taken — which is what a `#[jit_interp]` frontend saw
+        /// before `JitDriver::register_dispatch_jitcode` set the slot.
+        #[test]
+        fn handle_jitexception_publishes_terminal_only_when_a_frame_names_its_jitdriver() {
+            let build_chain = |portal: bool| {
+                let mut b = JitCodeBuilder::default();
+                b.load_const_i_value(0, 42);
+                b.int_return(0);
+                let jitcode = b.finish();
+                jitcode.set_index(0);
+                if portal {
+                    jitcode.set_jitdriver_sd(0);
+                }
+                jitcode
+            };
+
+            for portal in [true, false] {
+                let mut builder = super::build_inline_call_only_bh_builder();
+                let mut bh = builder.acquire_interp();
+                bh.setposition(std::sync::Arc::new(build_chain(portal)), 0);
+                bh.registers_i[0] = 42;
+
+                let mut terminal = None;
+                let outcome = super::handle_jitexception(
+                    &mut builder,
+                    bh,
+                    crate::jitexc::JitException::DoneWithThisFrameInt(42),
+                    None,
+                    Some(&mut terminal),
+                );
+                assert!(
+                    outcome.is_err(),
+                    "a bottommost frame always propagates the exception",
+                );
+                assert_eq!(
+                    terminal.is_some(),
+                    portal,
+                    "terminal image published for portal={portal}",
+                );
+                if let Some(terminal) = terminal {
+                    assert_eq!(terminal.registers_i[0], 42);
+                }
+            }
+        }
+
         #[test]
         fn run_forever_steps_past_the_portal_frame_after_handle_jitexception() {
             let mut sub = JitCodeBuilder::default();
