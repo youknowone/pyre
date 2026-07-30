@@ -611,6 +611,42 @@ def synth_perf_gate(path):
     return None
 
 
+def synth_skip_backends(path):
+    """Read an optional per-fixture backend exemption from its header:
+        # pyre-check: skip-backends=wasm
+
+    For a fixture that guards a mechanism a backend does not implement at
+    all, so the fixture can only ever restate that known gap. The named
+    backends print `skip` instead of running, the way
+    `run_bench(skip_backends=...)` already does.
+
+    This is not a way to park a failure: the header line must be followed by
+    a comment saying which mechanism is missing, so the exemption is
+    reviewable next to the workload. Unknown backend names are an error, not
+    a silent no-op — a typo would otherwise read as "exempted".
+    """
+    prefix = "# pyre-check: skip-backends="
+    with open(path, encoding="utf-8") as source:
+        for _ in range(20):
+            line = source.readline()
+            if not line:
+                break
+            if not line.startswith(prefix):
+                continue
+            names = [n.strip() for n in line[len(prefix):].split(",")]
+            names = [n for n in names if n]
+            if not names:
+                raise ValueError(f"empty synthetic backend exemption in {path}: {line.strip()}")
+            unknown = [n for n in names if n not in ALL_BACKENDS]
+            if unknown:
+                raise ValueError(
+                    f"unknown backend(s) {unknown} in synthetic backend exemption in {path}: "
+                    f"{line.strip()}"
+                )
+            return tuple(names)
+    return ()
+
+
 def default_binary(backend):
     name = CARGO_CONFIG[backend]["bin"]
     return f"./target/release/{name}{EXE}"
@@ -1509,6 +1545,7 @@ class Check:
         effective_timeout = scaled_timeout(timeout, self.args.timeout_scale)
         try:
             max_pypy_ratio = synth_perf_gate(path)
+            skip_backends = synth_skip_backends(path)
         except ValueError as e:
             print(f"{red('ERROR')}: {e}")
             sys.exit(1)
@@ -1560,6 +1597,14 @@ class Check:
 
         for backend in ALL_BACKENDS:
             if not self.enabled(backend):
+                continue
+            # `# pyre-check: skip-backends=` — the fixture guards a mechanism
+            # this backend does not implement, so running it here would only
+            # restate that gap.
+            if backend in skip_backends:
+                sys.stdout.write(f"    {backend:<10s}")
+                print(dim("skip"))
+                self._append_comparison(backend, name, t_cpython, t_pypy, "skip")
                 continue
             # wasm carries no perf-ratio gate, matching `run_bench` (which has no
             # `wasm_vs_*` parameter at all): it legitimately runs a few× slower

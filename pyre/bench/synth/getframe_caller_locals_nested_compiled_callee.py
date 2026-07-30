@@ -12,6 +12,16 @@
 #      went through an allocator that could not materialize the virtual the
 #      slot named -- and a null slot reads back as an ABSENT name, so
 #      `f_locals['acc']` raised KeyError instead of returning a value.
+#
+# pyre-check: skip-backends=wasm
+# The wasm backend cannot force a running frame at all, so it reaches neither
+# defect: `OpCode::ForceToken` lowers to a literal `0` sentinel
+# (`majit-backend-wasm/src/codegen.rs:4225`), so the compiled loop stores 0 into
+# `vable_token` and `force_virtualizable_if_necessary` never forces; and the
+# backend does not override `force()` (`majit-backend/src/lib.rs:2170` returns
+# None), so it has no deadframe to decode if it did. wasm keeps loop state in
+# wasm locals rather than a heap jitframe, so a mid-execution force is a wasm
+# backend epic of its own, not a variant of the two defects above.
 import sys
 
 
