@@ -1717,11 +1717,25 @@ impl<'a> AssemblerARM64<'a> {
             ; sub x16, x16, 8           // ip0 -= WORD
             ; ldr x29, [x16]            // fp = *(top - WORD) = jf_ptr
         );
-        // aarch64/assembler.py:972-976 `_reload_frame_if_necessary`:
+        // aarch64/assembler.py:975-980 `_reload_frame_if_necessary`:
         // after a collecting helper call, re-apply the non-array write
         // barrier fast path on the current jitframe (`is_frame=True`).
-        let loc_base = crate::aarch64::registers::FP;
-        self.emit_write_barrier_fastpath_for_base(loc_base, false, None);
+        //
+        //     wbdescr = self.cpu.gc_ll_descr.write_barrier_descr
+        //     if gcrootmap and wbdescr:
+        //
+        // The `and wbdescr` is load-bearing: a collector that needs no write
+        // barrier reports none (`gc.py:156 GcLLDescr_boehm.write_barrier_descr
+        // = None`), and there is no barrier to re-apply for it. Calling
+        // through regardless is what `emit_write_barrier_fastpath_for_base`
+        // asserts against, and it reaches here from every collecting helper —
+        // `genop_call_malloc_nursery*` included — not only from a
+        // `COND_CALL_GC_WB` the GC rewriter emitted. The x86 counterpart
+        // already spells this gate as `if let Some(wb) = wb_descr`.
+        if crate::runner::dynasm_write_barrier_descr().is_some() {
+            let loc_base = crate::aarch64::registers::FP;
+            self.emit_write_barrier_fastpath_for_base(loc_base, false, None);
+        }
     }
 
     /// aarch64/assembler.py:254 `_push_all_regs_to_jitframe` parity.
