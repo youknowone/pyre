@@ -52,6 +52,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -129,6 +130,29 @@ def jit_panic_reason(stderr: str) -> str | None:
     return None
 
 
+def last_stderr_line(err: str) -> str:
+    """The last non-empty stderr line — the only evidence a dying run leaves."""
+    for line in reversed(err.splitlines()):
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def death_signal(rc: int) -> str:
+    """`SIGBUS` for a run killed by a signal, else a bare return code.
+
+    POSIX `subprocess` reports a signal death as a negative return code; a
+    shell-mediated one arrives as 128+n. Naming the signal is what separates
+    "the interpreter faulted" from "the interpreter aborted an assertion",
+    and those two want completely different investigations.
+    """
+    num = -rc if rc < 0 else rc - 128
+    try:
+        return signal.Signals(num).name
+    except ValueError:
+        return f"rc={rc}"
+
+
 def classify(rc: int, out: str, err: str) -> tuple[str, str]:
     """Map a finished run to (status, detail).
 
@@ -142,14 +166,15 @@ def classify(rc: int, out: str, err: str) -> tuple[str, str]:
     if panic:
         return "CRASH", panic
     if rc < 0 or rc > 128:
-        return "CRASH", f"signal/abort rc={rc}"
+        # Keep the stderr tail. A signal death is precisely the case where no
+        # test framework got to report anything, so the last line the
+        # interpreter wrote is all the evidence there is — and dropping it
+        # left CI runs that could only be re-run, never diagnosed.
+        detail = f"signal/abort {death_signal(rc)} rc={rc} {last_stderr_line(err)}"
+        return "CRASH", detail.strip()[:200]
     if rc == 0:
         return "PASS", ""
-    last = ""
-    for line in reversed(err.splitlines()):
-        if line.strip():
-            last = line.strip()
-            break
+    last = last_stderr_line(err)
     ran = "Ran " in out or "Ran " in err or "FAILED (" in out or "FAILED (" in err
     # A module that bails with unittest.SkipTest before any test runs is
     # opting out (a missing optional C extension or wrong platform) — CPython
