@@ -2340,9 +2340,18 @@ impl PyFrame {
         if w_locals.is_null() || !self.code().flags.contains(crate::CodeFlags::OPTIMIZED) {
             return Ok(w_locals);
         }
-        let snapshot = pyre_object::w_dict_new();
-        crate::opcode_ops::dict_update_value(snapshot, w_locals)?;
-        Ok(snapshot)
+        let _roots = pyre_object::gc_roots::push_roots();
+        let locals_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_locals);
+        let snapshot_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+        // `dict_update_value` walks a mapping's `keys()`, so both sides are
+        // reloaded across it as well as across the `w_dict_new` above.
+        crate::opcode_ops::dict_update_value(
+            pyre_object::gc_roots::shadow_stack_get(snapshot_slot),
+            pyre_object::gc_roots::shadow_stack_get(locals_slot),
+        )?;
+        Ok(pyre_object::gc_roots::shadow_stack_get(snapshot_slot))
     }
 
     /// Test-helper constructor — creates a frame with a fresh execution

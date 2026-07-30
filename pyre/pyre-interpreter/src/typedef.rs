@@ -1892,6 +1892,14 @@ unsafe fn stamp_method_owners(ns: PyObjectRef, owner: &'static crate::gateway::M
         .next()
         .unwrap_or(owner.type_name);
     for key in keys {
+        let _key_roots = pyre_object::gc_roots::push_roots();
+        // The qualname is allocated before the namespace lookup and read back
+        // from the shadow stack, so no collection point separates the
+        // descriptor pointers below from the store that uses them: a colliding
+        // key can route `w_dict_getitem_str` through a user `__eq__`, which
+        // allocates and would relocate a `descr` read before it.
+        let qualname_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_str_new(&format!("{qualifier}.{key}")));
         let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
         let Some(entry) = pyre_object::w_dict_getitem_str(ns, &key) else {
             continue;
@@ -1922,7 +1930,7 @@ unsafe fn stamp_method_owners(ns: PyObjectRef, owner: &'static crate::gateway::M
         }
         crate::function::function_set_qualname(
             descr,
-            pyre_object::w_str_new(&format!("{qualifier}.{key}")),
+            pyre_object::gc_roots::shadow_stack_get(qualname_slot),
         );
         if wrapped.is_none() && key != "__new__" {
             crate::gateway::builtin_code_set_owner(code, owner);
@@ -2093,8 +2101,11 @@ fn new_typeobject_with_base_and_layout(
     // `array.array.__dict__["__module__"] == "array"`.  An unqualified name
     // stores nothing and the `type.__module__` getset reports "builtins".
     if let Some((module, _)) = name.rsplit_once('.') {
+        // Allocate the value first: reading `ns` before `w_str_new` would hand
+        // the store an address the allocation is free to move.
+        let w_module = w_str_new(module);
         let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, "__module__", w_str_new(module)) };
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, "__module__", w_module) };
     }
     // The namespace is complete, so every method descriptor in it can be
     // bound to the type that defines it before the type goes live.
