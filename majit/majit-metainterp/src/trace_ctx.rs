@@ -359,6 +359,23 @@ pub struct TraceCtx {
     /// namespace-length gate).  Per-trace: a fresh ctx starts `false`, so no
     /// manual reset is needed.
     pub reads_module_global: bool,
+    /// Green keys whose cross-loop close this recording walk already attempted
+    /// and did not get compiled.
+    ///
+    /// `reached_loop_header` (pyjitpl.py:3020-3050) answers a cancelled close by
+    /// `cancel_count += 1` and, once `cancelled_too_many_times()` holds
+    /// (`max_unroll_loops` defaults to 0, `rlib/jit.py:598`), by
+    /// `SwitchToBlackhole(ABORT_BAD_LOOP)` — so upstream re-attempts a close at
+    /// most once per tracing pass. The walker instead keeps tracing when the
+    /// crossed key is not its own root, because closing there would store the
+    /// loop where nothing enters. Without this set it would also re-attempt the
+    /// close on every later crossing of the same header, and each attempt
+    /// re-optimizes the whole trace-so-far: an inner loop crossed N times costs
+    /// N optimizer passes over a trace that keeps growing. A structural decline
+    /// is deterministic — the same key rebuilds the same unsupported bridge —
+    /// which is the reasoning `MetaInterp::declined_bridge_guards` records for
+    /// guards. Per-trace, so a fresh walk retries once.
+    pub declined_cross_loop_closes: Vec<u64>,
     /// For a bridge trace (`is_bridge_trace`), the loop-header bytecode pc of
     /// the parent loop the bridge will JUMP into. The bridge closes when it
     /// reaches this pc (a real compiled-loop header), NOT when it transiently
@@ -1421,6 +1438,7 @@ impl TraceCtx {
             compiled_key_for_greens_fn: None,
             is_bridge_trace: false,
             reads_module_global: false,
+            declined_cross_loop_closes: Vec::new(),
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
@@ -1503,6 +1521,7 @@ impl TraceCtx {
             compiled_key_for_greens_fn: None,
             is_bridge_trace: false,
             reads_module_global: false,
+            declined_cross_loop_closes: Vec::new(),
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
@@ -1867,6 +1886,20 @@ impl TraceCtx {
     /// to a reached loop header during tracing.
     pub fn root_green_key(&self) -> u64 {
         self.root_green_key
+    }
+
+    /// Whether this walk already tried, and failed, to close across `key`.
+    /// See [`TraceCtx::declined_cross_loop_closes`].
+    pub fn cross_loop_close_declined(&self, key: u64) -> bool {
+        self.declined_cross_loop_closes.contains(&key)
+    }
+
+    /// Record that closing across `key` did not compile, so a later crossing of
+    /// the same header does not re-run the optimizer on the trace-so-far.
+    pub fn note_cross_loop_close_declined(&mut self, key: u64) {
+        if !self.cross_loop_close_declined(key) {
+            self.declined_cross_loop_closes.push(key);
+        }
     }
 
     /// Mark that the current back-edge was reached inside an inline callee

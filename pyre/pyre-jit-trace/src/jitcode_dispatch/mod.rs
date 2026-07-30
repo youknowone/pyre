@@ -10332,66 +10332,77 @@ fn handle<Sym: WalkSym>(
                     .bridge_info()
                     .map(|b| (b.trace_id, b.fail_index));
                 let has_targets = driver.meta_interp().has_compiled_targets(key);
+                // A close that did not compile is not retried on a later
+                // crossing of the same header: the attempt runs the optimizer
+                // over the whole trace-so-far, and the decline is deterministic,
+                // so an inner loop crossed N times would pay N optimizer passes
+                // over a growing trace (see
+                // `TraceCtx::declined_cross_loop_closes`).
+                let already_declined = ctx.trace_ctx.cross_loop_close_declined(key);
                 if !has_partial && has_targets {
-                    let outcome = match bridge_origin {
-                        // Guard-origin: existing bridge path.
-                        Some(_) => {
-                            driver
-                                .meta_interp_mut()
-                                .compile_trace(key, &live_args, bridge_origin)
-                        }
-                        // pyjitpl.py interp-origin: a
-                        // function-entry trace (ResumeFromInterpDescr)
-                        // closes as an entry bridge jumping into the
-                        // already-compiled hot loop (compile.py);
-                        // a trace rooted at a *loop header* falls back to
-                        // the plain bridge shape.
-                        None => match driver.compile_trace_entry_data() {
-                            Some((original_green_key, mut entry_meta)) => {
-                                // `compile_trace_entry_data` clones the active
-                                // trace metadata, whose `namespace_dependent` is
-                                // only finalized by `finish_trace_namespace_dependency`
-                                // after the walk returns. An entry bridge is
-                                // compiled mid-walk, before that finalize, so a
-                                // trace that has already read a module global
-                                // would otherwise install the bridge with a stale
-                                // `namespace_dependent = false` and let it be
-                                // re-entered after later namespace growth. Fold in
-                                // the live per-trace flag so the bridge keeps the
-                                // conservative namespace gate.
-                                entry_meta.namespace_dependent |= ctx.trace_ctx.reads_module_global;
-                                driver.meta_interp_mut().compile_trace_from_interp(
-                                    key,
-                                    &live_args,
-                                    original_green_key,
-                                    entry_meta,
-                                )
-                            }
-                            None => driver
-                                .meta_interp_mut()
-                                .compile_trace(key, &live_args, None),
-                        },
-                    };
-                    if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
-                        if majit_metainterp::majit_log_enabled() {
-                            eprintln!(
-                                "[jit][walker-reached-loop-header] compile_trace success: \
-                                 key={} pc={} bridge={:?}",
-                                key, next_instr, bridge_origin
-                            );
-                        }
-                        // pyjitpl.py raise_if_successful() — the
-                        // successful compile_trace ends tracing; surface
-                        // the dedicated outcome so the driver maps it to
-                        // `TraceAction::CompileTrace` (no further compile
-                        // or abort on this session).
-                        driver.note_compile_trace_success();
-                        return Ok((
-                            DispatchOutcome::CompileTracePending {
-                                loop_header_pc: next_instr,
+                    if !already_declined {
+                        let outcome = match bridge_origin {
+                            // Guard-origin: existing bridge path.
+                            Some(_) => driver.meta_interp_mut().compile_trace(
+                                key,
+                                &live_args,
+                                bridge_origin,
+                            ),
+                            // pyjitpl.py interp-origin: a
+                            // function-entry trace (ResumeFromInterpDescr)
+                            // closes as an entry bridge jumping into the
+                            // already-compiled hot loop (compile.py);
+                            // a trace rooted at a *loop header* falls back to
+                            // the plain bridge shape.
+                            None => match driver.compile_trace_entry_data() {
+                                Some((original_green_key, mut entry_meta)) => {
+                                    // `compile_trace_entry_data` clones the active
+                                    // trace metadata, whose `namespace_dependent` is
+                                    // only finalized by `finish_trace_namespace_dependency`
+                                    // after the walk returns. An entry bridge is
+                                    // compiled mid-walk, before that finalize, so a
+                                    // trace that has already read a module global
+                                    // would otherwise install the bridge with a stale
+                                    // `namespace_dependent = false` and let it be
+                                    // re-entered after later namespace growth. Fold in
+                                    // the live per-trace flag so the bridge keeps the
+                                    // conservative namespace gate.
+                                    entry_meta.namespace_dependent |=
+                                        ctx.trace_ctx.reads_module_global;
+                                    driver.meta_interp_mut().compile_trace_from_interp(
+                                        key,
+                                        &live_args,
+                                        original_green_key,
+                                        entry_meta,
+                                    )
+                                }
+                                None => driver
+                                    .meta_interp_mut()
+                                    .compile_trace(key, &live_args, None),
                             },
-                            op.next_pc,
-                        ));
+                        };
+                        if matches!(outcome, majit_metainterp::CompileOutcome::Compiled { .. }) {
+                            if majit_metainterp::majit_log_enabled() {
+                                eprintln!(
+                                    "[jit][walker-reached-loop-header] compile_trace success: \
+                                 key={} pc={} bridge={:?}",
+                                    key, next_instr, bridge_origin
+                                );
+                            }
+                            // pyjitpl.py raise_if_successful() — the
+                            // successful compile_trace ends tracing; surface
+                            // the dedicated outcome so the driver maps it to
+                            // `TraceAction::CompileTrace` (no further compile
+                            // or abort on this session).
+                            driver.note_compile_trace_success();
+                            return Ok((
+                                DispatchOutcome::CompileTracePending {
+                                    loop_header_pc: next_instr,
+                                },
+                                op.next_pc,
+                            ));
+                        }
+                        ctx.trace_ctx.note_cross_loop_close_declined(key);
                     }
                     // The jump did not take (`compile.compile_trace` returns
                     // None when none of the existing loop tokens match). Fall
