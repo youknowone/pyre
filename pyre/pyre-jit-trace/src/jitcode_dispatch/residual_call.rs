@@ -3036,6 +3036,21 @@ pub(crate) fn residual_call_descr_index_in_body(body_code: &[u8], d: &DecodedOp)
     Some(decode_descr_index(body_code, d, descr_offset))
 }
 
+/// Which specialization table arm a body `BINARY_OP` residual was admitted
+/// under, hence what its result is proven to be.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SpecializedBinop {
+    /// `Add` / `Subtract` / `Multiply` (+ in-place): exact-numeric operands,
+    /// exact-numeric result.
+    Numeric,
+    /// `And` / `Or` / `Xor` (+ in-place): exact-plain-int operands,
+    /// exact-plain-int result.
+    PlainInt,
+    /// One of the six ordinary comparisons over exact numeric operands:
+    /// exact-bool result.
+    Compare,
+}
+
 /// A `BINARY_OP` has the generic residual shape in a per-function jitcode, but
 /// the walker replaces a statically tagged plain arithmetic op with a native
 /// one before the generic residual executor (and its nested-residual decline)
@@ -3056,7 +3071,8 @@ pub(crate) fn residual_call_descr_index_in_body(body_code: &[u8], d: &DecodedOp)
 /// - `And` / `Or` / `Xor` (+ in-place) — `IntAnd` / `IntOr` / `IntXor`, also
 ///   unconditional, but *int-only*: the float table falls through to
 ///   `_ => return Ok(None)` for them.  Hence the separate
-///   `args_all_exact_plain_int`.
+///   [`SpecializedBinop::PlainInt`] arm, which additionally demands both
+///   operands be proven plain ints.
 /// - `FloorDivide` / `Remainder` (+ in-place) — `IntFloorDiv` / `IntMod`,
 ///   int-only for the same reason (neither has a `FLOAT_*` opcode).  These two
 ///   are the one accepted pair whose lowering *can* decline — on a zero divisor
@@ -3085,7 +3101,8 @@ pub(crate) fn residual_call_descr_index_in_body(body_code: &[u8], d: &DecodedOp)
 /// The two provenance sets describe the actual operands of each binop.  This
 /// admits `def f(self, x): return x + 1` when only `x` is numeric, while still
 /// rejecting `self + x` and global numeric subclasses with user dunders.
-pub(crate) fn residual_call_is_specialized_plain_numeric_op(
+/// `None` for every op outside the accepted set.
+pub(crate) fn residual_call_specialized_plain_numeric_binop(
     body_code: &[u8],
     numeric_ref_regs: &[bool; u8::MAX as usize + 1],
     plain_int_ref_regs: &[bool; u8::MAX as usize + 1],
@@ -3093,7 +3110,7 @@ pub(crate) fn residual_call_is_specialized_plain_numeric_op(
     num_regs_i: usize,
     constants_i: &[i64],
     callee_descr_refs: &[DescrRef],
-) -> bool {
+) -> Option<SpecializedBinop> {
     let helper = residual_call_helper_kind_in_body(body_code, d, callee_descr_refs);
     if !matches!(
         d.key,
@@ -3102,41 +3119,41 @@ pub(crate) fn residual_call_is_specialized_plain_numeric_op(
         helper,
         Some(majit_ir::PyreHelperKind::BinaryOp | majit_ir::PyreHelperKind::CompareOp)
     ) {
-        return false;
+        return None;
     }
     // `iIR`: the R-list follows the I-list.  `walker_int_specialization_operands`
     // / `walker_float_specialization_operands` read exactly `r_args[0]` (lhs)
     // and `r_args[1]` (rhs) and decline any other arity, so demand the same
     // shape here and require both operands to be proven.
     let Some(&i_len) = body_code.get(d.pc + 2) else {
-        return false;
+        return None;
     };
     let r_len_pc = d.pc + 1 + 1 + 1 + i_len as usize;
     if body_code.get(r_len_pc) != Some(&2) {
-        return false;
+        return None;
     }
     let (Some(&lhs_reg), Some(&rhs_reg)) =
         (body_code.get(r_len_pc + 1), body_code.get(r_len_pc + 2))
     else {
-        return false;
+        return None;
     };
     if !numeric_ref_regs[lhs_reg as usize] || !numeric_ref_regs[rhs_reg as usize] {
-        return false;
+        return None;
     }
     // The first I-list item is the BINARY_OP tag.  It must be in the callee's
     // immutable constants window; a runtime tag could select an operation
     // outside the accepted set.
     if i_len == 0 {
-        return false;
+        return None;
     }
     let Some(&tag_reg) = body_code.get(d.pc + 3) else {
-        return false;
+        return None;
     };
     let Some(&tag) = (tag_reg as usize)
         .checked_sub(num_regs_i)
         .and_then(|constant_index| constants_i.get(constant_index))
     else {
-        return false;
+        return None;
     };
     // Both compare tables map all six `ComparisonOperator`s unconditionally
     // (`IntLt/Le/Gt/Ge/Eq/Ne` in `try_walker_specialize_compare_op_int`,
@@ -3146,7 +3163,9 @@ pub(crate) fn residual_call_is_specialized_plain_numeric_op(
     // shape with `ISINSTANCE_OP` (tag 10), which is not one of the six and so
     // stays excluded.
     if helper == Some(majit_ir::PyreHelperKind::CompareOp) {
-        return pyre_interpreter::runtime_ops::compare_op_from_tag(tag).is_some();
+        return pyre_interpreter::runtime_ops::compare_op_from_tag(tag)
+            .is_some()
+            .then_some(SpecializedBinop::Compare);
     }
     use pyre_interpreter::bytecode::BinaryOperator;
     match pyre_interpreter::runtime_ops::binary_op_from_tag(tag) {
@@ -3157,7 +3176,7 @@ pub(crate) fn residual_call_is_specialized_plain_numeric_op(
             | BinaryOperator::InplaceAdd
             | BinaryOperator::InplaceSubtract
             | BinaryOperator::InplaceMultiply,
-        ) => true,
+        ) => Some(SpecializedBinop::Numeric),
         Some(
             BinaryOperator::And
             | BinaryOperator::Or
@@ -3169,8 +3188,9 @@ pub(crate) fn residual_call_is_specialized_plain_numeric_op(
             | BinaryOperator::Remainder
             | BinaryOperator::InplaceFloorDivide
             | BinaryOperator::InplaceRemainder,
-        ) => plain_int_ref_regs[lhs_reg as usize] && plain_int_ref_regs[rhs_reg as usize],
-        _ => false,
+        ) => (plain_int_ref_regs[lhs_reg as usize] && plain_int_ref_regs[rhs_reg as usize])
+            .then_some(SpecializedBinop::PlainInt),
+        _ => None,
     }
 }
 
@@ -3250,42 +3270,6 @@ pub(crate) fn residual_call_is_proven_truth(
     };
     numeric_ref_regs[arg_reg as usize] || bool_ref_regs[arg_reg as usize]
 }
-
-pub(crate) fn residual_call_is_specialized_plain_int_binop(
-    body_code: &[u8],
-    d: &DecodedOp,
-    num_regs_i: usize,
-    constants_i: &[i64],
-) -> bool {
-    let Some(&i_len) = body_code.get(d.pc + 2) else {
-        return false;
-    };
-    if i_len == 0 {
-        return false;
-    }
-    let Some(&tag_reg) = body_code.get(d.pc + 3) else {
-        return false;
-    };
-    let Some(&tag) = (tag_reg as usize)
-        .checked_sub(num_regs_i)
-        .and_then(|constant_index| constants_i.get(constant_index))
-    else {
-        return false;
-    };
-    use pyre_interpreter::bytecode::BinaryOperator;
-    matches!(
-        pyre_interpreter::runtime_ops::binary_op_from_tag(tag),
-        Some(
-            BinaryOperator::And
-                | BinaryOperator::Or
-                | BinaryOperator::Xor
-                | BinaryOperator::InplaceAnd
-                | BinaryOperator::InplaceOr
-                | BinaryOperator::InplaceXor
-        )
-    )
-}
-
 pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,

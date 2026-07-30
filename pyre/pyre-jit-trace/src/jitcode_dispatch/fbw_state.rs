@@ -1991,8 +1991,10 @@ pub(crate) fn fbw_callee_body_replay_safety(
             let provably_side_effect_free = replay_safe_read
                 || ei.check_is_elidable()
                 || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant;
-            let accepted_numeric_op = !provably_side_effect_free
-                && residual_call_is_specialized_plain_numeric_op(
+            let accepted_numeric_op = if provably_side_effect_free {
+                None
+            } else {
+                residual_call_specialized_plain_numeric_binop(
                     body_code,
                     &numeric_ref_regs,
                     &plain_int_ref_regs,
@@ -2000,12 +2002,15 @@ pub(crate) fn fbw_callee_body_replay_safety(
                     num_regs_i,
                     constants_i,
                     callee_descr_refs,
-                );
+                )
+            };
             // A `COMPARE_OP` over the same proven operands is accepted for the
             // same reason, but its result is a `bool`, not an operand the
             // numeric provenance below may chain on.
-            let accepted_binop =
-                accepted_numeric_op && ei.pyre_helper == majit_ir::PyreHelperKind::BinaryOp;
+            let accepted_binop = matches!(
+                accepted_numeric_op,
+                Some(SpecializedBinop::Numeric | SpecializedBinop::PlainInt)
+            );
             // `CHECK_EXC_MATCH` shares the `COMPARE_OP` shape but reads only
             // types, so it needs no operand proof at all.
             let accepted_exc_match = !provably_side_effect_free
@@ -2016,7 +2021,8 @@ pub(crate) fn fbw_callee_body_replay_safety(
                     constants_i,
                     callee_descr_refs,
                 );
-            dst_exact_bool = (accepted_numeric_op && !accepted_binop) || accepted_exc_match;
+            dst_exact_bool =
+                accepted_numeric_op == Some(SpecializedBinop::Compare) || accepted_exc_match;
             let accepted_truth = !provably_side_effect_free
                 && crate::jitcode_dispatch::residual_call::residual_call_is_proven_truth(
                     body_code,
@@ -2028,16 +2034,10 @@ pub(crate) fn fbw_callee_body_replay_safety(
             // An accepted arithmetic op over exact numeric operands returns an
             // exact numeric.  Bitwise ops require and return exact ints.
             dst_exact_numeric = dst_boxed_int || accepted_binop;
-            dst_exact_plain_int = dst_boxed_int
-                || (accepted_binop
-                    && residual_call_is_specialized_plain_int_binop(
-                        body_code,
-                        &d,
-                        num_regs_i,
-                        constants_i,
-                    ));
+            dst_exact_plain_int =
+                dst_boxed_int || accepted_numeric_op == Some(SpecializedBinop::PlainInt);
             if !provably_side_effect_free
-                && !accepted_numeric_op
+                && accepted_numeric_op.is_none()
                 && !accepted_truth
                 && !accepted_exc_match
             {
