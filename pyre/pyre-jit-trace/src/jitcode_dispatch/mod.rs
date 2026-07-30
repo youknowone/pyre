@@ -740,6 +740,25 @@ fn emit_traceback_node<Sym: WalkSym>(
             .heapcache_setfield_cached(traceback, descr.index(), value);
     }
 
+    // `f_lineno` resolves through `offset2lineno(pycode, last_instr)` on every
+    // read, so the frame itself has to carry the coordinate — the node's own
+    // `tb_lasti` answers a different question and is frozen. The interpreter
+    // gets this for free from `pyopcode.py`'s per-opcode `last_instr` store;
+    // compiled code does not run it, and `fbw_publish_exit_last_instr` only
+    // reaches the virtualizable, so an inlined callee frame would keep the `-1`
+    // initialization sentinel and report its `def` line. A frame that goes on
+    // running has this overwritten by its own later publish, exactly as the
+    // per-opcode store would.
+    let last_instr_value = ctx.trace_ctx.const_int(i64::from(site.last_instruction));
+    let last_instr_descr = crate::descr::pyframe_next_instr_descr();
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[site.frame, last_instr_value],
+        last_instr_descr.clone(),
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(site.frame, last_instr_descr.index(), last_instr_value);
+
     let traceback_descr = crate::descr::w_exception_traceback_descr(kind);
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
@@ -2747,11 +2766,12 @@ fn label_operand_offset(key: &str) -> Option<usize> {
 /// (`pyjitpl.py:2530-2546`) does, and a handler that returns out of the frame is
 /// `finishframe`'s ordinary case (`pyjitpl.py:2503-2525`).
 ///
-/// What the predicate still gates is INLINING a caller whose in-try CALL would
-/// deliver a raise across the inline boundary: with a non-rejoining handler that
-/// delivery drops the catching frame's traceback node, so
-/// `exception_traceback_frame_lineno` reports the raising frame twice and at the
-/// wrong lineno (both backends).
+/// What the predicate still gates is INLINING a CLOSURE callee at a caller's
+/// in-try CALL.  A non-rejoining handler is an `except E as e` body, and the
+/// callee's free variables resolve through cells that body's implicit cleanup
+/// stores `None` into and then clears; the inlined read answers `None`
+/// (`synth/exception_as_cell_cleanup`, dynasm).  A callee with no free
+/// variables cannot reach a caller cell and is inlined either way.
 ///
 /// Bounded forward reachability from `catch_target`, following `goto`/
 /// `goto_if_not` successors: `true` as soon as any path reaches a

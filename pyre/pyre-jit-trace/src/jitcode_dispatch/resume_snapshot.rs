@@ -1063,9 +1063,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
 /// (`ctx.registers_*`) are still in scope.  `call_jit_pc` is the CALL op's
 /// jitcode pc in the caller.  Returns a named decline reason
 /// when the caller frame is not snapshot-able for this first slice: missing
-/// liveness / resume tables, a CALL inside a try-block whose `except` handler
-/// does NOT rejoin a loop (returns out of the frame — its hot raise cannot be
-/// bridged, so it stays on the residual path, see
+/// liveness / resume tables, a CLOSURE callee at a CALL inside a try-block
+/// whose `except` handler does NOT rejoin a loop (it reads caller cells the
+/// handler cleanup clears, see
 /// [`decline_inline_caller_frame_for_catch_marker`]), or no result on the
 /// operand stack at the return point.
 ///
@@ -1083,11 +1083,22 @@ pub(crate) enum InlineCallerFrameDecline {
 pub(crate) fn decline_inline_caller_frame_for_catch_marker(
     after_residual_call_resume: Option<usize>,
     caller_jitcode: &[u8],
+    callee_has_freevars: bool,
 ) -> Result<(), InlineCallerFrameDecline> {
     let Some(resume_pos) = after_residual_call_resume else {
         // Not a try-block CALL — nothing to route on a raise.
         return Ok(());
     };
+    // A closure callee reads its captured values out of the cells the caller
+    // frame owns, and inside a try-block one of those cells is the `except E as
+    // e` binding, which the handler's implicit cleanup stores `None` into and
+    // then clears.  Inlining such a callee here reads that cell as `None`
+    // (`bench/synth/exception_as_cell_cleanup`).  A callee with no free
+    // variables cannot reach a caller cell at all, so the decline below is not
+    // needed for it.
+    if !callee_has_freevars {
+        return Ok(());
+    }
     // The CALL is inside a try-block.  Inline it when its exception handler
     // rejoins a loop (the exc-edge-bridgeable shape): the paused caller frame
     // resumes at the CALL fallthrough on the no-raise path, and on a raise the
@@ -1334,6 +1345,7 @@ pub(crate) fn inline_call_return_marker(
 pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
+    callee_has_freevars: bool,
 ) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
     // #68 nested multiframe: when an inlined callee is already active
     // (the framestack has a top level), the immediate caller of THIS
@@ -1351,7 +1363,12 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         .last()
         .map(|frame| frame.w_code);
     if let Some(caller_code) = caller_code {
-        return compute_nested_inline_caller_frame(ctx, call_jit_pc, caller_code);
+        return compute_nested_inline_caller_frame(
+            ctx,
+            call_jit_pc,
+            caller_code,
+            callee_has_freevars,
+        );
     }
     let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
     if caller_sym_ptr.is_null() {
@@ -1377,6 +1394,7 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
             jc.payload
                 .after_residual_call_resume_for_jitcode_pc(call_jit_pc),
             jc.payload.jitcode.code.as_slice(),
+            callee_has_freevars,
         )?;
         let code = &*jc.payload.code_ptr;
         let fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32;
@@ -1515,6 +1533,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
     caller_code: usize,
+    callee_has_freevars: bool,
 ) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
     let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())
         .ok_or(InlineCallerFrameDecline::Unavailable)? as u32;
@@ -1529,7 +1548,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     // scoped to the top-level caller (`compute_inline_caller_frame`) for now, so
     // pass an empty jitcode here — a nested try-block CALL keeps declining
     // (its catch-marker resume is not yet routed through the deeper snapshot).
-    decline_inline_caller_frame_for_catch_marker(after_residual_call_resume, &[])?;
+    decline_inline_caller_frame_for_catch_marker(after_residual_call_resume, &[], callee_has_freevars)?;
     let legacy_fallthrough_py_pc = || unsafe {
         let call_py = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
         let code = &*pjc.code_ptr;

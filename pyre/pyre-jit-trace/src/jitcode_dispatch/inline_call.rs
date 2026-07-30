@@ -3234,7 +3234,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // walk context is the callee's. A caller frame that is not snapshot-able
     // (try-block catch marker / missing liveness) declines to interpretation.
     let parent_frame = if try_multiframe {
-        match compute_inline_caller_frame(ctx, op.pc) {
+        match compute_inline_caller_frame(ctx, op.pc, !callee_code.freevars.is_empty()) {
             Ok(pf) => Some(pf),
             Err(InlineCallerFrameDecline::TryBlockCatchMarker) => {
                 // An un-entered multiframe-inline CALL declined at its
@@ -3281,40 +3281,21 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // served correctly today), so this never removes a working inline.
         //
         // A `TryBlockCatchMarker` decline is different: the CALL is covered by
-        // the caller's exception table.  The collapse resumes at the CALL's
-        // pre-call `-live-`, which precedes the CALL's own `catch_exception`,
-        // so an in-callee `GUARD_NO_EXCEPTION` failing there hands the
-        // blackhole a pending exception at a coordinate from which neither the
-        // forward check nor the bounded backward startpoint scan
-        // (`handle_exception_in_frame`) can reach that catch — the raise exits
-        // the caller frame past its matching handler.  Decline the inline so
-        // the call stays residual, where the post-call catch resume
+        // the caller's exception table AND the callee has free variables, so it
+        // reads cells the caller frame owns — one of which, inside a handler, is
+        // the `except E as e` binding the implicit cleanup stores `None` into
+        // and then clears.  Inlining reads that cell as `None`
+        // (`synth/exception_as_cell_cleanup`).  Decline so the call stays
+        // residual, where the post-call catch resume
         // (`GuardCaptureScope::residual_call_catch_resume`) routes the raise.
         //
         // This `Err` discards the whole enclosing loop trace, where the comment
-        // above describes only declining the inline — and it costs real
-        // compilation: `synth/exception_nested_exc_info_restore`'s
-        // `classify(sys.exc_info()[0])` calls sit in handler bodies, whose
-        // implicit cleanup entry never rejoins the loop, so every retrace
-        // aborts here and the loop is interpreted (5 aborts, 0.34s vs 0.17s
-        // once inlined).  It cannot become `Ok(None)` in place like the seed
-        // preconditions below: by here the seed block has already recorded
-        // `GETFIELD_GC_R` + `emit_new_pyframe_inline_with_params` and stamped a
-        // concrete `FrameBox` onto that op, so returning would leave dead IR
-        // behind.
-        //
-        // Hoisting the decline (`decline_inline_caller_frame_for_catch_marker`
-        // is caller-side, so it answers before the seed) is mechanical, but the
-        // abort is masking two defects on the residual path it would open, both
-        // reproduced by doing exactly that:
-        //   * `synth/exception_inline_callee_tb_frames` panics in the dynasm
-        //     backend with `RegisterManager.loc: box RefOp(N) not found`;
-        //   * `synth/gc_bug_bridge_flavor_traceback_names` prints traceback
-        //     tuples missing their outermost frame — the caller's own
-        //     `PyTraceback` node is never recorded once its try-block CALL goes
-        //     residual (that fixture pins its expected output in its header).
-        // Fix those two first; the hoist is then a two-line change.
-        match compute_inline_caller_frame(ctx, op.pc) {
+        // above describes only declining the inline.  It cannot become
+        // `Ok(None)` in place like the seed preconditions below: by here the
+        // seed block has already recorded `GETFIELD_GC_R` +
+        // `emit_new_pyframe_inline_with_params` and stamped a concrete
+        // `FrameBox` onto that op, so returning would leave dead IR behind.
+        match compute_inline_caller_frame(ctx, op.pc, !callee_code.freevars.is_empty()) {
             Ok(pf) => Some(pf),
             Err(InlineCallerFrameDecline::TryBlockCatchMarker) => {
                 return Err(DispatchError::callee_inline_unsupported(op.pc));
