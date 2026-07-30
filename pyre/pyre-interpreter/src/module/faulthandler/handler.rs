@@ -72,7 +72,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     faulthandler_extract_fd(args.first().copied().unwrap_or(pyre_object::PY_NULL))?;
                 #[cfg(all(unix, feature = "host_env"))]
                 {
-                    FAULTHANDLER_FD.store(fd, std::sync::atomic::Ordering::Relaxed);
+                    // `pypy_faulthandler_enable(fileno, all_threads)` takes the
+                    // descriptor as an argument, so the handler never observes
+                    // a descriptor the install did not commit to. Split across
+                    // two statements here, the new fd has to be visible before
+                    // the handlers go in — a fatal signal in between would
+                    // otherwise dump to the old one — and has to be rolled back
+                    // when the install fails, or a failed re-enable would
+                    // redirect the handlers already installed.
+                    let previous_fd =
+                        FAULTHANDLER_FD.swap(fd, std::sync::atomic::Ordering::Relaxed);
                     let ok = rustpython_host_env::faulthandler::enable_fatal_handlers(
                         faulthandler_signal_handler,
                         libc::SA_NODEFER | libc::SA_ONSTACK,
@@ -81,6 +90,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         FAULTHANDLER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
                         return Ok(pyre_object::w_none());
                     }
+                    FAULTHANDLER_FD.store(previous_fd, std::sync::atomic::Ordering::Relaxed);
                     return Err(crate::PyError::runtime_error(
                         "faulthandler.enable: sigaction failed",
                     ));

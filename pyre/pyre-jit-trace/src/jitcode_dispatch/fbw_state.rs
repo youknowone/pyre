@@ -52,6 +52,23 @@ pub(crate) fn fbw_max_multiframe_depth() -> usize {
 /// `opimpl_recursive_call` (`pyjitpl.py:1390-1402`) counting the portal frames
 /// already on `MetaInterp.framestack` before comparing against
 /// `max_unroll_recursion`.
+///
+/// Upstream compares the whole greenkey element-wise (`pyjitpl.py:1396-1401`
+/// `gk[i].same_constant(greenboxes[i])`) over `(next_instr, is_being_profiled,
+/// bytecode)` (`interp_jit.py:34`); matching `w_code` alone is that comparison,
+/// because every entry this scan can see carries `next_instr == 0`:
+///
+/// * `MIFrame.setup` (`pyjitpl.py:74-80`) assigns `greenkey` once and never
+///   updates it, so a frame's greenkey stays its ENTRY greens however far its
+///   pc has since advanced;
+/// * every [`InlineFrame`] is pushed by `InlineFrameGuard::enter` at a callee
+///   entry, and the bridge-reconstructed frames stamp the same `(w_code, 0)`
+///   identity (`state.rs` `reconstruct_inline_recipe`).
+///
+/// The root frame is deliberately absent from this framestack, which is also
+/// what upstream's greenkey compare achieves: the root's greenkey holds the
+/// merge-point pc, so it fails `same_constant` against a call's `next_instr ==
+/// 0` greens and is not counted either.
 pub(crate) fn fbw_inline_recursion_count<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     w_code: usize,

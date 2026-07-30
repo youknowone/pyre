@@ -483,12 +483,19 @@ pub fn release_owner_root(index: usize) {
 /// RAII owner for one fixed translated-livevar root slot.
 pub struct OwnerRootGuard {
     index: usize,
+    /// `index` names a slot in the ACQUIRING thread's `OWNER_ROOTS`, so the
+    /// guard must not outlive that thread's stack frame.  Bare `usize` would
+    /// make it auto-`Send`, and dropping it elsewhere would release a foreign
+    /// thread's slot (or trip the inactive-slot assert).  The raw-pointer
+    /// marker pins it to one thread at compile time.
+    _not_send: std::marker::PhantomData<*mut ()>,
 }
 
 impl OwnerRootGuard {
     pub fn new(root: GcRef) -> Self {
         Self {
             index: acquire_owner_root(root),
+            _not_send: std::marker::PhantomData,
         }
     }
 

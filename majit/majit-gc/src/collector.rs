@@ -3402,9 +3402,6 @@ impl MiniMarkGC {
                 unsafe { (*hdr).type_id() },
                 self.gc_state
             );
-            if unsafe { (*hdr).type_id() } == 9 {
-                eprintln!("{}", std::backtrace::Backtrace::force_capture());
-            }
         }
         unsafe { (*hdr).clear_flag(flags::TRACK_YOUNG_PTRS) };
     }

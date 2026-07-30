@@ -191,9 +191,27 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
     // the items-block allocation and the write barrier below. Publish it
     // immediately; in a free-threaded run either operation may park behind a
     // foreign collector even though the address is old-gen and non-moving.
+    //
+    // The allocator hands back UNINITIALIZED payload, and once the root is
+    // published `tuple_object_custom_trace` may read `ob_header.w_class` and
+    // `wrappeditems` off it at any parking point.  Write both slots first, with
+    // a null items block — the state the trace hook already returns early on —
+    // and install the real block below.
     let raw_slot = if raw.is_null() {
         None
     } else {
+        unsafe {
+            std::ptr::write(
+                raw as *mut W_TupleObject,
+                W_TupleObject {
+                    ob_header: PyObject {
+                        ob_type: header.ob_type,
+                        w_class: header.w_class,
+                    },
+                    wrappeditems: std::ptr::null_mut(),
+                },
+            );
+        }
         crate::gc_roots::pin_root(raw as PyObjectRef);
         Some(crate::gc_roots::shadow_stack_len() - 1)
     };
@@ -213,14 +231,10 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
         .unwrap_or(std::ptr::null_mut()) as *mut u8;
 
     if !raw.is_null() {
+        // The header went in before the root was published; only the items
+        // block is still outstanding.
         unsafe {
-            std::ptr::write(
-                raw as *mut W_TupleObject,
-                W_TupleObject {
-                    ob_header: header,
-                    wrappeditems: items_block,
-                },
-            );
+            (*(raw as *mut W_TupleObject)).wrappeditems = items_block;
         }
         // The tuple lives in old-gen (`try_gc_alloc_stable`); its items
         // may still be in the nursery. The element pointers are stored in
