@@ -3993,18 +3993,14 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
     if !exception_string_override_straight_line(body.code) {
         return Ok(None);
     }
-    // A nested Python call in the override body (e.g. `return repr(self.args)`)
-    // cannot be inlined on this bounded route: recording the callee's own
-    // residual and its guard-resume snapshot aborts mid-trace, discarding the
-    // whole loop instead of declining.  Keep such a body on the residual
-    // dispatch path where the interpreter owns the nested frame.
-    let Some((override_descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
+    // A nested call in the override body (e.g. `return repr(self.args)`) is
+    // inlined like any other: the nested callee records its own residual and
+    // guard-resume snapshot on this route without aborting, and a raise from it
+    // reaches the enclosing handler unchanged.
+    let Some((_override_descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
     else {
         return Ok(None);
     };
-    if exception_string_override_has_nested_call(body.code, override_descr_refs) {
-        return Ok(None);
-    }
 
     // A straight-line, effect-free override can be sampled before any IR is
     // emitted. If its observed result is not a string, decline to the original
