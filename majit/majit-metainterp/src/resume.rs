@@ -5232,6 +5232,112 @@ mod tests {
         reader.consume_vref_and_vable(None, Some(&TestVirtualizableInfo), None, None);
     }
 
+    /// resume.py:1368-1375 / compile.py:956-963 — the GUARD_NOT_FORCED resume
+    /// path.  `handle_async_forcing` already materialized the virtuals and
+    /// already rewrote the virtualizable, so this resume must reuse that cache
+    /// and leave the virtualizable alone: `consume_vref_and_vable` jumps the
+    /// vable and vref sections (resume.py:1433-1435) instead of consuming them.
+    #[test]
+    fn blackhole_from_resumedata_with_all_virtuals_skips_the_vable_section() {
+        use crate::blackhole::BlackholeInterpBuilder;
+        use crate::jitcode::JitCodeBuilder;
+        use crate::jitcode::insns::{BC_ABORT, BC_CATCH_EXCEPTION, BC_LIVE, BC_RVMPROF_CODE};
+
+        let mut writer = crate::resumecode::Writer::new(8);
+        writer.append_int(0); // items_resume_section (patched below)
+        writer.append_int(1); // count
+        writer.append_int(1); // vable_size: the identity only (get_total_size == 0)
+        writer.append_int(tag(0, TAGBOX).unwrap() as i64); // virtualizable identity
+        writer.append_int(0); // vref_array length
+        writer.append_int(0); // jitcode_pos
+        writer.append_int(0); // pc
+        writer.append_int(0); // py_pc
+        writer.patch_current_size(0);
+        let rd_numb = writer.create_numbering();
+
+        let mut runtime = JitCodeBuilder::default().finish();
+        runtime.body_mut().code = vec![BC_LIVE, 0, 0, BC_ABORT];
+        runtime.body_mut().c_num_regs_i = 1;
+        runtime.body_mut().constants_i = vec![321];
+        runtime.body_mut().startpoints = Some([0_usize, 3].into_iter().collect());
+        let runtime = std::sync::Arc::new(runtime);
+        let all_liveness: Vec<u8> = vec![0, 0, 0];
+        let deadframe = [0x4000_i64];
+        let deadframe_types = [majit_ir::Type::Ref];
+
+        let resume = |all_virtuals: Option<(Vec<i64>, Vec<i64>)>| {
+            let mut builder = BlackholeInterpBuilder::new();
+            builder.setup_cached_control_opcodes(
+                BC_LIVE as i32,
+                BC_CATCH_EXCEPTION as i32,
+                BC_RVMPROF_CODE as i32,
+            );
+            let resolve_jitcode = |_jitcode_pos: i32, _pc: i32| -> Option<ResolvedJitCode> {
+                Some(ResolvedJitCode::new(runtime.clone(), 0))
+            };
+            blackhole_from_resumedata(
+                &mut builder,
+                &resolve_jitcode,
+                &rd_numb,
+                &[],
+                &all_liveness,
+                &deadframe,
+                Some(&deadframe_types),
+                None, // rd_virtuals
+                None, // rd_guard_pendingfields
+                None,
+                Some(&TestVirtualizableInfo),
+                None,
+                None,
+                all_virtuals,
+                &NullAllocator,
+            )
+            .expect("resume should produce a blackhole")
+        };
+
+        // resume.py:1427-1428: the ordinary path consumes the vable section, so
+        // the reader surfaces the virtualizable the identity item named.
+        let (bh, virtualizable_ptr) = resume(None);
+        assert_eq!(virtualizable_ptr, 0x4000);
+        assert_eq!(bh.position, 0);
+
+        // resume.py:1433-1435: with a GUARD_NOT_FORCED cache the same items are
+        // jumped — no virtualizable is surfaced, and the frame section behind
+        // them still decodes, which is what proves the jump lengths line up.
+        let (bh, virtualizable_ptr) = resume(Some((vec![0x1234], vec![7])));
+        assert_eq!(virtualizable_ptr, 0);
+        assert_eq!(bh.position, 0);
+    }
+
+    /// resume.py:990-991 `_prepare_virtuals` resets `virtuals_cache` to zeros.
+    /// That is why `blackhole_from_resumedata` must not run `_prepare` on the
+    /// GUARD_NOT_FORCED path (resume.py:1368-1375): there the preloaded cache is
+    /// the resume's only source of virtuals, and `rd_virtuals` stays None.
+    #[test]
+    fn prepare_virtuals_resets_a_preloaded_guard_not_forced_cache() {
+        let rd = majit_ir::RdVirtualInfo::VRawSliceInfo {
+            offset: 0,
+            fieldnums: vec![],
+        };
+        let virtuals = [rd_virtual_to_virtual_info(&rd, &[], 0, 1)];
+        let mut reader = ResumeDataDirectReader::new(
+            &[0, 0],
+            &[],
+            &[],
+            &[],
+            None,
+            Some((vec![0x1234], vec![7])),
+            &NullAllocator,
+        );
+        assert_eq!(reader.resume_after_guard_not_forced, 2);
+        assert_eq!(reader.virtuals_cache.get_ptr(0), 0x1234);
+        assert_eq!(reader.virtuals_cache.get_int(0), 7);
+
+        reader.prepare(Some(&virtuals), None);
+        assert_eq!(reader.virtuals_cache.get_ptr(0), 0);
+        assert_eq!(reader.virtuals_cache.get_int(0), 0);
+    }
+
     #[test]
     #[should_panic(expected = "load_next_value_of_type: unexpected type Void")]
     fn test_next_value_of_type_rejects_void() {
@@ -7512,7 +7618,10 @@ pub fn blackhole_from_resumedata<'a>(
 ///
 /// Force all virtuals from resume data without running a blackhole.
 /// Used for GUARD_NOT_FORCED handling.
-/// Returns (virtuals_cache_ptr, virtuals_cache_int) — RPython VirtualCache parity.
+///
+/// Returns (virtuals_cache_ptr, virtuals_cache_int) — RPython VirtualCache
+/// parity — plus the virtualizable the vable section named, which the caller
+/// needs as the cache key (see `MetaInterp::save_forced_virtuals`).
 pub fn force_from_resumedata<'a>(
     profiler: &crate::jitprof::JitProfiler,
     rd_numb: &'a [u8],
@@ -7526,7 +7635,7 @@ pub fn force_from_resumedata<'a>(
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
     allocator: &'a dyn BlackholeAllocator,
-) -> (Vec<i64>, Vec<i64>) {
+) -> (Vec<i64>, Vec<i64>, i64) {
     // resume.py:1346
     profiler.count(crate::pyjitpl::counters::FORCE_VIRTUALIZABLES, 1);
     // resume.py:1347-1348
@@ -7545,7 +7654,12 @@ pub fn force_from_resumedata<'a>(
     resumereader.handling_async_forcing();
     // resume.py:1350
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo, None);
+    // resume.py:1404 the virtualizable the vable section just named. Read it
+    // before `force_all_virtuals` allocates: unlike `blackhole_from_resumedata`,
+    // the bare `prepare` above opened no resume-root scope, so there is nothing
+    // to forward the reader's slot in place.
+    let virtualizable_ptr = resumereader.virtualizable_ptr;
     // resume.py:1351: return resumereader.force_all_virtuals()
     let (ptrs, ints) = resumereader.force_all_virtuals();
-    (ptrs.to_vec(), ints.to_vec())
+    (ptrs.to_vec(), ints.to_vec(), virtualizable_ptr)
 }

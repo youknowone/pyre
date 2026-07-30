@@ -3522,6 +3522,10 @@ fn install_gc_root_walkers() {
     majit_gc::shadow_stack::register_ephemeron_pruner(
         pyre_interpreter::objspace::std::mapdict::prune_dead_owner_entries,
     );
+    // `MetaInterp::forced_virtuals` is the same shape: keyed by the forced
+    // frame's address and rooting its values, so an entry the following
+    // `GUARD_NOT_FORCED` never consumes has to go when its owner is swept.
+    majit_gc::shadow_stack::register_ephemeron_pruner(prune_forced_virtuals_for_dead_frames);
 }
 
 fn register_thread_root_areas() {
@@ -3580,6 +3584,7 @@ fn register_thread_root_areas() {
         register(partial_trace_root_walker_area, jit_driver);
         register(active_trace_root_walker_area, jit_driver);
         register(compile_snapshot_root_walker_area, jit_driver);
+        register(forced_virtuals_root_walker_area, jit_driver);
     }
 }
 
@@ -3975,15 +3980,11 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
                 // Decoding it through `NullAllocator` instead wrote a null over
                 // that slot, and `fast2locals` renders a null slot as an absent
                 // name — a live local vanished from `f_locals`.
-                let all_virtuals = driver.force_virtualizable_token(token);
-                // compile.py:999-1000 set_savedata_ref: hold what was
-                // materialized for the GUARD_NOT_FORCED that follows, keyed by
-                // the frame this force ran against.
-                if let Some((ptrs, ints)) = all_virtuals {
-                    driver
-                        .meta_interp_mut()
-                        .save_forced_virtuals(ptr as u64, ptrs, ints);
-                }
+                //
+                // `handle_async_forcing` keeps what it materialized for the
+                // GUARD_NOT_FORCED that follows (compile.py:999-1000), so there
+                // is nothing to attach here.
+                driver.force_virtualizable_token(token);
             });
         };
         // Force the traced frame only when the frame handed to Python belongs
@@ -4078,6 +4079,44 @@ unsafe fn compile_snapshot_root_walker_area(
     if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
         pair.0.walk_compile_snapshot_refs(visitor);
     }
+}
+
+/// GC walker for the virtual caches `handle_async_forcing` produced and left
+/// for the `GUARD_NOT_FORCED` that follows. Upstream traces them through the
+/// deadframe's `jf_savedata` GCREF field; pyre holds them on `MetaInterp` and
+/// needs the edge drawn explicitly.
+/// See `MetaInterp::walk_forced_virtuals_refs`.
+unsafe fn forced_virtuals_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
+        pair.0.walk_forced_virtuals_refs(visitor);
+    }
+}
+
+/// Drop forced-virtual caches whose owner frame the major collection is about
+/// to sweep — the ephemeron half of rooting them at all.
+///
+/// The force runs inside a residual `CALL_MAY_FORCE`, and two paths leave the
+/// entry unconsumed: an escaped virtualizable raises instead of failing a
+/// guard, and `handle_fail`'s bridge-compiled arm returns without resuming.
+/// Both would otherwise pin the materialized virtuals for the process lifetime
+/// and leave a key a recycled `PyFrame` address could match.
+///
+/// Reads the `JIT_DRIVER` cell directly rather than through `driver_pair()`:
+/// that initializes the GC subsystem and can allocate, which is not allowed
+/// mid-collection.
+fn prune_forced_virtuals_for_dead_frames(classify: &mut dyn FnMut(usize) -> Option<usize>) {
+    JIT_DRIVER.with(|cell| {
+        let data = cell as *const _ as *const ();
+        // SAFETY: same re-derivation and same aliasing caveat as the root
+        // walkers above (`jit_driver_pair_from_root_area`). The pruner runs on
+        // the collecting thread, so it reaches only that thread's driver.
+        if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
+            pair.0.prune_forced_virtuals(classify);
+        }
+    });
 }
 
 /// Re-derives the thread-local `JitDriverPair` for a GC root walk from the

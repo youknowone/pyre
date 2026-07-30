@@ -4590,14 +4590,14 @@ impl<S: JitState> JitDriver<S> {
     /// virtuals through the same resume allocator used by ordinary guard
     /// failure.  In particular, a `jit.virtual_ref` frame must not be decoded
     /// through `NullAllocator`, or its `forced` writeback remains null.
-    pub fn force_virtualizable_token(&mut self, token: u64) -> Option<(Vec<i64>, Vec<i64>)> {
+    pub fn force_virtualizable_token(&mut self, token: u64) {
         let fallback_alloc = crate::resume::NullAllocator;
         let allocator: &dyn crate::resume::BlackholeAllocator = self
             .blackhole_allocator
             .as_deref()
             .unwrap_or(&fallback_alloc);
         self.meta
-            .force_virtualizable_token_with_allocator(token, allocator)
+            .force_virtualizable_token_with_allocator(token, allocator);
     }
 
     fn prepare_exit_resume_heap_with_blackhole_allocator(
@@ -4641,6 +4641,18 @@ impl<S: JitState> JitDriver<S> {
     /// live during compilation. See `MetaInterp::walk_compile_snapshot_refs`.
     pub fn walk_compile_snapshot_refs(&mut self, visitor: impl FnMut(&mut majit_ir::GcRef)) {
         self.meta.walk_compile_snapshot_refs(visitor);
+    }
+
+    /// GC walker for the forced-virtual caches awaiting a `GUARD_NOT_FORCED`.
+    /// See `MetaInterp::walk_forced_virtuals_refs`.
+    pub fn walk_forced_virtuals_refs(&mut self, visitor: impl FnMut(&mut majit_ir::GcRef)) {
+        self.meta.walk_forced_virtuals_refs(visitor);
+    }
+
+    /// Drop forced-virtual caches whose owner frame died.
+    /// See `MetaInterp::prune_forced_virtuals`.
+    pub fn prune_forced_virtuals(&mut self, classify: &mut dyn FnMut(usize) -> Option<usize>) {
+        self.meta.prune_forced_virtuals(classify);
     }
 
     pub fn run_compiled_detailed_keyed(
