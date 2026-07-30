@@ -28,7 +28,7 @@ use majit_backend::{
 };
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
-use majit_gc::{GcAllocator, GcMap, GcRewriter, WriteBarrierDescr};
+use majit_gc::{GcAllocator, GcMap, GcRewriter};
 use majit_ir::{
     AccumInfo, CallDescr, DescrRef, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex, Op,
     OpCode, OpRc, OpRef, OpTypeIndex, Type, Value,
@@ -8123,21 +8123,12 @@ impl CraneliftBackend {
             nursery_free_addr: gc.nursery_free_addr(),
             nursery_top_addr: gc.nursery_top_addr(),
             max_nursery_size: gc.max_nursery_object_size(),
-            // gc.py:259-283 WriteBarrierDescr parity.
-            wb_descr: {
-                let mut descr = WriteBarrierDescr::for_current_gc();
-                let card_page_shift = gc.card_page_shift();
-                if card_page_shift > 0 {
-                    descr.jit_wb_card_page_shift = card_page_shift;
-                } else {
-                    // gc.py:283: no card marking → jit_wb_cards_set = 0
-                    descr.jit_wb_cards_set = 0;
-                    descr.jit_wb_card_page_shift = 0;
-                    descr.jit_wb_cards_set_byteofs = 0;
-                    descr.jit_wb_cards_set_singlebyte = 0;
-                }
-                descr
-            },
+            // gc.py:401 `gc_ll_descr.write_barrier_descr` — the collector
+            // answers (gc.py:259-283 WriteBarrierDescr parity, card marking
+            // included), and `None` from one that needs no barrier
+            // (`gc.py:156 GcLLDescr_boehm`) keeps `rewrite.py:393` from
+            // emitting `COND_CALL_GC_WB*` the backend could not assemble.
+            wb_descr: gc.get_write_barrier_descr(),
             jitframe_info: JITFRAME_LAYOUT
                 .get()
                 .and_then(|info| info.jitframe_descrs.clone()),
@@ -12270,26 +12261,13 @@ impl CraneliftBackend {
 
                     // Load flag byte from object header.
                     let rw = self.gc_rewriter();
-                    let wb_byteofs = rw
-                        .as_ref()
-                        .map(|r| r.wb_descr.jit_wb_if_flag_byteofs as i32)
-                        .unwrap_or(0);
-                    let wb_mask_raw = rw
-                        .as_ref()
-                        .map(|r| r.wb_descr.jit_wb_if_flag_singlebyte)
-                        .unwrap_or(0);
-                    let wb_cards_set = rw
-                        .as_ref()
-                        .map(|r| r.wb_descr.jit_wb_cards_set)
-                        .unwrap_or(0);
-                    let wb_card_shift = rw
-                        .as_ref()
-                        .map(|r| r.wb_descr.jit_wb_card_page_shift)
-                        .unwrap_or(0);
-                    let wb_cards_singlebyte = rw
-                        .as_ref()
-                        .map(|r| r.wb_descr.jit_wb_cards_set_singlebyte)
-                        .unwrap_or(0);
+                    let wb = rw.as_ref().and_then(|r| r.wb_descr.as_ref());
+                    let wb_byteofs = wb.map(|d| d.jit_wb_if_flag_byteofs as i32).unwrap_or(0);
+                    let wb_mask_raw = wb.map(|d| d.jit_wb_if_flag_singlebyte).unwrap_or(0);
+                    let wb_cards_set = wb.map(|d| d.jit_wb_cards_set).unwrap_or(0);
+                    let wb_card_shift = wb.map(|d| d.jit_wb_card_page_shift).unwrap_or(0);
+                    let wb_cards_singlebyte =
+                        wb.map(|d| d.jit_wb_cards_set_singlebyte).unwrap_or(0);
                     drop(rw);
 
                     // opassembler.py:921-929: mask includes CARDS_SET singlebyte for array ops.

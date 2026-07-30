@@ -1506,19 +1506,13 @@ impl DynasmBackend {
                 nursery_free_addr: gc.nursery_free_addr(),
                 nursery_top_addr: gc.nursery_top_addr(),
                 max_nursery_size: gc.max_nursery_object_size(),
-                wb_descr: {
-                    let mut descr = majit_gc::WriteBarrierDescr::for_current_gc();
-                    let card_page_shift = gc.card_page_shift();
-                    if card_page_shift > 0 {
-                        descr.jit_wb_card_page_shift = card_page_shift;
-                    } else {
-                        descr.jit_wb_cards_set = 0;
-                        descr.jit_wb_card_page_shift = 0;
-                        descr.jit_wb_cards_set_byteofs = 0;
-                        descr.jit_wb_cards_set_singlebyte = 0;
-                    }
-                    descr
-                },
+                // gc.py:401 `gc_ll_descr.write_barrier_descr` — ask the active
+                // collector rather than assuming the MiniMark layout, so the
+                // rewriter and `emit_write_barrier_fastpath_for_base` agree on
+                // whether barriers exist at all. A collector that needs none
+                // reports `None` (`gc.py:156 GcLLDescr_boehm`), and
+                // `rewrite.py:393` then emits no `COND_CALL_GC_WB*`.
+                wb_descr: gc.get_write_barrier_descr(),
                 jitframe_info: crate::jitframe_layout().and_then(|info| info.jitframe_descrs),
                 // rewrite.py:673 — read compiled_loop_token._ll_initial_locs +
                 // ptr2int(compiled_loop_token.frame_info), both sourced from the

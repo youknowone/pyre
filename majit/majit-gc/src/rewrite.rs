@@ -115,8 +115,13 @@ pub struct GcRewriterImpl {
     pub nursery_top_addr: usize,
     /// Maximum object size for nursery allocation.
     pub max_nursery_size: usize,
-    /// Write barrier descriptor.
-    pub wb_descr: WriteBarrierDescr,
+    /// `gc.py:401 self.write_barrier_descr = WriteBarrierDescr(self)` — `None`
+    /// for a collector that needs no write barrier, exactly as
+    /// `gc.py:156 GcLLDescr_boehm.write_barrier_descr` is.
+    /// `rewrite.py:393` gates the whole barrier section on this being set,
+    /// so a `None` here means no `COND_CALL_GC_WB*` is ever emitted; the
+    /// backend asserts the same agreement when it assembles one.
+    pub wb_descr: Option<WriteBarrierDescr>,
     /// JitFrame info for call_assembler rewriting.
     /// rewrite.py:665 — handle_call_assembler needs frame layout info.
     pub jitframe_info: Option<JitFrameDescrs>,
@@ -2514,7 +2519,14 @@ impl GcRewriterImpl {
     // ────────────────────────────────────────────────────────
 
     fn gen_write_barrier_array(&self, v_base: Operand, v_index: Operand, st: &mut RewriteState) {
-        if self.wb_descr.jit_wb_cards_set != 0 {
+        // rewrite.py:956-957 reads `self.gc_ll_descr.write_barrier_descr`
+        // unguarded: this is only reached from the barrier section, which
+        // `rewrite.py:393` already gated on the descriptor being set.
+        let wb_descr = self
+            .wb_descr
+            .as_ref()
+            .expect("gen_write_barrier_array reached with no write barrier descriptor");
+        if wb_descr.jit_wb_cards_set != 0 {
             // If we know statically the length of 'v_base', and it is not
             // too big, then produce a regular write_barrier. If it's
             // unknown or too big, produce a write_barrier_from_array.
@@ -3078,7 +3090,11 @@ impl GcRewriter for GcRewriterImpl {
                 // `transform_to_gc_load` has forwarded the store op to
                 // GC_STORE / GC_STORE_INDEXED.  `emit_maybe_forwarded`
                 // follows the forward and emits the lowered op.
-                OpCode::SetfieldGc => {
+                // rewrite.py:393 `if self.gc_ll_descr.write_barrier_descr is
+                // not None:` — a collector that needs no write barrier
+                // (`gc.py:156 GcLLDescr_boehm.write_barrier_descr = None`)
+                // must not have `COND_CALL_GC_WB*` emitted for it at all.
+                OpCode::SetfieldGc if self.wb_descr.is_some() => {
                     // rewrite.py:393-395 — consider_setfield_gc clears the
                     // pending zero-init entry before WB emission.
                     self.consider_setfield_gc(op, &mut st);
@@ -3086,17 +3102,35 @@ impl GcRewriter for GcRewriterImpl {
                     st.emit_maybe_forwarded(op);
                     continue;
                 }
-                OpCode::SetinteriorfieldGc => {
+                OpCode::SetinteriorfieldGc if self.wb_descr.is_some() => {
                     // rewrite.py:946 `handle_write_barrier_setinteriorfield
                     // = handle_write_barrier_setarrayitem`.
                     self.handle_write_barrier_setarrayitem(op, &mut st);
                     st.emit_maybe_forwarded(op);
                     continue;
                 }
-                OpCode::SetarrayitemGc => {
+                OpCode::SetarrayitemGc if self.wb_descr.is_some() => {
                     // rewrite.py:401-404
                     self.consider_setarrayitem_gc(op, &mut st);
                     self.handle_write_barrier_setarrayitem(op, &mut st);
+                    st.emit_maybe_forwarded(op);
+                    continue;
+                }
+                // rewrite.py:405-412 — the `else` arm of that gate: the
+                // zero-init bookkeeping still runs and no barrier is emitted.
+                // Upstream reaches the ordinary lowering by *not* `continue`
+                // -ing; pyre's loop body ends at this match, so the same
+                // lowering is spelled out as the `emit_maybe_forwarded` the
+                // barrier arms and the catch-all both use.
+                // `SETINTERIORFIELD_GC` gets no `consider_*` there, so it
+                // falls to the catch-all unchanged.
+                OpCode::SetfieldGc => {
+                    self.consider_setfield_gc(op, &mut st);
+                    st.emit_maybe_forwarded(op);
+                    continue;
+                }
+                OpCode::SetarrayitemGc => {
+                    self.consider_setarrayitem_gc(op, &mut st);
                     st.emit_maybe_forwarded(op);
                     continue;
                 }
@@ -3390,7 +3424,7 @@ mod tests {
             nursery_free_addr: 0x1000,
             nursery_top_addr: 0x2000,
             max_nursery_size: 4096,
-            wb_descr: WriteBarrierDescr {
+            wb_descr: Some(WriteBarrierDescr {
                 jit_wb_if_flag: 1,
                 jit_wb_if_flag_byteofs: 0,
                 jit_wb_if_flag_singlebyte: 1,
@@ -3398,7 +3432,7 @@ mod tests {
                 jit_wb_card_page_shift: 0,
                 jit_wb_cards_set_byteofs: 0,
                 jit_wb_cards_set_singlebyte: 0,
-            },
+            }),
             jitframe_info: None,
             call_assembler_callee_locs: None,
             // llmodel.py:39 default keeps existing pre-scale-everything behavior
@@ -3776,6 +3810,71 @@ mod tests {
         assert_eq!(result[0].opcode, OpCode::CondCallGcWb);
         assert_eq!(result[0].arg(0).to_opref(), obj);
         assert_eq!(result[1].opcode, OpCode::GcStore);
+    }
+
+    #[test]
+    fn test_no_write_barrier_descr_emits_no_barrier_but_keeps_the_store() {
+        // rewrite.py:393 `if self.gc_ll_descr.write_barrier_descr is not
+        // None:` — a collector that needs no write barrier reports `None`
+        // (`gc.py:156 GcLLDescr_boehm.write_barrier_descr`), and the whole
+        // barrier section is skipped for it.  rewrite.py:405-412's `else`
+        // still lowers the store; only the barrier goes away.
+        //
+        // The backend asserts the same agreement from its side
+        // (`emit_write_barrier_fastpath_for_base` expects a descriptor
+        // because `COND_CALL_GC_WB` only exists if the rewriter emitted
+        // one), so emitting a barrier here would panic at assembly time.
+        let mut rw = make_rewriter();
+        rw.wb_descr = None;
+        let obj = OpRef::ref_op(0);
+        let val = OpRef::ref_op(1);
+        let ops = vec![Op::with_descr(
+            OpCode::SetfieldGc,
+            &[ro(obj), ro(val)],
+            ref_field_descr(),
+        )];
+
+        let result = rw.rewrite_for_gc(&ops);
+
+        assert!(
+            !result
+                .iter()
+                .any(|o| matches!(o.opcode, OpCode::CondCallGcWb | OpCode::CondCallGcWbArray)),
+            "no barrier may be emitted without a write barrier descriptor"
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::GcStore);
+    }
+
+    #[test]
+    fn test_no_write_barrier_descr_still_lowers_setarrayitem() {
+        // rewrite.py:411-412 — the `else` arm calls `consider_setarrayitem_gc`
+        // and leaves the store to the ordinary lowering.
+        let mut rw = make_rewriter();
+        rw.wb_descr = None;
+        let arr = OpRef::ref_op(0);
+        let idx = OpRef::int_op(1);
+        let val = OpRef::ref_op(2);
+        let ops = vec![Op::with_descr(
+            OpCode::SetarrayitemGc,
+            &[ro(arr), ro(idx), ro(val)],
+            array_descr_ref(),
+        )];
+
+        let result = rw.rewrite_for_gc(&ops);
+
+        assert!(
+            !result
+                .iter()
+                .any(|o| matches!(o.opcode, OpCode::CondCallGcWb | OpCode::CondCallGcWbArray)),
+            "no barrier may be emitted without a write barrier descriptor"
+        );
+        assert!(
+            result
+                .iter()
+                .any(|o| matches!(o.opcode, OpCode::GcStore | OpCode::GcStoreIndexed)),
+            "the store itself must still be lowered: {result:?}"
+        );
     }
 
     #[test]
@@ -4885,7 +4984,7 @@ mod tests {
             nursery_free_addr: 0x1000,
             nursery_top_addr: 0x2000,
             max_nursery_size: 4096,
-            wb_descr: WriteBarrierDescr {
+            wb_descr: Some(WriteBarrierDescr {
                 jit_wb_if_flag: 1,
                 jit_wb_if_flag_byteofs: 0,
                 jit_wb_if_flag_singlebyte: 1,
@@ -4893,7 +4992,7 @@ mod tests {
                 jit_wb_card_page_shift: 7,
                 jit_wb_cards_set_byteofs: 0,
                 jit_wb_cards_set_singlebyte: 0x40,
-            },
+            }),
             jitframe_info: None,
             call_assembler_callee_locs: None,
             load_supported_factors: &[1],
