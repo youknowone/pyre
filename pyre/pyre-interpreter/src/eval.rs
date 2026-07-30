@@ -579,6 +579,18 @@ unsafe fn walk_builtin_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) 
     }
 }
 
+/// Whether `PYRE_INTERP_RETURN_LOG` asks the RETURN_VALUE handler to trace
+/// every returning frame.
+///
+/// Read once: `finish_value` runs on every interpreted return, and `getenv`
+/// takes a lock and scans the environment array, so an uncached read puts that
+/// scan on the return path of every Python-level call.
+#[cfg(not(feature = "sandbox"))]
+fn interp_return_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_INTERP_RETURN_LOG").is_some())
+}
+
 /// Whether the incminimark-parity minor-collection skip of clean prebuilt
 /// structures is enabled (`PYRE_GC_PREBUILT_REMEMBER=0` opts out, restoring
 /// the rescan-everything-every-minor behavior).
@@ -2688,7 +2700,7 @@ impl ControlFlowOpcodeHandler for PyFrame {
     /// when the returning path exits the frame (matched by StepResult::Return).
     fn finish_value(&mut self, value: Self::Value) -> Result<StepResult<Self::Value>, PyError> {
         #[cfg(not(feature = "sandbox"))]
-        if std::env::var_os("PYRE_INTERP_RETURN_LOG").is_some() {
+        if interp_return_log_enabled() {
             unsafe {
                 let code_ptr = crate::pyframe::pyframe_get_pycode(self);
                 let name = if !code_ptr.is_null() {
