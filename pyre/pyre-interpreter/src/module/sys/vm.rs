@@ -2046,6 +2046,26 @@ fn stdio_stdin_readline(args: &[PyObjectRef]) -> crate::PyResult {
     ])
 }
 
+/// `pylifecycle.c init_sys_streams` builds the standard streams after the
+/// import system, so a text codec is reachable by the time they need one.
+/// Pyre builds them from `sys` module creation instead, where the codec lookup
+/// would import `encodings` and re-enter that creation through its own
+/// `import sys`.  They start without an encoder and decoder and pick them up
+/// here, once the import system is up.
+///
+/// The `__std*__` aliases name the streams this built even after user code
+/// rebinds `sys.stdout`; a rebound one is not this function's to reconfigure.
+pub fn init_stream_codecs() {
+    let Some(sys) = crate::importing::get_sys_module("sys") else {
+        return;
+    };
+    for name in ["__stdout__", "__stderr__", "__stdin__"] {
+        if let Ok(stream) = crate::baseobjspace::getattr_str(sys, name) {
+            crate::module::_io::W_TextIOWrapper::attach_stdio_codec(stream);
+        }
+    }
+}
+
 fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     let writable = fd != 0;
     let to_stderr = fd == 2;

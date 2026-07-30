@@ -1059,6 +1059,19 @@ pub(crate) fn init_importlib_bootstrap(
     canonical: pyre_object::PyObjectRef,
     ec_ptr: *const pyre_interpreter::PyExecutionContext,
 ) -> Result<(), pyre_interpreter::PyError> {
+    let bootstrapped = bootstrap_importlib_modules(canonical, ec_ptr);
+    // pylifecycle.c init_sys_streams, which follows init_importlib: the
+    // standard streams can reach a text codec from here on.  A failed
+    // bootstrap leaves the native importer serving imports, so the codec is
+    // still reachable and the streams still want it.
+    pyre_interpreter::module::sys::vm::init_stream_codecs();
+    bootstrapped
+}
+
+fn bootstrap_importlib_modules(
+    canonical: pyre_object::PyObjectRef,
+    ec_ptr: *const pyre_interpreter::PyExecutionContext,
+) -> Result<(), pyre_interpreter::PyError> {
     let import =
         |name: &str| importing::importhook(name, canonical, pyre_object::PY_NULL, 0, ec_ptr);
 

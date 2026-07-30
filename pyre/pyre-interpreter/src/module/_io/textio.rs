@@ -802,6 +802,46 @@ impl W_TextIOWrapper {
         crate::module::_codecs::lookup_text_codec("open", encoding)
     }
 
+    /// Install the buffer and everything derived from it.  The interpreter
+    /// built standard streams run this too, so they reach the same state a
+    /// constructed wrapper does instead of only the fields a struct literal
+    /// can spell.
+    #[allow(clippy::too_many_arguments)]
+    fn attach_buffer(
+        &mut self,
+        buffer: PyObjectRef,
+        encoding: &str,
+        errors: &str,
+        newline: PyObjectRef,
+        newline_value: Option<&str>,
+        codec: PyObjectRef,
+        line_buffering: bool,
+        write_through: bool,
+    ) -> Result<(), crate::PyError> {
+        self.w_buffer = buffer;
+        self.w_encoding = w_str_new(encoding);
+        self.w_errors = w_str_new(errors);
+        self.w_newline = newline;
+        self.line_buffering = line_buffering;
+        self.write_through = write_through;
+        self.decoded.reset();
+        self.snapshot = None;
+        self.pending_bytes = None;
+        self.pending_bytes_count = 0;
+        self.chunk_size = 8192;
+        self.b2cratio = 0.0;
+        self.set_newline(newline_value);
+        self.has_read1 = crate::baseobjspace::getattr_str(buffer, "read1").is_ok();
+        self.set_encoder_decoder(codec)?;
+        self.seekable_flag =
+            crate::baseobjspace::is_true(super::call_method_result(buffer, "seekable", &[])?)?;
+        self.telling = self.seekable_flag;
+        self.state = STATE_OK;
+        self.reset_encoder_state();
+        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        Ok(())
+    }
+
     /// Allocate the typed payload used by the interpreter-created standard
     /// streams.  Their methods and metadata remain instance overrides until
     /// sys stream construction is ported to a real FileIO-backed pipeline.
@@ -817,42 +857,72 @@ impl W_TextIOWrapper {
         // a payload whose stdio methods are installed in the instance dict.
         let _ = type_object();
         let obj = Self::allocate_stable(Self {
-            state: STATE_OK,
-            w_buffer: buffer,
-            w_encoding: w_str_new(encoding),
-            w_errors: w_str_new(errors),
-            // `app_main.py create_stdio:494`
-            // `newline = None if sys.platform == 'win32' else '\n'`.  Universal
-            // newline mode must never be on for POSIX stdio — '\r\n' in stdin
-            // does not mean '\n' there, unlike a file explicitly opened in text
-            // mode — while Windows wants the translation in both directions.
-            w_newline: if cfg!(windows) {
-                w_none()
-            } else {
-                w_str_new("\n")
-            },
             w_stdio_name: w_str_new(name),
-            w_encoder: PY_NULL,
-            w_decoder: PY_NULL,
-            line_buffering,
-            write_through,
-            decoded: DecodeBuffer::default(),
-            snapshot: None,
-            pending_bytes: None,
-            pending_bytes_count: 0,
-            chunk_size: 8192,
-            b2cratio: 0.0,
-            has_read1: false,
-            // What `set_newline` derives from the `w_newline` above.
-            readuniversal: cfg!(windows),
-            readtranslate: cfg!(windows),
-            seekable_flag: false,
-            telling: false,
-            encoding_start_of_stream: false,
             ..Self::default()
         });
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(obj);
+        pyre_object::gc_roots::pin_root(buffer);
+        // `app_main.py create_stdio:494`
+        // `newline = None if sys.platform == 'win32' else '\n'`.  Universal
+        // newline mode must never be on for POSIX stdio — '\r\n' in stdin does
+        // not mean '\n' there, unlike a file explicitly opened in text mode —
+        // while Windows wants the translation in both directions.
+        let newline_value = if cfg!(windows) { None } else { Some("\n") };
+        let newline = newline_value.map_or_else(w_none, w_str_new);
+        // No codec here: looking one up imports `encodings`, whose own
+        // `import sys` would re-enter the `sys` creation this runs inside and
+        // hand the import system a second, half built module.
+        // [`attach_stdio_codec`] supplies it once the import system is up.
+        let payload = unsafe { &mut *(obj as *mut Self) };
+        let _ = payload.attach_buffer(
+            buffer,
+            encoding,
+            errors,
+            newline,
+            newline_value,
+            PY_NULL,
+            line_buffering,
+            write_through,
+        );
+        // `attach_buffer` reaches its fallible calls only once the buffer and
+        // the newline mode are stored, so a stream whose buffer answers no
+        // `seekable` — a descriptor the host refused to open arrives as none at
+        // all — is still the stream this used to build unconditionally.
+        payload.state = STATE_OK;
+        pyre_object::gc_hook::try_gc_write_barrier(payload as *mut Self as *mut u8);
         crate::baseobjspace::setdictvalue_native(obj, "name", w_str_new(name));
         obj
+    }
+
+    /// Give a stream [`allocate_stdio`] built the encoder and decoder it had to
+    /// go without.  Every read path needs the decoder: without it the stream
+    /// reports itself unreadable however readable its buffer is, and only the
+    /// methods `make_std_stream` installs as instance overrides work.
+    ///
+    /// Ignores anything else — a replaced `sys.stdout`, a stream that already
+    /// has a codec, one whose encoding is unknown to the codec registry.
+    pub fn attach_stdio_codec(stream: PyObjectRef) {
+        if stream.is_null()
+            || !std::ptr::eq(
+                unsafe { pyre_object::ll_type(stream) },
+                <Self as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+            )
+        {
+            return;
+        }
+        let payload = unsafe { &mut *(stream as *mut Self) };
+        if !payload.w_encoder.is_null() || !payload.w_decoder.is_null() {
+            return;
+        }
+        let Some(encoding) =
+            unsafe { pyre_object::w_str_get_value_opt(payload.w_encoding) }.map(str::to_owned)
+        else {
+            return;
+        };
+        if let Ok(codec) = Self::lookup_text_codec(&encoding) {
+            let _ = payload.set_encoder_decoder(codec);
+        }
     }
 }
 
@@ -891,32 +961,24 @@ impl W_TextIOWrapper {
         Self::io_check_errors(&errors)?;
         let newline_value = Self::unwrap_newline(newline)?;
         let codec = Self::lookup_text_codec(&encoding)?;
-
-        self.w_buffer = buffer;
-        self.w_encoding = w_str_new(&encoding);
-        self.w_errors = w_str_new(&errors);
-        self.w_newline = newline;
         // 3.14's constructor uses the `bool` Argument Clinic converter (truth
         // testing), unlike `reconfigure`'s `int` converter — an object with
-        // `__bool__` but no `__index__` is accepted here.
-        self.line_buffering = crate::baseobjspace::is_true(line_buffering)?;
-        self.write_through = crate::baseobjspace::is_true(write_through)?;
-        self.decoded.reset();
-        self.snapshot = None;
-        self.pending_bytes = None;
-        self.pending_bytes_count = 0;
-        self.chunk_size = 8192;
-        self.b2cratio = 0.0;
-        self.set_newline(newline_value.as_deref());
-        self.has_read1 = crate::baseobjspace::getattr_str(buffer, "read1").is_ok();
-        self.set_encoder_decoder(codec)?;
-        self.seekable_flag =
-            crate::baseobjspace::is_true(super::call_method_result(buffer, "seekable", &[])?)?;
-        self.telling = self.seekable_flag;
-        self.state = STATE_OK;
-        self.reset_encoder_state();
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
-        Ok(())
+        // `__bool__` but no `__index__` is accepted here.  Argument parsing
+        // runs before the body, so an object whose `__bool__` raises leaves
+        // the stream unattached rather than half filled in.
+        let line_buffering = crate::baseobjspace::is_true(line_buffering)?;
+        let write_through = crate::baseobjspace::is_true(write_through)?;
+
+        self.attach_buffer(
+            buffer,
+            &encoding,
+            &errors,
+            newline,
+            newline_value.as_deref(),
+            codec,
+            line_buffering,
+            write_through,
+        )
     }
 
     fn read(
