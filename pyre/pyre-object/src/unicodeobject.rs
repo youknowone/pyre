@@ -436,53 +436,25 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
 /// PyPy's `BaseUserClassMapdict.getslotvalue` indexes the instance-owned
 /// storage list by `Member.index`.  `PY_NULL` is the unbound-slot sentinel.
 pub unsafe fn w_str_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-    let slots = unsafe { (*(obj as *const W_UnicodeObject)).w_slots };
-    if slots.is_null() {
-        return None;
-    }
-    unsafe { crate::listobject::w_list_getitem(slots, index as i64) }
-        .filter(|value| !value.is_null())
+    unsafe { crate::slots::slot_get(obj, index, str_slots_field) }
 }
 
 /// Write one app-level `__slots__` entry on a `str` subclass.
 pub unsafe fn w_str_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
-    let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(obj);
-    crate::gc_roots::pin_root(value);
-    let obj_slot = crate::gc_roots::shadow_stack_len() - 2;
-    let value_slot = crate::gc_roots::shadow_stack_len() - 1;
-
-    let mut rooted_obj = crate::gc_roots::shadow_stack_get(obj_slot);
-    let mut slots = unsafe { (*(rooted_obj as *const W_UnicodeObject)).w_slots };
-    if slots.is_null() {
-        slots = crate::listobject::w_list_new(vec![PY_NULL; index + 1]);
-        rooted_obj = crate::gc_roots::shadow_stack_get(obj_slot);
-        unsafe { (*(rooted_obj as *mut W_UnicodeObject)).w_slots = slots };
-        crate::gc_hook::try_gc_write_barrier(rooted_obj as *mut u8);
-    } else {
-        while unsafe { crate::listobject::w_list_len(slots) } <= index {
-            unsafe { crate::listobject::w_list_append(slots, PY_NULL) };
-        }
-    }
-    unsafe {
-        crate::listobject::w_list_setitem(
-            slots,
-            index as i64,
-            crate::gc_roots::shadow_stack_get(value_slot),
-        );
-    }
+    unsafe { crate::slots::slot_set(obj, index, value, str_slots_field) }
 }
 
 /// Clear one app-level `__slots__` entry on a `str` subclass.
 pub unsafe fn w_str_slot_del(obj: PyObjectRef, index: usize) -> bool {
-    let slots = unsafe { (*(obj as *const W_UnicodeObject)).w_slots };
-    if slots.is_null()
-        || unsafe { crate::listobject::w_list_getitem(slots, index as i64) }
-            .is_none_or(|value| value.is_null())
-    {
-        return false;
-    }
-    unsafe { crate::listobject::w_list_setitem(slots, index as i64, PY_NULL) }
+    unsafe { crate::slots::slot_del(obj, index, str_slots_field) }
+}
+
+/// Address of `W_UnicodeObject::w_slots` for the shared slot helpers.
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject`.
+unsafe fn str_slots_field(obj: PyObjectRef) -> *mut PyObjectRef {
+    unsafe { &mut (*(obj as *mut W_UnicodeObject)).w_slots }
 }
 
 /// FNV-1a over the key bytes, the digest the type-lookup method cache already
