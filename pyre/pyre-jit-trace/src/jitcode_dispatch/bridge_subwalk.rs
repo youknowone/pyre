@@ -959,9 +959,17 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
 
     let callee_code = jc.code.as_slice();
     let lookup_ref: &SubJitCodeLookup = &sub_jitcode_lookup;
+    // `InlineCalleeConsts.w_code` is the callee frame's `pycode` red — a
+    // `W_Code` object.  `callee_code_key` is the raw compiled-code pointer the
+    // recipe carries, which is the JIT-side key, not that object; the live
+    // wrapper is what `recover_inline_callee_globals` already reads
+    // `w_globals` out of.  Passing the key through made every consumer that
+    // type-checks it decline (the inlined callee then contributed no
+    // `PyTraceback` node) and every consumer that does not re-read it as a
+    // `W_Code` of the wrong type.
     let consts = InlineCalleeConsts {
         w_globals: callee_w_globals,
-        w_code: callee_code_key,
+        w_code: crate::state::recover_inline_callee_code(callee_code_key as *const ()) as usize,
         jitcode_index: jc.try_index().map_or(-1, |index| index as i32),
     };
 

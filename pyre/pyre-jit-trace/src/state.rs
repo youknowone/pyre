@@ -12864,6 +12864,21 @@ fn recipe_slot_to_pyobj(v: majit_ir::Value) -> PyObjectRef {
 /// live wrapper is registered or it carries no globals yet — the callers
 /// (`reconstruct_inline_recipe` and `assemble_bridge_inline_pending`) treat a
 /// null result as "decline the multi-frame path".
+/// Recover the callee's `W_Code` OBJECT for a reconstructed inline frame.
+///
+/// Sibling of [`recover_inline_callee_globals`], reading the same
+/// `code_ptr → live wrapper` registry.  A reconstructed frame's `pycode` red
+/// has to be this object, not the raw code pointer the recipe carries: every
+/// consumer treats it as a `W_Code` (constant pool reads, `PyTraceback` node
+/// construction).  Returns `PY_NULL` when no live wrapper is registered.
+pub(crate) fn recover_inline_callee_code(code_ptr: *const ()) -> pyre_object::PyObjectRef {
+    let live = pyre_interpreter::live_code_wrapper(code_ptr);
+    if live.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    live
+}
+
 pub(crate) fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object::PyObjectRef {
     let live = pyre_interpreter::live_code_wrapper(code_ptr);
     if !live.is_null() {
