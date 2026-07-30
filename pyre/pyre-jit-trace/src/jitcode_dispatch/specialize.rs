@@ -5509,8 +5509,8 @@ pub(crate) fn try_walker_specialize_math_ldexp<Sym: WalkSym>(
 /// result.  Pyre's native module wrapper otherwise materializes an `RBigInt`
 /// before the walker can see that arm.  Recreate the translated shape as an
 /// exact-class guard, unbox, pure non-raising integer call, and `wrapint`.
-/// Longs, subclasses, negative values, rebound callables, and `__index__`
-/// objects retain the generic residual path.
+/// Longs, bools, subclasses, negative values, rebound callables, and
+/// `__index__` objects retain the generic residual path.
 pub(crate) fn try_walker_specialize_math_isqrt<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -5538,7 +5538,15 @@ pub(crate) fn try_walker_specialize_math_isqrt<Sym: WalkSym>(
         return Ok(None);
     }
     let value = unsafe {
-        if !pyre_object::is_exact_builtin_instance(arg_obj) || !pyre_object::is_int(arg_obj) {
+        // `is_int` also accepts a `bool`, whose singletons carry a `&BOOL_TYPE`
+        // vtable and a NULL `w_class`.  The unbox and the exact-class guard
+        // below both pin the canonical `int` class, so neither can hold for one;
+        // decline it here as the int/long binop specializations do instead of
+        // emitting a guard that fails on the operand it was recorded from.
+        if !pyre_object::is_exact_builtin_instance(arg_obj)
+            || !pyre_object::is_int(arg_obj)
+            || pyre_object::is_bool(arg_obj)
+        {
             return Ok(None);
         }
         pyre_object::w_int_get_value(arg_obj)
