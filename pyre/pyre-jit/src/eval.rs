@@ -3909,12 +3909,27 @@ unsafe extern "C" fn force_pyframe_vref(
 ) -> *mut pyre_interpreter::PyFrame {
     let (driver, _info) = driver_pair();
     let vrefinfo = majit_metainterp::virtualref::VirtualRefInfo::new();
+    // Entry, distinct from the token arm logged below: a vref built during
+    // tracing carries `forced` already set and `virtual_token = TOKEN_NONE`
+    // (`virtualref.py:85-92`), so `force_virtual` returns without running the
+    // closure. Counting only the closure conflates "never reached" with
+    // "reached and short-circuited".
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!("[jit][force-hook] vref-entry vref={vref:p}");
+    }
     let forced = unsafe {
         vrefinfo.force_virtual(vref as *mut u8, |v| {
             // `compile.py:967-971 force_now(cpu, token)` — force the JIT frame
             // the vref names, then run the guard's async forcing, which is
             // what writes `virtual_token = TOKEN_NONE` and `forced` back.
             let token = (*v).virtual_token as usize as u64;
+            // Name the entry point. The two hooks reach the same
+            // `handle_async_forcing`, and nothing downstream distinguishes
+            // them — which is how this one silently diverged from
+            // `force_pyframe` in the first place.
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[jit][force-hook] vref token=0x{token:x}");
+            }
             driver.force_virtualizable_token(token);
         })
     };
@@ -3991,6 +4006,12 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
                 // `handle_async_forcing` keeps what it materialized for the
                 // GUARD_NOT_FORCED that follows (compile.py:999-1000), so there
                 // is nothing to attach here.
+                //
+                // See the counterpart in `force_pyframe_vref` for why the entry
+                // point is named.
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!("[jit][force-hook] frame token=0x{token:x} frame={ptr:p}");
+                }
                 driver.force_virtualizable_token(token);
             });
         };
