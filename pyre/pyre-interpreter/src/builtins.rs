@@ -9879,7 +9879,7 @@ pub const HASH_SEED_ERROR: &str =
 /// A digest taken before this runs pins a random secret and the variable is
 /// ignored from then on, so the launcher calls it before anything hashes.
 pub fn init_hash_secret_from_env() -> Result<(), &'static str> {
-    let value = crate::host_seam::ops::getenv(b"PYTHONHASHSEED")
+    let value = crate::host_seam::getenv(b"PYTHONHASHSEED")
         .ok()
         .flatten()
         .unwrap_or_default();

@@ -413,6 +413,16 @@ declare_seam! {
     sleep(seconds: f64) -> unit = "ll_time.ll_time_sleep";
 }
 
+/// Read one process-environment value through the host seam.
+///
+/// Keep this target-independent entry point at the module root: Charon's
+/// wasm-layout extraction does not retain the macro-generated `ops` module,
+/// while ordinary Unix builds still delegate to the same real/sandbox host
+/// selected by [`ops::getenv`].
+pub fn getenv(name: &[u8]) -> SeamResult<Option<Vec<u8>>> {
+    ops::getenv(name)
+}
+
 // ── Interpreter stdio ────────────────────────────────────────────────────────
 //
 // Diagnostic output (tracebacks, warnings, the interactive displayhook) reaches

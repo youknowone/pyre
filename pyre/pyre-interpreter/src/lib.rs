@@ -50,15 +50,12 @@ pub mod host_seam;
 // every target.
 #[cfg(not(unix))]
 pub mod host_seam {
-    pub mod ops {
-        /// Read a process environment value. Numeric `PYTHONHASHSEED` values
-        /// are ASCII; lossily encoding any other platform string still makes
-        /// the seed parser reject it instead of treating it as absent.
-        pub fn getenv(name: &[u8]) -> Result<Option<Vec<u8>>, ()> {
-            let name = std::str::from_utf8(name).map_err(|_| ())?;
-            Ok(std::env::var_os(name)
-                .map(|value| value.to_string_lossy().into_owned().into_bytes()))
-        }
+    /// Read a process environment value. Numeric `PYTHONHASHSEED` values are
+    /// ASCII; lossily encoding any other platform string still makes the seed
+    /// parser reject it instead of treating it as absent.
+    pub fn getenv(name: &[u8]) -> Result<Option<Vec<u8>>, ()> {
+        let name = std::str::from_utf8(name).map_err(|_| ())?;
+        Ok(std::env::var_os(name).map(|value| value.to_string_lossy().into_owned().into_bytes()))
     }
 
     /// Emit bytes to the interpreter's stdout (fd 1).
