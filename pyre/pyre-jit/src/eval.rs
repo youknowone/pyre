@@ -6064,6 +6064,26 @@ fn nested_break_bridge_resume_hazard(code: &pyre_interpreter::CodeObject) -> boo
         let Some(inner_header) = inner_header else {
             continue;
         };
+        let Some((pyre_interpreter::Instruction::ForIter { delta }, op_arg)) =
+            pyre_interpreter::decode_instruction_at(code, inner_header)
+        else {
+            continue;
+        };
+        let inner_exit = pyre_interpreter::jump_target_forward(
+            &code.instructions,
+            inner_header + 1,
+            delta.get(op_arg).as_usize(),
+        );
+        // A real inner-loop break pops the inner iterator while control is
+        // still inside that FOR_ITER's body. If the POP_TOP lies at or beyond
+        // the inner loop's exhaustion target, the nested loop has already
+        // ended; a later statement-result POP_TOP followed by the enclosing
+        // loop's backedge is not a break. This is the shape in testDist:
+        // an inlined list comprehension ends, then assertTrue() pops its
+        // result and continues the surrounding product loop.
+        if pop_pc >= inner_exit {
+            continue;
+        }
         for guard_pc in (inner_header + 1)..pop_pc {
             match pyre_interpreter::decode_instruction_at(code, guard_pc) {
                 Some((pyre_interpreter::Instruction::PopJumpIfTrue { .. }, _)) => {
@@ -11236,6 +11256,30 @@ mod tests {
         let code = function_code_from_module(&module, "s");
         assert!(for_iter_bodies_all_jit_safe(&code));
         assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn nested_break_hazard_ignores_completed_comprehension_before_outer_backedge() {
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def f(rows, pred, sink):\n    for p in rows:\n        for q in rows:\n            diffs = [x for x in q]\n            if pred(diffs):\n                sink(diffs)\n            elif pred(q):\n                sink(q)\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+
+        assert!(!nested_break_bridge_resume_hazard(&code));
+    }
+
+    #[test]
+    fn nested_break_hazard_keeps_secondary_edge_inner_break() {
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def f(n):\n    total = 0\n    for i in range(n):\n        for j in range(2, 4):\n            if not i % 3 != 0:\n                break\n            total += j\n    return total\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+
+        assert!(nested_break_bridge_resume_hazard(&code));
     }
 
     #[test]
