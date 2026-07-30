@@ -2805,7 +2805,7 @@ pub fn w_exception_slot_descr(
 /// dead-store-eliminates a balanced save/restore (and the stored
 /// exception, if it never otherwise escapes, stays virtual and DCEs).
 pub fn ec_sys_exc_value_descr() -> DescrRef {
-    EC_DESCR_GROUP.field_descrs[0].clone() as DescrRef
+    ec_field_descr(pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET)
 }
 
 /// Field descr for `ExecutionContext::topframeref`, used by the JIT lowering
@@ -2817,7 +2817,16 @@ pub fn ec_sys_exc_value_descr() -> DescrRef {
 /// heap optimizer can forward an `enter` store to the matching `leave` read
 /// and dead-store-eliminate a balanced pair whose frame never escaped.
 pub fn ec_topframeref_descr() -> DescrRef {
-    EC_DESCR_GROUP.field_descrs[1].clone() as DescrRef
+    ec_field_descr(pyre_interpreter::EC_TOPFRAMEREF_OFFSET)
+}
+
+/// Resolve one `EC_DESCR_GROUP` field by byte offset.  The group stamps
+/// `index_in_parent` as the field's rank by offset, so the positional order of
+/// `field_descrs` follows the offsets rather than the declaration order; look
+/// the field up by offset so the two accessors above cannot swap.
+fn ec_field_descr(offset: usize) -> DescrRef {
+    let parent = EC_DESCR_GROUP.size_descr.clone() as DescrRef;
+    majit_ir::descr::field_descr_from_parent_by_offset(&parent, offset)
 }
 
 /// The `ExecutionContext` field group.  `type_id 0 + vtable 0` →
@@ -2842,22 +2851,32 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
         is_quasi_immutable: false,
         flag: ArrayFlag::Unsigned,
         virtualizable: false,
+        // Stamped below, once the specs are in offset order.
         index_in_parent: 0,
     };
-    majit_ir::descr::make_simple_descr_group(
-        u32::MAX,
-        pyre_interpreter::EC_SIZE,
-        0,
-        0,
-        &[
-            field(
-                0,
-                "sys_exc_value",
-                pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET,
-            ),
-            field(1, "topframeref", pyre_interpreter::EC_TOPFRAMEREF_OFFSET),
-        ],
-    )
+    let mut specs = vec![
+        field(
+            0,
+            "sys_exc_value",
+            pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET,
+        ),
+        field(1, "topframeref", pyre_interpreter::EC_TOPFRAMEREF_OFFSET),
+    ];
+    // `index_in_parent` is the field's rank by byte offset
+    // (`jitcode/assembler.rs:625`), and once a parent SizeDescr is bound it is
+    // also the `PtrInfo._fields` slot key the heap optimizer reads
+    // (`optimizeopt/heap.rs` `field_slot_index`), so the two fields must not
+    // share a rank — a shared rank makes a read of one field resolve to the
+    // cached value of the other.  `ExecutionContext` is `repr(Rust)`, so rank by
+    // the actual offsets instead of the declaration order; sorting the specs
+    // first keeps the rank, the spec order and the `all_fielddescrs` positional
+    // order one numbering, as `.enumerate()` gives
+    // `build_object_descr_group_with_def_path`.
+    specs.sort_by_key(|spec| spec.offset);
+    for (index_in_parent, spec) in specs.iter_mut().enumerate() {
+        spec.index_in_parent = index_in_parent;
+    }
+    majit_ir::descr::make_simple_descr_group(u32::MAX, pyre_interpreter::EC_SIZE, 0, 0, &specs)
 });
 
 /// Size descriptor for W_SliceObject allocation via NewWithVtable.
