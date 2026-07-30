@@ -37,7 +37,10 @@ static INT_MAX_STR_DIGITS: AtomicI32 = AtomicI32::new(DEFAULT_MAX_STR_DIGITS);
 
 /// `space.sys.recursionlimit` getter. Matches
 /// `pypy/module/sys/vm.py:102 return space.newint(space.sys.recursionlimit)`.
-#[inline]
+///
+/// The value is mutable sys-module state, so tracing must read it at runtime
+/// rather than bake the build process's atomic value into a JitCode.
+#[majit_macros::dont_look_inside]
 pub fn recursion_limit() -> i32 {
     RECURSION_LIMIT.load(Ordering::Relaxed)
 }

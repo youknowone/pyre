@@ -190,7 +190,12 @@ thread_local! {
 }
 
 /// Get current call depth. Used by pyre-jit for JIT_CALL_DEPTH parity.
-#[inline(always)]
+///
+/// The counter is runtime-mutable execution-context state.  Like
+/// [`frame_entry_count`], its TLS read has no source-translatable graph and
+/// must remain a residual read rather than exposing `LocalKey::with` to the
+/// annotator.
+#[majit_macros::dont_look_inside]
 pub fn call_depth() -> u32 {
     CALL_DEPTH.with(|d| d.get())
 }

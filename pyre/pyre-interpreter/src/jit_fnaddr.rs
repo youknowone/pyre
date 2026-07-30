@@ -1223,6 +1223,16 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::call::bump_frame_entry_count",
         crate::call::bump_frame_entry_count as *const (),
     );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::call::call_depth",
+        crate::call::call_depth as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "pyre_interpreter::module::sys::state::recursion_limit",
+        crate::module::sys::state::recursion_limit as *const (),
+    );
     // The dispatch-loop safepoint entry itself paces the poll inline and
     // dispatches to the threshold and collection hooks.
     push_alias_pair(
@@ -3061,6 +3071,10 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             &crate::function::BUILTIN_FUNCTION_TYPE as *const _ as i64,
         ),
         (
+            "function::METHOD_DESCRIPTOR_TYPE",
+            &crate::function::METHOD_DESCRIPTOR_TYPE as *const _ as i64,
+        ),
+        (
             "function::SLOT_WRAPPER_TYPE",
             &crate::function::SLOT_WRAPPER_TYPE as *const _ as i64,
         ),
@@ -3272,7 +3286,10 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_list_write_barrier, is_pyframe_operand_stack_accessor, jit_trace_fnaddrs};
+    use super::{
+        is_list_write_barrier, is_pyframe_operand_stack_accessor, jit_static_pytype_addrs,
+        jit_trace_fnaddrs,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -3296,6 +3313,16 @@ mod tests {
             list_append
         );
         assert_eq!(bindings["pyre_object::jit_list_append"], list_append);
+    }
+
+    #[test]
+    fn jit_static_pytype_addrs_covers_interpreter_function_types() {
+        let bindings: HashMap<&'static str, i64> = jit_static_pytype_addrs().into_iter().collect();
+
+        assert_eq!(
+            bindings["function::METHOD_DESCRIPTOR_TYPE"],
+            &crate::function::METHOD_DESCRIPTOR_TYPE as *const _ as i64
+        );
     }
 
     #[test]
@@ -3492,6 +3519,16 @@ mod tests {
         assert_eq!(
             bindings["pyre_interpreter::call::bump_frame_entry_count"],
             bump
+        );
+
+        let call_depth = crate::call::call_depth as *const () as usize as i64;
+        assert_eq!(bindings["pyre_interpreter::call::call_depth"], call_depth);
+
+        let recursion_limit =
+            crate::module::sys::state::recursion_limit as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::module::sys::state::recursion_limit"],
+            recursion_limit
         );
 
         let safepoint = pyre_object::gc_interp::safepoint as *const () as usize as i64;

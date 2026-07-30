@@ -18,7 +18,7 @@ use majit_charon_reader::{
     Llbc,
     ullbc::{GlobalDecl, Operand, PlaceKind, Rvalue, StmtKind},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Marker-const name prefix → the JIT hint strings it implies.  The
 /// user function's leaf name is the const leaf with the prefix stripped.
@@ -47,6 +47,10 @@ const CONST_PREFIX_HINTS: &[(&str, &[&str])] = &[
 pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     for llbc in llbcs {
+        let function_paths: HashSet<String> = llbc
+            .iter_local_fns()
+            .map(|fd| strip_crate_prefix(&fd.item_meta.name_path()))
+            .collect();
         for gd in llbc.iter_global_decls() {
             let path = gd.item_meta.name_path();
             let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
@@ -75,7 +79,7 @@ pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> 
                 };
                 push_hint(
                     &mut out,
-                    marker_path_to_fn_path(&path, "_jit_look_inside_"),
+                    marker_path_to_fn_path(&path, "_jit_look_inside_", &function_paths),
                     hint,
                 );
                 continue;
@@ -108,7 +112,7 @@ pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> 
                 // resolve names→positions; emit it here when such a spec lands.
                 push_hint(
                     &mut out,
-                    marker_path_to_fn_path(&path, "oopspec_"),
+                    marker_path_to_fn_path(&path, "oopspec_", &function_paths),
                     &format!("oopspec:{spec}"),
                 );
                 continue;
@@ -122,7 +126,7 @@ pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> 
                     if should_skip_generated_elidable_helper(fn_name) {
                         continue;
                     }
-                    let key = marker_path_to_fn_path(&path, prefix);
+                    let key = marker_path_to_fn_path(&path, prefix, &function_paths);
                     for hint in *hints {
                         push_hint(&mut out, key.clone(), hint);
                     }
@@ -146,7 +150,11 @@ fn push_hint(out: &mut HashMap<String, Vec<String>>, key: String, hint: &str) {
     out.entry(key).or_default().push(hint.to_string());
 }
 
-fn marker_path_to_fn_path(marker_path: &str, prefix: &str) -> String {
+fn marker_path_to_fn_path(
+    marker_path: &str,
+    prefix: &str,
+    function_paths: &HashSet<String>,
+) -> String {
     let stripped = strip_crate_prefix(marker_path);
     match stripped.rsplit_once("::") {
         Some((module, leaf)) => {
@@ -157,10 +165,20 @@ fn marker_path_to_fn_path(marker_path: &str, prefix: &str) -> String {
             // promotes under `<method>::_elidable_function_<method>`.
             // In that spelling the parent already is the function path; do
             // not append the leaf a second time.
-            if module.rsplit("::").next() == Some(fn_leaf) {
+            // A module and its free function may legitimately have the same
+            // leaf (`stack_check::stack_check`).  The old leaf-equality
+            // heuristic collapsed that path to `stack_check`, silently
+            // dropping its `dont_look_inside` hint.  Resolve against Charon's
+            // actual function declarations: a sibling marker names
+            // `module::fn_leaf`, while an impl/body-local marker names its
+            // already-complete parent function path.
+            let sibling_path = format!("{module}::{fn_leaf}");
+            if function_paths.contains(&sibling_path) {
+                sibling_path
+            } else if function_paths.contains(module) {
                 module.to_string()
             } else {
-                format!("{module}::{fn_leaf}")
+                sibling_path
             }
         }
         None => stripped
@@ -292,7 +310,34 @@ fn decode_bool_const(value: &serde_json::Value) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_str_const;
+    use super::{decode_str_const, marker_path_to_fn_path};
+    use std::collections::HashSet;
+
+    #[test]
+    fn marker_path_keeps_same_named_module_function() {
+        let functions = HashSet::from(["stack_check::stack_check".to_string()]);
+        assert_eq!(
+            marker_path_to_fn_path(
+                "pyre_interpreter::stack_check::_jit_look_inside_stack_check",
+                "_jit_look_inside_",
+                &functions,
+            ),
+            "stack_check::stack_check"
+        );
+    }
+
+    #[test]
+    fn marker_path_keeps_impl_body_local_parent() {
+        let functions = HashSet::from(["rbigint::RBigInt::mul".to_string()]);
+        assert_eq!(
+            marker_path_to_fn_path(
+                "pyre_object::rbigint::RBigInt::mul::_elidable_function_mul",
+                "_elidable_function_",
+                &functions,
+            ),
+            "rbigint::RBigInt::mul"
+        );
+    }
 
     #[test]
     fn decode_str_const_reads_constant_expr_literal() {

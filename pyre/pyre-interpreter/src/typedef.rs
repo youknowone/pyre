@@ -15358,17 +15358,8 @@ fn float_descr_as_integer_ratio(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
         ));
     }
     let v = unsafe { pyre_object::w_float_get_value(args[0]) };
-    // Exact numerator/denominator via the shared rational decomposition
-    // (full exponent range, reduced to lowest terms).
-    let (numer, denom) = rustpython_common::int::float_to_ratio(v).ok_or_else(|| {
-        if v.is_infinite() {
-            crate::PyError::overflow_error("cannot convert Infinity to integer ratio")
-        } else {
-            crate::PyError::value_error("cannot convert NaN to integer ratio")
-        }
-    })?;
-    let to_pyint = |b| {
-        let b = crate::compiler_bigint_to_rbigint(&b);
+    let (numer, denom) = float_as_rbigint_ratio(v)?;
+    let to_pyint = |b: BigInt| {
         if pyre_object::jit_bigint_to_i64_fits(&b) != 0 {
             pyre_object::w_int_new(pyre_object::jit_bigint_to_i64_value(&b))
         } else {
@@ -15379,6 +15370,48 @@ fn float_descr_as_integer_ratio(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
         to_pyint(numer),
         to_pyint(denom),
     ]))
+}
+
+/// RPython `rpython/rlib/rfloat.py:292 float_as_rbigint_ratio`.
+///
+/// Keeping the decomposition on pyre's translated `RBigInt` surface matches
+/// PyPy's `W_FloatObject.descr_as_integer_ratio` and avoids crossing into
+/// RustPython's opaque malachite `Rational` implementation.
+fn float_as_rbigint_ratio(value: f64) -> Result<(BigInt, BigInt), crate::PyError> {
+    if value.is_infinite() {
+        return Err(crate::PyError::overflow_error(
+            "cannot convert Infinity to integer ratio",
+        ));
+    }
+    if value.is_nan() {
+        return Err(crate::PyError::value_error(
+            "cannot convert NaN to integer ratio",
+        ));
+    }
+    let (mut float_part, mut exp_int) = float_frexp(value);
+    for _ in 0..300 {
+        if float_part == float_part.floor() {
+            break;
+        }
+        float_part *= 2.0;
+        exp_int -= 1;
+    }
+    let mut num = match BigInt::fromfloat(float_part) {
+        Ok(num) => num,
+        Err(_) => return Err(crate::PyError::memory_error("")),
+    };
+    let mut den = BigInt::fromint(1);
+    let shift = if exp_int < 0 { -exp_int } else { exp_int };
+    let exp = match den.lshift(shift as i64) {
+        Ok(exp) => exp,
+        Err(_) => return Err(crate::PyError::memory_error("")),
+    };
+    if exp_int > 0 {
+        num = num.mul(&exp);
+    } else {
+        den = exp;
+    }
+    Ok((num, den))
 }
 
 /// Manual interp2app gateway for `float.as_integer_ratio`.

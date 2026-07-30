@@ -1969,16 +1969,18 @@ impl HostEnv {
         let bigint = HostObject::new_module("BigInt");
         bigint.module_set("from", HostObject::new_builtin_callable("BigInt.from"));
 
-        // `longlong2float.float2longlong(x)` reinterprets an f64 bit pattern as
-        // i64 (`convert_float_bytes_to_longlong` llop).  The front-end mints this
-        // callsite in the `f64::is_sign_negative` lowering; surface a module-shaped
-        // stub so Branch 3b in `flowspace_adapter::translate_op` resolves the
-        // 2-segment path, the annotator types it `SomeInteger(r_longlong)`, and the
-        // rtyper's `Float2LongLong` extregistry entry emits the genop.
+        // RPython `rlib.longlong2float` bitcast pair.  The front-end mints
+        // these callsites for Rust's `f64::{to_bits,from_bits}` surface;
+        // expose both ExtRegistryEntry-backed functions so annotation and
+        // rtyping emit the matching convert_* llops.
         let longlong2float = HostObject::new_module("longlong2float");
         longlong2float.module_set(
             "float2longlong",
             HostObject::new_builtin_callable("longlong2float.float2longlong"),
+        );
+        longlong2float.module_set(
+            "longlong2float",
+            HostObject::new_builtin_callable("longlong2float.longlong2float"),
         );
 
         // Rust primitive type conversion impls (`u32::from`,

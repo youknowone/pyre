@@ -373,6 +373,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "longlong2float.float2longlong",
         float2longlong_analyzer,
     );
+    analyzer_for(
+        &mut reg,
+        "longlong2float.longlong2float",
+        longlong2float_analyzer,
+    );
     // Foreign Rust container constructors — `Vec::new` /
     // `Vec::with_capacity` / `indexmap::IndexMap::new` / `Box::new`.
     // Each returns the classdef-less opaque `SomeInstance` shell (twin
@@ -1276,6 +1281,16 @@ pub fn float2longlong_analyzer(
         false,
         crate::annotator::model::KnownType::LongLong,
     )))
+}
+
+/// `longlong2float.longlong2float(llval)` — upstream
+/// `LongLong2FloatEntry.compute_result_annotation` returns `SomeFloat`.
+pub fn longlong2float_analyzer(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(SomeValue::Float(Default::default()))
 }
 
 /// Analyzer for `std::ptr::eq(p1, p2) -> bool` — Rust pointer identity

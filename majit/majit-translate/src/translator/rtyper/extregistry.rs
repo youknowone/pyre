@@ -193,6 +193,9 @@ pub enum ExtRegistryEntry {
     /// (`float2longlong_analyzer` → `SomeInteger(r_longlong)`); this entry fires on
     /// the rtyper's `findbltintyper` → `specialize_call` path.
     Float2LongLong,
+    /// `longlong2float.longlong2float(i64) -> f64` — RPython
+    /// `LongLong2FloatEntry`, the inverse bit reinterpretation.
+    LongLong2Float,
 }
 
 /// Small Send-able annotation payload for static HostObject type
@@ -303,6 +306,7 @@ pub enum ExtRegistryEntryKey {
     /// `self.__class__` and there is no `self.instance`.
     BigIntFrom,
     Float2LongLong,
+    LongLong2Float,
 }
 
 impl ExtRegistryEntry {
@@ -340,6 +344,7 @@ impl ExtRegistryEntry {
             ExtRegistryEntry::WeAreJitted => ExtRegistryEntryKey::WeAreJitted,
             ExtRegistryEntry::BigIntFrom => ExtRegistryEntryKey::BigIntFrom,
             ExtRegistryEntry::Float2LongLong => ExtRegistryEntryKey::Float2LongLong,
+            ExtRegistryEntry::LongLong2Float => ExtRegistryEntryKey::LongLong2Float,
         }
     }
 
@@ -484,6 +489,9 @@ impl ExtRegistryEntry {
                     crate::annotator::model::KnownType::LongLong,
                 ),
             )),
+            ExtRegistryEntry::LongLong2Float => Ok(SomeValue::Float(
+                crate::annotator::model::SomeFloat::default(),
+            )),
         }
     }
 
@@ -626,6 +634,10 @@ impl ExtRegistryEntry {
             // emits `genop('convert_float_bytes_to_longlong', [v_float], SignedLongLong)`.
             ExtRegistryEntry::Float2LongLong => {
                 Ok(super::rbuiltin::rtype_float2longlong as BuiltinTyperFn)
+            }
+            // `rlib/longlong2float.py:95-98` — inverse bitcast.
+            ExtRegistryEntry::LongLong2Float => {
+                Ok(super::rbuiltin::rtype_longlong2float as BuiltinTyperFn)
             }
         }
     }
@@ -874,6 +886,9 @@ fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
     }
     if host.qualname() == "longlong2float.float2longlong" {
         return Some(ExtRegistryEntry::Float2LongLong);
+    }
+    if host.qualname() == "longlong2float.longlong2float" {
+        return Some(ExtRegistryEntry::LongLong2Float);
     }
     if let Some(entry) = host_value_registry().lock().unwrap().get(host).cloned() {
         return Some(entry);
