@@ -1749,7 +1749,20 @@ fn pair_abstract_string_rtype_compare(
         ConvertedTo::Repr(r0_arc.as_ref()),
         ConvertedTo::Repr(r1_arc.as_ref()),
     ])?;
+    string_compare_tail(hop, func, vlist, ptr_lltype, eq_helper_name, cmp_helper_name)
+}
 
+/// Lower an already-coerced `(v_str1, v_str2)` string pair to the compare
+/// result: `eq`/`ne` via `ll_streq` (+ `bool_not`), `lt`/`le`/`gt`/`ge` via
+/// `ll_strcmp` + `int_<func>(diff, 0)` (rstr.py:661-692).
+fn string_compare_tail(
+    hop: &HighLevelOp,
+    func: &str,
+    vlist: Vec<Hlvalue>,
+    ptr_lltype: LowLevelType,
+    eq_helper_name: &str,
+    cmp_helper_name: &str,
+) -> RTypeResult {
     match func {
         "eq" => {
             let v_eq = call_ll_streq_helper(hop, vlist, ptr_lltype, eq_helper_name)?;
@@ -1777,6 +1790,37 @@ fn pair_abstract_string_rtype_compare(
             "pair_abstract_string_rtype_compare unsupported func '{func}'"
         ))),
     }
+}
+
+/// RPython resolves a `String <op> Char` comparison through the pair MRO to
+/// `pairtype(AbstractStringRepr, AbstractStringRepr)` (rstr.py:661-692) because
+/// `CharRepr(AbstractCharRepr, StringRepr)` inherits `StringRepr.repr =
+/// string_repr` (lltypesystem/rstr.py:1262). That body does
+/// `hop.inputargs(r_str1.repr, r_str2.repr)`, i.e. coerces BOTH operands to the
+/// string repr — the Char operand becomes a 1-char string via `ll_chr2str`
+/// (rstr.py:805-813) — then runs `ll_streq`/`ll_strcmp`. Pyre's `CharRepr`
+/// pair_mro is `[CharRepr, Repr]` (explicit per-class arms, no String MRO
+/// fallback), so the mixed pair needs its own arm. `str_arg_idx` names which
+/// operand is already the string repr; both are coerced to it.
+pub(crate) fn pair_string_char_rtype_compare(
+    hop: &HighLevelOp,
+    func: &str,
+    str_arg_idx: usize,
+) -> RTypeResult {
+    let str_repr = hop
+        .args_r
+        .borrow()
+        .get(str_arg_idx)
+        .cloned()
+        .flatten()
+        .ok_or_else(|| {
+            TyperError::message("pair string/char compare: string-side args_r missing")
+        })?;
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::Repr(str_repr.as_ref()),
+        ConvertedTo::Repr(str_repr.as_ref()),
+    ])?;
+    string_compare_tail(hop, func, vlist, STRPTR.clone(), "ll_streq", "ll_strcmp")
 }
 
 fn call_ll_streq_helper(

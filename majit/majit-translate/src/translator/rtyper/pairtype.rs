@@ -852,6 +852,19 @@ fn dispatch_rtype_op(
             committed(super::rstr::pair_string_string_rtype_compare(hop, "ge"))
         }
 
+        // rstr.py:661-692 via `CharRepr(AbstractCharRepr, StringRepr)` MRO —
+        // a String compared with a Char coerces the Char operand to a 1-char
+        // string (ll_chr2str) then reuses the AbstractStringRepr compare body.
+        // Pyre's CharRepr pair_mro is [CharRepr, Repr] (explicit-arm design),
+        // so the mixed pair needs its own arm; `str_arg_idx` names the string
+        // operand both sides coerce to.
+        (StringRepr, CharRepr, "eq" | "ne" | "lt" | "le" | "gt" | "ge") => {
+            committed(super::rstr::pair_string_char_rtype_compare(hop, opname, 0))
+        }
+        (CharRepr, StringRepr, "eq" | "ne" | "lt" | "le" | "gt" | "ge") => {
+            committed(super::rstr::pair_string_char_rtype_compare(hop, opname, 1))
+        }
+
         // rstr.py:651-692 inherited via AbstractUnicodeRepr(AbstractStringRepr) —
         // pairtype(AbstractUnicodeRepr, AbstractUnicodeRepr) routes through
         // the same body modulo the helper-graph identity (ll_unicode_eq /
