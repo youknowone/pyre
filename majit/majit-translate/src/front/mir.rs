@@ -4905,8 +4905,46 @@ impl<'a> Lowering<'a> {
                         // types), so read and write attrs key under one
                         // owner.
                         let owner = format!("Tuple{}", tyref_tuple_suffix(&inner.ty, self.llbc));
+                        // A tuple reached through a pointer/reference deref
+                        // (a residual call returning `&(A, B)`, a
+                        // `*mut (A, B)` field) resolves its base to a
+                        // classdef-less `SomeInstance`: pyre's pointer
+                        // erasure drops the tuple shape, so the annotator
+                        // Blocks the `__pos_<N>` read (dispatched as
+                        // `getattr`) on a classdef-less instance.  Narrow the
+                        // base to this tuple's `Tuple{suffix}` classdef first
+                        // — identity when it already carries it — the same
+                        // `__pyre_cast_instance` downcast the raw-ptr-deref
+                        // Adt field arm applies (see `narrow_root` above).  A
+                        // by-value tuple base is not deref-shaped and keeps
+                        // its concrete classdef, so it is left untouched.
+                        let base_is_deref = matches!(
+                            &inner.kind,
+                            PlaceKind::Projection(_, ProjectionElem::Atom(s)) if s == "Deref"
+                        );
                         let base = self.resolve_place(mir_bb, *inner)?;
                         let bb_id = self.block_id[mir_bb];
+                        let base = if base_is_deref {
+                            let narrowed = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(narrowed.clone()),
+                                kind: OpKind::Call {
+                                    target: CallTarget::FunctionPath {
+                                        segments: vec![
+                                            "__pyre_cast_instance".to_string(),
+                                            owner.clone(),
+                                        ],
+                                    },
+                                    args: vec![base],
+                                    result_ty: ValueType::Ref(Some(owner.clone())),
+                                },
+                            });
+                            narrowed
+                        } else {
+                            base
+                        };
                         let ty = tyref_to_value_type(&place_ty, self.llbc);
                         let res = self
                             .graph
