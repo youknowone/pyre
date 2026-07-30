@@ -1064,38 +1064,57 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
     ]
 }
 
-// ── Print hook for wasm (stdout capture) ──
-use std::cell::RefCell;
-thread_local! {
-    static PRINT_HOOK: RefCell<Option<fn(&str)>> = RefCell::new(None);
+// ── Print / stderr hooks for wasm (fd-1 / fd-2 capture) ──
+//
+// An embedder installs these to receive everything the interpreter writes to
+// fd 1 and fd 2. The sink belongs to the *process*, not to whichever thread
+// installed it: a traceback or warning raised on any interpreter thread has to
+// reach the same embedder, and on wasm32 `std::io::stderr().write_all`
+// discards the bytes outright, so a thread that saw no hook would lose them.
+// Both are plain `fn` pointers, so one atomic word each holds them and the
+// write path takes no lock.
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static PRINT_HOOK: AtomicUsize = AtomicUsize::new(0);
+static STDERR_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+fn store_hook(slot: &AtomicUsize, hook: fn(&[u8])) {
+    slot.store(hook as usize, Ordering::Release);
 }
 
-/// Set a hook that receives all `print()` output instead of stdout.
-pub fn set_print_hook(hook: fn(&str)) {
-    PRINT_HOOK.with(|h| *h.borrow_mut() = Some(hook));
+fn load_hook(slot: &AtomicUsize) -> Option<fn(&[u8])> {
+    match slot.load(Ordering::Acquire) {
+        0 => None,
+        // SAFETY: the slot only ever holds a `fn(&[u8])` written by
+        // `store_hook`, and a function pointer is pointer-sized.
+        raw => Some(unsafe { std::mem::transmute::<usize, fn(&[u8])>(raw) }),
+    }
 }
 
-/// Offer `s` to the print hook. Returns whether a hook consumed it;
-/// `false` leaves the caller on its own descriptor path.
-pub fn print_hook_emit(s: &str) -> bool {
-    PRINT_HOOK.with(|h| match *h.borrow() {
-        Some(hook) => {
-            hook(s);
-            true
-        }
-        None => false,
-    })
+/// Set a hook that receives all fd-1 output instead of stdout.
+///
+/// The hook takes bytes rather than `&str` so a write the filesystem or a
+/// `sys.stdout.buffer` caller made is handed over unmodified; decoding it is
+/// the embedder's decision, not a lossy conversion applied on the way out.
+pub fn set_print_hook(hook: fn(&[u8])) {
+    store_hook(&PRINT_HOOK, hook);
 }
 
-/// [`print_hook_emit`] for callers holding already-encoded bytes.
+/// Offer already-encoded `bytes` to the print hook. Returns whether a hook
+/// consumed them; `false` leaves the caller on its own descriptor path.
 pub fn print_hook_emit_bytes(bytes: &[u8]) -> bool {
-    PRINT_HOOK.with(|h| match *h.borrow() {
+    match load_hook(&PRINT_HOOK) {
         Some(hook) => {
-            hook(&String::from_utf8_lossy(bytes));
+            hook(bytes);
             true
         }
         None => false,
-    })
+    }
+}
+
+/// [`print_hook_emit_bytes`] for callers holding a `str`.
+pub fn print_hook_emit(s: &str) -> bool {
+    print_hook_emit_bytes(s.as_bytes())
 }
 
 /// Write a string through the print hook (if set) or stdout.
@@ -1112,11 +1131,6 @@ pub fn print_output(s: &str) {
     print!("{s}");
 }
 
-// ── Stderr hook for wasm (fd-2 capture) ──
-thread_local! {
-    static STDERR_HOOK: RefCell<Option<fn(&[u8])>> = RefCell::new(None);
-}
-
 /// Set a hook that receives everything the interpreter writes to fd 2 —
 /// `sys.stderr.write`, tracebacks, warnings — instead of the real descriptor.
 ///
@@ -1124,19 +1138,19 @@ thread_local! {
 /// discards the bytes, so without a hook a traceback simply vanishes. The
 /// stdout twin is [`set_print_hook`].
 pub fn set_stderr_hook(hook: fn(&[u8])) {
-    STDERR_HOOK.with(|h| *h.borrow_mut() = Some(hook));
+    store_hook(&STDERR_HOOK, hook);
 }
 
 /// Offer `bytes` to the stderr hook. Returns whether a hook consumed them;
 /// `false` leaves the caller on its own descriptor path.
 pub fn stderr_hook_emit(bytes: &[u8]) -> bool {
-    STDERR_HOOK.with(|h| match *h.borrow() {
+    match load_hook(&STDERR_HOOK) {
         Some(hook) => {
             hook(bytes);
             true
         }
         None => false,
-    })
+    }
 }
 
 // baseobjspace call helpers are re-exported from `baseobjspace`.

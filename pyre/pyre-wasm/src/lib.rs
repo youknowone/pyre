@@ -430,8 +430,11 @@ thread_local! {
 
 #[cfg(any(feature = "web", feature = "wasm-host"))]
 fn install_wasm_print_hook() {
-    pyre_interpreter::set_print_hook(|s| {
-        OUTPUT_BUF.with(|buf| buf.borrow_mut().push_str(s));
+    pyre_interpreter::set_print_hook(|b| {
+        // The hook is handed raw fd-1 bytes; this embedder returns a `String`
+        // to its host, so the decode happens here rather than inside the
+        // interpreter, where it would corrupt every embedder's output.
+        OUTPUT_BUF.with(|buf| buf.borrow_mut().push_str(&String::from_utf8_lossy(b)));
     });
     pyre_interpreter::set_stderr_hook(|b| {
         ERR_BUF.with(|buf| buf.borrow_mut().extend_from_slice(b));

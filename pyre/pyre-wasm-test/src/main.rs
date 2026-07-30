@@ -5,8 +5,8 @@ thread_local! {
     static TEST_OUTPUT: RefCell<String> = RefCell::new(String::new());
 }
 
-fn capture_print(s: &str) {
-    TEST_OUTPUT.with(|buf| buf.borrow_mut().push_str(s));
+fn capture_print(bytes: &[u8]) {
+    TEST_OUTPUT.with(|buf| buf.borrow_mut().push_str(&String::from_utf8_lossy(bytes)));
 }
 
 fn run_test(name: &str, source: &str, expected: &str) {
