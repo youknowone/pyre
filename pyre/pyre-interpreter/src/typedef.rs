@@ -1535,14 +1535,14 @@ fn patch_float_realimag_descriptors() {
     }
     for (name, getter) in [
         (
+            // `floatobject.py:610 descr_get_real` returns `space.float(self)`,
+            // so a subclass receiver is down-converted to a base `float`.
             "real",
             make_builtin_function_with_arity(
                 "real",
-                |args| {
-                    Ok(args
-                        .get(1)
-                        .copied()
-                        .unwrap_or(pyre_object::w_float_new(0.0)))
+                |args| match args.get(1).copied() {
+                    Some(receiver) => crate::builtins::builtin_float_dunder(&[receiver]),
+                    None => Ok(pyre_object::w_float_new(0.0)),
                 },
                 2,
             ),
@@ -15581,18 +15581,18 @@ fn init_float_type(ns: PyObjectRef) {
             ),
         )
     };
-    // float.conjugate — identity for a real number.
+    // `floatobject.py:616 descr_conjugate` returns `space.float(self)` — the
+    // value is unchanged for a real number, but a subclass receiver is
+    // down-converted to a base `float`.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "conjugate",
             make_builtin_function_with_arity(
                 "conjugate",
-                |args| {
-                    Ok(args
-                        .first()
-                        .copied()
-                        .unwrap_or(pyre_object::w_float_new(0.0)))
+                |args| match args.first().copied() {
+                    Some(receiver) => crate::builtins::builtin_float_dunder(&[receiver]),
+                    None => Ok(pyre_object::w_float_new(0.0)),
                 },
                 1,
             ),
