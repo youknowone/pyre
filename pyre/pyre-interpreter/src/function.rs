@@ -960,13 +960,19 @@ pub unsafe fn function_get_qualname(obj: PyObjectRef) -> String {
 /// `obj` must point to a valid `Function`.
 pub unsafe fn function_get_qualname_obj(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
-        let func = obj as *mut Function;
-        if !(*func).w_qualname.is_null() {
-            return (*func).w_qualname;
+        if !(*(obj as *const Function)).w_qualname.is_null() {
+            return (*(obj as *const Function)).w_qualname;
         }
+        // `w_str_new` is a collection point that can relocate the function, so
+        // pin the receiver and reload it before storing through it.  The name
+        // itself lives in the off-GC `Box<String>` and does not move.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(obj);
         let w_qualname = pyre_object::w_str_new(function_get_name(obj));
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         function_write_barrier(obj);
-        (*func).w_qualname = w_qualname;
+        (*(obj as *mut Function)).w_qualname = w_qualname;
         w_qualname
     }
 }
