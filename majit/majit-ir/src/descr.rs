@@ -408,8 +408,13 @@ pub fn struct_id_for_name(raw: &str) -> Option<StructId> {
         .trim_start_matches("&mut ")
         .trim_start_matches('&')
         .trim();
+    // Generic instantiations share the defining ADT's one physical Rust
+    // layout.  The annotator keeps `Result<T>::Ok` spellings distinct for
+    // ClassDef payload precision, but the descriptor layer must resolve all
+    // of them to the template variant identity registered from the TypeDecl.
+    let s = strip_generic_args(s);
     let guard = STRUCT_ID_BY_NAME.lock().unwrap();
-    guard.get(s).copied().flatten()
+    guard.get(s.as_ref()).copied().flatten()
 }
 
 /// Use-import resolver / module-aware canonicalisation table.

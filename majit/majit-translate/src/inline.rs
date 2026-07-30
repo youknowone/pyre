@@ -430,6 +430,9 @@ pub(crate) fn remap_op_kind(
         OpKind::ConstRef(obj) => OpKind::ConstRef(obj.clone()),
         OpKind::ConstRefNull => OpKind::ConstRefNull,
         OpKind::ConstRefAddr(addr) => OpKind::ConstRefAddr(*addr),
+        OpKind::New { owner } => OpKind::New {
+            owner: owner.clone(),
+        },
         OpKind::NewWithVtable { owner, vtable } => OpKind::NewWithVtable {
             owner: owner.clone(),
             vtable: *vtable,
@@ -876,6 +879,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         | OpKind::LoopHeader { .. }
         | OpKind::Abort { .. }
         | OpKind::LoadStatic { .. }
+        | OpKind::New { .. }
         | OpKind::NewWithVtable { .. } => {
             vec![]
         }
@@ -1109,10 +1113,10 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
 /// pure op's args even though both should die together.
 pub fn is_pure_op(kind: &OpKind) -> bool {
     match kind {
-        // `new_with_vtable` heap-allocates a fresh boxed object: NOT pure.
+        // `new` / `new_with_vtable` heap-allocate fresh objects: NOT pure.
         // CSE must never coalesce two allocations, or Python `is` object
         // identity would break.
-        OpKind::NewWithVtable { .. } => false,
+        OpKind::New { .. } | OpKind::NewWithVtable { .. } => false,
         // `OpKind::ConstInt` / `OpKind::ConstFloat` materialize a
         // `Variable` for a literal in pyre's IR.  There
         // is NO upstream `int_constant` op — RPython's `Constant` is

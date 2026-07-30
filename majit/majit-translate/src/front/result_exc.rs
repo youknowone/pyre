@@ -667,6 +667,7 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::LoopHeader { .. }
         | OpKind::Abort { .. }
         | OpKind::LoadStatic { .. }
+        | OpKind::New { .. }
         | OpKind::NewWithVtable { .. } => Vec::new(),
 
         OpKind::FieldRead { base, .. }
@@ -1013,7 +1014,7 @@ enum SiteOutcome {
 /// custom `match` consumer that gets the catch-and-rewrap treatment.
 pub(crate) fn rewire_result_exc_call_sites(
     graph: &mut FunctionGraph,
-    results: &[(Variable, Option<String>)],
+    results: &[(Variable, Option<String>, ValueType)],
     enclosing_scoped: bool,
 ) -> Result<RewireOutcome, String> {
     let mut outcome = RewireOutcome {
@@ -1022,8 +1023,14 @@ pub(crate) fn rewire_result_exc_call_sites(
         rewrapped: 0,
         fused: 0,
     };
-    for (r, suffix) in results {
-        match rewire_one_call_site(graph, r, suffix.as_deref().unwrap_or(""), enclosing_scoped)? {
+    for (r, suffix, payload_ty) in results {
+        match rewire_one_call_site(
+            graph,
+            r,
+            suffix.as_deref().unwrap_or(""),
+            payload_ty,
+            enclosing_scoped,
+        )? {
             SiteOutcome::Diamond => outcome.diamonds += 1,
             SiteOutcome::TailForward => outcome.tail_forwards += 1,
             SiteOutcome::Rewrapped => outcome.rewrapped += 1,
@@ -1037,6 +1044,7 @@ fn rewire_one_call_site(
     graph: &mut FunctionGraph,
     r: &Variable,
     suffix: &str,
+    payload_ty: &ValueType,
     enclosing_scoped: bool,
 ) -> Result<SiteOutcome, String> {
     let name = graph.name.clone();
@@ -1083,7 +1091,7 @@ fn rewire_one_call_site(
         if try_fuse_drain_match(graph, a, r).is_ok() {
             return Ok(SiteOutcome::Fused);
         }
-        catch_and_rewrap(graph, a, r, suffix)?;
+        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
         return Ok(SiteOutcome::Rewrapped);
     };
     assert_single_pred(graph, b, &name)?;
@@ -1246,6 +1254,7 @@ fn catch_and_rewrap(
     a: usize,
     r: &Variable,
     suffix: &str,
+    payload_ty: &ValueType,
 ) -> Result<(), String> {
     use crate::model::BlockId;
     let name = graph.name.clone();
@@ -1283,7 +1292,14 @@ fn catch_and_rewrap(
             .position(|a| is_r(a))
             .expect("has_r implies a Value position");
         let payload = n_inputs[r_value_idx].clone();
-        Some(build_shell(graph, n_id, "Ok", payload, suffix))
+        Some(build_shell(
+            graph,
+            n_id,
+            "Ok",
+            payload,
+            payload_ty.clone(),
+            suffix,
+        ))
     } else {
         None
     };
@@ -1352,7 +1368,14 @@ fn catch_and_rewrap(
                 true,
             )
             .expect("from_exc_object must produce a value");
-        Some(build_shell(graph, e_id, "Err", v_err, suffix))
+        Some(build_shell(
+            graph,
+            e_id,
+            "Err",
+            v_err,
+            ValueType::Ref(None),
+            suffix,
+        ))
     } else {
         None
     };
@@ -2198,6 +2221,7 @@ fn build_shell(
     block: crate::model::BlockId,
     variant: &str,
     payload: Variable,
+    payload_ty: ValueType,
     suffix: &str,
 ) -> Variable {
     use crate::model::FieldDescriptor;
@@ -2235,7 +2259,7 @@ fn build_shell(
                     owner_id: None,
                 },
                 value: crate::model::LinkArg::Value(payload),
-                ty: ValueType::Ref(None),
+                ty: payload_ty,
             },
         });
     shell

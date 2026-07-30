@@ -125,13 +125,17 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         let req_lits = param_required.iter().map(|b| quote! { #b });
         let fn_name_str = user_name.to_string();
         quote! {
-            let __pyre_positional_count =
-                crate::builtins::split_builtin_kwargs(args).0.len();
+            let __pyre_has_kwargs = crate::builtins::has_builtin_kwargs(args);
+            let __pyre_positional_count = if __pyre_has_kwargs {
+                args.len() - 1
+            } else {
+                args.len()
+            };
             const __PYRE_PARAM_NAMES: &[&str] = &[ #(#name_lits),* ];
             const __PYRE_PARAM_REQUIRED: &[bool] = &[ #(#req_lits),* ];
             let __pyre_bound_args;
             let args: &[::pyre_object::PyObjectRef] =
-                if crate::builtins::has_builtin_kwargs(args) {
+                if __pyre_has_kwargs {
                     __pyre_bound_args = crate::builtins::bind_builtin_kwargs(
                         args,
                         __PYRE_PARAM_NAMES,
@@ -1892,13 +1896,17 @@ fn expand_pyre_methods(
                 let req_lits = all_required.iter().map(|b| quote! { #b });
                 let fn_name_str = mname.to_string();
                 quote! {
-                    let __pyre_positional_count =
-                        crate::builtins::split_builtin_kwargs(args).0.len();
+                    let __pyre_has_kwargs = crate::builtins::has_builtin_kwargs(args);
+                    let __pyre_positional_count = if __pyre_has_kwargs {
+                        args.len() - 1
+                    } else {
+                        args.len()
+                    };
                     const __PYRE_PARAM_NAMES: &[&str] = &[ #(#name_lits),* ];
                     const __PYRE_PARAM_REQUIRED: &[bool] = &[ #(#req_lits),* ];
                     let __pyre_bound_args;
                     let args: &[::pyre_object::PyObjectRef] =
-                        if crate::builtins::has_builtin_kwargs(args) {
+                        if __pyre_has_kwargs {
                             __pyre_bound_args = crate::builtins::bind_builtin_kwargs(
                                 args,
                                 __PYRE_PARAM_NAMES,

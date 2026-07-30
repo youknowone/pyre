@@ -620,6 +620,14 @@ pub enum OpKind {
         value: LinkArg,
         ty: ValueType,
     },
+    /// RPython `malloc(GcStruct, flavor='gc')` lowered by
+    /// `jtransform.py:1012-1045 rewrite_op_malloc` to `new(descr)`.
+    /// Synthetic Rust aggregate constructors reach pyre before the missing
+    /// rtyper malloc lowering, so jtransform restores that exact operation
+    /// using the aggregate owner to resolve its size descriptor.
+    New {
+        owner: String,
+    },
     /// RPython `malloc(STRUCT, flavor='gc')` for a fixed-size GcStruct: the
     /// heap allocation of a boxed object (`pyre_object::lltype::malloc_typed`).
     /// Lowered to the `new_with_vtable` jitcode op (executor

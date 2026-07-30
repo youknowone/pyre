@@ -1585,6 +1585,34 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            // RPython `jtransform.py:1040-1045 rewrite_op_malloc`: a fixed-size
+            // GC struct without a vtable lowers to `new(descr)`.
+            OpKind::New { owner } => {
+                let spec = bh_size_spec_from_callcontrol(
+                    callcontrol.expect("new assembly requires a CallControl"),
+                    owner,
+                )
+                .unwrap_or_else(|| panic!("new: no struct layout registered for owner {owner:?}"));
+                let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Size {
+                    size: spec.size,
+                    type_id: spec.type_id,
+                    vtable: 0,
+                    owner: String::new(),
+                    all_fielddescrs: spec.all_fielddescrs,
+                    is_gc_managed: spec.is_gc_managed,
+                });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                let result = op.result.as_ref().expect("new must produce a result");
+                let (reg, kind) = self.lookup_reg_with_kind_var(result, regallocs);
+                assert_eq!(kind, 'r', "new result must use the ref register bank");
+                state.code.push(reg);
+                argcodes.push('>');
+                argcodes.push('r');
+                let key = format!("new/{argcodes}");
+                state.code[startposition] = self.get_opnum(&key);
+            }
             // Boxing GC allocation (`fuse_boxing_alloc`).  Mirrors the runtime
             // tracer oracle (`box_trace.rs trace_box_float`): a `new_with_vtable`
             // carrying ONLY a size descriptor and a fresh ref-kind result, no
@@ -2608,6 +2636,7 @@ impl Assembler {
                 OpKind::Abort { .. } => "Abort",
                 OpKind::NewTuple { .. } => "NewTuple",
                 OpKind::NewList { .. } => "NewList",
+                OpKind::New { .. } => "New",
                 OpKind::NewWithVtable { .. } => "NewWithVtable",
                 OpKind::LoweredBlackholeOp { .. } => "LoweredBlackholeOp",
                 OpKind::LoadStatic { .. } => "LoadStatic",
@@ -3214,10 +3243,17 @@ fn bh_size_spec_from_callcontrol(
     if owner.is_empty() {
         return None;
     }
+    // RPython keys SizeDescrs on the low-level STRUCT object, not on an
+    // annotation-side generic instantiation.  Charon registers one physical
+    // layout for the generic TypeDecl, so `Result<T>::Ok` and
+    // `Result<U>::Ok` must converge on the template variant here while their
+    // ClassDefs remain distinct in the annotator.
+    let layout_owner = majit_ir::descr::strip_generic_args(owner);
+    let layout_owner = layout_owner.as_ref();
     let size = cc
-        .struct_layout_for(owner)
+        .struct_layout_for(layout_owner)
         .map(|layout| layout.size)
-        .or_else(|| heuristic_struct_size_for_bh(cc, owner))?;
+        .or_else(|| heuristic_struct_size_for_bh(cc, layout_owner))?;
     Some(crate::jitcode::BhSizeSpec {
         size,
         // Analyzer-side structs keep the guard (unchanged); the raw
@@ -3239,9 +3275,9 @@ fn bh_size_spec_from_callcontrol(
         // structs (birthday paradox), whereas PyPy's `id(STRUCT)` never
         // aliases.  The rare hash-to-zero case (1 in 2^64) is handled
         // by `simple_descr_group_from_bh_size`'s no-identity branch.
-        type_id: majit_ir::descr::path_hash(owner),
+        type_id: majit_ir::descr::path_hash(layout_owner),
         vtable: 0,
-        all_fielddescrs: bh_all_field_specs_for_struct(cc, owner),
+        all_fielddescrs: bh_all_field_specs_for_struct(cc, layout_owner),
     })
 }
 
@@ -3956,6 +3992,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             opname
         }
         OpKind::FieldWrite { ty, .. } => format!("setfield_gc_{}", value_type_to_kind(ty)),
+        OpKind::New { .. } => "new".into(),
         OpKind::NewWithVtable { .. } => "new_with_vtable".into(),
         // RPython: getarrayitem_gc_i etc.
         OpKind::ArrayRead { item_ty, .. } => {

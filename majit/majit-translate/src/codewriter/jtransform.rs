@@ -2878,6 +2878,56 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::ConstRefNull,
             }]);
         }
+        // RPython `rtyper` lowers a heap-carried `Result` variant to
+        // `malloc(GcStruct)` plus its discriminant/payload `setfield`s before
+        // `jtransform`; `rewrite_op_malloc` then emits `new(descr)`.
+        // Charon exposes the pre-rtyper shape instead: a niladic synthetic
+        // ctor followed by a payload `FieldWrite`, and it does not spell the
+        // enum tag as a separate MIR operand. Restore the exact low-level
+        // shape here. The existing payload write follows this replacement in
+        // program order; the tag write is emitted beside the allocation.
+        if let CallTarget::SyntheticTransparentCtor { name, owner_path } = target
+            && args.is_empty()
+            && matches!(name.as_str(), "Ok" | "Err")
+            && owner_path
+                .last()
+                .is_some_and(|owner| owner.starts_with("Result"))
+            && let ValueType::Ref(Some(owner)) = result_ty
+        {
+            let tag = i64::from(name == "Err");
+            let result_base = owner
+                .strip_suffix(format!("::{name}").as_str())
+                .unwrap_or(owner)
+                .to_string();
+            let result = op
+                .result
+                .clone()
+                .expect("SyntheticTransparentCtor must produce a value");
+            return RewriteResult::Replace(vec![
+                SpaceOperation {
+                    result: Some(result.clone()),
+                    kind: OpKind::New {
+                        owner: owner.clone(),
+                    },
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: result,
+                        field: crate::model::FieldDescriptor::new(
+                            "__discriminant",
+                            Some(result_base),
+                        ),
+                        value: crate::model::LinkArg::Const(
+                            crate::flowspace::model::Constant::new(
+                                crate::flowspace::model::ConstValue::Int(tag),
+                            ),
+                        ),
+                        ty: ValueType::Int,
+                    },
+                },
+            ]);
+        }
         // `rbuiltin.py:412-418 rtype_const_result` /
         // `translator/rtyper/rbuiltin.rs::rtype_ptr_null`: by the time
         // jtransform runs, `ptr::null[_mut]()` is a typed null pointer
@@ -5644,6 +5694,7 @@ fn remap_op(
         | OpKind::LoopHeader { .. }
         | OpKind::Abort { .. }
         | OpKind::LoadStatic { .. }
+        | OpKind::New { .. }
         | OpKind::NewWithVtable { .. } => op.kind.clone(),
         OpKind::NewTuple { args } => OpKind::NewTuple {
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),
@@ -8832,6 +8883,64 @@ mod tests {
             RewriteResult::Identity(alias) => assert_eq!(alias, arg),
             _ => panic!("expected Identity alias to the operand"),
         }
+    }
+
+    #[test]
+    fn niladic_result_variant_lowers_to_new_and_tag_store() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("result_variant_malloc");
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let owner = "core::result::Result<i64,PyError>::Err".to_string();
+        let target = CallTarget::synthetic_transparent_ctor_with_owner(
+            vec![
+                "core".to_string(),
+                "result".to_string(),
+                "Result<i64,PyError>".to_string(),
+            ],
+            "Err",
+        );
+        let result_ty = ValueType::Ref(Some(owner.clone()));
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![],
+                result_ty: result_ty.clone(),
+            },
+        };
+
+        let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "result_variant_malloc",
+            &mut graph,
+        ) else {
+            panic!("niladic Result variant must lower to malloc + tag store");
+        };
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(
+            &ops[0],
+            SpaceOperation {
+                result: Some(result),
+                kind: OpKind::New { owner: allocated },
+            } if result == &result_var && allocated == &owner
+        ));
+        assert!(matches!(
+            &ops[1].kind,
+            OpKind::FieldWrite {
+                base,
+                field,
+                value: crate::model::LinkArg::Const(value),
+                ty: ValueType::Int,
+            } if base == &result_var
+                && field.name == "__discriminant"
+                && field.owner_root.as_deref()
+                    == Some("core::result::Result<i64,PyError>")
+                && value.value == crate::flowspace::model::ConstValue::Int(1)
+        ));
     }
 
     /// `fold_we_are_jitted_calls` rewrites the `we_are_jitted()`

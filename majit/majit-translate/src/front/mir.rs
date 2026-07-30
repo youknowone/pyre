@@ -2403,7 +2403,7 @@ struct Lowering<'a> {
     /// lowering completes.  The paired `Option<String>` is the callee's
     /// per-instantiation `<…>` suffix (Ref-shaped payloads only) keying
     /// the rebuilt `Ok`/`Err` shells' ClassDef per instantiation.
-    result_exc_call_results: Vec<(Variable, Option<String>)>,
+    result_exc_call_results: Vec<(Variable, Option<String>, ValueType)>,
     /// `Iterator::next()` call results (`Option<T>`-typed) recorded for
     /// the `next`-diamond rewiring pass (`front::iter_next`) that runs
     /// after the body lowering completes.
@@ -7941,8 +7941,11 @@ impl<'a> Lowering<'a> {
                 &call.dest.ty,
                 self.llbc,
             );
+            let payload_ty = crate::front::result_exc::tyref_result_ok(&call.dest.ty, self.llbc)
+                .map(|ty| tyref_to_value_type(&ty, self.llbc))
+                .unwrap_or(ValueType::Ref(None));
             self.result_exc_call_results
-                .push((result_var.clone(), suffix));
+                .push((result_var.clone(), suffix, payload_ty));
         }
         // Capture `Iterator::next()` results (`Option<T>`-typed) for the
         // `next`-diamond rewiring pass (`front::iter_next`).  Recognition
