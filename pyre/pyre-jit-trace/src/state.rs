@@ -9482,14 +9482,18 @@ impl JitState for PyreJitState {
         // of synthesizing parent OpRefs.
         sym.clear_active_vable();
         // `pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`:
-        // `ec` is the second root inputarg, not a PyFrame semantic register.
-        // `create_sym` has already bound it to `OpRef::input_arg_ref(1)`;
-        // `resume.rebuild_from_resumedata` rebuilds only each MIFrame's
-        // `registers_i/r/f`, while the root reds remain the bridge inputargs.
-        // Keep those two stores separate exactly as upstream does. In
-        // particular, do not recover `ec` from `bridge_registers_r`: that bank
-        // is sized and populated from the current MIFrame liveness and has no
-        // slot for a distinct root-red color.
+        // `ec` is a root red, not a PyFrame semantic register, so it is not
+        // recovered from `bridge_registers_r` — that bank is sized and
+        // populated from the current MIFrame liveness and has no slot for a
+        // distinct root-red color.
+        //
+        // The root binding `create_sym` left behind (`OpRef::input_arg_ref(1)`)
+        // does not survive here either: a bridge's inputargs come from the
+        // failing guard's failargs, so index 1 addresses nothing in its own
+        // dense stream and closing the trace rejects it. Clear the slot and let
+        // `ensure_execution_context` re-derive ec from this frame, the same
+        // recovery every other adapter path takes.
+        sym.execution_context = OpRef::NONE;
         // pyjitpl.py:3400-3430 rebuild_state_after_failure parity: after
         // a guard failure the tracing-time `virtualizable_boxes` mirror
         // must be rebuilt from the resume data so subsequent vable
