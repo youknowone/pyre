@@ -2522,7 +2522,19 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // decision from the portal-frame count alone — already applied above via
         // `fbw_inline_recursion_count` — and asks nothing about how deep the
         // framestack is or whether a bridge or a primary trace is walking.
-        let root_bridge = !ctx.fbw_mode.carrier_resume && !ctx.fbw_mode.snapshot_sym.is_null();
+        //
+        // An inline sub-walk is the exception, and it is one with no upstream
+        // counterpart: `perform_call` pushes onto `MetaInterp.framestack` and
+        // returns to the single `interpret()` loop, so upstream is never inside
+        // one walk while starting another and can never seed a multiframe
+        // snapshot from a sub-walk. Seeding one here makes the wasm bridge
+        // replay re-execute the sub-walk's body — wrong output from
+        // `synth/ca_bridge_multiframe_resume_double_call` and
+        // `synth/recursion_memo_branch`, and a `fib_recursive` timeout, all
+        // while dynasm and cranelift stay green.
+        let root_bridge = !ctx.fbw_mode.carrier_resume
+            && !ctx.fbw_mode.inline_subwalk
+            && !ctx.fbw_mode.snapshot_sym.is_null();
         // A carrier-resume sub-walk (`drive_bridge_frame_subwalk`) drives its
         // reconstructed frame(s) forward through the same metainterp the initial
         // trace uses, so its inline of a nested int-arith call is the SAME as a
