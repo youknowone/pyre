@@ -2010,9 +2010,16 @@ mod tests {
     /// `build_inline_call_only_bh_builder` instead.
     ///
     /// `new/d>r` left it the same way: lowering a rebuilt `Result` shell as an
-    /// allocation made `OpKind::New` reachable from the codewriter. Its operand
-    /// shape is `new_with_vtable/d>r`'s — a 2-byte little-endian descr index
-    /// then a 1-byte ref register — and `handler_new` decodes exactly that.
+    /// allocation, and a `#[jit_interp]` frontend's declared `struct_allocs`
+    /// literal, each make `OpKind::New` reachable from the codewriter. Its
+    /// operand shape is `new_with_vtable/d>r`'s — a 2-byte little-endian descr
+    /// index then a 1-byte ref register — and `handler_new` decodes exactly
+    /// that.
+    ///
+    /// `new_array/id>r` left with it: the builder reached both with a wired
+    /// handler but no opname→byte entry, so the blackhole took
+    /// `dispatch_step: unwired opcode=0xd9` on the abort path.  Both are now
+    /// registered.
     #[test]
     fn production_bh_builder_overlay_only_gap_snapshot() {
         let builder = build_pyre_production_bh_builder();
@@ -2049,7 +2056,6 @@ mod tests {
             "getlistitem_gc_i/ridd>i",
             "getlistitem_gc_r/ridd>r",
             "int_between/iii>i",
-            "new_array/id>r",
             "newlist/idddd>r",
             "newlist_clear/idddd>r",
             "newlist_hint/idddd>r",
