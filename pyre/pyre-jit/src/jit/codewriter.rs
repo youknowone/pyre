@@ -14179,6 +14179,12 @@ impl CodeWriter {
             // matches RPython's "same JitCode object is filled later"
             // identity flow even after other stores cloned the Arc.
             let Some(pyjitcode) = self.transform_graph_to_jitcode(unsafe { &*code_ptr }) else {
+                // Cache the authoritative assembler result for shapes that
+                // reach this exact check. The graph is immutable, so a later
+                // drain cannot make this encoding failure disappear.
+                self.callcontrol()
+                    .graph_jit_shapes
+                    .insert(code_ptr as usize, 3);
                 continue;
             };
             let key = code_ptr as usize;
