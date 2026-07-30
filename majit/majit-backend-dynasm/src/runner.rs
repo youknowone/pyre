@@ -854,9 +854,7 @@ pub extern "C" fn dynasm_nursery_slowpath(total_size: u64) -> u64 {
     });
     if std::env::var_os("PYRE_GC_FREELIST_DIAG").is_some() {
         let nursery = dynasm_gc_is_nursery_object(ptr as usize);
-        eprintln!(
-            "[malloc-slow] total={total_size} payload={ptr:#x} nursery={nursery}"
-        );
+        eprintln!("[malloc-slow] total={total_size} payload={ptr:#x} nursery={nursery}");
         debug_validate_oldgen_freeblocks("after malloc slowpath");
     }
     if majit_ir::debug::have_debug_prints() {

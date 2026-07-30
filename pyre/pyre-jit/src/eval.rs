@@ -8392,9 +8392,7 @@ fn compile_and_run_once(
     let tracing_finished = !driver.is_tracing();
     if tracing_finished
         && std::env::var_os("PYRE_DYNASM_EXEC_DIAG").is_some()
-        && let Some(trace_id) = driver
-            .meta_interp()
-            .compiled_root_trace_id(compiled_key)
+        && let Some(trace_id) = driver.meta_interp().compiled_root_trace_id(compiled_key)
     {
         eprintln!(
             "[dynasm-compile] trace={trace_id} key={compiled_key} function={} file={}",
