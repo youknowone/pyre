@@ -130,7 +130,7 @@ pub fn trace_box_int(
     size_descr: majit_ir::DescrRef,
     _ob_type_descr: majit_ir::DescrRef,
     intval_descr: majit_ir::DescrRef,
-    _int_type_addr: i64,
+    int_type_addr: i64,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
 
@@ -140,7 +140,13 @@ pub fn trace_box_int(
     // jtransform.py:908-911 parity: typeptr setfield filtered in trace.
     // rewrite.py:479-484 GC rewriter emits vtable via fielddescr_vtable.
     let obj = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
+    // pyjitpl.py:2714-2718 `execute_new_with_vtable` stamps BOTH halves —
+    // `heapcache.new(resbox)` AND `heapcache.class_now_known(resbox)`; only
+    // plain `execute_new` (:2720-2723) stops at `new`. The vtable the GC
+    // rewriter writes from `size_descr` IS the class, so it is known by
+    // construction and upstream records it unconditionally.
     ctx.heap_cache_mut().new_object(obj);
+    ctx.heap_cache_mut().class_now_known(obj, int_type_addr);
     let intval_idx = intval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, value], intval_descr);
     // `upd.setfield(valuebox)` parity — the cache stores the Box
@@ -390,13 +396,16 @@ pub fn trace_box_float(
     size_descr: majit_ir::DescrRef,
     _ob_type_descr: majit_ir::DescrRef,
     floatval_descr: majit_ir::DescrRef,
-    _float_type_addr: i64,
+    float_type_addr: i64,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
     // RPython parity: NEW_WITH_VTABLE + jtransform.py typeptr filter +
     // rewrite.py GC rewriter fielddescr_vtable emission.
     let obj = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
+    // pyjitpl.py:2714-2718: `execute_new_with_vtable` records the class too.
+    // Same reasoning as `trace_box_int`.
     ctx.heap_cache_mut().new_object(obj);
+    ctx.heap_cache_mut().class_now_known(obj, float_type_addr);
     let floatval_idx = floatval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, value], floatval_descr);
     // `upd.setfield(valuebox)` parity — the cache stores the Box
