@@ -445,16 +445,20 @@ def _jit_stats_snapshot(stderr):
     return "".join(f"{key}={fields[key]}\n" for key in sorted(fields))
 
 
+def _parse_jit_stats(snapshot):
+    """Split a normalized jit-stats snapshot into its `field -> value` map. A
+    snapshot that was never taken reads as no fields at all, so every caller can
+    treat "absent" and "absent from this side" the same way."""
+    if snapshot is None:
+        return {}
+    return dict(line.split("=", 1) for line in snapshot.splitlines())
+
+
 def _jit_stats_fields_equal(saved, current):
     """Whether two snapshots agree on every `JITSTATS_SNAPSHOT_FIELDS` key,
     reading a field missing from either side as "0"."""
-    def parse(snapshot):
-        if snapshot is None:
-            return {}
-        return dict(line.split("=", 1) for line in snapshot.splitlines())
-
-    old_fields = parse(saved)
-    new_fields = parse(current)
+    old_fields = _parse_jit_stats(saved)
+    new_fields = _parse_jit_stats(current)
     return all(
         old_fields.get(field, "0") == new_fields.get(field, "0")
         for field in JITSTATS_SNAPSHOT_FIELDS
@@ -463,13 +467,8 @@ def _jit_stats_fields_equal(saved, current):
 
 def _jit_stats_diff(saved, current, limit=6):
     """Describe normalized jit-stats changes, capped for terminal output."""
-    def parse(snapshot):
-        if snapshot is None:
-            return {}
-        return dict(line.split("=", 1) for line in snapshot.splitlines())
-
-    old_fields = parse(saved)
-    new_fields = parse(current)
+    old_fields = _parse_jit_stats(saved)
+    new_fields = _parse_jit_stats(current)
     changes = [
         f"{key} {old_fields.get(key, '<missing>')} -> "
         f"{new_fields.get(key, '<missing>')}"
@@ -548,13 +547,8 @@ def _jit_stats_regression_floor(saved, current):
     internal compile panics it did not before — a defect on any platform. A
     counter that falls (an improvement) or holds never gates, and a field
     missing from either side is read as 0 so it cannot fire spuriously."""
-    def parse(snapshot):
-        if snapshot is None:
-            return {}
-        return dict(line.split("=", 1) for line in snapshot.splitlines())
-
-    old_fields = parse(saved)
-    new_fields = parse(current)
+    old_fields = _parse_jit_stats(saved)
+    new_fields = _parse_jit_stats(current)
     regressions = []
     for field in JITSTATS_BADNESS_FIELDS:
         try:
