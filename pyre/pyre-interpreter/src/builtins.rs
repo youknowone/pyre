@@ -1019,10 +1019,13 @@ unsafe fn memoryview_get_offset(
     }
 }
 
-/// An index key — `getindex_w` accepts any object with `__index__`, not only
-/// an exact int, so a scalar key or a multi-index tuple element counts as an
-/// index when it is an int or exposes `__index__`.
-unsafe fn memoryview_is_index(w: PyObjectRef) -> bool {
+/// `_PyIndex_Check(v)` — whether the type exposes `nb_index` at all.
+///
+/// This is a *type* test and never a conversion, which is what lets a caller
+/// substitute its own "not an index" message for a miss while anything
+/// `__index__` itself raises still propagates unchanged.  Converting here
+/// instead would both run a user slot twice and relabel its exception.
+pub(crate) unsafe fn index_check(w: PyObjectRef) -> bool {
     unsafe { pyre_object::is_int(w) || crate::baseobjspace::lookup(w, "__index__").is_some() }
 }
 
@@ -1037,7 +1040,7 @@ unsafe fn memoryview_start_from_tuple(
         let mut start = 0;
         for dim in 0..n {
             let w = pyre_object::w_tuple_getitem(index, dim).unwrap_or(w_none());
-            if !memoryview_is_index(w) {
+            if !index_check(w) {
                 return Err(crate::PyError::type_error("memoryview: invalid slice key"));
             }
             let index = getindex_w(w)?;
@@ -1060,7 +1063,7 @@ unsafe fn memoryview_tuple_kind(index: PyObjectRef) -> (bool, bool) {
         let mut all_slice = n > 0;
         for i in 0..n {
             let w = pyre_object::w_tuple_getitem(index, i as i64).unwrap_or(w_none());
-            if !memoryview_is_index(w) {
+            if !index_check(w) {
                 all_index = false;
             }
             if !pyre_object::is_slice(w) {
@@ -1084,7 +1087,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         if pyre_object::is_slice(index) {
             return memoryview_slice_view(mv, index);
         }
-        if memoryview_is_index(index) {
+        if index_check(index) {
             if ndim == 0 {
                 return Err(crate::PyError::type_error(
                     "invalid indexing of 0-dim memory",
@@ -1265,7 +1268,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             full[addr..addr + isz].copy_from_slice(&packed);
             return Ok(w_none());
         }
-        if !memoryview_is_index(index) {
+        if !index_check(index) {
             return Err(crate::PyError::type_error(
                 "memoryview: invalid slice key, must be int or slice",
             ));
@@ -13551,11 +13554,12 @@ fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `sum(sequence, start=0)` — PyPy `__builtin__/app_functional.py sum`.
 ///
-/// A plain left-fold through `space.add` (`_regular_sum`'s
-/// `last = last + x`).  No Kahan/Neumaier compensation: float operands
-/// accumulate with ordinary left-to-right IEEE rounding, exactly as PyPy
-/// does (`sum([0.1, 0.2, 0.3])` is `0.6000000000000001`, not `0.6`).  A
-/// `str`/`bytes`/`bytearray` `start` is rejected up front.
+/// A left-fold through `space.add` (`_regular_sum`'s `last = last + x`) while
+/// the running total is an exact int, then the improved Kahan-Babuška
+/// (Neumaier) compensated float accumulator `builtin_sum_impl` uses — so
+/// `sum([0.1] * 10)` is exactly `1.0` rather than the naive partial sum
+/// `functional.py:_sum` produces.  A `str`/`bytes`/`bytearray` `start` is
+/// rejected up front.
 fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `sum(iterable, /, start=0)`: iterable is positional-only, start is
     // positional-or-keyword; at most two arguments total.
@@ -13638,7 +13642,15 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             total = t;
             i += 1;
         }
-        last = pyre_object::w_float_new(total + compensation);
+        // The residual is folded back only while the total is still finite.
+        // Once it reaches an infinity the term degenerates — `(total - t)` is
+        // `inf - inf` — and adding that NaN in would report `sum([inf, 1.0])`
+        // as NaN instead of `inf`.
+        last = pyre_object::w_float_new(if total.is_finite() {
+            total + compensation
+        } else {
+            total
+        });
     }
     for &item in &items[i..] {
         last = crate::baseobjspace::add(last, item)?;
