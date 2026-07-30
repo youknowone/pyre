@@ -14,9 +14,10 @@
 //! test binary because it sets `MAJIT_STEP_LIMIT`, and the knob is a
 //! process-wide `LazyLock` (`lib.rs step_limit`) — one test per process.
 //!
-//! With the conversion disabled (`MAJIT_ABORT_BLACKHOLE=0`) the same run panics
-//! with `index out of bounds: the len is N but the index is N` from `PUSH`, or a
-//! `stackpos` of `usize::MAX` from `POP`: a torn stack pointer.
+//! Short-circuiting the conversion so the abort falls back to that source pc
+//! makes the same run panic with `index out of bounds: the len is N but the
+//! index is N` from `PUSH`, or reach a `stackpos` of `usize::MAX` from `POP`:
+//! a torn stack pointer.
 
 pub type Bytecode = [u8];
 

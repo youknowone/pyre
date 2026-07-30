@@ -474,23 +474,6 @@ fn portal_rca_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("PYRE_PORTAL_RCA").is_some())
 }
 
-/// `MAJIT_ABORT_BLACKHOLE=0` opts out of routing a tracing abort through
-/// `blackhole.py:1799 convert_and_run_from_pyjitpl`, leaving the abort on the
-/// walk's raw source pc.
-///
-/// RPython has no switch here — `pyjitpl.py:2949` always converts — so this is
-/// an escape hatch, not a policy: the conversion re-enters the aborted
-/// framestack in the blackhole, which needs the frontend's whole dispatch
-/// jitcode to be dispatchable there.  A frontend that trips an unwired opcode
-/// can fall back with it while the gap is closed.
-fn abort_blackhole_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| match std::env::var_os("MAJIT_ABORT_BLACKHOLE") {
-        Some(v) => v != "0" && v != "false",
-        None => true,
-    })
-}
-
 fn format_rca_live_values(labels: Option<&[String]>, values: &[Value]) -> String {
     let mut out = String::new();
     for (idx, value) in values.iter().enumerate() {
@@ -1921,8 +1904,7 @@ impl<S: JitState> JitDriver<S> {
     /// Returns the resume pc when the conversion ran and reached a merge point,
     /// having already written the blackhole's register banks back into `state`.
     /// `None` leaves the abort on the pre-existing source-pc handoff — the walk
-    /// did not abort, the gate is off, or the state shape has no seed path (see
-    /// below).
+    /// did not abort, or the state shape has no seed path (see below).
     ///
     /// ⚠️ **`None` means "declined before the chain ran", and only that.** Once
     /// `drive_multi_frame_blackhole` returns, the chain has executed the rest
@@ -3486,35 +3468,30 @@ impl<S: JitState> JitDriver<S> {
                     // sym's state-field image so the `jit_merge_point!` hook can
                     // finish the half-executed opcodes in the blackhole and take
                     // the resume position from the merge point they reach.
-                    if abort_blackhole_enabled() {
-                        let staged = self.meta.trace_ctx().and_then(|ctx| {
-                            let framestack = ctx.aborted_framestack.take()?;
-                            Some((
-                                framestack,
-                                ctx.collect_virtualizable_element_values(),
-                                ctx.virtualizable_heap_ptr().map_or(0, |p| p as i64),
-                            ))
+                    let staged = self.meta.trace_ctx().and_then(|ctx| {
+                        let framestack = ctx.aborted_framestack.take()?;
+                        Some((
+                            framestack,
+                            ctx.collect_virtualizable_element_values(),
+                            ctx.virtualizable_heap_ptr().map_or(0, |p| p as i64),
+                        ))
+                    });
+                    if let (Some((framestack, virt_array_values, virtualizable_ptr)), Some(sym)) =
+                        (staged, self.sym.as_ref())
+                    {
+                        self.meta.pending_abort_blackhole = Some(PendingAbortBlackhole {
+                            framestack,
+                            scalar_values: S::collect_scalar_state_field_values(sym),
+                            ref_scalar_values: S::collect_ref_scalar_state_field_values(sym),
+                            virt_array_values,
+                            virtualizable_ptr,
+                            // `blackhole.py:1811-1814` reads
+                            // `metainterp.last_exc_value` at conversion time;
+                            // snapshot it here because `abort_trace_live` below
+                            // tears down the tracing state it belongs to.
+                            last_exc_value: self.meta.last_exc_value,
+                            raising_exception: abort_raising_exception,
                         });
-                        if let (
-                            Some((framestack, virt_array_values, virtualizable_ptr)),
-                            Some(sym),
-                        ) = (staged, self.sym.as_ref())
-                        {
-                            self.meta.pending_abort_blackhole = Some(PendingAbortBlackhole {
-                                framestack,
-                                scalar_values: S::collect_scalar_state_field_values(sym),
-                                ref_scalar_values: S::collect_ref_scalar_state_field_values(sym),
-                                virt_array_values,
-                                virtualizable_ptr,
-                                // `blackhole.py:1811-1814` reads
-                                // `metainterp.last_exc_value` at conversion
-                                // time; snapshot it here because
-                                // `abort_trace_live` below tears down the
-                                // tracing state it belongs to.
-                                last_exc_value: self.meta.last_exc_value,
-                                raising_exception: abort_raising_exception,
-                            });
-                        }
                     }
                 }
                 self.meta.abort_trace_live(false);

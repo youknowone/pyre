@@ -2238,11 +2238,10 @@ where
             // blackhole.py:1799 `convert_and_run_from_pyjitpl`) finishes the
             // *current* jitcode frame in the blackhole before control returns
             // to the interpreter.  `JitDriver::run_pending_abort_blackhole` is
-            // that consumer, but it declines for state shapes it cannot seed
-            // and `MAJIT_ABORT_BLACKHOLE=0` turns it off entirely; the abort
-            // then falls back to a source-level pc taken from the walk's root
-            // frame i0, which dispatch advances *before* running the opcode
-            // arm.  Returning mid-opcode on that fallback resumes the
+            // that consumer, but it declines for state shapes it cannot seed;
+            // the abort then falls back to a source-level pc taken from the
+            // walk's root frame i0, which dispatch advances *before* running
+            // the opcode arm.  Returning mid-opcode on that fallback resumes the
             // interpreter past an opcode whose side effects only partly ran.
             // A push that stores its element and then bumps the length can
             // commit the store and lose the bump, leaving a container whose
