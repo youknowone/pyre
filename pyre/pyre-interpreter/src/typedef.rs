@@ -9962,6 +9962,29 @@ fn init_type_type(ns: PyObjectRef) {
     });
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "mro", mro_method) };
 
+    // typeobject.py:1274-1275 `descr___prepare__` —
+    //
+    // ```python
+    // def descr___prepare__(space, __args__):
+    //     return space.newdict(module=True)
+    // ```
+    //
+    // installed at :1323 as `interp2app(descr___prepare__,
+    // as_classmethod=True)`.  Every argument is swallowed: the default
+    // implementation only has to produce the mapping a class body executes
+    // in, so a metaclass that does not override it never sees the name,
+    // bases, or keywords `build_class` forwards.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__prepare__",
+            pyre_object::function::w_classmethod_new(make_builtin_function(
+                "__prepare__",
+                |_args| Ok(pyre_object::w_dict_new()),
+            )),
+        )
+    };
+
     // typeobject.py:1269-1272 descr___subclasses__ — return the list of
     // immediate subclasses recorded in `weak_subclasses` (dead weakrefs
     // filtered out by `w_type_get_subclasses`).
@@ -13881,6 +13904,12 @@ pub(crate) const FUNCTION_DOC: &str = r#"Create a function object.
 /// CPython 3.14 `PyMethod_Type.tp_doc`.
 pub(crate) const METHOD_DOC: &str = "Create a bound instance method object.";
 
+/// `PyType_Type.tp_doc`.  `init_type_type` installs a `__doc__` getset under
+/// the same key so a heap subclass can replace its own docstring, which
+/// shadows the metatype's own doc the way `property`'s and `function`'s do.
+pub(crate) const TYPE_DOC: &str = "type(object) -> the object's type\n\
+                                   type(name, bases, dict, **kwds) -> a new type";
+
 /// CPython 3.14 `PyProperty_Type.tp_doc`.  The instance-level `__doc__`
 /// descriptor occupies the same type-dict key; `baseobjspace` serves this
 /// separate type doc for the exact builtin, matching PyPy's TypeDef rawdict
@@ -14414,23 +14443,25 @@ int_binop_rev!(
 );
 /// `int.__rpow__(self, base[, mod])` — the reflected slot accepts an
 /// optional modulus argument, so it validates arity as one-or-two.
+///
+/// `intobject.py:712-718 descr_rpow` then hands the work to
+/// `w_base.descr_pow(space, self, w_modulus)`: the modulus travels with the
+/// swapped operands instead of being dropped, so `(4).__rpow__(2, 5)` is
+/// `pow(2, 4, 5)`.
 fn int_dunder_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_pow(args, "__rpow__")?;
     if !unsafe { pyre_object::pyobject::is_int_or_long(args[1]) } {
         return Ok(pyre_object::w_not_implemented());
     }
-    if args.len() >= 3 && !unsafe { pyre_object::pyobject::is_none(args[2]) } {
-        if !unsafe { pyre_object::pyobject::is_int_or_long(args[2]) } {
-            return Ok(pyre_object::w_not_implemented());
+    let mut swapped = [args[1], args[0], pyre_object::PY_NULL];
+    let len = match args.get(2) {
+        Some(&modulus) => {
+            swapped[2] = modulus;
+            3
         }
-        return match crate::objspace::descroperation::try_int_long_pow_with_modulo(
-            args[1], args[0], args[2],
-        )? {
-            Some(result) => Ok(result),
-            None => Ok(pyre_object::w_not_implemented()),
-        };
-    }
-    crate::objspace::descroperation::pow_builtin(args[1], args[0])
+        None => 2,
+    };
+    int_dunder_pow(&swapped[..len])
 }
 int_binop_fwd!(
     int_dunder_lshift,
@@ -17020,7 +17051,13 @@ fn init_object_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__subclasshook__",
-            make_builtin_function("__subclasshook__", |_| Ok(pyre_object::w_not_implemented())),
+            // objectobject.py:413 `interp2app(descr___subclasshook__,
+            // as_classmethod=True)` — the hook receives the class it is
+            // consulted for, so a read off any type binds to that type.
+            pyre_object::function::w_classmethod_new(make_builtin_function(
+                "__subclasshook__",
+                |_| Ok(pyre_object::w_not_implemented()),
+            )),
         )
     };
     // PyPy: objectobject.py descr___setattr__

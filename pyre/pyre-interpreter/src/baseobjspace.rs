@@ -6429,10 +6429,7 @@ pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
 pub(crate) fn type_get_doc(obj: PyObjectRef) -> PyResult {
     unsafe {
         if std::ptr::eq(obj, crate::typedef::w_type()) {
-            return Ok(w_str_new(
-                "type(object) -> the object's type\n\
-                 type(name, bases, dict, **kwds) -> a new type",
-            ));
+            return Ok(w_str_new(crate::typedef::TYPE_DOC));
         }
         if std::ptr::eq(
             obj,
