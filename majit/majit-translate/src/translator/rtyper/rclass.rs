@@ -3489,6 +3489,38 @@ impl Repr for InstanceRepr {
             return Ok(Some(v_method));
         }
 
+        // A niche `Option<&T>` receiver collapses to a maybe-null instance
+        // pointer with no `__discriminant` tag field — a payload enum's
+        // `__discriminant` IS an instance field, resolved by the
+        // `allinstancefields` branch above.  Reaching the fall-through for
+        // `"__discriminant"` therefore means the discriminant is the
+        // pointer's null-ness (`None` = null = 0, `Some` = non-null = 1), so
+        // read it as `cast_bool_to_int(ptr_nonzero(vinst))` rather than a
+        // class field (which does not exist and rtypes to Void).  Mirrors the
+        // `CanBeNull.rtype_bool` `ptr_nonzero` lowering (rmodel.py) and the
+        // front-end `Discriminant` niche fold's in-place null test; the
+        // `option_is_none` post-pass emits this `__discriminant` FieldRead for
+        // both niche and aggregate `is_some`/`is_none` receivers.
+        if attr == "__discriminant" {
+            use crate::translator::rtyper::rtyper::GenopResult;
+            let v_nonzero = hop
+                .genop(
+                    "ptr_nonzero",
+                    vec![vinst.clone()],
+                    GenopResult::LLType(LowLevelType::Bool),
+                )
+                .ok_or_else(|| {
+                    TyperError::message(
+                        "InstanceRepr.rtype_getattr: ptr_nonzero produced no result var",
+                    )
+                })?;
+            return Ok(hop.genop(
+                "cast_bool_to_int",
+                vec![v_nonzero],
+                GenopResult::LLType(LowLevelType::Signed),
+            ));
+        }
+
         // upstream: `else:`
         //          `vcls = self.getfield(vinst, '__class__', hop.llops)`
         //          `return self.rclass.getclsfield(vcls, attr, hop.llops)`
