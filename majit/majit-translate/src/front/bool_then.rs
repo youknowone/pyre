@@ -120,16 +120,20 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
         })
         .ok_or_else(|| format!("{name}: bool::then result var has no producer block"))?;
 
-    // The call must be A's last op (lower_call closes the block right
-    // after pushing it) so removing it leaves the closure-env construction
-    // ops as the block tail.
-    let call_idx = graph.blocks[a].operations.len() - 1;
-    if graph.blocks[a].operations[call_idx].result.as_ref() != Some(&site.result_var) {
-        return Err(format!(
-            "{name}: bool::then call is not the last op of block {a}"
-        ));
-    }
-    // Capture the condition + closure env operands.
+    // The `then`/`then_some` call is normally A's last op (lower_call closes
+    // the block right after pushing it), so removing it leaves the closure-env
+    // construction ops as the block tail.  Locate it by result rather than
+    // assuming the last slot: on a simplified graph (a result_exc / next /
+    // checked-arith callee runs `simplify_lowered_graph` before this pass) the
+    // opaque `Ref` result is immediately narrowed to the concrete `Option<T>`
+    // by a `__pyre_cast_instance` recast tail that `eliminate_empty_blocks`
+    // folds into A, leaving the call no longer last.
+    let call_idx = graph.blocks[a]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(&site.result_var))
+        .ok_or_else(|| format!("{name}: bool::then producer op vanished from block {a}"))?;
+    // Capture the condition + closure env operands from the raw call.
     let (cond, env) = match &graph.blocks[a].operations[call_idx].kind {
         OpKind::Call { args, .. } if args.len() == 2 => (args[0].clone(), args[1].clone()),
         other => {
@@ -138,6 +142,16 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
             ));
         }
     };
+    // Peel the trailing recast chain (`front::iter_next::peel_recast_chain`):
+    // the `Option` value B consumes is the chain's final result, and the peeled
+    // recasts are removed with the call below so it becomes A's last op.
+    let opt_val = crate::front::iter_next::peel_recast_chain(
+        graph,
+        a,
+        call_idx,
+        &site.result_var,
+        "bool::then",
+    )?;
 
     // A's single exit → B (the continuation consuming the Option).  Must be
     // a plain goto — `lower_call` closes with exactly this shape.
@@ -160,7 +174,7 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
     let mut carried: Vec<Variable> = Vec::new();
     for arg in &saved_exit.args {
         if let LinkArg::Value(v) = arg
-            && *v != site.result_var
+            && *v != opt_val
             && !carried.contains(v)
         {
             carried.push(v.clone());
@@ -222,7 +236,7 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
     );
     let then_link_args = reproduce_exit_args(
         &saved_exit,
-        &site.result_var,
+        &opt_val,
         &some_var,
         &then_sources,
         &then_inputs,
@@ -234,7 +248,7 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
     let none_var = emit_option_variant(graph, else_bb, &site.option_owner, 0, None);
     let else_link_args = reproduce_exit_args(
         &saved_exit,
-        &site.result_var,
+        &opt_val,
         &none_var,
         &carried,
         &else_inputs,
@@ -242,11 +256,12 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
     )?;
     close_goto_mixed(graph, else_bb, b_target, else_link_args);
 
-    // A: drop the residual `then` call, branch on `cond`.  `set_branch`
-    // appends the `bool(cond)` hop and installs the Bool(false)/Bool(true)
-    // arm links; the closure-env construction ops stay as A's tail.
+    // A: drop the residual `then` call and any peeled `__pyre_cast_instance`
+    // recast tail, branch on `cond`.  `set_branch` appends the `bool(cond)` hop
+    // and installs the Bool(false)/Bool(true) arm links; the closure-env
+    // construction ops before the call stay as A's tail.
     let a_id = graph.blocks[a].id;
-    graph.blocks[a].operations.remove(call_idx);
+    graph.blocks[a].operations.truncate(call_idx);
     graph.set_branch(a_id, cond, then_bb, then_sources, else_bb, carried);
     Ok(())
 }

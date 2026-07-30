@@ -281,11 +281,17 @@ fn is_recast_narrow(kind: &OpKind) -> bool {
 /// a single value would drop a live use).  With no recast (`next` registered,
 /// or a list element that needs no narrow) the chain is length 0 and this
 /// returns `opt` unchanged.  Any other shape declines (fail-safe).
-fn peel_recast_chain(
+///
+/// Shared with `front::bool_then`: a residual `then`/`then_some` produces the
+/// same opaque `Ref` narrowed to the concrete `Option<T>` by a
+/// `__pyre_cast_instance` recast tail, so it peels the identical chain (the
+/// caller passes its own `op_label` for the decline messages).
+pub(crate) fn peel_recast_chain(
     graph: &FunctionGraph,
     a: usize,
     next_idx: usize,
     opt: &Variable,
+    op_label: &str,
 ) -> Result<Variable, String> {
     let name = &graph.name;
     let ops = &graph.blocks[a].operations;
@@ -296,13 +302,13 @@ fn peel_recast_chain(
         // The next op must be a recast whose single operand is `cur`.
         let OpKind::Call { args, .. } = &follow.kind else {
             return Err(format!(
-                "{name}: op after next() in block {a} is not the block terminator \
+                "{name}: op after {op_label} in block {a} is not the block terminator \
                  nor a recast narrow"
             ));
         };
         if !is_recast_narrow(&follow.kind) || args[0] != cur {
             return Err(format!(
-                "{name}: op after next() in block {a} is not a recast of the prior result"
+                "{name}: op after {op_label} in block {a} is not a recast of the prior result"
             ));
         }
         // `cur` (a non-final chain intermediate) must be dead except for
@@ -376,7 +382,7 @@ fn rewire_one_next_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(),
     // `recast`, `rpython/rtyper/rlist.py:448` `self.r_list.recast`).  Such a
     // narrow is a `cast_pointer` alias, so the native `next` op subsumes it:
     // peel the trailing chain and scrutinise its final result as the Option.
-    let effective_opt = peel_recast_chain(graph, a, next_idx, opt)?;
+    let effective_opt = peel_recast_chain(graph, a, next_idx, opt, "next()")?;
     let opt = &effective_opt;
 
     // The 2-exit StopIteration-only shape is faithful ONLY for a list
