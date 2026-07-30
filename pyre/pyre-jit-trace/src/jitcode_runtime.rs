@@ -630,6 +630,32 @@ pub fn descr_set_jit_stats() -> String {
 /// wasm guest has no stderr and exports these individually
 /// (`pyre_jit_descr_set_*` in `pyre-wasm`), which the runner prints on its
 /// behalf.
+/// The field-position census, as `[jit-stats]` key/value tokens.
+///
+/// This sits next to `descr_set_*` because it answers the question those
+/// counters only appear to answer. `descr_set_absent` asks whether a raw-set
+/// member resolved to SOME descr; it reads 0 while a field is bound under a
+/// parent that numbers its `all_fielddescrs` by a different convention, because
+/// resolving and resolving CORRECTLY are different questions. Upstream cannot
+/// tell them apart either — but it does not have to, since `heaptracker.py:60-72
+/// get_fielddescr_index_in` and `:96-112 all_fielddescrs` are one walker sharing
+/// one skip set, so `all_fielddescrs(S)[i].get_index() == i` holds by
+/// construction and there is nothing to count.
+///
+/// `rederived` is the one to watch: it counts fields whose caller-supplied index
+/// disagreed with the parent that will actually be indexed at
+/// `optimizeopt/info.rs force_box`. Every one of those was, before this was
+/// derived rather than transported, either an out-of-range panic or a store
+/// emitted against a DIFFERENT field.
+pub fn field_position_jit_stats() -> String {
+    let [parent_absent, parent_empty, rederived, unresolved] =
+        majit_ir::descr::GcCache::field_position_census();
+    format!(
+        "field_pos_parent_absent={parent_absent} field_pos_parent_empty={parent_empty} \
+         field_pos_rederived={rederived} field_pos_unresolved={unresolved}"
+    )
+}
+
 pub fn descr_set_counts() -> DescrSetCounts {
     let ledger = crate::descr::set_member_ledger();
     DescrSetCounts {

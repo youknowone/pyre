@@ -962,6 +962,9 @@ fn maybe_print_jit_stats() {
     // `AbsentContainer` question against the universe as it stands now, so it
     // has to be read here, after the run published everything it is going to.
     eprintln!("[jit-stats] {}", pyre_jit::descr_set_jit_stats());
+    // Whether those slots were filled CORRECTLY, which the line above
+    // cannot say. See `field_position_jit_stats`.
+    eprintln!("[jit-stats] {}", pyre_jit::field_position_jit_stats());
 }
 
 /// Shared top-level launcher bootstrap for `run_source` and `run_module`:

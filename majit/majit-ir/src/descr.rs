@@ -668,6 +668,15 @@ pub fn next_call_descr_heapcache_index() -> u32 {
 /// setup_descrs() iterates caches in RPython's fixed order:
 ///   _cache_size, _cache_field, _cache_array, _cache_arraylen,
 ///   _cache_call, _cache_interiorfield
+/// Counters behind [`GcCache::field_position_census`]. Process-global like the
+/// gccache itself; only ever incremented under its lock.
+static FIELD_PARENT_ABSENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FIELD_PARENT_EMPTY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FIELD_INDEX_REDERIVED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static FIELD_INDEX_UNRESOLVED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub struct GcCache {
     /// descr.py:18: _cache_size[STRUCT]
     pub _cache_size: HashMap<LLType, DescrRef>,
@@ -896,6 +905,71 @@ impl GcCache {
     /// Callers that know the owning struct's source name pass the full
     /// `Owner.field` spelling; `None` falls back to the `T<type_id>.` stand-in
     /// for the mint sites that only carry the numeric struct identity.
+    /// Census of what `get_field_descr` found when it bound a field to a parent.
+    ///
+    /// `descr_set_absent` / `descr_set_ambiguous` cannot see any of this: they
+    /// ask whether a raw-set member resolved to SOME descr, so they read 0 while
+    /// a field sits under a parent that numbers its list differently. They count
+    /// slots filled, not slots filled correctly. These four count the latter.
+    ///
+    /// Upstream needs no such census because `heaptracker.py:60-72` and `:96-112`
+    /// share one walker, making `all_fielddescrs(S)[i].get_index() == i` true by
+    /// construction; every nonzero below is a place pyre's split producers reach
+    /// a state `descr.py` cannot represent.
+    pub fn field_position_census() -> [usize; 4] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            FIELD_PARENT_ABSENT.load(Relaxed),
+            FIELD_PARENT_EMPTY.load(Relaxed),
+            FIELD_INDEX_REDERIVED.load(Relaxed),
+            FIELD_INDEX_UNRESOLVED.load(Relaxed),
+        ]
+    }
+
+    /// Where `field_name`/`offset` sits in `parent`'s own `all_fielddescrs`.
+    ///
+    /// `None` when there is nothing to derive from — no parent published yet, or
+    /// a parent whose list is empty — in which case the caller's index is all
+    /// there is. `None` also when the field is absent from a NON-empty list:
+    /// that means two producers disagree about which fields the struct has, and
+    /// inventing a position would be worse than leaving the caller's, since the
+    /// existing `debug_assert!` canaries are what should catch it.
+    fn derive_index_in_parent(
+        parent: Option<&DescrRef>,
+        field_name: &str,
+        offset: usize,
+        caller_index: usize,
+    ) -> Option<usize> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(size_descr) = parent.and_then(|p| p.as_size_descr()) else {
+            FIELD_PARENT_ABSENT.fetch_add(1, Relaxed);
+            return None;
+        };
+        let fields = size_descr.all_fielddescrs();
+        if fields.is_empty() {
+            FIELD_PARENT_EMPTY.fetch_add(1, Relaxed);
+            return None;
+        }
+        // Name only. An offset fallback looks tempting but is unsound while one
+        // struct is reachable under several identity keys: the parent found may
+        // belong to a different struct, and a same-offset field of another type
+        // then reads as this one.
+        let _ = offset;
+        let found = fields.iter().position(|f| f.field_key() == field_name);
+        match found {
+            Some(i) => {
+                if i != caller_index {
+                    FIELD_INDEX_REDERIVED.fetch_add(1, Relaxed);
+                }
+                Some(i)
+            }
+            None => {
+                FIELD_INDEX_UNRESOLVED.fetch_add(1, Relaxed);
+                None
+            }
+        }
+    }
+
     pub fn get_field_descr(
         &mut self,
         struct_key: LLType,
@@ -965,8 +1039,29 @@ impl GcCache {
             field_name.to_string(),
         );
         fd.virtualizable = virtualizable;
-        // descr.py:228: index_in_parent (from heaptracker)
-        fd.index_in_parent = index_in_parent;
+        // descr.py:228: index_in_parent (from heaptracker).
+        //
+        // Upstream has no caller-supplied index: `heaptracker.py:60-72
+        // get_fielddescr_index_in` is the sole numberer and shares its skip set
+        // with `:96-112 all_fielddescrs`, so `all_fielddescrs(S)[i].get_index()
+        // == i` holds by construction. pyre has several independent numberers
+        // that disagree — the analyzer's `field_pos` and the assembler's
+        // `specs.len()` both COUNT the two header words at offsets 0 and 8 that
+        // the runtime publish skips, because the skip sets only drop `typeptr`
+        // and pyre spells that header `ob_type` / `w_class`. A field carrying
+        // one convention under a parent numbered by another is not a cosmetic
+        // mismatch: `all_fielddescrs()[index_in_parent]` is a load-bearing
+        // lookup (`optimizeopt/info.rs force_box`), so a too-high index either
+        // runs off the end or silently names a DIFFERENT field and emits the
+        // store against it.
+        //
+        // So take the index from the parent that will actually be indexed,
+        // rather than from whoever happened to call. Match on the cache key
+        // first and fall back to the offset, which identifies a field even when
+        // two producers spell its name differently.
+        fd.index_in_parent =
+            Self::derive_index_in_parent(parent.as_ref(), field_name, offset, index_in_parent)
+                .unwrap_or(index_in_parent);
         // descr.py:229 `is_quasi_immutable = '%s?' in STRUCT._hints.get(
         // '_immutable_fields_', ())` parity.  The analyzer side reads
         // `#[jit_immutable_fields(..., "field?", ...)]` via

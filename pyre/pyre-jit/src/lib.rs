@@ -56,7 +56,7 @@ mod trace_verify;
 // Re-export auto-generated trace functions from pyre-jit-trace
 pub use pyre_jit_trace::jitcode_runtime::{
     descr_set_counts, descr_set_jit_stats, descr_spelling_gate_recheck_now,
-    field_descr_identity_census_now,
+    field_descr_identity_census_now, field_position_jit_stats,
 };
 pub use pyre_jit_trace::{
     trace_box_float, trace_box_int, trace_float_binop, trace_float_compare, trace_int_binop,
