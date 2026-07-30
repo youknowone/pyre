@@ -25,12 +25,6 @@ pub static METHOD_DESCRIPTOR_TYPE: PyType = pyre_object::pyobject::new_pytype("m
 /// payload deliberately reuses [`Function`]: both are immutable BuiltinCode
 /// carriers and therefore have identical GC edges and call ABI.
 pub static SLOT_WRAPPER_TYPE: PyType = pyre_object::pyobject::new_pytype("wrapper_descriptor");
-/// CPython-compatible ordinary builtin method descriptor.
-///
-/// PyPy represents these as `FunctionWithFixedCode`; the payload therefore
-/// deliberately remains [`Function`] while the public descriptor type follows
-/// Python 3.14.
-pub static METHOD_DESCRIPTOR_TYPE: PyType = pyre_object::pyobject::new_pytype("method_descriptor");
 
 /// User-defined function object.
 ///

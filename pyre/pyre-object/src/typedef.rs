@@ -346,22 +346,6 @@ pub unsafe fn w_member_set_cls(obj: PyObjectRef, w_cls: PyObjectRef) {
     unsafe { (*(obj as *mut W_MemberDescr)).w_cls = w_cls }
 }
 
-pub unsafe fn w_member_get_doc(obj: PyObjectRef) -> Option<&'static str> {
-    if unsafe { w_member_is_direct(obj) } {
-        match unsafe { w_member_get_name(obj) } {
-            "real" => return Some("the real part of a complex number"),
-            "imag" => return Some("the imaginary part of a complex number"),
-            _ => {}
-        }
-    }
-    let doc = unsafe { (*(obj as *const W_MemberDescr)).doc };
-    if !doc.is_null() {
-        Some(unsafe { &*doc })
-    } else {
-        None
-    }
-}
-
 /// `typedef.py:446 Member.index` — the slot index (`base_nslots + position`),
 /// used by the LOAD_ATTR/STORE_ATTR cache to form the `SLOTS_STARTING_FROM +
 /// index` attrkind (mapdict.py:1520).

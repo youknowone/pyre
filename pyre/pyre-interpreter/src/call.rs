@@ -4763,6 +4763,7 @@ pub(crate) unsafe fn check_and_find_best_base(
         // typeobject.py:1122-1128: check layout conflicts
         let best_layout = pyre_object::w_type_get_layout_ptr(w_bestbase);
         if !best_layout.is_null() && !w_bases.is_null() && pyre_object::is_tuple(w_bases) {
+            let len = pyre_object::w_tuple_len(w_bases);
             for i in 0..len {
                 if let Some(w_base) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
                     if !pyre_object::is_type(w_base) {
