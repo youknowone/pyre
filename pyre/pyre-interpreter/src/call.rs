@@ -1315,7 +1315,10 @@ fn call_callable_with_mode(
         // a normal function".
         let binds_self = unsafe {
             std::ptr::eq((*call_fn).ob_type, &crate::FUNCTION_TYPE as *const _)
-                || std::ptr::eq((*call_fn).ob_type, &crate::METHOD_DESCRIPTOR_TYPE as *const _)
+                || std::ptr::eq(
+                    (*call_fn).ob_type,
+                    &crate::METHOD_DESCRIPTOR_TYPE as *const _,
+                )
         };
         if binds_self {
             let mut call_args = Vec::with_capacity(1 + args.len());
