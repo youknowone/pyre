@@ -994,6 +994,16 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             concrete_r[i] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
         }
     }
+    let concrete_callee_frame = regs_r
+        .get(callee_pjc.metadata.portal_frame_reg as usize)
+        .and_then(|&frame_box| ctx.box_value(frame_box))
+        .and_then(|value| match value {
+            majit_ir::Value::Ref(frame) if !frame.is_null() => {
+                Some(frame.as_usize() as *mut pyre_interpreter::PyFrame)
+            }
+            _ => None,
+        })
+        .unwrap_or(std::ptr::null_mut());
     if let Some(result) = child_result {
         let call_dst_reg = call_dst_reg_for_residual_return(jc.code.as_slice(), entry)?;
         if call_dst_reg >= regs_r.len() {
@@ -1108,6 +1118,12 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         };
         let _inline_frame =
             InlineFrameGuard::enter(session, callee_code_key, Some(parent_for_current));
+        // `MIFrame` owns one concrete red frame at every inline depth.  The
+        // bridge-resume sub-walk must publish its reconstructed frame just as
+        // the forward-inline sub-walk does; vable stores then write through to
+        // this frame's own locals array, and residual calls publish the same
+        // frame on the execution-context chain.
+        let _inline_concrete_frame = InlineConcreteFrameGuard::enter(concrete_callee_frame);
         // Nested self-recursive calls inside the resumed callee fold straight to
         // a recursive-portal CALL_ASSEMBLER (the bridge is the deopt
         // continuation, not a fresh unroll).

@@ -6847,6 +6847,19 @@ fn rd_virtual_at(
     rd_virtuals.and_then(|v| v.get(vidx)).map(|rc| &**rc)
 }
 
+/// One decoded Ref-array write from `rd_pendingfields`.
+///
+/// RPython's resume reader applies this stream before `consume_boxes`; retain
+/// the decoded boxes so Pyre's portal-shaped frame reconstruction can consume
+/// the same just-written value without rediscovering it through a different
+/// array descriptor.
+#[derive(Clone, Copy)]
+struct PendingRefArrayWrite {
+    target: OpRef,
+    item_index: usize,
+    value: OpRef,
+}
+
 /// Rebuild the semantic Ref slots of a forced inline frame from its own
 /// `locals_cells_stack_w` array.
 ///
@@ -6864,6 +6877,7 @@ fn reconstruct_materialized_frame_slots(
     valuestackdepth: usize,
     pending_result_abs_slot: Option<usize>,
     stream_covered: &[bool],
+    pending_ref_array_writes: &[PendingRefArrayWrite],
 ) -> Option<(Vec<OpRef>, Vec<majit_ir::Value>)> {
     if frame_ref.is_null() || frame_ref == majit_ir::GcRef::NO_CONCRETE {
         return None;
@@ -6879,7 +6893,21 @@ fn reconstruct_materialized_frame_slots(
         return None;
     }
 
-    let array_box = frame_locals_cells_stack_array(ctx, frame_box);
+    // ResumeDataBoxReader applies pending writes before consuming frame boxes.
+    // Pyre's portal-shaped frame section rediscovers locals through
+    // `frame.locals_cells_stack_w`; retain the pending target's box identity
+    // when it names that exact array. This is the decoded pending stream, not
+    // optimizer state or a per-box side table.
+    let pending_array_box = pending_ref_array_writes.iter().find_map(|write| {
+        matches!(
+            ctx.box_value(write.target),
+            Some(majit_ir::Value::Ref(concrete))
+                if concrete.as_usize() == arr_ptr as usize
+        )
+        .then_some(write.target)
+    });
+    let array_box =
+        pending_array_box.unwrap_or_else(|| frame_locals_cells_stack_array(ctx, frame_box));
     // `frame_locals_cells_stack_array` currently emits GetfieldRawI for
     // backend compatibility, but the field is a GC array Ref
     // (virtualizable.py:94). Preserve that boxed-pointer view for the
@@ -6893,6 +6921,26 @@ fn reconstruct_materialized_frame_slots(
     let mut concrete_r = vec![majit_ir::Value::Void; valuestackdepth];
     for k in 0..valuestackdepth {
         if Some(k) == pending_result_abs_slot || stream_covered.get(k).copied().unwrap_or(false) {
+            continue;
+        }
+        // `_prepare_pendingfields` precedes `consume_boxes` in resume.py. If
+        // this exact materialized locals array was just written, consume the
+        // decoded value box directly. The pending descriptor may be the
+        // generic virtualizable-array descriptor while the PyFrame reload uses
+        // its concrete GC-array descriptor, so routing through a fresh GET
+        // would hide the write from heap optimization despite identical boxes.
+        if let Some(write) = pending_ref_array_writes.iter().rev().find(|write| {
+            write.item_index == k
+                && matches!(
+                    ctx.box_value(write.target),
+                    Some(majit_ir::Value::Ref(concrete))
+                        if concrete.as_usize() == arr_ptr as usize
+                )
+        }) {
+            registers_r[k] = write.value;
+            concrete_r[k] = ctx.box_value(write.value).unwrap_or_else(|| {
+                majit_ir::Value::Ref(majit_ir::GcRef(arr.as_slice()[k] as usize))
+            });
             continue;
         }
         let index = ctx.const_int(k as i64);
@@ -6976,6 +7024,7 @@ fn reconstruct_inline_recipe(
     backend: &dyn majit_backend::Backend,
     cache: &mut BridgeVirtualCache,
     in_a_call: bool,
+    pending_ref_array_writes: &[PendingRefArrayWrite],
 ) -> Option<ReconstructRecipe> {
     // Each decline below ends the whole multi-frame path (`recipes.clear()` in
     // the caller), so name every class: an uncensused decline is invisible in
@@ -7261,6 +7310,7 @@ fn reconstruct_inline_recipe(
                 valuestackdepth,
                 pending_result_abs_slot,
                 &stream_covered,
+                pending_ref_array_writes,
             )?;
             overlay_stream_ref_slots(
                 ctx,
@@ -7705,9 +7755,10 @@ fn prepare_bridge_pending_fields(
     fail_types: &[Type],
     backend: &dyn majit_backend::Backend,
     cache: &mut BridgeVirtualCache,
-) {
+) -> Vec<PendingRefArrayWrite> {
+    let mut pending_ref_array_writes = Vec::new();
     let Some(storage) = resume_data.storage.as_ref() else {
-        return;
+        return pending_ref_array_writes;
     };
     let target_descr = crate::descr::ec_sys_exc_value_descr();
     for pending in &storage.rd_pendingfields {
@@ -7767,7 +7818,7 @@ fn prepare_bridge_pending_fields(
         } else {
             // resume.py:993-1007 `_prepare_pendingfields`: replay ordinary
             // pending writes as bridge-entry SETFIELD_GC / SETARRAYITEM_GC ops.
-            let (target_op, _) = bridge_decode_box(
+            let (target_op, target_concrete) = bridge_decode_box(
                 ctx,
                 &target,
                 Type::Ref,
@@ -7778,6 +7829,10 @@ fn prepare_bridge_pending_fields(
                 backend,
                 cache,
             );
+            // history.py FrontendOp parity: a decoded live target carries its
+            // runtime value on the box before decoding the value can allocate
+            // and trigger a moving collection.
+            ctx.try_set_opref_concrete(target_op, target_concrete);
             let value_kind = if pending.item_index < 0 {
                 descr
                     .as_field_descr()
@@ -7789,7 +7844,7 @@ fn prepare_bridge_pending_fields(
                     .map(|ad| ad.item_type())
                     .unwrap_or(Type::Ref)
             };
-            let (value_op, _) = bridge_decode_box(
+            let (value_op, value_concrete) = bridge_decode_box(
                 ctx,
                 &value,
                 value_kind,
@@ -7800,6 +7855,61 @@ fn prepare_bridge_pending_fields(
                 backend,
                 cache,
             );
+            // The value box has the same FrontendOp value contract.  The target
+            // stamp above also lets the later portal-frame consume recover this
+            // exact pending-target box after a moving GC.
+            ctx.try_set_opref_concrete(value_op, value_concrete);
+            // ResumeDataBoxReader._prepare_pendingfields dispatches through
+            // `execute_setfield_gc` / `execute_setarrayitem_gc`: execute the
+            // write on the recording-time heap as well as recording it.  The
+            // concrete execution is observable immediately when the following
+            // frame-section consume reads a materialized PyFrame's locals
+            // array; recording alone would leave that consume one write stale.
+            let target_ptr = match ctx.box_value(target_op).unwrap_or(target_concrete) {
+                majit_ir::Value::Ref(ptr) if !ptr.is_null() => ptr.as_usize() as i64,
+                _ => continue,
+            };
+            if pending.item_index < 0 {
+                let Some(fielddescr) = descr.as_field_descr() else {
+                    continue;
+                };
+                let bh_descr = majit_translate::jitcode::BhDescr::from_field_descr(fielddescr);
+                match (fielddescr.field_type(), value_concrete) {
+                    (Type::Ref, majit_ir::Value::Ref(value)) => {
+                        backend.bh_setfield_gc_r(target_ptr, value, &bh_descr)
+                    }
+                    (Type::Float, majit_ir::Value::Float(value)) => {
+                        backend.bh_setfield_gc_f(target_ptr, value, &bh_descr)
+                    }
+                    (Type::Int, majit_ir::Value::Int(value)) => {
+                        backend.bh_setfield_gc_i(target_ptr, value, &bh_descr)
+                    }
+                    _ => continue,
+                }
+            } else {
+                let Some(arraydescr) = descr.as_array_descr() else {
+                    continue;
+                };
+                let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr(arraydescr);
+                let index = i64::from(pending.item_index);
+                match (arraydescr.item_type(), value_concrete) {
+                    (Type::Ref, majit_ir::Value::Ref(value)) => {
+                        backend.bh_setarrayitem_gc_r(target_ptr, index, value, &bh_descr);
+                        pending_ref_array_writes.push(PendingRefArrayWrite {
+                            target: target_op,
+                            item_index: pending.item_index as usize,
+                            value: value_op,
+                        });
+                    }
+                    (Type::Float, majit_ir::Value::Float(value)) => {
+                        backend.bh_setarrayitem_gc_f(target_ptr, index, value, &bh_descr)
+                    }
+                    (Type::Int, majit_ir::Value::Int(value)) => {
+                        backend.bh_setarrayitem_gc_i(target_ptr, index, value, &bh_descr)
+                    }
+                    _ => continue,
+                }
+            }
             // resume.py:993-1007 _prepare_pendingfields op-emission: replay the
             // decoded write as a bridge-entry SETFIELD_GC / SETARRAYITEM_GC and
             // seed the heapcache after recording so a later same-slot get folds
@@ -7816,6 +7926,7 @@ fn prepare_bridge_pending_fields(
             );
         }
     }
+    pending_ref_array_writes
 }
 
 /// resume.py:1245-1264 decode_box concrete parity for tagged fieldnums.
@@ -10034,6 +10145,24 @@ impl JitState for PyreJitState {
         // `pyjitpl.py:3433 self.virtualref_boxes = virtualref_boxes`.
         ctx.restore_virtualref_boxes(restored_virtualref_boxes);
 
+        // resume.py AbstractResumeDataReader._prepare runs
+        // `_prepare_virtuals` and then `_prepare_pendingfields` before
+        // `rebuild_from_resumedata` consumes any frame section.  Preserve that
+        // order here as well.  In particular, a pending SETARRAYITEM_GC may
+        // target a materialized inline frame's locals array; decoding that
+        // frame into a reconstruction recipe first would capture the stale
+        // pre-write slot and later copy it into the rebuilt frame.
+        let pending_ref_array_writes = prepare_bridge_pending_fields(
+            sym,
+            ctx,
+            resume_data,
+            rd_virtuals,
+            fail_values,
+            fail_types,
+            backend,
+            &mut virtuals_cache,
+        );
+
         // `sync_virtualizable_after_guard_failure` runs before bridge setup,
         // but on the multi-frame inlined-callee path its resume-decoded array
         // image is then clobbered by the vsd-correction `clear_stack_above`
@@ -10092,6 +10221,7 @@ impl JitState for PyreJitState {
                         backend,
                         &mut virtuals_cache,
                         in_a_call,
+                        &pending_ref_array_writes,
                     ) {
                         Some(recipe) => recipes.push(recipe),
                         None => {
@@ -10120,17 +10250,6 @@ impl JitState for PyreJitState {
                 recipes,
             });
         }
-
-        prepare_bridge_pending_fields(
-            sym,
-            ctx,
-            resume_data,
-            rd_virtuals,
-            fail_values,
-            fail_types,
-            backend,
-            &mut virtuals_cache,
-        );
     }
 
     /// resume.py:1042-1057 rebuild_from_resumedata parity.
@@ -10935,6 +11054,7 @@ mod tests {
             values.len(),
             Some(1),
             &[],
+            &[],
         )
         .expect("forced frame slots should be reconstructable");
 
@@ -10964,6 +11084,49 @@ mod tests {
                 .filter(|op| op.opcode == OpCode::GetarrayitemGcR)
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn materialized_inline_frame_consumes_pending_ref_array_write() {
+        let code = compile_function_body("def f(a, b):\n    return a\n");
+        let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
+        let values = [w_int_new(11), w_int_new(22)];
+        for (index, value) in values.iter().copied().enumerate() {
+            frame.locals_w_mut()[index] = value;
+        }
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+        let array_ptr = frame.locals_cells_stack_w as usize;
+
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref, Type::Ref]);
+        let frame_box = OpRef::input_arg_ref(0);
+        let target = OpRef::input_arg_ref(1);
+        let value = OpRef::input_arg_ref(2);
+        ctx.try_set_opref_concrete(frame_box, Value::Ref(majit_ir::GcRef(frame_ptr)));
+        ctx.try_set_opref_concrete(target, Value::Ref(majit_ir::GcRef(array_ptr)));
+        ctx.try_set_opref_concrete(value, Value::Ref(majit_ir::GcRef(values[1] as usize)));
+
+        let writes = [PendingRefArrayWrite {
+            target,
+            item_index: 1,
+            value,
+        }];
+        let (registers_r, concrete_r) = reconstruct_materialized_frame_slots(
+            &mut ctx,
+            frame_box,
+            majit_ir::GcRef(frame_ptr),
+            values.len(),
+            None,
+            &[],
+            &writes,
+        )
+        .expect("forced frame slots should consume the pending write stream");
+
+        assert_eq!(registers_r[1], value);
+        assert_eq!(
+            concrete_r[1],
+            Value::Ref(majit_ir::GcRef(values[1] as usize))
         );
     }
 

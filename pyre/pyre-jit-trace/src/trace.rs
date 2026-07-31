@@ -1631,20 +1631,6 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             carrier.recipes.len()
         );
     }
-    // Each resumed frame needs its own red frame and register bank. The
-    // current carrier driver has one root `sym`, so it can faithfully drain a
-    // single reconstructed callee but cannot yet keep two reconstructed
-    // callees' color banks independent. Decline before concrete sub-walking:
-    // executing the deepest frame only to roll it back adds substantial
-    // overhead and compiling the collapsed shape is unsound.
-    if carrier.recipes.len() > 1 {
-        crate::jitcode_dispatch::census_record("P2Drain::MultiFrameIdentityUnsupported");
-        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
-        crate::jitcode_dispatch::bool_box_truth_reset();
-        crate::jitcode_dispatch::fbw_finish_payload_reset();
-        crate::jitcode_dispatch::fbw_store_journal_rollback();
-        return p2_drain_abort();
-    }
     let Some(recipe) = carrier.recipes.last() else {
         crate::jitcode_dispatch::census_record("P2Drain::NoRecipes");
         // Churn guard (Task 8): making this class transient retried the same
