@@ -7772,6 +7772,8 @@ fn handle_fail(
         // This is an intentional replacement, unlike ordinary
         // GUARD_NOT_INVALIDATED handling: discard the range trace's target
         // tokens so the next walk compiles the generic FOR_ITER residual.
+        // The `ResumeInBlackhole` below decodes off the exit layout it was
+        // handed, so retiring the entry here cannot starve it of slot types.
         driver.remove_compiled_loop(green_key);
         return HandleFailOutcome::ResumeInBlackhole;
     }
@@ -7959,14 +7961,21 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     // `jit_blackhole_resume_from_guard` (call_jit.rs:1855-1881) without the
     // green_key recovery that path needs.
     if let Some(storage) = exit_layout.storage.as_deref() {
-        let deadframe_types = {
-            let (driver, _) = driver_pair();
-            driver.get_recovery_slot_types(
-                exit_layout.rd_loop_token,
-                exit_layout.trace_id,
-                exit_layout.fail_index,
-            )
-        };
+        // The failing guard's own `exit_types`, not a re-lookup of them:
+        // `get_recovery_slot_types` is `exit_types.to_vec()` off a
+        // `(green_key, trace_id, fail_index)` re-resolution of *this*
+        // layout, and that resolution starts at `compiled_loops.get(&
+        // green_key)`, which `handle_fail` may have just emptied
+        // (`remove_compiled_loop` on the range-FOR_ITER demotion) before
+        // returning `ResumeInBlackhole`.  A miss produced `None`, which
+        // disarms both `ResumeDeadframeRoots::register` and the Ref/Int
+        // discrimination in `decode_ref` — an unrooted, mistyped raw word
+        // reaching the resume as a GCREF.  Upstream never retires metadata a
+        // pending resume is about to read: `compile.py:701-717 handle_fail`
+        // and `resume.py:1312 blackhole_from_resumedata` read every slot's
+        // kind out of the self-describing deadframe+descr it was handed.
+        // The sibling resume paths already pass this slice directly
+        // (`jitdriver.rs:493`, `:3772`).
         let all_virtuals = take_forced_virtuals_for_frame(forced_cache_owner);
         let result = crate::call_jit::blackhole_resume_via_rd_numb(
             &storage.rd_numb,
@@ -7974,7 +7983,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
             raw_values,
             Some(&storage.rd_pendingfields),
             Some(&storage.rd_virtuals),
-            deadframe_types.as_deref(),
+            Some(exit_layout.exit_types.as_slice()),
             guard_exc,
             novable,
             all_virtuals,

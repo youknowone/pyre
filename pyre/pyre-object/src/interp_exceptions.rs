@@ -222,6 +222,15 @@ pub enum ExcKind {
 }
 
 impl ExcKind {
+    /// The largest valid discriminant.  `PyError::kind_from_exc` matches
+    /// every variant with no wildcard arm, so the compiler is free to lower
+    /// it to a bounds-check-free jump table over exactly `0..=` this value;
+    /// a byte outside the range reaching that match is an indirect branch to
+    /// an address computed from garbage.  Anything reading the tag out of a
+    /// value whose provenance is not proven must go through
+    /// `w_exception_kind_checked`, which range-checks against this.
+    pub const MAX_DISCRIMINANT: u8 = ExcKind::StopAsyncIteration as u8;
+
     /// True when this kind's constructor is the trivial
     /// `W_BaseException.descr_init` (`self.args_w = args_w`) — i.e. it
     /// stores nothing beyond `args_w`.
@@ -1374,6 +1383,54 @@ pub unsafe fn w_exception_get_kind(obj: PyObjectRef) -> ExcKind {
     unsafe { (*(obj as *const W_BaseException)).kind }
 }
 
+/// The raw tag byte, read without interpreting it as an `ExcKind`.
+///
+/// # Safety
+/// `obj` must be non-null and point to at least
+/// `offset_of!(W_BaseException, kind) + 1` readable bytes.
+#[inline]
+pub unsafe fn w_exception_kind_byte(obj: PyObjectRef) -> u8 {
+    unsafe {
+        std::ptr::addr_of!((*(obj as *const W_BaseException)).kind)
+            .cast::<u8>()
+            .read()
+    }
+}
+
+/// `w_exception_get_kind` for a value whose provenance is not proven — a raw
+/// resume word handed back by the blackhole, say.
+///
+/// `blackhole.py:1679-1682 _exit_frame_with_exception` casts its value to
+/// GCREF and every later classification runs through a genuine class lookup
+/// (`bh_classof` / `space.exception_match`, i.e. the `rclass.py:1133-1137`
+/// subclass ranges).  Pyre reads a `#[repr(u8)]` tag out of the object
+/// instead, which turns a bad value into an out-of-range index into a
+/// bounds-check-free jump table (`ExcKind::MAX_DISCRIMINANT`).  This restores
+/// the class check in front of the tag read: `is_exception` is the
+/// `ll_isinstance` port.
+///
+/// The tag byte is range-checked *before* the class check because it is the
+/// cheaper load — one dereference of `obj` rather than a dereference of the
+/// `ob_type` loaded out of it — and it is the exact byte the jump table
+/// would index.
+///
+/// # Safety
+/// `obj` must be null or point to at least `size_of::<W_BaseException>()`
+/// readable bytes.
+#[inline]
+pub unsafe fn w_exception_kind_checked(obj: PyObjectRef) -> Option<ExcKind> {
+    if obj.is_null() {
+        return None;
+    }
+    if unsafe { w_exception_kind_byte(obj) } > ExcKind::MAX_DISCRIMINANT {
+        return None;
+    }
+    if !unsafe { is_exception(obj) } {
+        return None;
+    }
+    Some(unsafe { w_exception_get_kind(obj) })
+}
+
 /// Reads the caught exception's `kind` discriminant as an integer, the
 /// residual-callable twin of `w_exception_get_kind`.  The tracer cannot
 /// model the raw pointer read, so the JIT residualises the call rather than
@@ -1566,6 +1623,35 @@ mod tests {
                 Wtf8::new("bad value")
             );
         }
+    }
+
+    /// A word that is not a `W_BaseException` must not reach
+    /// `kind_from_exc`: that match has no wildcard arm, so an out-of-range
+    /// byte indexes a bounds-check-free jump table.  The range check has to
+    /// reject before the class check dereferences `ob_type`, so this uses a
+    /// buffer whose header is deliberately not a live type pointer.
+    #[test]
+    fn test_kind_checked_rejects_out_of_range_tag() {
+        let mut buf = [0u8; std::mem::size_of::<W_BaseException>()];
+        let kind_offset = std::mem::offset_of!(W_BaseException, kind);
+        for raw in [ExcKind::MAX_DISCRIMINANT + 1, 128, 160, u8::MAX] {
+            buf[kind_offset] = raw;
+            assert_eq!(
+                unsafe { w_exception_kind_checked(buf.as_ptr() as PyObjectRef) },
+                None,
+                "tag byte {raw} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_kind_checked_accepts_real_exception() {
+        let obj = w_exception_new(ExcKind::ValueError, "bad value");
+        assert_eq!(
+            unsafe { w_exception_kind_checked(obj) },
+            Some(ExcKind::ValueError)
+        );
+        assert_eq!(unsafe { w_exception_kind_checked(std::ptr::null_mut()) }, None);
     }
 
     #[test]

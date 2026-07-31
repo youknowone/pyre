@@ -2053,6 +2053,49 @@ impl Drop for BareRefRoot {
     }
 }
 
+/// `blackhole.py:1679-1682 _exit_frame_with_exception`:
+///
+/// ```python
+/// e = cast_opaque_ptr(GCREF, e)
+/// raise ExitFrameWithExceptionRef(e)
+/// ```
+///
+/// Upstream hands the value on as an opaque GCREF and every later
+/// classification runs through a real class lookup.  Pyre instead reads a
+/// `#[repr(u8)]` `ExcKind` tag out of the object and feeds it to
+/// `kind_from_exc`, a wildcard-free match the compiler may lower to a
+/// bounds-check-free jump table — so a word that is not a `W_BaseException`
+/// becomes an indirect branch to an address derived from whatever byte sits
+/// at the tag offset.  `w_exception_kind_checked` restores the class check in
+/// front of that read; a value that fails it names itself here instead.
+fn exit_frame_exception_ref(exc_value: i64, site: &str) -> pyre_interpreter::PyError {
+    let obj = exc_value as PyObjectRef;
+    if unsafe { pyre_object::interp_exceptions::w_exception_kind_checked(obj) }.is_some() {
+        return unsafe { pyre_interpreter::PyError::from_exc_object(obj) };
+    }
+    if obj.is_null() {
+        return pyre_interpreter::PyError::new(
+            pyre_interpreter::PyErrorKind::RuntimeError,
+            "blackhole exception (null exc_value)",
+        );
+    }
+    let tag = unsafe { pyre_object::interp_exceptions::w_exception_kind_byte(obj) };
+    // Report the raw header before touching anything reached *through* it: if
+    // `ob_type` is itself garbage the name lookup below faults, and then this
+    // line is all the evidence there is.
+    let words = unsafe { std::slice::from_raw_parts(obj as *const u64, 4) };
+    eprintln!(
+        "[jit][BUG] {site}: exc_value is not a W_BaseException: obj={obj:p} \
+         tag_byte={tag} words=[{:#018x} {:#018x} {:#018x} {:#018x}]",
+        words[0], words[1], words[2], words[3],
+    );
+    let type_name = unsafe { pyre_object::pyobject::type_name_of(obj) };
+    panic!(
+        "{site}: blackhole exception value is not a W_BaseException \
+         (obj={obj:p} tag_byte={tag} type={type_name})"
+    );
+}
+
 /// resume.py:1312 blackhole_from_resumedata parity:
 /// Decode rd_numb via ResumeDataDirectReader, build blackhole chain,
 /// run _run_forever.
@@ -2429,11 +2472,7 @@ pub fn blackhole_resume_via_rd_numb(
                 None => {
                     // blackhole.py:1629 bottommost frame, unhandled →
                     // raise ExitFrameWithExceptionRef(exc).
-                    let err = unsafe {
-                        pyre_interpreter::PyError::from_exc_object(
-                            guard_exc as pyre_object::PyObjectRef,
-                        )
-                    };
+                    let err = exit_frame_exception_ref(guard_exc, "guard_exc propagation");
                     if !frame_ptr.is_null() {
                         let last_instruction = jitcode_index
                             .and_then(|index| {
@@ -2595,21 +2634,7 @@ pub fn blackhole_resume_via_rd_numb(
             }
             release_bh_rd(bh);
             let Some(mut caller_bh) = next.map(|b| *b) else {
-                // blackhole.py:1679-1682 _exit_frame_with_exception:
-                //   e = cast_opaque_ptr(GCREF, e)
-                //   raise ExitFrameWithExceptionRef(e)
-                let err = if exc_value != 0 {
-                    unsafe {
-                        pyre_interpreter::PyError::from_exc_object(
-                            exc_value as pyre_object::PyObjectRef,
-                        )
-                    }
-                } else {
-                    pyre_interpreter::PyError::new(
-                        pyre_interpreter::PyErrorKind::RuntimeError,
-                        "blackhole exception (null exc_value)",
-                    )
-                };
+                let err = exit_frame_exception_ref(exc_value, "blackhole exception propagation");
                 // `attach_tb` deliberately stays true on the way out.  It
                 // suppresses the traceback record of the re-raising frame
                 // only, and this frame's decision was already applied above by

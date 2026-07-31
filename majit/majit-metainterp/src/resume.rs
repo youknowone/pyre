@@ -7147,12 +7147,25 @@ impl<'a> ResumeDataDirectReader<'a> {
                     idx += self.count;
                 }
                 let value = self.deadframe[idx as usize];
-                match self
-                    .deadframe_types
-                    .and_then(|tys| tys.get(idx as usize))
-                    .copied()
-                    .unwrap_or(majit_ir::Type::Ref)
-                {
+                let slot_type = match self.deadframe_types {
+                    // resume.py has no `deadframe_types`: `cpu.get_ref_value`
+                    // reads a self-describing deadframe, so a ref slot always
+                    // holds a ref.  The vector exists only because pyre's
+                    // optimizer may unbox Ref→Int in deadframe slots; a
+                    // caller with no vector at all recorded no such unboxing.
+                    None => majit_ir::Type::Ref,
+                    // A vector that is present but too short is not that
+                    // state — it means the producer's compact fail args and
+                    // this decode disagree, and falling back to Ref would
+                    // hand `value` on as a pointer.
+                    Some(tys) => *tys.get(idx as usize).unwrap_or_else(|| {
+                        panic!(
+                            "decode_ref: deadframe_types has {} entries, slot {idx} requested",
+                            tys.len()
+                        )
+                    }),
+                };
+                match slot_type {
                     majit_ir::Type::Ref => value,
                     // RPython: decode_ref + TAGBOX always returns a GC
                     // pointer via cpu.get_ref_value(). These Int/Float
