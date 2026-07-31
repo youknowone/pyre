@@ -24833,14 +24833,17 @@ fn product_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         gettypefor(&pyre_object::interp_itertools::PRODUCT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let cls = positional.first().copied().unwrap_or(PY_NULL);
-    // `tp_new_wrapper` screens the requested subtype before `product_new`
-    // runs, so this precedes the keyword census, the `repeat` conversion and
-    // any contact with the input iterables — an unbound call with a foreign
-    // class must not reach their side effects. `itertools_alloc_for_class`
-    // repeats the check on the allocation path.
-    check_user_subclass(exact, cls)?;
     let inputs = positional.get(1..).unwrap_or(&[]);
+    // interp_itertools.py:1350-1360 W_Product__new__ orders the keyword census
+    // (`repeat` extraction, then the unexpected-keyword raise), the
+    // `allocate_instance` subtype check and `W_Product.__init__` — which does
+    // the `repeat` conversion and the pass over the input iterables — in that
+    // sequence, so the subtype check sits between the two.  Reaching it only
+    // through `itertools_alloc_for_class` would put it after the iterables,
+    // and an unbound `product.__new__(int, gen())` would consume `gen()`
+    // before reporting the foreign class.
     crate::builtins::kwarg_reject_unknown(kwargs, &["repeat"], "product")?;
+    check_user_subclass(exact, cls)?;
 
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(cls);
