@@ -678,10 +678,16 @@ fn reraise_bad_operand_diag(
         )
     };
     let stack: Vec<String> = below.iter().map(|&v| describe(v)).collect();
-    eprintln!(
-        "[reraise] code={code_name} oparg={oparg} depth={depth} operand={operand} \
-         below=[{}]",
-        stack.join(", ")
+    // Through the seam, not `eprintln!`: under sandbox the interpreter reaches
+    // fd 2 only via `ops::write`, and the compile-out fence rejects a direct
+    // `std::io::_eprint` here.
+    crate::host_seam::emit_stderr(
+        format!(
+            "[reraise] code={code_name} oparg={oparg} depth={depth} operand={operand} \
+             below=[{}]\n",
+            stack.join(", ")
+        )
+        .as_bytes(),
     );
 }
 
