@@ -408,6 +408,44 @@ pub fn module_dict_storage_gc_type_id() -> u32 {
     MODULE_DICT_STORAGE_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The single `IndexMap` probe [`ModuleDictStorage::get`] runs —
+/// `celldict.py:143-145 getitem_str`'s
+/// `self.unerase(w_dict.dstorage).get(key)`.
+///
+/// Residualise the probe alone (`@dont_look_inside`, `rlib/jit.py:139`), the
+/// twin of `dictmultiobject::dict_entries_probe_str`: the `IndexMap::get` it
+/// wraps is an external-crate heap lookup the tracer cannot model — the
+/// oopspec'd residual arm of `rordereddict.ll_dict_getitem` (traced only for a
+/// virtual dict).  The keys are owned `String`s, so no user `__eq__` or
+/// `__hash__` can run inside the boundary at all.
+#[majit_macros::dont_look_inside]
+pub fn module_dict_entries_get(
+    entries: &indexmap::IndexMap<String, PyObjectRef>,
+    key: &str,
+) -> Option<PyObjectRef> {
+    entries.get(key).copied()
+}
+
+/// The store side of [`module_dict_entries_get`] — `celldict.py:47`'s
+/// `self.unerase(w_dict.dstorage)[key] = w_value`, returning the displaced
+/// value so the caller can tell an overwrite from an insert.
+///
+/// `IndexMap::insert` preserves the existing slot's position on overwrite,
+/// matching Python `{}`'s assignment semantics (rewriting an existing key does
+/// not move it to the end).  Residualised for [`module_dict_entries_get`]'s
+/// reason; upstream's `_ll_dict_setitem_lookup_done` (`rordereddict.py:674`)
+/// is likewise `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))`
+/// and neither conjunct can hold for an `IndexMap` here.  The borrowed name is
+/// copied to the owned `String` the entry table stores inside the boundary.
+#[majit_macros::dont_look_inside]
+pub fn module_dict_entries_insert(
+    entries: &mut indexmap::IndexMap<String, PyObjectRef>,
+    key: &str,
+    w_value: PyObjectRef,
+) -> Option<PyObjectRef> {
+    entries.insert(key.to_string(), w_value)
+}
+
 impl ModuleDictStorage {
     pub fn new() -> Self {
         Self {
@@ -427,7 +465,7 @@ impl ModuleDictStorage {
     /// `dict.__getitem__(key)` returning the raw stored value (or
     /// cell — eventually).  None when absent.
     pub fn get(&self, key: &str) -> Option<PyObjectRef> {
-        self.entries.get(key).copied()
+        module_dict_entries_get(&self.entries, key)
     }
 
     /// `dict[key] = w_value` — insertion-ordered.  Returns the
@@ -436,10 +474,7 @@ impl ModuleDictStorage {
         // Prebuilt-family store (see `write_cell`): the module-dict storage
         // is Box-immortal, so the write-tracking bit is its write barrier.
         crate::gc_roots::mark_prebuilt_roots_dirty();
-        // `IndexMap::insert` preserves the existing slot's position
-        // on overwrite, matching Python `{}`'s assignment semantics
-        // (rewriting an existing key does not move it to the end).
-        self.entries.insert(key.to_string(), w_value)
+        module_dict_entries_insert(&mut self.entries, key, w_value)
     }
 
     /// `del dict[key]` — returns the removed value or None.
