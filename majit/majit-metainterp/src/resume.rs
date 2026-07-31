@@ -6722,6 +6722,18 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     /// resume.py:969 force_all_virtuals
     pub fn force_all_virtuals(&mut self) -> (&[i64], &[i64]) {
+        // Materializing one virtual allocates, so it can trigger a collection
+        // that relocates the virtuals materialized before it. `getvirtual_ptr`
+        // answers with the cache slot rather than `allocate`'s raw result on
+        // the premise that the slot is a registered root the collection
+        // forwards in place; check the premise here, once per force.
+        debug_assert!(
+            self.virtuals_cache.virtuals_ptr_cache.is_empty()
+                || majit_gc::shadow_stack::resume_ref_slice_registered(
+                    self.virtuals_cache.virtuals_ptr_cache.as_ptr()
+                ),
+            "force_all_virtuals: virtuals_ptr_cache is not a registered resume root"
+        );
         if let Some(rd_virtuals) = self.rd_virtuals {
             for i in 0..rd_virtuals.len() {
                 let rd_virtual = &rd_virtuals[i];
@@ -7650,14 +7662,24 @@ pub fn force_from_resumedata<'a>(
     );
     // resume.py:1371 common-case __init__ calls self._prepare(storage)
     // before handling_async_forcing() flips the GUARD_NOT_FORCED state.
-    resumereader.prepare(rd_virtuals, rd_guard_pendingfields);
+    //
+    // The scope must outlive `force_all_virtuals` below. `getvirtual_ptr`
+    // returns the cache slot rather than `allocate`'s result precisely because
+    // a materialization collection is expected to forward that slot in place;
+    // with a bare `prepare` the slice is registered nowhere, so a minor
+    // triggered while materializing virtual N leaves every virtual already
+    // written for N-1 pointing into from-space, and a major sweeps them.
+    let _resume_roots =
+        prepare_resume_heap_with_roots(&mut resumereader, rd_virtuals, rd_guard_pendingfields);
     resumereader.handling_async_forcing();
     // resume.py:1350
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo, None);
-    // resume.py:1404 the virtualizable the vable section just named. Read it
-    // before `force_all_virtuals` allocates: unlike `blackhole_from_resumedata`,
-    // the bare `prepare` above opened no resume-root scope, so there is nothing
-    // to forward the reader's slot in place.
+    // resume.py:1404 the virtualizable the vable section just named. The scope
+    // above roots `virtuals_ptr_cache` only, not this field, so nothing would
+    // forward the reader's slot in place — read it before `force_all_virtuals`
+    // allocates. The value stays valid across that window because a
+    // virtualizable is an interpreter-created frame from `FrameBox::new` →
+    // `try_gc_alloc_stable_raw`, which no collection moves.
     let virtualizable_ptr = resumereader.virtualizable_ptr;
     // resume.py:1351: return resumereader.force_all_virtuals()
     let (ptrs, ints) = resumereader.force_all_virtuals();

@@ -1079,6 +1079,16 @@ pub fn resume_ref_roots_depth() -> usize {
     RESUME_REF_ROOTS_STACK.with(|ss| ss.borrow().len())
 }
 
+/// Whether a ref slice starting at `ptr` is currently registered as a
+/// resume-construction root on this thread.
+///
+/// Exists so the paths that materialize virtuals can assert their own
+/// precondition — the cache slice they write into has to be forwardable in
+/// place by a collection their allocations trigger — instead of arguing it.
+pub fn resume_ref_slice_registered(ptr: *const i64) -> bool {
+    RESUME_REF_ROOTS_STACK.with(|ss| ss.borrow().iter().any(|&(p, _)| p as *const i64 == ptr))
+}
+
 /// Register a ref slice as a GC root for the blackhole resume
 /// construction window (`resume.py:1312 blackhole_from_resumedata`).
 ///

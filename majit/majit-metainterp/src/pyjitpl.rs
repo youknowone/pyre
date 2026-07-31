@@ -1904,6 +1904,23 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Unmaterialized `0` cache slots pass through unchanged, as they do in
     /// `shadow_stack::walk_resume_ref_roots`.
+    ///
+    /// The walk is unconditional, so it is a strong edge where `jf_savedata` is
+    /// an ephemeron one: a major seeds these values from `seed_major_roots`,
+    /// while [`Self::prune_forced_virtuals`] can only drop a dead owner's entry
+    /// at the *end* of marking, once VISITED is decided. An entry whose owner
+    /// died inside the cycle therefore keeps its materialized graph until the
+    /// next major — one cycle of floating garbage, bounded: the sweep clears
+    /// VISITED on every survivor and the entry is gone, and the sole writer
+    /// (`save_forced_virtuals`) is reached only by forcing a live virtualizable,
+    /// so nothing re-adds it. The prune also strictly precedes the sweep, so a
+    /// named owner's address can never be recycled underneath an entry.
+    ///
+    /// That bound holds only while no cached virtual reaches the owner frame: a
+    /// back-edge would let this walk mark the owner, `classify_owner` would then
+    /// answer `Some`, and the entry would never be pruned at all. The vable is
+    /// returned beside the cache rather than inside it (`force_from_resumedata`)
+    /// and no such edge exists today.
     pub fn walk_forced_virtuals_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
         for (_owner, ptrs, _ints) in self.forced_virtuals.iter_mut() {
             for slot in ptrs.iter_mut() {
