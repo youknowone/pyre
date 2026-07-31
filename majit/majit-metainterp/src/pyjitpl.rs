@@ -10703,7 +10703,15 @@ impl<M: Clone> MetaInterp<M> {
                 // which `has_compiled_loop` reads — not on target_tokens. The JUMP
                 // resolves to `green_key`'s TargetToken via the JUMP op's own descr,
                 // so the entry-bridge token owns no TargetTokens of its own.
-                let front_target_tokens: Vec<crate::history::TargetToken> = Vec::new();
+                //
+                // `attach_procedure_to_interp` (warmstate.py:339-348) re-points
+                // the jitcell and keeps the old token alive; it never takes the
+                // loop's own TargetTokens away.  `compiled_loops` is the single
+                // map pyre reads for both, so the replacement entry carries the
+                // retired loop's labels forward — publishing an empty list here
+                // leaves a key whose loop nothing can close into again, and every
+                // later trace reaching it declines for want of a front target.
+                let mut front_target_tokens: Vec<crate::history::TargetToken> = Vec::new();
                 let retraced_count = self
                     .compiled_loops
                     .get(&original_green_key)
@@ -10714,6 +10722,7 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(old_entry) = self.compiled_loops.swap_remove(&original_green_key) {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
                     next_global_opref = next_global_opref.max(old_entry.next_global_opref);
+                    front_target_tokens = old_entry.front_target_tokens.clone();
                     if let Some(old_tok) = old_entry.live_token() {
                         self.backend.migrate_bridges(&old_tok, token.as_ref());
                     }

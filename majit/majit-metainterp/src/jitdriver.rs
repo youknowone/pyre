@@ -2480,26 +2480,15 @@ impl<S: JitState> JitDriver<S> {
     /// ResumeFromInterpDescr parity: data needed to compile an entry bridge
     /// from the currently active trace.
     ///
-    /// Returns `Some` only for a function-entry trace (`header_pc == 0`, the
-    /// interpreter portal into the function). An entry bridge runs the
-    /// function prologue and closes with a JUMP into an already-compiled hot
-    /// loop. A trace rooted at a *loop header* (`header_pc != 0`) returns
-    /// `None`: closing it as an entry bridge into another loop would drop its
-    /// own back-edge, so its iterations would no longer run in compiled code
-    /// (the caller then falls back to compile_loop, which aborts cleanly).
+    /// An entry bridge starts with the unoptimized interpreter arguments and
+    /// closes with a JUMP into an already-compiled loop.  The key it attaches
+    /// to is `original_boxes[:num_green_args]` — the greens of the merge point
+    /// tracing STARTED at (`_compile_and_run_once`, pyjitpl.py:2900-2905), with
+    /// no function-entry versus loop-header distinction; whether the trace came
+    /// from the interpreter at all is already decided by the absent bridge
+    /// origin at the caller.
     pub fn compile_trace_entry_data(&mut self) -> Option<(u64, S::Meta)> {
-        // Only a function-entry trace (header_pc == 0) closes as an entry
-        // bridge into an already-compiled hot loop. Both backends use this
-        // gate: dynasm jumps directly to the target LABEL via target_arglocs;
-        // cranelift's body-direct dual entry (compiler.rs) reads the LABEL
-        // args from the frame and jumps past the peeled preamble. A
-        // loop-header trace (header_pc != 0) returns None and the caller falls
-        // back to compile_loop, so its back-edge is never dropped.
-        let original_green_key = self
-            .meta
-            .trace_ctx()
-            .filter(|ctx| ctx.header_pc == 0)
-            .map(|ctx| ctx.root_green_key())?;
+        let original_green_key = self.meta.trace_ctx().map(|ctx| ctx.root_green_key())?;
         let trace_meta = self.meta.trace_meta()?.clone();
         Some((original_green_key, trace_meta))
     }
