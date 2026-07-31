@@ -19437,22 +19437,17 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     } else if unsafe { pyre_object::bytesobject::is_bytes_like(data_obj) } {
         unsafe { pyre_object::bytesobject::bytes_like_data(data_obj).to_vec() }
     } else {
-        let not_bytes = || {
-            crate::PyError::type_error(format!(
-                "cannot convert '{}' object to bytes",
-                crate::baseobjspace::object_functionstr_type_name(data_obj)
-            ))
-        };
+        let not_bytes = format!(
+            "cannot convert '{}' object to bytes",
+            crate::baseobjspace::object_functionstr_type_name(data_obj)
+        );
         if unsafe { pyre_object::is_str(data_obj) } {
-            return Err(not_bytes());
+            return Err(crate::PyError::type_error(not_bytes));
         }
-        let items = crate::builtins::collect_iterable(data_obj).map_err(|e| {
-            if e.kind == crate::PyErrorKind::TypeError {
-                not_bytes()
-            } else {
-                e
-            }
-        })?;
+        // `PySequence_Fast` wording applies to the `iter(obj)` failure only:
+        // a `TypeError` the iterator raises from `__next__` is that object's
+        // error and keeps its own message and traceback.
+        let items = crate::builtins::sequence_fast(data_obj, &not_bytes)?;
         let mut v = Vec::with_capacity(items.len());
         for it in items {
             let n = crate::baseobjspace::int_w(it)?;

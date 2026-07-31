@@ -2073,7 +2073,14 @@ fn expand_pyre_methods(
                             ::std::option::Option::None => false,
                         };
                         if !__pyre_same_tp {
+                            // `ob.w_class` is a traced edge of every
+                            // `#[pyre_class]` layout, and an old-gen payload
+                            // can take a young heap type here, so the store
+                            // joins the remembered set.
                             unsafe { (*__pyre_obj).w_class = __pyre_cls; }
+                            ::pyre_object::gc_hook::try_gc_write_barrier(
+                                __pyre_obj as *mut u8,
+                            );
                         }
                     }
                 }
