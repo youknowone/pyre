@@ -51,6 +51,7 @@
 #[cfg(debug_assertions)]
 use std::cell::Cell;
 use std::cell::UnsafeCell;
+use std::marker::PhantomData;
 
 use crate::pyobject::PyObjectRef;
 
@@ -60,9 +61,11 @@ thread_local! {
     /// each [`RootScope`]'s lifetime; the matching [`Drop`] truncates
     /// back to the saved length.
     ///
-    /// Access is raw, matching RPython's base/top shadow-stack shape.
-    /// Debug builds retain the old re-entrancy safety net through
-    /// `SHADOW_STACK_ACCESS_DEPTH`; release builds pay no borrow-check cost.
+    /// Access is raw, matching RPython's base/top shadow-stack shape. Debug
+    /// builds check overlapping ordinary accesses through
+    /// `SHADOW_STACK_ACCESS_DEPTH` and separately reject mutation during a
+    /// root walk through `SHADOW_STACK_WALK_IN_PROGRESS`; release builds pay
+    /// no bookkeeping cost.
     static SHADOW_STACK: UnsafeCell<Vec<PyObjectRef>> =
         const { UnsafeCell::new(Vec::new()) };
 
@@ -70,6 +73,10 @@ thread_local! {
     /// count shared accesses, while `-1` marks an exclusive access.
     #[cfg(debug_assertions)]
     static SHADOW_STACK_ACCESS_DEPTH: Cell<i32> = const { Cell::new(0) };
+
+    /// Whether this thread is currently driving a shadow-stack root walk.
+    #[cfg(debug_assertions)]
+    static SHADOW_STACK_WALK_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(debug_assertions)]
@@ -106,6 +113,41 @@ impl Drop for ShadowStackAccess<'_> {
     fn drop(&mut self) {
         self.depth.set(self.previous);
     }
+}
+
+#[cfg(debug_assertions)]
+struct ShadowStackWalk<'a> {
+    in_progress: &'a Cell<bool>,
+}
+
+#[cfg(debug_assertions)]
+impl<'a> ShadowStackWalk<'a> {
+    fn new(in_progress: &'a Cell<bool>) -> Self {
+        // Arm the flag outside the assertion: the walk must be marked whether
+        // or not assertions are compiled in, and an assertion that doubles as
+        // the only writer stops arming the moment it is disabled.
+        let was_walking = in_progress.replace(true);
+        debug_assert!(!was_walking, "a shadow-stack root walk was re-entered");
+        Self { in_progress }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for ShadowStackWalk<'_> {
+    fn drop(&mut self) {
+        self.in_progress.set(false);
+    }
+}
+
+#[cfg(debug_assertions)]
+#[inline(always)]
+fn assert_shadow_stack_not_walking() {
+    SHADOW_STACK_WALK_IN_PROGRESS.with(|in_progress| {
+        debug_assert!(
+            !in_progress.get(),
+            "the shadow stack was mutated while a root walk was in progress"
+        );
+    });
 }
 
 #[inline(always)]
@@ -166,6 +208,9 @@ pub struct RootScope {
     /// called. Will be replaced with a backend
     /// `RootSet::Handle` once the active GC consumes the stack.
     save_point: usize,
+    /// A root bracket belongs to the thread whose shadow stack supplied this
+    /// save point. Moving it could truncate an unrelated thread's stack.
+    _not_send: PhantomData<*const ()>,
 }
 
 impl RootScope {
@@ -175,6 +220,7 @@ impl RootScope {
     fn new() -> Self {
         Self {
             save_point: shadow_stack_len(),
+            _not_send: PhantomData,
         }
     }
 }
@@ -185,6 +231,8 @@ impl Drop for RootScope {
     /// bracketed `livevars` slots.
     #[inline]
     fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        assert_shadow_stack_not_walking();
         with_shadow_stack_mut(|stack| {
             // `truncate` is a no-op if `save_point >= len()`, which is
             // the steady-state case for an empty bracket.
@@ -215,6 +263,8 @@ pub fn push_roots() -> RootScope {
 /// it (`@dont_look_inside`, `rlib/jit.py:139`), the `shadow_stack_len` twin.
 #[majit_macros::dont_look_inside]
 pub fn pin_root(root: PyObjectRef) {
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
     // Publish the raw value first.  `try_gc_current_object_address` is itself
     // a GC operation and may wait behind another thread's collection; the
     // fresh allocation must already be visible to that collector before we
@@ -316,6 +366,8 @@ pub fn shadow_stack_copy_range(base: usize, dst: &mut [PyObjectRef]) {
 /// `rlib/jit.py:139`), the [`shadow_stack_get`] twin.
 #[majit_macros::dont_look_inside]
 pub fn shadow_stack_set(index: usize, root: PyObjectRef) {
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
     // Publish the raw value first, for the reason [`pin_root`] gives: the
     // `try_gc_current_object_address` query is itself a GC operation and may
     // wait behind another thread's collection, so the value must already be
@@ -335,16 +387,26 @@ pub fn shadow_stack_set(index: usize, root: PyObjectRef) {
 /// `#[repr(transparent)]` over `usize` and `PyObjectRef =
 /// *mut PyObject` is also pointer-sized.
 ///
-/// The visitor receives mutable references so a moving collector can
-/// rewrite slot contents post-relocation. In debug builds the signed
-/// `SHADOW_STACK_ACCESS_DEPTH` guard catches re-entrant access from an
-/// accidentally allocating walker; release builds match upstream's raw
-/// root-stack access without that safety net.
+/// The visitor receives mutable references so a moving collector can rewrite
+/// slot contents post-relocation. Each slot is re-derived from the stack after
+/// the previous visitor call, so a re-entrant push cannot leave the walk using
+/// a pointer into an old allocation. Debug builds additionally reject shadow-
+/// stack mutation by an accidentally allocating walker; release builds match
+/// upstream's raw root-stack access without that diagnostic.
 #[inline]
 pub fn walk_shadow_stack(mut visitor: impl FnMut(&mut PyObjectRef)) {
-    with_shadow_stack_mut(|stack| {
-        for slot in stack.iter_mut() {
-            visitor(slot);
+    SHADOW_STACK.with(|cell| {
+        let cell = cell as *const UnsafeCell<Vec<PyObjectRef>>;
+        #[cfg(debug_assertions)]
+        SHADOW_STACK_WALK_IN_PROGRESS.with(|in_progress| {
+            let _walk = ShadowStackWalk::new(in_progress);
+            // SAFETY: `cell` is this thread's live shadow-stack cell.
+            unsafe { walk_shadow_stack_cell(cell, &mut visitor) };
+        });
+        #[cfg(not(debug_assertions))]
+        // SAFETY: `cell` is this thread's live shadow-stack cell.
+        unsafe {
+            walk_shadow_stack_cell(cell, &mut visitor);
         }
     });
 }
@@ -355,14 +417,62 @@ pub fn capture_shadow_stack_area() -> *const () {
 }
 
 /// Visit a captured thread's pinned-root stack without consulting caller TLS.
+/// Like [`walk_shadow_stack`], this re-derives each slot after the previous
+/// visitor call so a push cannot strand the walk in a reallocated buffer.
+/// Debug builds reject shadow-stack mutation for the duration of the walk.
 ///
 /// # Safety
 /// `data` must come from [`capture_shadow_stack_area`], and the owning thread
 /// must be quiesced for the duration of the walk.
 pub unsafe fn walk_shadow_stack_area(data: *const (), mut visitor: impl FnMut(&mut PyObjectRef)) {
-    let stack = unsafe { &mut *(*(data as *const UnsafeCell<Vec<PyObjectRef>>)).get() };
-    for slot in stack.iter_mut() {
-        visitor(slot);
+    let cell = data as *const UnsafeCell<Vec<PyObjectRef>>;
+    #[cfg(debug_assertions)]
+    SHADOW_STACK_WALK_IN_PROGRESS.with(|in_progress| {
+        // For a self-collection this protects the stack being walked. A
+        // foreign walk marks the collector thread instead, which is harmless:
+        // the owning mutator is quiesced and performs no stack accesses.
+        let _walk = ShadowStackWalk::new(in_progress);
+        // SAFETY: the caller guarantees that `cell` is a captured shadow stack
+        // whose owning thread is quiesced for this walk.
+        unsafe { walk_shadow_stack_cell(cell, &mut visitor) };
+    });
+    #[cfg(not(debug_assertions))]
+    // SAFETY: the caller guarantees that `cell` is a captured shadow stack
+    // whose owning thread is quiesced for this walk.
+    unsafe {
+        walk_shadow_stack_cell(cell, &mut visitor);
+    }
+}
+
+/// Walk one captured shadow-stack cell without retaining a reference to its
+/// `Vec` across a visitor call.
+///
+/// # Safety
+/// `cell` must remain a valid shadow-stack cell for the duration of the walk,
+/// and no thread other than a re-entrant visitor may mutate it.
+unsafe fn walk_shadow_stack_cell(
+    cell: *const UnsafeCell<Vec<PyObjectRef>>,
+    visitor: &mut impl FnMut(&mut PyObjectRef),
+) {
+    let mut index = 0;
+    loop {
+        let slot = {
+            // SAFETY: the caller guarantees exclusive access except for a
+            // possible re-entrant mutation by `visitor`. No reference from a
+            // previous iteration is live here, and this temporary reference
+            // ends before `visitor` is called.
+            let stack = unsafe { &mut *(*cell).get() };
+            if index >= stack.len() {
+                break;
+            }
+            // Return only the slot address so the `Vec` reference is not held
+            // across the visitor, which may push and reallocate its buffer.
+            unsafe { stack.as_mut_ptr().add(index) }
+        };
+        // SAFETY: `slot` names the live element at `index`. The reference is
+        // handed directly to the visitor and is not used after it returns.
+        visitor(unsafe { &mut *slot });
+        index += 1;
     }
 }
 
@@ -531,5 +641,46 @@ mod tests {
             }
         });
         assert_eq!(shadow_stack_get(shadow_stack_len() - 2) as usize, 0xAA);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "the shadow stack was mutated while a root walk was in progress")]
+    fn walk_shadow_stack_area_rejects_reentrant_push_in_debug_builds() {
+        let _roots = push_roots();
+        pin_root(dummy(0x1));
+        let area = capture_shadow_stack_area();
+        // SAFETY: `area` is this thread's shadow stack, and this synchronous
+        // self-walk keeps it live for the duration of the call.
+        unsafe { walk_shadow_stack_area(area, |_| pin_root(dummy(0x2))) };
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn walk_shadow_stack_survives_push_that_reallocates() {
+        let _roots = push_roots();
+        pin_root(dummy(0x11));
+        pin_root(dummy(0x22));
+
+        let (capacity_before, additional) =
+            with_shadow_stack(|stack| (stack.capacity(), stack.capacity() - stack.len() + 1));
+        let mut pushed = false;
+        let mut seen = Vec::new();
+        walk_shadow_stack(|slot| {
+            seen.push(*slot as usize);
+            if !pushed {
+                pushed = true;
+                for offset in 0..additional {
+                    pin_root(dummy(0x1000 + offset));
+                }
+            }
+        });
+
+        assert!(pushed);
+        assert!(with_shadow_stack(Vec::capacity) > capacity_before);
+        assert_eq!(&seen[..2], &[0x11, 0x22]);
+        assert_eq!(seen.len(), 2 + additional);
+        assert_eq!(shadow_stack_get(0) as usize, 0x11);
+        assert_eq!(shadow_stack_get(1) as usize, 0x22);
     }
 }
