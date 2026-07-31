@@ -3628,6 +3628,37 @@ mod tests {
         }
     }
 
+    /// The shared `PyObject` header's `w_class` bridges to the same descr the
+    /// walker pins a value's class through, so a codewriter-lowered subclass
+    /// test (`is_plain_int1`) reads the header the walker already guarded
+    /// instead of emitting a second, uncacheable read of offset 8.
+    #[test]
+    fn make_descr_from_bh_bridges_pyobject_w_class_to_the_walker_descr() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_translate::jitcode::BhDescr;
+
+        for owner in ["PyObject", "pyre_object::pyobject::PyObject"] {
+            let descr = make_descr_from_bh(&BhDescr::Field {
+                offset: 8,
+                field_size: 8,
+                field_type: Type::Ref,
+                field_flag: ArrayFlag::Signed,
+                is_field_signed: false,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                // slot 0 is `ob_type`; `w_class` is slot 1 of the header.
+                index_in_parent: 1,
+                parent: None,
+                name: "w_class".into(),
+                owner: owner.into(),
+            });
+            assert!(
+                std::sync::Arc::ptr_eq(&descr, &w_class_descr()),
+                "{owner}.w_class must bridge to the walker's w_class descr Arc",
+            );
+        }
+    }
+
     #[test]
     fn make_descr_from_bh_struct_array_preserves_type_and_interior_fields() {
         use majit_ir::descr::ArrayFlag;
@@ -4308,6 +4339,26 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // (one skipped `list.pop(0)` per compiled loop entry). One field is
             // one descr — `metainterp_sd.all_descrs` has no second entry for a
             // field just because a different interpreter reached it.
+            // Same split, one struct up: the shared `PyObject` header's
+            // `w_class`. The walker pins a value's Python-level class by
+            // reading offset 8 through `w_class_descr()`; a codewriter-lowered
+            // body testing the same header — `is_plain_int1` reading
+            // `value.w_class` (listobject.rs) — reaches it through the modelled
+            // `PyObject` parent, whose group entry is a different identity for
+            // the same field. The pinned constant then never reached the
+            // second read, so the strict subclass test stayed symbolic and
+            // re-emitted the load plus its null and equality tests.
+            //
+            // Like the leaves below this runs BEFORE the parent-group lookup,
+            // which would otherwise answer with the parent's own entry.
+            if name.as_str() == "w_class"
+                && matches!(
+                    owner.as_str(),
+                    "PyObject" | "pyre_object::pyobject::PyObject"
+                )
+            {
+                return w_class_descr();
+            }
             if owner.as_str() == "W_ListObject" {
                 match name.as_str() {
                     "int_items.len" => return list_int_items_len_descr(),
