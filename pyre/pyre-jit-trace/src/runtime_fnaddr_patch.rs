@@ -75,12 +75,38 @@ pub fn patch_constants_i_fnaddrs(jitcodes: &mut Vec<Arc<JitCode>>) {
     // whose runtime lookup actually disagrees with the build value get
     // patched; identical entries are dropped so the constants_i scan
     // can early-exit on a `HashMap::get` miss without comparing.
+    //
+    // The key is an address from the build process and the value an address
+    // from this one, so nothing guarantees a build address names one function
+    // here.  If it named two with distinct runtime addresses, the last write
+    // would win and one callee's `constants_i` constant would be patched to
+    // the other's address: a residual call to the wrong target, with no
+    // decline and no panic to mark it.  Registering several path spellings
+    // for one function is deliberate (`jit_fnaddr.rs` lists both
+    // `pyre_object::listobject::jit_list_reverse` and
+    // `pyre_object::jit_list_reverse`), and those agree on the runtime
+    // address, so only a disagreement is a defect.  Every binding is checked,
+    // not just those that survive the `!=` filter below — an alias pair
+    // straddling that filter would leave the same hole.
     let mut correspondence: HashMap<i64, i64> = HashMap::new();
+    let mut claimed: HashMap<i64, (&str, i64)> = HashMap::new();
     for (path, build_fnaddr) in &build_bindings {
-        if let Some(&runtime_fnaddr) = runtime_map.get(path.as_str()) {
-            if *build_fnaddr != runtime_fnaddr {
-                correspondence.insert(*build_fnaddr, runtime_fnaddr);
+        let Some(&runtime_fnaddr) = runtime_map.get(path.as_str()) else {
+            continue;
+        };
+        match claimed.get(build_fnaddr) {
+            Some(&(other_path, other_runtime)) => assert_eq!(
+                other_runtime, runtime_fnaddr,
+                "runtime fnaddr patch: build address {build_fnaddr:#x} stands for both \
+                 `{other_path}` ({other_runtime:#x}) and `{path}` ({runtime_fnaddr:#x}); \
+                 patching would send one callee's residual call to the other",
+            ),
+            None => {
+                claimed.insert(*build_fnaddr, (path.as_str(), runtime_fnaddr));
             }
+        }
+        if *build_fnaddr != runtime_fnaddr {
+            correspondence.insert(*build_fnaddr, runtime_fnaddr);
         }
     }
 
