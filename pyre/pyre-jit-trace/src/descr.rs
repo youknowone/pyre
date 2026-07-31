@@ -3628,33 +3628,66 @@ mod tests {
         }
     }
 
-    /// The shared `PyObject` header's `w_class` bridges to the same descr the
-    /// walker pins a value's class through, so a codewriter-lowered subclass
-    /// test (`is_plain_int1`) reads the header the walker already guarded
-    /// instead of emitting a second, uncacheable read of offset 8.
-    #[test]
-    fn make_descr_from_bh_bridges_pyobject_w_class_to_the_walker_descr() {
+    /// A `PyObject.w_class` `BhDescr` describing the same access as the
+    /// canonical header descr, for both owner spellings the codewriter emits.
+    fn w_class_bh(owner: &str, field_size: usize) -> majit_translate::jitcode::BhDescr {
         use majit_ir::descr::ArrayFlag;
         use majit_translate::jitcode::BhDescr;
 
+        BhDescr::Field {
+            offset: pyre_object::pyobject::W_CLASS_OFFSET,
+            field_size,
+            field_type: Type::Ref,
+            field_flag: ArrayFlag::Signed,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            // slot 0 is `ob_type`; `w_class` is slot 1 of the header.
+            index_in_parent: 1,
+            parent: None,
+            name: "w_class".into(),
+            owner: owner.into(),
+        }
+    }
+
+    /// The shared `PyObject` header's `w_class` bridges to the same descr the
+    /// walker pins a value's class through, so a codewriter-lowered subclass
+    /// test (`is_plain_int1`) reads the header the walker already guarded
+    /// instead of emitting a second, uncacheable read of the same offset.
+    #[test]
+    fn make_descr_from_bh_bridges_pyobject_w_class_to_the_walker_descr() {
+        let canonical = w_class_descr();
+        let width = W_CLASS_FIELD_DESCR.field_size();
+
         for owner in ["PyObject", "pyre_object::pyobject::PyObject"] {
-            let descr = make_descr_from_bh(&BhDescr::Field {
-                offset: 8,
-                field_size: 8,
-                field_type: Type::Ref,
-                field_flag: ArrayFlag::Signed,
-                is_field_signed: false,
-                is_immutable: false,
-                is_quasi_immutable: false,
-                // slot 0 is `ob_type`; `w_class` is slot 1 of the header.
-                index_in_parent: 1,
-                parent: None,
-                name: "w_class".into(),
-                owner: owner.into(),
-            });
+            let descr = make_descr_from_bh(&w_class_bh(owner, width));
             assert!(
-                std::sync::Arc::ptr_eq(&descr, &w_class_descr()),
+                std::sync::Arc::ptr_eq(&descr, &canonical),
                 "{owner}.w_class must bridge to the walker's w_class descr Arc",
+            );
+        }
+    }
+
+    /// …but only when the two spellings describe the same access. The canonical
+    /// descr hardcodes an 8-byte width while the codewriter sizes a pointer by
+    /// `target_word_size()`, so on a 32-bit target the incoming descr is a
+    /// narrower load at the same offset. Bridging there would widen the read
+    /// over the adjacent payload, so the mismatch declines instead.
+    #[test]
+    fn make_descr_from_bh_declines_w_class_bridge_on_a_width_mismatch() {
+        let canonical = w_class_descr();
+        let narrower = W_CLASS_FIELD_DESCR.field_size() / 2;
+
+        for owner in ["PyObject", "pyre_object::pyobject::PyObject"] {
+            let descr = make_descr_from_bh(&w_class_bh(owner, narrower));
+            assert!(
+                !std::sync::Arc::ptr_eq(&descr, &canonical),
+                "{owner}.w_class must not bridge to a descr of a different width",
+            );
+            assert_eq!(
+                descr.as_field_descr().map(|f| f.field_size()),
+                Some(narrower),
+                "the declined descr must keep the width the codewriter asked for",
             );
         }
     }
@@ -4351,13 +4384,30 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             //
             // Like the leaves below this runs BEFORE the parent-group lookup,
             // which would otherwise answer with the parent's own entry.
+            //
+            // Only when the two spellings describe the same memory access.
+            // `new_w_class_field_descr` hardcodes `field_size: 8` while the
+            // codewriter sizes a pointer field by `layout::target_word_size()`
+            // (`call.rs get_type_flag`), so on wasm32 the incoming descr is a
+            // 4-byte load and the canonical one an 8-byte load at the same
+            // offset. Merging them there would widen the read over four bytes
+            // of the adjacent payload. That size split is deliberate and
+            // documented at `new_w_class_field_descr`; until it is resolved the
+            // bridge declines rather than papering over it, leaving those
+            // targets exactly as they were before the bridge existed.
             if name.as_str() == "w_class"
                 && matches!(
                     owner.as_str(),
                     "PyObject" | "pyre_object::pyobject::PyObject"
                 )
             {
-                return w_class_descr();
+                let canonical = &*W_CLASS_FIELD_DESCR;
+                if canonical.offset() == *offset
+                    && canonical.field_size() == *field_size
+                    && canonical.field_type() == *field_type
+                {
+                    return w_class_descr();
+                }
             }
             if owner.as_str() == "W_ListObject" {
                 match name.as_str() {
