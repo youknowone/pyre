@@ -2690,8 +2690,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 // iteration's contribution is dropped, silently.  A `Clean`
                 // body is still admitted from there — it has nothing that can
                 // abort.
-                foriter_deferred_admit = arg_class_guard.is_none()
-                    && !fbw_foriter_deferred_call_denied(callee_code_key);
+                foriter_deferred_admit =
+                    arg_class_guard.is_none() && !fbw_foriter_deferred_call_denied(callee_code_key);
                 foriter_deferred_admit
             }
             CalleeReplaySafety::Dirty => {

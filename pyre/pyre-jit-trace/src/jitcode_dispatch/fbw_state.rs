@@ -2148,6 +2148,21 @@ pub(crate) fn fbw_callee_body_replay_safety(
                 // [`fbw_store_journal_rollback`] replays the journal in reverse
                 // on a non-committed exit — so a folded store is undone for the
                 // replay, and an unfolded one never runs.
+                // `binary_op` / `compare_op` over operands this scan could not
+                // prove exact-numeric is the same shape one more time: which
+                // `__add__` / `__lt__` runs is a property of the operand's
+                // runtime class, not of this body.  The proven-operand case was
+                // already accepted above; what is left here is exactly the
+                // operand whose provenance the scan lost — most commonly a
+                // `LOAD_ATTR` result, since that arm is itself deferred and
+                // clears numeric provenance.  Deferring instead of declining is
+                // what lets `self.v + i` inline: at trace time the attribute
+                // read folds to a mapdict slot with a concrete int shadow, so
+                // the walker's numeric specialization erases the residual before
+                // the backstop is reached.  An operand pair that stays opaque
+                // leaves the residual standing, and it reaches
+                // `fbw_abort_nested_unjournaled_residual` like any other — the
+                // helper never runs.
                 if matches!(
                     ei.pyre_helper,
                     majit_ir::PyreHelperKind::CallFn
@@ -2156,6 +2171,8 @@ pub(crate) fn fbw_callee_body_replay_safety(
                         | majit_ir::PyreHelperKind::RaiseVarargs
                         | majit_ir::PyreHelperKind::SetCurrentException
                         | majit_ir::PyreHelperKind::LoadAttr
+                        | majit_ir::PyreHelperKind::BinaryOp
+                        | majit_ir::PyreHelperKind::CompareOp
                 ) {
                     deferred_call = true;
                     // The callee this resolves to is a runtime value, so what it
