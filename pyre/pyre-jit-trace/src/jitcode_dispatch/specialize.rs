@@ -7549,14 +7549,17 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj_op) else {
         return Ok(None);
     };
-    // STORE_ATTR needs the live value operand to run the authentic
-    // concrete `setattr_str` below (the value plays no role in the raise
-    // decision — the terminal raises before consulting it).
+    // STORE_ATTR runs the authentic concrete `setattr_str` below only for
+    // its raising exception.  The value plays no role in that raise — the
+    // stability predicate proves no data descriptor for `name`, so the
+    // terminal raises before consulting the value — so a non-constant store
+    // value (the common `int.x = i` loop case) still folds: a `None`
+    // concrete value substitutes a placeholder for the authentic run, and
+    // the value operand never enters the emitted trace.
     let concrete_value = match store_value {
-        Some(value_op) => match walker_concrete_ref_object(ctx, value_op) {
-            Some(v) => Some(v),
-            None => return Ok(None),
-        },
+        Some(value_op) => {
+            Some(walker_concrete_ref_object(ctx, value_op).unwrap_or_else(pyre_object::w_none))
+        }
         None => None,
     };
     let name = unsafe {
@@ -7578,6 +7581,24 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
         return Ok(None);
     }
 
+    // The raise decision also reads the metaclass-MRO descriptor state — the
+    // branch-F `lookup_in_type_where(type, name)` walk and the forwarding
+    // `type.__setattr__` / `type.__delattr__` — which the receiver
+    // `GuardValue` below does not cover.  A `version_tag` guard on the
+    // metaclass pins that state (the guard the sibling method/attr folds
+    // carry, `typeobject.py promote(self.version_tag())`): mutating `type`'s
+    // dict bumps its tag directly, and mutating `object`'s dict bumps it too
+    // because `mutated()` propagates down to the `type` subclass — so one
+    // guard covers the whole `(type, object)` MRO the walk reads.  Branch C
+    // proved the metaclass is the canonical `type`.  A tagless metaclass
+    // (`version_tag == 0`) is uncacheable, so decline before emitting guards.
+    let metaclass = pyre_object::get_instantiate(&pyre_object::pyobject::TYPE_TYPE);
+    let metaclass_version_tag =
+        unsafe { pyre_object::typeobject::w_type_get_version_tag(metaclass) };
+    if metaclass_version_tag == 0 {
+        return Ok(None);
+    }
+
     // --- commit: pin the receiver, run the authentic raise, emit inline ---
     // The stability predicate makes the raise a pure function of `(obj,
     // name)`; `GuardValue` pins the one live input (`name` is a co_names
@@ -7589,6 +7610,19 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         ctx.trace_ctx.heap_cache_mut().replace_box(obj_op, expected);
     }
+    // Pin the metaclass `version_tag` (see above): a `GETFIELD_GC_I` +
+    // `GuardValue` that side-exits on any `type`/`object` dict mutation.
+    let metaclass_const = ctx.trace_ctx.const_ref(metaclass as i64);
+    let vt_op = walker_record_getfield_gc_i_uncached(
+        ctx,
+        metaclass_const,
+        crate::descr::type_version_tag_descr(),
+    );
+    let vt_const = ctx.trace_ctx.const_int(metaclass_version_tag as i64);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[vt_op, vt_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    ctx.trace_ctx.heap_cache_mut().replace_box(vt_op, vt_const);
 
     // The authoritative walk's concrete execution — the same call the
     // residual executor would have made, raising before any heap
