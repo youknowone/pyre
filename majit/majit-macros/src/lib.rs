@@ -1183,8 +1183,12 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
 /// Mark a function as opaque to the tracer.
 ///
 /// The JIT will not trace into this function; it will be called as a black box.
-/// Adds `#[inline(never)]` to prevent inlining, and a hidden `#[majit_opaque]`
-/// marker constant that the tracer can detect at compile time.
+/// `rlib/jit.py:133-140 @dont_look_inside` — sets `_jit_look_inside_ = False`
+/// (line 139) and nothing else.  This expansion carries that flag as the
+/// `_jit_look_inside_` marker const [`rpython_attribute_const_for`] emits next
+/// to the function; `front/llbc_hints.rs` harvests it out of the extracted LLBC
+/// and `front/mir.rs` turns it into the residual-call decision.  The policy is
+/// therefore a property of the marker, not of the function's codegen.
 #[proc_macro_attribute]
 pub fn dont_look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_dont_look_inside_attribute(item, "dont_look_inside")
@@ -1304,9 +1308,20 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
     // inferred to `Assembler` at that single JIT-crate call site.
     let prebuild_name = format_ident!("__majit_inline_jitcode_{}_prebuild", sig.ident);
 
+    // No `#[inline(never)]`: the tracer's view of this function does not depend
+    // on how the host backend codegens it.  `@dont_look_inside` sets one flag
+    // (`rlib/jit.py:139 _jit_look_inside_ = False`) and leaves the C backend's
+    // inliner free to inline the body; the decision is read off the
+    // `_jit_look_inside_` marker const below, which `front/llbc_hints.rs`
+    // harvests from the extracted LLBC.  That LLBC cannot be reshaped by an
+    // inlining attribute either — Charon disables the MIR optimizations
+    // (`charon cargo --mir`: "Charon disables all the optimizations it can"),
+    // so no `dont_look_inside` body is folded into a traced caller regardless.
+    // Residual call targets are likewise unaffected: they resolve through the
+    // function-item coercions `pyre-interpreter/src/jit_fnaddr.rs` writes by
+    // hand, not through a linker symbol.
     let expanded = quote! {
         #(#attrs)*
-        #[inline(never)]
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
         #vis #sig {

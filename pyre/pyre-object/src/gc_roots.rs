@@ -285,9 +285,10 @@ pub fn pin_root(root: PyObjectRef) {
     // The slot already holds `root`, so a query that found no forwarding stub
     // has nothing to write back.  That is the steady state — nothing collected
     // between the push above and the query — and the write-back is not free:
-    // this thread-local resolves through `_tlv_get_addr` on every `with`, and
-    // pinning sits on the interpreter's allocation and call paths, so the
-    // second resolve is paid once per pinned livevar.
+    // each `with` re-checks the thread-local's initialization state (the
+    // `_tlv_get_addr` result itself is common-subexpression-eliminated across
+    // the two accesses, the state load is not), and pinning sits on the
+    // interpreter's allocation and call paths.
     if normalized != root {
         with_shadow_stack_mut(|stack| stack[index] = normalized);
     }
@@ -328,10 +329,9 @@ pub fn pin_roots(roots: &[PyObjectRef]) -> usize {
 ///
 /// Reads the thread-local `SHADOW_STACK`, a runtime-mutable root the
 /// tracer cannot type; the JIT residualises the read instead of tracing
-/// into it (`@dont_look_inside`, `rlib/jit.py:139`). The attribute forces
-/// `#[inline(never)]` so the residual call has a stable symbol; the read
-/// rides on top of the surrounding allocation, so the lost inlining is
-/// in the noise.
+/// into it (`@dont_look_inside`, `rlib/jit.py:139`). The attribute is a
+/// tracing-policy marker only — it leaves the host backend free to inline
+/// this body, exactly as the RPython decorator leaves the C backend free.
 #[majit_macros::dont_look_inside]
 pub fn shadow_stack_len() -> usize {
     with_shadow_stack(Vec::len)
