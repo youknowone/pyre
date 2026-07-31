@@ -464,6 +464,37 @@ declines, `..._while_escaping_read_frame_identity` 10 / 10 / 0 and
 `..._while_inlined_callee_subwalk` 5 / 5 / 0, all with unchanged output, and
 `synth/blackhole_inlined_callee_local_after_escape` matches the reference.
 
+**The RUNTIME half of that anchor was investigated and declined.**  Only the
+walk-time record was moved onto the level's own frame; the `emit_runtime` arm of
+`record_inline_application_traceback` still emits the frame-fabricating hook.
+Two things came out of measuring it, and both are worth keeping:
+
+*It is unreachable.*  An lldb breakpoint on that arm's own call-descr
+construction counts zero hits across the 43 corpus exception fixtures and 15
+hand-built probes, corroborated by a `MAJIT_LOG` scan finding no call with the
+hook's `[Ref, Ref, Ref, Int, Int]` signature in any dumped trace.  The mechanism
+is that `record_prepend_application_traceback` never declines: `emit_runtime` is
+its negation, and the `exc.is_constant()` arm it would decline on is suppressed
+because every raising residual assigns `class_of_last_exc_is_const = false`
+immediately before `walker_record_guard_exception` reads it.  So the fabricating
+hook reaches no compiled traceback today — it is still called, but only from the
+walk's own no-frame fallback inside a bridge sub-walk.
+
+*Porting it would break a documented allocation contract.*  The obvious port —
+emit the pointer-taking hook with the level's frame operand, the shape the
+top-level sibling already uses — cannot be applied here.  Every frame that
+reaches `record_application_traceback` today is a non-moving oldgen block, which
+is exactly what `w_pytraceback_new` relies on when it roots `w_next` and `w_code`
+but deliberately not `frame`.  The top-level sibling passes the standard
+virtualizable, the walk passes a `FrameBox`, and the fabricating hook passes its
+own `createframe_obj` frame — all oldgen.  A compiled trace's inlined callee
+frame is not: it is the trace's own `NewWithVtable`, which the GC rewriter lowers
+to a nursery allocation.  Handing that to the recorder would hold a movable
+pointer across the parking allocation inside `w_pytraceback_new` and store a
+pre-move address into `PyTraceback.frame`.  The port therefore needs the
+root-and-reload shape on the recorder first, which also covers the same
+pre-existing exposure on its `w_next` argument.
+
 One thing the ON path already fixes: with a side-effecting inlined callee under
 a `while` loop that returns from inside the loop, the OFF path runs the callee's
 side effect ~5.2k extra times (the recorded trace-abort double-run class) while
