@@ -1887,12 +1887,14 @@ fn walker_guard_specialised_pair_class<Sym: WalkSym>(
 /// One hop of a `while tb is not None: names.append(tb.tb_frame.f_code.co_name);
 /// tb = tb.tb_next` traceback walk.
 ///
-/// Each of these is a `GetSetProperty` whose getter body is a single slot read
-/// on a receiver [`walker_specialize_traceback_walk_field`] pins by class:
-/// `pytraceback.py descr_get_next` / `descr_get_tb_frame` and `pyframe.py`
-/// `fget_code`.  None of them dispatches anywhere or can raise.  Left residual,
-/// every hop of the walk costs a forcing call, which is what makes each
-/// traceback fixture dominated by the walk rather than by the raise.
+/// Each of these is a `GetSetProperty` whose getter body is a slot read on a
+/// receiver [`walker_specialize_traceback_walk_field`] pins by class:
+/// `pytraceback.py descr_get_next` / `descr_get_tb_frame` /
+/// `descr_get_tb_lineno` / `descr_get_tb_lasti` and `pyframe.py fget_code`.
+/// None of them dispatches anywhere or can raise.  Left residual, every hop of
+/// the walk costs a forcing call — measured at 207 ns per `tb_lineno` read
+/// against 0 for the folded `tb_next` — which is what makes each traceback
+/// fixture dominated by the walk rather than by the raise.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TracebackWalkField {
     /// `tb.tb_next` — the chain link; a null slot is the terminator and
@@ -1903,6 +1905,14 @@ enum TracebackWalkField {
     TbFrame,
     /// `frame.f_code` — `fget_f_code` is `self.pycode as PyObjectRef`.
     FCode,
+    /// `tb.tb_lineno` — the line the node froze at.  `get_lineno` resolves it
+    /// lazily upstream; pyre stamps it at `record_application_traceback` time,
+    /// so the getter is the slot read plus the `LINENO_NOT_COMPUTED` mapping.
+    ///
+    /// `tb_lasti` is deliberately absent: its getter reports `lasti * 2`, so
+    /// the fold would have to carry the doubling rather than hand back the
+    /// slot.
+    TbLineno,
 }
 
 /// Which walk hop, if any, this `(receiver, attribute)` pair is.
@@ -1915,6 +1925,7 @@ fn traceback_walk_field(
         return match name {
             "tb_next" => Some(TracebackWalkField::TbNext),
             "tb_frame" => Some(TracebackWalkField::TbFrame),
+            "tb_lineno" => Some(TracebackWalkField::TbLineno),
             _ => None,
         };
     }
@@ -1942,30 +1953,16 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
 ) -> Result<Option<()>, DispatchError> {
     use pyre_interpreter::pyframe::PyFrame;
 
-    let (receiver_type, descr, stored) = match field {
-        TracebackWalkField::TbNext => (
-            &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE,
-            crate::descr::pytraceback_w_next_descr(),
-            unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_w_next(concrete_obj) },
-        ),
-        TracebackWalkField::TbFrame => (
-            &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE,
-            crate::descr::pytraceback_frame_descr(),
-            unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_frame(concrete_obj) }
-                as pyre_object::PyObjectRef,
-        ),
-        TracebackWalkField::FCode => (
-            &pyre_interpreter::pyframe::FRAME_TYPE,
-            crate::descr::pyframe_code_descr(),
-            unsafe { (*(concrete_obj as *const PyFrame)).pycode } as pyre_object::PyObjectRef,
-        ),
+    let receiver_type = match field {
+        TracebackWalkField::FCode => &pyre_interpreter::pyframe::FRAME_TYPE,
+        _ => &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE,
     };
-    // Only `tb_next` has a null with a defined meaning.  A null frame is a
-    // torn-down traceback and a null `pycode` a half-built frame; both are
-    // answered by a `sys.namespace` stub or `None` the residual owns.
-    if stored.is_null() && field != TracebackWalkField::TbNext {
-        return Ok(None);
-    }
+    let descr = match field {
+        TracebackWalkField::TbNext => crate::descr::pytraceback_w_next_descr(),
+        TracebackWalkField::TbFrame => crate::descr::pytraceback_frame_descr(),
+        TracebackWalkField::FCode => crate::descr::pyframe_code_descr(),
+        TracebackWalkField::TbLineno => crate::descr::pytraceback_lineno_descr(),
+    };
     let w_type = pyre_interpreter::typedef::gettypeobject(receiver_type);
     let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
     if version_tag == 0 {
@@ -1979,6 +1976,54 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
         return Ok(None);
     }
 
+    if field == TracebackWalkField::TbLineno {
+        let live =
+            unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_lineno_raw(concrete_obj) };
+        // `get_lineno` answers the sentinel with `-1`, so the slot value is the
+        // getter's value only once it is pinned against the sentinel.  A node
+        // that already carries it — built from a frame with no `pycode` — has
+        // nothing to pin, so decline before recording anything.
+        if live == pyre_interpreter::pytraceback::LINENO_NOT_COMPUTED {
+            return Ok(None);
+        }
+        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+        let raw_value = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, descr);
+        ctx.trace_ctx
+            .set_opref_concrete(raw_value, majit_ir::Value::Int(live));
+        let not_computed = ctx
+            .trace_ctx
+            .const_int(pyre_interpreter::pytraceback::LINENO_NOT_COMPUTED);
+        let is_not_computed = ctx
+            .trace_ctx
+            .record_op(OpCode::IntEq, &[raw_value, not_computed]);
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[is_not_computed])?;
+        // The getter returns a Python int, so the raw slot is reboxed the way
+        // the unboxed mapdict read does; the boxed op is a heap `NewWithVtable`
+        // so its concrete has to be a heap pointer too.
+        let boxed = walker_box_int(ctx, op_pc, raw_value, live)?;
+        let live_ptr = pyre_object::w_int_new(live) as i64;
+        ctx.trace_ctx
+            .set_opref_concrete(boxed, box_int_concrete(live, live_ptr));
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+        return Ok(Some(()));
+    }
+
+    let stored = match field {
+        TracebackWalkField::TbNext => unsafe {
+            pyre_interpreter::pytraceback::w_pytraceback_get_w_next(concrete_obj)
+        },
+        TracebackWalkField::TbFrame => {
+            (unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_frame(concrete_obj) })
+                as pyre_object::PyObjectRef
+        }
+        _ => (unsafe { (*(concrete_obj as *const PyFrame)).pycode }) as pyre_object::PyObjectRef,
+    };
+    // Only `tb_next` has a null with a defined meaning.  A null frame is a
+    // torn-down traceback and a null `pycode` a half-built frame; both are
+    // answered by a `sys.namespace` stub or `None` the residual owns.
+    if stored.is_null() && field != TracebackWalkField::TbNext {
+        return Ok(None);
+    }
     walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
     let raw_value = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, descr);
     let value = if stored.is_null() {

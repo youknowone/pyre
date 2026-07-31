@@ -2886,6 +2886,18 @@ pub fn pytraceback_w_next_descr() -> DescrRef {
     field_descr_from_group(&PYTRACEBACK_DESCR_GROUP, index)
 }
 
+/// Field descriptor for `PyTraceback.lineno`, the line `descr_get_tb_lineno`
+/// reports.  Located by offset for the same reason as
+/// [`pytraceback_w_next_descr`].
+pub fn pytraceback_lineno_descr() -> DescrRef {
+    let index = PYTRACEBACK_DESCR_GROUP
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == pyre_interpreter::pytraceback::PYTRACEBACK_LINENO_OFFSET)
+        .expect("PyTraceback descr group has no lineno field");
+    field_descr_from_group(&PYTRACEBACK_DESCR_GROUP, index)
+}
+
 /// Cached field descriptor for a raw reference slot selected by the
 /// exception attribute fold.  Indices are those of `build_w_exception_group`;
 /// no parallel descriptor is constructed.
