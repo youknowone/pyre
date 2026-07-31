@@ -4693,8 +4693,7 @@ unsafe fn create_weakref_slot(w_type: pyre_object::PyObjectRef) {
     }
 }
 
-/// typeobject.py:1335-1353 find_best_base, with the non-type rejection
-/// `Objects/typeobject.c` `best_base` performs in the same loop.
+/// typeobject.py:1335-1353 find_best_base.
 unsafe fn find_best_base(
     w_bases: pyre_object::PyObjectRef,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
@@ -4706,16 +4705,11 @@ unsafe fn find_best_base(
         let mut w_bestbase: pyre_object::PyObjectRef = std::ptr::null_mut();
         for i in 0..len {
             if let Some(w_candidate) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
-                // `best_base` rejects a non-type entry rather than skipping
-                // it. Skipping is not merely a lost diagnostic: `compute_mro`
-                // appends every supplied base, so a plain instance reaches
-                // the MRO and attribute lookup then reads it as a type
-                // layout. `__bases__` assignment screens its tuple before
-                // this and keeps its own message.
+                // typeobject.py:1341-1342 — a non-type base is skipped here,
+                // not rejected: it is a classic base, and `get_mro` walks it
+                // through `abstract_mro` when the C3 merge reaches it.
                 if !pyre_object::is_type(w_candidate) {
-                    return Err(crate::PyError::type_error(
-                        "bases must be types".to_string(),
-                    ));
+                    continue;
                 }
                 // typeobject.py:1343-1345 — a custom metaclass mro() may
                 // expose the nascent type before its MRO is installed, but

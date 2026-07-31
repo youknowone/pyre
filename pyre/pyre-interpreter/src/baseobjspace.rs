@@ -9340,6 +9340,54 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
     Ok(pyre_object::w_none())
 }
 
+/// Pin `w` into the ambient root scope and hand back its slot.
+fn pin_slot(w: PyObjectRef) -> usize {
+    pyre_object::gc_roots::pin_root(w);
+    pyre_object::gc_roots::shadow_stack_len() - 1
+}
+
+/// `typeobject.py:1665-1678 abstract_mro` — the app-level classic-class walk
+/// that `get_mro` (typeobject.py:1680-1684) applies to a base which is not a
+/// `W_TypeObject`.  Reading `__bases__` is what rejects a plain instance
+/// handed in as a base.
+///
+/// Returns shadow-stack slots rather than values: a `__bases__` read can run
+/// `__getattr__` and allocate, so the caller's scope owns the walk's roots and
+/// the entries stay addressable across the reads that follow.
+///
+/// `klass not in mro` is answered by pointer identity, matching the C3 merge
+/// this feeds instead of running an app-level `__eq__` between the reads.
+unsafe fn abstract_mro(w_klass: PyObjectRef) -> Result<Vec<usize>, crate::PyError> {
+    let mut mro_slots: Vec<usize> = Vec::new();
+    let mut stack_slots: Vec<usize> = vec![pin_slot(w_klass)];
+    while let Some(slot) = stack_slots.pop() {
+        let w_cls = pyre_object::gc_roots::shadow_stack_get(slot);
+        if mro_slots
+            .iter()
+            .any(|&seen| std::ptr::eq(pyre_object::gc_roots::shadow_stack_get(seen), w_cls))
+        {
+            continue;
+        }
+        mro_slots.push(slot);
+        let bases_slot = pin_slot(getattr_str(w_cls, "__bases__")?);
+        if !is_tuple(pyre_object::gc_roots::shadow_stack_get(bases_slot)) {
+            return Err(crate::PyError::type_error("__bases__ must be a tuple"));
+        }
+        // `stack += klass.__bases__[::-1]` — the reversed extend leaves
+        // `__bases__[0]` on top, so the walk descends in declaration order.
+        let nbases = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(bases_slot));
+        for j in (0..nbases).rev() {
+            if let Some(w_base) = w_tuple_getitem(
+                pyre_object::gc_roots::shadow_stack_get(bases_slot),
+                j as i64,
+            ) {
+                stack_slots.push(pin_slot(w_base));
+            }
+        }
+    }
+    Ok(mro_slots)
+}
+
 /// Reject a base tuple whose C3 merge has no valid next head.
 ///
 /// Type construction calls this before allocating the new type or running
@@ -9350,9 +9398,15 @@ pub unsafe fn validate_c3_mro(bases: PyObjectRef) -> Result<(), crate::PyError> 
         return Ok(());
     }
     let n = w_tuple_len(bases);
+    // `is_type_like_w` dispatches through the object space and the classic-base
+    // walk below runs Python outright, so the tuple is pinned for the whole
+    // validation and reread after anything that can collect.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let bases_slot = pin_slot(bases);
     // CPython's typeobject.c reports duplicate direct bases before the C3
     // merge. PyPy's mro_error discovers the same case in its final list.
     for i in 0..n {
+        let bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
         let Some(base) = w_tuple_getitem(bases, i as i64) else {
             continue;
         };
@@ -9370,23 +9424,67 @@ pub unsafe fn validate_c3_mro(bases: PyObjectRef) -> Result<(), crate::PyError> 
             )));
         }
     }
-    let mut lists: Vec<Vec<PyObjectRef>> = Vec::with_capacity(n + 1);
-    let mut bases_list = Vec::with_capacity(n);
+    // typeobject.py:1519,1560 — `setup_user_defined_type` runs
+    // `check_and_find_best_base` before it reaches `compute_mro`, so the C3
+    // merge only ever sees a tuple that already holds at least one type.  pyre
+    // runs this validation ahead of the best-base check, so reproduce that
+    // precondition here: with no type among the bases, leave the tuple to
+    // `check_and_find_best_base` and its own message.
+    let has_type_base = (0..n).any(|i| {
+        w_tuple_getitem(
+            pyre_object::gc_roots::shadow_stack_get(bases_slot),
+            i as i64,
+        )
+        .is_some_and(|base| is_type_like_w(base))
+    });
+
+    // typeobject.py:1689-1690 `orderlists = [get_mro(space, base) for base in
+    // cls.bases_w]` then `orderlists.append([cls] + cls.bases_w)`.  The
+    // classic branch of `get_mro` runs Python, so the lists are accumulated as
+    // shadow-stack slots and only materialized once the build is over — the
+    // merge below allocates nothing, so reading the values there is safe.
+    let mut list_slots: Vec<Vec<usize>> = Vec::with_capacity(n + 1);
+    let mut bases_slots = Vec::with_capacity(n);
     for i in 0..n {
-        let Some(base) = w_tuple_getitem(bases, i as i64) else {
+        let Some(base) = w_tuple_getitem(
+            pyre_object::gc_roots::shadow_stack_get(bases_slot),
+            i as i64,
+        ) else {
             continue;
         };
+        // typeobject.py:1680-1684 `get_mro`: a `W_TypeObject` contributes its
+        // own linearization, anything else is walked as a classic class.
         if is_type_like_w(base) {
             let mro = w_type_get_mro(base);
-            lists.push(if mro.is_null() {
+            let entry = if mro.is_null() {
                 compute_mro(base)
             } else {
                 (*mro).to_vec()
-            });
+            };
+            list_slots.push(entry.into_iter().map(pin_slot).collect());
+        } else if has_type_base {
+            list_slots.push(abstract_mro(base)?);
         }
-        bases_list.push(base);
+        bases_slots.push(pin_slot(
+            w_tuple_getitem(
+                pyre_object::gc_roots::shadow_stack_get(bases_slot),
+                i as i64,
+            )
+            .unwrap_or(base),
+        ));
     }
-    lists.push(bases_list);
+    list_slots.push(bases_slots);
+
+    let bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
+    let mut lists: Vec<Vec<PyObjectRef>> = list_slots
+        .into_iter()
+        .map(|slots| {
+            slots
+                .into_iter()
+                .map(pyre_object::gc_roots::shadow_stack_get)
+                .collect()
+        })
+        .collect();
 
     loop {
         lists.retain(|list| !list.is_empty());
