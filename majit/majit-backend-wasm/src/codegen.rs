@@ -1090,12 +1090,33 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
                 .get_fail_arg_types()
                 .unwrap_or_else(|| fail_args.iter().map(|_| Type::Int).collect());
 
+            let meta_descr = op.getdescr();
+            // `regalloc.py:496-499 consider_guard_value` — stamp the per-value
+            // counter here, where the native backends stamp it during guard
+            // layout, so `store_guard_hashes`' `status == 0` gate
+            // (`compile.py:826-829`) leaves it alone and `must_compile` hashes
+            // the (guard, failing value) pair. Without it a guard whose failing
+            // value never repeats accumulates in one bucket and compiles
+            // another bridge every `trace_eagerness` failures, without bound.
+            if op.opcode == OpCode::GuardValue {
+                if let Some(fd) = meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+                    let arg0 = op.arg(0).to_opref();
+                    if let Some(idx) = fail_args.iter().position(|r| *r == arg0) {
+                        let type_tag = match fail_arg_types.get(idx) {
+                            Some(Type::Ref) => majit_backend::STATUS_TY_REF,
+                            Some(Type::Float) => majit_backend::STATUS_TY_FLOAT,
+                            _ => majit_backend::STATUS_TY_INT,
+                        };
+                        fd.make_a_counter_per_value(idx as u32, type_tag);
+                    }
+                }
+            }
             guards.push(GuardExit {
                 fail_index,
                 fail_arg_refs: fail_args,
                 fail_arg_types,
                 is_finish: op.opcode == OpCode::Finish,
-                meta_descr: op.getdescr(),
+                meta_descr,
             });
             fail_index += 1;
         }
