@@ -312,7 +312,12 @@ pub fn pin_roots(roots: &[PyObjectRef]) -> usize {
         // may already have rewritten every published root in place.
         let root = with_shadow_stack(|stack| stack[index]);
         let current = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
-        with_shadow_stack_mut(|stack| stack[index] = current);
+        // Same write-back economy as `pin_root`: the slot already holds `root`,
+        // so a query that found no forwarding stub has nothing to store, and
+        // skipping it saves a second thread-local resolve per livevar.
+        if current != root {
+            with_shadow_stack_mut(|stack| stack[index] = current);
+        }
     }
     base
 }

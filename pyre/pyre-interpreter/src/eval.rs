@@ -610,6 +610,77 @@ fn gc_prebuilt_remember_enabled() -> bool {
     })
 }
 
+/// Whether `PYRE_RERAISE_DIAG` asks `RERAISE` to describe an operand that is
+/// not an exception before it raises the `TypeError`.
+///
+/// Read once: the check sits on the raise path, which is cold, but the flag is
+/// also consulted from a `OnceLock` for the same reason as
+/// [`interp_return_log_enabled`] — a `getenv` scans the environment array under
+/// a lock.
+#[cfg(not(feature = "sandbox"))]
+fn reraise_diag_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_RERAISE_DIAG").is_some())
+}
+
+#[cfg(feature = "sandbox")]
+fn reraise_diag_enabled() -> bool {
+    false
+}
+
+/// Describe a `RERAISE` operand that failed the `W_BaseException` check.
+///
+/// The operand is whatever `PUSH_EXC_INFO` pushed, and the compiler emits the
+/// pair together, so a non-exception here means the frame's value-stack slot
+/// was corrupted in between — never a program error. Report enough to tell the
+/// two shapes apart: a NULL slot (a live slot that was cleared) versus a live
+/// pointer whose object is no longer an exception (a stale or swept address).
+fn reraise_bad_operand_diag(
+    w_exc: PyObjectRef,
+    oparg: u32,
+    code_name: &str,
+    depth: usize,
+    below: &[PyObjectRef],
+) {
+    let describe = |v: PyObjectRef| -> String {
+        if v.is_null() {
+            return "NULL".to_string();
+        }
+        let ob_type = unsafe { (*v).ob_type };
+        let name = if ob_type.is_null() {
+            "<null ob_type>"
+        } else {
+            unsafe { (*ob_type).name }
+        };
+        let is_exc = unsafe { pyre_object::is_exception(v) };
+        format!("0x{:x}:{name}{}", v as usize, if is_exc { "(EXC)" } else { "" })
+    };
+    let operand = if w_exc.is_null() {
+        "NULL".to_string()
+    } else {
+        let addr = w_exc as usize;
+        let owned = pyre_object::gc_hook::try_gc_owns_object(w_exc as *mut u8);
+        let words: Vec<String> = (0..4)
+            .map(|i| {
+                format!("0x{:x}", unsafe {
+                    *((addr + i * std::mem::size_of::<usize>()) as *const usize)
+                })
+            })
+            .collect();
+        format!(
+            "{} gc_owned={owned} words=[{}]",
+            describe(w_exc),
+            words.join(", ")
+        )
+    };
+    let stack: Vec<String> = below.iter().map(|&v| describe(v)).collect();
+    eprintln!(
+        "[reraise] code={code_name} oparg={oparg} depth={depth} operand={operand} \
+         below=[{}]",
+        stack.join(", ")
+    );
+}
+
 pub fn capture_pyframe_root_area() -> *const () {
     PYFRAME_ROOT_AREA.with(|area| area as *const _ as *const ())
 }
@@ -3708,6 +3779,12 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── Reraise ──
     // `pypy/interpreter/pyopcode.py:1348-1376 RERAISE`.
+    //
+    // `RERAISE` reads the operand `PUSH_EXC_INFO` left on the value stack, so
+    // this opcode only sees a non-exception when the frame's stack slot itself
+    // went bad between the two. That is unreachable for a correct interpreter,
+    // and the intermittent `test_asyncio` failures reach it — hence the
+    // diagnostic below rather than a bare `TypeError`.
     fn reraise(&mut self, oparg: u32) -> Result<(), PyError> {
         // pyopcode.py:1357-1363
         let reraise_lasti: i32 = if oparg != 0 {
@@ -3720,6 +3797,24 @@ impl OpcodeStepExecutor for PyFrame {
         let w_exc = self.popvalue();
         // pyopcode.py:1367 — w_value = space.interp_w(W_BaseException, w_exc)
         if w_exc.is_null() || !unsafe { pyre_object::is_exception(w_exc) } {
+            if reraise_diag_enabled() {
+                // Snapshot what is left below the popped operand. If the real
+                // exception is sitting one or two slots away, the defect is a
+                // stack-depth miscount; if it is nowhere on the stack, the slot
+                // held a reference the collector reclaimed and reissued.
+                let depth = self.valuestackdepth;
+                let below: Vec<PyObjectRef> = (0..6)
+                    .take_while(|i| *i < depth)
+                    .map(|i| self.peekvalue_maybe_none(i))
+                    .collect();
+                let code_ptr = unsafe { crate::pyframe::pyframe_get_pycode(self) };
+                let code_name = if code_ptr.is_null() {
+                    "?"
+                } else {
+                    unsafe { (*code_ptr).obj_name.as_str() }
+                };
+                reraise_bad_operand_diag(w_exc, oparg, code_name, depth, &below);
+            }
             return Err(PyError::type_error(
                 "exception must derive from BaseException",
             ));

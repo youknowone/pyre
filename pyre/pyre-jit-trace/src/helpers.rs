@@ -126,9 +126,14 @@ pub extern "C" fn jit_dict_nth_value_versioned(
 ) -> i64 {
     let dict = dict as PyObjectRef;
     unsafe {
-        // `w_dict_lock` is reentrant, so the nested acquire inside
-        // `w_dict_nth_item` neither blocks nor releases this guard.
-        let _dict_guard = pyre_object::dictmultiobject::w_dict_lock(dict);
+        // A contended acquire enters `before_external_block`, which is a GC
+        // safepoint, so `dict` arrives as a raw JIT argument that must be
+        // shadow-rooted across the lock and re-read afterwards —
+        // `DictOperationGuard` is that bracket. The stripe is reentrant, so the
+        // nested acquire inside `w_dict_nth_item` neither blocks nor releases
+        // this guard.
+        let dict_guard = pyre_object::dictmultiobject::DictOperationGuard::new(dict, &[]);
+        let dict = dict_guard.root(0);
         if pyre_object::dictmultiobject::w_dict_keys_version(dict) != expected_version as usize {
             return PY_NULL as i64;
         }
