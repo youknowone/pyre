@@ -3394,6 +3394,18 @@ mod tests {
     }
 
     #[test]
+    fn jit_trace_fnaddrs_covers_int_bit_length_gateway_wrapper() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected =
+            crate::typedef::__pyre_wrap_int_descr_bit_length as *const () as usize as i64;
+
+        assert_eq!(
+            bindings["pyre_interpreter::typedef::__pyre_wrap_int_descr_bit_length"],
+            expected,
+        );
+    }
+
+    #[test]
     fn jit_trace_fnaddrs_covers_generated_runtime_helper_families() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
 

@@ -2881,6 +2881,34 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::ConstRefNull,
             }]);
         }
+        // RPython `rtyper/rtuple.py:153-169 TupleRepr.newtuple`: every
+        // non-empty tuple is a `malloc(GcStruct)` followed by one `setfield`
+        // per item.  `front::mir` has already emitted those positional
+        // `FieldWrite`s after this synthetic aggregate constructor; lower the
+        // constructor itself to the matching allocation instead of treating
+        // it as a host call.  A residual synthetic call has no registered
+        // function address and would put its stable hash in JitCode as though
+        // it were executable code.
+        //
+        // The frontend names non-empty tuple shapes `Tuple<...>` while the
+        // exact bare `Tuple` above is the zero-item `Void` representation.
+        // Keep the owner-path gate: the universal MIR tuple aggregate has no
+        // Rust nominal owner, whereas a user ADT whose leaf happens to start
+        // with `Tuple` is a different allocation policy.
+        if let CallTarget::SyntheticTransparentCtor { name, owner_path } = target
+            && owner_path.is_empty()
+            && name != "Tuple"
+            && majit_ir::descr::strip_instantiation_suffix(name) == "Tuple"
+            && args.is_empty()
+            && let ValueType::Ref(Some(owner)) = result_ty
+        {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::New {
+                    owner: owner.clone(),
+                },
+            }]);
+        }
         // RPython `rtyper` lowers a heap-carried `Result` variant to
         // `malloc(GcStruct)` plus its discriminant/payload `setfield`s before
         // `jtransform`; `rewrite_op_malloc` then emits `new(descr)`.
@@ -9067,6 +9095,84 @@ mod tests {
             .find(|op| op.result.as_ref() == Some(&result_var))
             .expect("null result must survive as a constant definition");
         assert!(matches!(folded.kind, OpKind::ConstRefNull));
+    }
+
+    /// `rtuple.py:153-169 TupleRepr.newtuple`: a non-empty tuple lowers to
+    /// `malloc(GcStruct)`; the following per-item `FieldWrite`s supply the
+    /// `setfield`s.  It must never survive as a synthetic residual call.
+    #[test]
+    fn nonempty_synthetic_tuple_ctor_lowers_to_new() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("nonempty_tuple_malloc");
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let owner = "Tuple<PyObjectRef,Option<PyObjectRef>>".to_string();
+        let target = CallTarget::synthetic_transparent_ctor(owner.clone());
+        let result_ty = ValueType::Ref(Some(owner.clone()));
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![],
+                result_ty: result_ty.clone(),
+            },
+        };
+
+        let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "nonempty_tuple_malloc",
+            &mut graph,
+        ) else {
+            panic!("non-empty Tuple aggregate must lower to malloc");
+        };
+        assert!(matches!(
+            ops.as_slice(),
+            [SpaceOperation {
+                result: Some(result),
+                kind: OpKind::New { owner: allocated },
+            }] if result == &result_var && allocated == &owner
+        ));
+    }
+
+    /// The exact bare tuple tag is the empty tuple's `Void` representation,
+    /// not a heap allocation (`rtuple.py:160-161`).
+    #[test]
+    fn empty_synthetic_tuple_ctor_remains_null_ref_constant() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("empty_tuple_void");
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::synthetic_transparent_ctor("Tuple");
+        let result_ty = ValueType::Ref(Some("Tuple".into()));
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![],
+                result_ty: result_ty.clone(),
+            },
+        };
+
+        let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "empty_tuple_void",
+            &mut graph,
+        ) else {
+            panic!("empty Tuple aggregate must lower to its Void placeholder");
+        };
+        assert!(matches!(
+            ops.as_slice(),
+            [SpaceOperation {
+                result: Some(result),
+                kind: OpKind::ConstRefNull,
+            }] if result == &result_var
+        ));
     }
 
     /// PyPy parity regression guard: the qualified spellings

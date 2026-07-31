@@ -787,14 +787,14 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     // ── Pass 1: walk type_decls + trait_decls ─────────────────────
     let (
-        known_struct_names,
+        mut known_struct_names,
         known_trait_names,
         mut struct_fields,
         mut enum_variant_by_discriminant,
         mut struct_origins,
-        struct_field_attrs,
+        mut struct_field_attrs,
         exact_layouts,
-        struct_ids,
+        mut struct_ids,
     ) = derive_program_metadata(llbc);
     harden_duplicate_leaf_metadata(
         &mut struct_fields,
@@ -1042,6 +1042,13 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             returns_objectptr,
         });
     }
+    register_synthetic_tuple_metadata(
+        &functions,
+        &mut known_struct_names,
+        &mut struct_fields,
+        &mut struct_field_attrs,
+        &mut struct_ids,
+    );
     // Coverage gate. Every `skipped` entry is a function whose MIR shape
     // the driver could not lower — already after the reverse-postorder
     // retry in `lower_fun_decl`. The single known, tracked gap is an
@@ -1150,6 +1157,121 @@ fn should_lower_function(
     name: &str,
 ) -> bool {
     function_filter.is_none_or(|names| names.contains(name))
+}
+
+/// Register the low-level struct identity and fields for every non-empty MIR
+/// tuple shape that survived into a translated graph.
+///
+/// RPython creates one distinct `GcStruct('tupleN', item0, item1, ...)` per
+/// [`SomeTuple`] representation (`rtyper/rtuple.py:115-125`), then
+/// `TupleRepr.newtuple` allocates that struct and writes its fields
+/// (`rtuple.py:153-169`). Charon has no `TypeDecl` row for Rust's built-in
+/// tuple aggregate, so [`derive_program_metadata`] cannot discover these
+/// layouts from the declaration table. The graph is the authoritative
+/// rtyper input here: `front::mir` has already attached the complete
+/// `Tuple<T,...>` shape to the synthetic constructor and its `__pos_N`
+/// fields.
+///
+/// Each full shape gets its own [`StructId`]. Generic nominal ADTs share their
+/// template layout, but tuples do not: `(A,)` and `(A, B)` are distinct
+/// low-level struct objects in RPython and must not collapse onto a bare
+/// `Tuple` identity.
+fn register_synthetic_tuple_metadata(
+    functions: &[crate::front::semantic::SemanticFunction],
+    known_struct_names: &mut std::collections::HashSet<String>,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    struct_field_attrs: &mut std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+) {
+    let mut shapes = std::collections::BTreeSet::new();
+    for function in functions {
+        for op in function
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+        {
+            let OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, owner_path },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if owner_path.is_empty()
+                && args.is_empty()
+                && name != "Tuple"
+                && majit_ir::descr::strip_instantiation_suffix(name) == "Tuple"
+            {
+                shapes.insert(name.clone());
+            }
+        }
+    }
+
+    for shape in shapes {
+        let Some(inner) = shape
+            .strip_prefix("Tuple<")
+            .and_then(|rest| rest.strip_suffix('>'))
+        else {
+            continue;
+        };
+        let items = split_top_level_type_args(inner);
+        if items.is_empty() {
+            continue;
+        }
+        let rows: Vec<(String, String)> = items
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| (format!("__pos_{index}"), (*ty).to_string()))
+            .collect();
+        let attrs: Vec<(String, ValueType)> = items
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| (format!("__pos_{index}"), tuple_field_value_type(ty)))
+            .collect();
+        let sid = majit_ir::descr::StructId::from_canonical(&shape);
+        known_struct_names.insert(shape.clone());
+        struct_fields.fields.insert(shape.clone(), rows);
+        struct_field_attrs.insert(shape.clone(), attrs);
+        record_struct_id(struct_ids, shape, sid);
+    }
+}
+
+/// Split `A,B<C,D>,[E;2]` at top-level commas only.
+fn split_top_level_type_args(input: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, ch) in input.char_indices() {
+        match ch {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let item = input[start..index].trim();
+                if !item.is_empty() {
+                    out.push(item);
+                }
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let tail = input[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+fn tuple_field_value_type(type_name: &str) -> ValueType {
+    match type_name.trim() {
+        "()" => ValueType::Void,
+        "f64" => ValueType::Float,
+        "bool" | "char" | "f32" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8"
+        | "u16" | "u32" | "u64" | "u128" | "usize" => ValueType::Int,
+        _ => ValueType::Ref(None),
+    }
 }
 
 /// Derive whole-program type-metadata fields of `SemanticProgram` from
@@ -1424,6 +1546,20 @@ fn derive_program_metadata(
                 // `{enum_leaf}::{variant}`.  No cross-variant dedup: each
                 // variant owns its field namespace.
                 let enum_layout = td.layout_for_target(&target);
+                // `Result<T, E>` is not materialised as Rust's native enum in
+                // translated code.  The inverse exception transform removes
+                // ordinary `?` paths; a hand-written `match` that remains is
+                // represented by the explicit rtyper shell emitted below:
+                // `{ __discriminant: Signed, __pos_0: payload }`.  Rust's
+                // niche layout commonly places both the implicit tag and the
+                // payload at offset 0, but applying that host layout to this
+                // explicit shell makes the payload store overwrite the tag
+                // and every following switch take its unreachable default.
+                // RPython's low-level representation is the explicit fields
+                // the graph declares, so give that synthetic struct its own
+                // non-overlapping layout instead of borrowing Rust's enum
+                // layout.
+                let synthetic_result_shell = name == "core::result::Result";
                 // Register the enum BASE in `exact_layouts`: a single
                 // `__discriminant` field at the tag's real byte position
                 // (`discriminator.Branch.offset` via `discriminant_offset`).
@@ -1434,18 +1570,31 @@ fn derive_program_metadata(
                 // heuristic exactly; a single-variant type has no `Branch`
                 // tag (`discriminant_offset` → `None`) and also registers 0.
                 // Fieldless enums skip this (int-valued, no base ClassDef).
-                if !fieldless && let Some(l) = enum_layout.as_ref() {
-                    let mut base_offsets = std::collections::HashMap::new();
-                    base_offsets.insert(
-                        "__discriminant".to_string(),
-                        l.discriminant_offset().unwrap_or(0),
-                    );
-                    let base_exact = crate::front::semantic::ExactLayout {
-                        size: l.size,
-                        align: l.align,
-                        field_offsets: base_offsets,
-                    };
-                    exact_layouts.insert(base_sid, base_exact);
+                if !fieldless {
+                    if synthetic_result_shell {
+                        let mut base_offsets = std::collections::HashMap::new();
+                        base_offsets.insert("__discriminant".to_string(), 0);
+                        exact_layouts.insert(
+                            base_sid,
+                            crate::front::semantic::ExactLayout {
+                                size: Some(16),
+                                align: Some(8),
+                                field_offsets: base_offsets,
+                            },
+                        );
+                    } else if let Some(l) = enum_layout.as_ref() {
+                        let mut base_offsets = std::collections::HashMap::new();
+                        base_offsets.insert(
+                            "__discriminant".to_string(),
+                            l.discriminant_offset().unwrap_or(0),
+                        );
+                        let base_exact = crate::front::semantic::ExactLayout {
+                            size: l.size,
+                            align: l.align,
+                            field_offsets: base_offsets,
+                        };
+                        exact_layouts.insert(base_sid, base_exact);
+                    }
                 }
                 // Per-variant subclasses carry each variant's OWN payload
                 // fields; a fieldless enum has none, so it needs no variant
@@ -1475,9 +1624,12 @@ fn derive_program_metadata(
                                     tyref_to_attr_value_type(&f.ty, llbc),
                                 )
                             };
-                            if let Some(off) =
+                            let field_offset = if synthetic_result_shell {
+                                Some(8 + (i as u64) * 8)
+                            } else {
                                 enum_layout.as_ref().and_then(|l| l.field_offset(vidx, i))
-                            {
+                            };
+                            if let Some(off) = field_offset {
                                 voffsets.insert(fname.clone(), off);
                             }
                             vattrs.push((fname.clone(), attr_ty));
@@ -1496,7 +1648,14 @@ fn derive_program_metadata(
                         record_struct_id(&mut struct_ids, variant_qual.clone(), vsid);
                         record_struct_id(&mut struct_ids, variant_leaf.clone(), vsid);
                         record_struct_id(&mut struct_ids, variant_canon.clone(), vsid);
-                        if let Some(l) = enum_layout.as_ref() {
+                        if synthetic_result_shell {
+                            let exact = crate::front::semantic::ExactLayout {
+                                size: Some(16),
+                                align: Some(8),
+                                field_offsets: voffsets,
+                            };
+                            exact_layouts.insert(vsid, exact);
+                        } else if let Some(l) = enum_layout.as_ref() {
                             let exact = crate::front::semantic::ExactLayout {
                                 size: l.size,
                                 align: l.align,

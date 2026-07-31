@@ -14759,6 +14759,55 @@ cmp_dunder_set!(
 
 type DunderFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
 
+/// `intobject.py:657 W_IntObject.descr_bit_length` /
+/// `longobject.py:48 W_AbstractLongObject.descr_bit_length`, exposed through
+/// `interpindirect2app` (`intobject.py:1171`).
+///
+/// This must be a named gateway wrapper, not an `init_int_type` closure:
+/// RPython's `BuiltinCode.func` is a PBC containing the generated interp2app
+/// function graphs. Publishing the wrapper descriptor below gives pyre's
+/// source translator the same candidate graph and lets a traced
+/// `int.bit_length()` call descend to `rbigint::bit_length_int`.
+pub fn __pyre_wrap_int_descr_bit_length(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    // `intobject.py descr_bit_length` — number of bits in the absolute
+    // value, so long/bigint operands must route through their magnitude
+    // rather than the i64 fast path (which leaves out-of-range values at 0).
+    let bits = if !args.is_empty() && unsafe { pyre_object::is_bool(args[0]) } {
+        pyre_object::rbigint::bit_length_int(unsafe {
+            pyre_object::w_bool_get_value(args[0]) as i64
+        }) as u64
+    } else if !args.is_empty() && unsafe { pyre_object::is_int(args[0]) } {
+        pyre_object::rbigint::bit_length_int(unsafe { pyre_object::w_int_get_value(args[0]) })
+            as u64
+    } else if !args.is_empty() && unsafe { pyre_object::is_long(args[0]) } {
+        match unsafe { pyre_object::w_long_get_value(args[0]).bit_length() } {
+            Ok(bits) => bits as u64,
+            Err(pyre_object::rbigint::RBigIntError::Overflow) => {
+                return Err(crate::PyError::overflow_error("too many digits in integer"));
+            }
+            Err(_) => unreachable!("rbigint.bit_length only raises OverflowError"),
+        }
+    } else {
+        0
+    };
+    Ok(pyre_object::w_int_new(bits as i64))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_int_descr_bit_length:
+    crate::gateway::BuiltinWrapperDescriptor = crate::gateway::BuiltinWrapperDescriptor {
+    path: concat!(
+        module_path!(),
+        "::",
+        stringify!(__pyre_wrap_int_descr_bit_length)
+    ),
+    func: __pyre_wrap_int_descr_bit_length,
+};
+
 fn init_int_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -14869,40 +14918,7 @@ fn init_int_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "bit_length",
-            make_builtin_function_with_arity(
-                "bit_length",
-                |args| {
-                    // `intobject.py descr_bit_length` — number of bits in the
-                    // absolute value, so long/bigint operands must route
-                    // through their magnitude rather than the i64 fast path
-                    // (which leaves out-of-range values at 0).
-                    let bits = if !args.is_empty() && unsafe { pyre_object::is_bool(args[0]) } {
-                        pyre_object::rbigint::bit_length_int(unsafe {
-                            pyre_object::w_bool_get_value(args[0]) as i64
-                        }) as u64
-                    } else if !args.is_empty() && unsafe { pyre_object::is_int(args[0]) } {
-                        pyre_object::rbigint::bit_length_int(unsafe {
-                            pyre_object::w_int_get_value(args[0])
-                        }) as u64
-                    } else if !args.is_empty() && unsafe { pyre_object::is_long(args[0]) } {
-                        match unsafe { pyre_object::w_long_get_value(args[0]).bit_length() } {
-                            Ok(bits) => bits as u64,
-                            Err(pyre_object::rbigint::RBigIntError::Overflow) => {
-                                return Err(crate::PyError::overflow_error(
-                                    "too many digits in integer",
-                                ));
-                            }
-                            Err(_) => {
-                                unreachable!("rbigint.bit_length only raises OverflowError")
-                            }
-                        }
-                    } else {
-                        0
-                    };
-                    Ok(pyre_object::w_int_new(bits as i64))
-                },
-                1,
-            ),
+            make_builtin_function_with_arity("bit_length", __pyre_wrap_int_descr_bit_length, 1),
         )
     };
     unsafe {

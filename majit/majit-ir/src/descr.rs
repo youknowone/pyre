@@ -408,11 +408,17 @@ pub fn struct_id_for_name(raw: &str) -> Option<StructId> {
         .trim_start_matches("&mut ")
         .trim_start_matches('&')
         .trim();
-    // Generic instantiations share the defining ADT's one physical Rust
-    // layout.  The annotator keeps `Result<T>::Ok` spellings distinct for
-    // ClassDef payload precision, but the descriptor layer must resolve all
-    // of them to the template variant identity registered from the TypeDecl.
-    let s = strip_generic_args(s);
+    // Generic nominal ADT instantiations share the defining TypeDecl's one
+    // physical layout. Tuples are the exception: RPython's `TupleRepr`
+    // creates a distinct `GcStruct` for each item shape, and Charon spells
+    // that synthetic identity as `Tuple<T,...>` because there is no nominal
+    // TypeDecl to resolve. Preserve the full tuple shape while continuing to
+    // collapse `Result<T>::Ok` and other nominal generics to their template.
+    let s = if strip_instantiation_suffix(s) == "Tuple" && s != "Tuple" {
+        std::borrow::Cow::Borrowed(s)
+    } else {
+        strip_generic_args(s)
+    };
     let guard = STRUCT_ID_BY_NAME.lock().unwrap();
     guard.get(s.as_ref()).copied().flatten()
 }

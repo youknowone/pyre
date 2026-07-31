@@ -3246,16 +3246,62 @@ fn bh_size_spec_from_callcontrol(
         return None;
     }
     // RPython keys SizeDescrs on the low-level STRUCT object, not on an
-    // annotation-side generic instantiation.  Charon registers one physical
-    // layout for the generic TypeDecl, so `Result<T>::Ok` and
-    // `Result<U>::Ok` must converge on the template variant here while their
-    // ClassDefs remain distinct in the annotator.
-    let layout_owner = majit_ir::descr::strip_generic_args(owner);
+    // annotation-side generic instantiation. Charon registers one physical
+    // layout for a nominal generic TypeDecl, so `Result<T>::Ok` and
+    // `Result<U>::Ok` converge on the template variant. A tuple is different:
+    // `TupleRepr` creates one low-level GcStruct per item shape, so preserve
+    // its full `Tuple<T,...>` identity and layout.
+    let layout_owner =
+        if majit_ir::descr::strip_instantiation_suffix(owner) == "Tuple" && owner != "Tuple" {
+            std::borrow::Cow::Borrowed(owner)
+        } else {
+            majit_ir::descr::strip_generic_args(owner)
+        };
     let layout_owner = layout_owner.as_ref();
-    let size = cc
+    let mut size = cc
         .struct_layout_for(layout_owner)
         .map(|layout| layout.size)
         .or_else(|| heuristic_struct_size_for_bh(cc, layout_owner))?;
+    let mut all_fielddescrs = bh_all_field_specs_for_struct(cc, layout_owner);
+    // `rclass.py` lays a subclass's inherited fields out before its own
+    // fields.  Annotation metadata deliberately keeps enum-variant attrs
+    // variant-local, so reconstruct that inherited physical slot here for
+    // the explicit Result shell.  PtrInfo indexes virtual fields by
+    // `index_in_parent`; without the base tag in this list both the tag and
+    // payload are slot 0 and the payload replaces the tag despite living at
+    // byte offset 8.
+    let result_variant = layout_owner.ends_with("result::Result::Ok")
+        || layout_owner.ends_with("result::Result::Err")
+        || layout_owner == "Result::Ok"
+        || layout_owner == "Result::Err";
+    if result_variant {
+        size = size.max(16);
+    }
+    if result_variant
+        && !all_fielddescrs
+            .iter()
+            .any(|field| field.field_key() == "__discriminant")
+    {
+        for (index, field) in all_fielddescrs.iter_mut().enumerate() {
+            field.index = (index + 1) as u32;
+            field.index_in_parent = index + 1;
+        }
+        all_fielddescrs.insert(
+            0,
+            bh_field_spec_from_parts(
+                0,
+                layout_owner,
+                "__discriminant",
+                0,
+                8,
+                majit_ir::value::Type::Int,
+                majit_ir::descr::ArrayFlag::Signed,
+                false,
+                false,
+                0,
+            ),
+        );
+    }
     Some(crate::jitcode::BhSizeSpec {
         size,
         // Analyzer-side structs keep the guard (unchanged); the raw
@@ -3279,7 +3325,7 @@ fn bh_size_spec_from_callcontrol(
         // by `simple_descr_group_from_bh_size`'s no-identity branch.
         type_id: majit_ir::descr::path_hash(layout_owner),
         vtable: 0,
-        all_fielddescrs: bh_all_field_specs_for_struct(cc, layout_owner),
+        all_fielddescrs,
     })
 }
 
@@ -3501,11 +3547,11 @@ fn fielddescrof(
         }
         if let Some(parent_spec) = parent.as_ref() {
             let full_name = bh_field_name(owner, &field.name);
-            if let Some(spec) = parent_spec
-                .all_fielddescrs
-                .iter()
-                .find(|spec| spec.name == full_name)
-            {
+            if let Some(spec) = parent_spec.all_fielddescrs.iter().find(|spec| {
+                spec.name == full_name
+                    || spec.field_key() == field.name
+                    || spec.name.ends_with(&format!(".{}", field.name))
+            }) {
                 offset = spec.offset;
                 field_size = spec.field_size;
                 field_type = spec.field_type;
@@ -4660,6 +4706,29 @@ mod tests {
             parent_type_id("core::result::Result<i64,PyError>"),
             owner_id.as_u64(),
         );
+    }
+
+    #[test]
+    fn explicit_result_variant_size_inherits_discriminant_slot() {
+        use crate::call::CallControl;
+
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            "core::result::Result::Ok".to_string(),
+            vec![("__pos_0".to_string(), "??TypeVar".to_string())],
+        );
+        cc.set_struct_fields(struct_fields);
+
+        let spec = bh_size_spec_from_callcontrol(&cc, "core::result::Result<i64,PyError>::Ok")
+            .expect("explicit Result variant size");
+        assert_eq!(spec.size, 16);
+        assert_eq!(spec.all_fielddescrs.len(), 2);
+        assert_eq!(spec.all_fielddescrs[0].field_key(), "__discriminant");
+        assert_eq!(spec.all_fielddescrs[0].offset, 0);
+        assert_eq!(spec.all_fielddescrs[0].index_in_parent, 0);
+        assert_eq!(spec.all_fielddescrs[1].field_key(), "__pos_0");
+        assert_eq!(spec.all_fielddescrs[1].index_in_parent, 1);
     }
 
     #[test]
