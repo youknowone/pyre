@@ -1478,11 +1478,14 @@ fn residual_ref_call_dst_before(code: &[u8], entry: usize) -> Option<usize> {
 /// canonical residual-call encoding.
 ///
 /// The result is always mirrored into `bridge_registers_r` for interior-entry
-/// bridge walks, whose Ref-bank seed is color-indexed.  Opcode-entry bridge
+/// bridge walks, whose Ref-bank seed is color-indexed. Opcode-entry bridge
 /// walks rebuild slot-indexed locals and operand-stack values from
-/// `bridge_local_oprefs` / `bridge_stack_oprefs`, so mirror the destination
-/// there too.  Returns `false` (caller declines the compile) when the register
-/// is unresolved.
+/// `bridge_local_oprefs` / `bridge_stack_oprefs`, so invert the destination
+/// color through the resume pc's color→semantic-slot map before mirroring it
+/// there. Treating a post-regalloc color as a localsplus slot corrupts an
+/// unrelated local whenever regalloc coalesces the call result.
+/// Returns `false` (caller declines the compile) when the register is
+/// unresolved.
 fn inject_root_call_result<Sym: WalkSym>(
     sym: &mut Sym,
     root_pc: usize,
@@ -1509,15 +1512,33 @@ fn inject_root_call_result<Sym: WalkSym>(
         }
         bridge_regs[result_reg] = result;
     }
-    if result_reg < nlocals {
+    let valuestackdepth = sym.valuestackdepth();
+    let stack_only = valuestackdepth.saturating_sub(nlocals);
+    let semantic_result_slot = payload
+        .jitcode
+        .try_index()
+        .map(|index| crate::state::bridge_semantic_maps_from_pc(index as i32, root_pc as i32))
+        .and_then(|maps| {
+            crate::state::semantic_ref_slot_for_reg_color(
+                nlocals,
+                stack_only,
+                &maps.pcdep_entries,
+                result_reg,
+            )
+        })
+        .or_else(|| (result_reg < valuestackdepth).then_some(result_reg));
+    let Some(semantic_result_slot) = semantic_result_slot else {
+        return false;
+    };
+    if semantic_result_slot < nlocals {
         if let Some(locals) = sym.bridge_local_oprefs_mut().as_mut() {
-            if locals.len() <= result_reg {
-                locals.resize(result_reg + 1, majit_ir::OpRef::NONE);
+            if locals.len() <= semantic_result_slot {
+                locals.resize(semantic_result_slot + 1, majit_ir::OpRef::NONE);
             }
-            locals[result_reg] = result;
+            locals[semantic_result_slot] = result;
         }
     } else {
-        let slot = result_reg - nlocals;
+        let slot = semantic_result_slot - nlocals;
         let bridge = sym.bridge_stack_oprefs_mut().get_or_insert_with(Vec::new);
         if bridge.len() <= slot {
             bridge.resize(slot + 1, majit_ir::OpRef::NONE);
@@ -1609,6 +1630,20 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             "[p2-shape] root_pc={root_pc} n_recipes={} recipe_pcs={pcs:?}",
             carrier.recipes.len()
         );
+    }
+    // Each resumed frame needs its own red frame and register bank. The
+    // current carrier driver has one root `sym`, so it can faithfully drain a
+    // single reconstructed callee but cannot yet keep two reconstructed
+    // callees' color banks independent. Decline before concrete sub-walking:
+    // executing the deepest frame only to roll it back adds substantial
+    // overhead and compiling the collapsed shape is unsound.
+    if carrier.recipes.len() > 1 {
+        crate::jitcode_dispatch::census_record("P2Drain::MultiFrameIdentityUnsupported");
+        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+        crate::jitcode_dispatch::bool_box_truth_reset();
+        crate::jitcode_dispatch::fbw_finish_payload_reset();
+        crate::jitcode_dispatch::fbw_store_journal_rollback();
+        return p2_drain_abort();
     }
     let Some(recipe) = carrier.recipes.last() else {
         crate::jitcode_dispatch::census_record("P2Drain::NoRecipes");

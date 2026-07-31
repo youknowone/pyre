@@ -13195,11 +13195,8 @@ pub(crate) fn assemble_bridge_inline_pending(
     let w_globals = recover_inline_callee_globals(recipe.code_ptr);
 
     // resume.py:1042-1057 newframe + reload: the decoded boxes are reloaded
-    // into the symbolic frame below. The callee's concrete state lives in
-    // `sym.concrete_locals` / `sym.concrete_stack` and in the emitted frame
-    // vable that `setup_reconstructed_callee_frame` binds to `sym.frame`;
-    // no separate interpreter-side `PyFrame` is materialized here.
-    //
+    // into the symbolic frame below. `setup_reconstructed_callee_frame`
+    // supplies the matching recording-time PyFrame for residual execution.
     // Symbolic side: mirror the FAST branch field-for-field.
     let mut sym = PyreSym::new_uninit(OpRef::NONE);
     sym.nlocals = nlocals;
@@ -13360,8 +13357,76 @@ pub(crate) fn setup_reconstructed_callee_frame(
         ec_const,
     );
 
+    // pyjitpl.py:2445-2476 perform_call creates a concrete frame alongside
+    // the callee MIFrame before setup_call installs its boxes. A bridge resume
+    // does the same in resume.py:1042-1057: newframe(jitcode), then
+    // consume_boxes. The emitted `frame_vable` above is the runtime half; give
+    // it the matching recording-time PyFrame so residuals that consume the
+    // frame red can execute while tracing. Without this value the very first
+    // such residual sees a symbolic-only Ref and the carrier sub-walk aborts.
+    //
+    // Root the code, globals, and every reconstructed prefix slot before the
+    // closure tuple/frame allocations. This is the same shadow-stack shape as
+    // the forward-inline constructor in `inline_call.rs`; the resulting
+    // GC-managed FrameBox relinquishes only its host handle after the frontend
+    // op becomes its trace root.
+    let concrete_roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
+    pyre_object::gc_roots::pin_root(w_globals as pyre_object::PyObjectRef);
+    for (slot, &captured) in recipe.concrete_r[..stack_base].iter().enumerate() {
+        let value = match captured {
+            majit_ir::Value::Ref(gc) if gc != majit_ir::GcRef::NO_CONCRETE => {
+                if slot >= nlocals && gc.is_null() {
+                    return None;
+                }
+                gc.as_usize() as pyre_object::PyObjectRef
+            }
+            majit_ir::Value::Void => pyre_object::PY_NULL,
+            _ => return None,
+        };
+        pyre_object::gc_roots::pin_root(value);
+    }
+    let closure = if stack_base == nlocals {
+        pyre_object::PY_NULL
+    } else {
+        let cells = (nlocals..stack_base)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 2 + i))
+            .collect();
+        let closure = pyre_object::w_tuple_new(cells);
+        pyre_object::gc_roots::pin_root(closure);
+        closure
+    };
+    let closure_root = (stack_base != nlocals).then_some(root_base + 2 + stack_base);
+    let concrete_locals: Vec<pyre_object::PyObjectRef> = (0..nlocals)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 2 + i))
+        .collect();
+    let current_code = pyre_object::gc_roots::shadow_stack_get(root_base) as *const ();
+    let current_globals = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+    let current_closure = closure_root
+        .map(pyre_object::gc_roots::shadow_stack_get)
+        .unwrap_or(closure);
+    let mut concrete_frame = pyre_interpreter::pyframe::FrameBox::new(
+        pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
+            current_code,
+            &concrete_locals,
+            current_globals,
+            execution_context,
+            current_closure,
+            pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+        ),
+    );
+    let concrete_frame_ptr = concrete_frame.as_mut_ptr();
+    ctx.set_opref_concrete(
+        frame_vable,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
+    );
+    drop(concrete_frame);
+    drop(concrete_roots);
+
     let mut pending = assemble_bridge_inline_pending(ctx, recipe, execution_context, parent_frames);
     pending.sym.frame = frame_vable;
+    pending.sym.concrete_vable_ptr = concrete_frame_ptr as *mut u8;
     // The portal reds are [frame, ec], force-alive at every pc; a guard snapshot
     // (`collect_outer_active_boxes`) reads ec at portal_ec_reg via
     // `sym.execution_context`.  `assemble_bridge_inline_pending` only seeds it
