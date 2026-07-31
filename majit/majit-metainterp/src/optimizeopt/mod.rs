@@ -3094,7 +3094,6 @@ impl OptContext {
         short_args: &[OpRef],
         short_inputargs: &[OpRef],
         short_boxes: &[(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)],
-        short_box_const_values: &indexmap::IndexMap<OpRef, majit_ir::Value>,
         result_map: &indexmap::IndexMap<OpRef, OpRef>,
         mut imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
         exported_infos: &indexmap::IndexMap<
@@ -3221,7 +3220,6 @@ impl OptContext {
                 short_args,
                 produced_results,
                 imported_constants,
-                short_box_const_values,
             )
             .map(|cls| match cls {
                 crate::optimizeopt::ImportedShortPureArg::OpRef(r) => r,
@@ -3350,11 +3348,8 @@ impl OptContext {
                             };
                             // shortpreamble.py:81 `g.getarg(1).getint()`:
                             // pull the integer VALUE through the shared
-                            // `classify_short_arg` rule, which checks
-                            // `short_box_const_values` (producer snapshot)
-                            // first then the consumer ctx const pool.
-                            // `OpRef::raw()` is a tagged trace position —
-                            // not the constant integer value.
+                            // `classify_short_arg` rule. `OpRef::raw()` is a
+                            // tagged trace position — not the constant value.
                             let index_arg = produced_op.preamble_op.arg(1);
                             let index_opref = match resolve_arg(
                                 index_arg.to_opref(),

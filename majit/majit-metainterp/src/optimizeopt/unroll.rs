@@ -821,7 +821,6 @@ impl UnrollOptimizer {
                         exported_infos: indexmap::IndexMap::new(),
                         exported_short_boxes: Vec::new(),
                         short_boxes: Vec::new(),
-                        short_box_const_values: indexmap::IndexMap::new(),
                         short_preamble: None,
                         renamed_inputargs: state.renamed_inputargs.clone(),
                         short_inputargs: Vec::new(),
@@ -2055,28 +2054,6 @@ pub struct ExportedState {
     /// `exported_short_boxes + label_args + short_inputargs` at export time
     /// (`shortpreamble.py:269-270 ShortBoxes.create_short_boxes` parity).
     pub short_boxes: Vec<(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)>,
-    /// TODO: producer-side const value snapshot for any
-    /// const-namespace OpRef referenced by `short_boxes` op args. RPython
-    /// gets this for free because `Const` Box objects carry their value as
-    /// an attribute and persist across optimization phases. In majit, OpRef
-    /// is a flat trace-local index — `OpRef::from_const(N)` only resolves
-    /// to a value through `OptContext::const_pool[N]`, and consumer-side ctx
-    /// (Phase 2 / bridge) may not have the producer's slot N populated.
-    ///
-    /// The legacy `ExportedShortOp::Pure { args: Vec<ExportedShortArg> }`
-    /// path captured constant args inline as `ExportedShortArg::Const
-    /// { source, value }`. Phase B.1's polymorphic `ProducedShortOp::
-    /// produce_op` reads raw OpRef args, so we lift the value snapshot to
-    /// this sidecar map keyed by source OpRef. `produce_op` /
-    /// `classify_short_arg` (shortpreamble.rs) read this map first when
-    /// classifying a Const arg.
-    ///
-    /// Convergence path: this map disappears once consumer ctxs are
-    /// guaranteed to have producer constants pre-seeded (production
-    /// already does this at `optimizer.rs:1927`; bridges and unit tests
-    /// remain the open cases). At that point `classify_short_arg` can
-    /// read the box's `const_value()` exclusively.
-    pub short_box_const_values: indexmap::IndexMap<OpRef, majit_ir::Value>,
     /// Short preamble builder for bridge entry.
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
     /// Renamed inputargs from the preamble. Each OpRef is a typed
@@ -2168,8 +2145,6 @@ enum ExportedGcRefField {
     InfoPtrInfoConstant,
     /// virtual_state.state[index] = Constant(Value::Ref)
     VirtualStateConstantRef(usize),
-    /// short_box_const_values[OpRef] = Value::Ref(...)
-    ShortBoxConstValue(OpRef),
     /// `partial_trace_inputargs[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Constant(_)))`.
     /// PyPy `InputArg._forwarded` host (resoperation.py:700).
     PartialTraceInputArgInfoPtrInfoConstant(usize),
@@ -2218,7 +2193,6 @@ impl ExportedState {
             exported_infos,
             exported_short_boxes,
             short_boxes,
-            short_box_const_values: indexmap::IndexMap::new(),
             short_preamble: None,
             renamed_inputargs,
             short_inputargs,
@@ -2340,21 +2314,6 @@ impl ExportedState {
         for (key, produced) in &mut self.short_boxes {
             visit_opref(key, visitor);
             visit_produced_short_op(produced, visitor);
-        }
-        // The key stays an `OpRef`, not an `Operand` (unlike the migrated #108
-        // sites): this is a value-keyed const lookup, and an operand is ordered
-        // and compared by `Rc` identity (no `Ord`, `Eq` via `Rc::ptr_eq`), so
-        // two `ConstPtr` boxes carrying the same gcref would be distinct keys
-        // and the dedup the map relies on would break. `visit_opref` already
-        // forwards the key's inline gcref canonically, and `visit_value`
-        // forwards the stored `Value::Ref`, so the slot is GC-safe as-is.
-        // OpRef keys may carry GcRef values whose hash changes after
-        // forwarding; drain and reinsert to maintain index integrity.
-        let consts: Vec<_> = self.short_box_const_values.drain(..).collect();
-        for (mut key, mut value) in consts {
-            visit_opref(&mut key, visitor);
-            visit_value(&mut value, visitor);
-            self.short_box_const_values.insert(key, value);
         }
         if let Some(short_preamble) = self.short_preamble.as_mut() {
             short_preamble.walk_const_ptr_refs_mut(visitor);
@@ -2560,27 +2519,6 @@ impl ExportedState {
                 _ => {}
             }
         }
-        // RPython Const boxes are GC-traced objects. The Rust producer-side
-        // const snapshot must therefore root any Ref payload it carries.
-        let mut const_keys: Vec<OpRef> = self.short_box_const_values.keys().copied().collect();
-        const_keys.sort_by_key(|k| match k {
-            OpRef::ConstInt(v) => (1u8, *v as u64),
-            OpRef::ConstFloat(v) => (2u8, v.to_bits()),
-            OpRef::ConstPtr(v) => (3u8, v.0 as u64),
-            _ => (0u8, k.raw() as u64),
-        });
-        for key in const_keys {
-            if let Some(Value::Ref(gcref)) = self.short_box_const_values.get(&key)
-                && !gcref.is_null()
-            {
-                let ss_idx = majit_gc::shadow_stack::push(*gcref);
-                self.rooted_refs.push((
-                    Operand::None,
-                    ExportedGcRefField::ShortBoxConstValue(key),
-                    ss_idx,
-                ));
-            }
-        }
         // ── partial_trace `_forwarded` GcRef fields ──
         // `partial_trace.inputargs` / `partial_trace.operations`
         // (compile.py:362) keep every preamble-pass `AbstractValue`
@@ -2662,11 +2600,6 @@ impl ExportedState {
                             Value::Ref(updated),
                         ));
                         virtual_state_dirty = true;
-                    }
-                }
-                ExportedGcRefField::ShortBoxConstValue(source) => {
-                    if let Some(value) = self.short_box_const_values.get_mut(source) {
-                        *value = Value::Ref(updated);
                     }
                 }
                 ExportedGcRefField::PartialTraceInputArgInfoPtrInfoConstant(i) => {
@@ -2755,7 +2688,6 @@ impl Clone for ExportedState {
             exported_infos: self.exported_infos.clone(),
             exported_short_boxes: self.exported_short_boxes.clone(),
             short_boxes: self.short_boxes.clone(),
-            short_box_const_values: self.short_box_const_values.clone(),
             short_preamble: self.short_preamble.clone(),
             renamed_inputargs: self.renamed_inputargs.clone(),
             short_inputargs: self.short_inputargs.clone(),
@@ -3130,32 +3062,6 @@ impl OptUnroll {
             })
             .collect();
         state.partial_trace_operations = optimizer.phase1_emit_ops.clone();
-        // TODO: snapshot producer-side const values for
-        // any const-namespace OpRef referenced by `short_boxes` op args.
-        // Phase B.2 `ProducedShortOp::produce_op` reads raw OpRefs (not the
-        // legacy `ExportedShortArg::Const { source, value }` enum), so we
-        // capture the const value here for the consumer's
-        // `classify_short_arg` to find. Bridges and unit tests run with
-        // a consumer ctx that may not have the producer's const slot
-        // populated; without this snapshot, the import path silently
-        // skips the short op.
-        for (_, produced) in &state.short_boxes {
-            for arg in produced.preamble_op.getarglist().iter() {
-                if !arg.is_constant() {
-                    continue;
-                }
-                let arg = arg.to_opref();
-                if state.short_box_const_values.contains_key(&arg) {
-                    continue;
-                }
-                if let Some(value) = ctx
-                    .get_box_replacement_operand_opt(arg)
-                    .and_then(|cb| cb.const_value())
-                {
-                    state.short_box_const_values.insert(arg, value);
-                }
-            }
-        }
         state
     }
 
@@ -4293,7 +4199,6 @@ impl OptUnroll {
             &short_args,
             &exported_state.short_inputargs,
             &exported_state.short_boxes,
-            &exported_state.short_box_const_values,
             &result_map,
             &mut imported_constants,
             &exported_state.exported_infos,
@@ -4326,7 +4231,6 @@ impl OptUnroll {
                 &result_map,
                 &mut produced_results,
                 &mut imported_constants,
-                &exported_state.short_box_const_values,
             );
             debug_assert!(
                 produced_result.is_some()
@@ -6065,8 +5969,6 @@ mod tests {
             Operand::from_opref(old_ref),
             OpInfo::ptr(PtrInfo::Constant(old)),
         );
-        let mut short_box_const_values = indexmap::IndexMap::new();
-        short_box_const_values.insert(old_ref, Value::Ref(old));
         let mut constants = majit_ir::ConstMap::new();
         constants.insert(0, majit_ir::Const::Ref(old));
 
@@ -6103,7 +6005,6 @@ mod tests {
                 label_arg_idx: None,
             },
         ));
-        state.short_box_const_values = short_box_const_values;
         state.short_preamble = Some(ShortPreamble {
             ops: vec![ShortPreambleOp {
                 op: Op::new(OpCode::GuardNonnull, &[Operand::from_opref(old_ref)]),
@@ -6155,10 +6056,6 @@ mod tests {
         assert_eq!(
             produced.same_as_source.as_ref().map(|b| b.to_opref()),
             Some(new_ref)
-        );
-        assert_eq!(
-            state.short_box_const_values.get(&new_ref),
-            Some(&Value::Ref(new))
         );
         assert_eq!(
             state.patchguardop.as_ref().map(|op| op.arg(0).to_opref()),
