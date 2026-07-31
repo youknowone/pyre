@@ -1077,7 +1077,15 @@ impl GcRewriterImpl {
         // CALL_R helper (`malloc_big_fixedsize`) does it inside the
         // helper so `gen_malloc_fixedsize` does NOT call
         // `gen_initialize_tid` after the fact.
-        let obj_ref = match self.gen_malloc_nursery(size, op.pos.get(), st) {
+        // A descr marked `non_moving` declines the nursery the same way an
+        // oversized one does, and lands on the same helper: `gen_malloc_fixedsize`
+        // allocates in the old generation, which never moves an object.
+        let nursery_ref = if descr.non_moving() {
+            None
+        } else {
+            self.gen_malloc_nursery(size, op.pos.get(), st)
+        };
+        let obj_ref = match nursery_ref {
             Some(r) => {
                 self.gen_initialize_tid(r.clone(), type_id, st);
                 r
@@ -3297,6 +3305,7 @@ mod tests {
         vtable: usize,
         w_class: Option<i64>,
         headerless: bool,
+        non_moving: bool,
         gc_fields: Vec<Arc<dyn FieldDescr>>,
     }
 
@@ -3327,6 +3336,9 @@ mod tests {
         }
         fn headerless(&self) -> bool {
             self.headerless
+        }
+        fn non_moving(&self) -> bool {
+            self.non_moving
         }
         fn gc_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
             &self.gc_fields
@@ -3500,6 +3512,7 @@ mod tests {
             vtable: 0,
             w_class: None,
             headerless: false,
+            non_moving: false,
             gc_fields: Vec::new(),
         })
     }
@@ -3511,6 +3524,19 @@ mod tests {
             vtable: 0,
             w_class: None,
             headerless: true,
+            non_moving: false,
+            gc_fields: Vec::new(),
+        })
+    }
+
+    fn non_moving_size_descr(size: usize, type_id: u32) -> DescrRef {
+        Arc::new(TestSizeDescr {
+            size,
+            type_id,
+            vtable: 0,
+            w_class: None,
+            headerless: false,
+            non_moving: true,
             gc_fields: Vec::new(),
         })
     }
@@ -3526,6 +3552,7 @@ mod tests {
             vtable: 0,
             w_class: None,
             headerless: false,
+            non_moving: false,
             gc_fields,
         })
     }
@@ -3543,6 +3570,7 @@ mod tests {
             vtable,
             w_class,
             headerless: false,
+            non_moving: false,
             gc_fields,
         })
     }
@@ -3554,6 +3582,7 @@ mod tests {
             vtable,
             w_class: None,
             headerless: false,
+            non_moving: false,
             gc_fields: Vec::new(),
         })
     }
@@ -3652,6 +3681,50 @@ mod tests {
                  for each constant it mints"
             );
         }
+    }
+
+    /// A `non_moving` descr takes the `malloc_big_fixedsize` helper even at a
+    /// size the nursery would happily accept, so the object is born in the
+    /// non-moving old generation. The size the helper is handed is still the
+    /// headered total, and no separate `gen_initialize_tid` follows — the
+    /// helper stamps the tid itself.
+    #[test]
+    fn test_non_moving_new_declines_nursery_at_small_size() {
+        let rw = make_rewriter();
+        let payload_size = 32;
+        let type_id = 53;
+        let ops = vec![Op::with_descr(
+            OpCode::New,
+            &[],
+            non_moving_size_descr(payload_size, type_id),
+        )];
+
+        let (result, _constants, _gcrefs) =
+            rw.rewrite_for_gc_with_constants(&ops, &ConstMap::new());
+
+        assert!(
+            result.iter().all(|op| op.opcode != OpCode::CallMallocNursery),
+            "a non_moving descr must never reach the nursery bump path"
+        );
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::CallR);
+        assert_eq!(result[1].opcode, OpCode::CheckMemoryError);
+        assert_eq!(
+            result[0]
+                .arg(0)
+                .to_opref()
+                .inline_const_bits()
+                .expect("malloc_big_fixedsize fn const"),
+            TEST_MALLOC_BIG_FIXEDSIZE_FN
+        );
+        assert_eq!(
+            result[0]
+                .arg(1)
+                .to_opref()
+                .inline_const_bits()
+                .expect("headered total size const"),
+            round_up(payload_size + crate::header::GcHeader::SIZE) as i64
+        );
     }
 
     #[test]
