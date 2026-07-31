@@ -175,6 +175,11 @@ try:
 except AttributeError:
     _builtin_code_type = None
 
+# ``types.WrapperDescriptorType`` cannot name the slot-wrapper type here:
+# ``object.__init__`` is an ordinary method descriptor, so that alias resolves
+# to ``MethodDescriptorType``.  ``int.__pow__`` is a real slot wrapper.
+_slot_wrapper_type = type(int.__pow__)
+
 # Create constants for the compiler flags in Include/code.h
 # We try to get them from dis to avoid duplication
 mod_dict = globals()
@@ -197,7 +202,10 @@ def isclass(object):
 
 def ismethod(object):
     """Return true if the object is an instance method."""
-    return isinstance(object, types.MethodType)
+    if not isinstance(object, types.MethodType):
+        return False
+    func = object.__func__
+    return not isinstance(func, types.MethodDescriptorType)
 
 def ispackage(object):
     """Return true if the object is a package."""
@@ -218,7 +226,8 @@ def ismethoddescriptor(object):
     tests return false from the ismethoddescriptor() test, simply because
     the other tests promise more -- you can, e.g., count on having the
     __func__ attribute (etc) when an object passes ismethod()."""
-    if isclass(object) or ismethod(object) or isfunction(object):
+    if (isclass(object) or ismethod(object) or isfunction(object)
+            or isbuiltin(object) or ismethodwrapper(object)):
         # mutual exclusion
         return False
     tp = type(object)
@@ -290,7 +299,10 @@ def isfunction(object):
         __dict__        namespace which is supporting arbitrary function attributes
         __closure__     a tuple of cells or None
         __type_params__ tuple of type parameters"""
-    return isinstance(object, types.FunctionType)
+    if not isinstance(object, types.FunctionType):
+        return False
+    code = getattr(object, "__code__", None)
+    return not (_builtin_code_type and isinstance(code, _builtin_code_type))
 
 def _has_code_flag(f, flag):
     """Return true if ``f`` is a function (or a method or functools.partial
@@ -446,11 +458,26 @@ def isbuiltin(object):
         __doc__         documentation string
         __name__        original name of this function or method
         __self__        instance to which a method is bound, or None"""
-    return isinstance(object, types.BuiltinFunctionType)
+    if isinstance(object, types.BuiltinFunctionType):
+        # A bound slot dunder shares this type; it is a method wrapper, and
+        # the two predicates are mutually exclusive.
+        return not ismethodwrapper(object)
+    if isinstance(object, types.MethodType):
+        name = getattr(object.__func__, "__name__", "")
+        if name.startswith("__") and name.endswith("__"):
+            return False
+        func = object.__func__
+        return isinstance(func, types.MethodDescriptorType)
+    return False
 
 def ismethodwrapper(object):
     """Return true if the object is a method wrapper."""
-    return isinstance(object, types.MethodWrapperType)
+    if not isinstance(object, types.MethodWrapperType):
+        return False
+    func = getattr(object, "__func__", None)
+    name = getattr(func, "__name__", "")
+    return (name.startswith("__") and name.endswith("__")
+            and isinstance(func, types.MethodDescriptorType))
 
 def isroutine(object):
     """Return true if the object is any kind of function or method."""
@@ -1458,17 +1485,24 @@ def getcallargs(func, /, *positional, **named):
     possible_kwargs = set(args + kwonlyargs)
     if varkw:
         arg2value[varkw] = {}
+    unknown_kwargs = []
     for kw, value in named.items():
         if kw not in possible_kwargs:
             if not varkw:
-                raise TypeError("%s() got an unexpected keyword argument %r" %
-                                (f_name, kw))
+                # PyPy argument.py `_match_keywords` counts unknown names and
+                # reports ArgErrUnknownKwds only after the complete scan;
+                # a later duplicate positional value therefore wins.
+                unknown_kwargs.append(kw)
+                continue
             arg2value[varkw][kw] = value
             continue
         if kw in arg2value:
             raise TypeError("%s() got multiple values for argument %r" %
                             (f_name, kw))
         arg2value[kw] = value
+    if unknown_kwargs:
+        raise TypeError("%s() got an unexpected keyword argument %r" %
+                        (f_name, unknown_kwargs[0]))
     if num_pos > num_args and not varargs:
         _too_many(f_name, args, kwonlyargs, varargs, num_defaults,
                    num_pos, arg2value)
@@ -1929,7 +1963,7 @@ def _signature_get_user_defined_method(cls, method_name, *, follow_wrapper_chain
     # PYPY: the CPython callable-type gate is too broad here.  On PyPy and
     # pyre WrapperDescriptorType aliases FunctionType, MethodWrapperType
     # aliases MethodType, and ClassMethodDescriptorType aliases classmethod.
-    # Inspect the wrapped callable and its code object instead.
+    # Inspect the wrapped callable's concrete descriptor type instead.
     if meth is None:
         return None
     if meth in (type.__call__, type.__init__, type.__new__,
@@ -1939,14 +1973,18 @@ def _signature_get_user_defined_method(cls, method_name, *, follow_wrapper_chain
         inner = meth.__func__
     elif isinstance(meth, types.MethodType):
         inner = meth.__func__
+        if isinstance(inner, (types.MethodDescriptorType, _slot_wrapper_type)):
+            # Bound BuiltinMethodType / MethodWrapperType remain unsupported
+            # here.  A bare FunctionWithFixedCode method descriptor below is
+            # handled separately.
+            return None
     else:
         inner = meth
     if follow_wrapper_chains:
         inner = unwrap(inner, stop=lambda m: hasattr(m, "__signature__"))
     if isinstance(inner, types.BuiltinFunctionType):
         return None
-    code = getattr(inner, '__code__', None)
-    if _builtin_code_type and isinstance(code, _builtin_code_type):
+    if isinstance(inner, types.MethodDescriptorType):
         own_new = (method_name == '__new__' and
                    getattr(inner, '__objclass__', None) is cls)
         if not getattr(inner, '__text_signature__', None) or own_new:

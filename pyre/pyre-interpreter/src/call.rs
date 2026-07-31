@@ -703,12 +703,48 @@ fn raise_if_posonly_kwds(posonly_kwds: &[String], fname: &str) -> Result<(), PyE
     )))
 }
 
-fn call_user_function_with_eval(
+/// Materialize a Python call frame without retaining the by-value `PyFrame`
+/// construction temporary while that frame executes recursively.
+///
+/// RPython allocates `PyFrame` as a GC object before `execute_frame`; the
+/// allocation graph has returned when the recursive interpreter graph runs.
+/// Keeping Rust's large `Result<PyFrame, _>` temporary in the executor's
+/// native frame multiplies stack use at every Python call, so preserve the
+/// same graph boundary explicitly.
+#[inline(never)]
+fn make_user_call_frame(
+    w_code: *const (),
+    args: &[PyObjectRef],
+    w_globals: PyObjectRef,
+    execution_context: *const crate::PyExecutionContext,
+    closure: PyObjectRef,
+) -> Result<crate::pyframe::FrameBox, crate::PyError> {
+    let frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        w_code,
+        args,
+        w_globals,
+        execution_context,
+        closure,
+        crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+    )?;
+    Ok(crate::pyframe::FrameBox::new(frame))
+}
+
+enum PreparedUserCall {
+    Frame(crate::pyframe::FrameBox),
+    Generator(PyObjectRef),
+}
+
+/// PyPy `Function.funccall` prepares arguments and allocates the callee frame
+/// before entering `PyFrame.execute_frame`.  Keep that preparation in its own
+/// native graph as well: none of its argument-matching or frame-construction
+/// temporaries are live while the recursive evaluator runs.
+#[inline(never)]
+fn prepare_user_call(
     frame: &PyFrame,
     callable: PyObjectRef,
     args: &[PyObjectRef],
-    eval_fn: EvalFn,
-) -> PyResult {
+) -> Result<PreparedUserCall, crate::PyError> {
     let w_code = unsafe { crate::getcode(callable) };
     let w_globals = unsafe { function_get_globals_obj(callable) };
     let closure = unsafe { function_get_closure(callable) };
@@ -717,32 +753,31 @@ fn call_user_function_with_eval(
     };
     let code_ref = unsafe { &*func_code };
     let final_args = fill_user_function_args(callable, code_ref, args)?;
+    let func_frame = make_user_call_frame(
+        w_code,
+        &final_args,
+        w_globals,
+        frame.execution_context,
+        closure,
+    )?;
 
-    // Generator function: create generator object instead of executing.
-    // PyPy: generator.py GeneratorIterator.__init__ wraps PyFrame.
-    // RustPython compiler uses CodeFlags::GENERATOR instead of RETURN_GENERATOR opcode.
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        let gen_frame =
-            crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                w_code,
-                &final_args,
-                w_globals,
-                frame.execution_context,
-                closure,
-                crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
-            )?);
-        return frame_into_generator_for_function(gen_frame, callable);
+        return frame_into_generator_for_function(func_frame, callable)
+            .map(PreparedUserCall::Generator);
     }
+    Ok(PreparedUserCall::Frame(func_frame))
+}
 
-    let mut func_frame =
-        crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code,
-            &final_args,
-            w_globals,
-            frame.execution_context,
-            closure,
-            crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
-        )?);
+fn call_user_function_with_eval(
+    frame: &PyFrame,
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+    eval_fn: EvalFn,
+) -> PyResult {
+    let mut func_frame = match prepare_user_call(frame, callable, args)? {
+        PreparedUserCall::Frame(func_frame) => func_frame,
+        PreparedUserCall::Generator(generator) => return Ok(generator),
+    };
     func_frame.fix_array_ptrs();
     let _caller_locals_root = FrameLocalsRoot::new(frame);
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
@@ -913,6 +948,56 @@ enum CallMode {
 
 pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
     call_callable_with_mode(frame, callable, args, CallMode::Jit)
+}
+
+/// Function/_BuiltinFunction leaf of ObjSpace call dispatch.
+///
+/// PyPy does not recursively feed a bound `_Method` back through the generic
+/// callable dispatcher.  `Method.call_args` delegates to
+/// `space.call_obj_args`, whose Function fast path calls the function
+/// directly (`baseobjspace.py:1204-1211`).  Keeping this leaf separate lets
+/// the method arm below preserve that shape instead of retaining a second
+/// large generic-dispatch Rust frame for every Python method call.
+fn call_function_carrier_with_mode(
+    frame: &mut PyFrame,
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+    mode: CallMode,
+) -> PyResult {
+    let frame_ptr = frame as *mut PyFrame;
+    match classify_callable(callable)? {
+        CallableKind::Builtin => {
+            // baseobjspace.py:1243 — `if frame.get_is_being_profiled() and
+            // is_builtin_code(w_func): ... return self.call_args_and_c_profile(...)`
+            // The `is_builtin_code(w_func)` check is structurally implicit
+            // here: `classify_callable` already selected the builtin arm
+            // (`runtime_ops.rs`: `if is_builtin_code(code) { Builtin }`),
+            // so reaching this closure means the callable is a builtin.
+            // The remaining condition is the per-frame profile flag, set
+            // by `ec.call_trace` (executioncontext.py:150) on frame entry
+            // and cleared by `_c_call_return_trace` when profilefunc was
+            // turned off (executioncontext.py:122-123).
+            let profile_active = unsafe { (*frame_ptr).get_is_being_profiled() };
+            if profile_active {
+                let w_res = crate::baseobjspace::call_args_and_c_profile(
+                    unsafe { &mut *frame_ptr },
+                    callable,
+                    args,
+                );
+                if w_res == pyre_object::PY_NULL {
+                    return Err(take_call_error()
+                        .unwrap_or_else(|| crate::PyError::value_error("call failed")));
+                }
+                return Ok(w_res);
+            }
+            let code = unsafe { crate::getcode(callable) };
+            call_builtin_code_positional(code as pyre_object::PyObjectRef, args)
+        }
+        CallableKind::User => match mode {
+            CallMode::Jit => call_user_function(frame, callable, args),
+            CallMode::Plain => call_user_function_plain(frame, callable, args),
+        },
+    }
 }
 
 /// CALL_FUNCTION_EX helper — unpack `starargs`, merge the `**` mapping, and
@@ -1301,7 +1386,7 @@ fn staticmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRe
 /// an instance of a user-defined class — including one deriving from a builtin
 /// type, where `class C(int)` carries its `__call__` on the type just as a
 /// plain `class C` does.
-fn user_call_slot(callable: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+fn user_call_slot(callable: PyObjectRef) -> Result<Option<(PyObjectRef, bool)>, PyError> {
     let Some(w_type) = crate::typedef::r#type(callable) else {
         return Ok(None);
     };
@@ -1316,45 +1401,39 @@ fn user_call_slot(callable: PyObjectRef) -> Result<Option<PyObjectRef>, PyError>
     // recurse natively.  The interpreter-level check turns that into
     // RecursionError instead of exhausting the machine stack.
     crate::stack_check::stack_check()?;
-    Ok(Some(call_fn))
-}
-
-/// Resolve a `__call__` slot descriptor to the object to actually call and
-/// whether `callable` must be prepended as an implicit self.
-///
-/// descroperation.py `get_and_call_args` / `get_and_call_function`: only a
-/// plain function or method descriptor binds `callable` as self.  Every other
-/// `__call__` descriptor is resolved through `__get__` (a non-binding builtin
-/// lacks it and is used as-is) and then called WITHOUT a prepended self — "a
-/// builtin function binds differently than a normal function".
-fn resolve_user_call_slot(
-    callable: PyObjectRef,
-    call_fn: PyObjectRef,
-) -> Result<(PyObjectRef, bool), PyError> {
-    let binds_self = unsafe {
-        std::ptr::eq((*call_fn).ob_type, &crate::FUNCTION_TYPE as *const _)
-            || std::ptr::eq(
-                (*call_fn).ob_type,
-                &crate::METHOD_DESCRIPTOR_TYPE as *const _,
-            )
-    };
-    if binds_self {
-        return Ok((call_fn, true));
+    // descroperation.py:161-167 `get_and_call_args` — the rule `call_args`
+    // uses for `__call__`: `isinstance(w_descr, Function)`, so a builtin
+    // function and a fixed-code function take it too.  Such a descriptor
+    // takes the object directly as its first positional argument; every other
+    // one is bound through `space.get` and then called without an extra
+    // receiver. The bool tells all call entrypoints which of the two applies.
+    // (`get_and_call_function`'s narrower `type(w_descr) is Function` test is
+    // for the *other* entrypoint and must not be used here.)
+    if unsafe { crate::is_function(call_fn) } {
+        return Ok(Some((call_fn, true)));
     }
-    let w_impl = match crate::typedef::r#type(callable) {
-        Some(w_type) => unsafe { crate::baseobjspace::get(call_fn, callable, w_type.as_ptr()) }?
-            .unwrap_or(call_fn),
-        None => call_fn,
-    };
-    Ok((w_impl, false))
+    let bound = unsafe { crate::baseobjspace::get(call_fn, callable, w_type) }?.unwrap_or(call_fn);
+    Ok(Some((bound, false)))
 }
 
+/// baseobjspace.py `call_valuestack` / `call_obj_args` speedhack boundary.
+///
+/// Keep this wrapper small so exact Functions and bound Methods never enter
+/// (and therefore never reserve the native stack frame of) the generic
+/// descriptor/type dispatcher below.
+#[inline(always)]
 fn call_callable_with_mode(
     frame: &mut PyFrame,
     callable: PyObjectRef,
     args: &[PyObjectRef],
     mode: CallMode,
 ) -> PyResult {
+    // baseobjspace.py:1241-1242 `call_valuestack`: Function is the primary
+    // speedhack and calls `funccall_valuestack` directly.  Do not retain the
+    // generic descriptor/type dispatcher across every Python frame.
+    if unsafe { crate::is_function_carrier(callable) } {
+        return call_function_carrier_with_mode(frame, callable, args, mode);
+    }
     if unsafe { pyre_object::is_method(callable) } {
         let func = unsafe { pyre_object::w_method_get_func(callable) };
         let receiver = unsafe {
@@ -1370,8 +1449,24 @@ fn call_callable_with_mode(
             call_args.push(receiver);
         }
         call_args.extend_from_slice(args);
+        if unsafe { crate::is_function_carrier(func) } {
+            // function.py `_Method.call_args` -> baseobjspace.py
+            // `call_obj_args`: exact Function/BuiltinFunction carriers skip a
+            // second generic callable dispatch.
+            return call_function_carrier_with_mode(frame, func, &call_args, mode);
+        }
         return call_callable_with_mode(frame, func, &call_args, mode);
     }
+    call_non_function_callable_with_mode(frame, callable, args, mode)
+}
+
+#[inline(never)]
+fn call_non_function_callable_with_mode(
+    frame: &mut PyFrame,
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+    mode: CallMode,
+) -> PyResult {
     if unsafe { pyre_object::is_type(callable) } {
         if let Some(bound) = metaclass_call_override(callable) {
             return call_callable_with_mode(frame, bound, args, mode);
@@ -1394,13 +1489,28 @@ fn call_callable_with_mode(
     // The base ClassMethod defines no descr_call (function.py), so a raw
     // classmethod object falls through to the not-callable error.
 
-    if let Some(call_fn) = user_call_slot(callable)? {
-        let (target, prepend) = resolve_user_call_slot(callable, call_fn)?;
-        if prepend {
-            let mut call_args = Vec::with_capacity(1 + args.len());
-            call_args.push(callable);
-            call_args.extend_from_slice(args);
-            return call_callable_with_mode(frame, target, &call_args, mode);
+    // descroperation.py `descr__call__` keeps both `w_obj` and `Arguments`
+    // live while binding a non-Function `__call__` descriptor.  `space.get`
+    // may execute arbitrary Python and move every nursery argument, so mirror
+    // the translated shadow-stack roots and reload them after binding.
+    let _user_call_roots = pyre_object::gc_roots::push_roots();
+    let user_call_root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(callable);
+    for &arg in args {
+        pyre_object::gc_roots::pin_root(arg);
+    }
+    if let Some((call_fn, prepend_receiver)) =
+        user_call_slot(pyre_object::gc_roots::shadow_stack_get(user_call_root_base))?
+    {
+        let current_callable = pyre_object::gc_roots::shadow_stack_get(user_call_root_base);
+        let current_args: Vec<PyObjectRef> = (0..args.len())
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(user_call_root_base + 1 + i))
+            .collect();
+        if prepend_receiver {
+            let mut call_args = Vec::with_capacity(1 + current_args.len());
+            call_args.push(current_callable);
+            call_args.extend_from_slice(&current_args);
+            return call_callable_with_mode(frame, call_fn, &call_args, mode);
         }
         // `user_call_slot`'s stack_check bounds a self-referential
         // `A.__call__ = A()` chain only while this self-dispatch recurses
@@ -1408,7 +1518,7 @@ fn call_callable_with_mode(
         // dropping only after the call returns, keeps it off the tail so LLVM
         // cannot rewrite the self-call into a loop that never grows the stack.
         let _depth_guard = enter_native_dispatch();
-        return call_callable_with_mode(frame, target, args, mode);
+        return call_callable_with_mode(frame, call_fn, &current_args, mode);
     }
 
     // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
@@ -1421,39 +1531,7 @@ fn call_callable_with_mode(
         return Ok(result);
     }
 
-    let frame_ptr = frame as *mut PyFrame;
-    match classify_callable(callable)? {
-        CallableKind::Builtin => {
-            // baseobjspace.py:1243 — `if frame.get_is_being_profiled() and
-            // is_builtin_code(w_func): ... return self.call_args_and_c_profile(...)`
-            // The `is_builtin_code(w_func)` check is structurally implicit
-            // here: `classify_callable` already answered `Builtin`, so
-            // reaching this arm means the callable is one.  The remaining
-            // condition is the per-frame profile flag, set by `ec.call_trace`
-            // (executioncontext.py:150) on frame entry and cleared by
-            // `_c_call_return_trace` when profilefunc was turned off
-            // (executioncontext.py:122-123).
-            let profile_active = unsafe { (*frame_ptr).get_is_being_profiled() };
-            if profile_active {
-                let w_res = crate::baseobjspace::call_args_and_c_profile(
-                    unsafe { &mut *frame_ptr },
-                    callable,
-                    args,
-                );
-                if w_res == pyre_object::PY_NULL {
-                    return Err(take_call_error()
-                        .unwrap_or_else(|| crate::PyError::value_error("call failed")));
-                }
-                return Ok(w_res);
-            }
-            let code = unsafe { crate::getcode(callable) };
-            call_builtin_code_positional(code as pyre_object::PyObjectRef, args)
-        }
-        CallableKind::User => match mode {
-            CallMode::Jit => call_user_function(frame, callable, args),
-            CallMode::Plain => call_user_function_plain(frame, callable, args),
-        },
-    }
+    call_function_carrier_with_mode(frame, callable, args, mode)
 }
 
 pub fn call_user_function(
@@ -2088,6 +2166,25 @@ pub fn call_with_kwargs(
     pos_args: &[PyObjectRef],
     kwargs: &[(Wtf8Buf, PyObjectRef)],
 ) -> PyResult {
+    // RPython's `Arguments` is GC-traced for the whole call. Mirror the GC
+    // transform explicitly: keyword binding below allocates tuples, dicts,
+    // and keyword-name strings before the callee frame owns these values.
+    let _call_roots = pyre_object::gc_roots::push_roots();
+    let call_root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(callable);
+    for &arg in pos_args {
+        pyre_object::gc_roots::pin_root(arg);
+    }
+    for (_, value) in kwargs {
+        pyre_object::gc_roots::pin_root(*value);
+    }
+    let current_callable = || pyre_object::gc_roots::shadow_stack_get(call_root_base);
+    let current_pos_arg =
+        |index: usize| pyre_object::gc_roots::shadow_stack_get(call_root_base + 1 + index);
+    let current_kwarg = |index: usize| {
+        pyre_object::gc_roots::shadow_stack_get(call_root_base + 1 + pos_args.len() + index)
+    };
+
     // function.py:712-713 StaticMethod.descr_call — the wrapper contributes
     // no implicit argument; forward the original positional and keyword
     // collections unchanged to its w_function.
@@ -2288,7 +2385,7 @@ pub fn call_with_kwargs(
 
         // For user functions: resolve kwargs to parameter slots
         {
-            let w_code = unsafe { crate::getcode(callable) };
+            let w_code = unsafe { crate::getcode(current_callable()) };
             let code = unsafe {
                 &*(crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
                     as *const crate::CodeObject)
@@ -2297,7 +2394,7 @@ pub fn call_with_kwargs(
             let n_pos_params = code.arg_count as usize;
             let has_varkw = code.flags.contains(crate::CodeFlags::VARKEYWORDS);
             let has_varargs = code.flags.contains(crate::CodeFlags::VARARGS);
-            let fname = unsafe { crate::function_get_qualname(callable) };
+            let fname = unsafe { crate::function_get_qualname(current_callable()) };
 
             // `argument.py:235-236` — flag too-many positional args with no
             // *vararg; the error is raised after keyword matching
@@ -2310,7 +2407,7 @@ pub fn call_with_kwargs(
             // Fill positional args — bound at `n_pos_params` so excess
             // positionals don't spill into kwonly slots.
             for i in 0..pos_args.len().min(n_pos_params) {
-                result[i] = pos_args[i];
+                result[i] = current_pos_arg(i);
             }
             // Match keywords to parameter names
             let posonly = code.posonlyarg_count as usize;
@@ -2319,7 +2416,8 @@ pub fn call_with_kwargs(
             // argument.py:469,481-484 — collected across the whole loop,
             // reported together instead of raising on the first violation.
             let mut posonly_kwds: Vec<String> = Vec::new();
-            for (key, value) in kwargs {
+            for (kw_index, (key, _value)) in kwargs.iter().enumerate() {
+                let value = current_kwarg(kw_index);
                 // A lone-surrogate keyword name never equals a source-level
                 // parameter name; it falls to **kwargs or the error below.
                 let key_str = key.as_str().ok();
@@ -2346,14 +2444,14 @@ pub fn call_with_kwargs(
                                 fname, key
                             )));
                         }
-                        result[pi] = *value;
+                        result[pi] = value;
                         matched = true;
                         break;
                     }
                 }
                 if !matched {
                     if has_varkw {
-                        extra_kwargs.push((key.clone(), *value));
+                        extra_kwargs.push((key.clone(), value));
                     } else {
                         unmatched_kw_names.push(key.clone());
                     }
@@ -2374,7 +2472,7 @@ pub fn call_with_kwargs(
             // keyword-matching errors above.
             if too_many_args {
                 let ndefaults = {
-                    let defaults = unsafe { crate::function_get_defaults(callable) };
+                    let defaults = unsafe { crate::function_get_defaults(current_callable()) };
                     if !defaults.is_null() {
                         if unsafe { pyre_object::is_tuple(defaults) } {
                             unsafe { pyre_object::w_tuple_len(defaults) }
@@ -2410,7 +2508,7 @@ pub fn call_with_kwargs(
             }
 
             // Fill positional defaults from __defaults__ tuple.
-            let defaults = unsafe { crate::function_get_defaults(callable) };
+            let defaults = unsafe { crate::function_get_defaults(current_callable()) };
             if !defaults.is_null() {
                 if unsafe { pyre_object::is_tuple(defaults) } {
                     let ndefaults = unsafe { pyre_object::w_tuple_len(defaults) };
@@ -2432,7 +2530,7 @@ pub fn call_with_kwargs(
             // defaults from the kwdefaults dict by name lookup.
             let nkwonly = code.kwonlyarg_count as usize;
             if nkwonly > 0 {
-                let kwdefaults = unsafe { crate::function_get_kwdefaults(callable) };
+                let kwdefaults = unsafe { crate::function_get_kwdefaults(current_callable()) };
                 if !kwdefaults.is_null() && unsafe { pyre_object::is_dict(kwdefaults) } {
                     for ki in 0..nkwonly {
                         let slot = n_pos_params + ki;
@@ -2477,36 +2575,56 @@ pub fn call_with_kwargs(
                 )));
             }
 
-            // Pack *args and **kwargs
-            let mut final_args = result;
+            // Keep the matched parameter array live while packing *args and
+            // **kwargs: both allocations can relocate values already copied
+            // into `result`.
+            let _bound_roots = pyre_object::gc_roots::push_roots();
+            let bound_root_base = pyre_object::gc_roots::shadow_stack_len();
+            for &value in &result {
+                pyre_object::gc_roots::pin_root(value);
+            }
+            let mut packed_tail_slots = Vec::new();
             if has_varargs {
                 let extra_pos: Vec<PyObjectRef> = if pos_args.len() > n_pos_params {
-                    pos_args[n_pos_params..].to_vec()
+                    (n_pos_params..pos_args.len())
+                        .map(current_pos_arg)
+                        .collect()
                 } else {
                     vec![]
                 };
-                final_args.push(pyre_object::w_tuple_new(extra_pos));
+                let packed = pyre_object::w_tuple_new(extra_pos);
+                let slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(packed);
+                packed_tail_slots.push(slot);
             }
             if has_varkw {
                 let kw_dict = pyre_object::w_dict_new();
-                // See the kwargs-packing note above: born old-stable keys plus a
-                // straight-line native loop mean no safepoint separates a key's
-                // allocation from its install, so no shadow-stack pin is needed.
+                let kw_dict_slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(kw_dict);
                 for (key, value) in &extra_kwargs {
                     unsafe {
                         pyre_object::w_dict_store(
-                            kw_dict,
+                            pyre_object::gc_roots::shadow_stack_get(kw_dict_slot),
                             pyre_object::w_str_from_wtf8_managed(key.clone()),
-                            *value,
+                            pyre_object::gc_hook::try_gc_current_object_address(*value as *mut u8)
+                                as PyObjectRef,
                         );
                     }
                 }
-                final_args.push(kw_dict);
+                packed_tail_slots.push(kw_dict_slot);
             }
+            let mut final_args: Vec<PyObjectRef> = (0..result.len())
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(bound_root_base + i))
+                .collect();
+            final_args.extend(
+                packed_tail_slots
+                    .iter()
+                    .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot)),
+            );
 
             // Create frame and execute
-            let w_globals = unsafe { function_get_globals_obj(callable) };
-            let closure = unsafe { function_get_closure(callable) };
+            let w_globals = unsafe { function_get_globals_obj(current_callable()) };
+            let closure = unsafe { function_get_closure(current_callable()) };
             let mut func_frame = crate::pyframe::FrameBox::new(
                 crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
                     w_code,
@@ -2525,7 +2643,7 @@ pub fn call_with_kwargs(
             // `func(*args, **kwds)` from `contextlib.contextmanager`) would
             // execute eagerly and surface the first yielded value.
             if crate::pyframe::code_flags_make_generator(code.flags) {
-                return frame_into_generator_for_function(func_frame, callable);
+                return frame_into_generator_for_function(func_frame, current_callable());
             }
             let plain_mode = FORCE_PLAIN_EVAL.with(|c| c.get() > 0);
             let eval_fn = if plain_mode {
@@ -2543,6 +2661,14 @@ pub fn call_with_kwargs(
     // For type objects: allocate via __new__ then call __init__ with kwargs.
     // PyPy: typeobject.py descr_call → __new__ + __init__
     if unsafe { pyre_object::is_type(callable) } {
+        // `typeobject.py::descr_call` keeps `self` live across the arbitrary
+        // Python call to `__new__`.  The translated RPython GC transform
+        // reloads it from the shadow stack afterwards; a Rust local would
+        // otherwise retain the pre-move address of a heap type.
+        let _type_root = pyre_object::gc_roots::push_roots();
+        let type_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(callable);
+        let current_type = || pyre_object::gc_roots::shadow_stack_get(type_slot);
         // Types with acceptable_as_base_class=false (bool, NoneType) reject kwargs.
         // PyPy: boolobject.py descr_new uses @unwrap_spec (positional only).
         // The `function`, `memoryview`, and deque iterator types are
@@ -2550,45 +2676,57 @@ pub fn call_with_kwargs(
         // keywords: FunctionType has `kwdefaults=...`, CPython 3.14 exposes
         // `memoryview(object=...)`, and the deque iterator constructors accept
         // (and ignore) `index=...`.  Route them through `__new__`.
-        let accepts_keywords_despite_nonbase =
-            std::ptr::eq(
-                callable,
-                crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
-            ) || std::ptr::eq(
-                callable,
-                crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
-            ) || std::ptr::eq(
-                callable,
-                crate::module::_collections::deque_iter::public_type(),
-            ) || std::ptr::eq(
-                callable,
-                crate::module::_collections::deque_rev_iter::public_type(),
-            ) || std::ptr::eq(callable, crate::module::_contextvars::context_var_type());
+        let accepts_keywords_despite_nonbase = std::ptr::eq(
+            current_type(),
+            crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
+        ) || std::ptr::eq(
+            current_type(),
+            crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
+        ) || std::ptr::eq(
+            current_type(),
+            crate::module::_collections::deque_iter::public_type(),
+        ) || std::ptr::eq(
+            current_type(),
+            crate::module::_collections::deque_rev_iter::public_type(),
+        ) || std::ptr::eq(
+            current_type(),
+            crate::module::_contextvars::context_var_type(),
+        );
         if !kwargs.is_empty()
             && !accepts_keywords_despite_nonbase
-            && !unsafe { pyre_object::w_type_get_acceptable_as_base_class(callable) }
+            && !unsafe { pyre_object::w_type_get_acceptable_as_base_class(current_type()) }
         {
-            let type_name = unsafe { pyre_object::w_type_get_name(callable) };
+            let type_name = unsafe { pyre_object::w_type_get_name(current_type()) };
             return Err(crate::PyError::type_error(format!(
                 "{}() takes no keyword arguments",
                 type_name,
             )));
         }
-        // Calculate the winning metaclass from bases.
-        // type(name, bases, dict, **kw) needs to find the correct metaclass
-        // and call its __new__ with the kwargs.
-        let w_metaclass = if pos_args.len() >= 2 && unsafe { pyre_object::is_tuple(pos_args[1]) } {
-            calculate_metaclass(callable, pos_args[1]).unwrap_or(callable)
+        // Three-argument `type(name, bases, namespace, **kw)` must select the
+        // winning metaclass.  Keep the check at the actual type-construction
+        // shape: the former `len >= 2 && args[1] is tuple` condition also
+        // captured ordinary constructors such as
+        // `_GenericAlias(origin, args, **kw)`.
+        let w_metaclass = if pos_args.len() >= 3
+            && unsafe { pyre_object::is_str(pos_args[0]) }
+            && unsafe { pyre_object::is_tuple(pos_args[1]) }
+        {
+            calculate_metaclass(current_type(), pos_args[1]).unwrap_or(current_type())
         } else {
-            callable
+            current_type()
         };
+        let metaclass_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_metaclass);
+        let current_metaclass = || pyre_object::gc_roots::shadow_stack_get(metaclass_slot);
         // Step 1: __new__(cls, *args, **kwargs)
         let instance = if let Some(new_fn) =
-            unsafe { crate::baseobjspace::lookup_in_type(w_metaclass, "__new__") }
+            unsafe { crate::baseobjspace::lookup_in_type(current_metaclass(), "__new__") }
         {
             let new_fn = unsafe { unwrap_static_new(new_fn) };
             let mut new_args = Vec::with_capacity(1 + pos_args.len());
-            new_args.push(w_metaclass);
+            // `lookup_in_type` interns its name and can collect; reload the
+            // winning metaclass rather than retaining its pre-lookup address.
+            new_args.push(current_metaclass());
             new_args.extend_from_slice(pos_args);
             if unsafe { crate::is_function(new_fn) } && !kwargs.is_empty() {
                 call_with_kwargs(frame, new_fn, &new_args, kwargs)?
@@ -2596,7 +2734,7 @@ pub fn call_with_kwargs(
                 call_callable(frame, new_fn, &new_args)?
             }
         } else {
-            pyre_object::w_instance_new(callable)
+            pyre_object::w_instance_new(current_type())
         };
         // `instance` is a movable nursery object held only as a Rust local
         // across the `__init__` dispatch below, which runs arbitrary
@@ -2609,18 +2747,35 @@ pub fn call_with_kwargs(
         let instance_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(instance);
         // Step 2: __init__(self, *args, **kwargs) with full kwargs support.
-        if let Some(w_insttype) = type_call_init_type(instance, callable)
-            && !type_call_type_x_shortcut(callable, pos_args.len(), kwargs.is_empty())
-            && let Some(init_fn) =
+        if let Some(w_insttype) = type_call_init_type(
+            pyre_object::gc_roots::shadow_stack_get(instance_slot),
+            current_type(),
+        ) && !type_call_type_x_shortcut(current_type(), pos_args.len(), kwargs.is_empty())
+            && let Some(init_descr) =
                 unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
         {
-            let mut init_args = Vec::with_capacity(1 + pos_args.len());
-            init_args.push(instance);
-            init_args.extend_from_slice(pos_args);
-            let init_result = if unsafe { crate::is_function(init_fn) } && !kwargs.is_empty() {
-                call_with_kwargs(frame, init_fn, &init_args, kwargs)?
+            // typeobject.py:737-740 `space.get_and_call_args`: exact
+            // Function takes the instance explicitly; every other descriptor
+            // binds itself and receives only the original constructor args.
+            let init_result = if unsafe { crate::is_function(init_descr) } {
+                let mut init_args = Vec::with_capacity(1 + pos_args.len());
+                // The `__new__` result is a movable nursery object. Reload
+                // the pointer rooted immediately above instead of retaining
+                // the pre-collection Rust local across argument binding and
+                // descriptor dispatch.
+                init_args.push(pyre_object::gc_roots::shadow_stack_get(instance_slot));
+                init_args.extend_from_slice(pos_args);
+                call_with_kwargs(frame, init_descr, &init_args, kwargs)?
             } else {
-                call_callable(frame, init_fn, &init_args)?
+                let init_fn = unsafe {
+                    crate::baseobjspace::get(
+                        init_descr,
+                        pyre_object::gc_roots::shadow_stack_get(instance_slot),
+                        w_insttype,
+                    )?
+                }
+                .unwrap_or(init_descr);
+                call_with_kwargs(frame, init_fn, pos_args, kwargs)?
             };
             check_init_returned_none(init_result)?;
         }
@@ -2639,19 +2794,27 @@ pub fn call_with_kwargs(
         return call_with_kwargs(frame, func, &full_args, kwargs);
     }
 
-    if let Some(call_fn) = user_call_slot(callable)? {
-        let (target, prepend) = resolve_user_call_slot(callable, call_fn)?;
-        if prepend {
-            let mut call_args = Vec::with_capacity(1 + pos_args.len());
-            call_args.push(callable);
-            call_args.extend_from_slice(pos_args);
-            return call_with_kwargs(frame, target, &call_args, kwargs);
+    if let Some((call_fn, prepend_receiver)) = user_call_slot(current_callable())? {
+        // `user_call_slot` may run a descriptor and collect.  Rebuild the
+        // Arguments view from the roots installed at function entry instead
+        // of forwarding the stale incoming slices.
+        let current_pos_args: Vec<PyObjectRef> = (0..pos_args.len()).map(current_pos_arg).collect();
+        let current_kwargs: Vec<(Wtf8Buf, PyObjectRef)> = kwargs
+            .iter()
+            .enumerate()
+            .map(|(index, (name, _))| (name.clone(), current_kwarg(index)))
+            .collect();
+        if prepend_receiver {
+            let mut call_args = Vec::with_capacity(1 + current_pos_args.len());
+            call_args.push(current_callable());
+            call_args.extend_from_slice(&current_pos_args);
+            return call_with_kwargs(frame, call_fn, &call_args, &current_kwargs);
         }
         // Depth guard: count this dispatch level and, dropping after the call,
         // keep it off the tail so a self-referential `A.__call__ = A()`
         // recurses natively for stack_check (see call_callable_with_mode).
         let _depth_guard = enter_native_dispatch();
-        return call_with_kwargs(frame, target, pos_args, kwargs);
+        return call_with_kwargs(frame, call_fn, &current_pos_args, &current_kwargs);
     }
 
     // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
@@ -2854,19 +3017,27 @@ pub fn call_function_impl_result(
             set_orig_class(result, callable)?;
             return Ok(result);
         }
-        if let Some(call_fn) = user_call_slot(callable)? {
-            let (target, prepend) = resolve_user_call_slot(callable, call_fn)?;
-            if prepend {
-                let mut call_args = Vec::with_capacity(1 + args.len());
-                call_args.push(callable);
-                call_args.extend_from_slice(args);
-                return call_function_impl_result(target, &call_args);
+        if let Some((call_fn, prepend_receiver)) =
+            user_call_slot(pyre_object::gc_roots::shadow_stack_get(root_base))?
+        {
+            // Binding a custom descriptor can collect.  The entry roots above
+            // have been updated to forwarded addresses; reconstruct the
+            // argument view before recursively dispatching the bound call.
+            let current_callable = pyre_object::gc_roots::shadow_stack_get(root_base);
+            let current_args: Vec<PyObjectRef> = (0..args.len())
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i))
+                .collect();
+            if prepend_receiver {
+                let mut call_args = Vec::with_capacity(1 + current_args.len());
+                call_args.push(current_callable);
+                call_args.extend_from_slice(&current_args);
+                return call_function_impl_result(call_fn, &call_args);
             }
             // Depth guard: count this dispatch level and, dropping after the
             // call, keep it off the tail so a self-referential
             // `A.__call__ = A()` recurses natively for stack_check.
             let _depth_guard = enter_native_dispatch();
-            return call_function_impl_result(target, args);
+            return call_function_impl_result(call_fn, &current_args);
         }
     }
     let type_name = crate::typedef::r#type(callable)
@@ -3519,6 +3690,10 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     // inference; record the original bases for __orig_bases__ when changed.
     let w_orig_bases = pyre_object::w_tuple_new(base_args.to_vec());
     let (resolved_bases, bases_changed) = update_bases(base_args, w_orig_bases)?;
+    // Non-type bases are not rejected here: `__build_class__` hands the
+    // resolved tuple to whichever metaclass was selected, and a metaclass
+    // that is not a type may legitimately accept them.  `best_base` performs
+    // the `bases must be types` check on the type-construction path.
     let bases_tuple = pyre_object::w_tuple_new(resolved_bases);
     let w_orig_bases = if bases_changed {
         Some(w_orig_bases)
@@ -4441,24 +4616,36 @@ fn type_descr_call_with_mode(
     new_args.push(w_type);
     new_args.extend_from_slice(args);
     let instance = call_callable_with_mode(frame, new_fn, &new_args, mode)?;
+    let _instance_roots = pyre_object::gc_roots::push_roots();
+    let instance_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(instance);
+    let current_instance = || pyre_object::gc_roots::shadow_stack_get(instance_slot);
 
     // Step 2: __init__ — only if __new__ returned an instance of w_type.
     // PyPy: descr_call — skips __init__ when __new__ returns a foreign type.
-    if let Some(w_insttype) = type_call_init_type(instance, w_type)
+    if let Some(w_insttype) = type_call_init_type(current_instance(), w_type)
         && !type_call_type_x_shortcut(w_type, args.len(), true)
     {
-        if let Some(init_fn) =
+        if let Some(init_descr) =
             unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
         {
-            let mut init_args = Vec::with_capacity(1 + args.len());
-            init_args.push(instance);
-            init_args.extend_from_slice(args);
-            let init_result = call_callable_with_mode(frame, init_fn, &init_args, mode)?;
+            let init_result = if unsafe { crate::is_function(init_descr) } {
+                let mut init_args = Vec::with_capacity(1 + args.len());
+                init_args.push(current_instance());
+                init_args.extend_from_slice(args);
+                call_callable_with_mode(frame, init_descr, &init_args, mode)?
+            } else {
+                let init_fn = unsafe {
+                    crate::baseobjspace::get(init_descr, current_instance(), w_insttype)?
+                }
+                .unwrap_or(init_descr);
+                call_callable_with_mode(frame, init_fn, args, mode)?
+            };
             check_init_returned_none(init_result)?;
         }
     }
 
-    Ok(instance)
+    Ok(current_instance())
 }
 
 /// typeobject.py:1157-1176 — unpack __slots__ to slot name strings.
@@ -4921,6 +5108,25 @@ pub(crate) unsafe fn check_and_find_best_base(
     w_bases: pyre_object::PyObjectRef,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     unsafe {
+        // Every base is rejected here rather than silently skipped: Python 3
+        // has no classic classes, so a non-type in a mixed tuple is an error,
+        // not something `find_best_base` may drop.  The base survived
+        // `__mro_entries__` resolution and metaclass selection, so the winner
+        // is a real type being asked to build over a non-type, and the layout
+        // walk below would otherwise read `__bases__` off it.
+        let len = if w_bases.is_null() || !pyre_object::is_tuple(w_bases) {
+            0
+        } else {
+            pyre_object::w_tuple_len(w_bases)
+        };
+        for i in 0..len {
+            let Some(w_base) = pyre_object::w_tuple_getitem(w_bases, i as i64) else {
+                continue;
+            };
+            if !pyre_object::is_type(w_base) {
+                return Err(crate::PyError::type_error("bases must be types"));
+            }
+        }
         let w_bestbase = find_best_base(w_bases)?;
         // typeobject.py:1113-1115
         if w_bestbase.is_null() {

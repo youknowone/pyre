@@ -3134,7 +3134,7 @@ pub unsafe fn w_dict_adopt_regular_copy_for_empty_update(dst: PyObjectRef, w_cop
     debug_assert!(!is_module_dict(w_copy));
 
     let dst_dict = &mut *(dst as *mut W_DictObject);
-    let copy_dict = &mut *(w_copy as *mut W_DictObject);
+    let copy_dict = &*(w_copy as *const W_DictObject);
     let old_dstorage = dst_dict.dstorage;
 
     dst_dict.dstrategy = copy_dict.dstrategy;
@@ -5100,6 +5100,26 @@ pub static INT_DICT_STRATEGY: IntDictStrategy = IntDictStrategy;
 /// into the Object fallback.
 pub struct EmptyDictStrategy;
 
+/// Install a freshly allocated strategy storage on an empty dict.
+///
+/// RPython's `w_dict.dstorage = strategy.erase(storage)` is a `setfield_gc`:
+/// the GC transform roots and reloads `w_dict` across the storage allocation,
+/// then records the old-to-young edge.  Do the same explicitly here.
+unsafe fn install_empty_strategy(
+    w_dict: PyObjectRef,
+    strategy: &'static dyn crate::dictmultiobject::DictStrategy,
+) {
+    let _roots = crate::gc_roots::push_roots();
+    let dict_slot = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(w_dict);
+    let storage = strategy.get_empty_storage();
+    let w_dict = crate::gc_roots::shadow_stack_get(dict_slot);
+    let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
+    dict.dstorage = storage;
+    dict.dstrategy = strategy;
+    crate::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
+}
+
 impl EmptyDictStrategy {
     /// `dictmultiobject.py:692-705 switch_to_correct_strategy`.
     ///
@@ -5119,7 +5139,7 @@ impl EmptyDictStrategy {
         // `:696-698 type(w_key) is self.space.UnicodeObjectCls`
         // (Python 2 unicode / Python 3 str).
         if crate::is_exact_type(w_key, &crate::STR_TYPE) {
-            crate::dictmultiobject::w_dict_set_strategy(w_dict, &UNICODE_DICT_STRATEGY);
+            install_empty_strategy(w_dict, &UNICODE_DICT_STRATEGY);
             return;
         }
         // `:700-701 is_w(w_type, self.space.w_int)` — plain int only;
@@ -5164,11 +5184,7 @@ impl EmptyDictStrategy {
     /// `w_dict` must point at a valid `W_DictObject` whose strategy
     /// is currently `EmptyDictStrategy`.
     unsafe fn switch_to_int_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        // Overwrite the placeholder box (`setfield_gc`); the unreachable old
-        // Object-shape box is reclaimed by the sweep.
-        dict.dstorage = INT_DICT_STRATEGY.get_empty_storage();
-        dict.dstrategy = &INT_DICT_STRATEGY;
+        install_empty_strategy(w_dict, &INT_DICT_STRATEGY);
     }
 
     /// `dictmultiobject.py:707-711 switch_to_bytes_strategy`:
@@ -5187,9 +5203,7 @@ impl EmptyDictStrategy {
     /// # Safety
     /// Same as [`switch_to_int_strategy`].
     unsafe fn switch_to_bytes_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        dict.dstorage = BYTES_DICT_STRATEGY.get_empty_storage();
-        dict.dstrategy = &BYTES_DICT_STRATEGY;
+        install_empty_strategy(w_dict, &BYTES_DICT_STRATEGY);
     }
 
     /// `dictmultiobject.py:725-730 switch_to_identity_strategy`:
@@ -5211,9 +5225,7 @@ impl EmptyDictStrategy {
     /// # Safety
     /// Same as [`switch_to_int_strategy`].
     unsafe fn switch_to_identity_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        dict.dstorage = crate::identitydict::IDENTITY_DICT_STRATEGY.get_empty_storage();
-        dict.dstrategy = &crate::identitydict::IDENTITY_DICT_STRATEGY;
+        install_empty_strategy(w_dict, &crate::identitydict::IDENTITY_DICT_STRATEGY);
     }
 }
 
@@ -5245,12 +5257,7 @@ impl EmptyKwargsDictStrategy {
     /// `w_dict` must be a W_DictObject whose strategy is
     /// `EMPTY_KWARGS_DICT_STRATEGY`.
     unsafe fn switch_to_kwargs_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        // No legacy Vec to drop — EmptyKwargsDictStrategy keeps a
-        // null `dstorage` like its parent until the first switch
-        // installs typed storage.
-        dict.dstorage = crate::kwargsdict::KWARGS_DICT_STRATEGY.get_empty_storage();
-        dict.dstrategy = &crate::kwargsdict::KWARGS_DICT_STRATEGY;
+        install_empty_strategy(w_dict, &crate::kwargsdict::KWARGS_DICT_STRATEGY);
     }
 
     /// `dictmultiobject.py:692-705 switch_to_correct_strategy`
@@ -5417,9 +5424,7 @@ impl DictStrategy for EmptyDictStrategy {
     /// pointer.  The field overwrite is a `setfield_gc`; the unreachable
     /// old placeholder box is reclaimed by the sweep.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        dict.dstorage = OBJECT_DICT_STRATEGY.get_empty_storage();
-        dict.dstrategy = &OBJECT_DICT_STRATEGY;
+        install_empty_strategy(w_dict, &OBJECT_DICT_STRATEGY);
     }
 
     unsafe fn getitem(&self, _w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
@@ -5479,7 +5484,7 @@ impl DictStrategy for EmptyDictStrategy {
         //   w_dict.setitem_str(key, w_value)
         // Unicode-strategy promotion is direct since the caller has
         // already chosen the str-keyed path.
-        crate::dictmultiobject::w_dict_set_strategy(w_dict, &UNICODE_DICT_STRATEGY);
+        install_empty_strategy(w_dict, &UNICODE_DICT_STRATEGY);
         crate::dictmultiobject::w_dict_setitem_str(w_dict, key, w_value);
     }
 

@@ -284,6 +284,7 @@ pub fn init_typeobjects() {
         // 'object' first — PyPy: objectobject.py W_ObjectObject.typedef
         // MRO = [object]. All other types inherit from object.
         let object_type = new_root_typeobject("object", init_object_type);
+        unsafe { pyre_object::w_type_set_text_signature(object_type, "()") };
         reg.insert(
             &INSTANCE_TYPE as *const PyType as usize,
             object_type as usize,
@@ -652,15 +653,25 @@ pub fn init_typeobjects() {
         );
 
         // staticmethod — PyPy: function.py StaticMethod, bases=(object,)
+        let staticmethod_type =
+            new_typeobject_with_base("staticmethod", init_staticmethod_type, object_type);
+        unsafe {
+            pyre_object::w_type_set_text_signature(staticmethod_type, "(function, /)");
+        }
         reg.insert(
             &pyre_object::function::STATICMETHOD_TYPE as *const PyType as usize,
-            new_typeobject_with_base("staticmethod", init_staticmethod_type, object_type) as usize,
+            staticmethod_type as usize,
         );
 
         // classmethod — PyPy: function.py ClassMethod, bases=(object,)
+        let classmethod_type =
+            new_typeobject_with_base("classmethod", init_classmethod_type, object_type);
+        unsafe {
+            pyre_object::w_type_set_text_signature(classmethod_type, "(function, /)");
+        }
         reg.insert(
             &pyre_object::function::CLASSMETHOD_TYPE as *const PyType as usize,
-            new_typeobject_with_base("classmethod", init_classmethod_type, object_type) as usize,
+            classmethod_type as usize,
         );
 
         // property — PyPy: descriptor.py W_Property, bases=(object,)
@@ -728,7 +739,11 @@ pub fn init_typeobjects() {
         // `__slots__` includes `__weakref__` (`_pypy_generic_alias.py:247`),
         // so a union is weak-referenceable.
         let union_type = new_typeobject_with_base("typing.Union", init_union_type, object_type);
-        unsafe { pyre_object::w_type_set_weakrefable(union_type, true) };
+        unsafe {
+            pyre_object::w_type_set_weakrefable(union_type, true);
+            pyre_object::w_type_set_acceptable_as_base_class(union_type, false);
+            pyre_object::w_type_set_disallow_instantiation(union_type);
+        };
         reg.insert(
             &pyre_object::UNION_TYPE as *const PyType as usize,
             union_type as usize,
@@ -2011,6 +2026,34 @@ unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef) {
         let Some(descr) = pyre_object::w_dict_getitem_str(ns, &key) else {
             continue;
         };
+        // typeobject.py:1772-1782 TypeCache.build — unwrap class/static
+        // methods, then stamp every FunctionWithFixedCode with the defining
+        // type and `Type.qualname.method` qualified name.
+        let function = if !descr.is_null() && pyre_object::function::is_classmethod(descr) {
+            pyre_object::function::w_classmethod_get_func(descr)
+        } else if !descr.is_null() && pyre_object::function::is_staticmethod(descr) {
+            pyre_object::function::w_staticmethod_get_func(descr)
+        } else {
+            descr
+        };
+        // Only a plain type-owned entry is reachable as a method descriptor.
+        // A class/static method hands its payload back through the wrapper's
+        // `__get__`, so `str.maketrans` and `dict.fromkeys` stay ordinary
+        // builtin callables; the stamping below still applies to both.
+        let is_plain_entry = std::ptr::eq(function, descr);
+        if !function.is_null()
+            && pyre_object::py_type_check(function, &crate::function::FUNCTION_TYPE)
+        {
+            let code = crate::function::getcode(function) as PyObjectRef;
+            if !code.is_null() && crate::gateway::is_builtin_code(code) {
+                crate::function::function_set_objclass(function, type_obj);
+                let qualname = format!("{}.{}", pyre_object::w_type_get_qualname(type_obj), key);
+                crate::function::function_set_qualname(function, pyre_object::w_str_new(&qualname));
+                if is_plain_entry {
+                    crate::function::function_mark_method_descriptor(function);
+                }
+            }
+        }
         // CPython member descriptors carry their defining type in d_type;
         // PyPy's Member receives w_cls while the TypeDef is materialised.
         // Builtin TypeDef initializers necessarily create the descriptor
@@ -2309,16 +2352,10 @@ pub fn make_builtin_type_with_layout(
 fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = new_descr_class(args, "int")?;
     // intobject.py _new_int → check_user_subclass
-    if !cls.is_null() && unsafe { pyre_object::is_type(cls) } {
-        if let Some(w_int) = gettypefor(&pyre_object::INT_TYPE) {
-            check_user_subclass(w_int.as_ptr(), cls)?;
-        }
-    }
+    let w_int = gettypeobject(&pyre_object::INT_TYPE);
+    check_user_subclass(w_int, cls)?;
     let value = crate::builtins::builtin_int(&args[1..])?;
-    // If cls is int itself (or null), return a plain int.
-    if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
-        return Ok(value);
-    }
+    // If cls is int itself, return a plain int.
     let int_typeobj = gettypefor(&pyre_object::INT_TYPE);
     if int_typeobj.map_or(false, |t| std::ptr::eq(cls, t.as_ptr())) {
         return Ok(value);
@@ -5134,7 +5171,12 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "join",
-            make_builtin_function_with_arity("join", crate::type_methods::str_method_join, 2),
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "join",
+                crate::type_methods::str_method_join,
+                2,
+                "($self, iterable, /)",
+            ),
         )
     };
     unsafe {
@@ -6138,6 +6180,14 @@ fn init_dict_type(ns: PyObjectRef) {
                         if backing.is_null() { o } else { backing }
                     };
                     let a = resolve(args[0]);
+                    // `W_DictProxyObject` is not a `W_DictMultiObject`, so a
+                    // proxy operand fails `descr_eq`'s isinstance test.  It has
+                    // to reach the reflected `mappingproxy.__eq__`, which
+                    // unwraps only its own receiver and so lets an ordered
+                    // wrapped mapping compare under its own ordering rules.
+                    if unsafe { pyre_object::is_dict_proxy(args[1]) } {
+                        return Ok(pyre_object::w_not_implemented());
+                    }
                     let b = resolve(args[1]);
                     // `dictmultiobject.py descr_eq`: a non-dict operand yields
                     // NotImplemented. Handing it to `compare` would re-dispatch
@@ -6160,6 +6210,11 @@ fn init_dict_type(ns: PyObjectRef) {
                 "__ne__",
                 |args| {
                     crate::type_methods::arity_slot(args, 1)?;
+                    // See `__eq__`: a proxy operand belongs to the reflected
+                    // `mappingproxy` comparison, not to this one.
+                    if unsafe { pyre_object::is_dict_proxy(args[1]) } {
+                        return Ok(pyre_object::w_not_implemented());
+                    }
                     let a = crate::type_methods::resolve_dict_backing(args[0]);
                     let b = crate::type_methods::resolve_dict_backing(args[1]);
                     if a.is_null() || b.is_null() {
@@ -6363,112 +6418,135 @@ fn init_dict_type(ns: PyObjectRef) {
         )
     };
     // dict.fromkeys(iterable, value=None) — classmethod
+    let fromkeys = crate::gateway::make_builtin_function_with_text_signature(
+        "fromkeys",
+        |args| {
+            // classmethod: args[0] is the bound cls; the user arguments are
+            // fromkeys(iterable, value=None).
+            let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+            crate::type_methods::arity_at_most(args, "fromkeys", 2)?;
+            let (iterable, value) = if args.len() >= 3 {
+                (args[1], args[2])
+            } else if args.len() == 2 {
+                (args[1], pyre_object::w_none())
+            } else {
+                return Err(crate::PyError::type_error(
+                    "fromkeys expected at least 1 argument, got 0",
+                ));
+            };
+            dict_fromkeys_impl(cls, iterable, value)
+        },
+        "($type, iterable, value=None, /)",
+    );
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "fromkeys",
-            pyre_object::function::w_classmethod_new(make_builtin_function("fromkeys", |args| {
-                // classmethod: args[0] is the bound cls; the user arguments are
-                // fromkeys(iterable, value=None).
-                let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                crate::type_methods::arity_at_most(args, "fromkeys", 2)?;
-                let (iterable, value) = if args.len() >= 3 {
-                    (args[1], args[2])
-                } else if args.len() == 2 {
-                    (args[1], pyre_object::w_none())
-                } else {
-                    return Err(crate::PyError::type_error(
-                        "fromkeys expected at least 1 argument, got 0",
-                    ));
-                };
-                // dictmultiobject.py:120-134 descr_fromkeys — for `dict` itself,
-                // fill a fresh dict through the dict's own setitem, which hashes
-                // each key; for a dict subclass, construct an instance via `cls()`
-                // and route through `space.setitem` so the result is an instance
-                // of the subclass.
-                let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-                if cls.is_null() || crate::baseobjspace::is_w(cls, w_dict_type) {
-                    let d = pyre_object::w_dict_new();
-                    // Python 3.14's exact-set/frozenset fast path carries each
-                    // entry's cached hash into the new exact dict.  This is the
-                    // reverse of `set_update_dict_lock_held` and avoids a
-                    // second observable `__hash__` call.  Subclasses still go
-                    // through their iterator below.
-                    if unsafe {
-                        pyre_object::is_exact_type(iterable, &pyre_object::setobject::SET_TYPE)
-                            || pyre_object::is_exact_type(
-                                iterable,
-                                &pyre_object::setobject::FROZENSET_TYPE,
-                            )
-                    } {
-                        let _roots = pyre_object::gc_roots::push_roots();
-                        let sp = pyre_object::gc_roots::shadow_stack_len();
-                        pyre_object::gc_roots::pin_root(d);
-                        pyre_object::gc_roots::pin_root(value);
-                        pyre_object::gc_roots::pin_root(iterable);
-                        let mut index = 0usize;
-                        loop {
-                            let iterable = pyre_object::gc_roots::shadow_stack_get(sp + 2);
-                            let Some(key) = (unsafe { pyre_object::w_set_key_at(iterable, index) })
-                            else {
-                                break;
-                            };
-                            let d = pyre_object::gc_roots::shadow_stack_get(sp);
-                            let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                            unsafe {
-                                pyre_object::w_dict_store_hashed_checked(
-                                    d, key.obj, value, key.hash,
-                                )
-                            }
-                            .map_err(|_| {
-                                crate::baseobjspace::take_pending_dict_key_error(key.obj)
-                            })?;
-                            index += 1;
-                        }
-                        return Ok(pyre_object::gc_roots::shadow_stack_get(sp));
-                    }
-                    let items = crate::builtins::collect_iterable(iterable)?;
-                    // `try_hash_value` may run a user `__hash__` that allocates
-                    // and triggers a moving minor collection; `d`, the shared
-                    // `value` (reused across every key), and every not-yet-added
-                    // key are rooted for the whole loop and reloaded after each
-                    // hash.
-                    let d = unsafe {
-                        let _roots = pyre_object::gc_roots::push_roots();
-                        let sp = pyre_object::gc_roots::shadow_stack_len();
-                        pyre_object::gc_roots::pin_root(d);
-                        pyre_object::gc_roots::pin_root(value);
-                        let key_base = sp + 2;
-                        for key in items {
-                            pyre_object::gc_roots::pin_root(key);
-                        }
-                        let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
-                        for i in 0..key_len {
-                            let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
-                            let hash = crate::builtins::try_hash_value(key).map_err(|err| {
-                                crate::baseobjspace::wrap_dict_key_hash_error(key, err)
-                            })?;
-                            let d = pyre_object::gc_roots::shadow_stack_get(sp);
-                            let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
-                            let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                            pyre_object::w_dict_store_hashed_checked(d, key, value, hash).map_err(
-                                |_| crate::baseobjspace::take_pending_dict_key_error(key),
-                            )?;
-                        }
-                        pyre_object::gc_roots::shadow_stack_get(sp)
-                    };
-                    Ok(d)
-                } else {
-                    let items = crate::builtins::collect_iterable(iterable)?;
-                    let d = crate::call::call_function_impl_result(cls, &[])?;
-                    for key in items {
-                        crate::baseobjspace::setitem(d, key, value)?;
-                    }
-                    Ok(d)
-                }
-            })),
+            pyre_object::function::w_classmethod_new(fromkeys),
         )
     };
+    fn dict_fromkeys_impl(
+        cls: PyObjectRef,
+        iterable: PyObjectRef,
+        value: PyObjectRef,
+    ) -> crate::PyResult {
+        // dictmultiobject.py:120-134 descr_fromkeys — for `dict` itself,
+        // fill a fresh dict through the dict's own setitem, which hashes
+        // each key; for a dict subclass, construct an instance via `cls()`
+        // and route through `space.setitem` so the result is an instance
+        // of the subclass.
+        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+        if cls.is_null() || crate::baseobjspace::is_w(cls, w_dict_type) {
+            let d = pyre_object::w_dict_new();
+            // Python 3.14's exact-set/frozenset fast path carries each
+            // entry's cached hash into the new exact dict.  This is the
+            // reverse of `set_update_dict_lock_held` and avoids a
+            // second observable `__hash__` call.  Subclasses still go
+            // through their iterator below.
+            if unsafe {
+                pyre_object::is_exact_type(iterable, &pyre_object::setobject::SET_TYPE)
+                    || pyre_object::is_exact_type(iterable, &pyre_object::setobject::FROZENSET_TYPE)
+            } {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let sp = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(d);
+                pyre_object::gc_roots::pin_root(value);
+                pyre_object::gc_roots::pin_root(iterable);
+                let mut index = 0usize;
+                loop {
+                    let iterable = pyre_object::gc_roots::shadow_stack_get(sp + 2);
+                    let Some(key) = (unsafe { pyre_object::w_set_key_at(iterable, index) }) else {
+                        break;
+                    };
+                    let d = pyre_object::gc_roots::shadow_stack_get(sp);
+                    let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                    unsafe {
+                        pyre_object::w_dict_store_hashed_checked(d, key.obj, value, key.hash)
+                    }
+                    .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key.obj))?;
+                    index += 1;
+                }
+                return Ok(pyre_object::gc_roots::shadow_stack_get(sp));
+            }
+            let items = crate::builtins::collect_iterable(iterable)?;
+            // `try_hash_value` may run a user `__hash__` that allocates
+            // and triggers a moving minor collection; `d`, the shared
+            // `value` (reused across every key), and every not-yet-added
+            // key are rooted for the whole loop and reloaded after each
+            // hash.
+            let d = unsafe {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let sp = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(d);
+                pyre_object::gc_roots::pin_root(value);
+                let key_base = sp + 2;
+                for key in items {
+                    pyre_object::gc_roots::pin_root(key);
+                }
+                let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
+                for i in 0..key_len {
+                    let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
+                    let hash = crate::builtins::try_hash_value(key)
+                        .map_err(|err| crate::baseobjspace::wrap_dict_key_hash_error(key, err))?;
+                    let d = pyre_object::gc_roots::shadow_stack_get(sp);
+                    let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
+                    let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                    pyre_object::w_dict_store_hashed_checked(d, key, value, hash)
+                        .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))?;
+                }
+                pyre_object::gc_roots::shadow_stack_get(sp)
+            };
+            Ok(d)
+        } else {
+            // dictmultiobject.py:135-137 — `space.call_function(w_type)` runs
+            // before `space.listview(w_keys)`, so the subclass constructor
+            // observes the iterable unconsumed.  That constructor and each
+            // `setitem` can execute Python and move objects, so the iterable,
+            // the fill value, the new dict and every collected key ride the
+            // shadow stack rather than a raw `Vec`.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let sp = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(iterable);
+            pyre_object::gc_roots::pin_root(value);
+            let d = crate::call::call_function_impl_result(cls, &[])?;
+            let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(d);
+            let items =
+                crate::builtins::collect_iterable(pyre_object::gc_roots::shadow_stack_get(sp))?;
+            let key_base = pyre_object::gc_roots::shadow_stack_len();
+            for key in items {
+                pyre_object::gc_roots::pin_root(key);
+            }
+            let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
+            for i in 0..key_len {
+                let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
+                let d = pyre_object::gc_roots::shadow_stack_get(dict_slot);
+                let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                crate::baseobjspace::setitem(d, key, value)?;
+            }
+            Ok(pyre_object::gc_roots::shadow_stack_get(dict_slot))
+        }
+    }
 }
 
 // ── Mappingproxy TypeDef ─────────────────────────────────────────────
@@ -8092,6 +8170,9 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                 args[0]
             }
         };
+        // Only the receiver is unwrapped: `w_other` reaches the comparison
+        // as given, so a mapping whose `__eq__` distinguishes a proxy from
+        // its backing mapping still observes the proxy.
         crate::baseobjspace::compare(self_mapping, args[1], op)
     }
     fn proxy_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -8957,6 +9038,10 @@ fn union_class_getitem(args: &[PyObjectRef]) -> crate::PyResult {
             "Cannot take a Union of no types.",
         ));
     }
+    let items = items
+        .into_iter()
+        .map(crate::_pypy_generic_alias::typing_type_convert)
+        .collect::<Result<Vec<_>, _>>()?;
     crate::_pypy_generic_alias::union_from_items(&items)
 }
 
@@ -9050,6 +9135,19 @@ fn union_getattribute_method(args: &[PyObjectRef]) -> crate::PyResult {
     crate::baseobjspace::object_getattribute(self_, name)
 }
 
+/// `typing.Union.__name__` / `__qualname__` — the shared 3.14 runtime
+/// type reports the spelling `typing.Union` uses, not `UnionType`.
+fn union_name_getter(args: &[PyObjectRef]) -> crate::PyResult {
+    let self_ = args.get(1).copied().unwrap_or(PY_NULL);
+    if unsafe { pyre_object::is_union(self_) } {
+        Ok(pyre_object::w_str_new("Union"))
+    } else {
+        Err(crate::PyError::type_error(
+            "descriptor requires a 'typing.Union' object",
+        ))
+    }
+}
+
 fn init_union_type(ns: PyObjectRef) {
     // `_pypy_generic_alias.py:241-246 UnionType` docstring, plus CPython
     // 3.14's three read-only identity getsets on union instances.
@@ -9115,6 +9213,45 @@ fn init_union_type(ns: PyObjectRef) {
             pyre_object::w_str_new("typing"),
         )
     };
+    // Python 3.14 exposes these special attributes on every union instance.
+    for name in ["__name__", "__qualname__"] {
+        let getter = make_builtin_function_with_arity(name, union_name_getter, 2);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_descriptor_named(getter, name),
+            )
+        };
+    }
+    let origin_getter = make_builtin_function_with_arity(
+        "__origin__",
+        |args| {
+            let self_ = args.get(1).copied().unwrap_or(PY_NULL);
+            if unsafe { pyre_object::is_union(self_) } {
+                Ok(gettypeobject(&pyre_object::UNION_TYPE))
+            } else {
+                Err(crate::PyError::type_error(
+                    "descriptor '__origin__' requires a 'typing.Union' object",
+                ))
+            }
+        },
+        2,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__origin__",
+            make_getset_descriptor_named(origin_getter, "__origin__"),
+        );
+        // _pypy_generic_alias.py:325 — suppress the legacy
+        // `__getitem__`-based iteration fallback.
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__iter__",
+            pyre_object::w_none(),
+        );
+    }
     // UnionType.__args__ — returns the tuple of union member types
     let args_getter = make_builtin_function_with_arity(
         "__args__",
@@ -9157,6 +9294,68 @@ fn init_union_type(ns: PyObjectRef) {
             make_getset_descriptor(params_getter),
         )
     };
+    // `_pypy_generic_alias.py:275`: `hash(frozenset(self.__args__))`.
+    // Hashing is intentionally deferred until `hash(union)` so unions may
+    // contain classes with an unhashable metaclass and fail at the same point
+    // as CPython/PyPy.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__hash__",
+            make_builtin_function_with_arity(
+                "__hash__",
+                |args| {
+                    let self_ = args.first().copied().unwrap_or(PY_NULL);
+                    if !unsafe { pyre_object::is_union(self_) } {
+                        return Err(crate::PyError::type_error(
+                            "descriptor '__hash__' requires a 'types.UnionType' object",
+                        ));
+                    }
+                    let union_args = unsafe { pyre_object::w_union_get_args(self_) };
+                    let items = unsafe {
+                        (0..pyre_object::w_tuple_len(union_args))
+                            .filter_map(|i| pyre_object::w_tuple_getitem(union_args, i as i64))
+                            .collect::<Vec<_>>()
+                    };
+                    // Hash the members first: `w_frozenset_from_items` stores
+                    // an infallible digest, which would hide a member whose
+                    // metaclass sets `__hash__ = None`.
+                    for &item in &items {
+                        crate::builtins::try_hash_value(item)?;
+                    }
+                    let members = pyre_object::w_frozenset_from_items(&items);
+                    Ok(pyre_object::w_int_new(crate::baseobjspace::hash_w_strict(
+                        members,
+                    )?))
+                },
+                1,
+            ),
+        )
+    };
+    // CPython unionobject.c `union_mro_entries`: a union participates in the
+    // PEP 560 base-resolution protocol solely to provide the precise error
+    // instead of falling through to the generic non-type-base rejection.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__mro_entries__",
+            make_builtin_function_with_arity(
+                "__mro_entries__",
+                |args| {
+                    let self_ = args.first().copied().unwrap_or(PY_NULL);
+                    let rendered = if self_.is_null() {
+                        "typing.Union".to_string()
+                    } else {
+                        unsafe { crate::py_repr(self_) }?
+                    };
+                    Err(crate::PyError::type_error(format!(
+                        "Cannot subclass {rendered}"
+                    )))
+                },
+                2,
+            ),
+        )
+    };
     // UnionType.__getitem__ (`_pypy_generic_alias.py:312`) — substitute the
     // free parameters with `items`, then fold the results back into a union
     // with `|`.
@@ -9190,7 +9389,12 @@ fn init_union_type(ns: PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("__or__ requires 2 arguments"));
                     }
-                    crate::_pypy_generic_alias::create_union(args[0], args[1])
+                    if unsafe { pyre_object::is_str(args[1]) } {
+                        let other = crate::_pypy_generic_alias::typing_type_convert(args[1])?;
+                        crate::_pypy_generic_alias::union_from_items(&[args[0], other])
+                    } else {
+                        crate::_pypy_generic_alias::create_union(args[0], args[1])
+                    }
                 },
                 2,
             ),
@@ -9207,7 +9411,12 @@ fn init_union_type(ns: PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("__ror__ requires 2 arguments"));
                     }
-                    crate::_pypy_generic_alias::create_union(args[1], args[0])
+                    if unsafe { pyre_object::is_str(args[1]) } {
+                        let other = crate::_pypy_generic_alias::typing_type_convert(args[1])?;
+                        crate::_pypy_generic_alias::union_from_items(&[other, args[0]])
+                    } else {
+                        crate::_pypy_generic_alias::create_union(args[1], args[0])
+                    }
                 },
                 2,
             ),
@@ -10003,6 +10212,101 @@ fn init_type_type(ns: PyObjectRef) {
             }),
         )
     };
+    // typeobject.py `W_TypeObject.descr_repr`.  Native `py_repr` handles the
+    // common direct path, but the descriptor must also exist for
+    // `super().__repr__()` in user metaclasses such as typing._AnyMeta.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| {
+                    let obj = args.first().copied().unwrap_or(PY_NULL);
+                    if obj.is_null() || !unsafe { pyre_object::is_type(obj) } {
+                        return Err(crate::PyError::type_error(
+                            "descriptor '__repr__' requires a 'type' object",
+                        ));
+                    }
+                    let rendered = format!(
+                        "<class '{}'>",
+                        crate::baseobjspace::type_repr_qualified_name(obj)
+                    );
+                    Ok(pyre_object::w_str_new(&rendered))
+                },
+                1,
+            ),
+        )
+    };
+    // typeobject.py:833-841 `W_TypeObject.descr_or` / `descr_ror` delegate
+    // to `_pypy_generic_alias._create_union`.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__or__",
+            make_builtin_function_with_arity(
+                "__or__",
+                |args| crate::_pypy_generic_alias::create_union(args[0], args[1]),
+                2,
+            ),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ror__",
+            make_builtin_function_with_arity(
+                "__ror__",
+                |args| crate::_pypy_generic_alias::create_union(args[1], args[0]),
+                2,
+            ),
+        );
+    }
+    // typeobject.py:1280-1288 / W_TypeObject.typedef:1317-1318.
+    // Keep these as the public type slots which delegate to abstractinst's
+    // recursive implementations, just as PyPy does.
+    let instancecheck = make_builtin_function_with_arity(
+        "__instancecheck__",
+        |args| {
+            Ok(pyre_object::w_bool_from(unsafe {
+                crate::baseobjspace::p_recursive_isinstance_type_w(args[1], args[0])?
+            }))
+        },
+        2,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__instancecheck__",
+            instancecheck,
+        );
+        crate::function::fset_func_text_signature(
+            instancecheck,
+            pyre_object::w_str_new("($self, instance, /)"),
+        );
+    }
+    let subclasscheck = make_builtin_function_with_arity(
+        "__subclasscheck__",
+        |args| {
+            Ok(pyre_object::w_bool_from(unsafe {
+                crate::baseobjspace::p_recursive_issubclass_w(args[1], args[0])?
+            }))
+        },
+        2,
+    );
+    unsafe {
+        // CPython/PyPy expose these method-descriptor signatures to inspect.
+        // Keep slot wrappers such as type.__or__ distinct: inspect's PyPy
+        // compatibility path intentionally does not treat those as supported
+        // MethodDescriptorType callables.
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__subclasscheck__",
+            subclasscheck,
+        );
+        crate::function::fset_func_text_signature(
+            subclasscheck,
+            pyre_object::w_str_new("($self, subclass, /)"),
+        );
+    }
     // type.__annotations__ / __dict__ / __mro__ / __name__ / __bases__ /
     // __base__
     // are exposed as getset descriptors so
@@ -10107,6 +10411,56 @@ fn init_type_type(ns: PyObjectRef) {
             ns,
             "__flags__",
             make_getset_descriptor(flags_getter),
+        )
+    };
+
+    // typeobject.py:1220-1230 `type_get_text_signature` and
+    // W_TypeObject.typedef's `__text_signature__` GetSetProperty. Keeping
+    // this on the metatype makes it a data descriptor, so a heap type cannot
+    // shadow it by merely placing `__text_signature__` in its namespace.
+    let text_signature_getter = make_builtin_function_with_arity(
+        "__text_signature__",
+        |args| unsafe {
+            let w_type = args[1];
+            if let Some(signature) = pyre_object::w_type_get_text_signature(w_type) {
+                return Ok(pyre_object::w_str_new(signature));
+            }
+            // typeobject.py:1194-1230 `extract_txtsig`.
+            let w_doc = crate::baseobjspace::getattr_str(w_type, "__doc__")?;
+            if pyre_object::is_none(w_doc) || !pyre_object::is_str(w_doc) {
+                return Ok(pyre_object::w_none());
+            }
+            // Read through the WTF-8 view: a docstring may carry lone
+            // surrogates, and both the prefix and the marker are ASCII, so
+            // every offset below lands on a code point boundary.
+            let raw_doc = pyre_object::w_str_get_wtf8(w_doc);
+            let full_name = pyre_object::w_type_get_name(w_type);
+            let name = full_name.rsplit('.').next().unwrap_or(full_name);
+            let prefix = format!("{name}(");
+            if raw_doc.starts_with(prefix.as_str()) {
+                const MARKER: &str = ")\n--\n\n";
+                if let Some(end) = raw_doc.find(MARKER.as_ref()) {
+                    if end > 0 {
+                        return Ok(pyre_object::w_str_from_wtf8(
+                            raw_doc[name.len()..end + 1].to_wtf8_buf(),
+                        ));
+                    }
+                }
+            }
+            Ok(pyre_object::w_none())
+        },
+        2,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__text_signature__",
+            make_getset_property_named(
+                text_signature_getter,
+                pyre_object::PY_NULL,
+                pyre_object::PY_NULL,
+                "__text_signature__",
+            ),
         )
     };
 
@@ -11573,12 +11927,15 @@ fn init_function_type(ns: PyObjectRef) {
             make_getset_property(typeparams_getter, typeparams_setter, typeparams_deleter),
         )
     };
-    // The shared rawdict mirrors PyPy and is still used by
-    // BuiltinFunction.  Python 3.14's user `function` type omits these
-    // PyPy-only introspection extensions.
+    // The shared rawdict mirrors PyPy and is still used by BuiltinCode-backed
+    // FunctionWithFixedCode method descriptors. Keep `__text_signature__`:
+    // its getter raises AttributeError for an ordinary function whose field
+    // is unset, while builtin method descriptors need the same shared slot to
+    // expose their inspect signature. The same applies to `__objclass__`:
+    // its getter raises AttributeError while unset on an ordinary function,
+    // but TypeCache.build stamps it on FunctionWithFixedCode descriptors.
+    // `__defaults_count__` remains hidden from Python user functions.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(ns, "__objclass__");
-        pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(ns, "__text_signature__");
         pyre_object::dictmultiobject::w_dict_delitem_str_no_proxy(ns, "__defaults_count__");
     }
     // `funcobject.c func_new` — `FunctionType(code, globals, name=None,
@@ -12338,6 +12695,48 @@ fn init_slot_wrapper_type(ns: PyObjectRef) {
     // `Function.w_objclass` and `d_name` in `Function.name`, both published as
     // members rather than getsets.
     install_descr_members(ns);
+
+    // `tp_descr_get` / `tp_call` are also reachable as ordinary namespace
+    // entries: `callable()` and `inspect.ismethoddescriptor` read them off the
+    // type rather than through the native slots.
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__get__",
+            make_builtin_function_with_arity(
+                "__get__",
+                |args| {
+                    let obj = if pyre_object::is_none(args[1]) {
+                        pyre_object::PY_NULL
+                    } else {
+                        args[1]
+                    };
+                    let w_type = if pyre_object::is_none(args[2]) {
+                        pyre_object::PY_NULL
+                    } else {
+                        args[2]
+                    };
+                    bind_slot_wrapper(args[0], obj, w_type)
+                },
+                3,
+            ),
+        );
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__call__",
+            make_builtin_function("__call__", |args| {
+                let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+                let descr = slot_wrapper_receiver(
+                    positional.first().copied().unwrap_or(pyre_object::PY_NULL),
+                    "__call__",
+                )?;
+                if let Some(&obj) = positional.get(1) {
+                    slot_wrapper_check_instance(descr, obj)?;
+                }
+                function_descr_call_impl(positional, kwargs, descr)
+            }),
+        );
+    }
 }
 
 fn method_descriptor_receiver(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
@@ -12373,25 +12772,51 @@ fn method_descriptor_check_instance(
     )))
 }
 
-fn bind_method_descriptor(
+/// `descrobject.c method_get` / `wrapperdescr_get` — the binding both
+/// fixed-code descriptor types share once their own receiver typecheck has
+/// accepted `descr`.  `new_bound` is the only difference between the two:
+/// `baseobjspace::get` binds a method descriptor through
+/// `builtin_bound_method_new` and a slot wrapper through `w_method_new`, and
+/// the namespace entry must produce the same object as the native slot.
+fn bind_fixed_code_descriptor(
     descr: PyObjectRef,
     obj: PyObjectRef,
     w_type: PyObjectRef,
+    new_bound: fn(PyObjectRef, PyObjectRef, PyObjectRef) -> PyObjectRef,
 ) -> crate::PyResult {
-    let descr = method_descriptor_receiver(descr, "__get__")?;
     if obj.is_null() {
         if w_type.is_null() {
             return Err(crate::PyError::type_error("__get__(None, None) is invalid"));
         }
         return Ok(descr);
     }
-    method_descriptor_check_instance(descr, obj)?;
     let actual_type = crate::typedef::r#type(obj).map_or(pyre_object::PY_NULL, |tp| tp.as_ptr());
-    Ok(crate::function::builtin_bound_method_new(
+    Ok(new_bound(descr, obj, actual_type))
+}
+
+fn bind_method_descriptor(
+    descr: PyObjectRef,
+    obj: PyObjectRef,
+    w_type: PyObjectRef,
+) -> crate::PyResult {
+    let descr = method_descriptor_receiver(descr, "__get__")?;
+    if !obj.is_null() {
+        method_descriptor_check_instance(descr, obj)?;
+    }
+    bind_fixed_code_descriptor(
         descr,
         obj,
-        actual_type,
-    ))
+        w_type,
+        crate::function::builtin_bound_method_new,
+    )
+}
+
+fn bind_slot_wrapper(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) -> crate::PyResult {
+    let descr = slot_wrapper_receiver(descr, "__get__")?;
+    if !obj.is_null() {
+        slot_wrapper_check_instance(descr, obj)?;
+    }
+    bind_fixed_code_descriptor(descr, obj, w_type, pyre_object::w_method_new)
 }
 
 fn init_method_descriptor_type(ns: PyObjectRef) {
@@ -13622,9 +14047,16 @@ fn staticmethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_str_new_managed(&format!("<staticmethod({repr})>")))
 }
 
-/// PyPy `typedef.py:852-877 StaticMethod.typedef`, with the CPython 3.14
-/// surface taking precedence: PEP 649 proxy descriptors and generic alias
-/// support are present, while PyPy 3.11's `__reduce_ex__` is absent.
+/// function.py:708-709 `StaticMethod.descr_reduce_ex`.
+fn staticmethod_descr_reduce_ex(args: &[PyObjectRef]) -> crate::PyResult {
+    staticmethod_require(args.first().copied().unwrap_or(PY_NULL), "__reduce_ex__")?;
+    Err(crate::PyError::type_error(
+        "cannot pickle 'staticmethod' object",
+    ))
+}
+
+/// PyPy `typedef.py:852-877 StaticMethod.typedef`, augmented with the newer
+/// PEP 649 proxy descriptors and generic alias support.
 fn init_staticmethod_type(ns: PyObjectRef) {
     let dict_getter = make_builtin_function_with_arity("__dict__", descr_get_dict, 2);
     let dict_setter = make_builtin_function_with_arity("__dict__", descr_set_dict, 3);
@@ -13717,6 +14149,10 @@ fn init_staticmethod_type(ns: PyObjectRef) {
         (
             "__repr__",
             make_builtin_function("__repr__", staticmethod_descr_repr),
+        ),
+        (
+            "__reduce_ex__",
+            make_builtin_function("__reduce_ex__", staticmethod_descr_reduce_ex),
         ),
     ];
     for (name, value) in entries {
@@ -13884,9 +14320,16 @@ fn classmethod_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_str_new_managed(&format!("<classmethod({repr})>")))
 }
 
-/// PyPy `typedef.py:878-908 ClassMethod.typedef`, with the Python 3.14
-/// surface taking precedence: PEP 649 proxy descriptors and generic alias
-/// support replace PyPy 3.11's eager annotations copy and `__reduce_ex__`.
+/// function.py:763-764 `ClassMethod.descr_reduce_ex`.
+fn classmethod_descr_reduce_ex(args: &[PyObjectRef]) -> crate::PyResult {
+    classmethod_require(args.first().copied().unwrap_or(PY_NULL), "__reduce_ex__")?;
+    Err(crate::PyError::type_error(
+        "cannot pickle 'classmethod' object",
+    ))
+}
+
+/// PyPy `typedef.py:878-908 ClassMethod.typedef`, augmented with the newer
+/// PEP 649 proxy descriptors and generic alias support.
 fn init_classmethod_type(ns: PyObjectRef) {
     let dict_getter = make_builtin_function_with_arity("__dict__", descr_get_dict, 2);
     let dict_setter = make_builtin_function_with_arity("__dict__", descr_set_dict, 3);
@@ -13975,6 +14418,10 @@ fn init_classmethod_type(ns: PyObjectRef) {
         (
             "__repr__",
             make_builtin_function("__repr__", classmethod_descr_repr),
+        ),
+        (
+            "__reduce_ex__",
+            make_builtin_function("__reduce_ex__", classmethod_descr_reduce_ex),
         ),
     ];
     for (name, value) in entries {
@@ -15518,16 +15965,19 @@ fn init_int_type(ns: PyObjectRef) {
         };
     }
     // `__pow__` and `__rpow__` take an optional modulus, so they are variadic.
+    // A variadic wrapper has no arity to derive a signature from, so stamp the
+    // one `inspect.signature` reports.
     for (name, func) in [
         ("__pow__", int_dunder_pow as DunderFn),
         ("__rpow__", int_dunder_rpow),
     ] {
+        let wrapper = crate::make_slot_wrapper(name, func);
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                name,
-                crate::make_slot_wrapper(name, func),
-            )
+            crate::function::fset_func_text_signature(
+                wrapper,
+                pyre_object::w_str_new("($self, value, mod=None, /)"),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, wrapper)
         };
     }
     for (name, func) in [
@@ -16840,12 +17290,14 @@ fn init_object_type(ns: PyObjectRef) {
             ),
         )
     };
+    let object_new = make_new_descr(__pyre_wrap_object_descr_new);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_new_descr(__pyre_wrap_object_descr_new),
-        )
+        let function = pyre_object::function::w_staticmethod_get_func(object_new);
+        crate::function::fset_func_text_signature(
+            function,
+            pyre_object::w_str_new("($type, *args, **kwargs)"),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__new__", object_new)
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(

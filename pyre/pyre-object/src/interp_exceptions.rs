@@ -59,6 +59,9 @@ pub static EXC_UNICODE_TRANSLATE_ERROR_TYPE: PyType =
 pub static EXC_SYSTEM_EXIT_TYPE: PyType = crate::pyobject::new_pytype("SystemExit");
 pub static EXC_MEMORY_ERROR_TYPE: PyType = crate::pyobject::new_pytype("MemoryError");
 pub static EXC_SYSTEM_ERROR_TYPE: PyType = crate::pyobject::new_pytype("SystemError");
+/// PyPy `W_EOFError`, a direct `Exception` subclass used by stream readers
+/// such as pickle and marshal.
+pub static EXC_EOF_ERROR_TYPE: PyType = crate::pyobject::new_pytype("EOFError");
 /// `BufferError` — raised when an operation cannot proceed because a
 /// buffer is exported (e.g. resizing a bytearray that backs a live
 /// memoryview).  Direct subclass of Exception.
@@ -111,6 +114,7 @@ pub fn exc_kind_to_pytype(kind: ExcKind) -> &'static PyType {
         ExcKind::SystemExit => &EXC_SYSTEM_EXIT_TYPE,
         ExcKind::MemoryError => &EXC_MEMORY_ERROR_TYPE,
         ExcKind::SystemError => &EXC_SYSTEM_ERROR_TYPE,
+        ExcKind::EOFError => &EXC_EOF_ERROR_TYPE,
         ExcKind::BufferError => &EXC_BUFFER_ERROR_TYPE,
         ExcKind::LookupError => &EXC_LOOKUP_ERROR_TYPE,
         ExcKind::UnicodeError => &EXC_UNICODE_ERROR_TYPE,
@@ -219,6 +223,9 @@ pub enum ExcKind {
     /// Signals exhaustion of an asynchronous iterator.  Appended so the
     /// existing discriminants embedded by the JIT remain stable.
     StopAsyncIteration = 33,
+    /// Direct Exception subclass raised when a stream ends before an object.
+    /// Appended so existing JIT-baked discriminants remain stable.
+    EOFError = 34,
 }
 
 impl ExcKind {
@@ -643,7 +650,7 @@ fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
 /// arrays against the same authoritative bound.  Anchored on the
 /// highest-numbered variant so adding new ExcKinds at the end of the
 /// enum extends the bound automatically.
-pub const EXC_KIND_COUNT: usize = (ExcKind::StopAsyncIteration as u8 as usize) + 1;
+pub const EXC_KIND_COUNT: usize = (ExcKind::EOFError as u8 as usize) + 1;
 
 static EXC_CLASS_BY_KIND: [std::sync::atomic::AtomicUsize; EXC_KIND_COUNT] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; EXC_KIND_COUNT];
@@ -1486,6 +1493,7 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::SystemExit => "SystemExit",
         ExcKind::MemoryError => "MemoryError",
         ExcKind::SystemError => "SystemError",
+        ExcKind::EOFError => "EOFError",
         ExcKind::LookupError => "LookupError",
         ExcKind::UnicodeError => "UnicodeError",
         ExcKind::UnicodeTranslateError => "UnicodeTranslateError",
@@ -1606,6 +1614,7 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "SystemExit" => Some(ExcKind::SystemExit),
         "MemoryError" => Some(ExcKind::MemoryError),
         "SystemError" => Some(ExcKind::SystemError),
+        "EOFError" => Some(ExcKind::EOFError),
         "LookupError" => Some(ExcKind::LookupError),
         "UnicodeError" => Some(ExcKind::UnicodeError),
         "UnicodeTranslateError" => Some(ExcKind::UnicodeTranslateError),
@@ -1736,6 +1745,7 @@ mod tests {
             ExcKind::SystemExit,
             ExcKind::MemoryError,
             ExcKind::SystemError,
+            ExcKind::EOFError,
             ExcKind::LookupError,
             ExcKind::UnicodeError,
             ExcKind::UnicodeTranslateError,

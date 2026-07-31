@@ -111,6 +111,10 @@ pub struct W_TypeObject {
     /// App-level `__qualname__` object, with the same lazy/identity semantics
     /// as `w_name`.
     pub w_qualname: PyObjectRef,
+    /// typeobject.py:213 `text_signature` — an optional interpreter-level
+    /// string supplied by the builtin TypeDef.  This is not a Python object
+    /// and therefore is not a GC edge.
+    pub text_signature: *mut String,
     /// Tuple of base type objects (PyObjectRef → W_TupleObject or PY_NULL).
     pub bases: PyObjectRef,
     /// Raw pointer to the class dict backing storage (`dict_w` analogue).
@@ -372,6 +376,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         w_name: PY_NULL,
         qualname,
         w_qualname: PY_NULL,
+        text_signature: std::ptr::null_mut(),
         bases,
         dict: dict_ptr,
         flag_heaptype: true,
@@ -490,6 +495,7 @@ pub fn w_type_new_builtin(
         w_name: PY_NULL,
         qualname,
         w_qualname: PY_NULL,
+        text_signature: std::ptr::null_mut(),
         bases,
         dict: dict_ptr,
         flag_heaptype: false,
@@ -951,6 +957,23 @@ pub unsafe fn w_type_set_qualname(obj: PyObjectRef, w_qualname: PyObjectRef) {
     *t.qualname = crate::w_str_get_wtf8(w_qualname).to_string();
     t.w_qualname = w_qualname;
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+/// typeobject.py:1220-1230 `type_get_text_signature` backing field.
+pub unsafe fn w_type_get_text_signature(obj: PyObjectRef) -> Option<&'static str> {
+    let signature = (*(obj as *const W_TypeObject)).text_signature;
+    if signature.is_null() {
+        None
+    } else {
+        Some(&*signature)
+    }
+}
+
+/// Set the initialization-time TypeDef `_text_signature_` value.
+pub unsafe fn w_type_set_text_signature(obj: PyObjectRef, signature: &str) {
+    let type_obj = &mut *(obj as *mut W_TypeObject);
+    debug_assert!(type_obj.text_signature.is_null());
+    type_obj.text_signature = crate::lltype::malloc_raw(signature.to_owned());
 }
 
 /// Get the bases tuple.

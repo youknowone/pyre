@@ -2393,6 +2393,7 @@ fn format_spec_err(
             crate::PyError::value_error("Precision not allowed in integer format specifier")
         }
         E::PrecisionTooBig => crate::PyError::value_error("precision too big"),
+        E::PrecisionMissing => crate::PyError::value_error("Format specifier missing precision"),
         E::InvalidFormatSpecifier => crate::PyError::value_error(format!(
             "Invalid format specifier '{spec}' for object of type '{type_name}'"
         )),

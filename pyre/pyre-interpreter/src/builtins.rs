@@ -3010,10 +3010,19 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "EOFError",
-        make_exc_type("EOFError", exc_exception_new, exception),
+        make_exc_type("EOFError", exc_eof_error_new, exception),
     );
     let syntax_error = make_exc_type("SyntaxError", exc_syntax_error_new, exception);
     crate::module_ns_store(ns, "SyntaxError", syntax_error);
+    // Python 3.14 `exceptions.c` — the private exception raised by
+    // `compile(..., flags=PyCF_ALLOW_INCOMPLETE_INPUT)` for an unfinished
+    // interactive input.  `codeop._maybe_compile` intentionally resolves the
+    // underscore-prefixed name through builtins rather than importing it.
+    crate::module_ns_store(
+        ns,
+        "_IncompleteInputError",
+        make_exc_type("_IncompleteInputError", exc_syntax_error_new, syntax_error),
+    );
     let indentation_error = make_exc_type("IndentationError", exc_syntax_error_new, syntax_error);
     crate::module_ns_store(ns, "IndentationError", indentation_error);
     crate::module_ns_store(
@@ -4712,7 +4721,10 @@ fn type_descr_new_with_metaclass(
                             if args.len() > 3 {
                                 metaclass_args.extend_from_slice(&args[3..]);
                             }
-                            return Ok(crate::call_function(w_metaclass, &metaclass_args));
+                            return crate::call::call_function_impl_result(
+                                w_metaclass,
+                                &metaclass_args,
+                            );
                         }
                     }
                 }
@@ -4889,7 +4901,7 @@ fn type_descr_new_with_metaclass(
                 if args.len() > 3 {
                     new_args.extend_from_slice(&args[3..]);
                 }
-                return Ok(crate::call_function(w_metaclass_new, &new_args));
+                return crate::call::call_function_impl_result(w_metaclass_new, &new_args);
             }
         }
         let w_metaclass = w_winner;
@@ -5100,6 +5112,10 @@ exc_constructor!(
 exc_constructor!(
     exc_exception,
     pyre_object::interp_exceptions::ExcKind::Exception
+);
+exc_constructor!(
+    exc_eof_error,
+    pyre_object::interp_exceptions::ExcKind::EOFError
 );
 exc_constructor!(
     exc_arithmetic_error,
@@ -6192,6 +6208,7 @@ macro_rules! exc_new_wrapper {
 
 exc_new_wrapper!(exc_base_exception_new, exc_base_exception);
 exc_new_wrapper!(exc_exception_new, exc_exception);
+exc_new_wrapper!(exc_eof_error_new, exc_eof_error);
 exc_new_wrapper!(exc_arithmetic_error_new, exc_arithmetic_error);
 exc_new_wrapper!(exc_zero_division_new, exc_zero_division);
 exc_new_wrapper!(exc_type_error_new, exc_type_error);
@@ -8840,32 +8857,129 @@ pub fn compile_err_to_syntax_error(
     e: crate::compile::CompileError,
     source: &str,
 ) -> crate::PyError {
+    compile_err_to_syntax_error_maybe_incomplete(e, source, false)
+}
+
+/// RustPython `vm_new.rs:new_syntax_error_maybe_incomplete` — select the
+/// private Python 3.14 `_IncompleteInputError` subclass for parser failures
+/// which end at an unfinished interactive input when
+/// `PyCF_ALLOW_INCOMPLETE_INPUT` is set.  PyPy's compiler has the same
+/// parser-level distinction through its `compile_command` path; pyre consumes
+/// RustPython's parser, so keep its exact error-shape classification here.
+fn compile_err_to_syntax_error_maybe_incomplete(
+    e: crate::compile::CompileError,
+    source: &str,
+    allow_incomplete: bool,
+) -> crate::PyError {
+    use rustpython_compiler::parser::{
+        InterpolatedStringErrorType, LexicalErrorType, ParseErrorType,
+    };
+
+    // Parser locations are byte offsets, so index the source as bytes: a
+    // non-ASCII character ahead of the quote would otherwise shift a
+    // character-indexed lookup off the run being tested.  Quotes are ASCII,
+    // so the byte comparison is exact.
+    fn opens_triple_quote(source: &str, loc: usize) -> bool {
+        let bytes = source.as_bytes();
+        bytes.get(loc).is_some_and(|quote| {
+            bytes.get(loc + 1) == Some(quote) && bytes.get(loc + 2) == Some(quote)
+        })
+    }
+
+    let incomplete = if allow_incomplete {
+        match &e {
+            crate::compile::CompileError::Parse(error) => match &error.error {
+                ParseErrorType::Lexical(LexicalErrorType::Eof) => true,
+                _ if error.is_unclosed_bracket => true,
+                ParseErrorType::Lexical(LexicalErrorType::FStringError(
+                    InterpolatedStringErrorType::UnterminatedTripleQuotedString,
+                )) => true,
+                ParseErrorType::Lexical(LexicalErrorType::UnclosedStringError) => {
+                    opens_triple_quote(source, error.raw_location.start().to_usize())
+                }
+                ParseErrorType::OtherError(message)
+                    if message.starts_with("Expected an indented block after")
+                        || message.starts_with("expected an indented block after") =>
+                {
+                    // Byte offsets again: the span covers the blank run that
+                    // should have held the indented block.
+                    let bytes = source.as_bytes();
+                    let from = error
+                        .raw_location
+                        .start()
+                        .to_usize()
+                        .saturating_add(1)
+                        .min(bytes.len());
+                    let to = error
+                        .raw_location
+                        .end()
+                        .to_usize()
+                        .saturating_add(1)
+                        .min(bytes.len());
+                    from <= to && bytes[from..to].iter().all(u8::is_ascii_whitespace)
+                }
+                // `codeop._maybe_compile` retries a failed command with one
+                // trailing newline.  The pinned RustPython parser reports the
+                // first unterminated triple quote as `UnclosedStringError`,
+                // but the newline retry as this `OtherError` shape.  CPython
+                // keeps both attempts incomplete; preserve RustPython's
+                // triple-quote test across that parser-shape variation.
+                ParseErrorType::OtherError(message)
+                    if message.starts_with("unterminated triple-quoted string literal") =>
+                {
+                    opens_triple_quote(source, error.raw_location.start().to_usize())
+                }
+                ParseErrorType::OtherError(_) => {
+                    error.raw_location.end().to_usize() >= source.len() && !source.ends_with('\n')
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    } else {
+        false
+    };
+
+    // `syntax_error_subclass` can supply a replacement message, so it
+    // runs before the located error is built.
     let subclass = syntax_error_subclass(&e, source);
     let msg = match subclass {
         Some((_, Some(replacement))) => replacement.to_string(),
         _ => e.to_string(),
     };
     let (lineno, offset) = e.python_location();
-    if lineno == 0 {
-        return crate::PyError::syntax_error(msg);
+    let mut error = if lineno == 0 {
+        crate::PyError::syntax_error(msg)
+    } else {
+        let (end_lineno, end_offset) = e.python_end_location().unwrap_or((lineno, offset));
+        let filename = e.source_path().to_string();
+        // The offending source line, keeping its trailing newline like `e.text`.
+        let text = source.split_inclusive('\n').nth(lineno - 1);
+        crate::PyError::syntax_error_located(
+            msg,
+            &filename,
+            lineno as i64,
+            offset as i64,
+            end_lineno as i64,
+            end_offset as i64,
+            text,
+        )
+    };
+    if incomplete {
+        let w_error = error.to_exc_object();
+        let w_type = lookup_exc_class("_IncompleteInputError")
+            .expect("_IncompleteInputError must be installed before compile()");
+        unsafe {
+            (*(w_error as *mut pyre_object::PyObject)).w_class = w_type;
+            return crate::PyError::from_exc_object(w_error);
+        }
     }
-    let (end_lineno, end_offset) = e.python_end_location().unwrap_or((lineno, offset));
-    let filename = e.source_path().to_string();
-    // The offending source line, keeping its trailing newline like `e.text`.
-    let text = source.split_inclusive('\n').nth(lineno - 1);
-    let mut err = crate::PyError::syntax_error_located(
-        msg,
-        &filename,
-        lineno as i64,
-        offset as i64,
-        end_lineno as i64,
-        end_offset as i64,
-        text,
-    );
+    // An incomplete input has returned already; the indentation subclass
+    // is the remaining retag.
     if let Some((name, _)) = subclass {
-        err.retag_exception_class(name);
+        error.retag_exception_class(name);
     }
-    err
+    error
 }
 
 /// Which of `tokenizer.c tok_get_normal_mode`'s two indentation rejections a
@@ -9287,8 +9401,14 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         return Ok(crate::w_code_new(code_ptr));
     }
     let source = source_str.as_deref().expect("non-AST source");
-    let code = crate::compile::compile_source_with_opts(source, mode, &filename, opts)
-        .map_err(|e| compile_err_to_syntax_error(e, source))?;
+    let code =
+        crate::compile::compile_source_with_opts(source, mode, &filename, opts).map_err(|e| {
+            compile_err_to_syntax_error_maybe_incomplete(
+                e,
+                source,
+                flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0,
+            )
+        })?;
     let code_ptr = Box::into_raw(Box::new(code)) as *const ();
     Ok(crate::w_code_new(code_ptr))
 }
@@ -10274,6 +10394,9 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             // guard, so a nest deep enough to exhaust the C stack has to be
             // caught on the way down.
             crate::stack_check::stack_check()?;
+            if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
+                return Ok(hash);
+            }
             let n = w_tuple_len(obj);
             let mut hashes = Vec::with_capacity(n);
             for i in 0..(n as i64) {
@@ -10303,13 +10426,17 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             // agrees with `__eq__`'s set equality.
             let args = pyre_object::w_union_get_args(obj);
             let n = pyre_object::w_tuple_len(args);
-            let mut members = Vec::with_capacity(n);
+            let mut hashes = Vec::with_capacity(n);
             for i in 0..n {
                 if let Some(item) = pyre_object::w_tuple_getitem(args, i as i64) {
-                    members.push(item);
+                    // Preserve frozenset construction's fallible element-hash
+                    // phase.  Building a low-level frozenset first would use
+                    // its stored infallible digest path and hide an
+                    // unhashable union member.
+                    hashes.push(try_hash_value(item)?);
                 }
             }
-            return try_hash_value(pyre_object::w_frozenset_from_items(&members));
+            return Ok(_hash_frozenset(&hashes));
         }
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
@@ -14474,6 +14601,11 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     if !unsafe { pyre_object::is_str(name_obj) } {
         return Err(crate::PyError::type_error("module name must be a string"));
     }
+    // Keep the wrapped name live across `level.__index__`: the precise
+    // collector can relocate a young string while the index protocol runs.
+    let _name_roots = pyre_object::gc_roots::push_roots();
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(name_obj);
     let globals = scope[1];
     let locals = scope[2];
     let fromlist = scope[3];
@@ -14494,7 +14626,9 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         }
     });
     // The native importer keys every lookup by `&str`, so a name that has no
-    // such spelling goes straight to the app-level bootstrap.
+    // such spelling goes straight to the app-level bootstrap.  Re-read the
+    // name through its root: `space_index_w` above may have moved it.
+    let name_obj = pyre_object::gc_roots::shadow_stack_get(name_slot);
     let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name_obj) }) else {
         return crate::importing::dunder_import_name_obj(
             name_obj, globals, locals, fromlist, level,
@@ -14826,6 +14960,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn int_string_rejects_trailing_nondigit() {
+        crate::typedef::init_typeobjects();
+        for text in ["1234L", "12x", "0x12g"] {
+            let source = w_str_new(text);
+            let base = if text.starts_with("0x") { 0 } else { 10 };
+            let err = parse_int_from_str(source, text, base).unwrap_err();
+            assert_eq!(err.kind, crate::PyErrorKind::ValueError);
+        }
+    }
     /// PyPy `interp_io._open` constructs `W_FileIO`, and
     /// `W_FileIO.descr_init` calls `_open_fd` before returning.  A writable
     /// pathname must therefore be created/truncated while the stream is still

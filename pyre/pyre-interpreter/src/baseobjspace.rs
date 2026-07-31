@@ -740,6 +740,13 @@ pub(crate) unsafe fn p_recursive_issubclass_w(
     w_derived: PyObjectRef,
     w_cls: PyObjectRef,
 ) -> Result<bool, PyError> {
+    // A parameterized GenericAlias delegates ordinary attributes (including
+    // `__bases__`) to its origin, but is not itself a class.  CPython's
+    // abstract subclass check rejects it as argument 1 before the legacy
+    // tuple-valued-`__bases__` fallback can mistake it for the origin.
+    if pyre_object::is_generic_alias(w_derived) {
+        return Err(PyError::type_error("issubclass() arg 1 must be a class"));
+    }
     if is_type_like_w(w_cls) && is_type_like_w(w_derived) {
         return Ok(issubtype_w(w_derived, w_cls));
     }
@@ -1157,13 +1164,15 @@ pub(crate) unsafe fn normalize_slice(
 ///         return space.call_args(w_impl, args)
 /// ```
 ///
-/// The `Function`/`FunctionWithFixedCode` fast path (both `FUNCTION_TYPE`
-/// here, exact match) calls `funccall(w_obj, *args_w)` — `w_obj` leads the
-/// positionals.  `BuiltinFunction` (`BUILTIN_FUNCTION_TYPE`) is excluded
-/// because it binds differently.  Every other descriptor is bound through
-/// `get` (`space.get`) first, then called with `args_w` alone, so
-/// `@staticmethod` / `@classmethod` / custom-descriptor dunders receive the
-/// arguments PyPy gives them.
+/// The `Function`/`FunctionWithFixedCode` fast path calls
+/// `funccall(w_obj, *args_w)` — `w_obj` leads the positionals.  Pyre gives a
+/// type-owned `FunctionWithFixedCode` the distinct public
+/// `METHOD_DESCRIPTOR_TYPE`, but it retains this exact PyPy call shape.
+/// `BuiltinFunction` (`BUILTIN_FUNCTION_TYPE`) is excluded because it binds
+/// differently.  Every other descriptor is bound through `get` (`space.get`)
+/// first, then called with `args_w` alone, so `@staticmethod` /
+/// `@classmethod` / custom-descriptor dunders receive the arguments PyPy
+/// gives them.
 pub(crate) unsafe fn get_and_call_function(
     w_descr: PyObjectRef,
     w_obj: PyObjectRef,
@@ -4407,6 +4416,37 @@ pub fn getdict(obj: PyObjectRef) -> PyResult {
             return Ok(w_dict);
         }
     }
+    // `tupleobject.W_AbstractTupleObject.user_setup` gives every user tuple
+    // subclass its own mapdict `dict` SPECIAL slot. pyre's tuple-subclass
+    // constructor always uses the canonical array-backed layout, whose
+    // trailing `w_dict` field is that per-object owner. Do not route it
+    // through the address-keyed native-object side table: a reclaimed
+    // structseq address can otherwise leak its extras into a later tuple.
+    if unsafe {
+        pyre_object::is_tuple(obj)
+            && !pyre_object::specialisedtupleobject::is_specialised_tuple(obj)
+    } {
+        let Some(w_type) = crate::typedef::r#type(obj) else {
+            return Ok(PY_NULL);
+        };
+        if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
+            let existing = unsafe { pyre_object::tupleobject::w_tuple_getdict(obj) };
+            if !existing.is_null() {
+                return Ok(existing);
+            }
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(obj);
+            let w_dict = pyre_object::w_dict_new();
+            unsafe {
+                pyre_object::tupleobject::w_tuple_setdict(
+                    pyre_object::gc_roots::shadow_stack_get(root_base),
+                    w_dict,
+                )
+            };
+            return Ok(w_dict);
+        }
+    }
     let w_type = match crate::typedef::r#type(obj) {
         Some(tp) => tp,
         None => return Ok(pyre_object::PY_NULL),
@@ -4423,10 +4463,10 @@ pub fn getdict(obj: PyObjectRef) -> PyResult {
 ///
 /// A `W_Member` slot normally reads/writes the receiver's mapdict slot
 /// storage (`MapdictSlotsSupport`), which only a `W_ObjectObject` carries.
-/// Native `str` subclasses carry their PyPy-shaped indexed storage on the
-/// `W_UnicodeObject` itself. Other fixed Rust payloads still fall back to an
-/// exposed instance `__dict__` when their type has one. `None`/`false` means
-/// the receiver has no writable storage.
+/// Native `str` and `list` subclasses carry their PyPy-shaped indexed storage
+/// on the payload object itself. Other fixed Rust payloads still fall back to
+/// an exposed instance `__dict__` when their type has one. `None`/`false`
+/// means the receiver has no writable storage.
 pub(crate) fn native_slot_get(
     obj: PyObjectRef,
     name: &str,
@@ -4452,6 +4492,9 @@ pub(crate) fn native_slot_get(
     }
     if unsafe { pyre_object::interp_array::is_array(obj) } {
         return Ok(unsafe { pyre_object::interp_array::w_array_slot_get(obj, index as usize) });
+    }
+    if unsafe { pyre_object::is_list(obj) } {
+        return Ok(unsafe { pyre_object::listobject::w_list_slot_get(obj, index as usize) });
     }
     let w_dict = getdict(obj)?;
     if w_dict.is_null() {
@@ -4490,6 +4533,10 @@ pub(crate) fn native_slot_set(
         unsafe { pyre_object::interp_array::w_array_slot_set(obj, index as usize, value) };
         return Ok(true);
     }
+    if unsafe { pyre_object::is_list(obj) } {
+        unsafe { pyre_object::listobject::w_list_slot_set(obj, index as usize, value) };
+        return Ok(true);
+    }
     let w_dict = getdict(obj)?;
     if w_dict.is_null() {
         return Ok(false);
@@ -4518,6 +4565,9 @@ pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str, index: u32) -> Resul
     }
     if unsafe { pyre_object::interp_array::is_array(obj) } {
         return Ok(unsafe { pyre_object::interp_array::w_array_slot_del(obj, index as usize) });
+    }
+    if unsafe { pyre_object::is_list(obj) } {
+        return Ok(unsafe { pyre_object::listobject::w_list_slot_del(obj, index as usize) });
     }
     let w_dict = getdict(obj)?;
     if w_dict.is_null() {
@@ -4607,6 +4657,20 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
         require_dict_for_setdict(w_dict)?;
         unsafe { pyre_object::interp_array::w_array_setdict(obj, w_dict) };
         return Ok(());
+    }
+    if unsafe {
+        pyre_object::is_tuple(obj)
+            && !pyre_object::specialisedtupleobject::is_specialised_tuple(obj)
+    } {
+        // A tuple without a dict slot falls through to the generic path so it
+        // still reports `__dict__` as not writable.
+        if let Some(w_type) = crate::typedef::r#type(obj) {
+            if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
+                require_dict_for_setdict(w_dict)?;
+                unsafe { pyre_object::tupleobject::w_tuple_setdict(obj, w_dict) };
+                return Ok(());
+            }
+        }
     }
     // W_TypeObject and Module keep their namespace mappings as readonly
     // attributes.  Their Python class/metaclass may itself inherit a regular
@@ -4929,6 +4993,31 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                     return Ok(dict);
                 }
             }
+        }
+    }
+
+    // `type.__annotations__` is owned by the receiver type itself and is
+    // never inherited.  Handle it at the object-space entry point before a
+    // metaclass/type-dict lookup can surface the raw getset descriptor stored
+    // in `type`'s own namespace.  A metaclass that defines its own
+    // `__annotations__` descriptor still outranks the cache, so only the
+    // builtin `type` getset routes here; anything else falls through to the
+    // ordinary metatype-MRO search below.
+    if name == "__annotations__" && unsafe { pyre_object::is_type(obj) } {
+        let owns_default = unsafe {
+            let metatype = crate::typedef::r#type(obj).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+            let found = lookup_in_type(metatype, "__annotations__");
+            match found {
+                None => true,
+                Some(descr) => {
+                    let type_obj = crate::typedef::gettypeobject(&pyre_object::pyobject::TYPE_TYPE);
+                    lookup_in_type(type_obj, "__annotations__")
+                        .is_some_and(|builtin| std::ptr::eq(descr, builtin))
+                }
+            }
+        };
+        if owns_default {
+            return type_get_annotations(obj);
         }
     }
 
@@ -5642,6 +5731,12 @@ pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
 
 /// `space.setattr(w_obj, w_name, w_val)`.
 pub fn setattr(obj: PyObjectRef, w_name: PyObjectRef, value: PyObjectRef) -> PyResult {
+    if w_name.is_null() || unsafe { !pyre_object::is_str(w_name) } {
+        return Err(PyError::type_error(format!(
+            "attribute name must be string, not '{}'",
+            crate::type_methods::arg_type_name(w_name)
+        )));
+    }
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
     match name.as_str() {
         Ok(s) => setattr_str(obj, s, value),
@@ -5651,6 +5746,12 @@ pub fn setattr(obj: PyObjectRef, w_name: PyObjectRef, value: PyObjectRef) -> PyR
 
 /// `space.delattr(w_obj, w_name)`.
 pub fn delattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
+    if w_name.is_null() || unsafe { !pyre_object::is_str(w_name) } {
+        return Err(PyError::type_error(format!(
+            "attribute name must be string, not '{}'",
+            crate::type_methods::arg_type_name(w_name)
+        )));
+    }
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
     match name.as_str() {
         Ok(s) => delattr_str(obj, s),
@@ -6316,18 +6417,23 @@ unsafe fn type_getattr_hook_or_err(
 /// shape: explicit annotations and the lazy cache belong to this type's own
 /// namespace and are never inherited from a base class.
 pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
-    if let Some(value) = crate::type_dict_lookup(obj, "__annotations__") {
-        return Ok(value);
-    }
-    if let Some(value) = crate::type_dict_lookup(obj, "__annotations_cache__") {
-        return Ok(value);
-    }
-
+    // `type.__annotations__` is the getset descriptor implementing this
+    // operation, not annotations owned by the static builtin `type` itself.
+    // Static builtin types cannot acquire annotations, so reject them before
+    // consulting their namespace.  Heap types below may have an explicit
+    // class-body entry with this name.
     if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
         return Err(PyError::attribute_error(format!(
             "type object '{}' has no attribute '__annotations__'",
             unsafe { w_type_get_name(obj) },
         )));
+    }
+
+    if let Some(value) = crate::type_dict_lookup(obj, "__annotations__") {
+        return Ok(value);
+    }
+    if let Some(value) = crate::type_dict_lookup(obj, "__annotations_cache__") {
+        return Ok(value);
     }
 
     // An explicit class-body __annotate__ is an ordinary visible class-dict
@@ -6875,6 +6981,14 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     // PyPy: typeobject.py lookup_where → MRO search + descriptor unwrap
     unsafe {
         if is_type(obj) {
+            // CPython/PyPy `type_get_annotations` is metadata owned by the
+            // type object itself, not an inheritable class-dict value.  Apply
+            // it before the metaclass/data-descriptor search so `type` itself
+            // raises AttributeError instead of finding and returning the raw
+            // getset stored in its own MRO.
+            if name == "__annotations__" {
+                return type_get_annotations(obj);
+            }
             // baseobjspace.py:76 — the metaclass is type(C), read from w_class.
             let w_type_type = crate::typedef::w_type();
             let w_metaclass = {
@@ -7083,7 +7197,12 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // that returns None. abc.update_abstractmethods relies on
             // hasattr() returning False to short-circuit non-ABCs.
             if name == "__abstractmethods__" {
-                if let Some(v) = lookup_in_type_where(obj, name) {
+                // typeobject.py:1249-1256 uses `w_type.getdictvalue`, i.e.
+                // this type's own dictionary only.  Inheriting a base's
+                // `__abstractmethods__` here makes `inspect.isabstract`
+                // believe ABCMeta.__new__ has already finished while
+                // __init_subclass__ is still running.
+                if let Some(v) = crate::type_dict_lookup(obj, name) {
                     return Ok(v);
                 }
                 // descroperation.py:234 wraps the whole getattribute slot, so
@@ -7361,6 +7480,18 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
     }
     unsafe {
         if crate::is_function(obj) {
+            // PyPy has separate Function and BuiltinFunction classes.
+            // Pyre shares the Rust Function representation, so preserve that
+            // app-level distinction here: builtin functions do not expose
+            // Python-function storage attributes.
+            if crate::is_builtin_code(crate::getcode(obj) as PyObjectRef)
+                && matches!(
+                    name,
+                    "__code__" | "__globals__" | "__closure__" | "__defaults__" | "__kwdefaults__"
+                )
+            {
+                return Err(raiseattrerror(obj, name, None));
+            }
             match name {
                 "__code__" => {
                     // function_get_code returns Code-level pointer (PyCode or BuiltinCode)
@@ -7401,13 +7532,10 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     });
                 }
                 "__qualname__" => {
-                    // function.py:470-471 fget_func_qualname returns
-                    // space.newtext(self.qualname); the typed
-                    // `function_get_qualname` mirrors PyPy's `qualname or
-                    // self.name` short-circuit (w_qualname slot →
-                    // code.co_qualname → name).
-                    let s = crate::function::function_get_qualname(obj);
-                    return Ok(w_str_new(&s));
+                    // Return the object-owned `Function.w_qualname` field.
+                    // The helper materialises the PyPy `qualname or
+                    // self.name` fallback once for legacy callers.
+                    return Ok(crate::function::fget_func_qualname(obj));
                 }
                 "__doc__" => {
                     // `pypy/interpreter/function.py:395-398 fget_func_doc`

@@ -1162,6 +1162,34 @@ pub fn make_builtin_function(name: &'static str, func: BuiltinCodeFn) -> PyObjec
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// GatewayCache.build parity for an interp2app carrying the text signature
+/// produced by `interp2app._generate_text_signature`.
+pub fn make_builtin_function_with_text_signature(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    text_signature: &'static str,
+) -> PyObjectRef {
+    let function = make_builtin_function(name, func);
+    unsafe {
+        crate::function::fset_func_text_signature(function, pyre_object::w_str_new(text_signature));
+    }
+    function
+}
+
+/// Fixed-arity twin of `make_builtin_function_with_text_signature`.
+pub fn make_builtin_function_with_arity_and_text_signature(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    arity: u16,
+    text_signature: &'static str,
+) -> PyObjectRef {
+    let function = make_builtin_function_with_arity(name, func, arity);
+    unsafe {
+        crate::function::fset_func_text_signature(function, pyre_object::w_str_new(text_signature));
+    }
+    function
+}
+
 /// Like `make_builtin_function` but tagged as `BuiltinFunction`
 /// (the `builtin_function` type) rather than `FunctionWithFixedCode`.
 /// Used for builtin `__new__` carriers so `type(int.__new__)` is the

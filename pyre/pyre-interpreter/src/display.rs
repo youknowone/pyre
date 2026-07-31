@@ -7,8 +7,8 @@ use pyre_object::pyobject::{
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 use crate::{
-    BUILTIN_CODE_TYPE, BUILTIN_FUNCTION_TYPE, FUNCTION_TYPE, builtin_code_name, function_get_name,
-    function_get_qualname,
+    BUILTIN_CODE_TYPE, BUILTIN_FUNCTION_TYPE, FUNCTION_TYPE, METHOD_DESCRIPTOR_TYPE,
+    builtin_code_name, function_get_name, function_get_qualname,
 };
 
 /// Try to call a dunder method (__repr__, __str__, etc.) on an instance.
@@ -369,6 +369,7 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
             || std::ptr::eq(tp, &BOOL_TYPE as *const PyType)
             || std::ptr::eq(tp, &STR_TYPE as *const PyType)
             || std::ptr::eq(tp, &pyre_object::LIST_TYPE as *const PyType)
+            || pyre_object::is_tuple(obj)
             || std::ptr::eq(
                 tp,
                 &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const PyType,
@@ -876,10 +877,8 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
                         )
                     {
                         parts.push("None".to_string());
-                    } else if pyre_object::is_type(item) {
-                        parts.push(pyre_object::w_type_get_name(item).to_string());
                     } else {
-                        parts.push(py_repr(item)?);
+                        parts.push(crate::_pypy_generic_alias::repr_item(item)?);
                     }
                 }
             }

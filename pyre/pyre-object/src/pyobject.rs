@@ -987,6 +987,10 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
             &crate::interp_exceptions::EXC_BUFFER_ERROR_TYPE,
             &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
         ),
+        (
+            &crate::interp_exceptions::EXC_EOF_ERROR_TYPE,
+            &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
+        ),
     ];
     PYTYPES
 }
@@ -1059,6 +1063,7 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(31, &crate::interp_exceptions::EXC_UNBOUND_LOCAL_ERROR_TYPE),
         subclass_range_alias(31, &crate::interp_exceptions::EXC_BUFFER_ERROR_TYPE),
         subclass_range_alias(31, &crate::interp_exceptions::EXC_STOP_ASYNC_ITERATION_TYPE),
+        subclass_range_alias(31, &crate::interp_exceptions::EXC_EOF_ERROR_TYPE),
         subclass_range_alias(32, &crate::generator::GENERATOR_TYPE),
         subclass_range_alias(33, &TYPE_TYPE),
         subclass_range_alias(34, &STR_TYPE),

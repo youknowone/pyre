@@ -355,16 +355,37 @@ pub fn new_instance_with_extra(
     items: Vec<PyObjectRef>,
     extras: Vec<(&str, PyObjectRef)>,
 ) -> PyObjectRef {
+    // RPython's local GCREFs remain live across every allocation below.
+    // Mirror that explicitly: tuple allocation may collect before the extras
+    // dict exists, and each dict insertion may then relocate both the dict and
+    // the remaining values. The host `extras` Vec is not a GC root.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let extras_root_base = pyre_object::gc_roots::shadow_stack_len();
+    for &(_, value) in &extras {
+        pyre_object::gc_roots::pin_root(value);
+    }
     let obj = pyre_object::w_tuple_new_array_backed(items);
     unsafe {
         (*obj).w_class = cls;
     }
     if !extras.is_empty() {
         let w_dict = pyre_object::w_dict_new();
-        for (k, v) in extras {
-            unsafe { pyre_object::w_dict_setitem_str(w_dict, k, v) };
+        pyre_object::gc_roots::pin_root(w_dict);
+        let dict_root = pyre_object::gc_roots::shadow_stack_len() - 1;
+        for (i, (k, _)) in extras.iter().enumerate() {
+            unsafe {
+                pyre_object::w_dict_setitem_str(
+                    pyre_object::gc_roots::shadow_stack_get(dict_root),
+                    k,
+                    pyre_object::gc_roots::shadow_stack_get(extras_root_base + i),
+                )
+            };
         }
-        crate::baseobjspace::setdict(obj, w_dict).expect(
+        crate::baseobjspace::setdict(
+            obj,
+            pyre_object::gc_roots::shadow_stack_get(dict_root),
+        )
+        .expect(
             "structseq extras: setdict on a fresh hasdict tuple subclass with a fresh dict cannot fail",
         );
     }

@@ -6,7 +6,8 @@
 //! becomes `Ptr(GcArray(OBJECTPTR))`; the `[*]` annotation marks both
 //! the list and its contents as immutable so the JIT can hoist loads.
 //! pyre stores the array via `*mut ItemsBlock` (shared GcArray body
-//! layer with `W_ListObject`). Length comes directly from the
+//! layer with `W_ListObject`) and the content hash in `_hash_cache`.
+//! Length comes directly from the
 //! GcArray header — `arraylen_gc(wrappeditems)` on the JIT side and
 //! `items_block_capacity(wrappeditems)` on the host side.
 //! Python 3.14 adds `PyTupleObject.ob_hash`, initially `-1`, and caches the
@@ -54,7 +55,8 @@ pub const TUPLE_HASH_UNSET: i64 = -1;
 /// Python tuple object — array-backed default representation.
 ///
 /// Layout mirrors `pypy/objspace/std/tupleobject.py:376-390` after
-/// RPython translation: `{wrappeditems: Ptr(GcArray(OBJECTPTR))}`.
+/// RPython translation:
+/// `{wrappeditems: Ptr(GcArray(OBJECTPTR)), _hash_cache: Signed}`.
 /// `_immutable_fields_ = ['wrappeditems[*]']` is reflected via
 /// `immutable: true` on the `wrappeditems` field descr; the array
 /// items are loaded as `getfield_gc_pure_r` and the array length
@@ -70,6 +72,15 @@ pub struct W_TupleObject {
     /// `len(l.items)`); empty tuples carry a 0-cap header-only
     /// allocation (non-null pointer).
     pub wrappeditems: *mut ItemsBlock,
+    /// Mapdict's per-instance `dict` SPECIAL slot for a user subclass.
+    ///
+    /// PyPy's `user_setup` mixes mapdict storage into the concrete
+    /// user-subclass instance. Rust has one fixed payload layout, so the
+    /// optional slot lives on the canonical array-backed tuple object;
+    /// exact tuples leave it null. Tuple subclasses are deliberately rebuilt
+    /// with this layout in `tuple_descr_new`, never with an arity-2
+    /// specialised layout.
+    pub w_dict: PyObjectRef,
 }
 
 /// GC type id assigned to `W_TupleObject` at `JitDriver` init time.
@@ -139,6 +150,8 @@ pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mu
     if is_specialised_tuple_ii(obj) || is_specialised_tuple_ff(obj) {
         return;
     }
+    let tuple = obj as *mut W_TupleObject;
+    visitor(std::ptr::addr_of_mut!((*tuple).w_dict));
     // General `W_TupleObject`: forward each slot of the exact-size items block.
     if let Some((ptr, n)) = w_tuple_object_items_ptr_len(obj) {
         for i in 0..n {
@@ -232,6 +245,7 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
                     },
                     hash: AtomicI64::new(TUPLE_HASH_UNSET),
                     wrappeditems: std::ptr::null_mut(),
+                    w_dict: PY_NULL,
                 },
             );
         }
@@ -263,6 +277,7 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
                     ob_header: header,
                     hash: AtomicI64::new(TUPLE_HASH_UNSET),
                     wrappeditems: items_block,
+                    w_dict: PY_NULL,
                 },
             );
         }
@@ -281,7 +296,27 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
         ob_header: header,
         hash: AtomicI64::new(TUPLE_HASH_UNSET),
         wrappeditems: items_block,
+        w_dict: PY_NULL,
     })) as PyObjectRef
+}
+
+/// Read the mapdict `dict` SPECIAL slot of an array-backed tuple subclass.
+///
+/// # Safety
+/// `obj` must be a non-specialised `W_TupleObject`.
+#[inline]
+pub unsafe fn w_tuple_getdict(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_TupleObject)).w_dict }
+}
+
+/// Replace the mapdict `dict` SPECIAL slot of an array-backed tuple subclass.
+///
+/// # Safety
+/// `obj` must be a non-specialised `W_TupleObject`.
+#[inline]
+pub unsafe fn w_tuple_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
+    unsafe { (*(obj as *mut W_TupleObject)).w_dict = w_dict };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// CPython 3.14 `FT_ATOMIC_LOAD_SSIZE_RELAXED(v->ob_hash)`, generalized over

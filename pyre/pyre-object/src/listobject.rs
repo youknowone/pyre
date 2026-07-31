@@ -120,6 +120,11 @@ pub struct W_ListObject {
     pub strategy: ListStrategy,
     pub int_items: IntArray,
     pub float_items: FloatArray,
+    /// PyPy `BaseUserClassMapdict` indexed instance storage for a native
+    /// `list` subclass declaring `__slots__`.  Kept on the object itself,
+    /// just like `W_UnicodeObject.w_slots`; `PY_NULL` means that no slot has
+    /// been assigned yet.
+    pub w_slots: PyObjectRef,
 }
 
 /// GC type id assigned to `W_ListObject` at `JitDriver` init time.
@@ -788,6 +793,7 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
             strategy,
             int_items,
             float_items,
+            w_slots: PY_NULL,
         });
         return Box::into_raw(boxed) as PyObjectRef;
     }
@@ -805,6 +811,7 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
                 strategy,
                 int_items,
                 float_items,
+                w_slots: PY_NULL,
             },
         );
     }
@@ -819,6 +826,59 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
         list_write_barrier_impl(raw as PyObjectRef, true);
     }
     raw as PyObjectRef
+}
+
+/// Read one app-level `__slots__` entry from a `list` subclass.
+///
+/// PyPy's `BaseUserClassMapdict.getslotvalue` indexes the instance-owned
+/// storage list by `Member.index`. `PY_NULL` is the unbound-slot sentinel.
+pub unsafe fn w_list_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+    let slots = unsafe { (*(obj as *const W_ListObject)).w_slots };
+    if slots.is_null() {
+        return None;
+    }
+    unsafe { w_list_getitem(slots, index as i64) }.filter(|value| !value.is_null())
+}
+
+/// Write one app-level `__slots__` entry on a `list` subclass.
+pub unsafe fn w_list_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(obj);
+    crate::gc_roots::pin_root(value);
+    let obj_slot = crate::gc_roots::shadow_stack_len() - 2;
+    let value_slot = crate::gc_roots::shadow_stack_len() - 1;
+
+    let mut rooted_obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let mut slots = unsafe { (*(rooted_obj as *const W_ListObject)).w_slots };
+    if slots.is_null() {
+        slots = w_list_new(vec![PY_NULL; index + 1]);
+        rooted_obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        unsafe { (*(rooted_obj as *mut W_ListObject)).w_slots = slots };
+        crate::gc_hook::try_gc_write_barrier(rooted_obj as *mut u8);
+    }
+    crate::gc_roots::pin_root(slots);
+    let slots_slot = crate::gc_roots::shadow_stack_len() - 1;
+    while unsafe { w_list_len(crate::gc_roots::shadow_stack_get(slots_slot)) } <= index {
+        unsafe { w_list_append(crate::gc_roots::shadow_stack_get(slots_slot), PY_NULL) };
+    }
+    unsafe {
+        w_list_setitem(
+            crate::gc_roots::shadow_stack_get(slots_slot),
+            index as i64,
+            crate::gc_roots::shadow_stack_get(value_slot),
+        );
+    }
+}
+
+/// Clear one app-level `__slots__` entry on a `list` subclass.
+pub unsafe fn w_list_slot_del(obj: PyObjectRef, index: usize) -> bool {
+    let slots = unsafe { (*(obj as *const W_ListObject)).w_slots };
+    if slots.is_null()
+        || unsafe { w_list_getitem(slots, index as i64) }.is_none_or(|value| value.is_null())
+    {
+        return false;
+    }
+    unsafe { w_list_setitem(slots, index as i64, PY_NULL) }
 }
 
 // Integer-strategy low-level access primitives, mirroring the rlist.py
@@ -1318,6 +1378,27 @@ pub unsafe fn w_list_uses_float_storage(obj: PyObjectRef) -> bool {
 pub unsafe fn w_list_uses_empty_storage(obj: PyObjectRef) -> bool {
     let list = &*(obj as *const W_ListObject);
     list.strategy == ListStrategy::Empty
+}
+
+/// True when the next `w_list_append` on `obj` takes the Object strategy's
+/// in-place arm (`rlist.py:285` resize-ge fast case) into a GC-managed items
+/// block: spare capacity, so the store is an item-slot write and the list's
+/// `items` pointer does not change.
+///
+/// The tracer uses this to decide whether the recorded trace needs
+/// `list_write_barrier` at all — see `FbwWalkMode::append_inplace_wb_covered`.
+/// A `std::alloc` block (`PYRE_GC_ITEMSBLOCK=0`) answers false: it has no GC
+/// header for an array barrier to mark, so the barrier on the enclosing
+/// `W_ListObject` is the only thing keeping the block's slots reachable.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`.
+pub unsafe fn w_list_append_stores_into_gc_block_in_place(obj: PyObjectRef) -> bool {
+    let list = &*(obj as *const W_ListObject);
+    list.strategy == ListStrategy::Object
+        && ll_list_obj_length(list) < ll_list_obj_capacity(list)
+        && !list.items.is_null()
+        && crate::gc_hook::try_gc_owns_object(list.items as *mut u8)
 }
 
 /// Rebuild the list's object storage from a Vec.

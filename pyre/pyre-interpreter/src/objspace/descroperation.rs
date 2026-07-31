@@ -4748,7 +4748,10 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         // restrict to those ops; other ops fall through to the dunder
         // dispatch which currently raises TypeError, matching the
         // unimplemented `__lt__` etc. on plain dict.
-        if is_dict(a) && is_dict(b) && matches!(op, CompareOp::Eq | CompareOp::Ne) {
+        if is_exact_type(a, &pyre_object::DICT_TYPE)
+            && is_exact_type(b, &pyre_object::DICT_TYPE)
+            && matches!(op, CompareOp::Eq | CompareOp::Ne)
+        {
             let la = pyre_object::w_dict_len(a);
             let lb = pyre_object::w_dict_len(b);
             let mut equal = la == lb;
