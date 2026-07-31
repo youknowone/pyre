@@ -272,14 +272,26 @@ pub unsafe fn w_pytraceback_get_w_code(obj: PyObjectRef) -> PyObjectRef {
 /// ```
 ///
 /// Pyre stamps the real line number at `record_application_traceback`
-/// time (the frame is guaranteed live there), so this reader never
-/// has to walk back through `self.frame.pycode`.  That walk is what
-/// upstream does, and it is safe there because the frame edge is
-/// unconditional; pyre's is not forwarded for a frame the GC does not
-/// own, which may already have been freed by the time `tb_lineno` is
-/// read.  The `LINENO_NOT_COMPUTED` sentinel still surfaces as `-1`
-/// for the edge case where the traceback was constructed without a
-/// frame (e.g. unit tests).
+/// time instead of resolving it here.  The upstream walk goes through
+/// `self.frame.pycode`, which this reader cannot do: `frame` is only
+/// forwarded for a frame the GC owns, so it may already have been
+/// freed by the time `tb_lineno` is read.  The `w_code` snapshot is
+/// forwarded unconditionally and IS that `pycode`, so `offset2lineno`
+/// off `w_code` and `lasti` would be safe to run lazily.  What still
+/// depends on the eager stamp is the JIT fold
+/// `walker_specialize_traceback_walk_field` (pyre-jit-trace): it reads
+/// this slot directly and declines on the sentinel, so under a lazy
+/// `get_lineno` every fresh node would decline on its first read.
+///
+/// Two `tb_lineno` answers diverge from `get_lineno` because of it.
+/// Upstream re-resolves from the CURRENT `lasti` whenever the slot
+/// still holds the sentinel, so `tb.tb_lasti = N; tb.tb_lineno` reads
+/// the new offset there and the originally-stamped line here; and a
+/// sentinel written back through `TracebackType(..., -sys.maxsize-1)`
+/// or the `tb_lineno` setter is re-resolved there and answered `-1`
+/// here.  Porting back to lazy needs the fold to call a resolver
+/// rather than decline.  The sentinel also still surfaces as `-1` for
+/// a traceback constructed without a frame (e.g. unit tests).
 ///
 /// # Safety
 /// `tb` must point to a valid `PyTraceback`.
@@ -385,12 +397,14 @@ pub unsafe fn record_application_traceback(
         crate::eval::set_in_flight_exception(w_exc_object);
         // `pytraceback.py:36 self.lineno = offset2lineno(self.frame
         // .pycode, self.lasti)` — pyre resolves the line number
-        // eagerly here rather than lazily in `get_lineno`, because a
-        // frame the GC does not own is not kept alive by the traceback
-        // and may already be freed by the time `tb_lineno` is read.
-        // Stamping at construction guarantees the value survives the
-        // frame's lifetime.  `frame.pycode` is the `PyCode` wrapper;
-        // the inner `CodeObject` is extracted via `pyframe_get_pycode`.
+        // eagerly here rather than lazily in `get_lineno`; stamping at
+        // construction guarantees the value survives the frame's
+        // lifetime, since a frame the GC does not own is not kept alive
+        // by the traceback.  See `w_pytraceback_get_lineno` for what
+        // still depends on the eager stamp and which two `tb_lineno`
+        // answers it diverges on.  `frame.pycode` is the `PyCode`
+        // wrapper; the inner `CodeObject` is extracted via
+        // `pyframe_get_pycode`.
         //
         // The `PyCode` PyObjectRef is also captured into the `w_code`
         // slot so the traceback's source-path / function name metadata
