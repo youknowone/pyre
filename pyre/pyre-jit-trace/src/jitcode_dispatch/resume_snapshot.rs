@@ -2066,17 +2066,18 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             })
             .map(|m| m as i32)
             .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC),
-        None if ctx.live_before_jit_pc != usize::MAX
-            && matches!(
-                ctx.trace_ctx.last_guard_opcode(),
-                Some(OpCode::GuardValue | OpCode::GuardClass)
-            )
-            && callee_pjc
-                .jitcode
-                .can_decode_live_vars(ctx.live_before_jit_pc, crate::state::op_live()) =>
-        {
-            ctx.live_before_jit_pc as i32
-        }
+        // No `-live-` BEFORE anchor arm here, unlike the single-frame path.
+        // The marker below is `callee_op_pc`'s codewrite-time twin: the
+        // coordinate whose liveness window the boxes this frame is about to
+        // collect were emitted against. `ctx.live_before_jit_pc` is merely
+        // another `-live-` byte the walk stepped over, and passing
+        // `can_decode_live_vars` only says its window decodes, not that it is
+        // the one those boxes belong to. Carrying it makes
+        // `collect_callee_active_boxes` size the section from one coordinate
+        // while reading the values out of the sub-walk registers at another.
+        // The single-frame path can substitute the anchor because it re-reads
+        // the owning frame's vable shadow at the carried coordinate; the callee
+        // sub-walk owns no shadow to re-read.
         None => callee_pjc
             .resume_marker_for_jitcode_pc(callee_op_pc)
             .map(|m| m as i32)

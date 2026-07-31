@@ -10712,19 +10712,39 @@ fn sync_virtualizable_after_guard_failure(
         // pyjitpl.py:3427-3429: reset token before synchronize_virtualizable().
         vinfo.reset_vable_token(frame_u8);
     }
-    let expected_total_without_identity = vinfo.num_static_extra_boxes
-        + (0..vinfo.array_fields.len())
-            .map(|array_index| unsafe {
-                vinfo.get_array_length(frame_u8.cast_const(), array_index)
+    let array_lengths: Vec<usize> = (0..vinfo.array_fields.len())
+        .map(|array_index| unsafe { vinfo.get_array_length(frame_u8.cast_const(), array_index) })
+        .collect();
+    let expected_total_without_identity =
+        vinfo.num_static_extra_boxes + array_lengths.iter().sum::<usize>();
+    if resolved_vable.len() != expected_total_without_identity + 1 {
+        // A length read out of a frame the reader did not actually restore is
+        // wild, not merely off by a slot, so name the pointer it came from and
+        // every field the sum walked: `statics + Σ lengths` alone cannot say
+        // which of the two sides is the wrong one.
+        let arrays: Vec<String> = vinfo
+            .array_fields
+            .iter()
+            .zip(&array_lengths)
+            .map(|(field, len)| {
+                let container =
+                    unsafe { *(frame_u8.cast_const().add(field.field_offset) as *const *const u8) };
+                format!(
+                    "{}@{}: container={container:?} len_off={} len={len}",
+                    field.name, field.field_offset, field.length_offset,
+                )
             })
-            .sum::<usize>();
-    assert_eq!(
-        resolved_vable.len(),
-        expected_total_without_identity + 1,
-        "rebuild_guard_fail_state: virtualizable box count mismatch (expected {}, got {})",
-        expected_total_without_identity + 1,
-        resolved_vable.len(),
-    );
+            .collect();
+        panic!(
+            "rebuild_guard_fail_state: virtualizable box count mismatch \
+             (expected {}, got {}); frame={frame_u8:?} statics={} arrays=[{}] vable={:?}",
+            expected_total_without_identity + 1,
+            resolved_vable.len(),
+            vinfo.num_static_extra_boxes,
+            arrays.join(", "),
+            resolved_vable,
+        );
+    }
 
     let mut boxes: Vec<i64> = Vec::with_capacity(expected_total_without_identity + 1);
     let mut cursor = 1;
