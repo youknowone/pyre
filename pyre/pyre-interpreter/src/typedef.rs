@@ -18235,7 +18235,9 @@ fn bytes_require_no_args(args: &[PyObjectRef], name: &str) -> Result<(), crate::
     } else {
         "bytes"
     };
-    crate::type_methods::arity_no_args(args, &format!("{owner}.{name}"))
+    // The declaring class, not the receiver's own type: a `bytes` subclass
+    // instance still reports `bytes.capitalize`.
+    crate::type_methods::arity_no_args_of(Some(owner), args, name)
 }
 
 fn bytes_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
