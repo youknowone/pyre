@@ -917,7 +917,9 @@ impl BlackholeInterpreter {
         // (it may be caught by a catch_operation in this frame)
         if current_exc != 0 {
             if !self.handle_exception_in_frame(current_exc) {
-                // No handler: propagate
+                // No handler: propagate.  The exception leaves this frame here,
+                // so record its node — see [`Self::record_frame_traceback`].
+                self.record_frame_traceback(current_exc);
                 if self.nextblackholeinterp.is_none() {
                     return Err(self.exit_frame_with_exception(current_exc));
                 }
@@ -943,6 +945,9 @@ impl BlackholeInterpreter {
         // Check for exception during execution
         if self.got_exception {
             let exc = self.exception_last_value;
+            // `run` reached the end of the frame with an uncaught exception, so
+            // the frame is left here — see [`Self::record_frame_traceback`].
+            self.record_frame_traceback(exc);
             if self.nextblackholeinterp.is_none() {
                 // blackhole.py:1629
                 return Err(self.exit_frame_with_exception(exc));
@@ -1299,19 +1304,7 @@ impl BlackholeInterpreter {
         // move (`w_exception_new_empty` allocates in the stable old gen), but
         // old gen is mark-sweep, so an unrooted one is collectable.
         self.exception_last_value = exc_value;
-        // pyopcode.py raise_varargs records the raising instruction before
-        // handler lookup; RaiseWithExplicitTraceback skips it for bare
-        // reraise.
-        if self.jitcode.code[self.last_opcode_position] != jitcode::insns::BC_RERAISE
-            && let Some(record) = self.record_caught_exception
-        {
-            record(
-                exc_value,
-                self.virtualizable_ptr,
-                self.jitcode.try_index().map_or(-1, |index| index as i64),
-                self.last_opcode_position as i64,
-            );
-        }
+        self.record_frame_traceback(exc_value);
         self.position = target;
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
         // A residual `bh_call` that raised published the exception into BOTH
@@ -1323,6 +1316,54 @@ impl BlackholeInterpreter {
         // Drain the backend cells here so the handler runs with a pristine cell.
         self.cpu().clear_stored_exception();
         true
+    }
+
+    /// `pyopcode.py:147-148 pytraceback.record_application_traceback` for the
+    /// frame this interpreter is leaving with `exc_value` live.
+    ///
+    /// Upstream takes the handler search and the traceback record from one
+    /// `handle_operation_error`, so a frame that raises always gets its node no
+    /// matter which way the search went.  Here the search half is the jitcode
+    /// `catch_exception` scan and the record half has no jitcode counterpart,
+    /// so every arm that ends an exception's stay in this frame has to make the
+    /// call — the caught arm ([`Self::route_to_catch`]) and the two propagate
+    /// arms in [`Self::resume_mainloop`] alike.
+    ///
+    /// `raise_varargs` records the raising instruction before the handler
+    /// lookup; `RaiseWithExplicitTraceback` skips it for a bare reraise. The
+    /// installed hook additionally drops a node the exception's chain head
+    /// already carries, so a second call for one delivery is a no-op.
+    fn record_frame_traceback(&self, exc_value: i64) {
+        if exc_value == 0 {
+            return;
+        }
+        if self.jitcode.code.get(self.last_opcode_position) == Some(&jitcode::insns::BC_RERAISE) {
+            return;
+        }
+        let jitcode_index = self.jitcode.try_index().map_or(-1, |index| index as i32);
+        let position = self.last_opcode_position as i32;
+        match self.record_caught_exception {
+            Some(record) => record(
+                exc_value,
+                self.virtualizable_ptr,
+                i64::from(jitcode_index),
+                i64::from(position),
+            ),
+            // The per-interpreter field is an override a chain builder or a
+            // test installs on the frames it owns.  An interpreter leased
+            // straight from the pool — every one the tracing-abort adoption
+            // drives — has none, and dropping the record there is what left a
+            // frame the blackhole finished out of its own traceback.  The
+            // process-global hook is the same host callback
+            // (`build_jit_driver_pair` installs one function for both) and
+            // no-ops while unset.
+            None => crate::pyjitpl::record_application_traceback_for_recording(
+                exc_value,
+                self.virtualizable_ptr,
+                jitcode_index,
+                position,
+            ),
+        }
     }
 
     /// Locate the `catch_exception` op that belongs to the just-executed
