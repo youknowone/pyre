@@ -9280,15 +9280,30 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
     // PyPy's C3 merge raises here when the bases are inconsistent; pyre's
     // low-level Vec-returning helper cannot carry that exception, so preserve
     // the same ordering through its fallible validation front door.
+    // The validation and the metaclass `mro()` below both execute Python.  A
+    // type reaching `type.__new__` has no referrer yet beyond this argument,
+    // and the MRO snapshots are untraced Rust Vecs, so root all of them and
+    // reread every use that crosses one of those calls.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pin_slot(w_self);
     let w_bases = pyre_object::typeobject::w_type_get_bases(w_self);
     validate_c3_mro(w_bases, true)?;
+    let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
     let default_mro = compute_default_mro(w_self);
+    let default_mro_start = pyre_object::gc_roots::shadow_stack_len();
+    let default_mro_len = default_mro.len();
+    for w_class in default_mro {
+        pyre_object::gc_roots::pin_root(w_class);
+    }
+    let default_mro =
+        |index: usize| pyre_object::gc_roots::shadow_stack_get(default_mro_start + index);
     if pyre_object::w_type_is_heaptype(w_self) {
         let w_metaclass = (*w_self).w_class;
         if !w_metaclass.is_null() {
             if let Some((w_where, w_mro_func)) = lookup_where_with_method_cache(w_metaclass, "mro")
             {
                 if !std::ptr::eq(w_where, crate::typedef::w_type()) {
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
                     let w_mro = get_and_call_function(w_mro_func, w_self, w_metaclass, &[])?;
                     let mro_w = crate::builtins::collect_iterable(w_mro)?;
                     // `fixedview` keeps PyPy's items GC-visible through the
@@ -9307,27 +9322,28 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
                             return Err(PyError::type_error("mro() returned a non-class"));
                         }
                     }
-                    let mro_w: Vec<_> = (0..mro_w.len())
-                        .map(|index| {
-                            pyre_object::gc_roots::shadow_stack_get(mro_root_start + index)
-                        })
-                        .collect();
-                    if !mro_w.iter().any(|&entry| std::ptr::eq(entry, w_self)) {
+                    let mro_len = mro_w.len();
+                    let mro_at = |index: usize| {
+                        pyre_object::gc_roots::shadow_stack_get(mro_root_start + index)
+                    };
+                    let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
+                    if !(0..mro_len).any(|index| std::ptr::eq(mro_at(index), w_self)) {
                         return Err(PyError::type_error(
                             "mro() returned a result without the new class",
                         ));
                     }
-                    pyre_object::w_type_set_mro(w_self, mro_w.clone());
+                    pyre_object::w_type_set_mro(w_self, (0..mro_len).map(mro_at).collect());
 
                     // typeobject.py `_add_mro_classes_as_subclasses`: custom
                     // MRO entries outside the default hierarchy participate
                     // in invalidation just like real bases.
-                    for w_ancestor in mro_w {
-                        if !default_mro
-                            .iter()
-                            .any(|&default| std::ptr::eq(default, w_ancestor))
+                    for index in 0..mro_len {
+                        let w_ancestor = mro_at(index);
+                        if !(0..default_mro_len)
+                            .any(|default| std::ptr::eq(default_mro(default), w_ancestor))
                             && pyre_object::is_type(w_ancestor)
                         {
+                            let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
                             pyre_object::typeobject::w_type_add_subclass(w_ancestor, w_self);
                         }
                     }
@@ -9336,7 +9352,8 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
             }
         }
     }
-    pyre_object::w_type_set_mro(w_self, default_mro);
+    let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
+    pyre_object::w_type_set_mro(w_self, (0..default_mro_len).map(default_mro).collect());
     Ok(pyre_object::w_none())
 }
 

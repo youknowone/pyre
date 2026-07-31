@@ -4024,11 +4024,18 @@ fn build_class_inner(
             }
         }
         let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
+        // Slot creation, C3 validation and `__set_name__` below all allocate
+        // and can execute Python; the nascent type has no other referrer
+        // until its mro is installed, so keep it rooted and reread it after
+        // every such step.
+        let w_root = pyre_object::gc_roots::shadow_stack_len();
         let w = pyre_object::w_type_new(name, w_effective_bases, dict_obj as *mut u8);
+        pyre_object::gc_roots::pin_root(w);
         crate::builtins::type_new_take_qualname(w, dict_obj)?;
         // typeobject.py:1143-1204 create_all_slots parity.
         unsafe { create_all_slots(w, w_effective_bases)? };
         // baseobjspace.py:76 — set w_class to 'type' (default metaclass)
+        let w = pyre_object::gc_roots::shadow_stack_get(w_root);
         unsafe {
             (*w).w_class = crate::typedef::w_type();
         }
@@ -4037,6 +4044,7 @@ fn build_class_inner(
         // the tuple.  `compute_default_mro` cannot raise, so `get_mro`'s
         // classic branch runs through the fallible validation here.
         unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases, true)? };
+        let w = pyre_object::gc_roots::shadow_stack_get(w_root);
         let mro = unsafe { crate::baseobjspace::compute_default_mro(w) };
         unsafe { pyre_object::w_type_set_mro(w, mro) };
         // typeobject.py:373-377 ready() — register self on each base's
@@ -4050,6 +4058,7 @@ fn build_class_inner(
         // provisional class-body namespace.
         if let Some(classdictcell_root) = classdictcell_root {
             let classdictcell = pyre_object::gc_roots::shadow_stack_get(classdictcell_root);
+            let w = pyre_object::gc_roots::shadow_stack_get(w_root);
             let type_dict = unsafe { pyre_object::w_type_get_dict_ptr(w) as PyObjectRef };
             if !type_dict.is_null() {
                 unsafe { pyre_object::w_cell_set(classdictcell, type_dict) };
@@ -4061,16 +4070,29 @@ fn build_class_inner(
         // __set_name__. The metaclass path above goes through type.__new__()
         // which handles __set_name__ in builtins.rs, so we must NOT call it
         // again there to avoid double invocation.
-        if unsafe { pyre_object::is_type(w) } {
+        if unsafe { pyre_object::is_type(pyre_object::gc_roots::shadow_stack_get(w_root)) } {
             let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
             let entries = unsafe { pyre_object::w_dict_items(dict_obj) };
+            // Every `__set_name__` runs Python, so the snapshot cannot stay in
+            // an untraced Vec across the loop.
+            let _entry_roots = pyre_object::gc_roots::push_roots();
+            let entries_root = pyre_object::gc_roots::shadow_stack_len();
+            let mut pinned = 0;
             for (w_name, value) in entries {
                 if !value.is_null() && unsafe { pyre_object::is_str(w_name) } {
-                    unsafe { crate::baseobjspace::set_name(w, w_name, value) }?;
+                    pyre_object::gc_roots::pin_root(w_name);
+                    pyre_object::gc_roots::pin_root(value);
+                    pinned += 1;
                 }
             }
+            for i in 0..pinned {
+                let w_name = pyre_object::gc_roots::shadow_stack_get(entries_root + i * 2);
+                let value = pyre_object::gc_roots::shadow_stack_get(entries_root + i * 2 + 1);
+                let w = pyre_object::gc_roots::shadow_stack_get(w_root);
+                unsafe { crate::baseobjspace::set_name(w, w_name, value) }?;
+            }
         }
-        w
+        pyre_object::gc_roots::shadow_stack_get(w_root)
     };
 
     // `_store_type_in_classcell` runs inside type.__new__, which the

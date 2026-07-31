@@ -318,14 +318,16 @@ fn simple_namespace_repr(args: &[PyObjectRef]) -> crate::PyResult {
             Err(err) if err.kind == crate::PyErrorKind::KeyError => continue,
             Err(err) => return Err(err),
         };
+        let value_sp = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(value);
+        // `getitem` above ran a lookup that can collect, so the key has to be
+        // reread from its slot rather than reused from before the call.
+        let key = pyre_object::gc_roots::shadow_stack_get(keys_sp + i);
         parts.push(format!(
             "{}={}",
             unsafe { crate::display::py_str(key)? },
             unsafe {
-                crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(
-                    pyre_object::gc_roots::shadow_stack_len() - 1,
-                ))?
+                crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(value_sp))?
             }
         ));
     }
@@ -381,9 +383,27 @@ fn simple_namespace_richcompare(
     // CPython 3.14 forwards all six operations to the two namespace dicts.
     // In particular, ordering reaches dict's TypeError instead of returning
     // NotImplemented from the namespace type itself.
-    let self_dict = crate::baseobjspace::getattr_str(self_obj, "__dict__")?;
-    let other_dict = crate::baseobjspace::getattr_str(other, "__dict__")?;
-    crate::baseobjspace::compare(self_dict, other_dict, op)
+    //
+    // A subclass `__getattribute__` runs on each lookup, so both operands and
+    // the first dict have to survive it.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_obj);
+    pyre_object::gc_roots::pin_root(other);
+    let self_dict = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(sp),
+        "__dict__",
+    )?;
+    pyre_object::gc_roots::pin_root(self_dict);
+    let other_dict = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(sp + 1),
+        "__dict__",
+    )?;
+    crate::baseobjspace::compare(
+        pyre_object::gc_roots::shadow_stack_get(sp + 2),
+        other_dict,
+        op,
+    )
 }
 
 /// CPython 3.14 `namespace_reduce`: `(type(self), (), self.__dict__)`.
