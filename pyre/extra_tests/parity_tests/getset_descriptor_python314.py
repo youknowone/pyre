@@ -1,3 +1,4 @@
+import enum
 import types
 
 
@@ -58,6 +59,20 @@ assert dict_descriptor.__qualname__ == "Outer.Inner.__dict__"
 assert dict_descriptor.__objclass__ is Outer.Inner
 assert dict_descriptor.__doc__ == "dictionary for instance variables"
 assert repr(dict_descriptor) == "<attribute '__dict__' of 'Inner' objects>"
+
+
+class MixedIntEnum(enum.IntEnum):
+    item = 1
+
+
+# Enum contributes the instance __dict__ descriptor while IntEnum's concrete
+# storage layout is int-backed.  The descriptor reaches the receiver's own
+# instance dictionary across that mixed layout.
+enum_dict_descriptor = enum.Enum.__dict__["__dict__"]
+member_dict = enum_dict_descriptor.__get__(MixedIntEnum.item, MixedIntEnum)
+assert member_dict is MixedIntEnum.item.__dict__
+assert member_dict["_name_"] == "item"
+assert member_dict["_value_"] == 1
 
 weakref_descriptor = Outer.Inner.__dict__["__weakref__"]
 assert type(weakref_descriptor) is types.GetSetDescriptorType
