@@ -346,7 +346,7 @@ pub(crate) fn fbw_store_journal_reset() {
     FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_SYS_EXC_JOURNAL.with(|j| j.borrow_mut().clear());
-    FBW_TRACEBACK_STORE_JOURNAL.with(|j| *j.borrow_mut() = None);
+    FBW_TRACEBACK_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(false));
     FBW_UNJOURNALED_SYMBOLIC.with(|c| c.set(false));
     FBW_EXECUTED_RESIDUAL_VOID.with(|c| c.set(0));
@@ -496,14 +496,10 @@ pub(crate) fn fbw_traceback_journal_push_if_attached(
         unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_w_next(node) },
         previous_head
     );
-    FBW_TRACEBACK_STORE_JOURNAL.with(|j| {
-        let mut entry = j.borrow_mut();
-        assert!(
-            entry.is_none(),
-            "bridge-entry traceback attach ran more than once in one walk session"
-        );
-        *entry = Some((exception, node));
-    });
+    // A carrier sub-walk that keeps its journals across the root continuation
+    // attaches once per entered handler, so the log grows rather than asserting
+    // a single attach; the rollback unwinds the entries in reverse push order.
+    FBW_TRACEBACK_STORE_JOURNAL.with(|j| j.borrow_mut().push((exception, node)));
 }
 
 /// Commit-path epilogue: the walk's eager stores and appends stand; drop
@@ -519,7 +515,7 @@ pub(crate) fn fbw_store_journal_commit() {
     FBW_SYS_EXC_JOURNAL.with(|j| j.borrow_mut().clear());
     // The compiled trace owns the recorded attach and the authoritative walk
     // already applied this iteration's concrete node, so keep it in place.
-    FBW_TRACEBACK_STORE_JOURNAL.with(|j| *j.borrow_mut() = None);
+    FBW_TRACEBACK_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     // #57 Option C: a committed walk's end-flush adopts the advanced
     // iterator + the body that consumed it (counted once), so the in-flight
     // items must NOT also be delivered — drop the stash (and with it the
@@ -951,19 +947,41 @@ pub(crate) fn fbw_store_journal_rollback() {
             pyre_interpreter::eval::set_current_exception(displaced);
         }
     });
-    // Remove the bridge-entry node only while it remains the exact head the
-    // recording helper installed.  If later concrete execution replaced the
-    // head, discarding this walk must not overwrite that newer state.
+    // Splice every journaled bridge-entry node back out of its exception's
+    // chain.  The node is not necessarily still the head: concrete execution
+    // after the attach can prepend further nodes to the same exception (a
+    // handler that re-raises, or another raising callee), and dropping the undo
+    // in that case would leave the speculative node behind for the replay to
+    // record the catching frame on top of — a duplicated frame in the reported
+    // traceback.  Newer heads are preserved; only the journaled link is
+    // removed, in reverse push order so the chain collapses to its pre-walk
+    // shape.
     FBW_TRACEBACK_STORE_JOURNAL.with(|j| {
-        let Some((exception, node)) = j.borrow_mut().take() else {
-            return;
-        };
-        let current =
-            unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exception) };
-        if current == node {
-            let previous = unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_w_next(node) };
-            unsafe {
-                pyre_object::interp_exceptions::w_exception_set_traceback(exception, previous);
+        let mut entries = j.borrow_mut();
+        while let Some((exception, node)) = entries.pop() {
+            let next = unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_w_next(node) };
+            let head =
+                unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exception) };
+            if head == node {
+                unsafe {
+                    pyre_object::interp_exceptions::w_exception_set_traceback(exception, next);
+                }
+                continue;
+            }
+            let mut prev = head;
+            while !prev.is_null() && unsafe { pyre_interpreter::pytraceback::is_pytraceback(prev) }
+            {
+                let curr = unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_w_next(prev) };
+                if curr == node {
+                    // The removed node sat between `prev` and `next`, so the
+                    // shortened chain cannot reach `prev` again and the
+                    // setter's loop check always passes.
+                    let _ = unsafe {
+                        pyre_interpreter::pytraceback::w_pytraceback_set_w_next(prev, next)
+                    };
+                    break;
+                }
+                prev = curr;
             }
         }
     });

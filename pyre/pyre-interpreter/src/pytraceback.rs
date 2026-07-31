@@ -205,6 +205,10 @@ pub unsafe fn w_pytraceback_set_w_next(
             curr = w_pytraceback_get_w_next(curr);
         }
         (*(obj as *mut PyTraceback)).w_next = w_new_next;
+        // An older `obj` now names a possibly younger `w_new_next`; remember it
+        // for the next minor tracer, as the allocation above does for the
+        // fields written at birth.
+        pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
     }
     Ok(())
 }

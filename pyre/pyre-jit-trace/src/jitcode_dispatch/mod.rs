@@ -5043,17 +5043,26 @@ thread_local! {
     static FBW_SYS_EXC_JOURNAL: std::cell::RefCell<Vec<pyre_object::PyObjectRef>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
-    /// Undo entry for the concrete traceback-head store performed while a
-    /// bridge-entry exception arm is recorded: `(exception, attached_node)`.
-    /// The two arms are mutually exclusive and each is entered at most once
-    /// per walk session, so one slot covers the concrete attach.  It shares
-    /// the store journal's lifecycle: a committing walk keeps the node and
-    /// clears the entry, while a discarded walk removes the node only when it
-    /// is still the exception's current traceback head.  Both refs are GC
-    /// roots via [`fbw_store_journal_root_walker`].
+    /// Undo entries for the concrete traceback-head stores performed while
+    /// bridge-entry exception arms are recorded: `(exception, attached_node)`.
+    /// The two arms are mutually exclusive per invocation, but a carrier
+    /// sub-walk that continues its root under [`WalkJournals::Keep`] runs both
+    /// inside one journal lifecycle (the callee handler entry, then the root's
+    /// carrier-raise seed), so the log holds every attach.  It shares the store
+    /// journal's lifecycle: a committing walk keeps the nodes and clears the
+    /// log, while a discarded walk splices each node back out in reverse push
+    /// order.  Both refs of every entry are GC roots via
+    /// [`fbw_store_journal_root_walker`].
+    ///
+    /// TLS owner: the log belongs to the in-progress walk, and a walk runs to
+    /// its commit-or-discard point on the thread that started it — the same
+    /// ownership the sibling `FBW_*_JOURNAL` logs above use.  The entries never
+    /// outlive that walk and are never read from another thread; GC
+    /// reachability is supplied explicitly by the root walker rather than by
+    /// the storage.
     static FBW_TRACEBACK_STORE_JOURNAL:
-        std::cell::RefCell<Option<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>> =
-        const { std::cell::RefCell::new(None) };
+        std::cell::RefCell<Vec<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 
     /// In-flight FOR_ITER continuation (#57 Option C): `(consumed_item,
     /// body coordinate)` stashed when the FOR_ITER `for_iter_next` residual
@@ -5244,7 +5253,7 @@ struct FbwStoreJournalRootArea {
     cell_stores: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64)>>,
     sys_exc: *const std::cell::RefCell<Vec<pyre_object::PyObjectRef>>,
     traceback_store:
-        *const std::cell::RefCell<Option<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>>,
+        *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>>,
     foriter: *const std::cell::RefCell<Vec<InflightForiter>>,
     bridge_iter: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64, i64)>>,
     abort_resume: *const std::cell::RefCell<Option<InlineAbortCarrier>>,
@@ -5571,7 +5580,7 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     // walk commits or rolls back.  The entry may be their only scanned owner
     // after later concrete execution changes the exception's head.
     let traceback_store = unsafe { &mut *(*area.traceback_store).as_ptr() };
-    if let Some((exception, node)) = traceback_store.as_mut() {
+    for (exception, node) in traceback_store.iter_mut() {
         visitor(unsafe { &mut *(exception as *mut pyre_object::PyObjectRef).cast() });
         visitor(unsafe { &mut *(node as *mut pyre_object::PyObjectRef).cast() });
     }

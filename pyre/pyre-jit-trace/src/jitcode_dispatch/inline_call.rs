@@ -2866,8 +2866,14 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             callee_frame_reg,
         );
     // A strict straight-line callee at the top inline level is seeded with
-    // its own frame red so guards can carry a real two-frame snapshot.
-    let strict_seed = strict_inlinable && inline_depth < fbw_max_multiframe_depth();
+    // its own frame red so guards can carry a real two-frame snapshot.  A
+    // callee needing fresh cellvar allocation is not seeded — the seed block
+    // below breaks out to the ordinary single-frame inline for it — so exclude
+    // it here too, or the preflight would decline a CALL that path still
+    // serves.
+    let strict_seed = strict_inlinable
+        && inline_depth < fbw_max_multiframe_depth()
+        && callee_code.cellvars.is_empty();
     // Preflight the caller frame BEFORE the seed below records a virtual
     // PyFrame.  A CALL covered by a try/catch marker must remain residual so
     // its post-call catch resume routes an exception; returning after frame
@@ -3184,11 +3190,10 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         'seed: {
             // Branch-A frame shape only (mirror REC_CA): existing freevar
             // cells are admissible, while fresh cellvar allocation is not.
+            // `strict_seed` already excludes such a callee, so only the
+            // multiframe path reaches this.
             if !callee_code.cellvars.is_empty() {
-                if try_multiframe {
-                    return Ok(None);
-                }
-                break 'seed;
+                return Ok(None);
             }
             // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to an `is`/`is_not`
             // identity residual call whose operands must be Ref (the codewriter
