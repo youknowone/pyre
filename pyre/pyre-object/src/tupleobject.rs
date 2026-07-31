@@ -42,6 +42,15 @@ use crate::specialisedtupleobject::{
 };
 use std::sync::atomic::{AtomicI64, Ordering};
 
+/// `ob_hash` before the first successful element walk, and the one value a
+/// finished walk never stores — `tuplehash` remaps a computed `-1` to
+/// `1546275796`, so a cache hit is exactly `hash != TUPLE_HASH_UNSET`.
+///
+/// `_PyTuple_RESET_HASH_CACHE` is the single place this is written upstream.
+/// Here every constructor writes it instead, host and trace alike: zeroed
+/// allocation memory would otherwise read back as the valid hash `0`.
+pub const TUPLE_HASH_UNSET: i64 = -1;
+
 /// Python tuple object — array-backed default representation.
 ///
 /// Layout mirrors `pypy/objspace/std/tupleobject.py:376-390` after
@@ -53,7 +62,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 #[repr(C)]
 pub struct W_TupleObject {
     pub ob_header: PyObject,
-    /// CPython 3.14 `PyTupleObject.ob_hash`. `-1` means not computed.
+    /// CPython 3.14 `PyTupleObject.ob_hash`; `TUPLE_HASH_UNSET` until computed.
     pub hash: AtomicI64,
     /// `Ptr(GcArray(OBJECTPTR))` — items body, allocation-immutable
     /// per `_immutable_fields_ = ['wrappeditems[*]']`. The GcArray
@@ -221,7 +230,7 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
                         ob_type: header.ob_type,
                         w_class: header.w_class,
                     },
-                    hash: AtomicI64::new(-1),
+                    hash: AtomicI64::new(TUPLE_HASH_UNSET),
                     wrappeditems: std::ptr::null_mut(),
                 },
             );
@@ -252,7 +261,7 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
                 raw as *mut W_TupleObject,
                 W_TupleObject {
                     ob_header: header,
-                    hash: AtomicI64::new(-1),
+                    hash: AtomicI64::new(TUPLE_HASH_UNSET),
                     wrappeditems: items_block,
                 },
             );
@@ -270,7 +279,7 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
     }
     Box::into_raw(Box::new(W_TupleObject {
         ob_header: header,
-        hash: AtomicI64::new(-1),
+        hash: AtomicI64::new(TUPLE_HASH_UNSET),
         wrappeditems: items_block,
     })) as PyObjectRef
 }
@@ -299,17 +308,18 @@ pub unsafe fn w_tuple_cached_hash(obj: PyObjectRef) -> Option<i64> {
             .hash
             .load(Ordering::Relaxed)
     };
-    (hash != -1).then_some(hash)
+    (hash != TUPLE_HASH_UNSET).then_some(hash)
 }
 
 /// CPython 3.14 `FT_ATOMIC_STORE_SSIZE_RELAXED(v->ob_hash, acc)`, generalized
 /// over PyPy's arity-2 specialized tuple layouts.
 ///
 /// # Safety
-/// `obj` must point to a valid tuple object and `hash` must not be `-1`.
+/// `obj` must point to a valid tuple object and `hash` must not be
+/// `TUPLE_HASH_UNSET`.
 #[inline]
 pub unsafe fn w_tuple_set_cached_hash(obj: PyObjectRef, hash: i64) {
-    debug_assert_ne!(hash, -1);
+    debug_assert_ne!(hash, TUPLE_HASH_UNSET);
     if is_specialised_tuple_ii(obj) {
         (*(obj as *const W_SpecialisedTupleObject_ii))
             .hash

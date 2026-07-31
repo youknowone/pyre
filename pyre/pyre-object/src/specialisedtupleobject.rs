@@ -25,6 +25,7 @@
 #![allow(non_camel_case_types)]
 
 use crate::pyobject::*;
+use crate::tupleobject::TUPLE_HASH_UNSET;
 use std::sync::atomic::AtomicI64;
 
 /// Specialised tuple holding two raw `i64` values
@@ -35,7 +36,7 @@ use std::sync::atomic::AtomicI64;
 #[repr(C)]
 pub struct W_SpecialisedTupleObject_ii {
     pub ob_header: PyObject,
-    /// CPython 3.14 tuple hash cache; `-1` means not computed.
+    /// CPython 3.14 tuple hash cache; `TUPLE_HASH_UNSET` until computed.
     pub hash: AtomicI64,
     pub value0: i64,
     pub value1: i64,
@@ -46,7 +47,7 @@ pub struct W_SpecialisedTupleObject_ii {
 #[repr(C)]
 pub struct W_SpecialisedTupleObject_ff {
     pub ob_header: PyObject,
-    /// CPython 3.14 tuple hash cache; `-1` means not computed.
+    /// CPython 3.14 tuple hash cache; `TUPLE_HASH_UNSET` until computed.
     pub hash: AtomicI64,
     pub value0: f64,
     pub value1: f64,
@@ -57,7 +58,7 @@ pub struct W_SpecialisedTupleObject_ff {
 #[repr(C)]
 pub struct W_SpecialisedTupleObject_oo {
     pub ob_header: PyObject,
-    /// CPython 3.14 tuple hash cache; `-1` means not computed.
+    /// CPython 3.14 tuple hash cache; `TUPLE_HASH_UNSET` until computed.
     pub hash: AtomicI64,
     pub value0: PyObjectRef,
     pub value1: PyObjectRef,
@@ -127,7 +128,7 @@ pub fn w_specialised_tuple_ii_new(value0: i64, value1: i64) -> PyObjectRef {
                 raw as *mut W_SpecialisedTupleObject_ii,
                 W_SpecialisedTupleObject_ii {
                     ob_header: header,
-                    hash: AtomicI64::new(-1),
+                    hash: AtomicI64::new(TUPLE_HASH_UNSET),
                     value0,
                     value1,
                 },
@@ -137,7 +138,7 @@ pub fn w_specialised_tuple_ii_new(value0: i64, value1: i64) -> PyObjectRef {
     }
     Box::into_raw(Box::new(W_SpecialisedTupleObject_ii {
         ob_header: header,
-        hash: AtomicI64::new(-1),
+        hash: AtomicI64::new(TUPLE_HASH_UNSET),
         value0,
         value1,
     })) as PyObjectRef
@@ -161,7 +162,7 @@ pub fn w_specialised_tuple_ff_new(value0: f64, value1: f64) -> PyObjectRef {
                 raw as *mut W_SpecialisedTupleObject_ff,
                 W_SpecialisedTupleObject_ff {
                     ob_header: header,
-                    hash: AtomicI64::new(-1),
+                    hash: AtomicI64::new(TUPLE_HASH_UNSET),
                     value0,
                     value1,
                 },
@@ -171,7 +172,7 @@ pub fn w_specialised_tuple_ff_new(value0: f64, value1: f64) -> PyObjectRef {
     }
     Box::into_raw(Box::new(W_SpecialisedTupleObject_ff {
         ob_header: header,
-        hash: AtomicI64::new(-1),
+        hash: AtomicI64::new(TUPLE_HASH_UNSET),
         value0,
         value1,
     })) as PyObjectRef
@@ -212,7 +213,7 @@ pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> P
                 raw as *mut W_SpecialisedTupleObject_oo,
                 W_SpecialisedTupleObject_oo {
                     ob_header: header,
-                    hash: AtomicI64::new(-1),
+                    hash: AtomicI64::new(TUPLE_HASH_UNSET),
                     value0,
                     value1,
                 },
@@ -231,7 +232,7 @@ pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> P
     }
     Box::into_raw(Box::new(W_SpecialisedTupleObject_oo {
         ob_header: header,
-        hash: AtomicI64::new(-1),
+        hash: AtomicI64::new(TUPLE_HASH_UNSET),
         value0,
         value1,
     })) as PyObjectRef

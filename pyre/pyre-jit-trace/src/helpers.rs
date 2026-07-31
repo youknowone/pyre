@@ -695,10 +695,11 @@ pub fn emit_empty_list_inline(ctx: &mut TraceCtx) -> OpRef {
 }
 
 /// Initialize CPython 3.14's tuple hash cache on a trace-visible allocation.
-/// `NewWithVtable` clears memory to zero, but the tuple sentinel is `-1`, so
-/// every virtual/materializable tuple constructor must emit this store.
+/// `NewWithVtable` clears memory to zero, but the tuple sentinel is
+/// `TUPLE_HASH_UNSET`, so every virtual/materializable tuple constructor must
+/// emit this store.
 pub fn emit_tuple_hash_sentinel(ctx: &mut TraceCtx, tuple: OpRef, hash_descr: majit_ir::DescrRef) {
-    let uncomputed = ctx.const_int(-1);
+    let uncomputed = ctx.const_int(pyre_object::tupleobject::TUPLE_HASH_UNSET);
     let descr_index = hash_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[tuple, uncomputed], hash_descr);
     ctx.heapcache_setfield_cached(tuple, descr_index, uncomputed);
