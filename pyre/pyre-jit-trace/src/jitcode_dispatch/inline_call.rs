@@ -3098,14 +3098,22 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             crate::descr::function_code_descr(),
             callee_code_key as i64,
         )?;
-        walker_guard_function_field(
-            ctx,
-            op.pc,
-            callable_guard_op,
-            crate::descr::function_w_globals_descr(),
-            inline_consts.w_globals as i64,
-        )?;
-        if !concrete_freevar_cells.is_empty() {
+        // `w_func_globals` and `closure` are the two names in the set with no
+        // Python-level setter, so for a callable the trace has already pinned
+        // to one object they cannot come back different and the reads are
+        // pure overhead.  `code` and `defs_w` above and below are writable
+        // (`f.__code__ = ...`, `f.__defaults__ = ...`) and are guarded either
+        // way.
+        if !callable_guard_op.is_constant() {
+            walker_guard_function_field(
+                ctx,
+                op.pc,
+                callable_guard_op,
+                crate::descr::function_w_globals_descr(),
+                inline_consts.w_globals as i64,
+            )?;
+        }
+        if !callable_guard_op.is_constant() && !concrete_freevar_cells.is_empty() {
             // `closure?[*]`: the tuple itself is rebuilt by every
             // `MAKE_FUNCTION`, so guarding its identity would reintroduce the
             // per-iteration failure.  The cells are what this inline bakes and
