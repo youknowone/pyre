@@ -5287,8 +5287,31 @@ impl<S: JitState> JitDriver<S> {
             self.meta
                 .must_compile_with_values(&descr_arc, &raw_values, fallback_green_key);
         // compile.py:702-703: must_compile() and not stack_almost_full().
-        let should_bridge =
-            must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
+        // `no_bridge_enabled()` is the same opt-out the two sibling loops
+        // apply; this is the loop pyre actually runs, so leaving it out made
+        // `MAJIT_NO_BRIDGE=1` report a bridge-free run while still compiling
+        // every bridge.
+        let should_bridge = must_compile
+            && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
+            && !no_bridge_enabled();
+
+        // Same `@@@GUARD` line the sibling loops emit. Without it this loop —
+        // the one pyre reaches — had no per-guard-failure trace at all, so
+        // identifying a failing guard meant reading the whole `MAJIT_LOG`
+        // stream. `resume_pc` is resolved by the caller here, so report the
+        // guard's own coordinates instead.
+        if guardlog_enabled() {
+            let preview: Vec<i64> = raw_values.iter().take(6).map(|v| *v as i64).collect();
+            eprintln!(
+                "@@@GUARD key={} trace={} fail={} bridge={} nvals={} vals={:?}",
+                owning_key,
+                trace_id,
+                fail_index,
+                should_bridge,
+                raw_values.len(),
+                preview
+            );
+        }
 
         // Return raw guard failure data. State restoration and bridge/
         // blackhole decision happen in the caller's handle_fail().
