@@ -3906,6 +3906,25 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 shadow.set_opref(slot, value);
                 shadow.set_concrete(callee_portal_frame_reg, slot, concrete);
             }
+            // `MIFrame.registers_r` retains cell/freevar slots across a
+            // may-force call just like ordinary locals.  The heapcache entry
+            // installed by `emit_new_pyframe_inline_with_params` is only a
+            // forwarding optimization and is invalidated by that call; seed
+            // the frame-local shadow too so a later LOAD_DEREF re-reads the
+            // same live cell instead of manufacturing an unstamped
+            // GetarrayitemGcR result.  This callee shape has no fresh cellvars
+            // (rejected above), so existing freevars begin at `nlocals`.
+            for (i, &cell) in concrete_freevar_cells.iter().enumerate() {
+                let slot = (callee_code.varnames.len() + i) as i64;
+                let value = sub_wc.trace_ctx.const_ref(cell as i64);
+                let shadow = sub_wc.callee_shadow.as_mut().unwrap();
+                shadow.set_opref(slot, value);
+                shadow.set_concrete(
+                    callee_portal_frame_reg,
+                    slot,
+                    majit_ir::Value::Ref(majit_ir::GcRef(cell as usize)),
+                );
+            }
         }
         // Capture a depth-1 live callee before these guards drop. This is the
         // two-frame specialization of `run_blackhole_interp_to_cancel_tracing`:
