@@ -6898,10 +6898,24 @@ assert GA.__lt__(list[int], list[str]) is NotImplemented
     fn test_union_type_exposes_cpython_314_richcompare_surface() {
         let source = r#"
 UT = type(int | str)
-required = {'__getattribute__', '__ne__', '__lt__', '__le__', '__gt__', '__ge__'}
+required = {
+    '__getattribute__', '__ne__', '__lt__', '__le__', '__gt__', '__ge__',
+    '__name__', '__qualname__', '__origin__', '__iter__', '__doc__',
+}
 assert required <= UT.__dict__.keys()
 u = int | str
 assert UT.__getattribute__(u, '__args__') == (int, str)
+assert u.__name__ == 'Union'
+assert u.__qualname__ == 'Union'
+assert u.__origin__ is UT
+assert u.__module__ == 'typing'
+assert UT.__dict__['__iter__'] is None
+try:
+    iter(u)
+except TypeError:
+    pass
+else:
+    raise AssertionError('UnionType must disable __getitem__ iteration fallback')
 assert UT.__ne__(u, int | str) is False
 assert UT.__ne__(u, int | bytes) is True
 assert UT.__ne__(u, int) is NotImplemented
