@@ -2701,7 +2701,7 @@ fn try_adopt_multi_frame_blackhole(
     mf_builder.cpu = Some(majit_metainterp::blackhole::pyre_production_cpu());
     let majit_metainterp::MultiFrameBlackholeResult {
         outcome,
-        terminal: _mf_terminal,
+        terminal: mf_terminal,
     } = majit_metainterp::drive_multi_frame_blackhole(
         &mut mf_builder,
         &mut latched.framestack,
@@ -2814,6 +2814,19 @@ fn try_adopt_multi_frame_blackhole(
             ));
         }
         majit_metainterp::jitexc::JitException::ExitFrameWithExceptionRef(value) => {
+            // The terminal image is the BOTTOMMOST level, which
+            // `convert_and_run_from_pyjitpl` made the portal frame — i.e. the
+            // one `cf_addr` / `root_addr` represent, the frame the raise is
+            // about to leave.  Same publication as the single-frame arm.
+            if let Some(image) = mf_terminal.as_ref()
+                && let Ok(jitcode_index) = i32::try_from(image.jitcode_index)
+            {
+                publish_terminal_raise_coordinate(
+                    jitcode_index,
+                    image.last_opcode_position,
+                    &[cf_addr, root_addr],
+                );
+            }
             crate::jitcode_dispatch::fbw_finish_raise_set(crate::state::ConcreteValue::Ref(
                 value.as_usize() as pyre_object::PyObjectRef,
             ));
