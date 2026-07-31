@@ -3262,7 +3262,6 @@ fn bh_size_spec_from_callcontrol(
         .struct_layout_for(layout_owner)
         .map(|layout| layout.size)
         .or_else(|| heuristic_struct_size_for_bh(cc, layout_owner))?;
-    let mut all_fielddescrs = bh_all_field_specs_for_struct(cc, layout_owner);
     // `rclass.py` lays a subclass's inherited fields out before its own
     // fields.  Annotation metadata deliberately keeps enum-variant attrs
     // variant-local, so reconstruct that inherited physical slot here for
@@ -3274,6 +3273,23 @@ fn bh_size_spec_from_callcontrol(
         || layout_owner.ends_with("result::Result::Err")
         || layout_owner == "Result::Ok"
         || layout_owner == "Result::Err";
+    // The bare Charon variant can contain only the inherited enum tag while
+    // the annotator keeps the payload row on the concrete instantiation
+    // (`Result<PyObjectRef, PyError>::Ok`).  RPython has one concrete low-level
+    // STRUCT at this point, whose embedded base and variant fields are flattened
+    // together by `heaptracker.all_fielddescrs`.  Prefer the instantiated rows
+    // for Result variants, falling back to the template only when no such rows
+    // exist, so the payload participates in that same flattened slot list.
+    let mut all_fielddescrs = if result_variant {
+        let instantiated = bh_all_field_specs_for_struct(cc, owner);
+        if instantiated.is_empty() {
+            bh_all_field_specs_for_struct(cc, layout_owner)
+        } else {
+            instantiated
+        }
+    } else {
+        bh_all_field_specs_for_struct(cc, layout_owner)
+    };
     if result_variant {
         size = size.max(16);
     }
@@ -3301,6 +3317,23 @@ fn bh_size_spec_from_callcontrol(
                 0,
             ),
         );
+    }
+    if result_variant {
+        // `heaptracker.get_fielddescr_index_in` counts through the embedded
+        // base before the variant's own fields.  Source registries assign
+        // indices within each owner, so normalize the combined physical list
+        // after adding the inherited tag.  Offset order is the low-level
+        // STRUCT order for this explicit shell (tag at 0, payload at 8).
+        all_fielddescrs.sort_by_key(|field| {
+            (
+                field.offset,
+                usize::from(field.field_key() != "__discriminant"),
+            )
+        });
+        for (index, field) in all_fielddescrs.iter_mut().enumerate() {
+            field.index = index as u32;
+            field.index_in_parent = index;
+        }
     }
     Some(crate::jitcode::BhSizeSpec {
         size,
@@ -4726,6 +4759,35 @@ mod tests {
         assert_eq!(spec.all_fielddescrs.len(), 2);
         assert_eq!(spec.all_fielddescrs[0].field_key(), "__discriminant");
         assert_eq!(spec.all_fielddescrs[0].offset, 0);
+        assert_eq!(spec.all_fielddescrs[0].index_in_parent, 0);
+        assert_eq!(spec.all_fielddescrs[1].field_key(), "__pos_0");
+        assert_eq!(spec.all_fielddescrs[1].index_in_parent, 1);
+    }
+
+    #[test]
+    fn instantiated_result_payload_follows_template_discriminant_slot() {
+        use crate::call::CallControl;
+
+        let owner = "core::result::Result<*mut PyObject,PyError>::Ok";
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        // The production registry keeps the enum-root tag on the template,
+        // while the concrete payload row belongs to the instantiation.
+        struct_fields.fields.insert(
+            "core::result::Result::Ok".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![("__pos_0".to_string(), "*mut PyObject".to_string())],
+        );
+        cc.set_struct_fields(struct_fields);
+
+        let spec =
+            bh_size_spec_from_callcontrol(&cc, owner).expect("instantiated Result variant size");
+        assert_eq!(spec.size, 16);
+        assert_eq!(spec.all_fielddescrs.len(), 2);
+        assert_eq!(spec.all_fielddescrs[0].field_key(), "__discriminant");
         assert_eq!(spec.all_fielddescrs[0].index_in_parent, 0);
         assert_eq!(spec.all_fielddescrs[1].field_key(), "__pos_0");
         assert_eq!(spec.all_fielddescrs[1].index_in_parent, 1);
