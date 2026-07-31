@@ -3861,7 +3861,7 @@ fn build_class_inner(
     // A custom metaclass owns its bases until (and unless) it invokes
     // type.__new__; do not perform type's C3 validation before dispatch.
     if w_metaclass.is_none() {
-        unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases)? };
+        unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases, false)? };
     }
     // Create class via metaclass or default type()
     // PyPy: typeobject.py — metaclass(name, bases, dict_w) or type.__new__
@@ -4032,6 +4032,11 @@ fn build_class_inner(
         unsafe {
             (*w).w_class = crate::typedef::w_type();
         }
+        // typeobject.py:1560 `compute_mro(w_self)`, reached only once
+        // `check_and_find_best_base` inside `create_all_slots` above accepted
+        // the tuple.  `compute_default_mro` cannot raise, so `get_mro`'s
+        // classic branch runs through the fallible validation here.
+        unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases, true)? };
         let mro = unsafe { crate::baseobjspace::compute_default_mro(w) };
         unsafe { pyre_object::w_type_set_mro(w, mro) };
         // typeobject.py:373-377 ready() — register self on each base's

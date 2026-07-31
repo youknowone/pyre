@@ -9281,7 +9281,7 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
     // low-level Vec-returning helper cannot carry that exception, so preserve
     // the same ordering through its fallible validation front door.
     let w_bases = pyre_object::typeobject::w_type_get_bases(w_self);
-    validate_c3_mro(w_bases)?;
+    validate_c3_mro(w_bases, true)?;
     let default_mro = compute_default_mro(w_self);
     if pyre_object::w_type_is_heaptype(w_self) {
         let w_metaclass = (*w_self).w_class;
@@ -9393,7 +9393,17 @@ unsafe fn abstract_mro(w_klass: PyObjectRef) -> Result<Vec<usize>, crate::PyErro
 /// Type construction calls this before allocating the new type or running
 /// descriptor/class-subclass hooks, so an invalid hierarchy cannot escape as
 /// a later and unrelated lookup failure.
-pub unsafe fn validate_c3_mro(bases: PyObjectRef) -> Result<(), crate::PyError> {
+///
+/// `walk_classic_bases` selects `get_mro`'s classic branch, which reads a
+/// non-type base's `__bases__` and so can run Python.  Only the call standing
+/// in for `compute_mro` (typeobject.py:1560) passes `true`: that one runs after
+/// `check_and_find_best_base` (typeobject.py:1519), so a bad type base is still
+/// reported before any classic base's `__bases__` executes.  The early
+/// pre-flight passes `false` and stays a pure C3 check.
+pub unsafe fn validate_c3_mro(
+    bases: PyObjectRef,
+    walk_classic_bases: bool,
+) -> Result<(), crate::PyError> {
     if bases.is_null() || !is_tuple(bases) {
         return Ok(());
     }
@@ -9426,17 +9436,17 @@ pub unsafe fn validate_c3_mro(bases: PyObjectRef) -> Result<(), crate::PyError> 
     }
     // typeobject.py:1519,1560 — `setup_user_defined_type` runs
     // `check_and_find_best_base` before it reaches `compute_mro`, so the C3
-    // merge only ever sees a tuple that already holds at least one type.  pyre
-    // runs this validation ahead of the best-base check, so reproduce that
-    // precondition here: with no type among the bases, leave the tuple to
-    // `check_and_find_best_base` and its own message.
-    let has_type_base = (0..n).any(|i| {
-        w_tuple_getitem(
-            pyre_object::gc_roots::shadow_stack_get(bases_slot),
-            i as i64,
-        )
-        .is_some_and(|base| is_type_like_w(base))
-    });
+    // merge only ever sees a tuple that already holds at least one type.  With
+    // no type among the bases the tuple belongs to `check_and_find_best_base`
+    // and its own message, not to the classic walk.
+    let walk_classic_bases = walk_classic_bases
+        && (0..n).any(|i| {
+            w_tuple_getitem(
+                pyre_object::gc_roots::shadow_stack_get(bases_slot),
+                i as i64,
+            )
+            .is_some_and(|base| is_type_like_w(base))
+        });
 
     // typeobject.py:1689-1690 `orderlists = [get_mro(space, base) for base in
     // cls.bases_w]` then `orderlists.append([cls] + cls.bases_w)`.  The
@@ -9462,7 +9472,7 @@ pub unsafe fn validate_c3_mro(bases: PyObjectRef) -> Result<(), crate::PyError> 
                 (*mro).to_vec()
             };
             list_slots.push(entry.into_iter().map(pin_slot).collect());
-        } else if has_type_base {
+        } else if walk_classic_bases {
             list_slots.push(abstract_mro(base)?);
         }
         bases_slots.push(pin_slot(

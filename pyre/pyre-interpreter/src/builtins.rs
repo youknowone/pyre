@@ -4820,7 +4820,7 @@ fn type_descr_new_with_metaclass(
 
         // This is type.__new__'s own construction path. A different winning
         // metaclass above received the original bases without a C3 pre-check.
-        unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases)? };
+        unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases, false)? };
 
         let _dict_root = pyre_object::gc_roots::push_roots();
         let dict_root = pyre_object::gc_roots::shadow_stack_len();
