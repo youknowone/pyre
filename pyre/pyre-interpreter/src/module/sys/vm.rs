@@ -458,6 +458,19 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
     let self_type = crate::typedef::r#type(self_obj)
         .map(|tp| tp.as_ptr())
         .unwrap_or(PY_NULL);
+    // `namespace___replace__` is a method on the namespace type, so a foreign
+    // receiver is rejected by the descriptor before anything else runs — in
+    // particular before `type(self)()` could execute a foreign constructor.
+    if !unsafe { crate::baseobjspace::issubtype_w(self_type, simple_namespace_type()) } {
+        let received = if self_type.is_null() {
+            "object".to_string()
+        } else {
+            unsafe { crate::baseobjspace::type_fully_qualified_name(self_type) }
+        };
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '__replace__' for 'types.SimpleNamespace' objects doesn't apply to a '{received}' object"
+        )));
+    }
     pyre_object::gc_roots::pin_root(self_type);
     let result = crate::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(

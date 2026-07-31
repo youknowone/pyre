@@ -3861,9 +3861,15 @@ fn build_class_inner(
     } else {
         bases
     };
+    // The C3 validations read `__bases__` off classic bases and
+    // `create_all_slots` unpacks `__slots__`; both execute Python, so the
+    // tuple cannot stay in an untraced local across them.
+    let bases_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_effective_bases);
     // A custom metaclass owns its bases until (and unless) it invokes
     // type.__new__; do not perform type's C3 validation before dispatch.
     if w_metaclass.is_none() {
+        let w_effective_bases = pyre_object::gc_roots::shadow_stack_get(bases_root);
         unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases, false)? };
     }
     // Create class via metaclass or default type()
@@ -4032,11 +4038,15 @@ fn build_class_inner(
         // until its mro is installed, so keep it rooted and reread it after
         // every such step.
         let w_root = pyre_object::gc_roots::shadow_stack_len();
-        let w = pyre_object::w_type_new(name, w_effective_bases, dict_obj as *mut u8);
+        let w = pyre_object::w_type_new(
+            name,
+            pyre_object::gc_roots::shadow_stack_get(bases_root),
+            dict_obj as *mut u8,
+        );
         pyre_object::gc_roots::pin_root(w);
         crate::builtins::type_new_take_qualname(w, dict_obj)?;
         // typeobject.py:1143-1204 create_all_slots parity.
-        unsafe { create_all_slots(w, w_effective_bases)? };
+        unsafe { create_all_slots(w, pyre_object::gc_roots::shadow_stack_get(bases_root))? };
         // baseobjspace.py:76 — set w_class to 'type' (default metaclass)
         let w = pyre_object::gc_roots::shadow_stack_get(w_root);
         unsafe {
@@ -4046,7 +4056,12 @@ fn build_class_inner(
         // `check_and_find_best_base` inside `create_all_slots` above accepted
         // the tuple.  `compute_default_mro` cannot raise, so `get_mro`'s
         // classic branch runs through the fallible validation here.
-        unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases, true)? };
+        unsafe {
+            crate::baseobjspace::validate_c3_mro(
+                pyre_object::gc_roots::shadow_stack_get(bases_root),
+                true,
+            )?
+        };
         let w = pyre_object::gc_roots::shadow_stack_get(w_root);
         let mro = unsafe { crate::baseobjspace::compute_default_mro(w) };
         unsafe { pyre_object::w_type_set_mro(w, mro) };
@@ -4169,7 +4184,11 @@ fn build_class_inner(
             },
             _ => Vec::new(),
         };
-        call_init_subclass_on_bases(w_type, w_effective_bases, &init_subclass_kwargs)?;
+        call_init_subclass_on_bases(
+            w_type,
+            pyre_object::gc_roots::shadow_stack_get(bases_root),
+            &init_subclass_kwargs,
+        )?;
     }
 
     Ok(w_type)
