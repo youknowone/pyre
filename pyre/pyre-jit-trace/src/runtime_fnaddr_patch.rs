@@ -76,35 +76,42 @@ pub fn patch_constants_i_fnaddrs(jitcodes: &mut Vec<Arc<JitCode>>) {
     // patched; identical entries are dropped so the constants_i scan
     // can early-exit on a `HashMap::get` miss without comparing.
     //
-    // The key is an address from the build process and the value an address
-    // from this one, so nothing guarantees a build address names one function
-    // here.  If it named two with distinct runtime addresses, the last write
-    // would win and one callee's `constants_i` constant would be patched to
-    // the other's address: a residual call to the wrong target, with no
-    // decline and no panic to mark it.  Registering several path spellings
-    // for one function is deliberate (`jit_fnaddr.rs` lists both
-    // `pyre_object::listobject::jit_list_reverse` and
-    // `pyre_object::jit_list_reverse`), and those agree on the runtime
-    // address, so only a disagreement is a defect.  Every binding is checked,
-    // not just those that survive the `!=` filter below — an alias pair
-    // straddling that filter would leave the same hole.
+    // The key is an address from the build process and the value one from
+    // this one, so a build address can stand for two registered paths.  Both
+    // ways that happens are benign, and last write wins in each:
+    //
+    //   * Several spellings of one function are registered on purpose
+    //     (`jit_fnaddr.rs` lists both
+    //     `pyre_object::listobject::jit_list_reverse` and
+    //     `pyre_object::jit_list_reverse`); they resolve to the same runtime
+    //     address, so the repeated insert is idempotent.
+    //   * The build binary's identical-COMDAT folding (MSVC `/OPT:ICF`, or
+    //     LLVM `MergeFunctions`) merges two byte-identical bodies onto one
+    //     address.  With `#[inline(never)]` confined to the release-GIL
+    //     surface the tracing-policy helpers inline their callees, and several
+    //     distinct registered residuals then compile to the same code:
+    //     `label_arg_to_usize` / `load_fast_var_num_to_index` are both
+    //     `arg.get(op_arg).as_usize()`, `convert_value_arg` /
+    //     `special_method_arg` are both `arg.get(op_arg)`, and
+    //     `hash_str_hooked_bytes` decomposes its slice to the `(ptr, len)`
+    //     `hash_str_hooked` already takes.  The build binary folds each pair;
+    //     the runtime binary, built at a different optimization level, need
+    //     not, so the two runtime addresses differ.  Folding merges only
+    //     identical machine code, so a residual call patched to either twin
+    //     runs the same body.
+    //
+    // A genuinely wrong runtime target could only come from a path bound to
+    // the wrong `fn`, and that binding runs identically in both processes, so
+    // the build and runtime addresses would agree rather than collide.  The
+    // `jit_fnaddr` registry test guards against new same-address pairs but
+    // observes only this process, where nothing folds, so it cannot see a
+    // build-script fold.  There is therefore no collision this map must
+    // reject; picking any of the folded twins' runtime addresses is correct.
     let mut correspondence: HashMap<i64, i64> = HashMap::new();
-    let mut claimed: HashMap<i64, (&str, i64)> = HashMap::new();
     for (path, build_fnaddr) in &build_bindings {
         let Some(&runtime_fnaddr) = runtime_map.get(path.as_str()) else {
             continue;
         };
-        match claimed.get(build_fnaddr) {
-            Some(&(other_path, other_runtime)) => assert_eq!(
-                other_runtime, runtime_fnaddr,
-                "runtime fnaddr patch: build address {build_fnaddr:#x} stands for both \
-                 `{other_path}` ({other_runtime:#x}) and `{path}` ({runtime_fnaddr:#x}); \
-                 patching would send one callee's residual call to the other",
-            ),
-            None => {
-                claimed.insert(*build_fnaddr, (path.as_str(), runtime_fnaddr));
-            }
-        }
         if *build_fnaddr != runtime_fnaddr {
             correspondence.insert(*build_fnaddr, runtime_fnaddr);
         }
