@@ -893,18 +893,27 @@ impl OptVirtualize {
                     // rather than mis-indexing a value field.
                     return OptimizationResult::PassOn;
                 }
-                // Once the allocation is forced the read is NOT resolved here.
-                // `virtualize.py:184-195 optimize_GETFIELD_GC_*` folds only
-                // under `opinfo.is_virtual()` and otherwise emits, leaving a
-                // non-virtual's field read to `heap.py`. That layering is
-                // load-bearing for this field: `force_box` empties the forced
-                // instance's field list (info.rs:1113-1118, so heap's
-                // `do_setfield` cannot MUST_ALIAS-elide the materializing
-                // SETFIELD_GC) and routes the write into `OptHeap`, where it
-                // sits in `CachedField::lazy_set`. Folding here would run
-                // BEFORE that pass and answer from the layout's canonical
-                // class, discarding a pending retag to a user subclass.
-                // The canonical-class fallback lives in `optimize_getfield`.
+                // Once the allocation is forced the read is NOT resolved — not
+                // here and not in `optimize_getfield`. `virtualize.py:184-195
+                // optimize_GETFIELD_GC_*` folds only under
+                // `opinfo.is_virtual()` and otherwise emits; upstream has no
+                // counterpart to resolve afterwards because
+                // `jtransform.py:1004-1009 handle_getfield_typeptr` deletes the
+                // read at codewriter time, so no typeptr getfield ever reaches
+                // the optimizer.
+                //
+                // Answering from the layout's canonical class here is unsound:
+                // `force_box` empties the forced instance's field list
+                // (info.rs:1113-1118, so heap's `do_setfield` cannot
+                // MUST_ALIAS-elide the materializing SETFIELD_GC) and routes
+                // the header write into `OptHeap`, where it sits in
+                // `CachedField::lazy_set`. A retag to a user subclass would be
+                // discarded and the base class answered instead. Resolving it
+                // in `OptHeap` does not close the hole either: reads and writes
+                // of this header carry different descr spellings, and the
+                // caches are keyed by `Arc::as_ptr` while `structinfo_setfield`
+                // slots by `field_slot_index`, so the two do not meet. Removing
+                // that split is the prerequisite for folding this read at all.
             }
             let field_val = match &info {
                 PtrInfo::Virtual(vinfo) => get_field(&vinfo.fields, field_idx),
