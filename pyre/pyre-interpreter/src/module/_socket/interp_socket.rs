@@ -2323,7 +2323,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__new__",
-        crate::make_builtin_function("__new__", |args| {
+        crate::typedef::make_new_descr(|args| {
             let cls = args
                 .first()
                 .copied()

@@ -763,9 +763,12 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
             let owner_name = pyre_object::w_type_get_name(owner);
             format!("<method '{name}' of '{owner_name}' objects>")
         } else if std::ptr::eq(tp, &BUILTIN_FUNCTION_TYPE as *const PyType) {
-            // function.py:721 BuiltinFunction.descr_function_repr
+            // function.py:721 BuiltinFunction.descr_function_repr.  Same text
+            // the `__repr__` this type registers in `typedef.rs` produces;
+            // this native arm is the one `repr()` actually reaches.
             let name = function_get_name(obj);
-            format!("<built-in function {name}>")
+            let w_self = crate::function::function_get_self_or_none(obj);
+            crate::function::builtin_function_repr_text(name, w_self)
         } else if std::ptr::eq(tp, &FUNCTION_TYPE as *const PyType) {
             // function.py:283 Function.descr_function_repr —
             // `self.getrepr(space, 'function %s' % self.qualname)`, and

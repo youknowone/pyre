@@ -367,7 +367,7 @@ fn init_zdecompress_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            crate::make_builtin_function("__new__", |args| {
+            crate::typedef::make_new_descr(|args| {
                 // args[0] is the type; the rest are the constructor arguments.
                 let (pos, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
                 let wbits = to_wbits(arg_int(pos, kwargs, "wbits", 0, backend::MAX_WBITS as i64)?);

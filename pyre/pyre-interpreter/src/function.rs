@@ -760,6 +760,26 @@ pub unsafe fn function_get_self_or_none(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
+/// `meth_repr` — the receiver decides the wording, not how the carrier is
+/// spelled: a null or module `m_self` reports as a plain function, anything
+/// else as a method of that receiver.  A `__new__` entry carries its owning
+/// type, so it reads `<built-in method __new__ of type object at 0x...>`.
+///
+/// # Safety
+/// `w_self` must be null or a valid object pointer.
+pub unsafe fn builtin_function_repr_text(name: &str, w_self: PyObjectRef) -> String {
+    let bound = !w_self.is_null()
+        && !unsafe { pyre_object::is_none(w_self) }
+        && !unsafe { pyre_object::is_module(w_self) };
+    if !bound {
+        return format!("<built-in function {name}>");
+    }
+    let type_name = crate::typedef::r#type(w_self)
+        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
+        .unwrap_or("object");
+    format!("<built-in method {name} of {type_name} object at {w_self:p}>")
+}
+
 /// CPython 3.14 `meth_reduce`: type-bound builtins reconstruct through
 /// `getattr(__self__, __name__)`; module-level builtins reduce by qualname.
 pub unsafe fn descr_builtin_function_reduce(obj: PyObjectRef) -> crate::PyResult {

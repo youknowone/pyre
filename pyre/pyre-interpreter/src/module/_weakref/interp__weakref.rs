@@ -147,7 +147,7 @@ fn init_weakref_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_builtin_function("__new__", descr__new__weakref_typecall),
+            crate::typedef::make_new_descr(descr__new__weakref_typecall),
         )
     };
     unsafe {
@@ -244,7 +244,7 @@ fn init_proxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_builtin_function("__new__", descr__new__proxy),
+            crate::typedef::make_new_descr(descr__new__proxy),
         )
     };
     unsafe {
@@ -296,7 +296,7 @@ fn init_callable_proxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_builtin_function("__new__", descr__new__callableproxy),
+            crate::typedef::make_new_descr(descr__new__callableproxy),
         )
     };
     unsafe {

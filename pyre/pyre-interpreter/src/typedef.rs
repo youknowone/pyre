@@ -1985,11 +1985,15 @@ unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef) {
     pyre_object::gc_roots::pin_root(type_obj);
 
     if let Some(w_new) = pyre_object::w_dict_getitem_str(ns, "__new__") {
-        if !w_new.is_null() && pyre_object::function::is_staticmethod(w_new) {
-            let inner = pyre_object::function::w_staticmethod_get_func(w_new);
-            if !inner.is_null() && crate::function::is_function(inner) {
-                crate::function::function_set_new_self(inner, type_obj);
-            }
+        // A user class reaches type creation with `__new__` already wrapped in
+        // `staticmethod`; a builtin type's entry is the carrier itself.
+        let carrier = if !w_new.is_null() && pyre_object::function::is_staticmethod(w_new) {
+            pyre_object::function::w_staticmethod_get_func(w_new)
+        } else {
+            w_new
+        };
+        if !carrier.is_null() && crate::function::is_function(carrier) {
+            crate::function::function_set_new_self(carrier, type_obj);
         }
     }
     // typeobject.py:1738-1742 — `if isinstance(descrvalue, GetSetProperty):
@@ -2390,24 +2394,24 @@ fn complex_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(tag_subclass_instance(obj, cls))
 }
 
-/// Wrap a `__new__` builtin function in a staticmethod descriptor.
+/// Build a builtin type's `__new__` entry.
 ///
-/// `__new__` must NOT bind a receiver — calling `cls.__new__(other_cls, ...)`
-/// passes `other_cls` as the first argument, not `cls`. PyPy/CPython model
-/// this by automatically wrapping `__new__` definitions in `staticmethod` at
-/// type-creation time. pyre's TypeDef registry uses this helper at install
-/// time so each builtin type's `__new__` slot already carries the correct
-/// non-binding descriptor.
+/// `add_tp_new_wrapper` stores `PyCFunction_NewEx(tp_new_methoddef, type)`
+/// straight into the type dict, so the namespace entry IS the
+/// `builtin_function_or_method` and `T.__new__ is T.__dict__['__new__']`.
+/// No `staticmethod` wrapper is involved: `tp_new` is not a `tp_methods`
+/// entry, and the carrier is not a descriptor, so nothing rebinds it on
+/// access — which is what `__new__` needs, since `cls.__new__(other, ...)`
+/// must pass `other` as the first argument rather than `cls`.  (A
+/// `METH_STATIC` entry such as `str.maketrans` is the case that does get a
+/// `staticmethod`; see [`make_maketrans_descr`].)
+///
+/// `__self__` is the owning type, stamped at type-finalisation by
+/// [`stamp_new_descr_self`] because the type does not exist yet here.
 pub(crate) fn make_new_descr(
     func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
 ) -> PyObjectRef {
-    // `BuiltinFunction`-typed so `type(int.__new__)` differs from a user
-    // `def`'s `function`, letting `copyreg._reduce_ex`'s
-    // `isinstance(new, type(int.__new__))` match only builtin `tp_new`
-    // wrappers (mirrors `builtin_function_or_method`).  `__self__` is
-    // stamped at type-finalisation via `stamp_new_descr_self`.
-    let f = crate::gateway::make_builtin_function_as_builtin("__new__", func);
-    pyre_object::w_staticmethod_new(f)
+    crate::gateway::make_builtin_function_as_builtin("__new__", func)
 }
 
 /// Signature-aware [`make_new_descr`] for builtin constructors with keyword
@@ -2416,8 +2420,7 @@ pub(crate) fn make_new_descr_with_signature(
     func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
     signature: crate::gateway::Signature,
 ) -> PyObjectRef {
-    let f = crate::make_builtin_function_as_builtin_with_signature("__new__", func, signature);
-    pyre_object::w_staticmethod_new(f)
+    crate::make_builtin_function_as_builtin_with_signature("__new__", func, signature)
 }
 
 /// `typeobject.c tp_new_wrapper` — `__new__` takes the class to instantiate
@@ -11697,19 +11700,14 @@ fn init_builtin_function_type(ns: PyObjectRef) {
                     )?;
                     let carrier = unsafe { builtin_function_carrier(func) };
                     let name = unsafe { crate::function_get_name(carrier) };
-                    if is_bound_builtin_method(func) {
-                        let instance = unsafe { pyre_object::w_method_get_self(func) };
-                        let type_name = crate::typedef::r#type(instance)
-                            .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
-                            .unwrap_or("object");
-                        Ok(pyre_object::w_str_new(&format!(
-                            "<built-in method {name} of {type_name} object at {instance:p}>"
-                        )))
+                    let w_self = if is_bound_builtin_method(func) {
+                        unsafe { pyre_object::w_method_get_self(func) }
                     } else {
-                        Ok(pyre_object::w_str_new(&format!(
-                            "<built-in function {name}>"
-                        )))
-                    }
+                        unsafe { crate::function::function_get_self_or_none(carrier) }
+                    };
+                    Ok(pyre_object::w_str_new(&unsafe {
+                        crate::function::builtin_function_repr_text(name, w_self)
+                    }))
                 },
                 1,
             ),

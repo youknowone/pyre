@@ -269,7 +269,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__new__",
-        crate::make_builtin_function("__new__", |args| {
+        crate::typedef::make_new_descr(|args| {
             if args.is_empty() {
                 return Err(crate::PyError::type_error(
                     "mmap() requires fileno + length",

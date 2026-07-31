@@ -100,7 +100,7 @@ cached_type!(CFIELD, cfield_type, || {
         type_ns_store(
             ns,
             "__new__",
-            crate::make_builtin_function("__new__", cfield_new_internal),
+            crate::typedef::make_new_descr(cfield_new_internal),
         );
         type_ns_store(
             ns,
@@ -180,7 +180,7 @@ cached_type!(POINTER_BASE, pointer_base_type, || {
 });
 
 fn install_new(ns: PyObjectRef, f: crate::gateway::BuiltinCodeFn) {
-    type_ns_store(ns, "__new__", crate::make_builtin_function("__new__", f));
+    type_ns_store(ns, "__new__", crate::typedef::make_new_descr(f));
 }
 
 fn install_init(ns: PyObjectRef, f: crate::gateway::BuiltinCodeFn) {
@@ -235,11 +235,7 @@ fn install_fields_getset(ns: PyObjectRef) {
 }
 
 fn init_aggregate_base(ns: PyObjectRef) {
-    type_ns_store(
-        ns,
-        "__new__",
-        crate::make_builtin_function("__new__", structure_new),
-    );
+    type_ns_store(ns, "__new__", crate::typedef::make_new_descr(structure_new));
     type_ns_store(
         ns,
         "__init__",

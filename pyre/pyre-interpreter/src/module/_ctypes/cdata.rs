@@ -263,7 +263,7 @@ fn init_simplecdata_type(ns: PyObjectRef) {
     type_ns_store(
         ns,
         "__new__",
-        crate::make_builtin_function("__new__", simplecdata_new),
+        crate::typedef::make_new_descr(simplecdata_new),
     );
     type_ns_store(
         ns,

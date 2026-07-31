@@ -2124,6 +2124,16 @@ fn expand_pyre_methods(
                     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, #py_name, #raw_fn) };
                 });
             }
+            // `__new__` is the one static entry that is not a `tp_methods`
+            // entry: `add_tp_new_wrapper` stores the carrier itself, so the
+            // namespace holds a `builtin_function_or_method` bound to the
+            // owning type rather than a `staticmethod` around one.
+            MethodKind::Static if py_name == "__new__" => {
+                registrations.push(quote! {
+                    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, #py_name,
+                        crate::typedef::make_new_descr(#wrapper_name)) };
+                });
+            }
             MethodKind::Static => {
                 registrations.push(quote! {
                     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, #py_name,

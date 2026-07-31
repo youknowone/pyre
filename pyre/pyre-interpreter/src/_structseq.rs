@@ -428,7 +428,7 @@ fn make_struct_seq_impl(
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "__new__",
-                    crate::make_builtin_function("__new__", structseq_descr_new),
+                    crate::typedef::make_new_descr(structseq_descr_new),
                 )
             };
             unsafe {

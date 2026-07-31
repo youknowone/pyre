@@ -52,11 +52,7 @@ pub(super) fn cfuncptr_type() -> PyObjectRef {
 }
 
 fn init_cfuncptr_type(ns: PyObjectRef) {
-    type_ns_store(
-        ns,
-        "__new__",
-        crate::make_builtin_function("__new__", cfuncptr_new),
-    );
+    type_ns_store(ns, "__new__", crate::typedef::make_new_descr(cfuncptr_new));
     type_ns_store(
         ns,
         "__call__",

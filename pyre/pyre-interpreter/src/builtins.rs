@@ -6469,7 +6469,7 @@ fn make_exc_type_with_init(
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "__new__",
-                    make_builtin_function("__new__", new_fn),
+                    crate::typedef::make_new_descr(new_fn),
                 )
             };
             if let Some(init_fn) = init_fn {
@@ -6734,7 +6734,7 @@ pub(crate) fn make_exc_type_multi(
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "__new__",
-                    make_builtin_function("__new__", new_fn),
+                    crate::typedef::make_new_descr(new_fn),
                 )
             };
         },
@@ -7276,7 +7276,7 @@ fn make_exception_group_type(name: &'static str, bases: &[PyObjectRef]) -> PyObj
                 pyre_object::w_dict_setitem_str_no_proxy(
                     ns,
                     "__new__",
-                    make_builtin_function("__new__", exception_group_new),
+                    crate::typedef::make_new_descr(exception_group_new),
                 );
                 pyre_object::w_dict_setitem_str_no_proxy(
                     ns,
