@@ -24764,6 +24764,12 @@ fn product_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         gettypefor(&pyre_object::interp_itertools::PRODUCT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let cls = positional.first().copied().unwrap_or(PY_NULL);
+    // `tp_new_wrapper` screens the requested subtype before `product_new`
+    // runs, so this precedes the keyword census, the `repeat` conversion and
+    // any contact with the input iterables — an unbound call with a foreign
+    // class must not reach their side effects. `itertools_alloc_for_class`
+    // repeats the check on the allocation path.
+    check_user_subclass(exact, cls)?;
     let inputs = positional.get(1..).unwrap_or(&[]);
     crate::builtins::kwarg_reject_unknown(kwargs, &["repeat"], "product")?;
 
