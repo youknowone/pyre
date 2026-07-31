@@ -411,21 +411,68 @@ context, which is what `walker_ec_enter` / `walker_ec_leave` do; the
 right that an inline-push `enter` is the prerequisite, and wrong only about which
 check it gated.
 
-**Resolved 2026-07-30.**  With that push landed, the same fixture reports
-`30000 30000 0 0` — zero wrong frames — under CPython and under pyre, with 10
-`adopted multi-frame terminal` events and no chain-root decline, so the adopt
-commits rather than declining.  The gate was flipped default-ON and then retired
-outright (§3); the acceptance test became the regression guard for the
-unconditional path.  `synth/getframe_inline_subwalk_multiframe`, whose header had
-recorded that the chain-root identity gate declined its shape, now measures 5
-builds, 5 adopts, zero declines, and the same output as before.
+**Identity half resolved 2026-07-30.**  With that push landed, the same fixture
+reports `30000 30000 0 0` — zero wrong frames — under CPython and under pyre, and
+the chain-root identity gate no longer declines these shapes.  The gate was
+flipped default-ON and then retired outright (§3).
+
+**But the flip was not sound.**  A SECOND blocker was recorded in
+`try_adopt_multi_frame_blackhole`'s own comment and missed when the flip was
+verified: only frame 0's locals were published, so an inlined callee's frame array
+kept its pre-sub-walk contents while every LOAD_FAST reads that array.  With the
+flip live, an inlined callee that stores `e.__traceback__` and then reads an
+attribute off it resumed the local as null and faulted in `object_getattr_miss`
+— a hard SIGSEGV, reproduced at `0f9c371b63`.  Two PR reviewers flagged it
+independently, and `synth/blackhole_inlined_callee_local_after_escape` pins the
+crashing shape.  It is closed by mirroring an inlined MIFrame's standard-vable
+writes onto that level's own concrete red frame at the time they are made
+(`current_inline_concrete_frame`, `store_live_frame_static_int`), so a level is
+resumable from the frame it already owns rather than from a publication step
+that runs at the adopt — one red frame per MIFrame, which is the shape the
+codewriter's `getarrayitem_vable_r` lowering assumes.
+
+**A THIRD blocker sits under the second.**  With the levels resumable and no
+crash, the fixture still returned a silently wrong `[(False, 2), (True, 2)]`
+against `[(True, 2)]`, at exactly one wrong iteration per adopt.  At every
+mismatch the escaping `sys._getframe()` returned the chain's level-1 frame
+(`per_frame[1]`, the frame the seed built and the sub-walk runs on) while the
+traceback named a *different* frame object for the same invocation.  The producer
+is `record_inline_traceback_for_recording`: the walk-time concrete traceback node
+for an inlined level was anchored on a frame the hook `createframe_obj`s from the
+promoted code and globals.  That hook predates the seed, and the level now has a
+real frame — the same object the EMITTED node already names, since
+`traceback_node_site` resolves its frame operand from the level's frame register.
+So the walk and the compiled run disagreed, and only the walk's answer is
+committed by an adopt, which is why the corpus saw it exactly once per adopt and
+never in steady state.  `record_inline_application_traceback` now anchors the
+concrete node on that frame and falls back to the fabricating hook only for a
+level inlined without one.
+
+Anchoring on the real frame moves one obligation along with the node.  The
+fabricated frame carried the raise coordinate because the hook stamped it, while
+the level's own frame carries the entry sentinel: the recording walk does not
+make `dispatch_bytecode`'s per-opcode `last_instr` store, and a frame that leaves
+by the exception never reaches an exit that would publish one either, so
+`f_lineno` answers the `def` line.  `synth/exception_traceback_frame_lineno`
+reads exactly that, as a second `('raises_out', 1, 0)` shape beside the correct
+`('raises_out', 1, 1)`.  The anchor therefore makes the same store the blackhole
+already makes for its replay in `publish_last_instr_at_live_marker`.
+
+**All three are closed, and the arm adopts.**
+`synth/getframe_inline_subwalk_multiframe` measures 5 builds / 5 adopts / 0
+declines, `..._while_escaping_read_frame_identity` 10 / 10 / 0 and
+`..._while_inlined_callee_subwalk` 5 / 5 / 0, all with unchanged output, and
+`synth/blackhole_inlined_callee_local_after_escape` matches the reference.
 
 One thing the ON path already fixes: with a side-effecting inlined callee under
 a `while` loop that returns from inside the loop, the OFF path runs the callee's
 side effect ~5.2k extra times (the recorded trace-abort double-run class) while
 the adopt gives the exact count.
 
-Everything else that was thought to block the flip was measured and did not: the
+Everything else that was thought to block the flip was measured and did not —
+except the two gaps above, which the sweeps below did not cover because no corpus
+fixture assigned a local in an inlined callee and read it back after the escape,
+the one shape that reaches both: the
 full corpus was **336/336 with the gate on (dynasm) and 336/336 with it off
 (cranelift)** at the time, the blast radius is exactly `inline_subwalk = true` at
 a vable escape (the latch is an `if`/`else if` whose single-frame arm requires

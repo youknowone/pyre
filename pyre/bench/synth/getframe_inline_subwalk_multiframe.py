@@ -9,9 +9,10 @@
 # residual frame rather than the walked frame, and
 # `try_adopt_multi_frame_blackhole`'s chain-root identity gate declined it. What
 # that decline wanted was the `jit.virtual_ref` emit at the inline push
-# (`executioncontext.py:89`); `walker_ec_enter` / `walker_ec_leave` landed it.
-# The gate no longer fires here: the shape now adopts once per build and returns
-# the same result as before. This fixture pins that result.
+# (`executioncontext.py:89`); `walker_ec_enter` / `walker_ec_leave` landed it, so
+# the chain-root gate no longer fires here, and with every level resumable from
+# the concrete frame it owns, the chain is adopted rather than replayed. This fixture pins the
+# result across that adopt.
 #
 # One `sys._getframe(1)` level does NOT reach the build: the chain needs a
 # residual level under the walked frame and an inlined level under that, so
@@ -21,10 +22,10 @@
 # repro at all.
 #
 # The multi-frame image is built unconditionally when the latch conditions hold,
-# so this is both an output guard and build-path coverage: 5 builds, and now 5
-# adopts with zero chain-root declines (`PYRE_FBW_DEBUG_ABORT=1` prints both
-# tallies; the other 5 escapes in the run have `inline_subwalk=false` and take
-# the single-frame arm).
+# so this is both an output guard and build-path coverage: 5 builds, 5 adopts,
+# and zero declines of any kind (`PYRE_FBW_DEBUG_ABORT=1` prints every tally;
+# the other 5 escapes in the run have `inline_subwalk=false` and take the
+# single-frame arm, which adopts too).
 #
 # What the decline used to hold back, measured by lifting it before the
 # execution-context push landed: the resumed chain shifted every

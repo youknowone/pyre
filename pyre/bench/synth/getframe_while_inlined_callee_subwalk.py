@@ -7,7 +7,8 @@
 # callee's nested residual is declined by fbw_abort_nested_unjournaled_residual
 # before execute_residual_call runs, so the force happens outside the sub-walk
 # and the single-frame arm takes it. Driving with `while` is what reaches the
-# site, and build_multi_frame_miframe then produces a depth-2 image.
+# site, and build_multi_frame_miframe then produces a depth-2 image the adopt
+# takes.
 #
 # The shape below is load-bearing, not incidental:
 #   - `while`, not `for`, per the decline above;

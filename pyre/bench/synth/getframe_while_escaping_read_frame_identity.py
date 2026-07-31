@@ -1,6 +1,6 @@
 # pyre-check: max-pypy-ratio=159
 # The frame-identity read the multi-frame blackhole adopt commits, and the
-# regression guard for making that path unconditional.
+# regression guard for the path that commits it.
 #
 # The walk executes the forcing residual CONCRETELY, and an inline push never
 # runs the interpreter's call sequence. Before `walker_ec_enter` /
@@ -18,12 +18,15 @@
 # A `_gf(1)` reading `f_locals` on that shape raised `KeyError` for any caller
 # local, for the same reason and not because outer locals go unmaterialized.
 #
-# Both answers are correct now, with the adopt committing rather than declining
-# (`PYRE_FBW_DEBUG_ABORT=1` prints one `adopted multi-frame terminal` per
-# iteration that latches, and no `chain rooted at` decline). Note the read has
-# to be the ESCAPING call: once the escape has happened, a `sys._getframe(1)`
-# executed inside the blackhole was always correct, because the chain publishes
-# each level's frame as it runs.
+# Both answers are correct now, and they come from the adopt: with every level
+# resumable from the concrete frame it owns, the chain is adopted rather than
+# replayed
+# (`PYRE_FBW_DEBUG_ABORT=1` prints 10 `BUILT multi-frame` and 10 `adopted
+# multi-frame terminal`, with no decline of any kind), so this fixture is once
+# again the discriminator for the identity answer rather than a guard on the
+# replay that stood in for it. Note the read has to be the ESCAPING call: once
+# the escape has happened, a `sys._getframe(1)` executed inside the blackhole was
+# always correct, because the chain publishes each level's frame as it runs.
 import sys
 
 _gf = sys._getframe
