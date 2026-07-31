@@ -2134,7 +2134,7 @@ fn parse_source_module(pathname: &str, source: &str) -> Result<CodeObject, Strin
 // instead of erasing the field).
 
 fn exec_code_module(
-    code: CodeObject,
+    w_code: PyObjectRef,
     w_globals: pyre_object::PyObjectRef,
     execution_context: *const PyExecutionContext,
     pathname: Option<&str>,
@@ -2195,8 +2195,6 @@ fn exec_code_module(
             }
         }
     }
-    let code_ptr = Box::into_raw(Box::new(code));
-    let w_code = crate::w_code_new(code_ptr as *const ());
     // importing.py:300 code_w.exec_code(space, w_dict, w_dict) → eval.py:31-33
     // Code.exec_code → space.createframe(...) + frame.run().  Surface
     // initialize_frame_scopes' freevar/closure mismatch (TypeError /
@@ -2309,19 +2307,46 @@ fn load_source_module(
     })?;
 
     let pathname_str = pathname.to_string_lossy();
-    let code = parse_source_module(&pathname_str, &source).map_err(|e| {
-        crate::PyError::new(
-            crate::PyErrorKind::ImportError,
-            format!("cannot compile '{}': {e}", pathname.display()),
-        )
-    })?;
+
+    let _root = pyre_object::gc_roots::push_roots();
+    // The two importlib bootstrap sources are imported by the native importer
+    // before `SourceFileLoader` exists, so they never reach the `.pyc` cache and
+    // otherwise recompile on every startup.  `_frozen_importlib._cached_compile`:
+    // reload a marshalled, source-validated code object when the cache holds one
+    // for this binary, recompiling only on a miss.
+    let cache_key = match modulename {
+        "importlib._bootstrap" | "importlib._bootstrap_external" => Some(modulename),
+        _ => None,
+    };
+    let (w_code, store) = match cache_key
+        .and_then(|key| crate::module::imp::interp_imp::frozen_cache_load(key, &source))
+    {
+        Some(w_code) => (w_code, false),
+        None => {
+            let code = parse_source_module(&pathname_str, &source).map_err(|e| {
+                crate::PyError::new(
+                    crate::PyErrorKind::ImportError,
+                    format!("cannot compile '{}': {e}", pathname.display()),
+                )
+            })?;
+            (
+                crate::w_code_new(Box::into_raw(Box::new(code)) as *const ()),
+                cache_key.is_some(),
+            )
+        }
+    };
+    // Root before any allocation (fresh_module_globals, the cache write) can
+    // collect the freshly boxed code out from under us.
+    pyre_object::gc_roots::pin_root(w_code);
+    if let (true, Some(key)) = (store, cache_key) {
+        crate::module::imp::interp_imp::frozen_cache_store(key, &source, w_code);
+    }
 
     // Create a fresh namespace for the module, seeded with builtins.
     // PyPy equivalent: Module.__init__ creates w_dict = space.newdict()
     // then exec_code_module sets __builtins__ and runs code in w_dict.
     let ctx = unsafe { &*execution_context };
     let w_globals = ctx.fresh_module_globals();
-    let _root = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(w_globals);
 
     // PyPy `interpreter/module.py:Module.__init__` seeds `__name__` on
@@ -2399,7 +2424,7 @@ fn load_source_module(
     // (`_bootstrap._load`) so a retried import re-runs the body instead of
     // observing a half-built module.
     if let Err(e) = exec_code_module(
-        code,
+        w_code,
         w_globals,
         execution_context,
         Some(&pathname_str),
