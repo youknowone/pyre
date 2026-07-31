@@ -8983,9 +8983,10 @@ fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 /// / `e.end_lineno` / `e.end_offset` / `e.filename`.  Parser errors carry
 /// the offending line sliced from `source`; compiler errors such as
 /// ``return`` outside a function retain their location but expose `e.text`
-/// as `None`, matching CPython's `PyErr_SyntaxLocationObject` path.  A
-/// location-less codegen error (line 0) falls back to a bare, message-only
-/// SyntaxError.
+/// as `None` for synthetic ``<string>`` input, matching CPython's
+/// `PyErr_SyntaxLocationObject` path.  File compilation retains the decoded
+/// line for error display.  A location-less codegen error (line 0) falls back
+/// to a bare, message-only SyntaxError.
 pub fn compile_err_to_syntax_error(
     e: crate::compile::CompileError,
     source: &str,
@@ -9089,10 +9090,12 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             .or_else(|| codegen_statement_end(&e, source, lineno, offset))
             .unwrap_or((lineno, offset));
         let filename = e.source_path().to_string();
-        // Only the parser owns source text, and it keeps the trailing newline
-        // like `e.text`.  Later compiler failures retain their source range but
-        // no original input line.
-        let text = if matches!(&e, crate::compile::CompileError::Parse(_)) {
+        // Parser errors own their source text directly, keeping the trailing
+        // newline like `e.text`.  Later compiler failures omit it for the
+        // synthetic ``<string>`` input, while file compilation keeps the
+        // decoded source line for the top-level error printer.
+        let text = if matches!(&e, crate::compile::CompileError::Parse(_)) || filename != "<string>"
+        {
             source.split_inclusive('\n').nth(lineno - 1)
         } else {
             None

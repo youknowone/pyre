@@ -1744,16 +1744,20 @@ fn write_syntax_error_object<W: Write>(writer: &mut W, exc: PyObjectRef) -> std:
     if let Some(text) = str_of(attr("text")) {
         let raw = text.trim_end_matches(['\n', '\r']);
         let shown = raw.trim_start();
-        let lead = raw.len() - shown.len();
+        let lead_bytes = raw.len() - shown.len();
+        let lead = raw[..lead_bytes].chars().count();
         writeln!(writer, "    {shown}")?;
         if let Some(offset) = int_of(attr("offset")).filter(|&offset| offset > 0) {
-            // `traceback._byte_offset_to_character_offset` clamps malformed
-            // constructor-supplied offsets to the displayed line.  Offsets
-            // at or below zero suppress the marker entirely.
-            let start_col = ((offset as usize) - 1).min(raw.len());
+            // Traceback formatting treats the stored columns as display
+            // columns and clamps malformed constructor-supplied offsets to
+            // the displayed line.  Offsets at or below zero suppress the
+            // marker entirely.
+            let displayed_len = raw.chars().count();
+            let display_col = |offset: i64| ((offset as usize) - 1).min(displayed_len);
+            let start_col = display_col(offset);
             let end_col = int_of(attr("end_offset"))
                 .filter(|&e| e >= offset)
-                .map_or(start_col, |e| ((e as usize) - 1).min(raw.len()));
+                .map_or(start_col, display_col);
             let caret_start = start_col.saturating_sub(lead);
             let caret_len = end_col.saturating_sub(start_col).max(1);
             let mut caret = String::from("    ");
