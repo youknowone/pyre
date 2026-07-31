@@ -1770,9 +1770,80 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
     let Some(concrete_seq) = walker_concrete_ref_object(ctx, seq) else {
         return Ok(None);
     };
+    // `objspace.py:507-541 StdObjSpace.{unpackiterable,fixedview}` takes an
+    // exact tuple straight to its immutable `wrappeditems` list; and
+    // `pyopcode.py:889 UNPACK_SEQUENCE` calls `fixedview_unroll`, so a
+    // constant item count exposes each tuple item directly to the trace.
+    // Preserve that shape for pyre's split `UnpackSequence` / `UnpackItem`
+    // helpers.  In particular, `zip` produces an ordinary array-backed tuple
+    // each iteration; leaving these helpers residual makes the three-item
+    // comprehension trace execute one validation call plus one call per
+    // projected item.
+    let tuple_type = &pyre_object::pyobject::TUPLE_TYPE as *const pyre_object::pyobject::PyType;
+    let canonical_tuple_class = pyre_object::pyobject::get_instantiate(unsafe { &*tuple_type });
+    if unsafe {
+        std::ptr::eq((*concrete_seq).ob_type, tuple_type)
+            && std::ptr::eq((*concrete_seq).w_class, canonical_tuple_class)
+    } {
+        let concrete_len = unsafe { pyre_object::w_tuple_len(concrete_seq) };
+        if int_val < 0 {
+            return Ok(None);
+        }
+        walker_guard_class(ctx, op_pc, seq, tuple_type as i64)?;
+        walker_guard_exact_w_class(ctx, op_pc, seq, canonical_tuple_class)?;
+        let items = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            seq,
+            crate::descr::tuple_wrappeditems_descr(),
+        );
+        match helper {
+            majit_ir::PyreHelperKind::UnpackSequence => {
+                if int_val as usize != concrete_len {
+                    return Ok(None);
+                }
+                let length = crate::state::opimpl_arraylen_gc(
+                    ctx.trace_ctx,
+                    items,
+                    crate::state::pyobject_gcarray_descr(),
+                );
+                let expected = ctx.trace_ctx.const_int(int_val);
+                walker_emit_guard_with_snapshot(
+                    ctx,
+                    op_pc,
+                    OpCode::GuardValue,
+                    &[length, expected],
+                )?;
+                write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, seq)?;
+                return Ok(Some(()));
+            }
+            majit_ir::PyreHelperKind::UnpackItem => {
+                let index = int_val as usize;
+                if index >= concrete_len {
+                    return Ok(None);
+                }
+                let index_op = ctx.trace_ctx.const_int(int_val);
+                let item = crate::state::trace_items_block_getitem_value_pure(
+                    ctx.trace_ctx,
+                    items,
+                    index_op,
+                );
+                let concrete_item = unsafe {
+                    pyre_object::w_tuple_getitem(concrete_seq, int_val)
+                        .unwrap_or(pyre_object::PY_NULL)
+                };
+                ctx.trace_ctx.set_opref_concrete(
+                    item,
+                    majit_ir::Value::Ref(majit_ir::GcRef(concrete_item as usize)),
+                );
+                write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, item)?;
+                return Ok(Some(()));
+            }
+            _ => {}
+        }
+    }
     // Both arity-2 specialisations fold; any other shape (a plain tuple, a
-    // longer unpack, a list) falls through to the opaque residual (correct,
-    // slower).
+    // list, or a non-canonical tuple) falls through to the opaque residual
+    // (correct, slower).
     let spec_ii = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE
         as *const pyre_object::pyobject::PyType;
     let spec_oo = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE
