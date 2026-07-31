@@ -6401,6 +6401,17 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
 /// exit-frame traceback recording preserves its traceback exactly. `LOAD_ATTR`
 /// is admitted because a mid-body abort from its method call follows the same
 /// exact-resume path rather than dropping the remainder of the iteration.
+///
+/// `SET_ADD` and `MAP_ADD` — the set/dict comprehension accumulators — are
+/// admitted on the same footing, because upstream spells them as operations this
+/// body scan already admits and gives them no accumulator status of their own:
+/// `pyopcode.py:1515 SET_ADD` is `space.call_method(w_set, 'add', w_value)`, the
+/// `LOAD_ATTR` + `CALL` pair above, and `pyopcode.py:1525 MAP_ADD` is
+/// `space.setitem(w_dict, w_key, w_value)`, i.e. `STORE_SUBSCR`. Neither is
+/// folded here — the codewriter lowers both to a void `residual_call_r_v`
+/// (`bh_set_add_fn` / `bh_map_add_fn`), so they carry exactly the body-effect
+/// accounting of the residual they are, and a mid-body abort resumes through the
+/// same `try_commit_midbody_abort` path as the store family.
 fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
     use pyre_interpreter::Instruction as I;
     let instructions = &code.instructions;
@@ -6501,6 +6512,10 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
                             | I::DeleteSubscr
                             | I::DeleteAttr { .. }
                             | I::LoadName { .. }
+                            // `call_method(set, 'add', v)` / `setitem(d, k, v)`
+                            // spelled as one opcode; void residuals, not folds.
+                            | I::SetAdd { .. }
+                            | I::MapAdd { .. }
                     )
                     || (!body_has_call && matches!(body_instr, I::ListAppend { .. }));
                 if !permitted {
