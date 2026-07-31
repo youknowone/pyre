@@ -3605,6 +3605,39 @@ pub(crate) fn sys_displayhook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     Ok(w_none())
 }
 
+/// `sys.excepthook(exc_type, exc_value, exc_tb)` and its preserved
+/// `__excepthook__` alias.  CPython routes both through `_PyErr_Display`;
+/// using the shared structured renderer keeps exception chains and
+/// tracebacks visible to tests that deliberately call the original hook.
+pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let value = args.get(1).copied().unwrap_or_else(w_none);
+    let traceback = args.get(2).copied().unwrap_or_else(w_none);
+    let mut rendered = Vec::new();
+    crate::error::write_exception_from_parts(&mut rendered, value, traceback)
+        .map_err(|_| crate::PyError::runtime_error("sys.excepthook: failed to write exception"))?;
+    // Route through the live `sys.stderr`, not directly through the host
+    // seam: tests and applications are allowed to replace `sys.stderr` and
+    // `sys.__excepthook__` must honor that replacement.
+    let wrote = crate::importing::get_sys_module("sys")
+        .and_then(|sys| crate::baseobjspace::getattr_str(sys, "stderr").ok())
+        .filter(|stderr| !stderr.is_null() && unsafe { !pyre_object::is_none(*stderr) })
+        .is_some_and(|stderr| {
+            let text = String::from_utf8_lossy(&rendered).into_owned();
+            let w_text = pyre_object::w_str_new(&text);
+            let result = crate::baseobjspace::call_method(stderr, "write", &[w_text]);
+            if result.is_null() {
+                let _ = crate::call::take_call_error();
+                false
+            } else {
+                true
+            }
+        });
+    if !wrote {
+        crate::host_seam::emit_stderr(&rendered);
+    }
+    Ok(w_none())
+}
+
 /// `space.index` re-wraps a result whose type is not exactly `int` (a
 /// bool, or a strict int subclass) as a plain int (descroperation.py:622
 /// `index`).  A range stores its bounds wrapped, so normalize each here —

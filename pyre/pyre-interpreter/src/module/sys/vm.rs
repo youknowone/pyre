@@ -2244,8 +2244,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
-    // sys.displayhook / excepthook. `__displayhook__` keeps the original so
-    // code (e.g. doctest) can save and restore the hook.
+    // sys.displayhook / excepthook. The double-underscore names keep the
+    // original hooks so code (e.g. doctest and exception tests) can save and
+    // restore them.
     module_ns_store(
         ns,
         "displayhook",
@@ -2259,7 +2260,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(
         ns,
         "excepthook",
-        make_builtin_function_with_arity("excepthook", |_| Ok(w_none()), 3),
+        make_builtin_function_with_arity("excepthook", crate::builtins::sys_excepthook, 3),
+    );
+    module_ns_store(
+        ns,
+        "__excepthook__",
+        make_builtin_function_with_arity("excepthook", crate::builtins::sys_excepthook, 3),
     );
     // sys.breakpointhook — `app.py breakpointhook`, called by `breakpoint()`.
     // `__breakpointhook__` keeps the original so code can restore it.
