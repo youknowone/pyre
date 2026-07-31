@@ -1135,13 +1135,13 @@ pub(crate) unsafe fn exception_kind_str(
         let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
         match kind {
             pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError => {
-                return Ok(Some(unicode_translate_error_str(obj)));
+                return unicode_translate_error_str(obj).map(Some);
             }
             pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError => {
-                return Ok(Some(unicode_decode_error_str(obj)));
+                return unicode_decode_error_str(obj).map(Some);
             }
             pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError => {
-                return Ok(Some(unicode_encode_error_str(obj)));
+                return unicode_encode_error_str(obj).map(Some);
             }
             // `interp_exceptions.py:540-548 W_KeyError.descr_str` —
             // a single-argument KeyError stringifies as `repr(args[0])`
@@ -1483,16 +1483,16 @@ unsafe fn unicode_err_int_slot(stored: PyObjectRef) -> Result<i64, String> {
 /// non-str at construction time; this helper covers the
 /// post-construction mutation case (`e.encoding = 42`,
 /// `e.reason = None`, etc.) the way PyPy would via `%s`-coerce.
-unsafe fn unicode_err_str_slot(stored: PyObjectRef) -> String {
+unsafe fn unicode_err_str_slot(stored: PyObjectRef) -> Result<String, crate::PyError> {
     unsafe {
         if stored.is_null() {
-            return String::new();
+            return Ok(String::new());
         }
-        if pyre_object::is_str(stored) {
-            return pyre_object::w_str_get_value(stored).to_string();
+        if pyre_object::is_exact_type(stored, &pyre_object::STR_TYPE) {
+            return Ok(pyre_object::w_str_get_value(stored).to_string());
         }
-        // `descr_str` deliberately `%s`-coerces rather than raising.
-        py_str(stored).unwrap_or_default()
+        // `%s` propagates an exception raised by the value's `__str__`.
+        py_str(stored)
     }
 }
 
@@ -1547,18 +1547,31 @@ fn unicode_err_end_minus_one_repr(slot: &Result<i64, String>) -> String {
 /// shape with a `<?>` placeholder for the indexed character — never
 /// silently degrading to the plural-range message when the shape
 /// `end == start + 1` says single-char.
-unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> String {
+unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
     unsafe {
-        let w_object = pyre_object::interp_exceptions::w_exception_get_object(obj);
-        if w_object.is_null() || pyre_object::is_none(w_object) {
-            return String::new();
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(obj);
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let initial = pyre_object::interp_exceptions::w_exception_get_object(obj);
+        if initial.is_null() || pyre_object::is_none(initial) {
+            return Ok(String::new());
         }
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let start_slot =
             unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_start(obj));
         let end_slot =
             unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_end(obj));
         let reason =
-            unicode_err_str_slot(pyre_object::interp_exceptions::w_exception_get_reason(obj));
+            unicode_err_str_slot(pyre_object::interp_exceptions::w_exception_get_reason(obj))?;
+        // Formatting `reason` can run arbitrary Python and mutate the
+        // exception.  CPython 3.14 rereads `object` before indexing it.
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let w_object = pyre_object::interp_exceptions::w_exception_get_object(obj);
+        if w_object.is_null() || !pyre_object::is_str(w_object) {
+            return Err(crate::PyError::type_error(
+                "UnicodeError 'object' attribute must be str",
+            ));
+        }
         let start_repr = unicode_err_int_repr(&start_slot);
         // Shape predicate `self.end == self.start + 1` — true iff both
         // slots are int AND `end == start + 1`.  Any non-int slot
@@ -1590,19 +1603,19 @@ unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> String {
             } else {
                 None
             };
-            return format!(
+            return Ok(format!(
                 "can't translate character {} in position {}: {}",
                 badchar_repr.unwrap_or_else(|| "<?>".to_string()),
                 start_repr,
                 reason
-            );
+            ));
         }
-        format!(
+        Ok(format!(
             "can't translate characters in position {}-{}: {}",
             start_repr,
             unicode_err_end_minus_one_repr(&end_slot),
             reason
-        )
+        ))
     }
 }
 
@@ -1625,21 +1638,32 @@ unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> String {
 /// non-bytes-like `w_object` keeps the single-byte format shape with
 /// `0x??` for the byte position — the shape never silently degrades
 /// to the plural-range message when `end == start + 1`.
-unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> String {
+unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
     unsafe {
-        let w_object = pyre_object::interp_exceptions::w_exception_get_object(obj);
-        if w_object.is_null() || pyre_object::is_none(w_object) {
-            return String::new();
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(obj);
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let initial = pyre_object::interp_exceptions::w_exception_get_object(obj);
+        if initial.is_null() || pyre_object::is_none(initial) {
+            return Ok(String::new());
         }
         let encoding = unicode_err_str_slot(
             pyre_object::interp_exceptions::w_exception_get_encoding(obj),
-        );
+        )?;
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let start_slot =
             unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_start(obj));
         let end_slot =
             unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_end(obj));
         let reason =
-            unicode_err_str_slot(pyre_object::interp_exceptions::w_exception_get_reason(obj));
+            unicode_err_str_slot(pyre_object::interp_exceptions::w_exception_get_reason(obj))?;
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let w_object = pyre_object::interp_exceptions::w_exception_get_object(obj);
+        if w_object.is_null() || !pyre_object::is_bytes_like(w_object) {
+            return Err(crate::PyError::type_error(
+                "UnicodeError 'object' attribute must be bytes",
+            ));
+        }
         let start_repr = unicode_err_int_repr(&start_slot);
         let single_char = matches!((&start_slot, &end_slot), (Ok(s), Ok(e)) if *e == *s + 1);
         if single_char {
@@ -1653,21 +1677,21 @@ unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> String {
             } else {
                 None
             };
-            return format!(
+            return Ok(format!(
                 "'{}' codec can't decode byte {} in position {}: {}",
                 encoding,
                 byte_repr.unwrap_or_else(|| "0x??".to_string()),
                 start_repr,
                 reason
-            );
+            ));
         }
-        format!(
+        Ok(format!(
             "'{}' codec can't decode bytes in position {}-{}: {}",
             encoding,
             start_repr,
             unicode_err_end_minus_one_repr(&end_slot),
             reason
-        )
+        ))
     }
 }
 
@@ -1676,21 +1700,32 @@ unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> String {
 /// `W_UnicodeTranslateError` but prefixed with the encoding name.
 /// Non-int / non-str / OOR mutations match the parity rules in
 /// [`unicode_translate_error_str`] / [`unicode_decode_error_str`].
-unsafe fn unicode_encode_error_str(obj: PyObjectRef) -> String {
+unsafe fn unicode_encode_error_str(obj: PyObjectRef) -> Result<String, crate::PyError> {
     unsafe {
-        let w_object = pyre_object::interp_exceptions::w_exception_get_object(obj);
-        if w_object.is_null() || pyre_object::is_none(w_object) {
-            return String::new();
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(obj);
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let initial = pyre_object::interp_exceptions::w_exception_get_object(obj);
+        if initial.is_null() || pyre_object::is_none(initial) {
+            return Ok(String::new());
         }
         let encoding = unicode_err_str_slot(
             pyre_object::interp_exceptions::w_exception_get_encoding(obj),
-        );
+        )?;
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let start_slot =
             unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_start(obj));
         let end_slot =
             unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_end(obj));
         let reason =
-            unicode_err_str_slot(pyre_object::interp_exceptions::w_exception_get_reason(obj));
+            unicode_err_str_slot(pyre_object::interp_exceptions::w_exception_get_reason(obj))?;
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let w_object = pyre_object::interp_exceptions::w_exception_get_object(obj);
+        if w_object.is_null() || !pyre_object::is_str(w_object) {
+            return Err(crate::PyError::type_error(
+                "UnicodeError 'object' attribute must be str",
+            ));
+        }
         let start_repr = unicode_err_int_repr(&start_slot);
         let single_char = matches!((&start_slot, &end_slot), (Ok(s), Ok(e)) if *e == *s + 1);
         if single_char {
@@ -1718,21 +1753,21 @@ unsafe fn unicode_encode_error_str(obj: PyObjectRef) -> String {
             } else {
                 None
             };
-            return format!(
+            return Ok(format!(
                 "'{}' codec can't encode character {} in position {}: {}",
                 encoding,
                 badchar_repr.unwrap_or_else(|| "<?>".to_string()),
                 start_repr,
                 reason
-            );
+            ));
         }
-        format!(
+        Ok(format!(
             "'{}' codec can't encode characters in position {}-{}: {}",
             encoding,
             start_repr,
             unicode_err_end_minus_one_repr(&end_slot),
             reason
-        )
+        ))
     }
 }
 
