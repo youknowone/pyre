@@ -478,7 +478,18 @@ pub fn intern_liveness(live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> Option<u1
             v
         };
         let key = (canonical(live_i), canonical(live_r), canonical(live_f));
-        if let Some(&pos) = asm.all_liveness_positions.get(&key) {
+        // The dict is derived from the buffer on first use after each
+        // `publish_state`, which installs bytes without one. See
+        // `assembler::liveness_positions_of`.
+        if asm.all_liveness_positions.is_none() {
+            let positions = crate::assembler::liveness_positions_of(&asm.all_liveness);
+            asm.all_liveness_positions = Some(positions);
+        }
+        let positions = asm
+            .all_liveness_positions
+            .as_ref()
+            .expect("derived just above");
+        if let Some(&pos) = positions.get(&key) {
             return Some((pos, asm.all_liveness.clone()));
         }
         let pos = asm.all_liveness_length;
@@ -493,7 +504,10 @@ pub fn intern_liveness(live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> Option<u1
             return None;
         }
         let pos_u16 = pos as u16;
-        asm.all_liveness_positions.insert(key, pos_u16);
+        asm.all_liveness_positions
+            .as_mut()
+            .expect("derived above")
+            .insert(key, pos_u16);
         asm.all_liveness.push(live_i.len() as u8);
         asm.all_liveness.push(live_r.len() as u8);
         asm.all_liveness.push(live_f.len() as u8);

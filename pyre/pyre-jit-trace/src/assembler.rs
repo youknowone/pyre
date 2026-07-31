@@ -30,13 +30,14 @@ use indexmap::IndexMap;
 ///   mapped to opcode number; source for `MetaInterpStaticData.setup_insns`.
 /// - `all_liveness`    — running byte buffer appended by `_encode_liveness`.
 /// - `all_liveness_length` — explicit length counter mirroring upstream.
-/// - `all_liveness_positions` — dedup dict from bitset key to offset.
+/// - `all_liveness_positions` — dedup dict from bitset key to offset. `None`
+///   until a reader-side intern asks for it; see [`liveness_positions_of`].
 /// - `num_liveness_ops` — running count of liveness writes (diagnostic).
 pub struct AssemblerState {
     pub insns: IndexMap<String, u8>,
     pub all_liveness: Vec<u8>,
     pub all_liveness_length: usize,
-    pub all_liveness_positions: IndexMap<(Vec<u8>, Vec<u8>, Vec<u8>), u16>,
+    pub all_liveness_positions: Option<IndexMap<(Vec<u8>, Vec<u8>, Vec<u8>), u16>>,
     pub num_liveness_ops: usize,
 }
 
@@ -68,7 +69,7 @@ impl AssemblerState {
         let insns = crate::jitcode_runtime::insns_opname_to_byte().clone();
         Self {
             insns,
-            all_liveness_positions: liveness_positions_of(&all_liveness),
+            all_liveness_positions: None,
             all_liveness,
             all_liveness_length,
             num_liveness_ops: 0,
@@ -84,7 +85,16 @@ impl AssemblerState {
 /// the dict has to describe the same records those bytes hold, or the next
 /// `intern_liveness` re-appends a triple already present and spends part of the
 /// 2-byte `-live-` operand's 64 KiB budget on a duplicate.
-fn liveness_positions_of(all_liveness: &[u8]) -> IndexMap<(Vec<u8>, Vec<u8>, Vec<u8>), u16> {
+///
+/// Derived on demand rather than at either entry: `publish_state` runs once per
+/// writer-side `-live-` intern, and this walks the whole buffer and rehashes
+/// every record it holds, so deriving eagerly there costs
+/// `interns × buffer_len`. `state::intern_liveness` is the only consumer, so it
+/// derives on its own first use and every later intern reuses the dict it left
+/// behind.
+pub(crate) fn liveness_positions_of(
+    all_liveness: &[u8],
+) -> IndexMap<(Vec<u8>, Vec<u8>, Vec<u8>), u16> {
     majit_translate::liveness::decode_liveness_records(all_liveness)
         .into_iter()
         .filter_map(|(live_i, live_r, live_f, offset)| {
@@ -155,11 +165,12 @@ pub fn publish_state(
         asm.all_liveness.extend_from_slice(all_liveness);
         asm.all_liveness_length = all_liveness_length;
         asm.num_liveness_ops = num_liveness_ops;
-        // The dedup table describes the *previous* buffer, so rebuild it from
-        // the one just installed. Clearing instead would leave the mirror
-        // unable to see any record in the fresh bytes, and the next
-        // `intern_liveness` would append a duplicate of one already there.
-        asm.all_liveness_positions = liveness_positions_of(all_liveness);
+        // The dedup table describes the *previous* buffer, so drop it and let
+        // the next reader-side intern derive one from the bytes just installed.
+        // Clearing it to an empty dict instead would leave the mirror unable to
+        // see any record in the fresh bytes, and that intern would append a
+        // duplicate of one already there.
+        asm.all_liveness_positions = None;
     });
     crate::state::publish_liveness_info(all_liveness.to_vec());
 }
