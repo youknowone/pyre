@@ -1419,10 +1419,20 @@ pub unsafe fn w_exception_kind_byte(obj: PyObjectRef) -> u8 {
 /// readable bytes.
 #[inline]
 pub unsafe fn w_exception_kind_checked(obj: PyObjectRef) -> Option<ExcKind> {
-    if obj.is_null() {
+    // Every screen below precedes the dereference it protects, cheapest
+    // first, so that a value which is not an object at all is rejected rather
+    // than faulting: alignment before the tag load, the tag range before the
+    // `ob_type` load, and `ob_type`'s own shape before `ll_issubclass` reads
+    // the subclass range through it.
+    if obj.is_null() || !(obj as usize).is_multiple_of(align_of::<W_BaseException>()) {
         return None;
     }
     if unsafe { w_exception_kind_byte(obj) } > ExcKind::MAX_DISCRIMINANT {
+        return None;
+    }
+    let ob_type = unsafe { (*obj).ob_type };
+    if ob_type.is_null() || !(ob_type as usize).is_multiple_of(align_of::<crate::pyobject::PyType>())
+    {
         return None;
     }
     if !unsafe { is_exception(obj) } {

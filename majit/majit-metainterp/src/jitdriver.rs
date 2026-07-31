@@ -1807,6 +1807,18 @@ impl<S: JitState> JitDriver<S> {
             .get_resume_storage(green_key, trace_id, fail_index)
     }
 
+    /// The storage and the fail-argument types of one and the same exit
+    /// layout — see `MetaInterp::get_resume_storage_with_slot_types`.
+    pub fn get_resume_storage_with_slot_types(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<(std::sync::Arc<crate::resume::ResumeStorage>, Vec<Type>)> {
+        self.meta
+            .get_resume_storage_with_slot_types(green_key, trace_id, fail_index)
+    }
+
     pub fn get_exit_types(
         &self,
         green_key: u64,

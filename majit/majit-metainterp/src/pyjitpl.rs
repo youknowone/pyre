@@ -10325,6 +10325,48 @@ impl<M: Clone> MetaInterp<M> {
             .and_then(|layout| layout.storage.clone())
     }
 
+    /// A guard's resume storage together with the fail-argument types that
+    /// describe the very same deadframe.
+    ///
+    /// Asking for the two separately can pair them across *different*
+    /// layouts: `get_resume_storage` prefers the trace's own `exit_layouts`
+    /// entry and only then falls back to `get_compiled_exit_layout_in_trace`,
+    /// while `get_recovery_slot_types` always takes the fallback route — so a
+    /// caller can get storage from one and `None` from the other.  A `None`
+    /// there is not benign: it disarms the deadframe GC rooting and makes
+    /// `decode_ref` read every TAGBOX slot as a pointer.  `resume.py:1312
+    /// blackhole_from_resumedata` reads both out of the one deadframe+descr
+    /// it was handed; resolve once here for the same reason.
+    pub fn get_resume_storage_with_slot_types(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<(Arc<ResumeStorage>, Vec<Type>)> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let layout = Self::trace_for_exit(compiled, trace_id)
+            .and_then(|(resolved_trace_id, trace)| {
+                Self::compiled_exit_layout_from_trace(
+                    trace,
+                    green_key,
+                    resolved_trace_id,
+                    fail_index,
+                )
+            })
+            .filter(|layout| layout.storage.is_some())
+            .or_else(|| {
+                self.compiled_exit_layout_from_backend(compiled, green_key, trace_id, fail_index)
+            })?;
+        let storage = layout.storage.clone()?;
+        Some((
+            storage,
+            Self::recovery_slot_types_from_exit_types_and_layout(
+                &layout.exit_types,
+                layout.recovery_layout.as_ref(),
+            ),
+        ))
+    }
+
     /// Get exit_types for a guard (for decode_ref type dispatch).
     pub fn get_exit_types(
         &self,
@@ -11812,7 +11854,10 @@ impl<M: Clone> MetaInterp<M> {
                 })
                 .collect::<Vec<_>>()
         });
-        let deadframe_types = self.get_recovery_slot_types(green_key, norm_tid, fail_index);
+        // The layout resolved above already carries them; `get_recovery_slot_
+        // types` is `exit_types.to_vec()` off a second resolution of the same
+        // key, so re-asking can only lose them.
+        let deadframe_types = exit_layout.exit_types.as_slice();
         // compile.py:990-991: vinfo = self.jitdriver_sd.virtualizable_info
         let vinfo = self.virtualizable_info();
         let all_liveness = self.staticdata.liveness_info.as_slice();
@@ -11823,7 +11868,7 @@ impl<M: Clone> MetaInterp<M> {
                 rd_consts,
                 all_liveness,
                 fail_values,
-                deadframe_types.as_deref(),
+                Some(deadframe_types),
                 rd_virtuals.as_deref(),
                 storage.map(|s| s.rd_pendingfields.as_slice()),
                 Some(&self.staticdata.virtualref_info as &dyn crate::resume::VRefInfo),
