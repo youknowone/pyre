@@ -1001,8 +1001,10 @@ fn direct_helper_i64_arity(op: &Op, ref_values: &RefValues) -> Option<usize> {
 }
 
 fn has_call_ops(ops: &[Op]) -> bool {
-    // Allocation ops (`New*`, `Newstr`/`Newunicode`) also reach the host via
-    // the `jit_call` trampoline, so the import must be present for them too.
+    // `New*` also reaches the host via the `jit_call` trampoline, so the import
+    // must be present for it too. `Newstr` / `Newunicode` stay listed as a
+    // conservative superset: `build_function` declines any trace carrying them
+    // (no rstr lowering), so their entry here only ever over-imports.
     ops.iter().any(|op| {
         op.opcode.is_call()
             || matches!(
@@ -1039,7 +1041,8 @@ pub fn has_trampoline_calls(inputargs: &[InputArg], ops: &[Op], emit_ca: bool) -
         // CALL arm, lowering it directly to the callee-loop table slot. It
         // therefore never uses the host call area.
         opcode if opcode.is_call_assembler() && emit_ca => false,
-        // These arms have no direct helper lowering.
+        // No direct helper lowering — and in fact no lowering at all: a trace
+        // carrying either is declined. Kept as a conservative superset.
         OpCode::Newstr | OpCode::Newunicode => true,
         // Every residual CALL uses the trampoline unless its exact lowering
         // predicate supplies an i64 helper ABI or a typed float ABI.
@@ -3052,52 +3055,31 @@ fn build_function(
                 // Metadata-only ops, no codegen needed.
             }
 
-            // ── Allocation via trampoline ──
-            OpCode::Newstr | OpCode::Newunicode => {
-                // These may appear in traces that materialize strings.
-                // Use CALL trampoline if available, otherwise skip.
-                if let Some(jit_call) = jit_call_idx {
-                    let vi = op.pos.get().raw();
-                    sink.local_get(0);
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // length
-                    sink.i64_store(mem64(frame.call_args_ofs));
-                    sink.local_get(0);
-                    sink.i64_const(0); // func_ptr = 0 signals "newstr" to host
-                    sink.i64_store(mem64(frame.call_func_ofs));
-                    sink.local_get(0);
-                    sink.i64_const(1);
-                    sink.i64_store(mem64(frame.call_nargs_ofs));
-                    sink.local_get(0);
-                    emit_jit_call(&mut sink, jit_call, frame);
-                    // The trampoline routes to a collecting allocator, so the
-                    // call may have moved every other live Ref (and forwarded
-                    // the JitFrame). Reload them from their homes, skipping the
-                    // fresh result (`vi`), exactly as the `New` collecting path.
-                    emit_reload_frame_if_necessary(
-                        &mut sink,
-                        residual_type_base,
-                        ca.ca_reload_fn_ptr,
-                        ca.jf_top_addr,
-                    );
-                    emit_reload_refs_from_homes(
-                        &mut sink,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
-                        (!OpRef::raw_is_constant(vi)).then_some(vi),
-                        frame,
-                    );
-                    if !OpRef::raw_is_constant(vi) {
-                        sink.local_get(0);
-                        sink.i64_load(mem64(frame.call_result_ofs));
-                        sink.local_set(1 + vi);
-                    }
-                }
-            }
-
-            // ── String content copy ──
-            OpCode::Copystrcontent | OpCode::Copyunicodecontent => {
-                // Bulk memory copy — use CALL trampoline or skip
+            // ── The rstr IR family: declined, not lowered ──
+            //
+            // Nothing on the pyre side lowers Python strings to these opcodes
+            // — there is no `Newstr` / `Strsetitem` / `Copystrcontent`
+            // producer outside majit's ported RPython infrastructure, so
+            // string work stays in residual interpreter calls and none of
+            // these reach a wasm trace today.
+            //
+            // They are declined rather than left as silent no-ops. The old
+            // arms emitted nothing for the copies and, for the allocations, a
+            // trampoline call whose host side has no string allocator (the
+            // runner's `func_ptr == 0` sentinel returns 0). Either shape
+            // produces wrong code the moment the opcode becomes reachable,
+            // with no signal — the same failure mode as the dropped
+            // `non_moving` flag. A decline keeps the trace interpreted and
+            // says so.
+            OpCode::Newstr
+            | OpCode::Newunicode
+            | OpCode::Copystrcontent
+            | OpCode::Copyunicodecontent => {
+                return Err(BackendError::Unsupported(format!(
+                    "wasm backend: {:?} is unsupported (no rstr lowering); \
+                     declining the trace",
+                    op.opcode
+                )));
             }
 
             // ── Misc ops ──
@@ -3110,12 +3092,35 @@ fn build_function(
                     sink.local_set(1 + vi);
                 }
             }
+            // Emitted by `RawBufferPtrInfo::_force_elements` after a
+            // `RAW_MALLOC_VARSIZE_CHAR`, which pyre never produces, so this
+            // does not reach a wasm trace today. Declined rather than skipped:
+            // the allocation helpers do return 0 on OOM (that is how
+            // `alloc_with_type` drives this op on the native backends), and an
+            // unchecked null is worse on wasm than on native — address 0 is
+            // ordinary linear memory, so the following stores would corrupt it
+            // silently instead of trapping.
             OpCode::CheckMemoryError => {
-                // After allocation: check if result is null
-                // No-op in wasm (allocations don't fail the same way)
+                return Err(BackendError::Unsupported(
+                    "wasm backend: CheckMemoryError is unsupported (a null allocation \
+                     result would be stored into valid linear memory at address 0); \
+                     declining the trace"
+                        .to_string(),
+                ));
             }
+            // Emitted only by the GC rewrite pass (`_gen_zero_array`), which
+            // wasm does not run, so this cannot reach here. Skipping it used to
+            // be harmless only by accident: wasm allocation hands back zeroed
+            // memory on both routes (`nursery.rs` memsets the whole nursery on
+            // reset under `target_arch = "wasm32"`, and `finish_alloc_in_oldgen`
+            // zero-fills the payload). That is a property of the allocator, not
+            // of this op, so do not silently rely on it.
             OpCode::ZeroArray => {
-                // Zero-initialize array region — skip for MVP
+                return Err(BackendError::Unsupported(
+                    "wasm backend: ZeroArray is unsupported (it is a GC-rewrite op and \
+                     wasm does not run the rewrite); declining the trace"
+                        .to_string(),
+                ));
             }
             OpCode::LoadFromGcTable => {
                 // `assembler.py:1545` `genop_load_from_gc_table`: this op is
