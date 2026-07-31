@@ -919,10 +919,22 @@ impl MiniMarkGC {
                 return GcRef(0);
             }
             let ptr = self.nursery.alloc(total_size);
-            if ptr.is_null() {
-                // Still no space after collection. Allocate in old gen as fallback.
+            let ptr = if ptr.is_null() {
+                self.reserve_nursery_gap(total_size)
+            } else {
+                ptr
+            };
+            if ptr.is_null() && Self::nursery_allocation_size(total_size) > self.nursery.size() {
+                // Production incminimark keeps `nonlarge_max` below the
+                // nursery size. Tiny backend tests can configure the two
+                // independently; retain their external-allocation fallback
+                // only for an object that cannot physically fit anywhere.
                 return self.alloc_in_oldgen(type_id, total_size);
             }
+            assert!(
+                !ptr.is_null(),
+                "collect_and_reserve could not find nursery space for a non-large object"
+            );
             Self::init_nursery_object(ptr, type_id);
             let obj = GcRef((ptr as usize) + GcHeader::SIZE);
             self.register_weakref_if_needed(type_id, obj.0);
@@ -986,10 +998,19 @@ impl MiniMarkGC {
                 return GcRef(0);
             }
             let ptr = self.nursery.alloc(total_size);
-            if ptr.is_null() {
+            let ptr = if ptr.is_null() {
+                self.reserve_nursery_gap(total_size)
+            } else {
+                ptr
+            };
+            if ptr.is_null() && Self::nursery_allocation_size(total_size) > self.nursery.size() {
                 unsafe { *needs_write_barrier = true };
                 return self.alloc_in_oldgen(type_id, total_size);
             }
+            assert!(
+                !ptr.is_null(),
+                "collect_and_reserve could not find nursery space for a non-large object"
+            );
             Self::init_nursery_object(ptr, type_id);
             let obj = GcRef((ptr as usize) + GcHeader::SIZE);
             self.register_weakref_if_needed(type_id, obj.0);
@@ -1002,6 +1023,69 @@ impl MiniMarkGC {
         self.register_weakref_if_needed(type_id, obj.0);
         self.register_destructor_if_needed(type_id, obj.0);
         obj
+    }
+
+    /// incminimark.py:865-930 `collect_and_reserve` pinned-barrier walk.
+    ///
+    /// A minor collection can leave `nursery_free` after the highest pinned
+    /// object, where the tail is too short for the triggering allocation even
+    /// though an earlier gap is large enough. Upstream walks the ordered
+    /// `nursery_barriers` and reserves from the first fitting gap; it never
+    /// changes a non-large malloc into an old-generation allocation. Preserve
+    /// that young-result contract because the GC rewrite elides write barriers
+    /// while initializing a fresh nursery object (`rewrite.py:911`).
+    fn nursery_allocation_size(total_size: usize) -> usize {
+        total_size
+            .max(GcHeader::MIN_NURSERY_OBJ_SIZE)
+            .checked_add(7)
+            .map(|size| size & !7)
+            .unwrap_or(usize::MAX)
+    }
+
+    fn reserve_nursery_gap(&mut self, total_size: usize) -> *mut u8 {
+        if self.pinned_objects.is_empty() {
+            return std::ptr::null_mut();
+        }
+
+        let aligned_size = Self::nursery_allocation_size(total_size);
+        let nursery_start = self.nursery.start_ptr() as usize;
+        let nursery_end = nursery_start + self.nursery.size();
+        let mut barriers = Vec::with_capacity(self.pinned_objects.len());
+        for &obj_addr in &self.pinned_objects {
+            let type_id = unsafe { (*header_of(obj_addr)).type_id() };
+            let type_info = self.types.get(type_id);
+            let payload_size = if type_info.item_size > 0 {
+                let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
+                type_info.total_instance_size(length)
+            } else {
+                type_info.size
+            };
+            let object_size = Self::nursery_allocation_size(GcHeader::SIZE + payload_size);
+            barriers.push((obj_addr - GcHeader::SIZE, object_size));
+        }
+        barriers.sort_unstable_by_key(|&(header_start, _)| header_start);
+
+        let mut gap_start = nursery_start;
+        for (header_start, object_size) in barriers {
+            if header_start.saturating_sub(gap_start) >= aligned_size {
+                unsafe {
+                    self.nursery.set_free_ptr(gap_start as *mut u8);
+                    self.nursery.set_top_ptr(header_start as *const u8);
+                }
+                self.refresh_published_nursery_top();
+                return self.nursery.alloc(total_size);
+            }
+            gap_start = gap_start.max(header_start.saturating_add(object_size));
+        }
+        if nursery_end.saturating_sub(gap_start) >= aligned_size {
+            unsafe {
+                self.nursery.set_free_ptr(gap_start as *mut u8);
+                self.nursery.set_top_ptr(nursery_end as *const u8);
+            }
+            self.refresh_published_nursery_top();
+            return self.nursery.alloc(total_size);
+        }
+        std::ptr::null_mut()
     }
 
     /// Allocate without triggering collection.
@@ -3722,6 +3806,7 @@ impl MiniMarkGC {
     /// and sets the free pointer past the highest pinned object.
     fn reset_nursery_with_pinned(&mut self) {
         let nursery_start = self.nursery.start_ptr() as usize;
+        let nursery_end = nursery_start + self.nursery.size();
 
         // Collect (header_start, total_size, data) for each pinned object.
         let mut saved: Vec<(usize, usize, Vec<u8>)> = Vec::new();
@@ -3741,6 +3826,13 @@ impl MiniMarkGC {
                 std::slice::from_raw_parts(header_start as *const u8, total_size).to_vec()
             };
             saved.push((header_start, total_size, data));
+        }
+
+        // Rebuild the barrier range from the whole arena. A preceding
+        // `reserve_nursery_gap` may have shortened `nursery_top` to the next
+        // pinned object, exactly as upstream does while consuming one gap.
+        unsafe {
+            self.nursery.set_top_ptr(nursery_end as *const u8);
         }
 
         // Zero-fill the entire nursery.
@@ -4755,6 +4847,45 @@ mod tests {
         let obj = gc.alloc_with_type(0, 16);
         assert!(!obj.is_null());
         assert!(gc.is_in_nursery(obj.0));
+    }
+
+    #[test]
+    fn collect_and_reserve_uses_gap_before_pinned_object() {
+        fn arrange_pinned_tail(gc: &mut MiniMarkGC) -> (u32, GcRef) {
+            let pinned_tid = gc.register_type(TypeInfo::simple(440));
+            let result_tid = gc.register_type(TypeInfo::simple(400));
+            let _dead_prefix = gc.alloc_with_type(pinned_tid, 440);
+            let pinned = gc.alloc_with_type(pinned_tid, 440);
+            assert!(gc.pin(pinned));
+            (result_tid, pinned)
+        }
+
+        // incminimark.py:865-930 walks back to the free gap before a pinned
+        // object. The old fallback returned an old-gen object here, violating
+        // the fresh nursery allocation contract used by the GC rewrite.
+        let mut gc = test_gc(1024);
+        let (result_tid, pinned) = arrange_pinned_tail(&mut gc);
+        let result = gc.alloc_with_type(result_tid, 400);
+        assert!(gc.is_in_nursery(result.0));
+        assert!(result.0 < pinned.0);
+        assert_eq!(
+            unsafe { &*(gc.nursery_top_addr() as *const AtomicUsize) }.load(Ordering::Acquire),
+            pinned.0 - GcHeader::SIZE,
+            "compiled allocators must stop at the same pinned barrier",
+        );
+
+        // The rooted slow path has the same collect-and-reserve contract and
+        // must continue reporting that initialization needs no write barrier.
+        let mut gc = test_gc(1024);
+        let (result_tid, pinned) = arrange_pinned_tail(&mut gc);
+        let mut root = GcRef::NULL;
+        let mut needs_write_barrier = true;
+        let result = unsafe {
+            gc.alloc_with_type_rooted(result_tid, 400, &mut root, &mut needs_write_barrier)
+        };
+        assert!(gc.is_in_nursery(result.0));
+        assert!(result.0 < pinned.0);
+        assert!(!needs_write_barrier);
     }
 
     /// incminimark.py:2601-2615 `PYPY_GC_MAX` out-of-memory policy: a bounded
