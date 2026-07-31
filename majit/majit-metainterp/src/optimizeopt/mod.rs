@@ -2119,8 +2119,21 @@ impl OptContext {
         let idx = opref.raw() as usize;
         match opref {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                // `inputarg_refs` is grown with `resize_with(.., new_int(0))`
+                // (see `materialize_operand_at`), so a slot past the last
+                // bound inputarg holds a placeholder whose `index` is 0, not
+                // `idx`. Returning it hands the caller a box for a DIFFERENT
+                // position — and `new_int(0)` also retypes the read, so a Ref
+                // position resolves to an Int box. The write path already
+                // repairs such a slot before use; the read path must instead
+                // report "no binding", which makes `get_replacement_opref`
+                // return the position itself — `resoperation.py:57-68
+                // get_box_replacement`, where a box with no `_forwarded`
+                // resolves to itself.
                 if let Some(ia) = self.inputarg_refs.get(idx) {
-                    return Some(Operand::from_bound_inputarg(ia));
+                    if ia.index as usize == idx {
+                        return Some(Operand::from_bound_inputarg(ia));
+                    }
                 }
             }
             _ => {}

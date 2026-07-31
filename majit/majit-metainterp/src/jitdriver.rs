@@ -2784,6 +2784,39 @@ impl<S: JitState> JitDriver<S> {
                 if let Some(elems) = virt_elems {
                     self.meta.single_pass_virt_array_values = Some(elems);
                 }
+                // pyjitpl.py:2974-2989: `live_arg_boxes` is built ONCE, here at
+                // the top of `reached_loop_header`, and every consumer below
+                // reads that same list — the bridge's closing JUMP
+                // (line 2988 `compile_trace`), the merge-point scan
+                // (line 3019), and `current_merge_points.append` (line 3059).
+                //
+                // `remove_consts_and_duplicates` RECORDS a `SAME_AS` op for
+                // every constant or duplicate it rewrites, so normalizing once
+                // per consumer appends a duplicate set of them. On the path
+                // where a bridge close falls through to the loop close
+                // (`RetraceNeeded` / `Declined`) that second set lands after
+                // `compile_trace` sampled `potential_retrace_position`, moving
+                // every later trace position off by the number of rewrites.
+                let live_arg_boxes: Vec<OpRef> = match self.sym.as_ref() {
+                    Some(sym) => {
+                        // pyjitpl.py:2982-2989: carry virtualizable_boxes[:-1]
+                        // into the list as well (owned clone releases the
+                        // trace-ctx borrow before the consumers below).
+                        let vable_boxes = self
+                            .meta
+                            .trace_ctx()
+                            .and_then(|ctx| ctx.collect_virtualizable_typed_boxes());
+                        let mut boxes = match vable_boxes {
+                            Some(ref b) => S::collect_jump_args_with_boxes(sym, b),
+                            None => S::collect_jump_args(sym),
+                        };
+                        if let Some(ctx) = self.meta.trace_ctx() {
+                            ctx.remove_consts_and_duplicates_untyped(&mut boxes);
+                        }
+                        boxes
+                    }
+                    None => Vec::new(),
+                };
                 // pyjitpl.py:2979-3036 reached_loop_header parity.
                 // Path 1: bridge — only if has_compiled_targets (line 2982).
                 let _has_partial_trace = self.meta.partial_trace().is_some();
@@ -2860,25 +2893,12 @@ impl<S: JitState> JitDriver<S> {
                                 target_key, bridge_key, bridge_trace_id, bridge_fail_index
                             );
                         }
-                        if let Some(sym) = self.sym.as_ref() {
-                            // pyjitpl.py:2982-2989: carry virtualizable_boxes[:-1]
-                            // into the bridge JUMP too (owned clone releases the
-                            // trace-ctx borrow before close_bridge).
-                            let vable_boxes = self
-                                .meta
-                                .trace_ctx()
-                                .and_then(|ctx| ctx.collect_virtualizable_typed_boxes());
-                            let mut finish_args = match vable_boxes {
-                                Some(ref boxes) => S::collect_jump_args_with_boxes(sym, boxes),
-                                None => S::collect_jump_args(sym),
-                            };
-                            // pyjitpl.py:2978-2987: the same normalization the
-                            // loop close applies — the bridge JUMP is built from
-                            // the same `live_arg_boxes`.
-                            if let Some(ctx) = self.meta.trace_ctx() {
-                                ctx.remove_consts_and_duplicates_untyped(&mut finish_args);
-                            }
-                            let finish_args = finish_args;
+                        if self.sym.is_some() {
+                            // pyjitpl.py:2988 `compile_trace(live_arg_boxes,
+                            // ptoken)`: the bridge JUMP passes the very list
+                            // built above — not a second, separately
+                            // normalized one.
+                            let finish_args = live_arg_boxes.clone();
                             let continue_running_normally_values = {
                                 let trace_meta = self.meta.trace_meta().cloned();
                                 match (trace_meta, self.sym.as_ref()) {
@@ -2960,26 +2980,10 @@ impl<S: JitState> JitDriver<S> {
                     return;
                 };
                 if S::validate_close(sym, &trace_meta) {
-                    // pyjitpl.py:2982-2989 reached_loop_header:
-                    // `live_arg_boxes += self.virtualizable_boxes;
-                    // live_arg_boxes.pop()`. Extract the live shadow as an
-                    // owned Vec so the trace-ctx borrow is released before the
-                    // `self.meta.compile_loop` mutable borrow below.
-                    let vable_boxes = self
-                        .meta
-                        .trace_ctx()
-                        .and_then(|ctx| ctx.collect_virtualizable_typed_boxes());
-                    let mut jump_args = match vable_boxes {
-                        Some(ref boxes) => S::collect_jump_args_with_boxes(sym, boxes),
-                        None => S::collect_jump_args(sym),
-                    };
-                    // pyjitpl.py:2978-2987 `remove_consts_and_duplicates` runs
-                    // over this list before anything consumes it, so the JUMP
-                    // never passes a constant or the same box twice.
-                    if let Some(ctx) = self.meta.trace_ctx() {
-                        ctx.remove_consts_and_duplicates_untyped(&mut jump_args);
-                    }
-                    let jump_args = jump_args;
+                    // pyjitpl.py:3019/3059: the merge-point scan and the
+                    // `current_merge_points.append` both read the one
+                    // `live_arg_boxes` built at the top of this arm.
+                    let jump_args = live_arg_boxes;
                     // pyjitpl.py:2993-3036 parity: compile_loop borrows the
                     // frontend meta the same way `self.history` is a shared
                     // mutable object on the RPython MetaInterp — the caller

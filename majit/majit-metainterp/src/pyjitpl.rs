@@ -5563,6 +5563,21 @@ impl<M: Clone> MetaInterp<M> {
                 // pyjitpl.py:2994: iterate current_merge_points in reverse,
                 // check same_greenkey and position match. Use header_pc
                 // for precise matching across root/inner key registrations.
+                //
+                // pyjitpl.py:3018-3031 is really a three-way SCAN — a
+                // same-greenkey entry at `retracing_from` retraces, one at
+                // another position raises ABORT_BAD_LOOP, and NO same-greenkey
+                // entry falls through to `current_merge_points.append` with the
+                // history still live so tracing continues to the next header
+                // visit. pyre cannot take that third branch yet: the walk emits
+                // a loop-close action at EVERY pc it steps to after a cancelled
+                // close (45, 49, 53, 57, … one per element), not only at the
+                // header, so "keep tracing until the same header comes round
+                // again" never terminates and the intervening close compiles a
+                // zero-iteration body (`Label; Jump`, an empty infinite loop).
+                // Until the walk only closes at real header visits, collapse to
+                // the two-way test: retrace when the pending merge point is at
+                // `retracing_from`, otherwise abandon.
                 let position_matches = self
                     .tracing
                     .as_ref()
@@ -6942,12 +6957,27 @@ impl<M: Clone> MetaInterp<M> {
                 cloned
             })
             .collect();
+        // Same contract as the `bridge_ops` rebuild above: an `InputArg`
+        // minted from a type alone has an empty concrete-value slot, but the
+        // bridge trace must carry the values the recorder was seeded with at
+        // `start_retrace_from_guard` (resume.py:1274 `IntFrontendOp(num,
+        // cpu.get_int_value(deadframe, num))`). `closing_jump_runtime_boxes`
+        // reads them to build `runtime_boxes`, which is the only channel
+        // `virtualstate.py:493-498` has for deciding that an extra bound
+        // guard can retarget the bridge into the loop body instead of the
+        // preamble.
         let bridge_inputargs: Vec<majit_ir::InputArg> = ctx
             .recorder
-            .inputarg_types()
+            .inputargs()
             .iter()
             .enumerate()
-            .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
+            .map(|(i, src)| {
+                let ia = majit_ir::InputArg::from_type(src.tp, i as u32);
+                if let Some(v) = src.get_value() {
+                    ia.set_value(v);
+                }
+                ia
+            })
             .collect();
         // The recorder carries Const values inline on the OpRef variants
         // (history.py:227/268/314), so there is no legacy TraceCtx
@@ -7298,6 +7328,20 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.cpu = self.cpu.clone();
         unroll_opt.phase2_input_ops_seed = phase2_input_ops_seed;
         unroll_opt.call_pure_results = call_pure_results.clone();
+        // opencoder.py:264-267 `self.inputargs = [rop.inputarg_from_tp(arg.type)
+        // for arg in self.trace.inputargs]` + the `_cache[...] = arg` seeding
+        // loop: the TraceIterator that walks the retrace body pre-seeds its
+        // cache from the trace's OWN inputargs. In majit that list reaches the
+        // iterator through `Optimizer::trace_inputargs`, which `compile_loop`
+        // fills from `preamble_data.base.inputargs()`. Left empty here, the
+        // retrace's Phase 2 iterator seeds nothing and `_get` misses on the
+        // first body operand that refers to a cut inputarg.
+        unroll_opt.trace_inputargs = trace
+            .inputargs
+            .iter()
+            .enumerate()
+            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
+            .collect();
         let (
             mut retrace_snapshot_boxes,
             retrace_snapshot_frame_sizes,
@@ -11803,6 +11847,22 @@ impl<M: Clone> MetaInterp<M> {
         // RPython pyjitpl.py:2609 `create_history(max_num_inputargs)` — the
         // MetaInterp owns the history factory on the bridge path too.
         let recorder = crate::recorder::Trace::with_input_types(bridge_input_types);
+        // resume.py:1267-1282 `load_box_from_cpu`:
+        //
+        //     box = IntFrontendOp(num, self.cpu.get_int_value(self.deadframe, num))
+        //
+        // The frontend box for a resumed live value is CONSTRUCTED carrying
+        // the concrete value read out of the deadframe — that value is what
+        // `virtualstate.py:493-498` reads back as `runtime_box.getint()` when
+        // it decides whether an extra `int_ge`/`int_le` guard can bridge the
+        // gap to a target label's `IntBound`. Stamping the bridge's input
+        // boxes here is the same construction: `fail_values` IS the deadframe,
+        // in `fail_arg_types` order.
+        for (ia, &raw) in recorder.inputargs().iter().zip(fail_values.iter()) {
+            if ia.tp != Type::Void {
+                ia.set_value(heap_value_for(ia.tp, raw));
+            }
+        }
         // compile.py:725-731 `_trace_and_compile_from_bridge`:
         //     loop_token = self.rd_loop_token.loop_token_wref()
         //     force_finish_trace = False
