@@ -476,6 +476,12 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
                 "accepted_ca",
                 "decl_ca_trampoline",
                 "forced_ca_terminal_decline",
+                "ml_no_descr",
+                "ml_unpublished",
+                "pub_peeled",
+                "pub_flat",
+                "pub_flat_skipped",
+                "label_retracted",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
@@ -563,6 +569,13 @@ fn run(module_path: &PathBuf, source: &str) -> Result<i32> {
                 "stfe_dead_token",
                 "stfe_tick",
                 "toolong_suppressed",
+                "wct_declined",
+                "cl_hct_giveup",
+                "ct_no_front_token",
+                "ct_origin_loop_gone",
+                "ct_entry_bridge_failed",
+                "ct_no_entry_data",
+                "ct_not_tracing",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

@@ -518,6 +518,8 @@ impl Drop for CompiledWasmLoop {
                     if let Some(t) = map.get(&id) {
                         if t.func_handle == self.func_handle {
                             map.remove(&id);
+                            crate::BRIDGE_DIAG[22]
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 }

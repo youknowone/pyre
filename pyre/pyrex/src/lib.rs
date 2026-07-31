@@ -976,30 +976,12 @@ fn maybe_print_jit_stats() {
     eprintln!("[jit-stats] {}", pyre_jit::field_position_jit_stats());
 }
 
-/// Names for the `MC_DIAG` tallies, in index order. Mirrors the legend on
-/// `majit_metainterp::MC_DIAG` and the labels the wasm runner prints for the
-/// `pyre_jit_mc_diag` export, so a native run and a wasm run of the same
-/// program are diffable field by field.
-const MC_DIAG_FIELDS: [&str; 18] = [
-    "mc_entered",
-    "decl_shortcircuit",
-    "descr0_skip",
-    "busy_skip",
-    "FIRED",
-    "stack_full",
-    "retrace_entered",
-    "retrace_bailed",
-    "cb_entered",
-    "cb_invalidloop",
-    "cb_retrace_req",
-    "cb_arity_giveup",
-    "sbt_entered",
-    "sbt_not_faildescr",
-    "sbt_no_jct",
-    "sbt_no_meta",
-    "sbt_cant_trace",
-    "sbt_short_vals",
-];
+/// Names for the `MC_DIAG` tallies, in index order — the array
+/// `majit_metainterp` declares beside the counters themselves, so a slot cannot
+/// be added there and go unnamed here. The wasm runner prints the same names for
+/// the `pyre_jit_mc_diag` export, making a native run and a wasm run of the same
+/// program diffable field by field.
+use majit_metainterp::MC_DIAG_LABELS as MC_DIAG_FIELDS;
 
 /// Print the guard-failure → bridge-trace gate tallies. Until this existed the
 /// counters were bumped on every backend but only readable through the wasm

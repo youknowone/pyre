@@ -599,17 +599,26 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 /// should_trace_function_entry declined (dead procedure token cleanup), 25 =
 /// should_trace_function_entry answered from the counter tick, 26 = walk steps
 /// recorded past `trace_limit` whose abort was suppressed because the walk had
-/// already executed an unrollbackable effect.
-pub static MC_DIAG: [std::sync::atomic::AtomicU64; 27] = {
+/// already executed an unrollbackable effect, 27 = the walker's in-trace
+/// `compile_trace` attempt did not take and fell through to the merge-point
+/// scan, 28 = `compile_loop` gave the trace up at its own
+/// `has_compiled_targets`, 29 = `compile_trace` cancelled with no
+/// front target token to jump at, 30 = `compile_trace` cancelled because the
+/// origin guard's loop is no longer compiled, 31 = the interp-origin entry
+/// bridge did not compile, 32 = `compile_trace` had neither a guard origin nor
+/// entry-bridge data to close against, 33 = `compile_trace` was called with no
+/// tracing session.
+pub static MC_DIAG: [std::sync::atomic::AtomicU64; 34] = {
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     [
-        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
+        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
+        Z, Z, Z, Z,
     ]
 };
 
 /// Short label per [`MC_DIAG`] slot, in index order, so a tally cannot be added
 /// without naming it. Readers join these with the counter values.
-pub const MC_DIAG_LABELS: [&str; 27] = [
+pub const MC_DIAG_LABELS: [&str; 34] = [
     "mc_entered",
     "decl_shortcircuit",
     "descr0_skip",
@@ -637,6 +646,13 @@ pub const MC_DIAG_LABELS: [&str; 27] = [
     "stfe_dead_token",
     "stfe_tick",
     "toolong_suppressed",
+    "wct_declined",
+    "cl_hct_giveup",
+    "ct_no_front_token",
+    "ct_origin_loop_gone",
+    "ct_entry_bridge_failed",
+    "ct_no_entry_data",
+    "ct_not_tracing",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.

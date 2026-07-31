@@ -33,10 +33,19 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// (guard side-trace that would livelock the chained loop), 14 = accepted
 /// CALL_ASSEMBLER trace, 15 = declined CA because a trace would use the host
 /// call trampoline on a movable CA frame.  Index 16 records the dormant
-/// forced-terminal-decline runtime regression hook.
-pub static BRIDGE_DIAG: [AtomicU64; 17] = {
+/// forced-terminal-decline runtime regression hook. Sub-breakdown of the
+/// index-8 unresolved-target decline: 17 = the terminal JUMP carries no descr
+/// at all, 18 = the descr is present but `LABEL_TARGETS` holds no entry for it.
+/// Publish-side counterpart, so an unresolved lookup can be told from a label
+/// that was never offered: 19 = labels published off a peeled loop, 20 =
+/// published off a non-peeled loop, 21 = a non-peeled loop's first label left
+/// unpublished (no descr, or its arity is not the inputarg count), 22 = a
+/// dropped loop retracted a published entry.
+pub static BRIDGE_DIAG: [AtomicU64; 23] = {
     const Z: AtomicU64 = AtomicU64::new(0);
-    [Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z]
+    [
+        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
+    ]
 };
 
 /// Read a `BRIDGE_DIAG` tally (saturating index). Surfaced to the host through
@@ -1862,6 +1871,7 @@ impl majit_backend::Backend for WasmBackend {
                 if id == 0 {
                     continue;
                 }
+                diag_bump(19);
                 publish_label_target(
                     id,
                     LabelTarget {
@@ -1874,8 +1884,15 @@ impl majit_backend::Backend for WasmBackend {
                     },
                 );
             }
-        } else if let Some(&id) = label_descrs.first() {
-            if id != 0 && label_num_args.first() == Some(&inputargs.len()) {
+        } else {
+            let publishable = label_descrs.first().is_some_and(|&id| id != 0)
+                && label_num_args.first() == Some(&inputargs.len());
+            if !publishable {
+                diag_bump(21);
+            }
+            if publishable {
+                let id = label_descrs[0];
+                diag_bump(20);
                 publish_label_target(
                     id,
                     LabelTarget {
@@ -2238,16 +2255,17 @@ impl majit_backend::Backend for WasmBackend {
                 .iter()
                 .rev()
                 .find(|op| op.opcode == majit_ir::OpCode::Jump);
-            let target = closing_jump
+            let target_descr_id = closing_jump
                 .and_then(|j| j.getdescr())
                 .map(|d| std::sync::Arc::as_ptr(&d) as *const () as usize)
-                .filter(|id| *id != 0)
-                .and_then(label_target);
+                .filter(|id| *id != 0);
+            let target = target_descr_id.and_then(label_target);
             let arity = closing_jump.map_or(0, |j| j.getarglist().len());
             let accepted_target = match target {
                 // Descr stripped, or the target label was never published.
                 None => {
                     diag_bump(8);
+                    diag_bump(if target_descr_id.is_none() { 17 } else { 18 });
                     false
                 }
                 Some(t) if arity != t.num_args => {

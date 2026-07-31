@@ -5554,6 +5554,7 @@ impl<M: Clone> MetaInterp<M> {
             // the single `aborted_tracing` to the `abort_trace` that follows
             // this `Aborted`. Tallying here as well would count one aborted
             // trace twice, and under the `Generic` catch-all besides.
+            crate::mc_diag_bump(28); // compile_loop: has_compiled_targets giveup
             self.pending_abort_reason = Some(counters::ABORT_BAD_LOOP);
             return CompileOutcome::Aborted;
         }
@@ -6779,7 +6780,10 @@ impl<M: Clone> MetaInterp<M> {
         let ends_with_jump = finish_descr.is_none();
         let ctx = match self.tracing.as_mut() {
             Some(ctx) => ctx,
-            None => return CompileOutcome::Cancelled,
+            None => {
+                crate::mc_diag_bump(33); // compile_trace: no tracing session
+                return CompileOutcome::Cancelled;
+            }
         };
 
         // pyjitpl.py:3187: save position before recording JUMP/FINISH
@@ -6805,6 +6809,7 @@ impl<M: Clone> MetaInterp<M> {
                 if crate::closedbg_enabled() {
                     eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
+                crate::mc_diag_bump(29); // compile_trace: no front target token
                 return CompileOutcome::Cancelled;
             };
             ctx.recorder
@@ -6915,6 +6920,7 @@ impl<M: Clone> MetaInterp<M> {
                     if crate::closedbg_enabled() {
                         eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
+                    crate::mc_diag_bump(30); // compile_trace: origin loop gone
                     return CompileOutcome::Cancelled;
                 }
                 let descr_arc = match self.bridge_info() {
@@ -6956,6 +6962,7 @@ impl<M: Clone> MetaInterp<M> {
                     if crate::closedbg_enabled() {
                         eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
+                    crate::mc_diag_bump(32); // compile_trace: no entry-bridge data
                     return CompileOutcome::Cancelled;
                 };
                 let success = self.compile_entry_bridge(
@@ -6977,6 +6984,7 @@ impl<M: Clone> MetaInterp<M> {
                         from_retry: false,
                     }
                 } else {
+                    crate::mc_diag_bump(31); // compile_trace: entry bridge failed
                     CompileOutcome::Cancelled
                 }
             }

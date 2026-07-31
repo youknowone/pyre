@@ -54,7 +54,10 @@ fn record_bridge_handler_entry_traceback<Sym: WalkSym>(
     record_inline_application_traceback(wc, exc, exc_concrete, position, true, emit_runtime);
     record_top_level_application_traceback(wc, exc, exc_concrete, position, true, emit_runtime);
     if let Some(exception) = traceback_exception {
-        crate::jitcode_dispatch::fbw_traceback_journal_push_if_attached(exception, traceback_before);
+        crate::jitcode_dispatch::fbw_traceback_journal_push_if_attached(
+            exception,
+            traceback_before,
+        );
     }
 }
 

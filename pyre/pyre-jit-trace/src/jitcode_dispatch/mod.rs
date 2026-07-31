@@ -10253,6 +10253,7 @@ fn handle<Sym: WalkSym>(
                     // `has_compiled_targets` (pyjitpl.py:3185-3189); a first visit
                     // registers a merge point (pyjitpl.py:3057-3059) and keeps
                     // tracing.
+                    majit_metainterp::mc_diag_bump(27);
                 }
             }
 
