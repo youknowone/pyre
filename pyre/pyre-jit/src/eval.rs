@@ -6928,8 +6928,11 @@ fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
             // `eval_loop_jit` consumes `ExitFrameWithException` at its
             // `maybe_compile_and_run` site (offers it to the frame's exception
             // table, then re-loops or returns `Done`), so it never surfaces
-            // here; propagate defensively should that invariant change.
-            LoopResult::ExitFrameWithException(err) => return Err(err),
+            // here; make the same offer should that invariant change, rather
+            // than propagating past a handler this frame has.
+            LoopResult::ExitFrameWithException(err) => {
+                return deliver_exit_frame_exception(frame_root.frame(), err);
+            }
             LoopResult::ContinueRunningNormally => {
                 // RPython warmspot.py:976-978: result = portal_ptr(*args).
                 // The blackhole has already written back the merge point
@@ -6950,6 +6953,12 @@ fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
 /// into the interpreter loop), otherwise return it for propagation out of the
 /// frame.  The eval loop's own `maybe_compile_and_run` site handles the warm
 /// path inline via `continue` instead of recursing here.
+///
+/// This is not optional bookkeeping: pyre's Python-level handler search is
+/// interpreter machinery, so neither a compiled trace's exception exit nor the
+/// blackhole's `handle_exception_in_frame` (which only knows the jitcode
+/// `catch_exception` a residual helper's own RPython `try` emits) has consulted
+/// it.  Skipping it exits a frame without running its `finally`.
 fn deliver_exit_frame_exception(
     frame: &mut PyFrame,
     mut err: pyre_interpreter::PyError,
@@ -8474,7 +8483,32 @@ fn compile_and_run_once(
                 return Some(LoopResult::Done(Ok(result)));
             }
             Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Raise(cv)) => {
-                return Some(LoopResult::Done(Err(finish_concrete_raise_error(cv))));
+                // warmspot.py:998-1005 — the walk (or the blackhole that
+                // finished it) left the frame with this exception, so the
+                // interpreter owes it the frame's exception table before
+                // propagating: pyre's Python-level handler search is
+                // interpreter machinery, not jitcode, and the blackhole's
+                // `handle_exception_in_frame` scan only knows the jitcode
+                // `catch_exception` a residual helper's own RPython try
+                // emits.  Without this a `try`/`finally` whose body escaped
+                // through the blackhole exits without running its `finally`.
+                let mut err = finish_concrete_raise_error(cv);
+                // This frame's traceback node is already on the chain: the
+                // walk's own uncaught-raise arm records it
+                // (`record_top_level_application_traceback`) and a blackhole
+                // that finished the frame records it on the way out
+                // (`record_frame_traceback`).  `attach_tb` is exactly the flag
+                // that says so — `pyopcode.py:91-94` routes
+                // `RaiseWithExplicitTraceback` through the `attach_tb=False`
+                // branch for the same reason — so the delivery below runs the
+                // handler search without adding a second node.
+                // `handle_exception` restores the flag once this frame's
+                // decision is made, so an outer frame still records its own.
+                // The flag belongs here and not in `finish_concrete_raise_error`:
+                // its other caller is the bridge-walk raise, whose frame has no
+                // node yet.
+                err.attach_tb = false;
+                return Some(LoopResult::ExitFrameWithException(err));
             }
             None => {}
         }
@@ -8969,10 +9003,13 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         &env,
     ) {
         Some(LoopResult::Done(result)) => Some(result),
-        // `compile_and_run_once` resolves a compiled-code exception exit inside
-        // `handle_jit_outcome` (offering it to the frame's exception table), so
-        // it never surfaces `ExitFrameWithException` here; propagate defensively.
-        Some(LoopResult::ExitFrameWithException(err)) => Some(Err(err)),
+        // warmspot.py:998-1005: a walk that ended in an uncaught raise, or a
+        // compiled-code exception exit `handle_jit_outcome` surfaced, is offered
+        // to this frame's exception table before it propagates — the same
+        // delivery the eval loop's `maybe_compile_and_run` site performs.
+        Some(LoopResult::ExitFrameWithException(err)) => {
+            Some(deliver_exit_frame_exception(frame_root.frame(), err))
+        }
         Some(LoopResult::ContinueRunningNormally) => {
             // warmspot.py:976-978 portal re-entry.  Marker mode completed the
             // synchronous walk; continue from the adopted/restart state.
