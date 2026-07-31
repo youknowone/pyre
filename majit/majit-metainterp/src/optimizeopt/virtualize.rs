@@ -6307,9 +6307,138 @@ mod tests {
         let virtuals = guard_op
             .resolved_rd_virtuals()
             .expect("rd_virtuals should encode the array and nested item");
+        // A count alone also passes when the two are numbered as UNRELATED
+        // virtuals. What the bridge decoder follows is the link: it reads the
+        // array's item slot, resolves its TAGVIRTUAL number back into
+        // `rd_virtuals`, and materializes the entry it lands on. Assert that
+        // path, locating each end by what it is rather than by slot order.
+        use majit_ir::resumedata::{TAGBOX, TAGVIRTUAL, UNINITIALIZED_TAG, untag};
+
+        let array_idx = {
+            let found = virtuals
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| {
+                    matches!(
+                        v.as_ref(),
+                        majit_ir::RdVirtualInfo::VArrayInfoClear { .. }
+                            | majit_ir::RdVirtualInfo::VArrayInfoNotClear { .. }
+                    )
+                })
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                found.len(),
+                1,
+                "exactly one VArrayInfo entry expected; got {virtuals:?}"
+            );
+            found[0]
+        };
+        let (array_arraydescr, array_items) = match virtuals[array_idx].as_ref() {
+            majit_ir::RdVirtualInfo::VArrayInfoClear {
+                arraydescr,
+                fieldnums,
+                ..
+            }
+            | majit_ir::RdVirtualInfo::VArrayInfoNotClear {
+                arraydescr,
+                fieldnums,
+                ..
+            } => (arraydescr.clone(), fieldnums.clone()),
+            _ => unreachable!("filtered by the matches! above"),
+        };
+        // The materializer dereferences the arraydescr unconditionally.
         assert!(
-            virtuals.len() >= 2,
-            "rd_virtuals should recursively number both virtuals; got {virtuals:?}"
+            array_arraydescr.is_some(),
+            "VArrayInfo must carry its live arraydescr"
+        );
+        assert_eq!(
+            array_items.len(),
+            1,
+            "NEW_ARRAY(len=1) leaves exactly one item slot; got {array_items:?}"
+        );
+        let (item_num, item_tagbits) = untag(array_items[0]);
+        assert_eq!(
+            item_tagbits,
+            TAGVIRTUAL,
+            "array item 0 must stay TAGVIRTUAL rather than force-boxing to a \
+             failarg; got {:?}",
+            untag(array_items[0])
+        );
+        // resume.py:278-284 assign_number_to_virtual numbers nested virtuals
+        // negatively and resume.py:945-954 getvirtual_ptr resolves them by
+        // Python negative indexing.
+        let item_idx = if item_num < 0 {
+            (virtuals.len() as i32 + item_num) as usize
+        } else {
+            item_num as usize
+        };
+        assert_ne!(
+            item_idx, array_idx,
+            "the item's TAGVIRTUAL must name a slot other than the array's"
+        );
+        let majit_ir::RdVirtualInfo::VirtualInfo {
+            descr: item_descr,
+            fielddescrs: item_fielddescrs,
+            fieldnums: item_fieldnums,
+            ..
+        } = virtuals[item_idx].as_ref()
+        else {
+            panic!(
+                "the array item's TAGVIRTUAL must resolve to the nested \
+                 NEW_WITH_VTABLE VirtualInfo; got {:?}",
+                virtuals[item_idx]
+            )
+        };
+        // A `None` size descr silently drops the whole nested materialization.
+        assert!(
+            item_descr.is_some(),
+            "nested VirtualInfo must carry its live SizeDescr"
+        );
+        assert_eq!(
+            item_fielddescrs.len(),
+            item_fieldnums.len(),
+            "fielddescrs and fieldnums must stay 1:1"
+        );
+        // resume.py:597-603 setfields skips UNINITIALIZED, so the item's only
+        // live slot is the one the SETFIELD_GC wrote.
+        let live = item_fieldnums
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(_, n)| n != UNINITIALIZED_TAG)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            live.len(),
+            1,
+            "nested item has exactly one live field slot; got {live:?}"
+        );
+        let (live_slot, live_tag) = live[0];
+        assert_eq!(
+            item_fielddescrs[live_slot].index, 42,
+            "the live slot must be the field_descr(42) the SETFIELD_GC named; \
+             got {:?}",
+            item_fielddescrs[live_slot]
+        );
+        let (leaf_num, leaf_tagbits) = untag(live_tag);
+        assert_eq!(
+            leaf_tagbits,
+            TAGBOX,
+            "the nested item's leaf must be a TAGBOX failarg; got {:?}",
+            untag(live_tag)
+        );
+        // resume.py:1259-1261 decode_box indexes liveboxes with the same
+        // negative-index rule.
+        let leaf_slot = if leaf_num < 0 {
+            leaf_num + failargs.len() as i32
+        } else {
+            leaf_num
+        } as usize;
+        assert_eq!(
+            failargs[leaf_slot].to_opref(),
+            OpRef::input_arg_int(40),
+            "the leaf TAGBOX must resolve to the SETFIELD_GC value i40; \
+             got {failargs:?}"
         );
     }
 }
