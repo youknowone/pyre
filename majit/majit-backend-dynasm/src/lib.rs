@@ -69,6 +69,23 @@ pub fn majit_j2plan_log_enabled() -> bool {
     *ENABLED
 }
 
+/// Whether `PYRE_GC_FREELIST_DIAG` is set, cached at first access.
+///
+/// Read once per residual call and twice per compiled-trace entry, so the
+/// uncached form put `getenv` on the hottest paths the backend has.
+pub fn gc_freelist_diag_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("PYRE_GC_FREELIST_DIAG").is_some());
+    *ENABLED
+}
+
+/// Whether `PYRE_DYNASM_EXEC_DIAG` is set, cached at first access.
+pub fn dynasm_exec_diag_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("PYRE_DYNASM_EXEC_DIAG").is_some());
+    *ENABLED
+}
+
 static JIT_EXC_VALUE: AtomicI64 = AtomicI64::new(0);
 // Holds the pending exception's `typeptr` (an immortal static `PyType`), never a
 // managed object, so it is deliberately not GC-rooted.
