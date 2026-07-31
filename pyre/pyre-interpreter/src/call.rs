@@ -1326,12 +1326,24 @@ fn call_callable_with_mode(
             call_args.extend_from_slice(args);
             return call_callable_with_mode(frame, call_fn, &call_args, mode);
         }
-        let Some(w_type) = crate::typedef::r#type(callable) else {
-            return call_callable_with_mode(frame, call_fn, args, mode);
+        let w_impl = match crate::typedef::r#type(callable) {
+            Some(w_type) => {
+                unsafe { crate::baseobjspace::get(call_fn, callable, w_type.as_ptr()) }?
+                    .unwrap_or(call_fn)
+            }
+            None => call_fn,
         };
-        let w_impl = unsafe { crate::baseobjspace::get(call_fn, callable, w_type.as_ptr()) }?
-            .unwrap_or(call_fn);
-        return call_callable_with_mode(frame, w_impl, args, mode);
+        // `user_call_slot`'s stack_check bounds a self-referential
+        // `A.__call__ = A()` chain only while this self-dispatch recurses
+        // natively.  Left in tail position it is a candidate for LLVM's
+        // sibling-call optimization, which rewrites it into a loop that never
+        // grows the native stack — then neither the SP check nor the depth
+        // counter trips and the chain spins forever.  The black_box barrier
+        // keeps the call off the tail so the stack grows and the check fires.
+        // (The RPython C backend does not perform this optimization, so there
+        // is no matching guard upstream.)
+        let result = call_callable_with_mode(frame, w_impl, args, mode);
+        return std::hint::black_box(result);
     }
 
     // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
