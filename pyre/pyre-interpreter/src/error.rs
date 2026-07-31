@@ -1052,7 +1052,12 @@ impl PyError {
         if !self.w_obj_context.is_null() {
             pyre_object::gc_roots::pin_root(self.w_obj_context);
         }
-        let exc = w_exception_new(self.to_exc_kind(), &self.message);
+        // `w_exception_new_empty`, not `w_exception_new`: the message block
+        // below builds `args_w` itself (it must keep the message object in a
+        // shadow-stack slot for the `ImportError` `msg` stamp), so letting the
+        // message helper build a first string + list here only to overwrite
+        // both allocated two W_Str/W_List pairs per raise and threw one away.
+        let exc = pyre_object::interp_exceptions::w_exception_new_empty(self.to_exc_kind());
         // Root the fresh managed exception across the message/context stamping
         // below: `exc` lives only in this Rust local while `w_list_new` (and the
         // setters) run, so a collection there could sweep the unrooted
