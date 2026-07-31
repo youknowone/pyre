@@ -120,6 +120,14 @@ impl Random {
 #[crate::pyre_class("_random.Random")]
 #[derive(Default)]
 pub struct W_Random {
+    /// PyPy composes `MapdictStorageMixin` into a native-layout object when
+    /// `space.allocate_instance(W_Random, w_subtype)` allocates a Python
+    /// subclass (`objspace.py:485-487`, `mapdict.py:907-910`).  Keep the same
+    /// `[PyObject | map | storage]` prefix as `W_ObjectObject`, so the shared
+    /// mapdict implementation can operate on both layouts.  The builtin
+    /// `_random.Random` itself simply retains the empty/null state.
+    pub map: *const u8,
+    pub storage: *mut pyre_object::object_array::ItemsBlock,
     rnd: Random,
 }
 

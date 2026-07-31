@@ -7126,11 +7126,12 @@ fn walker_guard_class<Sym: WalkSym>(
     Ok(())
 }
 
-/// Guard the fixed-layout instance representation, the receiver type's live
-/// version tag, and the exact map shape used by the mapdict attribute folds.
-/// `INSTANCE_TYPE` proves the receiver has `W_ObjectObject` fields; the
-/// promoted map identity pins its class and storage coordinates
-/// (mapdict.py).
+/// Guard the fixed-layout mapdict-carrier representation, the receiver type's
+/// live version tag, and the exact map shape used by the mapdict attribute
+/// folds.  The concrete layout vtable proves that the receiver has the shared
+/// `[PyObject | map | storage]` prefix (`W_ObjectObject`, or a native-layout
+/// carrier such as `W_Random`); the promoted map identity pins its class and
+/// storage coordinates (mapdict.py).
 fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -7139,13 +7140,20 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     version_tag: u64,
     map: pyre_interpreter::objspace::std::mapdict::MapRef,
 ) -> Result<(), DispatchError> {
-    let instance_type_addr = &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64;
+    // `load/store_attr_*_fast_path` accepted this receiver only after
+    // `has_mapdict_storage` proved its prefix. Preserve the concrete layout
+    // tag here: claiming every carrier is `INSTANCE_TYPE` poisons the heap
+    // cache for native-layout subclasses and lets later folds use unrelated
+    // field descriptors on the same box.
+    let concrete_obj = walker_concrete_ref_object(ctx, obj)
+        .expect("mapdict shape guard requires the concrete carrier used by the fast path");
+    let layout_type_addr = unsafe { (*concrete_obj).ob_type as i64 };
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(instance_type_addr);
+        let type_const = ctx.trace_ctx.const_int(layout_type_addr);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
         ctx.trace_ctx
             .heap_cache_mut()
-            .class_now_known(obj, instance_type_addr);
+            .class_now_known(obj, layout_type_addr);
     }
 
     // The instance map pins the storage layout, but class mutation can change

@@ -639,7 +639,9 @@ unsafe fn tokenizer_iter_destructor(obj_addr: usize) {
     unsafe { pyre_interpreter::module::_tokenize::w_tokenizer_iter_dealloc(obj) };
 }
 
-/// Custom trace for `W_ObjectObject` (instance `map`+`storage`,
+/// Custom trace for objects carrying the `MapdictStorageMixin` prefix
+/// (`W_ObjectObject` and native-layout Python subclasses such as
+/// `W_Random`; instance `map`+`storage`,
 /// `mapdict.py:907-910`).  The `storage` list is an off-GC
 /// `Box<Vec<PyObjectRef>>`, so — exactly as `dict_object_custom_trace`
 /// reaches the off-GC dict entries — this forwards each boxed
@@ -2519,12 +2521,31 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // the descriptor's `gc_type_id` matches the order here so the
     // hardcoded `type_id` constants on the `#[pyre_class]`
     // attribute cannot silently drift.
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_interpreter::module::_random::W_Random
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
+    // PyPy's `allocate_instance(W_Random, w_subtype)` composes
+    // `MapdictStorageMixin` into Python subclasses. `W_Random` therefore has
+    // the same `[PyObject | map | storage]` prefix as `W_ObjectObject` and
+    // needs the same custom trace for boxed attributes. Register it in the
+    // original slot so every later type id remains stable.
+    {
+        let descr = <pyre_interpreter::module::_random::W_Random
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+        let tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+            descr.object_size,
+            object_tid,
+            object_object_custom_trace,
+        ));
+        if descr.gc_type_id.is_unassigned() {
+            descr.gc_type_id.set(tid);
+        } else {
+            debug_assert_eq!(tid, descr.gc_type_id.get());
+        }
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, descr.pytype_ptr as usize, tid);
+        pytype_to_tid.insert(descr.pytype_ptr as usize, tid);
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            descr.pytype_ptr as usize,
+            descr.ptr_offsets,
+        );
+    }
     // Per-`ExcKind` GC type ids.  The pre-registration loop at the
     // top of this function mapped every exception PyType to a
     // single `W_BASE_EXCEPTION_GC_TYPE_ID` so `new_with_vtable` knows

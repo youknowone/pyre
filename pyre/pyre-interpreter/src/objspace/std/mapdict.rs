@@ -352,6 +352,26 @@ pub unsafe fn ensure_type_terminator(w_type: PyObjectRef) -> *const u8 {
     unsafe { type_terminator_or_create(w_type) as *const u8 }
 }
 
+/// Whether `obj` carries the `[PyObject | map | storage]` prefix supplied by
+/// PyPy's `MapdictStorageMixin` (`mapdict.py:748-761, 905-910`).  Ordinary
+/// user instances have that prefix in `W_ObjectObject`; native-layout
+/// `_random.Random` instances carry it explicitly because
+/// `allocate_instance(W_Random, w_subtype)` composes the same mixin for Python
+/// subclasses upstream.  Keeping this as a layout predicate lets all mapdict
+/// operations share the original node/storage machinery instead of creating
+/// a per-native-type attribute side table.
+///
+/// # Safety
+/// `obj` must be null or a live object reference.
+#[inline]
+pub unsafe fn has_mapdict_storage(obj: PyObjectRef) -> bool {
+    if obj.is_null() || unsafe { pyre_object::is_type(obj) } {
+        return false;
+    }
+    (unsafe { pyre_object::is_instance(obj) })
+        || unsafe { pyre_object::py_type_check(obj, &crate::module::_random::RANDOM_TYPE) }
+}
+
 /// Fetch `w_type`'s instance terminator, lazily creating and storing it on the
 /// type if absent (covering types built before the eager install site).
 ///
@@ -606,7 +626,7 @@ pub unsafe fn instance_del_weakref_slot(obj: PyObjectRef) {
 #[majit_macros::dont_look_inside]
 pub unsafe fn getslotvalue(obj: PyObjectRef, slotindex: u32) -> Option<PyObjectRef> {
     assert!(
-        unsafe { pyre_object::is_instance(obj) },
+        unsafe { has_mapdict_storage(obj) },
         "W_Root.getslotvalue: receiver has no mapdict slot storage"
     );
     ensure_mapdict_initialized(obj);
@@ -633,7 +653,7 @@ pub unsafe fn getslotvalue(obj: PyObjectRef, slotindex: u32) -> Option<PyObjectR
 #[majit_macros::dont_look_inside]
 pub unsafe fn setslotvalue(obj: PyObjectRef, slotindex: u32, w_value: PyObjectRef) {
     assert!(
-        unsafe { pyre_object::is_instance(obj) },
+        unsafe { has_mapdict_storage(obj) },
         "W_Root.setslotvalue: receiver has no mapdict slot storage"
     );
     ensure_mapdict_initialized(obj);
@@ -659,7 +679,7 @@ pub unsafe fn setslotvalue(obj: PyObjectRef, slotindex: u32, w_value: PyObjectRe
 #[majit_macros::dont_look_inside]
 pub unsafe fn delslotvalue(obj: PyObjectRef, slotindex: u32) -> bool {
     assert!(
-        unsafe { pyre_object::is_instance(obj) },
+        unsafe { has_mapdict_storage(obj) },
         "W_Root.delslotvalue: receiver has no mapdict slot storage"
     );
     ensure_mapdict_initialized(obj);
@@ -1082,10 +1102,7 @@ unsafe fn mapdict_map_or_null(w_obj: PyObjectRef) -> MapRef {
     // mix in MapdictStorageMixin.  Let type attribute stores reach the
     // metatype data descriptors (__name__, __qualname__, __module__, ...)
     // instead of treating the type object's header as mapdict storage.
-    if w_obj.is_null()
-        || unsafe { pyre_object::is_type(w_obj) }
-        || !unsafe { pyre_object::is_instance(w_obj) }
-    {
+    if !unsafe { has_mapdict_storage(w_obj) } {
         return std::ptr::null();
     }
     unsafe { ensure_mapdict_initialized(w_obj) };
@@ -3883,12 +3900,13 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
     // makes the view funnel every get/set/del/iter through the instance map+storage
     // — the single `__dict__` authority.
     //
-    // Only a `W_ObjectObject` carries a mapdict. User subclasses of builtin
-    // types (`class MyInt(int)`) keep the builtin layout (no map) while their
-    // type is hasdict, so their `__dict__` stays in the address-keyed
-    // INSTANCE_DICT side table as a plain own-storage dict until subclass
-    // instances grow mapdict storage (upstream `user_setup`, mapdict.py:758).
-    if unsafe { pyre_object::is_instance(self_ref) } {
+    // Only an object that carries mapdict storage answers out of the map —
+    // the same gate `_obj_setdict` applies. User subclasses of builtin types
+    // (`class MyInt(int)`) keep the builtin layout (no map) while their type is
+    // hasdict, so their `__dict__` stays in the address-keyed INSTANCE_DICT
+    // side table as a plain own-storage dict until subclass instances grow
+    // mapdict storage (upstream `user_setup`, mapdict.py:758).
+    if unsafe { has_mapdict_storage(self_ref) } {
         // mapdict.py:828-830 `if w_dict is not None`.  RPython's `read` answers
         // None both for an absent slot and for one holding None, and both mean
         // "build the view" — so a null must not reach the caller.  It would be
@@ -4226,7 +4244,7 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
             "setting dictionary to a non-dict".to_string(),
         ));
     }
-    if unsafe { pyre_object::is_instance(self_ref) } {
+    if unsafe { has_mapdict_storage(self_ref) } {
         // mapdict.py:892-900: the old dict has `self` as its dstorage, so
         // before pointing the "dict" SPECIAL slot at the new dict, force the
         // old view to its own storage if it is still an instance-backed
@@ -4279,7 +4297,7 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
 ///     return lifeline
 /// ```
 pub fn getweakref(self_ref: PyObjectRef) -> Option<PyObjectRef> {
-    if unsafe { pyre_object::is_instance(self_ref) } {
+    if unsafe { has_mapdict_storage(self_ref) } {
         unsafe { instance_get_weakref_slot(self_ref) }
     } else {
         WEAKREF_TABLE
@@ -4300,7 +4318,7 @@ pub fn getweakref(self_ref: PyObjectRef) -> Option<PyObjectRef> {
 ///     self._get_mapdict_map().write(self, "weakref", SPECIAL, weakreflifeline)
 /// ```
 pub fn setweakref(self_ref: PyObjectRef, weakreflifeline: PyObjectRef) {
-    if unsafe { pyre_object::is_instance(self_ref) } {
+    if unsafe { has_mapdict_storage(self_ref) } {
         let flag = unsafe { instance_set_weakref_slot(self_ref, weakreflifeline) };
         debug_assert!(flag, "write to the weakref SPECIAL slot failed");
     } else {
@@ -4315,7 +4333,7 @@ pub fn setweakref(self_ref: PyObjectRef, weakreflifeline: PyObjectRef) {
 ///     self._get_mapdict_map().write(self, "weakref", SPECIAL, None)
 /// ```
 pub fn delweakref(self_ref: PyObjectRef) {
-    if unsafe { pyre_object::is_instance(self_ref) } {
+    if unsafe { has_mapdict_storage(self_ref) } {
         unsafe { instance_del_weakref_slot(self_ref) };
     } else {
         WEAKREF_TABLE.lock().unwrap().remove(&(self_ref as usize));

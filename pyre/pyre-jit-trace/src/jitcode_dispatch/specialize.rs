@@ -2154,9 +2154,10 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
 /// monomorphic instance whose attribute resolves to a boxed plain storage slot
 /// or an unboxed integer/float slot, emit the guarded read PyPy compiles
 /// LOAD_ATTR to under the JIT —
-///   * `guard_class(obj, &INSTANCE_TYPE)` — the receiver is a `W_ObjectObject`
-///     (so the `map`/`storage` field reads below are valid; `mapdict.py`
-///     `if map is not None:` also filters non-instances at trace time).
+///   * `guard_class(obj, concrete_layout)` — the receiver keeps the exact
+///     layout vtable whose mapdict-carrier prefix was proved at trace time (so
+///     the `map`/`storage` reads below are valid; `mapdict.py` `if map is not
+///     None:` also filters non-carriers at trace time).
 ///   * `guard_value(getfield_gc_i(w_type, version_tag), C_version_tag)` — pins
 ///     the class lookup result so a later descriptor or `__getattribute__`
 ///     mutation deopts on trace re-entry.
