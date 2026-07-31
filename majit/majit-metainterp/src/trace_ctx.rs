@@ -624,6 +624,9 @@ pub struct ReconstructRecipe {
     /// Guard-carried JitCode offset from the decoded resume frame;
     /// `majit_ir::resumedata::NO_JITCODE_PC` when the frame carried none.
     pub jitcode_pc: i32,
+    /// Semantic stack base: `co_nlocals + ncellvars + nfreevars`, matching
+    /// `MIFrame.registers_r` / `PyFrame.locals_cells_stack_w`.  This was
+    /// historically named `nlocals`; keep the field name for wire stability.
     pub nlocals: usize,
     pub valuestackdepth: usize,
     pub registers_i: Vec<OpRef>,

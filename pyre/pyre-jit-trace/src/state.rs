@@ -6834,10 +6834,8 @@ impl PyreJitState {
 /// single-frame bridge) when the callee cannot be faithfully rebuilt:
 ///   - `pc` is the no-snapshot sentinel (`< 0`),
 ///   - `jitcode_index` does not resolve to a code object,
-///   - the callee has cell or free variables — `locals_cells_stack_w` then
-///     carries cell objects whose contents are not in the resume liveness
-///     stream, so a dead-frame rebuild would seed null cells and LOAD_DEREF
-///     would raise `NameError`,
+///   - the callee has fresh cell variables (the forward inline constructor
+///     does not yet allocate them either),
 ///   - the liveness enumeration count disagrees with the encoded section.
 /// `rd_virtuals[vidx]` with negative-index resolution already applied by the
 /// caller. Returns the `RdVirtualInfo` behind the `Rc`, or `None` when the
@@ -6955,11 +6953,12 @@ fn overlay_stream_ref_slots(
 /// the liveness invariants the reader consumes. Pyre's per-function portal
 /// model + super-instruction bytecode cannot guarantee those invariants for
 /// every reconstructed callee, so this returns `None` exactly where a rebuild
-/// would be unsound: a no-snapshot pc, an unresolved jitcode, cell/free vars
-/// (cell contents live outside the resume stream → LOAD_DEREF NameError),
+/// would be unsound: a no-snapshot pc, an unresolved jitcode, fresh cellvars,
 /// unrecoverable callee globals, an `enumerate_vars` count that disagrees with
 /// the encoded section (`consume_boxes`), or an int/float-bank register with no
-/// boxed-Ref source.
+/// boxed-Ref source. Existing freevar cell objects are ordinary entries in the
+/// frame red's `locals_cells_stack_w` array and are rebuilt with that frame,
+/// exactly as `resume.py:1042-1057 consume_boxes` rebuilds every MIFrame slot.
 ///
 /// The `None` fallback is semantically equivalent in program result: the caller
 /// declines the multi-frame inline reconstruction and routes to the
@@ -7005,8 +7004,14 @@ fn reconstruct_inline_recipe(
         decline!("NullRawCode");
     }
     let code_ref = unsafe { &*raw_code };
-    if !code_ref.freevars.is_empty() || pyre_interpreter::pyframe::ncells(code_ref) != 0 {
-        decline!("CellsOrFreevars");
+    // Forward inlining already accepts freevars by threading the existing
+    // closure cell objects into the callee's own frame. Resume reconstruction
+    // must preserve those same slots, not discard the whole frame merely
+    // because its semantic prefix is `[locals | cells]`. Fresh cellvars still
+    // require allocation/initialisation and remain on the conservative path,
+    // matching `try_walker_inline_resolved_user_call`.
+    if !code_ref.cellvars.is_empty() {
+        decline!("FreshCellvars");
     }
     // pyframe.py:128-132 get_w_globals_storage(): the reconstructed callee frame's
     // globals come from its own pycode (`assemble_bridge_inline_pending`
@@ -7017,7 +7022,13 @@ fn reconstruct_inline_recipe(
     if recover_inline_callee_globals(raw_code as *const ()).is_null() {
         decline!("NoCalleeGlobals");
     }
-    let nlocals = code_ref.varnames.len();
+    let frame_nlocals = code_ref.varnames.len();
+    // PyPy's MIFrame register prefix and PyFrame's physical stack base include
+    // cell/freevar slots (`pyframe.py:107-111`). All semantic slot/color maps
+    // below are keyed to that full prefix, so treat it as the recipe's
+    // historical `nlocals` value. This is what keeps LOAD_DEREF attached to
+    // the reconstructed callee frame rather than collapsing onto its caller.
+    let nlocals = frame_nlocals + pyre_interpreter::pyframe::ncells(code_ref);
 
     let liveness = crate::liveness::liveness_for(raw_code);
     let stack_only = match liveness.stack_depth_at(py_pc) {
@@ -7275,7 +7286,7 @@ fn reconstruct_inline_recipe(
                 registers_r,
                 registers_f: Vec::new(),
                 concrete_r,
-                nargs: nlocals,
+                nargs: frame_nlocals,
             });
         }
         let RebuiltValue::Virtual(frame_vidx) = values[frame_pos] else {
@@ -7414,7 +7425,7 @@ fn reconstruct_inline_recipe(
             registers_r,
             registers_f: Vec::new(),
             concrete_r,
-            nargs: nlocals,
+            nargs: frame_nlocals,
         });
     }
 
@@ -7603,7 +7614,7 @@ fn reconstruct_inline_recipe(
         registers_r,
         registers_f,
         concrete_r,
-        nargs: nlocals,
+        nargs: frame_nlocals,
     })
 }
 
@@ -13286,10 +13297,13 @@ pub(crate) fn setup_reconstructed_callee_frame(
         return None;
     }
     let code_ref = unsafe { &*raw_code };
-    let (_nlocals_plus_cells, frame_array_size) = callee_layout_for_call_assembler(code_ref);
-    let nlocals = recipe.nlocals;
+    let (stack_base, frame_array_size) = callee_layout_for_call_assembler(code_ref);
+    let nlocals = code_ref.varnames.len();
     let valuestackdepth = recipe.valuestackdepth;
-    if recipe.registers_r.len() < valuestackdepth || nlocals > valuestackdepth {
+    if recipe.nlocals != stack_base
+        || recipe.registers_r.len() < valuestackdepth
+        || stack_base > valuestackdepth
+    {
         return None;
     }
 
@@ -13305,6 +13319,12 @@ pub(crate) fn setup_reconstructed_callee_frame(
     let ec_const = ctx.const_ref(execution_context as i64);
 
     let locals_boxes: Vec<OpRef> = recipe.registers_r[..nlocals].to_vec();
+    // This reconstruction path admits freevars but still rejects fresh
+    // cellvars, so the remainder of the semantic prefix is exactly the
+    // existing closure-cell objects. Feed them through the same constructor
+    // channel as forward inlining instead of pretending they are positional
+    // parameters.
+    let freevar_cells: Vec<OpRef> = recipe.registers_r[nlocals..stack_base].to_vec();
     // `registers_r` are the paused root's OpRefs, whose trace concrete can still
     // read as a stale NULL once reused as the reconstructed callee's locals,
     // while `concrete_r[k]` holds the value captured at guard failure. A
@@ -13313,7 +13333,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // ever built and the guard re-deopts forever. Restamp each local from its
     // captured value; a NULL/Void capture is an unmaterialized hole and is left
     // alone, matching how `setup_bridge_sym` seeds the root frame's slots.
-    for (k, &opref) in locals_boxes.iter().enumerate() {
+    for (k, &opref) in recipe.registers_r[..stack_base].iter().enumerate() {
         if opref.is_none() {
             continue;
         }
@@ -13331,10 +13351,10 @@ pub(crate) fn setup_reconstructed_callee_frame(
     let frame_vable = crate::helpers::emit_new_pyframe_inline_with_params(
         ctx,
         &locals_boxes,
-        &[],
-        0,
-        frame_array_size,
+        &freevar_cells,
         nlocals,
+        frame_array_size,
+        stack_base,
         pycode_const,
         w_globals_const,
         ec_const,
@@ -13373,7 +13393,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // Falls back to identity when no live color owns the slot (empty map /
     // non-diverging coloring).
     let pcdep = pcdep_trivia_at(recipe.jitcode_index, recipe.jitcode_pc).unwrap_or_default();
-    for k in nlocals..valuestackdepth {
+    for k in stack_base..valuestackdepth {
         let opref = recipe.registers_r[k];
         if opref.is_none() {
             continue;
