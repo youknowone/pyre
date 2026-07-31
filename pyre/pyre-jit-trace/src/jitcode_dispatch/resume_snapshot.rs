@@ -1999,6 +1999,25 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     if !callee_pjc.is_populated() || callee_pjc.code_ptr.is_null() {
         return Err(DispatchError::callee_inline_unsupported(callee_op_pc));
     }
+    // Mirror of the single-frame path: the callee (top) frame carries a branch
+    // guard's supplied pc (`GuardCaptureScope::branch_guard_jitcode_pc`)
+    // unchanged. For other guards, the callee payload supplies the
+    // resume-marker twin:
+    // after-residual guards use the fallthrough twin and retain the sentinel
+    // on a miss, while plain guards retain the raw `callee_op_pc` on a miss.
+    // Computed before box collection so encoder liveness and decoder resume
+    // use the same coordinate.
+    let callee_jitcode_pc: i32 = match scope.branch_guard_jitcode_pc {
+        Some(g) => g as i32,
+        None if after_residual_call => callee_pjc
+            .after_residual_marker_for_jitcode_pc(callee_op_pc)
+            .map(|m| m as i32)
+            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC),
+        None => callee_pjc
+            .resume_marker_for_jitcode_pc(callee_op_pc)
+            .map(|m| m as i32)
+            .unwrap_or(callee_op_pc as i32),
+    };
     let mf_diag = std::env::var_os("PYRE_FBW_MF_DIAG").is_some();
     let recipe_resultcolor_audit = pcmap_recipe_resultcolor_audit_enabled();
     if mf_diag || recipe_resultcolor_audit {
@@ -2049,18 +2068,37 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             let depth = callee_pjc
                 .depth_for_jitcode_pc_pred(callee_op_pc)
                 .unwrap_or(0);
-            let banks = crate::state::frame_liveness_reg_indices_by_bank_at(
+            // Read the coordinate the box collection below actually uses, not
+            // the raw `callee_op_pc`; and read it through the
+            // decline-reporting form, since the lossy query maps an
+            // unresolvable coordinate and a genuinely empty window onto the
+            // same all-empty result.
+            let resolved = crate::state::try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
                 callee_jitcode_index as i32,
-                callee_op_pc as i32,
+                callee_jitcode_pc,
             );
+            let window = if resolved.is_some() {
+                "resolved"
+            } else {
+                "UNRESOLVED"
+            };
+            let banks = resolved.unwrap_or_default();
             eprintln!(
                 "[fbw-mf-diag] callee jc={callee_jitcode_index} op_pc={callee_op_pc} \
              py_pc={callee_py_pc} after_residual={after_residual_call} depth={depth} \
              pcdep_color_slots={pcdep:?}"
             );
+            // The color→slot inversion must be read at the same coordinate as
+            // the banks above; `pcdep` at the raw `callee_op_pc` can name a
+            // different set, which is what makes a live color look unmapped.
+            let coord_pcdep = usize::try_from(callee_jitcode_pc)
+                .ok()
+                .and_then(|coord| callee_pjc.pcdep_for_jitcode_pc(coord))
+                .unwrap_or_default();
             eprintln!(
-                "[fbw-mf-diag]   live banks: i={:?} r={:?} f={:?}",
-                banks.int, banks.ref_, banks.float
+                "[fbw-mf-diag]   live banks: i={:?} r={:?} f={:?} coord={callee_jitcode_pc} \
+                 window={window} coord_pcdep={coord_pcdep:?}",
+                banks.int, banks.ref_, banks.float,
             );
             for &c in &banks.ref_ {
                 eprintln!(
@@ -2092,25 +2130,6 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             }
         }
     }
-    // Mirror of the single-frame path: the callee (top) frame carries a branch
-    // guard's supplied pc (`GuardCaptureScope::branch_guard_jitcode_pc`)
-    // unchanged. For other guards, the callee payload supplies the
-    // resume-marker twin:
-    // after-residual guards use the fallthrough twin and retain the sentinel
-    // on a miss, while plain guards retain the raw `callee_op_pc` on a miss.
-    // Computed before box collection so encoder liveness and decoder resume
-    // use the same coordinate.
-    let callee_jitcode_pc: i32 = match scope.branch_guard_jitcode_pc {
-        Some(g) => g as i32,
-        None if after_residual_call => callee_pjc
-            .after_residual_marker_for_jitcode_pc(callee_op_pc)
-            .map(|m| m as i32)
-            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC),
-        None => callee_pjc
-            .resume_marker_for_jitcode_pc(callee_op_pc)
-            .map(|m| m as i32)
-            .unwrap_or(callee_op_pc as i32),
-    };
     let callee_boxes = collect_callee_active_boxes(
         ctx.registers_i,
         ctx.registers_r,
