@@ -200,3 +200,14 @@ pub mod builders {
         }
     }
 }
+
+/// `__pypy__.bufferable` — PyPy keeps `bufferable` in a submodule rather
+/// than exporting the class directly from `__pypy__`.
+pub mod bufferable {
+    crate::py_module! {
+        "__pypy__.bufferable",
+        interpleveldefs: {
+            "bufferable" => crate::module::__pypy__::interp_buffer::bufferable_impl::type_object(),
+        }
+    }
+}

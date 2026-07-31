@@ -477,7 +477,12 @@ pub fn builtin_module_names() -> Vec<&'static str> {
         .unwrap()
         .keys()
         .copied()
-        .filter(|name| !name.contains('.'))
+        // Frozen importlib's BuiltinImporter consults this tuple before
+        // invoking pyre's dotted-module hook.  Keep the PyPy package
+        // submodules advertised so `from __pypy__ import bufferable` (and
+        // the existing builders module) can reach their registered Mixed
+        // Module initializers; unrelated dotted aliases remain internal.
+        .filter(|name| !name.contains('.') || name.starts_with("__pypy__."))
         .collect();
     names.sort_unstable();
     names
@@ -582,6 +587,7 @@ pub fn install_builtin_modules() {
     // pickle.py imports (identity_dict + builders.BytesBuilder).
     pyre_install_module!("__pypy__" => crate::module::__pypy__::init);
     pyre_install_module!("__pypy__.builders" => crate::module::__pypy__::builders::init);
+    pyre_install_module!("__pypy__.bufferable" => crate::module::__pypy__::bufferable::init);
 
     // pypyjit — runtime JIT-parameter control (`set_param`).
     pyre_install_module!("pypyjit" => crate::module::pypyjit::init);
