@@ -4192,6 +4192,11 @@ impl OuterActiveBoxesEntryTwin {
     }
 }
 
+fn snapshot_diag_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("PYRE_SNAPSHOT_DIAG").is_some())
+}
+
 fn collect_outer_active_boxes<Sym: WalkSym>(
     sym: &Sym,
     trace_ctx: &mut TraceCtx,
@@ -4561,27 +4566,24 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                             walk_real.unwrap_or_else(|| vbox.unwrap_or_else(fallback))
                         }
                     } else {
-                        // At a branch guard the walk register is the live
-                        // `MIFrame.registers_r[index]` binding captured by
-                        // `_get_list_of_active_boxes`.  The virtualizable
-                        // shadow can still hold the loop-entry value for a
-                        // local overwritten earlier in this arm, so prefer the
-                        // guard-state register and retain the shadow as the
-                        // fallback.  Non-branch captures keep the shadow-first
-                        // portal-local path.
-                        let walk_is_real = walk_box
-                            .is_some_and(|b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
-                        let shadow_is_real = vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
-                        if guard_present && walk_is_real {
-                            walk_box.unwrap_or_else(fallback)
-                        } else if shadow_is_real {
-                            vbox.unwrap_or_else(fallback)
-                        } else {
-                            match walk_box {
-                                Some(v) if v != OpRef::NONE && !opref_is_null_const_ptr(v) => v,
-                                _ => vbox.unwrap_or_else(fallback),
-                            }
-                        }
+                        // `pyjitpl.py:177-232 get_list_of_active_boxes` reads
+                        // `self.registers_r[index]`, and a local's register is
+                        // written in lock-step with the virtualizable array, so
+                        // the live register is the box — the shadow is only the
+                        // fallback for colors the retired mirror left empty.
+                        //
+                        // The color→slot map that named this a local is a
+                        // per-program-point label, not a binding: the regalloc
+                        // freely reuses a local's color for an unrelated SSA
+                        // temp (a residual-call result, a raise operand), and
+                        // the map still reports the slot.  Preferring the
+                        // shadow there substituted the local's value for the
+                        // temp — a `raise` whose operand color doubled as
+                        // `self` then resumed publishing `self` as the
+                        // exception.
+                        let walk_real =
+                            walk_box.filter(|&b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
+                        walk_real.or(vbox).unwrap_or_else(fallback)
                     }
                 }
                 // `semantic_idx` is `None`: this Ref color names no live
@@ -4622,6 +4624,23 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
         };
         if value == OpRef::NONE {
             panic!("{}", dump_ctx("ref", idx));
+        }
+        // `PYRE_SNAPSHOT_DIAG=1`: report every live Ref color whose snapshot
+        // box did NOT come from the walk register bank.  `pyjitpl.py:177-232
+        // get_list_of_active_boxes` reads `registers_r[index]` unconditionally,
+        // so each of these is a place where pyre's virtualizable-shadow
+        // preference decided otherwise — the resume value and the register the
+        // resumed bytecode reads then disagree.
+        if snapshot_diag_enabled() {
+            let walk = regs_r.get(color).copied().unwrap_or(OpRef::NONE);
+            if walk != OpRef::NONE && walk != value {
+                eprintln!(
+                    "[snap] jc={outer_jitcode_index} carried={carried_jitcode_pc} \
+                     entry={entry_jitcode_pc} color={color} semantic_idx={semantic_idx:?} \
+                     guard_present={guard_present} nlocals={nlocals} \
+                     stack_only={valid_stack_only} walk={walk:?} chose={value:?}"
+                );
+            }
         }
         active.push(value);
     }
