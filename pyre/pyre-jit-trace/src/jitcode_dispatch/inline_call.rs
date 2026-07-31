@@ -413,6 +413,13 @@ pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
     false
 }
 
+/// Whether a method-form callee body is free of `LoadAttr` residuals.
+///
+/// Consulted only by the entries that pass `allow_method_load_attr = false`.
+/// A `self.attr` read in the body is what makes it answer `false`, which is the
+/// common shape (`def at(self, i): return self.v + i`), so an entry that opts
+/// out of the check trades a narrower inline surface for the ability to inline
+/// ordinary accessor methods.
 pub(crate) fn method_form_callee_body_supported(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
@@ -1742,7 +1749,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         has_closure,
         None,
         None,
-        false,
+        true,
         false,
         None,
     )
