@@ -648,16 +648,15 @@ pub fn emit_instance_inline(ctx: &mut TraceCtx, header_w_class: OpRef, map: OpRe
 /// `CondCallGcWb(obj)` for it, and it is emitted after the item stores, so a
 /// young value already in the block is remembered with the instance.
 ///
-/// The two instance field stores are ordered `storage` before `map`, and that
-/// order is load-bearing under free threading.  These are raw stores, so a
-/// concurrent reader of the same instance can observe the pair half-written;
-/// with this order the only visible intermediate is the longer block under the
-/// shorter map, which over-allocates by one slot.  The reverse order would
-/// publish a map claiming an index the installed block does not have.  Nothing
-/// here serializes against another thread mutating the same instance — the
-/// pre-existing in-trace mapdict fast paths (`jit_mapdict_read`,
-/// `jit_mapdict_boxed_write`) reach `storage` without the striped
-/// `instance_lock` in the same way.
+/// Free threading: these are raw stores, so unlike the interpreter's transition
+/// they do not hold the striped `instance_lock`, and unlike the single-slot
+/// in-place write they publish two fields.  The caller is what makes that
+/// sound — it folds only an `is_unescaped` receiver, one this trace allocated
+/// and no other thread can name yet.  The two stores are still ordered
+/// `storage` before `map`, so the only intermediate a later reader can observe
+/// is the longer block under the shorter map, which over-allocates by one slot;
+/// the reverse order would publish a map claiming an index the installed block
+/// does not have.
 pub fn emit_mapdict_add_attr_inline(
     ctx: &mut TraceCtx,
     obj: OpRef,

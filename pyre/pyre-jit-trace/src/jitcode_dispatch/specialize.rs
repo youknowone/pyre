@@ -3132,13 +3132,25 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     // The attribute is not in the map yet: fold the `map -> PlainAttribute`
     // transition and the grow-by-one storage rewrite into trace ops instead of
     // leaving the generic `setattr` residual, which would force the receiver.
-    if let Some(add) = unsafe {
-        pyre_interpreter::objspace::std::mapdict::store_attr_add_fast_path(
-            concrete_obj,
-            &name,
-            concrete_value,
-        )
-    } {
+    //
+    // Only for a receiver this trace allocated and has not let escape.  The
+    // emitted transition is a pair of raw field stores, so unlike the
+    // interpreter's it does not hold the striped `instance_lock`, and unlike
+    // the single-slot in-place write it publishes two fields: a concurrent
+    // mutator of the same instance could pair one thread's `map` with
+    // another's `storage`.  `is_unescaped` is what rules that out — no other
+    // thread has a reference yet.  It costs almost nothing, because the fold's
+    // payoff is exactly the unescaped case: an escaped receiver is one the
+    // optimizer cannot remove anyway.
+    if ctx.trace_ctx.heap_cache().is_unescaped(obj)
+        && let Some(add) = unsafe {
+            pyre_interpreter::objspace::std::mapdict::store_attr_add_fast_path(
+                concrete_obj,
+                &name,
+                concrete_value,
+            )
+        }
+    {
         walker_guard_mapdict_instance_shape(ctx, op_pc, obj, add.w_type, add.version_tag, add.map)?;
         let new_map_const = ctx.trace_ctx.const_int(add.new_map as i64);
         crate::helpers::emit_mapdict_add_attr_inline(
