@@ -8760,12 +8760,27 @@ fn union_getitem(args: &[PyObjectRef]) -> crate::PyResult {
             pyre_object::w_tuple_new(vec![]),
         ));
     }
-    // `curr = newargs[0]; for i in range(1, ...): curr |= newargs[i]`.
-    let mut curr = newargs[0];
-    for &next in &newargs[1..] {
-        curr = crate::objspace::descroperation::or_(curr, next)?;
+    // `curr = newargs[0]; for i in range(1, len(newargs)): curr |= newargs[i]`.
+    //
+    // `newargs` is a plain Rust `Vec` — `subs_parameters` released its root
+    // scope on the way out — while every `|` dispatches `__or__`/`__ror__` and
+    // allocates a fresh union.  PyPy's `newargs` is an app-level list the
+    // collector traces, so pin the members and reread both the accumulator and
+    // the next member from their slots after each step.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    for &arg in &newargs {
+        pyre_object::gc_roots::pin_root(arg);
     }
-    Ok(curr)
+    pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(base));
+    let curr_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    for i in 1..newargs.len() {
+        let next = pyre_object::gc_roots::shadow_stack_get(base + i);
+        let curr = pyre_object::gc_roots::shadow_stack_get(curr_slot);
+        let joined = crate::objspace::descroperation::or_(curr, next)?;
+        pyre_object::gc_roots::shadow_stack_set(curr_slot, joined);
+    }
+    Ok(pyre_object::gc_roots::shadow_stack_get(curr_slot))
 }
 
 /// `UnionType.__class_getitem__(items)` — `typing.Union` is bound to this
