@@ -3414,6 +3414,38 @@ impl TraceCtx {
         self.box_value(elem)
     }
 
+    /// Resolve the array-base `OpRef` (`frame.locals_cells_stack_w`) for a
+    /// NONSTANDARD virtualizable the way `opimpl_getfield_gc_r` does
+    /// (`_opimpl_getfield_gc_any_pureornot`, pyjitpl.py): forward the cached
+    /// field box on a hit, otherwise record the `GetfieldGcR` once and publish
+    /// it with `getfield_now_known`.
+    ///
+    /// Every `getarrayitem_vable` / `setarrayitem_vable` on such a frame has to
+    /// come through here, because the per-array element cache is keyed by this
+    /// base `OpRef`.  Recording a fresh base per access instead keys each store
+    /// under an `OpRef` no read ever looks up, so a store neither updates nor
+    /// invalidates the entry the reads share — a local written after the read
+    /// that seeded the cache then keeps reading its pre-store value for as long
+    /// as the base stays cached.
+    fn nonstandard_vable_array_base(&mut self, vable_opref: OpRef, fdescr: &DescrRef) -> OpRef {
+        let record_descr = self.vable_array_record_descr(fdescr);
+        let field_index = record_descr.index();
+        if let Some(cached) = self.heapcache_getfield_cached(vable_opref, field_index) {
+            self.profiler().count_ops(
+                OpCode::GetfieldGcR,
+                crate::pyjitpl::counters::HEAPCACHED_OPS,
+            );
+            return cached;
+        }
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
+        let op = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
+        self.heapcache_getfield_now_known(vable_opref, field_index, op);
+        op
+    }
+
     /// pyjitpl.py:1167-1172 `opimpl_getfield_vable_i(box, fielddescr, pc)`.
     ///
     /// ```text
@@ -4025,13 +4057,7 @@ impl TraceCtx {
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
             // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
             // return self.opimpl_getarrayitem_gc_i(arraybox, indexbox, adescr)
-            let record_descr = self.vable_array_record_descr(&fdescr);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
-            let array_opref =
-                self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
+            let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
             return (
                 self.vable_getarrayitem_int_descr(array_opref, index, adescr),
                 None,
@@ -4103,13 +4129,7 @@ impl TraceCtx {
                 index,
                 adescr.index(),
             );
-            let record_descr = self.vable_array_record_descr(&fdescr);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
-            let array_opref =
-                self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
+            let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
             let item = self.vable_getarrayitem_ref_descr(array_opref, index, adescr);
             if let Some(v) = fwd {
                 self.set_opref_concrete(item, v);
@@ -4174,13 +4194,7 @@ impl TraceCtx {
     ) -> (OpRef, Option<Value>) {
         let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
-            let record_descr = self.vable_array_record_descr(&fdescr);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
-            let array_opref =
-                self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
+            let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
             return (
                 self.vable_getarrayitem_float_descr(array_opref, index, adescr),
                 None,
@@ -4244,18 +4258,12 @@ impl TraceCtx {
     ) -> bool {
         let vable_concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, vable_concrete) {
-            let record_descr = self.vable_array_record_descr(&fdescr);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
-            let array_opref =
-                self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
+            let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
             self.profiler()
                 .count_ops(OpCode::SetarrayitemGc, crate::counters::OPS);
             self.profiler()
                 .count_ops(OpCode::SetarrayitemGc, crate::counters::RECORDED_OPS);
-            self.vable_setarrayitem_descr(array_opref, index, value, adescr);
+            self.execute_setarrayitem_gc(array_opref, index, value, adescr);
             return true;
         }
         // index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
@@ -4487,6 +4495,29 @@ impl TraceCtx {
         descr: DescrRef,
     ) {
         self.record_op_with_descr(OpCode::SetarrayitemGc, &[array_opref, index, value], descr);
+    }
+
+    /// `execute_setarrayitem_gc(arraydescr, arraybox, indexbox, itembox)`
+    /// (pyjitpl.py): record the `SETARRAYITEM_GC`, then publish the stored item
+    /// to the heapcache.  `gen_store_back_in_vable` deliberately does NOT come
+    /// through here — it records the op directly — so the raw recording form
+    /// stays available as `vable_setarrayitem_descr`.
+    ///
+    /// The heapcache write is what keeps a later read of the same slot from
+    /// forwarding the value the cache was seeded with: the element cache is the
+    /// only thing a nonstandard virtualizable's reads consult for the stored
+    /// box, so a store that skips it leaves every subsequent read answering the
+    /// pre-store value.
+    fn execute_setarrayitem_gc(
+        &mut self,
+        array_opref: OpRef,
+        index: OpRef,
+        value: OpRef,
+        descr: DescrRef,
+    ) {
+        let descr_index = descr.index();
+        self.vable_setarrayitem_descr(array_opref, index, value, descr);
+        self.heapcache_setarrayitem(array_opref, index, descr_index, value);
     }
 }
 
