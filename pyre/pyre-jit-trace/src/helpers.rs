@@ -1209,9 +1209,12 @@ pub fn emit_box_float_inline(
 /// `_opimpl_inline_call*` / `perform_call`+`setup_call` create a fresh frame
 /// per inlined call (`pyjitpl.py:2445-2476,1862-1874`); the box stays virtual
 /// on the hot path (the optimizer folds `NewWithVtable`+`SetfieldGc`) and is
-/// materialized lazily only on guard failure.  Field-complete so a forced
-/// materialization (`materialize_virtual_from_rd`) never dereferences an unset
-/// field.
+/// materialized lazily only on guard failure.  Carries every field the frame
+/// constructor assigns, so a forced materialization
+/// (`materialize_virtual_from_rd`) never dereferences a field the interpreter
+/// would have written; the class-level defaults listed at the end of the body
+/// stay at the allocation's zero-fill, exactly as they do in a frame the
+/// interpreter builds.
 pub fn emit_new_pyframe_inline_with_params(
     ctx: &mut TraceCtx,
     param_boxes: &[OpRef],
@@ -1327,6 +1330,12 @@ pub fn emit_new_pyframe_inline_with_params(
     // setfield for them; the freshly allocated payload is already zeroed
     // (zero_gc_pointers_inside, incminimark.py:960), so the fields read back
     // as PY_NULL. No explicit store here.
+    //
+    // `w_builtin` joins them: the frame constructor (pyframe.py) assigns
+    // `self.builtin` only under `honor__builtins__`, which
+    // `baseobjspace::HONOR_BUILTINS` leaves off, so the constructor writes
+    // nothing and every reader goes through `get_builtin`, which answers
+    // `space.builtin` for an unset slot.
 
     new_frame
 }
@@ -1437,6 +1446,12 @@ pub fn emit_new_pyframe_inline_self_recursive(
     // setfield for them; the freshly allocated payload is already zeroed
     // (zero_gc_pointers_inside, incminimark.py:960), so the fields read back
     // as PY_NULL. No explicit store here.
+    //
+    // `w_builtin` joins them: the frame constructor (pyframe.py) assigns
+    // `self.builtin` only under `honor__builtins__`, which
+    // `baseobjspace::HONOR_BUILTINS` leaves off, so the constructor writes
+    // nothing and every reader goes through `get_builtin`, which answers
+    // `space.builtin` for an unset slot.
 
     new_frame
 }
