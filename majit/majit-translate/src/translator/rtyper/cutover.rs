@@ -1117,6 +1117,7 @@ fn op_result_can_remove(kind: &crate::model::OpKind) -> bool {
             | OpKind::RecordQuasiImmutField { .. }
             | OpKind::NewTuple { .. }
             | OpKind::NewList { .. }
+            | OpKind::GetSlice { .. }
             | OpKind::ConstInt(_)
             | OpKind::ConstBool(_)
             | OpKind::ConstFloat(_)

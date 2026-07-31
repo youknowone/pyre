@@ -2636,6 +2636,7 @@ impl Assembler {
                 OpKind::Abort { .. } => "Abort",
                 OpKind::NewTuple { .. } => "NewTuple",
                 OpKind::NewList { .. } => "NewList",
+                OpKind::GetSlice { .. } => "GetSlice",
                 OpKind::New { .. } => "New",
                 OpKind::NewWithVtable { .. } => "NewWithVtable",
                 OpKind::LoweredBlackholeOp { .. } => "LoweredBlackholeOp",
@@ -4159,6 +4160,12 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::Abort { .. } => "abort".into(),
         OpKind::NewTuple { .. } => "newtuple".into(),
         OpKind::NewList { .. } => "newlist".into(),
+        // `getslice` never reaches the assembler in a lifted graph — the
+        // rtyper's `rtype_getslice` replaces it with a `direct_call` to the
+        // `ll_listslice_*` helper, and the gated front recognizer keeps it
+        // out of graphs that drop to the legacy walker.  The opname exists
+        // only for exhaustiveness / diagnostics.
+        OpKind::GetSlice { .. } => "getslice".into(),
         // The opname-dispatch spine lowers the rtyper helper graphs to
         // register-shaped blackhole insns, carrying the resolved opname
         // (`strlen`/`strgetitem`/`strsetitem`/`newstr`/…) verbatim.  The

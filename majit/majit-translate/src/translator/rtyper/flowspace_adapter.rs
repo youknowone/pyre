@@ -1152,6 +1152,24 @@ pub fn translate_op(
             Ok(vec![FlowspaceOp::new("newlist", hl_args, result)])
         }
 
+        // ─── `getslice` — RPython `l[start:stop]` / `space.getslice` ───
+        // `PureOperation` (`operation.py:461`).  The three operands are
+        // `(list, start, stop)`, each routed through `value_map` so the
+        // legacy SpaceOperation references the Hlvalue identities
+        // `checkgraph` tracks.  The annotator's `getslice` handler
+        // (`unaryop.py:420-423`) builds a fresh `listdef.offspring`, and the
+        // rtyper's `rtype_getslice` (`rlist.py:409-414`) lowers it to a
+        // `gendirectcall` of the per-kind `ll_listslice_*` helper.
+        OpKind::GetSlice { args } => {
+            let mut hl_args: Vec<Hlvalue> = Vec::with_capacity(args.len());
+            for (i, var) in args.iter().enumerate() {
+                let role = format!("arg{i}");
+                hl_args.push(lookup_operand(value_map, var, op, &role)?);
+            }
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new("getslice", hl_args, result)])
+        }
+
         // ─── `NewWithVtable` — boxing GC allocation (`fuse_boxing_alloc`) ───
         // The model-graph op carries the boxing struct leaf `owner` and flows
         // straight to the codewriter/assembler (`new_with_vtable`).  For the
@@ -4362,6 +4380,41 @@ mod tests {
         let lowered = &translated[0];
         assert_eq!(lowered.opname, "add", "opname passes through unchanged");
         assert_eq!(lowered.args.len(), 2);
+    }
+
+    #[test]
+    fn translate_op_getslice_lowers_to_getslice_spaceop() {
+        // GetSlice arm: the three `(list, start, stop)` operands route
+        // through lookup_operand and the result via resolve_result_hlvalue,
+        // producing a flowspace `getslice` SpaceOperation the annotator's
+        // list handler (unaryop.rs:1418) consumes.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_getslice_fixture");
+        let vars = mint_vars(&mut graph, 11); // vars[0..11]
+        for slot in [1, 2, 3, 4] {
+            value_map.insert(vars[slot].clone(), Hlvalue::Variable(Variable::new()));
+        }
+
+        let op = SpaceOperation {
+            result: Some(vars[4].clone()),
+            kind: OpKind::GetSlice {
+                args: vec![vars[1].clone(), vars[2].clone(), vars[3].clone()],
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &empty_call_registry()).expect("GetSlice arm must lower");
+        assert_eq!(
+            translated.len(),
+            1,
+            "GetSlice lowers to exactly one SpaceOp"
+        );
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "getslice", "opname is getslice");
+        assert_eq!(
+            lowered.args.len(),
+            3,
+            "getslice carries (list, start, stop)"
+        );
     }
 
     #[test]

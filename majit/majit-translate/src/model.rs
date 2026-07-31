@@ -1155,6 +1155,20 @@ pub enum OpKind {
         args: Vec<crate::flowspace::model::Variable>,
     },
 
+    /// RPython `getslice` operation (`operation.py`) — `l[start:stop]`.
+    /// The three operands are `(list, start, stop)`; the annotator's
+    /// `getslice` handler (`unaryop.py:420-423`) builds a fresh
+    /// `listdef.offspring` (a copy, not a view), and the rtyper lowers it
+    /// through `AbstractBaseListRepr.rtype_getslice`
+    /// (`rlist.py:409-414`) to a `gendirectcall` of the per-kind
+    /// `ll_listslice_{startonly,startstop,minusone}` helper — so the op
+    /// never survives to the assembler as a bare primitive.  Emitted only
+    /// by the gated slice-range front recognizer; a graph that drops to
+    /// the legacy walker keeps the residual `slice::index` call instead.
+    GetSlice {
+        args: Vec<crate::flowspace::model::Variable>,
+    },
+
     /// A pre-lowered, register-shaped blackhole opcode emitted by the
     /// opname-dispatch convergence spine (`codewriter::jtransform_opname`).
     ///

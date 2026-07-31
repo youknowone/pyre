@@ -396,6 +396,9 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         // `newlist` yields a `Ref` to the freshly allocated list object
         // (RPython `SomeList` lowers to `Ptr<GcStruct>`).
         OpKind::NewList { .. } => ValueType::Ref(None),
+        // `getslice` yields a `Ref` to the freshly copied list object
+        // (RPython `SomeList` lowers to `Ptr<GcStruct>`).
+        OpKind::GetSlice { .. } => ValueType::Ref(None),
         // `LoweredBlackholeOp` is born only in the opname-dispatch spine
         // (`jtransform_opname::lower_graph`), whose graphs re-enter the
         // shared tail at `finalize_rewritten_graph_to_jitcode` and never

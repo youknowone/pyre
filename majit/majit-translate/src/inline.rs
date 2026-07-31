@@ -837,6 +837,9 @@ pub(crate) fn remap_op_kind(
         OpKind::NewList { args } => OpKind::NewList {
             args: args.iter().map(&remap_var).collect(),
         },
+        OpKind::GetSlice { args } => OpKind::GetSlice {
+            args: args.iter().map(&remap_var).collect(),
+        },
         OpKind::LoweredBlackholeOp { opname, args } => OpKind::LoweredBlackholeOp {
             opname: opname.clone(),
             args: args.iter().map(&remap_var).collect(),
@@ -885,6 +888,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         }
         OpKind::NewTuple { args } => args.iter().map(clone_var).collect(),
         OpKind::NewList { args } => args.iter().map(clone_var).collect(),
+        OpKind::GetSlice { args } => args.iter().map(clone_var).collect(),
         OpKind::LoweredBlackholeOp { args, .. } => args.iter().map(clone_var).collect(),
         OpKind::VableForce { base } => vec![clone_var(base)],
         OpKind::Hint { value, .. } => vec![clone_var(value)],
@@ -1171,6 +1175,10 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // `newlist` is `PureOperation` — a fresh list allocation has no
         // observable effect on existing state.
         | OpKind::NewList { .. }
+        // `getslice` is a `PureOperation` (`operation.py:461`,
+        // `pure=True`) — the slice copy reads the source and allocates a
+        // fresh list, with no observable effect on existing state.
+        | OpKind::GetSlice { .. }
         // `isinstance` lowers to `int_between` over `obj.typeptr`'s
         // subclass-range fields plus an optional null branch — all
         // pure reads, classified `canfold=True` upstream
