@@ -8990,21 +8990,21 @@ fn init_union_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function("__repr__", union_repr_method),
+            make_builtin_function_with_arity("__repr__", union_repr_method, 1),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            make_builtin_function("__hash__", union_hash_method),
+            make_builtin_function_with_arity("__hash__", union_hash_method, 1),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__mro_entries__",
-            make_builtin_function("__mro_entries__", union_mro_entries_method),
+            make_builtin_function_with_arity("__mro_entries__", union_mro_entries_method, 2),
         )
     };
 }
