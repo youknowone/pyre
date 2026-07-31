@@ -7245,7 +7245,17 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     return Ok(value);
                 }
                 if let Some(descr) = w_descr {
-                    if crate::is_function(descr) {
+                    // A plain Python function is the one callable `get` leaves
+                    // unhandled; bind it here.  A builtin-code carrier is not:
+                    // a `method_descriptor` binds to a
+                    // `builtin_function_or_method` and a `BuiltinFunction`
+                    // class attribute (`class T(tuple): f = len`) stays
+                    // unbound, both of which `get` decides.
+                    if crate::is_function(descr)
+                        && !crate::is_builtin_code(
+                            crate::function_get_code(descr) as pyre_object::PyObjectRef
+                        )
+                    {
                         return Ok(pyre_object::w_method_new(descr, obj, w_type.as_ptr()));
                     }
                     match get(descr, obj, w_type.as_ptr()) {
@@ -7324,7 +7334,14 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
             // typed slots, function/code attributes, the generic type-dict
             // path) — the terminal `__getattr__` hook runs at the final miss.
         } else if let Some(method) = unsafe { lookup_in_type_where(w_type.as_ptr(), name) } {
-            if unsafe { crate::is_function(method) } {
+            // Same split as the type-dict arm above: only a plain Python
+            // function binds here, every builtin-code carrier goes to `get`.
+            if unsafe {
+                crate::is_function(method)
+                    && !crate::is_builtin_code(
+                        crate::function_get_code(method) as pyre_object::PyObjectRef
+                    )
+            } {
                 return Ok(pyre_object::w_method_new(method, obj, w_type.as_ptr()));
             }
             if let Some(result) = unsafe { get(method, obj, w_type.as_ptr())? } {
