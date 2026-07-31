@@ -20,7 +20,11 @@ def main():
     for _ in range(120):
         warm = warm + hot(3, 20000)      # a in {3,4}; a*a tiny, never overflows
     # Big scale: a ~ 5e9, a*a = 2.5e19 overflows int64 (and uint64) -> big int.
-    print(hot(5000000000, 20000))
+    # Sized so the promoting loop, not the warm-up, dominates the measurement:
+    # at 20000 the whole run was pypy exec 0.01s against a 0.01s pypy startup
+    # and a 0.08s dynasm one, so the ratio was startup noise rather than the
+    # promotion this fixture is named for.
+    print(hot(5000000000, 10000000))
     print(warm)
 
 
