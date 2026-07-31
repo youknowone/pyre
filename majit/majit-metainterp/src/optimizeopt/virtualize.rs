@@ -754,7 +754,17 @@ impl OptVirtualize {
                                     .descr
                                     .as_size_descr()
                                     .map(|sd| sd.all_fielddescrs().len())
-                                    .unwrap_or(0)
+                                    .unwrap_or(0),
+                            "Virtual field slot {} is outside its own descr's field list \
+                             (len {}, descr index {}); `set_field` just wrote past the \
+                             struct this PtrInfo describes",
+                            field_idx,
+                            vinfo
+                                .descr
+                                .as_size_descr()
+                                .map(|sd| sd.all_fielddescrs().len())
+                                .unwrap_or(0),
+                            vinfo.descr.index(),
                         );
                         Some(OptimizationResult::Remove)
                     }
@@ -766,7 +776,17 @@ impl OptVirtualize {
                                     .descr
                                     .as_size_descr()
                                     .map(|sd| sd.all_fielddescrs().len())
-                                    .unwrap_or(0)
+                                    .unwrap_or(0),
+                            "VirtualStruct field slot {} is outside its own descr's field list \
+                             (len {}, descr index {}); `set_field` just wrote past the \
+                             struct this PtrInfo describes",
+                            field_idx,
+                            vinfo
+                                .descr
+                                .as_size_descr()
+                                .map(|sd| sd.all_fielddescrs().len())
+                                .unwrap_or(0),
+                            vinfo.descr.index(),
                         );
                         Some(OptimizationResult::Remove)
                     }
