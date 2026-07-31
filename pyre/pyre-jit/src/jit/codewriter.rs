@@ -181,6 +181,30 @@ fn make_three_flow_lists(values: &[super::flow::FlowValue]) -> Vec<super::flow::
     ]
 }
 
+/// The `jdindex` operand of `jit_merge_point` / `loop_header` names a
+/// **jitdriver**, and the blackhole resolves it against one process-wide table
+/// (`blackhole.py:1079` `metainterp_sd.jitdrivers_sd[jdindex]`).  Every Python
+/// portal jitcode belongs to the single Python jitdriver — upstream's
+/// `PyPyJitDriver` (`interp_jit.py:67-78`), of which `warmspot.py` builds
+/// exactly one.
+///
+/// `CallControl.jitdrivers_sd` is pyre's portal registry: `setup_jitdriver`
+/// appends one entry per portal CodeObject, so a code's position in it is a
+/// portal id, not a jitdriver id.  Emitting that position made the second
+/// registered portal name jitdriver 1, the third jitdriver 2, and so on —
+/// indices no resume-side table has.
+///
+/// The value is 0 because the table a Python portal frame is resumed against
+/// (`call_jit.rs` `blackhole_resume_via_rd_numb`) holds exactly that one
+/// driver.  `metainterp_sd.jitdrivers_sd` numbers differently: the
+/// `ensure_default_driver_sd` placeholder occupies slot 0 there and the Python
+/// portal registers at 1 (`eval.rs`), so a blackhole fed by `bh_jitdrivers_sd`
+/// reads the placeholder.  That slot shares the portal's `result_type`
+/// (`set_result_type` broadcasts to every registered driver) but has no
+/// `portal_runner_adr`, which `portal_runner_call_args` reports instead of
+/// calling through address 0.
+const PYTHON_PORTAL_JD_INDEX: usize = 0;
+
 fn portal_jit_merge_point_graph_args(
     graph: &super::flow::FunctionGraph,
     next_instr: usize,
@@ -7800,8 +7824,7 @@ impl CodeWriter {
                         // jit_merge_point, "for inlined short preambles".
                         emit_live_placeholder!(py_pc);
                         if is_true_portal {
-                            let jdindex = portal_jd_index
-                                .expect("portal jit_merge_point requires a registered jitdriver");
+                            let jdindex = PYTHON_PORTAL_JD_INDEX;
                             let scratch_pycode_reg =
                                 ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             let pycode_var = emit_vable_getfield_ref!(
@@ -8502,8 +8525,9 @@ impl CodeWriter {
                                         code,
                                         py_pc,
                                         target_py_pc,
-                                    ) && let Some(jdindex) = portal_jd_index
+                                    ) && is_true_portal
                                     {
+                                        let jdindex = PYTHON_PORTAL_JD_INDEX;
                                         emit_loop_header(
                                             &graph,
                                             &current_block,
@@ -8985,8 +9009,9 @@ impl CodeWriter {
                                         code,
                                         py_pc,
                                         target_py_pc,
-                                    ) && let Some(jdindex) = portal_jd_index
+                                    ) && is_true_portal
                                     {
+                                        let jdindex = PYTHON_PORTAL_JD_INDEX;
                                         emit_loop_header(
                                             &graph,
                                             &current_block,
