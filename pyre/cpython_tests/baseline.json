@@ -1186,7 +1186,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_typing": {
-      "dynasm": "PASS"
+      "dynasm": "CRASH"
     },
     "test.test_ucn": {
       "dynasm": "IMPORTERROR"

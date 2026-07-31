@@ -7012,6 +7012,47 @@ fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
     }
 }
 
+/// True when this frame's exception-table entry for the exit PC expects operand
+/// slots the compiled run never wrote back.
+///
+/// `setfield_vable_i(valuestackdepth)` and `setarrayitem_vable_r` are
+/// virtualizable operations: they update the trace's own boxes, and the real
+/// `PyFrame` fields are written only where the virtualizable is forced
+/// (`virtualizable.py:282-284`). The `exit_frame_with_exception` edge forces
+/// nothing, so on this path `valuestackdepth` and the operand slots still hold
+/// what the frame carried when it entered the JIT — for a function-entry run,
+/// an empty operand stack.
+///
+/// `handle_exception` pops down to the entry's depth (`pyopcode.py:155-156`)
+/// and can never restore slots that were never written, so an entry expecting a
+/// non-empty operand stack resumes short.
+///
+/// The entry that names such a stack from *inside* compiled code is the
+/// `lasti` one: it covers a handler body, and the slots it counts are the
+/// `prev_exc`/`exc` pair `PUSH_EXC_INFO` pushed there. Reaching it means the
+/// compiled run entered the handler and then raised out of it, so those pushes
+/// only ever existed as trace boxes — its `COPY n; POP_EXCEPT; RERAISE n`
+/// cleanup then underflows. A `try`-body entry counts slots the interpreter
+/// itself pushed before the JIT took the frame over, which are still in place.
+///
+/// Such a frame propagates instead — `warmspot.py:997-1005
+/// ExitFrameWithExceptionRef` re-raises out of the portal and never offers the
+/// exception to the frame's own table, so propagation is the orthodox half of
+/// the delivery below.
+fn exit_frame_handler_needs_unwritten_stack(frame: &PyFrame) -> bool {
+    if frame.last_instr < 0 {
+        return false;
+    }
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    let pc_bytes = (frame.last_instr as u32) * 2;
+    let Some((_target, depth, lasti)) =
+        pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, pc_bytes)
+    else {
+        return false;
+    };
+    lasti && frame.valuestackdepth < frame.nlocals() + frame.ncells() + depth as usize
+}
+
 /// warmspot.py:998-1005 `ExitFrameWithExceptionRef` delivery for a compiled-run
 /// exit that surfaced outside the eval loop (the `handle_jit_outcome` /
 /// compile-once path).  Offer the pending exception to `frame`'s exception
@@ -7031,6 +7072,9 @@ fn deliver_exit_frame_exception(
     mut err: pyre_interpreter::PyError,
 ) -> PyResult {
     let mut handler_instr = frame.next_instr();
+    if exit_frame_handler_needs_unwritten_stack(frame) {
+        return Err(err);
+    }
     if pyre_interpreter::eval::handle_exception(frame, &mut err, &mut handler_instr) {
         frame.set_last_instr_from_next_instr(handler_instr);
         handle_jitexception(frame)
