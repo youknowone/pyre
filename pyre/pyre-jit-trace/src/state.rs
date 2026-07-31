@@ -493,12 +493,23 @@ pub fn intern_liveness(live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> Option<u1
             return Some((pos, asm.all_liveness.clone()));
         }
         let pos = asm.all_liveness_length;
-        let encoded_i = encode_liveness(live_i);
-        let encoded_r = encode_liveness(live_r);
-        let encoded_f = encode_liveness(live_f);
-        if live_i.len() > u8::MAX as usize
-            || live_r.len() > u8::MAX as usize
-            || live_f.len() > u8::MAX as usize
+        // `assembler.py:241` counts `len(live_i)` on the set
+        // `get_liveness_info` returns (`assembler.py:228`), so the count byte
+        // is the same cardinality `encode_liveness` packs into the bitset.
+        // Take both the counts and the bytes off the canonical form for that
+        // reason: `LivenessIterator` is driven by the count, so a raw slice
+        // length inflated by a repeated index would read more bits than this
+        // record holds, run into the next record's bytes, and desync every
+        // record after it. The sibling producers get the invariant from their
+        // argument type (`assembler.rs:1060` counts a `VecSet`); this one
+        // takes plain slices, so it establishes the set here.
+        let (len_i, len_r, len_f) = (key.0.len(), key.1.len(), key.2.len());
+        let encoded_i = encode_liveness(&key.0);
+        let encoded_r = encode_liveness(&key.1);
+        let encoded_f = encode_liveness(&key.2);
+        if len_i > u8::MAX as usize
+            || len_r > u8::MAX as usize
+            || len_f > u8::MAX as usize
             || pos > u16::MAX as usize
         {
             return None;
@@ -508,9 +519,9 @@ pub fn intern_liveness(live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> Option<u1
             .as_mut()
             .expect("derived above")
             .insert(key, pos_u16);
-        asm.all_liveness.push(live_i.len() as u8);
-        asm.all_liveness.push(live_r.len() as u8);
-        asm.all_liveness.push(live_f.len() as u8);
+        asm.all_liveness.push(len_i as u8);
+        asm.all_liveness.push(len_r as u8);
+        asm.all_liveness.push(len_f as u8);
         asm.all_liveness.extend(encoded_i);
         asm.all_liveness.extend(encoded_r);
         asm.all_liveness.extend(encoded_f);

@@ -208,4 +208,37 @@ mod tests {
             );
         });
     }
+
+    /// `assembler.py:241` writes `len(live_i)` where `live_i` is the set
+    /// `get_liveness_info` built (`assembler.py:228`), so the count byte and
+    /// the bitset always agree. `intern_liveness` takes plain slices instead
+    /// of a set, so a repeated register index is the one input that can drive
+    /// the two apart — and the count is what `LivenessIterator` trusts, so an
+    /// inflated one reads past its own record into the next one's bytes.
+    #[test]
+    fn interned_liveness_counts_the_deduped_set_not_the_raw_slice() {
+        use indexmap::IndexMap;
+        use majit_translate::liveness::decode_liveness_records;
+
+        let mut insns = IndexMap::new();
+        insns.insert("live/".to_string(), 0u8);
+        super::publish_state(&insns, &[], 0, 0);
+
+        let dup = crate::state::intern_liveness(&[1, 1, 2], &[], &[])
+            .expect("first record must fit in the shared buffer");
+        let next = crate::state::intern_liveness(&[], &[4], &[])
+            .expect("second record must fit in the shared buffer");
+        assert_eq!(dup, 0, "the first record starts the buffer");
+
+        let buffer = super::all_liveness_snapshot();
+        let records = decode_liveness_records(&buffer);
+        assert_eq!(
+            records,
+            vec![
+                (vec![1, 2], Vec::new(), Vec::new(), 0),
+                (Vec::new(), vec![4], Vec::new(), usize::from(next)),
+            ],
+            "buffer {buffer:?} did not decode back to the two interned sets"
+        );
+    }
 }
