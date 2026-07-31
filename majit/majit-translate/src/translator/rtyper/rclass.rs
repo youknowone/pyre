@@ -3501,7 +3501,24 @@ impl Repr for InstanceRepr {
         // front-end `Discriminant` niche fold's in-place null test; the
         // `option_is_none` post-pass emits this `__discriminant` FieldRead for
         // both niche and aggregate `is_some`/`is_none` receivers.
-        if attr == "__discriminant" {
+        //
+        // Gate on the receiver being a genuinely nullable instance
+        // (`SomeInstance.can_be_none`): only a niche `Option<&T>` reads its
+        // discriminant from the pointer's null-ness.  A statically non-null
+        // receiver — or one whose tag field should exist but is absent through
+        // an unpopulated `allinstancefields`, a mangled-name mismatch, or a
+        // >2-variant enum erased to a bare pointer — must fall through to the
+        // `getclsfield` path below and surface a `TyperError`, matching
+        // upstream (rclass.py:855-857 raises on a missing field), rather than
+        // fabricating a 0/1 value.
+        let receiver_is_nullable_instance = {
+            let args_s = hop.args_s.borrow();
+            matches!(
+                args_s.first(),
+                Some(SomeValue::Instance(inst)) if inst.can_be_none
+            )
+        };
+        if attr == "__discriminant" && receiver_is_nullable_instance {
             use crate::translator::rtyper::rtyper::GenopResult;
             let v_nonzero = hop
                 .genop(

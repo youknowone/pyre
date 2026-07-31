@@ -906,7 +906,10 @@ impl LLFrame {
                     }
                     _ => MallocFlavor::Gc,
                 };
-                let n = vals[2].as_i64(opname)? as usize;
+                let n_signed = vals[2].as_i64(opname)?;
+                let n = usize::try_from(n_signed).map_err(|_| TaskError {
+                    message: format!("{opname}: negative varsize length {n_signed}"),
+                })?;
                 let ptr = malloc((**t).clone(), Some(n), flavor, false).map_err(|e| TaskError {
                     message: format!("{opname}: {e}"),
                 })?;
@@ -1330,7 +1333,10 @@ mod tests {
         // / `op_cast_uint_to_int` folds (opimpl.py, `r_uint` templates +
         // :465-467), chained straight-line so one eval_graph run exercises
         // all four: 12345 //u 10 = 1234; 1234 %u 10 = 4; intmask(4) = 4;
-        // is_true(4) = True; cast_bool_to_int(True) = 1.
+        // is_true(4) = True; cast_bool_to_int(True) = 1. The result folds the
+        // `cast_uint_to_int` value `s` back in (`int_add(s, c) = 4 + 1 = 5`)
+        // so a broken `uint_floordiv`/`uint_mod` — which `uint_is_true` alone
+        // would collapse to 1 for any nonzero result — changes the return.
         use crate::flowspace::model::Constant as FlowConstant;
         let ten = || Hlvalue::Constant(FlowConstant::new(ConstValue::Int(10)));
 
@@ -1346,6 +1352,8 @@ mod tests {
         t.set_concretetype(Some(LowLevelType::Bool));
         let c = Variable::named("c");
         c.set_concretetype(Some(LowLevelType::Signed));
+        let d = Variable::named("d");
+        d.set_concretetype(Some(LowLevelType::Signed));
 
         let start = Block::shared(vec![x.clone().into()]);
         start.borrow_mut().operations.push(SpaceOperation::new(
@@ -1365,13 +1373,18 @@ mod tests {
         ));
         start.borrow_mut().operations.push(SpaceOperation::new(
             "uint_is_true",
-            vec![s.into()],
+            vec![s.clone().into()],
             t.clone().into(),
         ));
         start.borrow_mut().operations.push(SpaceOperation::new(
             "cast_bool_to_int",
             vec![t.into()],
             c.clone().into(),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "int_add",
+            vec![s.into(), c.clone().into()],
+            d.clone().into(),
         ));
 
         let retvar = Hlvalue::Variable(Variable::named("ret"));
@@ -1385,7 +1398,7 @@ mod tests {
         )));
         let returnblock = graph.borrow().returnblock.clone();
         start.closeblock(vec![
-            Link::new(vec![c.into()], Some(returnblock), None).into_ref(),
+            Link::new(vec![d.into()], Some(returnblock), None).into_ref(),
         ]);
 
         let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
@@ -1396,7 +1409,8 @@ mod tests {
                 false,
             )
             .expect("uint fold chain should run");
-        assert_eq!(*out.downcast::<i64>().expect("Signed return"), 1);
+        // 4 (cast_uint_to_int of 1234 %u 10) + 1 (cast_bool_to_int of is_true) = 5.
+        assert_eq!(*out.downcast::<i64>().expect("Signed return"), 5);
     }
 
     #[test]
