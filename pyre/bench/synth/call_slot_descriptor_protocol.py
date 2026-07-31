@@ -46,4 +46,40 @@ class UsesFunc:
 
 assert UsesFunc()(4) == ("self", "UsesFunc", 4)
 
+
+# The keyword-call path must honour the same protocol as the positional one.
+class CalleeKw:
+    def __call__(self, *a, **k):
+        return (a, k)
+
+
+class UsesInstanceKw:
+    __call__ = CalleeKw()
+
+
+assert UsesInstanceKw()(1, x=2) == ((1,), {"x": 2})
+
+
+class HolderKw:
+    def m(self, a, b=0):
+        return ("m", a, b)
+
+
+_hk = HolderKw()
+
+
+class UsesBoundKw:
+    __call__ = _hk.m
+
+
+assert UsesBoundKw()(1, b=2) == ("m", 1, 2)
+
+
+class UsesFuncKw:
+    def __call__(self, a, b=0):
+        return (type(self).__name__, a, b)
+
+
+assert UsesFuncKw()(1, b=2) == ("UsesFuncKw", 1, 2)
+
 print("OK")

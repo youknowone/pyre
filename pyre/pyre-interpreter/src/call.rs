@@ -1261,6 +1261,36 @@ fn user_call_slot(callable: PyObjectRef) -> Result<Option<PyObjectRef>, PyError>
     Ok(Some(call_fn))
 }
 
+/// Resolve a `__call__` slot descriptor to the object to actually call and
+/// whether `callable` must be prepended as an implicit self.
+///
+/// descroperation.py `get_and_call_args` / `get_and_call_function`: only a
+/// plain function or method descriptor binds `callable` as self.  Every other
+/// `__call__` descriptor is resolved through `__get__` (a non-binding builtin
+/// lacks it and is used as-is) and then called WITHOUT a prepended self — "a
+/// builtin function binds differently than a normal function".
+fn resolve_user_call_slot(
+    callable: PyObjectRef,
+    call_fn: PyObjectRef,
+) -> Result<(PyObjectRef, bool), PyError> {
+    let binds_self = unsafe {
+        std::ptr::eq((*call_fn).ob_type, &crate::FUNCTION_TYPE as *const _)
+            || std::ptr::eq(
+                (*call_fn).ob_type,
+                &crate::METHOD_DESCRIPTOR_TYPE as *const _,
+            )
+    };
+    if binds_self {
+        return Ok((call_fn, true));
+    }
+    let w_impl = match crate::typedef::r#type(callable) {
+        Some(w_type) => unsafe { crate::baseobjspace::get(call_fn, callable, w_type.as_ptr()) }?
+            .unwrap_or(call_fn),
+        None => call_fn,
+    };
+    Ok((w_impl, false))
+}
+
 fn call_callable_with_mode(
     frame: &mut PyFrame,
     callable: PyObjectRef,
@@ -1307,32 +1337,13 @@ fn call_callable_with_mode(
     // classmethod object falls through to the not-callable error.
 
     if let Some(call_fn) = user_call_slot(callable)? {
-        // descroperation.py `get_and_call_args` / `get_and_call_function`: only a
-        // plain function or method descriptor binds `callable` as an implicit
-        // self.  Any other `__call__` descriptor is resolved through `__get__`
-        // (a non-binding builtin lacks it and is used as-is) and then called
-        // WITHOUT a prepended self — "a builtin function binds differently than
-        // a normal function".
-        let binds_self = unsafe {
-            std::ptr::eq((*call_fn).ob_type, &crate::FUNCTION_TYPE as *const _)
-                || std::ptr::eq(
-                    (*call_fn).ob_type,
-                    &crate::METHOD_DESCRIPTOR_TYPE as *const _,
-                )
-        };
-        if binds_self {
+        let (target, prepend) = resolve_user_call_slot(callable, call_fn)?;
+        if prepend {
             let mut call_args = Vec::with_capacity(1 + args.len());
             call_args.push(callable);
             call_args.extend_from_slice(args);
-            return call_callable_with_mode(frame, call_fn, &call_args, mode);
+            return call_callable_with_mode(frame, target, &call_args, mode);
         }
-        let w_impl = match crate::typedef::r#type(callable) {
-            Some(w_type) => {
-                unsafe { crate::baseobjspace::get(call_fn, callable, w_type.as_ptr()) }?
-                    .unwrap_or(call_fn)
-            }
-            None => call_fn,
-        };
         // `user_call_slot`'s stack_check bounds a self-referential
         // `A.__call__ = A()` chain only while this self-dispatch recurses
         // natively.  Left in tail position it is a candidate for LLVM's
@@ -1342,7 +1353,7 @@ fn call_callable_with_mode(
         // keeps the call off the tail so the stack grows and the check fires.
         // (The RPython C backend does not perform this optimization, so there
         // is no matching guard upstream.)
-        let result = call_callable_with_mode(frame, w_impl, args, mode);
+        let result = call_callable_with_mode(frame, target, args, mode);
         return std::hint::black_box(result);
     }
 
@@ -2575,10 +2586,18 @@ pub fn call_with_kwargs(
     }
 
     if let Some(call_fn) = user_call_slot(callable)? {
-        let mut call_args = Vec::with_capacity(1 + pos_args.len());
-        call_args.push(callable);
-        call_args.extend_from_slice(pos_args);
-        return call_with_kwargs(frame, call_fn, &call_args, kwargs);
+        let (target, prepend) = resolve_user_call_slot(callable, call_fn)?;
+        if prepend {
+            let mut call_args = Vec::with_capacity(1 + pos_args.len());
+            call_args.push(callable);
+            call_args.extend_from_slice(pos_args);
+            return call_with_kwargs(frame, target, &call_args, kwargs);
+        }
+        // black_box: keep this self-dispatch off the tail so a self-referential
+        // `A.__call__ = A()` recurses natively for stack_check (see
+        // call_callable_with_mode).
+        let result = call_with_kwargs(frame, target, pos_args, kwargs);
+        return std::hint::black_box(result);
     }
 
     // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
@@ -2768,10 +2787,18 @@ pub fn call_function_impl_result(
             return Ok(result);
         }
         if let Some(call_fn) = user_call_slot(callable)? {
-            let mut call_args = Vec::with_capacity(1 + args.len());
-            call_args.push(callable);
-            call_args.extend_from_slice(args);
-            return call_function_impl_result(call_fn, &call_args);
+            let (target, prepend) = resolve_user_call_slot(callable, call_fn)?;
+            if prepend {
+                let mut call_args = Vec::with_capacity(1 + args.len());
+                call_args.push(callable);
+                call_args.extend_from_slice(args);
+                return call_function_impl_result(target, &call_args);
+            }
+            // black_box: keep this self-dispatch off the tail so a
+            // self-referential `A.__call__ = A()` recurses natively for
+            // stack_check (see call_callable_with_mode).
+            let result = call_function_impl_result(target, args);
+            return std::hint::black_box(result);
         }
     }
     let type_name = crate::typedef::r#type(callable)
