@@ -1,20 +1,20 @@
 class identity_dict(object):
     """A mapping keyed by object identity rather than equality.
 
-    Stores entries in an internal dict keyed on ``id(key)`` so that
-    unhashable objects (lists, dicts, sets) work as keys.  The value
-    side is expected to keep the key object alive for the dict's
-    lifetime, so ``id(key)`` stays valid.
+    Stores the key alongside each value so unhashable objects (lists,
+    dicts, sets) work as keys and the key's identity remains valid for
+    the lifetime of the entry.  This mirrors PyPy's interp-level
+    ``W_IdentityDict.dict``.
     """
 
     def __init__(self):
         self._d = {}
 
     def __getitem__(self, key):
-        return self._d[id(key)]
+        return self._d[id(key)][1]
 
     def __setitem__(self, key, value):
-        self._d[id(key)] = value
+        self._d[id(key)] = (key, value)
 
     def __delitem__(self, key):
         del self._d[id(key)]
@@ -23,10 +23,21 @@ class identity_dict(object):
         return id(key) in self._d
 
     def get(self, key, default=None):
-        return self._d.get(id(key), default)
+        entry = self._d.get(id(key))
+        return default if entry is None else entry[1]
 
     def __len__(self):
         return len(self._d)
 
     def clear(self):
         self._d.clear()
+
+    def keys(self):
+        return [key for key, _ in self._d.values()]
+
+    def values(self):
+        return [value for _, value in self._d.values()]
+
+    def __iter__(self):
+        raise TypeError("'identity_dict' object does not support iteration; "
+                        "iterate over x.keys()")

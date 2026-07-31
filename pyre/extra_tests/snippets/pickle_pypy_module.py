@@ -6,6 +6,14 @@ d[a] = ("idx_a", a)
 assert a in d and b not in d     # identity, not equality
 assert d.get(a)[0] == "idx_a"
 assert len(d) == 1
+assert d.keys() == [a]
+assert d.values() == [("idx_a", a)]
+try:
+    iter(d)
+except TypeError:
+    pass
+else:
+    raise AssertionError("identity_dict must not be directly iterable")
 bb = BytesBuilder(); bb.append(b"ab"); bb.append(b"cd")
 assert bb.build() == b"abcd" and len(bb) == 4
 
