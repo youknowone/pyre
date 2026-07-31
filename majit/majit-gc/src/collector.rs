@@ -893,7 +893,9 @@ impl MiniMarkGC {
             self.do_collect_full();
         }
 
-        let total_size = GcHeader::SIZE + payload_size;
+        let Some(total_size) = GcHeader::SIZE.checked_add(payload_size) else {
+            return GcRef(0);
+        };
 
         // Large objects go directly to old gen.
         if total_size > self.config.large_object_threshold {
@@ -978,7 +980,9 @@ impl MiniMarkGC {
             self.roots.remove(root);
         }
 
-        let total_size = GcHeader::SIZE + payload_size;
+        let Some(total_size) = GcHeader::SIZE.checked_add(payload_size) else {
+            return GcRef(0);
+        };
 
         // Large objects never trigger a nursery collection, so the native
         // slot needs no temporary registration.
@@ -1042,6 +1046,19 @@ impl MiniMarkGC {
             .unwrap_or(usize::MAX)
     }
 
+    /// `incminimark.py:978-983 external_malloc` parity: both the variable
+    /// portion and the final payload sum are overflow-checked.  The caller
+    /// turns `None` into NULL so compiled code raises `MemoryError`.
+    fn checked_varsize_payload_size(
+        base_size: usize,
+        item_size: usize,
+        length: usize,
+    ) -> Option<usize> {
+        item_size
+            .checked_mul(length)
+            .and_then(|var_size| base_size.checked_add(var_size))
+    }
+
     fn reserve_nursery_gap(&mut self, total_size: usize) -> *mut u8 {
         if self.pinned_objects.is_empty() {
             return std::ptr::null_mut();
@@ -1094,7 +1111,9 @@ impl MiniMarkGC {
     /// old-gen allocation so compiled code can keep running without needing
     /// stack-map-mediated collection.
     pub fn alloc_with_type_no_collect(&mut self, type_id: u32, payload_size: usize) -> GcRef {
-        let total_size = GcHeader::SIZE + payload_size;
+        let Some(total_size) = GcHeader::SIZE.checked_add(payload_size) else {
+            return GcRef(0);
+        };
 
         if total_size > self.config.large_object_threshold {
             return self.alloc_in_oldgen(type_id, total_size);
@@ -4144,7 +4163,10 @@ impl GcAllocator for MiniMarkGC {
     }
 
     fn alloc_varsize(&mut self, base_size: usize, item_size: usize, length: usize) -> GcRef {
-        let payload_size = base_size + item_size * length;
+        let Some(payload_size) = Self::checked_varsize_payload_size(base_size, item_size, length)
+        else {
+            return GcRef(0);
+        };
         self.alloc_with_type(0, payload_size)
     }
 
@@ -4155,7 +4177,10 @@ impl GcAllocator for MiniMarkGC {
         item_size: usize,
         length: usize,
     ) -> GcRef {
-        let payload_size = base_size + item_size * length;
+        let Some(payload_size) = Self::checked_varsize_payload_size(base_size, item_size, length)
+        else {
+            return GcRef(0);
+        };
         self.alloc_with_type(type_id, payload_size)
     }
 
@@ -4165,12 +4190,17 @@ impl GcAllocator for MiniMarkGC {
         item_size: usize,
         length: usize,
     ) -> GcRef {
-        let payload_size = base_size + item_size * length;
+        let Some(payload_size) = Self::checked_varsize_payload_size(base_size, item_size, length)
+        else {
+            return GcRef(0);
+        };
         self.alloc_with_type_no_collect(0, payload_size)
     }
 
     fn alloc_oldgen_typed(&mut self, type_id: u32, size: usize) -> GcRef {
-        let total_size = GcHeader::SIZE + size;
+        let Some(total_size) = GcHeader::SIZE.checked_add(size) else {
+            return GcRef(0);
+        };
         self.alloc_in_oldgen(type_id, total_size)
     }
 
@@ -5661,6 +5691,24 @@ mod tests {
 
         gc.collect_nursery();
         gc.collect_full();
+    }
+
+    #[test]
+    fn varsize_allocation_overflow_returns_null() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+
+        // incminimark.py external_malloc turns either multiplication or
+        // addition overflow into MemoryError; the JIT allocator reports that
+        // condition as NULL to its CHECK_MEMORY_ERROR caller.
+        assert!(gc.alloc_varsize(0, 2, usize::MAX).is_null());
+        assert!(gc.alloc_varsize_typed(tid, usize::MAX, 1, 1).is_null());
+        assert!(gc.alloc_varsize_no_collect(0, usize::MAX, 2).is_null());
+
+        // Include the GC header in the same checked-size contract.
+        assert!(gc.alloc_nursery(usize::MAX).is_null());
+        assert!(gc.alloc_nursery_no_collect(usize::MAX).is_null());
+        assert!(gc.alloc_oldgen_typed(tid, usize::MAX).is_null());
     }
 
     /// llsupport/gc.py:563 GcLLDescr_framework
