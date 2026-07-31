@@ -2,7 +2,7 @@
 
 These mirror the objects in Objects/typevarobject.c: TypeVar, ParamSpec,
 TypeVarTuple, ParamSpecArgs/Kwargs, TypeAliasType, Generic, plus the
-NoDefault sentinel and the _idfunc helper.  The heavy substitution and
+NoDefault sentinel.  The heavy substitution and
 class-getitem logic lives in typing.py; these objects delegate to its
 module-level helpers (_typevar_subst, _paramspec_subst, _generic_class_getitem,
 ...), exactly as the C objects call back into the typing module.
@@ -10,10 +10,6 @@ module-level helpers (_typevar_subst, _paramspec_subst, _generic_class_getitem,
 
 import sys
 from types import GenericAlias, UnionType as Union
-
-
-def _idfunc(*args, **kwargs):
-    return args[0]
 
 
 def _caller_module():

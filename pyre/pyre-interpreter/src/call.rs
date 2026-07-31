@@ -1307,10 +1307,28 @@ fn call_callable_with_mode(
     // classmethod object falls through to the not-callable error.
 
     if let Some(call_fn) = user_call_slot(callable)? {
-        let mut call_args = Vec::with_capacity(1 + args.len());
-        call_args.push(callable);
-        call_args.extend_from_slice(args);
-        return call_callable_with_mode(frame, call_fn, &call_args, mode);
+        // descroperation.py `get_and_call_args` / `get_and_call_function`: only a
+        // plain function or method descriptor binds `callable` as an implicit
+        // self.  Any other `__call__` descriptor is resolved through `__get__`
+        // (a non-binding builtin lacks it and is used as-is) and then called
+        // WITHOUT a prepended self — "a builtin function binds differently than
+        // a normal function".
+        let binds_self = unsafe {
+            std::ptr::eq((*call_fn).ob_type, &crate::FUNCTION_TYPE as *const _)
+                || std::ptr::eq((*call_fn).ob_type, &crate::METHOD_DESCRIPTOR_TYPE as *const _)
+        };
+        if binds_self {
+            let mut call_args = Vec::with_capacity(1 + args.len());
+            call_args.push(callable);
+            call_args.extend_from_slice(args);
+            return call_callable_with_mode(frame, call_fn, &call_args, mode);
+        }
+        let Some(w_type) = crate::typedef::r#type(callable) else {
+            return call_callable_with_mode(frame, call_fn, args, mode);
+        };
+        let w_impl = unsafe { crate::baseobjspace::get(call_fn, callable, w_type.as_ptr()) }?
+            .unwrap_or(call_fn);
+        return call_callable_with_mode(frame, w_impl, args, mode);
     }
 
     // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
