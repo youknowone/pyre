@@ -13813,16 +13813,21 @@ fn fileio_method_readinto(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if let Some(fd) = file_get_fd(self_obj) {
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
-            match fd_read_into(fd, target) {
-                Ok(n) => return Ok(w_int_new(n as i64)),
-                Err(err)
-                    if err.raw_os_error().is_some_and(|errno| {
-                        errno == libc::EAGAIN || errno == libc::EWOULDBLOCK
-                    }) =>
-                {
-                    return Ok(w_none());
+            // interp_fileio.py:400-408 `direct_read`: the raw read sits in the
+            // `eintr_retry` loop, so an interrupted read runs the signal
+            // handlers and is re-issued instead of surfacing.
+            loop {
+                match fd_read_into(fd, target) {
+                    Ok(n) => return Ok(w_int_new(n as i64)),
+                    Err(err)
+                        if err.raw_os_error().is_some_and(|errno| {
+                            errno == libc::EAGAIN || errno == libc::EWOULDBLOCK
+                        }) =>
+                    {
+                        return Ok(w_none());
+                    }
+                    Err(err) => eintr_retry(err)?,
                 }
-                Err(err) => return Err(fd_io_err(err)),
             }
         }
         #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
@@ -14020,25 +14025,55 @@ fn fd_read_into(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
         return Ok(n);
     }
     #[cfg(not(feature = "sandbox"))]
-    loop {
+    {
         // `count` is `size_t` on Unix but `c_uint` on Windows; `as _` casts
         // to whichever the platform's `libc::read` expects.
         let (n, errno) = crate::module::thread::call_external_function(|| unsafe {
             libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as _)
         });
         if n < 0 {
-            if errno == libc::EINTR {
-                continue;
-            }
+            // `EINTR` travels to the caller, the way `os.read`'s `OSError`
+            // does: only the caller can run the pending signal handlers
+            // before re-issuing the call ([`eintr_retry`]).
             return Err(std::io::Error::from_raw_os_error(errno));
         }
-        return Ok(n as usize);
+        Ok(n as usize)
     }
+}
+
+/// `error.py:805-808` — the `EINTR` arm of `wrap_oserror2(..., eintr_retry=True)`.
+///
+/// An interrupted syscall is not a failure the caller reports.  Upstream runs
+/// the pending Python signal handlers (`space.getexecutioncontext()
+/// .checksignals()`) and, when none of them raised, hands the caller `None` so
+/// it re-issues the call; `Ok(())` here is that `None`.
+///
+/// Retrying without the handler run is what hangs a read whose remaining bytes
+/// the handler itself is supposed to write — `signal.alarm(1)` firing into a
+/// blocked `read(6)` never gets its `os.write` executed, so the read waits
+/// forever for bytes no one will send.
+/// `wrap` stands in for upstream's `w_exception_class` / `w_filename`
+/// arguments: the OSError each call site would have raised for a non-`EINTR`
+/// errno.
+pub(crate) fn eintr_retry_with(
+    e: std::io::Error,
+    wrap: impl FnOnce(std::io::Error) -> crate::PyError,
+) -> Result<(), crate::PyError> {
+    if io_error_posix_errno(&e, 0) != libc::EINTR {
+        return Err(wrap(e));
+    }
+    crate::module::signal::interp_signal::checksignals_now()
+}
+
+/// [`eintr_retry_with`] over the fd helpers' own [`fd_io_err`].
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+fn eintr_retry(e: std::io::Error) -> Result<(), crate::PyError> {
+    eintr_retry_with(e, fd_io_err)
 }
 
 /// Read up to `n` bytes (or until EOF when `n` is `None`) from `fd`.
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
-fn fd_read(fd: i32, n: Option<usize>) -> std::io::Result<Vec<u8>> {
+fn fd_read(fd: i32, n: Option<usize>) -> Result<Vec<u8>, crate::PyError> {
     let mut out = Vec::new();
     let mut buf = [0u8; 65536];
     loop {
@@ -14051,7 +14086,13 @@ fn fd_read(fd: i32, n: Option<usize>) -> std::io::Result<Vec<u8>> {
             }
             None => buf.len(),
         };
-        let got = fd_read_into(fd, &mut buf[..want])?;
+        let got = match fd_read_into(fd, &mut buf[..want]) {
+            Ok(got) => got,
+            Err(err) => {
+                eintr_retry(err)?;
+                continue;
+            }
+        };
         if got == 0 {
             break;
         }
@@ -14093,7 +14134,7 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         };
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
-            let data = fd_read(fd, n).map_err(fd_io_err)?;
+            let data = fd_read(fd, n)?;
             return fd_bytes_to_obj(args[0], data);
         }
         #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
@@ -14151,7 +14192,13 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 if max == Some(out.len()) {
                     break;
                 }
-                let got = fd_read_into(fd, &mut byte).map_err(fd_io_err)?;
+                let got = match fd_read_into(fd, &mut byte) {
+                    Ok(got) => got,
+                    Err(err) => {
+                        eintr_retry(err)?;
+                        continue;
+                    }
+                };
                 if got == 0 {
                     break;
                 }

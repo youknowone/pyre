@@ -1337,14 +1337,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 #[cfg(not(feature = "sandbox"))]
                 let buf = {
                     let mut buf = vec![0u8; n];
-                    let (ret, errno) = crate::module::thread::call_external_function(|| unsafe {
-                        libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, n as _)
-                    });
-                    if ret < 0 {
-                        return Err(io_err(std::io::Error::from_raw_os_error(errno), ""));
+                    // interp_posix.py:364-372 `read`: the syscall sits inside
+                    // the `eintr_retry=True` loop, so an interrupted read runs
+                    // the pending signal handlers and is re-issued rather than
+                    // surfacing as `InterruptedError`.  The blocking guard is
+                    // scoped to the syscall alone: `checksignals` runs Python.
+                    loop {
+                        let (ret, errno) =
+                            crate::module::thread::call_external_function(|| unsafe {
+                                libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, n as _)
+                            });
+                        if ret >= 0 {
+                            buf.truncate(ret as usize);
+                            break buf;
+                        }
+                        crate::builtins::eintr_retry_with(
+                            std::io::Error::from_raw_os_error(errno),
+                            |e| io_err(e, ""),
+                        )?;
                     }
-                    buf.truncate(ret as usize);
-                    buf
                 };
                 #[cfg(feature = "sandbox")]
                 let buf = crate::host_seam::ops::read(fd, n as i64)
@@ -1371,27 +1382,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let mut buffer = unsafe { crate::builtins::WritableBuffer::acquire(args[1]) }?;
                 let target = unsafe { buffer.as_mut_slice() };
                 #[cfg(not(feature = "sandbox"))]
-                let result = {
-                    let _blocked = crate::module::thread::before_external_block();
-                    loop {
-                        let result = unsafe {
+                let result = loop {
+                    let result = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        unsafe {
                             libc::read(
                                 fd,
                                 target.as_mut_ptr() as *mut libc::c_void,
                                 target.len() as _,
                             )
-                        };
-                        if result >= 0 {
-                            break Ok(result as i64);
                         }
-                        let error = std::io::Error::last_os_error();
-                        if error.raw_os_error() != Some(libc::EINTR) {
-                            break Err(error);
-                        }
+                    };
+                    if result >= 0 {
+                        break result as i64;
                     }
+                    // The retry used to skip the handlers, so an interrupted
+                    // read never let the handler that supplies the remaining
+                    // bytes run.  Guard dropped first: `checksignals` runs
+                    // Python.
+                    crate::builtins::eintr_retry_with(std::io::Error::last_os_error(), |e| {
+                        io_err(e, "")
+                    })?;
                 };
-                #[cfg(not(feature = "sandbox"))]
-                let result = result.map_err(|error| io_err(error, ""))?;
                 #[cfg(feature = "sandbox")]
                 let result = {
                     let data = crate::host_seam::ops::read(fd, target.len() as i64)
