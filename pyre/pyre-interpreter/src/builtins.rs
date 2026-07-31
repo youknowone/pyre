@@ -287,6 +287,20 @@ unsafe fn w_memoryview_cast_nd(
     }
 }
 
+/// PyPy `interp_buffer.newmemoryview`'s `FormatBufferViewND`: retain the
+/// source export while replacing only the public format/itemsize and geometry.
+/// Unlike `memoryview.cast`, the format may be a structured (non-native)
+/// string, so this helper intentionally skips cast's format validation.
+pub(crate) unsafe fn w_memoryview_new_formatted_nd(
+    mv_src: PyObjectRef,
+    fmt: &str,
+    itemsize: i64,
+    shape: &[i64],
+    strides: &[i64],
+) -> PyObjectRef {
+    unsafe { w_memoryview_cast_nd(mv_src, fmt, itemsize, shape, strides) }
+}
+
 /// Build the live view returned by selecting one or more leading integer
 /// axes from an N-D memoryview (`memoryobject.py:1093-1110`).  The selected
 /// axes contribute to the byte offset; the remaining shape/stride tuples are

@@ -8,6 +8,169 @@ use pyre_object::PyObjectRef;
 
 use crate::PyError;
 
+/// `interp_buffer.newmemoryview` — construct a formatted N-D view over an
+/// existing memoryview.  This is an internal PyPy helper, not the public
+/// `memoryview.cast`: structured format strings are accepted verbatim.
+pub(crate) fn newmemoryview(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if positional.len() > 5 {
+        return Err(PyError::type_error(format!(
+            "newmemoryview() takes at most 5 arguments ({} given)",
+            positional.len()
+        )));
+    }
+    let kw = |name: &str| -> Option<PyObjectRef> {
+        kwargs.and_then(|dict| unsafe { pyre_object::w_dict_getitem_str(dict, name) })
+    };
+    let arg = |index: usize, name: &str| -> Result<Option<PyObjectRef>, PyError> {
+        if let Some(&value) = positional.get(index) {
+            if kw(name).is_some() {
+                return Err(PyError::type_error(format!(
+                    "newmemoryview() got multiple values for argument '{name}'"
+                )));
+            }
+            return Ok(Some(value));
+        }
+        Ok(kw(name))
+    };
+    if let Some(dict) = kwargs {
+        for (key, _) in unsafe { pyre_object::w_dict_items(dict) } {
+            let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(key) }) else {
+                continue;
+            };
+            if name == "__pyre_kw__" {
+                continue;
+            }
+            if !matches!(name, "buf" | "itemsize" | "format" | "shape" | "strides") {
+                return Err(PyError::type_error(format!(
+                    "newmemoryview() got an unexpected keyword argument '{name}'"
+                )));
+            }
+        }
+    }
+    let w_obj = arg(0, "buf")?
+        .ok_or_else(|| PyError::type_error("newmemoryview() missing required argument 'buf'"))?;
+    let itemsize_obj = arg(1, "itemsize")?.ok_or_else(|| {
+        PyError::type_error("newmemoryview() missing required argument 'itemsize'")
+    })?;
+    let fmt_obj = arg(2, "format")?
+        .ok_or_else(|| PyError::type_error("newmemoryview() missing required argument 'format'"))?;
+    let shape_obj = arg(3, "shape")?.unwrap_or_else(pyre_object::w_none);
+    let strides_obj = arg(4, "strides")?.unwrap_or_else(pyre_object::w_none);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    for value in [w_obj, itemsize_obj, fmt_obj, shape_obj, strides_obj] {
+        pyre_object::gc_roots::pin_root(value);
+    }
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(sp);
+    if !unsafe { pyre_object::memoryview::is_w_memoryview(w_obj) } {
+        return Err(PyError::value_error("memoryview expected"));
+    }
+    unsafe { crate::builtins::memoryview_check_released(w_obj)? };
+    let itemsize = crate::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(sp + 1))?;
+    let fmt_obj = pyre_object::gc_roots::shadow_stack_get(sp + 2);
+    if !unsafe { pyre_object::is_str(fmt_obj) } {
+        return Err(PyError::type_error("format must be a string"));
+    }
+    let fmt = unsafe { pyre_object::w_str_get_wtf8(fmt_obj) }.to_string();
+    let shape_obj = pyre_object::gc_roots::shadow_stack_get(sp + 3);
+    let shape = if !unsafe { pyre_object::is_none(shape_obj) } {
+        dimensions(shape_obj)?
+    } else {
+        Vec::new()
+    };
+    let strides_obj = pyre_object::gc_roots::shadow_stack_get(sp + 4);
+    let strides = if !unsafe { pyre_object::is_none(strides_obj) } {
+        dimensions(strides_obj)?
+    } else {
+        Vec::new()
+    };
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(sp);
+    let nbytes = unsafe { pyre_object::memoryview::w_memoryview_length(w_obj) };
+    let shape = if shape.is_empty() {
+        if itemsize == 0 {
+            return Err(PyError::value_error("cannot guess shape when itemsize==0"));
+        }
+        if nbytes % itemsize != 0 {
+            return Err(PyError::value_error(format!(
+                "itemsize {itemsize} does not match buffer size {nbytes}"
+            )));
+        }
+        vec![nbytes / itemsize]
+    } else {
+        shape
+    };
+    if shape.len() > 64 {
+        return Err(PyError::value_error(
+            "number of dimensions must not exceed 64",
+        ));
+    }
+    let has_strides = !strides.is_empty();
+    let strides = if !has_strides {
+        let mut result = vec![itemsize; shape.len()];
+        for i in (0..shape.len().saturating_sub(1)).rev() {
+            result[i] = result[i + 1].saturating_mul(shape[i + 1]);
+        }
+        result
+    } else {
+        if strides.len() != shape.len() {
+            return Err(PyError::value_error(
+                "shape and strides must have the same length",
+            ));
+        }
+        strides
+    };
+    if has_strides {
+        // PyPy's `FormatBufferViewND` validates the covered byte extent from
+        // strides (a strided view may expose fewer elements than its source).
+        let mut span = 1i64;
+        for i in (0..shape.len()).rev() {
+            if span != 0 && strides[i] % span != 0 {
+                return Err(PyError::value_error("strides do not match shape"));
+            }
+            let step = if span == 0 { 0 } else { strides[i] / span };
+            span = span
+                .checked_mul(shape[i])
+                .and_then(|v| v.checked_mul(step))
+                .ok_or_else(|| PyError::value_error("shape exceeds buffer size"))?;
+        }
+        if span != nbytes {
+            return Err(PyError::value_error(
+                "shape and strides do not match buffer size",
+            ));
+        }
+    } else {
+        let mut product = 1i64;
+        for &dim in &shape {
+            product = product
+                .checked_mul(dim)
+                .ok_or_else(|| PyError::value_error("shape exceeds buffer size"))?;
+        }
+        if product.saturating_mul(itemsize) != nbytes {
+            return Err(PyError::value_error(
+                "shape/itemsize does not match buffer size",
+            ));
+        }
+    }
+    if nbytes > 0 {
+        for (&stride, &dim) in strides.iter().zip(&shape) {
+            if stride.saturating_mul(dim) > nbytes {
+                return Err(PyError::value_error("shape and strides exceed object size"));
+            }
+        }
+    }
+    Ok(unsafe {
+        crate::builtins::w_memoryview_new_formatted_nd(w_obj, &fmt, itemsize, &shape, &strides)
+    })
+}
+
+fn dimensions(obj: PyObjectRef) -> Result<Vec<i64>, PyError> {
+    crate::baseobjspace::unpackiterable(obj, -1)?
+        .into_iter()
+        .map(crate::baseobjspace::int_w)
+        .collect()
+}
+
 #[crate::pyre_class("__pypy__.PickleBuffer")]
 pub struct W_PickleBuffer {
     /// The wrapped buffer-supporting object, or `None` after `release()`.
@@ -301,6 +464,69 @@ pub(crate) fn is_contiguous(obj: PyObjectRef) -> Result<bool, PyError> {
         return crate::baseobjspace::is_true(w);
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::newmemoryview;
+
+    #[test]
+    fn formatted_memoryview_keeps_shape_strides_and_format() {
+        crate::typedef::init_typeobjects();
+        let source = pyre_object::w_bytearray_new(12);
+        let view = crate::builtins::w_memoryview_new(source).unwrap();
+        let shape = pyre_object::w_list_new(vec![pyre_object::w_int_new(6)]);
+        let strides = pyre_object::w_list_new(vec![pyre_object::w_int_new(2)]);
+        let result = newmemoryview(&[
+            view,
+            pyre_object::w_int_new(1),
+            pyre_object::w_str_new("T{B:x}"),
+            shape,
+            strides,
+        ])
+        .unwrap();
+        unsafe {
+            assert_eq!(
+                pyre_object::memoryview::w_memoryview_native_shape(result),
+                vec![6]
+            );
+            assert_eq!(
+                pyre_object::memoryview::w_memoryview_native_strides(result),
+                vec![2]
+            );
+            assert_eq!(
+                pyre_object::memoryview::w_memoryview_format_str(result),
+                "T{B:x}"
+            );
+            assert_eq!(pyre_object::memoryview::w_memoryview_itemsize(result), 1);
+        }
+    }
+
+    #[test]
+    fn empty_formatted_memoryview_accepts_zero_itemsize_with_shape() {
+        crate::typedef::init_typeobjects();
+        let source = pyre_object::w_bytearray_new(0);
+        let view = crate::builtins::w_memoryview_new(source).unwrap();
+        let shape = pyre_object::w_tuple_new(vec![pyre_object::w_int_new(42)]);
+        let result = newmemoryview(&[
+            view,
+            pyre_object::w_int_new(0),
+            pyre_object::w_str_new("B"),
+            shape,
+        ])
+        .unwrap();
+        unsafe {
+            assert_eq!(
+                pyre_object::memoryview::w_memoryview_native_shape(result),
+                vec![42]
+            );
+            assert_eq!(
+                pyre_object::memoryview::w_memoryview_native_strides(result),
+                vec![0]
+            );
+            assert_eq!(pyre_object::memoryview::w_memoryview_length(result), 0);
+        }
+    }
 }
 
 /// The `memoryview` builtin type via the live execution context.

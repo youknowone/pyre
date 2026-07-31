@@ -173,6 +173,7 @@ crate::py_module! {
         "reversed_dict" / 1 = reversed_dict,
         "move_to_end" / * = move_to_end,
         "objects_in_repr" / 0 = objects_in_repr,
+        "newmemoryview" / * = interp_buffer::newmemoryview,
     },
     extra_init: |ns| {
         // Mark as a package so `from __pypy__.builders import ...`
