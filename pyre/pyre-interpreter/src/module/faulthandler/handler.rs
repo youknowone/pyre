@@ -30,7 +30,7 @@ static FAULTHANDLER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::Atomic
 /// than be collected and have its finalizer close the fd under them.  pyre has
 /// no Handler instance and the signal callback is a bare `extern "C" fn` that
 /// cannot capture one, so the owner is a process-global slot, walked as a GC
-/// root by [`walk_fatal_error_file`].
+/// root by [`walk_faulthandler_roots`].
 #[cfg(all(unix, feature = "host_env"))]
 static FAULTHANDLER_FILE: std::sync::atomic::AtomicPtr<pyre_object::PyObject> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
@@ -41,6 +41,20 @@ static FAULTHANDLER_FILE: std::sync::atomic::AtomicPtr<pyre_object::PyObject> =
 fn set_fatal_error_file(w_file: pyre_object::PyObjectRef) {
     FAULTHANDLER_FILE.store(w_file, std::sync::atomic::Ordering::Relaxed);
 }
+
+/// `enable` / `disable` / `register` / `unregister` each install (or remove) a
+/// handler and then hand the matching file to the owner slot in a second
+/// statement.  `Handler` runs those two statements under the GIL, so no other
+/// thread can interleave between them; pyre has no GIL, and an interleaving
+/// leaves the installed descriptor owned by the *other* call's file — the file
+/// this call resolved is then unrooted, collected, and its finalizer closes the
+/// descriptor the handler still writes through.  Serialize the pairs.
+///
+/// Only bookkeeping runs inside: the file is resolved (which runs Python) before
+/// the guard is taken, and the fatal-signal handler reads `FAULTHANDLER_FD`
+/// atomically without acquiring anything.
+#[cfg(all(unix, feature = "host_env"))]
+static FAULTHANDLER_STATE_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
 
 /// `handler.py:22` `self.user_w_files = None` / `:125`
 /// `self.user_w_files[signum] = w_file` / `:132`
@@ -145,8 +159,11 @@ fn faulthandler_get_fileno_and_file(
     };
     // `fileno` and `flush` both run Python; keep the file addressable across
     // them so the caller receives the relocated pointer, not a stale one.
+    // `pin_root` normalizes a forwarding stub into the slot, not into the
+    // caller's copy, so read the pinned value back before using it.
     pyre_object::gc_roots::pin_root(resolved);
     let file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let resolved = pyre_object::gc_roots::shadow_stack_get(file_slot);
     let method = crate::baseobjspace::getattr_str(resolved, "fileno")?;
     let res = crate::call::call_function_impl_result(method, &[])?;
     if !unsafe { pyre_object::is_int(res) } {
@@ -198,8 +215,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let (fd, w_file) = faulthandler_get_fileno_and_file(
                         args.first().copied().unwrap_or(pyre_object::PY_NULL),
                     )?;
-                    // `set_fatal_error_file` allocates its key, so the file has
-                    // to stay addressable from here to the store below.
+                    // Nothing else names the resolved file between here and the
+                    // owner store below, so keep it rooted across the install.
                     let _roots = pyre_object::gc_roots::push_roots();
                     let file_slot = (!w_file.is_null()).then(|| {
                         pyre_object::gc_roots::pin_root(w_file);
@@ -213,6 +230,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // otherwise dump to the old one — and has to be rolled back
                     // when the install fails, or a failed re-enable would
                     // redirect the handlers already installed.
+                    let _state = FAULTHANDLER_STATE_LOCK.lock();
                     let previous_fd =
                         FAULTHANDLER_FD.swap(fd, std::sync::atomic::Ordering::Relaxed);
                     let ok = rustpython_host_env::faulthandler::enable_fatal_handlers(
@@ -254,6 +272,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             |_| {
                 #[cfg(all(unix, feature = "host_env"))]
                 {
+                    let _state = FAULTHANDLER_STATE_LOCK.lock();
                     rustpython_host_env::faulthandler::disable_fatal_handlers();
                     FAULTHANDLER_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
                     // `handler.py:150` `self.fatal_error_w_file = None`.
@@ -362,13 +381,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let (fd, w_file) = faulthandler_get_fileno_and_file(
                         args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
                     )?;
-                    // `set_user_signal_file` allocates, so keep the file
-                    // addressable from here to the store below.
+                    // Nothing else names the resolved file between here and the
+                    // owner store below, so keep it rooted across the install.
                     let _roots = pyre_object::gc_roots::push_roots();
                     let file_slot = (!w_file.is_null()).then(|| {
                         pyre_object::gc_roots::pin_root(w_file);
                         pyre_object::gc_roots::shadow_stack_len() - 1
                     });
+                    let _state = FAULTHANDLER_STATE_LOCK.lock();
                     rustpython_host_env::faulthandler::register_user_signal(
                         signum,
                         fd,
@@ -422,6 +442,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         return Err(crate::PyError::type_error("unregister() missing signal"));
                     }
                     let signum = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
+                    let _state = FAULTHANDLER_STATE_LOCK.lock();
                     let changed =
                         rustpython_host_env::faulthandler::unregister_user_signal(signum);
                     // `handler.py:131-132` `self.user_w_files.pop(signum, None)`,
