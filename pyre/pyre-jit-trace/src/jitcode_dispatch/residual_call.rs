@@ -2650,6 +2650,29 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     }
                 }
             }
+            // `pyjitpl.py:3389-3392`: ABORT_ESCAPE is raised with
+            // `raising_exception=True` "because we must still have the eventual
+            // exception raised (this is normally done after the call to
+            // `vable_after_residual_call()`)" — the post-call `execute_raised`
+            // bookkeeping still owes its work even though the walk is over.
+            // Returning here skips the `Err(bh_exc)` arm below, and with it the
+            // half of that bookkeeping that has no upstream counterpart: the
+            // shared `bh_*` helper published this raise into the backend
+            // `_store_exception` cells as well as `BH_LAST_EXC_VALUE`
+            // (`publish_residual_call_exception`), and those cells belong to
+            // compiled / blackhole execution, which RPython tracing never
+            // touches.  A survivor is read by the next compiled trace's
+            // `must_save_exception` guard and delivered as that frame's own
+            // raise — an exception surfacing out of a frame that raised
+            // nothing.  `BH_LAST_EXC_VALUE` stays as `execute_residual_call`
+            // left it (cleared on read): the escape's consumers take the
+            // exception from `exec_result` directly, so restoring it would only
+            // outlive the walk.
+            if exec_result.is_err()
+                && let Some(cb) = crate::callbacks::try_get()
+            {
+                (cb.drain_backend_jit_exc)();
+            }
             return Err(DispatchError::VableEscapedDuringResidualCall { pc: op_pc });
         }
     }
