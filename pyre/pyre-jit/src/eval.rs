@@ -6854,56 +6854,9 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     // portal_ptr = eval_loop_jit at depth 0 (has jit_merge_point +
     // can_enter_jit back-edge), plain interpreter at depth > 0.
     if let Some(result) = try_function_entry_jit(frame_root.frame()) {
-        if majit_metainterp::majit_log_enabled() {
-            log_named_global_result(
-                frame_root.frame(),
-                "eval_with_jit_inner.try_function_entry_jit",
-            );
-        }
         return result;
     }
-    let result = handle_jitexception(frame_root.frame());
-    if majit_metainterp::majit_log_enabled() {
-        log_named_global_result(
-            frame_root.frame(),
-            "eval_with_jit_inner.handle_jitexception",
-        );
-    }
-    result
-}
-
-fn log_named_global_result(frame: &PyFrame, label: &str) {
-    unsafe {
-        let w_globals = frame.get_w_globals();
-        if w_globals.is_null() {
-            return;
-        }
-        let Some(value) = pyre_object::w_dict_getitem_str(w_globals, "result") else {
-            return;
-        };
-        if value.is_null() {
-            eprintln!("[jit][{label}] result=NULL");
-            return;
-        }
-        // pyobject.rs:308 `is_int` returns true for both INT_TYPE and
-        // BOOL_TYPE (bool is a W_IntObject subclass sharing `intval`). Match
-        // INT_TYPE strictly here so the log labels a bool result distinctly
-        // in the branch below.
-        if pyre_object::pyobject::py_type_check(value, &pyre_object::pyobject::INT_TYPE) {
-            eprintln!(
-                "[jit][{label}] result_ptr=0x{:x} kind=int intval={}",
-                value as usize,
-                pyre_object::intobject::w_int_get_value(value),
-            );
-        } else if pyre_object::pyobject::is_bool(value) {
-            eprintln!("[jit][{label}] result_ptr=0x{:x} kind=bool", value as usize,);
-        } else {
-            eprintln!(
-                "[jit][{label}] result_ptr=0x{:x} kind=other",
-                value as usize,
-            );
-        }
-    }
+    handle_jitexception(frame_root.frame())
 }
 
 /// warmspot.py:970-983 ContinueRunningNormally → portal_ptr(*args) parity.
