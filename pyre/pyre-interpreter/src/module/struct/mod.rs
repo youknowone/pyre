@@ -1360,9 +1360,7 @@ pub mod unpack_iter {
         let sp = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(format);
         pyre_object::gc_roots::pin_root(buffer);
-        let r_format = pyre_object::gc_roots::shadow_stack_get(sp);
-        let r_buffer = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-        let buf = unsafe { readbuf(r_buffer)? };
+        let buf = unsafe { readbuf(pyre_object::gc_roots::shadow_stack_get(sp + 1))? };
         if size <= 0 {
             return Err(struct_error(format!(
                 "cannot iteratively unpack with a struct of length {size}"
@@ -1373,13 +1371,19 @@ pub mod unpack_iter {
                 "iterative unpacking requires a buffer of a multiple of {size} bytes"
             )));
         }
-        let export_active = unsafe { crate::builtins::buffer_export_incref(r_buffer) };
+        let export_active = unsafe {
+            crate::builtins::buffer_export_incref(pyre_object::gc_roots::shadow_stack_get(sp + 1))
+        };
+        // Both slots are reread here rather than reused from a local: `readbuf`
+        // and `buffer_export_incref` above can each run Python and collect, and
+        // `allocate_stable` itself allocates, so a value captured before them
+        // would name the pre-relocation address.
         let w_iter = W_UnpackIter::allocate_stable(W_UnpackIter {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
             },
-            format: r_format,
+            format: pyre_object::gc_roots::shadow_stack_get(sp),
             buffer: pyre_object::gc_roots::shadow_stack_get(sp + 1),
             size,
             index: 0,
