@@ -1,3 +1,4 @@
+# pyre-check: max-pypy-ratio=8
 # A loop that defines a function in its own body and calls it.
 #
 # `MAKE_FUNCTION` hands back a fresh `Function` every iteration, so an inline
