@@ -2130,9 +2130,17 @@ unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef) {
         {
             let code = crate::function::getcode(function) as PyObjectRef;
             if !code.is_null() && crate::gateway::is_builtin_code(code) {
-                crate::function::function_set_objclass(function, type_obj);
                 let qualname = format!("{}.{}", pyre_object::w_type_get_qualname(type_obj), key);
-                crate::function::function_set_qualname(function, pyre_object::w_str_new(&qualname));
+                // Building the qualname string may collect, so pin the carrier
+                // and re-read both it and the type before stamping them.
+                let _function_roots = pyre_object::gc_roots::push_roots();
+                let function_slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(function);
+                let w_qualname = pyre_object::w_str_new(&qualname);
+                let function = pyre_object::gc_roots::shadow_stack_get(function_slot);
+                let type_obj = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
+                crate::function::function_set_objclass(function, type_obj);
+                crate::function::function_set_qualname(function, w_qualname);
                 // Same `is_slot_wrapper` split the TypeDef sweep applies: the
                 // slot half becomes a `wrapper_descriptor`, the `tp_methods`
                 // half a `method_descriptor`.  Both sweeps reach a builtin
@@ -2153,6 +2161,14 @@ unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef) {
                 }
             }
         }
+        // The qualname allocation above may collect and relocate them; every
+        // metadata branch below must read the namespace entry and the type
+        // again.
+        let ns = pyre_object::gc_roots::shadow_stack_get(save_point);
+        let type_obj = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
+        let Some(descr) = pyre_object::w_dict_getitem_str(ns, &key) else {
+            continue;
+        };
         // CPython member descriptors carry their defining type in d_type;
         // PyPy's Member receives w_cls while the TypeDef is materialised.
         // Builtin TypeDef initializers necessarily create the descriptor
@@ -27854,6 +27870,37 @@ mod tests {
         }
         check_cell_typedef_python314_surface();
         check_cell_comparison_repr_and_hash();
+    }
+
+    #[test]
+    fn builtin_static_and_class_methods_have_qualified_names() {
+        crate::typedef::init_typeobjects();
+        for (owner, name, expected) in [
+            (
+                crate::typedef::gettypeobject(&pyre_object::DICT_TYPE),
+                "fromkeys",
+                "dict.fromkeys",
+            ),
+            (
+                crate::typedef::gettypeobject(&pyre_object::FLOAT_TYPE),
+                "__getformat__",
+                "float.__getformat__",
+            ),
+            (
+                crate::typedef::gettypeobject(&pyre_object::STR_TYPE),
+                "maketrans",
+                "str.maketrans",
+            ),
+            (
+                crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE),
+                "maketrans",
+                "bytes.maketrans",
+            ),
+        ] {
+            let callable = crate::baseobjspace::getattr_str(owner, name).unwrap();
+            let qualname = crate::baseobjspace::getattr_str(callable, "__qualname__").unwrap();
+            assert_eq!(unsafe { pyre_object::w_str_get_value(qualname) }, expected);
+        }
     }
 
     fn check_cell_typedef_python314_surface() {
