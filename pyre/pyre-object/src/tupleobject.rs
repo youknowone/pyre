@@ -221,6 +221,7 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
                         ob_type: header.ob_type,
                         w_class: header.w_class,
                     },
+                    hash: AtomicI64::new(-1),
                     wrappeditems: std::ptr::null_mut(),
                 },
             );
