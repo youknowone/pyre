@@ -8905,11 +8905,12 @@ pub unsafe fn load_method_fast_path(
 /// same shape a plain instance method takes, with the class in the receiver
 /// slot instead of an instance.
 ///
-/// `is_type` is exact-metatype, so a custom metaclass declines (its
-/// `__getattribute__` may not follow `type.__getattribute__`).  A name the
-/// metatype itself defines is declined too: a metatype attribute would shadow
-/// the class attribute (data descriptor) or be returned in its place.  An
-/// uncacheable type and any non-`classmethod` descriptor also decline.
+/// The metatype is read off the class (`getclass()`) and must be `type`
+/// itself, so a custom metaclass declines (its `__getattribute__` may not
+/// follow `type.__getattribute__`).  A name the metatype itself defines is
+/// declined too: a metatype attribute would shadow the class attribute (data
+/// descriptor) or be returned in its place.  An uncacheable type and any
+/// non-`classmethod` descriptor also decline.
 ///
 /// # Safety
 /// `w_obj` must be a valid object pointer (null tolerated).
@@ -8921,10 +8922,18 @@ pub unsafe fn classmethod_on_type_fast_path(
         return None;
     }
     let w_type = w_obj;
-    // `is_type` pins the metaclass to exactly `type`, so `type.__getattribute__`
-    // is the resolution path.  A metatype attribute of the same name would win
-    // over the class attribute, so decline any name the metatype defines.
-    let metatype = &pyre_object::pyobject::TYPE_TYPE as *const _ as PyObjectRef;
+    // `is_type` answers for the object's physical layout — every type object
+    // carries the same `ob_type` — so it says nothing about the metaclass.
+    // `getclass()` (baseobjspace.py) reads the metaclass off `w_class`; only
+    // `type` itself resolves the name through `type.__getattribute__`, so any
+    // other metaclass declines rather than have its `__getattribute__`
+    // override bypassed.
+    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
+    if !std::ptr::eq(metatype, crate::typedef::w_type()) {
+        return None;
+    }
+    // A metatype attribute of the same name would win over the class attribute,
+    // so decline any name the metatype defines.
     if lookup_in_type(metatype, name).is_some() {
         return None;
     }

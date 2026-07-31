@@ -2979,6 +2979,20 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
             // METAclass MRO (`space.type(w_obj)`), so a name found in the
             // type's own MRO reaches the call as a plain getattr value
             // with no binding.
+            //
+            // `is_type` reports the physical layout every type object shares,
+            // not the metaclass, so read the metaclass and require it to be
+            // `type`.  The shape inferred below is what
+            // `type.__getattribute__` produces; a custom metaclass can
+            // override `__getattribute__` or define a data descriptor of the
+            // same name, and either one produced `attr` in place of the
+            // class's own MRO entry — binding `cls` onto that value would
+            // pass the class to something that never asked for it.
+            let metatype_is_type = crate::typedef::r#type(obj)
+                .is_some_and(|meta| std::ptr::eq(meta.as_ptr(), crate::typedef::w_type()));
+            if !metatype_is_type {
+                return PY_NULL;
+            }
             let raw = crate::baseobjspace::lookup_in_type(obj, name);
             match raw {
                 Some(d) if pyre_object::is_classmethod(d) => obj,
