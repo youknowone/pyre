@@ -1068,6 +1068,35 @@ pub extern "C" fn dynasm_malloc_array_nonstandard(
     ))
 }
 
+/// Old-generation twin of [`dynasm_malloc_array`], selected by
+/// `gen_malloc_array` for a `non_moving` array descr.  Same signature.
+pub extern "C" fn dynasm_malloc_array_oldgen(item_size: u64, type_id: u64, num_elem: u64) -> u64 {
+    oom_signal_if_zero(dynasm_alloc_oldgen_varsize_typed_and_set_len(
+        type_id as u32,
+        std::mem::size_of::<usize>(),
+        item_size as usize,
+        0,
+        num_elem as usize,
+    ))
+}
+
+/// Old-generation twin of [`dynasm_malloc_array_nonstandard`].
+pub extern "C" fn dynasm_malloc_array_nonstandard_oldgen(
+    base_size: u64,
+    item_size: u64,
+    length_ofs: u64,
+    type_id: u64,
+    num_elem: u64,
+) -> u64 {
+    oom_signal_if_zero(dynasm_alloc_oldgen_varsize_typed_and_set_len(
+        type_id as u32,
+        base_size as usize,
+        item_size as usize,
+        length_ofs as usize,
+        num_elem as usize,
+    ))
+}
+
 fn dynasm_raw_fixedsize_alloc_typed(type_id: u32, size: usize) -> u64 {
     let Some(total_size) = majit_gc::header::GcHeader::SIZE.checked_add(size) else {
         return 0;
@@ -1608,6 +1637,9 @@ impl DynasmBackend {
                 fielddescr_tid: Some(majit_ir::make_tid_field_descr()),
                 malloc_array_fn: dynasm_malloc_array as *const () as i64,
                 malloc_array_nonstandard_fn: dynasm_malloc_array_nonstandard as *const () as i64,
+                malloc_array_oldgen_fn: dynasm_malloc_array_oldgen as *const () as i64,
+                malloc_array_nonstandard_oldgen_fn: dynasm_malloc_array_nonstandard_oldgen
+                    as *const () as i64,
                 malloc_str_fn: dynasm_malloc_str as *const () as i64,
                 malloc_unicode_fn: dynasm_malloc_unicode as *const () as i64,
                 malloc_big_fixedsize_fn: dynasm_malloc_big_fixedsize as *const () as i64,

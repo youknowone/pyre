@@ -3930,6 +3930,60 @@ extern "C" fn gc_malloc_array_nonstandard_helper(
     ))
 }
 
+/// Old-generation twin of [`gc_malloc_array_helper`], selected by
+/// `gen_malloc_array` for a `non_moving` array descr.  Same signature.
+extern "C" fn gc_malloc_array_oldgen_helper(item_size: u64, type_id: u64, num_elem: u64) -> u64 {
+    oom_signal_if_zero(active_runtime_alloc_oldgen_varsize_typed_and_set_len(
+        type_id as u32,
+        std::mem::size_of::<usize>(),
+        item_size as usize,
+        0,
+        num_elem as usize,
+    ))
+}
+
+/// Old-generation twin of [`gc_malloc_array_nonstandard_helper`].
+extern "C" fn gc_malloc_array_nonstandard_oldgen_helper(
+    base_size: u64,
+    item_size: u64,
+    length_ofs: u64,
+    type_id: u64,
+    num_elem: u64,
+) -> u64 {
+    oom_signal_if_zero(active_runtime_alloc_oldgen_varsize_typed_and_set_len(
+        type_id as u32,
+        base_size as usize,
+        item_size as usize,
+        length_ofs as usize,
+        num_elem as usize,
+    ))
+}
+
+/// Variable-size old-generation allocation, stamping the GcArray length
+/// header the way [`active_runtime_alloc_varsize_typed_and_set_len`] does
+/// for the nursery.
+fn active_runtime_alloc_oldgen_varsize_typed_and_set_len(
+    type_id: u32,
+    base_size: usize,
+    item_size: usize,
+    length_ofs: usize,
+    length: usize,
+) -> u64 {
+    let Some(var_bytes) = item_size.checked_mul(length) else {
+        return 0;
+    };
+    let Some(payload_size) = base_size.checked_add(var_bytes) else {
+        return 0;
+    };
+    let obj = active_runtime_alloc_oldgen_typed(type_id, payload_size);
+    if obj != 0 {
+        unsafe {
+            *((obj as *mut u8).add(length_ofs) as *mut usize) = length;
+        }
+    }
+    obj
+}
+
 fn raw_fixedsize_alloc_typed(type_id: u32, size: usize) -> u64 {
     let Some(total_size) = GcHeader::SIZE.checked_add(size) else {
         return 0;
@@ -8193,6 +8247,9 @@ impl CraneliftBackend {
             fielddescr_tid: Some(majit_ir::make_tid_field_descr()),
             malloc_array_fn: gc_malloc_array_helper as *const () as i64,
             malloc_array_nonstandard_fn: gc_malloc_array_nonstandard_helper as *const () as i64,
+            malloc_array_oldgen_fn: gc_malloc_array_oldgen_helper as *const () as i64,
+            malloc_array_nonstandard_oldgen_fn: gc_malloc_array_nonstandard_oldgen_helper
+                as *const () as i64,
             malloc_str_fn: gc_malloc_str_helper as *const () as i64,
             malloc_unicode_fn: gc_malloc_unicode_helper as *const () as i64,
             malloc_big_fixedsize_fn: gc_malloc_big_fixedsize_helper as *const () as i64,

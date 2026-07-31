@@ -3707,6 +3707,13 @@ pub trait ArrayDescr: Descr {
         false
     }
 
+    /// Whether `NEW_ARRAY` for this descr must allocate in the non-moving
+    /// old generation instead of the movable nursery.  Same contract as
+    /// [`SizeDescr::non_moving`], for the varsize path.
+    fn non_moving(&self) -> bool {
+        false
+    }
+
     /// Whether the array is a real GC-managed array (has a GC header so
     /// `GUARD_GC_TYPE` may read a type-id at `ptr - GcHeader::SIZE`).
     /// Default `true` so existing array descrs keep their guard; only a
@@ -5028,6 +5035,10 @@ pub struct SimpleArrayDescr {
     /// `ArrayDescr::is_gc_managed`).  `false` only for a header-less raw
     /// native pointer-array minted by `add_ptr_array_descr`.
     is_gc_managed: bool,
+    /// Allocation-generation bit for `NEW_ARRAY` rewriting; see
+    /// [`ArrayDescr::non_moving`].  Atomic so a frontend can stamp it onto
+    /// an already-shared descr, the way `type_id` is stamped.
+    non_moving: AtomicBool,
 }
 
 impl Clone for SimpleArrayDescr {
@@ -5051,6 +5062,7 @@ impl Clone for SimpleArrayDescr {
             concrete_type: self.concrete_type,
             all_interiorfielddescrs: interior,
             is_gc_managed: self.is_gc_managed,
+            non_moving: AtomicBool::new(self.non_moving.load(Ordering::Relaxed)),
         }
     }
 }
@@ -5079,6 +5091,7 @@ impl SimpleArrayDescr {
             concrete_type: '\x00',
             all_interiorfielddescrs: std::sync::OnceLock::new(),
             is_gc_managed: true,
+            non_moving: AtomicBool::new(false),
         }
     }
 
@@ -5106,7 +5119,15 @@ impl SimpleArrayDescr {
             concrete_type: '\x00',
             all_interiorfielddescrs: std::sync::OnceLock::new(),
             is_gc_managed: true,
+            non_moving: AtomicBool::new(false),
         }
+    }
+
+    /// Override the allocation-generation flag (default `false`); see
+    /// [`ArrayDescr::non_moving`].  Takes `&self` so a frontend can stamp
+    /// it after the descr is already behind an `Arc` and registered.
+    pub fn set_non_moving(&self, non_moving: bool) {
+        self.non_moving.store(non_moving, Ordering::Relaxed);
     }
 
     /// Set the GC-managed flag (`false` for a header-less raw native
@@ -5175,6 +5196,9 @@ impl Descr for SimpleArrayDescr {
 impl ArrayDescr for SimpleArrayDescr {
     fn is_gc_managed(&self) -> bool {
         self.is_gc_managed
+    }
+    fn non_moving(&self) -> bool {
+        self.non_moving.load(Ordering::Relaxed)
     }
     fn base_size(&self) -> usize {
         self.base_size
