@@ -584,24 +584,37 @@ pub fn release_owner_root(index: usize) {
 /// RAII owner for one fixed translated-livevar root slot.
 pub struct OwnerRootGuard {
     index: usize,
-    /// `index` names a slot in the ACQUIRING thread's `OWNER_ROOTS`, so the
-    /// guard must not outlive that thread's stack frame.  Bare `usize` would
-    /// make it auto-`Send`, and dropping it elsewhere would release a foreign
-    /// thread's slot (or trip the inactive-slot assert).  The raw-pointer
-    /// marker pins it to one thread at compile time.
-    _not_send: std::marker::PhantomData<*mut ()>,
+    /// Address of the ACQUIRING thread's `OWNER_ROOTS` cell, resolved once.
+    ///
+    /// A guard is read back on every access to the value it roots, so paying
+    /// the thread-local resolution (`_tlv_get_addr` on macOS) each time would
+    /// make re-reading the root cost more than the stale copy it replaces.
+    /// The cell never moves once created — the same invariant `MutatorEntry`
+    /// and [`ShadowStackSlot`] rely on — and RPython's translated code
+    /// likewise resolves its root-stack base once per function
+    /// (`gc_enter_roots_frame`) and then addresses slots by fixed offset.
+    ///
+    /// It also pins the guard to one thread: `index` names a slot in that
+    /// thread's `OWNER_ROOTS`, and a bare `usize` would make the guard
+    /// auto-`Send`, so dropping it elsewhere would release a foreign thread's
+    /// slot (or trip the inactive-slot assert).
+    roots: *const RefCell<Vec<Option<GcRef>>>,
 }
 
 impl OwnerRootGuard {
     pub fn new(root: GcRef) -> Self {
         Self {
             index: acquire_owner_root(root),
-            _not_send: std::marker::PhantomData,
+            roots: OWNER_ROOTS.with(|roots| roots as *const _),
         }
     }
 
+    #[inline]
     pub fn get(&self) -> GcRef {
-        OWNER_ROOTS.with(|roots| roots.borrow()[self.index].expect("inactive owner-root guard"))
+        // SAFETY: `roots` is this thread's own `OWNER_ROOTS` cell, alive for
+        // as long as the guard (which cannot leave the thread), and the slot
+        // stays acquired until `Drop`.
+        unsafe { (*self.roots).borrow()[self.index].expect("inactive owner-root guard") }
     }
 }
 
