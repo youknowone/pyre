@@ -101,6 +101,12 @@ use crate::resume::{
 use crate::trace_ctx::TraceCtx;
 use crate::virtualizable::VirtualizableInfo;
 
+#[inline]
+fn guardlog_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MAJIT_GUARDLOG").is_some())
+}
+
 /// No direct RPython equivalent — Rust struct carrying data that RPython
 /// passes through internal method calls in handle_guard_failure
 /// (pyjitpl.py:2890). Fields correspond to:
@@ -1977,6 +1983,9 @@ impl<M: Clone> MetaInterp<M> {
 
     #[inline]
     fn record_guard_failure_event(&mut self, green_key: u64, fail_index: u32) {
+        if guardlog_enabled() {
+            eprintln!("@@@GUARD key={green_key} fail={fail_index}");
+        }
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit] guard failure at key={}, guard={}",

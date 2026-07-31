@@ -619,6 +619,9 @@ fn debug_validate_oldgen_freeblocks(site: std::fmt::Arguments<'_>) {
 }
 
 pub extern "C" fn dynasm_debug_validate_oldgen_freeblocks(site: u64, frame: usize) {
+    if !crate::gc_freelist_diag_enabled() {
+        return;
+    }
     if site >= 1_000_000 {
         let top = majit_gc::shadow_stack::jf_top_ptr().0;
         eprintln!(
@@ -2503,7 +2506,11 @@ impl Backend for DynasmBackend {
             .iter()
             .map(|(&k, c)| (k, c.as_raw_i64()))
             .collect();
-        if crate::majit_log_enabled() && trace_id == 2 {
+        let trace_ops_diag = std::env::var("PYRE_TRACE_OPS_DIAG")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            == Some(trace_id);
+        if trace_ops_diag {
             eprintln!(
                 "--- dynasm bridge prepared ops (trace_id={}, fail_index={}) ---\n{}",
                 trace_id,
