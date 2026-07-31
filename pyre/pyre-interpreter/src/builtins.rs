@@ -3012,7 +3012,12 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         "EOFError",
         make_exc_type("EOFError", exc_eof_error_new, exception),
     );
-    let syntax_error = make_exc_type("SyntaxError", exc_syntax_error_new, exception);
+    let syntax_error = make_exc_type_with_init(
+        "SyntaxError",
+        exc_syntax_error_new,
+        Some(exc_syntax_error_init),
+        exception,
+    );
     crate::module_ns_store(ns, "SyntaxError", syntax_error);
     // Python 3.14 `exceptions.c` — the private exception raised by
     // `compile(..., flags=PyCF_ALLOW_INCOMPLETE_INPUT)` for an unfinished
@@ -5257,6 +5262,52 @@ fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     if !exception_args_already(w_self, positional) {
         let args_list = pyre_object::w_list_new(positional.to_vec());
         unsafe { pyre_object::interp_exceptions::w_exception_set_args(w_self, args_list) };
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// `interp_exceptions.py:836-858 W_SyntaxError.descr_init` — validate the
+/// optional details sequence before forwarding the original positional
+/// arguments to `BaseException.__init__`.  The details tuple must contain
+/// either four fields or all six location fields; a five-field form is
+/// specifically rejected because `end_offset` is required with
+/// `end_lineno`.  SyntaxError subclasses inherit this initializer.
+fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
+    })?;
+    let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
+    if has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "SyntaxError() takes no keyword arguments",
+        ));
+    }
+    if positional.len() == 2 {
+        let details = crate::baseobjspace::fixedview(positional[1], -1)?;
+        match details.len() {
+            4 | 6 => {}
+            5 => {
+                return Err(crate::PyError::type_error(
+                    "end_offset must be provided when end_lineno is provided",
+                ));
+            }
+            n if n < 4 => {
+                return Err(crate::PyError::type_error(
+                    "function missing required argument 'info[3]' (pos 4)",
+                ));
+            }
+            n => {
+                return Err(crate::PyError::type_error(format!(
+                    "function takes at most 6 arguments ({n} given)"
+                )));
+            }
+        }
+    }
+    unsafe {
+        pyre_object::interp_exceptions::w_exception_set_args(
+            w_self,
+            pyre_object::w_list_new(positional.to_vec()),
+        );
     }
     Ok(pyre_object::w_none())
 }
