@@ -17175,13 +17175,15 @@ mod tests {
             .expect("get() binds a method_descriptor");
         assert!(
             std::ptr::eq(
-                unsafe { (*bound).ob_type },
-                &crate::function::BUILTIN_FUNCTION_TYPE as *const _,
+                crate::typedef::r#type(bound)
+                    .expect("a bound carrier has a type")
+                    .as_ptr(),
+                crate::typedef::gettypeobject(&crate::function::BUILTIN_FUNCTION_TYPE),
             ),
             "binding a tp_methods descriptor yields a builtin_function_or_method",
         );
         assert!(std::ptr::eq(
-            unsafe { crate::function::builtin_bound_receiver(bound) },
+            unsafe { pyre_object::w_method_get_self(bound) },
             w_list,
         ));
 
