@@ -135,6 +135,12 @@ pub fn w_pytraceback_new(
         w_code,
     };
 
+    // The rule below cannot be spelled as a `debug_assert!` here: this crate
+    // is extracted to LLBC, so an assertion lands in the JIT's view of this
+    // function and its probe becomes a real call on every traceback the
+    // traced code builds — measurably, on the `getattr_*` gates.  It stays a
+    // stated obligation.
+    //
     // `frame` was copied into `value` above and is not among the roots
     // pinned here, so the allocation below — which can safepoint — must
     // not be able to move it.  Upstream has no such rule: a minor
