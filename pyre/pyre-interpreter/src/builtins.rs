@@ -8835,8 +8835,11 @@ pub fn compile_err_to_syntax_error(
     e: crate::compile::CompileError,
     source: &str,
 ) -> crate::PyError {
-    let msg = e.to_string();
     let subclass = syntax_error_subclass(&e, source);
+    let msg = match subclass {
+        Some((_, Some(replacement))) => replacement.to_string(),
+        _ => e.to_string(),
+    };
     let (lineno, offset) = e.python_location();
     if lineno == 0 {
         return crate::PyError::syntax_error(msg);
@@ -8854,58 +8857,194 @@ pub fn compile_err_to_syntax_error(
         end_offset as i64,
         text,
     );
-    if let Some(name) = subclass {
+    if let Some((name, _)) = subclass {
         err.retag_exception_class(name);
     }
     err
 }
 
-/// `tokenizer.c tok_get_normal_mode` measures indentation twice, with tabs
-/// expanded to 8 and to 1 columns, and raises `TabError` when the two
-/// measures disagree.  The parser reports one column, so the tab/space clash
-/// is recovered from the source: an indent that mixes both characters, or one
-/// block indented with tabs while another uses spaces.
-fn indentation_mixes_tabs_and_spaces(source: &str) -> bool {
-    let mut has_space_indent = false;
-    let mut has_tab_indent = false;
+/// Which of `tokenizer.c tok_get_normal_mode`'s two indentation rejections a
+/// line hits first.
+enum IndentFault {
+    /// `TabError`: the line's indentation measures differently with tabs
+    /// expanded to 8 columns than with tabs counted as 1, so which block it
+    /// belongs to depends on the tab width.
+    TabsAndSpaces,
+    /// `IndentationError`: a dedent that lands between two enclosing levels.
+    UnmatchedDedent,
+}
+
+/// The first indentation the tokenizer would reject, and why.
+///
+/// `tokenizer.c tok_get_normal_mode` keeps two indent stacks — `indstack`
+/// measured with tabs expanded to the next multiple of 8, `altindstack` with
+/// each tab counted as 1 — and compares the incoming line against both. Equal,
+/// deeper and shallower each have an `altcol` companion check, and it is the
+/// disagreement between the two measures that is `TabError`; a dedent matching
+/// no `indstack` entry is the plain indentation error.
+///
+/// A file-wide census cannot stand in for this. Tabs in one block and spaces in
+/// another is legal as long as no single comparison disagrees, so counting both
+/// characters anywhere in the source retags an unrelated failure.
+///
+/// Answers `None` for anything this cannot decide from lines alone — an
+/// unterminated string, or a line still inside brackets when the source runs
+/// out — because the tokenizer processes indentation only outside both, and
+/// `TabError` should be claimed only on positive evidence.
+fn first_indent_fault(source: &str) -> Option<IndentFault> {
+    let mut indstack = vec![0usize];
+    let mut altindstack = vec![0usize];
+    let mut depth = 0usize;
+    let mut in_triple: Option<u8> = None;
     for line in source.lines() {
-        let indent = line
-            .as_bytes()
-            .iter()
-            .take_while(|&&b| b == b' ' || b == b'\t')
-            .collect::<Vec<_>>();
-        let spaces = indent.contains(&&b' ');
-        let tabs = indent.contains(&&b'\t');
-        if spaces && tabs {
-            return true;
+        let bytes = line.as_bytes();
+        // Only a logical line's first physical line carries indentation; a
+        // continuation inside brackets or a triple-quoted string does not.
+        let measures = (depth == 0 && in_triple.is_none()).then(|| {
+            let mut col = 0usize;
+            let mut altcol = 0usize;
+            let mut i = 0;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b' ' => {
+                        col += 1;
+                        altcol += 1;
+                    }
+                    b'\t' => {
+                        col = col / 8 * 8 + 8;
+                        altcol += 1;
+                    }
+                    _ => break,
+                }
+                i += 1;
+            }
+            (col, altcol, i)
+        });
+        scan_line_nesting(bytes, &mut depth, &mut in_triple)?;
+        let Some((col, altcol, indent_len)) = measures else {
+            continue;
+        };
+        // `tok->blankline`: a blank or comment-only line is not indentation.
+        match bytes.get(indent_len) {
+            None | Some(b'#') | Some(b'\r') => continue,
+            _ => {}
         }
-        has_space_indent |= spaces;
-        has_tab_indent |= tabs;
+        let (top, alttop) = (
+            indstack[indstack.len() - 1],
+            altindstack[altindstack.len() - 1],
+        );
+        if col == top {
+            if altcol != alttop {
+                return Some(IndentFault::TabsAndSpaces);
+            }
+        } else if col > top {
+            if altcol <= alttop {
+                return Some(IndentFault::TabsAndSpaces);
+            }
+            indstack.push(col);
+            altindstack.push(altcol);
+        } else {
+            while indstack.len() > 1 && col < indstack[indstack.len() - 1] {
+                indstack.pop();
+                altindstack.pop();
+            }
+            if col != indstack[indstack.len() - 1] {
+                return Some(IndentFault::UnmatchedDedent);
+            }
+            if altcol != altindstack[altindstack.len() - 1] {
+                return Some(IndentFault::TabsAndSpaces);
+            }
+        }
     }
-    has_space_indent && has_tab_indent
+    None
+}
+
+/// Advance `depth` (bracket nesting) and `in_triple` (the open triple quote's
+/// character) across one physical line, skipping what a quote or a `#` hides.
+/// `None` when the line ends inside a single-quoted string that is not a
+/// continuation, which means this scan has lost track.
+fn scan_line_nesting(bytes: &[u8], depth: &mut usize, in_triple: &mut Option<u8>) -> Option<()> {
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(quote) = *in_triple {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == quote && bytes[i + 1..].starts_with(&[quote, quote]) {
+                *in_triple = None;
+                i += 3;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'#' => return Some(()),
+            b'(' | b'[' | b'{' => *depth += 1,
+            b')' | b']' | b'}' => *depth = depth.saturating_sub(1),
+            b'"' | b'\'' => {
+                if bytes[i + 1..].starts_with(&[c, c]) {
+                    *in_triple = Some(c);
+                    i += 3;
+                    continue;
+                }
+                // A single-quoted string closes on this line or the source is
+                // malformed in a way this scan cannot follow.
+                let mut j = i + 1;
+                loop {
+                    match bytes.get(j) {
+                        None => return None,
+                        Some(b'\\') => j += 2,
+                        Some(&b) if b == c => break,
+                        Some(_) => j += 1,
+                    }
+                }
+                i = j + 1;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Some(())
 }
 
 /// The `SyntaxError` subclass a compile failure belongs to.  3.14 raises
 /// `IndentationError` for every indentation-shaped tokenizer failure,
 /// `TabError` when that failure comes from mixing tabs and spaces, and plain
 /// `SyntaxError` for the rest.
-fn syntax_error_subclass(e: &crate::compile::CompileError, source: &str) -> Option<&'static str> {
+fn syntax_error_subclass(
+    e: &crate::compile::CompileError,
+    source: &str,
+) -> Option<(&'static str, Option<&'static str>)> {
     use rustpython_compiler::parser::{LexicalErrorType, ParseErrorType};
     let crate::compile::CompileError::Parse(parse_err) = e else {
         return None;
     };
+    // Every indentation-shaped failure is one of the two the tokenizer
+    // distinguishes, and only the source says which — the parser reports a
+    // single column, having already collapsed the two measures.  `TabError`
+    // carries the tokenizer's own message rather than the parser's, which
+    // describes the shape it saw instead of the tab/space clash behind it.
+    let indentation = |plain: Option<&'static str>| match first_indent_fault(source) {
+        Some(IndentFault::TabsAndSpaces) => (
+            "TabError",
+            Some("inconsistent use of tabs and spaces in indentation"),
+        ),
+        _ => ("IndentationError", plain),
+    };
     match &parse_err.error {
-        ParseErrorType::Lexical(LexicalErrorType::IndentationError)
-            if indentation_mixes_tabs_and_spaces(source) =>
-        {
-            Some("TabError")
-        }
-        ParseErrorType::UnexpectedIndentation
-        | ParseErrorType::Lexical(LexicalErrorType::IndentationError) => Some("IndentationError"),
+        // The parser spells this one "Unexpected indentation"; the tokenizer
+        // raises `unexpected indent`.  The dedent message below already reads
+        // as the tokenizer writes it, so it keeps the parser's.
+        ParseErrorType::UnexpectedIndentation => Some(indentation(Some("unexpected indent"))),
+        ParseErrorType::Lexical(LexicalErrorType::IndentationError) => Some(indentation(None)),
         // `pegen`'s "expected an indented block after <clause> on line N",
         // which the compiler reconstructs as a plain message.
         ParseErrorType::OtherError(msg) if msg.starts_with("expected an indented block") => {
-            Some("IndentationError")
+            Some(("IndentationError", None))
         }
         _ => None,
     }
