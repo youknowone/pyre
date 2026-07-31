@@ -2387,6 +2387,39 @@ fn inline_chain_unrolls_recursion<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) 
 /// resolve an app-level descriptor first and enter here with that function as
 /// the callee while independently pinning the original builtin callable.
 #[allow(clippy::too_many_arguments)]
+/// Latch the outer CALL boundary as the forward-resume point for a discarded
+/// inline sub-walk, so the walk driver re-executes the whole call in the
+/// interpreter instead of rolling back and replaying the loop from entry.
+///
+/// Sound only when the attempt committed nothing observable: it must be the
+/// top-level inline, no unjournaled effect may predate it, and the callee must
+/// have executed no concrete effect.  Otherwise the re-execution would apply
+/// twice what the sub-walk already ran.  Every caller that discards a sub-walk
+/// result must go through this — returning the error without latching leaves
+/// the driver replaying the loop, which repeats the callee's effects.
+fn latch_abort_call_resume<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &WalkContext<'_, '_, Sym>,
+    is_top_inline: bool,
+    unjournaled_before_subwalk: bool,
+    executed_effects_before: usize,
+    abort_flush_call_jitcode_coord: Option<(u32, usize)>,
+) {
+    if !is_top_inline
+        || unjournaled_before_subwalk
+        || fbw_executed_effect_count() != executed_effects_before
+    {
+        return;
+    }
+    let Some((outer_jitcode_index, call_jitcode_pc)) = abort_flush_call_jitcode_coord else {
+        return;
+    };
+    if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx) {
+        fbw_set_abort_call_resume(outer_jitcode_index, call_jitcode_pc, stack);
+    }
+}
+
 pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -3947,16 +3980,16 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 e,
                 DispatchError::AbortPermanentMarkerReached { .. }
                     | DispatchError::LoopBearingCalleeInlineUnsupported { .. }
-            ) && is_top_inline
-                && !unjournaled_before_subwalk
-                && fbw_executed_effect_count() == executed_effects_before
-            {
-                if let Some((outer_jitcode_index, call_jitcode_pc)) = abort_flush_call_jitcode_coord
-                {
-                    if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx) {
-                        fbw_set_abort_call_resume(outer_jitcode_index, call_jitcode_pc, stack);
-                    }
-                }
+            ) {
+                latch_abort_call_resume(
+                    code,
+                    op,
+                    ctx,
+                    is_top_inline,
+                    unjournaled_before_subwalk,
+                    executed_effects_before,
+                    abort_flush_call_jitcode_coord,
+                );
             }
             return Err(e);
         }
@@ -3978,30 +4011,39 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 // original builtin call at the caller boundary so the
                 // interpreter raises its faithful TypeError; the inlined
                 // body has no committed concrete effect at this point.
-                if is_top_inline
-                    && !unjournaled_before_subwalk
-                    && fbw_executed_effect_count() == executed_effects_before
-                {
-                    if let Some((outer_jitcode_index, call_jitcode_pc)) =
-                        abort_flush_call_jitcode_coord
-                    {
-                        if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx) {
-                            fbw_set_abort_call_resume(outer_jitcode_index, call_jitcode_pc, stack);
-                        }
-                    }
-                }
+                latch_abort_call_resume(
+                    code,
+                    op,
+                    ctx,
+                    is_top_inline,
+                    unjournaled_before_subwalk,
+                    executed_effects_before,
+                    abort_flush_call_jitcode_coord,
+                );
                 return Err(DispatchError::callee_inline_unsupported(op.pc));
             }
             // `descr_call` discards `__init__`'s result after checking it is
             // None and returns the instance instead (`check_init_returned_none`).
             // A non-None result is a TypeError the inlined body cannot raise, so
             // give the callee back to the interpreter, which re-runs the call and
-            // raises the faithful message.
+            // raises the faithful message.  Latch the CALL boundary first, like
+            // the invalid-`str`/`repr`-result path above: the sub-walk already
+            // executed the constructor body, so a plain abort would have the
+            // interpreter replay it and repeat any effect it performed.
             let (value, concrete_for_shadow) = match constructor_result {
                 Some(instance) => {
                     if !matches!(concrete_for_shadow,
                         ConcreteValue::Ref(obj) if unsafe { pyre_object::is_none(obj) })
                     {
+                        latch_abort_call_resume(
+                            code,
+                            op,
+                            ctx,
+                            is_top_inline,
+                            unjournaled_before_subwalk,
+                            executed_effects_before,
+                            abort_flush_call_jitcode_coord,
+                        );
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
                     }
                     instance
