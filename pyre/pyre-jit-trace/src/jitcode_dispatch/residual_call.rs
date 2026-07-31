@@ -363,12 +363,28 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         }
     }
 
+    // An `OpRef::None` register is an ABSENT BOX, not an unresolved one: the
+    // walk never defined this color.  `blackhole.py:1711-1730
+    // _copy_data_from_miframe` copies a register only `if box`, so upstream
+    // leaves the blackhole's slot exactly as unset as the MIFrame's, and the
+    // drive cannot read it — every path that reaches this coordinate with the
+    // color live also defines it, or the jitcode would read an undefined
+    // register.  It arrives undefined here because a `-live-` set is the union
+    // over the paths INTO its coordinate, and the walk took one of them.
+    // Declining refused the whole image over a register nothing will read; the
+    // shape it kept on the replay path is a `CALL_FUNCTION_EX` whose escape
+    // fell back to a legacy replay of an already-executed frame.
+    // A color that HAS a box but no recoverable concrete still declines: there
+    // the drive can read it and the walk lost the value.
     for &color in &live.int {
         let color = color as usize;
         if miframe.int_values.get(color).copied().flatten().is_some() {
             continue;
         }
         let ConcreteValue::Int(value) = ctx.concrete_registers_i.get(color).copied()? else {
+            if ctx.registers_i.get(color).copied()?.is_none() {
+                continue;
+            }
             return None;
         };
         *miframe.int_values.get_mut(color)? = Some(value);
@@ -388,6 +404,9 @@ fn build_single_frame_miframe<Sym: WalkSym>(
             // that cannot resolve it.
             _ => {
                 let opref = ctx.registers_r.get(color).copied()?;
+                if opref.is_none() {
+                    continue;
+                }
                 match ctx.trace_ctx.recover_ref_value(opref, 8) {
                     Some(majit_ir::Value::Ref(gc)) => gc.0 as i64,
                     _ => return None,
@@ -402,6 +421,9 @@ fn build_single_frame_miframe<Sym: WalkSym>(
             continue;
         }
         let opref = ctx.registers_f.get(color).copied()?;
+        if opref.is_none() {
+            continue;
+        }
         let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
             return None;
         };
