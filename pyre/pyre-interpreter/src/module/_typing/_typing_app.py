@@ -8,6 +8,12 @@ module-level helpers (_typevar_subst, _paramspec_subst, _generic_class_getitem,
 ...), exactly as the C objects call back into the typing module.
 """
 
+# CPython exposes these runtime classes as members of `typing`, and their
+# repr/pickle/substitution semantics depend on that public owner. Mixed-module
+# applevel code executes in a private globals dict, so declare it explicitly
+# instead of inheriting that dict's default `builtins` module name.
+__name__ = "typing"
+
 import sys
 from types import GenericAlias, UnionType as Union
 
@@ -16,7 +22,7 @@ def _caller_module():
     # Equivalent to sys._getframe(2).f_globals['__name__']: frame 0 is this
     # helper, frame 1 the constructor, frame 2 the user that called it.
     try:
-        return sys._getframe(2).f_globals.get('__name__', '__main__')
+        return sys._getframe(2).f_globals.get('__name__')
     except (AttributeError, ValueError):
         return None
 
@@ -31,15 +37,29 @@ def _evaluate_typeparam(thunk):
     return thunk()
 
 
-class _NoDefaultType:
+class _NoDefaultMeta(type):
+    def __new__(mcls, name, bases, namespace):
+        if any(isinstance(base, _NoDefaultMeta) for base in bases):
+            raise TypeError("type 'typing.NoDefault' is not an acceptable base type")
+        return super().__new__(mcls, name, bases, namespace)
+
+    def __setattr__(cls, name, value):
+        raise TypeError("cannot set attributes of immutable type 'typing.NoDefault'")
+
+
+_no_default_instance = None
+
+
+class _NoDefaultType(metaclass=_NoDefaultMeta):
     """Type of the typing.NoDefault sentinel."""
 
-    _instance = None
+    __slots__ = ()
 
     def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+        global _no_default_instance
+        if _no_default_instance is None:
+            _no_default_instance = super().__new__(cls)
+        return _no_default_instance
 
     def __repr__(self):
         return "typing.NoDefault"
@@ -79,9 +99,20 @@ class TypeVar:
             raise TypeError("Constraints cannot be combined with bound=...")
         if len(constraints) == 1:
             raise TypeError("A single constraint is not allowed")
-        self._constraints = tuple(constraints)
+        import typing
+        self._constraints = tuple(
+            typing._type_check(
+                constraint,
+                f"TypeVar(name, constraint, ...). Constraints must be types. Got {constraint!r}.",
+            )
+            for constraint in constraints
+        )
         self._evaluate_constraints = None
-        self._bound = bound
+        self._bound = (
+            None
+            if bound is None
+            else typing._type_check(bound, "Bound must be a type.")
+        )
         self._evaluate_bound = None
         self.__module__ = _caller_module()
 
@@ -129,10 +160,9 @@ class TypeVar:
             index = list(params).index(self)
         except ValueError:
             return args
-        if len(args) <= index and self.has_default():
+        if len(args) == index and self.has_default():
             args = list(args)
-            while len(args) <= index:
-                args.append(self.__default__)
+            args.append(self.__default__)
             args = tuple(args)
         return args
 
@@ -146,14 +176,19 @@ class TypeVar:
         raise TypeError("Cannot subclass an instance of TypeVar")
 
     def __or__(self, other):
-        return Union[self, other]
+        import typing
+        return Union[self, typing._type_convert(other)]
 
     def __ror__(self, other):
-        return Union[other, self]
+        import typing
+        return Union[typing._type_convert(other), self]
 
     def __repr__(self):
         return _variance_prefix(self.__infer_variance__, self.__covariant__,
                                 self.__contravariant__) + self.__name__
+
+    def __init_subclass__(cls, **kwargs):
+        raise TypeError("type 'typing.TypeVar' is not an acceptable base type")
 
 
 class ParamSpec:
@@ -204,6 +239,9 @@ class ParamSpec:
     def __ror__(self, other):
         return Union[other, self]
 
+    def __init_subclass__(cls, **kwargs):
+        raise TypeError("type 'typing.ParamSpec' is not an acceptable base type")
+
     def __repr__(self):
         return _variance_prefix(self.__infer_variance__, self.__covariant__,
                                 self.__contravariant__) + self.__name__
@@ -229,6 +267,9 @@ class ParamSpecArgs:
     def __mro_entries__(self, bases):
         raise TypeError("Cannot subclass an instance of ParamSpecArgs")
 
+    def __init_subclass__(cls, **kwargs):
+        raise TypeError("type 'typing.ParamSpecArgs' is not an acceptable base type")
+
 
 class ParamSpecKwargs:
     """The kwargs of a ParamSpec, e.g. P.kwargs."""
@@ -249,6 +290,9 @@ class ParamSpecKwargs:
 
     def __mro_entries__(self, bases):
         raise TypeError("Cannot subclass an instance of ParamSpecKwargs")
+
+    def __init_subclass__(cls, **kwargs):
+        raise TypeError("type 'typing.ParamSpecKwargs' is not an acceptable base type")
 
 
 class TypeVarTuple:
@@ -282,15 +326,26 @@ class TypeVarTuple:
     def __repr__(self):
         return self.__name__
 
+    def __init_subclass__(cls, **kwargs):
+        raise TypeError("type 'typing.TypeVarTuple' is not an acceptable base type")
+
 
 class TypeAliasType:
     """A PEP 695 ``type X = ...`` alias."""
 
-    def __init__(self, name, value, *, type_params=()):
+    def __init__(self, name, value, *, type_params=(), _evaluate_value=None):
         self.__name__ = name
-        self.__value__ = value
+        self._value = value
+        self._evaluate_value = _evaluate_value
         self.__type_params__ = tuple(type_params)
         self.__module__ = _caller_module()
+
+    @property
+    def __value__(self):
+        if self._evaluate_value is not None:
+            self._value = self._evaluate_value()
+            self._evaluate_value = None
+        return self._value
 
     @property
     def __parameters__(self):
@@ -371,4 +426,6 @@ def _intrinsic_typealias(args):
     name, type_params, value = args
     if type_params is None:
         type_params = ()
-    return TypeAliasType(name, value, type_params=type_params)
+    return TypeAliasType(
+        name, None, type_params=type_params, _evaluate_value=value
+    )

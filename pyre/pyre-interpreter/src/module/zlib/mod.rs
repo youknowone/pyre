@@ -63,14 +63,7 @@ fn zlib_error(msg: impl Into<String>) -> crate::PyError {
 }
 
 fn eof_error(msg: &str) -> crate::PyError {
-    let mut err = crate::PyError::value_error(msg.to_string());
-    if let Some(cls) = crate::builtins::lookup_exc_class("EOFError") {
-        let args = [cls, w_str_new(msg)];
-        if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
-            err.exc_object = exc;
-        }
-    }
-    err
+    crate::PyError::new(crate::PyErrorKind::EOFError, msg)
 }
 
 // ── argument helpers ────────────────────────────────────────────────────

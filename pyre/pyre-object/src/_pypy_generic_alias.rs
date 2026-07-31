@@ -42,19 +42,38 @@ pub fn w_generic_alias_new(
 ) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
     let _roots = crate::gc_roots::push_roots();
+    let save_point = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(origin);
     crate::gc_roots::pin_root(args);
     crate::gc_roots::pin_root(parameters);
-    GenericAlias::allocate(GenericAlias {
+    // Allocate with empty pointer fields, then reload the GC-forwarded roots
+    // and install them.  Building the payload before `allocate` retained the
+    // pre-minor-collection addresses even though the shadow-stack slots were
+    // updated during the allocation.
+    // RPython allocates the alias as a GC object whose `_args` and
+    // `_parameters` fields are traced.  Use pyre's stable managed bridge:
+    // the legacy `allocate` path lives outside the collector, so a minor GC
+    // could move either tuple without forwarding these owning fields.
+    let obj = GenericAlias::allocate_stable(GenericAlias {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
         },
-        origin,
-        args,
-        parameters,
+        origin: std::ptr::null_mut(),
+        args: std::ptr::null_mut(),
+        parameters: std::ptr::null_mut(),
         unpacked: false,
-    })
+    });
+    unsafe {
+        (*(obj as *mut GenericAlias)).origin = crate::gc_roots::shadow_stack_get(save_point);
+        (*(obj as *mut GenericAlias)).args = crate::gc_roots::shadow_stack_get(save_point + 1);
+        (*(obj as *mut GenericAlias)).parameters =
+            crate::gc_roots::shadow_stack_get(save_point + 2);
+        // `allocate_stable` barriers the initially-empty payload.  Record the
+        // young pointers installed afterwards as well.
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    }
+    obj
 }
 
 /// `_origin` reader.
@@ -170,16 +189,26 @@ pub fn w_union_from_members(members: Vec<PyObjectRef>, parameters: PyObjectRef) 
     let args = crate::w_tuple_new(members);
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
     let _roots = crate::gc_roots::push_roots();
+    let save_point = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(args);
     crate::gc_roots::pin_root(parameters);
-    UnionType::allocate(UnionType {
+    // PyPy's `UnionType` is GC-owned and keeps `_args` / `_parameters`
+    // reachable.  The stable managed bridge preserves that ownership while
+    // interpreter methods still carry raw `PyObjectRef` receivers.
+    let obj = UnionType::allocate_stable(UnionType {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
         },
-        args,
-        parameters,
-    })
+        args: std::ptr::null_mut(),
+        parameters: std::ptr::null_mut(),
+    });
+    unsafe {
+        (*(obj as *mut UnionType)).args = crate::gc_roots::shadow_stack_get(save_point);
+        (*(obj as *mut UnionType)).parameters = crate::gc_roots::shadow_stack_get(save_point + 1);
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    }
+    obj
 }
 
 /// Get the `__args__` tuple of a UnionType.

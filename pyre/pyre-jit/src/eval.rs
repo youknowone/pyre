@@ -3763,9 +3763,6 @@ fn install_gc_root_walkers() {
     // `MetaInterp::forced_virtuals` is the same shape but lives in one mutator's
     // `JIT_DRIVER` rather than a global table, so it registers per mutator
     // instead — see `forced_virtuals_pruner_area`.
-    // The GC-managed weakref box holds its referent and callback outside any
-    // traced field, so the boxes' inner slots need their own root area.
-    majit_gc::shadow_stack::register_extra_root_walker(weakref_box_inner_root_walker);
 }
 
 fn register_thread_root_areas() {
@@ -4556,12 +4553,6 @@ fn pyre_interpreter_side_table_root_walker(visitor: &mut dyn FnMut(&mut majit_ir
 #[cfg(not(target_arch = "wasm32"))]
 fn signal_handler_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     pyre_interpreter::module::signal::interp_signal::walk_signal_handler_roots(|slot| {
-        visit_pyobject_root(slot, visitor);
-    });
-}
-
-fn weakref_box_inner_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    pyre_object::weakref::walk_gc_weakref_box_inner_roots(|slot| {
         visit_pyobject_root(slot, visitor);
     });
 }

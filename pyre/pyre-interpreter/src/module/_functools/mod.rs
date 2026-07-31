@@ -9,10 +9,127 @@
 
 use pyre_object::*;
 
+/// PyPy `module/_functools/interp_functools.py:reduce`.
+///
+/// Keep the accumulator in a GC-walked one-element list: `next()` and the
+/// reduction callback may both collect, so a Rust local would not track a
+/// relocated object between iterations.
+fn reduce(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let keyword_initial =
+        kwargs.and_then(|dict| unsafe { pyre_object::w_dict_getitem_str(dict, "initial") });
+    let keyword_count = crate::builtins::real_kwarg_count(kwargs);
+    if keyword_count != usize::from(keyword_initial.is_some()) {
+        return Err(crate::PyError::type_error(
+            "reduce() got an unexpected keyword argument",
+        ));
+    }
+    // CPython 3.14 `_functoolsmodule.c:reduce` keeps `function` and
+    // `iterable` positional-only even though `initial` may be named.  A named
+    // initial cannot fill either required position.
+    if positional.len() < 2 {
+        return Err(crate::PyError::type_error(format!(
+            "reduce() takes at least 2 positional arguments ({} given)",
+            positional.len()
+        )));
+    }
+    let mut effective = positional.to_vec();
+    if let Some(initial) = keyword_initial {
+        effective.push(initial);
+    }
+    if effective.len() > 3 {
+        return Err(crate::PyError::type_error(format!(
+            "reduce() takes at most 3 arguments ({} given)",
+            effective.len()
+        )));
+    }
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    for &arg in &effective {
+        pyre_object::gc_roots::pin_root(arg);
+    }
+    let function_slot = base;
+    let sequence_slot = base + 1;
+    let w_iter = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(sequence_slot))?;
+    pyre_object::gc_roots::pin_root(w_iter);
+    let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    let initial = if effective.len() == 3 {
+        pyre_object::gc_roots::shadow_stack_get(base + 2)
+    } else {
+        match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
+            Ok(value) => value,
+            Err(err) if err.kind == crate::PyErrorKind::StopIteration => {
+                return Err(crate::PyError::type_error(
+                    "reduce() of empty iterable with no initial value",
+                ));
+            }
+            Err(err) => return Err(err),
+        }
+    };
+    pyre_object::gc_roots::pin_root(initial);
+    let initial_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let accumulator =
+        pyre_object::listobject::w_list_new(vec![pyre_object::gc_roots::shadow_stack_get(
+            initial_slot,
+        )]);
+    pyre_object::gc_roots::pin_root(accumulator);
+    let accumulator_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    loop {
+        let item =
+            match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
+                Ok(value) => value,
+                Err(err) if err.kind == crate::PyErrorKind::StopIteration => break,
+                Err(err) => return Err(err),
+            };
+        // `next()` returns a raw object reference.  Keep this iteration's
+        // transient values in their own root scope: the reducer is arbitrary
+        // Python and `w_list_setitem` may switch list strategy and allocate.
+        let _iteration_roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(item);
+        let item_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let current = unsafe {
+            pyre_object::listobject::w_list_getitem(
+                pyre_object::gc_roots::shadow_stack_get(accumulator_slot),
+                0,
+            )
+            .unwrap()
+        };
+        let result = crate::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(function_slot),
+            &[current, pyre_object::gc_roots::shadow_stack_get(item_slot)],
+        )?;
+        pyre_object::gc_roots::pin_root(result);
+        let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        unsafe {
+            pyre_object::listobject::w_list_setitem(
+                pyre_object::gc_roots::shadow_stack_get(accumulator_slot),
+                0,
+                pyre_object::gc_roots::shadow_stack_get(result_slot),
+            );
+        }
+    }
+    Ok(unsafe {
+        pyre_object::listobject::w_list_getitem(
+            pyre_object::gc_roots::shadow_stack_get(accumulator_slot),
+            0,
+        )
+        .unwrap()
+    })
+}
+
 crate::py_module! {
     "_functools",
     inline_app: {
         r#"
+from operator import itemgetter as _partial_itemgetter
+from reprlib import recursive_repr as _partial_recursive_repr
+from types import GenericAlias as _PartialGenericAlias
+from types import MethodType as _PartialMethodType
+
+
 def cmp_to_key(mycmp):
     class K(object):
         __slots__ = ['obj']
@@ -31,48 +148,53 @@ def cmp_to_key(mycmp):
         __hash__ = None
     return K
 
-_initial_missing = object()
+# `_functools.cmp_to_key` is an interp-level builtin in CPython.  Unlike an
+# app-level function, it therefore does not acquire an instance when a caller
+# stores it on a class (the CPython functools tests do exactly that).  A
+# callable staticmethod preserves the app-level implementation while giving
+# the exported object the same non-binding descriptor behavior.
+cmp_to_key = staticmethod(cmp_to_key)
 
 
-def reduce(function, sequence, initial=_initial_missing):
-    # _functoolsmodule.c functools_reduce — reduce(function, iterable[, initial]).
-    try:
-        it = iter(sequence)
-    except TypeError:
-        raise TypeError("reduce() arg 2 must support iteration") from None
-    if initial is not _initial_missing:
-        accum = initial
-    else:
-        try:
-            accum = next(it)
-        except StopIteration:
-            raise TypeError(
-                "reduce() of empty iterable with no initial value") from None
-    for element in it:
-        accum = function(accum, element)
-    return accum
+def _placeholder_immutable(name):
+    return TypeError(
+        f"cannot set {name!r} attribute of immutable type "
+        "'functools._PlaceholderType'"
+    )
 
 
-# PyPy: lib_pypy/_functools.py `partial`, extended with the Placeholder
-# semantics introduced in Python 3.14. The private storage plus read-only
-# properties is intentional: it is the upstream accelerator object shape.
-from operator import itemgetter as _partial_itemgetter
-from reprlib import recursive_repr as _partial_recursive_repr
-from types import GenericAlias as _PartialGenericAlias
-from types import MethodType as _PartialMethodType
+class _PlaceholderMeta(type):
+    # The accelerator's type is static, so `type_setattro` refuses both an
+    # assignment and a deletion, with the same wording.  The pure-Python
+    # fallback in `functools.py` is an ordinary class and accepts them; this
+    # module stands in for the accelerator.
+    def __setattr__(cls, name, value):
+        raise _placeholder_immutable(name)
+
+    def __delattr__(cls, name):
+        raise _placeholder_immutable(name)
 
 
-class _PlaceholderType:
-    __instance = None
+# The singleton cannot live on the class, whose attributes are now read-only.
+_placeholder_instance = None
+
+
+class _PlaceholderType(metaclass=_PlaceholderMeta):
+    """The type of the Placeholder singleton."""
+
+    __module__ = "functools"
     __slots__ = ()
 
     def __init_subclass__(cls, *args, **kwargs):
-        raise TypeError(f"type '{cls.__name__}' is not an acceptable base type")
+        raise TypeError(
+            "type 'functools._PlaceholderType' is not an acceptable base type"
+        )
 
     def __new__(cls):
-        if cls.__instance is None:
-            cls.__instance = object.__new__(cls)
-        return cls.__instance
+        global _placeholder_instance
+        if _placeholder_instance is None:
+            _placeholder_instance = object.__new__(cls)
+        return _placeholder_instance
 
     def __repr__(self):
         return "Placeholder"
@@ -110,7 +232,13 @@ def _partial_new(cls, func, /, *args, **keywords):
         if value is Placeholder:
             raise TypeError("Placeholder cannot be passed as a keyword argument")
 
-    if isinstance(func, partial):
+    # `partial_new` unpacks a wrapped partial only while it carries no
+    # instance state (`part->dict == NULL`); placeholder positions and bound
+    # arguments are merged for subclasses too, since subclassing alone does
+    # not block the optimization.  The slots above keep `__dict__` empty until
+    # user code assigns an attribute, so a partial holding its own state stays
+    # wrapped and keeps running its own behaviour.
+    if isinstance(func, partial) and not func.__dict__:
         pto_phcount = func._phcount
         tot_args = func.args
         if args:
@@ -132,32 +260,35 @@ def _partial_new(cls, func, /, *args, **keywords):
         phcount, merger = _partial_prepare_merger(tot_args)
 
     self = object.__new__(cls)
-    self._func = func
-    self._args = tot_args
-    self._keywords = keywords
-    self._phcount = phcount
-    self._merger = merger
+    object.__setattr__(self, "_func", func)
+    object.__setattr__(self, "_args", tot_args)
+    object.__setattr__(self, "_keywords", keywords)
+    object.__setattr__(self, "_phcount", phcount)
+    object.__setattr__(self, "_merger", merger)
     return self
 
 
 def _partial_repr(self):
     cls = type(self)
-    module = cls.__module__
-    qualname = cls.__qualname__
     func, p_args, keywords = self.func, self.args, self.keywords
     args = [repr(func)]
     args.extend(map(repr, p_args))
     args.extend(f"{key}={value!r}" for key, value in keywords.items())
-    return f"{module}.{qualname}({', '.join(args)})"
+    return f"{cls.__module__}.{cls.__qualname__}({', '.join(args)})"
 
 
-class partial(object):
+class partial:
     """New function with partial application of the given arguments
     and keywords.
     """
 
-    __slots__ = ("_func", "_args", "_keywords", "_phcount", "_merger",
-                 "__dict__", "__weakref__")
+    # CPython's accelerator keeps these three fields in the partial object and
+    # exposes them through read-only member descriptors.  Private slots plus
+    # getter-only properties preserve the same ownership and mutability shape.
+    __slots__ = (
+        "_func", "_args", "_keywords", "_phcount", "_merger",
+        "__dict__", "__weakref__",
+    )
 
     __new__ = _partial_new
     __repr__ = _partial_recursive_repr()(_partial_repr)
@@ -186,9 +317,10 @@ class partial(object):
                 pto_args = self._merger(self.args + args)
                 args = args[phcount:]
             except IndexError:
-                raise TypeError("missing positional arguments "
-                                "in 'partial' call; expected "
-                                f"at least {phcount}, got {len(args)}")
+                raise TypeError(
+                    "missing positional arguments in 'partial' call; "
+                    f"expected at least {phcount}, got {len(args)}"
+                )
         else:
             pto_args = self.args
         keywords = {**self.keywords, **keywords}
@@ -200,45 +332,51 @@ class partial(object):
         return _PartialMethodType(self, obj)
 
     def __reduce__(self):
-        return (type(self), (self.func,),
-                (self.func, self.args, self.keywords or None,
-                 self.__dict__ or None))
+        return (
+            type(self),
+            (self.func,),
+            (self.func, self.args, self.keywords or None, self.__dict__ or None),
+        )
 
     def __setstate__(self, state):
         if not isinstance(state, tuple):
             raise TypeError("argument to __setstate__ must be a tuple")
         if len(state) != 4:
             raise TypeError(f"expected 4 items in state, got {len(state)}")
-        func, args, keywords, namespace = state
-        if (not callable(func) or not isinstance(args, tuple) or
-                (keywords is not None and not isinstance(keywords, dict)) or
-                (namespace is not None and not isinstance(namespace, dict))):
+        func, args, kwds, namespace = state
+        if (
+            not callable(func)
+            or not isinstance(args, tuple)
+            or (kwds is not None and not isinstance(kwds, dict))
+            or (namespace is not None and not isinstance(namespace, dict))
+        ):
             raise TypeError("invalid partial state")
         if args and args[-1] is Placeholder:
             raise TypeError("trailing Placeholders are not allowed")
 
         phcount, merger = _partial_prepare_merger(args)
         args = tuple(args)
-        if keywords is None:
-            keywords = {}
-        elif type(keywords) is not dict:
-            keywords = dict(keywords)
+        if kwds is None:
+            kwds = {}
+        elif type(kwds) is not dict:
+            kwds = dict(kwds)
         if namespace is None:
             namespace = {}
 
         self.__dict__ = namespace
-        self._func = func
-        self._args = args
-        self._keywords = keywords
-        self._phcount = phcount
-        self._merger = merger
+        object.__setattr__(self, "_func", func)
+        object.__setattr__(self, "_args", args)
+        object.__setattr__(self, "_keywords", kwds)
+        object.__setattr__(self, "_phcount", phcount)
+        object.__setattr__(self, "_merger", merger)
 
     __class_getitem__ = classmethod(_PartialGenericAlias)
 
 
-# CPython exposes these accelerator types from the public `functools` module.
 partial.__module__ = "functools"
-_PlaceholderType.__module__ = "functools"
-"# => ["cmp_to_key", "reduce", "partial", "Placeholder", "_PlaceholderType"],
+"# => ["cmp_to_key", "partial", "Placeholder", "_PlaceholderType"],
+    },
+    functions: {
+        "reduce" / * = reduce,
     },
 }

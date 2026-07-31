@@ -137,6 +137,28 @@ pub(crate) fn call_fn(callable: PyObjectRef, args: &[PyObjectRef]) -> Result<PyO
     Ok(r)
 }
 
+fn call_fn_with_kwargs(
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+    kwargs: &[(&str, PyObjectRef)],
+) -> Result<PyObjectRef, PyError> {
+    let ec = crate::call::getexecutioncontext();
+    if ec.is_null() {
+        return Err(PyError::runtime_error(
+            "no execution context for _pickle keyword call",
+        ));
+    }
+    let frame = unsafe { (*ec).gettopframe() };
+    if frame.is_null() {
+        return Err(PyError::runtime_error("no frame for _pickle keyword call"));
+    }
+    let kwargs = kwargs
+        .iter()
+        .map(|(name, value)| (rustpython_wtf8::Wtf8Buf::from(*name), *value))
+        .collect::<Vec<_>>();
+    crate::call::call_with_kwargs(unsafe { &mut *frame }, callable, args, &kwargs)
+}
+
 pub(crate) fn call_meth(
     obj: PyObjectRef,
     name: &str,
@@ -592,12 +614,36 @@ pub(crate) fn read_int_le(data: &[u8]) -> i64 {
 }
 
 pub(crate) fn str_from_utf8(data: &[u8]) -> Result<PyObjectRef, PyError> {
-    // The binary string opcodes carry `surrogatepass` UTF-8, which is exactly
-    // the WTF-8 the pickler wrote, so a lone surrogate decodes back to the
-    // code point it was pickled from.
-    let buf = rustpython_wtf8::Wtf8Buf::from_bytes(data.to_vec())
-        .map_err(|_| unpickling_error("invalid utf-8 in pickle"))?;
-    Ok(pyre_object::w_str_from_wtf8(buf))
+    // BINUNICODE is encoded with Python's UTF-8 `surrogatepass`: lone
+    // surrogates are valid pickle payloads and are represented internally as
+    // WTF-8, while malformed byte sequences must still be rejected.
+    let s = rustpython_wtf8::Wtf8Buf::from_bytes(data.to_vec()).map_err(utf8_decode_error)?;
+    Ok(pyre_object::unicodeobject::w_str_from_wtf8(s))
+}
+
+/// Construct Python's UTF-8 decode error details from Rust's `Utf8Error`.
+/// `error_len == None` is a truncated multibyte sequence; otherwise a valid
+/// leading byte at `valid_up_to` means the following byte was an invalid
+/// continuation, and every other offending byte is an invalid start.
+pub(crate) fn utf8_decode_error(bytes: Vec<u8>) -> PyError {
+    let error = std::str::from_utf8(&bytes).unwrap_err();
+    let start = error.valid_up_to();
+    let reason = match error.error_len() {
+        None => "unexpected end of data",
+        Some(_)
+            if bytes
+                .get(start)
+                .is_some_and(|byte| matches!(byte, 0xC2..=0xF4)) =>
+        {
+            "invalid continuation byte"
+        }
+        Some(_) => "invalid start byte",
+    };
+    let end = start
+        + error
+            .error_len()
+            .unwrap_or(bytes.len().saturating_sub(start));
+    crate::typedef::unicode_decode_error("utf-8", &bytes, start, end.min(bytes.len()), reason)
 }
 
 crate::py_module! {
@@ -624,8 +670,12 @@ crate::py_module! {
             obj: PyObjectRef,
             file: PyObjectRef,
             #[default(pyre_object::w_none())] protocol: PyObjectRef,
-            #[default(pyre_object::boolobject::w_bool_from(true))] fix_imports: PyObjectRef,
-            #[default(pyre_object::w_none())] buffer_callback: PyObjectRef,
+            #[kwonly]
+            #[default(pyre_object::boolobject::w_bool_from(true))]
+            fix_imports: PyObjectRef,
+            #[kwonly]
+            #[default(pyre_object::w_none())]
+            buffer_callback: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
             // Pin every input before any Python-visible work: `normalize_protocol`
             // (`__index__`) and `is_true` (`__bool__`) run user code and can
@@ -675,8 +725,12 @@ crate::py_module! {
         fn dumps(
             obj: PyObjectRef,
             #[default(pyre_object::w_none())] protocol: PyObjectRef,
-            #[default(pyre_object::boolobject::w_bool_from(true))] fix_imports: PyObjectRef,
-            #[default(pyre_object::w_none())] buffer_callback: PyObjectRef,
+            #[kwonly]
+            #[default(pyre_object::boolobject::w_bool_from(true))]
+            fix_imports: PyObjectRef,
+            #[kwonly]
+            #[default(pyre_object::w_none())]
+            buffer_callback: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
             // Pin every input before any Python-visible work (`__index__` /
             // `__bool__` / `copyreg` import / memo alloc can relocate objects).
@@ -719,14 +773,22 @@ crate::py_module! {
         // `pickle.load` — read a pickle from `file`.
         fn load(
             file: PyObjectRef,
-            #[default(pyre_object::boolobject::w_bool_from(true))] fix_imports: PyObjectRef,
-            #[default(pyre_object::w_none())] encoding: PyObjectRef,
-            #[default(pyre_object::w_none())] errors: PyObjectRef,
-            #[default(pyre_object::w_none())] buffers: PyObjectRef,
+            #[kwonly]
+            #[default(pyre_object::boolobject::w_bool_from(true))]
+            fix_imports: PyObjectRef,
+            #[kwonly] #[default(pyre_object::w_none())] encoding: PyObjectRef,
+            #[kwonly] #[default(pyre_object::w_none())] errors: PyObjectRef,
+            #[kwonly] #[default(pyre_object::w_none())] buffers: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
-            let unpickler = call_fn(
+            let unpickler = call_fn_with_kwargs(
                 unpickler::type_object(),
-                &[file, fix_imports, encoding, errors, buffers],
+                &[file],
+                &[
+                    ("fix_imports", fix_imports),
+                    ("encoding", encoding),
+                    ("errors", errors),
+                    ("buffers", buffers),
+                ],
             )?;
             call_meth(unpickler, "load", &[])
         }
@@ -734,10 +796,12 @@ crate::py_module! {
         // `pickle.loads` — read a pickle from a `bytes` object.
         fn loads(
             data: PyObjectRef,
-            #[default(pyre_object::boolobject::w_bool_from(true))] fix_imports: PyObjectRef,
-            #[default(pyre_object::w_none())] encoding: PyObjectRef,
-            #[default(pyre_object::w_none())] errors: PyObjectRef,
-            #[default(pyre_object::w_none())] buffers: PyObjectRef,
+            #[kwonly]
+            #[default(pyre_object::boolobject::w_bool_from(true))]
+            fix_imports: PyObjectRef,
+            #[kwonly] #[default(pyre_object::w_none())] encoding: PyObjectRef,
+            #[kwonly] #[default(pyre_object::w_none())] errors: PyObjectRef,
+            #[kwonly] #[default(pyre_object::w_none())] buffers: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
             // Pin every argument that outlives the `BytesIO` construction;
             // a minor collection there can relocate them.
@@ -754,14 +818,26 @@ crate::py_module! {
                 bytesio_cls,
                 &[pyre_object::gc_roots::shadow_stack_get(base)],
             )?;
-            let unpickler = call_fn(
+            let unpickler = call_fn_with_kwargs(
                 unpickler::type_object(),
+                &[file],
                 &[
-                    file,
-                    pyre_object::gc_roots::shadow_stack_get(base + 1),
-                    pyre_object::gc_roots::shadow_stack_get(base + 2),
-                    pyre_object::gc_roots::shadow_stack_get(base + 3),
-                    pyre_object::gc_roots::shadow_stack_get(base + 4),
+                    (
+                        "fix_imports",
+                        pyre_object::gc_roots::shadow_stack_get(base + 1),
+                    ),
+                    (
+                        "encoding",
+                        pyre_object::gc_roots::shadow_stack_get(base + 2),
+                    ),
+                    (
+                        "errors",
+                        pyre_object::gc_roots::shadow_stack_get(base + 3),
+                    ),
+                    (
+                        "buffers",
+                        pyre_object::gc_roots::shadow_stack_get(base + 4),
+                    ),
                 ],
             )?;
             call_meth(unpickler, "load", &[])

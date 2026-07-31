@@ -24,14 +24,7 @@ fn marshal_error(error: wire::MarshalError) -> PyError {
 }
 
 fn eof_error(message: &str) -> PyError {
-    let mut error = PyError::value_error(message);
-    if let Some(cls) = crate::builtins::lookup_exc_class("EOFError") {
-        let args = [cls, w_str_new(message)];
-        if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
-            error.exc_object = exc;
-        }
-    }
-    error
+    PyError::new(crate::PyErrorKind::EOFError, message)
 }
 
 fn call_method(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> PyResult {

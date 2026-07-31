@@ -41,8 +41,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if args.is_empty() {
                     return Ok(w_bool_from(false));
                 }
-                let ch = unsafe { w_int_get_value(args[0]) } as u8 as char;
-                Ok(w_bool_from(ch.is_ascii_alphabetic()))
+                let ch = unsafe { w_int_get_value(args[0]) } as u32;
+                Ok(w_bool_from(ch < 128 && (ch as u8).is_ascii_alphabetic()))
             },
             1,
         ),
@@ -71,9 +71,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if args.is_empty() {
                     return Ok(w_int_new(0));
                 }
-                Ok(w_int_new(
-                    (unsafe { w_int_get_value(args[0]) } as u8).to_ascii_lowercase() as i64,
-                ))
+                let ch = unsafe { w_int_get_value(args[0]) };
+                Ok(w_int_new(if (0..128).contains(&ch) {
+                    (ch as u8).to_ascii_lowercase() as i64
+                } else {
+                    ch
+                }))
             },
             1,
         ),
@@ -623,18 +626,22 @@ fn char_slice(s: &Wtf8, start: i64, end: i64) -> Option<&Wtf8> {
     if end > char_len(s) {
         return None;
     }
-    Some(&s[char_to_byte(s, start)..char_to_byte(s, end)])
+    Some(unsafe {
+        Wtf8::from_bytes_unchecked(
+            &s.as_bytes()[char_to_byte(s, start)..char_to_byte(s, end)],
+        )
+    })
 }
 
 fn byte_slice(b: &'static [u8], start: i64, end: i64) -> Option<&'static [u8]> {
     if start < 0 || end < start {
         return None;
     }
-    let start = start as usize;
-    let end = end as usize;
-    if end > b.len() {
-        return None;
-    }
+    // `BufMatchContext` slices clamp old match spans to the exporter's current
+    // length (`interp_sre.py:slice_w`).  This matters for a one-shot match on
+    // a bytearray resized after matching (issue 29444).
+    let start = (start as usize).min(b.len());
+    let end = (end as usize).min(b.len());
     Some(&b[start..end])
 }
 
@@ -963,13 +970,30 @@ fn do_match(
     args: &[PyObjectRef],
     search: bool,
     match_all: bool,
+    name: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if args.len() < 2 {
-        return Err(crate::PyError::type_error("requires self and string"));
+    crate::builtins::kwarg_reject_unknown(kwargs, &["string", "pos", "endpos"], name)?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, "string", "string", args.get(1).is_some())?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, "pos", "pos", args.get(2).is_some())?;
+    crate::builtins::kwarg_reject_duplicate(kwargs, "endpos", "endpos", args.get(3).is_some())?;
+    if args.len() > 4 {
+        return Err(crate::PyError::type_error(format!(
+            "{name}() takes at most 3 arguments ({} given)",
+            args.len() - 1
+        )));
     }
-    let pat = args[0];
-    let string = args[1];
+    let Some(string) = args
+        .get(1)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "string"))
+    else {
+        return Err(crate::PyError::type_error("requires self and string"));
+    };
+    let pat = args
+        .first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error(format!("{name} requires self and string")))?;
     let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
     let subj = make_subject(pat, string)?;
     let w_buffer = unsafe { readbuf_obj(string) };
@@ -1044,13 +1068,13 @@ fn make_match(
 }
 
 fn sre_pattern_match(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    do_match(args, false, false)
+    do_match(args, false, false, "match")
 }
 fn sre_pattern_fullmatch(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    do_match(args, false, true)
+    do_match(args, false, true, "fullmatch")
 }
 fn sre_pattern_search(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    do_match(args, true, false)
+    do_match(args, true, false, "search")
 }
 
 /// Read an optional positional int argument (pos/endpos/count), using
@@ -1083,19 +1107,36 @@ fn arg_int_kw(
     arg_int(pos_args, idx, default)
 }
 
+fn required_arg_kw(
+    pos_args: &[PyObjectRef],
+    idx: usize,
+    kwargs: Option<PyObjectRef>,
+    name: &str,
+    function: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let positional = pos_args.get(idx).copied();
+    let keyword = crate::builtins::kwarg_get(kwargs, name);
+    if positional.is_some() && keyword.is_some() {
+        return Err(crate::PyError::type_error(format!(
+            "{function}() got multiple values for argument '{name}'"
+        )));
+    }
+    positional.or(keyword).ok_or_else(|| {
+        crate::PyError::type_error(format!("{function} requires self and {name}"))
+    })
+}
+
 /// `findall_w` (interp_sre.py:339-365) — non-overlapping matches.  With no
 /// groups the whole match is collected; with one group that group's text;
 /// with two or more a tuple of the groups.  Unmatched groups become the
 /// empty string (`w_emptystr`, :344-347).
 fn sre_pattern_findall(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if args.len() < 2 {
-        return Err(crate::PyError::type_error(
-            "findall requires self and string",
-        ));
-    }
-    let pat = args[0];
-    let string = args[1];
+    let pat = args
+        .first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("findall requires self and string"))?;
+    let string = required_arg_kw(args, 1, kwargs, "string", "findall")?;
     let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no code"))?;
     let subj = make_subject(pat, string)?;
     let (pos, endpos) = normalize_bounds(
@@ -1132,13 +1173,11 @@ fn sre_pattern_findall(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// `W_SRE_Scanner` that yields a `W_SRE_Match` per non-overlapping match.
 fn sre_pattern_finditer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if args.len() < 2 {
-        return Err(crate::PyError::type_error(
-            "finditer requires self and string",
-        ));
-    }
-    let pat = args[0];
-    let string = args[1];
+    let pat = args
+        .first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("finditer requires self and string"))?;
+    let string = required_arg_kw(args, 1, kwargs, "string", "finditer")?;
     if !unsafe { is_sre_pattern(pat) } {
         return Err(crate::PyError::type_error("descriptor 'finditer' for 're.Pattern'"));
     }
@@ -1151,13 +1190,19 @@ fn sre_pattern_finditer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         arg_int_kw(args, 2, kwargs, "pos", 0)?,
         arg_int_kw(args, 3, kwargs, "endpos", i64::MAX)?,
     );
-    Ok(w_sre_scanner_new(
+    let export_active = unsafe { crate::builtins::buffer_export_incref(string) };
+    let scanner = w_sre_scanner_new(
         pat,
         string,
         w_buffer,
         pos as i64,
         endpos as i64,
-    ))
+        export_active,
+    );
+    if export_active {
+        crate::executioncontext::register_finalizer(scanner);
+    }
+    Ok(scanner)
 }
 
 /// `sub_w` (interp_sre.py:409-412).
@@ -1177,6 +1222,7 @@ fn sre_pattern_subn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 /// references expanded ([`parse_template`]), or a plain literal; `count`
 /// caps the number of substitutions (0 = unlimited).
 fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
     let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
     if args.len() < 3 {
         return Err(crate::PyError::type_error("sub requires self, repl, string"));
@@ -1207,13 +1253,14 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
                 (unsafe { w_str_get_wtf8(w_repl) }.as_bytes(), false)
             }
             Subject::Bytes(_) => {
-                if !unsafe { pyre_object::bytesobject::is_bytes_like(w_repl) } {
+                let Some(w_bytes) = crate::typedef::buffer_as_bytes_like(w_repl)? else {
                     return Err(crate::PyError::type_error(
                         "sub: replacement must be bytes-like or callable",
                     ));
-                }
+                };
+                pyre_object::gc_roots::pin_root(w_bytes);
                 (
-                    unsafe { pyre_object::bytesobject::bytes_like_data(w_repl) },
+                    unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes) },
                     true,
                 )
             }
@@ -1313,11 +1360,11 @@ fn is_exact_str_or_bytes(w: PyObjectRef) -> bool {
 /// final item.
 fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if args.len() < 2 {
-        return Err(crate::PyError::type_error("split requires self and string"));
-    }
-    let pat = args[0];
-    let string = args[1];
+    let pat = args
+        .first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("split requires self and string"))?;
+    let string = required_arg_kw(args, 1, kwargs, "string", "split")?;
     let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
     let subj = make_subject(pat, string)?;
     let maxsplit = arg_int_kw(args, 2, kwargs, "maxsplit", 0)?;
@@ -1812,6 +1859,7 @@ fn sre_scanner_step(
     };
     if !found {
         unsafe { (*sc).pos = -1 }; // self.ctx = None
+        unsafe { sre_scanner_release_export(obj) };
         return Ok(None);
     }
     // engine.rs:255-256 — thread (start, must_advance) for the next step.
@@ -1828,6 +1876,20 @@ fn sre_scanner_step(
         original_pos,
         endpos as i64,
     )))
+}
+
+/// Release the buffer export owned by a lazy finditer/scanner.
+///
+/// PyPy's `W_SRE_Scanner._finalize_` and normal-exhaustion path share this
+/// idempotent ownership-bit check.
+pub unsafe fn sre_scanner_release_export(obj: PyObjectRef) {
+    let sc = obj as *mut W_SRE_Scanner;
+    unsafe {
+        if (*sc).export_active {
+            (*sc).export_active = false;
+            crate::builtins::buffer_export_decref((*sc).w_string);
+        }
+    }
 }
 
 /// `next_w` (interp_sre.py:918-923) — also the host `space.next` step for

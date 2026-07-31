@@ -532,6 +532,25 @@ def _unwrap_partialmethod(func):
 
 _CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
 
+class _HashedSeq(list):
+    """Cache the hash of an LRU key built from a specialized PyPy tuple.
+
+    Python 3.14 removed this wrapper after adding a hash cache to CPython's
+    sole tuple representation.  PyPy's arity-two specialized tuples
+    intentionally have no cache, so retain the PyPy adapter: lru_cache may
+    probe the same key several times on a miss but must hash its elements only
+    once per call.
+    """
+
+    __slots__ = 'hashvalue'
+
+    def __init__(self, tup, hash=hash):
+        self[:] = tup
+        self.hashvalue = hash(tup)
+
+    def __hash__(self):
+        return self.hashvalue
+
 def _make_key(args, kwds, typed,
              kwd_mark = (object(),),
              fasttypes = {int, str},
@@ -561,7 +580,7 @@ def _make_key(args, kwds, typed,
             key += tuple(type(v) for v in kwds.values())
     elif len(key) == 1 and type(key[0]) in fasttypes:
         return key[0]
-    return key
+    return _HashedSeq(key)
 
 def lru_cache(maxsize=128, typed=False):
     """Least-recently-used cache decorator.

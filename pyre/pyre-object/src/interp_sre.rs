@@ -30,50 +30,32 @@ pub struct W_SRE_Pattern {
     pub w_indexgroup: PyObjectRef,
 }
 
-thread_local! {
-    /// Every `W_SRE_Pattern` ever allocated. Patterns are `malloc_typed`
-    /// (immortal, off-GC), so the collector never traces into them: their
-    /// GC-heap `w_pattern` / `w_groupindex` / `w_indexgroup` slots would be
-    /// reclaimed (or relocated without updating the slot) by a collection,
-    /// and a later `groupdict()` / `group("name")` would iterate / read a
-    /// dangling dict. Walking these slots as roots (see
-    /// [`walk_sre_pattern_roots`]) keeps them coherent, as the signal
-    /// handler-table and weakref-box walkers do for their immortal storage.
-    static SRE_PATTERNS: std::cell::RefCell<Vec<*mut W_SRE_Pattern>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+/// Every `W_SRE_Pattern` ever allocated.  PyPy's compiled patterns are normal
+/// interpreter objects, shared by all threads; the root owner must therefore
+/// be process-global too.  The addresses are stored as `usize` because the
+/// immortal raw pointer itself is not `Send`.
+///
+/// Patterns are `malloc_typed` (immortal, off-GC), so the collector never
+/// traces into them: their GC-heap `w_pattern` / `w_groupindex` /
+/// `w_indexgroup` slots would otherwise be reclaimed or relocated without
+/// updating the slot.
+static SRE_PATTERNS: std::sync::OnceLock<std::sync::Mutex<Vec<usize>>> = std::sync::OnceLock::new();
+
+fn sre_patterns() -> &'static std::sync::Mutex<Vec<usize>> {
+    SRE_PATTERNS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
 /// Visit each immortal pattern's GC-heap `PyObjectRef` slots as roots.
+#[majit_macros::dont_look_inside]
 pub fn walk_sre_pattern_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
-    SRE_PATTERNS.with(|b| {
-        for &p in b.borrow().iter() {
-            if p.is_null() {
-                continue;
-            }
-            visitor(unsafe { &mut (*p).w_pattern });
-            visitor(unsafe { &mut (*p).w_groupindex });
-            visitor(unsafe { &mut (*p).w_indexgroup });
-        }
-    });
-}
-
-pub fn capture_sre_pattern_root_area() -> *const () {
-    SRE_PATTERNS.with(|patterns| patterns as *const _ as *const ())
-}
-
-/// # Safety
-/// `data` must come from [`capture_sre_pattern_root_area`], and its owning
-/// thread must be quiesced.
-pub unsafe fn walk_sre_pattern_roots_area(
-    data: *const (),
-    mut visitor: impl FnMut(&mut PyObjectRef),
-) {
-    let patterns =
-        unsafe { &*(*(data as *const std::cell::RefCell<Vec<*mut W_SRE_Pattern>>)).as_ptr() };
-    for &pattern in patterns.iter() {
-        if pattern.is_null() {
+    let patterns = sre_patterns()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for &addr in patterns.iter() {
+        if addr == 0 {
             continue;
         }
+        let pattern = addr as *mut W_SRE_Pattern;
         visitor(unsafe { &mut (*pattern).w_pattern });
         visitor(unsafe { &mut (*pattern).w_groupindex });
         visitor(unsafe { &mut (*pattern).w_indexgroup });
@@ -108,7 +90,13 @@ pub fn w_sre_pattern_new(
         w_groupindex,
         w_indexgroup,
     });
-    SRE_PATTERNS.with(|b| b.borrow_mut().push(obj as *mut W_SRE_Pattern));
+    // This is a prebuilt-family root store: make the collector rescan it after
+    // publishing a newly allocated pattern.
+    crate::gc_roots::mark_prebuilt_roots_dirty();
+    sre_patterns()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(obj as usize);
     obj
 }
 
@@ -240,6 +228,8 @@ pub struct W_SRE_Scanner {
     /// `req.must_advance` (engine.rs:255) — set after a zero-width match so
     /// the next search refuses to re-match at the same position.
     pub must_advance: i64,
+    /// Whether this lazy scanner owns one buffer export on `w_string`.
+    pub export_active: bool,
 }
 
 /// Allocate a `W_SRE_Scanner` — `W_SRE_Scanner.__init__` (interp_sre.py:905).
@@ -249,6 +239,7 @@ pub fn w_sre_scanner_new(
     w_buffer: PyObjectRef,
     pos: i64,
     endpos: i64,
+    export_active: bool,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_srepat);
@@ -266,6 +257,7 @@ pub fn w_sre_scanner_new(
         pos,
         endpos,
         must_advance: 0,
+        export_active,
     })
 }
 

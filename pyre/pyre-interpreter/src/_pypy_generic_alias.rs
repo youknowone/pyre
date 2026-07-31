@@ -441,9 +441,21 @@ pub(crate) fn subs_parameters(
     params: PyObjectRef,
     items: PyObjectRef,
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
-    let nparams = unsafe { w_tuple_len(params) };
+    // The Python hooks below are arbitrary collecting calls.  RPython's GC
+    // transform keeps all four live arguments in shadow-stack slots and
+    // reloads them afterwards; mirror that ownership explicitly.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_);
+    pyre_object::gc_roots::pin_root(args);
+    pyre_object::gc_roots::pin_root(params);
+    pyre_object::gc_roots::pin_root(items);
+    let current_self = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let current_args = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+    let current_params = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);
+    let nparams = unsafe { w_tuple_len(current_params()) };
     if nparams == 0 {
-        let repr = unsafe { crate::display::py_repr(self_)? };
+        let repr = unsafe { crate::display::py_repr(current_self())? };
         return Err(crate::PyError::type_error(format!(
             "{repr} is not a generic class"
         )));
@@ -478,10 +490,15 @@ pub(crate) fn subs_parameters(
         }) else {
             continue;
         };
+        let param_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(param);
         // `prepare = getattr(param, '__typing_prepare_subst__', None)` then
         // `if prepare is not None`: a missing attribute and an attribute
         // explicitly set to `None` both skip the reshape.
-        let prepare = match crate::baseobjspace::getattr_str(param, "__typing_prepare_subst__") {
+        let prepare = match crate::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(param_slot),
+            "__typing_prepare_subst__",
+        ) {
             Ok(p) => p,
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => w_none(),
             Err(e) => return Err(e),
@@ -509,6 +526,41 @@ pub(crate) fn subs_parameters(
         let direction = if nitems > nparams { "many" } else { "few" };
         let s =
             unsafe { crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(self_slot))? };
+        if nitems < nparams {
+            // A parameter carrying a default need not be supplied, so the
+            // shortfall is measured against the required count rather than
+            // `nparams` (`typing.py:1071` spells the same "expected at least"
+            // form). Only the trailing run can be defaulted away: a default
+            // cannot fill a missing required parameter ahead of it.
+            let mut required = nparams;
+            while required > 0 {
+                let Some(param) = (unsafe {
+                    w_tuple_getitem(
+                        pyre_object::gc_roots::shadow_stack_get(params_slot),
+                        (required - 1) as i64,
+                    )
+                }) else {
+                    break;
+                };
+                let has_default = match crate::baseobjspace::getattr_str(param, "has_default") {
+                    Ok(method) => {
+                        let result = crate::call::call_function_impl_result(method, &[])?;
+                        crate::baseobjspace::is_true(result)?
+                    }
+                    Err(e) if e.kind == crate::PyErrorKind::AttributeError => false,
+                    Err(e) => return Err(e),
+                };
+                if !has_default {
+                    break;
+                }
+                required -= 1;
+            }
+            if nitems < required {
+                return Err(crate::PyError::type_error(format!(
+                    "Too few arguments for {s}; actual {nitems}, expected at least {required}"
+                )));
+            }
+        }
         return Err(crate::PyError::type_error(format!(
             "Too {direction} arguments for {s}; actual {nitems}, expected {nparams}"
         )));
@@ -829,6 +881,35 @@ pub(crate) fn union_from_items(items: &[PyObjectRef]) -> crate::PyResult {
     }
 }
 
+/// `typing._type_convert(arg)` for the string operands accepted by
+/// `typing.Union[...]`, TypeVar `|`, and an already-created Union's `|`.
+/// Plain `type | "name"` still follows the ordinary unionable check and
+/// rejects the string before reaching this helper.
+pub(crate) fn typing_type_convert(arg: PyObjectRef) -> crate::PyResult {
+    if !unsafe { pyre_object::is_str(arg) } {
+        return Ok(arg);
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(arg);
+    let arg_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let typing = crate::importing::check_sys_modules("typing")
+        .ok_or_else(|| crate::PyError::type_error("typing module is not initialized"))?;
+    pyre_object::gc_roots::pin_root(typing);
+    let typing_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    // Module getattr may execute Python and collect.  Reload both the module
+    // and operand from their PyPy-shaped roots before the call.
+    let convert = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(typing_slot),
+        "_type_convert",
+    )?;
+    pyre_object::gc_roots::pin_root(convert);
+    let convert_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(convert_slot),
+        &[pyre_object::gc_roots::shadow_stack_get(arg_slot)],
+    )
+}
+
 /// `add_recurse(arg)` (`_pypy_generic_alias.py:253-262`) — the deduplicating
 /// flatten body of `UnionType.__init__`.  `None` becomes `NoneType`, a nested
 /// `UnionType` is spliced member-by-member, and a member is appended only when
@@ -1113,15 +1194,49 @@ pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
 /// # Safety
 /// `obj` must point to a valid `GenericAlias`.
 pub(crate) unsafe fn repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
-    let origin = w_generic_alias_get_origin(obj);
-    let args = w_generic_alias_get_args(obj);
-    let n = w_tuple_len(args);
-    let inner = if n == 0 {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let origin = w_generic_alias_get_origin(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+    pyre_object::gc_roots::pin_root(origin);
+    let origin_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let args = w_generic_alias_get_args(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+    pyre_object::gc_roots::pin_root(args);
+    let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let current_args = || pyre_object::gc_roots::shadow_stack_get(args_slot);
+    let n = w_tuple_len(current_args());
+    // CPython's GenericAlias formatter compares against the actual
+    // `collections.abc.Callable` object.  Spoofable `__module__` /
+    // `__qualname__` metadata must not select Callable's flattened layout.
+    let origin_is_callable =
+        is_collections_abc_callable(pyre_object::gc_roots::shadow_stack_get(origin_slot))?;
+    let inner = if origin_is_callable && n >= 1 {
+        let result = w_tuple_getitem(current_args(), (n - 1) as i64).unwrap();
+        let result_repr = repr_item(result)?;
+        if n == 1 {
+            format!("[], {result_repr}")
+        } else {
+            let first = w_tuple_getitem(current_args(), 0).unwrap();
+            if is_ellipsis(first) {
+                format!("..., {result_repr}")
+            } else if n == 2 && (is_param_spec(first)? || is_typing_generic_alias(first)?) {
+                format!("{}, {result_repr}", repr_item(first)?)
+            } else {
+                let mut params = Vec::with_capacity(n - 1);
+                for i in 0..n - 1 {
+                    if let Some(item) = w_tuple_getitem(current_args(), i as i64) {
+                        params.push(repr_item(item)?);
+                    }
+                }
+                format!("[{}], {result_repr}", params.join(", "))
+            }
+        }
+    } else if n == 0 {
         "()".to_string()
     } else {
         let mut parts = Vec::with_capacity(n);
         for i in 0..n {
-            if let Some(item) = w_tuple_getitem(args, i as i64) {
+            if let Some(item) = w_tuple_getitem(current_args(), i as i64) {
                 parts.push(if is_list(item) {
                     repr_items_list(item)?
                 } else {
@@ -1131,12 +1246,15 @@ pub(crate) unsafe fn repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
         }
         parts.join(", ")
     };
-    let star = if w_generic_alias_get_unpacked(obj) {
+    let star = if w_generic_alias_get_unpacked(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
         "*"
     } else {
         ""
     };
-    Ok(format!("{star}{}[{inner}]", repr_item(origin)?))
+    Ok(format!(
+        "{star}{}[{inner}]",
+        repr_item(pyre_object::gc_roots::shadow_stack_get(origin_slot))?
+    ))
 }
 
 /// CPython 3.14 `ga_repr_items_list` — ParamSpec substitutions retain a
@@ -1157,24 +1275,85 @@ unsafe fn repr_items_list(list: PyObjectRef) -> Result<String, crate::PyError> {
 /// `_repr_item(it)` (`_pypy_generic_alias.py:124`) — a class renders as its
 /// qualname (prefixed with the module when it is not `builtins`); anything
 /// else falls back to `repr`.
-unsafe fn repr_item(it: PyObjectRef) -> Result<String, crate::PyError> {
-    if is_ellipsis(it) {
+pub(crate) unsafe fn repr_item(it: PyObjectRef) -> Result<String, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(it);
+    let item_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let current_item = || pyre_object::gc_roots::shadow_stack_get(item_slot);
+    if is_ellipsis(current_item()) {
         return Ok("...".to_string());
     }
-    if is_generic_alias(it) {
-        return repr(it);
+    if is_generic_alias(current_item()) {
+        return repr(current_item());
+    }
+    // `_pypy_generic_alias.py:129-130` checks
+    // `isinstance(it, typing._GenericAlias)` before consulting
+    // `__qualname__`; otherwise aliases such as
+    // `typing.Concatenate[int, P]` collapse to `typing.Concatenate`.
+    if is_typing_generic_alias(current_item())? {
+        return crate::display::py_repr(current_item());
     }
     // `getattr(it, "__qualname__")` / `getattr(it, "__module__")`.
-    if let Ok(w_qualname) = crate::baseobjspace::getattr_str(it, "__qualname__") {
+    if let Ok(w_qualname) = crate::baseobjspace::getattr_str(current_item(), "__qualname__") {
         if let Ok(qualname) = crate::baseobjspace::text_w(w_qualname) {
-            let module = crate::baseobjspace::getattr_str(it, "__module__")
+            let qualname = qualname.to_string();
+            let module = crate::baseobjspace::getattr_str(current_item(), "__module__")
                 .ok()
-                .and_then(|w| crate::baseobjspace::text_w(w).ok());
+                .and_then(|w| crate::baseobjspace::text_w(w).ok().map(str::to_string));
             return Ok(match module {
                 Some(m) if m != "builtins" => format!("{m}.{qualname}"),
-                _ => qualname.to_string(),
+                _ => qualname,
             });
         }
     }
-    crate::display::py_repr(it)
+    crate::display::py_repr(current_item())
+}
+
+fn is_collections_abc_callable(origin: PyObjectRef) -> Result<bool, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(origin);
+    let origin_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let module = crate::importing::check_sys_modules("collections.abc")
+        .or_else(|| crate::importing::check_sys_modules("_collections_abc"));
+    let Some(module) = module else {
+        return Ok(false);
+    };
+    let callable = crate::baseobjspace::getattr_str(module, "Callable")?;
+    Ok(callable == pyre_object::gc_roots::shadow_stack_get(origin_slot))
+}
+
+fn is_typing_generic_alias(obj: PyObjectRef) -> Result<bool, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let Some(typing) = crate::importing::check_sys_modules("typing") else {
+        return Ok(false);
+    };
+    let alias_type = crate::baseobjspace::getattr_str(typing, "_GenericAlias")?;
+    Ok(unsafe {
+        crate::baseobjspace::isinstance_w(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            alias_type,
+        )
+    })
+}
+
+/// `typing._is_param_expr`: the only non-alias object that remains as the
+/// first element of a two-item `collections.abc.Callable.__args__` tuple is a
+/// `ParamSpec`.  Concrete argument lists are flattened into the surrounding
+/// tuple, while `Concatenate` is covered by `is_typing_generic_alias`.
+fn is_param_spec(obj: PyObjectRef) -> Result<bool, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let Some(typing) = crate::importing::check_sys_modules("_typing") else {
+        return Ok(false);
+    };
+    let param_spec_type = crate::baseobjspace::getattr_str(typing, "ParamSpec")?;
+    Ok(unsafe {
+        crate::baseobjspace::isinstance_w(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            param_spec_type,
+        )
+    })
 }

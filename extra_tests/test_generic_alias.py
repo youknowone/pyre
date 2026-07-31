@@ -304,3 +304,41 @@ def test_union_not_iterable():
     T = TypeVar('T')
     with pytest.raises(TypeError):
         list(set[T] | list[T])
+
+
+def test_keyword_type_call_does_not_treat_second_tuple_as_bases():
+    class Alias:
+        def __init__(self, origin, args, *, name=None):
+            self.origin = origin
+            self.args = args
+            self.name = name
+
+    class AnnotatedAlias(Alias):
+        pass
+
+    annotated = AnnotatedAlias(int, ())
+    alias = Alias(list, (annotated,), name="List")
+
+    assert type(alias) is Alias
+    assert alias.origin is list
+    assert alias.args == (annotated,)
+    assert alias.name == "List"
+
+
+def test_callable_repr_uses_origin_identity():
+    class FakeCallable:
+        pass
+
+    FakeCallable.__module__ = "collections.abc"
+    FakeCallable.__qualname__ = "Callable"
+    alias = GenericAlias(FakeCallable, (int, str))
+    assert repr(alias) == "collections.abc.Callable[int, str]"
+
+
+def test_typing_generic_alias_repr_uses_type_identity():
+    FakeGenericAlias = type("_GenericAlias", (), {"__module__": "typing"})
+    fake = FakeGenericAlias()
+    fake.__module__ = "spoof"
+    fake.__qualname__ = "VisibleAlias"
+    alias = GenericAlias(list, (fake,))
+    assert repr(alias) == "list[spoof.VisibleAlias]"

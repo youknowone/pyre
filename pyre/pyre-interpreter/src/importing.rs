@@ -35,7 +35,17 @@ use rustpython_wtf8::Wtf8Buf;
 pub(crate) mod host {
     #[cfg(not(target_arch = "wasm32"))]
     pub use rustpython_host_env::fs;
-    pub use rustpython_host_env::os;
+    pub mod os {
+        pub use rustpython_host_env::os::*;
+        // `replace` lives in the host layer's `posix`, which is only built for
+        // unix, wasi and windows. Targets without it have no replace-specific
+        // platform call, so the name degrades to `rename` exactly as the
+        // unix-like body does.
+        #[cfg(not(any(unix, windows, target_os = "wasi")))]
+        pub use rustpython_host_env::os::rename as replace;
+        #[cfg(any(unix, windows, target_os = "wasi"))]
+        pub use rustpython_host_env::posix::replace;
+    }
 }
 #[cfg(not(feature = "host_env"))]
 pub(crate) mod host {
@@ -59,6 +69,12 @@ pub(crate) mod host {
             unsafe { libc::isatty(fd) != 0 }
         }
         pub fn rename(
+            from: impl AsRef<std::path::Path>,
+            to: impl AsRef<std::path::Path>,
+        ) -> std::io::Result<()> {
+            std::fs::rename(from, to)
+        }
+        pub fn replace(
             from: impl AsRef<std::path::Path>,
             to: impl AsRef<std::path::Path>,
         ) -> std::io::Result<()> {
@@ -534,6 +550,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(msvcrt);
     pyre_install_module!(_abc);
     pyre_install_module!(_functools);
+    pyre_install_module!(_symtable);
     pyre_install_module!("_thread"(thread));
     pyre_install_module!(itertools);
     pyre_install_module!(_immutables_map);

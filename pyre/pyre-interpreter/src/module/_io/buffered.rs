@@ -543,7 +543,8 @@ impl W_BufferedReader {
 #[crate::pyre_methods(
     base = super::buffered_iobase_type(),
     weakrefable,
-    doc = "BufferedReader(raw, buffer_size=DEFAULT_BUFFER_SIZE)"
+    doc = "BufferedReader(raw, buffer_size=DEFAULT_BUFFER_SIZE)",
+    _text_signature_ = "(raw, buffer_size=DEFAULT_BUFFER_SIZE)"
 )]
 impl W_BufferedReader {
     #[staticmethod]

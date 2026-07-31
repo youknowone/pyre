@@ -1616,7 +1616,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(
         ns,
         "exit",
-        crate::make_builtin_function("exit", |args| {
+        crate::make_module_builtin_function("exit", |args| {
             // `exit(exitcode=None)` — resolve the single optional argument
             // like the app-level signature: strip the `__pyre_kw__` trailer,
             // reject unknown keywords, reproduce the normal function-call

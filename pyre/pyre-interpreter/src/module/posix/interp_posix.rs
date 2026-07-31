@@ -1554,9 +1554,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     //
     // The two entry points take the same arguments and differ only in what a
     // pre-existing `dst` does: `replace` overwrites it on every platform,
-    // `rename` leaves that to the platform call. The host layer renames
-    // through `std::fs::rename`, which overwrites on both, so one body serves
-    // both and `name` only selects the text of the argument errors.
+    // `rename` leaves that to the platform call. On Windows the host layer's
+    // `replace` uses MoveFileExW(MOVEFILE_REPLACE_EXISTING); plain `rename`
+    // deliberately omits that flag.
     fn rename_impl(
         args: &[PyObjectRef],
         name: &'static str,
@@ -1613,7 +1613,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
             (None, None)
         };
-        host_os::rename(&src, src_b, &dst, dst_b).map_err(|e| {
+        let result = if name == "replace" {
+            host_os::replace(&src, src_b, &dst, dst_b)
+        } else {
+            host_os::rename(&src, src_b, &dst, dst_b)
+        };
+        result.map_err(|e| {
             let errno = crate::builtins::io_error_posix_errno(&e, 0);
             // The source string must survive the destination's allocation.
             let _roots = pyre_object::gc_roots::push_roots();
@@ -3709,6 +3714,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         );
 
         // os.statvfs(path) / os.fstatvfs(fd) -> statvfs_result
+        #[cfg(not(target_os = "redox"))]
+        crate::module_ns_store(ns, "statvfs_result", statvfs_result_seq_type());
+
         #[cfg(not(target_os = "redox"))]
         fn statvfs_to_obj(
             info: rustpython_host_env::posix::StatVfsInfo,

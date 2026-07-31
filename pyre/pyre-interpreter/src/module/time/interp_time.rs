@@ -1014,6 +1014,99 @@ fn _checktm(tm: &c_tm) -> Result<(), crate::PyError> {
     Ok(())
 }
 
+fn decode_strftime_output(
+    bytes: &[u8],
+    passthrough: bool,
+) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
+    if passthrough {
+        Ok(unsafe { rustpython_wtf8::Wtf8::from_bytes_unchecked(bytes).to_wtf8_buf() })
+    } else {
+        crate::typedef::decode_bytes_to_wtf8(bytes, "utf-8", "surrogateescape")
+    }
+}
+
+#[cfg(all(unix, not(feature = "sandbox")))]
+fn strftime_one(
+    format: &[u8],
+    tm: &c_tm,
+    passthrough: bool,
+) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
+    if format.is_empty() {
+        return Ok(rustpython_wtf8::Wtf8Buf::new());
+    }
+    let c_fmt = std::ffi::CString::new(format).expect("NUL-free strftime segment");
+    let libc_tm = c_tm_to_libc_tm(tm);
+    let mut buf = vec![0u8; 1024];
+    unsafe {
+        loop {
+            let n = libc::strftime(
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                c_fmt.as_ptr(),
+                &libc_tm,
+            );
+            // A buffer 256 times the format length is not failing for
+            // lack of room: the format simply yields an empty result,
+            // e.g. `%Z` when the timezone is unknown.
+            if n != 0 || buf.len() >= 256 * format.len() {
+                return decode_strftime_output(&buf[..n], passthrough);
+            }
+            buf.resize(buf.len() * 2, 0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn strftime_one(
+    format: &[u8],
+    tm: &c_tm,
+    passthrough: bool,
+) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
+    unsafe extern "C" {
+        fn strftime(
+            buf: *mut libc::c_char,
+            maxsize: usize,
+            format: *const libc::c_char,
+            timeptr: *const MsvcTm,
+        ) -> usize;
+        /// The CRT's per-thread `errno` cell, which `strftime` sets to
+        /// `EINVAL` for a directive it does not accept.
+        fn _errno() -> *mut libc::c_int;
+    }
+    if format.is_empty() {
+        return Ok(rustpython_wtf8::Wtf8Buf::new());
+    }
+    let c_fmt = std::ffi::CString::new(format).expect("NUL-free strftime segment");
+    let msvc_tm = c_tm_to_msvc_tm(tm);
+    let mut buf = vec![0u8; 1024];
+    unsafe {
+        loop {
+            // interp_time.py:1171 reads the errno saved across the call, which
+            // only names this call once the cell starts out clear.
+            *_errno() = 0;
+            let n = strftime(
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                c_fmt.as_ptr(),
+                &msvc_tm,
+            );
+            // interp_time.py:1171-1172 — a rejected directive returns zero
+            // with `EINVAL`, which is neither a too-small buffer nor the
+            // empty-result case below.
+            if n == 0 && *_errno() == libc::EINVAL {
+                return Err(crate::PyError::value_error("invalid format string"));
+            }
+            // A buffer 256 times the format length is not failing for
+            // lack of room: the format simply yields an empty result,
+            // e.g. `%Z` when the timezone is unknown.
+            if n != 0 || buf.len() >= 256 * format.len() {
+                return decode_strftime_output(&buf[..n], passthrough);
+            }
+            buf.resize(buf.len() * 2, 0);
+        }
+    }
+}
+
 /// time.strftime(format[, tuple]) — interp_time.strftime
 pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let fmt = args
@@ -1032,6 +1125,10 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         }
         w_str_get_wtf8(fmt)
     };
+    // PyPy interp_time.py:1156-1162 tries the locale encoding and, when a
+    // lone surrogate makes that impossible, passes the internal UTF-8 bytes
+    // through libc and treats the result as the same internal representation.
+    let passthrough = fmt_wtf8.as_str().is_err();
 
     // `interp_time.py:1158-1164` has a byte-preserving passthrough for
     // formats the locale encoder cannot represent.  Keep pyre's WTF-8

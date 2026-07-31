@@ -794,7 +794,17 @@ fn real_main(binary_name: &str) {
             let mut argv = vec![path.clone()];
             argv.extend(args);
             importing::set_sys_argv(&argv);
-            run_source(&source, Mode::Exec, &path, no_site);
+            // CPython compiles a script with the same absolute path exposed
+            // as `__main__.__file__`; warnings use `code.co_filename`, so the
+            // two must not diverge when argv[0] was relative.
+            #[cfg(not(feature = "sandbox"))]
+            let compile_path = std::path::absolute(Path::new(&path))
+                .unwrap_or_else(|_| Path::new(&path).to_path_buf())
+                .to_string_lossy()
+                .into_owned();
+            #[cfg(feature = "sandbox")]
+            let compile_path = path.clone();
+            run_source(&source, Mode::Exec, &compile_path, no_site);
             if inspect {
                 repl::run_repl(true, no_site);
             }

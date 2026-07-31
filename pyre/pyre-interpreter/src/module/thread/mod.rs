@@ -1483,28 +1483,19 @@ fn spawn_thread(
     });
     let worker_started = std::sync::Arc::clone(&started);
 
-    let mut builder = std::thread::Builder::new();
-    let stack_size = STACK_SIZE.load(Ordering::Relaxed);
-    if stack_size != 0 {
-        builder = builder.stack_size(stack_size);
+    let configured_stack_size = STACK_SIZE.load(Ordering::Relaxed);
+    let stack_size = if configured_stack_size == 0 {
+        crate::stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE
     } else {
-        // `stack_check`'s byte budget is `MAX_STACK_SIZE`, and the clamp that
-        // keeps it inside the real stack reads `RLIMIT_STACK` — which describes
-        // the *main* thread. A spawned thread takes the host default instead
-        // (2 MiB), narrower than the budget, so deep recursion here would reach
-        // the guard page before `stack_check` ever reported overflow. Give the
-        // default thread room for the budget plus the same quarter margin the
-        // clamp reserves. An explicit `_thread.stack_size(n)` is still honored
-        // as requested.
-        builder = builder.stack_size(
-            crate::stack_check::MAX_STACK_SIZE + (crate::stack_check::MAX_STACK_SIZE >> 2),
-        );
-    }
+        configured_stack_size
+    };
+    let builder = std::thread::Builder::new().stack_size(stack_size);
     builder
         .spawn(move || {
             // First statement: from here on every exit path, panic included,
             // releases the starter.
             let bootstrap = BootstrapSignal(worker_started);
+            crate::stack_check::configure_current_thread_stack_size(stack_size);
             crate::call::enter_runtime_thread();
             // The parent holds these in its shadow stack until `started_tx`.
             // Copy them into this mutator's own shadow stack before any

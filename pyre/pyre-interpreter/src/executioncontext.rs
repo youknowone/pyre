@@ -2272,6 +2272,12 @@ impl UserDelAction {
             iter.release_export();
             return;
         }
+        if unsafe { pyre_object::interp_sre::is_sre_scanner(current()) } {
+            unsafe {
+                crate::module::_sre::interp_sre::sre_scanner_release_export(current());
+            }
+            return;
+        }
         if unsafe { pyre_object::generator::is_generator_or_coroutine(current()) } {
             if self.gc_disabled(current()) {
                 return;

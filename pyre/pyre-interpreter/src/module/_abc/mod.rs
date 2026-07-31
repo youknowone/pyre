@@ -254,6 +254,18 @@ fn subclasscheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_bool_from(subclass_of(args[0], args[1])?))
 }
 
+/// `_abc._reset_registry(cls)`: clear only this ABC's virtual-subclass
+/// registry.  ABCMeta exposes it as `_abc_registry_clear`; a no-op leaks
+/// registrations between independent users and test cases.
+/// The invalidation counter stays put: only `_abc_register` advances it, so
+/// an outstanding `get_cache_token` survives a registry reset.
+fn reset_registry(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if let Some(&cls) = args.first() {
+        crate::baseobjspace::setattr_str(cls, "_abc_registry", w_list_new(vec![]))?;
+    }
+    Ok(w_none())
+}
+
 crate::py_module! {
     "_abc",
     functions: {
@@ -263,7 +275,7 @@ crate::py_module! {
         "_abc_instancecheck"  / 2 = instancecheck,
         "_abc_subclasscheck"  / 2 = subclasscheck,
         "_get_dump"           / 1 = |_| Ok(w_tuple_new(vec![])),
-        "_reset_registry"     / 1 = |_| Ok(w_none()),
+        "_reset_registry"     / 1 = reset_registry,
         // Pyre keeps no object caches to clear; bumping the token invalidates
         // any outstanding `get_cache_token` value.
         "_reset_caches"       / 1 = |_| { INVALIDATION_COUNTER.fetch_add(1, Ordering::Relaxed); Ok(w_none()) },

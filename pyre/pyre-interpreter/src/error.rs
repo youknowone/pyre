@@ -529,6 +529,9 @@ pub enum PyErrorKind {
     /// live `memoryview` ("Existing exports of data: object cannot be
     /// re-sized").  Direct subclass of Exception.
     BufferError,
+    /// Direct Exception subclass raised when a stream ends before a complete
+    /// value is available.
+    EOFError,
 }
 
 impl PyError {
@@ -666,6 +669,69 @@ impl PyError {
             w_name_context: std::ptr::null_mut(),
             w_obj_context: std::ptr::null_mut(),
         }
+    }
+
+    /// Replace the filename in a located `SyntaxError` with an already-built
+    /// Python string.
+    ///
+    /// RustPython's compiler currently accepts `&str` paths, while PyPy's
+    /// `space.fsdecode_w()` can preserve surrogateescaped filesystem bytes.
+    /// Callers may therefore compile with a lossy Rust path but restore the
+    /// authoritative Python filename object in the exception details tuple.
+    /// Rebuild the immutable tuple through shadow-stack slots so every child
+    /// remains valid if either allocation triggers a moving collection.
+    pub fn replace_syntax_error_filename(&mut self, w_filename: PyObjectRef) {
+        if self.kind != PyErrorKind::SyntaxError
+            || self.exc_object.is_null()
+            || w_filename.is_null()
+        {
+            return;
+        }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(self.exc_object);
+        pyre_object::gc_roots::pin_root(w_filename);
+        let storage = unsafe {
+            pyre_object::interp_exceptions::w_exception_get_args_storage(
+                pyre_object::gc_roots::shadow_stack_get(base),
+            )
+        };
+        if storage.is_null() || unsafe { !pyre_object::is_list(storage) } {
+            return;
+        }
+        let Some(w_msg) = (unsafe { pyre_object::w_list_getitem(storage, 0) }) else {
+            return;
+        };
+        let Some(details) = (unsafe { pyre_object::w_list_getitem(storage, 1) }) else {
+            return;
+        };
+        if unsafe { !pyre_object::is_tuple(details) || pyre_object::w_tuple_len(details) < 6 } {
+            return;
+        }
+        pyre_object::gc_roots::pin_root(w_msg);
+        for index in 1..6 {
+            let Some(item) = (unsafe { pyre_object::w_tuple_getitem(details, index) }) else {
+                return;
+            };
+            pyre_object::gc_roots::pin_root(item);
+        }
+        let rebuilt_details = pyre_object::w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            pyre_object::gc_roots::shadow_stack_get(base + 3),
+            pyre_object::gc_roots::shadow_stack_get(base + 4),
+            pyre_object::gc_roots::shadow_stack_get(base + 5),
+            pyre_object::gc_roots::shadow_stack_get(base + 6),
+            pyre_object::gc_roots::shadow_stack_get(base + 7),
+        ]);
+        pyre_object::gc_roots::pin_root(rebuilt_details);
+        let rebuilt_args = pyre_object::w_list_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(base + 2),
+            pyre_object::gc_roots::shadow_stack_get(base + 8),
+        ]);
+        self.exc_object = pyre_object::gc_roots::shadow_stack_get(base);
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_args(self.exc_object, rebuilt_args)
+        };
     }
 
     pub fn zero_division(msg: impl Into<String>) -> Self {
@@ -1402,6 +1468,7 @@ impl PyError {
             PyErrorKind::UnicodeTranslateError => ExcKind::UnicodeTranslateError,
             PyErrorKind::SyntaxError => ExcKind::SyntaxError,
             PyErrorKind::BufferError => ExcKind::BufferError,
+            PyErrorKind::EOFError => ExcKind::EOFError,
         }
     }
 
@@ -1474,6 +1541,7 @@ impl PyError {
             ExcKind::LookupError => PyErrorKind::LookupError,
             ExcKind::SyntaxError => PyErrorKind::SyntaxError,
             ExcKind::BufferError => PyErrorKind::BufferError,
+            ExcKind::EOFError => PyErrorKind::EOFError,
         }
     }
 

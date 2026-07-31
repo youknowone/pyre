@@ -351,12 +351,7 @@ fn emit_next_token(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError>
                         return Err(raise_indentation_error(error, &this.source, &this.lines));
                     }
                 } else if matches!(error.error, ParseErrorType::Lexical(_))
-                    && !tolerated_extra_numeric_error(
-                        this.extra_tokens,
-                        error,
-                        &this.tokens,
-                        &this.source,
-                    )
+                    && !tolerated_extra_lexical_error(this.extra_tokens, error, &this.tokens)
                 {
                     return Err(raise_lexical_error(error, &this.source, &this.lines));
                 }
@@ -380,7 +375,9 @@ fn emit_next_token(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError>
         } else {
             token_kind_value(kind)
         };
-        let token_type = if this.extra_tokens && raw_type > TOKEN_DEDENT && raw_type < TOKEN_OP {
+        let token_type = if this.extra_tokens
+            && (kind == TokenKind::Unknown || (raw_type > TOKEN_DEDENT && raw_type < TOKEN_OP))
+        {
             TOKEN_OP
         } else {
             raw_type
@@ -552,12 +549,7 @@ fn emit_next_token(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError>
             if !this.source.contains('\t') {
                 return Err(raise_indentation_error(error, &this.source, &this.lines));
             }
-        } else if !tolerated_extra_numeric_error(
-            this.extra_tokens,
-            error,
-            &this.tokens,
-            &this.source,
-        ) {
+        } else if !tolerated_extra_lexical_error(this.extra_tokens, error, &this.tokens) {
             return Err(raise_lexical_error(error, &this.source, &this.lines));
         }
     }
@@ -607,27 +599,28 @@ const fn is_number_kind(kind: TokenKind) -> bool {
     matches!(kind, TokenKind::Int | TokenKind::Float | TokenKind::Complex)
 }
 
-fn tolerated_extra_numeric_error(
-    extra_tokens: bool,
-    error: &ParseError,
-    tokens: &[Token],
-    source: &str,
-) -> bool {
+/// RustPython `_tokenize` maps ruff's `TokenKind::Unknown` to CPython's
+/// `ERRORTOKEN` in public-tokenize mode.  The accompanying lexer error must
+/// not replace that token with `TokenError`: `inspect` relies on this for
+/// Argument Clinic's `$self` syntax, and CPython does the same for arbitrary
+/// invalid characters.  This also covers the numeric case, where ruff emits
+/// `Unknown` while recovering a malformed literal that tokenize exposes as
+/// NUMBER fragments — such a token always overlaps the reported error range.
+fn tolerated_extra_lexical_error(extra_tokens: bool, error: &ParseError, tokens: &[Token]) -> bool {
     if !extra_tokens {
         return false;
     }
-    let error_start = u32::from(error.location.start()) as usize;
     tokens.iter().any(|token| {
         if token.kind() != TokenKind::Unknown {
             return false;
         }
         let range = token.as_tuple().1;
-        let start = u32::from(range.start()) as usize;
-        let end = u32::from(range.end()) as usize;
-        start <= error_start
-            && error_start <= end
-            && end <= source.len()
-            && source[start..end].bytes().all(|byte| byte.is_ascii_digit())
+        ranges_touch(
+            u32::from(error.location.start()) as usize,
+            u32::from(error.location.end()) as usize,
+            u32::from(range.start()) as usize,
+            u32::from(range.end()) as usize,
+        )
     })
 }
 
