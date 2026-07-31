@@ -1431,7 +1431,8 @@ pub unsafe fn w_exception_kind_checked(obj: PyObjectRef) -> Option<ExcKind> {
         return None;
     }
     let ob_type = unsafe { (*obj).ob_type };
-    if ob_type.is_null() || !(ob_type as usize).is_multiple_of(align_of::<crate::pyobject::PyType>())
+    if ob_type.is_null()
+        || !(ob_type as usize).is_multiple_of(align_of::<crate::pyobject::PyType>())
     {
         return None;
     }
@@ -1661,7 +1662,10 @@ mod tests {
             unsafe { w_exception_kind_checked(obj) },
             Some(ExcKind::ValueError)
         );
-        assert_eq!(unsafe { w_exception_kind_checked(std::ptr::null_mut()) }, None);
+        assert_eq!(
+            unsafe { w_exception_kind_checked(std::ptr::null_mut()) },
+            None
+        );
     }
 
     #[test]

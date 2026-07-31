@@ -1470,12 +1470,10 @@ fn spawn_thread(
         fn drop(&mut self) {
             // Takes the word only from its initial state, so this is a no-op
             // once `publish` has run.
-            let _ = self.0.word.compare_exchange(
-                0,
-                START_FAILED,
-                Ordering::Release,
-                Ordering::Relaxed,
-            );
+            let _ =
+                self.0
+                    .word
+                    .compare_exchange(0, START_FAILED, Ordering::Release, Ordering::Relaxed);
         }
     }
 

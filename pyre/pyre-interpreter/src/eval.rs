@@ -653,7 +653,11 @@ fn reraise_bad_operand_diag(
             unsafe { (*ob_type).name }
         };
         let is_exc = unsafe { pyre_object::is_exception(v) };
-        format!("0x{:x}:{name}{}", v as usize, if is_exc { "(EXC)" } else { "" })
+        format!(
+            "0x{:x}:{name}{}",
+            v as usize,
+            if is_exc { "(EXC)" } else { "" }
+        )
     };
     let operand = if w_exc.is_null() {
         "NULL".to_string()
