@@ -327,6 +327,14 @@ impl RootSet {
 
     /// Remove a root.
     pub fn remove(&mut self, root: *mut GcRef) {
+        // Host root brackets are stack-shaped, matching RPython's
+        // shadowstack push/pop discipline.  Keep the general out-of-order
+        // fallback for callers that hold overlapping guards, but make the
+        // overwhelmingly common matching-pop path O(1).
+        if self.roots.last().copied() == Some(root) {
+            self.roots.pop();
+            return;
+        }
         if let Some(pos) = self.roots.iter().position(|r| *r == root) {
             self.roots.swap_remove(pos);
         }
@@ -4675,6 +4683,31 @@ mod tests {
             large_object_threshold: nursery_size / 2,
             ..GcConfig::default()
         })
+    }
+
+    #[test]
+    fn root_set_removes_lifo_and_out_of_order_roots() {
+        let mut roots = RootSet::new();
+        let mut a = GcRef(1);
+        let mut b = GcRef(2);
+        let mut c = GcRef(3);
+        let (a, b, c) = (
+            &mut a as *mut GcRef,
+            &mut b as *mut GcRef,
+            &mut c as *mut GcRef,
+        );
+        unsafe {
+            roots.add(a);
+            roots.add(b);
+            roots.add(c);
+        }
+
+        roots.remove(c);
+        assert_eq!(roots.roots, vec![a, b]);
+        roots.remove(a);
+        assert_eq!(roots.roots, vec![b]);
+        roots.remove(b);
+        assert!(roots.is_empty());
     }
 
     /// A born-old allocation that crosses the next-major threshold asks for a

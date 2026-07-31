@@ -390,8 +390,13 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
     crate::gc_roots::pin_root(block as PyObjectRef);
     let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
     let base = unsafe { items_block_items_base(block) };
-    for i in 0..len {
-        unsafe { *base.add(i) = crate::gc_roots::shadow_stack_get(save + i) };
+    if len > 0 {
+        // RPython's pop_roots reloads the livevars as one generated block.
+        // Enter TLS once for the whole contiguous item range instead of once
+        // per element; `base` names the freshly allocated block's initialized
+        // prefix and cannot alias the shadow stack.
+        let dst = unsafe { std::slice::from_raw_parts_mut(base, len) };
+        crate::gc_roots::shadow_stack_copy_range(save, dst);
     }
     for i in len..cap {
         unsafe { *base.add(i) = PY_NULL };
@@ -490,8 +495,10 @@ pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBl
     crate::gc_roots::pin_root(block as PyObjectRef);
     let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
     let base = unsafe { items_block_items_base(block) };
-    for i in 0..cap {
-        unsafe { *base.add(i) = crate::gc_roots::shadow_stack_get(save + i) };
+    if cap > 0 {
+        // Same block-shaped pop_roots reload as the list constructor above.
+        let dst = unsafe { std::slice::from_raw_parts_mut(base, cap) };
+        crate::gc_roots::shadow_stack_copy_range(save, dst);
     }
     // The block may have landed in old-gen (nursery-full fallback) while its
     // elements are still young. That old→young edge is invisible to a minor
