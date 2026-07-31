@@ -3069,7 +3069,35 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         }
     }
 
-    {
+    // Not every caller pins the callee function itself.  A specializer that
+    // resolves an app-level method behind a builtin — `str(e)` reaching an
+    // exception subclass's `__str__` — passes the CALL's own operand, which is
+    // the `str` builtin, while `callable` is the resolved `Function`.  Reading
+    // `Function.code` off that operand is a type-confused load: it returns
+    // whatever sits at the same offset in a `PyCFunction`, so the guard
+    // compares a value that is not `code` and fails every iteration (99480
+    // failures and 497 bridges on `synth/exception_subclass_attrs`, a 31x
+    // slowdown).  Guard the fields only when the pinned object really is the
+    // function whose code this inline resolved.
+    let guards_the_callee_function = unsafe {
+        (*callable_guard_value).ob_type as *const () as usize
+            == &pyre_interpreter::FUNCTION_TYPE as *const _ as usize
+            && pyre_interpreter::function_get_code(callable_guard_value) as usize == callee_code_key
+    };
+
+    if !guards_the_callee_function {
+        // Those sites resolve the callee through their own guarded path (a
+        // type version tag, a receiver class guard); all this has to pin is
+        // the operand they dispatched on.
+        if !callable_guard_op.is_constant() {
+            let expected = ctx
+                .trace_ctx
+                .const_ref(callable_guard_value as usize as i64);
+            ctx.trace_ctx
+                .record_guard(OpCode::GuardValue, &[callable_guard_op, expected], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        }
+    } else {
         // `function.py:91-96 getcode()` promotes `self.code`, never `self`.
         // The three constants this inline bakes — the code object below, the
         // globals namespace in `InlineCalleeConsts`, and the freevar cells
