@@ -366,13 +366,34 @@ pub(crate) fn subs_parameters(
             "{repr} is not a generic class"
         )));
     }
+    // Substitution runs arbitrary Python — `__typing_prepare_subst__`,
+    // `__typing_subst__`, and the recursive descent into nested lists and
+    // tuples — and allocates at nearly every step. The collector moves
+    // objects and does not scan Rust locals, so the owners and every produced
+    // argument live on the shadow stack and are reread after anything that
+    // can collect.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(self_);
+    let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(args);
+    let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::gc_roots::pin_root(params);
+    let params_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     // `items = _unpack_args(items)` flattens unpacked `tuple[...]` aliases.
     // `__typing_prepare_subst__` then reshapes `items` for
     // `ParamSpec`/`TypeVarTuple` parameters — honoured per param, missing
     // attribute (the `None` default) skips it.
-    let mut items = unpack_args(items)?;
+    pyre_object::gc_roots::pin_root(items);
+    let items_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let unpacked = unpack_args(pyre_object::gc_roots::shadow_stack_get(items_slot))?;
+    pyre_object::gc_roots::shadow_stack_set(items_slot, unpacked);
     for i in 0..nparams {
-        let Some(param) = (unsafe { w_tuple_getitem(params, i as i64) }) else {
+        let Some(param) = (unsafe {
+            w_tuple_getitem(
+                pyre_object::gc_roots::shadow_stack_get(params_slot),
+                i as i64,
+            )
+        }) else {
             continue;
         };
         // `prepare = getattr(param, '__typing_prepare_subst__', None)` then
@@ -384,20 +405,28 @@ pub(crate) fn subs_parameters(
             Err(e) => return Err(e),
         };
         if !unsafe { pyre_object::is_none(prepare) } {
-            items = crate::call::call_function_impl_result(prepare, &[self_, items])?;
+            let reshaped = crate::call::call_function_impl_result(
+                prepare,
+                &[
+                    pyre_object::gc_roots::shadow_stack_get(self_slot),
+                    pyre_object::gc_roots::shadow_stack_get(items_slot),
+                ],
+            )?;
+            pyre_object::gc_roots::shadow_stack_set(items_slot, reshaped);
         }
     }
     // Non-tuple `items` (a broken `__typing_prepare_subst__`) counts as one arg
     // per CPython `_Py_subs_parameters`; a bare `w_tuple_len` would crash on it.
-    let is_tuple_items = unsafe { is_tuple(items) };
+    let is_tuple_items = unsafe { is_tuple(pyre_object::gc_roots::shadow_stack_get(items_slot)) };
     let nitems = if is_tuple_items {
-        unsafe { w_tuple_len(items) }
+        unsafe { w_tuple_len(pyre_object::gc_roots::shadow_stack_get(items_slot)) }
     } else {
         1
     };
     if nparams != nitems {
         let direction = if nitems > nparams { "many" } else { "few" };
-        let s = unsafe { crate::display::py_repr(self_)? };
+        let s =
+            unsafe { crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(self_slot))? };
         return Err(crate::PyError::type_error(format!(
             "Too {direction} arguments for {s}; actual {nitems}, expected {nparams}"
         )));
@@ -405,81 +434,135 @@ pub(crate) fn subs_parameters(
     // `argitems` is the tuple view CPython indexes: `item` itself when it is a
     // tuple, otherwise a 1-tuple wrapping the single non-tuple `item`.
     let argitems = if is_tuple_items {
-        items
+        pyre_object::gc_roots::shadow_stack_get(items_slot)
     } else {
-        w_tuple_new(vec![items])
+        w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(items_slot)])
     };
-    let mut newargs: Vec<PyObjectRef> = Vec::new();
-    let args_are_tuple = unsafe { is_tuple(args) };
+    pyre_object::gc_roots::pin_root(argitems);
+    let argitems_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    // Slots rather than values: each entry has to survive every later
+    // iteration's allocations before the caller builds the result from them.
+    let mut newarg_slots: Vec<usize> = Vec::new();
+    let mut push_newarg = |value: PyObjectRef, slots: &mut Vec<usize>| {
+        pyre_object::gc_roots::pin_root(value);
+        slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
+    };
+    let args_are_tuple = unsafe { is_tuple(pyre_object::gc_roots::shadow_stack_get(args_slot)) };
     let nargs = if args_are_tuple {
-        unsafe { w_tuple_len(args) }
+        unsafe { w_tuple_len(pyre_object::gc_roots::shadow_stack_get(args_slot)) }
     } else {
-        unsafe { w_list_len(args) }
+        unsafe { w_list_len(pyre_object::gc_roots::shadow_stack_get(args_slot)) }
     };
     for i in 0..nargs {
+        let args_now = pyre_object::gc_roots::shadow_stack_get(args_slot);
         let old_arg = if args_are_tuple {
-            unsafe { w_tuple_getitem(args, i as i64) }
+            unsafe { w_tuple_getitem(args_now, i as i64) }
         } else {
-            unsafe { w_list_getitem(args, i as i64) }
+            unsafe { w_list_getitem(args_now, i as i64) }
         };
         let Some(old_arg) = old_arg else {
             continue;
         };
         if unsafe { is_type(old_arg) } {
-            newargs.push(old_arg);
+            push_newarg(old_arg, &mut newarg_slots);
             continue;
         }
+        pyre_object::gc_roots::pin_root(old_arg);
+        let old_arg_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         // CPython 3.14 `_Py_subs_parameters`: lists and tuples containing
         // parameters are recursively substituted, preserving their shape.
         if unsafe { is_tuple(old_arg) || is_list(old_arg) } {
-            let subargs = subs_parameters(self_, old_arg, params, items)?;
-            newargs.push(if unsafe { is_tuple(old_arg) } {
-                w_tuple_new(subargs)
-            } else {
-                w_list_new(subargs)
-            });
+            let subargs = subs_parameters(
+                pyre_object::gc_roots::shadow_stack_get(self_slot),
+                pyre_object::gc_roots::shadow_stack_get(old_arg_slot),
+                pyre_object::gc_roots::shadow_stack_get(params_slot),
+                pyre_object::gc_roots::shadow_stack_get(items_slot),
+            )?;
+            // The recursion returned through its own `_roots` scope, so the
+            // entries are unrooted again; build the container before anything
+            // else can allocate.
+            let nested =
+                if unsafe { is_tuple(pyre_object::gc_roots::shadow_stack_get(old_arg_slot)) } {
+                    w_tuple_new(subargs)
+                } else {
+                    w_list_new(subargs)
+                };
+            push_newarg(nested, &mut newarg_slots);
             continue;
         }
         // `unpack = _is_unpacked_typevartuple(old_arg)` decides whether the
         // produced `arg` is spliced (`newargs.extend`) or appended.
-        let unpack = is_unpacked_typevartuple(old_arg)?;
+        let unpack =
+            is_unpacked_typevartuple(pyre_object::gc_roots::shadow_stack_get(old_arg_slot))?;
         // `meth = getattr(old_arg, '__typing_subst__', None)` then
         // `if meth is not None`: a missing attribute and an attribute
         // explicitly set to `None` both fall through to `subs_tvars`.
-        let meth = match crate::baseobjspace::getattr_str(old_arg, "__typing_subst__") {
+        let meth = match crate::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(old_arg_slot),
+            "__typing_subst__",
+        ) {
             Ok(m) => m,
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => w_none(),
             Err(e) => return Err(e),
         };
         let arg = if !unsafe { pyre_object::is_none(meth) } {
-            let iparam = tuple_index(params, old_arg)?
-                .ok_or_else(|| crate::PyError::value_error("tuple.index(x): x not in tuple"))?;
-            let item = unsafe { w_tuple_getitem(argitems, iparam as i64) }.unwrap_or_else(w_none);
-            crate::call::call_function_impl_result(meth, &[item])?
+            pyre_object::gc_roots::pin_root(meth);
+            let meth_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let iparam = tuple_index(
+                pyre_object::gc_roots::shadow_stack_get(params_slot),
+                pyre_object::gc_roots::shadow_stack_get(old_arg_slot),
+            )?
+            .ok_or_else(|| crate::PyError::value_error("tuple.index(x): x not in tuple"))?;
+            let item = unsafe {
+                w_tuple_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(argitems_slot),
+                    iparam as i64,
+                )
+            }
+            .unwrap_or_else(w_none);
+            crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(meth_slot),
+                &[item],
+            )?
         } else {
-            subs_tvars(old_arg, params, argitems)?
+            subs_tvars(
+                pyre_object::gc_roots::shadow_stack_get(old_arg_slot),
+                pyre_object::gc_roots::shadow_stack_get(params_slot),
+                pyre_object::gc_roots::shadow_stack_get(argitems_slot),
+            )?
         };
         if unpack {
+            pyre_object::gc_roots::pin_root(arg);
+            let arg_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             // GH-138497: an unpacked `__typing_subst__` must return a tuple.
             // (authority = CPython 3.14)
-            if !unsafe { is_tuple(arg) } {
+            if !unsafe { is_tuple(pyre_object::gc_roots::shadow_stack_get(arg_slot)) } {
                 return Err(crate::PyError::type_error(format!(
                     "expected __typing_subst__ of {} objects to return a tuple, not {}",
-                    crate::type_methods::arg_type_name(old_arg),
-                    crate::type_methods::arg_type_name(arg),
+                    crate::type_methods::arg_type_name(pyre_object::gc_roots::shadow_stack_get(
+                        old_arg_slot
+                    )),
+                    crate::type_methods::arg_type_name(pyre_object::gc_roots::shadow_stack_get(
+                        arg_slot
+                    )),
                 )));
             }
-            let n = unsafe { w_tuple_len(arg) };
+            let n = unsafe { w_tuple_len(pyre_object::gc_roots::shadow_stack_get(arg_slot)) };
             for j in 0..n {
-                if let Some(x) = unsafe { w_tuple_getitem(arg, j as i64) } {
-                    newargs.push(x);
+                if let Some(x) = unsafe {
+                    w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(arg_slot), j as i64)
+                } {
+                    push_newarg(x, &mut newarg_slots);
                 }
             }
         } else {
-            newargs.push(arg);
+            push_newarg(arg, &mut newarg_slots);
         }
     }
-    Ok(newargs)
+    Ok(newarg_slots
+        .into_iter()
+        .map(pyre_object::gc_roots::shadow_stack_get)
+        .collect())
 }
 
 /// `subs_tvars(obj, params, argitems)` (`_pypy_generic_alias.py:183`) —
