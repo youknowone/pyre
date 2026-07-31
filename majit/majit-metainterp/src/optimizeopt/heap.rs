@@ -4692,7 +4692,16 @@ mod tests {
         // emitted heap only has to carry the non-virtual half; this pins that
         // half being emitted BEFORE the guard rather than left lazy past it.
         let sd = virtual_size_descr(1, 4);
-        let d_value = descr(10);
+        // `d_value` is stored INTO the virtual, so its slot has to be one of
+        // `sd`'s own fields: `optimize_setfield_gc` indexes
+        // `VirtualStruct.fields` by the field descr's slot and
+        // `virtualize.rs` asserts it stays inside `all_fielddescrs()`. A
+        // `TestDescr`'s slot reads back as `offset() / field_size()` — its
+        // index — wherever the descr is reconciled rather than used raw, so
+        // `descr(10)` addresses field 10 of a 4-field struct. `d_head` /
+        // `d_size` are stored into the non-virtual `p0` and carry no such
+        // bound.
+        let d_value = descr(0);
         let d_head = descr(11);
         let d_size = descr(12);
         let mut ops = vec![
