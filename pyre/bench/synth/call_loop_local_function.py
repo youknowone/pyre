@@ -1,17 +1,18 @@
 # A loop that defines a function in its own body and calls it.
 #
-# The inline lever specializes the call on the callable's OBJECT IDENTITY, so
-# the guard it emits can only ever hold if MAKE_FUNCTION happens to hand back
-# the same address twice.  It never does: every compiled entry deopts, one per
-# two Python iterations.
+# `MAKE_FUNCTION` hands back a fresh `Function` every iteration, so an inline
+# specialized on the callable's OBJECT IDENTITY can only ever hold by address
+# coincidence.  It never does.  What the inline actually depends on is the
+# `_immutable_fields_ = ['code?', 'w_func_globals?', 'closure?[*]', 'defs_w?[*]']`
+# set (function.py:34-42), all of which are loop-invariant here, so guarding
+# those fields off the live function keeps the trace.
 #
-# That is the frontend half.  The half this fixture pins is the backend one:
-# `make_a_counter_per_value` (regalloc.py:496-499) buckets the jitcounter by
-# (guard, failing value), so a guard whose value never repeats never reaches
-# `trace_eagerness` and compiles no bridge.  Without it every 200th failure
-# compiled another bridge, without bound — 47 here, and 2497 at N=1000000.
-#
-# `bridges_compiled` in the committed `.jitstats` baseline is the signal.
+# `guard_failures` in the committed `.jitstats` baseline is the signal: it is 1
+# with the field guards and 9480 with the identity guard, which also compiled
+# 47 bridges here (2497 at N=1000000) before `make_a_counter_per_value`
+# (regalloc.py:496-499) reached the dynasm and wasm backends.  With the
+# identity guard gone this fixture no longer exercises that bucketing —
+# `bridges_compiled` stays 0 either way.
 N = 20000
 
 

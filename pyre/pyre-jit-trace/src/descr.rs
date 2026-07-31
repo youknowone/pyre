@@ -942,31 +942,49 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
-/// `Function.defs_w` — PyPy `function.py:47`
-/// `_immutable_fields_ = [..., 'defs_w?[*]', ...]`.
+/// The `Function` fields PyPy declares quasi-immutable — `function.py:34-42`
+/// `_immutable_fields_ = ['code?', 'w_func_globals?', 'closure?[*]',
+/// 'defs_w?[*]', ...]`.
 ///
-/// The `?` makes the field quasi-immutable upstream and `[*]` makes the
-/// selected defaults immutable after the field has been promoted.  Pyre's
-/// `function_set_defaults` does not yet call `do_force_quasi_immutable`, so
-/// marking this descriptor quasi-immutable would leave compiled loops alive
-/// after `f.__defaults__ = ...`.  Keep the field live/mutable for now; the
-/// inline-call path pairs its read with a `GuardValue`, which is the sound
-/// pre-invalidation equivalent.  The tuple's backing array has its own
-/// immutable descriptor and is read with `GetarrayitemGcPureR`.
+/// The `?` makes each field quasi-immutable upstream and `[*]` makes the
+/// selected elements immutable after the field has been promoted.  Pyre's
+/// setters (`function_set_defaults` and friends) do not yet call
+/// `do_force_quasi_immutable`, so marking these descriptors quasi-immutable
+/// would leave compiled loops alive after `f.__defaults__ = ...` /
+/// `f.__code__ = ...`.  Keep the fields live/mutable for now; the inline-call
+/// path pairs every read with a `GuardValue`, which is the sound
+/// pre-invalidation equivalent.  A tuple's backing array has its own immutable
+/// descriptor and is read with `GetarrayitemGcPureR`.
+///
+/// `field_descr_from_group` indexes positionally, so new fields append.
 static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group_with_def_path(
-        pyre_interpreter::function::FUNCTION_OBJECT_SIZE,
-        FUNCTION_GC_TYPE_ID,
-        &pyre_interpreter::FUNCTION_TYPE as *const _ as usize,
-        &[(
-            "defs_w",
-            pyre_interpreter::function::FUNCTION_DEFS_W_OFFSET,
+    let field = |key, offset| {
+        (
+            key,
+            offset,
             std::mem::size_of::<usize>(),
             Type::Ref,
             false,
             false,
             false,
-        )],
+        )
+    };
+    build_object_descr_group_with_def_path(
+        pyre_interpreter::function::FUNCTION_OBJECT_SIZE,
+        FUNCTION_GC_TYPE_ID,
+        &pyre_interpreter::FUNCTION_TYPE as *const _ as usize,
+        &[
+            field("defs_w", pyre_interpreter::function::FUNCTION_DEFS_W_OFFSET),
+            field("code", pyre_interpreter::function::FUNCTION_CODE_OFFSET),
+            field(
+                "w_func_globals",
+                pyre_interpreter::function::FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET,
+            ),
+            field(
+                "closure",
+                pyre_interpreter::function::FUNCTION_CLOSURE_OFFSET,
+            ),
+        ],
         "Function",
         "function::Function",
     )
@@ -2032,6 +2050,25 @@ pub fn method_w_function_descr() -> DescrRef {
 /// pyre wires the upstream quasi-immutable invalidation hook.
 pub fn function_defs_w_descr() -> DescrRef {
     field_descr_from_group(&FUNCTION_DESCR_GROUP, 0)
+}
+
+/// Live `Function.code` — the field `Function.getcode()` promotes
+/// (`function.py:95 jit.promote(self.code)`).  This is what identifies an
+/// inlined body, so the inline lever guards it instead of the function object.
+pub fn function_code_descr() -> DescrRef {
+    field_descr_from_group(&FUNCTION_DESCR_GROUP, 1)
+}
+
+/// Live `Function.w_func_globals` — the namespace an inlined callee's
+/// LOAD_GLOBAL folds against.
+pub fn function_w_globals_descr() -> DescrRef {
+    field_descr_from_group(&FUNCTION_DESCR_GROUP, 2)
+}
+
+/// Live `Function.closure` — the freevar cell tuple threaded into the inlined
+/// callee's own frame.
+pub fn function_closure_descr() -> DescrRef {
+    field_descr_from_group(&FUNCTION_DESCR_GROUP, 3)
 }
 
 pub fn dict_keys_version_descr() -> DescrRef {

@@ -2382,6 +2382,34 @@ fn inline_chain_unrolls_recursion<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) 
     })
 }
 
+/// Read one of the callee function's `_immutable_fields_` slots live and pin
+/// the value this inline baked, replacing the box so later reads fold.
+///
+/// `function.py:34-42` declares `code?` / `w_func_globals?` / `closure?[*]` /
+/// `defs_w?[*]`; pyre's setters do not yet force the quasi-immutable
+/// invalidation, so a `GuardValue` stands in for it.
+fn walker_guard_function_field<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    callable: OpRef,
+    descr: majit_ir::DescrRef,
+    expected: i64,
+) -> Result<(), DispatchError> {
+    let field_op = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, callable, descr);
+    ctx.trace_ctx.try_set_opref_concrete(
+        field_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(expected as usize)),
+    );
+    let expected_op = ctx.trace_ctx.const_ref(expected);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[field_op, expected_op], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(field_op, expected_op);
+    Ok(())
+}
+
 /// Shared post-resolution half of the FBW inline lever. Ordinary Python calls
 /// resolve their callee from the CALL operand; builtin-dispatch specializers
 /// resolve an app-level descriptor first and enter here with that function as
@@ -3041,22 +3069,88 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         }
     }
 
-    let callable_expected = ctx
-        .trace_ctx
-        .const_ref(callable_guard_value as usize as i64);
-    if !callable_guard_op.is_constant() {
-        ctx.trace_ctx.record_guard(
-            OpCode::GuardValue,
-            &[callable_guard_op, callable_expected],
-            0,
-        );
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    {
+        // `function.py:91-96 getcode()` promotes `self.code`, never `self`.
+        // The three constants this inline bakes — the code object below, the
+        // globals namespace in `InlineCalleeConsts`, and the freevar cells
+        // baked into the callee frame — are exactly the `?`-fields
+        // `_immutable_fields_ = ['code?', 'w_func_globals?', 'closure?[*]',
+        // 'defs_w?[*]']` names, so guard each of them off the live function.
+        // `defs_w` has its own guard below.
+        //
+        // The guards are emitted even when the callable itself is already a
+        // trace constant.  Pinning the object pins none of these fields:
+        // `f.__code__ = g.__code__` keeps the same function and used to leave
+        // the inlined body running the old code.  Upstream is safe there
+        // because `code?` is quasi-immutable and assigning it invalidates the
+        // traces that folded it; pyre has no such hook yet, so the value guard
+        // is what stands in for the invalidation.
+        //
+        // Guarding the function OBJECT instead pinned its identity, which a
+        // callee built by a `MAKE_FUNCTION` in the caller's own loop body can
+        // never match twice: every iteration allocates a fresh function, so
+        // the guard failed forever while the code object it stands for is
+        // loop-invariant.
+        walker_guard_function_field(
+            ctx,
+            op.pc,
+            callable_guard_op,
+            crate::descr::function_code_descr(),
+            callee_code_key as i64,
+        )?;
+        walker_guard_function_field(
+            ctx,
+            op.pc,
+            callable_guard_op,
+            crate::descr::function_w_globals_descr(),
+            inline_consts.w_globals as i64,
+        )?;
+        if !concrete_freevar_cells.is_empty() {
+            // `closure?[*]`: the tuple itself is rebuilt by every
+            // `MAKE_FUNCTION`, so guarding its identity would reintroduce the
+            // per-iteration failure.  The cells are what this inline bakes and
+            // what the enclosing frame keeps stable, so read the tuple live and
+            // guard each element instead.  The element count needs no guard of
+            // its own: `code` above pins `co_freevars`, and a closure always
+            // has exactly that many cells.
+            let closure_op = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                callable_guard_op,
+                crate::descr::function_closure_descr(),
+            );
+            ctx.trace_ctx.try_set_opref_concrete(
+                closure_op,
+                majit_ir::Value::Ref(majit_ir::GcRef(concrete_closure as usize)),
+            );
+            let items_op = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                closure_op,
+                crate::descr::tuple_wrappeditems_descr(),
+            );
+            for (i, &cell) in concrete_freevar_cells.iter().enumerate() {
+                let index_op = ctx.trace_ctx.const_int(i as i64);
+                let cell_op = crate::state::trace_items_block_getitem_value_pure(
+                    ctx.trace_ctx,
+                    items_op,
+                    index_op,
+                );
+                ctx.trace_ctx.try_set_opref_concrete(
+                    cell_op,
+                    majit_ir::Value::Ref(majit_ir::GcRef(cell as usize)),
+                );
+                let cell_const = ctx.trace_ctx.const_ref(cell as i64);
+                ctx.trace_ctx
+                    .record_guard(OpCode::GuardValue, &[cell_op, cell_const], 0);
+                walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+                ctx.trace_ctx
+                    .heap_cache_mut()
+                    .replace_box(cell_op, cell_const);
+            }
+        }
     }
 
     if let Some(defaults) = positional_defaults {
-        // `defs_w?`: read the live field on every compiled iteration, then
-        // guard the tuple identity used while tracing.  Reassigning
-        // `f.__defaults__` therefore deopts at the caller's CALL boundary.
+        // `defs_w?`: read the live field on every compiled iteration.
         let defaults_op = ctx.trace_ctx.record_op_with_descr(
             OpCode::GetfieldGcR,
             &[callable_guard_op],
@@ -3066,19 +3160,33 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             defaults_op,
             majit_ir::Value::Ref(majit_ir::GcRef(defaults.tuple as usize)),
         );
-        let defaults_expected = ctx.trace_ctx.const_ref(defaults.tuple as i64);
+
+        // `defs_w?[*]`: the elements are read live below, so all trace time
+        // decided is WHICH element fills which missing parameter, and
+        // `positional_defaults_for_inline` derives that from `len(defs_w)`
+        // alone — the length is the only thing that has to be re-checked.
+        //
+        // Guard the tuple's identity all the same.  `GuardValue` over an
+        // `arraylen_gc` leaves the guard's only argument dead after it, and a
+        // bridge compiled at that fail index segfaults on entry: reassign
+        // `f.__defaults__` to a different length mid-loop and it is correct up
+        // to ~1000 post-flip iterations and dies past ~2000, with and without
+        // `MAJIT_NO_BRIDGE`.  Identity is stricter than needed but sound, and
+        // it only costs the shape that builds the callee in the caller's own
+        // loop AND omits an argument it has a default for.
+        let tuple_expected = ctx.trace_ctx.const_ref(defaults.tuple as i64);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[defaults_op, defaults_expected], 0);
+            .record_guard(OpCode::GuardValue, &[defaults_op, tuple_expected], 0);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
 
-        // `defs_w?[*]`: once the field guard pins the tuple, its
-        // `wrappeditems` pointer and contents are immutable.  Preserve the
-        // actual Ref boxes instead of baking one anchor's concrete value.
         let items = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             defaults_op,
             crate::descr::tuple_wrappeditems_descr(),
         );
+
+        // Preserve the actual Ref boxes instead of baking one anchor's
+        // concrete value.
         for (param_index, tuple_index, _) in defaults.values {
             let index = ctx.trace_ctx.const_int(tuple_index as i64);
             callee_args[param_index] =
