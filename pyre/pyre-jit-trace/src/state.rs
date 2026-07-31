@@ -3064,6 +3064,42 @@ pub(crate) fn int_gcarray_descr() -> DescrRef {
     )
 }
 
+/// `Ptr(GcArray(OBJECTPTR))` — `W_ObjectObject.storage`, the mapdict
+/// attribute-value block (`mapdict.py:910` `self.storage`).
+///
+/// Structurally the same `ItemsBlock` as [`pyobject_gcarray_descr`] and
+/// differing only in the two properties the allocation shape turns on:
+///
+/// * `W_MAPDICT_STORAGE_GC_TYPE_ID` is a GC **leaf** — the block is a mixed
+///   boxed/unboxed array, so the collector must never walk its interior; the
+///   owning instance's `object_object_custom_trace` walks the boxed slots
+///   itself, masked by the map. Reusing the object-array tid would have the
+///   tracer read an unboxed slot as a reference.
+/// * `non_moving`, because the instance's `storage` field is a raw pointer the
+///   custom trace marks but never rewrites, so a moved block would leave the
+///   instance pointing at the pre-move copy.
+///
+/// Both match `alloc_mapdict_storage_block` (`object_array.rs`), the allocator
+/// the interpreter itself uses for this block.
+pub(crate) fn mapdict_storage_gcarray_descr() -> DescrRef {
+    let token = &pyre_object::ITEMS_BLOCK_TOKEN;
+    let descr = crate::descr::make_array_descr_with_type(
+        token.base_size,
+        token.item_size,
+        pyre_object::object_array::W_MAPDICT_STORAGE_GC_TYPE_ID,
+        Some(token.len_offset),
+        Type::Ref,
+        false,
+    );
+    if let Some(simple) = descr
+        .as_any()
+        .and_then(|any| any.downcast_ref::<majit_ir::descr::SimpleArrayDescr>())
+    {
+        simple.set_non_moving(true);
+    }
+    descr
+}
+
 /// `Ptr(GcArray(Float))` — the `FloatListStrategy` backing block
 /// (`erase([float])`). See [`int_gcarray_descr`].
 pub(crate) fn float_gcarray_descr() -> DescrRef {
@@ -3977,6 +4013,54 @@ pub(crate) fn trace_items_block_setitem_value(
     // pyjitpl.py:980 `upd.setarrayitem(valuebox)` — cache stores the
     // Box identity (`value` OpRef); cache-hit readers resolve the
     // intrinsic value via `box_value(cached)` at hit time.
+    ctx.heapcache_setarrayitem(block, index, descr_idx, value);
+}
+
+/// `mapdict.py:914-916 _mapdict_read_storage` — the mapdict-storage twin of
+/// [`trace_items_block_getitem_value`], against
+/// [`mapdict_storage_gcarray_descr`].  Only ever issued for a slot the guarded
+/// map proves is boxed.
+pub(crate) fn trace_mapdict_storage_getitem(
+    ctx: &mut TraceCtx,
+    block: OpRef,
+    index: OpRef,
+) -> OpRef {
+    let descr = mapdict_storage_gcarray_descr();
+    let descr_idx = descr.index();
+    if let Some(cached) = ctx.heapcache_getarrayitem(block, index, descr_idx) {
+        return cached;
+    }
+    ctx.profiler()
+        .count_ops(OpCode::GetarrayitemGcR, majit_metainterp::counters::OPS);
+    ctx.profiler().count_ops(
+        OpCode::GetarrayitemGcR,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
+    let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[block, index], descr.clone());
+    if let Some(live_value) = array_load_for_cache(ctx, block, index, &descr, majit_ir::Type::Ref) {
+        ctx.set_opref_concrete(result, live_value);
+    }
+    ctx.heapcache_getarrayitem_now_known(block, index, descr_idx, result);
+    result
+}
+
+/// `mapdict.py:918-919 _mapdict_write_storage` — companion of
+/// [`trace_mapdict_storage_getitem`].
+pub(crate) fn trace_mapdict_storage_setitem(
+    ctx: &mut TraceCtx,
+    block: OpRef,
+    index: OpRef,
+    value: OpRef,
+) {
+    let descr = mapdict_storage_gcarray_descr();
+    let descr_idx = descr.index();
+    ctx.profiler()
+        .count_ops(OpCode::SetarrayitemGc, majit_metainterp::counters::OPS);
+    ctx.profiler().count_ops(
+        OpCode::SetarrayitemGc,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
+    ctx.record_op_with_descr(OpCode::SetarrayitemGc, &[block, index, value], descr);
     ctx.heapcache_setarrayitem(block, index, descr_idx, value);
 }
 

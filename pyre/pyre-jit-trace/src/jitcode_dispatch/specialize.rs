@@ -2137,7 +2137,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
 
         // getfield_gc_r(obj, storage) + getarrayitem_gc_r(block, C_storageindex):
         // the inline value read (`mapdict.py`).  `storageindex` is a green
-        // constant (the map guard pinned it); `trace_items_block_getitem_value`
+        // constant (the map guard pinned it); `trace_mapdict_storage_getitem`
         // stamps the dst's concrete shadow from the live block slot.
         let block = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
@@ -2145,7 +2145,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             crate::descr::object_storage_descr(),
         );
         let idx_const = ctx.trace_ctx.const_int(storageindex as i64);
-        let value = crate::state::trace_items_block_getitem_value(ctx.trace_ctx, block, idx_const);
+        let value = crate::state::trace_mapdict_storage_getitem(ctx.trace_ctx, block, idx_const);
         write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
         return Ok(Some(()));
     }
@@ -3126,6 +3126,37 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 }
             }
         }
+        return Ok(Some(WalkerStoreAttrSpecialization::Direct));
+    }
+
+    // The attribute is not in the map yet: fold the `map -> PlainAttribute`
+    // transition and the grow-by-one storage rewrite into trace ops instead of
+    // leaving the generic `setattr` residual, which would force the receiver.
+    if let Some(add) = unsafe {
+        pyre_interpreter::objspace::std::mapdict::store_attr_add_fast_path(
+            concrete_obj,
+            &name,
+            concrete_value,
+        )
+    } {
+        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, add.w_type, add.version_tag, add.map)?;
+        let new_map_const = ctx.trace_ctx.const_int(add.new_map as i64);
+        crate::helpers::emit_mapdict_add_attr_inline(
+            ctx.trace_ctx,
+            obj,
+            add.storageindex,
+            new_map_const,
+            value,
+        );
+        // The walk is the authoritative execution path, so apply the resolved
+        // transition now; the emitted operations reproduce it in compiled code.
+        unsafe {
+            pyre_interpreter::objspace::std::mapdict::store_attr_add_commit(
+                concrete_obj,
+                &add,
+                concrete_value,
+            )
+        };
         return Ok(Some(WalkerStoreAttrSpecialization::Direct));
     }
 

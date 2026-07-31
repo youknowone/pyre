@@ -1676,6 +1676,180 @@ pub unsafe fn store_attr_boxed_fast_path(
     Some((w_type, version_tag, map, p.storageindex))
 }
 
+/// The map transition an attribute-adding STORE_ATTR takes, resolved without
+/// performing it.  See [`store_attr_add_fast_path`].
+pub struct StoreAttrAdd {
+    /// The receiver's type, whose `version_tag` the caller guards.
+    pub w_type: PyObjectRef,
+    /// That type's live version tag.
+    pub version_tag: u64,
+    /// The instance's current map, which the caller guards.
+    pub map: MapRef,
+    /// The `PlainAttribute` the instance's map becomes — a direct child of
+    /// `map`, so the transition is `map -> new_map` with no reordering.
+    pub new_map: MapRef,
+    /// `new_map.storageindex`, which is also `map.storage_needed()`: the
+    /// transition appends exactly one slot, and the value lands in it.
+    pub storageindex: usize,
+}
+
+/// Resolve the `map -> PlainAttribute` transition that a STORE_ATTR adding a
+/// not-yet-present boxed attribute would take, *without* performing it, so the
+/// JIT can emit `_set_mapdict_increase_storage1` (mapdict.py:942-959) as trace
+/// operations instead of an opaque residual call.  Every value the caller needs
+/// is a trace-time constant once the receiver's map and its type's version tag
+/// are guarded.
+///
+/// Declines anything the plain grow-by-one shape does not cover, so the caller
+/// can fall back to the general residual: an attribute already in the map (the
+/// [`store_attr_boxed_fast_path`] / [`store_attr_unboxed_fast_path`] cases), a
+/// value that would take an unboxed slot, a terminator that routes the write
+/// elsewhere, the `_reorder_and_add` case (mapdict.py:204-258), the
+/// `LIMIT_MAP_ATTRIBUTES` devolve, and a storage block the collector does not
+/// own (whose replacement the interpreter would have to free).
+///
+/// Resolving interns the transition through `_find_branch_to_move_into`, which
+/// `add_attr` would do anyway on this very store; it is idempotent and the
+/// resulting node is immortal.
+///
+/// # Safety
+/// `w_obj` must be a live object and `w_value` a live value.
+pub unsafe fn store_attr_add_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+    w_value: PyObjectRef,
+) -> Option<StoreAttrAdd> {
+    if name == "__class__" {
+        return None;
+    }
+    // mapdict.py:1591 `if map is not None:` — also filters non-instances.
+    let map = unsafe { mapdict_map_or_null(w_obj) };
+    if map.is_null() {
+        return None;
+    }
+    let terminator = unsafe { (*map).terminator() };
+    let term = unsafe { (*terminator).as_terminator() };
+    let w_type = term.w_cls;
+    if w_type.is_null() {
+        return None;
+    }
+    // mapdict.py:1612-1614 / 1630-1631 — a custom `__setattr__` owns the
+    // write, and STORE caching also requires the standard `__getattribute__`.
+    if unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }.is_some() {
+        return None;
+    }
+    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+        return None;
+    }
+    // mapdict.py:1616 `if version_tag is not None:`.
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    // mapdict.py:1618-1627 `_pure_lookup_where_with_method_cache` + classify.
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
+    let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, true) };
+    if attrkind == INVALID {
+        return None;
+    }
+    let attrname = Wtf8::new(if is_slot { "slot" } else { name });
+    // This arm is the ADD; an attribute already in the map belongs to the
+    // in-place write paths (mapdict.py:1628 `map.find_map_attr`).
+    if unsafe { find_map_attr(map, attrname, attrkind) }.is_some() {
+        return None;
+    }
+    // mapdict.py:312-321 `_write_terminator` — a `NoDictTerminator` rejects a
+    // DICT write and a `DevolvedDictTerminator` sends it to the materialised
+    // instance dict; neither reaches `add_attr`.
+    if attrkind == DICT && term.kind != TerminatorKind::Dict {
+        return None;
+    }
+    // Only the boxed shape is emittable: an unboxed slot holds an erased
+    // longlong list the trace has no way to build (mapdict.py:629-646).
+    if unsafe { pick_unbox_type(map, w_value) }.is_some() {
+        return None;
+    }
+    // The emitted transition copies the live slots into the wider block with
+    // reference loads, so every existing slot must hold a reference.  An
+    // unboxed attribute anywhere in the chain puts an erased `Vec<i64>` raw
+    // pointer in its slot (mapdict.py:600-601 `_prim_direct_read`), which
+    // `instance_walk_boxed_storage` skips precisely because it is not one.
+    let mut node = map;
+    while unsafe { (*node).is_plain() } {
+        let n = unsafe { (*node).as_plain() };
+        if n.unboxed.is_some() {
+            return None;
+        }
+        node = n.back;
+    }
+    // mapdict.py:170-193 — `number_to_readd != 0` is `_reorder_and_add`, which
+    // pops and re-adds intermediate attributes.
+    let (number_to_readd, holder) =
+        unsafe { find_branch_to_move_into(map, attrname, attrkind, None) };
+    if number_to_readd != 0 {
+        return None;
+    }
+    let new_map = unsafe { holder_pick_attr(holder, None) };
+    if !unsafe { (*new_map).is_plain() } {
+        return None;
+    }
+    let p = unsafe { (*new_map).as_plain() };
+    if p.unboxed.is_some() || !std::ptr::eq(p.back, map) {
+        return None;
+    }
+    // mapdict.py:317-323 — a DICT add that reaches the attribute limit devolves
+    // the instance's `__dict__` into a text-strategy dict.
+    if attrkind == DICT && unsafe { (*new_map).num_attributes() } >= LIMIT_MAP_ATTRIBUTES {
+        return None;
+    }
+    // The grow-by-one shape `_set_mapdict_increase_storage1` implements: the
+    // new slot is appended at the current length.
+    let storage_needed = unsafe { (*map).storage_needed() };
+    if p.storageindex != storage_needed
+        || unsafe { (*new_map).storage_needed() } != storage_needed + 1
+    {
+        return None;
+    }
+    // `grow_instance_items_block` frees the block it replaces, which is a no-op
+    // only for a collector-owned block.  A `std::alloc` fallback block (no GC
+    // hook) would leak once the emitted allocation replaces it without a free.
+    let inst = unsafe { &*(w_obj as *const pyre_object::W_ObjectObject) };
+    if !inst.storage.is_null() && !pyre_object::gc_hook::try_gc_owns_object(inst.storage as *mut u8)
+    {
+        return None;
+    }
+    if unsafe { pyre_object::object_array::items_block_capacity(inst.storage) } != storage_needed {
+        return None;
+    }
+    Some(StoreAttrAdd {
+        w_type,
+        version_tag,
+        map,
+        new_map,
+        storageindex: p.storageindex,
+    })
+}
+
+/// Perform the transition [`store_attr_add_fast_path`] resolved.  The JIT's
+/// walk is the authoritative execution path, so it applies the store itself
+/// after emitting the equivalent trace operations.
+///
+/// # Safety
+/// `w_obj` must be the live instance the resolution came from, still on
+/// `resolved.map`, and `w_value` a live value.
+pub unsafe fn store_attr_add_commit(
+    w_obj: PyObjectRef,
+    resolved: &StoreAttrAdd,
+    w_value: PyObjectRef,
+) {
+    let _instance_guard = instance_lock(w_obj);
+    let inst = unsafe { &mut *(w_obj as *mut pyre_object::W_ObjectObject) };
+    debug_assert!(std::ptr::eq(inst._get_mapdict_map(), resolved.map));
+    // mapdict.py:449-459 with `storage_needed() > _mapdict_storage_length()`,
+    // which `store_attr_add_fast_path` proved by construction.
+    inst._set_mapdict_increase_storage1(resolved.new_map, w_value);
+}
+
 /// mapdict.py:914-916 `_mapdict_read_storage(storageindex)` for a
 /// `W_ObjectObject` — the boxed-slot read the JIT LOAD_ATTR fast path folds
 /// to. `load_attr_fast_path` already established that the resolved attribute
