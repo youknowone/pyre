@@ -1090,11 +1090,14 @@ fn flush_escape_state_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: us
         for &opref in oprefs.iter() {
             match ctx.concrete_of_opref(opref) {
                 Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
-                    let obj = r.as_usize() as pyre_object::PyObjectRef;
-                    if obj.is_null() {
-                        return false;
-                    }
-                    stack.push(obj);
+                    // A recorded concrete NULL is a real operand, not an absent
+                    // one — `NO_CONCRETE` is what "unavailable" looks like.  It
+                    // is the `self_or_null` sentinel `PUSH_NULL` puts under a
+                    // callable, so refusing it made every `CALL` /
+                    // `CALL_FUNCTION_EX` escape fall through to the plain flush,
+                    // which then declines on that same NULL slot and leaves the
+                    // portal replaying the frame from its entry.
+                    stack.push(r.as_usize() as pyre_object::PyObjectRef);
                 }
                 _ => return false,
             }
