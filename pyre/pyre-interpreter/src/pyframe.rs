@@ -679,10 +679,30 @@ impl FrameBox {
         }
     }
 
+    /// The frame's current address.
+    ///
+    /// `owner_root` is this handle's translated livevar slot.  A collection
+    /// rewrites the slot in place (`rpython/memory/gc/incminimark.py:2252`),
+    /// which is why RPython reads a GCREF local back out of its shadow-stack
+    /// slot rather than from a register it filled before the last operation
+    /// that could collect; the raw `ptr` field is that stale register, so
+    /// every read of the frame goes through the slot instead.  A `new_boxed`
+    /// snapshot holds no slot and is not GC-managed, so its address is fixed
+    /// and the field is the only answer.
+    #[inline]
+    fn frame_ptr(&self) -> *mut PyFrame {
+        match &self.owner_root {
+            Some(owner_root) => owner_root.get().0 as *mut PyFrame,
+            None => self.ptr,
+        }
+    }
+
     /// Relinquish ownership, returning the inner-frame pointer. The header
     /// remains at `ptr - GC_HEADER_SIZE`; reclaim via [`FrameBox::from_raw`].
     pub fn into_raw(mut self) -> *mut PyFrame {
-        let ptr = self.ptr;
+        // Read the slot before releasing it — afterwards the handle has no
+        // root to answer from and only the stale field remains.
+        let ptr = self.frame_ptr();
         drop(self.owner_root.take());
         std::mem::forget(self);
         ptr
@@ -715,7 +735,7 @@ impl FrameBox {
 
     /// Raw pointer to the inner frame (header at `ptr - GC_HEADER_SIZE`).
     pub fn as_mut_ptr(&mut self) -> *mut PyFrame {
-        self.ptr
+        self.frame_ptr()
     }
 
     /// Does the collector own this frame, so that [`Drop`] leaves the memory
@@ -886,14 +906,14 @@ impl std::ops::Deref for FrameBox {
     type Target = PyFrame;
     #[inline]
     fn deref(&self) -> &PyFrame {
-        unsafe { &*self.ptr }
+        unsafe { &*self.frame_ptr() }
     }
 }
 
 impl std::ops::DerefMut for FrameBox {
     #[inline]
     fn deref_mut(&mut self) -> &mut PyFrame {
-        unsafe { &mut *self.ptr }
+        unsafe { &mut *self.frame_ptr() }
     }
 }
 

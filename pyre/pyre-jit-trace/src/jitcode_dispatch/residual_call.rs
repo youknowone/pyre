@@ -95,8 +95,17 @@ thread_local! {
 /// brackets the corresponding per-thread execution state with
 /// [`InlineConcreteFrameGuard`].  Vable writes use this accessor to keep that
 /// frame's own heap image coherent for a later multi-frame blackhole handoff.
+///
+/// Read back out of the guard's root rather than from a raw copy: the value
+/// is compared for identity against the concrete bank's own `Value::Ref`,
+/// which the collector forwards, so a relocated frame would make the two
+/// disagree and silently drop the mirror write.
 pub(crate) fn current_inline_concrete_frame() -> usize {
-    INLINE_CONCRETE_FRAME.with(|slot| slot.get() as usize)
+    INLINE_CONCRETE_FRAME.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map_or(0, |owner_root| owner_root.get().0)
+    })
 }
 
 pub(crate) struct EscapeFlushUndo {
@@ -775,9 +784,12 @@ pub(crate) fn escape_flush_undo_cell_ptr() -> *const std::cell::RefCell<Option<E
 
 thread_local! {
     /// The concrete `PyFrame` the innermost inline sub-walk is executing, or
-    /// null outside one.  Set by [`InlineConcreteFrameGuard`].
-    static INLINE_CONCRETE_FRAME: std::cell::Cell<*mut pyre_interpreter::PyFrame> =
-        const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// `None` outside one.  Set by [`InlineConcreteFrameGuard`], and held as
+    /// a translated-livevar root rather than a raw pointer, the way
+    /// [`ResidualFrameChainGuard`] holds the `topframeref` it displaces.
+    static INLINE_CONCRETE_FRAME: std::cell::RefCell<
+        Option<majit_gc::shadow_stack::OwnerRootGuard>,
+    > = const { std::cell::RefCell::new(None) };
 
     /// The concrete frame currently published on the interpreter chain by a
     /// live [`ResidualFrameChainGuard`], or null.  Distinct from
@@ -818,7 +830,7 @@ impl LiveLastInstrGuard {
     /// declines to latch a sub-walk's mirror), and writing it onto the outer
     /// frame strands that frame's replay on a stack depth it never had.
     fn enter(live_frame: usize, py_pc: u32) -> Option<Self> {
-        let inline = INLINE_CONCRETE_FRAME.with(|slot| slot.get());
+        let inline = current_inline_concrete_frame() as *mut pyre_interpreter::PyFrame;
         let frame = if inline.is_null() {
             live_frame as *mut pyre_interpreter::PyFrame
         } else {
@@ -860,24 +872,28 @@ impl Drop for LiveLastInstrGuard {
 /// Names the frame an inline sub-walk executes concretely for the duration of
 /// that sub-walk.  Publishing it on the interpreter chain is left to
 /// [`ResidualFrameChainGuard`], which brackets only the residual calls.
-pub(crate) struct InlineConcreteFrameGuard(*mut pyre_interpreter::PyFrame);
+pub(crate) struct InlineConcreteFrameGuard(Option<majit_gc::shadow_stack::OwnerRootGuard>);
 
 impl InlineConcreteFrameGuard {
     pub(crate) fn enter(frame: *mut pyre_interpreter::PyFrame) -> Self {
-        // Set unconditionally, null included: a nested sub-walk whose seed
-        // block bailed has no frame of its own, and inheriting the enclosing
-        // callee's frame would publish it for the inner callee's residuals —
-        // resolving one level too shallow, the error this guard exists to
-        // stop.  A null slot makes `ResidualFrameChainGuard::enter` publish
-        // nothing.
-        let previous = INLINE_CONCRETE_FRAME.with(|slot| slot.replace(frame));
-        Self(previous)
+        // Set unconditionally, the empty case included: a nested sub-walk
+        // whose seed block bailed has no frame of its own, and inheriting the
+        // enclosing callee's frame would publish it for the inner callee's
+        // residuals — resolving one level too shallow, the error this guard
+        // exists to stop.  An empty slot makes `ResidualFrameChainGuard::enter`
+        // publish nothing.
+        //
+        // The displaced root stays in this guard, so the enclosing level's
+        // frame keeps its own root for the whole nested sub-walk.
+        let entered = (!frame.is_null())
+            .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame as usize)));
+        Self(INLINE_CONCRETE_FRAME.with(|slot| slot.replace(entered)))
     }
 }
 
 impl Drop for InlineConcreteFrameGuard {
     fn drop(&mut self) {
-        INLINE_CONCRETE_FRAME.with(|slot| slot.set(self.0));
+        INLINE_CONCRETE_FRAME.with(|slot| *slot.borrow_mut() = self.0.take());
     }
 }
 
@@ -911,7 +927,7 @@ struct ResidualFrameChainGuard {
 
 impl ResidualFrameChainGuard {
     fn enter() -> Option<Self> {
-        let frame = INLINE_CONCRETE_FRAME.with(|slot| slot.get());
+        let frame = current_inline_concrete_frame() as *mut pyre_interpreter::PyFrame;
         if frame.is_null() {
             return None;
         }
@@ -2373,7 +2389,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // outer code object and reports whatever line that byte happens to sit
         // on.  [`LiveLastInstrGuard`] makes the matching retarget for the
         // concrete store, publishing onto the callee's own frame instead.
-        if INLINE_CONCRETE_FRAME.with(|slot| slot.get()).is_null() {
+        if current_inline_concrete_frame() == 0 {
             let last_instr = ctx.trace_ctx.const_int(ctx.vstack_cur_pypc as i64);
             crate::trace_opcode::mirror_vable_static_to_boxes(
                 ctx.trace_ctx,
