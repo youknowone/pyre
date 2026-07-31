@@ -31,14 +31,6 @@ def cmp_to_key(mycmp):
         __hash__ = None
     return K
 
-# `_functools.cmp_to_key` is an interp-level builtin in CPython.  Unlike an
-# app-level function, it therefore does not acquire an instance when a caller
-# stores it on a class (the CPython functools tests do exactly that).  A
-# callable staticmethod preserves the app-level implementation while giving
-# the exported object the same non-binding descriptor behavior.
-cmp_to_key = staticmethod(cmp_to_key)
-
-
 _initial_missing = object()
 
 
@@ -59,10 +51,6 @@ def reduce(function, sequence, initial=_initial_missing):
     for element in it:
         accum = function(accum, element)
     return accum
-
-
-# Same descriptor-neutral accelerator surface as cmp_to_key above.
-reduce = staticmethod(reduce)
 
 
 # PyPy: lib_pypy/_functools.py `partial`, extended with the Placeholder
