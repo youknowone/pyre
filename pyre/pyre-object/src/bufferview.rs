@@ -63,13 +63,14 @@ fn copy_rec(
 unsafe fn read_dims(t: PyObjectRef) -> Vec<i64> {
     unsafe {
         let n = crate::tupleobject::w_tuple_len(t);
-        (0..n)
-            .map(|i| {
-                crate::tupleobject::w_tuple_getitem(t, i as i64)
-                    .map(|w| crate::intobject::w_int_get_value(w))
-                    .unwrap_or(0)
-            })
-            .collect()
+        let mut dims: Vec<i64> = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let d = crate::tupleobject::w_tuple_getitem(t, i as i64)
+                .map(|w| crate::intobject::w_int_get_value(w))
+                .unwrap_or(0);
+            dims.push(d);
+        }
+        dims
     }
 }
 

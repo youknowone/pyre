@@ -147,11 +147,11 @@ pub mod frame_locals_proxy {
         }
 
         fn __reversed__(&self) -> Result<PyObjectRef, crate::PyError> {
-            let mut keys: Vec<_> =
-                unsafe { pyre_object::dictmultiobject::w_dict_items(self.mapping()?) }
-                    .into_iter()
-                    .map(|(key, _)| key)
-                    .collect();
+            let items = unsafe { pyre_object::dictmultiobject::w_dict_items(self.mapping()?) };
+            let mut keys: Vec<PyObjectRef> = Vec::with_capacity(items.len());
+            for (key, _) in items {
+                keys.push(key);
+            }
             keys.reverse();
             Ok(pyre_object::w_list_new(keys))
         }
@@ -161,29 +161,30 @@ pub mod frame_locals_proxy {
         }
 
         fn keys(&self) -> Result<PyObjectRef, crate::PyError> {
-            let keys = unsafe { pyre_object::dictmultiobject::w_dict_items(self.mapping()?) }
-                .into_iter()
-                .map(|(key, _)| key)
-                .collect();
+            let items = unsafe { pyre_object::dictmultiobject::w_dict_items(self.mapping()?) };
+            let mut keys: Vec<PyObjectRef> = Vec::with_capacity(items.len());
+            for (key, _) in items {
+                keys.push(key);
+            }
             Ok(pyre_object::w_list_new(keys))
         }
 
         fn values(&self) -> Result<PyObjectRef, crate::PyError> {
-            let values = unsafe { pyre_object::dictmultiobject::w_dict_items(self.mapping()?) }
-                .into_iter()
-                .map(|(_, value)| value)
-                .collect();
+            let items = unsafe { pyre_object::dictmultiobject::w_dict_items(self.mapping()?) };
+            let mut values: Vec<PyObjectRef> = Vec::with_capacity(items.len());
+            for (_, value) in items {
+                values.push(value);
+            }
             Ok(pyre_object::w_list_new(values))
         }
 
         fn items(&self) -> Result<PyObjectRef, crate::PyError> {
             let items = unsafe { pyre_object::dictmultiobject::w_dict_items(self.mapping()?) };
-            Ok(pyre_object::w_list_new(
-                items
-                    .into_iter()
-                    .map(|(key, value)| pyre_object::w_tuple_new(vec![key, value]))
-                    .collect(),
-            ))
+            let mut out: Vec<PyObjectRef> = Vec::with_capacity(items.len());
+            for (key, value) in items {
+                out.push(pyre_object::w_tuple_new(vec![key, value]));
+            }
+            Ok(pyre_object::w_list_new(out))
         }
 
         fn copy(&self) -> Result<PyObjectRef, crate::PyError> {
