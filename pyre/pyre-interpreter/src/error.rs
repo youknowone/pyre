@@ -1746,11 +1746,14 @@ fn write_syntax_error_object<W: Write>(writer: &mut W, exc: PyObjectRef) -> std:
         let shown = raw.trim_start();
         let lead = raw.len() - shown.len();
         writeln!(writer, "    {shown}")?;
-        if let Some(offset) = int_of(attr("offset")) {
-            let start_col = (offset.max(1) as usize) - 1;
+        if let Some(offset) = int_of(attr("offset")).filter(|&offset| offset > 0) {
+            // `traceback._byte_offset_to_character_offset` clamps malformed
+            // constructor-supplied offsets to the displayed line.  Offsets
+            // at or below zero suppress the marker entirely.
+            let start_col = ((offset as usize) - 1).min(raw.len());
             let end_col = int_of(attr("end_offset"))
                 .filter(|&e| e >= offset)
-                .map_or(start_col, |e| (e as usize) - 1);
+                .map_or(start_col, |e| ((e as usize) - 1).min(raw.len()));
             let caret_start = start_col.saturating_sub(lead);
             let caret_len = end_col.saturating_sub(start_col).max(1);
             let mut caret = String::from("    ");
