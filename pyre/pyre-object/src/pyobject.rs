@@ -625,6 +625,8 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (153, Some(0)),
     (154, Some(0)),
     (155, Some(0)),
+    // `functools.KeyWrapper`, registered after them.
+    (156, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every

@@ -1061,6 +1061,9 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(153, typed::<crate::module::thread::W_Lock>()),
         subclass_range_alias(154, typed::<crate::module::thread::W_RLock>()),
         subclass_range_alias(155, typed::<crate::module::thread::W_ThreadHandle>()),
+        // `functools.KeyWrapper` follows them at the append-only AUTO-ID
+        // registration tail.
+        subclass_range_alias(156, typed::<crate::module::_functools::W_KeyWrapper>()),
     ]
 }
 

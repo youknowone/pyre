@@ -3378,6 +3378,15 @@ fn build_gc() -> Box<MiniMarkGC> {
             descriptor.ptr_offsets,
         );
     }
+    // `_functools.keyobject`: the comparator and wrapped object are both
+    // managed edges.  Keep this AUTO-ID payload at the absolute tail so adding
+    // the accelerator type does not renumber any established GC id.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_functools::W_KeyWrapper
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
     // `PYRE_CLASS_DESCRIPTORS` slice.  A type with inline managed children

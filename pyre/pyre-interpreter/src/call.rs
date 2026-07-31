@@ -1385,13 +1385,23 @@ fn staticmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRe
 /// payload (`weakref.ref` and friends, whose class holds the `__call__`), and
 /// an instance of a user-defined class — including one deriving from a builtin
 /// type, where `class C(int)` carries its `__call__` on the type just as a
-/// plain `class C` does.
+/// plain `class C` does.  `space.lookup` applies equally to interp-level
+/// `W_Root` payloads whose `TypeDef` publishes a call slot, so the accelerator
+/// key wrapper is admitted here as well.
 fn user_call_slot(callable: PyObjectRef) -> Result<Option<(PyObjectRef, bool)>, PyError> {
     let Some(w_type) = crate::typedef::r#type(callable) else {
         return Ok(None);
     };
     let w_type = w_type.as_ptr();
-    if !unsafe { pyre_object::is_instance(callable) || pyre_object::w_type_is_heaptype(w_type) } {
+    // Most fixed-layout builtin payloads are deliberately not generic
+    // instances.  The accelerator key wrapper is the exception: its
+    // TypeDef publishes `__call__`, so admit that one payload explicitly while
+    // retaining the old guard for all other internal objects (which avoids
+    // treating bootstrap implementation objects as recursive callables).
+    let key_wrapper = unsafe { pyre_object::w_type_get_name(w_type) == "functools.KeyWrapper" };
+    if !unsafe { pyre_object::is_instance(callable) || pyre_object::w_type_is_heaptype(w_type) }
+        && !key_wrapper
+    {
         return Ok(None);
     }
     let Some(call_fn) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__call__") }) else {
