@@ -1231,8 +1231,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_fnaddr(
         &mut entries,
-        "pyre_interpreter::call::call_depth",
-        crate::call::call_depth as *const (),
+        "pyre_interpreter::call::py_recursion_depth",
+        crate::call::py_recursion_depth as *const (),
     );
     push_fnaddr(
         &mut entries,
@@ -3547,8 +3547,11 @@ mod tests {
             bump
         );
 
-        let call_depth = crate::call::call_depth as *const () as usize as i64;
-        assert_eq!(bindings["pyre_interpreter::call::call_depth"], call_depth);
+        let py_recursion_depth = crate::call::py_recursion_depth as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::call::py_recursion_depth"],
+            py_recursion_depth
+        );
 
         let recursion_limit =
             crate::module::sys::state::recursion_limit as *const () as usize as i64;
