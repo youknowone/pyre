@@ -178,11 +178,15 @@ pub fn decode_source_bytes(
                     .filter(|&&b| b == b'\n')
                     .count()
                     + 1;
+                let (file_context, location_suffix) = if filename == "<string>" {
+                    (String::new(), format!(" ({filename}, line {line})"))
+                } else {
+                    (format!(" in file {filename}"), String::new())
+                };
                 Err(crate::PyError::syntax_error(format!(
-                    "Non-UTF-8 code starting with '\\x{bad_byte:02x}' \
+                    "Non-UTF-8 code starting with '\\x{bad_byte:02x}'{file_context} \
                      on line {line}, but no encoding declared; \
-                     see https://peps.python.org/pep-0263/ for details \
-                     ({filename}, line {line})"
+                     see https://peps.python.org/pep-0263/ for details{location_suffix}"
                 )))
             }
         }
