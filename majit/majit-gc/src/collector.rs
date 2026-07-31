@@ -1354,7 +1354,7 @@ impl MiniMarkGC {
             None
         };
         let walk_all_mutators = crate::gc_sync::mutators_quiesced();
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[gc][minor] start count={} remembered={} cards_set={}",
                 self.minor_collections + 1,
@@ -3059,7 +3059,7 @@ impl MiniMarkGC {
         debug_assert_eq!(self.gc_state, GcState::Sweeping);
         debug_assert!(!self.oldgen.rawmalloc_sweep_pending());
         self.major_collections += 1;
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[gc][major] complete count={} oldgen_bytes={}",
                 self.major_collections,

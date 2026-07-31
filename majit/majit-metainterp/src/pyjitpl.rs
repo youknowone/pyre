@@ -12425,11 +12425,11 @@ impl<M: Clone> MetaInterp<M> {
 
         // pyjitpl.py:1404 `dont_trace_here(greenboxes)` — the only `&mut`,
         // flagged by `decide_recursive_inline` when recursion reached
-        // `max_unroll_recursion`. Pyre's tracer also calls
-        // `disable_noninlinable_function` at the same decision point
-        // (trace_opcode.rs:3044-3049); doing it here too is idempotent and
-        // keeps the metainterp path self-consistent when entered without
-        // the tracer wrapper.
+        // `max_unroll_recursion`. This is the ONLY place the recursion bound
+        // applies it: pyre's FBW walker bounds self-recursive inlining with
+        // its own counter (`pyre-jit-trace` `jitcode_dispatch::inline_call`,
+        // against `FBW_MAX_INLINE_RECURSION`) and applies no side effect
+        // there, so do not read this comment as "the tracer does it too".
         if should_disable {
             self.warm_state.disable_noninlinable_function(callee_key);
         }

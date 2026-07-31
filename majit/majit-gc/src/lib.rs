@@ -99,6 +99,14 @@ pub fn gc_lifetime_log_enabled() -> bool {
     *ENABLED
 }
 
+/// `MAJIT_LOG`, read once — the same gate `majit_metainterp::majit_log_enabled`
+/// caches, for the collector's own per-collection sites.
+pub fn majit_log_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_LOG").is_some());
+    *ENABLED
+}
+
 /// Write barrier descriptor — information the JIT needs to emit write barrier checks.
 ///
 /// From rpython/jit/backend/llsupport/gc.py WriteBarrierDescr.
