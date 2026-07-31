@@ -1257,6 +1257,22 @@ pub struct NurseryAllocParams {
     pub plain_tids: std::collections::HashSet<u32>,
 }
 
+/// `__indirect_function_table` indices of the allocation helpers a compiled
+/// trace calls for `New*` / `NewArray*`.
+///
+/// Two generations, picked per operation from the descr's `non_moving` flag:
+/// the nursery pair is the default, the old-gen pair is for a descr whose
+/// object must not move (see `majit_backend_wasm::wasm_jit_alloc_oldgen`).
+/// The native backends make the same choice inside the GC rewrite pass, which
+/// the wasm backend bypasses in favour of this lowering.
+#[derive(Clone, Copy, Default)]
+pub struct AllocHelpers {
+    pub new_fn_ptr: i64,
+    pub new_array_fn_ptr: i64,
+    pub new_oldgen_fn_ptr: i64,
+    pub new_array_oldgen_fn_ptr: i64,
+}
+
 /// Build a wasm module from majit IR.
 pub fn build_wasm_module(
     inputargs: &[InputArg],
@@ -1265,8 +1281,7 @@ pub fn build_wasm_module(
     vtable_offset: Option<usize>,
     classptr_to_typeid: &HashMap<i64, u32>,
     guard_gc_type_info: &GuardGcTypeInfo,
-    alloc_fn_ptr: i64,
-    alloc_array_fn_ptr: i64,
+    alloc: AllocHelpers,
     wb_fn_ptr: i64,
     // Inline nursery-bump fast path for eligible `New`/`NewWithVtable`
     // (see `NurseryAllocParams`); `None` keeps allocations on the helper.
@@ -1558,8 +1573,7 @@ pub fn build_wasm_module(
         vtable_offset,
         classptr_to_typeid,
         guard_gc_type_info,
-        alloc_fn_ptr,
-        alloc_array_fn_ptr,
+        alloc,
         wb_fn_ptr,
         nursery,
         &ref_values,
@@ -1600,8 +1614,7 @@ fn build_function(
     vtable_offset: Option<usize>,
     classptr_to_typeid: &HashMap<i64, u32>,
     guard_gc_type_info: &GuardGcTypeInfo,
-    alloc_fn_ptr: i64,
-    alloc_array_fn_ptr: i64,
+    alloc: AllocHelpers,
     wb_fn_ptr: i64,
     nursery: Option<&NurseryAllocParams>,
     ref_values: &RefValues,
@@ -3674,6 +3687,16 @@ fn build_function(
                     })
                 });
 
+                // `rewrite.rs handle_new`: a `non_moving` descr declines the
+                // nursery outright — both the inline bump and the collecting
+                // helper — and allocates through the old-generation twin, whose
+                // address is the only thing that differs from the nursery call.
+                let non_moving = sd.is_some_and(|sd| sd.non_moving());
+                let alloc_fn_ptr = if non_moving {
+                    alloc.new_oldgen_fn_ptr
+                } else {
+                    alloc.new_fn_ptr
+                };
                 // Inline nursery bump (rewrite.py malloc fast path, x86
                 // `malloc_cond`): total = align8(max(header+size, MIN)); if
                 // `free + total` fits below `nursery_top`, commit the bump and
@@ -3686,7 +3709,7 @@ fn build_function(
                     use majit_gc::header::GcHeader;
                     ((GcHeader::SIZE + size as usize).max(GcHeader::MIN_NURSERY_OBJ_SIZE) + 7) & !7
                 };
-                let inline_nursery = nursery.filter(|na| {
+                let inline_nursery = nursery.filter(|_| !non_moving).filter(|na| {
                     total_size <= na.large_threshold
                         && u32::try_from(type_id).is_ok_and(|t| na.plain_tids.contains(&t))
                 });
@@ -3878,6 +3901,17 @@ fn build_function(
                 let (base_size, item_size) = (ad.base_size() as i64, ad.item_size() as i64);
                 let len_offset = ad.len_descr().map_or(0i64, |ld| ld.offset() as i64);
                 let type_id = ad.type_id() as i64;
+
+                // `rewrite.rs handle_new_array`: a `non_moving` descr declines
+                // both nursery routes and allocates through the old-generation
+                // twin. See the `New` arm.
+                let non_moving = ad.non_moving();
+                let alloc_array_fn_ptr = if non_moving {
+                    alloc.new_array_oldgen_fn_ptr
+                } else {
+                    alloc.new_array_fn_ptr
+                };
+                let nursery = nursery.filter(|_| !non_moving);
 
                 // Inline nursery bump for arrays of a plain type under the
                 // large-object threshold (same fast path as the `New` arm).

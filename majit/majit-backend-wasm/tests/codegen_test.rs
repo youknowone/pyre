@@ -207,8 +207,7 @@ fn build_module(
         vtable_offset,
         &HashMap::new(),
         gc_info,
-        0,
-        0,
+        codegen::AllocHelpers::default(),
         0,
         None, // nursery
         0,    // invalidated_flag_addr
@@ -581,8 +580,7 @@ fn test_guard_not_invalidated_loads_runtime_flag() {
         None,
         &HashMap::new(),
         &codegen::GuardGcTypeInfo::default(),
-        0,
-        0,
+        codegen::AllocHelpers::default(),
         0,
         None,
         0x1000,
@@ -1048,4 +1046,105 @@ fn test_registration_loop_stamps_label_block_id() {
         .getdescr()
         .and_then(|d| d.as_loop_target_descr().map(|t| t.label_block_id()));
     assert_eq!(recovered, Some(1));
+}
+
+/// Collect every `i32.const` / `i64.const` immediate in the emitted body, so a
+/// test can assert which helper address the allocation arms baked in.
+fn const_immediates(bytes: &[u8]) -> Vec<i64> {
+    let mut out = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                match operators.read().unwrap() {
+                    wasmparser::Operator::I32Const { value } => out.push(value as i64),
+                    wasmparser::Operator::I64Const { value } => out.push(value),
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A `non_moving` descr must allocate through the old-generation helper, never
+/// the nursery one. The native backends make that choice in the GC rewrite pass
+/// (`handle_new` / `handle_new_array`); the wasm backend lowers `New*` itself,
+/// so the flag has to be honoured here or it is silently dropped.
+///
+/// Dropping it is not a slowdown, it is a use-after-move: a `non_moving` descr
+/// marks an object reached through a raw pointer nothing forwards, so a movable
+/// copy leaves those pointers on the pre-move address.
+#[test]
+fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
+    use majit_ir::descr::{SimpleArrayDescr, SimpleSizeDescr};
+    use std::sync::Arc;
+
+    const NEW_FN: i64 = 0x11;
+    const NEW_ARRAY_FN: i64 = 0x22;
+    const NEW_OLDGEN_FN: i64 = 0x33;
+    const NEW_ARRAY_OLDGEN_FN: i64 = 0x44;
+
+    // One `New` and one `NewArrayClear`, both marked non-moving.
+    let build = |non_moving: bool| {
+        let size_descr = SimpleSizeDescr::new(0, 32, 53);
+        size_descr.set_non_moving(non_moving);
+        let array_descr = SimpleArrayDescr::new(1, 8, 8, 55, Type::Ref);
+        array_descr.set_non_moving(non_moving);
+
+        let new_op = make_op(OpCode::New, &[], OpRef::ref_op(1));
+        new_op.setdescr(Arc::new(size_descr));
+        let new_array_op = make_op(
+            OpCode::NewArrayClear,
+            &[OpRef::input_arg_int(0)],
+            OpRef::ref_op(2),
+        );
+        new_array_op.setdescr(Arc::new(array_descr));
+        let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
+        finish.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
+
+        let (bytes, _, _, _, _) = codegen::build_wasm_module(
+            &[InputArg::from_type(Type::Int, 0)],
+            &[new_op, new_array_op, finish],
+            &indexmap::IndexMap::new(),
+            Some(0),
+            &HashMap::new(),
+            &codegen::GuardGcTypeInfo::default(),
+            codegen::AllocHelpers {
+                new_fn_ptr: NEW_FN,
+                new_array_fn_ptr: NEW_ARRAY_FN,
+                new_oldgen_fn_ptr: NEW_OLDGEN_FN,
+                new_array_oldgen_fn_ptr: NEW_ARRAY_OLDGEN_FN,
+            },
+            0,
+            None, // nursery: the inline bump is off, so only the helper choice shows
+            0,
+            0,
+            0,
+            0,
+            codegen::FrameGeometry::fixed(),
+            codegen::CaParams::default(),
+        )
+        .expect("wasm codegen should succeed");
+        validate_wasm(&bytes);
+        const_immediates(&bytes)
+    };
+
+    let moving = build(false);
+    assert!(moving.contains(&NEW_FN) && moving.contains(&NEW_ARRAY_FN));
+    assert!(!moving.contains(&NEW_OLDGEN_FN) && !moving.contains(&NEW_ARRAY_OLDGEN_FN));
+
+    let non_moving = build(true);
+    assert!(
+        non_moving.contains(&NEW_OLDGEN_FN),
+        "non_moving New must call the old-gen helper"
+    );
+    assert!(
+        non_moving.contains(&NEW_ARRAY_OLDGEN_FN),
+        "non_moving NewArrayClear must call the old-gen helper"
+    );
+    assert!(
+        !non_moving.contains(&NEW_FN) && !non_moving.contains(&NEW_ARRAY_FN),
+        "non_moving descrs must not reach the nursery helpers"
+    );
 }

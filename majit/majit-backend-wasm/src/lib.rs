@@ -657,6 +657,63 @@ pub extern "C" fn wasm_jit_alloc_array(
     .unwrap_or(0)
 }
 
+/// Old-generation twin of [`wasm_jit_alloc`], selected by the `New` /
+/// `NewWithVtable` codegen for a `non_moving` size descr. Same signature, so it
+/// shares the call shape; only the generation differs.
+///
+/// A descr marked `non_moving` is one whose object is reached through a raw
+/// pointer nothing forwards — the interpreter holds it across an allocation, or
+/// another object's field stores it outside the collector's view. Placing such
+/// an object in the movable nursery leaves those pointers aimed at the pre-move
+/// copy. The native backends honour the flag in the GC rewrite pass
+/// (`rewrite.rs` `handle_new`); wasm lowers `New` itself, so it must apply the
+/// same policy here.
+pub extern "C" fn wasm_jit_alloc_oldgen(type_id: i64, size: i64) -> i64 {
+    with_wasm_active_gc_mut(|gc| gc.alloc_oldgen_typed(type_id as u32, size as usize).0 as i64)
+        .unwrap_or(0)
+}
+
+/// Old-generation twin of [`wasm_jit_alloc_array`], selected by the `NewArray` /
+/// `NewArrayClear` codegen for a `non_moving` array descr. Same signature and
+/// the same length stamp; see [`wasm_jit_alloc_oldgen`] for why the generation
+/// is part of the descr's contract.
+pub extern "C" fn wasm_jit_alloc_array_oldgen(
+    type_id: i64,
+    base_size: i64,
+    item_size: i64,
+    length: i64,
+    len_offset: i64,
+) -> i64 {
+    let Ok(length) = usize::try_from(length) else {
+        return 0;
+    };
+    let payload_size = base_size as usize + item_size as usize * length;
+    with_wasm_active_gc_mut(|gc| {
+        let obj = gc.alloc_oldgen_typed(type_id as u32, payload_size);
+        if obj.is_null() {
+            0
+        } else {
+            unsafe {
+                *((obj.0 as *mut u8).add(len_offset as usize) as *mut usize) = length;
+            }
+            obj.0 as i64
+        }
+    })
+    .unwrap_or(0)
+}
+
+/// Table indices of the four allocation trampolines, for the `New*` /
+/// `NewArray*` codegen. Taking each address here is what keeps the function in
+/// the module's `__indirect_function_table`, so a trace can `call_indirect` it.
+fn alloc_helpers() -> codegen::AllocHelpers {
+    codegen::AllocHelpers {
+        new_fn_ptr: wasm_jit_alloc as *const () as usize as i64,
+        new_array_fn_ptr: wasm_jit_alloc_array as *const () as usize as i64,
+        new_oldgen_fn_ptr: wasm_jit_alloc_oldgen as *const () as usize as i64,
+        new_array_oldgen_fn_ptr: wasm_jit_alloc_array_oldgen as *const () as usize as i64,
+    }
+}
+
 /// JIT-trace write-barrier trampoline target for ref-storing `SetfieldGc` /
 /// `SetarrayitemGc` / `SetinteriorfieldGc`. Routes through the host `jit_call`
 /// trampoline; invokes the active GC's `write_barrier`, which adds an old
@@ -1705,8 +1762,7 @@ impl majit_backend::Backend for WasmBackend {
         // Allocation helpers reached from a compiled trace through the host
         // `jit_call` trampoline. `fn as usize` is the `__indirect_function_table`
         // index on wasm32; taking it here keeps the function in the table.
-        let alloc_fn_ptr = wasm_jit_alloc as *const () as usize as i64;
-        let alloc_array_fn_ptr = wasm_jit_alloc_array as *const () as usize as i64;
+        let alloc = alloc_helpers();
         let wb_fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
         // Exit indices come from the global fail-index space so a cross-trace
         // chain's `frame[0]` resolves regardless of which module wrote it
@@ -1720,8 +1776,7 @@ impl majit_backend::Backend for WasmBackend {
                 self.vtable_offset,
                 &typeid_table,
                 &guard_gc_type_info,
-                alloc_fn_ptr,
-                alloc_array_fn_ptr,
+                alloc,
                 wb_fn_ptr,
                 nursery_alloc_params(ops).as_ref(),
                 Arc::as_ptr(&token.invalidated) as usize as u32,
@@ -2385,8 +2440,7 @@ impl majit_backend::Backend for WasmBackend {
 
         let typeid_table = self.collect_classptr_typeid_table(ops);
         let guard_gc_type_info = self.collect_guard_gc_type_info(ops);
-        let alloc_fn_ptr = wasm_jit_alloc as *const () as usize as i64;
-        let alloc_array_fn_ptr = wasm_jit_alloc_array as *const () as usize as i64;
+        let alloc = alloc_helpers();
         let wb_fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
 
         // CALL_ASSEMBLER: the CA arm allocates a fresh callee using the target
@@ -2433,8 +2487,7 @@ impl majit_backend::Backend for WasmBackend {
                 self.vtable_offset,
                 &typeid_table,
                 &guard_gc_type_info,
-                alloc_fn_ptr,
-                alloc_array_fn_ptr,
+                alloc,
                 wb_fn_ptr,
                 nursery_alloc_params(ops).as_ref(),
                 Arc::as_ptr(&bridge_flag) as usize as u32,
