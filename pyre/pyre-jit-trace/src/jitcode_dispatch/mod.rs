@@ -419,7 +419,7 @@ impl Default for CalleeLocalsShadow {
 
 impl CalleeLocalsShadow {
     /// A `NONE` value clears the slot.
-    fn set_opref(&mut self, slot: i64, value: OpRef) {
+    pub(crate) fn set_opref(&mut self, slot: i64, value: OpRef) {
         if value.is_none() {
             self.opref.remove(&slot);
         } else {

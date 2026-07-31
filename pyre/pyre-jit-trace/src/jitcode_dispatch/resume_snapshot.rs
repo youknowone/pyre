@@ -2130,9 +2130,56 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             }
         }
     }
+    // `MIFrame.registers_r` is the live color bank, but a reconstructed
+    // carrier frame also owns the semantic locals/stack image from which that
+    // bank was rebuilt.  A post-call liveness marker can conservatively carry
+    // a color whose current bank value is NONE (adjacent `-live-` union); map
+    // that color back to this callee's OWN frame slot and source the box from
+    // its frame-local shadow.  This is the inline-frame counterpart of
+    // `collect_outer_active_boxes`' virtualizable-slot recovery, and preserves
+    // the one-red-frame-per-MIFrame shape instead of falling back to the root.
+    let mut recovered_regs_r = ctx.registers_r.to_vec();
+    if recovered_regs_r.iter().any(|value| value.is_none()) && !callee_pjc.code_ptr.is_null() {
+        let code = unsafe { &*callee_pjc.code_ptr };
+        let (stack_base, _) = crate::state::callee_layout_for_call_assembler(code);
+        let maps =
+            crate::state::bridge_semantic_maps_from_pc(callee_jitcode_index, callee_jitcode_pc);
+        if let Some(shadow) = ctx.callee_shadow.as_ref() {
+            for (color, value) in recovered_regs_r.iter_mut().enumerate() {
+                if !value.is_none() {
+                    continue;
+                }
+                let Some(slot) = crate::state::semantic_ref_slot_for_reg_color(
+                    stack_base,
+                    maps.stack_depth_at_pc,
+                    &maps.pcdep_entries,
+                    color,
+                ) else {
+                    continue;
+                };
+                if let Some(&slot_value) = shadow.opref.get(&(slot as i64)) {
+                    *value = slot_value;
+                }
+            }
+        }
+        // A dense fallthrough marker can name the NEXT Python opcode's result
+        // color before that opcode has executed.  RPython's sparse stream has
+        // no opcode-entry marker at this seam; the translated Ref bank slot is
+        // still its empty/null value and the next opcode overwrites it before
+        // any read.  Admit exactly that metadata-proven result color as NULL;
+        // every other missing live color still declines below.
+        if after_residual_call {
+            let marker_result = usize::try_from(callee_jitcode_pc)
+                .ok()
+                .and_then(|coord| callee_pjc.result_color_trivia_for_jitcode_pc(coord))
+                .filter(|&color| color != u16::MAX);
+            let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
+            seed_missing_fallthrough_result(&mut recovered_regs_r, marker_result, null_ref);
+        }
+    }
     let callee_boxes = collect_callee_active_boxes(
         ctx.registers_i,
-        ctx.registers_r,
+        &recovered_regs_r,
         ctx.registers_f,
         callee_jitcode_index as u32,
         callee_op_pc,
@@ -2193,4 +2240,27 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             );
     }
     Ok(())
+}
+
+/// Seed only the not-yet-defined result color carried by pyre's dense
+/// fallthrough marker.  Returns whether a hole was filled.
+pub(crate) fn seed_missing_fallthrough_result(
+    registers_r: &mut [OpRef],
+    marker_result: Option<u16>,
+    null_ref: OpRef,
+) -> bool {
+    let Some(dst) = marker_result
+        .filter(|&color| color != u16::MAX)
+        .map(usize::from)
+    else {
+        return false;
+    };
+    let Some(slot) = registers_r.get_mut(dst) else {
+        return false;
+    };
+    if !slot.is_none() {
+        return false;
+    }
+    *slot = null_ref;
+    true
 }

@@ -900,6 +900,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     callee_w_globals: usize,
     entry: usize,
     argboxes_r: &[OpRef],
+    local_oprefs: &[OpRef],
     local_concretes: &[majit_ir::Value],
     child_result: Option<OpRef>,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
@@ -1134,6 +1135,13 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         // `getarrayitem_vable(frame, slot)` read fold to its value, so a nested
         // self-recursive call's int arg is known (`arg_is_int`) and the call
         // folds to `CALL_ASSEMBLER` instead of declining.
+        for (slot, &opref) in local_oprefs.iter().enumerate() {
+            sub_wc
+                .callee_shadow
+                .as_mut()
+                .unwrap()
+                .set_opref(slot as i64, opref);
+        }
         for (slot, &v) in local_concretes.iter().enumerate() {
             sub_wc.callee_shadow.as_mut().unwrap().set_concrete(
                 callee_pjc.metadata.portal_frame_reg,
@@ -1158,6 +1166,7 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
     callee_w_globals: usize,
     entry: usize,
     argboxes_r: &[OpRef],
+    local_oprefs: &[OpRef],
     local_concretes: &[majit_ir::Value],
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
@@ -1171,6 +1180,7 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
         callee_w_globals,
         entry,
         argboxes_r,
+        local_oprefs,
         local_concretes,
         None,
         paused_parent_recipes,
@@ -1188,6 +1198,7 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
     middle_w_globals: usize,
     entry: usize,
     argboxes_r: &[OpRef],
+    local_oprefs: &[OpRef],
     local_concretes: &[majit_ir::Value],
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
     child_result: OpRef,
@@ -1202,6 +1213,7 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
         middle_w_globals,
         entry,
         argboxes_r,
+        local_oprefs,
         local_concretes,
         Some(child_result),
         paused_parent_recipes,

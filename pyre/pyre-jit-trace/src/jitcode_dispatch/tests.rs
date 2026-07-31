@@ -11112,6 +11112,39 @@ fn callee_vable_ref_gates_on_frame_register_identity() {
     assert_eq!(super::callee_vable_ref_at(None, 1, 3), None);
 }
 
+#[test]
+fn dense_fallthrough_seeds_only_its_missing_result_color() {
+    let keep = OpRef::ref_op(3);
+    let null_ref = OpRef::const_ptr(majit_ir::GcRef(0));
+    let mut registers = vec![keep, OpRef::NONE, OpRef::NONE];
+
+    assert!(super::resume_snapshot::seed_missing_fallthrough_result(
+        &mut registers,
+        Some(1),
+        null_ref,
+    ));
+    assert_eq!(registers, vec![keep, null_ref, OpRef::NONE]);
+
+    // A defined register, a sentinel, and an out-of-range color are not
+    // rewritten. Other NONE holes remain visible to the ordinary decline.
+    assert!(!super::resume_snapshot::seed_missing_fallthrough_result(
+        &mut registers,
+        Some(0),
+        null_ref,
+    ));
+    assert!(!super::resume_snapshot::seed_missing_fallthrough_result(
+        &mut registers,
+        Some(u16::MAX),
+        null_ref,
+    ));
+    assert!(!super::resume_snapshot::seed_missing_fallthrough_result(
+        &mut registers,
+        Some(99),
+        null_ref,
+    ));
+    assert_eq!(registers, vec![keep, null_ref, OpRef::NONE]);
+}
+
 /// `insert_renamings` routes a cyclic parallel move through the Int scratch
 /// (`int_push/i` then `int_pop/>i`).  The pop must land the source's concrete
 /// shadow in `concrete_registers_i[dst]`; leaving the destination slot's old

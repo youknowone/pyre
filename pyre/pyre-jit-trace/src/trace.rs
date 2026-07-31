@@ -1675,6 +1675,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // sub-walk's local-concrete shadow so a nested self-recursive call's int arg
     // is known.
     let nlocals = recipe.nlocals.min(recipe.concrete_r.len());
+    let local_oprefs = &recipe.registers_r[..nlocals.min(recipe.registers_r.len())];
     let local_concretes = &recipe.concrete_r[..nlocals];
     // Increment 2b-i: drive the deepest callee as an inline SUB-WALK rooted on
     // the portal `sym` (is_top_level=false), so its `ref_return` surfaces
@@ -1690,6 +1691,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         callee_w_globals,
         entry,
         &argboxes_r,
+        local_oprefs,
         local_concretes,
         // Depth-N: tell the deepest sub-walk that all shallower frames are
         // paused so its in-callee guard snapshots encode the full
@@ -1843,8 +1845,35 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         }
         Some(Err(e)) => {
             if p2_diag {
+                let raw_code = recipe.code_ptr as *const CodeObject;
+                let (callee_name, source_path) = if raw_code.is_null() {
+                    ("<unknown>", "<unknown>")
+                } else {
+                    unsafe {
+                        (
+                            (*raw_code).obj_name.as_str(),
+                            (*raw_code).source_path.as_str(),
+                        )
+                    }
+                };
+                let stop_op = match e {
+                    crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported {
+                        pc,
+                    }
+                    | crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached {
+                        pc,
+                    } => crate::jitcode_runtime::decode_op_at(
+                        callee_pjc.jitcode.code.as_slice(),
+                        *pc,
+                    )
+                    .map(|op| op.opname)
+                    .unwrap_or("<undecodable>"),
+                    _ => "<n/a>",
+                };
                 eprintln!(
-                    "[p2-drain] callee sub-walk STOP recipe_py_pc={} entry={entry} err={e:?}",
+                    "[p2-drain] callee sub-walk STOP callee={callee_name} \
+                     source={source_path} recipe_py_pc={} entry={entry} \
+                     stop_op={stop_op} err={e:?}",
                     crate::state::forward_py_pc_or_backxlat(
                         recipe.jitcode_index,
                         recipe.jitcode_pc
@@ -1914,6 +1943,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     };
     let middle_w_globals = crate::state::recover_inline_callee_globals(middle.code_ptr) as usize;
     let middle_nlocals = middle.nlocals.min(middle.concrete_r.len());
+    let middle_local_oprefs = &middle.registers_r[..middle_nlocals.min(middle.registers_r.len())];
     let middle_local_concretes = &middle.concrete_r[..middle_nlocals];
     let middle_walk = crate::jitcode_dispatch::drive_bridge_middle_frame(
         ctx,
@@ -1925,6 +1955,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         middle_w_globals,
         middle_entry,
         &middle_argboxes_r,
+        middle_local_oprefs,
         middle_local_concretes,
         paused_parents,
         child_result,
