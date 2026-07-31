@@ -87,6 +87,7 @@ fn descr_to_bh_array_descr(descr: &DescrRef) -> Option<majit_translate::jitcode:
         itemsize: a.item_size(),
         len_offset: a.len_descr().map(|fd| fd.offset()),
         type_id: a.cache_key(),
+        gc_type_id: a.type_id(),
         item_type: a.item_type(),
         is_array_of_pointers: a.is_array_of_pointers(),
         is_array_of_structs: false,
@@ -2630,6 +2631,36 @@ impl TraceCtx {
         self.virtualizable_values
             .as_ref()
             .and_then(|values| values.last().copied())
+    }
+
+    /// Trace every concrete Ref carried by `virtualizable_boxes`.
+    ///
+    /// RPython stores these values directly on `BoxPtr` instances, so the GC
+    /// forwards them through the ordinary object graph.  Pyre's parallel
+    /// `virtualizable_values` vector is the concrete half of those same boxes
+    /// and therefore needs the identical in-place walk.  In particular, the
+    /// trailing identity is `virtualizable_boxes[-1]`; a bridge must keep that
+    /// rebuilt frame identity live instead of falling back to an older cached
+    /// portal-frame pointer.
+    pub(crate) fn walk_virtualizable_value_refs(
+        &mut self,
+        mut visitor: impl FnMut(&mut majit_ir::GcRef),
+    ) {
+        let Some(values) = self.virtualizable_values.as_mut() else {
+            return;
+        };
+        for value in values.iter_mut() {
+            if let Value::Ref(gcref) = value {
+                visitor(gcref);
+            }
+        }
+        if let Some(Value::Ref(identity)) = values.last() {
+            self.virtualizable_heap_ptr = if identity.is_null() {
+                None
+            } else {
+                Some(identity.as_usize() as *const u8)
+            };
+        }
     }
 
     /// Best-effort concrete (runtime) value associated with an OpRef, from

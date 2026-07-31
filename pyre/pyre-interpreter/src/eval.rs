@@ -1219,6 +1219,20 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         };
         crate::module::_pickle::walk_pickle_state_gc(&mut fwd);
     }
+    // `space.fromcache(MethodCache)` is a live interpreter-global GC root,
+    // not a write-once prebuilt object, and one cache serves every mutator.
+    // A cached young function may survive one minor collection and move again
+    // at the next; a single dirty bit cannot model minimark's remembered-set
+    // lifetime. Forward every cache slot on every collection, as RPython's
+    // traced MethodCache object does.
+    unsafe {
+        let mut forward_cache = |slot: &mut PyObjectRef| {
+            visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
+            walk_raw_function_roots(*slot, visitor);
+            walk_raw_getset_roots(*slot, visitor);
+        };
+        crate::baseobjspace::walk_method_cache_gc(&mut forward_cache);
+    }
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
     let scan_prebuilt = !is_minor
@@ -1238,10 +1252,6 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             walk_raw_getset_roots(*slot, visitor);
         };
         walk_builtin_type_dicts_gc(&mut forward);
-        // `space.fromcache(MethodCache)` is owned by the shared object space,
-        // not by an execution context. Trace its cached `(w_class, w_value)`
-        // slots once through the interpreter-global root walker.
-        crate::baseobjspace::walk_method_cache_gc(&mut forward);
         // interp_codecs.CodecState is `space.fromcache(CodecState)` in PyPy:
         // one process/interpreter-owned registry, not one copy per mutator.
         crate::module::_codecs::walk_codec_state_gc(&mut forward);

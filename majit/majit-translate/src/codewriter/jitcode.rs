@@ -1216,6 +1216,13 @@ pub enum BhDescr {
         /// runtime macro emission; see `BhSizeSpec.type_id` for the
         /// full identity rationale.
         type_id: u64,
+        /// Dense GC type id written into the allocation header
+        /// (`ArrayDescr.tid` in `gc.py:544-549`).  This is deliberately
+        /// separate from `type_id`, which is the `_cache_array`
+        /// structural identity surrogate.  Treating a dense tid as a
+        /// cache key makes equal integers alias unrelated ARRAY entries.
+        #[serde(default)]
+        gc_type_id: u32,
         item_type: majit_ir::value::Type,
         is_array_of_pointers: bool,
         is_array_of_structs: bool,
@@ -1426,6 +1433,11 @@ impl BhDescr {
     /// `get_type_id() as u32` so a materialized object carries a header the
     /// collector can trace.
     pub fn resolve_gc_tid(&self) -> u32 {
+        if let BhDescr::Array { gc_type_id, .. } = self
+            && *gc_type_id != 0
+        {
+            return *gc_type_id;
+        }
         let raw = self.get_type_id();
         let resolved = match self {
             BhDescr::Size { .. } => majit_ir::descr::gc_cache()
@@ -1516,6 +1528,7 @@ impl BhDescr {
             // not a `base_size`-derived heuristic.
             len_offset: info.len_offset,
             type_id: 0,
+            gc_type_id: 0,
             item_type: match info.item_type {
                 0 => majit_ir::value::Type::Ref,
                 2 => majit_ir::value::Type::Float,
@@ -1559,6 +1572,7 @@ impl BhDescr {
             // (zero for legacy non-keyed mints).  Round-trips through
             // `_cache_array[LLType::Array(cache_key)]` on the runtime side.
             type_id: array_descr.cache_key(),
+            gc_type_id: array_descr.type_id(),
             item_type: array_descr.item_type(),
             is_array_of_pointers: array_descr.is_array_of_pointers(),
             is_array_of_structs: array_descr.is_array_of_structs(),
@@ -1750,5 +1764,24 @@ mod tests {
         dict.insert(3, 20);
         descr.attach(dict);
         assert_eq!(descr.to_string(), "<SwitchDictDescr {1: 10, 3: 20, 7: 30}>");
+    }
+
+    #[test]
+    fn array_bh_descr_keeps_dense_gc_tid_separate_from_cache_identity() {
+        use majit_ir::descr::{ArrayFlag, SimpleArrayDescr};
+        use majit_ir::value::Type;
+
+        // `_cache_array` identity and `ArrayDescr.tid` are unrelated
+        // namespaces in RPython.  In particular, either integer may equal
+        // the key/tid of a different ARRAY.  The BhDescr bridge must carry
+        // both values instead of resolving the dense tid through the cache
+        // namespace.
+        let mut array =
+            SimpleArrayDescr::with_flag(u32::MAX, 8, 8, 9, Type::Ref, ArrayFlag::Pointer);
+        array.set_cache_key(3);
+
+        let bh = BhDescr::from_array_descr(&array);
+        assert_eq!(bh.get_type_id(), 3);
+        assert_eq!(bh.resolve_gc_tid(), 9);
     }
 }

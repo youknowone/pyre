@@ -3574,6 +3574,9 @@ pub unsafe fn instance_node_dict_keys(obj: PyObjectRef) -> Vec<PyObjectRef> {
     while i < nodes.len() {
         let node = nodes[i];
         let name = &(*node).as_plain().name;
+        // baseobjspace.py:new_interned_str / mapdict.py attribute names:
+        // materialising an instance dictionary must return the canonical
+        // interned name object, not a fresh equal string on every iteration.
         keys.push(pyre_object::unicodeobject::box_str_constant(name));
         i += 1;
     }

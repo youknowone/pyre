@@ -1247,6 +1247,17 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // `BaseUserClassMapdict.storage` equivalent for native list
+            // subclasses with `__slots__`. Mutable and instance-owned.
+            (
+                "W_ListObject.w_slots",
+                std::mem::offset_of!(W_ListObject, w_slots),
+                std::mem::size_of::<usize>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "W_ListObject",
         "listobject::W_ListObject",
@@ -1293,6 +1304,17 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 8,
                 Type::Int,
                 true,
+                false,
+                false,
+            ),
+            // Mapdict's optional instance dictionary for tuple subclasses.
+            // Exact tuples leave this mutable GC slot null.
+            (
+                "W_TupleObject.w_dict",
+                std::mem::offset_of!(W_TupleObject, w_dict),
+                std::mem::size_of::<usize>(),
+                Type::Ref,
+                false,
                 false,
                 false,
             ),
@@ -2404,6 +2426,10 @@ pub fn list_w_class_descr() -> DescrRef {
     field_descr_from_group(&W_LIST_DESCR_GROUP, 7)
 }
 
+pub fn list_w_slots_descr() -> DescrRef {
+    field_descr_from_group(&W_LIST_DESCR_GROUP, 8)
+}
+
 /// `Ptr(GcArray(OBJECTPTR))` — `wrappeditems` body per
 /// `tupleobject.py:381` `_immutable_fields_ = ['wrappeditems[*]']`.
 /// Immutable. Length comes from `arraylen_gc(items_block,
@@ -2420,6 +2446,10 @@ pub fn tuple_w_class_descr() -> DescrRef {
 
 pub fn tuple_hash_descr() -> DescrRef {
     field_descr_from_group(&W_TUPLE_DESCR_GROUP, 2)
+}
+
+pub fn tuple_w_dict_descr() -> DescrRef {
+    field_descr_from_group(&W_TUPLE_DESCR_GROUP, 3)
 }
 
 /// `W_SpecialisedTupleObject_ii.value0` — inline `i64` per
@@ -3659,6 +3689,29 @@ mod tests {
     }
 
     #[test]
+    fn list_and_tuple_subclass_storage_is_cleared_by_allocation_descrs() {
+        let list_size = w_list_size_descr();
+        let list_gc_offsets: Vec<_> = list_size
+            .as_size_descr()
+            .unwrap()
+            .gc_fielddescrs()
+            .iter()
+            .map(|field| field.offset())
+            .collect();
+        assert!(list_gc_offsets.contains(&std::mem::offset_of!(W_ListObject, w_slots)));
+
+        let tuple_size = w_tuple_size_descr();
+        let tuple_gc_offsets: Vec<_> = tuple_size
+            .as_size_descr()
+            .unwrap()
+            .gc_fielddescrs()
+            .iter()
+            .map(|field| field.offset())
+            .collect();
+        assert!(tuple_gc_offsets.contains(&std::mem::offset_of!(W_TupleObject, w_dict)));
+    }
+
+    #[test]
     fn make_descr_from_bh_bridges_codewriter_box_payload_fields_to_group() {
         use majit_ir::descr::ArrayFlag;
         use majit_translate::jitcode::BhDescr;
@@ -3828,6 +3881,7 @@ mod tests {
             itemsize: 16,
             len_offset: Some(0),
             type_id: 42,
+            gc_type_id: 0,
             item_type: Type::Ref,
             is_array_of_pointers: false,
             is_array_of_structs: true,
@@ -4511,6 +4565,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     "strategy" => return list_strategy_descr(),
                     "length" => return list_length_descr(),
                     "items" => return list_items_descr(),
+                    "w_slots" => return list_w_slots_descr(),
                     _ => {}
                 }
             }
@@ -4527,6 +4582,9 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // RPython has only one FieldDescr identity for this field.
             if owner.as_str() == "ItemsBlock" && name.as_str() == "capacity" {
                 return items_block_capacity_descr();
+            }
+            if owner.as_str() == "W_TupleObject" && name.as_str() == "w_dict" {
+                return tuple_w_dict_descr();
             }
             if let Some(parent) = parent {
                 if parent.type_id != 0 {
@@ -4618,6 +4676,11 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             interior_fields,
             ..
         } => {
+            // Old serialized BhDescr values default `gc_type_id` to zero.
+            // Resolve that legacy structural identity through the GC cache
+            // before publishing a runtime descriptor, exactly as the
+            // blackhole/materialization paths do.
+            let resolved_gc_type_id = bh.resolve_gc_tid();
             let descr = if *is_array_of_structs {
                 // `descr.py:348-378 get_array_descr(gccache, ARRAY)`:
                 // the u64 `*type_id` from `BhDescr::Array` is the cache
@@ -4634,7 +4697,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     *base_size,
                     *itemsize,
                     *len_offset,
-                    *type_id as u32,
+                    resolved_gc_type_id,
                     *type_id,
                     *item_type,
                     interior_fields,
@@ -4650,8 +4713,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 make_array_descr_with_full_id(
                     *base_size,
                     *itemsize,
-                    // TODO: same u32 gc tid truncation.
-                    *type_id as u32,
+                    resolved_gc_type_id,
                     *len_offset,
                     *item_type,
                     *is_item_signed,

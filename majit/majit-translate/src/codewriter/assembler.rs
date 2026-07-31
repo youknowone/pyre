@@ -3884,6 +3884,7 @@ fn arraydescrof(
             // Round-trips through `_cache_array[LLType::Array(cache_key)]`
             // on the runtime side.
             type_id: array_descr.cache_key(),
+            gc_type_id: array_descr.type_id(),
             item_type: array_descr.item_type(),
             is_array_of_pointers: array_descr.is_array_of_pointers(),
             is_array_of_structs: array_descr.is_array_of_structs(),
@@ -3954,6 +3955,7 @@ fn arraydescrof(
         itemsize,
         len_offset,
         type_id: 0,
+        gc_type_id: 0,
         item_type,
         is_array_of_pointers: flag == majit_ir::descr::ArrayFlag::Pointer,
         is_array_of_structs: flag == majit_ir::descr::ArrayFlag::Struct,
@@ -4002,6 +4004,7 @@ fn vable_arraydescrof(
         itemsize,
         len_offset: Some(0),
         type_id: 0,
+        gc_type_id: 0,
         item_type,
         is_array_of_pointers: matches!(item_type, majit_ir::value::Type::Ref),
         is_array_of_structs: false,
@@ -4636,6 +4639,7 @@ impl AssemblerDescrKey {
                 itemsize,
                 len_offset,
                 type_id,
+                gc_type_id: _,
                 item_type,
                 is_array_of_pointers,
                 is_array_of_structs,

@@ -1204,8 +1204,9 @@ pub fn extra_root_walk_kind() -> ExtraRootWalkKind {
 // Walkers registered today: eval.rs registers twelve (rd_consts, partial
 // trace, active trace, compile snapshot, jitcode constants, fbw store
 // journal, fbw finish concrete, pyre interpreter side tables, signal
-// handlers, weakref-box inner, jit callee frames, and pyre objects), plus
-// gcreftracer.rs registers the per-loop gc_table walker — thirteen total.
+// handlers, the _io autoflusher handle list, jit callee frames, and pyre
+// objects), plus gcreftracer.rs registers the per-loop gc_table walker —
+// thirteen total.
 // Leave headroom above that so a future root source does not overflow the
 // array and poison the registry lock with a "capacity exceeded" panic on
 // first use.

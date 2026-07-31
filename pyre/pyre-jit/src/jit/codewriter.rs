@@ -8696,9 +8696,7 @@ impl CodeWriter {
                             // `[callable, null_or_self]` order (eval.rs:3141,
                             // shared_opcode.rs opcode_call).
                             let loaded_dst_reg = stack_base + current_depth;
-                            if is_true_portal {
-                                let _ = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            }
+                            let _ = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             // #336: in the PORTAL jitcode, load the global at
                             // RUNTIME from the live frame instead of const-
                             // folding the resolved object's address into the
@@ -8719,158 +8717,48 @@ impl CodeWriter {
                             // (r1) is the jitcode's own promoted `W_Code`; the
                             // frame (r2) feeds `get_builtin()`.
                             //
-                            // The register-form namespace is portal-only.  In a
-                            // non-portal callee the frame register aliases the
-                            // outermost frame on a chained / inlined-callee
-                            // resume, and the extra `getfield_vable_r` graph op
-                            // misallocates against the inlined locals.  A
-                            // non-portal callee instead keeps the
-                            // `flowcontext.py:856-859 find_global` const-fold,
-                            // which the inliner needs as a foldable constant call
-                            // target — EXCEPT for a mutable container (dict /
-                            // list / set) or a function.  A container is grown
-                            // in place and relocates nursery->oldgen after the
-                            // jitcode is built, so its const-folded address
-                            // dangles when the blackhole resumes the unfused
-                            // callee (dynasm SIGSEGVs; cranelift null-softens the
-                            // read).  A function global can be rebound through
-                            // its module cell after the jitcode is built, so a
-                            // baked callable goes stale.  Resolve both through
-                            // the `bh_load_global_fn` residual whose namespace
-                            // operand is the callee's module dict object, built
-                            // eagerly at `PyFrame.__init__` so it reaches the
-                            // non-moving oldgen before any jitcode build: the
-                            // cell-fold then reads the value live through that
-                            // stable dict every iteration, giving the optimizer a
-                            // guarded value instead of baking a relocating or
-                            // rebindable one.  Classes / modules are created at
-                            // module load and are neither grown nor rebound, so
-                            // const-folding them stays safe.
-                            let result_value: super::flow::FlowValue = if is_true_portal {
-                                let ns_var = emit_graph_op_with_result(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    "getfield_vable_r",
-                                    vable_getfield_ref_graph_args(
-                                        frame_var.into(),
-                                        VABLE_NAMESPACE_FIELD_IDX,
-                                    ),
-                                    Kind::Ref,
-                                    py_pc as i64,
-                                );
-                                let code_const: super::flow::FlowValue =
-                                    super::flow::Constant::new(
-                                        super::flow::ConstantValue::Signed(w_code as i64),
-                                        Some(Kind::Ref),
-                                    )
-                                    .into();
-                                let loaded = residual_call!(
-                                    load_global_fn_idx,
-                                    CallFlavor::Plain,
-                                    majit_ir::PyreHelperKind::LoadGlobal,
-                                    vec![super::flow::Constant::signed(raw_namei).into()],
-                                    vec![ns_var.into(), code_const, frame_var.into()],
-                                    vec![],
-                                    vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
-                                    ResKind::Ref,
-                                    py_pc as i64,
-                                );
-                                loaded
-                                    .map(super::flow::FlowValue::from)
-                                    .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
-                            } else {
-                                let name_idx = raw_namei as usize >> 1;
-                                let name = code.names.get(name_idx).map(|name| name.as_str());
-                                // Classify the FINAL resolved global — module
-                                // globals OR `__builtins__`.  Only a
-                                // module-load-immortal, non-rebindable call
-                                // target (a class or a module) is safe to
-                                // const-fold: it is promoted to the non-moving
-                                // oldgen before any jitcode build and is not
-                                // rebound in place, and the inliner needs it as a
-                                // foldable constant call target.  Every other
-                                // resolved global is either relocatable (an
-                                // `int`/`str` built at run time, or a mutable
-                                // dict/list/set whose const-folded address
-                                // dangles once the moving GC relocates it — the
-                                // baked pointer then crashes the blackhole
-                                // resume) or rebindable (a function whose module
-                                // cell can be reassigned after the jitcode is
-                                // built, so a baked callable goes stale).  Route
-                                // those through the live residual
-                                // (`bh_load_global_fn` resolves the value from
-                                // the frame's own globals every iteration, never
-                                // baking the relocating or rebindable pointer);
-                                // `LOAD_GLOBAL` under the JIT always resolves
-                                // through `get_w_globals()` live
-                                // (celldict.py:287), so the residual is the
-                                // orthodox shape and the const-fold is the
-                                // optimization carve-out.
-                                let global_is_const_foldable = name
-                                    .and_then(|nm| frontend_global_object(w_code, nm))
-                                    .is_some_and(|obj| unsafe {
-                                        pyre_object::is_type(obj) || pyre_object::is_module(obj)
-                                    });
-                                if !global_is_const_foldable {
-                                    // The namespace operand is the callee's
-                                    // module dict OBJECT (`pycode.w_globals`).
-                                    // `PyFrame.__init__` stamps it eagerly
-                                    // (`w_code_get_w_globals`), a
-                                    // `malloc_typed`-immortal wrapper, so by
-                                    // jitcode build time it is already in the
-                                    // non-moving oldgen and const-folding ITS
-                                    // pointer is GC-safe.
-                                    // `try_walker_load_global_cell_fold` reads
-                                    // the container VALUE live through it each
-                                    // iteration, so the relocating value is
-                                    // never baked.  A container is never a call
-                                    // target, so the cell-fold's deep-inline
-                                    // call mis-resolution does not apply.
-                                    let ns_obj = unsafe {
-                                        pyre_interpreter::w_code_get_w_globals(
-                                            w_code as pyre_object::PyObjectRef,
-                                        )
-                                    };
-                                    let ns_const: super::flow::FlowValue =
-                                        super::flow::Constant::new(
-                                            super::flow::ConstantValue::Signed(ns_obj as i64),
-                                            Some(Kind::Ref),
-                                        )
-                                        .into();
-                                    let code_const: super::flow::FlowValue =
-                                        super::flow::Constant::new(
-                                            super::flow::ConstantValue::Signed(w_code as i64),
-                                            Some(Kind::Ref),
-                                        )
-                                        .into();
-                                    let loaded = residual_call!(
-                                        load_global_fn_idx,
-                                        CallFlavor::Plain,
-                                        majit_ir::PyreHelperKind::LoadGlobal,
-                                        vec![super::flow::Constant::signed(raw_namei).into()],
-                                        vec![ns_const, code_const, frame_var.into()],
-                                        vec![],
-                                        vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
-                                        ResKind::Ref,
-                                        py_pc as i64,
-                                    );
-                                    loaded
-                                        .map(super::flow::FlowValue::from)
-                                        .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
-                                } else {
-                                    // Module-load-immortal, non-rebindable call
-                                    // target (a class or a module): const-fold so
-                                    // the inliner sees a foldable constant call
-                                    // target.  Such objects reach the non-moving
-                                    // oldgen before any jitcode build and are not
-                                    // rebound, so the baked pointer stays stable.
-                                    // Function globals take the residual path
-                                    // above because rebinding can change their
-                                    // module-cell payload.
-                                    name.and_then(|nm| frontend_global_flow_value(w_code, nm))
-                                        .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
-                                }
-                            };
+                            // Every per-code jitcode reads the namespace from
+                            // its own red frame, including an inlined callee.
+                            // The inline walker either seeds that frame as the
+                            // callee's virtual PyFrame or resolves this exact
+                            // static-field read from `InlineCalleeConsts`.
+                            // Keeping the namespace as a register-form value is
+                            // essential: the optimizer's known-result/cell
+                            // cache keys the traced GetfieldVableR result, and a
+                            // raw ConstRef namespace is a different box even
+                            // when its concrete pointer is equal.  PyPy has the
+                            // same shape: LOAD_GLOBAL reads
+                            // `self.get_w_globals()` from the live MIFrame.
+                            let ns_var = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "getfield_vable_r",
+                                vable_getfield_ref_graph_args(
+                                    frame_var.into(),
+                                    VABLE_NAMESPACE_FIELD_IDX,
+                                ),
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
+                            let loaded = residual_call!(
+                                load_global_fn_idx,
+                                CallFlavor::Plain,
+                                majit_ir::PyreHelperKind::LoadGlobal,
+                                vec![super::flow::Constant::signed(raw_namei).into()],
+                                vec![ns_var.into(), code_const, frame_var.into()],
+                                vec![],
+                                vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
+                                ResKind::Ref,
+                                py_pc as i64,
+                            );
+                            let result_value = loaded
+                                .map(super::flow::FlowValue::from)
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph).into());
                             current_state.stack.push(result_value.clone());
                             // `loaded_dst_reg == stack_base + current_depth`
                             // here, so the trailing `emit_ref_copy(stack_base +
@@ -9688,20 +9576,24 @@ impl CodeWriter {
                             // has a proper terminator (mirrors
                             // `flatten.py:189 make_exception_link`
                             // exception-edge shape).
-                            let symbolic_exc = current_state.stack.last().cloned();
-                            let exc_value = if matches!(
-                                symbolic_exc,
-                                Some(super::flow::FlowValue::Constant(ref constant))
-                                    if constant.value == super::flow::ConstantValue::None
-                            ) {
-                                // Handler entry can carry a null symbolic
-                                // placeholder while exception dispatch has
-                                // already installed the value in the semantic
-                                // frame slot. Read it before popvalue clears it.
-                                let exc_depth = current_depth.saturating_sub(1);
-                                let exc_slot = stack_base_absolute + exc_depth as usize;
-                                let exc_slot_value: super::flow::FlowValue =
-                                    super::flow::Constant::signed(exc_slot as i64).into();
+                            // pyframe.py:411-417 `popvalue_maybe_none` first
+                            // reads `locals_cells_stack_w[depth - 1]`, then
+                            // clears that exact slot.  Read the authoritative
+                            // vable slot here before `emit_popvalue_ref!`
+                            // records the clear, rather than reusing the
+                            // handler-entry shadow Variable.  In a
+                            // `COPY 3; POP_EXCEPT; RERAISE 1` cleanup the
+                            // shadow exception and boxed lasti can otherwise
+                            // coalesce to one colour; the raise edge then
+                            // receives the lasti integer even though the live
+                            // frame TOS still contains the exception.  PyPy's
+                            // direct `self.popvalue()` load makes that collapse
+                            // impossible.
+                            let exc_depth = current_depth.saturating_sub(1);
+                            let exc_slot = stack_base_absolute + exc_depth as usize;
+                            let exc_slot_value: super::flow::FlowValue =
+                                super::flow::Constant::signed(exc_slot as i64).into();
+                            let exc_value =
                                 super::flow::FlowValue::from(emit_graph_op_with_result(
                                     &mut graph,
                                     &current_block.block(),
@@ -9712,10 +9604,7 @@ impl CodeWriter {
                                     ),
                                     Kind::Ref,
                                     py_pc as i64,
-                                ))
-                            } else {
-                                symbolic_exc.unwrap_or_else(|| fresh_ref_value(&mut graph))
-                            };
+                                ));
                             let exc_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let _ = current_state.stack.pop();
                             // RERAISE: pyre-only deviation from RPython

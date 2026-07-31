@@ -835,12 +835,17 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     }
                 {
                     majit_ir::resumedata::encode_branch_orgpc(ctx.live_before_jit_pc, flavor_true)
-                } else if marker.is_some()
-                    && ctx.live_before_jit_pc != usize::MAX
+                } else if ctx.live_before_jit_pc != usize::MAX
                     && matches!(
                         ctx.trace_ctx.last_guard_opcode(),
                         Some(OpCode::GuardValue | OpCode::GuardClass)
                     )
+                    && unsafe {
+                        (&*sym.jitcode())
+                            .payload
+                            .jitcode
+                            .can_decode_live_vars(ctx.live_before_jit_pc, crate::state::op_live())
+                    }
                 {
                     ctx.live_before_jit_pc as i32
                 } else {
@@ -2049,8 +2054,29 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         Some(g) => g as i32,
         None if after_residual_call => callee_pjc
             .after_residual_marker_for_jitcode_pc(callee_op_pc)
+            .or_else(|| {
+                // Fallback only, for the same reason as the single-frame path:
+                // the sticky cursor names this frame's op only while no other
+                // residual has passed, so it may not displace the twin.
+                (ctx.live_after_jit_pc != usize::MAX
+                    && callee_pjc
+                        .jitcode
+                        .can_decode_live_vars(ctx.live_after_jit_pc, crate::state::op_live()))
+                .then_some(ctx.live_after_jit_pc)
+            })
             .map(|m| m as i32)
             .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC),
+        None if ctx.live_before_jit_pc != usize::MAX
+            && matches!(
+                ctx.trace_ctx.last_guard_opcode(),
+                Some(OpCode::GuardValue | OpCode::GuardClass)
+            )
+            && callee_pjc
+                .jitcode
+                .can_decode_live_vars(ctx.live_before_jit_pc, crate::state::op_live()) =>
+        {
+            ctx.live_before_jit_pc as i32
+        }
         None => callee_pjc
             .resume_marker_for_jitcode_pc(callee_op_pc)
             .map(|m| m as i32)

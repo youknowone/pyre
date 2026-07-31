@@ -805,6 +805,7 @@ unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maji
     let tuple_ptr = obj_addr as *mut pyre_object::tupleobject::W_TupleObject;
     let tuple = unsafe { &mut *tuple_ptr };
     f(&mut tuple.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut tuple.w_dict as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     let block = tuple.wrappeditems;
     if block.is_null() {
         return;
@@ -841,6 +842,7 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     let list_ptr = obj_addr as *mut pyre_object::listobject::W_ListObject;
     let list = unsafe { &mut *list_ptr };
     f(&mut list.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut list.w_slots as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if list.strategy == pyre_object::listobject::ListStrategy::Object && !list.items.is_null() {
         if pyre_object::gc_hook::try_gc_owns_object(list.items as *mut u8) {
             // Phase L2: a GC-managed (moving) block is forwarded by handing the
@@ -1924,7 +1926,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // `pytype_to_tid`, so this pre-registration wins over its
     // generic `object_subclass(sizeof(PyObject), parent_tid)`
     // default which would underallocate `W_BaseException`.
-    for kind_idx in 0u8..=(pyre_object::interp_exceptions::ExcKind::StopAsyncIteration as u8) {
+    for kind_idx in 0u8..=(pyre_object::interp_exceptions::ExcKind::EOFError as u8) {
         // Round-trip the byte through the enum so we don't depend
         // on unsafe transmute; every value in [0, UnboundLocalError]
         // is a valid `ExcKind` variant by construction.
@@ -1963,6 +1965,7 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
             31 => pyre_object::interp_exceptions::ExcKind::BufferError,
             32 => pyre_object::interp_exceptions::ExcKind::UnboundLocalError,
             33 => pyre_object::interp_exceptions::ExcKind::StopAsyncIteration,
+            34 => pyre_object::interp_exceptions::ExcKind::EOFError,
             _ => unreachable!(),
         };
         let pytype_ptr =
@@ -3763,6 +3766,12 @@ fn install_gc_root_walkers() {
     // `MetaInterp::forced_virtuals` is the same shape but lives in one mutator's
     // `JIT_DRIVER` rather than a global table, so it registers per mutator
     // instead — see `forced_virtuals_pruner_area`.
+
+    // GC-heap slots of the immortal, process-global `W_SRE_Pattern` store. The
+    // patterns are `malloc_typed`, so nothing traces into them; a compiled
+    // pattern outlives the thread that compiled it, so its owner is a global
+    // walker rather than a per-mutator area.
+    majit_gc::shadow_stack::register_extra_root_walker(sre_pattern_root_walker);
 }
 
 fn register_thread_root_areas() {
@@ -3806,8 +3815,8 @@ fn register_thread_root_areas() {
             pyre_interpreter::module::signal::interp_signal::capture_signal_handler_root_area(),
         );
         register(
-            sre_pattern_root_walker_area,
-            pyre_object::interp_sre::capture_sre_pattern_root_area(),
+            autoflusher_root_walker_area,
+            pyre_interpreter::module::_io::capture_autoflusher_root_area(),
         );
         register(
             jit_callee_frame_root_walker_area,
@@ -4517,12 +4526,12 @@ unsafe fn signal_handler_root_walker_area(
     }
 }
 
-unsafe fn sre_pattern_root_walker_area(
+unsafe fn autoflusher_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
     unsafe {
-        pyre_object::interp_sre::walk_sre_pattern_roots_area(data, |slot| {
+        pyre_interpreter::module::_io::walk_autoflusher_roots_area(data, |slot| {
             visit_pyobject_root(slot, visitor);
         });
     }

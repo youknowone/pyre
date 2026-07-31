@@ -1862,6 +1862,11 @@ impl<M: Clone> MetaInterp<M> {
                 visitor(gcref);
             }
         }
+        // pyjitpl.py:3290-3306 `self.virtualizable_boxes` stores ordinary
+        // BoxPtr objects whose concrete refs are traced by RPython's object
+        // graph.  Pyre keeps their concrete half in `virtualizable_values`;
+        // forward those refs in place as the same Box-attached state.
+        trace_ctx.walk_virtualizable_value_refs(&mut visitor);
         // heapcache.py:50-104 — the heapcache caches field values /
         // replacements / loop-invariant results as `OpRef`. With inline
         // consts (history.py:314 `ConstPtr.value`) those value slots can be
@@ -5373,6 +5378,17 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(ptr) = from_consts {
             return ptr;
         }
+        // resume.py:1083-1091 `consume_virtualizable_boxes` finds the bridge's
+        // virtualizable in `nums[-1]` and `load_list_of_boxes` returns it as
+        // the trailing box, which `rebuild_state_after_failure` installs as
+        // `metainterp.virtualizable_boxes`.  That is the authoritative bridge
+        // identity; prefer its concrete value over MetaInterp's portal-entry
+        // cache. `walk_active_trace_refs` forwards this Value::Ref in place.
+        if let Some(Value::Ref(frame)) = ctx.standard_virtualizable_concrete() {
+            if !frame.is_null() {
+                return frame.as_usize() as *const u8;
+            }
+        }
         // Bridge traces start from rebuilt resume state, not a fresh portal
         // entry, so `initial_inputarg_consts` is not seeded with the
         // virtualizable inputarg's ConstPtr.  The TraceCtx pointer is the
@@ -5388,6 +5404,11 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(ptr) = ctx.virtualizable_heap_ptr() {
             return ptr;
         }
+        // Bridge traces start from rebuilt resume state, not a fresh portal
+        // entry, so `initial_inputarg_consts` is not seeded with the
+        // virtualizable inputarg's ConstPtr.  `vable_ptr` is retained only as
+        // the legacy/test fallback when neither the rebuilt boxes nor their
+        // heap mirror were installed.
         if !self.vable_ptr.is_null() {
             return self.vable_ptr;
         }

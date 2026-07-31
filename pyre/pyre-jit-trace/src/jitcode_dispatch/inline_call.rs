@@ -2928,6 +2928,31 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         u16::MAX
     };
     let inline_depth = ctx.session.borrow().framestack.len();
+    let contains_raise = callee_body_contains_raise(body.code);
+    if contains_raise
+        && !strict_inlinable
+        && jitcode_has_exception_handler(body.code)
+        && fbw_callee_body_replay_safety(
+            body.code,
+            &exact_numeric_args,
+            body.num_regs_i,
+            body.constants_i,
+            body.num_regs_r,
+            body.constants_r,
+            callee_descr_refs,
+        ) != CalleeReplaySafety::Clean
+    {
+        // A branchy callee with its own exception handler can take a structural
+        // abort after an earlier effectful Python opcode. The current
+        // callee-rebuild payload resumes at the Python opcode owning the abort
+        // jitcode pc; it cannot yet carry a post-op stack anchor. Re-entering
+        // that opcode would repeat its residual effect (PyPy instead resumes
+        // the live MIFrame at its precise resumepc). Keep that callee on the
+        // ordinary residual path until the generated frame snapshot can
+        // represent the precise post-effect coordinate. A terminal raising
+        // callee without a handler retains its after-residual live anchor.
+        return Ok(None);
+    }
     // A callee that raises inline needs the cross-frame bridge (gh#343 /
     // gh#467) the drain cannot yet build, but only when the raise has to come
     // back INTO the traced region — i.e. when some frame already on the
@@ -2948,7 +2973,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // same frame, which is what `fbw_max_rec_unroll_depth` bounds above;
     // letting the raising leaf inline below one costs 1.9x on
     // `bench/synth/selfrec_tail_exception_unwind`.
-    let effective_multiframe_depth = if callee_body_contains_raise(body.code) {
+    let effective_multiframe_depth = if contains_raise {
         let bounded = crate::jitcode_dispatch::inline_chain_catches_a_raise(ctx.session)
             || inline_chain_unrolls_recursion(ctx);
         if bounded { 1 } else { 2 }

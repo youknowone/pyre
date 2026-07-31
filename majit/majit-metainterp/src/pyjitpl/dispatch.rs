@@ -1435,6 +1435,7 @@ where
         // gets for free from `dict[ARRAY_OR_STRUCT]`.
         let (
             type_id,
+            gc_type_id,
             base_size,
             itemsize,
             len_offset,
@@ -1449,6 +1450,7 @@ where
         ) = match bh {
             crate::jitcode::CanonicalBhDescr::Array {
                 type_id,
+                gc_type_id,
                 base_size,
                 itemsize,
                 len_offset,
@@ -1462,6 +1464,7 @@ where
                 array_type_id,
             } => (
                 *type_id,
+                *gc_type_id,
                 *base_size,
                 *itemsize,
                 *len_offset,
@@ -1577,7 +1580,11 @@ where
             // takes the u32 gc tid; this caller has the u64 cache key.
             // Truncate `as u32` until gc_cache routing resolves the proper
             // allocated tid here.
-            type_id as u32,
+            if gc_type_id != 0 {
+                gc_type_id
+            } else {
+                type_id as u32
+            },
             base_size,
             itemsize,
             len_offset,
