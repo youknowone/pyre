@@ -10,13 +10,30 @@
 //!         self.lineno = lineno
 //! ```
 //!
-//! Pyre stores `frame` as a raw `*mut PyFrame` opaque pointer.  PyPy's
-//! `frame` is a `PyFrame` W_Root; pyre's `PyFrame` lacks the
-//! `PyObject` header (`pyframe.py:39` `#[repr(C)]` without `ob_header`
-//! — frames are heap-allocated outside the nursery and walked by a
-//! custom GC walker).  Until `PyFrame` grows a W_Root header (which is
-//! itself a multi-file change), the descriptor `tb_frame` cannot
-//! return a Python-visible object directly.
+//! Upstream `frame` is an ordinary traced field of an ordinary movable
+//! instance: `pytraceback.py:29 self.frame = frame` on a
+//! `baseobjspace.W_Root`, pointing at `pyframe.py:52 class
+//! PyFrame(W_Root)`, which declares no `_alloc_flavor_` and is never
+//! pinned — `rpython/rlib/rgc.py:88-97` documents `pin` as a
+//! short-lived-buffer facility that does not extend lifetime, and
+//! nothing under `pypy/interpreter/` calls it.  A minor collection
+//! copies the frame (`rpython/memory/gc/incminimark.py:2237`) and
+//! rewrites every referring slot in place (`:2252`), because roots
+//! reach the collector as slot addresses
+//! (`rpython/memory/gctransform/shadowstack.py:43-46`) and compiled
+//! code re-reads the frame after each collecting call
+//! (`rpython/jit/backend/x86/assembler.py:1369-1377`).
+//!
+//! Pyre's `PyFrame` does carry the `PyObject` prefix (its `ob_header`
+//! field), so `tb_frame` returns a Python-visible object.  What
+//! diverges is the slot type: this struct holds a raw `*mut PyFrame`
+//! rather than a `PyObjectRef`, and the edge reaches the collector
+//! only through the hand-written `pytraceback_object_custom_trace`
+//! hook, which forwards it as a mutable slot but skips a frame the GC
+//! does not own (a `FrameBox::new_boxed` tracer snapshot).  The
+//! pointee must additionally never move, which is not an upstream
+//! requirement and is not caused by anything in this file — see
+//! `w_pytraceback_new`.
 
 use pyre_object::pyobject::*;
 
@@ -29,21 +46,24 @@ pub const LINENO_NOT_COMPUTED: i64 = i64::MIN;
 pub static PYTRACEBACK_TYPE: PyType = new_pytype("traceback");
 
 /// Layout: `[ob_header | frame: *mut PyFrame | lasti: i64 | w_next:
-/// PyObjectRef | lineno: i64]`.
+/// PyObjectRef | lineno: i64 | w_code: PyObjectRef]`.
 ///
-/// Only `w_next` is GC-traced.  `frame` is a raw pointer to a
-/// custom-walked `PyFrame` allocation; the frame walker scans the
-/// traceback chain separately once wired up.
+/// Every reference slot is traced, but by the hand-written
+/// `pytraceback_object_custom_trace` rather than by an offsets table:
+/// `TypeInfo::object_subclass_with_custom_trace` leaves
+/// `gc_ptr_offsets` empty for every type that supplies a hook.
 #[repr(C)]
 pub struct PyTraceback {
     pub ob_header: PyObject,
-    /// `pytraceback.py:29 self.frame = frame` — opaque `*mut PyFrame`.
-    /// Not a `PyObjectRef` because `PyFrame` has no `PyObject` header.
-    /// Frames are GC-owned non-moving blocks and
-    /// `pytraceback_object_custom_trace` forwards this edge, so the
-    /// pointer stays live for the traceback's whole lifetime and
-    /// `tb_frame` is safe to dereference.  The `w_code` snapshot below
-    /// still exists for readers that run without the GC hook wired.
+    /// `pytraceback.py:29 self.frame = frame` — a raw `*mut PyFrame`
+    /// rather than a `PyObjectRef`, so it takes part in collection
+    /// only through `pytraceback_object_custom_trace`.  That hook
+    /// forwards the slot when the GC owns the frame, which keeps it
+    /// live and would rewrite it if the frame ever moved; it skips a
+    /// frame the GC does not own — a `FrameBox::new_boxed` tracer
+    /// snapshot, freed at the end of its walk — and such a pointer is
+    /// left dangling and must not be dereferenced.  The `w_code`
+    /// snapshot below is what readers use in that case.
     pub frame: *mut crate::pyframe::PyFrame,
     /// `pytraceback.py:30 self.lasti = lasti` — bytecode index at
     /// which the exception was raised (in instruction units).
@@ -57,14 +77,15 @@ pub struct PyTraceback {
     /// `get_lineno` calls `offset2lineno` to resolve it lazily
     /// (`pytraceback.py:34-37`).
     pub lineno: i64,
-    /// Snapshot of the raising frame's `pycode` — kept alive via GC
-    /// tracing so `tb_frame`-less traceback consumers (e.g.
-    /// `write_traceback_chain`) can still read `source_path` /
-    /// `obj_name` / `qualname` after the underlying `PyFrame` has
-    /// been freed.  PyPy doesn't need this because its `PyFrame` is
-    /// itself a W_Root; pyre's frame isn't, so the PyCode is
-    /// the smallest GC-rooted handle that preserves the parity-
-    /// visible metadata.
+    /// Snapshot of the raising frame's `pycode`, with no upstream
+    /// counterpart — `pytraceback.py` reads `self.frame.pycode`
+    /// directly (`:36`), because upstream's frame edge is unconditional
+    /// and the frame therefore outlives the traceback.  Pyre's does not
+    /// hold for a frame the GC does not own, so consumers that must
+    /// keep working then (`write_traceback_chain`) read `source_path` /
+    /// `obj_name` / `qualname` through this handle instead.  Retiring
+    /// the field is blocked on making every frame that can reach a
+    /// traceback GC-owned.
     pub w_code: PyObjectRef,
 }
 
@@ -81,14 +102,6 @@ pub const PYTRACEBACK_W_CODE_OFFSET: usize = std::mem::offset_of!(PyTraceback, w
 pub const PYTRACEBACK_GC_TYPE_ID: u32 = 44;
 
 pub const PYTRACEBACK_OBJECT_SIZE: usize = std::mem::size_of::<PyTraceback>();
-
-/// Two `PyObjectRef`-shaped slots are GC-traced — the chained
-/// `w_next` traceback link and the `w_code` snapshot kept alive so
-/// `source_path` / `obj_name` survive after the raising frame is
-/// freed.  `frame` is a raw `*mut PyFrame` to a custom-walked
-/// structure and `lasti`/`lineno` are scalar tags.
-pub const PYTRACEBACK_GC_PTR_OFFSETS: [usize; 2] =
-    [PYTRACEBACK_W_NEXT_OFFSET, PYTRACEBACK_W_CODE_OFFSET];
 
 impl pyre_object::lltype::GcType for PyTraceback {
     fn type_id() -> u32 {
@@ -122,15 +135,26 @@ pub fn w_pytraceback_new(
         w_code,
     };
 
-    // Executing frames are GC-managed non-moving oldgen blocks
-    // (`PYFRAME_GC_TYPE_ID`); to keep `tb_frame` alive across the
-    // traceback's lifetime the traceback itself must be a GC object
-    // whose `pytraceback_object_custom_trace` forwards the `frame`
-    // edge.  Allocate into oldgen (non-moving — raw `*mut PyTraceback`
-    // readers and the exception `w_traceback` chain hold bare
-    // pointers), mirroring `FrameBox::new` (`pyframe.rs:307`).  Before
-    // the GC hook is wired (bootstrap, tests) `try_gc_alloc_stable`
-    // returns `None`; fall back to the leaked `malloc_typed` block.
+    // `frame` was copied into `value` above and is not among the roots
+    // pinned here, so the allocation below — which can safepoint — must
+    // not be able to move it.  Upstream has no such rule: a minor
+    // collection would relocate the frame and rewrite the slot
+    // (`incminimark.py:2237` / `:2252`).  Pyre cannot, because raw
+    // `*mut PyFrame` copies exist that no root walker reaches —
+    // `FrameBox::deref` reads its raw field while holding a
+    // forwarding-capable `owner_root` it never reads back, `eval_loop`
+    // runs behind a `&mut PyFrame` across a safepoint, and the
+    // blackhole keeps the virtualizable as a bare integer.  Frames are
+    // therefore allocated non-moving (`FrameBox::new`), and callers of
+    // `record_application_traceback` owe this function a frame that
+    // stays reachable across the allocation: on the `CURRENT_FRAME` /
+    // `f_backref` chain, or pinned by hand.
+    //
+    // Allocate the traceback itself into oldgen for the same reason —
+    // raw `*mut PyTraceback` readers and the exception `w_traceback`
+    // chain hold bare pointers.  Before the GC hook is wired
+    // (bootstrap, tests) `try_gc_alloc_stable` returns `None`; fall
+    // back to the leaked `malloc_typed` block.
     let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
         PYTRACEBACK_GC_TYPE_ID,
         PYTRACEBACK_OBJECT_SIZE,
@@ -245,11 +269,12 @@ pub unsafe fn w_pytraceback_get_w_code(obj: PyObjectRef) -> PyObjectRef {
 ///
 /// Pyre stamps the real line number at `record_application_traceback`
 /// time (the frame is guaranteed live there), so this reader never
-/// has to walk back through `self.frame.pycode` — which would be
-/// unsafe in pyre because `PyFrame` is not a GC-traced W_Root and
-/// the frame may have been freed by the time `tb_lineno` is read.
-/// The `LINENO_NOT_COMPUTED` sentinel still surfaces as `-1` for
-/// the edge case where the traceback was constructed without a
+/// has to walk back through `self.frame.pycode`.  That walk is what
+/// upstream does, and it is safe there because the frame edge is
+/// unconditional; pyre's is not forwarded for a frame the GC does not
+/// own, which may already have been freed by the time `tb_lineno` is
+/// read.  The `LINENO_NOT_COMPUTED` sentinel still surfaces as `-1`
+/// for the edge case where the traceback was constructed without a
 /// frame (e.g. unit tests).
 ///
 /// # Safety
@@ -356,20 +381,18 @@ pub unsafe fn record_application_traceback(
         crate::eval::set_in_flight_exception(w_exc_object);
         // `pytraceback.py:36 self.lineno = offset2lineno(self.frame
         // .pycode, self.lasti)` — pyre resolves the line number
-        // eagerly here (rather than lazily in `get_lineno`) because
-        // pyframe.rs's `PyFrame` is not a GC-traced W_Root, so by
-        // the time `tb_lineno` is read the frame may already be
-        // freed.  Stamping at construction guarantees the value
-        // survives the frame's lifetime.  `frame.pycode` is the
-        // `PyCode` wrapper; the inner `CodeObject` is
-        // extracted via `pyframe_get_pycode`.
+        // eagerly here rather than lazily in `get_lineno`, because a
+        // frame the GC does not own is not kept alive by the traceback
+        // and may already be freed by the time `tb_lineno` is read.
+        // Stamping at construction guarantees the value survives the
+        // frame's lifetime.  `frame.pycode` is the `PyCode` wrapper;
+        // the inner `CodeObject` is extracted via `pyframe_get_pycode`.
         //
-        // The `PyCode` PyObjectRef is also captured into the
-        // `w_code` slot so the traceback's source-path / function
-        // name metadata stays GC-rooted after the raising frame's
-        // freed — readers (e.g. `write_traceback_chain` in
-        // `error.rs`) MUST go through `w_code` rather than
-        // dereferencing the dangling `frame` pointer.
+        // The `PyCode` PyObjectRef is also captured into the `w_code`
+        // slot so the traceback's source-path / function name metadata
+        // stays GC-rooted in that same case — readers (e.g.
+        // `write_traceback_chain` in `error.rs`) MUST go through
+        // `w_code` rather than dereferencing the `frame` pointer.
         let w_code = (*frame).pycode as PyObjectRef;
         let lineno = {
             let code_obj = crate::pyframe::pyframe_get_pycode(&*frame);

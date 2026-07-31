@@ -521,9 +521,11 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
 /// chain) through the ordinary reference.  Pyre stores `frame` as a
 /// raw `*mut PyFrame` and the two `PyObjectRef` slots (`w_next`,
 /// `w_code`) inline; none are reachable through `gc_ptr_offsets`
-/// (the type was registered with empty offsets), so forward all three
-/// here:
+/// (the type was registered with empty offsets), so forward all of
+/// them here:
 ///
+///   * `ob_header.w_class` — the type object every `PyObject`-layout
+///     struct carries.
 ///   * `w_next` — the chained caller-side traceback link.
 ///   * `w_code` — the raising frame's PyCode snapshot (kept alive so
 ///     source-path / function-name metadata survives).

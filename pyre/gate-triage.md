@@ -495,6 +495,42 @@ pre-move address into `PyTraceback.frame`.  The port therefore needs the
 root-and-reload shape on the recorder first, which also covers the same
 pre-existing exposure on its `w_next` argument.
 
+**That contract is a pyre deviation, and it is not the traceback's.**  Upstream
+attaches no allocation rule to a traceback's frame at all: `pytraceback.py:29`
+stores an ordinary traced field of an ordinary movable `pyframe.py:52 class
+PyFrame(W_Root)`, nothing under `pypy/interpreter/` calls `rgc.pin` (whose own
+doc, `rpython/rlib/rgc.py:88-97`, rules out the lifetime use), and a minor
+collection relocates the frame and rewrites every referring slot
+(`rpython/memory/gc/incminimark.py:2237` / `:2252`) because roots arrive as slot
+addresses (`rpython/memory/gctransform/shadowstack.py:43-46`) and compiled code
+re-reads the frame after each collecting call
+(`rpython/jit/backend/x86/assembler.py:1369-1377`).  The one obligation upstream
+does attach is a JIT one — force the vref, `error.py:370
+tb.frame.mark_as_escaped()` — which pyre already has.
+
+The traceback edge itself is likewise already upstream-shaped:
+`pytraceback_object_custom_trace` forwards `frame` as a *mutable* slot, so a
+relocation would be written back today.  What forbids a movable frame is
+elsewhere — raw `*mut PyFrame` duplicates no root walker reaches.  `FrameBox`
+holds a forwarding-capable `owner_root` and never reads it back, so every
+`Deref` goes through the stale raw field; `eval_loop` runs behind a
+`&mut PyFrame` across a safepoint (the exact class RPython's translated
+shadowstack enumerates for free); the blackhole keeps the virtualizable as a
+bare integer, as does `INLINE_CONCRETE_FRAME`.  Converging means, in order:
+teach `FrameBox::deref` to read its own root and root the inline concrete frame
+the same way; then give compiled code a virtualizable reload after collecting
+calls — pyre has only the JITFRAME half (`reload_frame_if_necessary` in the
+dynasm aarch64 assembler, cited against `assembler.py:1369-1377`).  Only after
+both does dropping the non-moving frame allocation become safe, and with it the
+`PyTraceback.w_code` snapshot, which exists solely because the frame edge is
+conditional.
+
+Two hand-placed props currently hold the invariant up rather than the allocator:
+the dynasm runner routes a resume-materialized virtual `PyFrame` to oldgen on
+purpose, and the JIT's traceback recorder builds a fresh oldgen frame instead of
+handing `record_application_traceback` a materialized virtual.  Both are
+comment-enforced.
+
 One thing the ON path already fixes: with a side-effecting inlined callee under
 a `while` loop that returns from inside the loop, the OFF path runs the callee's
 side effect ~5.2k extra times (the recorded trace-abort double-run class) while

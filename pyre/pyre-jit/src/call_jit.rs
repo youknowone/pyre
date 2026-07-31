@@ -396,8 +396,11 @@ pub unsafe fn walk_jit_callee_frame_roots_area(
     let live_frames = unsafe { &mut *(*area.live_frames).get() };
     for slot in live_frames.iter_mut() {
         // Mark the frame object itself — this list is its only root
-        // until the call returns. The frame is a non-moving stable
-        // allocation, so the visitor never rewrites the slot.
+        // until the call returns. The slot is handed over as a mutable
+        // `GcRef` so a relocation would be written back, as upstream's
+        // slot-address roots are (`shadowstack.py:43-46`); it stays
+        // unwritten only because `FrameBox::new` allocates frames
+        // non-moving.
         visitor(unsafe { &mut *(slot as *mut *mut PyFrame as *mut GcRef) });
         unsafe { visit_callee_frame_roots(*slot, visitor) };
     }
