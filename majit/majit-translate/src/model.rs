@@ -568,6 +568,17 @@ pub enum OpKind {
     /// the common sentinel as `PY_NULL`; it materialises in the ref bank
     /// as address 0, not as an integer register.
     ConstRefNull,
+    /// The RPython annotator constant `None` — a `Constant(NoneType)` whose
+    /// `concretetype` is `lltype.Void`.  Distinct from [`ConstRefNull`]: the
+    /// latter is a null GCREF (`SomePtr`), whereas this folds to
+    /// `SomeValue::None_` (`SomeNone`) so the rtyper's `none_repr` /
+    /// `decompose_slice_args` `stop_is_none` selection see a true `None`.
+    /// The sole producer is the gated slice-range front recognizer, which
+    /// plants it as the `stop` operand of a `[start:]` (`StartOnly`)
+    /// `getslice`; it mirrors how `LOAD_CONST None` pushes `Constant(None)`
+    /// upstream.  Const-inlined by `legacy_const_define_hlvalue`, so no
+    /// SpaceOp reaches the assembler.
+    ConstNone,
     /// Process-wide singleton pointer that must be materialised in the
     /// ref bank (e.g. PyPy `space.fromcache(DictStrategy)` singletons
     /// represented by pyre's Rust `pub static *_DICT_STRATEGY` values).

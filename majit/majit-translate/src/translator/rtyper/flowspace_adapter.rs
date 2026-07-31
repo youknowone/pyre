@@ -343,6 +343,15 @@ pub fn build_value_to_hlvalue_map(
                 OpKind::ConstRefNull => {
                     map.insert(result, Hlvalue::Constant(const_ref_gcref_constant(None)));
                 }
+                OpKind::ConstNone => {
+                    map.insert(
+                        result,
+                        Hlvalue::Constant(Constant::with_concretetype(
+                            ConstValue::None,
+                            LowLevelType::Void,
+                        )),
+                    );
+                }
                 OpKind::ConstRefAddr(addr) => {
                     map.insert(
                         result,
@@ -1042,6 +1051,7 @@ pub fn translate_op(
         | OpKind::ConstBool(_)
         | OpKind::ConstFloat(_)
         | OpKind::ConstRefNull
+        | OpKind::ConstNone
         | OpKind::ConstRefAddr(_) => Ok(Vec::new()),
         // ─── Skipped: pyre JIT trace markers without a flowspace peer ───
         // `GuardTrue` / `GuardFalse` / `GuardValue` are JIT-side
@@ -2716,6 +2726,16 @@ fn legacy_const_define_hlvalue(
             LowLevelType::Float,
         )))),
         OpKind::ConstRefNull => Ok(Some(Hlvalue::Constant(const_ref_gcref_constant(None)))),
+        // The annotator `None` constant — `Constant(NoneType)`,
+        // `concretetype = Void`.  `immutableconstant` annotates it
+        // `SomeValue::None_` (bookkeeper `immutablevalue(&ConstValue::None)`
+        // → `s_none()`), the shape `decompose_slice_args`'s `stop_is_none`
+        // selection reads for a `[start:]` getslice.  Same `(None, Void)`
+        // carrier `set_return` uses for a void return.
+        OpKind::ConstNone => Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        )))),
         OpKind::ConstRefAddr(addr) => Ok(Some(Hlvalue::Constant(const_ref_gcref_constant(Some(
             *addr,
         ))))),

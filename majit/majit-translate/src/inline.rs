@@ -429,6 +429,7 @@ pub(crate) fn remap_op_kind(
         OpKind::ConstFloat(bits) => OpKind::ConstFloat(*bits),
         OpKind::ConstRef(obj) => OpKind::ConstRef(obj.clone()),
         OpKind::ConstRefNull => OpKind::ConstRefNull,
+        OpKind::ConstNone => OpKind::ConstNone,
         OpKind::ConstRefAddr(addr) => OpKind::ConstRefAddr(*addr),
         OpKind::New { owner } => OpKind::New {
             owner: owner.clone(),
@@ -876,6 +877,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         | OpKind::ConstFloat(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
+        | OpKind::ConstNone
         | OpKind::ConstRefAddr(_)
         | OpKind::CurrentTraceLength
         | OpKind::Live
@@ -1157,6 +1159,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::ConstFloat(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
+        | OpKind::ConstNone
         | OpKind::ConstRefAddr(_)
         // Pure reads — `getfield(_pure) getarrayitem(_pure)
         // getinteriorfield` in `enum_ops_without_sideeffects`.

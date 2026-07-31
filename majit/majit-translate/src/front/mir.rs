@@ -1907,6 +1907,21 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.next_call_results,
             );
         }
+        // NOTE: the `&s[k..]` (`RangeFrom` sub-slice) → orthodox `getslice`
+        // copy recognizer (`front::slice_index`) is DORMANT — it is not wired
+        // into the pipeline here.  Empirically (census build 8c68710) it is a
+        // CAPSTONE, not a standalone slice: `getslice` + its Void `ConstNone`
+        // stop are UNWIRED at the legacy walker (unlike `slice_first`'s
+        // legacy-safe `ArrayRead`/`ConstInt`/discriminant ops), so planting
+        // them into a graph that still drops to legacy — which every real
+        // `&args[1..]` interpreter method does, blocked by a co-wall such as
+        // the scalar `args[1..][0]` slice index or a `compute_at_fixpoint`
+        // failure — crashes regalloc on the Void `ConstNone`
+        // (`assembler.rs:2529 lookup_coloring`) or breaks the unwired-opname
+        // snapshot on the bare `getslice`.  The recognizer, `ConstNone`, and
+        // the `getslice` rtyper lowering stay built + tested so the capstone
+        // can activate once these graphs' co-walls close (mirrors the dormant
+        // vec!/`NewList` recognizer, `design-346-foreign-lib-cluster-epic.md`).
         let next_rewritten = if lo.next_call_results.is_empty() {
             0
         } else {
@@ -4408,6 +4423,14 @@ impl<'a> Lowering<'a> {
                             end: arg_vars[1].clone(),
                         });
                 }
+                // NOTE: `RangeFrom { start }` aggregate (`&s[k..]`) capture for
+                // `front::slice_index`'s orthodox `getslice` copy is DORMANT —
+                // the recognizer is a capstone that cannot plant its unwired
+                // `getslice` + Void `ConstNone` into the co-wall-blocked
+                // `&args[1..]` graphs without crashing the legacy walker (see
+                // the post-pass note in `simplify_and_finalize`).  Re-enable
+                // the `slice_index_rangefrom_sites` push here + the post-pass
+                // once those graphs' co-walls close.
                 // Surface every operand through a separate FieldWrite so
                 // the field-to-value binding survives into the
                 // codewriter / annotator.  Field names default to
@@ -18608,6 +18631,7 @@ fn panic_block_is_pure_message(block: &crate::model::Block) -> bool {
             | OpKind::ConstFloat(_)
             | OpKind::ConstRef(_)
             | OpKind::ConstRefNull
+            | OpKind::ConstNone
             | OpKind::ConstRefAddr(_)
             | OpKind::ConstSymbolic { .. }
             | OpKind::FieldRead { .. }

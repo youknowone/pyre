@@ -83,6 +83,7 @@ pub(crate) mod rbigint_call;
 pub(crate) mod result_exc;
 pub mod semantic;
 pub(crate) mod slice_first;
+pub(crate) mod slice_index;
 pub mod typestr;
 
 pub use semantic::{AstGraphOptions, SemanticFunction, SemanticProgram, StructFieldRegistry};

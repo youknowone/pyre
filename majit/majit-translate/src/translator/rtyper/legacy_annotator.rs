@@ -278,6 +278,11 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         OpKind::ConstRef(_) | OpKind::ConstRefNull | OpKind::ConstRefAddr(_) => {
             ValueType::Ref(None)
         }
+        // The annotator `None` constant is `Void`-typed (`concretetype =
+        // lltype.Void`), not a ref.  Only reaches the legacy annotator in a
+        // graph that drops before `decompose_slice_args` consumes the
+        // getslice `stop` operand (which discards it for `[start:]`).
+        OpKind::ConstNone => ValueType::Void,
         OpKind::FieldRead { ty, .. } => ty.clone(),
         OpKind::FieldWrite { .. } => ValueType::Void,
         OpKind::New { owner } => ValueType::Ref(Some(owner.clone())),

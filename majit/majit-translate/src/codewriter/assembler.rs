@@ -2593,6 +2593,7 @@ impl Assembler {
                 OpKind::ConstFloat(_) => "ConstFloat",
                 OpKind::ConstRef(_) => "ConstRef",
                 OpKind::ConstRefNull => "ConstRefNull",
+                OpKind::ConstNone => "ConstNone",
                 OpKind::ConstRefAddr(_) => "ConstRefAddr",
                 OpKind::FieldRead { .. } => "FieldRead",
                 OpKind::FieldWrite { .. } => "FieldWrite",
@@ -3999,6 +4000,16 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // `emit_const_r`, then a `ref_copy/r>r` op moves it into the
         // SSA destination register.
         OpKind::ConstRef(_) | OpKind::ConstRefNull | OpKind::ConstRefAddr(_) => "ref_copy".into(),
+        // `ConstNone` (Void `None`) is const-inlined by
+        // `legacy_const_define_hlvalue`, and `decompose_slice_args` DROPS
+        // the getslice `stop` operand for a `[start:]` slice
+        // (rtyper.rs:2841) — so it never reaches the assembler in a lifted
+        // graph.  It only appears here if a graph that planted it dropped
+        // to the legacy walker (the gate failed); the distinctive
+        // handler-less `const_none` opname trips
+        // `default_bh_builder_unwired_set_matches_task_85_snapshot` loudly
+        // rather than mis-materialising a Void into a register.
+        OpKind::ConstNone => "const_none".into(),
         // RPython: getfield_gc_i, getfield_gc_r, getfield_gc_f and `_pure`
         // variants from jtransform.py rewrite_op_getfield().
         OpKind::FieldRead { ty, pure, .. } => {

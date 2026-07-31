@@ -1123,6 +1123,7 @@ fn op_result_can_remove(kind: &crate::model::OpKind) -> bool {
             | OpKind::ConstFloat(_)
             | OpKind::ConstRef(_)
             | OpKind::ConstRefNull
+            | OpKind::ConstNone
             | OpKind::ConstRefAddr(_)
             | OpKind::ConstSymbolic { .. }
     )

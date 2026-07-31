@@ -661,6 +661,7 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::ConstFloat(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
+        | OpKind::ConstNone
         | OpKind::ConstRefAddr(_)
         | OpKind::CurrentTraceLength
         | OpKind::Live
