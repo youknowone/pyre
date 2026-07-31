@@ -63,6 +63,21 @@ for owner, name in ORDINARY:
 # `__getitem__` are per-type: the mapping and sequence protocols fill
 # different slots, so `dict.__getitem__` is a `tp_methods` entry while
 # `tuple.__getitem__` is a slot.
+#
+# The in-place number slots and the `tp_as_async` trio are here because they
+# are reachable on only a couple of types, so a table that forgets them stays
+# green on the core types and misclassifies exactly those.
+import types as _types
+import weakref as _weakref
+
+
+class _Referent:
+    pass
+
+
+_referent = _Referent()
+_ProxyType = type(_weakref.proxy(_referent))
+
 SLOTS = [
     (list, "__len__"),
     (tuple, "__getitem__"),
@@ -72,6 +87,15 @@ SLOTS = [
     (object, "__init__"),
     (object, "__setattr__"),
     (type(x for x in ()), "__del__"),
+    (_ProxyType, "__ifloordiv__"),
+    (_ProxyType, "__ilshift__"),
+    (_ProxyType, "__imod__"),
+    (_ProxyType, "__ipow__"),
+    (_ProxyType, "__irshift__"),
+    (_ProxyType, "__itruediv__"),
+    (_types.CoroutineType, "__await__"),
+    (_types.AsyncGeneratorType, "__aiter__"),
+    (_types.AsyncGeneratorType, "__anext__"),
 ]
 
 for owner, name in SLOTS:
@@ -84,6 +108,25 @@ assert type(list.__dict__["__getitem__"]).__name__ == "method_descriptor"
 assert type(tuple.__dict__["__getitem__"]).__name__ != "method_descriptor"
 assert type(dict.__dict__["__contains__"]).__name__ == "method_descriptor"
 assert type(str.__dict__["__contains__"]).__name__ != "method_descriptor"
+
+
+# `FrameLocalsProxy` is the third type on that split: `framelocalsproxy_methods`
+# carries both names, so both are `tp_methods` entries even though the type
+# also fills the mapping slots.
+def _frame_locals_proxy_type():
+    _unused = 1
+    import sys
+
+    return type(sys._getframe().f_locals)
+
+
+_FLP = _frame_locals_proxy_type()
+for _name in ("__contains__", "__getitem__", "keys", "get"):
+    _d = _FLP.__dict__[_name]
+    assert type(_d).__name__ == "method_descriptor", (_name, type(_d))
+    assert _d.__qualname__ == f"FrameLocalsProxy.{_name}", _name
+    assert _d.__objclass__ is _FLP, _name
+    assert repr(_d) == f"<method '{_name}' of 'FrameLocalsProxy' objects>"
 
 
 # Instance access binds to a builtin carrier, not a `method`.

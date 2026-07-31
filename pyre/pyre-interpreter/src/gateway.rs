@@ -999,13 +999,16 @@ pub unsafe fn builtin_code_no_keyword_arguments(
 /// slots everywhere except on the types that expose them through `tp_methods`.
 pub(crate) fn is_slot_wrapper(type_name: &str, name: &str) -> bool {
     match name {
-        "__contains__" => !matches!(type_name, "dict" | "set" | "frozenset"),
-        "__getitem__" => !matches!(type_name, "dict" | "list"),
+        "__contains__" => !matches!(type_name, "dict" | "set" | "frozenset" | "FrameLocalsProxy"),
+        "__getitem__" => !matches!(type_name, "dict" | "list" | "FrameLocalsProxy"),
         _ => matches!(
             name,
             "__abs__"
                 | "__add__"
+                | "__aiter__"
                 | "__and__"
+                | "__anext__"
+                | "__await__"
                 | "__bool__"
                 | "__buffer__"
                 | "__call__"
@@ -1024,19 +1027,27 @@ pub(crate) fn is_slot_wrapper(type_name: &str, name: &str) -> bool {
                 | "__hash__"
                 | "__iadd__"
                 | "__iand__"
+                | "__ifloordiv__"
+                | "__ilshift__"
+                | "__imatmul__"
+                | "__imod__"
                 | "__imul__"
                 | "__index__"
                 | "__init__"
                 | "__int__"
                 | "__invert__"
                 | "__ior__"
+                | "__ipow__"
+                | "__irshift__"
                 | "__isub__"
                 | "__iter__"
+                | "__itruediv__"
                 | "__ixor__"
                 | "__le__"
                 | "__len__"
                 | "__lshift__"
                 | "__lt__"
+                | "__matmul__"
                 | "__mod__"
                 | "__mul__"
                 | "__ne__"
@@ -1052,6 +1063,7 @@ pub(crate) fn is_slot_wrapper(type_name: &str, name: &str) -> bool {
                 | "__repr__"
                 | "__rfloordiv__"
                 | "__rlshift__"
+                | "__rmatmul__"
                 | "__rmod__"
                 | "__rmul__"
                 | "__ror__"
