@@ -4,9 +4,12 @@ PyPy ``interpreter/function.py:718-768 ClassMethod`` supplies the wrapped
 callable, lazy instance dictionary, descriptor and repr operations.
 ``interpreter/typedef.py:878-908`` exposes them in the type dictionary.
 Python 3.14 additionally proxies PEP 649's ``__annotations__`` and
-``__annotate__`` attributes and exposes ``__class_getitem__``; it omits
-PyPy 3.11's ``__reduce_ex__`` entry and does not make the wrapper callable.
+``__annotate__`` attributes and exposes ``__class_getitem__``; CPython omits
+PyPy's ``__reduce_ex__`` entry and neither implementation makes the wrapper
+callable.
 """
+
+import sys
 
 
 EXPECTED_SURFACE = {
@@ -23,6 +26,9 @@ EXPECTED_SURFACE = {
     "__repr__",
     "__wrapped__",
 }
+if sys.implementation.name != "cpython":
+    # PyPy function.py:763-764 / typedef.py:898.
+    EXPECTED_SURFACE.add("__reduce_ex__")
 
 assert set(classmethod.__dict__) == EXPECTED_SURFACE
 assert classmethod.__doc__.startswith("Convert a function to be a class method.\n")

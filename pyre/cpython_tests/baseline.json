@@ -466,7 +466,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_functools": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_future_stmt": {
       "dynasm": "IMPORTERROR"
@@ -577,7 +577,7 @@
       "dynasm": "FAIL"
     },
     "test.test_inspect": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_int": {
       "dynasm": "IMPORTERROR"
@@ -791,13 +791,13 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_pickle": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "TIMEOUT"
     },
     "test.test_picklebuffer": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_pickletools": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_pkg": {
       "dynasm": "FAIL"
@@ -1186,7 +1186,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_typing": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_ucn": {
       "dynasm": "IMPORTERROR"

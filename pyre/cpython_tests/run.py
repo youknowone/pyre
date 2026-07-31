@@ -104,6 +104,13 @@ KNOWN_SKIPS = {
     "test.test_c_locale_coercion": "asserts child stderr is empty, but MAJIT_STATS=1 prints a [jit-stats] line to every process's stderr",
 }
 
+# These modules intentionally assert on a child interpreter's exact stderr.
+# MAJIT_STATS is runner instrumentation rather than language-visible output,
+# so do not inject it into those modules or any subprocesses they spawn.
+STATS_STDERR_INCOMPATIBLE = {
+    "test.test_inspect",
+}
+
 # ── classification ───────────────────────────────────────────────────
 
 def jit_panic_reason(stderr: str) -> str | None:
@@ -293,9 +300,13 @@ def run_module(binary: Path, module: str, mode: str, timeout: int,
             cmd = [str(binary), str(driver)]
         else:
             cmd = build_cmd(binary, module, mode)
+        module_env = env
+        if module in STATS_STDERR_INCOMPATIBLE:
+            module_env = env.copy()
+            module_env.pop("MAJIT_STATS", None)
         try:
             proc = subprocess.run(
-                cmd, cwd=cwd, env=env, capture_output=True, text=True,
+                cmd, cwd=cwd, env=module_env, capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=timeout,
             )
         except subprocess.TimeoutExpired:

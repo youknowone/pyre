@@ -1,3 +1,4 @@
+import sys
 import types
 
 
@@ -21,6 +22,9 @@ EXPECTED = {
     "__repr__",
     "__type_params__",
 }
+if sys.implementation.name != "cpython":
+    # PyPy typedef.py:805-806 exposes these interpreter-level Function slots.
+    EXPECTED.update({"__objclass__", "__text_signature__"})
 
 
 assert set(types.FunctionType.__dict__) == EXPECTED
@@ -138,8 +142,12 @@ for method_name, args in (
     ("__get__", (None, type(None))),
     ("__repr__", ()),
 ):
+    # PyPy function.py deliberately represents builtins and Python functions
+    # with the same Function class, so `len` is a valid receiver there. Use an
+    # object foreign to both models while retaining CPython's stricter check.
+    foreign_receiver = len if sys.implementation.name == "cpython" else 42
     try:
-        type(f).__dict__[method_name](len, *args)
+        type(f).__dict__[method_name](foreign_receiver, *args)
     except TypeError:
         pass
     else:

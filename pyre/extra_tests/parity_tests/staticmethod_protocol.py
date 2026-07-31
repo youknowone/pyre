@@ -4,9 +4,11 @@ PyPy ``interpreter/function.py:671-716 StaticMethod`` supplies the wrapped
 callable, lazy instance dictionary, descriptor, call and repr operations.
 ``interpreter/typedef.py:852-877`` exposes them in the type dictionary.
 Python 3.14 additionally proxies PEP 649's ``__annotations__`` and
-``__annotate__`` attributes and exposes ``__class_getitem__``; it omits
-PyPy 3.11's ``__reduce_ex__`` entry.
+``__annotate__`` attributes and exposes ``__class_getitem__``; CPython omits
+PyPy's ``__reduce_ex__`` entry.
 """
+
+import sys
 
 
 EXPECTED_SURFACE = {
@@ -24,6 +26,9 @@ EXPECTED_SURFACE = {
     "__repr__",
     "__wrapped__",
 }
+if sys.implementation.name != "cpython":
+    # PyPy function.py:708-709 / typedef.py:871.
+    EXPECTED_SURFACE.add("__reduce_ex__")
 
 assert set(staticmethod.__dict__) == EXPECTED_SURFACE
 assert staticmethod.__doc__.startswith("Convert a function to be a static method.\n")

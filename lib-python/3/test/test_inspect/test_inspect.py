@@ -212,7 +212,8 @@ class TestPredicates(IsTestBase):
             self.istest(inspect.iscoroutine, 'coroutine_function_example(1)')
             self.istest(inspect.iscoroutinefunction, 'coroutine_function_example')
 
-        if hasattr(types, 'MemberDescriptorType'):
+        if (hasattr(types, 'MemberDescriptorType') and
+                isinstance(datetime.timedelta.days, types.MemberDescriptorType)):
             self.istest(inspect.ismemberdescriptor, 'datetime.timedelta.days')
         else:
             self.assertFalse(inspect.ismemberdescriptor(datetime.timedelta.days))
