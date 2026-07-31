@@ -1252,13 +1252,6 @@ impl GcCache {
     ) -> Arc<SimpleFieldDescr> {
         // descr.py:234-238: parent_descr = get_size_descr(gccache, STRUCT, vtable)
         let parent = self._cache_size.get(&struct_key).cloned();
-        // What the cached descr's own `index_in_parent` was normalised to when it
-        // was minted. The caller's raw number cannot be compared against it: a
-        // field that was rederived once stays rederived, so asserting the cached
-        // value equals the argument fires on the SECOND lookup of exactly the
-        // fields this normalisation exists for.
-        let expected_index_in_parent =
-            Self::find_index_in_parent(parent.as_ref(), field_name).unwrap_or(index_in_parent);
         // descr.py:220-221: cache[STRUCT][fieldname]
         let cached = self
             ._cache_field
@@ -1283,6 +1276,17 @@ impl GcCache {
                 } else {
                     (is_immutable, is_quasi_immutable)
                 };
+            // descr.py:220-221 returns the cached descr with no caller re-check.
+            // The authoritative slot number is the cached descr's own — it was
+            // normalised (rederived against the parent's positional list) when
+            // minted, so a field that was rederived once stays rederived. When
+            // the parent carries a positional list, `find_index_in_parent`
+            // arbitrates and the canary stays strict; when it does not (the mint
+            // path binds a fieldless size-descr shell), defer to the cached
+            // value rather than the caller's un-arbitrable raw number, which
+            // still carries whichever producer's header convention minted it.
+            let expected_index_in_parent = Self::find_index_in_parent(parent.as_ref(), field_name)
+                .unwrap_or(descr.index_in_parent);
             debug_assert!(
                 descr.describes_same_field(
                     offset,
@@ -6086,6 +6090,56 @@ mod register_keyed_size_authority_tests {
         assert_eq!(first.index_in_parent, 1, "the parent's own list wins");
         let second = lookup(&mut gc);
         assert_eq!(second.index_in_parent, 1);
+    }
+
+    /// The mint path binds a fieldless size-descr shell (`get_size_descr`
+    /// populates no `all_fielddescrs`), so `find_index_in_parent` cannot
+    /// arbitrate. The runtime published a headerless descr (`index 0`) first;
+    /// a later analyzer mint of the SAME field carries a header-counting number
+    /// (`index 2`). The cache hit must return the published descr and its canary
+    /// must defer to that cached index rather than fire on the caller's
+    /// un-arbitrable raw number — the exact `floatval 0-vs-2` /
+    /// `locals_cells_stack_w 0-vs-4` panic.
+    #[test]
+    fn a_shell_parent_defers_to_the_cached_index_not_the_caller() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(9);
+        // Fieldless shell — no positional list to rederive against.
+        gc._cache_size.insert(key.clone(), size_descr_at(3, 0, &[]));
+        // First lookup: the headerless producer's index 0 is cached.
+        let first = gc.get_field_descr(
+            key.clone(),
+            "floatval",
+            None,
+            16,
+            8,
+            Type::Float,
+            false,
+            false,
+            ArrayFlag::Float,
+            0,
+            false,
+            0,
+        );
+        assert_eq!(first.index_in_parent, 0);
+        // Second lookup: a header-counting producer hands index 2. No parent
+        // arbitrates, so the canary must defer to the cached 0 (no panic) and
+        // return the cached descr unchanged.
+        let second = gc.get_field_descr(
+            key.clone(),
+            "floatval",
+            None,
+            16,
+            8,
+            Type::Float,
+            false,
+            false,
+            ArrayFlag::Float,
+            0,
+            false,
+            2,
+        );
+        assert_eq!(second.index_in_parent, 0, "the cached descr wins");
     }
 
     /// The upgrade rule itself is unchanged when both sides carry a vtable.
