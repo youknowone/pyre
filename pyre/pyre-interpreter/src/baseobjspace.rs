@@ -13929,8 +13929,12 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     return Ok(item);
                 }
             }
-            // `listreviter_next` only parks the -1 sentinel; the source list
-            // stays referenced so `__setstate__` can restart the descent.
+            // PyPy `W_ReverseSeqIterObject.descr_next` drops `w_seq` on
+            // exhaustion.  Besides matching its reduce form, this is
+            // observable through weak references: a consumed iterator must
+            // not keep the list alive.  `__setstate__` consequently becomes
+            // a no-op once the source has been released.
+            pyre_object::w_list_reverse_iter_set_seq(obj, PY_NULL);
             pyre_object::w_list_reverse_iter_set_index(obj, -1);
             return Err(PyError::stop_iteration());
         }
