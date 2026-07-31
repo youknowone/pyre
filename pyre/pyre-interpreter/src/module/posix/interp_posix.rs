@@ -3917,11 +3917,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             };
             let (path_obj, uid_obj, gid_obj) =
                 (arg(0, "path")?, arg(1, "uid")?, arg(2, "gid")?);
-            let path = extract_path(path_obj).map_err(|_| {
-                crate::PyError::type_error(format!(
-                    "{name}: path should be string, bytes, os.PathLike"
-                ))
-            })?;
+            // `posixmodule.c path_converter` calls `__fspath__` and lets what it
+            // raises out: a `RuntimeError` from a user `__fspath__` is that
+            // object's error, not a statement that the argument was the wrong
+            // type.  Rewriting every failure into a `TypeError` here would also
+            // swallow the `UnicodeEncodeError` a lone surrogate produces.
+            let path = extract_path(path_obj)?;
             // `_Py_Uid_Converter` / `_Py_Gid_Converter`: `uid_t` is unsigned, yet
             // -1 is always accepted as the "leave unchanged" sentinel.  Only
             // that one value means unchanged; every other id is judged by
