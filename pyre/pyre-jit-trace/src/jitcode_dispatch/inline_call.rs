@@ -3079,11 +3079,24 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // failures and 497 bridges on `synth/exception_subclass_attrs`, a 31x
     // slowdown).  Guard the fields only when the pinned object really is the
     // function whose code this inline resolved.
-    let guards_the_callee_function = unsafe {
-        (*callable_guard_value).ob_type as *const () as usize
-            == &pyre_interpreter::FUNCTION_TYPE as *const _ as usize
-            && pyre_interpreter::function_get_code(callable_guard_value) as usize == callee_code_key
-    };
+    //
+    // A trace-constant callable is excluded for a second reason: the field
+    // reads would dereference a baked `ConstPtr`, and a baked constant object
+    // pointer is not GC-forwarded yet (gh #108 gc-table — see the note in
+    // `synth/exception_subclass_attrs.py`).  Comparing against such a constant
+    // is fine, but loading through one dangles as soon as a minor collection
+    // moves the object: `synth/inline_subwalk_property_mutates` — a property
+    // getter that allocates on every iteration — segfaults on cranelift under
+    // CI's macOS runner with the reads in place.  The callable being constant
+    // means something already pinned the object, so this only gives up the
+    // `f.__code__ = g.__code__` re-check on that path.
+    let guards_the_callee_function = !callable_guard_op.is_constant()
+        && unsafe {
+            (*callable_guard_value).ob_type as *const () as usize
+                == &pyre_interpreter::FUNCTION_TYPE as *const _ as usize
+                && pyre_interpreter::function_get_code(callable_guard_value) as usize
+                    == callee_code_key
+        };
 
     if !guards_the_callee_function {
         // Those sites resolve the callee through their own guarded path (a
@@ -3106,13 +3119,11 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // 'defs_w?[*]']` names, so guard each of them off the live function.
         // `defs_w` has its own guard below.
         //
-        // The guards are emitted even when the callable itself is already a
-        // trace constant.  Pinning the object pins none of these fields:
-        // `f.__code__ = g.__code__` keeps the same function and used to leave
-        // the inlined body running the old code.  Upstream is safe there
-        // because `code?` is quasi-immutable and assigning it invalidates the
-        // traces that folded it; pyre has no such hook yet, so the value guard
-        // is what stands in for the invalidation.
+        // Reading them live is what `f.__code__ = g.__code__` needs: pinning
+        // the object pins none of its fields.  Upstream is safe there because
+        // `code?` is quasi-immutable and assigning it invalidates the traces
+        // that folded it; pyre has no such hook yet, so the value guard stands
+        // in for the invalidation.
         //
         // Guarding the function OBJECT instead pinned its identity, which a
         // callee built by a `MAKE_FUNCTION` in the caller's own loop body can
@@ -3126,22 +3137,14 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             crate::descr::function_code_descr(),
             callee_code_key as i64,
         )?;
-        // `w_func_globals` and `closure` are the two names in the set with no
-        // Python-level setter, so for a callable the trace has already pinned
-        // to one object they cannot come back different and the reads are
-        // pure overhead.  `code` and `defs_w` above and below are writable
-        // (`f.__code__ = ...`, `f.__defaults__ = ...`) and are guarded either
-        // way.
-        if !callable_guard_op.is_constant() {
-            walker_guard_function_field(
-                ctx,
-                op.pc,
-                callable_guard_op,
-                crate::descr::function_w_globals_descr(),
-                inline_consts.w_globals as i64,
-            )?;
-        }
-        if !callable_guard_op.is_constant() && !concrete_freevar_cells.is_empty() {
+        walker_guard_function_field(
+            ctx,
+            op.pc,
+            callable_guard_op,
+            crate::descr::function_w_globals_descr(),
+            inline_consts.w_globals as i64,
+        )?;
+        if !concrete_freevar_cells.is_empty() {
             // `closure?[*]`: the tuple itself is rebuilt by every
             // `MAKE_FUNCTION`, so guarding its identity would reintroduce the
             // per-iteration failure.  The cells are what this inline bakes and
