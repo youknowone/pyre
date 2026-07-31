@@ -2262,6 +2262,10 @@ pub fn make_builtin_type_with_bases(
     unsafe { w_type_set_mro(type_obj, mro) };
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     unsafe { stamp_new_descr_self(ns, type_obj) };
+    // Readying registers the new type on every entry of `__bases__`, so a
+    // multi-base builtin such as `io.UnsupportedOperation(OSError, ValueError)`
+    // reaches both `OSError.__subclasses__()` and `ValueError.__subclasses__()`.
+    unsafe { pyre_object::typeobject::w_type_ready(type_obj) };
     type_obj
 }
 
