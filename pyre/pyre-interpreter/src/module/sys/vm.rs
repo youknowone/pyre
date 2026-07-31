@@ -64,27 +64,64 @@ fn sys_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
 /// instance dict directly, so `setdictvalue` is used rather than `setattr` — a
 /// subclass `__setattr__` is not consulted during construction.
 fn namespace_apply_kwargs(self_obj: PyObjectRef, kwargs: Option<PyObjectRef>) -> crate::PyResult {
-    // `self.__dict__.update(kwargs)` evaluates `self.__dict__` first, so a
-    // receiver without an instance dict raises AttributeError even for an
-    // empty keyword set.
-    crate::baseobjspace::getattr_str(self_obj, "__dict__")?;
     if let Some(dict) = kwargs {
-        unsafe {
-            for (key, value) in pyre_object::w_dict_items(dict) {
-                if pyre_object::is_str(key) {
-                    if let Ok(name) = pyre_object::w_str_get_wtf8(key).as_str() {
-                        if name == "__pyre_kw__" {
-                            continue;
-                        }
-                        crate::baseobjspace::setdictvalue_native(self_obj, name, value);
-                        continue;
-                    }
-                }
-                crate::baseobjspace::setattr(self_obj, key, value)?;
-            }
-        }
+        namespace_update_dict(self_obj, dict, true)?;
+    } else {
+        // `self.__dict__.update(kwargs)` evaluates `self.__dict__` first, so
+        // a receiver without an instance dict raises even for no keywords.
+        crate::baseobjspace::getattr_str(self_obj, "__dict__")?;
     }
     Ok(w_none())
+}
+
+/// CPython 3.14 `PyDict_Update(ns->ns_dict, source)`, with the flat builtin
+/// ABI's private `__pyre_kw__` marker optionally omitted.  Validate every key
+/// before the first store, matching `PyArg_ValidateKeywordArguments`: a bad
+/// mapping cannot partially update the namespace.  The destination is the
+/// real instance dict, so subclass `__setattr__` is deliberately bypassed.
+fn namespace_update_dict(
+    self_obj: PyObjectRef,
+    source: PyObjectRef,
+    skip_kw_marker: bool,
+) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_obj);
+    pyre_object::gc_roots::pin_root(source);
+    let destination = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(sp),
+        "__dict__",
+    )?;
+    pyre_object::gc_roots::pin_root(destination);
+    let items = unsafe {
+        pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(sp + 1))
+    };
+    let items_sp = pyre_object::gc_roots::shadow_stack_len();
+    for &(key, value) in &items {
+        pyre_object::gc_roots::pin_root(key);
+        pyre_object::gc_roots::pin_root(value);
+    }
+    for i in 0..items.len() {
+        let key = pyre_object::gc_roots::shadow_stack_get(items_sp + i * 2);
+        if !unsafe { pyre_object::is_str(key) } {
+            return Err(crate::PyError::type_error("keywords must be strings"));
+        }
+    }
+    for i in 0..items.len() {
+        let key = pyre_object::gc_roots::shadow_stack_get(items_sp + i * 2);
+        let value = pyre_object::gc_roots::shadow_stack_get(items_sp + i * 2 + 1);
+        if skip_kw_marker
+            && unsafe { pyre_object::w_str_get_wtf8(key).as_str() == Ok("__pyre_kw__") }
+        {
+            continue;
+        }
+        crate::type_methods::dict_store_checked(
+            pyre_object::gc_roots::shadow_stack_get(sp + 2),
+            key,
+            value,
+        )?;
+    }
+    Ok(())
 }
 
 /// Allocate a fresh stub instance whose type supports `setattr`. Used for
@@ -93,35 +130,76 @@ fn make_sys_namespace_instance() -> PyObjectRef {
     w_instance_new(sys_namespace_type())
 }
 
-/// `_structseq.py:171 SimpleNamespace.__init__(self, **kwargs)` — keyword-only,
-/// so a positional argument raises the arg-count TypeError instead of being
-/// accepted as a mapping.
+/// CPython 3.14 `namespace_init`: accept at most one positional mapping or
+/// iterable of pairs, validate that its resulting dict has only string keys,
+/// merge it into the instance, then overlay keyword arguments.  This is the
+/// target-version delta from PyPy 3.11's keyword-only `_structseq.py` class.
 fn simple_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    for &arg in args {
+        pyre_object::gc_roots::pin_root(arg);
+    }
+    let rooted = (0..args.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(sp + i))
+        .collect::<Vec<_>>();
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&rooted);
     let Some(&self_obj) = positional.first() else {
         return Err(crate::PyError::type_error(
             "__init__() missing 1 required positional argument: 'self'",
         ));
     };
-    if positional.len() > 1 {
+    if positional.len() > 2 {
         return Err(crate::PyError::type_error(format!(
-            "SimpleNamespace.__init__() takes 1 positional argument but {} were given",
-            positional.len()
+            "SimpleNamespace expected at most 1 argument, got {}",
+            positional.len() - 1
         )));
     }
-    namespace_apply_kwargs(self_obj, kwargs)
+    // The kwargs carrier is not guaranteed to occupy the last raw ABI slot
+    // relative to positional arguments.  Pin the parsed operands into a
+    // canonical order before any allocation instead of deriving their slots
+    // from the flat input layout.
+    let operands_sp = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_obj);
+    if positional.len() == 2 {
+        pyre_object::gc_roots::pin_root(positional[1]);
+    }
+    if let Some(kwargs) = kwargs {
+        pyre_object::gc_roots::pin_root(kwargs);
+    }
+    if positional.len() == 2 {
+        let temporary = w_dict_new();
+        pyre_object::gc_roots::pin_root(temporary);
+        let temporary_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let temporary = pyre_object::gc_roots::shadow_stack_get(temporary_slot);
+        crate::type_methods::dict_update1(
+            temporary,
+            pyre_object::gc_roots::shadow_stack_get(operands_sp + 1),
+        )?;
+        namespace_update_dict(
+            pyre_object::gc_roots::shadow_stack_get(operands_sp),
+            pyre_object::gc_roots::shadow_stack_get(temporary_slot),
+            false,
+        )?;
+    }
+    namespace_apply_kwargs(
+        pyre_object::gc_roots::shadow_stack_get(operands_sp),
+        kwargs.map(|_| {
+            pyre_object::gc_roots::shadow_stack_get(
+                operands_sp + 1 + usize::from(positional.len() == 2),
+            )
+        }),
+    )
 }
 
 /// `types.SimpleNamespace` — the attribute-bag type exposed as
 /// `type(sys.implementation)` and re-published by `types.py:20`
 /// (`SimpleNamespace = type(sys.implementation)`).
 ///
-/// `_structseq.py:166 SimpleNamespace`: keyword-only construction that copies
-/// into the instance dict, a `namespace(...)` repr over the sorted items with
-/// a recursion guard, structural `__eq__`/`__ne__` (NotImplemented against a
-/// non-namespace), and no `__hash__` (so instances are unhashable). The
-/// keyword copy into the instance dict is shared with `sys.namespace` via
-/// `namespace_apply_kwargs`; the positional rejection is `SimpleNamespace`-specific.
+/// `_structseq.py:166 SimpleNamespace`, with CPython 3.14's newer constructor,
+/// full rich-comparison surface, pickle reducer and `__replace__`.  Storage
+/// remains PyPy-shaped: the values live in the instance dict, not a side
+/// table or a second native mapping.
 fn simple_namespace_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
     let raw = *TYPE.get_or_init(|| {
@@ -147,6 +225,28 @@ fn simple_namespace_type() -> PyObjectRef {
                     "__ne__",
                     make_builtin_function_with_arity("__ne__", simple_namespace_ne, 2),
                 );
+                for (name, function) in [
+                    ("__lt__", simple_namespace_lt as fn(&[PyObjectRef]) -> crate::PyResult),
+                    ("__le__", simple_namespace_le),
+                    ("__gt__", simple_namespace_gt),
+                    ("__ge__", simple_namespace_ge),
+                ] {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        name,
+                        make_builtin_function_with_arity(name, function, 2),
+                    );
+                }
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__reduce__",
+                    make_builtin_function_with_arity("__reduce__", simple_namespace_reduce, 1),
+                );
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__replace__",
+                    make_builtin_function("__replace__", simple_namespace_replace),
+                );
                 // SimpleNamespace defines no `__hash__`, so it inherits None
                 // and is unhashable.
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__hash__", w_none());
@@ -163,91 +263,107 @@ fn simple_namespace_type() -> PyObjectRef {
     raw as PyObjectRef
 }
 
-/// `_structseq.py:174 SimpleNamespace.__repr__` — `namespace(k=v, ...)` over
-/// the sorted `__dict__` items (`%s=%r`), returning `namespace(...)` when the
-/// instance is already being repr'd on this thread.
+/// CPython 3.14 `namespace_repr`, layered over PyPy's recursion guard.  Exact
+/// instances use `namespace`, subclasses use their concrete type name.  Walk
+/// a snapshot of the insertion-ordered keys, then re-read each live value so
+/// a re-entrant repr that mutates the dict has CPython's skip/update behavior.
 fn simple_namespace_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let Some(&self_obj) = args.first() else {
         return Err(crate::PyError::type_error(
             "__repr__() missing 1 required positional argument: 'self'",
         ));
     };
-    let Some(_guard) = crate::display::ReprGuard::enter(self_obj) else {
-        return Ok(w_str_new("namespace(...)"));
-    };
-    let dict = crate::baseobjspace::getattr_str(self_obj, "__dict__")?;
-    // A user `__lt__`, `__str__` or `__repr__` below can collect, and the
-    // moving GC relocates the items this snapshot holds. Pin every key and
-    // value on the shadow stack and address them by slot from here on: a raw
-    // `(key, value)` vector would go stale at the first such call.
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    let items = unsafe { pyre_object::w_dict_items(dict) };
-    for (k, v) in &items {
-        pyre_object::gc_roots::pin_root(*k);
-        pyre_object::gc_roots::pin_root(*v);
-    }
-    let key = |i: usize| pyre_object::gc_roots::shadow_stack_get(base + i * 2);
-    let value = |i: usize| pyre_object::gc_roots::shadow_stack_get(base + i * 2 + 1);
-
-    // `sorted(self.__dict__.items())` — order by the key objects with Python
-    // `<`, not by their `str()`. Incomparable keys (e.g. `int` mixed with
-    // `str`) raise, halting the repr as the sort itself does. Rust's `sort_by`
-    // closure cannot return `Result`, so a raising comparison is captured in a
-    // `Cell` and surfaced once the sort completes.
-    let sort_error: std::cell::Cell<Option<crate::PyError>> = std::cell::Cell::new(None);
-    let lt = |x: usize, y: usize| -> bool {
-        if let Some(e) = sort_error.take() {
-            sort_error.set(Some(e));
-            return false;
-        }
-        match crate::baseobjspace::compare(key(x), key(y), crate::baseobjspace::CompareOp::Lt) {
-            Ok(r) => crate::baseobjspace::is_true(r).unwrap_or_else(|e| {
-                sort_error.set(Some(e));
-                false
-            }),
-            Err(e) => {
-                sort_error.set(Some(e));
-                false
-            }
-        }
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_obj);
+    let actual_type = crate::typedef::r#type(self_obj)
+        .map(|tp| tp.as_ptr())
+        .unwrap_or(simple_namespace_type());
+    let name = if std::ptr::eq(actual_type, simple_namespace_type()) {
+        "namespace".to_string()
+    } else {
+        unsafe { w_type_get_name(actual_type) }.to_string()
     };
-    let mut order: Vec<usize> = (0..items.len()).collect();
-    order.sort_by(|&a, &b| {
-        if lt(a, b) {
-            std::cmp::Ordering::Less
-        } else if lt(b, a) {
-            std::cmp::Ordering::Greater
-        } else {
-            std::cmp::Ordering::Equal
-        }
-    });
-    if let Some(e) = sort_error.take() {
-        return Err(e);
+    let Some(_guard) = crate::display::ReprGuard::enter(self_obj) else {
+        return Ok(w_str_new(&format!("{name}(...)")));
+    };
+    let dict = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(sp),
+        "__dict__",
+    )?;
+    pyre_object::gc_roots::pin_root(dict);
+    let keys = unsafe {
+        pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(sp + 1))
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>()
+    };
+    let keys_sp = pyre_object::gc_roots::shadow_stack_len();
+    for &key in &keys {
+        pyre_object::gc_roots::pin_root(key);
     }
-    let mut parts = Vec::with_capacity(order.len());
-    for i in order {
+    let mut parts = Vec::with_capacity(keys.len());
+    for i in 0..keys.len() {
+        let key = pyre_object::gc_roots::shadow_stack_get(keys_sp + i);
+        if !unsafe { pyre_object::is_str(key) }
+            || unsafe { pyre_object::w_str_len(key) == 0 }
+        {
+            continue;
+        }
+        let value = match crate::baseobjspace::getitem(
+            pyre_object::gc_roots::shadow_stack_get(sp + 1),
+            key,
+        ) {
+            Ok(value) => value,
+            Err(err) if err.kind == crate::PyErrorKind::KeyError => continue,
+            Err(err) => return Err(err),
+        };
+        pyre_object::gc_roots::pin_root(value);
         parts.push(format!(
             "{}={}",
-            unsafe { crate::display::py_str(key(i))? },
-            unsafe { crate::display::py_repr(value(i))? }
+            unsafe { crate::display::py_str(key)? },
+            unsafe {
+                crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(
+                    pyre_object::gc_roots::shadow_stack_len() - 1,
+                ))?
+            }
         ));
     }
-    Ok(w_str_new(&format!("namespace({})", parts.join(", "))))
+    Ok(w_str_new(&format!("{name}({})", parts.join(", "))))
 }
 
 /// `_structseq.py:185 SimpleNamespace.__eq__` — structural over `__dict__`
 /// when `other` is a namespace, NotImplemented otherwise.
 fn simple_namespace_eq(args: &[PyObjectRef]) -> crate::PyResult {
-    simple_namespace_richcompare(args, "__eq__", false)
+    simple_namespace_richcompare(args, "__eq__", crate::baseobjspace::CompareOp::Eq)
 }
 
 /// `_structseq.py:190 SimpleNamespace.__ne__`.
 fn simple_namespace_ne(args: &[PyObjectRef]) -> crate::PyResult {
-    simple_namespace_richcompare(args, "__ne__", true)
+    simple_namespace_richcompare(args, "__ne__", crate::baseobjspace::CompareOp::Ne)
 }
 
-fn simple_namespace_richcompare(args: &[PyObjectRef], name: &str, negate: bool) -> crate::PyResult {
+fn simple_namespace_lt(args: &[PyObjectRef]) -> crate::PyResult {
+    simple_namespace_richcompare(args, "__lt__", crate::baseobjspace::CompareOp::Lt)
+}
+
+fn simple_namespace_le(args: &[PyObjectRef]) -> crate::PyResult {
+    simple_namespace_richcompare(args, "__le__", crate::baseobjspace::CompareOp::Le)
+}
+
+fn simple_namespace_gt(args: &[PyObjectRef]) -> crate::PyResult {
+    simple_namespace_richcompare(args, "__gt__", crate::baseobjspace::CompareOp::Gt)
+}
+
+fn simple_namespace_ge(args: &[PyObjectRef]) -> crate::PyResult {
+    simple_namespace_richcompare(args, "__ge__", crate::baseobjspace::CompareOp::Ge)
+}
+
+fn simple_namespace_richcompare(
+    args: &[PyObjectRef],
+    name: &str,
+    op: crate::baseobjspace::CompareOp,
+) -> crate::PyResult {
     // `def __eq__(self, other)` — a missing argument is an arity error, not a
     // NotImplemented result.
     let (Some(&self_obj), Some(&other)) = (args.first(), args.get(1)) else {
@@ -256,15 +372,123 @@ fn simple_namespace_richcompare(args: &[PyObjectRef], name: &str, negate: bool) 
             if args.is_empty() { "self" } else { "other" }
         )));
     };
-    if !unsafe { crate::baseobjspace::isinstance_w(other, simple_namespace_type()) } {
+    let other_type = crate::typedef::r#type(other)
+        .map(|tp| tp.as_ptr())
+        .unwrap_or(PY_NULL);
+    if !unsafe { crate::baseobjspace::issubtype_w(other_type, simple_namespace_type()) } {
         return Ok(w_not_implemented());
     }
-    // `self.__dict__ == other.__dict__` — read through the descriptor so a
-    // subclass `__dict__` override is honoured, as PyPy's attribute access is.
+    // CPython 3.14 forwards all six operations to the two namespace dicts.
+    // In particular, ordering reaches dict's TypeError instead of returning
+    // NotImplemented from the namespace type itself.
     let self_dict = crate::baseobjspace::getattr_str(self_obj, "__dict__")?;
     let other_dict = crate::baseobjspace::getattr_str(other, "__dict__")?;
-    let equal = crate::baseobjspace::eq_w(self_dict, other_dict)?;
-    Ok(w_bool_from(equal ^ negate))
+    crate::baseobjspace::compare(self_dict, other_dict, op)
+}
+
+/// CPython 3.14 `namespace_reduce`: `(type(self), (), self.__dict__)`.
+fn simple_namespace_reduce(args: &[PyObjectRef]) -> crate::PyResult {
+    let Some(&self_obj) = args.first() else {
+        return Err(crate::PyError::type_error(
+            "__reduce__() missing 1 required positional argument: 'self'",
+        ));
+    };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_obj);
+    let w_type = crate::typedef::r#type(self_obj)
+        .map(|tp| tp.as_ptr())
+        .unwrap_or(PY_NULL);
+    pyre_object::gc_roots::pin_root(w_type);
+    let w_args = w_tuple_new(Vec::new());
+    pyre_object::gc_roots::pin_root(w_args);
+    let w_dict = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(sp),
+        "__dict__",
+    )?;
+    pyre_object::gc_roots::pin_root(w_dict);
+    Ok(w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(sp + 1),
+        pyre_object::gc_roots::shadow_stack_get(sp + 2),
+        pyre_object::gc_roots::shadow_stack_get(sp + 3),
+    ]))
+}
+
+/// CPython 3.14 `namespace_replace`: construct `type(self)()` first, require
+/// that its actual type remains a SimpleNamespace subtype, copy the source
+/// dict, then overlay keyword changes.
+fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let Some(&self_obj) = positional.first() else {
+        return Err(crate::PyError::type_error(
+            "__replace__() missing 1 required positional argument: 'self'",
+        ));
+    };
+    if positional.len() != 1 {
+        return Err(crate::PyError::type_error(
+            "__replace__() takes no positional arguments",
+        ));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_obj);
+    if let Some(kwargs) = kwargs {
+        pyre_object::gc_roots::pin_root(kwargs);
+    }
+    let self_type = crate::typedef::r#type(self_obj)
+        .map(|tp| tp.as_ptr())
+        .unwrap_or(PY_NULL);
+    pyre_object::gc_roots::pin_root(self_type);
+    let result = crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(
+            sp + 1 + usize::from(kwargs.is_some()),
+        ),
+        &[],
+    )?;
+    pyre_object::gc_roots::pin_root(result);
+    let result = pyre_object::gc_roots::shadow_stack_get(
+        sp + 2 + usize::from(kwargs.is_some()),
+    );
+    let result_type = crate::typedef::r#type(result)
+        .map(|tp| tp.as_ptr())
+        .unwrap_or(PY_NULL);
+    if !unsafe { crate::baseobjspace::issubtype_w(result_type, simple_namespace_type()) } {
+        let constructed = unsafe {
+            crate::baseobjspace::type_fully_qualified_name(
+                pyre_object::gc_roots::shadow_stack_get(
+                    sp + 1 + usize::from(kwargs.is_some()),
+                ),
+            )
+        };
+        let returned = if result_type.is_null() {
+            "object"
+        } else {
+            unsafe { w_type_get_name(result_type) }
+        };
+        return Err(crate::PyError::type_error(format!(
+            "expect types.SimpleNamespace type, but {constructed}() returned '{returned}' object"
+        )));
+    }
+    let source_dict = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(sp),
+        "__dict__",
+    )?;
+    pyre_object::gc_roots::pin_root(source_dict);
+    namespace_update_dict(
+        result,
+        pyre_object::gc_roots::shadow_stack_get(
+            sp + 3 + usize::from(kwargs.is_some()),
+        ),
+        false,
+    )?;
+    if kwargs.is_some() {
+        namespace_update_dict(
+            result,
+            pyre_object::gc_roots::shadow_stack_get(sp + 1),
+            true,
+        )?;
+    }
+    Ok(result)
 }
 
 /// `pypy/module/sys/vm.py:217 space.getexecutioncontext()` access for
