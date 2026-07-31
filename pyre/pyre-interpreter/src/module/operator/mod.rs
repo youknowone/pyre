@@ -132,19 +132,66 @@ use crate::baseobjspace::{
     matmul, mod_, mul, neg, or_, pos, pow, rshift, setitem, sub, truediv, xor,
 };
 
+/// `countOf(a, b)` — number of times `b` occurs in `a`, counting `x is b or
+/// x == b` while iterating `a` through the iterator protocol.
+fn op_countof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let iterator = baseobjspace::iter(args[0])?;
+    let mut count = 0i64;
+    loop {
+        match baseobjspace::next(iterator) {
+            Ok(item) => {
+                if std::ptr::eq(item, args[1])
+                    || is_true(baseobjspace::compare(item, args[1], CompareOp::Eq)?)?
+                {
+                    count += 1;
+                }
+            }
+            Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(w_int_new(count))
+}
+
+/// `indexOf(a, b)` — first index `i` where `a[i] is b or a[i] == b`, iterating
+/// `a` through the iterator protocol; a miss raises
+/// `ValueError('sequence.index(x): x not in sequence')`.
+fn op_indexof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let iterator = baseobjspace::iter(args[0])?;
+    let mut index = 0i64;
+    loop {
+        match baseobjspace::next(iterator) {
+            Ok(item) => {
+                if std::ptr::eq(item, args[1])
+                    || is_true(baseobjspace::compare(item, args[1], CompareOp::Eq)?)?
+                {
+                    return Ok(w_int_new(index));
+                }
+                index += 1;
+            }
+            Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(crate::PyError::value_error(
+        "sequence.index(x): x not in sequence",
+    ))
+}
+
 crate::py_module! {
     "operator",
-    // `countOf` + the `itemgetter`/`attrgetter`/`methodcaller` callable
-    // classes are app-level (`pypy/module/operator/app_operator.py`,
-    // `moduledef.py` `app_names`), not interp-level.  `indexOf`/`inv`/
-    // `is_none`/`is_not_none`/`call` follow the `operator.py` pure-Python
-    // definitions verbatim (`call`'s `**kwargs` forwarding is awkward to
-    // express interp-level).  `concat` is interp-level (`op_concat`,
-    // `interp_operator.py:20`) so it guards both operands for `__getitem__`.
+    // Only the `itemgetter`/`attrgetter`/`methodcaller` callable factory
+    // classes stay app-level (`pypy/module/operator/app_operator.py`,
+    // `moduledef.py` `app_names`); a factory class cannot be expressed as a
+    // plain interp-level function.  `countOf`/`indexOf`/`inv`/`is_none`/
+    // `is_not_none`/`call` live in the `functions:` block below so they
+    // register as non-binding `BuiltinFunction` (no `__get__`), instead of
+    // globals-bearing app-level functions that bind `self` when stored on a
+    // class.  `concat` is interp-level (`op_concat`, `interp_operator.py:20`)
+    // so it guards both operands for `__getitem__`.
     appleveldefs: {
         "app_operator.py" => [
-            "countOf", "itemgetter", "attrgetter", "methodcaller",
-            "indexOf", "inv", "is_none", "is_not_none", "call",
+            "itemgetter", "attrgetter", "methodcaller",
         ],
     },
     functions: {
@@ -161,6 +208,8 @@ crate::py_module! {
         "pos"      / 1 = |args| pos(args[0]),
         "abs"      / 1 = |args| crate::builtins::builtin_abs(args),
         "invert"   / 1 = |args| invert(args[0]),
+        // `inv` is the historical spelling of `invert` — same as `~a`.
+        "inv"      / 1 = |args| invert(args[0]),
         "lshift"   / 2 = |args| lshift(args[0], args[1]),
         "rshift"   / 2 = |args| rshift(args[0], args[1]),
         "and_"     / 2 = |args| and_(args[0], args[1]),
@@ -187,7 +236,22 @@ crate::py_module! {
         "truth"    / 1 = |args| Ok(w_bool_from(is_true(args[0])?)),
         "is_"      / 2 = |args| Ok(w_bool_from(std::ptr::eq(args[0], args[1]))),
         "is_not"   / 2 = |args| Ok(w_bool_from(!std::ptr::eq(args[0], args[1]))),
+        "is_none"     / 1 = |args| Ok(w_bool_from(std::ptr::eq(args[0], w_none()))),
+        "is_not_none" / 1 = |args| Ok(w_bool_from(!std::ptr::eq(args[0], w_none()))),
         "contains" / 2 = |args| Ok(w_bool_from(contains(args[0], args[1])?)),
+        "countOf"  / 2 = op_countof,
+        "indexOf"  / 2 = op_indexof,
+        // `call(obj, /, *args, **kwargs)` == `obj(*args, **kwargs)`.
+        // `call_forwarding_args` re-splits the `__pyre_kw__` marker back into
+        // keyword arguments before dispatching.
+        "call"     / * = |args: &[PyObjectRef]| {
+            if args.is_empty() {
+                return Err(crate::PyError::type_error(
+                    "call expected at least 1 argument, got 0",
+                ));
+            }
+            crate::builtins::call_forwarding_args(args[0], &args[1..])
+        },
         "getitem"  / 2 = |args| getitem(args[0], args[1]),
         "setitem"  / 3 = |args| { setitem(args[0], args[1], args[2])?; Ok(w_none()) },
         "delitem"  / 2 = |args| { delitem(args[0], args[1])?; Ok(w_none()) },

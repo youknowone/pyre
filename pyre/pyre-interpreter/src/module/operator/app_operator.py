@@ -6,44 +6,6 @@
 __name__ = 'operator'
 
 
-def countOf(a, b):
-    'countOf(a, b) -- Return the number of times b occurs in a.'
-    count = 0
-    for x in a:
-        if x is b or x == b:
-            count += 1
-    return count
-
-
-def indexOf(a, b):
-    "Return the first index of b in a."
-    for i, j in enumerate(a):
-        if j is b or j == b:
-            return i
-    else:
-        raise ValueError('sequence.index(x): x not in sequence')
-
-
-def inv(a):
-    "Same as ~a."
-    return ~a
-
-
-def is_none(a):
-    "Same as a is None."
-    return a is None
-
-
-def is_not_none(a):
-    "Same as a is not None."
-    return a is not None
-
-
-def call(obj, /, *args, **kwargs):
-    "Same as obj(*args, **kwargs)."
-    return obj(*args, **kwargs)
-
-
 class attrgetter(object):
     """
     Return a callable object that fetches the given attribute(s) from its operand.
