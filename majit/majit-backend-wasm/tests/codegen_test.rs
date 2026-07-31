@@ -167,6 +167,72 @@ fn terminal_declined_call_assembler_matches_dynasm_at_runtime() {
     );
 }
 
+#[test]
+#[ignore = "runtime integration test: needs the release pyre-dynasm, pyre-wasm-runner, and wasm-host module; \
+            run via `cargo test -- --ignored` in the check.py job, which builds them"]
+fn wasm_outlier_bridges_stay_compiled_at_runtime() {
+    let root = workspace_root();
+    let dynasm = root.join("target/release/pyre-dynasm");
+    let wasm_runner = root.join("target/release/pyre-wasm-runner");
+    let host_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wasm");
+    let plain_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm");
+    let wasm_module = if host_module.exists() {
+        host_module
+    } else {
+        plain_module
+    };
+
+    for artifact in [&dynasm, &wasm_runner, &wasm_module] {
+        assert!(
+            artifact.exists(),
+            "runtime outlier regression needs {}; build the requested dynasm and wasm-host artifacts first",
+            artifact.display()
+        );
+    }
+
+    let module = wasm_module.to_str().expect("workspace paths must be UTF-8");
+    for (bench, expected_counter) in [
+        ("exception_oserror_fields.py", "BRIDGE_OK"),
+        ("generator_tree_recursion.py", "accepted_ca"),
+    ] {
+        let script = root.join("pyre/bench/synth").join(bench);
+        let dynasm_run = run_runtime_program(&dynasm, &script, &[]);
+        assert!(dynasm_run.status.success(), "dynasm failed for {bench}");
+        let wasm_run = run_runtime_program(
+            &wasm_runner,
+            &script,
+            &[
+                ("PYRE_WASM_MODULE", module),
+                ("PYRE_WASM_ENGINE", "wasmtime"),
+                ("PYRE_WASM_JIT_STATS", "1"),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&wasm_run.stderr);
+        assert!(
+            wasm_run.status.success(),
+            "wasm failed for {bench}:\n{stderr}"
+        );
+        assert_eq!(
+            wasm_run.stdout, dynasm_run.stdout,
+            "wasm output diverged from dynasm for {bench}:\n{stderr}"
+        );
+        assert!(
+            stat_value(&stderr, expected_counter) > 0,
+            "{bench} did not compile its formerly-declined bridge:\n{stderr}"
+        );
+        assert_eq!(
+            stat_value(&stderr, "ml_unsafe_label"),
+            0,
+            "{bench} declined a LABEL resume:\n{stderr}"
+        );
+        assert_eq!(
+            stat_value(&stderr, "decl_callasm"),
+            0,
+            "{bench} declined a CALL_ASSEMBLER bridge:\n{stderr}"
+        );
+    }
+}
+
 fn make_op(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
     let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
     let op = Op::new(opcode, &bx);
@@ -200,6 +266,24 @@ fn build_module(
     vtable_offset: Option<usize>,
     gc_info: &codegen::GuardGcTypeInfo,
 ) -> (Vec<u8>, Vec<codegen::GuardExit>) {
+    build_module_with_frame(
+        inputargs,
+        ops,
+        constants,
+        vtable_offset,
+        gc_info,
+        codegen::FrameGeometry::fixed(),
+    )
+}
+
+fn build_module_with_frame(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    constants: &indexmap::IndexMap<u32, i64>,
+    vtable_offset: Option<usize>,
+    gc_info: &codegen::GuardGcTypeInfo,
+    frame: codegen::FrameGeometry,
+) -> (Vec<u8>, Vec<codegen::GuardExit>) {
     let (bytes, guards, _, _, _) = codegen::build_wasm_module(
         inputargs,
         ops,
@@ -215,7 +299,7 @@ fn build_module(
         0,    // fail_index_base
         0,    // external_jump_slot
         0,    // external_jump_key
-        codegen::FrameGeometry::fixed(),
+        frame,
         codegen::CaParams::default(),
     )
     .expect("wasm codegen should succeed");
@@ -912,6 +996,60 @@ fn test_single_label_peeled_loop_validates() {
 }
 
 #[test]
+fn test_peeled_label_captures_missing_ref_livein_in_frozen_frame() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        // The Ref input remains live in the body but is intentionally absent
+        // from the semantic LABEL args: it must be restored from a GC-rooted
+        // backend capture home on bridge re-entry.
+        Op::new(OpCode::Label, &[rb(OpRef::int_op(2))]),
+        make_guard(
+            OpCode::GuardNonnull,
+            &[OpRef::input_arg_ref(0)],
+            &[OpRef::input_arg_ref(0), OpRef::int_op(2)],
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(3))]),
+    ];
+
+    assert!(codegen::is_resumable_peeled(&ops));
+    assert_eq!(codegen::label_ref_capture_slots(&inputargs, &ops), 1);
+    let ordinary_homes = codegen::count_ref_homes(&inputargs, &ops);
+    let frame = codegen::FrameGeometry::compact(
+        codegen::frame_value_slots(&inputargs, &ops),
+        ordinary_homes + 1,
+        1,
+    );
+    assert_eq!(
+        codegen::label_resume_info(&inputargs, &ops, frame),
+        vec![(true, true)]
+    );
+    assert_eq!(frame.ordinary_home_slots(), ordinary_homes);
+    let (bytes, guards) = build_module_with_frame(
+        &inputargs,
+        &ops,
+        &indexmap::IndexMap::new(),
+        Some(0),
+        &codegen::GuardGcTypeInfo::default(),
+        frame,
+    );
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+}
+
+#[test]
 fn test_multi_label_peeled_resumes_at_last_label_validates() {
     // A MULTI-label peeled loop: a preamble precedes an outer entry LABEL and
     // the inner loop-header LABEL. `is_single_label_peeled` is false (two
@@ -1120,6 +1258,7 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
             },
             0,
             None, // nursery: the inline bump is off, so only the helper choice shows
+            0,
             0,
             0,
             0,

@@ -146,9 +146,13 @@ pub struct LabelTarget {
     /// The label's arg count — the resume loader reads exactly this many
     /// positional frame slots, so the JUMP arity must equal it.
     pub num_args: usize,
-    /// Whether the label's args are the complete live set of the owning
-    /// trace's remainder (`codegen::label_resume_safety`).
+    /// Whether every live-in can be reconstructed from LABEL args or frozen
+    /// backend capture slots (`codegen::label_resume_info`).
     pub resume_safe: bool,
+    /// Backend capture slots are populated by this target loop's own
+    /// fall-through path. If true, a bridge may resume only its source loop,
+    /// not a sibling specialization that happens to share the geometry.
+    pub requires_own_frame: bool,
     /// Whether this is the owning loop's LAST label (the loop header). A
     /// bridge landing here re-runs no segment code before the `loop`, so the
     /// livelock advance-check applies; earlier labels execute the peeled
@@ -424,7 +428,9 @@ pub fn publish_label_target(descr_id: usize, target: LabelTarget) {
 /// guard that lives inside an already-chained bridge: the failing guard's
 /// meta descr carries `(trace_id, per-trace fail_index)`, and this record
 /// supplies the owning bridge's cell array and livelock advance flags — the
-/// same data `CompiledWasmLoop` holds for the loop's own guards.
+/// same data `CompiledWasmLoop` holds for the loop's own guards.  It also
+/// publishes whether another bridge may safely compose a CALL_ASSEMBLER arm
+/// while executing on this bridge's shared frozen frame.
 pub struct ChainedTraceMeta {
     /// Base address of the bridge's per-guard bridge-slot cell array
     /// (`CompiledWasmLoop::bridge_cells_base` analog); `0` = no dispatch.
@@ -434,6 +440,10 @@ pub struct ChainedTraceMeta {
     /// Per-guard, per-fail-arg induction-advance flags
     /// (`CompiledWasmLoop::guard_fail_arg_advanced` analog).
     pub guard_fail_arg_advanced: Vec<Vec<bool>>,
+    /// This bridge contains no host-trampoline lowering, so a nested bridge's
+    /// movable CALL_ASSEMBLER callee cannot strand a stale source-frame
+    /// pointer when control returns here.
+    pub ca_reentry_safe: bool,
 }
 
 /// Compiled wasm loop metadata, stored in `JitCellToken.compiled`.

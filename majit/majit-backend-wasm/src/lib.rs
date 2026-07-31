@@ -1763,9 +1763,11 @@ impl majit_backend::Backend for WasmBackend {
         // geometry for both the loop and each nursery-allocated self callee.
         let raw_frame_value_slots = codegen::frame_value_slots(inputargs, ops);
         let raw_num_ref_homes = codegen::count_ref_homes(inputargs, ops);
+        let label_ref_slots = codegen::label_ref_capture_slots(inputargs, ops);
         let frame = codegen::FrameGeometry::compact(
             raw_frame_value_slots.max(FROZEN_CHAIN_VALUE_SLOTS),
-            raw_num_ref_homes.max(FROZEN_CHAIN_REF_HOMES),
+            raw_num_ref_homes.max(FROZEN_CHAIN_REF_HOMES) + label_ref_slots,
+            label_ref_slots,
         );
         let input_types: Vec<majit_ir::Type> = inputargs.iter().map(|ia| ia.tp).collect();
         // Count with CA direct-lowering enabled.  This is the safety census
@@ -1962,7 +1964,7 @@ impl majit_backend::Backend for WasmBackend {
         // arg count and the label's args are the complete live set of the
         // trace remainder.
         let label_num_args = codegen::label_arg_counts(ops);
-        let label_resume_safe = codegen::label_resume_safety(ops);
+        let label_resume_info = codegen::label_resume_info(inputargs, ops, frame);
         // Per-guard, per-fail-arg induction-advance flags for
         // `compile_bridge`'s livelock check (see `guard_fail_args_advanced`).
         let guard_fail_arg_advanced = guard_fail_args_advanced(ops, &guard_exits);
@@ -1988,7 +1990,8 @@ impl majit_backend::Backend for WasmBackend {
                         func_handle,
                         key: j as u32 + 1,
                         num_args: label_num_args[j],
-                        resume_safe: label_resume_safe[j],
+                        resume_safe: label_resume_info[j].0,
+                        requires_own_frame: label_resume_info[j].1,
                         is_last_label: j == last,
                         frame,
                     },
@@ -2010,6 +2013,7 @@ impl majit_backend::Backend for WasmBackend {
                         key: 0,
                         num_args: inputargs.len(),
                         resume_safe: true,
+                        requires_own_frame: false,
                         // No real ops precede a non-peeled loop's header, so
                         // an entry re-run lands at the header without any
                         // advancing segment — the livelock check applies.
@@ -2175,7 +2179,7 @@ impl majit_backend::Backend for WasmBackend {
         // `original_token` is released before the `&mut self` codegen calls.
         let (
             source_guard,
-            source_is_direct,
+            source_ca_reentry_safe,
             source_func_handle,
             source_has_preamble,
             source_frame,
@@ -2199,35 +2203,42 @@ impl majit_backend::Backend for WasmBackend {
             // per-fail-arg advance flags. `None` = foreign trace (declined
             // below, diag 3).
             let is_direct = source_trace_id == source_loop.trace_id;
-            let guard = if is_direct {
-                Some((
-                    source_loop.bridge_cells_base,
-                    source_loop.num_guard_cells,
-                    source_loop
-                        .guard_fail_arg_advanced
-                        .get(source_fail_index as usize)
-                        .cloned()
-                        .unwrap_or_default(),
-                ))
+            let (guard, ca_reentry_safe) = if is_direct {
+                (
+                    Some((
+                        source_loop.bridge_cells_base,
+                        source_loop.num_guard_cells,
+                        source_loop
+                            .guard_fail_arg_advanced
+                            .get(source_fail_index as usize)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )),
+                    true,
+                )
             } else {
-                source_loop
+                match source_loop
                     .chained_trace_meta
                     .borrow()
                     .get(&source_trace_id)
-                    .map(|m| {
-                        (
+                {
+                    Some(m) => (
+                        Some((
                             m.cells_base,
                             m.num_cells,
                             m.guard_fail_arg_advanced
                                 .get(source_fail_index as usize)
                                 .cloned()
                                 .unwrap_or_default(),
-                        )
-                    })
+                        )),
+                        m.ca_reentry_safe,
+                    ),
+                    None => (None, false),
+                }
             };
             (
                 guard,
-                is_direct,
+                ca_reentry_safe,
                 source_loop.func_handle,
                 source_loop.has_preamble,
                 source_loop.frame,
@@ -2254,9 +2265,13 @@ impl majit_backend::Backend for WasmBackend {
                 "wasm backend: bridge source guard index has no dispatch cell".into(),
             ));
         }
-        // Keep CA bridges attached directly to their source loop. Nested
-        // bridge metadata is not yet published as a CALL_ASSEMBLER target.
-        let mut allow_ca = ca_candidate && source_is_direct;
+        // A nested bridge may compose CALL_ASSEMBLER only when its owning
+        // bridge published that it has no host-trampoline lowering.  Merely
+        // finding the nested guard's cell is insufficient: after a movable
+        // callee returns, a trampoline-bearing source would retain a stale
+        // frame pointer. Direct loop guards satisfy the same condition through
+        // the token-wide trampoline census below.
+        let mut allow_ca = ca_candidate && source_ca_reentry_safe;
         let ca_trampoline_decline = if allow_ca && source_has_trampoline_calls {
             Some(
                 "wasm backend: self-recursive CA source token or chained bridge \
@@ -2292,7 +2307,7 @@ impl majit_backend::Backend for WasmBackend {
         let bridge_value_slots = codegen::frame_value_slots(inputargs, ops);
         let bridge_ref_homes = codegen::count_ref_homes(inputargs, ops);
         if bridge_value_slots > source_frame.value_slots
-            || bridge_ref_homes > source_frame.home_slots
+            || bridge_ref_homes > source_frame.ordinary_home_slots()
             || (source_ca_active && bridge_has_trampoline_calls)
         {
             if source_ca_active && bridge_has_trampoline_calls {
@@ -2310,7 +2325,8 @@ impl majit_backend::Backend for WasmBackend {
             return Err(BackendError::Unsupported(format!(
                 "wasm backend: bridge frame needs values={bridge_value_slots}, homes={bridge_ref_homes}; \
                  source frozen layout has values={}, homes={}",
-                source_frame.value_slots, source_frame.home_slots,
+                source_frame.value_slots,
+                source_frame.ordinary_home_slots(),
             )));
         }
 
@@ -2387,6 +2403,12 @@ impl majit_backend::Backend for WasmBackend {
                 }
                 Some(t) if !t.resume_safe => {
                     diag_bump(9); // label args not the full live set
+                    false
+                }
+                Some(t) if t.requires_own_frame && t.func_handle != source_func_handle => {
+                    // The target's high capture homes were populated by its
+                    // own fall-through path, not by this sibling source loop.
+                    diag_bump(9);
                     false
                 }
                 Some(t) if t.frame != source_frame => {
@@ -2644,6 +2666,7 @@ impl majit_backend::Backend for WasmBackend {
                     cells_base: bridge_cells_base,
                     num_cells: guard_exits.len(),
                     guard_fail_arg_advanced: guard_fail_args_advanced(ops, &guard_exits),
+                    ca_reentry_safe: !bridge_has_trampoline_calls,
                 },
             );
             // The bridge module lives as long as this source loop, so hand its

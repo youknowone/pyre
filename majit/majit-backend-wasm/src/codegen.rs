@@ -62,6 +62,12 @@ pub struct FrameGeometry {
     pub home_slot_base: u64,
     /// Number of Ref-home slots the layout reserves.
     pub home_slots: usize,
+    /// Number of slots at the END of the Ref-home region reserved for
+    /// resume-at-LABEL live-ins.  Ordinary per-trace Ref homes grow upward
+    /// from `home_slot_base`; these captures grow from the frozen boundary and
+    /// therefore survive execution of a chained bridge, whose own home map may
+    /// use the low slots.  The whole home region remains covered by jf_gcmap.
+    pub label_ref_slots: usize,
     /// Bytes through the end of Ref homes. CA callee frames allocate exactly
     /// this many item bytes; the tail call area is intentionally omitted.
     pub ca_frame_bytes: u32,
@@ -85,6 +91,7 @@ impl FrameGeometry {
             dispatch_key_ofs: DISPATCH_KEY_OFS,
             home_slot_base: HOME_SLOT_BASE,
             home_slots: 0,
+            label_ref_slots: 0,
             ca_frame_bytes: HOME_SLOT_BASE as u32,
             frame_bytes: (MIN_FRAME_BYTES + SLOT_SIZE as usize) as u32,
         }
@@ -95,7 +102,8 @@ impl FrameGeometry {
     /// `value_slots` includes frame[0].  The trailing call area is always
     /// present, even for direct-only source traces, because later bridges are
     /// compiled against this immutable geometry.
-    pub fn compact(value_slots: usize, home_slots: usize) -> Self {
+    pub fn compact(value_slots: usize, home_slots: usize, label_ref_slots: usize) -> Self {
+        debug_assert!(label_ref_slots <= home_slots);
         let value_slots = value_slots.max(1);
         let dispatch_key_ofs = (value_slots as u64) * SLOT_SIZE;
         let home_slot_base = dispatch_key_ofs + SLOT_SIZE;
@@ -114,9 +122,17 @@ impl FrameGeometry {
             dispatch_key_ofs,
             home_slot_base,
             home_slots,
+            label_ref_slots,
             ca_frame_bytes: ca_frame_bytes as u32,
             frame_bytes: frame_bytes as u32,
         }
+    }
+
+    /// Low Ref homes available to the trace currently executing on this
+    /// geometry.  The high `label_ref_slots` belong to the source loop's LABEL
+    /// capture plan and must not be cleared or reused by a chained bridge.
+    pub const fn ordinary_home_slots(self) -> usize {
+        self.home_slots - self.label_ref_slots
     }
 }
 
@@ -367,7 +383,12 @@ impl RefHomes {
         }
     }
 
-    fn collect(inputargs: &[InputArg], ops: &[Op], include_ca_collects: bool) -> Self {
+    fn collect(
+        inputargs: &[InputArg],
+        ops: &[Op],
+        include_ca_collects: bool,
+        forced_refs: &[OpRef],
+    ) -> Self {
         let liveness = HomeLiveness::collect(inputargs, ops);
         let collect_positions = collecting_call_positions(ops, include_ca_collects);
         let ref_values = RefValues::collect(inputargs, ops);
@@ -400,6 +421,15 @@ impl RefHomes {
                         Self::assign(&mut by_id, &mut next, arg.raw());
                     }
                 }
+            }
+        }
+        // Resume-at-LABEL Ref captures must also have an ordinary home.  The
+        // high capture slot preserves the value while another bridge executes
+        // on this frame; the ordinary home participates in the existing
+        // post-collection local reload machinery once the target resumes.
+        for &r in forced_refs {
+            if ref_values.contains(r) {
+                Self::assign(&mut by_id, &mut next, r.raw());
             }
         }
         RefHomes {
@@ -440,6 +470,180 @@ impl RefHomes {
     }
 }
 
+#[derive(Clone, Copy)]
+enum LabelCaptureStorage {
+    /// Absolute frame value-slot index (slot zero is the fail index).
+    ValueSlot(usize),
+    /// Ordinal within the high, GC-rooted LABEL-capture home region.
+    RefSlot(usize),
+}
+
+/// Backend-only preservation plan for values that remain live across a peeled
+/// LABEL without appearing in that LABEL's semantic argument list.  RPython's
+/// assembler keeps such values in the frozen frame; wasm locals disappear on
+/// a tail-call re-entry, so we explicitly mirror that storage shape here.
+struct LabelResumeData {
+    per_label: Vec<Vec<OpRef>>,
+    uncapturable: Vec<bool>,
+    capture_by_id: Vec<Option<LabelCaptureStorage>>,
+    captured_refs: Vec<OpRef>,
+    scalar_slots: usize,
+    ref_slots: usize,
+}
+
+impl LabelResumeData {
+    fn collect(inputargs: &[InputArg], ops: &[Op]) -> Self {
+        let (_, num_vars) = collect_guards_and_vars(inputargs, ops);
+        let ref_values = RefValues::collect(inputargs, ops);
+        let normal_value_slots = normal_frame_value_slots(inputargs, ops);
+        let mut has_producer = vec![false; num_vars as usize];
+        let mut is_input = vec![false; num_vars as usize];
+        for ia in inputargs {
+            if let Some(v) = is_input.get_mut(ia.index as usize) {
+                *v = true;
+            }
+        }
+        for op in ops {
+            let r = op.pos.get();
+            if r != OpRef::NONE && !r.is_constant() {
+                if let Some(v) = has_producer.get_mut(r.raw() as usize) {
+                    *v = true;
+                }
+            }
+        }
+        let mut per_label = Vec::new();
+        let mut uncapturable = Vec::new();
+
+        for (label_pos, label) in ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| op.opcode == OpCode::Label)
+        {
+            let mut available = vec![false; num_vars as usize];
+            let mut defined_before = vec![false; num_vars as usize];
+            // Producer-less value ids are folded constant-pool seeds. Codegen
+            // binds them before the entry dispatch, so they dominate both the
+            // key-0 path and every LABEL resume and need no frame capture.
+            for (id, produced) in has_producer.iter().copied().enumerate() {
+                if !produced && !is_input[id] {
+                    available[id] = true;
+                    defined_before[id] = true;
+                }
+            }
+            for ia in inputargs {
+                if let Some(v) = defined_before.get_mut(ia.index as usize) {
+                    *v = true;
+                }
+            }
+            for op in &ops[..label_pos] {
+                let r = op.pos.get();
+                if r != OpRef::NONE && !r.is_constant() {
+                    if let Some(v) = defined_before.get_mut(r.raw() as usize) {
+                        *v = true;
+                    }
+                }
+            }
+            for arg in label.getarglist() {
+                let r = arg.to_opref();
+                if r != OpRef::NONE && !r.is_constant() {
+                    if let Some(v) = available.get_mut(r.raw() as usize) {
+                        *v = true;
+                    }
+                }
+            }
+
+            let mut missing = Vec::new();
+            let mut bad = false;
+            for op in &ops[label_pos + 1..] {
+                let mut reads: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+                if let Some(failargs) = op.getfailargs() {
+                    reads.extend(failargs.iter().map(|a| a.to_opref()));
+                }
+                for r in reads {
+                    if r == OpRef::NONE || r.is_constant() {
+                        continue;
+                    }
+                    let id = r.raw() as usize;
+                    if !available.get(id).copied().unwrap_or(false) {
+                        if !defined_before.get(id).copied().unwrap_or(false) {
+                            bad = true;
+                            continue;
+                        }
+                        missing.push(r);
+                        if let Some(v) = available.get_mut(id) {
+                            *v = true;
+                        }
+                    }
+                }
+                let r = op.pos.get();
+                if r != OpRef::NONE && !r.is_constant() {
+                    if let Some(v) = available.get_mut(r.raw() as usize) {
+                        *v = true;
+                    }
+                }
+            }
+            per_label.push(missing);
+            uncapturable.push(bad);
+        }
+
+        let mut capture_by_id = vec![None; num_vars as usize];
+        let mut captured_refs = Vec::new();
+        let mut scalar_slots = 0usize;
+        let mut ref_slots = 0usize;
+        for &r in per_label.iter().flatten() {
+            let id = r.raw() as usize;
+            if capture_by_id[id].is_some() {
+                continue;
+            }
+            let storage = if ref_values.contains(r) {
+                captured_refs.push(r);
+                let slot = LabelCaptureStorage::RefSlot(ref_slots);
+                ref_slots += 1;
+                slot
+            } else {
+                let slot = LabelCaptureStorage::ValueSlot(normal_value_slots + scalar_slots);
+                scalar_slots += 1;
+                slot
+            };
+            capture_by_id[id] = Some(storage);
+        }
+
+        Self {
+            per_label,
+            uncapturable,
+            capture_by_id,
+            captured_refs,
+            scalar_slots,
+            ref_slots,
+        }
+    }
+
+    fn storage(&self, r: OpRef) -> Option<LabelCaptureStorage> {
+        self.capture_by_id.get(r.raw() as usize).copied().flatten()
+    }
+
+    fn supported_by(&self, frame: FrameGeometry) -> bool {
+        self.ref_slots <= frame.label_ref_slots
+            && self
+                .capture_by_id
+                .iter()
+                .flatten()
+                .all(|storage| match storage {
+                    LabelCaptureStorage::ValueSlot(slot) => *slot < frame.value_slots,
+                    LabelCaptureStorage::RefSlot(slot) => *slot < frame.label_ref_slots,
+                })
+    }
+
+    fn frame_offset(&self, storage: LabelCaptureStorage, frame: FrameGeometry) -> u64 {
+        match storage {
+            LabelCaptureStorage::ValueSlot(slot) => slot as u64 * SLOT_SIZE,
+            LabelCaptureStorage::RefSlot(slot) => {
+                frame.home_slot_base + (frame.ordinary_home_slots() + slot) as u64 * SLOT_SIZE
+            }
+        }
+    }
+}
+
 /// Number of Ref-home slots a trace with these `inputargs`/`ops` reserves,
 /// matching the `num_ref_homes` [`build_wasm_module`] returns. Lets a CA-arena
 /// caller size the callee frame and the GC walker for a (wider) bridge's home
@@ -447,7 +651,13 @@ impl RefHomes {
 pub fn count_ref_homes(inputargs: &[InputArg], ops: &[Op]) -> usize {
     // This pre-sizing query is used for CA bridges before `CaParams` exists, so
     // count CALL_ASSEMBLER as a collecting position to match CA codegen.
-    RefHomes::collect(inputargs, ops, true).len()
+    let resume = LabelResumeData::collect(inputargs, ops);
+    RefHomes::collect(inputargs, ops, true, &resume.captured_refs).len()
+}
+
+/// Number of high GC-rooted homes reserved exclusively for LABEL live-ins.
+pub fn label_ref_capture_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
+    LabelResumeData::collect(inputargs, ops).ref_slots
 }
 
 /// First free value position — one past the highest id any input arg or op
@@ -463,7 +673,7 @@ pub fn next_value_pos(inputargs: &[InputArg], ops: &[Op]) -> u32 {
 /// Positional frame slots required for a token's inputs and guard spills.
 /// Slot zero is the fail index; the returned count therefore also gives the
 /// first free slot for the call trampoline.
-pub fn frame_value_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
+fn normal_frame_value_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
     let (guards, _) = collect_guards_and_vars(inputargs, ops);
     let max_fail_args = guards
         .iter()
@@ -471,6 +681,10 @@ pub fn frame_value_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
         .max()
         .unwrap_or(0);
     1 + max_fail_args.max(inputargs.len())
+}
+
+pub fn frame_value_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
+    normal_frame_value_slots(inputargs, ops) + LabelResumeData::collect(inputargs, ops).scalar_slots
 }
 
 /// Argument index of the stored value for a GC ref-storing op. `SetfieldRaw` /
@@ -1386,12 +1600,8 @@ pub fn build_wasm_module(
     // Ref homes, and the always-present tail call area; a chained bridge must
     // fit the source token's frozen value-slot count before it can share that
     // frame.
-    let max_fail_args = guards
-        .iter()
-        .map(|g| g.fail_arg_refs.len())
-        .max()
-        .unwrap_or(0);
-    let max_value_slots = 1 + max_fail_args.max(inputargs.len());
+    let label_resume = LabelResumeData::collect(inputargs, ops);
+    let max_value_slots = normal_frame_value_slots(inputargs, ops) + label_resume.scalar_slots;
     if max_value_slots > frame.value_slots {
         return Err(BackendError::Unsupported(format!(
             "wasm backend: {max_value_slots} frame value slots exceed frozen frame layout \
@@ -1402,12 +1612,14 @@ pub fn build_wasm_module(
 
     let value_types = collect_value_types(inputargs, ops, num_vars);
     let ref_values = RefValues::collect(inputargs, ops);
-    let ref_homes = RefHomes::collect(inputargs, ops, ca.emit_ca);
+    let ref_homes = RefHomes::collect(inputargs, ops, ca.emit_ca, &label_resume.captured_refs);
     let num_ref_homes = ref_homes.len();
-    if num_ref_homes > frame.home_slots {
+    if num_ref_homes > frame.ordinary_home_slots() || !label_resume.supported_by(frame) {
         return Err(BackendError::Unsupported(format!(
-            "wasm backend: {num_ref_homes} ref homes exceed frozen frame layout ({})",
-            frame.home_slots,
+            "wasm backend: {num_ref_homes} ordinary ref homes and {} LABEL ref captures exceed frozen frame layout ({}, {})",
+            label_resume.ref_slots,
+            frame.ordinary_home_slots(),
+            frame.label_ref_slots,
         )));
     }
 
@@ -1614,6 +1826,7 @@ pub fn build_wasm_module(
         nursery,
         &ref_values,
         &ref_homes,
+        &label_resume,
         cells_base,
         bridge_dispatch,
         invalidated_flag_addr,
@@ -1656,6 +1869,7 @@ fn build_function(
     nursery: Option<&NurseryAllocParams>,
     ref_values: &RefValues,
     ref_homes: &RefHomes,
+    label_resume: &LabelResumeData,
     cells_base: u32,
     bridge_dispatch: bool,
     invalidated_flag_addr: u32,
@@ -1746,14 +1960,6 @@ fn build_function(
     let mut func = Function::new(locals);
     let mut sink = func.instructions();
 
-    // Null-init every Ref-home slot so a slot read before its value is defined
-    // is null (forwarding-safe), not a stale word from the reused host frame.
-    for h in 0..ref_homes.len() as u64 {
-        sink.local_get(0);
-        sink.i64_const(0);
-        sink.i64_store(mem64(frame.home_slot_base + h * SLOT_SIZE));
-    }
-
     // Bind the folded constants the optimizer left under a plain op position
     // (see `unbound_pool_const_seeds`). Emitted before every block so the
     // binding dominates the whole body, including a resume-at-LABEL entry.
@@ -1833,6 +2039,24 @@ fn build_function(
         sink.end(); // end D $dispatch — key-0 entry path continues here
     }
 
+    // Fresh entry owns key 0 and must clear both the trace's ordinary homes
+    // and its high LABEL-capture homes.  A resume dispatch branches past this
+    // code, preserving captures written when the source loop first crossed
+    // the LABEL.  Chained bridges have no capture plan and clear only their
+    // own low ordinary-home prefix.
+    for h in 0..ref_homes.len() as u64 {
+        sink.local_get(0);
+        sink.i64_const(0);
+        sink.i64_store(mem64(frame.home_slot_base + h * SLOT_SIZE));
+    }
+    for h in 0..label_resume.ref_slots as u64 {
+        sink.local_get(0);
+        sink.i64_const(0);
+        sink.i64_store(mem64(
+            frame.home_slot_base + (frame.ordinary_home_slots() as u64 + h) * SLOT_SIZE,
+        ));
+    }
+
     // Load inputs from frame into locals, and store Ref inputs to their homes.
     // The input value lives at the frame slot its producer wrote it to: the
     // caller fills slot `k` for the k-th input — `execute_token` for a loop
@@ -1885,6 +2109,18 @@ fn build_function(
             // Branch over the resume loader, then close C_j, emit the loader
             // (resume path only), and close B_j. From inside C_j, `br 1`
             // targets B_j's end, skipping the loader.
+            // Preserve every non-argument live-in while its pre-LABEL local is
+            // still available. Scalar bits use frozen value slots; Refs use
+            // the high, GC-rooted capture region so a chained bridge cannot
+            // overwrite them with its own low home mapping.
+            for &r in &label_resume.per_label[labels_passed] {
+                let storage = label_resume
+                    .storage(r)
+                    .expect("LABEL live-in has assigned capture storage");
+                sink.local_get(0);
+                emit_resolve(&mut sink, constants, value_types, r);
+                sink.i64_store(mem64(label_resume.frame_offset(storage, frame)));
+            }
             sink.br(1); // segment done -> past_loader_j, over the resume loader
             sink.end(); // end C_j (the br_table lands here for key j+1)
             // Resume loader: a loop-closing bridge wrote each label arg into
@@ -1902,6 +2138,25 @@ fn build_function(
                 if let Some(h) = ref_homes.home(*la) {
                     sink.local_get(0);
                     sink.local_get(1 + la.raw());
+                    sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
+                }
+            }
+            // Restore backend-only live-ins after the semantic LABEL args.
+            // Ref restores also refresh the ordinary home used by the normal
+            // collecting-call reload path in the resumed loop body.
+            for &r in &label_resume.per_label[labels_passed] {
+                let storage = label_resume
+                    .storage(r)
+                    .expect("LABEL live-in has assigned capture storage");
+                sink.local_get(0);
+                sink.i64_load(mem64(label_resume.frame_offset(storage, frame)));
+                if value_types[r.raw() as usize] == ValType::F64 {
+                    sink.f64_reinterpret_i64();
+                }
+                sink.local_set(1 + r.raw());
+                if let Some(h) = ref_homes.home(r) {
+                    sink.local_get(0);
+                    sink.local_get(1 + r.raw());
                     sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
                 }
             }
@@ -4487,44 +4742,27 @@ pub fn label_arg_counts(ops: &[Op]) -> Vec<usize> {
         .collect()
 }
 
-/// Per-label resume safety, in ordinal order: label `j` is safe to resume at
-/// when every op after it references only values that are constants, defined
-/// after the label, or listed in the label's own args — i.e. the label's args
-/// are the complete live set, so the resume loader reconstructs every value
-/// the remainder of the trace reads. A value defined before the label and
-/// read after it without being a label arg would resume as a null local (the
-/// resume path skips the entry loader and every earlier segment). Guard fail
-/// args count as reads — they spill into the deopt frame.
-pub fn label_resume_safety(ops: &[Op]) -> Vec<bool> {
-    ops.iter()
+/// Per-label `(resume_safe, requires_own_frame)` metadata in ordinal order.
+/// Missing pre-LABEL live-ins are safe when the frozen geometry contains the
+/// capture plan. Such a plan is tied to the physical frame on which the owning
+/// loop populated it; a sibling specialization may share the same geometry
+/// but not those values, so bridge chaining must then stay on the owner.
+pub fn label_resume_info(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    frame: FrameGeometry,
+) -> Vec<(bool, bool)> {
+    let resume = LabelResumeData::collect(inputargs, ops);
+    let storage_supported = resume.supported_by(frame);
+    resume
+        .per_label
+        .iter()
         .enumerate()
-        .filter(|(_, op)| op.opcode == OpCode::Label)
-        .map(|(p, label)| {
-            let mut live: std::collections::HashSet<u32> = label
-                .getarglist()
-                .iter()
-                .map(|a| a.to_opref())
-                .filter(|r| *r != OpRef::NONE && !r.is_constant())
-                .map(|r| r.raw())
-                .collect();
-            for op in &ops[p + 1..] {
-                let args = op.getarglist();
-                let arg_reads = args.iter().map(|a| a.to_opref());
-                let fail_reads = op
-                    .getfailargs()
-                    .map(|fa| fa.iter().map(|a| a.to_opref()).collect::<Vec<_>>())
-                    .unwrap_or_default();
-                for r in arg_reads.chain(fail_reads) {
-                    if r != OpRef::NONE && !r.is_constant() && !live.contains(&r.raw()) {
-                        return false;
-                    }
-                }
-                let res = op.pos.get();
-                if res != OpRef::NONE && !res.is_constant() {
-                    live.insert(res.raw());
-                }
-            }
-            true
+        .map(|(j, missing)| {
+            (
+                !resume.uncapturable[j] && (missing.is_empty() || storage_supported),
+                !missing.is_empty(),
+            )
         })
         .collect()
 }
@@ -5266,7 +5504,7 @@ mod tests {
 
     #[test]
     fn compact_geometry_keeps_tail_call_area_out_of_ca_prefix() {
-        let frame = FrameGeometry::compact(32, 16);
+        let frame = FrameGeometry::compact(32, 16, 0);
         assert_eq!(frame.dispatch_key_ofs, 32 * SLOT_SIZE);
         assert_eq!(frame.home_slot_base, 33 * SLOT_SIZE);
         assert_eq!(frame.ca_frame_bytes, 392);
