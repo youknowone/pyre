@@ -2681,7 +2681,17 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         let legacy_admit = match safety {
             CalleeReplaySafety::Clean => true,
             CalleeReplaySafety::DeferredCall => {
-                foriter_deferred_admit = !fbw_foriter_deferred_call_denied(callee_code_key);
+                // The deferred promise rests on the abort REWINDING to the
+                // enclosing CALL and re-executing it from scratch.  A binop
+                // dunder dispatch (the only entry carrying an
+                // `arg_class_guard`) reaches this lever from a `BINARY_OP`
+                // instead, and that opcode is not a call boundary the rewind
+                // can name: the flush resumes one operand short and the whole
+                // iteration's contribution is dropped, silently.  A `Clean`
+                // body is still admitted from there — it has nothing that can
+                // abort.
+                foriter_deferred_admit = arg_class_guard.is_none()
+                    && !fbw_foriter_deferred_call_denied(callee_code_key);
                 foriter_deferred_admit
             }
             CalleeReplaySafety::Dirty => {
