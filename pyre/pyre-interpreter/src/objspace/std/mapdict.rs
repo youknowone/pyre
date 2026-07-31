@@ -341,6 +341,17 @@ pub unsafe fn ensure_mapdict_initialized(obj: PyObjectRef) {
     inst._set_mapdict_map(term);
 }
 
+/// [`type_terminator_or_create`] for callers outside the mapdict layer — the
+/// JIT's instantiation emit bakes the terminator into the trace as the fresh
+/// instance's `map`, so it needs the same one the interpreter would install
+/// rather than the null a not-yet-touched type still carries.
+///
+/// # Safety
+/// `w_type` must be a live `W_TypeObject`.
+pub unsafe fn ensure_type_terminator(w_type: PyObjectRef) -> *const u8 {
+    unsafe { type_terminator_or_create(w_type) as *const u8 }
+}
+
 /// Fetch `w_type`'s instance terminator, lazily creating and storing it on the
 /// type if absent (covering types built before the eager install site).
 ///

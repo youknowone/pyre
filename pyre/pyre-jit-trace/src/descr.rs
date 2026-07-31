@@ -2174,13 +2174,22 @@ pub fn type_version_tag_descr() -> DescrRef {
 /// `ensure_ptr_info_arg0` (`optimizer.py:478`); the LOAD_ATTR fold reads these
 /// fields inline, so they must carry the owning struct's SizeDescr.
 ///
-/// Only `map` and `storage` are enumerated (the header `ob_type`/`w_class` are
-/// read through their own `ob_type_descr` / `w_class_descr`).  `map` is an
-/// opaque `Int` word (interned immortal map nodes — not a GC ref, stays off
-/// `gc_fielddescrs`); `storage` is a `Ref` block pointer (enters
+/// `map` is an opaque `Int` word (interned immortal map nodes — not a GC ref,
+/// stays off `gc_fielddescrs`); `storage` is a `Ref` block pointer (enters
 /// `gc_fielddescrs` so a `setfield_gc` emits the write barrier).
+///
+/// The inherited header `w_class` is a member of the group — not just the
+/// standalone `w_class_descr` — because the instantiation emit
+/// (`try_walker_inline_type_call`) builds instances with `NewWithVtable`, and
+/// the class a `getfield_gc(w_class)` off such a virtual must answer with is
+/// the *stored* one.  Every instance shares `INSTANCE_TYPE` as its vtable
+/// while its Python class varies per instance, so the vtable-derived fallback
+/// (`w_class_obj`, which resolves `INSTANCE_TYPE`'s `get_instantiate` to
+/// `object`) is wrong here; only a field the virtual actually tracks gives
+/// `OptVirtualize` the right answer, and materialization then reproduces the
+/// header.
 static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group_with_def_path(
+    let group = build_object_descr_group_with_def_path(
         pyre_object::W_OBJECT_OBJECT_SIZE,
         pyre_object::objectobject::W_OBJECT_OBJECT_GC_TYPE_ID,
         &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
@@ -2209,10 +2218,29 @@ static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::n
                 false,
                 false,
             ),
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "W_ObjectObject",
         "objectobject::W_ObjectObject",
-    )
+    );
+    // `alloc_instance_object` (`objectobject.rs`) allocates every interpreter
+    // instance through the stable, non-moving old-gen allocator, because the
+    // instance layer reaches an instance through raw pointers it does not root
+    // — `store_attr_caching` holds one across the allocation of the storage
+    // block it is about to install.  A JIT-emitted instance has to agree: put
+    // it in the nursery and the first minor collection inside such a residual
+    // moves it, after which the caller finishes writing `map` / `storage` into
+    // the dead pre-move copy and the attribute is lost.
+    group.size_descr.set_non_moving(true);
+    group
 });
 
 /// `W_ObjectObject.map` (`objectobject.rs:38`) — the erased `*const MapNode`
@@ -2235,6 +2263,22 @@ pub fn object_map_descr() -> DescrRef {
 /// replaces the block.
 pub fn object_storage_descr() -> DescrRef {
     field_descr_from_group(&W_OBJECT_OBJECT_DESCR_GROUP, 1)
+}
+
+/// The instance's own `PyObject.w_class` — the Python class `w_instance_new`
+/// stamps into the header. Kept in the instance group (not the standalone
+/// `w_class_descr`) so the instantiation emit's store is a virtual field of
+/// the same size descr; see [`W_OBJECT_OBJECT_DESCR_GROUP`].
+pub fn object_header_w_class_descr() -> DescrRef {
+    field_descr_from_group(&W_OBJECT_OBJECT_DESCR_GROUP, 2)
+}
+
+/// Size descriptor for a `W_ObjectObject` allocation via `NewWithVtable`
+/// (vtable = `&INSTANCE_TYPE`); the header `w_class` and `map` are
+/// `SetfieldGc`'d after, and `storage` stays at the allocator's zero (the
+/// `_mapdict_init_empty` `storage = None` state).
+pub fn w_object_object_size_descr() -> DescrRef {
+    W_OBJECT_OBJECT_DESCR_GROUP.size_descr.clone()
 }
 
 /// rlist.py:116 `l.length` — live length of a list under the Object

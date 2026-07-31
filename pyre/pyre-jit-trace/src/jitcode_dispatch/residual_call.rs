@@ -3457,6 +3457,12 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         )? {
             return Ok(inlined);
         }
+        // A class is not a `Function`, so the user-call route above declined it.
+        if let Some(inlined) =
+            try_walker_inline_type_call(ctx, op, code, funcptr, &r_args, call_descr, dst_bank, dst)?
+        {
+            return Ok(inlined);
+        }
     }
 
     // #62: a self-recursive call the inline path declined (e.g. the
@@ -4466,6 +4472,15 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         dst,
     )? {
         return Ok(inlined);
+    }
+
+    // A class is not a `Function`, so the user-call route above declined it.
+    if ei.pyre_helper == majit_ir::PyreHelperKind::CallFn {
+        if let Some(inlined) =
+            try_walker_inline_type_call(ctx, op, code, funcptr, &r_args, call_descr, dst_bank, dst)?
+        {
+            return Ok(inlined);
+        }
     }
 
     // LoadConst fold: the LOAD_CONST helper (oopspec `LoadConst`, set

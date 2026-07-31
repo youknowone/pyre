@@ -589,6 +589,39 @@ pub fn emit_bound_method_inline(
     new_op
 }
 
+/// Emit inline `W_ObjectObject` creation (`NewWithVtable` + `SetfieldGc` for
+/// the inherited header `PyObject.w_class` and `map`), mirroring
+/// `objectobject.rs w_instance_new`.
+///
+/// `storage` keeps the allocation's zero — `w_instance_new` stores a null
+/// there as well (`mapdict.py:908-910 _mapdict_init_empty`, `storage = None`).
+/// `map` is the owning type's terminator, read eagerly for the same reason
+/// `w_instance_new` reads it: a deferred install leaves the promoted map guard
+/// on the next iteration's fresh instance naming a map the instance does not
+/// have yet.
+///
+/// Emitting the instantiation as New+SetField instead of the opaque
+/// `bh_call_fn` residual lets the optimizer virtualize the instance away when
+/// it never escapes the loop — the shape PyPy gets by tracing through
+/// `typeobject.py descr_call` → `space.allocate_instance`.
+pub fn emit_instance_inline(ctx: &mut TraceCtx, header_w_class: OpRef, map: OpRef) -> OpRef {
+    let new_op = ctx.record_op_with_descr(
+        OpCode::NewWithVtable,
+        &[],
+        crate::descr::w_object_object_size_descr(),
+    );
+    ctx.heap_cache_mut().new_object(new_op);
+    for (descr, value) in [
+        (crate::descr::object_header_w_class_descr(), header_w_class),
+        (crate::descr::object_map_descr(), map),
+    ] {
+        let index = descr.index();
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, value], descr);
+        ctx.heapcache_setfield_cached(new_op, index, value);
+    }
+    new_op
+}
+
 /// Emit inline Object-strategy `W_ListObject` creation as traced
 /// `NewArrayClear` + `SetarrayitemGc` + `NewWithVtable` + `SetfieldGc`
 /// ops the optimizer can virtualize when the list never escapes — instead

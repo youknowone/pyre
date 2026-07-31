@@ -1744,6 +1744,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         None,
         false,
         false,
+        None,
     )
 }
 
@@ -2410,6 +2411,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     arg_class_guard: Option<ArgClassGuard>,
     allow_method_load_attr: bool,
     require_str_result: bool,
+    constructor_result: Option<(OpRef, ConcreteValue)>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // `_compute_flatcall` (`pycode.py:256-268`) leaves `fast_natural_arity`
     // HOPELESS for a `*args` / `**kwargs` / keyword-only callee, so
@@ -3990,6 +3992,22 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 }
                 return Err(DispatchError::callee_inline_unsupported(op.pc));
             }
+            // `descr_call` discards `__init__`'s result after checking it is
+            // None and returns the instance instead (`check_init_returned_none`).
+            // A non-None result is a TypeError the inlined body cannot raise, so
+            // give the callee back to the interpreter, which re-runs the call and
+            // raises the faithful message.
+            let (value, concrete_for_shadow) = match constructor_result {
+                Some(instance) => {
+                    if !matches!(concrete_for_shadow,
+                        ConcreteValue::Ref(obj) if unsafe { pyre_object::is_none(obj) })
+                    {
+                        return Err(DispatchError::callee_inline_unsupported(op.pc));
+                    }
+                    instance
+                }
+                None => (value, concrete_for_shadow),
+            };
             match dst_bank {
                 'r' => write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
                 'i' => write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
@@ -4072,6 +4090,238 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
 }
 
 /// Route `str(exc)` / `repr(exc)` through an app-level exception override.
+/// Instantiate a user-defined class inside the trace instead of leaving `P()`
+/// an opaque `bh_call_fn` residual that re-enters `type_descr_call_impl`,
+/// `object.__new__` and an interpreted `__init__` frame every iteration.
+///
+/// This is the walker counterpart of `typeobject.py descr_call`: promote the
+/// class, run `__new__`, then `__init__` with the fresh instance as `self`.
+/// Only the shape where `__new__` is `object`'s is emitted — that is exactly
+/// the case whose allocation `object_descr_new` performs unconditionally
+/// (`w_instance_new`), so the emitted `NewWithVtable` + header/`map` stores
+/// reproduce it field for field.  A class that overrides `__new__`, is
+/// abstract, refuses instantiation, or carries `__del__` (whose instances
+/// `w_instance_new` registers on the finalizer queue) declines to the residual.
+///
+/// The payoff is not the removed dispatch alone: an instance built by
+/// `new_with_vtable` is a virtual, so a constructor whose result never escapes
+/// the loop optimizes away entirely, as it does upstream.
+#[allow(clippy::too_many_arguments)]
+/// Report why the instantiation emit declined, under `PYRE_FBW_INLINE_DIAG`.
+fn type_call_decline(reason: &str) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
+        eprintln!("[type-call-decline] {reason}");
+    }
+    Ok(None)
+}
+
+pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst_bank: char,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || ctx.fbw_mode.inline_subwalk || dst_bank != 'r' {
+        return Ok(None);
+    }
+    // `[callable, null_or_self, args...]`.  A method-form call (`null_or_self`
+    // populated) never names a class as its callable.
+    if r_args.len() < 2 || walker_concrete_ref_object(ctx, r_args[1]).is_some() {
+        return Ok(None);
+    }
+    let Some(w_type) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_type(w_type) } {
+        return Ok(None);
+    }
+    // `type(x)` is the one-argument class introspection shortcut, not an
+    // instantiation (`type_call_type_x_shortcut`).
+    let w_metatype = pyre_interpreter::typedef::w_type();
+    if std::ptr::eq(w_type, w_metatype) {
+        return type_call_decline("type(x) shortcut");
+    }
+    // What follows is `type.__call__`.  A metaclass that overrides `__call__`
+    // runs instead of it and may return anything at all, so it stays residual.
+    if !std::ptr::eq(unsafe { (*w_type).w_class }, w_metatype) {
+        return type_call_decline("metaclass overrides __call__");
+    }
+    // A version tag of 0 is a type whose dict changes are not tracked, so the
+    // `__new__` / `__init__` / `__del__` lookups below cannot be pinned.
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
+    if version_tag == 0 {
+        return type_call_decline("no version tag");
+    }
+    if unsafe {
+        pyre_object::w_type_disallows_instantiation(w_type)
+            || pyre_object::w_type_is_abstract(w_type)
+            || pyre_object::typeobject::w_type_get_hasuserdel(w_type)
+    } {
+        return type_call_decline("not instantiable, abstract, or has __del__");
+    }
+    // `map` is baked as a constant, so install the terminator now if the type
+    // has not been asked for one yet — a class nobody has read an attribute off
+    // still carries null, and baking that would hand every traced instance a
+    // map the interpreter's own instances do not have.  The terminator is
+    // created once and never replaced, so the constant stays valid.
+    let terminator =
+        unsafe { pyre_interpreter::objspace::std::mapdict::ensure_type_terminator(w_type) };
+    if terminator.is_null() {
+        return type_call_decline("no terminator");
+    }
+    let w_object = pyre_interpreter::typedef::w_object();
+    if w_object.is_null() {
+        return Ok(None);
+    }
+    // Only `object.__new__` allocates the plain `[ob_type | w_class | map |
+    // storage]` instance this emit builds; any other `__new__` picks its own
+    // layout (a builtin subclass) or runs arbitrary code.
+    let tp_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__new__") };
+    let obj_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__new__") };
+    if tp_new != obj_new {
+        return type_call_decline("__new__ overridden");
+    }
+    let tp_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__init__") };
+    let obj_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__init__") };
+    let init_override = (tp_init != obj_init).then_some(tp_init).flatten();
+    // `object.__new__`/`object.__init__` both reject surplus arguments when
+    // neither is overridden; leave that TypeError to the interpreter.
+    if init_override.is_none() && r_args.len() != 2 {
+        return type_call_decline("surplus args without __init__");
+    }
+    let inlinable_init = match init_override {
+        Some(init) => match unsafe { resolve_inlinable_callee(init) } {
+            Some(resolved) => Some((init, resolved)),
+            // An overridden `__init__` that is not a plain Python function
+            // (a builtin, or a callable object) has no body to walk.
+            None => return type_call_decline("__init__ not inlinable"),
+        },
+        None => None,
+    };
+
+    let mut arg_concretes = vec![ConcreteValue::Ref(w_type), ConcreteValue::Null];
+    let mut callee_arg_concretes = Vec::with_capacity(r_args.len() - 1);
+    for &arg in &r_args[2..] {
+        let Some(concrete) = walker_concrete_ref_object(ctx, arg) else {
+            return Ok(None);
+        };
+        arg_concretes.push(ConcreteValue::Ref(concrete));
+        callee_arg_concretes.push(ConcreteValue::Ref(concrete));
+    }
+
+    // Everything below emits.  `try_walker_inline_resolved_user_call` has
+    // decline paths of its own past this point, so keep a rewind point and cut
+    // back to it — the orphaned instance is unreachable and `__init__` has not
+    // run, so the residual re-does the whole instantiation from scratch.
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+
+    // Pin the class and the type-dict version the two lookups above resolved
+    // against, so redefining `__new__` / `__init__` / `__del__` deopts.
+    let type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[r_args[0], type_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(r_args[0], type_const);
+    let live_version = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        type_const,
+        crate::descr::type_version_tag_descr(),
+    );
+    let version_const = ctx.trace_ctx.const_int(version_tag as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op.pc,
+        OpCode::GuardValue,
+        &[live_version, version_const],
+    )?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(live_version, version_const);
+
+    // The walker is the executor here, so the instance the rest of this walk
+    // reads has to be a real one — the same split `trace_box_int` makes between
+    // the recorded allocation and the concrete object it hands back.
+    let concrete_instance = pyre_object::w_instance_new(w_type);
+    let terminator_const = ctx.trace_ctx.const_int(terminator as i64);
+    let instance =
+        crate::helpers::emit_instance_inline(ctx.trace_ctx, type_const, terminator_const);
+    // Bind the emitted allocation to the object the walker actually made, and
+    // record the layout its `NewWithVtable` stamps.  Without the concrete
+    // binding the instance reaches a residual as a box with no value and the
+    // residual declines (`[fbw-resid-decline] box_value=None`), which costs the
+    // recording iteration; without the class the receiver re-guards its own
+    // freshly emitted layout.
+    ctx.trace_ctx.set_opref_concrete(
+        instance,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_instance as usize)),
+    );
+    ctx.trace_ctx.heap_cache_mut().class_now_known(
+        instance,
+        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64,
+    );
+    if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
+        eprintln!(
+            "[type-call-inline] pc={} class={} init={}",
+            op.pc,
+            unsafe { pyre_object::w_type_get_name(w_type) },
+            inlinable_init.is_some(),
+        );
+    }
+
+    let Some((init, (w_code, nparams, has_closure))) = inlinable_init else {
+        write_ref_reg(
+            ctx,
+            op.pc,
+            dst,
+            instance,
+            ConcreteValue::Ref(concrete_instance),
+        )?;
+        return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+    };
+
+    let mut callee_args = vec![instance];
+    callee_args.extend_from_slice(&r_args[2..]);
+    callee_arg_concretes.insert(0, ConcreteValue::Ref(concrete_instance));
+    let inlined = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        dst_bank,
+        dst,
+        init,
+        r_args[0],
+        w_type,
+        arg_concretes,
+        callee_args,
+        callee_arg_concretes,
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        None,
+        None,
+        // `__init__` bodies are `self.x = ...` stores; the sub-walk folds them
+        // to slot writes on the fresh instance exactly as the property-setter
+        // route folds its own.
+        true,
+        false,
+        Some((instance, ConcreteValue::Ref(concrete_instance))),
+    )?;
+    if inlined.is_none() {
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+    }
+    Ok(inlined)
+}
+
 /// Pyre's exact `str` type call follows `str_descr_new` → `builtin_str` →
 /// `exc_user_dunder_obj`; the builtin `repr` follows `builtin_repr` →
 /// `py_repr_obj`. Both paths look up the receiver dunder before builtin
@@ -4210,6 +4460,7 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
         None,
         true,
         true,
+        None,
     )?
     else {
         return Ok(None);
@@ -4332,6 +4583,7 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
         // read (same allowance the exception `__str__`/`__repr__` override uses).
         true,
         false,
+        None,
     )
 }
 
@@ -4430,6 +4682,7 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
         None,
         true,
         false,
+        None,
     )
 }
 
@@ -4585,6 +4838,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         Some((rhs, concrete_rhs, w_typ_r.as_ptr())),
         false,
         false,
+        None,
     )?
     else {
         return Ok(None);
@@ -4730,6 +4984,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         Some((rhs, concrete_rhs, w_typ_r.as_ptr())),
         false,
         false,
+        None,
     )?
     else {
         return Ok(None);
