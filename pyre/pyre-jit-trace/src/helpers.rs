@@ -647,6 +647,17 @@ pub fn emit_instance_inline(ctx: &mut TraceCtx, header_w_class: OpRef, map: OpRe
 /// `storage` field is a reference store, so the GC rewriter emits
 /// `CondCallGcWb(obj)` for it, and it is emitted after the item stores, so a
 /// young value already in the block is remembered with the instance.
+///
+/// The two instance field stores are ordered `storage` before `map`, and that
+/// order is load-bearing under free threading.  These are raw stores, so a
+/// concurrent reader of the same instance can observe the pair half-written;
+/// with this order the only visible intermediate is the longer block under the
+/// shorter map, which over-allocates by one slot.  The reverse order would
+/// publish a map claiming an index the installed block does not have.  Nothing
+/// here serializes against another thread mutating the same instance — the
+/// pre-existing in-trace mapdict fast paths (`jit_mapdict_read`,
+/// `jit_mapdict_boxed_write`) reach `storage` without the striped
+/// `instance_lock` in the same way.
 pub fn emit_mapdict_add_attr_inline(
     ctx: &mut TraceCtx,
     obj: OpRef,
