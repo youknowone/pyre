@@ -220,6 +220,9 @@ pm1_edom!(atanh, "expected a number between -1 and 1");
 pm1_edom!(sqrt, "expected a nonnegative input");
 
 static MATH_SQRT_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MATH_LOG_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MATH_COS_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MATH_SIN_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MATH_FREXP_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MATH_LDEXP_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MATH_ISQRT_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -234,6 +237,9 @@ static MATH_ISQRT_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new
 pub fn register_jit_builtin_wrappers(ns: PyObjectRef) {
     for (name, slot) in [
         ("sqrt", &MATH_SQRT_WRAPPER),
+        ("log", &MATH_LOG_WRAPPER),
+        ("cos", &MATH_COS_WRAPPER),
+        ("sin", &MATH_SIN_WRAPPER),
         ("frexp", &MATH_FREXP_WRAPPER),
         ("ldexp", &MATH_LDEXP_WRAPPER),
         ("isqrt", &MATH_ISQRT_WRAPPER),
@@ -273,6 +279,18 @@ unsafe fn math_builtin_wrapper_matches(
 /// monkeypatched `math.sqrt` correctly declines the pure-inline specialization.
 pub fn is_math_sqrt_function(callable: PyObjectRef) -> bool {
     unsafe { math_builtin_wrapper_matches(callable, &MATH_SQRT_WRAPPER) }
+}
+
+pub fn is_math_log_function(callable: PyObjectRef) -> bool {
+    unsafe { math_builtin_wrapper_matches(callable, &MATH_LOG_WRAPPER) }
+}
+
+pub fn is_math_cos_function(callable: PyObjectRef) -> bool {
+    unsafe { math_builtin_wrapper_matches(callable, &MATH_COS_WRAPPER) }
+}
+
+pub fn is_math_sin_function(callable: PyObjectRef) -> bool {
+    unsafe { math_builtin_wrapper_matches(callable, &MATH_SIN_WRAPPER) }
 }
 
 /// Callable-identity probes used by the meta-trace walker.  As with

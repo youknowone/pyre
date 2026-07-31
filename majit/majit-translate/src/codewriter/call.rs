@@ -1061,6 +1061,32 @@ impl StructFieldLayout {
     }
 }
 
+/// RPython `isinstance(FIELD, lltype.Struct)` parity for the textual type
+/// carrier used by the Rust front end.  A spelling can occur in the global
+/// declaration census as well as in a field row, but pointer wrappers remain
+/// `lltype.Ptr` values even when their pointee/container type is known.  They
+/// must therefore contribute one pointer field descriptor rather than being
+/// recursively flattened as an embedded struct.
+fn is_known_by_value_struct(
+    known_structs: &std::collections::HashSet<String>,
+    type_name: &str,
+) -> bool {
+    let type_name = type_name.trim();
+    if type_name.starts_with("*mut ")
+        || type_name.starts_with("*const ")
+        || type_name.starts_with('&')
+        || type_name.starts_with("Box<")
+        || type_name.starts_with("Arc<")
+        || type_name.starts_with("Rc<")
+        || type_name.starts_with("Vec<")
+        || type_name.starts_with("Option<")
+        || type_name == "String"
+    {
+        return false;
+    }
+    known_structs.contains(type_name)
+}
+
 impl StructLayout {
     /// Build a StructLayout from type-string heuristic.
     /// Used at pipeline init to populate struct_layouts from struct_fields.
@@ -1083,7 +1109,7 @@ impl StructLayout {
         // clear interior field descriptors.
         let has_nested_struct = fields
             .iter()
-            .any(|(_, type_str)| known_structs.contains(type_str.as_str()));
+            .any(|(_, type_str)| is_known_by_value_struct(known_structs, type_str));
         let mut offset: usize = 0;
         let mut layout_fields = Vec::new();
         for (name, type_str) in fields {
@@ -1092,7 +1118,7 @@ impl StructLayout {
             if name == "typeptr" || name.starts_with("c__pad") {
                 // heaptracker.py:64-67
                 // typeptr is still counted for offset calculation below.
-                let sz = if known_structs.contains(type_str.as_str()) {
+                let sz = if is_known_by_value_struct(known_structs, type_str) {
                     known_struct_sizes
                         .get(type_str.as_str())
                         .copied()
@@ -1136,7 +1162,7 @@ impl StructLayout {
         let max_align = fields
             .iter()
             .map(|(_, ty)| {
-                if known_structs.contains(ty.as_str()) {
+                if is_known_by_value_struct(known_structs, ty) {
                     // Use actual nested struct size for alignment.
                     known_struct_sizes
                         .get(ty.as_str())
@@ -1481,7 +1507,7 @@ impl CallControl {
 
     /// RPython: isinstance(TYPE, lltype.Struct) check.
     pub fn is_known_struct(&self, name: &str) -> bool {
-        self.known_struct_names.contains(name)
+        is_known_by_value_struct(&self.known_struct_names, name)
     }
 
     /// RPython: register actual struct layout from `symbolic.get_field_token()`.
@@ -7416,7 +7442,7 @@ fn field_metadata(
     known_structs: &std::collections::HashSet<String>,
     known_struct_sizes: &std::collections::HashMap<String, usize>,
 ) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
-    if known_structs.contains(type_str) {
+    if is_known_by_value_struct(known_structs, type_str) {
         let nested_size = known_struct_sizes
             .get(type_str)
             .copied()
@@ -9478,6 +9504,39 @@ mod tests {
         assert_eq!(known_sizes["C"], 8, "C: single i64");
         assert_eq!(known_sizes["B"], 16, "B: C(8) + i64(8)");
         assert_eq!(known_sizes["A"], 24, "A: B(16) + i64(8)");
+    }
+
+    #[test]
+    fn raw_pointer_field_is_not_flattened_as_a_known_pointee_struct() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        // A merged declaration census can carry both spellings.  RPython's
+        // type test still sees Ptr(PyObject), never an embedded PyObject
+        // Struct, so the field occupies one pointer-sized leaf slot.
+        let known_structs: HashSet<String> = ["PyObject", "*mut PyObject"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let known_sizes: HashMap<String, usize> = [
+            ("PyObject".to_string(), 32),
+            ("*mut PyObject".to_string(), 32),
+        ]
+        .into_iter()
+        .collect();
+        let fields = vec![("__pos_0".to_string(), "*mut PyObject".to_string())];
+
+        let layout =
+            StructLayout::from_type_strings(&fields, &known_structs, &known_sizes, &HashMap::new());
+        assert_eq!(layout.size, crate::layout::target_word_size());
+        assert_eq!(layout.fields.len(), 1);
+        assert_eq!(layout.fields[0].flag, ArrayFlag::Pointer);
+        assert_eq!(layout.fields[0].field_type, Type::Ref);
+
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(known_structs);
+        assert!(cc.is_known_struct("PyObject"));
+        assert!(!cc.is_known_struct("*mut PyObject"));
     }
 
     #[derive(Debug)]

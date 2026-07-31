@@ -5426,6 +5426,110 @@ pub(crate) fn try_walker_specialize_math_sqrt<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `math.log/cos/sin(x)` on an exact int/float argument.  This is the direct
+/// RPython `ll_math_{log,cos,sin}` shape: pin the domain branch, unbox the
+/// numeric operand, emit the raw pure `CALL_F`, and leave the result box
+/// virtualizable.  Rebound callables, subclasses, exceptional domains, and
+/// non-numeric inputs retain the ordinary residual call.
+pub(crate) fn try_walker_specialize_math_log_trig<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(arg_obj),
+    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    else {
+        return Ok(None);
+    };
+    if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
+        return Ok(None);
+    }
+    let raw_fn =
+        if pyre_interpreter::module::math::interp_math::is_math_log_function(concrete_callable) {
+            crate::trace_opcode::math_log_positive_jit as *const ()
+        } else if pyre_interpreter::module::math::interp_math::is_math_cos_function(
+            concrete_callable,
+        ) {
+            crate::trace_opcode::math_cos_finite_jit as *const ()
+        } else if pyre_interpreter::module::math::interp_math::is_math_sin_function(
+            concrete_callable,
+        ) {
+            crate::trace_opcode::math_sin_finite_jit as *const ()
+        } else {
+            return Ok(None);
+        };
+    let is_log = raw_fn == crate::trace_opcode::math_log_positive_jit as *const ();
+    let (is_int, val) = unsafe {
+        if !pyre_object::is_exact_builtin_instance(arg_obj) {
+            return Ok(None);
+        }
+        if pyre_object::is_int(arg_obj) {
+            (true, pyre_object::w_int_get_value(arg_obj) as f64)
+        } else if pyre_object::is_float(arg_obj) {
+            (false, pyre_object::w_float_get_value(arg_obj))
+        } else {
+            return Ok(None);
+        }
+    };
+    // The hot RPython branches used here are log(finite positive) and
+    // trig(finite).  Cold NaN/inf/domain cases stay on the exact builtin.
+    if !val.is_finite() || (is_log && val <= 0.0) {
+        return Ok(None);
+    }
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &[arg_obj])
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    let x = walker_coerce_operand_to_float(ctx, op.pc, r_args[2], arg_obj, is_int, val, false)?;
+    let zero = ctx.trace_ctx.const_float(0.0f64.to_bits() as i64);
+    if is_log {
+        walker_float_cmp_guard(ctx, op.pc, OpCode::FloatLt, &[zero, x], true)?;
+    }
+    let diff = ctx.trace_ctx.record_op(OpCode::FloatSub, &[x, x]);
+    ctx.trace_ctx
+        .set_opref_concrete(diff, majit_ir::Value::Float(0.0));
+    walker_float_cmp_guard(ctx, op.pc, OpCode::FloatEq, &[diff, zero], true)?;
+    let raw = ctx.trace_ctx.call_float_typed_with_effect(
+        raw_fn,
+        &[x],
+        &[majit_ir::Type::Float],
+        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+    );
+    let result_val = unsafe { pyre_object::w_float_get_value(boxed_result) };
+    ctx.trace_ctx
+        .set_opref_concrete(raw, majit_ir::Value::Float(result_val));
+    let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+    Ok(Some(()))
+}
+
 /// `math.frexp(x)` on an exact int/float argument.  RPython lowers
 /// `ll_math_frexp` to two unboxed results and `space.newtuple2`; emit the same
 /// shape as two pure typed calls followed by a virtualizable object tuple.

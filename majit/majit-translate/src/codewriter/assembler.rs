@@ -3281,9 +3281,9 @@ fn bh_size_spec_from_callcontrol(
     // for Result variants, falling back to the template only when no such rows
     // exist, so the payload participates in that same flattened slot list.
     let mut all_fielddescrs = if result_variant {
-        let instantiated = bh_all_field_specs_for_struct(cc, owner);
+        let instantiated = bh_result_variant_field_specs(cc, owner);
         if instantiated.is_empty() {
-            bh_all_field_specs_for_struct(cc, layout_owner)
+            bh_result_variant_field_specs(cc, layout_owner)
         } else {
             instantiated
         }
@@ -3368,6 +3368,48 @@ fn bh_all_field_specs_for_struct(
 ) -> Vec<crate::jitcode::BhFieldSpec> {
     let mut specs = Vec::new();
     bh_all_field_specs_for_struct_into(cc, owner, owner, "", 0, &mut specs);
+    specs
+}
+
+/// Build the variant-owned portion of the explicit `Result<T, PyError>`
+/// shell.  The front end deliberately represents this as one inherited tag
+/// word followed by one-word payload fields (`front/mir.rs`'s
+/// `synthetic_result_shell`), rather than as Rust's native enum layout.  The
+/// shared nominal layout registry cannot describe each generic payload at
+/// once, so read the concrete instantiation's rows directly and place them
+/// after the inherited tag, matching RPython's concrete low-level STRUCT.
+fn bh_result_variant_field_specs(
+    cc: &CallControl,
+    owner: &str,
+) -> Vec<crate::jitcode::BhFieldSpec> {
+    let Some(fields) = cc.struct_field_entries(owner) else {
+        return Vec::new();
+    };
+    let mut specs = Vec::new();
+    let mut offset = 8usize;
+    for (field_name, field_type_str) in fields {
+        let (field_flag, field_type, field_size) = type_flag_from_str(field_type_str);
+        if field_type == majit_ir::value::Type::Void || field_size == 0 {
+            continue;
+        }
+        let align = scalar_align(field_size);
+        offset = (offset + align - 1) & !(align - 1);
+        let index = specs.len() + 1;
+        let rank = cc.field_immutability(Some(owner), field_name);
+        specs.push(bh_field_spec_from_parts(
+            index as u32,
+            owner,
+            field_name,
+            offset,
+            field_size,
+            field_type,
+            field_flag,
+            rank.is_some(),
+            rank.map(|r| r.is_quasi_immutable()).unwrap_or(false),
+            index,
+        ));
+        offset += field_size;
+    }
     specs
 }
 
@@ -3578,6 +3620,7 @@ fn fielddescrof(
         {
             parent_spec.type_id = owner_id.as_u64();
         }
+        let mut found_parent_field = false;
         if let Some(parent_spec) = parent.as_ref() {
             let full_name = bh_field_name(owner, &field.name);
             if let Some(spec) = parent_spec.all_fielddescrs.iter().find(|spec| {
@@ -3593,11 +3636,13 @@ fn fielddescrof(
                 is_immutable = spec.is_immutable;
                 is_quasi_immutable = spec.is_quasi_immutable;
                 index_in_parent = spec.index_in_parent;
+                found_parent_field = true;
             }
         }
-        if let Some(layout_field) = cc
-            .struct_layout_for(owner)
-            .and_then(|layout| layout.fields.iter().find(|fl| fl.name == field.name))
+        if !found_parent_field
+            && let Some(layout_field) = cc
+                .struct_layout_for(owner)
+                .and_then(|layout| layout.fields.iter().find(|fl| fl.name == field.name))
         {
             offset = layout_field.offset;
             field_size = layout_field.size;
@@ -3606,13 +3651,14 @@ fn fielddescrof(
             is_field_signed = field_flag == majit_ir::descr::ArrayFlag::Signed;
             is_immutable = layout_field.is_immutable();
             is_quasi_immutable = layout_field.is_quasi_immutable();
-        } else if let Some((
-            computed_offset,
-            computed_size,
-            computed_type,
-            computed_flag,
-            computed_signed,
-        )) = heuristic_field_layout(cc, owner, &field.name)
+        } else if !found_parent_field
+            && let Some((
+                computed_offset,
+                computed_size,
+                computed_type,
+                computed_flag,
+                computed_signed,
+            )) = heuristic_field_layout(cc, owner, &field.name)
         {
             offset = computed_offset;
             field_size = computed_size;
@@ -4788,8 +4834,15 @@ mod tests {
         assert_eq!(spec.size, 16);
         assert_eq!(spec.all_fielddescrs.len(), 2);
         assert_eq!(spec.all_fielddescrs[0].field_key(), "__discriminant");
+        assert_eq!(spec.all_fielddescrs[0].offset, 0);
         assert_eq!(spec.all_fielddescrs[0].index_in_parent, 0);
         assert_eq!(spec.all_fielddescrs[1].field_key(), "__pos_0");
+        assert_eq!(spec.all_fielddescrs[1].offset, 8);
+        assert_eq!(spec.all_fielddescrs[1].field_size, 8);
+        assert_eq!(
+            spec.all_fielddescrs[1].field_flag,
+            majit_ir::descr::ArrayFlag::Pointer
+        );
         assert_eq!(spec.all_fielddescrs[1].index_in_parent, 1);
     }
 
