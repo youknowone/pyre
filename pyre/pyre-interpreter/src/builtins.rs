@@ -9937,6 +9937,14 @@ fn _hash_bytes(bytes: &[u8]) -> i64 {
 /// selecting one-, two-, or four-byte native-endian units from the maximum
 /// code point.  Pyre stores WTF-8, so materialize only this hash input.
 fn _hash_unicode_with_key(wtf8: &rustpython_wtf8::Wtf8, secret: &[u8; 16]) -> i64 {
+    // An all-ASCII string's PEP 393 canonical code-unit storage is its
+    // one-byte-per-char form, byte-identical to the WTF-8 bytes, so hash those
+    // directly instead of materializing a separate code-unit buffer. This is
+    // the common case (identifiers, dict keys) and skips two Vec allocations.
+    let storage = wtf8.as_bytes();
+    if storage.is_ascii() {
+        return _hash_bytes_with_key(storage, secret);
+    }
     let codepoints: Vec<u32> = wtf8.code_points().map(|cp| cp.to_u32()).collect();
     let maxchar = codepoints.iter().copied().max().unwrap_or(0);
     let mut bytes = Vec::with_capacity(
@@ -9974,6 +9982,11 @@ fn _hash_unicode(wtf8: &rustpython_wtf8::Wtf8) -> i64 {
 /// without a `W_UnicodeObject`.
 #[inline]
 pub fn hash_str_bytes(bytes: &[u8]) -> i64 {
+    // ASCII fast path (see `_hash_unicode_with_key`): the storage bytes are the
+    // canonical hash input, so hash them without validating/constructing a Wtf8.
+    if bytes.is_ascii() {
+        return _hash_bytes(bytes);
+    }
     let wtf8 = rustpython_wtf8::Wtf8::from_bytes(bytes).expect("str storage is valid WTF-8");
     _hash_unicode(wtf8)
 }
