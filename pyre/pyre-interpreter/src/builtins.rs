@@ -6,6 +6,7 @@ use crate::{
     make_module_builtin_function_with_arity, make_module_builtin_function_with_doc,
 };
 use pyre_object::*;
+use ruff_text_size::Ranged;
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
@@ -8979,9 +8980,12 @@ fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 /// `compile`/`exec`/`eval`/`ast.parse` raise `SyntaxError` (not
 /// `ValueError`) for malformed source.  The error's `python_location` /
 /// `python_end_location` / `source_path` populate `e.lineno` / `e.offset`
-/// / `e.end_lineno` / `e.end_offset` / `e.filename`, and `e.text` is the
-/// offending line sliced from `source`; a location-less codegen error
-/// (line 0) falls back to a bare, message-only SyntaxError.
+/// / `e.end_lineno` / `e.end_offset` / `e.filename`.  Parser errors carry
+/// the offending line sliced from `source`; compiler errors such as
+/// ``return`` outside a function retain their location but expose `e.text`
+/// as `None`, matching CPython's `PyErr_SyntaxLocationObject` path.  A
+/// location-less codegen error (line 0) falls back to a bare, message-only
+/// SyntaxError.
 pub fn compile_err_to_syntax_error(
     e: crate::compile::CompileError,
     source: &str,
@@ -9080,10 +9084,19 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     let mut error = if lineno == 0 {
         crate::PyError::syntax_error(msg)
     } else {
-        let (end_lineno, end_offset) = e.python_end_location().unwrap_or((lineno, offset));
+        let (end_lineno, end_offset) = e
+            .python_end_location()
+            .or_else(|| codegen_statement_end(&e, source, lineno, offset))
+            .unwrap_or((lineno, offset));
         let filename = e.source_path().to_string();
-        // The offending source line, keeping its trailing newline like `e.text`.
-        let text = source.split_inclusive('\n').nth(lineno - 1);
+        // Only the parser owns source text, and it keeps the trailing newline
+        // like `e.text`.  Later compiler failures retain their source range but
+        // no original input line.
+        let text = if matches!(&e, crate::compile::CompileError::Parse(_)) {
+            source.split_inclusive('\n').nth(lineno - 1)
+        } else {
+            None
+        };
         crate::PyError::syntax_error_located(
             msg,
             &filename,
@@ -9296,6 +9309,45 @@ fn syntax_error_subclass(
         }
         _ => None,
     }
+}
+
+/// CPython attaches the complete top-level ``return`` statement range to the
+/// compiler-stage "outside function" error.  RustPython's codegen error keeps
+/// only its start location, although the parsed statement still has the exact
+/// byte range.  Recover that range before materialising `SyntaxError`.
+fn codegen_statement_end(
+    error: &crate::compile::CompileError,
+    source: &str,
+    lineno: usize,
+    offset: usize,
+) -> Option<(usize, usize)> {
+    let crate::compile::CompileError::Codegen(codegen) = error else {
+        return None;
+    };
+    if !matches!(
+        codegen.error,
+        crate::compile::codegen::error::CodegenErrorType::InvalidReturn
+    ) {
+        return None;
+    }
+    let line_start = source
+        .split_inclusive('\n')
+        .take(lineno.saturating_sub(1))
+        .map(str::len)
+        .sum::<usize>();
+    let start = line_start.checked_add(offset.saturating_sub(1))?;
+    let parsed = crate::compile::parser::parse_module(source).ok()?;
+    let end = parsed
+        .syntax()
+        .body
+        .iter()
+        .find(|stmt| stmt.range().start().to_usize() == start)?
+        .range()
+        .end()
+        .to_usize();
+    let end_line_start = source[..end].rfind('\n').map_or(0, |index| index + 1);
+    let end_lineno = source[..end].bytes().filter(|byte| *byte == b'\n').count() + 1;
+    Some((end_lineno, end - end_line_start + 1))
 }
 
 /// `pypy/interpreter/astcompiler/consts.py` compilation flag bits.

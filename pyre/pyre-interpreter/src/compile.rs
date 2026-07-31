@@ -3,7 +3,9 @@
 pub use rustpython_compiler::CompileError;
 pub use rustpython_compiler::CompileOpts;
 pub use rustpython_compiler::Mode;
+pub use rustpython_compiler::codegen;
 pub use rustpython_compiler::compile as rp_compile;
+pub use rustpython_compiler::parser;
 pub use rustpython_compiler_core::bytecode::{
     self, BinaryOperator, CodeFlags, CodeObject, ComparisonOperator, ConstantData, Instruction,
     MakeFunctionFlags, OpArg, OpArgState, SpecialMethod,
