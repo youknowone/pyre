@@ -753,6 +753,18 @@ pub unsafe fn builtin_code_get(obj: PyObjectRef) -> BuiltinCodeFn {
     unsafe { (*func_obj).func }
 }
 
+/// Whether two builtin implementations are the same function.
+///
+/// `std::ptr::fn_addr_eq` is bound on the `core::marker::FnPtr` lang item,
+/// which Charon does not model — every call site it appears in resolves to
+/// `Error during trait resolution` and leaves a hole in the extracted body.
+/// Both operands are already the same fn-pointer type here, so their
+/// addresses answer the question without the trait.
+#[inline]
+pub fn builtin_code_fn_eq(a: BuiltinCodeFn, b: BuiltinCodeFn) -> bool {
+    a as usize == b as usize
+}
+
 /// Record the type whose namespace this code object was installed in, so its
 /// receiver is checked before the implementation runs.
 ///

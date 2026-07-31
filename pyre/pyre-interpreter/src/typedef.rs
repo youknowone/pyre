@@ -11212,7 +11212,7 @@ fn bound_builtin_functions_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
     !a_code.is_null()
         && !b_code.is_null()
         && unsafe {
-            std::ptr::fn_addr_eq(
+            crate::gateway::builtin_code_fn_eq(
                 crate::gateway::builtin_code_get(a_code),
                 crate::gateway::builtin_code_get(b_code),
             )

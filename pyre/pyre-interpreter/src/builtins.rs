@@ -3658,7 +3658,7 @@ pub fn is_builtin_len_function(callable: PyObjectRef) -> bool {
         if code.is_null() || !crate::gateway::is_builtin_code(code) {
             return false;
         }
-        std::ptr::fn_addr_eq(
+        crate::gateway::builtin_code_fn_eq(
             crate::gateway::builtin_code_get(code),
             builtin_len as crate::gateway::BuiltinCodeFn,
         )
@@ -3677,7 +3677,7 @@ pub fn is_builtin_repr_function(callable: PyObjectRef) -> bool {
         if code.is_null() || !crate::gateway::is_builtin_code(code) {
             return false;
         }
-        std::ptr::fn_addr_eq(
+        crate::gateway::builtin_code_fn_eq(
             crate::gateway::builtin_code_get(code),
             builtin_repr as crate::gateway::BuiltinCodeFn,
         )
@@ -13160,7 +13160,7 @@ pub fn is_builtin_divmod_function(callable: PyObjectRef) -> bool {
         if code.is_null() || !crate::gateway::is_builtin_code(code) {
             return false;
         }
-        std::ptr::fn_addr_eq(
+        crate::gateway::builtin_code_fn_eq(
             crate::gateway::builtin_code_get(code),
             builtin_divmod as crate::gateway::BuiltinCodeFn,
         )
