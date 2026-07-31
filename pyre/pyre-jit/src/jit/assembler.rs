@@ -312,6 +312,7 @@ impl Assembler {
         self.fix_labels(&mut state);
 
         let jitcode = state.builder.try_finish()?;
+        dump_assembled_ssarepr(ssarepr, &jitcode);
         // `assembler.py` checks the completed register/constant namespace
         // before making the JitCode. Runtime-generated graphs use the checked
         // seam above; this assertion remains an invariant check on success.
@@ -618,6 +619,40 @@ fn use_c_form(opname: &str) -> bool {
 fn assemble(ssarepr: &mut SSARepr, builder: JitCodeBuilder, num_regs: Option<NumRegs>) -> JitCode {
     let mut assembler = Assembler::new();
     assembler.assemble(ssarepr, builder, num_regs)
+}
+
+/// Print the assembled instruction stream, byte position first, for graphs
+/// whose name matches `MAJIT_DUMP_SSAREPR`.
+///
+/// A blackhole failure reports a raw `(jitcode, position)` pair; without the
+/// stream there is no way back from that byte offset to the op that wrote it
+/// or to the register operands it reads.  The env lookup is cached because
+/// `try_assemble` runs per graph on the tracing path.
+fn dump_assembled_ssarepr(ssarepr: &SSARepr, jitcode: &JitCode) {
+    static WANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let want = WANT.get_or_init(|| {
+        std::env::var_os("MAJIT_DUMP_SSAREPR").map(|v| v.to_string_lossy().into_owned())
+    });
+    let Some(want) = want else { return };
+    if &ssarepr.name != want {
+        return;
+    }
+    let positions = ssarepr
+        .insns_pos
+        .as_ref()
+        .expect("insns_pos populated by the assembly loop");
+    eprintln!(
+        "-- ssarepr {} : {} insns, {} bytes, num_regs i={} r={} f={} --",
+        ssarepr.name,
+        ssarepr.insns.len(),
+        jitcode.code.len(),
+        jitcode.num_regs_i(),
+        jitcode.num_regs_r(),
+        jitcode.num_regs_f(),
+    );
+    for (idx, insn) in ssarepr.insns.iter().enumerate() {
+        eprintln!("[{:5}] {:5}: {insn:?}", positions[idx], idx);
+    }
 }
 
 fn builder_label(state: &mut AssemblyState, name: &str) -> u16 {

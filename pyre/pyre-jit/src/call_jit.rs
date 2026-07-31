@@ -2665,6 +2665,7 @@ pub fn blackhole_resume_via_rd_numb(
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
             let jitcode_index = bh.jitcode.try_index().map(|v| v as i32);
             let last_opcode_position = bh.last_opcode_position;
+            let bh_entry_position = bh.entry_position;
             let bh_opcode_at = bh.jitcode.code.get(last_opcode_position).copied();
             let bh_jitcode_name = bh.jitcode.name().to_string();
             // For `BC_RAISE` (`raise/r`) the following byte is the register the
@@ -2723,6 +2724,7 @@ pub fn blackhole_resume_via_rd_numb(
                     exit_frame_exception_ref(exc_value, "blackhole exception propagation", || {
                         format!(
                             "jitcode={jitcode_index:?} name={bh_jitcode_name} \
+                             entry_position={bh_entry_position} \
                              last_opcode_position={last_opcode_position} opcode={:?} \
                              operand_reg={bh_raise_reg:?} registers_r.len={bh_regs_r_len} \
                              regs_holding_exception={:?} \

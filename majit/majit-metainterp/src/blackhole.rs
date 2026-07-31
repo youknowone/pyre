@@ -252,6 +252,13 @@ pub struct BlackholeInterpreter {
     /// PC, not the next instruction PC. Public so caller-chain propagation in
     /// call_jit.rs can set it to the suspended caller's position.
     pub last_opcode_position: usize,
+    /// Position this frame was last seeded at by `setposition`.
+    ///
+    /// Diagnostic-only: an opcode that reads a register nobody wrote is
+    /// either a resume that landed here without restoring it or a forward
+    /// run whose producing opcode misbehaved, and only the seed coordinate
+    /// separates the two.
+    pub entry_position: usize,
     /// blackhole.py:391 exception_last_value: the caught exception object.
     /// Set when handle_exception_in_frame finds a handler.
     /// Read by CheckExcMatch and other exception opcodes in the handler.
@@ -404,6 +411,7 @@ impl Default for BlackholeInterpreter {
             aborted: false,
             got_exception: false,
             last_opcode_position: 0,
+            entry_position: 0,
             exception_last_value: 0,
             record_caught_exception: None,
             virtualizable_ptr: 0,
@@ -422,6 +430,7 @@ impl BlackholeInterpreter {
         self.aborted = false;
         self.got_exception = false;
         self.last_opcode_position = position;
+        self.entry_position = position;
         self.exception_last_value = 0;
     }
 
