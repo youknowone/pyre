@@ -446,9 +446,11 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
         &[],
     )?;
     pyre_object::gc_roots::pin_root(result);
-    let result = pyre_object::gc_roots::shadow_stack_get(
-        sp + 2 + usize::from(kwargs.is_some()),
-    );
+    // Reread from this slot at every use below: the `__dict__` lookup and each
+    // `namespace_update_dict` can run Python and collect, so a local captured
+    // here would name the pre-relocation address.
+    let result_slot = sp + 2 + usize::from(kwargs.is_some());
+    let result = pyre_object::gc_roots::shadow_stack_get(result_slot);
     let result_type = crate::typedef::r#type(result)
         .map(|tp| tp.as_ptr())
         .unwrap_or(PY_NULL);
@@ -475,7 +477,7 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
     )?;
     pyre_object::gc_roots::pin_root(source_dict);
     namespace_update_dict(
-        result,
+        pyre_object::gc_roots::shadow_stack_get(result_slot),
         pyre_object::gc_roots::shadow_stack_get(
             sp + 3 + usize::from(kwargs.is_some()),
         ),
@@ -483,12 +485,12 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
     )?;
     if kwargs.is_some() {
         namespace_update_dict(
-            result,
+            pyre_object::gc_roots::shadow_stack_get(result_slot),
             pyre_object::gc_roots::shadow_stack_get(sp + 1),
             true,
         )?;
     }
-    Ok(result)
+    Ok(pyre_object::gc_roots::shadow_stack_get(result_slot))
 }
 
 /// `pypy/module/sys/vm.py:217 space.getexecutioncontext()` access for
