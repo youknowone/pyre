@@ -144,6 +144,15 @@ pub enum BufferView {
         w_shape: PyObjectRef,
         w_strides: PyObjectRef,
     },
+    /// A leading-axis integer selection from a multidimensional view.
+    ViewNDOffset {
+        parent: Box<BufferView>,
+        w_obj: PyObjectRef,
+        offset: i64,
+        ndim: i64,
+        w_shape: PyObjectRef,
+        w_strides: PyObjectRef,
+    },
     /// `ReadonlyWrapper` (`buffer.py:415`) — `toreadonly`'s wrapper: every
     /// read delegates to the wrapped view, `readonly` is forced true.
     Readonly {
@@ -216,6 +225,21 @@ impl BufferView {
                 w_shape: *w_shape,
                 w_strides: *w_strides,
             },
+            BufferView::ViewNDOffset {
+                parent,
+                offset,
+                ndim,
+                w_shape,
+                w_strides,
+                ..
+            } => BufferView::ViewNDOffset {
+                parent: parent.clone(),
+                w_obj: new_obj,
+                offset: *offset,
+                ndim: *ndim,
+                w_shape: *w_shape,
+                w_strides: *w_strides,
+            },
             BufferView::Readonly { view, .. } => BufferView::Readonly {
                 view: view.clone(),
                 w_obj: new_obj,
@@ -230,7 +254,8 @@ impl BufferView {
             BufferView::Simple { backing, .. } | BufferView::Raw { backing, .. } => backing,
             BufferView::Slice { parent, .. }
             | BufferView::View1D { parent, .. }
-            | BufferView::ViewND { parent, .. } => parent.backing(),
+            | BufferView::ViewND { parent, .. }
+            | BufferView::ViewNDOffset { parent, .. } => parent.backing(),
             BufferView::Readonly { view, .. } => view.backing(),
         }
     }
@@ -243,6 +268,7 @@ impl BufferView {
             | BufferView::Slice { w_obj, .. }
             | BufferView::View1D { w_obj, .. }
             | BufferView::ViewND { w_obj, .. }
+            | BufferView::ViewNDOffset { w_obj, .. }
             | BufferView::Readonly { w_obj, .. } => *w_obj,
         }
     }
@@ -260,9 +286,9 @@ impl BufferView {
                 BufferView::Raw { w_fmt, .. } | BufferView::View1D { w_fmt, .. } => {
                     crate::w_str_get_value(*w_fmt)
                 }
-                BufferView::Slice { parent, .. } | BufferView::ViewND { parent, .. } => {
-                    parent.format_str()
-                }
+                BufferView::Slice { parent, .. }
+                | BufferView::ViewND { parent, .. }
+                | BufferView::ViewNDOffset { parent, .. } => parent.format_str(),
                 BufferView::Readonly { view, .. } => view.format_str(),
             }
         }
@@ -301,6 +327,7 @@ impl BufferView {
                     parent, itemsize, ..
                 } => vec![parent.length() / *itemsize],
                 BufferView::ViewND { w_shape, .. } => read_dims(*w_shape),
+                BufferView::ViewNDOffset { w_shape, .. } => read_dims(*w_shape),
                 BufferView::Readonly { view, .. } => view.native_shape(),
             }
         }
@@ -329,6 +356,7 @@ impl BufferView {
                     strides
                 }
                 BufferView::ViewND { w_strides, .. } => read_dims(*w_strides),
+                BufferView::ViewNDOffset { w_strides, .. } => read_dims(*w_strides),
                 BufferView::Readonly { view, .. } => view.native_strides(),
             }
         }
@@ -350,6 +378,11 @@ impl BufferView {
                 } => crate::tupleobject::w_tuple_getitem(*w_strides, 0)
                     .map(|s| crate::intobject::w_int_get_value(s))
                     .unwrap_or_else(|| parent.itemsize()),
+                BufferView::ViewNDOffset {
+                    parent, w_strides, ..
+                } => crate::tupleobject::w_tuple_getitem(*w_strides, 0)
+                    .map(|s| crate::intobject::w_int_get_value(s))
+                    .unwrap_or_else(|| parent.itemsize()),
                 BufferView::Readonly { view, .. } => view.stride0(),
             }
         }
@@ -359,9 +392,9 @@ impl BufferView {
         match self {
             BufferView::Raw { itemsize, .. } | BufferView::View1D { itemsize, .. } => *itemsize,
             BufferView::Simple { .. } => 1,
-            BufferView::Slice { parent, .. } | BufferView::ViewND { parent, .. } => {
-                parent.itemsize()
-            }
+            BufferView::Slice { parent, .. }
+            | BufferView::ViewND { parent, .. }
+            | BufferView::ViewNDOffset { parent, .. } => parent.itemsize(),
             BufferView::Readonly { view, .. } => view.itemsize(),
         }
     }
@@ -371,6 +404,7 @@ impl BufferView {
             BufferView::Simple { .. } | BufferView::Raw { .. } | BufferView::View1D { .. } => 1,
             BufferView::Slice { parent, .. } => parent.ndim(),
             BufferView::ViewND { ndim, .. } => *ndim,
+            BufferView::ViewNDOffset { ndim, .. } => *ndim,
             BufferView::Readonly { view, .. } => view.ndim(),
         }
     }
@@ -393,6 +427,7 @@ impl BufferView {
                 BufferView::View1D { parent, .. } | BufferView::ViewND { parent, .. } => {
                     parent.offset()
                 }
+                BufferView::ViewNDOffset { offset, .. } => *offset,
                 BufferView::Readonly { view, .. } => view.offset(),
             }
         }
@@ -426,6 +461,16 @@ impl BufferView {
                         shape.iter().product::<i64>() * parent.itemsize()
                     }
                 }
+                BufferView::ViewNDOffset {
+                    parent, w_shape, ..
+                } => {
+                    let shape = read_dims(*w_shape);
+                    if shape.is_empty() && parent.itemsize() == 0 {
+                        parent.length()
+                    } else {
+                        shape.iter().product::<i64>() * parent.itemsize()
+                    }
+                }
                 BufferView::Readonly { view, .. } => view.length(),
             }
         }
@@ -438,7 +483,8 @@ impl BufferView {
             }
             BufferView::Slice { parent, .. }
             | BufferView::View1D { parent, .. }
-            | BufferView::ViewND { parent, .. } => parent.readonly(),
+            | BufferView::ViewND { parent, .. }
+            | BufferView::ViewNDOffset { parent, .. } => parent.readonly(),
             BufferView::Readonly { .. } => true,
         }
     }

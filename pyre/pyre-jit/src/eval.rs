@@ -992,6 +992,13 @@ fn trace_bufferview(
             w_shape,
             w_strides,
             ..
+        }
+        | pyre_object::bufferview::BufferView::ViewNDOffset {
+            parent,
+            w_obj,
+            w_shape,
+            w_strides,
+            ..
         } => {
             f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
             f(w_shape as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
