@@ -2552,10 +2552,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     !ctx.fbw_mode.snapshot_sym.is_null(),
                 );
             }
-            // A top-level one-frame walk whose residual forced the vable and
-            // writes live heap resumes PAST the escaping opcode through the
-            // blackhole instead of falling back to escape/replay. Both the
-            // latch (`writes_live_heap`, odometer unchanged, non-bridge, empty
+            // A top-level one-frame walk whose residual forced the vable
+            // resumes PAST the escaping opcode through the blackhole instead of
+            // falling back to escape/replay. Both the latch (non-bridge, empty
             // framestack, no committed escape pc, resolvable snapshot sym) and
             // the adopt (`try_adopt_single_frame_blackhole` →
             // `apply_single_frame_blackhole_crn`, which validates every mapped
@@ -2563,9 +2562,24 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // decline to the pre-existing path on any unmet condition, so this
             // only ever replaces a replay that would have produced the same
             // state.
-            if writes_live_heap
-                && odometer_unchanged
-                && !ctx.trace_ctx.is_bridge_trace
+            //
+            // Neither `writes_live_heap` nor the odometer gates it.  Both
+            // describe hazards of RE-RUNNING the escaping opcode, which is what
+            // the rewind latch and the legacy replay do; this leg resumes past
+            // the opcode with the residual's result (or its raise) spliced in,
+            // so the residual runs exactly once no matter what it wrote or
+            // whether it entered a Python frame.  `writes_live_heap` is a static
+            // helper-kind list that does not even contain `CallFunctionEx`,
+            // whose callee is arbitrary user code; gating on it left exactly the
+            // frames whose replay is unsound — a re-entry guard plus a
+            // non-idempotent store ahead of the escaping call — on the replay
+            // path.  Upstream has no counterpart to either gate: ABORT_ESCAPE
+            // goes straight to `run_blackhole_interp_to_cancel_tracing`
+            // (`pyjitpl.py:2949` → `blackhole.py convert_and_run_from_pyjitpl`),
+            // which converts the framestack and runs FORWARD, never replays.
+            // The rewind latch stays mutually exclusive with this one through
+            // `committed_frame_escape_pc().is_none()` below.
+            if !ctx.trace_ctx.is_bridge_trace
                 && let Some((resume_pc, result_bank, result_color)) = blackhole_result
                 && !ctx.fbw_mode.snapshot_sym.is_null()
             {
