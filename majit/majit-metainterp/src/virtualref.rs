@@ -172,9 +172,12 @@ pub use crate::jit::InvalidVirtualRef;
 /// so the address is stable across a minor collection.  The `forced` frame may
 /// be young, hence the creation write barrier.
 ///
-/// The `Box` fallback covers the window before `set_vref_gc_type_id` has run
-/// (the id still reads its unset sentinel) and an old-gen allocation failure;
-/// it is leaked, and reclamation is what it gives up.
+/// The `Box` fallback covers only the window before `set_vref_gc_type_id` has
+/// run (the id still reads its unset sentinel), where there is no registered
+/// type to allocate and nothing has handed a vref to the collector yet; it is
+/// leaked, and reclamation is what it gives up.  Once the id is set the
+/// allocation stays collector-owned or fails loudly — a host box past that
+/// point would silently drop the `forced` edge this object exists to hold.
 fn alloc_virtual_ref(real_object: *mut u8) -> *mut u8 {
     let vref = JitVirtualRef {
         super_: ObjectHeader {
@@ -186,12 +189,14 @@ fn alloc_virtual_ref(real_object: *mut u8) -> *mut u8 {
     let type_id = vref_gc_type_id();
     if type_id != VREF_GC_TYPE_ID_UNSET {
         let gcref = majit_gc::alloc_oldgen_typed(type_id, std::mem::size_of::<JitVirtualRef>());
-        if gcref.0 != 0 {
-            unsafe { std::ptr::write(gcref.0 as *mut JitVirtualRef, vref) };
-            // Creation write barrier: an old-gen vref may point at a young frame.
-            majit_gc::gc_write_barrier(gcref);
-            return gcref.0 as *mut u8;
-        }
+        assert!(
+            gcref.0 != 0,
+            "JitVirtualRef old-gen allocation failed after the type was registered",
+        );
+        unsafe { std::ptr::write(gcref.0 as *mut JitVirtualRef, vref) };
+        // Creation write barrier: an old-gen vref may point at a young frame.
+        majit_gc::gc_write_barrier(gcref);
+        return gcref.0 as *mut u8;
     }
     Box::into_raw(Box::new(vref)) as *mut u8
 }
