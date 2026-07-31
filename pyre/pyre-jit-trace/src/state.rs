@@ -6744,12 +6744,17 @@ fn rd_virtual_at(
 /// The returned OpRefs are heap reads rooted at `frame_box`, not constants
 /// made from the current concrete frame.  A compiled bridge therefore reloads
 /// the frame image on every guard hit (resume.py:1042-1057 consume_boxes).
+///
+/// `stream_covered[k]` marks a slot the caller fills from the resume stream
+/// instead; the image is not read for it (the stream value is authoritative,
+/// see `reconstruct_inline_recipe`), and the slot is left NONE/Void here.
 fn reconstruct_materialized_frame_slots(
     ctx: &mut majit_metainterp::TraceCtx,
     frame_box: OpRef,
     frame_ref: majit_ir::GcRef,
     valuestackdepth: usize,
     pending_result_abs_slot: Option<usize>,
+    stream_covered: &[bool],
 ) -> Option<(Vec<OpRef>, Vec<majit_ir::Value>)> {
     if frame_ref.is_null() || frame_ref == majit_ir::GcRef::NO_CONCRETE {
         return None;
@@ -6778,7 +6783,7 @@ fn reconstruct_materialized_frame_slots(
     let mut registers_r = vec![OpRef::NONE; valuestackdepth];
     let mut concrete_r = vec![majit_ir::Value::Void; valuestackdepth];
     for k in 0..valuestackdepth {
-        if Some(k) == pending_result_abs_slot {
+        if Some(k) == pending_result_abs_slot || stream_covered.get(k).copied().unwrap_or(false) {
             continue;
         }
         let index = ctx.const_int(k as i64);
@@ -6789,6 +6794,45 @@ fn reconstruct_materialized_frame_slots(
             .unwrap_or_else(|| majit_ir::Value::Ref(majit_ir::GcRef(arr.as_slice()[k] as usize)));
     }
     Some((registers_r, concrete_r))
+}
+
+/// resume.py:1054 `consume_boxes`: fill the semantic slots the resume stream
+/// names straight from that stream, overriding whatever the paused frame's
+/// image holds for them.
+///
+/// `stream_slots` is `(index into the frame's decoded value section, semantic
+/// `locals_cells_stack_w` slot)`, built by inverting color -> slot with the
+/// per-pc `pcdep` map the encoder used.
+#[allow(clippy::too_many_arguments)]
+fn overlay_stream_ref_slots(
+    ctx: &mut majit_metainterp::TraceCtx,
+    stream_slots: &[(usize, usize)],
+    values: &[&majit_ir::resumedata::RebuiltValue],
+    registers_r: &mut [OpRef],
+    concrete_r: &mut [majit_ir::Value],
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    resume_data: &majit_metainterp::ResumeDataResult,
+    fail_values: &[i64],
+    fail_types: &[Type],
+    backend: &dyn majit_backend::Backend,
+    cache: &mut BridgeVirtualCache,
+) {
+    for &(pos, slot) in stream_slots {
+        let (box_ref, value) = bridge_decode_box(
+            ctx,
+            values[pos],
+            Type::Ref,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        ctx.try_set_opref_concrete(box_ref, value);
+        registers_r[slot] = box_ref;
+        concrete_r[slot] = value;
+    }
 }
 
 /// Decode one suspended inline-callee frame's resume section into a
@@ -7016,6 +7060,49 @@ fn reconstruct_inline_recipe(
         let Some(frame_pos) = reg_indices.ref_.iter().position(|&c| c == pframe_reg) else {
             decline!("NoFrameRedPosition");
         };
+        let valuestackdepth = nlocals + stack_only;
+        // resume.py:1042-1057 `consume_boxes` refills a paused frame from the
+        // resume stream alone.  Both frame images read below are pyre's
+        // stand-in for the slots that stream never names — a portal callee
+        // keeps its locals in `locals_cells_stack_w` rather than the register
+        // section — but wherever the stream DOES name a slot it is
+        // authoritative: that slot lives in a machine register neither image
+        // has been written back from.  A residual call's result at the guard is
+        // exactly that shape, and reading the image there yields NULL (the
+        // stale pre-call array entry for a forced frame, the never-stored
+        // `NewArrayClear` entry for a virtual one), so the next residual
+        // consuming it folds its Ref arg to concrete NULL
+        // (`walker_abort_if_mayforce_null_ref_arg`) and no bridge is ever
+        // built.  Invert color -> slot with the same `pcdep` map the encoder
+        // used and take those slots from the stream instead.
+        let mut stream_slots: Vec<(usize, usize)> = Vec::new();
+        let mut stream_covered = vec![false; valuestackdepth];
+        for (pos, &color) in reg_indices.ref_.iter().enumerate() {
+            if color == pframe_reg || color == pec_reg {
+                continue;
+            }
+            let Some(slot) = semantic_ref_slot_for_reg_color(
+                nlocals,
+                stack_only,
+                &maps.pcdep_entries,
+                color as usize,
+            ) else {
+                continue;
+            };
+            // The pending call result is delivered by `make_result_of_lastop`,
+            // not from resumedata, so its slot stays unwritten here.
+            if slot >= valuestackdepth
+                || Some(slot) == pending_result_abs_slot
+                || stream_covered[slot]
+            {
+                continue;
+            }
+            stream_covered[slot] = true;
+            stream_slots.push((pos, slot));
+        }
+        if !stream_slots.is_empty() {
+            crate::jitcode_dispatch::census_record("P2Recipe::StreamSlotOverImage");
+        }
         // resume.py:1042-1057 rebuild_from_resumedata consumes the saved boxes
         // for every frame without requiring the frame object itself to remain
         // virtual.  A Pyre callee frame can be forced before the guard (for
@@ -7045,14 +7132,27 @@ fn reconstruct_inline_recipe(
             };
             ctx.try_set_opref_concrete(frame_box, frame_value);
 
-            let valuestackdepth = nlocals + stack_only;
-            let (registers_r, concrete_r) = reconstruct_materialized_frame_slots(
+            let (mut registers_r, mut concrete_r) = reconstruct_materialized_frame_slots(
                 ctx,
                 frame_box,
                 frame_ref,
                 valuestackdepth,
                 pending_result_abs_slot,
+                &stream_covered,
             )?;
+            overlay_stream_ref_slots(
+                ctx,
+                &stream_slots,
+                &values,
+                &mut registers_r,
+                &mut concrete_r,
+                rd_virtuals,
+                resume_data,
+                fail_values,
+                fail_types,
+                backend,
+                cache,
+            );
             crate::jitcode_dispatch::census_record("P2Recipe::MaterializedFrameAdmit");
             return Some(ReconstructRecipe {
                 code_ptr: raw_code as *const (),
@@ -7111,7 +7211,6 @@ fn reconstruct_inline_recipe(
             | majit_ir::RdVirtualInfo::VArrayInfoNotClear { fieldnums, .. } => fieldnums.clone(),
             _ => decline!("LocalsArrayNotArrayInfo"),
         };
-        let valuestackdepth = nlocals + stack_only;
         if valuestackdepth > arr.len() {
             decline!("LocalsArrayTooShort");
         }
@@ -7123,7 +7222,7 @@ fn reconstruct_inline_recipe(
         // NULL in the rebuilt frame; a missing operand-stack slot is
         // unreconstructable and declines below.
         for k in 0..valuestackdepth {
-            if Some(k) == pending_result_abs_slot {
+            if Some(k) == pending_result_abs_slot || stream_covered[k] {
                 continue;
             }
             let tag = arr[k];
@@ -7144,6 +7243,22 @@ fn reconstruct_inline_recipe(
             );
             concrete_r[k] = value_for_slot(Type::Ref, bits);
         }
+        // Runs before the mandatory-operand check: a stack slot the virtual
+        // array never stored is `UNINITIALIZED`/clear-NULL there but present in
+        // the stream, so the overlay is what makes it reconstructable.
+        overlay_stream_ref_slots(
+            ctx,
+            &stream_slots,
+            &values,
+            &mut registers_r,
+            &mut concrete_r,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
         for s in nlocals..valuestackdepth {
             if Some(s) == pending_result_abs_slot
                 || unreconstructable_operand_floor.is_some_and(|floor| s >= floor)
@@ -10697,6 +10812,7 @@ mod tests {
             majit_ir::GcRef(frame_ptr),
             values.len(),
             Some(1),
+            &[],
         )
         .expect("forced frame slots should be reconstructable");
 
