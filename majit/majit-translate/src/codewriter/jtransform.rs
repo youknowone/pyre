@@ -2888,15 +2888,18 @@ impl<'a> Transformer<'a> {
         // enum tag as a separate MIR operand. Restore the exact low-level
         // shape here. The existing payload write follows this replacement in
         // program order; the tag write is emitted beside the allocation.
-        if let CallTarget::SyntheticTransparentCtor { name, owner_path } = target
-            && args.is_empty()
-            && matches!(name.as_str(), "Ok" | "Err")
-            && owner_path
-                .last()
-                .is_some_and(|owner| owner.starts_with("Result"))
+        // Recognize the ctor through the front-side rule rather than a second
+        // spelling test: it anchors the owner path head at `core::result` and
+        // compares the instantiation-stripped leaf for equality, where a
+        // `starts_with("Result")` leaf test also accepts an unrelated enum whose
+        // name merely begins with it and carries `Ok`/`Err` variants. Both gates
+        // decide the same question, so they must not be able to drift.
+        if args.is_empty()
+            && let Some(is_err) = crate::front::result_exc::result_ctor_kind(target)
             && let ValueType::Ref(Some(owner)) = result_ty
         {
-            let tag = i64::from(name == "Err");
+            let name = if is_err { "Err" } else { "Ok" };
+            let tag = i64::from(is_err);
             let result_base = owner
                 .strip_suffix(format!("::{name}").as_str())
                 .unwrap_or(owner)

@@ -302,7 +302,7 @@ pub(crate) fn widen_unit_return_to_void(graph: &mut FunctionGraph) {
 /// (`Result<Tuple,PyError>`) minted by the generic-ADT projection; strip
 /// it before the bare-path compare so suffixed and bare Result ctors are
 /// recognised alike.
-fn result_ctor_kind(target: &CallTarget) -> Option<bool> {
+pub(crate) fn result_ctor_kind(target: &CallTarget) -> Option<bool> {
     let CallTarget::SyntheticTransparentCtor { name, owner_path } = target else {
         return None;
     };
