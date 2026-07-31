@@ -3443,7 +3443,10 @@ fn build_ll_listslice_startonly_helper_graph(
     let newlength = variable_with_lltype("newlength", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "int_sub",
-        vec![Hlvalue::Variable(len1), Hlvalue::Variable(start_arg.clone())],
+        vec![
+            Hlvalue::Variable(len1),
+            Hlvalue::Variable(start_arg.clone()),
+        ],
         Hlvalue::Variable(newlength.clone()),
     ));
     emit_listslice_alloc_and_copy(
@@ -3654,14 +3657,17 @@ fn build_ll_listslice_startstop_helper_graph(
 
     // ---- block_merge: newlength = stop - start; alloc + copy.
     let newlength = variable_with_lltype("newlength", LowLevelType::Signed);
-    block_merge.borrow_mut().operations.push(SpaceOperation::new(
-        "int_sub",
-        vec![
-            Hlvalue::Variable(stop_m),
-            Hlvalue::Variable(start_m.clone()),
-        ],
-        Hlvalue::Variable(newlength.clone()),
-    ));
+    block_merge
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_sub",
+            vec![
+                Hlvalue::Variable(stop_m),
+                Hlvalue::Variable(start_m.clone()),
+            ],
+            Hlvalue::Variable(newlength.clone()),
+        ));
     emit_listslice_alloc_and_copy(
         &block_merge,
         &graph.returnblock,
@@ -6027,12 +6033,16 @@ mod tests {
         hop.args_v.borrow_mut().push(v_start_h);
         hop.args_s
             .borrow_mut()
-            .push(SomeValue::Integer(SomeInteger::new(/* nonneg */ true, false)));
+            .push(SomeValue::Integer(SomeInteger::new(
+                /* nonneg */ true, false,
+            )));
         hop.args_r.borrow_mut().push(Some(r_int.clone()));
         hop.args_v.borrow_mut().push(v_stop_h);
         hop.args_s
             .borrow_mut()
-            .push(SomeValue::Integer(SomeInteger::new(/* nonneg */ true, false)));
+            .push(SomeValue::Integer(SomeInteger::new(
+                /* nonneg */ true, false,
+            )));
         hop.args_r.borrow_mut().push(Some(r_int.clone()));
         // The slice result is a fresh resized list (listdef.offspring).
         *hop.r_result.borrow_mut() = Some(r_list.clone());
@@ -6052,7 +6062,8 @@ mod tests {
             .filter(|op| op.opname == "direct_call")
             .count();
         assert_eq!(
-            direct_calls, 1,
+            direct_calls,
+            1,
             "expected a single ll_listslice_startstop direct_call, got {:?}",
             ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
         );
@@ -6113,7 +6124,9 @@ mod tests {
         hop.args_v.borrow_mut().push(v_start_h);
         hop.args_s
             .borrow_mut()
-            .push(SomeValue::Integer(SomeInteger::new(/* nonneg */ true, false)));
+            .push(SomeValue::Integer(SomeInteger::new(
+                /* nonneg */ true, false,
+            )));
         hop.args_r.borrow_mut().push(Some(r_int.clone()));
         hop.args_v.borrow_mut().push(c_stop);
         hop.args_s.borrow_mut().push(s_none());
@@ -6131,7 +6144,8 @@ mod tests {
             .filter(|op| op.opname == "direct_call")
             .count();
         assert_eq!(
-            direct_calls, 1,
+            direct_calls,
+            1,
             "expected a single ll_listslice_startonly direct_call, got {:?}",
             ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
         );
@@ -6212,7 +6226,8 @@ mod tests {
             .filter(|op| op.opname == "direct_call")
             .count();
         assert_eq!(
-            direct_calls, 1,
+            direct_calls,
+            1,
             "expected a single ll_listslice_minusone direct_call, got {:?}",
             ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
         );

@@ -2816,20 +2816,27 @@ impl HighLevelOp {
         }
         if let SomeValue::Integer(si) = &s_stop {
             if !si.nonneg {
-                return Err(TyperError::message("slice stop must be proved non-negative"));
+                return Err(TyperError::message(
+                    "slice stop must be proved non-negative",
+                ));
             }
         }
 
         // v_start = inputconst(Signed, 0) when start is a constant None, else inputarg.
-        let start_is_none = s_start.is_constant() && matches!(s_start.const_(), Some(ConstValue::None));
+        let start_is_none =
+            s_start.is_constant() && matches!(s_start.const_(), Some(ConstValue::None));
         let v_start = if start_is_none {
-            Hlvalue::Constant(Self::inputconst(&LowLevelType::Signed, &ConstValue::Int(0))?)
+            Hlvalue::Constant(Self::inputconst(
+                &LowLevelType::Signed,
+                &ConstValue::Int(0),
+            )?)
         } else {
             self.inputarg(&LowLevelType::Signed, 1)?
         };
 
         // stop constant None -> "startonly"; else "startstop".
-        let stop_is_none = s_stop.is_constant() && matches!(s_stop.const_(), Some(ConstValue::None));
+        let stop_is_none =
+            s_stop.is_constant() && matches!(s_stop.const_(), Some(ConstValue::None));
         if stop_is_none {
             Ok((SliceKind::StartOnly, vec![v_start]))
         } else {
