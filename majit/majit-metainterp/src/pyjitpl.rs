@@ -1715,15 +1715,18 @@ impl<M: Clone> MetaInterp<M> {
     pub fn walk_rd_consts_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
         fn visit_pool(
             pool: Option<&Arc<majit_ir::SharedConstPool>>,
-            visited: &mut Vec<usize>,
+            visited: &mut indexmap::IndexSet<usize>,
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
             let Some(pool) = pool else { return };
             let identity = Arc::as_ptr(pool) as usize;
-            if visited.contains(&identity) {
+            // A set, not a scanned list: this runs once per exit layout of
+            // every trace of every compiled loop, so the number of pools it
+            // sees grows with the compiled code, and a linear membership scan
+            // would make one walk quadratic in that count.
+            if !visited.insert(identity) {
                 return;
             }
-            visited.push(identity);
             // SAFETY: pyre is single-threaded and the minor-collection
             // walker is the only writer; concurrent readers run outside
             // GC cycles.
@@ -1735,7 +1738,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        let mut visited = Vec::new();
+        let mut visited = indexmap::IndexSet::new();
         for entry in self.compiled_loops.values_mut() {
             for trace in entry.traces.values_mut() {
                 for layout in trace.exit_layouts.values_mut() {
