@@ -644,6 +644,44 @@ impl BlackholeInterpreter {
         }
     }
 
+    /// `blackhole.py:1102-1132` — the four `bhimpl_recursive_call_{i,r,f,v}`
+    /// share one prologue: resolve the driver's portal runner, then merge
+    /// greens and reds per kind (`greens_i + reds_i`, ...) into the
+    /// `bh_call_*` argument banks.
+    ///
+    /// A zero `fnptr` here would be an indirect call through a null address.
+    /// `get_portal_runner` reports zero for a driver slot whose
+    /// `portal_runner_adr` was never populated, and the recursive-call path is
+    /// not optional, so reaching this point with zero means `jdindex` named the
+    /// wrong slot of `jitdrivers_sd`.  Report the coordinates instead of
+    /// faulting at PC 0.
+    fn portal_runner_call_args(
+        &self,
+        jdindex: usize,
+        greens_i: Vec<i64>,
+        greens_r: Vec<i64>,
+        greens_f: Vec<i64>,
+        reds_i: Vec<i64>,
+        reds_r: Vec<i64>,
+        reds_f: Vec<i64>,
+    ) -> (i64, BhCallDescr, Vec<i64>, Vec<i64>, Vec<i64>) {
+        let (fnptr, calldescr) = self.get_portal_runner(jdindex);
+        assert!(
+            fnptr != 0,
+            "blackhole recursive_call: jitdrivers_sd[{jdindex}] carries no portal \
+             runner ({} driver(s) registered, jitcode={}) — blackhole.py:1095-1099",
+            self.jitdrivers_sd.len(),
+            self.jitcode.name(),
+        );
+        let mut all_i = greens_i;
+        all_i.extend(&reds_i);
+        let mut all_r = greens_r;
+        all_r.extend(&reds_r);
+        let mut all_f = greens_f;
+        all_f.extend(&reds_f);
+        (fnptr, calldescr, all_i, all_r, all_f)
+    }
+
     /// blackhole.py:1109-1116 bhimpl_recursive_call_r:
     ///   fnptr, calldescr = self.get_portal_runner(jdindex)
     ///   return self.cpu.bh_call_r(fnptr, greens_i+reds_i, greens_r+reds_r,
@@ -658,14 +696,10 @@ impl BlackholeInterpreter {
         reds_r: Vec<i64>,
         reds_f: Vec<i64>,
     ) -> majit_ir::GcRef {
-        let (fnptr, calldescr) = self.get_portal_runner(jdindex);
         // blackhole.py:1113-1116: greens + reds merged per kind.
-        let mut all_i = greens_i;
-        all_i.extend(&reds_i);
-        let mut all_r = greens_r;
-        all_r.extend(&reds_r);
-        let mut all_f = greens_f;
-        all_f.extend(&reds_f);
+        let (fnptr, calldescr, all_i, all_r, all_f) = self.portal_runner_call_args(
+            jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
+        );
         self.cpu()
             .bh_call_r(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
     }
@@ -1114,6 +1148,27 @@ impl BlackholeInterpreter {
         //   elif result_type == 'r': bhimpl_recursive_call_r + ref_return
         //   elif result_type == 'f': bhimpl_recursive_call_f + float_return
         //   assert False
+        // The jdindex operand names a jitdriver, and only this recursive-portal
+        // level indexes the table with it — the bottommost level above raises
+        // `ContinueRunningNormally` without ever reading it.  A value out of
+        // range here is a decode fault, not a missing driver: either this frame
+        // resumed at a position that is not a merge point, or a `setarg_i` wrote
+        // past `num_regs_i` and overwrote the constant slot the operand reads.
+        // Report both coordinates instead of an anonymous bounds panic.
+        assert!(
+            jdindex < self.jitdrivers_sd.len(),
+            "blackhole jit_merge_point decoded jdindex={jdindex} but only {} jitdriver(s) exist \
+             (jitcode={} c_form={} jdindex_byte={jdindex_byte} num_regs_i={} registers_i.len={} \
+             position={} last_opcode_position={} entry_position={})",
+            self.jitdrivers_sd.len(),
+            self.jitcode.name(),
+            opcode == jitcode::insns::BC_JIT_MERGE_POINT_C,
+            self.jitcode.num_regs_i(),
+            self.registers_i.len(),
+            self.position,
+            self.last_opcode_position,
+            self.entry_position,
+        );
         let result_type = self.jitdrivers_sd[jdindex].result_type;
         match result_type {
             BhReturnType::Void => {
@@ -1828,13 +1883,9 @@ impl BlackholeInterpreter {
         reds_r: Vec<i64>,
         reds_f: Vec<i64>,
     ) -> i64 {
-        let (fnptr, calldescr) = self.get_portal_runner(jdindex);
-        let mut all_i = greens_i;
-        all_i.extend(&reds_i);
-        let mut all_r = greens_r;
-        all_r.extend(&reds_r);
-        let mut all_f = greens_f;
-        all_f.extend(&reds_f);
+        let (fnptr, calldescr, all_i, all_r, all_f) = self.portal_runner_call_args(
+            jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
+        );
         self.cpu()
             .bh_call_i(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
     }
@@ -1850,13 +1901,9 @@ impl BlackholeInterpreter {
         reds_r: Vec<i64>,
         reds_f: Vec<i64>,
     ) -> f64 {
-        let (fnptr, calldescr) = self.get_portal_runner(jdindex);
-        let mut all_i = greens_i;
-        all_i.extend(&reds_i);
-        let mut all_r = greens_r;
-        all_r.extend(&reds_r);
-        let mut all_f = greens_f;
-        all_f.extend(&reds_f);
+        let (fnptr, calldescr, all_i, all_r, all_f) = self.portal_runner_call_args(
+            jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
+        );
         self.cpu()
             .bh_call_f(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
     }
@@ -1872,13 +1919,9 @@ impl BlackholeInterpreter {
         reds_r: Vec<i64>,
         reds_f: Vec<i64>,
     ) {
-        let (fnptr, calldescr) = self.get_portal_runner(jdindex);
-        let mut all_i = greens_i;
-        all_i.extend(&reds_i);
-        let mut all_r = greens_r;
-        all_r.extend(&reds_r);
-        let mut all_f = greens_f;
-        all_f.extend(&reds_f);
+        let (fnptr, calldescr, all_i, all_r, all_f) = self.portal_runner_call_args(
+            jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
+        );
         self.cpu()
             .bh_call_v(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr);
     }
