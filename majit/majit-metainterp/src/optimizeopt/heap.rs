@@ -861,6 +861,26 @@ impl OptHeap {
         }
     }
 
+    /// Is a `w_class` store still pending under ANY descr spelling?
+    ///
+    /// The field caches are keyed by `Arc::as_ptr` identity
+    /// (`cached_field_pos_for_descr`), and pyre mints more than one descr for
+    /// the `w_class` header (a walker singleton with no parent, and the size
+    /// descr's own `all_fielddescrs` entry). A miss on the descr being read
+    /// therefore does not prove the field is untouched — the store may sit in
+    /// the other spelling's `lazy_set`. Asking across every spelling costs a
+    /// fold, never correctness.
+    ///
+    /// Only `lazy_set` is consulted: a store that has already been flushed
+    /// (`force_lazy_set` → `put_field_back_to_info`) is readable from the
+    /// instance's own field slot, and `cached_structs` also fills up from plain
+    /// reads, which say nothing about the field having been written.
+    fn w_class_set_pending(&self) -> bool {
+        self.cached_fields.iter().any(|(_, descr, cf)| {
+            descr.as_field_descr().is_some_and(|fd| fd.is_w_class()) && cf.lazy_set.is_some()
+        })
+    }
+
     fn cached_field_pos_for_descr(&self, descr: &DescrRef) -> Option<usize> {
         let identity = descr_identity(descr);
         self.cached_fields
@@ -2205,6 +2225,75 @@ impl OptHeap {
                 ctx.structinfo_setfield(&lazy_op, lazy_field_idx, final_value.to_opref());
             }
             // Cache miss — fall through to emit the getfield
+        }
+
+        // Pyre object-model: `w_class` (PyObject header) carries Python-level
+        // class identity. `virtualize.rs` resolves it from a virtual's own
+        // class; once the allocation is forced the read arrives here instead.
+        // `info.py:152 force_box` keeps the class (`info.py:324
+        // get_known_class` still answers), so a forced instance still names its
+        // layout and the header value is that layout's canonical class.
+        //
+        // A store that reached the instance's own slot wins over the layout's
+        // canonical class; only when the header was never written does the
+        // layout answer, and then only if no store is still pending. A retag to
+        // a user subclass writes this header, and folding past that write would
+        // answer with the base class and silently defeat a class check. Reads
+        // of an object whose layout is unknown (`descr: None`, what
+        // `ensure_ptr_info_arg0` builds for a plain heap object) resolve to
+        // nothing and stay in the trace.
+        //
+        // The slot is looked up through the LAYOUT's own `w_class` fielddescr,
+        // never the read descr's index: a parent-bearing `w_class` spelling has
+        // `index_in_parent == 0`, which is the first VALUE field, and folding
+        // through it forwards `Ref <- Int` (`virtualize.rs:850-856`).
+        if descr.as_field_descr().is_some_and(|fd| fd.is_w_class()) {
+            let obj_box = ctx.get_box_replacement_operand(obj);
+            if let Some(crate::optimizeopt::info::PtrInfo::Instance(iinfo)) =
+                ctx.peek_ptr_info(&obj_box)
+            {
+                let size_descr = iinfo.descr.as_ref().and_then(|d| d.as_size_descr());
+                let stored = size_descr
+                    .and_then(|sd| {
+                        sd.all_fielddescrs()
+                            .iter()
+                            .find(|fd| fd.is_w_class())
+                            .map(|fd| fd.index_in_parent() as u32)
+                    })
+                    .and_then(|widx| {
+                        iinfo
+                            .fields
+                            .iter()
+                            .find(|(idx, _)| *idx == widx)
+                            .map(|(_, e)| e.clone())
+                    });
+                match stored {
+                    Some(crate::optimizeopt::info::FieldEntry::Value(b_val)) => {
+                        let b_old = Operand::from_bound_op(op_rc);
+                        let b_val = ctx.get_box_replacement_operand(b_val.to_opref());
+                        ctx.make_equal_to(&b_old, &b_val);
+                        return OptimizationResult::Remove;
+                    }
+                    // Not a value yet — leave the read rather than folding past
+                    // the pending preamble op.
+                    Some(crate::optimizeopt::info::FieldEntry::Preamble(_)) => {}
+                    None => {
+                        if !self.w_class_set_pending() {
+                            if let Some(w_class) = size_descr
+                                .and_then(|sd| sd.w_class_obj())
+                                .filter(|&w| w != 0)
+                            {
+                                let b = ctx.materialize_operand_at(op.pos.get());
+                                ctx.make_constant_box(
+                                    &b,
+                                    majit_ir::Value::Ref(majit_ir::GcRef(w_class as usize)),
+                                );
+                                return OptimizationResult::Remove;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Virtualizable fields are loop-variant; skip caching/import.

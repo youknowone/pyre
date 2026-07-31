@@ -893,67 +893,18 @@ impl OptVirtualize {
                     // rather than mis-indexing a value field.
                     return OptimizationResult::PassOn;
                 }
-                // Same resolution once the allocation has been forced.
-                // `info.py:152 force_box` keeps the SAME info object and only
-                // clears `_is_virtual`, so `info.py:324 get_known_class` still
-                // answers afterwards; pyre reproduces that by installing
-                // `PtrInfo::Instance` carrying the virtual's `descr` and
-                // `known_class` (info.rs:1113-1118). Without this arm the class
-                // is known but unusable the moment the allocation escapes, and
-                // every later header read re-emits with its guard.
-                //
-                // The slot is looked up the same way as the virtual arm above —
-                // through the layout's own `w_class` field descr, never through
-                // the read descr's index, which for a parent-bearing spelling is
-                // `index_in_parent == 0` and would alias the first value field.
-                if let PtrInfo::Instance(ref iinfo) = info {
-                    let stored = iinfo
-                        .descr
-                        .as_ref()
-                        .and_then(|d| d.as_size_descr())
-                        .and_then(|sd| {
-                            sd.all_fielddescrs()
-                                .iter()
-                                .find(|fd| fd.is_w_class())
-                                .map(|fd| fd.index_in_parent() as u32)
-                        })
-                        .and_then(|widx| {
-                            iinfo
-                                .fields
-                                .iter()
-                                .find(|(idx, _)| *idx == widx)
-                                .map(|(_, e)| e)
-                        });
-                    match stored {
-                        // A recorded write wins over the descr's canonical
-                        // class, exactly as the virtual arm prefers `stored`.
-                        Some(crate::optimizeopt::info::FieldEntry::Value(b_val)) => {
-                            let b_old = Operand::from_bound_op(op_rc);
-                            let b_val = ctx.get_box_replacement_operand(b_val.to_opref());
-                            ctx.make_equal_to(&b_old, &b_val);
-                            return OptimizationResult::Remove;
-                        }
-                        // Not a value yet — leave the read alone rather than
-                        // folding past the pending preamble op.
-                        Some(crate::optimizeopt::info::FieldEntry::Preamble(_)) => {}
-                        None => {
-                            if let Some(w_class) = iinfo
-                                .descr
-                                .as_ref()
-                                .and_then(|d| d.as_size_descr())
-                                .and_then(|sd| sd.w_class_obj())
-                                .filter(|&w| w != 0)
-                            {
-                                let b = ctx.materialize_operand_at(op.pos.get());
-                                ctx.make_constant_box(
-                                    &b,
-                                    majit_ir::Value::Ref(majit_ir::GcRef(w_class as usize)),
-                                );
-                                return OptimizationResult::Remove;
-                            }
-                        }
-                    }
-                }
+                // Once the allocation is forced the read is NOT resolved here.
+                // `virtualize.py:184-195 optimize_GETFIELD_GC_*` folds only
+                // under `opinfo.is_virtual()` and otherwise emits, leaving a
+                // non-virtual's field read to `heap.py`. That layering is
+                // load-bearing for this field: `force_box` empties the forced
+                // instance's field list (info.rs:1113-1118, so heap's
+                // `do_setfield` cannot MUST_ALIAS-elide the materializing
+                // SETFIELD_GC) and routes the write into `OptHeap`, where it
+                // sits in `CachedField::lazy_set`. Folding here would run
+                // BEFORE that pass and answer from the layout's canonical
+                // class, discarding a pending retag to a user subclass.
+                // The canonical-class fallback lives in `optimize_getfield`.
             }
             let field_val = match &info {
                 PtrInfo::Virtual(vinfo) => get_field(&vinfo.fields, field_idx),
