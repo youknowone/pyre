@@ -212,6 +212,72 @@ fn self_alias(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(self_)
 }
 
+/// `GenericAlias.__repr__` (`_pypy_generic_alias.py:57`).
+fn ga_repr(args: &[PyObjectRef]) -> crate::PyResult {
+    let self_ = self_alias(args)?;
+    Ok(w_str_new(&unsafe { repr(self_)? }))
+}
+
+/// `GenericAlias.__hash__` (`_pypy_generic_alias.py:82`).
+fn ga_hash(args: &[PyObjectRef]) -> crate::PyResult {
+    let self_ = self_alias(args)?;
+    Ok(w_int_new(crate::builtins::try_hash_value(self_)?))
+}
+
+/// `GenericAlias.__call__` (`_pypy_generic_alias.py:41-46`).
+fn ga_call(args: &[PyObjectRef]) -> crate::PyResult {
+    let self_ = self_alias(args)?;
+    let origin = unsafe { w_generic_alias_get_origin(self_) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_);
+    pyre_object::gc_roots::pin_root(origin);
+    let result = crate::builtins::call_forwarding_args(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(root_base + 1) },
+        &args[1..],
+    )?;
+    pyre_object::gc_roots::pin_root(result);
+    crate::call::set_orig_class(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(root_base + 2) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(root_base) },
+    )?;
+    Ok(unsafe { pyre_object::gc_roots::shadow_stack_get(root_base + 2) })
+}
+
+/// `GenericAlias.__getattribute__` (`_pypy_generic_alias.py:52-55`).
+fn ga_getattribute(args: &[PyObjectRef]) -> crate::PyResult {
+    let self_ = self_alias(args)?;
+    let name_obj = args.get(1).copied().unwrap_or_else(w_none);
+    let name = crate::baseobjspace::text_w(name_obj)?;
+    if !is_attr_exception(name) && !is_attr_blocked(name) {
+        let origin = unsafe { w_generic_alias_get_origin(self_) };
+        crate::baseobjspace::getattr_str(origin, name)
+    } else {
+        crate::baseobjspace::object_getattribute(self_, name)
+    }
+}
+
+/// `GenericAlias.__iter__` (`_pypy_generic_alias.py:108-109`).
+fn ga_iter(args: &[PyObjectRef]) -> crate::PyResult {
+    let self_ = self_alias(args)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(self_);
+    let starred = make_starred(self_)?;
+    let starred_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(starred);
+    let singleton = w_tuple_new(vec![unsafe {
+        pyre_object::gc_roots::shadow_stack_get(starred_slot)
+    }]);
+    let singleton_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(singleton);
+    crate::baseobjspace::iter(unsafe { pyre_object::gc_roots::shadow_stack_get(singleton_slot) })
+}
+
+/// `GenericAlias.__dir__` (`_pypy_generic_alias.py:85-88`).
+fn ga_dir(args: &[PyObjectRef]) -> crate::PyResult {
+    dir_list(self_alias(args)?)
+}
+
 /// `GenericAlias.__eq__` (`_pypy_generic_alias.py:64`).
 fn ga_eq(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = args.first().copied().unwrap_or_else(w_none);
@@ -229,6 +295,22 @@ fn ga_eq(args: &[PyObjectRef]) -> crate::PyResult {
         )? && w_generic_alias_get_unpacked(self_) == w_generic_alias_get_unpacked(other)
     };
     Ok(w_bool_from(eq))
+}
+
+/// CPython 3.14's `ga_richcompare`: `!=` is the inverse of the structural
+/// equality result; the four ordering operations return `NotImplemented`.
+fn ga_ne(args: &[PyObjectRef]) -> crate::PyResult {
+    let result = ga_eq(args)?;
+    if unsafe { is_not_implemented(result) } {
+        Ok(result)
+    } else {
+        Ok(w_bool_from(!unsafe { w_bool_get_value(result) }))
+    }
+}
+
+fn ga_ordering(args: &[PyObjectRef]) -> crate::PyResult {
+    self_alias(args)?;
+    Ok(w_not_implemented())
 }
 
 /// `GenericAlias.__mro_entries__` (`_pypy_generic_alias.py:49`) —
@@ -907,9 +989,42 @@ pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
             make_builtin_function("__eq__", ga_eq),
         )
     };
-    // __hash__ and __call__ are resolved at their dispatch points
-    // (`builtins::hash_value`, `call::call_function_impl_result`) because
-    // pyre does not consult a typedef slot for them on builtin W_Roots.
+    for (name, method) in [
+        ("__ne__", ga_ne as fn(&[PyObjectRef]) -> crate::PyResult),
+        ("__lt__", ga_ordering),
+        ("__le__", ga_ordering),
+        ("__gt__", ga_ordering),
+        ("__ge__", ga_ordering),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, method, 2),
+            )
+        };
+    }
+    // Pyre's ordinary operation dispatch has native fast paths for these
+    // slots, but CPython 3.14 and PyPy also expose the methods through the
+    // GenericAlias type dictionary for unbound calls.
+    for (name, method, arity) in [
+        (
+            "__repr__",
+            ga_repr as fn(&[PyObjectRef]) -> crate::PyResult,
+            Some(1),
+        ),
+        ("__hash__", ga_hash, Some(1)),
+        ("__call__", ga_call, None),
+        ("__getattribute__", ga_getattribute, Some(2)),
+        ("__iter__", ga_iter, Some(1)),
+        ("__dir__", ga_dir, Some(1)),
+    ] {
+        let function = match arity {
+            Some(arity) => make_builtin_function_with_arity(name, method, arity),
+            None => make_builtin_function(name, method),
+        };
+        unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, function) };
+    }
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -983,9 +1098,10 @@ pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
             ),
         )
     };
-    // `__iter__` and `__dir__` are intercepted directly by `baseobjspace::iter`
-    // and `builtins::builtin_dir`; explicit `ga.__iter__`/`ga.__dir__` access
-    // delegates to `__origin__` (they are not in `_ATTR_EXCEPTIONS`).
+    // Instance attribute access for `ga.__iter__`/`ga.__dir__` still delegates
+    // to `__origin__` because they are not in `_ATTR_EXCEPTIONS`; the typedef
+    // entries above provide CPython's `types.GenericAlias.__iter__(ga)` and
+    // `types.GenericAlias.__dir__(ga)` unbound-call surface.
 }
 
 /// Render a GenericAlias for `repr()` (`GenericAlias.__repr__`,

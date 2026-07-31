@@ -753,7 +753,10 @@ pub fn call_user_function_resolved(
 /// `__origin__`, set `result.__orig_class__ = self`.  This is wrapped in
 /// `try: ... except (AttributeError, TypeError): pass`, so only those two
 /// errors are swallowed; anything else propagates.
-fn set_orig_class(result: PyObjectRef, alias: PyObjectRef) -> Result<(), crate::PyError> {
+pub(crate) fn set_orig_class(
+    result: PyObjectRef,
+    alias: PyObjectRef,
+) -> Result<(), crate::PyError> {
     match crate::baseobjspace::setattr_str(result, "__orig_class__", alias) {
         Ok(_) => Ok(()),
         Err(e)
