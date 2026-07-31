@@ -2235,9 +2235,8 @@ fn build_stub_pygraph_with_result_shell(
 ///
 /// `Address` maps to the untyped `SomeAddress` shell (`llmemory.py:573
 /// SomeAddress`) — the annotation-stage projection a `*const T` / `*mut T`
-/// raw pointer carries when its element type is not modeled.  A
-/// `<[T]>::as_ptr` result is consumed here only as a residual-call argument
-/// (`hash_str_hooked(ptr, len)`), for which the untyped address is faithful.
+/// raw pointer carries when its element type is not modeled, for a residual
+/// whose result is consumed only as a residual-call argument.
 pub(crate) fn default_someshell_for_lltype(
     lltype: &LowLevelType,
 ) -> Option<crate::annotator::model::SomeValue> {
@@ -2416,10 +2415,12 @@ pub(crate) fn register_unsafe_fn_stubs(
 /// - `core::f64::<Impl>::to_bits` returns `u64` reinterpreted as `i64` —
 ///   `Signed` result.
 ///
-/// A raw `*const T` / `*mut T` result maps to the untyped `Address` shell
-/// (`core::slice::<Impl>::as_ptr`, `vec::Vec::as_ptr`) — faithful when the
-/// pointer is consumed only as a residual-call argument.  Paths whose
-/// faithful result is a non-scalar value the stub carrier still cannot
+/// `<[T]>::as_ptr` / `Vec::as_ptr` are NOT registered here: in the erased
+/// array-pointer value-model the slice's data pointer is the receiver value,
+/// so they fold to the receiver in the front end
+/// (`Lowering::is_container_as_ptr_identity`, twin of the `as_slice` and
+/// `NonNull::as_ptr` identity folds), leaving no residual to annotate.  Paths
+/// whose faithful result is a non-scalar value the stub carrier still cannot
 /// express (`alloc::fmt::format` → `String`,
 /// `core::array::iter::<Impl>::into_iter` → an iterator with no Repr,
 /// `core::num::<Impl>::checked_*` → `Option<i64>`) stay intentionally
@@ -2452,12 +2453,6 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &["layout"],
         LowLevelType::Void,
     ),
-    (
-        &["core", "slice", "<Impl>", "as_ptr"],
-        &["self"],
-        LowLevelType::Address,
-    ),
-    (&["vec", "Vec", "as_ptr"], &["self"], LowLevelType::Address),
     (
         &["sync", "atomic", "AtomicBool", "store"],
         &["self", "val", "order"],

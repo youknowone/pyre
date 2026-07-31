@@ -6987,6 +6987,17 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<[T]>::as_ptr` / `Vec::as_ptr` — the slice's data pointer is
+                // the receiver value in the erased array-pointer model.  Alias
+                // the result to the receiver (twin of the `as_slice` identity
+                // above and `NonNull::as_ptr`).
+                if args.len() == 1 && self.is_container_as_ptr_identity(&reg) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `alloc::fmt::format` of a no-placeholder constant
                 // message — `format!("literal")`, whose `format_args!`
                 // lowered to `Arguments::from_str` (aliased to its
@@ -9311,6 +9322,27 @@ impl<'a> Lowering<'a> {
                     | "pyre_object::int_array::<Impl>::as_mut_slice"
                     | "pyre_object::float_array::<Impl>::as_slice"
                     | "pyre_object::float_array::<Impl>::as_mut_slice"
+            )
+        })
+    }
+
+    /// `<[T]>::as_ptr` / `Vec::as_ptr` — the data-pointer projection of a
+    /// slice or vector receiver.  In the erased value-model a `&[T]` collapses
+    /// to a single GC array pointer (its length is read from the array header
+    /// by `ArrayLen`, not a companion fat-pointer word), so the slice's data
+    /// pointer IS the receiver value.  Alias the result to the receiver — the
+    /// same identity fold as `NonNull::as_ptr` (`nonnull_new_identity_alias`)
+    /// and `as_slice` above — instead of leaving an unregistered
+    /// `core::slice::<Impl>::as_ptr` residual whose only prior handling was a
+    /// `FOREIGN_STDLIB_EXTERNALS` `Address` annotation with no host address.
+    fn is_container_as_ptr_identity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::<Impl>::as_ptr" | "alloc::vec::<Impl>::as_ptr"
             )
         })
     }
