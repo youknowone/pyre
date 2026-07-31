@@ -224,6 +224,17 @@ pub struct CallControl {
     pub graph_jit_shapes: HashMap<usize, u8>,
 }
 
+/// The [`CallControl::graph_jit_shapes`] value recorded for a graph whose
+/// jitcode fails to assemble.
+///
+/// The map's values are `eval::UnsupportedJitShape` discriminants, and the
+/// codewriter must not name that private portal-evaluator type, so the one
+/// discriminant it has to write lives beside the map it writes into. `eval.rs`
+/// pins this to the enum with a `const _: () = assert!(..)`, so renumbering or
+/// removing the variant is a build error rather than a silently misclassified
+/// frame shape.
+pub(crate) const JIT_SHAPE_CONST_ENCODING_OVERFLOW: u8 = 3;
+
 impl CallControl {
     /// RPython: `CallControl.__init__(cpu=None, jitdrivers_sd=[])`
     /// (call.py:25-47).

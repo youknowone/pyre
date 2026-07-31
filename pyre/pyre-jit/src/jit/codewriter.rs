@@ -14182,9 +14182,10 @@ impl CodeWriter {
                 // Cache the authoritative assembler result for shapes that
                 // reach this exact check. The graph is immutable, so a later
                 // drain cannot make this encoding failure disappear.
-                self.callcontrol()
-                    .graph_jit_shapes
-                    .insert(code_ptr as usize, 3);
+                self.callcontrol().graph_jit_shapes.insert(
+                    code_ptr as usize,
+                    super::call::JIT_SHAPE_CONST_ENCODING_OVERFLOW,
+                );
                 continue;
             };
             let key = code_ptr as usize;

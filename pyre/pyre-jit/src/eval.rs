@@ -5971,6 +5971,15 @@ enum UnsupportedJitShape {
     ConstEncodingOverflow,
 }
 
+// The codewriter records `ConstEncodingOverflow` for a graph whose jitcode
+// fails to assemble, but `crate::jit` must not name this private type, so it
+// writes `call::JIT_SHAPE_CONST_ENCODING_OVERFLOW` instead. Pin the two
+// together here — this is the only module that sees both.
+const _: () = assert!(
+    crate::jit::call::JIT_SHAPE_CONST_ENCODING_OVERFLOW
+        == UnsupportedJitShape::ConstEncodingOverflow as u8
+);
+
 /// Return the immutable frame-shape classification for an immortal user-code
 /// graph.  RPython decides the analogous graph facts once while populating
 /// `CallControl.jitcodes`; pyre's temporary runtime gate must have the same
@@ -5979,11 +5988,18 @@ fn cached_unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> Unsuppor
     let key = code as *const _ as usize;
     let callcontrol = crate::jit::codewriter::CodeWriter::instance().callcontrol();
     if let Some(&raw) = callcontrol.graph_jit_shapes.get(&key) {
+        // Match on the discriminants themselves so the decode is the inverse of
+        // the `shape as u8` encode below by construction, rather than by a
+        // hand-kept numbering the compiler never checks.
+        const NONE: u8 = UnsupportedJitShape::None as u8;
+        const CURRENT_FRAME_ONLY: u8 = UnsupportedJitShape::CurrentFrameOnly as u8;
+        const NESTED_BREAK_BRIDGE_RESUME: u8 = UnsupportedJitShape::NestedBreakBridgeResume as u8;
+        const CONST_ENCODING_OVERFLOW: u8 = UnsupportedJitShape::ConstEncodingOverflow as u8;
         return match raw {
-            0 => UnsupportedJitShape::None,
-            1 => UnsupportedJitShape::CurrentFrameOnly,
-            2 => UnsupportedJitShape::NestedBreakBridgeResume,
-            3 => UnsupportedJitShape::ConstEncodingOverflow,
+            NONE => UnsupportedJitShape::None,
+            CURRENT_FRAME_ONLY => UnsupportedJitShape::CurrentFrameOnly,
+            NESTED_BREAK_BRIDGE_RESUME => UnsupportedJitShape::NestedBreakBridgeResume,
+            CONST_ENCODING_OVERFLOW => UnsupportedJitShape::ConstEncodingOverflow,
             _ => unreachable!("invalid cached UnsupportedJitShape discriminant"),
         };
     }
