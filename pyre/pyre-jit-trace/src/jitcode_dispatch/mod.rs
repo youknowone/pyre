@@ -597,13 +597,69 @@ fn record_inline_application_traceback<Sym: WalkSym>(
         return;
     }
     if execute_concrete {
-        majit_metainterp::record_inline_application_traceback_for_recording(
-            exc_ptr as usize as i64,
-            consts.w_code as i64,
-            consts.w_globals as i64,
+        // `pytraceback.py:104 record_application_traceback(space, operror,
+        // frame, last_instruction)` anchors the node on the frame that is
+        // executing.  This level has one whenever it was seeded: the sub-walk
+        // runs the callee on it, and the emitted node names the very same
+        // object, since [`traceback_node_site`] resolves its frame operand from
+        // this register and the seed stamps the concrete frame onto that
+        // operand's box (`inline_call.rs`).
+        //
+        // Only an unseeded level falls through to the frame-fabricating hook.
+        // It has no frame at all, so a node built from the promoted code /
+        // globals is the only one available — but it names an object nothing
+        // else can reach, and a `sys._getframe()` in the same handler answers
+        // the seeded frame, so `tb.tb_frame is sys._getframe()` reads False.
+        // That stays invisible only while the walk's concrete effects are
+        // discarded and the iteration replayed; a level whose effects are
+        // committed, as the multi-frame blackhole adopt commits them, shows it.
+        //
+        // Resolving the python pc first keeps this a choice of FRAME and
+        // nothing else: the fabricating hook drops the node outright when the
+        // coordinate does not map, while the pointer-taking recorder would
+        // substitute `frame.last_instr`.  Whether an unmappable coordinate
+        // should still contribute a node is a separate question from which
+        // frame the node names.
+        let node_frame = crate::state::python_pc_for_jitcode_pc_public(
             consts.jitcode_index,
             opcode_position as i32,
-        );
+        )
+        .and_then(|py_pc| {
+            concrete_portal_frame(ctx, consts.jitcode_index).map(|frame| (frame, py_pc))
+        });
+        match node_frame {
+            Some((frame_ptr, py_pc)) => {
+                // `dispatch_bytecode` (pyopcode.py) writes `self.last_instr`
+                // before every opcode so a frame read while it runs answers for
+                // the instruction executing.  The recording walk does not make
+                // that store, so this level's frame still holds the entry
+                // sentinel, and a frame that leaves by the exception never
+                // reaches an exit that would publish one either: `f_lineno`
+                // would answer the code object's first line for the node
+                // anchored here.  The blackhole closes the same gap for its
+                // replay in `publish_last_instr_at_live_marker`, and the
+                // fabricating hook stamps its fabricated frame for this reason.
+                //
+                // SAFETY: the portal red of this level's own register bank
+                // holds the concrete frame the sub-walk runs the callee on.
+                unsafe {
+                    (*frame_ptr).last_instr = py_pc as isize;
+                }
+                majit_metainterp::record_application_traceback_for_recording(
+                    exc_ptr as usize as i64,
+                    frame_ptr as i64,
+                    consts.jitcode_index,
+                    opcode_position as i32,
+                )
+            }
+            None => majit_metainterp::record_inline_application_traceback_for_recording(
+                exc_ptr as usize as i64,
+                consts.w_code as i64,
+                consts.w_globals as i64,
+                consts.jitcode_index,
+                opcode_position as i32,
+            ),
+        }
     }
     let hook = majit_metainterp::record_inline_application_traceback_hook_address();
     if emit_runtime && !hook.is_null() && !exc.is_none() {
@@ -618,6 +674,25 @@ fn record_inline_application_traceback<Sym: WalkSym>(
             default_effect_info(),
         );
     }
+}
+
+/// The concrete `PyFrame` this level's portal frame register holds, or `None`
+/// when the level was inlined without a materialized frame — a branchless leaf
+/// leaves the register unseeded, and the walk then has no frame identity for
+/// it at all.
+fn concrete_portal_frame<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    jitcode_index: i32,
+) -> Option<*mut pyre_interpreter::PyFrame> {
+    let jitcode = crate::state::pyjitcode_for_jitcode_index(jitcode_index)?;
+    let ConcreteValue::Ref(frame) = ctx
+        .concrete_registers_r
+        .get(jitcode.metadata.portal_frame_reg as usize)
+        .copied()?
+    else {
+        return None;
+    };
+    (!frame.is_null()).then_some(frame as *mut pyre_interpreter::PyFrame)
 }
 
 fn recording_instruction_is_bare_reraise<Sym: WalkSym>(
