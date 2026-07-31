@@ -4040,10 +4040,7 @@ impl OptUnroll {
                 // producer first, since the top-of-loop _map_args above would
                 // otherwise read an unmapped arg.
                 let grown = current_short_jump_args(short_preamble, ctx);
-                // `<=`, not `==`: the list only grows here, but the slice below
-                // indexes from `num_short_jump_args`, so a shrink would panic
-                // rather than fall into the "did not grow" exit.
-                if grown.len() <= num_short_jump_args {
+                if grown.len() == num_short_jump_args {
                     break;
                 }
                 let all_new_mapped = grown[num_short_jump_args..]
