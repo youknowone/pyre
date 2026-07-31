@@ -100,7 +100,15 @@ WIN_TIMER_QUANTUM_S = 1.0 / 64
 # not inflate the ratio/gate of a short bench. Never hardcode the startup.
 # Floored so a bench at/below its own startup (or noise) cannot drive a time
 # to <= 0 and blow up a ratio.
-STARTUP_SAMPLES = 3
+#
+# The startup is a divisor for every short bench: the baseline's exec time is
+# `bench - startup`, so a startup sample that lands high collapses that
+# denominator and inflates every ratio computed against it.  A CI runner
+# measured pypy startup at 0.031s where the same job on the same platform had
+# measured 0.013s, and three unrelated benches failed their gates in that run
+# while their pyre exec times had gone *down*.  Five samples make the median
+# robust to two outliers instead of one.
+STARTUP_SAMPLES = 5
 EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
 # A single slow sample is retried before failing a performance gate. Windows
 # needs more samples because its process CPU accounting is scheduler-tick
