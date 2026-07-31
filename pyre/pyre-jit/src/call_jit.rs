@@ -2394,7 +2394,24 @@ pub fn blackhole_resume_via_rd_numb(
     {
         let multi_frame = bh.nextblackholeinterp.is_some();
         let mut current = Some(&mut bh);
+        let mut frame_index = 0usize;
         while let Some(frame) = current {
+            if majit_metainterp::bh_debug_enabled() {
+                let raw_code =
+                    pyre_jit_trace::state::raw_code_for_jitcode_index(frame.jitcode.index() as i32);
+                let qualname = raw_code
+                    .map(|raw| unsafe { &*raw }.qualname.as_str())
+                    .unwrap_or("<null>");
+                let py_pc = pyre_jit_trace::state::python_pc_for_jitcode_pc_public(
+                    frame.jitcode.index() as i32,
+                    frame.position as i32,
+                );
+                eprintln!(
+                    "[bh-chain] frame={frame_index} jitcode={} qualname={qualname} position={} py_pc={py_pc:?}",
+                    frame.jitcode.index(),
+                    frame.position,
+                );
+            }
             // The outer/root frame's standard virtualizable identity comes
             // from `consume_vable_info` above. Preserve it for a single-frame
             // resume. In a multi-frame snapshot that one vable section names
@@ -2414,6 +2431,7 @@ pub fn blackhole_resume_via_rd_numb(
                 }
             }
             current = frame.nextblackholeinterp.as_deref_mut();
+            frame_index += 1;
         }
     }
 

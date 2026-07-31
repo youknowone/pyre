@@ -1500,7 +1500,7 @@ impl BlackholeInterpreter {
     }
 
     fn run_inner(&mut self) -> Option<MergePointArgs> {
-        let trace = crate::majit_log_enabled();
+        let trace = crate::majit_log_enabled() || crate::bh_debug_enabled();
         loop {
             if self.finished() {
                 if trace {
