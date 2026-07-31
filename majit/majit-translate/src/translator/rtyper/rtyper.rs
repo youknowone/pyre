@@ -2197,6 +2197,17 @@ impl RPythonTyper {
             }
             "cmp" => self.translate_pair_operation(hop, super::pairtype::pair_rtype_cmp),
             "coerce" => self.translate_pair_operation(hop, super::pairtype::pair_rtype_coerce),
+            // `front::checked_arith_uint` emits these unsigned overflow-test
+            // ops with the low-level opname already fixed (not the generic
+            // `mul`/`lt` the pairtype dispatch lowers by repr): the widening
+            // multiply's high word (`checked_mul`) and the wrapped-sum carry
+            // compare (`checked_add`).  Both operands are Unsigned, so the
+            // integer templates rebuild the identical `uint_` opname and emit
+            // it once — `uint_mul_high` (Unsigned result) through
+            // `rtype_template`, `uint_lt` (Bool result) through
+            // `rtype_compare_template`, exactly as `mul` / `lt` route.
+            "uint_mul_high" => super::rint::rtype_template(hop, "mul_high"),
+            "uint_lt" => super::rint::rtype_compare_template(hop, "lt"),
             // rtyper.py:547-549 — `translate_op_newtuple` calls the
             // free function `rtuple.rtype_newtuple(hop)` which routes
             // to `TupleRepr._rtype_newtuple`. No per-Repr dispatch.

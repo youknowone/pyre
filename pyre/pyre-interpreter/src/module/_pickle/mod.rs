@@ -201,7 +201,7 @@ pub(crate) fn import_module(name: &str) -> Result<PyObjectRef, PyError> {
 /// The live execution context reached via the current frame, or `None`
 /// when no frame is on the stack.
 fn current_ec() -> Option<*const crate::PyExecutionContext> {
-    let frame = crate::eval::CURRENT_FRAME.with(|f| f.get());
+    let frame = crate::eval::current_frame();
     if frame.is_null() {
         return None;
     }

@@ -320,22 +320,8 @@ pub(crate) fn emit_option_variant(
     disc: i64,
     payload: Option<(&str, Variable, ValueType)>,
 ) -> Variable {
-    let mut owner_path: Vec<String> = option_owner.split("::").map(str::to_string).collect();
-    let ctor_name = owner_path.pop().unwrap_or_default();
-    let ctor_target = if owner_path.is_empty() {
-        CallTarget::synthetic_transparent_ctor(ctor_name)
-    } else {
-        CallTarget::synthetic_transparent_ctor_with_owner(owner_path, ctor_name)
-    };
     let res = graph.alloc_value_var();
-    graph.block_mut(block).operations.push(SpaceOperation {
-        result: Some(res.clone()),
-        kind: OpKind::Call {
-            target: ctor_target,
-            args: Vec::new(),
-            result_ty: ValueType::Ref(Some(option_owner.to_string())),
-        },
-    });
+    push_option_ctor(graph, block, res.clone(), option_owner);
     // `__discriminant` keys the enum root (tag offset 0 of every variant);
     // materialize the tag as a `ConstInt` value, matching the aggregate
     // path's `FieldWrite { value: Value(..) }` shape.
@@ -344,10 +330,68 @@ pub(crate) fn emit_option_variant(
         result: Some(disc_var.clone()),
         kind: OpKind::ConstInt(disc),
     });
+    write_option_fields(graph, block, &res, option_owner, disc_var, payload);
+    res
+}
+
+/// Build an `Option` variant aggregate in `block`, reusing `result` as the
+/// ctor result and a **dynamic** discriminant `Variable` (rather than a
+/// compile-time tag) — the shape a residual whose Some/None outcome is only
+/// known at runtime folds to (`front::checked_arith_uint`).  `disc` must be a
+/// `0`/`1` integer value (`None` = 0, `Some` = 1).  Same transparent-ctor +
+/// `FieldWrite` chain as [`emit_option_variant`], only the discriminant is a
+/// live value instead of a materialized `ConstInt`.
+pub(crate) fn emit_option_variant_dynamic(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    result: Variable,
+    option_owner: &str,
+    disc: Variable,
+    payload: Option<(&str, Variable, ValueType)>,
+) {
+    push_option_ctor(graph, block, result.clone(), option_owner);
+    write_option_fields(graph, block, &result, option_owner, disc, payload);
+}
+
+/// Push the enum-root transparent ctor for `option_owner`, binding it to
+/// `result`.
+fn push_option_ctor(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    result: Variable,
+    option_owner: &str,
+) {
+    let mut owner_path: Vec<String> = option_owner.split("::").map(str::to_string).collect();
+    let ctor_name = owner_path.pop().unwrap_or_default();
+    let ctor_target = if owner_path.is_empty() {
+        CallTarget::synthetic_transparent_ctor(ctor_name)
+    } else {
+        CallTarget::synthetic_transparent_ctor_with_owner(owner_path, ctor_name)
+    };
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(result),
+        kind: OpKind::Call {
+            target: ctor_target,
+            args: Vec::new(),
+            result_ty: ValueType::Ref(Some(option_owner.to_string())),
+        },
+    });
+}
+
+/// Write the `__discriminant` tag (offset 0 of every variant) and, for a
+/// `Some`, the `__pos_0` payload keyed to the `Some` variant owner.
+fn write_option_fields(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    result: &Variable,
+    option_owner: &str,
+    disc_var: Variable,
+    payload: Option<(&str, Variable, ValueType)>,
+) {
     graph.block_mut(block).operations.push(SpaceOperation {
         result: None,
         kind: OpKind::FieldWrite {
-            base: res.clone(),
+            base: result.clone(),
             field: FieldDescriptor {
                 name: "__discriminant".to_string(),
                 owner_root: Some(option_owner.to_string()),
@@ -363,7 +407,7 @@ pub(crate) fn emit_option_variant(
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
-                base: res.clone(),
+                base: result.clone(),
                 field: FieldDescriptor {
                     name: "__pos_0".to_string(),
                     owner_root: Some(some_owner.to_string()),
@@ -374,7 +418,6 @@ pub(crate) fn emit_option_variant(
             },
         });
     }
-    res
 }
 
 /// Close `block` with a single plain-goto exit carrying mixed

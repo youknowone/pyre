@@ -127,6 +127,18 @@ fn push_current_frame_previous_root(
     }
 }
 
+/// Flat TLS read of the per-thread `CURRENT_FRAME` slot — the frame a builtin
+/// was called from, since a builtin call creates no Python frame of its own.
+/// Null when no frame is installed.
+///
+/// The slot is runtime-mutable, not a build-time constant, so the JIT
+/// residualises the read instead of tracing into it (`@dont_look_inside`, the
+/// [`get_current_exception`] shape).
+#[majit_macros::dont_look_inside]
+pub fn current_frame() -> *mut PyFrame {
+    CURRENT_FRAME.with(|current| current.get())
+}
+
 pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
     let previous = CURRENT_FRAME.with(|current| {
         let previous = current.get();

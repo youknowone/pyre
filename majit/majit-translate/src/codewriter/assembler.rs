@@ -4072,6 +4072,11 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             // jtransform-rewritten float operands carry the full RPython
             // opname (`float_add` / `float_lt` / etc.) — preserve as-is.
             s if s.starts_with("float_") => op.clone(),
+            // Already-canonical unsigned low-level ops the front-end emits
+            // directly (`uint_mul_high` / `uint_lt` from
+            // `front::checked_arith_uint`); pass through so the `int_` prefix
+            // does not double up (`int_uint_lt` has no `insns` entry).
+            s if s.starts_with("uint_") => op.clone(),
             _ => format!("int_{op}"),
         },
         // RPython `blackhole.py:488-498`: bitwise NOT on i64 is `int_invert`.

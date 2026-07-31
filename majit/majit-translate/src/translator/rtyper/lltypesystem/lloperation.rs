@@ -324,6 +324,11 @@ pub fn ll_operations() -> &'static HashMap<&'static str, LLOp> {
         );
         insert_llop(
             &mut ops,
+            "uint_mul_high",
+            LLOp::new(true, true, &[], false, false, false, false),
+        );
+        insert_llop(
+            &mut ops,
             "uint_floordiv",
             LLOp::new(true, true, &[], false, false, false, false),
         );

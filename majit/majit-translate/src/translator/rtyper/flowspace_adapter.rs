@@ -1613,6 +1613,35 @@ pub fn translate_op(
                         ))));
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
+                    // `__pyre_cast_address` — the erasing twin of the narrow
+                    // above (`front::mir` emits it for `p as *mut u8`).  It
+                    // carries no root, so the reconstruction is the plain
+                    // `simple_call(callable, operand)`; resolving through the
+                    // HOST_ENV singleton keeps the Arc identity that keys its
+                    // `BUILTIN_TYPER` entry, which a single-segment path
+                    // consulting the `PyreCallRegistry` first would lose.
+                    if segments.len() == 1 && segments[0] == "__pyre_cast_address" {
+                        if arg_hls.len() != 1 {
+                            return Err(TyperError::message(format!(
+                                "__pyre_cast_address requires exactly one operand, got {}",
+                                arg_hls.len()
+                            )));
+                        }
+                        let callable_host = HOST_ENV
+                            .lookup_builtin("__pyre_cast_address")
+                            .ok_or_else(|| {
+                                TyperError::message(
+                                    "__pyre_cast_address missing from HOST_ENV bootstrap"
+                                        .to_string(),
+                                )
+                            })?;
+                        let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+                        call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                            callable_host,
+                        ))));
+                        call_args.extend(arg_hls);
+                        return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
+                    }
                     // `front::range_iter`'s synthesized `range(start, stop)`
                     // (the exclusive int-`Range` for-loop divert).  It carries
                     // the reserved `__pyre_range` spelling rather than a bare

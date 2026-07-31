@@ -1642,6 +1642,19 @@ impl HostEnv {
             "__pyre_cast_instance",
             HostObject::new_builtin_callable("__pyre_cast_instance"),
         );
+        // Pyre-internal front-end pointer-type ERASURE, the twin of the
+        // narrow above: the frontend lowers `obj as *mut u8` to a
+        // `simple_call` against this stub so the result drops the pointee
+        // class and annotates as the classdef-less pointer shell.  This is
+        // the `llmemory.cast_ptr_to_adr` role — a heterogeneous heap block
+        // reaching a GC hook travels as an opaque address, never as
+        // `Ptr(instance)` — spelled in the annotation the port already uses
+        // for a pointee-less raw pointer.  Same three-way binding as the
+        // narrow (analyzer keys the qualname, typer keys this Arc).
+        self.insert_builtin(
+            "__pyre_cast_address",
+            HostObject::new_builtin_callable("__pyre_cast_address"),
+        );
     }
 
     fn bootstrap_std_modules(&mut self) {

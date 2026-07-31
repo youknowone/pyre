@@ -1086,6 +1086,51 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::sys_modules_registry_get",
         sys_modules_registry_get as *const (),
     );
+    // The same shape over four more runtime-mutable cells:
+    // `_io::unsupported_operation_type` reads the `UNSUPPORTED_OPERATION_TYPE`
+    // `OnceLock` the `_io` module init stamps with its module-local
+    // `UnsupportedOperation` class, `eval::current_frame` the `CURRENT_FRAME`
+    // thread-local `install_current_frame` moves, the two `display::repr_*`
+    // twins the `REPR_ACTIVE` mid-repr set (the
+    // `note_eval_activation_{enter,exit}` twin shape), and `autoflusher_add`
+    // the `AUTOFLUSHER` thread-local handle table.
+    let unsupported_operation_type: fn() -> pyre_object::PyObjectRef =
+        crate::module::_io::unsupported_operation_type;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::module::_io::unsupported_operation_type",
+        "pyre_interpreter::unsupported_operation_type",
+        unsupported_operation_type as *const (),
+    );
+    let current_frame: fn() -> *mut crate::pyframe::PyFrame = crate::eval::current_frame;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::eval::current_frame",
+        "pyre_interpreter::current_frame",
+        current_frame as *const (),
+    );
+    let repr_enter: fn(pyre_object::PyObjectRef) -> bool = crate::display::repr_enter;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::display::repr_enter",
+        "pyre_interpreter::repr_enter",
+        repr_enter as *const (),
+    );
+    let repr_leave: fn(pyre_object::PyObjectRef) = crate::display::repr_leave;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::display::repr_leave",
+        "pyre_interpreter::repr_leave",
+        repr_leave as *const (),
+    );
+    let autoflusher_add: fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef =
+        crate::module::_io::autoflusher_add;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::module::_io::autoflusher_add",
+        "pyre_interpreter::autoflusher_add",
+        autoflusher_add as *const (),
+    );
     let warnings_state_ns: fn() -> pyre_object::PyObjectRef = crate::module::_warnings::state_ns;
     push_alias_pair(
         &mut entries,

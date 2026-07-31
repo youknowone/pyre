@@ -2479,6 +2479,47 @@ impl RPythonAnnotator {
                 }
             }
 
+            // `uint_mul_high` / `uint_lt` — low-level unsigned ops the
+            // front-end (`front::checked_arith_uint`) emits directly for the
+            // native unsigned-overflow tests (`checked_mul`/`checked_add`
+            // lowering).  RPython's flowspace registers neither (they are
+            // rtyper-level ops, not `add_operator` operators), so
+            // `OpKind::from_opname` declines them and the canonical dispatch
+            // below would skip them, leaving the result Variable unbound — the
+            // next reader (`eq(result, 0)`) then raises an unbound-argument
+            // `AnnotatorError`.  Bind the result at the annotation level:
+            // `uint_mul_high` yields an unsigned integer (the widening
+            // product's high word), `uint_lt` a bool (the carry / order
+            // predicate).  The lltype retype is applied later at rtype.
+            {
+                let uint_result = {
+                    let blk = block.borrow();
+                    let sp = &blk.operations[i];
+                    match sp.opname.as_str() {
+                        "uint_mul_high" if sp.args.len() == 2 => {
+                            // `SomeInteger { unsigned: true }`, matching how
+                            // `ValueType::Unsigned` shells elsewhere
+                            // (`codewriter::annotation_state`).
+                            Some(SomeValue::Integer(super::model::SomeInteger::new(
+                                false, true,
+                            )))
+                        }
+                        "uint_lt" if sp.args.len() == 2 => {
+                            Some(SomeValue::Bool(super::model::SomeBool::new()))
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(s_result) = uint_result {
+                    let mut blk = block.borrow_mut();
+                    if let Hlvalue::Variable(v) = &mut blk.operations[i].result {
+                        self.setbinding(v, s_result);
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
+
             // Reify `SpaceOperation` (Block storage) into an
             // `HLOperation` the dispatcher can consume. Upstream
             // `Block.operations` carries HLOperations directly; the

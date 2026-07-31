@@ -341,6 +341,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // Keyed by the qualname `flowspace/model.rs`'s HOST_ENV bootstrap
     // assigns (which also keys the `BUILTIN_TYPER` entry on the same Arc).
     analyzer_for(&mut reg, "__pyre_cast_instance", pyre_cast_instance);
+    // `__pyre_cast_address` — the erasing twin.  `p as *mut u8` lowers to
+    // a simple_call against this stub so the pointee class is dropped
+    // instead of riding along on a value whose declared type is a bare
+    // byte pointer.
+    analyzer_for(&mut reg, "__pyre_cast_address", pyre_cast_address);
     // Rust `String::new()` / `String::with_capacity(n)` construct an empty
     // owned UTF-8 buffer; both annotate as a mutable `SomeString` so the
     // `String.new` / `String.with_capacity` HOST_ENV stubs do not reach the
@@ -1365,6 +1370,50 @@ fn std_mem_align_of(
     kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     std_mem_size_of(bk, args_s, kwds)
+}
+
+/// Analyzer for `__pyre_cast_address` — the front-end pointer-type
+/// erasure (`p as *mut u8`).  Upstream a heterogeneous heap block that
+/// reaches a GC ownership predicate or a write barrier travels as
+/// `llmemory.Address` (`llmemory.cast_ptr_to_adr`), never as
+/// `Ptr(instance)`: the hook discriminates blocks by address range, so
+/// the pointee type is not merely unused, it must not exist.  Aliasing
+/// the cast instead leaves `SomeInstance(PyFrame)` on the argument, and
+/// the hook's slot 0 then unions `PyFrame ∪ ItemsBlock` and blocks with
+/// "cannot unify instances with no common base class".
+///
+/// The erased result is the classdef-less pointer shell — the annotation
+/// a pointee-less raw pointer already carries here — rather than
+/// `SomeAddress`.  That keeps one annotation across both kinds of caller:
+/// the ones that erase a typed pointer, and the ones that pass an
+/// untyped `*mut u8` field straight through.  `SomeInstance` union takes
+/// the classdef-less side as the result (model.rs:3260), so every such
+/// slot merges cleanly.  `args[0]` is the pointer operand.
+///
+/// The operand's own annotation is not constrained: `cast_ptr_to_adr`
+/// takes any `Ptr`, and the operand here is whatever the pointee ADT
+/// annotated to — an instance, but also a `SomeList` for a `Vec` whose
+/// address is erased.  Only the nullability carries over, since an
+/// erasure of a nullable pointer is itself nullable.  (Its narrowing
+/// twin does reject a non-pointer operand: a downcast to a named root
+/// off a non-pointer is a producer bug, whereas dropping type
+/// information off one never is.)
+fn pyre_cast_address(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 1 {
+        return Err(AnnotatorError::new(
+            "__pyre_cast_address expects exactly one positional pointer argument",
+        ));
+    }
+    let can_be_none = arg_at(args_s, 0, "__pyre_cast_address").can_be_none();
+    Ok(SomeValue::Instance(super::model::SomeInstance::new(
+        None,
+        can_be_none,
+        std::collections::BTreeMap::new(),
+    )))
 }
 
 /// Analyzer for `__pyre_cast_instance` — the front-end pointer-downcast

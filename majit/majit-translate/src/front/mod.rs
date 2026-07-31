@@ -67,11 +67,14 @@
 pub(crate) mod bigint_binop;
 pub(crate) mod bool_then;
 pub(crate) mod checked_arith;
+pub(crate) mod checked_arith_uint;
+pub(crate) mod from_size_align;
 pub(crate) mod graph_body;
 pub(crate) mod iter_next;
 pub mod llbc_hints;
 pub mod mir;
 pub(crate) mod option_closure_select;
+pub(crate) mod option_expect;
 pub(crate) mod option_is_none;
 pub(crate) mod option_map_or;
 pub(crate) mod option_try;

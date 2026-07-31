@@ -64,17 +64,29 @@ fn iobase_set_internal_closed(obj: PyObjectRef, closed: bool) -> Result<(), crat
     }
 }
 
+/// Reads the `io.UnsupportedOperation` type installed into
+/// `UNSUPPORTED_OPERATION_TYPE` at module init; null before then.  The value is
+/// not a build-time constant, so the JIT residualises the read instead of
+/// tracing into it (`@dont_look_inside`).
+#[majit_macros::dont_look_inside]
+pub(crate) fn unsupported_operation_type() -> PyObjectRef {
+    UNSUPPORTED_OPERATION_TYPE
+        .get()
+        .map_or(std::ptr::null_mut(), |&addr| addr as PyObjectRef)
+}
+
 /// `interp_iobase.py:unsupported` — construct the module-local
 /// `UnsupportedOperation`, preserving its OSError + ValueError MRO.
 pub(crate) fn unsupported(message: &str) -> crate::PyError {
-    let Some(&type_addr) = UNSUPPORTED_OPERATION_TYPE.get() else {
+    let w_type = unsupported_operation_type();
+    if w_type.is_null() {
         return crate::PyError::value_error(message);
-    };
+    }
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_str_new(message));
     match crate::call::call_function_impl_result(
-        type_addr as PyObjectRef,
+        w_type,
         &[pyre_object::gc_roots::shadow_stack_get(sp)],
     ) {
         Ok(exc) => unsafe { crate::PyError::from_exc_object(exc) },
@@ -278,7 +290,13 @@ thread_local! {
 /// opt out.
 ///
 /// Returns `w_iobase`, which the rweakref allocation may have relocated.
-fn autoflusher_add(w_iobase: PyObjectRef) -> PyObjectRef {
+///
+/// Reads and rewrites the runtime-mutable `AUTOFLUSHER` thread-local handle
+/// table, not a build-time constant, so the JIT residualises the call instead
+/// of tracing into it (`@dont_look_inside`, the `importing::sys_modules_dict`
+/// shape).
+#[majit_macros::dont_look_inside]
+pub(crate) fn autoflusher_add(w_iobase: PyObjectRef) -> PyObjectRef {
     if w_iobase.is_null() {
         return w_iobase;
     }

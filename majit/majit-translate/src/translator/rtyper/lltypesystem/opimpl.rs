@@ -602,6 +602,14 @@ pub fn op_uint_mul(args: &[ConstValue]) -> Option<ConstValue> {
     Some(ConstValue::Int(a.wrapping_mul(b) as i64))
 }
 
+/// High 64 bits of the unsigned 64x64 -> 128 product — the overflow high
+/// word `checked_mul` tests. Matches the backend `OpCode::UintMulHigh`
+/// (`umulhi`) and `bhimpl_uint_mul_high`.
+pub fn op_uint_mul_high(args: &[ConstValue]) -> Option<ConstValue> {
+    let (a, b) = uint_pair(args)?;
+    Some(ConstValue::Int((((a as u128) * (b as u128)) >> 64) as i64))
+}
+
 pub fn op_uint_floordiv(args: &[ConstValue]) -> Option<ConstValue> {
     let (a, b) = uint_pair(args)?;
     if b == 0 {
@@ -1596,6 +1604,7 @@ pub fn get_op_impl(opname: &str) -> Option<FoldFn> {
         m.insert("uint_add", op_uint_add);
         m.insert("uint_sub", op_uint_sub);
         m.insert("uint_mul", op_uint_mul);
+        m.insert("uint_mul_high", op_uint_mul_high);
         m.insert("uint_floordiv", op_uint_floordiv);
         m.insert("uint_mod", op_uint_mod);
         m.insert("uint_lshift", op_uint_lshift);

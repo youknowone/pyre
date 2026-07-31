@@ -32,9 +32,6 @@
 //! leaves the residual `branch` call untouched, and the graph keeps its
 //! existing rtyper Skip / legacy-walker fallback.
 
-use majit_charon_reader::Llbc;
-use majit_charon_reader::ullbc::TyRef;
-
 use crate::flowspace::model::{ConstValue, Constant, Variable};
 use crate::front::bool_then::{emit_option_variant, map_source};
 use crate::front::result_exc::{
@@ -74,19 +71,6 @@ pub(crate) struct OptionTryStats {
     pub declined: usize,
 }
 
-/// The `Option` enum root name for `ty`, or `None` when `ty` is not
-/// `core::option::Option<...>`.
-pub(crate) fn tyref_option_owner(ty: &TyRef, llbc: &Llbc) -> Option<String> {
-    let body = match ty {
-        TyRef::Inline { value: (_, v) } => v,
-        TyRef::Other(v) => v,
-        TyRef::Dedup { id } => llbc.dedup_body(*id)?,
-    };
-    let id = body.get("Adt")?.get("id")?.get("Adt")?.as_u64()?;
-    let owner = llbc.type_by_id(id)?.item_meta.name_path();
-    (owner == "core::option::Option").then_some(owner)
-}
-
 /// Rewrite every recorded `Option` `Try::branch` site.  `return_option_owner`
 /// is the enclosing function's declared `Option<U>` root; `None` means the
 /// function is not Option-returning, so all sites decline.
@@ -122,12 +106,13 @@ fn rewire_one_option_try_site(
     let Some(return_option_owner) = return_option_owner else {
         return Err(format!("{name}: enclosing function does not return Option"));
     };
-    if return_option_owner != site.option_owner {
-        return Err(format!(
-            "{name}: branched Option owner {} differs from return owner {}",
-            site.option_owner, return_option_owner
-        ));
-    }
+    // The branched Option owner (`site.option_owner`, the payload read at the
+    // `?`) and the enclosing function's return Option owner may differ under
+    // per-instantiation classdef spelling — a cross-payload `?` branches one
+    // Option<A> and returns Option<B>.  The Some arm reads `__pos_0`/
+    // `__discriminant` from the branched owners; the None arm constructs from
+    // `return_option_owner`.  The arms are independent, so no equality is
+    // required here.
     if graph.blocks[graph.returnblock.0].inputargs.len() != 1 {
         return Err(format!(
             "{name}: Option-returning function returnblock is not unary"

@@ -2976,9 +2976,14 @@ impl<'a> Transformer<'a> {
         // the charon front-end skips the rtyper, so fold the marker to the
         // operand alias here too.  The JIT does not distinguish a downcast
         // pointer from its source, so this emits no jitcode op.
+        // `__pyre_cast_address` — the erasing twin (`p as *mut u8`), which
+        // carries no root and so is single-segment.  It reinterprets the
+        // same pointer too, and the JIT distinguishes a pointer no more
+        // from its erasure than from its downcast, so it folds the same
+        // way: the operand alias, no jitcode op.
         if let CallTarget::FunctionPath { segments } = target
-            && segments.len() == 2
-            && segments[0] == "__pyre_cast_instance"
+            && ((segments.len() == 2 && segments[0] == "__pyre_cast_instance")
+                || (segments.len() == 1 && segments[0] == "__pyre_cast_address"))
             && args.len() == 1
         {
             return RewriteResult::Identity(args[0].clone());

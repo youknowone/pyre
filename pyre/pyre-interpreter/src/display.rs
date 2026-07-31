@@ -162,34 +162,51 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Record `obj` as mid-repr on this thread, or report `false` when it already
+/// is (`Py_ReprEnter`).  Writes the runtime-mutable `REPR_ACTIVE` thread-local,
+/// not a build-time constant, so the JIT residualises the call instead of
+/// tracing into it (`@dont_look_inside`, the `eval::set_in_flight_exception`
+/// shape), the [`repr_leave`] twin.
+#[majit_macros::dont_look_inside]
+pub(crate) fn repr_enter(obj: PyObjectRef) -> bool {
+    let key = obj as usize;
+    REPR_ACTIVE.with(|active| {
+        let mut active = active.borrow_mut();
+        if active.contains(&key) {
+            false
+        } else {
+            active.push(key);
+            true
+        }
+    })
+}
+
+/// Drop `obj` from the mid-repr set (`Py_ReprLeave`) — see [`repr_enter`].
+#[majit_macros::dont_look_inside]
+pub(crate) fn repr_leave(obj: PyObjectRef) {
+    let key = obj as usize;
+    REPR_ACTIVE.with(|active| {
+        let mut active = active.borrow_mut();
+        if let Some(pos) = active.iter().rposition(|&k| k == key) {
+            active.remove(pos);
+        }
+    });
+}
+
 /// RAII cycle guard.  `enter` returns `None` when `obj` is already being
 /// repr'd on this thread — the caller emits the `...` placeholder — and
 /// otherwise records `obj`, removing it again when the guard drops.
-pub(crate) struct ReprGuard(usize);
+pub(crate) struct ReprGuard(PyObjectRef);
 
 impl ReprGuard {
     pub(crate) fn enter(obj: PyObjectRef) -> Option<ReprGuard> {
-        let key = obj as usize;
-        REPR_ACTIVE.with(|active| {
-            let mut active = active.borrow_mut();
-            if active.contains(&key) {
-                None
-            } else {
-                active.push(key);
-                Some(ReprGuard(key))
-            }
-        })
+        repr_enter(obj).then_some(ReprGuard(obj))
     }
 }
 
 impl Drop for ReprGuard {
     fn drop(&mut self) {
-        REPR_ACTIVE.with(|active| {
-            let mut active = active.borrow_mut();
-            if let Some(pos) = active.iter().rposition(|&k| k == self.0) {
-                active.remove(pos);
-            }
-        });
+        repr_leave(self.0);
     }
 }
 
