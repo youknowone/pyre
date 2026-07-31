@@ -1285,8 +1285,19 @@ impl GcCache {
             // path binds a fieldless size-descr shell), defer to the cached
             // value rather than the caller's un-arbitrable raw number, which
             // still carries whichever producer's header convention minted it.
-            let expected_index_in_parent = Self::find_index_in_parent(parent.as_ref(), field_name)
-                .unwrap_or(descr.index_in_parent);
+            // The arbitration walks the parent's whole positional list, and the
+            // canary below is its only reader — `debug_assert!` keeps the code
+            // but guards it on the same `cfg!(debug_assertions)`, so a release
+            // build would scan and discard. Repeat lookups are the common case
+            // (`make_simple_descr_group_keyed_with_headerless` calls this once
+            // per field spec under the `gc_cache` lock), so spell the gate out
+            // and let the release build keep the cached number.
+            let expected_index_in_parent = if cfg!(debug_assertions) {
+                Self::find_index_in_parent(parent.as_ref(), field_name)
+                    .unwrap_or(descr.index_in_parent)
+            } else {
+                descr.index_in_parent
+            };
             debug_assert!(
                 descr.describes_same_field(
                     offset,
