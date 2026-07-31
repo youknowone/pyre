@@ -50,11 +50,31 @@ fn set_fatal_error_file(w_file: pyre_object::PyObjectRef) {
 /// this call resolved is then unrooted, collected, and its finalizer closes the
 /// descriptor the handler still writes through.  Serialize the pairs.
 ///
-/// Only bookkeeping runs inside: the file is resolved (which runs Python) before
-/// the guard is taken, and the fatal-signal handler reads `FAULTHANDLER_FD`
-/// atomically without acquiring anything.
+/// Held across the host install or removal and the owner bookkeeping that
+/// follows it.  The file is resolved — which runs Python — before the guard is
+/// taken, and the fatal-signal handler reads `FAULTHANDLER_FD` atomically
+/// without acquiring anything.  A failed install still builds its exception
+/// inside the guard, so take it through `lock_faulthandler_state`.
 #[cfg(all(unix, feature = "host_env"))]
 static FAULTHANDLER_STATE_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+/// Only a contended acquisition blocks, and a thread parked in the futex can no
+/// longer poll the eval breaker, so it has to leave the collector's RUNNING
+/// census for that wait — otherwise a holder that allocates (`register` builds
+/// an `OSError` when the install fails, and `os_error_syscall2` allocates the
+/// exception and its args) requests a stop-the-world the waiter can never
+/// acknowledge, and both threads hang.  Same try-then-block split as
+/// `w_list_lock`.
+#[cfg(all(unix, feature = "host_env"))]
+fn lock_faulthandler_state() -> parking_lot::MutexGuard<'static, ()> {
+    if let Some(guard) = FAULTHANDLER_STATE_LOCK.try_lock() {
+        return guard;
+    }
+    let blocked = crate::module::thread::before_external_block();
+    let guard = FAULTHANDLER_STATE_LOCK.lock();
+    drop(blocked);
+    guard
+}
 
 /// `handler.py:22` `self.user_w_files = None` / `:125`
 /// `self.user_w_files[signum] = w_file` / `:132`
@@ -89,6 +109,12 @@ fn clear_user_signal_file(signum: libc::c_int) {
 /// process-global interpreter roots.  Forwards each slot in place so a moving
 /// collection relocates the held file rather than leaving a stale address the
 /// installed handler would keep writing through.
+///
+/// Runs from the collector inside the stop-the-world window, so no load/forward/
+/// store here can be torn by a concurrent owner update, and it must NOT take
+/// `FAULTHANDLER_STATE_LOCK`: the thread that requested the collection may be
+/// holding that guard (`register` allocates its `OSError` inside it), and the
+/// collector would then wait on a lock only a quiesced mutator can release.
 #[cfg(all(unix, feature = "host_env"))]
 pub fn walk_faulthandler_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     let mut forward = |addr: usize| -> usize {
@@ -230,7 +256,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // otherwise dump to the old one — and has to be rolled back
                     // when the install fails, or a failed re-enable would
                     // redirect the handlers already installed.
-                    let _state = FAULTHANDLER_STATE_LOCK.lock();
+                    let _state = lock_faulthandler_state();
                     let previous_fd =
                         FAULTHANDLER_FD.swap(fd, std::sync::atomic::Ordering::Relaxed);
                     let ok = rustpython_host_env::faulthandler::enable_fatal_handlers(
@@ -272,7 +298,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             |_| {
                 #[cfg(all(unix, feature = "host_env"))]
                 {
-                    let _state = FAULTHANDLER_STATE_LOCK.lock();
+                    let _state = lock_faulthandler_state();
                     rustpython_host_env::faulthandler::disable_fatal_handlers();
                     FAULTHANDLER_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
                     // `handler.py:150` `self.fatal_error_w_file = None`.
@@ -388,7 +414,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         pyre_object::gc_roots::pin_root(w_file);
                         pyre_object::gc_roots::shadow_stack_len() - 1
                     });
-                    let _state = FAULTHANDLER_STATE_LOCK.lock();
+                    let _state = lock_faulthandler_state();
                     rustpython_host_env::faulthandler::register_user_signal(
                         signum,
                         fd,
@@ -442,7 +468,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         return Err(crate::PyError::type_error("unregister() missing signal"));
                     }
                     let signum = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
-                    let _state = FAULTHANDLER_STATE_LOCK.lock();
+                    let _state = lock_faulthandler_state();
                     let changed =
                         rustpython_host_env::faulthandler::unregister_user_signal(signum);
                     // `handler.py:131-132` `self.user_w_files.pop(signum, None)`,
