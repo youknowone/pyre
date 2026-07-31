@@ -997,20 +997,23 @@ static W_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
-/// `Method` field layout — `w_function`, `w_self`, `w_class` per
-/// `function.rs:9-15`. All three are Ref slots; the JIT only consumes
-/// `w_function` (for guarding which method) and `w_self` (for recovering
-/// the receiver `OpRef` discarded by `LOAD_METHOD`). `w_class` is included
-/// for layout completeness so the descrs match the struct order.
+/// `Method` field layout — `w_function`, `w_self`, `w_class`, `w_module`.
+/// All four are Ref slots; the JIT only consumes `w_function` (for guarding
+/// which method) and `w_self` (for recovering the receiver `OpRef` discarded
+/// by `LOAD_METHOD`). `w_class` and `w_module` are included for layout
+/// completeness so the descrs match the struct order — a field the struct
+/// declares but this census omits has no `index_in_parent` to rederive, so
+/// the two sides that mint its descr disagree on the number.
 ///
 /// `w_function` and `w_self` are marked immutable per
 /// `pypy/interpreter/function.py:567`
 /// `_Method._immutable_fields_ = ['w_function', 'w_instance']`. `w_class`
-/// is not listed there and stays mutable.
+/// is not listed there and stays mutable; `w_module` is written after
+/// construction by `w_method_set_module` and is mutable for that reason.
 static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     use pyre_object::function::{
-        METHOD_W_CLASS_OFFSET, METHOD_W_FUNCTION_OFFSET, METHOD_W_SELF_OFFSET, W_METHOD_GC_TYPE_ID,
-        W_METHOD_OBJECT_SIZE,
+        METHOD_W_CLASS_OFFSET, METHOD_W_FUNCTION_OFFSET, METHOD_W_MODULE_OFFSET,
+        METHOD_W_SELF_OFFSET, W_METHOD_GC_TYPE_ID, W_METHOD_OBJECT_SIZE,
     };
     build_object_descr_group_with_def_path(
         W_METHOD_OBJECT_SIZE,
@@ -1038,6 +1041,15 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "w_class",
                 METHOD_W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "w_module",
+                METHOD_W_MODULE_OFFSET,
                 8,
                 Type::Ref,
                 false,
@@ -2042,12 +2054,19 @@ pub fn method_w_class_descr() -> DescrRef {
     field_descr_from_group(&W_METHOD_DESCR_GROUP, 2)
 }
 
+/// `Method.w_module` — `__module__` storage for a bound builtin method,
+/// written after construction by `w_method_set_module`. The JIT does not
+/// read it; the census entry exists so the struct's field order is complete.
+pub fn method_w_module_descr() -> DescrRef {
+    field_descr_from_group(&W_METHOD_DESCR_GROUP, 3)
+}
+
 /// Inherited `PyObject.w_class` on a `Method` — the Python-level `method`
 /// class stamped by `w_method_new`'s header. Kept in the Method group (not
 /// the standalone `w_class_descr`) so an inline emit's store is a virtual
 /// field of the same size descr and materialization reproduces the header.
 pub fn method_header_w_class_descr() -> DescrRef {
-    field_descr_from_group(&W_METHOD_DESCR_GROUP, 3)
+    field_descr_from_group(&W_METHOD_DESCR_GROUP, 4)
 }
 
 /// Size descriptor for `Method` allocation via `NewWithVtable`
