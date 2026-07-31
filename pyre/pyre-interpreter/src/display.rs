@@ -88,14 +88,14 @@ unsafe fn try_call_dunder_wtf8(
     }
 }
 
-/// `TypeError: __repr__ returned non-string (type 'X')` for a dunder whose
-/// override returned a non-`str` (`descroperation.py:918-920`).
+/// `TypeError: __repr__ returned non-string (type X)` for a dunder whose
+/// override returned a non-`str` (CPython 3.14 `slot_tp_repr`).
 unsafe fn dunder_returned_non_string(name: &str, result: PyObjectRef) -> crate::PyError {
     let type_name = match unsafe { crate::typedef::r#type(result) } {
         Some(tp) => unsafe { pyre_object::w_type_get_name(tp.as_ptr()) }.to_string(),
         None => "object".to_string(),
     };
-    crate::PyError::type_error(format!("{name} returned non-string (type '{type_name}')"))
+    crate::PyError::type_error(format!("{name} returned non-string (type {type_name})"))
 }
 
 /// `floatobject.py W_FloatObject.descr_repr` — the shortest decimal string

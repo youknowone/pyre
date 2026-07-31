@@ -6767,6 +6767,7 @@ pub(crate) fn make_exc_type_multi(
 
 const EG_MESSAGE_KEY: &str = "__pyre_exception_group_message";
 const EG_EXCEPTIONS_KEY: &str = "__pyre_exception_group_exceptions";
+const EG_EXCEPTIONS_REPR_KEY: &str = "__pyre_exception_group_exceptions_repr";
 
 fn exception_group_fields(
     w_self: PyObjectRef,
@@ -6807,6 +6808,19 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             ));
         }
     }
+    // CPython 3.14 Objects/exceptions.c BaseExceptionGroup_new (gh-141732):
+    // preserve the initial representation of a non-list/tuple sequence before
+    // converting it to the immutable `exceptions` tuple.  Besides keeping the
+    // repr stable when the source sequence is later mutated, doing this here
+    // deliberately propagates a raising or non-string custom `__repr__` from
+    // the constructor.
+    let exceptions_repr = if is_list_or_tuple {
+        None
+    } else {
+        Some(pyre_object::w_str_new(&unsafe {
+            crate::display::py_repr(w_exceptions)?
+        }))
+    };
     let exceptions = crate::baseobjspace::fixedview(w_exceptions, -1)?;
     if exceptions.is_empty() {
         return Err(crate::PyError::value_error(
@@ -6851,6 +6865,9 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         let w_dict = pyre_object::interp_exceptions::w_exception_getdict(exc);
         pyre_object::w_dict_setitem_str(w_dict, EG_MESSAGE_KEY, message);
         pyre_object::w_dict_setitem_str(w_dict, EG_EXCEPTIONS_KEY, tuple);
+        if let Some(exceptions_repr) = exceptions_repr {
+            pyre_object::w_dict_setitem_str(w_dict, EG_EXCEPTIONS_REPR_KEY, exceptions_repr);
+        }
         pyre_object::interp_exceptions::w_exception_set_args(
             exc,
             pyre_object::w_list_new(vec![message, w_exceptions]),
@@ -7242,10 +7259,33 @@ fn exception_group_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let cls = crate::typedef::r#type(w_self).unwrap();
     let name = unsafe { pyre_object::w_type_get_name(cls.as_ptr()) };
     let message_repr = unsafe { crate::display::py_repr(message)? };
-    let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) };
-    let list_repr = unsafe { crate::display::py_repr(pyre_object::w_list_new(items))? };
+    let w_dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(w_self) };
+    let exceptions_repr = if let Some(saved) =
+        unsafe { pyre_object::w_dict_getitem_str(w_dict, EG_EXCEPTIONS_REPR_KEY) }
+    {
+        unsafe { pyre_object::w_str_get_value(saved) }.to_string()
+    } else {
+        // CPython 3.14 BaseExceptionGroup_repr: render the immutable internal
+        // tuple using the original list/tuple spelling.  `args` intentionally
+        // still retains the caller's original sequence, but its contents must
+        // not influence repr after construction.
+        let w_args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(w_self) };
+        let original_was_list = unsafe {
+            pyre_object::is_tuple(w_args)
+                && pyre_object::w_tuple_len(w_args) >= 2
+                && pyre_object::is_list(
+                    pyre_object::w_tuple_getitem(w_args, 1).unwrap_or(pyre_object::PY_NULL),
+                )
+        };
+        if original_was_list {
+            let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) };
+            unsafe { crate::display::py_repr(pyre_object::w_list_new(items))? }
+        } else {
+            unsafe { crate::display::py_repr(exceptions)? }
+        }
+    };
     Ok(pyre_object::w_str_new(&format!(
-        "{name}({message_repr}, {list_repr})"
+        "{name}({message_repr}, {exceptions_repr})"
     )))
 }
 
