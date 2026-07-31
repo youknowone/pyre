@@ -1934,6 +1934,17 @@ unsafe fn stamp_method_owners(ns: PyObjectRef, owner: &'static crate::gateway::M
         );
         if wrapped.is_none() && key != "__new__" {
             crate::gateway::builtin_code_set_owner(code, owner);
+            // `type_ready_fill_dict` hands each `tp_methods` entry to
+            // `PyDescr_NewMethod`, so it is a `method_descriptor` and its
+            // `__get__` yields a `builtin_function_or_method`.  The slot half
+            // of the same sweep (`add_operators` → `PyDescr_NewWrapper`) wants
+            // `wrapper_descriptor`, which pyre does not tag yet, so those keep
+            // the `FunctionWithFixedCode` spelling.
+            if unsafe { pyre_object::py_type_check(descr, &crate::function::FUNCTION_TYPE) }
+                && !crate::gateway::is_slot_wrapper(owner.type_name, &key)
+            {
+                unsafe { crate::function::function_retag_method_descriptor(descr) };
+            }
         }
     }
 }

@@ -1009,6 +1009,7 @@ pub(crate) fn is_slot_wrapper(type_name: &str, name: &str) -> bool {
                 | "__bool__"
                 | "__buffer__"
                 | "__call__"
+                | "__del__"
                 | "__delattr__"
                 | "__delete__"
                 | "__delitem__"
