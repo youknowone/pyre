@@ -3340,7 +3340,26 @@ impl PyFrame {
     /// pyframe.py:861-863 get_last_lineno → pytraceback.offset2lineno(pycode, last_instr)
     #[inline]
     pub fn get_last_lineno(&self) -> isize {
-        offset2lineno(self.code(), self.last_instr) as isize
+        // A malformed replacement linetable is decoded by the compiler-core
+        // marshal reader as repeated zero-width positions on the first line.
+        // CPython reports ``frame.f_lineno is None`` for that table rather
+        // than manufacturing the code object's first line number.
+        let locations = &self.code().locations;
+        if !locations.is_empty()
+            && locations.iter().all(|(start, end)| {
+                start.character_offset.get() == 1 && end.character_offset.get() == 1
+            })
+        {
+            return -1;
+        }
+        // CPython exposes ``None`` when a code object's line table has no
+        // usable entry for the current instruction.  Ruff's decoded
+        // zero-line entries reach us as line 0; preserve the frame getter's
+        // existing -1 sentinel instead of leaking that implementation value.
+        match offset2lineno(self.code(), self.last_instr) {
+            0 => -1,
+            lineno => lineno as isize,
+        }
     }
 
     /// pyframe.py:660-671 fget_f_lineno
