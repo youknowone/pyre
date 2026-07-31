@@ -8080,6 +8080,11 @@ pub(crate) fn collect_iterator(it: PyObjectRef) -> Result<Vec<PyObjectRef>, crat
     // (framework.py:853-856).
     let base = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(it);
+    // `pin_root` itself queries the collector, so read the iterator back from
+    // its slot instead of reusing the caller's copy: a foreign collection that
+    // ran inside the pin forwarded the object and rewrote the slot, not the
+    // local.
+    let it = pyre_object::gc_roots::shadow_stack_get(base);
     // Dict-view iterators are currently off-GC RPython-style carriers.  Their
     // registered raw-field walker covers frame/value-stack reachability, but
     // this helper keeps the iterator on the shadow stack directly; retain its
@@ -10799,6 +10804,9 @@ fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let it = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?;
     let iterator_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(it);
+    // The pin queries the collector, so the slot — not this local — is what
+    // holds the forwarded iterator once it returns.
+    let it = pyre_object::gc_roots::shadow_stack_get(iterator_slot);
     if unsafe { pyre_object::dictmultiobject::is_dict_view_iterator(it) } {
         let w_dict = unsafe { pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(it) };
         pyre_object::gc_roots::pin_root(w_dict);
@@ -12905,6 +12913,9 @@ fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let it = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?;
     let iterator_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(it);
+    // The pin queries the collector, so the slot — not this local — is what
+    // holds the forwarded iterator once it returns.
+    let it = pyre_object::gc_roots::shadow_stack_get(iterator_slot);
     if unsafe { pyre_object::dictmultiobject::is_dict_view_iterator(it) } {
         let w_dict = unsafe { pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(it) };
         pyre_object::gc_roots::pin_root(w_dict);
