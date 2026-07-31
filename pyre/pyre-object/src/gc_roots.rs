@@ -454,17 +454,29 @@ unsafe fn walk_shadow_stack_cell(
     cell: *const UnsafeCell<Vec<PyObjectRef>>,
     visitor: &mut impl FnMut(&mut PyObjectRef),
 ) {
+    // The interval is fixed at entry: `walk_stack_root` (`shadowstack.py:43-46`)
+    // receives `start` and `addr` as arguments and runs `while addr != start`,
+    // so a root pushed mid-walk is not part of that walk. Re-reading the length
+    // each iteration instead would extend the walk over roots pinned by the
+    // visitor — and pinning during a walk is precisely what the debug guard
+    // above declares illegal, so there is nothing to serve by diverging here.
+    let end = {
+        // SAFETY: no reference from this block outlives it.
+        let stack = unsafe { &*(*cell).get() };
+        stack.len()
+    };
     let mut index = 0;
-    loop {
+    while index < end {
+        // Re-derive the slot address every iteration rather than holding one
+        // `iter_mut()` cursor: a re-entrant push can still reallocate the
+        // buffer, which would strand a cached pointer in the old allocation.
+        // Only pushes can occur, so `end` stays within bounds.
         let slot = {
             // SAFETY: the caller guarantees exclusive access except for a
             // possible re-entrant mutation by `visitor`. No reference from a
             // previous iteration is live here, and this temporary reference
             // ends before `visitor` is called.
             let stack = unsafe { &mut *(*cell).get() };
-            if index >= stack.len() {
-                break;
-            }
             // Return only the slot address so the `Vec` reference is not held
             // across the visitor, which may push and reallocate its buffer.
             unsafe { stack.as_mut_ptr().add(index) }
@@ -677,9 +689,15 @@ mod tests {
         });
 
         assert!(pushed);
+        // The visitor's pins really did move the buffer.
         assert!(with_shadow_stack(Vec::capacity) > capacity_before);
-        assert_eq!(&seen[..2], &[0x11, 0x22]);
-        assert_eq!(seen.len(), 2 + additional);
+        // `0x22` is the discriminator: it is read on the iteration AFTER the
+        // reallocation, so getting it right means the walk followed the buffer
+        // to its new address instead of reading the freed one. The walk stops
+        // at the two roots that were live at entry — the interval is fixed
+        // there, as in `walk_stack_root` (`shadowstack.py:43-46`), so the
+        // roots the visitor pinned are not part of this walk.
+        assert_eq!(seen, vec![0x11, 0x22]);
         assert_eq!(shadow_stack_get(0) as usize, 0x11);
         assert_eq!(shadow_stack_get(1) as usize, 0x22);
     }
