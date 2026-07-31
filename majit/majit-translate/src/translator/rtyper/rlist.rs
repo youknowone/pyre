@@ -30,8 +30,9 @@ use crate::translator::rtyper::lltypesystem::lltype::{
 use crate::translator::rtyper::lltypesystem::rstr::sub_helper_funcptr_constant;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype,
-    exception_args, helper_pygraph_from_graph, variable_with_lltype, void_field_const,
+    ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, RPythonTyper, SliceKind,
+    constant_with_lltype, exception_args, helper_pygraph_from_graph, variable_with_lltype,
+    void_field_const,
 };
 
 /// RPython `class FixedSizeListRepr(AbstractFixedSizeListRepr,
@@ -320,6 +321,20 @@ impl Repr for FixedSizeListRepr {
             self.lltype.clone(),
             self.item_repr.lowleveltype().clone(),
             vlist,
+        )
+    }
+
+    /// RPython `AbstractBaseListRepr.rtype_getslice(r_lst, hop)`
+    /// (`rlist.py:409-414`) — the fixed-size receiver slices into a fresh
+    /// resized list (`hop.r_result`), reading its length via `getarraysize`.
+    fn rtype_getslice(&self, hop: &HighLevelOp) -> RTypeResult {
+        let v_lst = hop.inputarg(ConvertedTo::Repr(self), 0)?;
+        rtype_getslice_via_ll_listslice(
+            hop,
+            ListLayout::Fixed,
+            self.lltype.clone(),
+            self.item_repr.lowleveltype().clone(),
+            v_lst,
         )
     }
 
@@ -631,18 +646,6 @@ pub fn ll_extend_with_str_slice_minusone() -> Result<(), TyperError> {
 
 pub fn ll_extend_with_char_count() -> Result<(), TyperError> {
     Err(rlist_runtime_deferred("ll_extend_with_char_count"))
-}
-
-pub fn ll_listslice_startonly() -> Result<(), TyperError> {
-    Err(rlist_runtime_deferred("ll_listslice_startonly"))
-}
-
-pub fn ll_listslice_startstop() -> Result<(), TyperError> {
-    Err(rlist_runtime_deferred("ll_listslice_startstop"))
-}
-
-pub fn ll_listslice_minusone() -> Result<(), TyperError> {
-    Err(rlist_runtime_deferred("ll_listslice_minusone"))
 }
 
 pub fn ll_listdelslice_startonly() -> Result<(), TyperError> {
@@ -1179,6 +1182,20 @@ impl Repr for ListRepr {
             self.lltype.clone(),
             self.item_repr.lowleveltype().clone(),
             vlist,
+        )
+    }
+
+    /// RPython `AbstractBaseListRepr.rtype_getslice(r_lst, hop)`
+    /// (`rlist.py:409-414`) — `l[start:stop]` allocates a fresh resized list
+    /// and copies the slice via the per-kind `ll_listslice_%s` helper.
+    fn rtype_getslice(&self, hop: &HighLevelOp) -> RTypeResult {
+        let v_lst = hop.inputarg(ConvertedTo::Repr(self), 0)?;
+        rtype_getslice_via_ll_listslice(
+            hop,
+            ListLayout::Resized,
+            self.lltype.clone(),
+            self.item_repr.lowleveltype().clone(),
+            v_lst,
         )
     }
 
@@ -3304,6 +3321,372 @@ fn build_ll_copy_helper_graph(
     ))
 }
 
+/// Emit `new_lst = RESLIST.ll_newlist(newlength)` then
+/// `ll_arraycopy(src_items, dst_items, src_start, 0, newlength)`, and close
+/// `block` returning `new_lst`. Shared tail of the three `ll_listslice_*`
+/// helper graphs — the only per-kind difference (`ll_listslice_%s`,
+/// rlist.py:883-911) is how `newlength` and `src_start` are computed, which
+/// the caller has already materialised into `block`.
+fn emit_listslice_alloc_and_copy(
+    block: &BlockRef,
+    returnblock: &BlockRef,
+    source_layout: ListLayout,
+    result_ptr_lltype: LowLevelType,
+    item_lltype: &LowLevelType,
+    newlist_const: Constant,
+    copy_const: Constant,
+    l: &Variable,
+    src_start: Hlvalue,
+    newlength: &Variable,
+) {
+    let items_ptr = items_array_ptr_lltype(item_lltype);
+    // l = RESLIST.ll_newlist(newlength).
+    let new_lst = variable_with_lltype("new_lst", result_ptr_lltype);
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(newlist_const),
+            Hlvalue::Variable(newlength.clone()),
+        ],
+        Hlvalue::Variable(new_lst.clone()),
+    ));
+    // src items (per source layout): a fixed list IS its items array; a resized
+    // header reaches the array through `items`. The result is always resized
+    // (`hop.r_result`), so its items come through `items`.
+    let src_items = match source_layout {
+        ListLayout::Fixed => Hlvalue::Variable(l.clone()),
+        ListLayout::Resized => {
+            let items = variable_with_lltype("src_items", items_ptr.clone());
+            block.borrow_mut().operations.push(SpaceOperation::new(
+                "getfield",
+                vec![Hlvalue::Variable(l.clone()), void_field_const("items")],
+                Hlvalue::Variable(items.clone()),
+            ));
+            Hlvalue::Variable(items)
+        }
+    };
+    let dst_items = variable_with_lltype("dst_items", items_ptr);
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(new_lst.clone()),
+            void_field_const("items"),
+        ],
+        Hlvalue::Variable(dst_items.clone()),
+    ));
+    // ll_arraycopy(src_items, dst_items, src_start, 0, newlength).
+    let copy_void = variable_with_lltype("v", LowLevelType::Void);
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(copy_const),
+            src_items,
+            Hlvalue::Variable(dst_items),
+            src_start,
+            signed_const(0),
+            Hlvalue::Variable(newlength.clone()),
+        ],
+        Hlvalue::Variable(copy_void),
+    ));
+    block.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(new_lst)],
+            Some(returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+}
+
+/// Synthesise `ll_listslice_startonly(RESLIST, l1, start)` (rlist.py:883-890):
+///
+/// ```python
+/// def ll_listslice_startonly(RESLIST, l1, start):
+///     len1 = l1.ll_length()
+///     newlength = len1 - start
+///     l = RESLIST.ll_newlist(newlength)
+///     ll_arraycopy(l1, l, start, 0, newlength)
+///     return l
+/// ```
+///
+/// The `ll_assert(0 <= start <= len1)` bounds are debug-only (no production
+/// op). Single-block graph: read len, `int_sub` for newlength, then the
+/// shared alloc-and-copy tail with `src_start = start`.
+fn build_ll_listslice_startonly_helper_graph(
+    rtyper: &RPythonTyper,
+    name: &str,
+    source_layout: ListLayout,
+    source_ptr_lltype: LowLevelType,
+    result_ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    newlist: &LowLevelFunction,
+    arraycopy: &LowLevelFunction,
+) -> Result<PyGraph, TyperError> {
+    let newlist_const = sub_helper_funcptr_constant(rtyper, newlist)?;
+    let copy_const = sub_helper_funcptr_constant(rtyper, arraycopy)?;
+
+    let l_arg = variable_with_lltype("l1", source_ptr_lltype);
+    let start_arg = variable_with_lltype("start", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(l_arg.clone()),
+        Hlvalue::Variable(start_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", result_ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // len1 = l1.ll_length(); newlength = len1 - start.
+    let len1 = emit_list_length_read(&startblock, source_layout, &l_arg);
+    let newlength = variable_with_lltype("newlength", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_sub",
+        vec![Hlvalue::Variable(len1), Hlvalue::Variable(start_arg.clone())],
+        Hlvalue::Variable(newlength.clone()),
+    ));
+    emit_listslice_alloc_and_copy(
+        &startblock,
+        &graph.returnblock,
+        source_layout,
+        result_ptr_lltype,
+        &item_lltype,
+        newlist_const,
+        copy_const,
+        &l_arg,
+        Hlvalue::Variable(start_arg),
+        &newlength,
+    );
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l1".to_string(), "start".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_listslice_minusone(RESLIST, l1)` (rlist.py:906-911):
+///
+/// ```python
+/// def ll_listslice_minusone(RESLIST, l1):
+///     newlength = l1.ll_length() - 1
+///     l = RESLIST.ll_newlist(newlength)
+///     ll_arraycopy(l1, l, 0, 0, newlength)
+///     return l
+/// ```
+///
+/// `ll_assert(newlength >= 0)` is debug-only. Single-block graph:
+/// `int_sub(len, 1)` then the shared tail with `src_start = 0`.
+fn build_ll_listslice_minusone_helper_graph(
+    rtyper: &RPythonTyper,
+    name: &str,
+    source_layout: ListLayout,
+    source_ptr_lltype: LowLevelType,
+    result_ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    newlist: &LowLevelFunction,
+    arraycopy: &LowLevelFunction,
+) -> Result<PyGraph, TyperError> {
+    let newlist_const = sub_helper_funcptr_constant(rtyper, newlist)?;
+    let copy_const = sub_helper_funcptr_constant(rtyper, arraycopy)?;
+
+    let l_arg = variable_with_lltype("l1", source_ptr_lltype);
+    let startblock = Block::shared(vec![Hlvalue::Variable(l_arg.clone())]);
+    let return_var = variable_with_lltype("result", result_ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // newlength = l1.ll_length() - 1.
+    let len1 = emit_list_length_read(&startblock, source_layout, &l_arg);
+    let newlength = variable_with_lltype("newlength", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_sub",
+        vec![Hlvalue::Variable(len1), signed_const(1)],
+        Hlvalue::Variable(newlength.clone()),
+    ));
+    emit_listslice_alloc_and_copy(
+        &startblock,
+        &graph.returnblock,
+        source_layout,
+        result_ptr_lltype,
+        &item_lltype,
+        newlist_const,
+        copy_const,
+        &l_arg,
+        signed_const(0),
+        &newlength,
+    );
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l1".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `ll_listslice_startstop(RESLIST, l1, start, stop)`
+/// (rlist.py:893-904):
+///
+/// ```python
+/// def ll_listslice_startstop(RESLIST, l1, start, stop):
+///     length = l1.ll_length()
+///     if stop > length:
+///         stop = length
+///     newlength = stop - start
+///     l = RESLIST.ll_newlist(newlength)
+///     ll_arraycopy(l1, l, start, 0, newlength)
+///     return l
+/// ```
+///
+/// The `stop > length` clamp is a two-way branch that merges `stop` back;
+/// `ll_assert(0 <= start <= length and stop >= start)` is debug-only. Three
+/// blocks: start (read len, `int_gt`) → clamp (pass `length` as the merged
+/// stop) / merge (`int_sub` newlength, then the shared alloc-and-copy tail).
+fn build_ll_listslice_startstop_helper_graph(
+    rtyper: &RPythonTyper,
+    name: &str,
+    source_layout: ListLayout,
+    source_ptr_lltype: LowLevelType,
+    result_ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    newlist: &LowLevelFunction,
+    arraycopy: &LowLevelFunction,
+) -> Result<PyGraph, TyperError> {
+    let newlist_const = sub_helper_funcptr_constant(rtyper, newlist)?;
+    let copy_const = sub_helper_funcptr_constant(rtyper, arraycopy)?;
+
+    let l_arg = variable_with_lltype("l1", source_ptr_lltype.clone());
+    let start_arg = variable_with_lltype("start", LowLevelType::Signed);
+    let stop_arg = variable_with_lltype("stop", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(l_arg.clone()),
+        Hlvalue::Variable(start_arg.clone()),
+        Hlvalue::Variable(stop_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", result_ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // merge block carries (l1, start, stop) with stop already clamped to length.
+    let l_m = variable_with_lltype("l1", source_ptr_lltype.clone());
+    let start_m = variable_with_lltype("start", LowLevelType::Signed);
+    let stop_m = variable_with_lltype("stop", LowLevelType::Signed);
+    let block_merge = Block::shared(vec![
+        Hlvalue::Variable(l_m.clone()),
+        Hlvalue::Variable(start_m.clone()),
+        Hlvalue::Variable(stop_m.clone()),
+    ]);
+    // clamp block carries (l1, start, length) — sets stop = length on the merge edge.
+    let l_c = variable_with_lltype("l1", source_ptr_lltype);
+    let start_c = variable_with_lltype("start", LowLevelType::Signed);
+    let len_c = variable_with_lltype("length", LowLevelType::Signed);
+    let block_clamp = Block::shared(vec![
+        Hlvalue::Variable(l_c.clone()),
+        Hlvalue::Variable(start_c.clone()),
+        Hlvalue::Variable(len_c.clone()),
+    ]);
+
+    // ---- startblock: length = ll_length; too_big = int_gt(stop, length); branch.
+    let length = emit_list_length_read(&startblock, source_layout, &l_arg);
+    let too_big = variable_with_lltype("too_big", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_gt",
+        vec![
+            Hlvalue::Variable(stop_arg.clone()),
+            Hlvalue::Variable(length.clone()),
+        ],
+        Hlvalue::Variable(too_big.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(too_big));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_arg.clone()),
+                Hlvalue::Variable(start_arg.clone()),
+                Hlvalue::Variable(length),
+            ],
+            Some(block_clamp.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_arg),
+                Hlvalue::Variable(start_arg),
+                Hlvalue::Variable(stop_arg),
+            ],
+            Some(block_merge.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_clamp: stop := length. Merge edge passes `length` as stop.
+    block_clamp.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_c),
+                Hlvalue::Variable(start_c),
+                Hlvalue::Variable(len_c),
+            ],
+            Some(block_merge.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // ---- block_merge: newlength = stop - start; alloc + copy.
+    let newlength = variable_with_lltype("newlength", LowLevelType::Signed);
+    block_merge.borrow_mut().operations.push(SpaceOperation::new(
+        "int_sub",
+        vec![
+            Hlvalue::Variable(stop_m),
+            Hlvalue::Variable(start_m.clone()),
+        ],
+        Hlvalue::Variable(newlength.clone()),
+    ));
+    emit_listslice_alloc_and_copy(
+        &block_merge,
+        &graph.returnblock,
+        source_layout,
+        result_ptr_lltype,
+        &item_lltype,
+        newlist_const,
+        copy_const,
+        &l_m,
+        Hlvalue::Variable(start_m),
+        &newlength,
+    );
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l1".to_string(), "start".to_string(), "stop".to_string()],
+        func,
+    ))
+}
+
 /// Derive the [`ListLayout`] from a list repr's `Ptr` lltype: a resized list
 /// is `Ptr(GcStruct("list", …))`, a fixed list is `Ptr(GcArray)`.
 fn list_layout_from_lltype(ptr_lltype: &LowLevelType) -> Result<ListLayout, TyperError> {
@@ -3395,6 +3778,147 @@ fn rtype_bltn_list_via_ll_copy(
         )?
     };
     hop.gendirectcall(&copy, vlist)
+}
+
+/// RPython `AbstractBaseListRepr.rtype_getslice(r_lst, hop)` (rlist.py:409-414):
+///
+/// ```python
+/// def rtype_getslice(r_lst, hop):
+///     cRESLIST = hop.inputconst(Void, hop.r_result.LIST)
+///     v_lst = hop.inputarg(r_lst, arg=0)
+///     kind, vlist = hop.decompose_slice_args()
+///     ll_listslice = globals()['ll_listslice_%s' % kind]
+///     return hop.gendirectcall(ll_listslice, cRESLIST, v_lst, *vlist)
+/// ```
+///
+/// `hop.r_result` is always the resized `ListRepr` (`listdef.offspring` yields
+/// a fresh growable list, unaryop.py:420-423); the receiver's `source_layout`
+/// varies (a `FixedSizeListRepr` slice source is possible). Mints
+/// `ll_arraycopy` (general 5-arg), `ll_newlist`, and the per-`kind`
+/// `ll_listslice_%s` helper in dependency order, then `gendirectcall`s it. The
+/// `cRESLIST` Void const is implicit — the result repr is `hop.r_result`, which
+/// the helper builders read directly.
+fn rtype_getslice_via_ll_listslice(
+    hop: &HighLevelOp,
+    source_layout: ListLayout,
+    source_ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    v_lst: Hlvalue,
+) -> RTypeResult {
+    let (kind, vlist) = hop.decompose_slice_args()?;
+
+    let r_result = hop
+        .r_result
+        .borrow()
+        .as_ref()
+        .map(Arc::clone)
+        .ok_or_else(|| TyperError::message("rtype_getslice: r_result not populated"))?;
+    let result_ptr_lltype = r_result.lowleveltype().clone();
+    let items_ptr = items_array_ptr_lltype(&item_lltype);
+
+    // ll_arraycopy(src, dst, src_start, dst_start, length) — general 5-arg
+    // (rgc.py:365): a slice copies from `src_start = start != 0`, so the
+    // start=0 specialisation used by `ll_copy` does not fit.
+    let arraycopy = {
+        let item = item_lltype.clone();
+        hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_arraycopy".to_string(),
+            vec![
+                items_ptr.clone(),
+                items_ptr.clone(),
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+            ],
+            LowLevelType::Void,
+            move |_rtyper, _args, _result| {
+                build_ll_arraycopy_general_helper_graph("ll_arraycopy", item.clone())
+            },
+        )?
+    };
+    let newlist = {
+        let result_ptr = result_ptr_lltype.clone();
+        let item = item_lltype.clone();
+        let result_layout = list_layout_from_lltype(&result_ptr_lltype)?;
+        hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_newlist".to_string(),
+            vec![LowLevelType::Signed],
+            result_ptr_lltype.clone(),
+            move |_rtyper, _args, _result| {
+                build_ll_newlist_helper_graph(
+                    "ll_newlist",
+                    result_layout,
+                    result_ptr.clone(),
+                    item.clone(),
+                )
+            },
+        )?
+    };
+
+    // The per-kind `ll_listslice_%s` helper (rlist.py:883-911).
+    let (helper_name, helper_args): (&str, Vec<LowLevelType>) = match kind {
+        SliceKind::MinusOne => ("ll_listslice_minusone", vec![source_ptr_lltype.clone()]),
+        SliceKind::StartOnly => (
+            "ll_listslice_startonly",
+            vec![source_ptr_lltype.clone(), LowLevelType::Signed],
+        ),
+        SliceKind::StartStop => (
+            "ll_listslice_startstop",
+            vec![
+                source_ptr_lltype.clone(),
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+            ],
+        ),
+    };
+    let listslice = {
+        let name = helper_name.to_string();
+        let source_ptr = source_ptr_lltype.clone();
+        let result_ptr = result_ptr_lltype.clone();
+        let item = item_lltype.clone();
+        hop.rtyper.lowlevel_helper_function_with_builder(
+            helper_name.to_string(),
+            helper_args,
+            result_ptr_lltype.clone(),
+            move |rtyper, _args, _result| match kind {
+                SliceKind::MinusOne => build_ll_listslice_minusone_helper_graph(
+                    rtyper,
+                    &name,
+                    source_layout,
+                    source_ptr.clone(),
+                    result_ptr.clone(),
+                    item.clone(),
+                    &newlist,
+                    &arraycopy,
+                ),
+                SliceKind::StartOnly => build_ll_listslice_startonly_helper_graph(
+                    rtyper,
+                    &name,
+                    source_layout,
+                    source_ptr.clone(),
+                    result_ptr.clone(),
+                    item.clone(),
+                    &newlist,
+                    &arraycopy,
+                ),
+                SliceKind::StartStop => build_ll_listslice_startstop_helper_graph(
+                    rtyper,
+                    &name,
+                    source_layout,
+                    source_ptr.clone(),
+                    result_ptr.clone(),
+                    item.clone(),
+                    &newlist,
+                    &arraycopy,
+                ),
+            },
+        )?
+    };
+
+    // gendirectcall(ll_listslice, v_lst, *vlist).
+    let mut call_args = vec![v_lst];
+    call_args.extend(vlist);
+    hop.gendirectcall(&listslice, call_args)
 }
 
 /// `FixedSizeListRepr` (bare `Ptr(GcArray)`) vs the resized `ListRepr`
@@ -5458,6 +5982,253 @@ mod tests {
         );
     }
 
+    /// `l[start:stop]` on a resized `ListRepr` with non-constant nonneg int
+    /// bounds decomposes to `"startstop"` (rtyper.py:781) and lowers to
+    /// `gendirectcall(ll_listslice_startstop, l, start, stop)`, which mints the
+    /// `ll_listslice_startstop` / `ll_newlist` / `ll_arraycopy` helper graphs
+    /// (rlist.py:893-904).
+    #[test]
+    fn translate_operation_getslice_startstop_emits_ll_listslice_helpers() {
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::SpaceOperation;
+        use std::cell::RefCell as StdRef;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_list: Arc<dyn Repr> =
+            Arc::new(ListRepr::new(&rtyper, r_int.clone()).expect("ListRepr::new"));
+        let list_lltype = r_list.lowleveltype().clone();
+
+        let v_lst = Variable::new();
+        v_lst.set_concretetype(Some(list_lltype));
+        let v_start = Variable::new();
+        v_start.set_concretetype(Some(LowLevelType::Signed));
+        let v_stop = Variable::new();
+        v_stop.set_concretetype(Some(LowLevelType::Signed));
+        let v_lst_h = Hlvalue::Variable(v_lst);
+        let v_start_h = Hlvalue::Variable(v_start);
+        let v_stop_h = Hlvalue::Variable(v_stop);
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            "getslice".to_string(),
+            vec![v_lst_h.clone(), v_start_h.clone(), v_stop_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_lst_h);
+        hop.args_s.borrow_mut().push(SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_list.clone()));
+        // Non-constant nonneg int bounds → the "startstop" arm.
+        hop.args_v.borrow_mut().push(v_start_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(/* nonneg */ true, false)));
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        hop.args_v.borrow_mut().push(v_stop_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(/* nonneg */ true, false)));
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        // The slice result is a fresh resized list (listdef.offspring).
+        *hop.r_result.borrow_mut() = Some(r_list.clone());
+
+        let out = rtyper
+            .translate_operation(&hop)
+            .expect("translate_operation getslice must dispatch to rtype_getslice")
+            .expect("getslice returns the fresh list Variable");
+        let Hlvalue::Variable(_) = out else {
+            panic!("getslice must return a Variable (the ll_listslice result)");
+        };
+        // The lowering is a single `direct_call(ll_listslice_startstop, …)`.
+        let ops = hop.llops.borrow();
+        let direct_calls = ops
+            .ops
+            .iter()
+            .filter(|op| op.opname == "direct_call")
+            .count();
+        assert_eq!(
+            direct_calls, 1,
+            "expected a single ll_listslice_startstop direct_call, got {:?}",
+            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
+        );
+        // The per-kind + support helper graphs were minted under their names.
+        let translator = ann.translator.clone();
+        let names: Vec<String> = translator
+            .graphs
+            .borrow()
+            .iter()
+            .map(|g| g.borrow().name.clone())
+            .collect();
+        for expected in ["ll_listslice_startstop", "ll_newlist", "ll_arraycopy"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "getslice must mint an {expected} helper graph, got {names:?}"
+            );
+        }
+    }
+
+    /// `l[start:]` — non-constant nonneg start, constant `None` stop —
+    /// decomposes to `"startonly"` (rtyper.py:778-779) and lowers to
+    /// `gendirectcall(ll_listslice_startonly, l, start)` (rlist.py:883-890).
+    #[test]
+    fn translate_operation_getslice_startonly_emits_startonly_helper() {
+        use crate::annotator::model::{SomeInteger, SomeValue, s_none};
+        use crate::flowspace::model::{Constant, SpaceOperation};
+        use std::cell::RefCell as StdRef;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_list: Arc<dyn Repr> =
+            Arc::new(ListRepr::new(&rtyper, r_int.clone()).expect("ListRepr::new"));
+        let list_lltype = r_list.lowleveltype().clone();
+
+        let v_lst = Variable::new();
+        v_lst.set_concretetype(Some(list_lltype));
+        let v_start = Variable::new();
+        v_start.set_concretetype(Some(LowLevelType::Signed));
+        let v_lst_h = Hlvalue::Variable(v_lst);
+        let v_start_h = Hlvalue::Variable(v_start);
+        // stop is a constant None (the [start:] shape).
+        let c_stop = Hlvalue::Constant(Constant::new(ConstValue::None));
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            "getslice".to_string(),
+            vec![v_lst_h.clone(), v_start_h.clone(), c_stop.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_lst_h);
+        hop.args_s.borrow_mut().push(SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_list.clone()));
+        hop.args_v.borrow_mut().push(v_start_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(/* nonneg */ true, false)));
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        hop.args_v.borrow_mut().push(c_stop);
+        hop.args_s.borrow_mut().push(s_none());
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        *hop.r_result.borrow_mut() = Some(r_list.clone());
+
+        rtyper
+            .translate_operation(&hop)
+            .expect("translate_operation getslice must dispatch to rtype_getslice")
+            .expect("getslice returns the fresh list Variable");
+        let ops = hop.llops.borrow();
+        let direct_calls = ops
+            .ops
+            .iter()
+            .filter(|op| op.opname == "direct_call")
+            .count();
+        assert_eq!(
+            direct_calls, 1,
+            "expected a single ll_listslice_startonly direct_call, got {:?}",
+            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
+        );
+        let translator = ann.translator.clone();
+        let names: Vec<String> = translator
+            .graphs
+            .borrow()
+            .iter()
+            .map(|g| g.borrow().name.clone())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "ll_listslice_startonly"),
+            "getslice [start:] must mint an ll_listslice_startonly helper graph, got {names:?}"
+        );
+    }
+
+    /// `l[:-1]` decomposes to `"minusone"` (rtyper.py:772) — start const 0,
+    /// stop const -1, no runtime bound args — and lowers to
+    /// `gendirectcall(ll_listslice_minusone, l)` (rlist.py:906-911).
+    #[test]
+    fn translate_operation_getslice_minusone_emits_minusone_helper() {
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{Constant, SpaceOperation};
+        use std::cell::RefCell as StdRef;
+
+        // A constant `SomeInteger` carrying `value` — `is_constant()` reads
+        // `const_box`, `const_()` reads its `ConstValue`.
+        fn const_int(value: i64) -> SomeValue {
+            let mut si = SomeInteger::new(value >= 0, false);
+            si.base.const_box = Some(Constant::new(ConstValue::Int(value)));
+            SomeValue::Integer(si)
+        }
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_list: Arc<dyn Repr> =
+            Arc::new(ListRepr::new(&rtyper, r_int.clone()).expect("ListRepr::new"));
+        let list_lltype = r_list.lowleveltype().clone();
+
+        let v_lst = Variable::new();
+        v_lst.set_concretetype(Some(list_lltype));
+        let v_lst_h = Hlvalue::Variable(v_lst);
+        // start = const 0, stop = const -1 (the [:-1] shape).
+        let c_start = Hlvalue::Constant(Constant::new(ConstValue::Int(0)));
+        let c_stop = Hlvalue::Constant(Constant::new(ConstValue::Int(-1)));
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            "getslice".to_string(),
+            vec![v_lst_h.clone(), c_start.clone(), c_stop.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_lst_h);
+        hop.args_s.borrow_mut().push(SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_list.clone()));
+        // Constant bounds carried on the annotation (is_constant() reads const_box).
+        hop.args_v.borrow_mut().push(c_start);
+        hop.args_s.borrow_mut().push(const_int(0));
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        hop.args_v.borrow_mut().push(c_stop);
+        hop.args_s.borrow_mut().push(const_int(-1));
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        *hop.r_result.borrow_mut() = Some(r_list.clone());
+
+        rtyper
+            .translate_operation(&hop)
+            .expect("translate_operation getslice must dispatch to rtype_getslice")
+            .expect("getslice returns the fresh list Variable");
+        let ops = hop.llops.borrow();
+        let direct_calls = ops
+            .ops
+            .iter()
+            .filter(|op| op.opname == "direct_call")
+            .count();
+        assert_eq!(
+            direct_calls, 1,
+            "expected a single ll_listslice_minusone direct_call, got {:?}",
+            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
+        );
+        let translator = ann.translator.clone();
+        let names: Vec<String> = translator
+            .graphs
+            .borrow()
+            .iter()
+            .map(|g| g.borrow().name.clone())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "ll_listslice_minusone"),
+            "getslice [:-1] must mint an ll_listslice_minusone helper graph, got {names:?}"
+        );
+    }
+
     #[test]
     fn makerepr_resized_somelist_routes_to_list_repr() {
         let rtyper = fresh_rtyper_live();
@@ -6313,9 +7084,9 @@ mod tests {
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("ll_append"));
 
-        let err = ll_listslice_startstop().expect_err("runtime helper deferred");
+        let err = ll_listsetslice().expect_err("runtime helper deferred");
         assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("ll_listslice_startstop"));
+        assert!(err.to_string().contains("ll_listsetslice"));
     }
 
     /// The `ll_reverse` helper is a four-block swap loop: `startblock`

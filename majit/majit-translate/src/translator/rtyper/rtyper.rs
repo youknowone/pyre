@@ -2754,6 +2754,104 @@ impl HighLevelOp {
         self.args_r.borrow_mut().insert(0, Some(r_newfirstarg));
         Ok(())
     }
+
+    /// RPython `HighLevelOp.decompose_slice_args(self)` (rtyper.py:764-782).
+    ///
+    /// ```python
+    /// def decompose_slice_args(self):
+    ///     # Select which kind of slicing is needed.  We support:
+    ///     #   * [start:]
+    ///     #   * [start:stop]
+    ///     #   * [:-1]
+    ///     s_start = self.args_s[1]
+    ///     s_stop = self.args_s[2]
+    ///     if (s_start.is_constant() and s_start.const in (None, 0) and
+    ///         s_stop.is_constant() and s_stop.const == -1):
+    ///         return "minusone", []
+    ///     if isinstance(s_start, annmodel.SomeInteger):
+    ///         if not s_start.nonneg:
+    ///             raise TyperError("slice start must be proved non-negative")
+    ///     if isinstance(s_stop, annmodel.SomeInteger):
+    ///         if not s_stop.nonneg:
+    ///             raise TyperError("slice stop must be proved non-negative")
+    ///     if s_start.is_constant() and s_start.const is None:
+    ///         v_start = inputconst(Signed, 0)
+    ///     else:
+    ///         v_start = self.inputarg(Signed, arg=1)
+    ///     if s_stop.is_constant() and s_stop.const is None:
+    ///         return "startonly", [v_start]
+    ///     else:
+    ///         v_stop = self.inputarg(Signed, arg=2)
+    ///         return "startstop", [v_start, v_stop]
+    /// ```
+    pub fn decompose_slice_args(&self) -> Result<(SliceKind, Vec<Hlvalue>), TyperError> {
+        let (s_start, s_stop) = {
+            let args_s = self.args_s.borrow();
+            let s_start = args_s.get(1).cloned().ok_or_else(|| {
+                TyperError::message("decompose_slice_args: args_s[1] (start) missing")
+            })?;
+            let s_stop = args_s.get(2).cloned().ok_or_else(|| {
+                TyperError::message("decompose_slice_args: args_s[2] (stop) missing")
+            })?;
+            (s_start, s_stop)
+        };
+
+        // start in (None, 0) and stop == -1 -> "minusone".
+        let start_none_or_zero = matches!(
+            s_start.const_(),
+            Some(ConstValue::None) | Some(ConstValue::Int(0))
+        );
+        let stop_minus_one = matches!(s_stop.const_(), Some(ConstValue::Int(-1)));
+        if s_start.is_constant() && start_none_or_zero && s_stop.is_constant() && stop_minus_one {
+            return Ok((SliceKind::MinusOne, vec![]));
+        }
+
+        // Non-constant integer bounds must be proved non-negative.
+        if let SomeValue::Integer(si) = &s_start {
+            if !si.nonneg {
+                return Err(TyperError::message(
+                    "slice start must be proved non-negative",
+                ));
+            }
+        }
+        if let SomeValue::Integer(si) = &s_stop {
+            if !si.nonneg {
+                return Err(TyperError::message("slice stop must be proved non-negative"));
+            }
+        }
+
+        // v_start = inputconst(Signed, 0) when start is a constant None, else inputarg.
+        let start_is_none = s_start.is_constant() && matches!(s_start.const_(), Some(ConstValue::None));
+        let v_start = if start_is_none {
+            Hlvalue::Constant(Self::inputconst(&LowLevelType::Signed, &ConstValue::Int(0))?)
+        } else {
+            self.inputarg(&LowLevelType::Signed, 1)?
+        };
+
+        // stop constant None -> "startonly"; else "startstop".
+        let stop_is_none = s_stop.is_constant() && matches!(s_stop.const_(), Some(ConstValue::None));
+        if stop_is_none {
+            Ok((SliceKind::StartOnly, vec![v_start]))
+        } else {
+            let v_stop = self.inputarg(&LowLevelType::Signed, 2)?;
+            Ok((SliceKind::StartStop, vec![v_start, v_stop]))
+        }
+    }
+}
+
+/// The three slice shapes RPython's `decompose_slice_args` selects
+/// (rtyper.py:764-782): `[:-1]`, `[start:]`, `[start:stop]`. Upstream keys
+/// the `globals()['ll_listslice_%s' % kind]` dispatch on the string name;
+/// the Rust port names them explicitly and maps each to the matching
+/// `ll_listslice_*` helper builder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SliceKind {
+    /// `[:-1]` — drop the last element.
+    MinusOne,
+    /// `[start:]` — from `start` to the end.
+    StartOnly,
+    /// `[start:stop]` — an explicit half-open range.
+    StartStop,
 }
 
 // ____________________________________________________________
