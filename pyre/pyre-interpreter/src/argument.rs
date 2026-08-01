@@ -1124,10 +1124,13 @@ impl Arguments {
 
         // argument.py:273-287 — fill missing args from kwds.
         let more_filling = input_argcount < co_argcount + co_kwonlyargcount;
-        let mut def_first: usize = 0;
+        // `argument.py:274` `def_first = co_argcount - len(defaults_w)` is
+        // signed: `defaults_w` longer than the positional parameters makes it
+        // negative and `defnum = i - def_first` then names the tuple's tail.
+        let mut def_first: isize = 0;
         if more_filling {
             let defaults_len = defaults_w.map(|d| d.len()).unwrap_or(0);
-            def_first = co_argcount.saturating_sub(defaults_len);
+            def_first = co_argcount as isize - defaults_len as isize;
             let mut j = 0usize;
             for i in input_argcount..(co_argcount + co_kwonlyargcount) {
                 if let Some(ref mapping) = kwds_mapping {
@@ -1175,7 +1178,7 @@ impl Arguments {
                 if !scope_w[i].is_null() {
                     continue;
                 }
-                let defnum = (i as isize) - (def_first as isize);
+                let defnum = (i as isize) - def_first;
                 if defnum >= 0 {
                     scope_w[i] = defaults_w.unwrap()[defnum as usize];
                 } else if let Some(list) = missing_positional.as_mut() {
@@ -1697,7 +1700,7 @@ fn format_too_many(
     let takes_str = if num_defaults > 0 {
         format!(
             "from {} to {} positional arguments",
-            num_args - num_defaults,
+            num_args as isize - num_defaults as isize,
             num_args,
         )
     } else {
