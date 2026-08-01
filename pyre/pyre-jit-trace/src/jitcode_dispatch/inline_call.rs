@@ -413,6 +413,13 @@ pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
     false
 }
 
+/// Whether a method-form callee body is free of `LoadAttr` residuals.
+///
+/// Consulted only by the entries that pass `allow_method_load_attr = false`.
+/// A `self.attr` read in the body is what makes it answer `false`, which is the
+/// common shape (`def at(self, i): return self.v + i`), so an entry that opts
+/// out of the check trades a narrower inline surface for the ability to inline
+/// ordinary accessor methods.
 pub(crate) fn method_form_callee_body_supported(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
@@ -1742,7 +1749,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         has_closure,
         None,
         None,
-        false,
+        true,
         false,
         None,
     )
@@ -2717,6 +2724,12 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     if !bridge_rec_root_selfrec && fbw_hazardous_inline_denied(callee_code_key) {
         return Ok(None);
     }
+    // True when only the widened method-form surface reaches this callee: an
+    // unbound `self.attr` accessor body, which the narrow surface declines.
+    let widened_method_form = method_form
+        && bound_method.is_none()
+        && allow_method_load_attr
+        && !method_form_callee_body_supported(body.code, callee_descr_refs);
     // A legacy, unseeded inline sub-walk inside a FOR_ITER body resumes a guard
     // at the caller's CALL boundary, so deopt re-executes the whole callee.
     // Replaying a live-heap mutation would double it, so a Dirty body stays on
@@ -2753,8 +2766,16 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 // iteration's contribution is dropped, silently.  A `Clean`
                 // body is still admitted from there — it has nothing that can
                 // abort.
-                foriter_deferred_admit =
-                    arg_class_guard.is_none() && !fbw_foriter_deferred_call_denied(callee_code_key);
+                //
+                // The widened method-form surface stays out: its deferred call
+                // is the `self.attr` read's own dispatch, which the lever
+                // resolves to a builtin rather than a body it can inline, so the
+                // admission spends the abort and then denies the callee anyway.
+                // Declining here reaches the same residual call without retiring
+                // the enclosing loop.
+                foriter_deferred_admit = arg_class_guard.is_none()
+                    && !widened_method_form
+                    && !fbw_foriter_deferred_call_denied(callee_code_key);
                 foriter_deferred_admit
             }
             CalleeReplaySafety::Dirty => {
@@ -2786,12 +2807,30 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             return Ok(None);
         }
     }
-    if method_form
-        && bound_method.is_none()
-        && !allow_method_load_attr
-        && !method_form_callee_body_supported(body.code, callee_descr_refs)
-    {
-        return Ok(None);
+    if method_form && bound_method.is_none() {
+        // Two surfaces for an unbound method-form callee.  The narrow one
+        // declines any `self.attr` read in the body.  The wide one admits it,
+        // and pays for the reach with a body that raises: the sub-walk records
+        // into the handler region, and a guard whose resume coordinate lands on
+        // the `Reraise` needs ref registers the recorded path never wrote
+        // (`collect_callee_active_boxes`).  That decline arrives mid-recording
+        // on a non-effect-free opcode, so it has no mid-body carrier and the
+        // whole enclosing loop is discarded.  Decline such a body here instead,
+        // where the call simply stays residual and the loop still compiles.
+        let declined = if allow_method_load_attr {
+            callee_body_contains_raise(body.code)
+        } else {
+            !method_form_callee_body_supported(body.code, callee_descr_refs)
+        };
+        if declined {
+            if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+                eprintln!(
+                    "[inline-method-form] decline pc={} allow_load_attr={allow_method_load_attr}",
+                    op.pc
+                );
+            }
+            return Ok(None);
+        }
     }
     if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
         let mut pc = 0usize;

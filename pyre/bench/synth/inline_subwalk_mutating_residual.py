@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=200
+# pyre-check: max-pypy-ratio=40
 # gh#495 guard: an inlined subwalk whose callee makes an unjournaled mutation
 # through a nested residual CALL, in the two miss-handling shapes.
 #
