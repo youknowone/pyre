@@ -655,10 +655,15 @@ impl OptIntBounds {
         let b0 = self.getintbound_arg(&op.arg(0), ctx);
         let b1 = self.getintbound_arg(&op.arg(1), ctx);
         if b0.add_bound_cannot_overflow(&b1) {
-            // replace_op_with(op, INT_ADD) + send_extra_operation
+            // intbounds.py:254-255: replace_op_with(op, INT_ADD) +
+            // send_extra_operation, which re-dispatches from
+            // first_optimization — `Restart`, not `Emit`.  The rewritten op
+            // has to reach OptPure: with both arguments constant it is
+            // constant-folded there, and skipping that lets an all-constant
+            // INT_ADD reach the backend.
             let new_op = op.copy_and_change(OpCode::IntAdd, None, None);
             new_op.pos.set(op.pos.get());
-            OptimizationResult::Emit(new_op)
+            OptimizationResult::Restart(new_op)
         } else {
             OptimizationResult::PassOn
         }
@@ -690,10 +695,11 @@ impl OptIntBounds {
             return OptimizationResult::Remove;
         }
         if b0.sub_bound_cannot_overflow(&b1) {
-            // replace_op_with(op, INT_SUB) + send_extra_operation
+            // intbounds.py:285-286: replace_op_with(op, INT_SUB) +
+            // send_extra_operation — see optimize_int_add_ovf.
             let new_op = op.copy_and_change(OpCode::IntSub, None, None);
             new_op.pos.set(op.pos.get());
-            OptimizationResult::Emit(new_op)
+            OptimizationResult::Restart(new_op)
         } else {
             OptimizationResult::PassOn
         }
@@ -711,10 +717,11 @@ impl OptIntBounds {
         let b0 = self.getintbound_arg(&op.arg(0), ctx);
         let b1 = self.getintbound_arg(&op.arg(1), ctx);
         if b0.mul_bound_cannot_overflow(&b1) {
-            // replace_op_with(op, INT_MUL) + send_extra_operation
+            // intbounds.py:301-302: replace_op_with(op, INT_MUL) +
+            // send_extra_operation — see optimize_int_add_ovf.
             let new_op = op.copy_and_change(OpCode::IntMul, None, None);
             new_op.pos.set(op.pos.get());
-            OptimizationResult::Emit(new_op)
+            OptimizationResult::Restart(new_op)
         } else {
             OptimizationResult::PassOn
         }
