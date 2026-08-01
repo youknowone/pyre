@@ -1576,4 +1576,52 @@ mod tests {
             assert!(!w_type_get_uses_object_setattr(PY_NULL));
         }
     }
+
+    /// Concurrent class creation against one process-global builtin parent is
+    /// the shape the striped lock exists for: `add_subclass`'s `push`
+    /// reallocates and frees the buffer `get_subclasses` is indexing, and its
+    /// null-check-then-install lets two threads each install a `Box`.
+    ///
+    /// Without `w_type_subclasses_lock` this aborts inside the allocator —
+    /// `double free or corruption (fasttop)` on glibc, `STATUS_HEAP_CORRUPTION`
+    /// on Windows, SIGSEGV in `w_weakref_deref` on macOS. Delete the three
+    /// guards and re-run to confirm the gate still bites before trusting it.
+    #[test]
+    fn subclass_registry_survives_concurrent_mutation() {
+        let w_parent = w_type_new("SharedParent", PY_NULL, std::ptr::null_mut());
+        let parent_addr = w_parent as usize;
+
+        std::thread::scope(|scope| {
+            for t in 0..4 {
+                scope.spawn(move || {
+                    let w_parent = parent_addr as PyObjectRef;
+                    // Kept alive for the whole thread so `weak_subclasses`
+                    // holds live entries rather than immediately-dead refs.
+                    let children: Vec<PyObjectRef> = (0..16)
+                        .map(|i| {
+                            w_type_new(&format!("Child{t}_{i}"), PY_NULL, std::ptr::null_mut())
+                        })
+                        .collect();
+                    for _ in 0..500 {
+                        for &w_child in &children {
+                            unsafe { w_type_add_subclass(w_parent, w_child) };
+                        }
+                        // Reads and dereferences every entry in the vector the
+                        // other threads are reallocating — a stale buffer shows
+                        // up here as a garbage `*mut Weakref`. The contents are
+                        // racy by construction, so only the read is asserted on.
+                        let seen = unsafe { w_type_get_subclasses(w_parent, false) };
+                        assert!(seen.iter().all(|w| !w.is_null()));
+                        for &w_child in &children {
+                            unsafe { w_type_remove_subclass(w_parent, w_child) };
+                        }
+                    }
+                });
+            }
+        });
+
+        // Every thread removed everything it added, and no entry outlived it.
+        let leftover = unsafe { w_type_get_subclasses(w_parent, false) };
+        assert!(leftover.is_empty(), "{} entries leaked", leftover.len());
+    }
 }
