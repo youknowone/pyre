@@ -3600,8 +3600,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("kill() requires 2 arguments"));
                     }
-                    let pid = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::pid_t;
-                    let sig = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int;
+                    // interp_posix.py:1386 `@unwrap_spec(pid=c_int, signal=c_int)`.
+                    // Both arguments go through `c_int_w`: a raw payload read
+                    // would accept any object, and `is_int` is an exact-type
+                    // check, so an `int` subclass instance — `signal.SIGHUP` is
+                    // an `IntEnum` member — never reaches the checked path.
+                    let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
+                    let sig = crate::baseobjspace::c_int_w(args[1])? as libc::c_int;
                     let r = unsafe { libc::kill(pid, sig) };
                     if r < 0 {
                         return Err(io_err(std::io::Error::last_os_error(), ""));
@@ -3621,8 +3626,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("killpg() requires 2 arguments"));
                     }
-                    let pgid = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::pid_t;
-                    let sig = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int;
+                    // interp_posix.py:1394 `@unwrap_spec(pgid=c_int, signal=c_int)`.
+                    let pgid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
+                    let sig = crate::baseobjspace::c_int_w(args[1])? as libc::c_int;
                     let r = unsafe { libc::killpg(pgid, sig) };
                     if r < 0 {
                         return Err(io_err(std::io::Error::last_os_error(), ""));
