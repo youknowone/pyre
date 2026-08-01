@@ -8918,26 +8918,17 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
         return Ok(false);
     }
     // Guard (a): the name must stay ABSENT from the module dict so the lookup
-    // keeps falling through to builtins.  A `QUASIIMMUT_FIELD` on the module
-    // dict registers the loop flag on the module-dict `version` watcher; a
-    // later `mutated()` (the new-key insert that shadows the builtin) fails
-    // GUARD_NOT_INVALIDATED.  The slot operand is unused for version keying
-    // (the watcher is per-`version`, not per-slot, and the registration
-    // ignores the slot); use `usize::MAX` as a past-the-end sentinel so the
-    // `quasi_immut_cache` key cannot collide with a real cell fold's slot for
-    // a DIFFERENT present name on the same module dict.
+    // keeps falling through to builtins.  Pinning the module dict's `version?`
+    // is what proves that: the new-key insert that would shadow the builtin
+    // runs `mutated()`, which fails GUARD_NOT_INVALIDATED.  It is the same
+    // field a present-name fold on this namespace pins, so the two share one
+    // marker.
     if !guard_current_frame_globals_identity(ctx, op_pc, w_globals)? {
         return Ok(false);
     }
-    let abs_ns_const = ctx.trace_ctx.const_ref(w_globals as i64);
-    let abs_slot_const = ctx.trace_ctx.const_int(usize::MAX as i64);
-    crate::state::record_namespace_quasiimmut_field(
-        ctx.trace_ctx,
-        abs_ns_const,
-        abs_slot_const,
-        u32::MAX,
-    );
-    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    if !walker_pin_namespace_version(ctx, op_pc, w_globals)? {
+        return Ok(false);
+    }
     // Guard (b): the builtins value for `name` must be unchanged.  The
     // `emit_namespace_cell_fold` below records a `QUASIIMMUT_FIELD` on the
     // builtins dict + the elidable cell lookup, so a rebind/del of the
@@ -9080,6 +9071,5 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
     let Some(majit_ir::Value::Int(new_int)) = ctx.trace_ctx.box_value(raw_int) else {
         return Ok(false);
     };
-    emit_namespace_cell_store_fold(ctx, op_pc, w_globals, slot, stored, raw_int, new_int)?;
-    Ok(true)
+    emit_namespace_cell_store_fold(ctx, op_pc, w_globals, slot, stored, raw_int, new_int)
 }

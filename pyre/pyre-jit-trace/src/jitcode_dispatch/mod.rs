@@ -7278,6 +7278,38 @@ fn walker_pin_type_version_tag<Sym: WalkSym>(
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
+/// The `celldict.py:34 _immutable_fields_ = ["version?"]` twin of
+/// [`walker_pin_type_version_tag`]: pin the module namespace's strategy version
+/// so the folds that bake a slot's stored cell (or the absence of a name) are
+/// revoked by `mutated()` instead of re-reading the dict each iteration.
+///
+/// The marker attaches to the strategy box, not the dict object, because
+/// `version` lives on the strategy — `getdictvalue_no_unwrapping`
+/// (celldict.py:47-55) promotes `self` and then `self.version` for the same
+/// reason. One marker covers every fold against one namespace, since they all
+/// depend on that single field.
+///
+/// `Ok(false)` when the dict has no strategy box to pin, which declines the
+/// fold rather than baking a constant nothing watches.
+fn walker_pin_namespace_version<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    ns: pyre_object::PyObjectRef,
+) -> Result<bool, DispatchError> {
+    let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_get_strategy(ns) };
+    if strategy.is_null() {
+        return Ok(false);
+    }
+    let strategy_const = ctx.trace_ctx.const_ref(strategy as i64);
+    crate::state::record_quasiimmut_field(
+        ctx.trace_ctx,
+        strategy_const,
+        crate::descr::module_dict_version_descr(),
+    );
+    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    Ok(true)
+}
+
 fn walker_record_getfield_gc_r_uncached<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     obj: OpRef,
@@ -7747,19 +7779,14 @@ fn emit_namespace_cell_fold<Sym: WalkSym>(
     if guard_frame_globals && !guard_current_frame_globals_identity(ctx, op_pc, ns)? {
         return Ok(false);
     }
-    let ns_const = ctx.trace_ctx.const_ref(ns as i64);
-    let slot_const = ctx.trace_ctx.const_int(slot as i64);
-    crate::state::record_namespace_quasiimmut_field(
-        ctx.trace_ctx,
-        ns_const,
-        slot_const,
-        slot as u32,
-    );
-    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    if !walker_pin_namespace_version(ctx, op_pc, ns)? {
+        return Ok(false);
+    }
     // Bake the immovable cell as a `ConstPtr` (pypy `ConstPtr(cell)`).  The
-    // `QuasiimmutField(ns, slot)` guard above invalidates the loop on a
-    // rebind / strategy-version bump (`optimize_QUASIIMMUT_FIELD` watches the
-    // `(dict, slot)` pair, not the cell), and the caller's `can_move` check
+    // `QuasiimmutField(strategy, version)` guard above invalidates the loop on a
+    // rebind / strategy-version bump (`_setitem_str_cell_known` calls
+    // `mutated()` before every write that replaces the stored pointer), and the
+    // caller's `can_move` check
     // guarantees the address is stable — the optimizer already folds the
     // equivalent elidable `jit_namespace_cell_lookup` down to this same const
     // ptr.  A genuine constant (not the elidable call's `RefOp` result, which
@@ -7837,16 +7864,10 @@ fn emit_namespace_cell_store_fold<Sym: WalkSym>(
     stored: pyre_object::PyObjectRef,
     raw_int: OpRef,
     new_int: i64,
-) -> Result<(), DispatchError> {
-    let ns_const = ctx.trace_ctx.const_ref(ns as i64);
-    let slot_const = ctx.trace_ctx.const_int(slot as i64);
-    crate::state::record_namespace_quasiimmut_field(
-        ctx.trace_ctx,
-        ns_const,
-        slot_const,
-        slot as u32,
-    );
-    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+) -> Result<bool, DispatchError> {
+    if !walker_pin_namespace_version(ctx, op_pc, ns)? {
+        return Ok(false);
+    }
     // Bake the immovable cell as a `ConstPtr`, identical to the LOAD fold
     // (`emit_namespace_cell_fold`), so this `setfield_gc_i` and the LOAD's
     // `getfield_gc_i` canonicalise onto one trace-heapcache slot via
@@ -7907,7 +7928,7 @@ fn emit_namespace_cell_store_fold<Sym: WalkSym>(
     // exception clear exactly as [`emit_namespace_cell_fold`] does.
     ctx.last_exc_value = None;
     ctx.last_exc_value_concrete = ConcreteValue::Null;
-    Ok(())
+    Ok(true)
 }
 
 /// #67 shape fix: append virtualizable data boxes so the walker merge-point

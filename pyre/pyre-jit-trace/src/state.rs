@@ -4406,36 +4406,12 @@ pub(crate) fn module_dict_cell_value_direct(obj: PyObjectRef, slot: usize) -> Op
     unsafe { pyre_object::dictmultiobject::module_dict_cell_at(obj, slot) }
 }
 
-/// pyjitpl.py:1074-1089 `opimpl_record_quasiimmut_field` for namespace
-/// slot folds: record the dependency marker and arm the pending
-/// GUARD_NOT_INVALIDATED once per heapcache epoch.
-pub(crate) fn record_namespace_quasiimmut_field(
-    ctx: &mut TraceCtx,
-    obj: OpRef,
-    slot: OpRef,
-    slot_index: u32,
-) {
-    if ctx.heap_cache().is_quasi_immut_known(slot_index, obj) {
-        ctx.profiler().count_ops(
-            OpCode::QuasiimmutField,
-            majit_metainterp::counters::HEAPCACHED_OPS,
-        );
-        return;
-    }
-    ctx.heap_cache_mut().quasi_immut_now_known(slot_index, obj);
-    ctx.record_op(OpCode::QuasiimmutField, &[obj, slot]);
-    if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
-        ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
-    }
-}
-
-/// pyjitpl.py:1074-1089 `opimpl_record_quasiimmut_field` for a real struct
-/// field, the [`record_namespace_quasiimmut_field`] twin.
+/// pyjitpl.py:1074-1089 `opimpl_record_quasiimmut_field`: record the
+/// dependency marker and arm the pending GUARD_NOT_INVALIDATED once per
+/// heapcache epoch.
 ///
-/// The namespace variant keys on a synthetic `(dict, slot)` pair because a
-/// module-dict cell has no field descriptor; a genuine quasi-immutable field
-/// carries one, so the op is recorded with the descr and the heapcache keys on
-/// `descr.index()` the same way [`opimpl_getfield_gc_i`] does.
+/// The heapcache keys on `descr.index()` and the receiver, the same way
+/// [`opimpl_getfield_gc_i`] does.
 ///
 /// The caller has already resolved the field's value and is baking it as a
 /// constant, so unlike `opimpl_getfield_gc_i` this records no load — that is
@@ -4461,8 +4437,7 @@ pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: Des
     // (quasiimmut.py:113-159), a descr minted fresh for every recorded
     // QUASIIMMUT_FIELD.  Pyre's descrs are registry-indexed singletons, so a
     // fresh one per op would mint a fresh registry entry per read; the value
-    // rides on the op instead, as the `record_namespace_quasiimmut_field` twin
-    // already does with its slot index.
+    // rides on the op instead.
     match constantfieldbox {
         Some(value) => ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj, value], descr),
         None => ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr),

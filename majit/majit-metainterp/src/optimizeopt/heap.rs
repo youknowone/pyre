@@ -3312,23 +3312,18 @@ impl OptHeap {
                         );
                     }
                 }
-                // RPython optimize_QUASIIMMUT_FIELD: collect quasi-immutable
-                // dependencies. Add (obj_ptr, field_idx) to quasi_immutable_deps
-                // for per-slot watcher registration after compilation.
-                // field_idx comes from descr (GC object fields) or arg(1)
-                // (namespace slot index).
-                let (dep_field_idx, cache_field_key) = if let Some(descr) = op.getdescr() {
-                    (
-                        Some(Self::field_effect_index(&descr)),
+                // heap.py:807-809 `self.optimizer.quasi_immutable_deps[
+                // qmutdescr.qmut] = None`.  Upstream keys the set on the
+                // `QuasiImmut` instance the descr already resolved; pyre records
+                // the pair that identifies it — the owning object and which of
+                // its quasi-immutable fields — and `register_quasi_immutable_deps`
+                // resolves the instance after compilation.
+                let (dep_field_idx, cache_field_key) = match op.getdescr() {
+                    Some(descr) => (
+                        Some(descr.index()),
                         Some(Self::field_cache_identity(&descr)),
-                    )
-                } else if op.num_args() > 1 {
-                    let idx = ctx
-                        .get_constant_int_box(&op.arg(1).get_box_replacement(false))
-                        .map(|v| v as u32);
-                    (idx, idx.map(|v| v as usize))
-                } else {
-                    (None, None)
+                    ),
+                    None => (None, None),
                 };
                 if let Some(idx) = dep_field_idx {
                     // The quasi-immutable dependency object (namespace dict /

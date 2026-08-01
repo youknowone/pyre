@@ -2214,6 +2214,36 @@ pub fn type_version_tag_descr() -> DescrRef {
     TYPE_VERSION_TAG_FIELD_DESCR.clone()
 }
 
+/// `celldict.py:32 ModuleDictStrategy.version` — the module-namespace version
+/// tag (`u64`, 8 bytes, unsigned) on the strategy box.
+///
+/// Quasi-immutable, per `celldict.py:34 _immutable_fields_ = ["version?"]`,
+/// which is the same declaration `getdictvalue_no_unwrapping` promotes before
+/// its elidable lookup (`celldict.py:47-55`). The `LOAD_GLOBAL` / `STORE_GLOBAL`
+/// cell folds bake the slot's stored cell as a `ConstPtr` under a
+/// `QUASIIMMUT_FIELD` on this field: `_setitem_str_cell_known`
+/// (`celldict.py:80-90`) calls `mutated()` before every write that replaces the
+/// stored pointer, and an in-place cell write leaves the pointer alone, so the
+/// version is exactly the datum that proves the baked address still stands.
+///
+/// `offset_of!` rather than a literal because `ModuleDictStrategy` is not
+/// `repr(C)`.
+///
+/// One object per run, for the reason spelled out on
+/// [`TYPE_VERSION_TAG_FIELD_DESCR`].
+static MODULE_DICT_VERSION_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    make_quasi_immutable_field_descr(
+        core::mem::offset_of!(pyre_object::celldict::ModuleDictStrategy, version),
+        8,
+        Type::Int,
+        false,
+    )
+});
+
+pub fn module_dict_version_descr() -> DescrRef {
+    MODULE_DICT_VERSION_FIELD_DESCR.clone()
+}
+
 /// `W_ObjectObject` SizeDescr group (`objectobject.rs:34-46`) — the instance
 /// layout `[ob_type | w_class | map | storage]`.  Built with a parent SizeDescr
 /// (unlike a bare [`make_field_descr`]) so a `getfield_gc` on `map` / `storage`

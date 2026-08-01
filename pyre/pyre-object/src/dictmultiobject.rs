@@ -964,28 +964,26 @@ pub unsafe fn module_dict_storage_len(obj: PyObjectRef) -> Option<usize> {
     Some((*md.dstorage).len())
 }
 
-/// Register a compiled loop's invalidation `flag` against the module
-/// dict's `ModuleDictStrategy.version?` quasi-immutable field
-/// (`celldict.py:34 _immutable_fields_ = ["version?"]`).  The compile-time
-/// glue calls this once per version-keyed module-global dependency so a
-/// later `mutated()` (new key, `del`, or `switch_to_object_strategy`)
-/// flips the flag and fails the loop's `GUARD_NOT_INVALIDATED`.  No-op
-/// when `obj` is not a `W_ModuleDictObject`.
+/// Register a compiled loop's invalidation `flag` against a module dict
+/// strategy's `version?` quasi-immutable field (`celldict.py:34
+/// _immutable_fields_ = ["version?"]`).  The compile-time glue calls this once
+/// per version-keyed module-global dependency so a later `mutated()` (new key,
+/// `del`, `switch_to_object_strategy`, or a write that replaces a stored cell)
+/// flips the flag and fails the loop's `GUARD_NOT_INVALIDATED`.
+///
+/// Takes the strategy rather than the dict because that is what the trace pins:
+/// `version` lives on the strategy, so the `QUASIIMMUT_FIELD` names it directly.
 ///
 /// # Safety
-/// `obj` must be null or a valid PyObjectRef.
-pub unsafe fn module_dict_register_version_watcher(
-    obj: PyObjectRef,
+/// `strategy` must be null or point at a valid `ModuleDictStrategy`.
+pub unsafe fn module_dict_strategy_register_version_watcher(
+    strategy: *mut crate::celldict::ModuleDictStrategy,
     flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    if obj.is_null() || !is_module_dict(obj) {
+    if strategy.is_null() {
         return;
     }
-    let md = &*(obj as *const W_ModuleDictObject);
-    if md.mstrategy.is_null() {
-        return;
-    }
-    (*md.mstrategy).register_version_watcher(flag);
+    (*strategy).register_version_watcher(flag);
 }
 
 /// Allocate a new empty dict per `dictmultiobject.py:67-69

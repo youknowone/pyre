@@ -285,7 +285,10 @@ mod tests {
 
         field.invalidate();
         assert!(flag.load(Ordering::Acquire));
-        assert!(!field.is_installed(), "the field is nulled before the sweep");
+        assert!(
+            !field.is_installed(),
+            "the field is nulled before the sweep"
+        );
 
         // A second invalidation with nothing installed must not double-free.
         field.invalidate();

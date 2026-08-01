@@ -5255,12 +5255,36 @@ pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
 // source of truth. call_depth() reads it. No more Box<dyn Any> allocation.
 
 /// RPython compile.py:204-207 (record_loop_or_bridge) parity:
-/// Register the compiled artifact's invalidation flag with all quasi-immutable
-/// dependencies collected during optimization. The optimizer records
-/// namespace pointers in quasi_immutable_deps when processing
-/// QUASIIMMUT_FIELD ops. After compilation, this function reads them
-/// from MetaInterp and registers watchers so GUARD_NOT_INVALIDATED
-/// fails when the namespace mutates.
+///
+/// ```text
+///  if loop.quasi_immutable_deps is not None:
+///      for qmut in loop.quasi_immutable_deps:
+///          qmut.register_loop_token(wref)
+/// ```
+///
+/// Upstream's set holds the `QuasiImmut` instances the optimizer already
+/// resolved through each `QuasiImmutDescr`. Pyre records the pair that
+/// identifies one — the owning object and the registry index of the
+/// quasi-immutable field — and resolves the instance here, which is why the
+/// field index has to select the registrar: a `ModuleDictStrategy` box carries
+/// no `PyObject` header, so offering it to the type-keyed registrar would read
+/// one that is not there.
+///
+/// The two `?` fields:
+///
+/// `celldict.py:34 _immutable_fields_ = ["version?"]` — the global cell fast
+/// path bakes a slot's stored cell as a `ConstPtr` under a
+/// `QUASIIMMUT_FIELD(strategy, version)`. `mutated()` (new key, `del`,
+/// `switch_to_object_strategy`, and every write that replaces the stored
+/// pointer) flips the flag; a same-key reassign mutates the cell in place
+/// without bumping the version and is observed by the live `cell.w_value` read
+/// instead.
+///
+/// `typeobject.py:177 _immutable_fields_ = ['_version_tag?']` — the
+/// LOAD_METHOD / LOAD_ATTR method-cache fold bakes a type's `version_tag` as a
+/// constant under a `QUASIIMMUT_FIELD(w_type, _version_tag)`. `mutated()`
+/// (typeobject.py:285-291) bumps the tag and walks subclasses, and the setter
+/// revokes each level's loops.
 fn register_quasi_immutable_deps(_green_key: u64) {
     let (driver, _) = driver_pair();
     let deps: Vec<(u64, u32)> =
@@ -5271,29 +5295,20 @@ fn register_quasi_immutable_deps(_green_key: u64) {
     let Some(flag) = driver.last_compiled_artifact_invalidation_flag() else {
         return;
     };
-    // `celldict.py:34 _immutable_fields_ = ["version?"]`: the global cell
-    // fast path's `QUASIIMMUT_FIELD(ns, slot)` is keyed on the module
-    // dict's `ModuleDictStrategy.version`, not a per-slot index, so every
-    // recorded dep registers the loop flag against that single version
-    // watcher.  `mutated()` (new key, `del`, `switch_to_object_strategy`)
-    // then flips the flag; a same-key value reassign mutates the cell in
-    // place without bumping the version and is observed by the live
-    // `cell.w_value` read instead.  `ns_ptr` is the `const_ref`-folded
-    // `w_globals` object pointer; `slot` is unused for version keying.
-    //
-    // `typeobject.py:177 _immutable_fields_ = ['_version_tag?']`: the
-    // LOAD_METHOD / LOAD_ATTR method-cache fold bakes a type's `version_tag`
-    // as a constant under a `QUASIIMMUT_FIELD(w_type)`, so the same loop flag
-    // registers against the type. `mutated()` (typeobject.py:285-291) bumps
-    // the tag and walks subclasses, and the setter revokes each level's loops.
-    //
-    // Both registrations self-filter on the object's kind, so a dep of either
-    // kind reaches exactly its own watcher list.
-    for (dep_ptr, _slot) in deps {
-        let obj = dep_ptr as pyre_object::PyObjectRef;
+    let module_dict_version = pyre_jit_trace::descr::module_dict_version_descr().index();
+    for (dep_ptr, field_index) in deps {
         unsafe {
-            pyre_object::dictmultiobject::module_dict_register_version_watcher(obj, &flag);
-            pyre_object::typeobject::w_type_register_quasi_immut_watcher(obj, &flag);
+            if field_index == module_dict_version {
+                pyre_object::dictmultiobject::module_dict_strategy_register_version_watcher(
+                    dep_ptr as *mut pyre_object::celldict::ModuleDictStrategy,
+                    &flag,
+                );
+            } else {
+                pyre_object::typeobject::w_type_register_quasi_immut_watcher(
+                    dep_ptr as pyre_object::PyObjectRef,
+                    &flag,
+                );
+            }
         }
     }
 }
@@ -8480,6 +8495,12 @@ fn compile_and_run_once(
             .clear_tracing_flag(starting_tracing_key);
         if !had_compiled && driver.has_compiled_loop(compiled_key) {
             register_quasi_immutable_deps(compiled_key);
+        } else {
+            // `register_quasi_immutable_deps` is the only drain of
+            // `last_quasi_immutable_deps`. An attempt that produced no artifact
+            // to attach them to has to clear them anyway, or the next compile
+            // registers this trace's dependencies against its flag.
+            driver.meta_interp_mut().last_quasi_immutable_deps.clear();
         }
     }
 
