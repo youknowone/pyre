@@ -7136,6 +7136,7 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
     w_type: pyre_object::PyObjectRef,
     version_tag: u64,
     map: pyre_interpreter::objspace::std::mapdict::MapRef,
@@ -7145,10 +7146,15 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     // tag here: claiming every carrier is `INSTANCE_TYPE` poisons the heap
     // cache for native-layout subclasses and lets later folds use unrelated
     // field descriptors on the same box.
-    let concrete_obj = walker_concrete_ref_object(ctx, obj)
-        .expect("mapdict shape guard requires the concrete carrier used by the fast path");
+    //
+    // A cached class that DISAGREES with the layout tag is that poisoning,
+    // and gating on `is_class_known` alone would then skip the guard and let
+    // the storage coordinates below run against an unguarded layout. Compare
+    // the recorded class instead and guard whenever it is absent or differs;
+    // a contradictory pair is folded out by the optimizer's constant-class
+    // handling, which discards the trace rather than reading a wild slot.
     let layout_type_addr = unsafe { (*concrete_obj).ob_type as i64 };
-    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+    if ctx.trace_ctx.heap_cache().get_known_class(obj) != Some(layout_type_addr) {
         let type_const = ctx.trace_ctx.const_int(layout_type_addr);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
         ctx.trace_ctx

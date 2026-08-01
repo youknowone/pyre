@@ -2207,7 +2207,15 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     if let Some((w_type, version_tag, map, storageindex)) = unsafe {
         pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, &name)
     } {
-        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, w_type, version_tag, map)?;
+        walker_guard_mapdict_instance_shape(
+            ctx,
+            op_pc,
+            obj,
+            concrete_obj,
+            w_type,
+            version_tag,
+            map,
+        )?;
 
         // getfield_gc_r(obj, storage) + getarrayitem_gc_r(block, C_storageindex):
         // the inline value read (`mapdict.py`).  `storageindex` is a green
@@ -2454,7 +2462,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     }) else {
         return Ok(None);
     };
-    walker_guard_mapdict_instance_shape(ctx, op_pc, obj, w_type, version_tag, map)?;
+    walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, version_tag, map)?;
 
     // `_prim_direct_read` (mapdict.py): read the raw longlong from the
     // shared list through a non-forcing, non-elidable residual.  Both indices
@@ -2971,7 +2979,15 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             }
         }
 
-        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, w_type, version_tag, map)?;
+        walker_guard_mapdict_instance_shape(
+            ctx,
+            op_pc,
+            obj,
+            concrete_obj,
+            w_type,
+            version_tag,
+            map,
+        )?;
         let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
         let listindex_const = ctx.trace_ctx.const_int(listindex as i64);
         let (helper_fn, raw, value_type) = match unbox_type {
@@ -3204,7 +3220,15 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             )
         }
     {
-        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, add.w_type, add.version_tag, add.map)?;
+        walker_guard_mapdict_instance_shape(
+            ctx,
+            op_pc,
+            obj,
+            concrete_obj,
+            add.w_type,
+            add.version_tag,
+            add.map,
+        )?;
         let new_map_const = ctx.trace_ctx.const_int(add.new_map as i64);
         crate::helpers::emit_mapdict_add_attr_inline(
             ctx.trace_ctx,
@@ -3230,7 +3254,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     }) else {
         return Ok(None);
     };
-    walker_guard_mapdict_instance_shape(ctx, op_pc, obj, w_type, version_tag, map)?;
+    walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, version_tag, map)?;
     let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
     let helper = ctx
         .trace_ctx
