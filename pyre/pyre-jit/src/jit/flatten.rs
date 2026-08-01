@@ -2571,6 +2571,8 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "load_name"
             | "store_name"
             | "store_global"
+            | "delete_name"
+            | "delete_global"
             | "simple_call"
             | "getattr"
             | "load_special"
@@ -3246,6 +3248,12 @@ pub struct LoweringContext {
     /// w_name, value]`, void result) via
     /// [`lower_store_global_hlop_to_insn`].
     pub store_global_fn_idx: u16,
+    /// `delete_name_fn` descrs-pool index. DELETE_NAME lowers to a void
+    /// two-Ref residual with `[frame, w_name]` operands.
+    pub delete_name_fn_idx: u16,
+    /// `delete_global_fn` descrs-pool index. DELETE_GLOBAL lowers to a void
+    /// two-Ref residual with `[frame, w_name]` operands.
+    pub delete_global_fn_idx: u16,
     /// `bind(assembler, cpu.newtuple_from_array_fn as *const (),
     /// CallFlavor::Plain)` descrs-pool index for the production
     /// source.  BUILD_TUPLE records the rtyped `pyopcode.py:995-998`
@@ -4290,6 +4298,54 @@ where
     ))
 }
 
+/// Lower pyopcode.py DELETE_NAME to a void two-Ref residual call.
+pub fn lower_delete_name_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "delete_name" || op.args.len() != 2 || op.result.is_some() {
+        return None;
+    }
+    let frame_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+    let name_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
+    Some(build_residual_call_r_v_insn_from_operands(
+        ctx.delete_name_fn_idx,
+        vec![frame_operand, name_operand],
+        CallFlavor::Plain,
+        majit_ir::PyreHelperKind::None,
+    ))
+}
+
+/// Lower pyopcode.py DELETE_GLOBAL to a void two-Ref residual call.
+pub fn lower_delete_global_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "delete_global" || op.args.len() != 2 || op.result.is_some() {
+        return None;
+    }
+    let frame_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+    let name_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
+    Some(build_residual_call_r_v_insn_from_operands(
+        ctx.delete_global_fn_idx,
+        vec![frame_operand, name_operand],
+        CallFlavor::Plain,
+        majit_ir::PyreHelperKind::None,
+    ))
+}
+
 /// Construct the CALL-family `residual_call_r_r` Insn from raw
 /// register indices.  Production codewriter callsite replaces the prior `emit_residual_call(
 /// call_fn_N_idx, ...)` SSARepr emit at codewriter.rs:5747-5754
@@ -5181,6 +5237,12 @@ where
         return Some(insn);
     }
     if let Some(insn) = lower_store_global_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_delete_name_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_delete_global_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
     if let Some(insn) = lower_tuple_build_hlop_to_insn(op, ctx, get_register, lower_constant) {
