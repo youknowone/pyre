@@ -3976,7 +3976,24 @@ fn run_perfn_walk<Sym: WalkSym>(
         }) = &walk_result
         {
             let abort_jit_pc = *pc;
-            if !crate::jitcode_dispatch::fbw_executed_nonpure_residual() {
+            // A walk commits at most ONE leg.  The carrier block above may
+            // already have taken `CalleeRebuild`, which resumes INSIDE the
+            // rebuilt callee, past what it applied; rewinding the caller to its
+            // CALL on top of that runs the whole callee a second time.  Nothing
+            // else keeps the two apart — this leg's own gates are inclusion
+            // tests on the residual odometer, and `walk_end_resume_provable`
+            // cannot see effects applied by the plain interpretation the
+            // rebuild resumed into (the `MidBodyDecline::AfterRun` argument,
+            // which the carrier block applies only to its own fallback).
+            if WALK_END_FLUSH_COMMITTED.with(|c| c.get()) {
+                crate::jitcode_dispatch::fbw_abort_outer_resume_reset();
+                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
+                             (a carrier leg already committed this walk)"
+                    );
+                }
+            } else if !crate::jitcode_dispatch::fbw_executed_nonpure_residual() {
                 if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                     eprintln!(
                         "[fbw-abort-flush] declined at abort_jit_pc={abort_jit_pc} \
