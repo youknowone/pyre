@@ -3387,6 +3387,23 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::_functools::W_KeyWrapper
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // `unicodedata.UCD` and `__pypy__.Bufferable`: `allocate_stable` types with
+    // no inline object payload, so the header `w_class` — which a Python
+    // subclass instance points at a managed heap type — is the only edge their
+    // marker forwards.  Appended after the accelerator so no established
+    // AUTO-ID moves.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::unicodedata::W_UCD
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::W_Bufferable
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
     // `PYRE_CLASS_DESCRIPTORS` slice.  A type with inline managed children

@@ -627,6 +627,11 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (155, Some(0)),
     // `functools.KeyWrapper`, registered after them.
     (156, Some(0)),
+    // `unicodedata.UCD` / `__pypy__.Bufferable` close the tail; both are
+    // `allocate_stable` with no inline object payload, so the header
+    // `w_class` is the only edge their marker forwards.
+    (157, Some(0)),
+    (158, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every
