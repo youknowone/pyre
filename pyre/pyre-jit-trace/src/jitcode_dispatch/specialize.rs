@@ -1821,6 +1821,24 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
                 if index >= concrete_len {
                     return Ok(None);
                 }
+                // `index < concrete_len` only holds for the tuple recorded
+                // here. A trace can enter between the `UnpackSequence` helper
+                // and this one — a bridge resumes mid-unpack — so this arm
+                // cannot rely on that helper's length guard being in the same
+                // trace. Emit it; when it is present the optimizer folds this
+                // one away, so a whole unpack still guards the length once.
+                let length = crate::state::opimpl_arraylen_gc(
+                    ctx.trace_ctx,
+                    items,
+                    crate::state::pyobject_gcarray_descr(),
+                );
+                let expected = ctx.trace_ctx.const_int(concrete_len as i64);
+                walker_emit_guard_with_snapshot(
+                    ctx,
+                    op_pc,
+                    OpCode::GuardValue,
+                    &[length, expected],
+                )?;
                 let index_op = ctx.trace_ctx.const_int(int_val);
                 let item = crate::state::trace_items_block_getitem_value_pure(
                     ctx.trace_ctx,
