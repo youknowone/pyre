@@ -60,9 +60,8 @@ fn semlock_set_i64(obj: PyObjectRef, key: &str, value: i64) {
     let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
     let boxed_slot = obj_slot + 1;
     pyre_object::gc_roots::pin_root(w_int_new(value));
-    let dict = crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(
-        obj_slot,
-    ));
+    let dict =
+        crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(obj_slot));
     if dict.is_null() {
         return;
     }
@@ -182,12 +181,12 @@ fn semlock_acquire(
             return Err(crate::PyError::os_error_with_errno(errno, "sem_trywait"));
         }
     } else {
-        let deadline =
-            rustpython_host_env::multiprocessing::deadline_from_timeout(timeout.unwrap()).map_err(
-                |error| {
-                    crate::PyError::os_error_with_errno(error.raw_os_error(), error.description())
-                },
-            )?;
+        let deadline = rustpython_host_env::multiprocessing::deadline_from_timeout(
+            timeout.unwrap(),
+        )
+        .map_err(|error| {
+            crate::PyError::os_error_with_errno(error.raw_os_error(), error.description())
+        })?;
         #[cfg(target_vendor = "apple")]
         {
             let mut delay = 0;
@@ -300,11 +299,7 @@ fn w_semlock_acquire(
         // threads.  The wait can run signal handlers, so the receiver comes
         // back off the shadow stack.
         let self_obj = pyre_object::gc_roots::shadow_stack_get(self_slot);
-        semlock_set_i64(
-            self_obj,
-            "last_tid",
-            crate::module::thread::current_ident(),
-        );
+        semlock_set_i64(self_obj, "last_tid", crate::module::thread::current_ident());
         semlock_set_i64(self_obj, "count", semlock_get_i64(self_obj, "count") + 1);
     }
     Ok(got)

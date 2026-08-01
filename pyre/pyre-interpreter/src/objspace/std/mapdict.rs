@@ -4985,6 +4985,42 @@ mod tests {
     }
 
     #[test]
+    fn obj_getdict_rebuilds_the_view_when_the_dict_slot_reads_null() {
+        use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
+        // mapdict.py:828-830 `if w_dict is not None` — RPython's `read` answers
+        // None both for an absent slot and for one holding None, and both mean
+        // "build the view".  Surfacing the null instead makes `getdict` report
+        // that the receiver has no dict, which is the single state
+        // `descr__setattr__` turns into
+        // `"'%T' object attribute '%s' is read-only"` — for any name the type
+        // carries, a class-variable default being enough to arm that branch.
+        crate::test_hooks::install_hash_hook();
+        unsafe {
+            let term = boxed_dict_terminator();
+            let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_ObjectObject);
+            obj._set_mapdict_map(term);
+
+            let w1 = _obj_getdict(obj_ref);
+            assert!(!w1.is_null());
+            assert_eq!(instance_get_dict_slot(obj_ref), Some(w1));
+
+            // The state a write that never landed leaves behind: the map still
+            // claims the SPECIAL attribute, its storage slot holds NULL.
+            assert!(instance_set_dict_slot(obj_ref, pyre_object::PY_NULL));
+            assert_eq!(instance_get_dict_slot(obj_ref), Some(pyre_object::PY_NULL));
+
+            let w2 = _obj_getdict(obj_ref);
+            assert!(!w2.is_null(), "a null SPECIAL slot must rebuild the view");
+            assert_eq!(instance_get_dict_slot(obj_ref), Some(w2));
+            let dict = &*(w2 as *const pyre_object::W_DictObject);
+            assert_eq!(dict.dstrategy.strategy_kind(), StrategyKind::Map);
+            // The rebuilt view backs onto the instance it was built for.
+            assert_eq!(dict.dstorage as PyObjectRef, obj_ref);
+        }
+    }
+
+    #[test]
     fn instance_custom_trace_walks_special_wrapper_and_values() {
         // The wrapper stored in the "dict" SPECIAL slot is forwarded by the
         // instance custom trace (it is one of the storage slots), and a
