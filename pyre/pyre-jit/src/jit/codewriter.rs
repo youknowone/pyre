@@ -9846,8 +9846,7 @@ impl CodeWriter {
                             // leaving it unlowered blacks out the whole
                             // enclosing module loop.
                             let name_idx = namei.get(op_arg) as usize;
-                            let name =
-                                super::flow::Constant::string(code.names[name_idx].as_str());
+                            let name = super::flow::Constant::string(code.names[name_idx].as_str());
                             emit_frontend_delete_name(
                                 &mut graph,
                                 &current_block.block(),
@@ -9864,8 +9863,7 @@ impl CodeWriter {
                             // call.  Same void 2-Ref, zero-stack-effect shape
                             // as the DeleteName arm.
                             let name_idx = namei.get(op_arg) as usize;
-                            let name =
-                                super::flow::Constant::string(code.names[name_idx].as_str());
+                            let name = super::flow::Constant::string(code.names[name_idx].as_str());
                             emit_frontend_delete_global(
                                 &mut graph,
                                 &current_block.block(),
