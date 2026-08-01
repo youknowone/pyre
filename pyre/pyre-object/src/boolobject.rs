@@ -29,12 +29,8 @@ impl crate::lltype::GcType for W_BoolObject {
     /// crate split was meant to avoid; the JIT init asserts the registered
     /// id matches the descr constant, so any drift surfaces there.
     ///
-    /// Note: there are no `malloc_typed::<W_BoolObject>` callers — every
-    /// bool flows through the `TRUE_SINGLETON` / `FALSE_SINGLETON`
-    /// statics via [`w_bool_from`]. The impl is kept as a consistency
-    /// anchor for the GC registration's `debug_assert_eq!(_, SIZE)` so
-    /// the singleton struct layout cannot drift from the registered
-    /// type info.
+    /// Every bool flows through the two process-global prebuilt allocations
+    /// owned by [`w_bool_from`].
     fn type_id() -> u32 {
         5
     }
@@ -56,24 +52,24 @@ pub unsafe fn w_bool_get_value(obj: PyObjectRef) -> bool {
 // `space.w_False` as singletons; every PyPy `space.newbool(value)`
 // call (pypy/interpreter/baseobjspace.py:893 `newbool`) returns one of
 // the two pre-allocated objects. pyre mirrors the singleton model with
-// two `static W_BoolObject` instances and routes all callers through
-// [`w_bool_from`].
+// two process-global prebuilt objects and routes all callers through
+// [`w_bool_from`]. Their host allocations carry the same GC header as an
+// RPython translated prebuilt object.
 
-static TRUE_SINGLETON: W_BoolObject = W_BoolObject {
-    ob_header: PyObject {
-        ob_type: &BOOL_TYPE as *const PyType,
-        w_class: std::ptr::null_mut(),
-    },
-    intval: 1,
-};
+static TRUE_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static FALSE_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-static FALSE_SINGLETON: W_BoolObject = W_BoolObject {
-    ob_header: PyObject {
-        ob_type: &BOOL_TYPE as *const PyType,
-        w_class: std::ptr::null_mut(),
-    },
-    intval: 0,
-};
+fn bool_singleton(slot: &'static std::sync::OnceLock<usize>, intval: i64) -> PyObjectRef {
+    *slot.get_or_init(|| {
+        crate::lltype::malloc_typed(W_BoolObject {
+            ob_header: PyObject {
+                ob_type: &BOOL_TYPE as *const PyType,
+                w_class: std::ptr::null_mut(),
+            },
+            intval,
+        }) as usize
+    }) as PyObjectRef
+}
 
 /// Get a boolean PyObjectRef from a bool value.
 ///
@@ -82,9 +78,9 @@ static FALSE_SINGLETON: W_BoolObject = W_BoolObject {
 #[inline]
 pub fn w_bool_from(value: bool) -> PyObjectRef {
     if value {
-        (&TRUE_SINGLETON as *const W_BoolObject).cast_mut() as PyObjectRef
+        bool_singleton(&TRUE_SINGLETON, 1)
     } else {
-        (&FALSE_SINGLETON as *const W_BoolObject).cast_mut() as PyObjectRef
+        bool_singleton(&FALSE_SINGLETON, 0)
     }
 }
 
@@ -142,7 +138,7 @@ mod tests {
         }
     }
 
-    /// `w_bool_from` returns one of the two static singletons —
+    /// `w_bool_from` returns one of the two prebuilt singletons —
     /// every call with the same value yields the same address.
     /// pypy/objspace/std/objspace.py:61 installs `space.w_True` /
     /// `space.w_False` with the same identity invariant.
@@ -155,5 +151,10 @@ mod tests {
         assert!(std::ptr::eq(a, b), "w_bool_from(true) is not a singleton");
         assert!(std::ptr::eq(c, d), "w_bool_from(false) is not a singleton");
         assert!(!std::ptr::eq(a, c));
+        unsafe {
+            let hdr = majit_gc::header::header_of(a as usize);
+            assert_eq!((*hdr).type_id(), 5);
+            assert!((*hdr).has_flag(majit_gc::flags::NO_HEAP_PTRS));
+        }
     }
 }

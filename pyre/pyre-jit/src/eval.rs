@@ -2416,6 +2416,16 @@ fn build_gc() -> Box<MiniMarkGC> {
             std::mem::size_of::<pyre_object::PyObject>(),
             parent_tid,
         ));
+        if pytype_ptr == &pyre_object::NONE_TYPE as *const _ as usize {
+            debug_assert_eq!(tid, pyre_object::noneobject::W_NONE_GC_TYPE_ID);
+        } else if pytype_ptr == &pyre_object::NOTIMPLEMENTED_TYPE as *const _ as usize {
+            debug_assert_eq!(
+                tid,
+                pyre_object::special::W_NOT_IMPLEMENTED_GC_TYPE_ID
+            );
+        } else if pytype_ptr == &pyre_object::ELLIPSIS_TYPE as *const _ as usize {
+            debug_assert_eq!(tid, pyre_object::special::W_ELLIPSIS_GC_TYPE_ID);
+        }
         majit_gc::GcAllocator::register_vtable_for_type(&mut gc, pytype_ptr, tid);
         pytype_to_tid.insert(pytype_ptr, tid);
     }

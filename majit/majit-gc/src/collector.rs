@@ -889,6 +889,25 @@ impl MiniMarkGC {
         self.is_valid_gc_object(addr) && (self.nursery.contains(addr) || self.oldgen.contains(addr))
     }
 
+    /// Resolve a PyObject header without asking the nursery/oldgen allocators.
+    /// A registered vtable plus the exact matching header tid is the translated
+    /// type-layout witness. The tid equality rejects headerless bootstrap
+    /// objects whose preceding allocator word happens to look like flags.
+    #[inline]
+    fn registered_pyobject_header(&self, addr: usize) -> Option<*mut GcHeader> {
+        if addr < GcHeader::SIZE || addr % GcHeader::ALIGN != 0 {
+            return None;
+        }
+        let vtable = unsafe { *(addr as *const usize) };
+        let expected_type_id = *self.vtable_to_type_id.get(&vtable)?;
+        let hdr = unsafe { header_of(addr) };
+        if unsafe { (*hdr).type_id() } == expected_type_id {
+            Some(hdr)
+        } else {
+            None
+        }
+    }
+
     /// Valid-object nursery check for arbitrary GC fields/roots.
     #[inline]
     fn is_nursery_object_start(&self, addr: usize) -> bool {
@@ -2432,13 +2451,24 @@ impl MiniMarkGC {
     }
 
     fn seed_major_root(&mut self, gcref: GcRef) {
-        if gcref.is_null()
-            || !self.is_managed_heap_object(gcref.0)
-            || !self.may_enter_marking_worklist(gcref.0)
-        {
+        if gcref.is_null() {
             return;
         }
-        let hdr = unsafe { header_of(gcref.0) };
+        let hdr = if let Some(hdr) = self.registered_pyobject_header(gcref.0) {
+            // incminimark.py:2782-2800: an untouched prebuilt object is a leaf.
+            if unsafe { (*hdr).has_flag(flags::NO_HEAP_PTRS) } {
+                return;
+            }
+            hdr
+        } else {
+            if !self.is_managed_heap_object(gcref.0) {
+                return;
+            }
+            unsafe { header_of(gcref.0) }
+        };
+        if !self.may_enter_marking_worklist(gcref.0) {
+            return;
+        }
         // SAFETY: header_of returns a raw pointer; keep each access
         // short-lived to avoid creating overlapping exclusive borrows.
         let newly_marked = unsafe {
@@ -3066,10 +3096,26 @@ impl MiniMarkGC {
         site: &str,
         header_bearing: bool,
     ) {
-        // Custom tracers expose GcRef slots, whose targets carry a header.
-        // incminimark.py:2782-2800 ignores untouched prebuilt objects.
-        if header_bearing && unsafe { (*header_of(addr)).has_flag(flags::NO_HEAP_PTRS) } {
-            return;
+        // Most custom-trace slots are PyObjectRefs. Their registered vtable
+        // gives the exact header type id, so a matching header restores
+        // incminimark.py:2739-2752's direct `_collect_obj` path without an
+        // arena-membership query. The equality check is load-bearing: pyre's
+        // same erased callback also exposes GC storage boxes, while legacy raw
+        // stepping stones can carry a Python vtable without a real header.
+        if header_bearing {
+            if let Some(hdr) = self.registered_pyobject_header(addr) {
+                if unsafe { (*hdr).has_flag(flags::NO_HEAP_PTRS) } {
+                    return;
+                }
+                if self.may_enter_marking_worklist(addr)
+                    && unsafe { !(*hdr).has_flag(flags::VISITED) }
+                {
+                    unsafe { (*hdr).set_flag(flags::VISITED) };
+                    self.incr_state.gray_stack.push(addr);
+                    self.note_nonmoving_nursery_mark(addr);
+                }
+                return;
+            }
         }
         if self.is_managed_heap_object(addr) && self.may_enter_marking_worklist(addr) {
             let hdr = unsafe { header_of(addr) };
