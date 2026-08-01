@@ -3787,27 +3787,27 @@ impl PyFrame {
         // values here; after a collection only the gcmap/shadow slots are
         // forwarded, so never carry the original slice across that call.
         let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(code as PyObjectRef);
-        pyre_object::gc_roots::pin_root(w_globals);
-        pyre_object::gc_roots::pin_root(closure);
+        let root_base = _roots.base();
+        _roots.pin_root(code as PyObjectRef);
+        _roots.pin_root(w_globals);
+        _roots.pin_root(closure);
         for &arg in args {
-            pyre_object::gc_roots::pin_root(arg);
+            _roots.pin_root(arg);
         }
         let w_builtin = crate::baseobjspace::frame_builtin_obj_checked(
-            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            _roots.get(root_base + 1),
             execution_context,
         )?;
         let mut current_args: Vec<PyObjectRef> = Vec::with_capacity(args.len());
         for i in 0..args.len() {
-            current_args.push(pyre_object::gc_roots::shadow_stack_get(root_base + 3 + i));
+            current_args.push(_roots.get(root_base + 3 + i));
         }
         Ok(Self::finish_for_call_with_globals_obj(
-            pyre_object::gc_roots::shadow_stack_get(root_base) as *const (),
+            _roots.get(root_base) as *const (),
             &current_args,
-            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            _roots.get(root_base + 1),
             execution_context,
-            pyre_object::gc_roots::shadow_stack_get(root_base + 2),
+            _roots.get(root_base + 2),
             w_builtin,
             allocation,
         ))
@@ -3830,27 +3830,27 @@ impl PyFrame {
         allocation: FrameLocalsArrayAllocation,
     ) -> Self {
         let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(code as PyObjectRef);
-        pyre_object::gc_roots::pin_root(w_globals);
-        pyre_object::gc_roots::pin_root(closure);
+        let root_base = _roots.base();
+        _roots.pin_root(code as PyObjectRef);
+        _roots.pin_root(w_globals);
+        _roots.pin_root(closure);
         for &arg in args {
-            pyre_object::gc_roots::pin_root(arg);
+            _roots.pin_root(arg);
         }
         let w_builtin = crate::baseobjspace::frame_builtin_obj(
-            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            _roots.get(root_base + 1),
             execution_context,
         );
         let mut current_args: Vec<PyObjectRef> = Vec::with_capacity(args.len());
         for i in 0..args.len() {
-            current_args.push(pyre_object::gc_roots::shadow_stack_get(root_base + 3 + i));
+            current_args.push(_roots.get(root_base + 3 + i));
         }
         Self::finish_for_call_with_globals_obj(
-            pyre_object::gc_roots::shadow_stack_get(root_base) as *const (),
+            _roots.get(root_base) as *const (),
             &current_args,
-            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            _roots.get(root_base + 1),
             execution_context,
-            pyre_object::gc_roots::shadow_stack_get(root_base + 2),
+            _roots.get(root_base + 2),
             w_builtin,
             allocation,
         )
@@ -3886,8 +3886,7 @@ impl PyFrame {
         let args_base = pyre_object::gc_roots::publish_roots(args);
         pyre_object::gc_roots::normalize_roots(root_base, 4 + args.len());
         let code_ref = unsafe {
-            &*(crate::w_code_get_ptr(pyre_object::gc_roots::shadow_stack_get(root_base))
-                as *const CodeObject)
+            &*(crate::w_code_get_ptr(_roots.get(root_base)) as *const CodeObject)
         };
         let num_locals = code_ref.varnames.len();
         let num_cells = ncells(code_ref);
@@ -3910,7 +3909,7 @@ impl PyFrame {
             // Bind positional arguments directly -- no intermediate Vec.
             let nargs = args.len().min(num_locals);
             for i in 0..nargs {
-                arr[i] = pyre_object::gc_roots::shadow_stack_get(args_base + i);
+                arr[i] = _roots.get(args_base + i);
             }
 
             // CPython 3.11+ `co_localsplusnames` unified slot layout:
@@ -3924,7 +3923,7 @@ impl PyFrame {
             for i in 0..npure {
                 arr[num_locals + i] = pyre_object::w_cell_new(PY_NULL);
             }
-            let closure = pyre_object::gc_roots::shadow_stack_get(root_base + 2);
+            let closure = _roots.get(root_base + 2);
             if !closure.is_null() {
                 let nfreevars = code_ref.freevars.len();
                 for i in 0..nfreevars {
@@ -3943,15 +3942,15 @@ impl PyFrame {
         // gated debugdata snapshot retired in favour of `w_globals`).
         unsafe {
             crate::w_code_frame_stores_global(
-                pyre_object::gc_roots::shadow_stack_get(root_base),
-                pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                _roots.get(root_base),
+                _roots.get(root_base + 1),
             );
         }
 
         let mut frame = PyFrame {
             ob_header: frame_ob_header(),
             execution_context,
-            pycode: pyre_object::gc_roots::shadow_stack_get(root_base) as *const (),
+            pycode: _roots.get(root_base) as *const (),
             locals_cells_stack_w,
             valuestackdepth: num_locals + num_cells,
             last_instr: -1,
@@ -3962,8 +3961,8 @@ impl PyFrame {
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
-            w_builtin: pyre_object::gc_roots::shadow_stack_get(root_base + 3),
-            w_globals: pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            w_builtin: _roots.get(root_base + 3),
+            w_globals: _roots.get(root_base + 1),
         };
         // This constructor bypasses `initialize_frame_scopes`, so apply the
         // scope binding it would have done.  `FunctionType(co, globals)` over

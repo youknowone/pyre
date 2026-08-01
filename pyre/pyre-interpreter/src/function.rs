@@ -2977,34 +2977,34 @@ pub fn funccall_valuestack(
         // slots cease to be roots when dropvalues() clears them, so publish
         // the same live-variable set on pyre's shadow stack before doing so.
         let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(code as PyObjectRef);
+        let root_base = _roots.base();
+        _roots.pin_root(code as PyObjectRef);
         match nargs {
             0 => {}
             1 => {
-                pyre_object::gc_roots::pin_root(frame.peekvalue(0));
+                _roots.pin_root(frame.peekvalue(0));
             }
             2 => {
-                pyre_object::gc_roots::pin_root(frame.peekvalue(1));
-                pyre_object::gc_roots::pin_root(frame.peekvalue(0));
+                _roots.pin_root(frame.peekvalue(1));
+                _roots.pin_root(frame.peekvalue(0));
             }
             3 => {
-                pyre_object::gc_roots::pin_root(frame.peekvalue(2));
-                pyre_object::gc_roots::pin_root(frame.peekvalue(1));
-                pyre_object::gc_roots::pin_root(frame.peekvalue(0));
+                _roots.pin_root(frame.peekvalue(2));
+                _roots.pin_root(frame.peekvalue(1));
+                _roots.pin_root(frame.peekvalue(0));
             }
             4 => {
-                pyre_object::gc_roots::pin_root(frame.peekvalue(3));
-                pyre_object::gc_roots::pin_root(frame.peekvalue(2));
-                pyre_object::gc_roots::pin_root(frame.peekvalue(1));
-                pyre_object::gc_roots::pin_root(frame.peekvalue(0));
+                _roots.pin_root(frame.peekvalue(3));
+                _roots.pin_root(frame.peekvalue(2));
+                _roots.pin_root(frame.peekvalue(1));
+                _roots.pin_root(frame.peekvalue(0));
             }
             _ => unreachable!(),
         }
         frame.dropvalues(dropvalues);
 
-        let code = pyre_object::gc_roots::shadow_stack_get(root_base);
-        let rooted_arg = |index| pyre_object::gc_roots::shadow_stack_get(root_base + 1 + index);
+        let code = _roots.get(root_base);
+        let rooted_arg = |index| _roots.get(root_base + 1 + index);
         // Pyre builtins share a single fn(&[PyObjectRef]) signature, so use
         // fixed-size stack arrays instead of heap-allocating a Vec.
         let result = match nargs {
