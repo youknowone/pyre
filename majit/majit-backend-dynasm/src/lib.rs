@@ -91,14 +91,19 @@ static JIT_EXC_VALUE: AtomicI64 = AtomicI64::new(0);
 // managed object, so it is deliberately not GC-rooted.
 static JIT_EXC_TYPE: AtomicI64 = AtomicI64::new(0);
 static JITFRAME_GC_TYPE_ID: AtomicU32 = AtomicU32::new(u32::MAX);
-#[allow(dead_code)]
+/// Stands in for the slot array before any slot is written, so the base a
+/// compiled entry receives is always a readable address rather than null.
+/// `llmodel.py:319-322` does the same in untranslated runs, handing the entry a
+/// dummy container instead of the real `pypy_threadlocal_s`.
 static DUMMY_THREADLOCAL_SLOT: i64 = 0;
 
 thread_local! {
-    /// llmodel.py:317-323 `threadlocalref_addr` parity: compiled entries
-    /// take the thread-local slot-array base as their second argument.
-    /// Dynasm's aarch64 CALL_ASSEMBLER path preserves and forwards that
-    /// entry ABI even before THREADLOCALREF_GET lowering exists.
+    /// llmodel.py:276-285 / :317-323 `threadlocalref_addr` parity: compiled
+    /// entries take the thread-local slot-array base as their second argument.
+    /// The aarch64 prologue spills it to `SAVED_THREADLOCAL_OFS` and the
+    /// CALL_ASSEMBLER path reloads it into x1 before invoking the callee trace,
+    /// so the ABI holds through the whole call chain even though
+    /// THREADLOCALREF_GET lowering does not exist yet.
     static JIT_THREADLOCAL_SLOTS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -186,7 +191,6 @@ pub fn jit_threadlocalref_set(offset: i64, value: i64) {
 }
 
 /// Return the base pointer passed to compiled entrypoints as x1.
-#[allow(dead_code)]
 pub(crate) fn jit_threadlocalref_base() -> *const i64 {
     JIT_THREADLOCAL_SLOTS.with(|slots| {
         let slots = slots.borrow();

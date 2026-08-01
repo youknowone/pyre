@@ -2828,12 +2828,14 @@ impl Backend for DynasmBackend {
             }
         }
 
-        // llmodel.py:323: ll_frame = func(ll_frame). The compiled
+        // llmodel.py:276-285 `make_execute_token` fixes the entry signature as
+        // `(jitframe, threadlocal_addr) -> jitframe`, and `:317-323` reads the
+        // address with `llop.threadlocalref_addr` before the call. The compiled
         // prologue (gen_shadowstack_header) / epilogue
         // (gen_footer_shadowstack) push/pop the jf_ptr onto the shadow
         // stack inline, matching aarch64/assembler.py:1422/1438 — no
         // manual push_jf/pop_jf_to around the call.
-        let func: unsafe extern "C" fn(*mut JitFrame) -> *mut JitFrame =
+        let func: unsafe extern "C" fn(*mut JitFrame, *const i64) -> *mut JitFrame =
             unsafe { std::mem::transmute(entry) };
         if crate::dynasm_exec_diag_enabled() {
             eprintln!(
@@ -2844,7 +2846,7 @@ impl Backend for DynasmBackend {
             );
         }
         debug_validate_oldgen_freeblocks(format_args!("before trace {}", compiled.trace_id));
-        let result_jf = unsafe { func(jf_ptr) };
+        let result_jf = unsafe { func(jf_ptr, crate::jit_threadlocalref_base()) };
         debug_validate_oldgen_freeblocks(format_args!("after trace {}", compiled.trace_id));
 
         if crate::majit_log_enabled() {
@@ -2966,9 +2968,9 @@ impl Backend for DynasmBackend {
             unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), val as isize) };
         }
 
-        let func: unsafe extern "C" fn(*mut JitFrame) -> *mut JitFrame =
+        let func: unsafe extern "C" fn(*mut JitFrame, *const i64) -> *mut JitFrame =
             unsafe { std::mem::transmute(entry) };
-        let result_jf = unsafe { func(jf_ptr) };
+        let result_jf = unsafe { func(jf_ptr, crate::jit_threadlocalref_base()) };
 
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
         let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize, result_jf);

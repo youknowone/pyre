@@ -35,15 +35,36 @@ const AARCH64_GEN_REGS: [crate::regloc::RegLoc; 18] = crate::aarch64::registers:
 
 const AARCH64_FLOAT_REGS: [crate::regloc::RegLoc; 8] = crate::aarch64::registers::ALL_VFP_REGS;
 
-/// Bytes the trace entry frame reserves: the frame-pointer/link pair and the
-/// callee-saved registers the trace body clobbers. The prologue, the
-/// stack-overflow early return and the epilogue must all agree on this, or the
-/// return unwinds a corrupt SP.
-const CALL_FRAME_SIZE: u32 = 48;
+/// Bytes the trace entry frame reserves: the frame-pointer/link pair, the
+/// callee-saved registers the trace body clobbers, and the thread-local base
+/// slot. The prologue, the stack-overflow early return and the epilogue must
+/// all agree on this, or the return unwinds a corrupt SP.
+const CALL_FRAME_SIZE: u32 = 64;
+
+/// Frame offset of the thread-local base a compiled entry receives in `x1`.
+///
+/// `aarch64/assembler.py:1128-1129` names this `saved_threadlocal_addr` and
+/// spills the incoming `x1` there once per entry, so any point inside the
+/// trace can reach `pypy_threadlocal_s` without the caller keeping a register
+/// live across the body. The upstream constant is `3 * WORD` because its frame
+/// reserves eight scratch words below the callee-saved area
+/// (`_call_header`: `STP_rri(..., (i + 8) * WORD)`); this frame packs its three
+/// register pairs from offset 0, so the slot lands above them instead. The
+/// offset differs, the mechanism does not.
+///
+/// Reads must add any `sub sp, sp, #n` in effect at the read point, the way
+/// `aarch64/callbuilder.py:173` adds `self.current_sp`. The only reader today
+/// (`genop_call_assembler`) runs outside the stack-argument window.
+const SAVED_THREADLOCAL_OFS: u32 = 48;
 
 const _: () = assert!(
     CALL_FRAME_SIZE % 16 == 0,
     "aarch64 SP stays 16-byte aligned"
+);
+
+const _: () = assert!(
+    SAVED_THREADLOCAL_OFS + 8 <= CALL_FRAME_SIZE,
+    "the thread-local slot lives inside the entry frame"
 );
 
 /// Resolved argument: either a frame slot (frame-pointer-relative offset) or a constant.
@@ -1380,6 +1401,9 @@ impl<'a> AssemblerARM64<'a> {
             ; stp x29, x30, [sp, -(CALL_FRAME_SIZE as i32)]!
             ; stp x19, x20, [sp, #16]   // save callee-saved regs
             ; stp x21, x22, [sp, #32]   // save callee-saved regs
+            // assembler.py:1128-1129: spill the thread-local base the entry
+            // received in x1, then take the jitframe out of x0.
+            ; str x1, [sp, #SAVED_THREADLOCAL_OFS]
             ; mov x29, x0
         );
         let propagate_descr = self.propagate_exception_descr_ptr();
@@ -6105,10 +6129,17 @@ impl<'a> AssemblerARM64<'a> {
             // pre-existing adaptation; it is not part of the RPython fast
             // path and is too expensive for recursive CALL_ASSEMBLER.
             let pushed_gcmap = self.push_pending_call_gcmap();
+            // `_call_assembler_emit_call` opens with `LDR x1, [sp, ofs]` — the
+            // callee's prologue re-spills x1 into its own frame, so the base
+            // has to be reloaded here rather than assumed live. The target
+            // address goes through ip0 because x1 is now an argument.
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x1, [sp, #SAVED_THREADLOCAL_OFS]
+            );
             if let Some(addr) = target_addr.immediate {
                 let addr = addr as i64;
-                self.emit_mov_imm64(1, addr);
-                dynasm!(self.mc ; .arch aarch64 ; blr x1);
+                self.emit_mov_imm64(16, addr);
+                dynasm!(self.mc ; .arch aarch64 ; blr x16);
             } else if let Some(entry_label) = self.self_entry_label {
                 dynasm!(self.mc ; .arch aarch64 ; bl =>entry_label);
             }
