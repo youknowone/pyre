@@ -1,4 +1,4 @@
-// Opt-in (`--features mimalloc`); see `pyre-dynasm.rs`. OFF by default.
+// Enabled by default; see `pyre-dynasm.rs`.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

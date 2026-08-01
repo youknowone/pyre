@@ -390,8 +390,8 @@ struct IncrementalMarkState {
     objects_marked: usize,
     /// Target number of bytes to trace per increment.
     ///
-    /// Mirrors incminimark's `gc_increment_step`, which defaults to
-    /// `nursery_size * 2`.
+    /// Mirrors incminimark.py:448,500-504 `gc_increment_step`, whose runtime
+    /// default is `nursery_size * 4` when `PYPY_GC_INCREMENT_STEP` is unset.
     mark_budget_per_step: usize,
     /// Reusable buffer for `mark_object`: the FIXED-part GC pointer offsets of
     /// the object currently being traced (bounded by the struct's field count),
@@ -405,10 +405,15 @@ struct IncrementalMarkState {
 
 impl IncrementalMarkState {
     fn new(nursery_size: usize) -> Self {
+        // incminimark.py:500-504: an explicit positive byte budget wins;
+        // otherwise mark four nursery sizes per incremental step.
+        let mark_budget_per_step = read_uint_from_env("PYPY_GC_INCREMENT_STEP")
+            .unwrap_or_else(|| nursery_size.saturating_mul(4))
+            .max(1);
         IncrementalMarkState {
             gray_stack: Vec::new(),
             objects_marked: 0,
-            mark_budget_per_step: (nursery_size.saturating_mul(2)).max(1),
+            mark_budget_per_step,
             mark_offsets: Vec::new(),
         }
     }

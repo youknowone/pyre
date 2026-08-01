@@ -1019,12 +1019,24 @@ impl FixedObjectArray {
     /// conditional array write barrier, then performs the store.  A raw Rust
     /// local is not part of that generated root map, so publish it explicitly
     /// and reload it after the barrier's safepoint before writing the slot.
+    #[inline]
     pub fn set_ref(&mut self, index: usize, value: PyObjectRef) {
         assert!(index < self.len);
         // Clearing a slot cannot create an old-to-young edge.  PyPy's
         // `popvalue_maybe_none` / `dropvalues*` therefore compile to the
         // plain `None` store with no collecting write-barrier slow path.
         if value.is_null() {
+            unsafe { self.items_mut_ptr().add(index).write(value) };
+            return;
+        }
+        // minimark.py:1063-1071 `writebarrier_before_copy` / the ordinary
+        // `setarrayitem_gc` rewrite: inspect TRACK_YOUNG_PTRS inline and enter
+        // the collecting slow path only while the old array still needs to be
+        // remembered.  The barrier clears this bit, so every later store into
+        // the same array is a plain write.  Nursery arrays and StdAlloc
+        // fallback arrays also carry a zero flag word and take this arm.
+        let header = unsafe { majit_gc::header::header_of(self as *mut Self as usize) };
+        if unsafe { !(*header).has_flag(majit_gc::flags::TRACK_YOUNG_PTRS) } {
             unsafe { self.items_mut_ptr().add(index).write(value) };
             return;
         }

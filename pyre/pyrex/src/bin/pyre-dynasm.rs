@@ -1,6 +1,5 @@
-// Opt-in (`--features mimalloc`): mimalloc roughly halves bignum-heavy
-// workloads by replacing the platform default heap on the per-rbigint-op limb
-// Vec allocation. OFF by default.
+// Enabled by default; allocator-sensitive diagnostics can disable default
+// features and select only `dynasm`. See pyrex/Cargo.toml.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

@@ -23,15 +23,15 @@ path = "src/bin/pyre-dynasm.rs"
 required-features = ["dynasm"]
 
 [features]
-default = ["dynasm"]
+default = ["dynasm", "mimalloc"]
 jit = []  # meta feature: enabled by cranelift or dynasm
 cranelift = ["jit", "pyre-jit/cranelift"]
 dynasm = ["jit", "pyre-jit/dynasm"]
-# Opt-in: use mimalloc as the global allocator. OFF by default. The bignum path
-# allocates a fresh limb Vec per rbigint op through the global allocator; the
-# platform default (notably the Windows system heap) dominates the per-op cost,
-# so mimalloc roughly halves bignum-heavy workloads (fib_loop beats PyPy).
-# Enable with e.g. `--features dynasm,mimalloc`.
+# Use mimalloc as the default global allocator. The bignum path allocates a
+# fresh limb Vec per rbigint op, and Python call/GC bookkeeping also performs
+# enough small host allocations for the platform allocator to be measurable.
+# Keep the feature separate so allocator-sensitive diagnostics can still use
+# `--no-default-features --features dynasm`.
 mimalloc = ["dep:mimalloc"]
 # Deterministic GC stress: forces a full collection at the start of every
 # allocation (opt in at runtime via MAJIT_GC_STRESS). Test/diagnostic only —
