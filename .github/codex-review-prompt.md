@@ -17,9 +17,12 @@ language differences between RPython and Rust. Mark those separately under
 "Structural adaptations".
 
 Scope discipline: before writing the report, run
-`git diff upstream/main --name-only` and treat that file list as the
-authoritative definition of "this patch" (when an authoritative changed-file
-list is appended below, use that instead of re-deriving it). Findings under
+`git diff upstream/main --name-only -- . ':(exclude)*.jitstats'` and treat that
+file list as the authoritative definition of "this patch" (when an authoritative
+changed-file list is appended below, use that instead of re-deriving it). The
+excluded `*.jitstats` files are `pyre/check.py`'s recorded jit-stats baselines —
+generated golden data with no RPython/PyPy counterpart, so no parity finding can
+cite one, and a bulk re-record of them is not a change to review. Findings under
 sections 1 and 2 MUST cite our-side files from that list; a divergence in any
 file NOT in the list is by definition not introduced by this patch — report
 it under section 3 instead, or omit it. Verify every section-1/2 citation
