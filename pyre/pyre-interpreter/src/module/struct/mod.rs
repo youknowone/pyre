@@ -1265,6 +1265,13 @@ pub mod unpack_iter {
     use super::{do_unpack, readbuf, struct_error};
     use pyre_object::*;
 
+    fn unpack_iter_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let name = crate::baseobjspace::text_w(
+            args.get(1).copied().unwrap_or_else(w_none),
+        )?;
+        crate::baseobjspace::object_getattribute(args[0], name)
+    }
+
     #[crate::pyre_class("_struct.unpack_iterator")]
     pub struct W_UnpackIter {
         format: PyObjectRef,
@@ -1345,6 +1352,19 @@ pub mod unpack_iter {
         // `unpack_iterator` type is not exposed as a module attribute, so
         // nothing else triggers `type_object()`).
         let iter_type = type_object();
+        unsafe {
+            let ns = pyre_object::w_type_get_dict_ptr(iter_type) as PyObjectRef;
+            pyre_object::w_dict_setitem_str(ns, "__module__", w_str_new("_struct"));
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                "__getattribute__",
+                crate::make_builtin_function_with_arity(
+                    "__getattribute__",
+                    unpack_iter_getattribute,
+                    2,
+                ),
+            );
+        }
         // W_UnpackIter.typedef has no `__new__` in PyPy.  Preserve that
         // TypeDef shape: the implementation type is returned by `type(it)`
         // but cannot be instantiated or used as a base class.
