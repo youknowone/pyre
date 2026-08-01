@@ -1091,10 +1091,11 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// described at
 /// `config/translationoption.py:11-12` as "just enough to inline
 /// add__Int_Int() and just small enough to prevent inlining of some rlist
-/// functions". Elidable bodies are not that size: 54 of the 124 sites are in
-/// `descroperation.rs` and 25 in `longobject.rs`. Dropping the attribute hands
-/// them to a cost model that accepts them, which is not what leaving upstream's
-/// inliner free would have done.
+/// functions". Elidable bodies are not that size: of the 126 non-test sites
+/// this expansion covers, 54 are in `descroperation.rs` and 25 in
+/// `longobject.rs`. Dropping the attribute hands them to a cost model that
+/// accepts them, which is not what leaving upstream's inliner free would have
+/// done.
 ///
 /// Measurement offers nothing to weigh against that. Throughput was flat
 /// (1.0070 / 1.0000 on the shadow-stack probes, 1.0000 on a pure integer

@@ -642,7 +642,13 @@ pub fn set_recursion_limit(new_limit: i32) -> Result<(), PyError> {
         .max(limit);
     pyre_stack_set_length_fraction(reserved as f64 * 0.001);
     crate::module::sys::state::set_recursion_limit(limit);
-    majit_gc::shadow_stack::increase_root_stack_depth((limit as f64 * 0.001 * 163840.0) as usize);
+    // pypy/module/sys/vm.py:97 `increase_root_stack_depth(int(new_limit *
+    // 0.001 * 163840))`.  Both of pyre's root stacks are sized off it: the
+    // jitframe one compiled code pushes to, and the interpreter's `push_roots`
+    // stack, which holds a slot per pinned livevar across a recursive call.
+    let root_stack_depth = (limit as f64 * 0.001 * 163840.0) as usize;
+    majit_gc::shadow_stack::increase_root_stack_depth(root_stack_depth);
+    pyre_object::gc_roots::increase_root_stack_depth(root_stack_depth);
     Ok(())
 }
 

@@ -48,71 +48,190 @@
 //!   pointers are now observable to the active `MiniMarkGC`
 //!   instance and survive across collections.
 
-#[cfg(debug_assertions)]
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::cell::Cell;
-use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 
 use crate::pyobject::PyObjectRef;
 
+/// `shadowstack.py:281 root_stack_depth` — the slot count `ShadowStackPool`
+/// raw-mallocs for a thread's root stack before any growth.  `majit-gc`'s
+/// jitframe root stack starts from the same constant.
+const DEFAULT_ROOT_STACK_DEPTH: usize = 163840;
+
+/// `gcdata.root_stack_base` / `root_stack_top` (`shadowstack.py:75-88`), with
+/// the `limit` cell `majit-gc`'s jitframe root stack also keeps so a push can
+/// see it has reached `root_stack_depth` without a separate depth load.
+///
+/// Deliberately holds no `Vec` and no `Box`.  A growable container puts drop
+/// glue on the thread-local, and a thread-local carrying a destructor costs a
+/// registration-state check on every access — `pin_root` and
+/// `shadow_stack_get` sit on the interpreter's allocation and call paths, so
+/// that check is not free: dropping it measures `.8711` / `.8727` on the
+/// any/all rooting probes with a pure-integer control at exactly `1.0000`.
+/// The buffer is raw-allocated once instead, as `_prepare_unused_stack` does
+/// (`shadowstack.py:344-349`), and released by [`RootStackOwner`].
+struct RootStack {
+    base: Cell<*mut PyObjectRef>,
+    top: Cell<*mut PyObjectRef>,
+    limit: Cell<*mut PyObjectRef>,
+}
+
+impl RootStack {
+    const fn new() -> Self {
+        Self {
+            base: Cell::new(std::ptr::null_mut()),
+            top: Cell::new(std::ptr::null_mut()),
+            limit: Cell::new(std::ptr::null_mut()),
+        }
+    }
+
+    /// Slots currently in use — `root_stack_top - root_stack_base`.
+    #[inline(always)]
+    fn len(&self) -> usize {
+        let base = self.base.get();
+        if base.is_null() {
+            return 0;
+        }
+        // SAFETY: `top` is derived from `base` by pointer arithmetic within
+        // the one live allocation, so the offset is in range.
+        unsafe { self.top.get().offset_from(base) as usize }
+    }
+
+    /// Slot count the current buffer can hold — `root_stack_depth`.
+    fn capacity(&self) -> usize {
+        let base = self.base.get();
+        if base.is_null() {
+            return 0;
+        }
+        // SAFETY: `limit` is the one-past-the-end pointer of the allocation
+        // `base` starts.
+        unsafe { self.limit.get().offset_from(base) as usize }
+    }
+
+    fn layout_for(depth: usize) -> Layout {
+        Layout::array::<PyObjectRef>(depth).expect("root stack layout")
+    }
+
+    /// `ShadowStackPool.increase_root_stack_depth` (`shadowstack.py:351-364`):
+    /// allocate a larger buffer, copy the used portion over, and re-derive
+    /// base/top; the depth can never shrink.  Unlike upstream this also serves
+    /// as the initial `_prepare_unused_stack`, so a null base is the
+    /// "no buffer yet" case rather than a separate pooled one.
+    #[cold]
+    fn grow(&self, new_depth: usize) {
+        let old_base = self.base.get();
+        let used = self.len();
+        let new_depth = new_depth.max(DEFAULT_ROOT_STACK_DEPTH).max(used);
+        if new_depth <= self.capacity() {
+            return; // can't easily decrease the size
+        }
+        // Registering this thread's free-at-exit hook is what keeps the hot
+        // `ROOT_STACK` key destructor-free; touching it here rather than on
+        // every push keeps that cost off the push path.
+        let _ = ROOT_STACK_OWNER.try_with(|_| ());
+        // SAFETY: a non-zero array layout; `alloc_zeroed` gives null slots,
+        // which the walkers read as "no root" exactly like a null GCREF.
+        let new_base = unsafe { alloc_zeroed(Self::layout_for(new_depth)) } as *mut PyObjectRef;
+        assert!(!new_base.is_null(), "root stack allocation failed");
+        if !old_base.is_null() {
+            // SAFETY: `used` slots are live in the old buffer and the new
+            // allocation is at least that large; the two never overlap.
+            unsafe { std::ptr::copy_nonoverlapping(old_base, new_base, used) };
+            // SAFETY: the old buffer came from this same allocator with the
+            // layout its own capacity names, and nothing references it now —
+            // callers hold indices, not slot addresses, across a push.
+            unsafe { dealloc(old_base as *mut u8, Self::layout_for(self.capacity())) };
+        }
+        self.base.set(new_base);
+        // SAFETY: both offsets are inside (or one past the end of) the new
+        // allocation.
+        unsafe {
+            self.top.set(new_base.add(used));
+            self.limit.set(new_base.add(new_depth));
+        }
+    }
+
+    /// `incr_stack(1)` (`shadowstack.py:80-84`) — return the slot that was the
+    /// top and advance past it.  Upstream's bump is unchecked because the
+    /// native stack check fires first, with `root_stack_depth` scaled to the
+    /// recursion limit.  pyre pins one slot per argument as well as per live
+    /// variable, so a single variadic call can outrun any fixed headroom; the
+    /// limit test grows instead of trusting that margin.
+    #[inline(always)]
+    fn incr_stack(&self) -> *mut PyObjectRef {
+        let top = self.top.get();
+        if top == self.limit.get() {
+            self.grow(self.capacity() * 2);
+            return self.incr_stack();
+        }
+        // SAFETY: `top` is below `limit`, so it names a live slot and the
+        // advanced pointer is at most one past the end.
+        self.top.set(unsafe { top.add(1) });
+        top
+    }
+
+    /// `decr_stack` to an absolute depth — the `pop_roots` rewind.
+    #[inline(always)]
+    fn truncate(&self, len: usize) {
+        if len < self.len() {
+            // SAFETY: `len` is below the live length, so the slot is inside
+            // the allocation.
+            self.top.set(unsafe { self.base.get().add(len) });
+        }
+    }
+
+    /// Address of slot `index`, panicking exactly like indexing did.
+    #[inline(always)]
+    fn slot(&self, index: usize) -> *mut PyObjectRef {
+        assert!(index < self.len(), "shadow-stack index out of range");
+        // SAFETY: bounds-checked against the live length just above.
+        unsafe { self.base.get().add(index) }
+    }
+}
+
+/// Frees [`ROOT_STACK`]'s buffer when the thread exits.  It lives in its own
+/// thread-local key, touched only from `RootStack::grow`, so the key on the
+/// push/read path keeps no destructor of its own.
+struct RootStackOwner;
+
+impl Drop for RootStackOwner {
+    fn drop(&mut self) {
+        // `ROOT_STACK` has no destructor, so it is never torn down and this
+        // access cannot fail; `try_with` keeps that from being load-bearing.
+        let _ = ROOT_STACK.try_with(|stack| {
+            let base = stack.base.get();
+            if base.is_null() {
+                return;
+            }
+            let layout = RootStack::layout_for(stack.capacity());
+            stack.base.set(std::ptr::null_mut());
+            stack.top.set(std::ptr::null_mut());
+            stack.limit.set(std::ptr::null_mut());
+            // SAFETY: the buffer came from this allocator with this layout and
+            // the cells that named it have just been cleared.
+            unsafe { dealloc(base as *mut u8, layout) };
+        });
+    }
+}
+
 thread_local! {
     /// Thread-local shadow stack — pyre's mirror of RPython's
     /// `framework.shadowstack` (`shadowstack.py`). Append-only across
-    /// each [`RootScope`]'s lifetime; the matching [`Drop`] truncates
+    /// each [`RootScope`]'s lifetime; the matching [`Drop`] rewinds `top`
     /// back to the saved length.
     ///
     /// Access is raw, matching RPython's base/top shadow-stack shape. Debug
-    /// builds check overlapping ordinary accesses through
-    /// `SHADOW_STACK_ACCESS_DEPTH` and separately reject mutation during a
-    /// root walk through `SHADOW_STACK_WALK_IN_PROGRESS`; release builds pay
-    /// no bookkeeping cost.
-    static SHADOW_STACK: UnsafeCell<Vec<PyObjectRef>> =
-        const { UnsafeCell::new(Vec::new()) };
+    /// builds reject mutation during a root walk through
+    /// `SHADOW_STACK_WALK_IN_PROGRESS`; release builds pay no bookkeeping.
+    static ROOT_STACK: RootStack = const { RootStack::new() };
 
-    /// Signed debug borrow depth for [`SHADOW_STACK`]: non-negative values
-    /// count shared accesses, while `-1` marks an exclusive access.
-    #[cfg(debug_assertions)]
-    static SHADOW_STACK_ACCESS_DEPTH: Cell<i32> = const { Cell::new(0) };
+    /// Registered on the first `grow`; see [`RootStackOwner`].
+    static ROOT_STACK_OWNER: RootStackOwner = const { RootStackOwner };
 
     /// Whether this thread is currently driving a shadow-stack root walk.
     #[cfg(debug_assertions)]
     static SHADOW_STACK_WALK_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
-}
-
-#[cfg(debug_assertions)]
-struct ShadowStackAccess<'a> {
-    depth: &'a Cell<i32>,
-    previous: i32,
-}
-
-#[cfg(debug_assertions)]
-impl<'a> ShadowStackAccess<'a> {
-    #[inline(always)]
-    fn shared(depth: &'a Cell<i32>) -> Self {
-        let previous = depth.get();
-        debug_assert!(
-            previous >= 0,
-            "shared shadow-stack access re-entered an exclusive access"
-        );
-        depth.set(previous + 1);
-        Self { depth, previous }
-    }
-
-    #[inline(always)]
-    fn exclusive(depth: &'a Cell<i32>) -> Self {
-        let previous = depth.get();
-        debug_assert_eq!(previous, 0, "exclusive shadow-stack access was re-entered");
-        depth.set(-1);
-        Self { depth, previous }
-    }
-}
-
-#[cfg(debug_assertions)]
-impl Drop for ShadowStackAccess<'_> {
-    #[inline(always)]
-    fn drop(&mut self) {
-        self.depth.set(self.previous);
-    }
 }
 
 #[cfg(debug_assertions)]
@@ -150,46 +269,29 @@ fn assert_shadow_stack_not_walking() {
     });
 }
 
+/// Run `f` against this thread's root stack.  The borrow guards the old
+/// `Vec` shape needed are gone with it: base/top are `Cell`s, so no
+/// reference is held across a call that could push.
 #[inline(always)]
-fn with_shadow_stack<R>(f: impl FnOnce(&Vec<PyObjectRef>) -> R) -> R {
-    SHADOW_STACK.with(|cell| {
-        #[cfg(debug_assertions)]
-        {
-            SHADOW_STACK_ACCESS_DEPTH.with(|depth| {
-                let _access = ShadowStackAccess::shared(depth);
-                // SAFETY: the debug-only access guard rejects overlap with an
-                // exclusive access. In release this is the raw, thread-local
-                // root-stack access shape used upstream.
-                f(unsafe { &*cell.get() })
-            })
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            // SAFETY: the stack is thread-local, and callers must not
-            // re-enter an access that holds an exclusive reference.
-            f(unsafe { &*cell.get() })
-        }
-    })
+fn with_shadow_stack<R>(f: impl FnOnce(&RootStack) -> R) -> R {
+    ROOT_STACK.with(f)
 }
 
-#[inline(always)]
-fn with_shadow_stack_mut<R>(f: impl FnOnce(&mut Vec<PyObjectRef>) -> R) -> R {
-    SHADOW_STACK.with(|cell| {
-        #[cfg(debug_assertions)]
-        {
-            SHADOW_STACK_ACCESS_DEPTH.with(|depth| {
-                let _access = ShadowStackAccess::exclusive(depth);
-                // SAFETY: the debug-only access guard rejects every
-                // overlapping access. Release preserves the same
-                // non-re-entrancy invariant without runtime bookkeeping.
-                f(unsafe { &mut *cell.get() })
-            })
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            // SAFETY: the stack is thread-local, and callers must not
-            // overlap this exclusive access with another stack access.
-            f(unsafe { &mut *cell.get() })
+/// `increase_root_stack_depth(new_depth)` (`rlib/rgc.py:775-779` →
+/// `shadowstack.py:351-364`).  `sys.setrecursionlimit` scales the root stack
+/// with the limit at `pypy/module/sys/vm.py:97`; the depth can only grow.
+pub fn increase_root_stack_depth(new_depth: usize) {
+    with_shadow_stack(|stack| stack.grow(new_depth));
+}
+
+/// `root_stack_depth` — the slot count this thread's root stack can hold.
+pub fn root_stack_depth() -> usize {
+    with_shadow_stack(|stack| {
+        let capacity = stack.capacity();
+        if capacity == 0 {
+            DEFAULT_ROOT_STACK_DEPTH
+        } else {
+            capacity
         }
     })
 }
@@ -204,14 +306,16 @@ fn with_shadow_stack_mut<R>(f: impl FnOnce(&mut Vec<PyObjectRef>) -> R) -> R {
               binding it to `_roots` makes the scope explicit, while binding \
               to `_` would pop immediately and defeat the bracket"]
 pub struct RootScope {
-    /// Length of [`SHADOW_STACK`] at the moment [`push_roots`] was
+    /// Length of [`ROOT_STACK`] at the moment [`push_roots`] was
     /// called. Will be replaced with a backend
     /// `RootSet::Handle` once the active GC consumes the stack.
     save_point: usize,
     /// Resolved thread-local stack cell. RPython keeps the shadow-stack
     /// base/top address live for the whole root bracket; caching the cell here
-    /// avoids resolving TLS again for every generated slot write/read.
-    stack_slot: *mut Vec<PyObjectRef>,
+    /// avoids resolving TLS again for every generated slot write/read. It names
+    /// the [`RootStack`] and not its buffer, so a `grow` under this bracket
+    /// leaves it valid.
+    stack_slot: *const RootStack,
     /// A root bracket belongs to the thread whose shadow stack supplied this
     /// save point. Moving it could truncate an unrelated thread's stack.
     _not_send: PhantomData<*const ()>,
@@ -222,10 +326,8 @@ impl RootScope {
     /// [`push_roots`] so the API surface stays uniform across phases.
     #[inline]
     fn new() -> Self {
-        let (save_point, stack_slot) = SHADOW_STACK.with(|cell| {
-            let stack = unsafe { &*cell.get() };
-            (stack.len(), cell.get())
-        });
+        let (save_point, stack_slot) =
+            with_shadow_stack(|stack| (stack.len(), stack as *const RootStack));
         Self {
             save_point,
             stack_slot,
@@ -244,23 +346,27 @@ impl RootScope {
     pub fn pin_root(&self, root: PyObjectRef) {
         #[cfg(debug_assertions)]
         assert_shadow_stack_not_walking();
+        // SAFETY: `stack_slot` is this thread's root-stack cell, alive for the
+        // bracket; `incr_stack` returns the slot it just claimed.
         let index = unsafe {
-            let stack = &mut *self.stack_slot;
+            let stack = &*self.stack_slot;
             let index = stack.len();
-            stack.push(root);
+            *stack.incr_stack() = root;
             index
         };
         let normalized =
             crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
         if normalized != root {
-            unsafe { (&mut *self.stack_slot)[index] = normalized };
+            // SAFETY: same cell, and `index` is still live.
+            unsafe { *(*self.stack_slot).slot(index) = normalized };
         }
     }
 
     /// Scope-local [`shadow_stack_get`] using the cached cell.
     #[majit_macros::dont_look_inside]
     pub fn get(&self, index: usize) -> PyObjectRef {
-        unsafe { (&*self.stack_slot)[index] }
+        // SAFETY: same cell; `slot` bounds-checks `index`.
+        unsafe { *(*self.stack_slot).slot(index) }
     }
 }
 
@@ -274,7 +380,9 @@ impl Drop for RootScope {
         assert_shadow_stack_not_walking();
         // `truncate` is a no-op if `save_point >= len()`, which is
         // the steady-state case for an empty bracket.
-        unsafe { (&mut *self.stack_slot).truncate(self.save_point) };
+        // SAFETY: `stack_slot` is this thread's root-stack cell; `_not_send`
+        // keeps the bracket on the thread that resolved it.
+        unsafe { (*self.stack_slot).truncate(self.save_point) };
     }
 }
 
@@ -295,7 +403,7 @@ pub fn push_roots() -> RootScope {
 /// so the matching [`Drop`] truncates the entry. Pinning without a
 /// guard is a leak from the GC's perspective once the backend GC consumes the stack.
 ///
-/// Pushes onto the thread-local `SHADOW_STACK`, a runtime-mutable root the
+/// Pushes onto the thread-local `ROOT_STACK`, a runtime-mutable root the
 /// tracer cannot type; the JIT residualises the call instead of tracing into
 /// it (`@dont_look_inside`, `rlib/jit.py:139`), the `shadow_stack_len` twin.
 #[majit_macros::dont_look_inside]
@@ -308,9 +416,10 @@ pub fn pin_root(root: PyObjectRef) {
     // enter the query safepoint.  RPython's push_roots writes the livevar to
     // the shadow stack before calling the allocation/GC slow path for the
     // same reason.
-    let index = with_shadow_stack_mut(|stack| {
+    let index = with_shadow_stack(|stack| {
         let index = stack.len();
-        stack.push(root);
+        // SAFETY: `incr_stack` returns the slot it just claimed.
+        unsafe { *stack.incr_stack() = root };
         index
     });
     // A foreign mutator may have completed a nursery collection after the
@@ -321,13 +430,15 @@ pub fn pin_root(root: PyObjectRef) {
     let normalized = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
     // The slot already holds `root`, so a query that found no forwarding stub
     // has nothing to write back.  That is the steady state — nothing collected
-    // between the push above and the query — and the write-back is not free:
-    // each `with` re-checks the thread-local's initialization state (the
-    // `_tlv_get_addr` result itself is common-subexpression-eliminated across
-    // the two accesses, the state load is not), and pinning sits on the
-    // interpreter's allocation and call paths.
+    // between the push above and the query — and skipping it keeps a second
+    // thread-local resolve off a path that sits on the interpreter's
+    // allocation and call paths.
     if normalized != root {
-        with_shadow_stack_mut(|stack| stack[index] = normalized);
+        with_shadow_stack(|stack| {
+            // SAFETY: `index` was live when claimed and only this thread can
+            // have shortened the stack, which it has not.
+            unsafe { *stack.slot(index) = normalized }
+        });
     }
 }
 
@@ -362,9 +473,12 @@ pub fn pin_roots(roots: &[PyObjectRef]) -> usize {
 pub fn publish_roots(roots: &[PyObjectRef]) -> usize {
     #[cfg(debug_assertions)]
     assert_shadow_stack_not_walking();
-    with_shadow_stack_mut(|stack| {
+    with_shadow_stack(|stack| {
         let base = stack.len();
-        stack.extend_from_slice(roots);
+        for &root in roots {
+            // SAFETY: `incr_stack` returns the slot it just claimed.
+            unsafe { *stack.incr_stack() = root };
+        }
         base
     })
 }
@@ -380,13 +494,15 @@ pub fn normalize_roots(base: usize, len: usize) {
     for index in base..base + len {
         // Read the slot each time: a collection triggered by an earlier query
         // may already have rewritten every published root in place.
-        let root = with_shadow_stack(|stack| stack[index]);
+        // SAFETY: every index in this range was claimed just above.
+        let root = with_shadow_stack(|stack| unsafe { *stack.slot(index) });
         let current = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
         // Same write-back economy as `pin_root`: the slot already holds `root`,
         // so a query that found no forwarding stub has nothing to store, and
         // skipping it saves a second thread-local resolve per livevar.
         if current != root {
-            with_shadow_stack_mut(|stack| stack[index] = current);
+            // SAFETY: same slot, still live.
+            with_shadow_stack(|stack| unsafe { *stack.slot(index) = current });
         }
     }
 }
@@ -395,14 +511,14 @@ pub fn normalize_roots(base: usize, len: usize) {
 /// [`RootScope::new`] to capture the save-point and by tests to
 /// observe pin/pop behaviour.
 ///
-/// Reads the thread-local `SHADOW_STACK`, a runtime-mutable root the
+/// Reads the thread-local `ROOT_STACK`, a runtime-mutable root the
 /// tracer cannot type; the JIT residualises the read instead of tracing
 /// into it (`@dont_look_inside`, `rlib/jit.py:139`). The attribute is a
 /// tracing-policy marker only — it leaves the host backend free to inline
 /// this body, exactly as the RPython decorator leaves the C backend free.
 #[majit_macros::dont_look_inside]
 pub fn shadow_stack_len() -> usize {
-    with_shadow_stack(Vec::len)
+    with_shadow_stack(RootStack::len)
 }
 
 /// Read a single shadow-stack slot by index, panicking if the index
@@ -417,7 +533,7 @@ pub fn shadow_stack_len() -> usize {
 /// call path (`call_function_impl_result`, the inline-call and specialize
 /// resume paths, `#[pyre_class]` method bodies), not just in tests.
 ///
-/// Reads the thread-local `SHADOW_STACK` the tracer cannot type; the JIT
+/// Reads the thread-local `ROOT_STACK` the tracer cannot type; the JIT
 /// residualises the read instead of tracing into it (`@dont_look_inside`,
 /// `rlib/jit.py:139`), the [`shadow_stack_len`] twin.
 #[majit_macros::dont_look_inside]
@@ -434,7 +550,8 @@ pub fn shadow_stack_get(index: usize) -> PyObjectRef {
     // copied from outside the bracket, so a foreign mutator can have collected
     // after that copy and before the pin.  That is also the pin's safepoint;
     // a read allocates nothing and has no reason to park.
-    with_shadow_stack(|stack| stack[index])
+    // SAFETY: `slot` bounds-checks `index` against the live length.
+    with_shadow_stack(|stack| unsafe { *stack.slot(index) })
 }
 
 /// Copy a contiguous range of rooted values out of the shadow stack.
@@ -449,7 +566,13 @@ pub fn shadow_stack_get(index: usize) -> PyObjectRef {
 #[majit_macros::dont_look_inside]
 pub fn shadow_stack_copy_range(base: usize, dst: &mut [PyObjectRef]) {
     with_shadow_stack(|stack| {
-        dst.copy_from_slice(&stack[base..base + dst.len()]);
+        assert!(
+            base + dst.len() <= stack.len(),
+            "shadow-stack range out of bounds"
+        );
+        // SAFETY: the whole range was just bounds-checked, and `dst` is a
+        // distinct caller-owned slice.
+        unsafe { std::ptr::copy_nonoverlapping(stack.slot(base), dst.as_mut_ptr(), dst.len()) };
     });
 }
 
@@ -458,7 +581,7 @@ pub fn shadow_stack_copy_range(base: usize, dst: &mut [PyObjectRef]) {
 /// is written here rather than re-pinned, mirroring `gc_save_root`'s
 /// overwrite of an already allocated slot (`shadowcolor.py:126-129`).
 ///
-/// Writes the thread-local `SHADOW_STACK` the tracer cannot type; the JIT
+/// Writes the thread-local `ROOT_STACK` the tracer cannot type; the JIT
 /// residualises the write instead of tracing into it (`@dont_look_inside`,
 /// `rlib/jit.py:139`), the [`shadow_stack_get`] twin.
 #[majit_macros::dont_look_inside]
@@ -469,11 +592,13 @@ pub fn shadow_stack_set(index: usize, root: PyObjectRef) {
     // `try_gc_current_object_address` query is itself a GC operation and may
     // wait behind another thread's collection, so the value must already be
     // visible to that collector before we enter the query safepoint.
-    with_shadow_stack_mut(|stack| stack[index] = root);
+    // SAFETY: `slot` bounds-checks `index` against the live length.
+    with_shadow_stack(|stack| unsafe { *stack.slot(index) = root });
     // Then normalize a GCREF the caller may have copied before a foreign
     // mutator's nursery collection, so the slot never keeps a forwarding stub.
     let root = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
-    with_shadow_stack_mut(|stack| stack[index] = root);
+    // SAFETY: same slot, still live.
+    with_shadow_stack(|stack| unsafe { *stack.slot(index) = root });
 }
 
 /// Visit every pinned root in the shadow stack with mutable access.
@@ -492,8 +617,8 @@ pub fn shadow_stack_set(index: usize, root: PyObjectRef) {
 /// upstream's raw root-stack access without that diagnostic.
 #[inline]
 pub fn walk_shadow_stack(mut visitor: impl FnMut(&mut PyObjectRef)) {
-    SHADOW_STACK.with(|cell| {
-        let cell = cell as *const UnsafeCell<Vec<PyObjectRef>>;
+    ROOT_STACK.with(|stack| {
+        let cell = stack as *const RootStack;
         #[cfg(debug_assertions)]
         SHADOW_STACK_WALK_IN_PROGRESS.with(|in_progress| {
             let _walk = ShadowStackWalk::new(in_progress);
@@ -510,7 +635,11 @@ pub fn walk_shadow_stack(mut visitor: impl FnMut(&mut PyObjectRef)) {
 
 /// Capture the current thread's pinned-root stack for a foreign STW walk.
 pub fn capture_shadow_stack_area() -> *const () {
-    SHADOW_STACK.with(|s| s as *const _ as *const ())
+    // The captured address is the `RootStack` cell itself, never its buffer:
+    // `grow` replaces the buffer, so a foreign walker must re-read base/top —
+    // the same rule `majit-gc`'s jitframe root stack states for the
+    // `root_stack_top` address it hands to compiled code.
+    ROOT_STACK.with(|s| s as *const _ as *const ())
 }
 
 /// Visit a captured thread's pinned-root stack without consulting caller TLS.
@@ -522,7 +651,7 @@ pub fn capture_shadow_stack_area() -> *const () {
 /// `data` must come from [`capture_shadow_stack_area`], and the owning thread
 /// must be quiesced for the duration of the walk.
 pub unsafe fn walk_shadow_stack_area(data: *const (), mut visitor: impl FnMut(&mut PyObjectRef)) {
-    let cell = data as *const UnsafeCell<Vec<PyObjectRef>>;
+    let cell = data as *const RootStack;
     #[cfg(debug_assertions)]
     SHADOW_STACK_WALK_IN_PROGRESS.with(|in_progress| {
         // For a self-collection this protects the stack being walked. A
@@ -541,14 +670,13 @@ pub unsafe fn walk_shadow_stack_area(data: *const (), mut visitor: impl FnMut(&m
     }
 }
 
-/// Walk one captured shadow-stack cell without retaining a reference to its
-/// `Vec` across a visitor call.
+/// Walk one captured root stack, re-reading `base` for every slot.
 ///
 /// # Safety
-/// `cell` must remain a valid shadow-stack cell for the duration of the walk,
+/// `cell` must remain a valid root-stack cell for the duration of the walk,
 /// and no thread other than a re-entrant visitor may mutate it.
 unsafe fn walk_shadow_stack_cell(
-    cell: *const UnsafeCell<Vec<PyObjectRef>>,
+    cell: *const RootStack,
     visitor: &mut impl FnMut(&mut PyObjectRef),
 ) {
     // The interval is fixed at entry: `walk_stack_root` (`shadowstack.py:43-46`)
@@ -557,27 +685,17 @@ unsafe fn walk_shadow_stack_cell(
     // each iteration instead would extend the walk over roots pinned by the
     // visitor — and pinning during a walk is precisely what the debug guard
     // above declares illegal, so there is nothing to serve by diverging here.
-    let end = {
-        // SAFETY: no reference from this block outlives it.
-        let stack = unsafe { &*(*cell).get() };
-        stack.len()
-    };
+    // SAFETY: the caller guarantees `cell` names a live root stack.
+    let stack = unsafe { &*cell };
+    let end = stack.len();
     let mut index = 0;
     while index < end {
-        // Re-derive the slot address every iteration rather than holding one
-        // `iter_mut()` cursor: a re-entrant push can still reallocate the
-        // buffer, which would strand a cached pointer in the old allocation.
-        // Only pushes can occur, so `end` stays within bounds.
-        let slot = {
-            // SAFETY: the caller guarantees exclusive access except for a
-            // possible re-entrant mutation by `visitor`. No reference from a
-            // previous iteration is live here, and this temporary reference
-            // ends before `visitor` is called.
-            let stack = unsafe { &mut *(*cell).get() };
-            // Return only the slot address so the `Vec` reference is not held
-            // across the visitor, which may push and reallocate its buffer.
-            unsafe { stack.as_mut_ptr().add(index) }
-        };
+        // Re-read `base` every iteration rather than caching it: a re-entrant
+        // push that hits the limit calls `grow`, which moves the buffer and
+        // would strand a cached pointer in the freed one. Only pushes can
+        // occur, so `end` stays within bounds.
+        // SAFETY: `index < end <= len()`, so the slot is live.
+        let slot = unsafe { stack.base.get().add(index) };
         // SAFETY: `slot` names the live element at `index`. The reference is
         // handed directly to the visitor and is not used after it returns.
         visitor(unsafe { &mut *slot });
@@ -779,7 +897,7 @@ mod tests {
 
     #[cfg(not(debug_assertions))]
     #[test]
-    fn walk_shadow_stack_survives_push_that_reallocates() {
+    fn walk_shadow_stack_survives_push_that_grows_the_buffer() {
         let _roots = push_roots();
         pin_root(dummy(0x11));
         pin_root(dummy(0x22));
@@ -799,10 +917,10 @@ mod tests {
         });
 
         assert!(pushed);
-        // The visitor's pins really did move the buffer.
-        assert!(with_shadow_stack(Vec::capacity) > capacity_before);
+        // The visitor's pins really did hit the limit and move the buffer.
+        assert!(with_shadow_stack(RootStack::capacity) > capacity_before);
         // `0x22` is the discriminator: it is read on the iteration AFTER the
-        // reallocation, so getting it right means the walk followed the buffer
+        // grow, so getting it right means the walk followed the buffer
         // to its new address instead of reading the freed one. The walk stops
         // at the two roots that were live at entry — the interval is fixed
         // there, as in `walk_stack_root` (`shadowstack.py:43-46`), so the
