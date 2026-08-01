@@ -6965,6 +6965,43 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `FixedObjectArray::set_ref(self, index, value)` — the
+                // length-prefixed array's GC-published element store.  The
+                // method body hand-rolls the write-barrier dance
+                // (`pin_root` / `try_gc_write_barrier` / reload-from-shadow-
+                // stack) because Rust has no GC-transform pass; in the
+                // lifted trace that is exactly RPython's single
+                // `setarrayitem_gc` (`ll_setitem_fast`, `rlist.py:377`),
+                // whose conditional write barrier is re-inserted by the
+                // backend rewrite (`handle_write_barrier_setarrayitem`,
+                // rewrite.py:403), not by a traced source call.  Collapse
+                // the whole call to one `ArrayWrite` over the receiver
+                // (a `FixedSizeListRepr`, `ll_fixed_items(l) = l`,
+                // rlist.py:399) so the barrier-body accessors
+                // (`items_mut_ptr`, `try_gc_owns_object`) never reach the
+                // annotator.  The call returns `()`; its dead destination
+                // binds to a fresh Void var.
+                if args.len() == 3 && self.is_object_array_set_ref_call(&reg) {
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::ArrayWrite {
+                            base: args[0].clone(),
+                            index: args[1].clone(),
+                            value: LinkArg::Value(args[2].clone()),
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: None,
+                            nolength: false,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(
+                        self.graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Void),
+                    );
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `<[T]>::swap(s, a, b)` over a `&mut [T]` whose base is
                 // the same `FixedObjectArray` shape the workspace index
                 // path reads.  Lower to the getarrayitem/setarrayitem
@@ -9324,6 +9361,19 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::<Impl>::swap")
+    }
+
+    /// `FixedObjectArray::set_ref(self, index, value)` — the GC-published
+    /// element store whose body hand-rolls the write barrier.  Recognised as
+    /// the receiver of a `setarrayitem_gc` collapse (`ll_setitem_fast`,
+    /// rlist.py:377); the barrier is a backend rewrite, not a traced call.
+    fn is_object_array_set_ref_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "pyre_object::object_array::<Impl>::set_ref")
     }
 
     /// Pointer reinterprets `*const T::cast_mut` / `*mut T::cast_const`
@@ -22817,6 +22867,54 @@ mod tests {
             lt_guards >= 1 && subs >= 1,
             "generic_alias_class_getitem: expected the a<b guard and the a-b subtraction \
              (lt={lt_guards}, sub={subs})"
+        );
+    }
+
+    /// Real-LLBC anchor for the `FixedObjectArray::set_ref` setarrayitem
+    /// collapse: `set_locals_w` (the shared STORE_FAST-family leaf) calls
+    /// `self.locals_cells_stack_w.set_ref(index, value)`.  After the
+    /// whole-method lift there must be no residual
+    /// `["object_array","<Impl>","set_ref"]` call and no residual
+    /// `items_mut_ptr` / write-barrier accessor from the method body, and at
+    /// least one native `ArrayWrite` (the `setarrayitem_gc`).  `#[ignore]`d
+    /// (loads the ~440MB real LLBC); run with `cargo test -p majit-translate
+    /// --lib set_ref_set_locals_w_real -- --ignored`.
+    #[test]
+    #[ignore]
+    fn set_ref_set_locals_w_real() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "set_locals_w").expect("lower set_locals_w");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["object_array", "<Impl>", "set_ref"])
+                )
+            })
+            .count();
+        assert_eq!(
+            residual, 0,
+            "set_locals_w: residual set_ref call after the setarrayitem collapse"
+        );
+        let array_writes = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| matches!(&op.kind, OpKind::ArrayWrite { .. }))
+            .count();
+        assert!(
+            array_writes >= 1,
+            "set_locals_w: expected at least one native ArrayWrite (setarrayitem_gc)"
         );
     }
 
