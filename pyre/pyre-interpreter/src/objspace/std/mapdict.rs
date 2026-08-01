@@ -4081,6 +4081,29 @@ pub fn prune_dead_owner_entries(classify: &mut dyn FnMut(usize) -> Option<usize>
     }
 }
 
+/// Mark weakref lifelines only for owners that survived major marking.
+///
+/// PyPy stores this edge in each concrete object's weakref field, so ordinary
+/// tracing reaches the lifeline iff it first reaches the owner. The temporary
+/// `WEAKREF_TABLE` carrier must reproduce that conditional edge; treating all
+/// values as unconditional roots delays callbacks by one major collection.
+pub fn mark_live_weakref_entries(
+    classify: &mut dyn FnMut(usize) -> Option<usize>,
+    roots: &mut Vec<majit_ir::GcRef>,
+) {
+    let entries: Vec<(usize, usize)> = WEAKREF_TABLE
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(&owner, &value)| (owner, value))
+        .collect();
+    for (owner, value) in entries {
+        if classify(owner).is_some() && value != 0 {
+            roots.push(majit_ir::GcRef(value));
+        }
+    }
+}
+
 /// Re-key and re-point the entries a root walk moved, as `(old, new, value)`.
 ///
 /// Collected during the walk and applied in one pass because the walk must not
@@ -4173,7 +4196,14 @@ pub unsafe fn walk_mapdict_roots_area(_data: *const (), mut visitor: impl FnMut(
     // The weakref walk visits the lifeline pointer and stops there, so it needs
     // no such re-arming: an off-GC lifeline never moves, and its own fields are
     // outside what this walk ever traced.
-    let weakref_values = snapshot_root_entries(&WEAKREF_TABLE, &WEAKREF_TABLE_PENDING, minor);
+    // A major collection handles this table through the ephemeron marker
+    // above, after ordinary owner marking has settled. A minor still forwards
+    // freshly stored lifelines because owner liveness is not being decided.
+    let weakref_values = if minor {
+        snapshot_root_entries(&WEAKREF_TABLE, &WEAKREF_TABLE_PENDING, true)
+    } else {
+        Vec::new()
+    };
     let mut weakref_rekeys = Vec::new();
     for (key, mut value) in weakref_values {
         let old_value = value;

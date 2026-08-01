@@ -3843,6 +3843,9 @@ fn install_gc_root_walkers() {
     majit_gc::shadow_stack::register_ephemeron_pruner(
         pyre_interpreter::objspace::std::mapdict::prune_dead_owner_entries,
     );
+    majit_gc::shadow_stack::register_ephemeron_marker(
+        pyre_interpreter::objspace::std::mapdict::mark_live_weakref_entries,
+    );
     // `MetaInterp::forced_virtuals` is the same shape but lives in one mutator's
     // `JIT_DRIVER` rather than a global table, so it registers per mutator
     // instead — see `forced_virtuals_pruner_area`.

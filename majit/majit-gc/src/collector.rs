@@ -3308,6 +3308,36 @@ impl MiniMarkGC {
         }
     }
 
+    /// Mark conditional side-table edges to a fixed point.
+    ///
+    /// RPython sees an object's weakref lifeline as an ordinary field: marking
+    /// the owner immediately marks the lifeline. Pyre's temporary carrier for
+    /// builtin layouts is address-keyed, so it reports the same edges here,
+    /// after ordinary marking has established which owners survived. A newly
+    /// marked value may itself make another owner live, hence the fixed point.
+    fn mark_ephemeron_values_to_fixed_point(&mut self) {
+        loop {
+            let marked_before = self.incr_state.objects_marked;
+            let mut classify_owner = |owner: usize| -> Option<usize> {
+                if owner == 0 || !self.oldgen.contains(owner) {
+                    return Some(owner);
+                }
+                let hdr = unsafe { header_of(owner) };
+                unsafe { (*hdr).has_flag(flags::VISITED) }.then_some(owner)
+            };
+            let roots = crate::shadow_stack::mark_ephemeron_tables(&mut classify_owner);
+            for root in roots {
+                self.seed_major_root(root);
+            }
+            while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
+                self.mark_object(obj_addr);
+            }
+            if self.incr_state.objects_marked == marked_before {
+                break;
+            }
+        }
+    }
+
     /// incminimark.py:2473-2533: finish MARKING and freeze this cycle's sweep
     /// candidates.  Every VISITED-dependent consumer runs before either raw or
     /// arena memory is freed.
@@ -3325,6 +3355,7 @@ impl MiniMarkGC {
         // after the cycle's initial snapshot.  Rescan and trace them before
         // finalizers, weakrefs, and sweep inspect VISITED.
         self.rescan_major_nonstack_roots_and_drain();
+        self.mark_ephemeron_values_to_fixed_point();
         // incminimark.py:2961-2965 (and :2495-2499) — clear weak
         // pointers to dying objects before the sweep frees them. The
         // VISITED bit on every old-gen object is still meaningful at

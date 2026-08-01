@@ -216,12 +216,10 @@ fn finalizer_queue_trigger() {
 ///
 /// Upstream's contract is "call this at most once"; it holds structurally
 /// there, because every requester sits in the object's own constructor. pyre
-/// has one requester that does not: `getlifeline`
-/// (`interp__weakref.py:252-257`) asks at weakref-creation time and cannot
-/// know what the constructor already did. So the guard upstream writes as
-/// `if self.user_overridden_class and self.getclass(space).hasuserdel` —
-/// "`allocate_instance` got here first" — is enforced by the queue instead,
-/// which answers for every requester rather than one of them.
+/// follows that ownership too: `WeakrefLifeline.enable_callbacks` registers
+/// the lifeline itself, while instance/generator/PickleBuffer construction
+/// registers its own object. The collector additionally keeps its duplicate
+/// guard as a fail-safe for repeated construction hooks.
 pub fn register_finalizer(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
 }

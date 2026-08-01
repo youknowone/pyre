@@ -414,6 +414,10 @@ fn enable_callbacks(self_lifeline: PyObjectRef) {
         ATTR_HAS_CALLBACKS,
         pyre_object::w_bool_from(true),
     );
+    // interp__weakref.py:107 — the lifeline, not its referent, owns the
+    // finalizer. This preserves the collector's ordering for referents that
+    // are themselves part of cyclic trash.
+    crate::executioncontext::register_finalizer(self_lifeline);
 }
 
 /// pypy/module/_weakref/interp__weakref.py:60-77 get_or_make_weakref
@@ -953,13 +957,6 @@ pub fn getlifeline(w_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     }
     let lifeline = weakref_lifeline_new();
     crate::baseobjspace::setweakref(w_obj, lifeline)?;
-    // RPython's collector invalidates every rweakref when its target dies.
-    // pyre routes the equivalent lifeline clear through the shared finalizer
-    // queue, including for refs/proxies without callbacks. This is the one
-    // registration that does not sit in the target's constructor, so it can
-    // land on an object some constructor already registered; the queue drops
-    // the repeat.
-    crate::executioncontext::register_finalizer(w_obj);
     Ok(lifeline)
 }
 
@@ -989,91 +986,51 @@ fn lifeline_refs(lifeline: PyObjectRef) -> Vec<PyObjectRef> {
 }
 
 /// `WeakrefLifeline._finalize_` (interp__weakref.py:131-153), invoked
-/// from pyre's shared finalizer queue when the referent becomes unreachable.
+/// from pyre's shared finalizer queue when the lifeline becomes unreachable.
 pub fn finalize_weakrefs(w_obj: PyObjectRef) {
-    // The finalizer deque entry was the owner's last root.  A callback may
-    // allocate and recursively drain this same queue, so keep the complete
-    // lifeline traversal in the moving collector's shadow stack instead of a
-    // Rust Vec of raw PyObjectRef values.
+    let is_lifeline = crate::typedef::r#type(w_obj)
+        .is_some_and(|tp| std::ptr::eq(tp.as_ptr(), weakref_lifeline_type()));
+    if !is_lifeline {
+        return;
+    }
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_obj);
-    let owner = || pyre_object::gc_roots::shadow_stack_get(root_base);
-    let Some(lifeline) = crate::baseobjspace::getweakref(owner()) else {
-        return;
-    };
-    pyre_object::gc_roots::pin_root(lifeline);
-    let lifeline_root = root_base + 1;
-    let current_lifeline = || pyre_object::gc_roots::shadow_stack_get(lifeline_root);
 
-    // WeakrefLifeline._finalize_ takes `items` and clears
-    // `self.other_refs_weak` before the first callback.  Detach pyre's owner
-    // slot at the same point so a nested finalizer drain cannot process this
-    // lifeline twice.
-    let others = read_attr(current_lifeline(), ATTR_OTHER_REFS_WEAK);
-    let others_root = if others.is_null() {
-        None
-    } else {
-        let index = pyre_object::gc_roots::shadow_stack_len();
+    // RPython's local `items` list is GC-transformed together with every
+    // element. A Rust Vec only holds copied raw pointers, so retain the same
+    // collection in shadow-stack slots while reads below can allocate.
+    let mut ref_slots = Vec::new();
+    let others = read_attr(w_obj, ATTR_OTHER_REFS_WEAK);
+    if !others.is_null() {
+        let others_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(others);
-        Some(index)
-    };
-    write_attr(
-        current_lifeline(),
-        ATTR_OTHER_REFS_WEAK,
-        pyre_object::w_none(),
-    );
-    crate::baseobjspace::delweakref(owner());
-
-    // Store shadow-stack indices, not object addresses: every read after an
-    // allocation observes the collector-updated pointer.
-    let mut refs = Vec::new();
-    for name in [ATTR_CACHED_WEAKREF, ATTR_CACHED_PROXY] {
-        let weak = read_attr(current_lifeline(), name);
-        let w_ref = unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(weak) };
-        if !w_ref.is_null() {
-            let index = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(w_ref);
-            refs.push((index, false));
-        }
-    }
-    if let Some(others_root) = others_root {
-        let current_others = || pyre_object::gc_roots::shadow_stack_get(others_root);
-        let length = unsafe { pyre_object::w_list_len(current_others()) };
+        let length = unsafe {
+            pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(others_slot))
+        };
         for i in 0..length {
-            let Some(weak) = (unsafe { pyre_object::w_list_getitem(current_others(), i as i64) })
-            else {
+            let Some(weak) = (unsafe {
+                pyre_object::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(others_slot),
+                    i as i64,
+                )
+            }) else {
                 continue;
             };
             let w_ref = unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(weak) };
             if !w_ref.is_null() {
-                let index = pyre_object::gc_roots::shadow_stack_len();
+                let slot = pyre_object::gc_roots::shadow_stack_len();
                 pyre_object::gc_roots::pin_root(w_ref);
-                refs.push((index, true));
+                ref_slots.push(slot);
             }
         }
     }
-
-    // `clear_all_weakrefs` / rweakref invalidation must be visible before a
-    // callback runs: every callback observes `ref() is None`.
-    for &(index, _) in &refs {
-        let w_ref = pyre_object::gc_roots::shadow_stack_get(index);
-        let target = read_attr(w_ref, ATTR_W_OBJ_WEAK);
-        unsafe { pyre_object::weakref::w_gc_weakref_box_clear(target) };
-        write_attr(
-            pyre_object::gc_roots::shadow_stack_get(index),
-            ATTR_W_OBJ_WEAK,
-            pyre_object::w_none(),
-        );
-    }
-
-    // PyPy runs `other_refs_weak` in reverse creation order. Cached refs and
-    // proxies have no callback and therefore need only the clearing above.
-    for &(index, has_callback) in refs.iter().rev() {
-        if !has_callback {
-            continue;
-        }
-        let w_ref = pyre_object::gc_roots::shadow_stack_get(index);
+    // interp__weakref.py:143-145 — detach the shrink-list before callbacks,
+    // then activate surviving weakrefs in reverse creation order. The GC's
+    // rweakref pass has already invalidated each dead referent.
+    write_attr(w_obj, ATTR_OTHER_REFS_WEAK, pyre_object::w_none());
+    for &slot in ref_slots.iter().rev() {
+        let w_ref = pyre_object::gc_roots::shadow_stack_get(slot);
         let w_callable = read_attr(w_ref, ATTR_W_CALLABLE);
         if w_callable.is_null() {
             continue;
@@ -1081,7 +1038,7 @@ pub fn finalize_weakrefs(w_obj: PyObjectRef) {
         let _call_roots = pyre_object::gc_roots::push_roots();
         let call_base = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(w_callable);
-        let current_ref = || pyre_object::gc_roots::shadow_stack_get(index);
+        let current_ref = || pyre_object::gc_roots::shadow_stack_get(slot);
         let current_callable = || pyre_object::gc_roots::shadow_stack_get(call_base);
         if let Err(error) =
             crate::call::call_function_impl_result(current_callable(), &[current_ref()])

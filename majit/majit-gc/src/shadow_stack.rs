@@ -1333,10 +1333,16 @@ pub fn walk_extra_roots(mut visitor: impl FnMut(&mut GcRef)) {
 /// and now lives at `addr`, `None` means it died and the entry must be
 /// dropped.
 pub type EphemeronPrunerFn = fn(&mut dyn FnMut(usize) -> Option<usize>);
+/// A companion marker for values whose owners survived major marking.
+/// Implementations append values to `roots`; the collector marks them and
+/// repeats to a fixed point before finalizer ordering and pruning.
+pub type EphemeronMarkerFn = fn(&mut dyn FnMut(usize) -> Option<usize>, &mut Vec<GcRef>);
 
 const MAX_EPHEMERON_PRUNERS: usize = 4;
 
 static EPHEMERON_PRUNERS: std::sync::RwLock<[Option<EphemeronPrunerFn>; MAX_EPHEMERON_PRUNERS]> =
+    std::sync::RwLock::new([None; MAX_EPHEMERON_PRUNERS]);
+static EPHEMERON_MARKERS: std::sync::RwLock<[Option<EphemeronMarkerFn>; MAX_EPHEMERON_PRUNERS]> =
     std::sync::RwLock::new([None; MAX_EPHEMERON_PRUNERS]);
 
 /// Register a side table whose entries must be dropped when their owner dies.
@@ -1359,6 +1365,36 @@ pub fn register_ephemeron_pruner(pruner: EphemeronPrunerFn) {
         "register_ephemeron_pruner: capacity exceeded ({MAX_EPHEMERON_PRUNERS} pruners already \
          registered)"
     );
+}
+
+pub fn register_ephemeron_marker(marker: EphemeronMarkerFn) {
+    let mut guard = EPHEMERON_MARKERS.write().unwrap();
+    for slot in guard.iter_mut() {
+        match slot {
+            Some(existing) if std::ptr::fn_addr_eq(*existing, marker) => return,
+            None => {
+                *slot = Some(marker);
+                return;
+            }
+            _ => {}
+        }
+    }
+    panic!(
+        "register_ephemeron_marker: capacity exceeded ({MAX_EPHEMERON_PRUNERS} markers already \
+         registered)"
+    );
+}
+
+pub fn mark_ephemeron_tables(classify: &mut dyn FnMut(usize) -> Option<usize>) -> Vec<GcRef> {
+    let markers = {
+        let guard = EPHEMERON_MARKERS.read().unwrap();
+        *guard
+    };
+    let mut roots = Vec::new();
+    for marker in markers.iter().flatten() {
+        marker(classify, &mut roots);
+    }
+    roots
 }
 
 /// Invoke every registered pruner with a classifier that answers whether an
