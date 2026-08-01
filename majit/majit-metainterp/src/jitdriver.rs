@@ -3143,8 +3143,15 @@ impl<S: JitState> JitDriver<S> {
                 loop_header_pc,
             } => {
                 // pyjitpl.py:2979-2990 reached_loop_header parity.
-                let _has_partial_trace = self.meta.partial_trace().is_some();
-                if let Some(bridge) = self.meta.bridge_info() {
+                //
+                // pyjitpl.py:3003 `if not self.partial_trace:` gates the whole
+                // bridge attempt, the same way it does on the `CloseLoop` twin
+                // above: once `retrace_needed` has armed `partial_trace` the
+                // loop being closed is a RETRACE, and re-entering
+                // `compile_trace` would both bridge into the loop the retrace
+                // exists to respecialize and arm the retrace a second time.
+                let has_partial_trace = self.meta.partial_trace().is_some();
+                if let Some(bridge) = self.meta.bridge_info().filter(|_| !has_partial_trace) {
                     let bridge_key = bridge.green_key;
                     let bridge_trace_id = bridge.trace_id;
                     let bridge_fail_index = bridge.fail_index;
@@ -3192,7 +3199,14 @@ impl<S: JitState> JitDriver<S> {
                             // partial_trace is set on MetaInterp. Fall through
                             // to compile_loop → compile_retrace in same call.
                             crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
-                                self.meta.take_bridge_info();
+                                // Same as the `CloseLoop` twin: `bridge_info`
+                                // is the `self.resumekey` class discriminator
+                                // and upstream writes it only at session start
+                                // (pyjitpl.py:2905 / 2939), never in
+                                // `retrace_needed` (pyjitpl.py:2438-2442), so
+                                // it has to survive into
+                                // `resumekey.compile_and_attach`
+                                // (compile.py:392-393).
                                 // Fall through — do NOT return.
                             }
                             // pyjitpl.py:3220 raise_if_successful() does not
@@ -3418,6 +3432,15 @@ impl<S: JitState> JitDriver<S> {
                 }
                 let setup_aborted_bridge_descr = if matches!(action, TraceAction::Abort)
                     && self.meta.bridge_info().is_some()
+                    // `bridge_info` survives `RetraceNeeded` now that it stands
+                    // for the `self.resumekey` CLASS rather than "still
+                    // building the bridge", so it alone no longer says which
+                    // PHASE the session is in. The contract below is about the
+                    // bridge's own setup shape, so exclude the retrace phase
+                    // explicitly: an abort there belongs to the retrace, not to
+                    // the guard the session grew from, and must not permanently
+                    // decline that guard.
+                    && self.meta.partial_trace().is_none()
                     && self.meta.tracing.as_ref().is_some_and(|ctx| {
                         let Some(start_ops) = self.bridge_body_start_op_count else {
                             return false;
