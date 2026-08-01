@@ -1596,6 +1596,30 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
     if allboxes.is_empty() {
         return;
     }
+    // A float-returning callee cannot be executed here, because the funcbox's
+    // ABI depends on which emitter produced the op and the descr does not say
+    // which:
+    //
+    //   * the codewriter's residual bakes the callee's OWN address, so the
+    //     `f64` comes back in the floating-point return register
+    //     (`majit-backend-wasm/src/codegen.rs:909 residual_call_float_sig`
+    //     builds an `f64`-returning `call_indirect` from that same pointer);
+    //   * the runtime emitter's `*_canonical_via_target` family bakes
+    //     `JitCallTarget::concrete_ptr` instead (`jitcode/assembler.rs:3343`),
+    //     an `extern "C" fn(...) -> i64` wrapper with the `f64` pre-packed via
+    //     `f64::to_bits` — which is the convention `execute_pure_call`'s Float
+    //     arm implements.
+    //
+    // Running the first kind under the second's convention yields whatever was
+    // left in the integer return register (probed: 7/7 garbage against
+    // `jit_bigint_to_f64_or_inf`), and the walker would stamp it as the folded
+    // constant.  Leave the recorded `CallPure*` for the backend, which calls
+    // the same pointer with the descr's real signature.  `JitCode`'s
+    // `call_descr_to_call_target` side table is the discriminator a future
+    // slice would consult to fold these; nothing reads it today.
+    if call_descr.result_type() == majit_ir::Type::Float {
+        return;
+    }
     // pyjitpl.py `_build_allboxes`: slot 0 is funcbox, slots
     // 1.. are user args in `descr.arg_types()` ABI order.  Walker's
     // [`build_allboxes`] preserves the same layout.

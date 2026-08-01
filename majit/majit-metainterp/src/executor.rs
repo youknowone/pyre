@@ -812,6 +812,15 @@ pub fn execute_pure_call(
         // `#[jit_module]` Float helpers expose `concrete_ptr` as
         // `extern "C" fn(...) -> i64` with the f64 pre-packed via
         // `f64::to_bits`; routing through `call_int_function` is bit-identical.
+        //
+        // That convention is a CALLER CONTRACT, not a property of the descr:
+        // it holds only when `func_ptr` is such a wrapper.  A funcbox baked by
+        // the codewriter instead carries the callee's own address, where the
+        // f64 comes back in the floating-point return register and this arm
+        // reads whatever was left in the integer one.  The two are
+        // indistinguishable here — `descr` records the signature, not which
+        // emitter produced the pointer — so the walker declines rather than
+        // guess (`residual_call.rs try_fold_pure_call_via_executor`).
         majit_ir::Type::Float => crate::pyjitpl::call_int_function(func_ptr, args),
     }
 }

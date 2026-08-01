@@ -11373,3 +11373,112 @@ fn ref_compare_same_box_fastpath_covers_the_instance_ptr_spellings() {
         );
     }
 }
+
+// A float-returning residual is never folded at record time: the funcbox's
+// ABI depends on which emitter baked it (the codewriter bakes the callee's own
+// `f64`-returning address; the runtime emitter's `*_canonical_via_target`
+// family bakes `JitCallTarget::concrete_ptr`, an `i64`-returning wrapper), and
+// the descr does not record which.  See the decline in
+// `try_fold_pure_call_via_executor`.
+
+/// A real `f64`-returning callee, i.e. the shape the codewriter bakes.
+extern "C" fn halve_f64_for_walker_test(x: i64) -> f64 {
+    (x as f64) / 2.0
+}
+
+#[test]
+fn walker_declines_to_fold_a_float_result_pure_call() {
+    let mut tc = fresh_trace_ctx();
+    let funcbox = tc.const_int(halve_f64_for_walker_test as *const () as i64);
+    let arg0 = tc.const_int(7);
+    let allboxes = [funcbox, arg0];
+    let descr = make_call_descr(
+        6,
+        vec![Type::Int],
+        Type::Float,
+        majit_ir::ExtraEffect::ElidableCannotRaise,
+    );
+    let recorded = tc.record_op_with_descr(majit_ir::OpCode::CallPureF, &allboxes, descr.clone());
+    let call_descr = descr.as_call_descr().expect("CallPureF descr");
+
+    // Same shape as the Int sibling above, which DOES fold — so a failure here
+    // is the float arm specifically, not the fixture.
+    let int_descr = make_call_descr(
+        7,
+        vec![Type::Int, Type::Int],
+        Type::Int,
+        majit_ir::ExtraEffect::ElidableCannotRaise,
+    );
+    let int_boxes = [
+        tc.const_int(add2_for_walker_test as *const () as i64),
+        tc.const_int(40),
+        tc.const_int(2),
+    ];
+    let int_recorded =
+        tc.record_op_with_descr(majit_ir::OpCode::CallPureI, &int_boxes, int_descr.clone());
+    let int_call_descr = int_descr.as_call_descr().expect("CallPureI descr");
+
+    let mut regs_i: Vec<OpRef> = Vec::new();
+    let mut regs_r: Vec<OpRef> = Vec::new();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut regs_r,
+        registers_i: &mut regs_i,
+        registers_f: &mut [],
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    try_fold_pure_call_via_executor(
+        &mut wc,
+        majit_ir::OpCode::CallPureF,
+        &allboxes,
+        call_descr,
+        recorded,
+    );
+    try_fold_pure_call_via_executor(
+        &mut wc,
+        majit_ir::OpCode::CallPureI,
+        &int_boxes,
+        int_call_descr,
+        int_recorded,
+    );
+    drop(wc);
+
+    assert_eq!(
+        tc.box_value(int_recorded),
+        Some(majit_ir::Value::Int(42)),
+        "control: the Int sibling folds, so the fixture reaches the executor",
+    );
+    assert_eq!(
+        tc.box_value(recorded),
+        None,
+        "a float-result pure call must stay symbolic, not be stamped with \
+         whatever the integer return register held",
+    );
+}
