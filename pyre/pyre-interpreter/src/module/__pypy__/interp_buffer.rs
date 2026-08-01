@@ -178,55 +178,51 @@ fn dimensions(obj: PyObjectRef) -> Result<Vec<i64>, PyError> {
 /// instance is an error, so accidentally using the helper without an
 /// override is diagnosed instead of recursing forever.
 pub mod bufferable_impl {
-use super::*;
+    use super::*;
 
-#[crate::pyre_class("__pypy__.Bufferable")]
-#[derive(Default)]
-pub struct W_Bufferable {}
+    #[crate::pyre_class("__pypy__.Bufferable")]
+    #[derive(Default)]
+    pub struct W_Bufferable {}
 
-#[crate::pyre_methods(
-    doc = "Base class for objects implementing the buffer protocol.",
-)]
-impl W_Bufferable {
-    /// `generic_new_descr(W_Bufferable)` accepts and ignores constructor
-    /// arguments, while preserving a user-defined subtype on the instance.
-    #[staticmethod]
-    fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        let _ = args;
-        let base = type_object();
-        crate::typedef::check_user_subclass(base, cls)?;
-        let obj = W_Bufferable::allocate_stable(W_Bufferable {
-            ob: pyre_object::PyObject {
-                ob_type: std::ptr::null(),
-                w_class: std::ptr::null_mut(),
-            },
-        });
-        crate::typedef::tag_subclass_instance(obj, cls);
-        Ok(obj)
-    }
-
-    /// PyPy `W_Bufferable.descr_buffer`: subclasses provide the actual
-    /// exporter and return a memoryview; the base class itself is abstract.
-    fn __buffer__(&self, w_flags: PyObjectRef) -> Result<PyObjectRef, PyError> {
-        let self_obj = self as *const W_Bufferable as PyObjectRef;
-        let self_type = crate::typedef::r#type(self_obj)
-            .map(|p| p.as_ptr())
-            .unwrap_or(pyre_object::PY_NULL);
-        if std::ptr::eq(self_type, type_object()) {
-            return Err(PyError::value_error("override __buffer__ in a subclass"));
+    #[crate::pyre_methods(doc = "Base class for objects implementing the buffer protocol.")]
+    impl W_Bufferable {
+        /// `generic_new_descr(W_Bufferable)` accepts and ignores constructor
+        /// arguments, while preserving a user-defined subtype on the instance.
+        #[staticmethod]
+        fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+            let _ = args;
+            let base = type_object();
+            crate::typedef::check_user_subclass(base, cls)?;
+            let obj = W_Bufferable::allocate_stable(W_Bufferable {
+                ob: pyre_object::PyObject {
+                    ob_type: std::ptr::null(),
+                    w_class: std::ptr::null_mut(),
+                },
+            });
+            crate::typedef::tag_subclass_instance(obj, cls);
+            Ok(obj)
         }
-        let method = crate::baseobjspace::getattr_str(self_obj, "__buffer__")?;
-        let result = crate::baseobjspace::call_function(method, &[w_flags]);
-        if result.is_null() {
-            Err(crate::call::take_call_error().unwrap_or_else(|| {
-                PyError::runtime_error("__buffer__ call failed")
-            }))
-        } else {
-            Ok(result)
+
+        /// PyPy `W_Bufferable.descr_buffer`: subclasses provide the actual
+        /// exporter and return a memoryview; the base class itself is abstract.
+        fn __buffer__(&self, w_flags: PyObjectRef) -> Result<PyObjectRef, PyError> {
+            let self_obj = self as *const W_Bufferable as PyObjectRef;
+            let self_type = crate::typedef::r#type(self_obj)
+                .map(|p| p.as_ptr())
+                .unwrap_or(pyre_object::PY_NULL);
+            if std::ptr::eq(self_type, type_object()) {
+                return Err(PyError::value_error("override __buffer__ in a subclass"));
+            }
+            let method = crate::baseobjspace::getattr_str(self_obj, "__buffer__")?;
+            let result = crate::baseobjspace::call_function(method, &[w_flags]);
+            if result.is_null() {
+                Err(crate::call::take_call_error()
+                    .unwrap_or_else(|| PyError::runtime_error("__buffer__ call failed")))
+            } else {
+                Ok(result)
+            }
         }
     }
-}
-
 }
 
 #[crate::pyre_class("pickle.PickleBuffer")]

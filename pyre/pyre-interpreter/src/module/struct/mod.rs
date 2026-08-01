@@ -1266,9 +1266,7 @@ pub mod unpack_iter {
     use pyre_object::*;
 
     fn unpack_iter_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let name = crate::baseobjspace::text_w(
-            args.get(1).copied().unwrap_or_else(w_none),
-        )?;
+        let name = crate::baseobjspace::text_w(args.get(1).copied().unwrap_or_else(w_none))?;
         crate::baseobjspace::object_getattribute(args[0], name)
     }
 
