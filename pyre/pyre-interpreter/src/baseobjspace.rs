@@ -114,7 +114,7 @@ pub(crate) unsafe fn walk_pending_hash_error_area(
 pub fn clear_method_cache() {
     let mut cache = METHOD_CACHE.lock();
     cache.versions.fill(0);
-    cache.names.fill(std::ptr::null_mut());
+    cache.names.fill(None);
     cache
         .lookup_where
         .fill((std::ptr::null_mut(), std::ptr::null_mut()));
@@ -8476,17 +8476,13 @@ pub(crate) unsafe fn lookup_in_type_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Op
 /// negative result (`_lookup_where_all_typeobjects` returned
 /// `(None, None)`).
 ///
-/// `names[h]` holds the interned name *object* and is validated by identity
-/// (`typeobject.py:541` `cache.names[method_hash] is name`), so a probe costs
-/// one pointer compare rather than a digest plus a `memcmp` over the bytes,
-/// and a fill stores the pointer rather than allocating a copy of the name.
-/// Every name reaching the cache comes from `box_str_constant`, which
-/// allocates through `malloc_typed`: the object is immortal and never
-/// relocated, so the slot needs no GC forwarding and its address is never
-/// reused by a later, different name (`null` = empty).
+/// `names[h]` is the untranslated string stored by upstream
+/// (`typeobject.py:541` `cache.names[method_hash] == name`). A fill owns one
+/// copy; a hit compares the incoming borrowed string without allocating or
+/// entering the Python-string intern table. `None` is an empty slot.
 struct MethodCache {
     versions: Vec<u64>,
-    names: Vec<PyObjectRef>,
+    names: Vec<Option<String>>,
     lookup_where: Vec<(PyObjectRef, PyObjectRef)>,
 }
 
@@ -8503,7 +8499,7 @@ static METHOD_CACHE: std::sync::LazyLock<parking_lot::Mutex<MethodCache>> =
     std::sync::LazyLock::new(|| {
         parking_lot::Mutex::new(MethodCache {
             versions: vec![0u64; METHOD_CACHE_SIZE],
-            names: vec![std::ptr::null_mut(); METHOD_CACHE_SIZE],
+            names: vec![None; METHOD_CACHE_SIZE],
             lookup_where: vec![(std::ptr::null_mut(), std::ptr::null_mut()); METHOD_CACHE_SIZE],
         })
     });
@@ -8511,16 +8507,13 @@ static METHOD_CACHE: std::sync::LazyLock<parking_lot::Mutex<MethodCache>> =
 /// `typeobject.py:520-535` method-hash.  `version_tag` is pyre's u64
 /// version token directly (PyPy hashes `current_object_addr_as_int(
 /// version_tag)`; the u64 is its own address-stable surrogate).
-/// `name_hash` only needs to be deterministic — the slot's validity is
-/// the exact `(version, name)` match, not the hash.  Upstream's
-/// `hash(name)` is the interned string's memoized digest, i.e. a
-/// per-name-object constant; the interned pointer is the same constant
-/// without the byte walk, so an FNV-1a over its bytes stands in.  Two
-/// threads that interned the same name into different objects then land
-/// in different slots instead of evicting each other from a shared one.
-fn method_hash(version_tag: u64, w_name: PyObjectRef) -> usize {
+/// `name_hash` only needs to be deterministic — the slot's validity is the
+/// exact `(version, name)` match, not the hash. Upstream's `compute_hash(name)`
+/// is a content hash; use the same FNV-1a content digest as pyre's other
+/// untranslated-name caches.
+fn method_hash(version_tag: u64, name: &str) -> usize {
     let mut name_hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in (w_name as usize as u64).to_le_bytes() {
+    for &b in name.as_bytes() {
         name_hash ^= b as u64;
         name_hash = name_hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -8575,10 +8568,11 @@ pub(crate) unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
 /// thread-local / `String` machinery stays off the trace surface, as the
 /// former `dont_look_inside` ensured.
 ///
-/// `name` arrives as `w_name`, an interned immortal str object
-/// (`box_str_constant`), because the elidable call ABI cannot pass a
-/// `&str` and an interned pointer is the green token the trace folds on;
-/// the body reads it back via `w_str_get_value`.  The result is a raw
+/// `name` arrives on this JIT-only projection as `w_name`, an interned
+/// immortal str object (`box_str_constant`), because the elidable call ABI
+/// cannot pass a `&str`; the body reads the untranslated string back via
+/// `w_str_get_value`. The ordinary interpreter passes its `&str` directly to
+/// [`_cached_lookup_where_name`], matching upstream. The result here is a raw
 /// pointer — null is the cached negative result (`None`), since the call
 /// ABI cannot carry `Option`.  The `is_type` / `version_tag == 0` guards
 /// live in the front door, so this is only ever entered with a valid
@@ -8610,9 +8604,9 @@ pub unsafe fn _pure_lookup_where_with_method_cache(
 /// trace surface.  The value half runs first and fills the slot, so this
 /// call is a guaranteed cache hit.
 ///
-/// See [`_pure_lookup_where_with_method_cache`] for the interned-`w_name`
-/// ABI and the null-as-`None` convention (a negative result has a null
-/// `w_class`).
+/// See [`_pure_lookup_where_with_method_cache`] for the JIT-only interned
+/// `w_name` ABI and the null-as-`None` convention (a negative result has a
+/// null `w_class`).
 #[majit_macros::elidable]
 pub unsafe fn _pure_lookup_class_with_method_cache(
     w_type: PyObjectRef,
@@ -8628,20 +8622,32 @@ pub unsafe fn _pure_lookup_class_with_method_cache(
 /// _lookup_where_all_typeobjects`) and fills the slot with the
 /// `(w_class, w_value)` pair (`typeobject.py:545-549`).
 ///
-/// `w_name` must be an interned name object (`box_str_constant`): the slot
-/// is keyed by its address, so a collectable or non-interned string would
-/// let a later allocation at the same address answer a hit for a different
-/// name.
+/// `w_name` must be an exact string accepted by `w_str_get_value`; the shared
+/// cache itself is content-keyed, exactly like upstream's untranslated name
+/// array.
 unsafe fn _cached_lookup_where(
     w_type: PyObjectRef,
     w_name: PyObjectRef,
     version_tag: u64,
 ) -> (PyObjectRef, PyObjectRef) {
-    let h = method_hash(version_tag, w_name);
+    let name = pyre_object::unicodeobject::w_str_get_value(w_name);
+    _cached_lookup_where_name(w_type, name, version_tag)
+}
+
+/// Untranslated-string MethodCache probe/fill used by the ordinary
+/// interpreter. This is the direct Rust shape of
+/// `typeobject.py:_pure_lookup_where_with_method_cache(name, version_tag)`;
+/// the `w_name` wrapper above exists only for the JIT residual-call ABI.
+unsafe fn _cached_lookup_where_name(
+    w_type: PyObjectRef,
+    name: &str,
+    version_tag: u64,
+) -> (PyObjectRef, PyObjectRef) {
+    let h = method_hash(version_tag, name);
     // Probe without holding the borrow across the MRO walk below.
     let hit = {
         let cache = METHOD_CACHE.lock();
-        if cache.versions[h] == version_tag && cache.names[h] == w_name {
+        if cache.versions[h] == version_tag && cache.names[h].as_deref() == Some(name) {
             // A valid entry with null pointers is the cached negative result.
             Some(cache.lookup_where[h])
         } else {
@@ -8651,7 +8657,6 @@ unsafe fn _cached_lookup_where(
     if let Some(tup) = hit {
         return tup;
     }
-    let name = pyre_object::unicodeobject::w_str_get_value(w_name);
     let tup =
         lookup_where_pair(w_type, name).unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
     // Prebuilt-family store: the cache slot is reached only by
@@ -8659,7 +8664,7 @@ unsafe fn _cached_lookup_where(
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     let mut cache = METHOD_CACHE.lock();
     cache.versions[h] = version_tag;
-    cache.names[h] = w_name;
+    cache.names[h] = Some(name.to_owned());
     cache.lookup_where[h] = tup;
     tup
 }
@@ -8716,6 +8721,14 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
         // typeobject.py:507-509 — no version tag: uncacheable.
         return lookup_where_pair(w_type, name);
     }
+    if !majit_metainterp::jit::we_are_jitted() {
+        let (w_class, w_value) = _cached_lookup_where_name(w_type, name, version_tag);
+        return if w_value.is_null() {
+            None
+        } else {
+            Some((w_class, w_value))
+        };
+    }
     // typeobject.py:510-511 — `w_class, w_value =
     // self._pure_lookup_where_with_method_cache(name, version_tag)`.  The
     // tuple is split across two single-register elidable residuals over the
@@ -8758,11 +8771,14 @@ pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Op
         // typeobject.py:507-509 — no version tag: uncacheable.
         return lookup_in_type_where_uncached(w_type, name);
     }
-    // The elidable takes the name as an interned, immortal str object
-    // (`box_str_constant`: content-keyed, never freed).  The elidable call
-    // ABI cannot pass a `&str`, and the interned pointer is the green token
-    // the trace folds the lookup on (PyPy's `name` is already an interned
-    // W_StringObject green constant from the bytecode).
+    if !majit_metainterp::jit::we_are_jitted() {
+        let v = _cached_lookup_where_name(w_type, name, version_tag).1;
+        return if v.is_null() { None } else { Some(v) };
+    }
+    // The JIT elidable projection takes an interned, immortal str object
+    // (`box_str_constant`: content-keyed, never freed) because its residual
+    // call ABI cannot pass a `&str`. The ordinary interpreter returned through
+    // `_cached_lookup_where_name` above without materialising this wrapper.
     let w_name = pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name));
     // typeobject.py:510 — `_pure_lookup_where_with_method_cache(name, version_tag)`.
     let v = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
