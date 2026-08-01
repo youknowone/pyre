@@ -227,7 +227,32 @@ pub struct W_TypeObject {
     /// has mutated since its last compile is the only one holding a box. Holds
     /// no GC pointers, so the `W_TYPE_GC_TYPE_ID` custom trace has nothing to
     /// walk here.
-    pub quasi_immut_watchers: *mut QuasiImmut,
+    ///
+    /// The pointer stays the single source of truth, as upstream's synthesised
+    /// field is; only the reads that dereference it are serialised, by
+    /// [`W_TypeObject::quasi_immut_lock`]. The bare null test is deliberately
+    /// left outside that lock — it is the whole cost a mutation on a type no
+    /// loop watches has to pay.
+    pub quasi_immut_watchers: std::sync::atomic::AtomicPtr<QuasiImmut>,
+    /// Serialises the get-or-create, every dereference, and the `Box` free of
+    /// [`W_TypeObject::quasi_immut_watchers`].
+    ///
+    /// Upstream needs nothing here: `_invalidate_now` (quasiimmut.py:129-134)
+    /// nulls the field and then sweeps the list, and the GIL makes that pair
+    /// indivisible against a concurrent `register_loop_token`. Pyre runs Python
+    /// threads on real OS threads with no GIL (`module/thread/mod.rs`
+    /// `start_new_thread`), so without this a thread mutating a class can free
+    /// the instance another thread is pushing a loop flag into, and two
+    /// mutators can free it twice.
+    ///
+    /// Per type rather than address-striped like the list/dict/set locks: a
+    /// `W_TypeObject` is allocated through `try_gc_alloc_stable_raw` (heap
+    /// types) or `malloc_typed` (builtins) and never moves, so it cannot be
+    /// remapped onto a different stripe while a thread holds the old one — the
+    /// residual hazard `DictOperationGuard` documents does not arise. The
+    /// critical section allocates nothing GC-managed and crosses no safepoint,
+    /// so it cannot park a mutator the collector is waiting for.
+    pub quasi_immut_lock: parking_lot::Mutex<()>,
 }
 
 /// Source of fresh `version_tag` identities (`VersionTag()`, typeobject.py:73).
@@ -398,7 +423,8 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         flag_disallow_instantiation: std::sync::atomic::AtomicBool::new(false),
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
         // Allocated lazily on the first loop registration.
-        quasi_immut_watchers: std::ptr::null_mut(),
+        quasi_immut_watchers: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+        quasi_immut_lock: parking_lot::Mutex::new(()),
     };
     let (w_type, gc_managed) = if !raw.is_null() {
         unsafe { std::ptr::write(raw as *mut W_TypeObject, value) };
@@ -517,7 +543,8 @@ pub fn w_type_new_builtin(
         flag_disallow_instantiation: std::sync::atomic::AtomicBool::new(false),
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
         // Allocated lazily on the first loop registration.
-        quasi_immut_watchers: std::ptr::null_mut(),
+        quasi_immut_watchers: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+        quasi_immut_lock: parking_lot::Mutex::new(()),
     }) as PyObjectRef;
     // A builtin type is Box-immortal, so its namespace values and `bases` are reachable only
     // through `walk_builtin_type_dicts_gc` (`pyre_interpreter::eval`).
@@ -811,12 +838,10 @@ impl QuasiImmut {
     /// []`; the caller then drops the instance itself, so a loop that recompiles
     /// registers against a fresh one.
     ///
-    /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`):
-    /// upstream never reaches `invalidate` from traced code — it hangs off the
-    /// residual `jit_force_quasi_immutable` path — and the `Vec` walk has no
-    /// lowering either way. The caller's null check stays traced, so the
-    /// common no-watcher mutation still makes no call.
-    #[majit_macros::dont_look_inside]
+    /// The residual boundary is [`w_type_sweep_quasi_immut_watchers`], not this
+    /// method: `dont_look_inside` only emits a call target for a free function
+    /// (`majit_macros`'s wrapper bails on a `self` receiver), so annotating an
+    /// inherent method leaves the tracer with a policy marker and no trampoline.
     fn invalidate(&mut self) {
         for wref in std::mem::take(&mut self.looptokens_wrefs) {
             if let Some(flag) = wref.upgrade() {
@@ -845,11 +870,20 @@ pub unsafe fn w_type_register_quasi_immut_watcher(
     if obj.is_null() || !is_type(obj) {
         return;
     }
-    let w_type = &mut *(obj as *mut W_TypeObject);
-    if w_type.quasi_immut_watchers.is_null() {
-        w_type.quasi_immut_watchers = Box::into_raw(Box::new(QuasiImmut::new()));
+    let w_type = &*(obj as *const W_TypeObject);
+    // The get-or-create and the push both dereference the instance, so both run
+    // under the lock a concurrent `_invalidate_now` needs in order to free it.
+    let _guard = w_type.quasi_immut_lock.lock();
+    let mut qmut_ptr = w_type
+        .quasi_immut_watchers
+        .load(std::sync::atomic::Ordering::Acquire);
+    if qmut_ptr.is_null() {
+        qmut_ptr = Box::into_raw(Box::new(QuasiImmut::new()));
+        w_type
+            .quasi_immut_watchers
+            .store(qmut_ptr, std::sync::atomic::Ordering::Release);
     }
-    (*w_type.quasi_immut_watchers).register_loop_token(flag);
+    (*qmut_ptr).register_loop_token(flag);
 }
 
 /// Revoke every loop that baked this type's `version_tag` as a constant
@@ -870,8 +904,9 @@ pub unsafe fn w_type_register_quasi_immut_watcher(
 ///
 /// Upstream runs the whole walk outside traced code — `_invalidate_now` is
 /// reached from the residual `jit_force_quasi_immutable` path, never from a
-/// trace — so the sweep is residualised the same way. The null check stays
-/// traced, so mutating a type no loop depends on still makes no call.
+/// trace — so the sweep is residualised the same way
+/// ([`w_type_sweep_quasi_immut_watchers`]). The null check stays traced, so
+/// mutating a type no loop depends on still makes no call.
 ///
 /// # Safety
 /// `obj` must be null or point at a valid `W_TypeObject`.
@@ -879,11 +914,45 @@ pub unsafe fn w_type_notify_quasi_immut_watchers(obj: PyObjectRef) {
     if obj.is_null() || !is_type(obj) {
         return;
     }
-    let w_type = &mut *(obj as *mut W_TypeObject);
-    if w_type.quasi_immut_watchers.is_null() {
+    let w_type = &*(obj as *const W_TypeObject);
+    if w_type
+        .quasi_immut_watchers
+        .load(std::sync::atomic::Ordering::Acquire)
+        .is_null()
+    {
         return;
     }
-    let qmut_ptr = std::mem::replace(&mut w_type.quasi_immut_watchers, std::ptr::null_mut());
+    w_type_sweep_quasi_immut_watchers(obj);
+}
+
+/// The residual half of [`w_type_notify_quasi_immut_watchers`]: unlink the
+/// instance and flip every loop flag it recorded.
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`) for the
+/// reason upstream's own walk is out of line — it hangs off the residual
+/// `jit_force_quasi_immutable` path and never appears in a trace — and because
+/// the lock and the `Vec` walk have no lowering. Split out as a free function
+/// so the macro can emit the call target; the same shape as
+/// `celldict::sweep_version_watchers`.
+///
+/// Re-reads the pointer under the lock rather than trusting the caller's test:
+/// two threads mutating the same class both see it non-null, and only the one
+/// that wins the swap owns the [`Box`].
+///
+/// # Safety
+/// `obj` must point at a valid `W_TypeObject`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_type_sweep_quasi_immut_watchers(obj: PyObjectRef) {
+    let w_type = &*(obj as *const W_TypeObject);
+    let qmut_ptr = {
+        let _guard = w_type.quasi_immut_lock.lock();
+        w_type
+            .quasi_immut_watchers
+            .swap(std::ptr::null_mut(), std::sync::atomic::Ordering::AcqRel)
+    };
+    if qmut_ptr.is_null() {
+        return;
+    }
     let mut qmut = Box::from_raw(qmut_ptr);
     qmut.invalidate();
 }
@@ -1537,6 +1606,112 @@ mod tests {
         // With every entry dead the limit collapses back to the empty-list
         // value rather than ratcheting upward.
         assert_eq!(qi.compress_limit, 30);
+    }
+
+    /// `quasiimmut.py:129-134 _invalidate_now` — publishing a new tag unlinks
+    /// the instance before sweeping it, so the flags of the loops that baked the
+    /// old tag flip and the next registration starts from a fresh instance.
+    #[test]
+    fn version_tag_write_unlinks_the_instance_and_revokes_its_loops() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let obj = w_type_new("Quasi", PY_NULL, std::ptr::null_mut());
+        let w_type = unsafe { &*(obj as *const W_TypeObject) };
+        assert!(
+            w_type
+                .quasi_immut_watchers
+                .load(Ordering::Acquire)
+                .is_null(),
+            "no instance until the first registration",
+        );
+
+        let flag = Arc::new(AtomicBool::new(false));
+        unsafe { w_type_register_quasi_immut_watcher(obj, &flag) };
+        let first = w_type.quasi_immut_watchers.load(Ordering::Acquire);
+        assert!(!first.is_null());
+
+        unsafe { w_type_set_version_tag(obj, new_version_tag()) };
+        assert!(flag.load(Ordering::Acquire), "the loop must be revoked");
+        assert!(
+            w_type
+                .quasi_immut_watchers
+                .load(Ordering::Acquire)
+                .is_null(),
+            "the field is nulled before the sweep",
+        );
+
+        // A second bump with nothing registered must not double-free.
+        unsafe { w_type_set_version_tag(obj, new_version_tag()) };
+
+        // A recompile registers against a fresh instance, so the identity the
+        // optimizer's revalidation compares really did change.
+        let flag2 = Arc::new(AtomicBool::new(false));
+        unsafe { w_type_register_quasi_immut_watcher(obj, &flag2) };
+        let second = w_type.quasi_immut_watchers.load(Ordering::Acquire);
+        assert!(!second.is_null());
+        assert_ne!(first, second, "invalidation must not reuse the instance");
+    }
+
+    /// Registration runs on the compiling thread while any other Python thread
+    /// can be mutating the same class. Upstream is safe here only because of the
+    /// GIL; pyre has none, so the get-or-create, the push and the free have to
+    /// be serialised or this races the instance to a double free.
+    #[test]
+    fn quasi_immut_publication_is_serialised_across_threads() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const ROUNDS: usize = 200_000;
+
+        let obj = w_type_new("QuasiRace", PY_NULL, std::ptr::null_mut());
+        let addr = obj as usize;
+        let stop = Arc::new(AtomicBool::new(false));
+
+        std::thread::scope(|scope| {
+            // Two compiling threads keep re-installing the instance, so the
+            // mutators below keep finding a non-null pointer to free. Without
+            // the lock the two sides overlap: two mutators load the same
+            // pointer and both drop it, or a mutator drops the instance a
+            // registrar is pushing into.
+            for _ in 0..2 {
+                let stop = Arc::clone(&stop);
+                scope.spawn(move || {
+                    let flag = Arc::new(AtomicBool::new(false));
+                    while !stop.load(Ordering::Relaxed) {
+                        unsafe {
+                            w_type_register_quasi_immut_watcher(addr as PyObjectRef, &flag);
+                        }
+                    }
+                });
+            }
+            let mutators: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(move || {
+                        for _ in 0..ROUNDS {
+                            unsafe {
+                                w_type_notify_quasi_immut_watchers(addr as PyObjectRef);
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for mutator in mutators {
+                mutator.join().expect("mutator thread faulted");
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+
+        // Whatever the interleaving, one final sweep must leave the field empty
+        // and must not fault on an instance another thread already freed.
+        unsafe { w_type_notify_quasi_immut_watchers(obj) };
+        let w_type = unsafe { &*(obj as *const W_TypeObject) };
+        assert!(
+            w_type
+                .quasi_immut_watchers
+                .load(Ordering::Acquire)
+                .is_null()
+        );
     }
 
     #[test]
