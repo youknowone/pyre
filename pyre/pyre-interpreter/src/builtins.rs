@@ -14055,6 +14055,10 @@ fn fd_read_into(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
 /// `wrap` stands in for upstream's `w_exception_class` / `w_filename`
 /// arguments: the OSError each call site would have raised for a non-`EINTR`
 /// errno.
+///
+/// wasm32 has neither `libc::EINTR` nor the `signal` module
+/// (`module/mod.rs:100-101`), and no caller survives the same gate there.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn eintr_retry_with(
     e: std::io::Error,
     wrap: impl FnOnce(std::io::Error) -> crate::PyError,
