@@ -4080,15 +4080,30 @@ fn init_someinstance_overrides(
                 // types the boxed `W_BaseException` result while the codewriter
                 // keeps the real fnaddr conversion.
                 if attr == "to_exc_object" {
-                    let is_pyerror = inst
-                        .classdef
-                        .as_ref()
-                        .is_some_and(|cd| cd.borrow().name.rsplit('.').next() == Some("PyError"));
+                    // Fires for a `classdef=Some(PyError)` receiver and for a
+                    // classdef-less one.  `to_exc_object` is the sole method of
+                    // that name (error.rs `PyError::to_exc_object`); it is only
+                    // lowered from `.to_exc_object()` callsites rustc typechecks
+                    // against a `PyError` receiver and from the result_exc
+                    // `?`-lowering (`Method{receiver_root: "PyError"}`,
+                    // result_exc.rs), so a classdef-less receiver here is a
+                    // pointer-erased `PyError` call-result — `OpKind::Call`
+                    // stamps a struct return `Ref(None)` with no `class_root`,
+                    // unlike the seeded `Input` arm, so a call-returned `PyError`
+                    // lifts `SomeInstance(classdef=None)`.  Same rustc-typecheck
+                    // reasoning as the `is_null` ptr-method arm above.  The
+                    // builtin result (`PyObjectRef`) and the codewriter residual
+                    // (`for_impl_method("PyError", "to_exc_object")`) are both
+                    // fixed, reading nothing off the receiver's classdef.
+                    let receiver_is_pyerror = match inst.classdef.as_ref() {
+                        Some(cd) => cd.borrow().name.rsplit('.').next() == Some("PyError"),
+                        None => true,
+                    };
                     let class_defines_attr = inst.classdef.as_ref().is_some_and(|cd| {
                         let classdesc = cd.borrow().classdesc.clone();
                         super::classdesc::ClassDesc::lookup(&classdesc, "to_exc_object").is_some()
                     });
-                    if is_pyerror && !class_defines_attr {
+                    if receiver_is_pyerror && !class_defines_attr {
                         return SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
                             "pyerror_method_to_exc_object",
                             s_self.clone(),
