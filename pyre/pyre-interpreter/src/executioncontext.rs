@@ -2260,12 +2260,18 @@ impl UserDelAction {
         if self.gc_disabled(current()) {
             return;
         }
+        // `__del__` runs arbitrary Python, so it can collect and move the
+        // callable that the error report names; publish it and read it back
+        // the way `current()` does for the receiver.
+        pyre_object::gc_roots::pin_root(w_del);
+        let del_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let del = || pyre_object::gc_roots::shadow_stack_get(del_slot);
         // pyre's combined helper cannot distinguish get-vs-call errors;
         // report through the call arm (executioncontext.py:680-690).
         if let Err(error) = unsafe {
-            crate::baseobjspace::get_and_call_function(w_del, current(), w_type.as_ptr(), &[])
+            crate::baseobjspace::get_and_call_function(del(), current(), w_type.as_ptr(), &[])
         } {
-            report_error(self.base.space, &error, "", w_del);
+            report_error(self.base.space, &error, "", del());
         }
     }
 }

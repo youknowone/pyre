@@ -4184,11 +4184,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }));
                 }
                 let keys = crate::baseobjspace::unpackiterable(keys_obj, -1)?;
+                // `getitem` runs the mapping's `__getitem__` and both encodes
+                // allocate, so the mapping and every key are published once and
+                // read back per iteration rather than kept in plain locals.
+                let _env_roots = pyre_object::gc_roots::push_roots();
+                let mapping_slot = pyre_object::gc_roots::pin_roots(&[mapping]);
+                let keys_base = pyre_object::gc_roots::pin_roots(&keys);
                 let mut env = Vec::with_capacity(keys.len());
-                for key_obj in keys {
-                    let value_obj = crate::baseobjspace::getitem(mapping, key_obj)?;
-                    let key = crate::gateway::fsencode_bytes_w(key_obj)?;
-                    let value = crate::gateway::fsencode_bytes_w(value_obj)?;
+                for i in 0..keys.len() {
+                    let _entry_roots = pyre_object::gc_roots::push_roots();
+                    let value_obj = crate::baseobjspace::getitem(
+                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
+                        pyre_object::gc_roots::shadow_stack_get(keys_base + i),
+                    )?;
+                    // Encoding the key can collect, so the value it was fetched
+                    // beside has to be published before that call.
+                    let value_slot = pyre_object::gc_roots::pin_roots(&[value_obj]);
+                    let key = crate::gateway::fsencode_bytes_w(
+                        pyre_object::gc_roots::shadow_stack_get(keys_base + i),
+                    )?;
+                    let value = crate::gateway::fsencode_bytes_w(
+                        pyre_object::gc_roots::shadow_stack_get(value_slot),
+                    )?;
                     if key.is_empty() || key.contains(&b'=') {
                         return Err(crate::PyError::value_error(
                             "illegal environment variable name",
