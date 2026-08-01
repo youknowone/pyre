@@ -131,6 +131,21 @@ pub struct W_Random {
     rnd: Random,
 }
 
+// `has_mapdict_storage` admits a `_random.Random` to the shared mapdict path,
+// where `_obj_getdict` / `_obj_setdict` and `object_object_custom_trace` read
+// `map` and `storage` through a `W_ObjectObject` cast. Pin the prefix so a
+// field reorder here is a build error rather than a silently misread slot.
+const _: () = assert!(
+    std::mem::offset_of!(W_Random, map)
+        == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, map),
+    "W_Random must keep W_ObjectObject's map offset"
+);
+const _: () = assert!(
+    std::mem::offset_of!(W_Random, storage)
+        == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, storage),
+    "W_Random must keep W_ObjectObject's storage offset"
+);
+
 #[crate::pyre_methods(
     doc = "Random() -> create a random number generator.\n\nNot for security or cryptographic use.",
     weakrefable
