@@ -1612,9 +1612,9 @@ pub(crate) fn fbw_terminate_void_with_finish<Sym: WalkSym>(
 /// the trace has finished, so the coordinate has to be published before it
 /// does.
 ///
-/// The store is the static-field shape `gen_store_back_in_vable` emits for
-/// this slot, so it reaches the frame on a compiled run; the shadow mirror
-/// keeps the walker's own virtualizable view in step with it.
+/// The store reaches the frame on a compiled run the way
+/// `gen_store_back_in_vable`'s does; the shadow mirror keeps the walker's own
+/// virtualizable view in step with it.
 pub(crate) fn fbw_publish_exit_last_instr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     opcode_position: usize,
@@ -1638,8 +1638,20 @@ pub(crate) fn fbw_publish_exit_last_instr<Sym: WalkSym>(
         return;
     };
     let value = ctx.trace_ctx.const_int(i64::from(py_pc));
-    ctx.trace_ctx
-        .vable_setfield_descr(vbox, value, info.static_field_descr(field_index));
+    // Record under the PARENT-STRUCT field descr, the resolution
+    // `vable_setfield` applies through `vable_static_record_descr`, not the
+    // vinfo's own `static_field_descrs[i]`.  `virtualizable.py:71` builds the
+    // vinfo descrs with `cpu.fielddescrof(VTYPE, name)`, so upstream's vinfo
+    // descr and the descr an ordinary `setfield_gc` on that field carries are
+    // the same object; pyre keeps the two numberings apart, so a store left on
+    // the vinfo descr reaches the optimizer as a location of its own.  A frame
+    // that catches gets `last_instr` written twice at one offset — the raise
+    // coordinate by the traceback node, the return coordinate here — and under
+    // two descrs neither store supersedes the other, so which one survives to
+    // the frame is decided by the order the deferred stores are flushed in
+    // rather than the order they were recorded in.
+    let descr = info.static_field_struct_descr(field_index);
+    ctx.trace_ctx.vable_setfield_descr(vbox, value, descr);
     crate::trace_opcode::mirror_vable_static_to_boxes(
         ctx.trace_ctx,
         "last_instr",
