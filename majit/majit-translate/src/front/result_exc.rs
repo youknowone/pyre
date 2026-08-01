@@ -1736,6 +1736,19 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
             {
                 op.result.clone().map(|m| (i, m))
             }
+            // The derived `PyErrorKind::eq` between two fieldless enums lowers
+            // to a discriminant `BinOp { op: "eq" }` (both operands sit in the
+            // int bank), the twin of the `sc` ConstInt form handled above. Pin
+            // the operands to exactly `{kind_var, sc}` in either order — as
+            // strict as the `Method` `args.contains` pair — so a comparison
+            // against any other kind can never fuse into a StopIteration test.
+            OpKind::BinOp { op: binop, lhs, rhs, .. }
+                if binop == "eq"
+                    && ((*lhs == kind_var && *rhs == sc)
+                        || (*lhs == sc && *rhs == kind_var)) =>
+            {
+                op.result.clone().map(|m| (i, m))
+            }
             _ => None,
         })
         .ok_or_else(|| format!("{name}: drain fuse: Err arm lacks the PyErrorKind::eq call"))?;
