@@ -85,6 +85,7 @@ pub(crate) mod range_iter;
 pub(crate) mod rbigint_call;
 pub(crate) mod result_exc;
 pub mod semantic;
+pub(crate) mod saturating_sub;
 pub(crate) mod slice_first;
 pub(crate) mod slice_index;
 pub mod typestr;

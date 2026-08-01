@@ -2275,6 +2275,18 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.slice_first_sites,
             )
         };
+        // The `saturating_sub` clamp rewrite (`front::saturating_sub`) splits
+        // the residual `saturating_sub` call block into an `if a < b { 0 } else
+        // { a - b }` diamond, same post-lowering shape and fail-safe contract as
+        // `slice_first`; gate the reachability sweep on an actual rewrite.
+        let saturating_sub_rewritten = if lo.saturating_sub_sites.is_empty() {
+            0
+        } else {
+            crate::front::saturating_sub::rewire_saturating_sub_call_sites(
+                &mut lo.graph,
+                &lo.saturating_sub_sites,
+            )
+        };
         // The `Option::unwrap_or` value-select rewrite
         // (`front::option_unwrap_or`) splits the residual `unwrap_or` call
         // block into a `__discriminant` diamond, same post-lowering shape and
@@ -2377,6 +2389,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || option_try_stats.rewritten > 0
             || bool_then_rewritten > 0
             || slice_first_rewritten > 0
+            || saturating_sub_rewritten > 0
             || unwrap_or_rewritten > 0
             || unwrap_rewritten > 0
             || expect_rewritten > 0
@@ -2783,6 +2796,11 @@ struct Lowering<'a> {
     /// after the body lowering completes (see
     /// [`crate::front::slice_first::SliceFirstSite`]).
     slice_first_sites: Vec<crate::front::slice_first::SliceFirstSite>,
+    /// `{uN}::saturating_sub(a, b)` call sites recorded for the unsigned clamp
+    /// diamond (`if a < b { 0 } else { a - b }`) the
+    /// `front::saturating_sub` post-pass synthesizes after body lowering (see
+    /// [`crate::front::saturating_sub::SaturatingSubSite`]).
+    saturating_sub_sites: Vec<crate::front::saturating_sub::SaturatingSubSite>,
     /// `RangeInclusive::new(lo, hi)` call sites recorded for the
     /// `(a..=b).contains(&x)` → `bitand(le, ge)` fold the
     /// `front::range_contains` post-pass synthesizes (see
@@ -3015,6 +3033,7 @@ impl<'a> Lowering<'a> {
             option_try_sites: Vec::new(),
             bool_then_sites: Vec::new(),
             slice_first_sites: Vec::new(),
+            saturating_sub_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
             range_contains_sites: Vec::new(),
@@ -8685,6 +8704,26 @@ impl<'a> Lowering<'a> {
         {
             self.slice_first_sites.push(site);
         }
+        // Capture `{uN}::saturating_sub(a, b)` sites for the unsigned clamp
+        // diamond `front::saturating_sub` synthesizes.  `saturating_sub` is a
+        // foreign leaf (its `Self` is a primitive integer, so `lower_call`
+        // keeps the raw `FunctionPath` segments), residualized as an
+        // unregistered callee the rtyper census Skips.  Restricted to unsigned
+        // receivers (every observed site is `usize`/`u16`/`u32`): the clamp
+        // floors at zero via `a < b`; a signed `saturating_sub` floors at
+        // `TYPE_MIN` (a different diamond) and stays residual.  A resolution
+        // miss leaves the residual call.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["num", "<Impl>", "saturating_sub"])
+            && let Some(site) = self.recognize_saturating_sub_site(&call.dest.ty, &result_var)
+        {
+            self.saturating_sub_sites.push(site);
+        }
         // Capture `RangeInclusive::new(lo, hi)` sites for the
         // `(a..=b).contains(&x)` fold `front::range_contains` synthesizes.
         // `new` is an inherent-impl associated function whose owner
@@ -10828,6 +10867,22 @@ impl<'a> Lowering<'a> {
             option_owner,
             some_owner,
             payload_ty,
+        })
+    }
+
+    /// Resolve a recognized `{uN}::saturating_sub(a, b)` call into a
+    /// [`crate::front::saturating_sub::SaturatingSubSite`].  Gated on an
+    /// **unsigned** result type (`saturating_sub` returns the receiver `uN`):
+    /// the unsigned clamp floors at zero via `a < b`.  A signed `saturating_sub`
+    /// floors at `TYPE_MIN` (a different diamond) and is left residual (`None`).
+    fn recognize_saturating_sub_site(
+        &self,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::saturating_sub::SaturatingSubSite> {
+        self.tyref_literal_uint_atom(dest_ty)?;
+        Some(crate::front::saturating_sub::SaturatingSubSite {
+            result_var: result_var.clone(),
         })
     }
 
@@ -22708,6 +22763,60 @@ mod tests {
         assert!(
             array_writes >= 1,
             "fill_user_function_args: expected at least one native ArrayWrite (setarrayitem)"
+        );
+    }
+
+    /// Real-LLBC anchor for the unsigned `saturating_sub` clamp diamond:
+    /// `generic_alias_class_getitem`'s arg-count error path computes
+    /// `args.len().saturating_sub(1)`.  After the `front::saturating_sub`
+    /// post-pass there must be no residual `["num","<Impl>","saturating_sub"]`
+    /// call and at least one `lt` guard + one `sub` (the `if a < b { 0 } else
+    /// { a - b }` diamond).  `#[ignore]`d (loads the ~440MB real LLBC); run with
+    /// `cargo test -p majit-translate --lib saturating_sub_generic_alias_real
+    /// -- --ignored`.
+    #[test]
+    #[ignore]
+    fn saturating_sub_generic_alias_real() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "generic_alias_class_getitem")
+            .expect("lower generic_alias_class_getitem");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["num", "<Impl>", "saturating_sub"])
+                )
+            })
+            .count();
+        assert_eq!(
+            residual, 0,
+            "generic_alias_class_getitem: residual saturating_sub after the clamp-diamond rewrite"
+        );
+        let lt_guards = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "lt"))
+            .count();
+        let subs = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "sub"))
+            .count();
+        assert!(
+            lt_guards >= 1 && subs >= 1,
+            "generic_alias_class_getitem: expected the a<b guard and the a-b subtraction \
+             (lt={lt_guards}, sub={subs})"
         );
     }
 
