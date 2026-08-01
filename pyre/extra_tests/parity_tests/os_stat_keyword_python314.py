@@ -22,19 +22,23 @@ else:
 # `follow_symlinks=False` has to reach the link itself, which the checks
 # above cannot observe: `.` is not a symlink, so both calls describe the
 # same file whether or not the flag is honored.
-root = tempfile.mkdtemp()
-try:
-    target = os.path.join(root, "target")
-    link = os.path.join(root, "link")
-    with open(target, "w") as stream:
-        stream.write("0123456789")
-    os.symlink(target, link)
-    assert os.stat(link).st_ino == os.stat(target).st_ino
-    assert os.stat(link, follow_symlinks=False).st_ino != os.stat(target).st_ino
-    assert os.stat(link, follow_symlinks=False).st_ino == os.lstat(link).st_ino
-    assert os.stat(link).st_size == 10
-    assert os.stat(link, follow_symlinks=False).st_size != 10
-finally:
-    shutil.rmtree(root)
+#
+# Creating one is skipped on Windows, where it needs a privilege the test
+# cannot assume.
+if os.name != "nt":
+    root = tempfile.mkdtemp()
+    try:
+        target = os.path.join(root, "target")
+        link = os.path.join(root, "link")
+        with open(target, "w") as stream:
+            stream.write("0123456789")
+        os.symlink(target, link)
+        assert os.stat(link).st_ino == os.stat(target).st_ino
+        assert os.stat(link, follow_symlinks=False).st_ino != os.stat(target).st_ino
+        assert os.stat(link, follow_symlinks=False).st_ino == os.lstat(link).st_ino
+        assert os.stat(link).st_size == 10
+        assert os.stat(link, follow_symlinks=False).st_size != 10
+    finally:
+        shutil.rmtree(root)
 
 print("OK")
