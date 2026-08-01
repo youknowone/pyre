@@ -18,8 +18,7 @@ use std::cmp::Ordering;
 use crate::object_array::{
     GC_INT_ARRAY_GC_TYPE_ID, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TypedItemsBlock,
     alloc_typed_items_block_immortal, alloc_typed_items_block_nursery,
-    try_alloc_typed_items_block_nursery, typed_items_block_capacity,
-    typed_items_block_items_base,
+    try_alloc_typed_items_block_nursery, typed_items_block_capacity, typed_items_block_items_base,
 };
 
 pub const SUPPORT_INT128: bool = true;
@@ -518,11 +517,13 @@ pub(crate) fn alloc_rbigint_nursery_impl(
     let tid = rbigint_gc_type_id();
     let mut needs_write_barrier = true;
     if tid != 0
-        && let Some(raw) = crate::gc_hook::try_gc_alloc_with_placement(
-            tid,
-            RBIGINT_PAYLOAD_SIZE,
-            &mut needs_write_barrier,
-        )
+        && let Some(raw) = unsafe {
+            crate::gc_hook::try_gc_alloc_fast_with_placement(
+                tid,
+                RBIGINT_PAYLOAD_SIZE,
+                &mut needs_write_barrier,
+            )
+        }
         .filter(|pointer| !pointer.is_null())
     {
         unsafe {
@@ -560,10 +561,15 @@ fn alloc_rbigint_nursery_collecting_impl(
         // collecting hook preserves that shape: the common nursery bump does
         // no dynamic root-set mutation, while the nursery-full slow path
         // temporarily registers and forwards this exact digit slot.
+        //
+        // The rbigint payload registers no destructor and is not a WEAKREF —
+        // its one traced edge is `_digits` — so this malloc site is one of the
+        // `malloc_fast` sites `gct_fv_gc_malloc` (`framework.py:820-838`)
+        // selects.
         let digit_slot = (&mut value._digits as *mut *mut TypedItemsBlock).cast::<*mut u8>();
         let mut needs_write_barrier = true;
         let raw = unsafe {
-            crate::gc_hook::try_gc_alloc_collecting_rooted(
+            crate::gc_hook::try_gc_alloc_fast_collecting_rooted(
                 tid,
                 RBIGINT_PAYLOAD_SIZE,
                 digit_slot,

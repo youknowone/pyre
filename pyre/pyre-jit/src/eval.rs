@@ -54,6 +54,14 @@ fn pyre_object_gc_alloc_trampoline(type_id: u32, size: usize) -> *mut u8 {
     majit_gc::alloc_nursery_typed(type_id, size).0 as *mut u8
 }
 
+/// `malloc_fast` companion of [`pyre_object_gc_alloc_trampoline`].
+///
+/// # Safety
+/// `type_id` must name a type with no destructor and no weakref flag.
+unsafe fn pyre_object_gc_alloc_fast_trampoline(type_id: u32, size: usize) -> *mut u8 {
+    unsafe { majit_gc::alloc_fast_nursery_typed(type_id, size) }.0 as *mut u8
+}
+
 /// Placement-reporting companion of [`pyre_object_gc_alloc_trampoline`].
 ///
 /// # Safety
@@ -66,6 +74,21 @@ unsafe fn pyre_object_gc_alloc_with_placement_trampoline(
 ) -> *mut u8 {
     unsafe { majit_gc::alloc_nursery_typed_with_placement(type_id, size, needs_write_barrier) }.0
         as *mut u8
+}
+
+/// `malloc_fast` companion of
+/// [`pyre_object_gc_alloc_with_placement_trampoline`].
+///
+/// # Safety
+/// Same contract, plus `type_id` must name a type with no destructor and no
+/// weakref flag.
+unsafe fn pyre_object_gc_alloc_fast_with_placement_trampoline(
+    type_id: u32,
+    size: usize,
+    needs_write_barrier: *mut bool,
+) -> *mut u8 {
+    unsafe { majit_gc::alloc_fast_nursery_typed_with_placement(type_id, size, needs_write_barrier) }
+        .0 as *mut u8
 }
 
 /// Trampoline for stable-address host-side allocations.
@@ -101,6 +124,29 @@ unsafe fn pyre_object_gc_alloc_collecting_rooted_trampoline(
 ) -> *mut u8 {
     unsafe {
         majit_gc::alloc_nursery_collecting_typed_rooted(
+            type_id,
+            size,
+            root as *mut majit_ir::GcRef,
+            needs_write_barrier,
+        )
+        .0 as *mut u8
+    }
+}
+
+/// `malloc_fast` companion of
+/// [`pyre_object_gc_alloc_collecting_rooted_trampoline`].
+///
+/// # Safety
+/// Same contract, plus `type_id` must name a type with no destructor and no
+/// weakref flag.
+unsafe fn pyre_object_gc_alloc_fast_collecting_rooted_trampoline(
+    type_id: u32,
+    size: usize,
+    root: *mut *mut u8,
+    needs_write_barrier: *mut bool,
+) -> *mut u8 {
+    unsafe {
+        majit_gc::alloc_fast_nursery_collecting_typed_rooted(
             type_id,
             size,
             root as *mut majit_ir::GcRef,
@@ -3843,8 +3889,12 @@ fn register_thread_root_areas() {
 /// `Cell` slots and do not touch interpreter state.
 fn install_pyre_object_hooks() {
     pyre_object::register_gc_alloc_hook(pyre_object_gc_alloc_trampoline);
+    pyre_object::gc_hook::register_gc_alloc_fast_hook(pyre_object_gc_alloc_fast_trampoline);
     pyre_object::register_gc_alloc_with_placement_hook(
         pyre_object_gc_alloc_with_placement_trampoline,
+    );
+    pyre_object::gc_hook::register_gc_alloc_fast_with_placement_hook(
+        pyre_object_gc_alloc_fast_with_placement_trampoline,
     );
     pyre_object::register_gc_alloc_stable_hook(pyre_object_gc_alloc_stable_trampoline);
     pyre_object::gc_hook::register_gc_alloc_collecting_hook(
@@ -3852,6 +3902,9 @@ fn install_pyre_object_hooks() {
     );
     pyre_object::gc_hook::register_gc_alloc_collecting_rooted_hook(
         pyre_object_gc_alloc_collecting_rooted_trampoline,
+    );
+    pyre_object::gc_hook::register_gc_alloc_fast_collecting_rooted_hook(
+        pyre_object_gc_alloc_fast_collecting_rooted_trampoline,
     );
     pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
     pyre_object::gc_hook::register_gc_collect_oldgen_hook(pyre_object_gc_collect_oldgen_trampoline);

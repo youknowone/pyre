@@ -753,6 +753,10 @@ pub unsafe fn alloc_typed_items_block_nursery(cap: usize, tid: u32) -> *mut Type
 }
 
 /// Fallible companion of [`alloc_typed_items_block_nursery`].
+///
+/// # Safety
+/// `tid` must name a registered array type with no destructor and no weakref
+/// flag — the `GcArray(Signed)` / `GcArray(Float)` bodies this serves.
 pub unsafe fn try_alloc_typed_items_block_nursery(
     cap: usize,
     tid: u32,
@@ -760,7 +764,10 @@ pub unsafe fn try_alloc_typed_items_block_nursery(
     let cap = cap.max(1);
     let layout = try_typed_items_block_layout(cap)?;
     if itemsblock_gc_enabled() {
-        match crate::gc_hook::try_gc_alloc(tid, layout.size()) {
+        // `GcArray(Signed)` / `GcArray(Float)` bodies: no finalizer, not a
+        // WEAKREF, so `gct_fv_gc_malloc` (`framework.py:820-838`) reaches
+        // `malloc_fast`.
+        match unsafe { crate::gc_hook::try_gc_alloc_fast(tid, layout.size()) } {
             Some(raw) if raw.is_null() => return None,
             Some(raw) => {
                 let block = raw as *mut TypedItemsBlock;

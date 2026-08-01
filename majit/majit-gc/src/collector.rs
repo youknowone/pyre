@@ -992,6 +992,53 @@ impl MiniMarkGC {
         root: *mut GcRef,
         needs_write_barrier: *mut bool,
     ) -> GcRef {
+        unsafe {
+            self.alloc_with_type_rooted_body::<false>(
+                type_id,
+                payload_size,
+                root,
+                needs_write_barrier,
+            )
+        }
+    }
+
+    /// [`alloc_with_type_rooted`](Self::alloc_with_type_rooted) for a type that
+    /// carries neither a finalizer nor the weakref flag: `malloc_fast`
+    /// (`framework.py:361-382`), the copy `gct_fv_gc_malloc` selects at
+    /// `framework.py:830-838` for exactly that case.
+    ///
+    /// # Safety
+    /// Same contract as [`alloc_with_type_rooted`](Self::alloc_with_type_rooted),
+    /// plus `type_id` must name a type with no destructor and no weakref flag.
+    #[inline]
+    pub unsafe fn alloc_fast_with_type_rooted(
+        &mut self,
+        type_id: u32,
+        payload_size: usize,
+        root: *mut GcRef,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe {
+            self.alloc_with_type_rooted_body::<true>(
+                type_id,
+                payload_size,
+                root,
+                needs_write_barrier,
+            )
+        }
+    }
+
+    /// # Safety
+    /// See [`alloc_with_type_rooted`](Self::alloc_with_type_rooted); `FAST`
+    /// additionally carries `malloc_fast`'s obligation on `type_id`.
+    #[inline]
+    unsafe fn alloc_with_type_rooted_body<const FAST: bool>(
+        &mut self,
+        type_id: u32,
+        payload_size: usize,
+        root: *mut GcRef,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
         unsafe { *needs_write_barrier = false };
 
         #[cfg(feature = "gc_stress")]
@@ -1008,7 +1055,7 @@ impl MiniMarkGC {
         if total_size <= self.config.large_object_threshold {
             let ptr = self.nursery.alloc(total_size);
             if !ptr.is_null() {
-                return self.finish_nursery_object(ptr, type_id);
+                return self.finish_bumped_nursery_object::<FAST>(ptr, type_id);
             }
         }
         unsafe { self.alloc_with_type_rooted_slow(type_id, total_size, root, needs_write_barrier) }
@@ -1060,8 +1107,46 @@ impl MiniMarkGC {
         self.finish_nursery_object(ptr, type_id)
     }
 
-    /// The tail every nursery bump shares: `init_gc_object` plus the
-    /// weakref and destructor registration of incminimark.py:687-693.
+    /// The tail a successful nursery bump runs: `init_gc_object`, then
+    /// incminimark.py:687-693's two registrations.
+    ///
+    /// `FAST` is `malloc_fast` (`framework.py:361-382`), the copy of
+    /// `malloc_fixedsize` annotated `s_False, s_False, s_False` — under that
+    /// annotation both `if`s constant-fold away, so the common allocation never
+    /// reaches the type's flags at all. `gct_fv_gc_malloc`
+    /// (`framework.py:830-838`) selects the copy only for a type with no
+    /// finalizer, and never passes `contains_weakptr=True` for a fixed-size
+    /// malloc: a WEAKREF is built by `gct_weakref_create` instead. The
+    /// obligation rides with the caller here too, so the `ll_assert` the
+    /// general body spells out becomes a debug assertion.
+    #[inline]
+    fn finish_bumped_nursery_object<const FAST: bool>(
+        &mut self,
+        ptr: *mut u8,
+        type_id: u32,
+    ) -> GcRef {
+        if FAST {
+            debug_assert!(
+                !self.type_needs_young_registration(type_id),
+                "malloc_fast served a type that needs a young weakref/destructor registration"
+            );
+            Self::init_nursery_object(ptr, type_id);
+            return GcRef((ptr as usize) + GcHeader::SIZE);
+        }
+        self.finish_nursery_object(ptr, type_id)
+    }
+
+    /// The `malloc_fast` precondition, as the debug build checks it.
+    fn type_needs_young_registration(&self, type_id: u32) -> bool {
+        if (type_id as usize) >= self.types.len() {
+            return false;
+        }
+        let info = self.types.get(type_id);
+        info.is_weakref || info.destructor.is_some()
+    }
+
+    /// The tail every non-`malloc_fast` nursery bump shares: `init_gc_object`
+    /// plus the weakref and destructor registration of incminimark.py:687-693.
     #[inline]
     fn finish_nursery_object(&mut self, ptr: *mut u8, type_id: u32) -> GcRef {
         Self::init_nursery_object(ptr, type_id);
@@ -1217,6 +1302,27 @@ impl MiniMarkGC {
         }
     }
 
+    /// [`try_alloc_with_type_no_collect`](Self::try_alloc_with_type_no_collect)
+    /// for a type that carries neither a finalizer nor the weakref flag:
+    /// `malloc_fast` (`framework.py:361-382`).
+    ///
+    /// # Safety
+    /// `type_id` must name a type with no destructor and no weakref flag.
+    pub unsafe fn try_alloc_fast_with_type_no_collect(
+        &mut self,
+        type_id: u32,
+        payload_size: usize,
+    ) -> GcRef {
+        let mut needs_write_barrier = true;
+        unsafe {
+            self.try_alloc_fast_with_type_no_collect_with_placement(
+                type_id,
+                payload_size,
+                &mut needs_write_barrier,
+            )
+        }
+    }
+
     /// Placement-reporting counterpart of
     /// [`try_alloc_with_type_no_collect`](Self::try_alloc_with_type_no_collect).
     ///
@@ -1237,6 +1343,50 @@ impl MiniMarkGC {
         payload_size: usize,
         needs_write_barrier: *mut bool,
     ) -> GcRef {
+        unsafe {
+            self.try_alloc_with_type_no_collect_body::<false>(
+                type_id,
+                payload_size,
+                needs_write_barrier,
+            )
+        }
+    }
+
+    /// [`try_alloc_with_type_no_collect_with_placement`](Self::try_alloc_with_type_no_collect_with_placement)
+    /// for a type that carries neither a finalizer nor the weakref flag:
+    /// `malloc_fast` (`framework.py:361-382`).
+    ///
+    /// # Safety
+    /// Same contract as
+    /// [`try_alloc_with_type_no_collect_with_placement`](Self::try_alloc_with_type_no_collect_with_placement),
+    /// plus `type_id` must name a type with no destructor and no weakref flag.
+    #[inline]
+    pub unsafe fn try_alloc_fast_with_type_no_collect_with_placement(
+        &mut self,
+        type_id: u32,
+        payload_size: usize,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe {
+            self.try_alloc_with_type_no_collect_body::<true>(
+                type_id,
+                payload_size,
+                needs_write_barrier,
+            )
+        }
+    }
+
+    /// # Safety
+    /// See
+    /// [`try_alloc_with_type_no_collect_with_placement`](Self::try_alloc_with_type_no_collect_with_placement);
+    /// `FAST` additionally carries `malloc_fast`'s obligation on `type_id`.
+    #[inline]
+    unsafe fn try_alloc_with_type_no_collect_body<const FAST: bool>(
+        &mut self,
+        type_id: u32,
+        payload_size: usize,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
         unsafe { *needs_write_barrier = true };
         let Some(total_size) = GcHeader::SIZE.checked_add(payload_size) else {
             return GcRef(0);
@@ -1245,7 +1395,7 @@ impl MiniMarkGC {
         if total_size <= self.config.large_object_threshold {
             let ptr = self.nursery.alloc(total_size);
             if !ptr.is_null() {
-                let obj = self.finish_nursery_object(ptr, type_id);
+                let obj = self.finish_bumped_nursery_object::<FAST>(ptr, type_id);
                 unsafe { *needs_write_barrier = false };
                 return obj;
             }
@@ -4265,6 +4415,16 @@ impl GcAllocator for MiniMarkGC {
         unsafe { self.alloc_with_type_rooted(type_id, size, root, needs_write_barrier) }
     }
 
+    unsafe fn alloc_fast_nursery_collecting_typed_rooted(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        root: *mut GcRef,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe { self.alloc_fast_with_type_rooted(type_id, size, root, needs_write_barrier) }
+    }
+
     fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef {
         self.alloc_with_type_no_collect(0, size)
     }
@@ -4277,6 +4437,14 @@ impl GcAllocator for MiniMarkGC {
         self.try_alloc_with_type_no_collect(type_id, size)
     }
 
+    unsafe fn try_alloc_fast_nursery_no_collect_typed(
+        &mut self,
+        type_id: u32,
+        size: usize,
+    ) -> GcRef {
+        unsafe { self.try_alloc_fast_with_type_no_collect(type_id, size) }
+    }
+
     unsafe fn try_alloc_nursery_no_collect_typed_with_placement(
         &mut self,
         type_id: u32,
@@ -4285,6 +4453,21 @@ impl GcAllocator for MiniMarkGC {
     ) -> GcRef {
         unsafe {
             self.try_alloc_with_type_no_collect_with_placement(type_id, size, needs_write_barrier)
+        }
+    }
+
+    unsafe fn try_alloc_fast_nursery_no_collect_typed_with_placement(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe {
+            self.try_alloc_fast_with_type_no_collect_with_placement(
+                type_id,
+                size,
+                needs_write_barrier,
+            )
         }
     }
 

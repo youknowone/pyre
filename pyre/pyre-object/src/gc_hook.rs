@@ -80,6 +80,23 @@ pub type GcAllocHookFn = fn(type_id: u32, payload_size: usize) -> *mut u8;
 majit_gc::global_hook!(static GC_ALLOC_HOOK: GcAllocHookFn);
 majit_gc::global_hook!(static GC_ALLOC_STABLE_HOOK: GcAllocHookFn);
 
+/// `malloc_fast` companion of [`GcAllocHookFn`].
+///
+/// `gct_fv_gc_malloc` (`framework.py:820-838`) resolves the allocated type's
+/// finalizer and weakref properties while transforming the malloc site, and
+/// calls the `inline=True` copy of `malloc_fixedsize` annotated
+/// `s_False, s_False, s_False` (`framework.py:361-382`) whenever both are
+/// false — which folds incminimark.py:687-693's two registrations out of the
+/// body. A pyre call site with a statically known type id is in the same
+/// position, so it selects the folded entry point the same way.
+///
+/// # Safety
+/// The caller passes a `type_id` naming a type with no destructor and no
+/// weakref flag.
+pub type GcAllocFastHookFn = unsafe fn(type_id: u32, payload_size: usize) -> *mut u8;
+
+majit_gc::global_hook!(static GC_ALLOC_FAST_HOOK: GcAllocFastHookFn);
+
 /// Placement-reporting companion of [`GcAllocHookFn`] for no-collect
 /// allocations that may spill from the nursery to old-gen.
 pub type GcAllocWithPlacementHookFn =
@@ -87,6 +104,10 @@ pub type GcAllocWithPlacementHookFn =
 
 majit_gc::global_hook!(
     static GC_ALLOC_WITH_PLACEMENT_HOOK: GcAllocWithPlacementHookFn
+);
+
+majit_gc::global_hook!(
+    static GC_ALLOC_FAST_WITH_PLACEMENT_HOOK: GcAllocWithPlacementHookFn
 );
 
 /// Install the allocation callback. Overwrites any previously-installed hook.
@@ -106,6 +127,31 @@ pub fn clear_gc_alloc_hook() {
 #[inline]
 pub fn try_gc_alloc(type_id: u32, payload_size: usize) -> Option<*mut u8> {
     GC_ALLOC_HOOK.get().map(|f| f(type_id, payload_size))
+}
+
+/// Install the `malloc_fast` allocation callback.
+pub fn register_gc_alloc_fast_hook(hook: GcAllocFastHookFn) {
+    GC_ALLOC_FAST_HOOK.set(Some(hook));
+}
+
+/// Remove the `malloc_fast` allocation callback.
+pub fn clear_gc_alloc_fast_hook() {
+    GC_ALLOC_FAST_HOOK.set(None);
+}
+
+/// [`try_gc_alloc`] for a statically-known type that carries neither a
+/// finalizer nor the weakref flag. Falls back to the general hook when no
+/// backend installed the folded one — the general body is always a correct
+/// implementation of the folded one.
+///
+/// # Safety
+/// `type_id` must name a type with no destructor and no weakref flag.
+#[inline]
+pub unsafe fn try_gc_alloc_fast(type_id: u32, payload_size: usize) -> Option<*mut u8> {
+    if let Some(f) = GC_ALLOC_FAST_HOOK.get() {
+        return Some(unsafe { f(type_id, payload_size) });
+    }
+    try_gc_alloc(type_id, payload_size)
 }
 
 pub fn register_gc_alloc_with_placement_hook(hook: GcAllocWithPlacementHookFn) {
@@ -130,6 +176,33 @@ pub fn try_gc_alloc_with_placement(
     }
     *needs_write_barrier = true;
     try_gc_alloc(type_id, payload_size)
+}
+
+/// Install the `malloc_fast` placement-reporting allocation callback.
+pub fn register_gc_alloc_fast_with_placement_hook(hook: GcAllocWithPlacementHookFn) {
+    GC_ALLOC_FAST_WITH_PLACEMENT_HOOK.set(Some(hook));
+}
+
+/// Remove the `malloc_fast` placement-reporting allocation callback.
+pub fn clear_gc_alloc_fast_with_placement_hook() {
+    GC_ALLOC_FAST_WITH_PLACEMENT_HOOK.set(None);
+}
+
+/// [`try_gc_alloc_with_placement`] for a statically-known type that carries
+/// neither a finalizer nor the weakref flag.
+///
+/// # Safety
+/// `type_id` must name a type with no destructor and no weakref flag.
+#[inline]
+pub unsafe fn try_gc_alloc_fast_with_placement(
+    type_id: u32,
+    payload_size: usize,
+    needs_write_barrier: &mut bool,
+) -> Option<*mut u8> {
+    if let Some(f) = GC_ALLOC_FAST_WITH_PLACEMENT_HOOK.get() {
+        return Some(unsafe { f(type_id, payload_size, needs_write_barrier as *mut bool) });
+    }
+    try_gc_alloc_with_placement(type_id, payload_size, needs_write_barrier)
 }
 
 /// Install the stable (old-gen) allocation callback for this thread.
@@ -211,12 +284,26 @@ majit_gc::global_hook!(
     static GC_ALLOC_COLLECTING_ROOTED_HOOK: GcAllocCollectingRootedHookFn
 );
 
+majit_gc::global_hook!(
+    static GC_ALLOC_FAST_COLLECTING_ROOTED_HOOK: GcAllocCollectingRootedHookFn
+);
+
 pub fn register_gc_alloc_collecting_rooted_hook(hook: GcAllocCollectingRootedHookFn) {
     GC_ALLOC_COLLECTING_ROOTED_HOOK.set(Some(hook));
 }
 
 pub fn clear_gc_alloc_collecting_rooted_hook() {
     GC_ALLOC_COLLECTING_ROOTED_HOOK.set(None);
+}
+
+/// Install the `malloc_fast` rooted collecting allocation callback.
+pub fn register_gc_alloc_fast_collecting_rooted_hook(hook: GcAllocCollectingRootedHookFn) {
+    GC_ALLOC_FAST_COLLECTING_ROOTED_HOOK.set(Some(hook));
+}
+
+/// Remove the `malloc_fast` rooted collecting allocation callback.
+pub fn clear_gc_alloc_fast_collecting_rooted_hook() {
+    GC_ALLOC_FAST_COLLECTING_ROOTED_HOOK.set(None);
 }
 
 /// Attempt a collecting allocation while preserving `root`.
@@ -248,6 +335,25 @@ pub unsafe fn try_gc_alloc_collecting_rooted(
         try_gc_remove_root(root);
     }
     Some(result)
+}
+
+/// [`try_gc_alloc_collecting_rooted`] for a statically-known type that carries
+/// neither a finalizer nor the weakref flag.
+///
+/// # Safety
+/// Same contract as [`try_gc_alloc_collecting_rooted`], plus `type_id` must
+/// name a type with no destructor and no weakref flag.
+#[inline]
+pub unsafe fn try_gc_alloc_fast_collecting_rooted(
+    type_id: u32,
+    payload_size: usize,
+    root: *mut *mut u8,
+    needs_write_barrier: *mut bool,
+) -> Option<*mut u8> {
+    if let Some(f) = GC_ALLOC_FAST_COLLECTING_ROOTED_HOOK.get() {
+        return Some(unsafe { f(type_id, payload_size, root, needs_write_barrier) });
+    }
+    unsafe { try_gc_alloc_collecting_rooted(type_id, payload_size, root, needs_write_barrier) }
 }
 
 /// Signature of the host-side full-collection callback. Used by

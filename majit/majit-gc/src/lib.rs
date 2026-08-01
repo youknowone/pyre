@@ -261,6 +261,32 @@ pub trait GcAllocator: Send {
         result
     }
 
+    /// [`Self::alloc_nursery_collecting_typed_rooted`] for a type that carries
+    /// neither a finalizer nor the weakref flag.
+    ///
+    /// `gct_fv_gc_malloc` (`framework.py:820-838`) resolves both properties at
+    /// transformation time and calls `malloc_fast` — the `inline=True` copy of
+    /// `malloc_fixedsize` annotated `s_False, s_False, s_False`
+    /// (`framework.py:361-382`) — whenever they are both false, which is the
+    /// case for every fixed-size malloc of a plain struct. The default forwards
+    /// to the general form, which is what a collector that does not distinguish
+    /// the two bodies has.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::alloc_nursery_collecting_typed_rooted`], plus
+    /// `type_id` must name a type with no destructor and no weakref flag.
+    unsafe fn alloc_fast_nursery_collecting_typed_rooted(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        root: *mut GcRef,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe {
+            self.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
+        }
+    }
+
     /// Allocate a fixed-size object without triggering collection.
     ///
     /// Implementations may fall back to old-gen allocation when the nursery
@@ -302,6 +328,20 @@ pub trait GcAllocator: Send {
         self.alloc_nursery_no_collect_typed(type_id, size)
     }
 
+    /// [`Self::try_alloc_nursery_no_collect_typed`] for a type that carries
+    /// neither a finalizer nor the weakref flag: `malloc_fast`
+    /// (`framework.py:361-382`).
+    ///
+    /// # Safety
+    /// `type_id` must name a type with no destructor and no weakref flag.
+    unsafe fn try_alloc_fast_nursery_no_collect_typed(
+        &mut self,
+        type_id: u32,
+        size: usize,
+    ) -> GcRef {
+        self.try_alloc_nursery_no_collect_typed(type_id, size)
+    }
+
     /// Fallible no-collect allocation that also reports whether initializing
     /// the fresh result with a young GC reference needs a creation barrier.
     ///
@@ -320,6 +360,29 @@ pub trait GcAllocator: Send {
     ) -> GcRef {
         unsafe { *needs_write_barrier = true };
         self.try_alloc_nursery_no_collect_typed(type_id, size)
+    }
+
+    /// [`Self::try_alloc_nursery_no_collect_typed_with_placement`] for a type
+    /// that carries neither a finalizer nor the weakref flag: `malloc_fast`
+    /// (`framework.py:361-382`).
+    ///
+    /// # Safety
+    /// Same contract as
+    /// [`Self::try_alloc_nursery_no_collect_typed_with_placement`], plus
+    /// `type_id` must name a type with no destructor and no weakref flag.
+    unsafe fn try_alloc_fast_nursery_no_collect_typed_with_placement(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe {
+            self.try_alloc_nursery_no_collect_typed_with_placement(
+                type_id,
+                size,
+                needs_write_barrier,
+            )
+        }
     }
 
     /// Allocate a variable-size object without triggering collection.
@@ -850,6 +913,17 @@ impl GcAllocator for GcHandle {
             gc.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
         })
     }
+    unsafe fn alloc_fast_nursery_collecting_typed_rooted(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        root: *mut GcRef,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        gc_sync::gc_op(|gc| unsafe {
+            gc.alloc_fast_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
+        })
+    }
     fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef {
         gc_sync::gc_op(|gc| gc.alloc_nursery_no_collect(size))
     }
@@ -871,6 +945,13 @@ impl GcAllocator for GcHandle {
     fn try_alloc_nursery_no_collect_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         gc_sync::gc_op(|gc| gc.try_alloc_nursery_no_collect_typed(type_id, size))
     }
+    unsafe fn try_alloc_fast_nursery_no_collect_typed(
+        &mut self,
+        type_id: u32,
+        size: usize,
+    ) -> GcRef {
+        gc_sync::gc_op(|gc| unsafe { gc.try_alloc_fast_nursery_no_collect_typed(type_id, size) })
+    }
     unsafe fn try_alloc_nursery_no_collect_typed_with_placement(
         &mut self,
         type_id: u32,
@@ -879,6 +960,20 @@ impl GcAllocator for GcHandle {
     ) -> GcRef {
         gc_sync::gc_op(|gc| unsafe {
             gc.try_alloc_nursery_no_collect_typed_with_placement(type_id, size, needs_write_barrier)
+        })
+    }
+    unsafe fn try_alloc_fast_nursery_no_collect_typed_with_placement(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        gc_sync::gc_op(|gc| unsafe {
+            gc.try_alloc_fast_nursery_no_collect_typed_with_placement(
+                type_id,
+                size,
+                needs_write_barrier,
+            )
         })
     }
     fn alloc_varsize_no_collect(
@@ -1459,6 +1554,16 @@ pub fn standalone_alloc_nursery_typed(type_id: u32, payload_size: usize) -> GcRe
     gc_sync::gc_op(|g| g.try_alloc_nursery_no_collect_typed(type_id, payload_size))
 }
 
+/// [`standalone_alloc_nursery_typed`] for a type that carries neither a
+/// finalizer nor the weakref flag: `malloc_fast` (`framework.py:361-382`).
+///
+/// # Safety
+/// `type_id` must name a type with no destructor and no weakref flag.
+#[inline]
+pub unsafe fn standalone_alloc_fast_nursery_typed(type_id: u32, payload_size: usize) -> GcRef {
+    gc_sync::gc_op(|g| unsafe { g.try_alloc_fast_nursery_no_collect_typed(type_id, payload_size) })
+}
+
 /// The rooted collecting nursery allocation a backend's
 /// `AllocNurseryCollectingTypedRootedFn` performs once no per-thread box owns
 /// the request.
@@ -1475,6 +1580,30 @@ pub unsafe fn standalone_alloc_nursery_collecting_typed_rooted(
 ) -> GcRef {
     gc_sync::gc_op(|g| unsafe {
         g.alloc_nursery_collecting_typed_rooted(type_id, payload_size, root, needs_write_barrier)
+    })
+}
+
+/// [`standalone_alloc_nursery_collecting_typed_rooted`] for a type that carries
+/// neither a finalizer nor the weakref flag: `malloc_fast`
+/// (`framework.py:361-382`).
+///
+/// # Safety
+/// Same contract as [`standalone_alloc_nursery_collecting_typed_rooted`], plus
+/// `type_id` must name a type with no destructor and no weakref flag.
+#[inline]
+pub unsafe fn standalone_alloc_fast_nursery_collecting_typed_rooted(
+    type_id: u32,
+    payload_size: usize,
+    root: *mut GcRef,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    gc_sync::gc_op(|g| unsafe {
+        g.alloc_fast_nursery_collecting_typed_rooted(
+            type_id,
+            payload_size,
+            root,
+            needs_write_barrier,
+        )
     })
 }
 
@@ -1498,6 +1627,27 @@ pub fn set_active_alloc_nursery_typed(hook: Option<AllocNurseryTypedFn>) {
 pub fn alloc_nursery_typed(type_id: u32, payload_size: usize) -> GcRef {
     match ACTIVE_ALLOC_NURSERY_TYPED.get() {
         Some(_) if !gc_box_installed() => standalone_alloc_nursery_typed(type_id, payload_size),
+        Some(f) => f(type_id, payload_size),
+        None => GcRef(0),
+    }
+}
+
+/// [`alloc_nursery_typed`] for a type that carries neither a finalizer nor the
+/// weakref flag: `malloc_fast` (`framework.py:361-382`), the copy
+/// `gct_fv_gc_malloc` (`framework.py:820-838`) selects for exactly that case.
+///
+/// Only the direct path folds the two registrations out. A per-thread GC box is
+/// a backend-test configuration, so its `AllocNurseryTypedFn` keeps running the
+/// general body — always a correct implementation of the fast one, just with
+/// the two constant-false tests still present.
+///
+/// # Safety
+/// `type_id` must name a type with no destructor and no weakref flag.
+pub unsafe fn alloc_fast_nursery_typed(type_id: u32, payload_size: usize) -> GcRef {
+    match ACTIVE_ALLOC_NURSERY_TYPED.get() {
+        Some(_) if !gc_box_installed() => unsafe {
+            standalone_alloc_fast_nursery_typed(type_id, payload_size)
+        },
         Some(f) => f(type_id, payload_size),
         None => GcRef(0),
     }
@@ -1567,6 +1717,36 @@ pub unsafe fn alloc_nursery_typed_with_placement(
         None => {
             // No backend installed placement reporting, so keep the
             // conservative creation barrier the sibling fallbacks report.
+            unsafe { *needs_write_barrier = true };
+            GcRef(0)
+        }
+    }
+}
+
+/// [`alloc_nursery_typed_with_placement`] for a type that carries neither a
+/// finalizer nor the weakref flag: `malloc_fast` (`framework.py:361-382`).
+///
+/// Like [`alloc_fast_nursery_typed`], only the direct path folds the two
+/// registrations out; a per-thread box keeps the general body.
+///
+/// # Safety
+/// Same contract as [`alloc_nursery_typed_with_placement`], plus `type_id` must
+/// name a type with no destructor and no weakref flag.
+pub unsafe fn alloc_fast_nursery_typed_with_placement(
+    type_id: u32,
+    payload_size: usize,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    match ACTIVE_ALLOC_NURSERY_TYPED_WITH_PLACEMENT.get() {
+        Some(_) if !gc_box_installed() => gc_sync::gc_op(|g| unsafe {
+            g.try_alloc_fast_nursery_no_collect_typed_with_placement(
+                type_id,
+                payload_size,
+                needs_write_barrier,
+            )
+        }),
+        Some(f) => unsafe { f(type_id, payload_size, needs_write_barrier) },
+        None => {
             unsafe { *needs_write_barrier = true };
             GcRef(0)
         }
@@ -1672,6 +1852,38 @@ pub unsafe fn alloc_nursery_collecting_typed_rooted(
         None => {
             // No backend installed placement reporting, so keep the
             // conservative creation barrier the sibling fallbacks report.
+            unsafe { *needs_write_barrier = true };
+            GcRef(0)
+        }
+    }
+}
+
+/// [`alloc_nursery_collecting_typed_rooted`] for a type that carries neither a
+/// finalizer nor the weakref flag: `malloc_fast` (`framework.py:361-382`).
+///
+/// Like [`alloc_fast_nursery_typed`], only the direct path folds the two
+/// registrations out; a per-thread box keeps the general body.
+///
+/// # Safety
+/// Same contract as [`alloc_nursery_collecting_typed_rooted`], plus `type_id`
+/// must name a type with no destructor and no weakref flag.
+pub unsafe fn alloc_fast_nursery_collecting_typed_rooted(
+    type_id: u32,
+    payload_size: usize,
+    root: *mut GcRef,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    match ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTED.get() {
+        Some(_) if !gc_box_installed() => unsafe {
+            standalone_alloc_fast_nursery_collecting_typed_rooted(
+                type_id,
+                payload_size,
+                root,
+                needs_write_barrier,
+            )
+        },
+        Some(f) => unsafe { f(type_id, payload_size, root, needs_write_barrier) },
+        None => {
             unsafe { *needs_write_barrier = true };
             GcRef(0)
         }
