@@ -7472,14 +7472,23 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         let step_result =
             execute_opcode_step(unsafe { &mut *f }, code, instruction, op_arg, next_instr);
         match step_result {
-            Ok(StepResult::Continue) => {
-                // pyjitpl.py:2843 blackhole_if_trace_too_long — check after
-                // every traced step to prevent infinite trace recording.
-                driver.blackhole_if_trace_too_long();
-            }
+            // `blackhole_if_trace_too_long` belongs to the tracer's own
+            // stepping loop (`pyjitpl.py:2861-2867 _interpret`, which drives
+            // `framestack[-1].run_one_step()`), not to the concrete bytecode
+            // dispatch loop — `pyframe.py dispatch_bytecode` has no such call.
+            // Pyre's tracer is the walker, and its walk loop already runs the
+            // check (`jitcode_dispatch/mod.rs`).  Calling it from here tore
+            // down `MetaInterp.tracing` from a *re-entrant* interpreter run:
+            // a residual call executed inside an inline sub-walk runs real
+            // Python through `eval_loop_jit`, whose per-step check saw the
+            // OUTER trace over its limit and moved that `TraceCtx` out of the
+            // shared slot, leaving the in-flight walk recording through a
+            // dangling `&mut TraceCtx`.  RPython cannot reach this: a nested
+            // JIT entry builds its own `MetaInterp` (`warmstate.py:437-441
+            // bound_reached`), so the outer attempt's history is untouchable.
+            Ok(StepResult::Continue) => {}
             Ok(StepResult::CloseLoop { loop_header_pc, .. }) => {
                 if !cached_loop_header_pcs(code).contains(&loop_header_pc) {
-                    driver.blackhole_if_trace_too_long();
                     continue;
                 }
                 // execute_opcode_step (above) is a collection point and this arm
