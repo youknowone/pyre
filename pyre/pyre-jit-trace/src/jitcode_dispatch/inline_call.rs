@@ -2808,17 +2808,25 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         }
     }
     if method_form && bound_method.is_none() {
-        // Two surfaces for an unbound method-form callee.  The narrow one
-        // declines any `self.attr` read in the body.  The wide one admits it,
-        // and pays for the reach with a body that raises: the sub-walk records
-        // into the handler region, and a guard whose resume coordinate lands on
-        // the `Reraise` needs ref registers the recorded path never wrote
-        // (`collect_callee_active_boxes`).  That decline arrives mid-recording
-        // on a non-effect-free opcode, so it has no mid-body carrier and the
-        // whole enclosing loop is discarded.  Decline such a body here instead,
-        // where the call simply stays residual and the loop still compiles.
+        // The narrow surface declines any `self.attr` read in the body.
+        //
+        // The wide one admits it, and pays for the reach with a body that also
+        // raises: the sub-walk records into the handler region, and a guard
+        // whose resume coordinate lands on the `Reraise` needs ref registers
+        // the recorded path never wrote (`collect_callee_active_boxes`).  That
+        // decline arrives mid-recording on a non-effect-free opcode, so it has
+        // no mid-body carrier and the whole enclosing loop is discarded.
+        // Decline here instead, where the call stays residual and the loop
+        // still compiles.
+        //
+        // Keyed on `widened_method_form`, not on `allow_method_load_attr`: five
+        // entries pass the latter, four of which did so before the body-reads-
+        // `self.attr` widening.  A raise-bearing body with no attribute read is
+        // one those four already inlined, and declining it here costs 3.6x on
+        // `for i in range(400000): t += b.bump(i)` over
+        // `def bump(self, n): if n < 0: raise ValueError(n); return n + 1`.
         let declined = if allow_method_load_attr {
-            callee_body_contains_raise(body.code)
+            widened_method_form && callee_body_contains_raise(body.code)
         } else {
             !method_form_callee_body_supported(body.code, callee_descr_refs)
         };
