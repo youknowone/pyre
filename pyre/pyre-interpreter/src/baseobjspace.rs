@@ -13929,12 +13929,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     return Ok(item);
                 }
             }
-            // PyPy `W_ReverseSeqIterObject.descr_next` drops `w_seq` on
-            // exhaustion.  Besides matching its reduce form, this is
-            // observable through weak references: a consumed iterator must
-            // not keep the list alive.  `__setstate__` consequently becomes
-            // a no-op once the source has been released.
-            pyre_object::w_list_reverse_iter_set_seq(obj, PY_NULL);
+            // CPython 3.14 keeps `w_seq` after exhaustion so an explicit
+            // `__setstate__` can revive the iterator.  The exhausted cursor
+            // alone selects the empty-list form in `__reduce__`; clearing
+            // the source here would incorrectly make state restoration a
+            // no-op.
             pyre_object::w_list_reverse_iter_set_index(obj, -1);
             return Err(PyError::stop_iteration());
         }
