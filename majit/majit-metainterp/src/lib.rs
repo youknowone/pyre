@@ -721,8 +721,7 @@ pub fn mc_diag_summary() -> String {
 ///
 /// Off unless `MAJIT_GUARD_CENSUS` is set: the map write sits on the deopt
 /// path, which is exactly the path under study.
-static GUARD_CENSUS: std::sync::Mutex<Option<Vec<((u64, u32), u64)>>> =
-    std::sync::Mutex::new(None);
+static GUARD_CENSUS: std::sync::Mutex<Option<Vec<((u64, u32), u64)>>> = std::sync::Mutex::new(None);
 
 fn guard_census_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

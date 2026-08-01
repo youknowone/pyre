@@ -1016,10 +1016,7 @@ fn maybe_print_jit_stats() {
     // that should already have a bridge, while a wide flat spread means many
     // guards each below `trace_eagerness`. Off unless `MAJIT_GUARD_CENSUS`.
     if std::env::var_os("MAJIT_GUARD_CENSUS").is_some() {
-        eprintln!(
-            "[jit-stats] {}",
-            majit_metainterp::guard_census_summary(12)
-        );
+        eprintln!("[jit-stats] {}", majit_metainterp::guard_census_summary(12));
     }
     // The descr-universe invariants. `descr_set_stale_absent` re-asks the
     // `AbsentContainer` question against the universe as it stands now, so it
