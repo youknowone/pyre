@@ -2840,14 +2840,6 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     func_ptr as usize,
                 );
             }
-            // Sampled BEFORE the withdrawal below: a commit means the escape
-            // flush made the LIVE frame authoritative at this opcode — the
-            // latched operand-stack mirror resolved and
-            // `flush_walk_end_state_to_frame_with_full_stack` wrote every
-            // local and every mid-expression stack slot.  Without it the frame
-            // still holds trace-entry values, which a resume PAST the residual
-            // would read back through the virtualizable and get a stale local.
-            let escape_flush_committed = committed_frame_escape_pc().is_some();
             // The escaping residual either wrote live heap outside the
             // journals, or entered a user Python frame whose body may have
             // committed irreversible effects.  Either way a committed escape
@@ -2856,9 +2848,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // pre-flush frame so the legacy replay re-enters pristine
             // pre-walk state (the flush moved the live frame mid-iteration;
             // replaying on top of it loses journal-rolled-back effects and
-            // re-runs partial state).  The sample above already read the
-            // commit, so the mirror-resolved witness survives the withdrawal
-            // for the blackhole gate below.
+            // re-runs partial state).
             if writes_live_heap
                 || heap_write_odometer_before
                     .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before)
@@ -2884,59 +2874,6 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // failure leaves the pre-existing escape/replay path untouched.
             let odometer_unchanged = heap_write_odometer_before
                 .is_some_and(|before| pyre_interpreter::call::frame_entry_count() == before);
-            // Feasibility probe for retiring the rewind latch in favour of the
-            // orthodox resume-PAST-the-residual path (`blackhole.py:1653-1662`
-            // splices the callee result into the caller past its call, so no
-            // re-runnability licence is needed at all).  The latch shape is the
-            // exact complement of the C3 S1 gate: it is `!writes_live_heap` and
-            // has already committed an escape pc, so it can never reach the
-            // build below.  Measure whether it COULD: build the image and throw
-            // it away.  `build_single_frame_miframe` only reads liveness and the
-            // concrete register banks, so discarding it is free.
-            if fbw_debug_abort_enabled()
-                && !writes_live_heap
-                && odometer_unchanged
-                && matches!(
-                    committed_frame_escape_pc(),
-                    Some((_, EscapeResumeKind::Exact))
-                )
-                && !ctx.trace_ctx.is_bridge_trace
-                && !ctx.fbw_mode.inline_subwalk
-                && ctx.session.borrow().framestack.is_empty()
-                && !ctx.fbw_mode.snapshot_sym.is_null()
-            {
-                let built = blackhole_result.and_then(|(resume_pc, result_bank, result_color)| {
-                    let lastop_result = match exec_result {
-                        Ok(value) => {
-                            (result_bank != 'v').then_some((result_bank, result_color, value))
-                        }
-                        Err(_) => None,
-                    };
-                    let jitcode = unsafe {
-                        let sym = &*ctx.fbw_mode.snapshot_sym;
-                        (!sym.jitcode().is_null())
-                            .then(|| (&(*sym.jitcode()).payload).jitcode.clone())
-                    };
-                    jitcode.map(|jitcode| {
-                        (
-                            resume_pc,
-                            build_single_frame_miframe(ctx, jitcode, resume_pc, lastop_result)
-                                .is_some(),
-                        )
-                    })
-                });
-                match built {
-                    Some((resume_pc, true)) => eprintln!(
-                        "[latch-vs-bh] latch shape COULD build a resume-past image at \
-                         resume_pc={resume_pc}"
-                    ),
-                    Some((resume_pc, false)) => eprintln!(
-                        "[latch-vs-bh] latch shape could NOT build an image at \
-                         resume_pc={resume_pc}"
-                    ),
-                    None => eprintln!("[latch-vs-bh] latch shape has no blackhole_result/jitcode"),
-                }
-            }
             if fbw_debug_abort_enabled() && ctx.fbw_mode.inline_subwalk {
                 eprintln!(
                     "[s2-gate] inline_subwalk fs={} writes_live={} odo_unchanged={} \
@@ -2950,16 +2887,22 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     !ctx.fbw_mode.snapshot_sym.is_null(),
                 );
             }
-            // A top-level one-frame walk whose residual forced the vable
-            // resumes PAST the escaping opcode through the blackhole instead of
-            // falling back to escape/replay. Both the latch (non-bridge, empty
-            // framestack, no committed escape pc, resolvable snapshot sym) and
-            // the adopt (`try_adopt_single_frame_blackhole` →
+            // `vable_after_residual_call` has exactly one continuation for an
+            // escape: `load_fields_from_virtualizable()` then
+            // `SwitchToBlackhole(ABORT_ESCAPE, raising_exception=True)`.  It
+            // never rewinds — the residual has run, its result is in hand, and
+            // the blackhole picks up PAST the call.  A top-level one-frame walk
+            // reaches that continuation whenever every live color has a
+            // concrete value, so build the resume-past image here, before
+            // WalkContext's concrete banks disappear, and consume it in
+            // run_perfn_walk's VableEscaped epilogue.  Both the latch
+            // (non-bridge, empty framestack, not an inline sub-walk, resolvable
+            // snapshot sym) and the adopt (`try_adopt_single_frame_blackhole` →
             // `apply_single_frame_blackhole_crn`, which validates every mapped
             // color and every live operand-stack slot before writing anything)
-            // decline to the pre-existing path on any unmet condition, so this
-            // only ever replaces a replay that would have produced the same
-            // state.
+            // decline to the pre-existing escape/replay path on any unmet
+            // condition, so this only ever replaces a replay that would have
+            // produced the same state.
             //
             // Neither `writes_live_heap` nor the odometer gates it.  Both
             // describe hazards of RE-RUNNING the escaping opcode, which is what
@@ -2975,8 +2918,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // goes straight to `run_blackhole_interp_to_cancel_tracing`
             // (`pyjitpl.py:2949` → `blackhole.py convert_and_run_from_pyjitpl`),
             // which converts the framestack and runs FORWARD, never replays.
-            // The rewind latch stays mutually exclusive with this one through
-            // `committed_frame_escape_pc().is_none()` below.
+            //
+            // An already-committed escape pc does not gate it either.  The
+            // withdraw above cancels the commit but only MARKS the frame
+            // restore pending, so the image is built over the forced frame it
+            // describes; `run_perfn_walk`'s epilogue runs the restore later and
+            // only when neither this image nor an escape pc claimed the
+            // continuation.  Requiring `committed_frame_escape_pc().is_none()`
+            // here instead left the shapes that DID commit — a re-entry guard
+            // plus a non-idempotent store ahead of the escaping call — on the
+            // replay path.
             if !ctx.trace_ctx.is_bridge_trace
                 && let Some((resume_pc, result_bank, result_color)) = blackhole_result
                 && !ctx.fbw_mode.snapshot_sym.is_null()
@@ -2989,10 +2940,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     ),
                     Err(exc) => (None, exc, true),
                 };
-                if ctx.session.borrow().framestack.is_empty()
-                    && !ctx.fbw_mode.inline_subwalk
-                    && committed_frame_escape_pc().is_none()
-                {
+                if ctx.session.borrow().framestack.is_empty() && !ctx.fbw_mode.inline_subwalk {
                     let jitcode = unsafe {
                         let sym = &*ctx.fbw_mode.snapshot_sym;
                         (!sym.jitcode().is_null())
@@ -3036,7 +2984,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 // the inlined-call push, which closed the gap.
                 // `synth/getframe_while_escaping_read_frame_identity` is the
                 // regression guard.
-                } else if ctx.fbw_mode.inline_subwalk
+                } else if writes_live_heap
+                    && odometer_unchanged
+                    && ctx.fbw_mode.inline_subwalk
                     && let Some(framestack) = build_multi_frame_miframe(
                         ctx,
                         resume_pc,
@@ -3056,12 +3006,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             }
             // On a kept commit the undo stays armed: the abort epilogue
             // consumes it — discard on adoption, restore when the flush is
-            // not adopted.
-            // On the cancel arm the restore above ran FIRST, so this refresh
-            // reloads PRE-walk values — the shadow then matches the frame the
-            // legacy replay will use, not walk-end state.  A future ladder
-            // leg must not assume walk-end shadow state after a cancelled
-            // commit.
+            // not adopted.  On the cancel arm the restore is only MARKED
+            // pending, so no restore has run by the time this refresh does:
+            // the reload is `load_fields_from_virtualizable()`'s either way,
+            // i.e. the FORCED frame.  A ladder leg that needs PRE-walk shadow
+            // state after a cancelled commit has to re-read it after the
+            // walk-end restore, not here.
             ctx.trace_ctx.refresh_virtualizable_shadow_from_heap();
             if fbw_debug_abort_enabled() {
                 // `vable_after_residual_call`'s
