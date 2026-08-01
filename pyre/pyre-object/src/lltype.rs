@@ -385,14 +385,17 @@ mod tests {
     }
 
     #[test]
-    fn malloc_prepends_zeroed_gc_header() {
+    fn malloc_prepends_prebuilt_gc_header() {
         let p = malloc(0x1234_5678_u64);
         unsafe {
             assert_eq!(*p, 0x1234_5678);
-            // A zeroed GcHeader precedes the payload, so the write barrier
-            // reads `*(obj - SIZE)` as TRACK_YOUNG_PTRS=0 and skips it.
+            // incminimark init_gc_object_immortal flags.
             let hdr = majit_gc::header::header_of(p as usize);
-            assert_eq!((*hdr).tid_and_flags, 0);
+            assert_eq!((*hdr).type_id(), 0);
+            assert_eq!(
+                (*hdr).flags(),
+                majit_gc::flags::NO_HEAP_PTRS | majit_gc::flags::TRACK_YOUNG_PTRS
+            );
         }
     }
 
@@ -427,7 +430,10 @@ mod tests {
             // The header carries the real GC type id, not a 0 placeholder.
             let hdr = majit_gc::header::header_of(p as usize);
             assert_eq!((*hdr).type_id(), 0xDEAD_BEEF);
-            assert_eq!((*hdr).flags(), 0);
+            assert_eq!(
+                (*hdr).flags(),
+                majit_gc::flags::NO_HEAP_PTRS | majit_gc::flags::TRACK_YOUNG_PTRS
+            );
         }
     }
 }

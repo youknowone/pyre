@@ -159,7 +159,7 @@ pub struct PyCode {
     /// PyPy: `PyCode.w_globals` — the globals dict OBJECT (`W_DictMultiObject`,
     /// `pycode.py:105 "w_globals?"`).  Module globals are `malloc_typed`-
     /// immortal, but `exec`/custom-globals dicts are `try_gc_alloc` movable.
-    /// The code object is Box-immortal, so the collector never reaches this
+    /// The code object is prebuilt-immortal, so the collector never reaches this
     /// slot by tracing into it; every stamped code object is registered in
     /// [`W_GLOBALS_STAMPED_CODES`] and forwarded from there on each
     /// collection. `eval::walk_raw_code_roots` additionally forwards it
@@ -287,13 +287,13 @@ pub unsafe fn w_code_qualname_obj(w_code: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// Box-immortal `PyCode` wrappers that own off-GC `w_globals` and
+/// Prebuilt-immortal `PyCode` wrappers that own off-GC `w_globals` and
 /// `co_consts_w` slots.
 ///
 /// PyPy's `PyCode` is GC-managed, so ordinary graph tracing reaches these
 /// fields even when a code object is stored directly in a module/container
 /// without first becoming a function or frame. Pyre's wrappers are
-/// `Box::into_raw`-immortal; retain their exact process-global lifetime and
+/// `malloc_typed`-immortal; retain their exact process-global lifetime and
 /// expose every wrapper through one small insertion-ordered registry instead
 /// of a TLS or per-value side table.
 static PREBUILT_CODE_ROOTS: std::sync::OnceLock<std::sync::Mutex<Vec<usize>>> =
@@ -414,9 +414,8 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 /// via `Box::into_raw`.
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the body
-/// boxes the `PyCode` and its per-name cache tables through direct
-/// `Box::into_raw(Box::new(...))`, whose `Box::new_uninit` primitive carries no
-/// annotator (raw allocation is deliberately unlifted). Residualise the whole
+/// boxes the `PyCode` through the prebuilt allocator and its per-name cache
+/// tables through direct raw allocations. Residualise the whole
 /// constructor — a `PyObjectRef` GCREF modelled by signature. Code objects are
 /// built at import/compile time, never on a traced hot path.
 #[majit_macros::dont_look_inside]
@@ -489,7 +488,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
             .first_line_number
             .map_or(1, |line| line.get() as i32)
     };
-    let obj = Box::new(PyCode {
+    let obj = pyre_object::lltype::malloc_typed(PyCode {
         ob_header: PyObject {
             ob_type: &CODE_TYPE as *const PyType,
             w_class: pyre_object::pyobject::get_instantiate(&CODE_TYPE),
@@ -504,8 +503,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         mapdict_caches,
         co_consts_w,
         w_qualname: pyre_object::PY_NULL,
-    });
-    let obj = Box::into_raw(obj) as PyObjectRef;
+    }) as PyObjectRef;
     register_prebuilt_code_root(obj);
     obj
 }
@@ -1736,7 +1734,7 @@ thread_local! {
     /// holds, so the JIT need not carry the wrapper identity as a separate
     /// `w_code` courier. First-write-wins, mirroring the first-store-wins
     /// `PyCode.w_globals` semantics in `w_code_frame_stores_global`. Wrappers
-    /// are `Box::into_raw`-immortal and non-moving, so stored pointers never
+    /// are prebuilt-immortal and non-moving, so stored pointers never
     /// dangle and need no GC rooting.
     static LIVE_CODE_WRAPPERS: std::cell::RefCell<std::collections::HashMap<*const (), PyObjectRef>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
@@ -2005,7 +2003,7 @@ thread_local! {
     /// Code objects whose `_mapdict_caches` hold (or once held) a filled
     /// `w_method` slot.  In PyPy `CacheEntry.w_method` (mapdict.py:1418)
     /// is traced through the GC-managed `PyCode`; pyre code objects are
-    /// Box-immortal (`w_code_new` → `Box::into_raw`), so no trace
+    /// prebuilt-immortal (`w_code_new` → `malloc_typed`), so no field trace
     /// reaches the slot — the extra-root walker forwards it through
     /// this registry instead (same family as `walk_method_cache_gc`).
     /// Entries are immortal code pointers, so they never dangle; the
@@ -2017,7 +2015,7 @@ thread_local! {
     /// strong field: the first globals object a code object runs in is kept
     /// for the code object's lifetime and never replaced.  Upstream that
     /// field is traced through the GC-managed `PyCode`; pyre code objects are
-    /// Box-immortal (`w_code_new` → `Box::into_raw`), so the only paths that
+    /// prebuilt-immortal (`w_code_new` → `malloc_typed`), so the only paths that
     /// reach the slot are the opportunistic `walk_raw_code_roots` calls on
     /// `frame.pycode` and `func.code`.  Those miss any stamped code object
     /// that is off the frame chain and not held in a walked frame slot at

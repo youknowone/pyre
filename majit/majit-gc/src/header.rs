@@ -143,17 +143,14 @@ pub unsafe fn header_of(obj_addr: usize) -> *mut GcHeader {
 /// payload pointer (`block + SIZE`).
 ///
 /// `malloc_fixedsize` analog: reserve `size_gc_header + size` bytes,
-/// `init_gc_object(result, typeid, flags=0)` at the block start, and return
-/// `obj = result + size_gc_header`. A freshly allocated object carries no
-/// flags, so the header word is exactly `type_id` (`GcHeader::new`). Callers
+/// `init_gc_object_immortal(result, typeid)` at the block start, and return
+/// `obj = result + size_gc_header`. incminimark.py initializes a prebuilt
+/// object with `NO_HEAP_PTRS | TRACK_YOUNG_PTRS`. Callers
 /// pass the object's GC type id (`malloc_typed` threads `GcType::type_id()`;
 /// the untyped bridge and frames pass the object-root id 0).
 ///
-/// The header's flags are all clear, so a write barrier reading `*(obj - SIZE)`
-/// sees `TRACK_YOUNG_PTRS = 0` and skips the object. These objects are not yet
-/// routed through the managed nursery allocator; they are leaked host
-/// allocations, and the header is what lets the barrier read `*(obj - SIZE)`
-/// without dereferencing foreign memory.
+/// These leaked host allocations are pyre's translated prebuilt family. The
+/// first pointer write opens the object through the collector's write barrier.
 ///
 /// # Safety
 /// - The result points past the header; it MUST NOT be passed to
@@ -176,7 +173,10 @@ pub fn alloc_with_gc_header<T>(value: T, type_id: u32) -> *mut T {
         if raw.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
-        (raw as *mut GcHeader).write(GcHeader::new(type_id));
+        (raw as *mut GcHeader).write(GcHeader::with_flags(
+            type_id,
+            crate::flags::NO_HEAP_PTRS | crate::flags::TRACK_YOUNG_PTRS,
+        ));
         let ptr = raw.add(GcHeader::SIZE) as *mut T;
         ptr.write(value);
         ptr
@@ -240,10 +240,12 @@ mod tests {
         unsafe {
             assert_eq!(*p, 0xABCD);
             let hdr = header_of(p as usize);
-            // type id recorded; flags clear (init_gc_object flags=0).
+            // incminimark init_gc_object_immortal flags.
             assert_eq!((*hdr).type_id(), 0x1357);
-            assert_eq!((*hdr).flags(), 0);
-            assert!(!(*hdr).has_flag(flags::TRACK_YOUNG_PTRS));
+            assert_eq!(
+                (*hdr).flags(),
+                flags::NO_HEAP_PTRS | flags::TRACK_YOUNG_PTRS
+            );
         }
     }
 
