@@ -1073,8 +1073,12 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Mark a function as elidable (pure / constant-foldable).
 ///
 /// The JIT can eliminate calls to this function when all arguments are constants.
-/// Adds `#[inline(never)]` to prevent inlining, and a hidden `#[majit_elidable]`
-/// marker attribute that the tracer can detect at compile time.
+/// `rlib/jit.py:14-73 elidable` sets `_elidable_function_ = True` (line 72) and
+/// nothing else.  This expansion carries that flag as the marker const
+/// [`rpython_attribute_const_for`] emits next to the function, which
+/// `front/llbc_hints.rs` harvests out of the extracted LLBC; the constant fold
+/// itself reaches the separate `__majit_call_target_*` trampoline, keyed by
+/// path.  Neither channel is a property of the function's codegen.
 ///
 /// `#[elidable]` is the conservative `EF_ELIDABLE_CAN_RAISE` form
 /// (`rpython/jit/codewriter/effectinfo.py:21`), matching `call.py:297
@@ -1160,9 +1164,15 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
     };
     let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
 
+    // No `#[inline(never)]`: `rlib/jit.py:72` sets `_elidable_function_ = True`
+    // and leaves the backend's inliner alone.  Upstream keeps a separate flag,
+    // `_dont_inline_` (`objectmodel.py:214`, read by
+    // `translator/backendopt/inline.py:565`), for suppressing inlining, and no
+    // elidable helper upstream carries it.  The constant fold reaches the
+    // `__majit_call_target_*` trampoline below, whose address is taken and so
+    // codegen'd out of line regardless.
     let expanded = quote! {
         #(#attrs)*
-        #[inline(never)]
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
         #vis #sig {
@@ -1423,9 +1433,27 @@ fn expand_call_surface_attr(
     };
     let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
 
+    // Only the release-gil surface suppresses inlining upstream, and it does so
+    // for a GC reason rather than a tracing one: `rffi.py:219
+    // call_external_function._dont_inline_ = True` alongside `:220
+    // _gctransformer_hint_close_stack_ = True`, explained at `:232` as "don't
+    // inline, as a hack to guarantee that no GC pointer is alive anywhere in
+    // call_external_function" — the body runs with the GIL released, so a
+    // caller folded into it would put live GC pointers in that window.
+    // `_dont_inline_` (`objectmodel.py:214`) is the backend-inliner flag read by
+    // `translator/backendopt/inline.py:565`, orthogonal to tracing policy;
+    // `jit_may_force` has no upstream decorator at all
+    // (`EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` is derived from the analyzed ops in
+    // `effectinfo.py:401-404`) and `loop_invariant` sets only its own flag.
+    let dont_inline = if attr_name == "jit_release_gil" {
+        quote! { #[inline(never)] }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
         #(#attrs)*
-        #[inline(never)]
+        #dont_inline
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
         #vis #sig {
@@ -2107,8 +2135,9 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let expanded = quote! {
-        // rlib/jit.py:184-185 — elidable(func); original body hidden
-        #[inline(never)]
+        // rlib/jit.py:184-185 — elidable(func); original body hidden.
+        // `elidable` sets only `_elidable_function_`, and the exec-built
+        // promote wrapper (jit.py:188-200) sets no inlining flag either.
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
         fn #orig_name(#(#full_params),*) #output {
@@ -2265,7 +2294,8 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         // rlib/jit.py:231-233 — @dont_look_inside def trampoline(...): return func(...)
-        #[inline(never)]
+        // `dont_look_inside` is a tracing-policy marker only (jit.py:139), so
+        // the trampoline carries no inlining attribute either.
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
         fn #trampoline_name(#(#full_params),*) #output {
