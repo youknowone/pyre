@@ -1275,9 +1275,7 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
                     // fast path above; exact dicts reach this iterator path.
                     // Keep dict subclasses generic so their `__len__` is not
                     // observed and the message has no total.
-                    if unsafe {
-                        pyre_object::is_exact_type(seq, &pyre_object::DICT_TYPE)
-                    } {
+                    if unsafe { pyre_object::is_exact_type(seq, &pyre_object::DICT_TYPE) } {
                         let len = unsafe { pyre_object::w_dict_len(seq) };
                         if len > count {
                             return Err(PyError::value_error(format!(

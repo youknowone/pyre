@@ -1897,6 +1897,10 @@ struct ParsedSpec {
     engine_spec: Wtf8Buf,
     width_start: usize,
     width_end: usize,
+    /// More than one code point remained after the presentation type.  The
+    /// local scanner retains the first one in `ty`; this bit preserves the
+    /// parser's final `length - i > 1` validation from `newformat.py`.
+    invalid_trailing: bool,
 }
 
 /// The lossy `char` view of a spec, for the scans that only test for ASCII
@@ -1996,6 +2000,7 @@ fn parse_spec(spec: &Wtf8) -> ParsedSpec {
         }
     }
     let ty = if i < n { chars[i] } else { '\0' };
+    let invalid_trailing = i.saturating_add(1) < n;
     let mut engine_spec = Wtf8Buf::with_capacity(spec.len());
     for (index, cp) in cps.iter().enumerate() {
         if Some(index) == fractional_grouping_index
@@ -2024,7 +2029,42 @@ fn parse_spec(spec: &Wtf8) -> ParsedSpec {
         engine_spec,
         width_start: width_start - z_shift,
         width_end: width_end - z_shift,
+        invalid_trailing,
     }
+}
+
+/// Complete the Python 3.14 syntax checks that are intentionally outside the
+/// pre-3.14 `rustpython_common::FormatSpec` parser.  PyPy's
+/// `newformat.py:_parse_spec` rejects a second grouping marker before choosing
+/// a presentation type, and rejects trailing code points as one invalid spec.
+/// Python 3.14 permits a grouping marker after the precision dot as well, so
+/// apply the same ordering to that new slot.
+fn validate_python314_spec_shape(
+    p: &ParsedSpec,
+    spec: &Wtf8,
+    type_name: &str,
+) -> Result<(), crate::PyError> {
+    if let Some(first) = p.fractional_grouping
+        && matches!(p.ty, ',' | '_')
+    {
+        if first != p.ty {
+            return Err(crate::PyError::value_error(
+                "Cannot specify both ',' and '_'.",
+            ));
+        }
+        if !p.invalid_trailing {
+            return Err(crate::PyError::value_error(format!(
+                "Unknown format code '{}' for object of type '{type_name}'",
+                p.ty
+            )));
+        }
+    }
+    if p.invalid_trailing {
+        return Err(crate::PyError::value_error(format!(
+            "Invalid format specifier '{spec}' for object of type '{type_name}'"
+        )));
+    }
+    Ok(())
 }
 
 /// Component spec used by CPython's complex advanced formatter.  Width and
@@ -2618,8 +2658,9 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
                 // newformat.py's `w_num.asbigint()` borrows `W_LongObject.num`.
                 pyre_object::w_long_get_value(val)
             };
-            let parsed = FormatSpec::parse(spec);
             let p = parse_spec(spec);
+            validate_python314_spec_shape(&p, spec, &type_name)?;
+            let parsed = FormatSpec::parse(&p.engine_spec);
             if p.no_neg_zero && matches!(p.ty, '\0' | 'b' | 'c' | 'd' | 'o' | 'x' | 'X' | 'n') {
                 // pypy/objspace/std/newformat.py format_int_or_long:
                 // `z` is meaningful only after conversion to a floating
@@ -2656,6 +2697,9 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
         }
         if let Some((re, im)) = crate::objspace::descroperation::complex_val(val) {
             let p = parse_spec(spec);
+            validate_python314_spec_shape(&p, spec, "complex")?;
+            FormatSpec::parse(&p.engine_spec)
+                .map_err(|e| format_spec_err(e, spec, "complex", false))?;
             if p.fill == '0' {
                 return Err(crate::PyError::value_error(
                     "Zero padding is not allowed in complex format specifier",
@@ -2720,6 +2764,13 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
             // but not a sign or `=` alignment, which are also disallowed for
             // strings.
             reject_string_sign_align(spec)?;
+            let p = parse_spec(spec);
+            validate_python314_spec_shape(&p, spec, "str")?;
+            if p.no_neg_zero {
+                return Err(crate::PyError::value_error(
+                    "Negative zero coercion (z) not allowed in string format specifier",
+                ));
+            }
             // A `0` fill flag at the start of the width pads text with the
             // default-left alignment; the shared formatter treats it as a
             // numeric alignment, so handle it here.
@@ -2961,6 +3012,7 @@ fn format_nonfinite(v: f64, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
 /// for their exact messages; the type and grouping-with-`n` checks are
 /// applied on top.
 fn validate_float_spec(spec: &Wtf8, p: &ParsedSpec) -> Result<(), crate::PyError> {
+    validate_python314_spec_shape(p, spec, "float")?;
     rustpython_common::format::FormatSpec::parse(&p.engine_spec)
         .map_err(|e| format_spec_err(e, spec, "float", false))?;
     if !matches!(p.ty, '\0' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n' | '%') {
