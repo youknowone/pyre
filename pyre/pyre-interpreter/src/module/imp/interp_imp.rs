@@ -514,46 +514,81 @@ fn frozen_code(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::
     Ok(w_code)
 }
 
-/// Identity of the running interpreter binary, used to invalidate the frozen
-/// marshal cache across rebuilds: a new binary may emit a different
-/// bytecode/marshal format for the same source, and the executable's
-/// modification time changes on every rebuild.
-#[cfg(feature = "host_env")]
-fn frozen_cache_binary_mtime() -> Option<u64> {
-    let exe = std::env::current_exe().ok()?;
-    let modified = std::fs::metadata(&exe).ok()?.modified().ok()?;
-    Some(modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as u64)
+/// Bytecode/marshal version token stamped into the frozen cache header and
+/// exposed as `_imp.pyc_magic_number_token`: the low half is the 3.14 magic
+/// 3627, the high half the `\r\n` marker so the number breaks when read as
+/// text.  A cache written by an interpreter with a different token is rejected.
+pub(crate) const PYC_MAGIC_NUMBER_TOKEN: u32 = 0x0A0D_0E2B;
+
+/// Per-process identity shared by every frozen-cache access: the stdlib
+/// `__pycache__` directory, the executable name (segregates backends), and the
+/// executable's modification time in ns (invalidates the cache across
+/// rebuilds).  Computed once so `current_exe`, the `stat`, and
+/// `detect_stdlib_path` each run a single time rather than once per lookup.
+///
+/// The cache is compiled out under `sandbox`: it needs `current_exe` (which the
+/// host seam has no equivalent for) and writes into the stdlib `__pycache__`
+/// (host FS mutation the seam forbids), so under sandbox the stubs below apply
+/// and the bootstrap sources simply recompile each startup.
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+struct FrozenCacheBase {
+    dir: std::path::PathBuf,
+    exe_name: String,
+    binary_mtime: u64,
+}
+
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+fn frozen_cache_base() -> Option<&'static FrozenCacheBase> {
+    use std::sync::OnceLock;
+    static BASE: OnceLock<Option<FrozenCacheBase>> = OnceLock::new();
+    BASE.get_or_init(|| {
+        let exe = std::env::current_exe().ok()?;
+        let exe_name = exe.file_name()?.to_str()?.to_owned();
+        let modified = std::fs::metadata(&exe).ok()?.modified().ok()?;
+        let binary_mtime =
+            modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as u64;
+        let dir = crate::importing::detect_stdlib_path()?.join("__pycache__");
+        Some(FrozenCacheBase { dir, exe_name, binary_mtime })
+    })
+    .as_ref()
 }
 
 /// Cache file for a source module's marshalled code, colocated with the stdlib
 /// bytecode cache.  `cache_key` names the entry (its frozen name, or the dotted
-/// module name for the native bootstrap import); the executable name segregates
-/// backends, which may emit differing marshal formats for the same source.
-#[cfg(feature = "host_env")]
+/// module name for the native bootstrap import).  The executable name segregates
+/// backends and the optimize level segregates `-O`/`-OO` bytecode, so those
+/// variants live in distinct files instead of overwriting one another.
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
 pub(crate) fn frozen_cache_path(cache_key: &str) -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let exe_name = exe.file_name()?.to_str()?;
-    let dir = crate::importing::detect_stdlib_path()?.join("__pycache__");
+    let base = frozen_cache_base()?;
+    let optimize = crate::importing::optimize_flag();
     let stem = cache_key.replace(['.', '/', '\\'], "_");
-    Some(dir.join(format!("frozen.{stem}.{exe_name}.marshalcache")))
+    Some(base.dir.join(format!(
+        "frozen.{stem}.{}.opt-{optimize}.marshalcache",
+        base.exe_name
+    )))
 }
 
 /// `_cached_compile` load half: return the cached marshalled code object when
-/// the file's recorded binary mtime and source prefix both match.  Any
+/// the recorded version token, binary mtime, and full source all match.  Any
 /// mismatch or I/O error yields `None`, so the caller recompiles.
-#[cfg(feature = "host_env")]
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
 pub(crate) fn frozen_cache_load(cache_key: &str, source: &str) -> Option<pyre_object::PyObjectRef> {
     let path = frozen_cache_path(cache_key)?;
-    let mtime = frozen_cache_binary_mtime()?;
+    let mtime = frozen_cache_base()?.binary_mtime;
     let bytes = std::fs::read(&path).ok()?;
-    // Header: [u64 binary_mtime][u64 source_len][source bytes][marshalled code].
-    let stored_mtime = u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?);
+    // Header: [u32 magic][u64 binary_mtime][u64 source_len][source bytes][marshalled code].
+    let magic = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
+    if magic != PYC_MAGIC_NUMBER_TOKEN {
+        return None;
+    }
+    let stored_mtime = u64::from_le_bytes(bytes.get(4..12)?.try_into().ok()?);
     if stored_mtime != mtime {
         return None;
     }
-    let src_len = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?) as usize;
-    let src_end = 16usize.checked_add(src_len)?;
-    if bytes.get(16..src_end)? != source.as_bytes() {
+    let src_len = u64::from_le_bytes(bytes.get(12..20)?.try_into().ok()?) as usize;
+    let src_end = 20usize.checked_add(src_len)?;
+    if bytes.get(20..src_end)? != source.as_bytes() {
         return None;
     }
     let code = crate::module::marshal::loads_bytes(bytes.get(src_end..)?).ok()?;
@@ -563,19 +598,20 @@ pub(crate) fn frozen_cache_load(cache_key: &str, source: &str) -> Option<pyre_ob
 /// `_cached_compile` store half (best effort): write the marshalled code with
 /// the validating header.  I/O failures (e.g. a read-only stdlib) are ignored —
 /// the next startup simply recompiles.
-#[cfg(feature = "host_env")]
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
 pub(crate) fn frozen_cache_store(cache_key: &str, source: &str, code: pyre_object::PyObjectRef) {
     let Some(path) = frozen_cache_path(cache_key) else {
         return;
     };
-    let Some(mtime) = frozen_cache_binary_mtime() else {
+    let Some(base) = frozen_cache_base() else {
         return;
     };
     let Ok(marshalled) = crate::module::marshal::dumps_bytes(code) else {
         return;
     };
-    let mut buf = Vec::with_capacity(16 + source.len() + marshalled.len());
-    buf.extend_from_slice(&mtime.to_le_bytes());
+    let mut buf = Vec::with_capacity(20 + source.len() + marshalled.len());
+    buf.extend_from_slice(&PYC_MAGIC_NUMBER_TOKEN.to_le_bytes());
+    buf.extend_from_slice(&base.binary_mtime.to_le_bytes());
     buf.extend_from_slice(&(source.len() as u64).to_le_bytes());
     buf.extend_from_slice(source.as_bytes());
     buf.extend_from_slice(&marshalled);
@@ -585,12 +621,12 @@ pub(crate) fn frozen_cache_store(cache_key: &str, source: &str, code: pyre_objec
     let _ = std::fs::write(&path, &buf);
 }
 
-#[cfg(not(feature = "host_env"))]
+#[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
 pub(crate) fn frozen_cache_load(_cache_key: &str, _source: &str) -> Option<pyre_object::PyObjectRef> {
     None
 }
 
-#[cfg(not(feature = "host_env"))]
+#[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
 pub(crate) fn frozen_cache_store(_cache_key: &str, _source: &str, _code: pyre_object::PyObjectRef) {}
 
 /// The `data` element of a `withdata=True` `find_frozen` result: a read-only
@@ -1031,12 +1067,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         pyre_object::w_str_new("default"),
     );
     // `MAGIC_NUMBER = _imp.pyc_magic_number_token.to_bytes(4, 'little')`
-    // (_bootstrap_external.py) — low half is the 3.14 magic 3627, high half
-    // the `\r\n` marker so the number breaks when read as text.  Cache
-    // files are already segregated by `sys.implementation.cache_tag`.
+    // (_bootstrap_external.py).  Cache files are already segregated by
+    // `sys.implementation.cache_tag`.
     crate::module_ns_store(
         ns,
         "pyc_magic_number_token",
-        pyre_object::w_int_new(0x0A0D_0E2B),
+        pyre_object::w_int_new(i64::from(PYC_MAGIC_NUMBER_TOKEN)),
     );
 }
