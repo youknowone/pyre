@@ -2247,26 +2247,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // sys.displayhook / excepthook. The double-underscore names keep the
     // original hooks so code (e.g. doctest and exception tests) can save and
     // restore them.
-    module_ns_store(
-        ns,
-        "displayhook",
-        make_builtin_function_with_arity("displayhook", crate::builtins::sys_displayhook, 1),
-    );
-    module_ns_store(
-        ns,
-        "__displayhook__",
-        make_builtin_function_with_arity("displayhook", crate::builtins::sys_displayhook, 1),
-    );
-    module_ns_store(
-        ns,
-        "excepthook",
-        make_builtin_function_with_arity("excepthook", crate::builtins::sys_excepthook, 3),
-    );
-    module_ns_store(
-        ns,
-        "__excepthook__",
-        make_builtin_function_with_arity("excepthook", crate::builtins::sys_excepthook, 3),
-    );
+    let displayhook_fn =
+        make_builtin_function_with_arity("displayhook", crate::builtins::sys_displayhook, 1);
+    module_ns_store(ns, "displayhook", displayhook_fn);
+    module_ns_store(ns, "__displayhook__", displayhook_fn);
+    let excepthook_fn =
+        make_builtin_function_with_arity("excepthook", crate::builtins::sys_excepthook, 3);
+    module_ns_store(ns, "excepthook", excepthook_fn);
+    module_ns_store(ns, "__excepthook__", excepthook_fn);
     // sys.breakpointhook — `app.py breakpointhook`, called by `breakpoint()`.
     // `__breakpointhook__` keeps the original so code can restore it.
     let breakpointhook_fn = make_builtin_function("breakpointhook", sys_breakpointhook);
