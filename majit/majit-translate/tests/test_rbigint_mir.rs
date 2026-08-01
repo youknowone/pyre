@@ -10,7 +10,10 @@ use majit_translate::{
     HostStaticAddrs,
     front::{
         llbc_hints::harvest_hints_from_llbcs,
-        mir::build_semantic_program_from_llbcs_with_static_addrs_and_module_paths,
+        mir::{
+            build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
+            build_semantic_program_from_llbcs_with_static_addrs_and_module_paths,
+        },
     },
     model::{CallTarget, OpKind, ValueType},
 };
@@ -1141,6 +1144,87 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
     }
 }
 
+/// Callers whose mixed long/int arm must reach the machine-word residual
+/// named beside it, and must not fall back to a full `RBigInt::int_*` call.
+const MIXED_INT_RESIDUAL_CALLERS: &[(&str, &str)] = &[
+    ("long_add", "jit_bigint_int_add"),
+    ("long_sub", "jit_bigint_int_sub"),
+    ("long_mul", "jit_bigint_int_mul"),
+    ("long_bitand", "jit_bigint_int_and"),
+    ("long_bitor", "jit_bigint_int_or"),
+    ("long_bitxor", "jit_bigint_int_xor"),
+];
+
+/// `(module suffix, caller)` pairs that must borrow their long operand's
+/// payload instead of allocating a translated `jit_bigint_clone`.
+const BORROWED_PAYLOAD_CALLERS: &[(&str, &str)] = &[
+    ("objspace::descroperation", "long_pow"),
+    ("objspace::descroperation", "try_int_long_pow_with_modulo"),
+    ("objspace::descroperation", "long_lshift"),
+    ("objspace::descroperation", "long_rshift"),
+    ("objspace::descroperation", "long_floordiv"),
+    ("objspace::descroperation", "long_mod"),
+    ("objspace::descroperation", "integer_divmod_pair"),
+    ("objspace::descroperation", "bigint_mod_inverse"),
+    ("objspace::descroperation", "complex_richcompare"),
+    ("objspace::descroperation", "compare_slot"),
+    ("baseobjspace", "compute_slice_indices3_big"),
+    ("baseobjspace", "uint_w"),
+    ("baseobjspace", "truncatedint_w"),
+    ("baseobjspace", "getindex_w"),
+    ("baseobjspace", "index_int_w_preserve_negative"),
+    ("baseobjspace", "space_index"),
+    ("builtins", "builtin_abs"),
+    ("builtins", "ensure_baseint_result"),
+    ("builtins", "int_to_decimal_string"),
+    ("typedef", "int_descr_new"),
+    ("typedef", "slice_method_indices"),
+    ("builtins", "format_index_radix"),
+    ("type_methods", "format_with_spec"),
+    ("builtins", "obj_to_bigint"),
+    ("objspace::std::formatting", "arg_to_bigint"),
+    ("module::math::interp_math", "comb"),
+    ("module::math::interp_math", "perm"),
+];
+
+/// Floor-division callers and the floor-semantics residual each must take.
+const FLOOR_DIVMOD_CALLERS: &[(&str, &str)] = &[
+    ("long_floordiv", "jit_bigint_div_floor"),
+    ("long_mod", "jit_bigint_mod_floor"),
+];
+
+/// Unary callers that must borrow their input and allocate only the result.
+const UNARY_RESIDUAL_CALLERS: &[(&str, &str)] = &[
+    ("bigint_neg", "jit_bigint_neg"),
+    ("bigint_invert", "jit_bigint_invert"),
+];
+
+/// Graphs the test reaches for one at a time rather than through a table.
+const SINGLE_GRAPHS: &[&str] = &[
+    "bigint_add",
+    "long_int_compare",
+    "long_pow",
+    "long_lshift",
+    "int_lshift",
+];
+
+/// Every graph name the assertions below look up.
+///
+/// This is what scopes the lowering: `pyre-interpreter.ullbc` declares tens
+/// of thousands of functions and the module filter alone still admits
+/// thousands of bodies, none of which these assertions read. Deriving the
+/// list from the same tables the assertions iterate keeps the two from
+/// drifting — a caller added to a table is lowered by construction, and a
+/// name that goes missing fails the lookup it was added for.
+fn asserted_graph_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = SINGLE_GRAPHS.to_vec();
+    names.extend(MIXED_INT_RESIDUAL_CALLERS.iter().map(|(caller, _)| *caller));
+    names.extend(BORROWED_PAYLOAD_CALLERS.iter().map(|(_, caller)| *caller));
+    names.extend(FLOOR_DIVMOD_CALLERS.iter().map(|(caller, _)| *caller));
+    names.extend(UNARY_RESIDUAL_CALLERS.iter().map(|(caller, _)| *caller));
+    names
+}
+
 #[test]
 fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
     if !std::path::Path::new(INTERPRETER_LLBC).is_file() {
@@ -1217,7 +1301,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
             "{path} must preserve rbigint ovfcheck's OverflowError edge, got {values:?}"
         );
     }
-    let program = build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &[llbc],
         HostStaticAddrs::default(),
         &[
@@ -1229,6 +1313,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
             "type_methods",
             "objspace::std::formatting",
         ],
+        &asserted_graph_names(),
     )
     .expect("lower descroperation module");
     let helper = program
@@ -1288,14 +1373,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
          calls={calls:?}; targets={call_targets:?}"
     );
 
-    for (caller_name, residual_name) in [
-        ("long_add", "jit_bigint_int_add"),
-        ("long_sub", "jit_bigint_int_sub"),
-        ("long_mul", "jit_bigint_int_mul"),
-        ("long_bitand", "jit_bigint_int_and"),
-        ("long_bitor", "jit_bigint_int_or"),
-        ("long_bitxor", "jit_bigint_int_xor"),
-    ] {
+    for &(caller_name, residual_name) in MIXED_INT_RESIDUAL_CALLERS {
         let caller = program
             .functions
             .iter()
@@ -1432,35 +1510,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         "the host Result wrapper must not survive in the translated graph: {pow_calls:?}"
     );
 
-    for (module_suffix, caller_name) in [
-        ("objspace::descroperation", "long_pow"),
-        ("objspace::descroperation", "try_int_long_pow_with_modulo"),
-        ("objspace::descroperation", "long_lshift"),
-        ("objspace::descroperation", "long_rshift"),
-        ("objspace::descroperation", "long_floordiv"),
-        ("objspace::descroperation", "long_mod"),
-        ("objspace::descroperation", "integer_divmod_pair"),
-        ("objspace::descroperation", "bigint_mod_inverse"),
-        ("objspace::descroperation", "complex_richcompare"),
-        ("objspace::descroperation", "compare_slot"),
-        ("baseobjspace", "compute_slice_indices3_big"),
-        ("baseobjspace", "uint_w"),
-        ("baseobjspace", "truncatedint_w"),
-        ("baseobjspace", "getindex_w"),
-        ("baseobjspace", "index_int_w_preserve_negative"),
-        ("baseobjspace", "space_index"),
-        ("builtins", "builtin_abs"),
-        ("builtins", "ensure_baseint_result"),
-        ("builtins", "int_to_decimal_string"),
-        ("typedef", "int_descr_new"),
-        ("typedef", "slice_method_indices"),
-        ("builtins", "format_index_radix"),
-        ("type_methods", "format_with_spec"),
-        ("builtins", "obj_to_bigint"),
-        ("objspace::std::formatting", "arg_to_bigint"),
-        ("module::math::interp_math", "comb"),
-        ("module::math::interp_math", "perm"),
-    ] {
+    for &(module_suffix, caller_name) in BORROWED_PAYLOAD_CALLERS {
         let caller = program
             .functions
             .iter()
@@ -1563,10 +1613,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         "the specialized host Result wrapper must not survive: {int_lshift_calls:?}"
     );
 
-    for (caller_name, residual_name) in [
-        ("long_floordiv", "jit_bigint_div_floor"),
-        ("long_mod", "jit_bigint_mod_floor"),
-    ] {
+    for &(caller_name, residual_name) in FLOOR_DIVMOD_CALLERS {
         let caller = program
             .functions
             .iter()
@@ -1596,10 +1643,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         );
     }
 
-    for (caller_name, residual_name) in [
-        ("bigint_neg", "jit_bigint_neg"),
-        ("bigint_invert", "jit_bigint_invert"),
-    ] {
+    for &(caller_name, residual_name) in UNARY_RESIDUAL_CALLERS {
         let caller = program
             .functions
             .iter()
