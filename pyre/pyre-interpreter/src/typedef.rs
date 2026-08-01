@@ -10534,7 +10534,7 @@ fn init_type_type(ns: PyObjectRef) {
     // take the recursive form that does NOT re-consult the override, which is
     // what lets `ABCMeta.__instancecheck__` fall back on `type`'s without
     // looping, and what `super().__instancecheck__(x)` in a metaclass reaches.
-    let instancecheck_method = make_builtin_function_with_arity(
+    let instancecheck_method = crate::gateway::make_builtin_function_with_arity_and_text_signature(
         "__instancecheck__",
         |args| {
             crate::type_methods::arity_exact(args, "__instancecheck__", 1)?;
@@ -10543,8 +10543,9 @@ fn init_type_type(ns: PyObjectRef) {
             Ok(pyre_object::w_bool_from(matched))
         },
         2,
+        "($self, inst, /)",
     );
-    let subclasscheck_method = make_builtin_function_with_arity(
+    let subclasscheck_method = crate::gateway::make_builtin_function_with_arity_and_text_signature(
         "__subclasscheck__",
         |args| {
             crate::type_methods::arity_exact(args, "__subclasscheck__", 1)?;
@@ -10553,6 +10554,7 @@ fn init_type_type(ns: PyObjectRef) {
             Ok(pyre_object::w_bool_from(matched))
         },
         2,
+        "($self, sub, /)",
     );
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -17292,9 +17294,10 @@ fn init_object_type(ns: PyObjectRef) {
     };
     let object_new = make_new_descr(__pyre_wrap_object_descr_new);
     unsafe {
-        let function = pyre_object::function::w_staticmethod_get_func(object_new);
+        // `make_new_descr` hands back the carrier itself, not a `staticmethod`
+        // around it, so the text signature belongs on that object directly.
         crate::function::fset_func_text_signature(
-            function,
+            object_new,
             pyre_object::w_str_new("($type, *args, **kwargs)"),
         );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__new__", object_new)

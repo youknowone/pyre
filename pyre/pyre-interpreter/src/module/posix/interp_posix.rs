@@ -2642,7 +2642,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "stat",
-        crate::make_builtin_function("stat", |args| stat_entry(args, true)),
+        crate::gateway::make_builtin_function_with_text_signature(
+            "stat",
+            |args| stat_entry(args, true),
+            "(path, *, dir_fd=None, follow_symlinks=True)",
+        ),
     );
     crate::module_ns_store(
         ns,
