@@ -3004,6 +3004,12 @@ pub fn trace_and_compile_from_bridge(
     if descr_arc.is_guard_forced() {
         return BridgeResolution::ResumeBlackhole;
     }
+    // compile.py:702-703 `must_compile() and not stack_almost_full()`: this is
+    // pyre's own guard-failure entry, so the diagnostic that suppresses bridge
+    // recording has to be read here as well as in the jitdriver's paths.
+    if majit_metainterp::no_bridge_enabled() {
+        return BridgeResolution::ResumeBlackhole;
+    }
     let Some((green_key, trace_id, fail_index)) = bridge_source_identity_from_descr(descr_arc)
     else {
         // compile.py:725-729 `_trace_and_compile_from_bridge` raises

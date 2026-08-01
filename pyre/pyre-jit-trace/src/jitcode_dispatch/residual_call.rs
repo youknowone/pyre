@@ -150,22 +150,36 @@ pub(crate) fn reset_single_frame_blackhole() {
     });
 }
 
-/// Snapshot the live meta-interpreter framestack for
-/// `SwitchToBlackhole(ABORT_TOO_LONG)`.
+/// Snapshot the live meta-interpreter framestack for a `SwitchToBlackhole`
+/// that stops the walk at an arbitrary coordinate.
 ///
-/// RPython calls `blackhole_if_trace_too_long()` immediately after
-/// `MIFrame.run_one_step()` and `convert_and_run_from_pyjitpl` copies every
-/// live MIFrame at its already-advanced `pc` (`pyjitpl.py:2863-2866`,
-/// `blackhole.py:1799-1821`).  The full-body walker has the same state here:
-/// `resume_pc` is `walk()`'s post-step `next_pc`, and the current
-/// [`WalkContext`] plus [`WalkSession::framestack`] own the concrete banks for
-/// the live frame and all paused callers.
+/// Two triggers reach it, and both need the same image:
+///
+/// - `ABORT_TOO_LONG`.  RPython calls `blackhole_if_trace_too_long()`
+///   immediately after `MIFrame.run_one_step()` and
+///   `convert_and_run_from_pyjitpl` copies every live MIFrame at its
+///   already-advanced `pc` (`pyjitpl.py:2863-2866`, `blackhole.py:1799-1821`).
+///   `resume_pc` is `walk()`'s post-step `next_pc`.
+/// - A bridge carrier sub-walk that stopped on a walker capability gap.  That
+///   sub-walk IS the reconstructed callee's one real execution (see
+///   `drive_bridge_frame_subwalk`'s `is_authoritative_executor` contract), so
+///   the drain may not discard it and let the guard resume from `rd_numb` —
+///   that re-runs every residual it already ran.  `resume_pc` is the
+///   unexecuted instruction the walk stopped at
+///   ([`DispatchError::stop_pc`]), which is the same "arbitrary coordinate"
+///   shape.  Upstream never rewinds an aborted bridge either:
+///   `_handle_guard_failure` ends `assert False, "should always raise"`
+///   (`pyjitpl.py:2956`) and the conversion continues from the frames
+///   `interpret()` reached.
+///
+/// Either way the current [`WalkContext`] plus [`WalkSession::framestack`] own
+/// the concrete banks for the live frame and all paused callers.
 ///
 /// Return `false` without publishing a partial image when any live value is
 /// unresolved.  A zero-effect walk may then use the legacy entry replay;
 /// an effectful walk must keep recording until a complete image can be built,
 /// because replaying it would apply the effect twice.
-pub(crate) fn latch_trace_too_long_blackhole<Sym: WalkSym>(
+pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     resume_pc: usize,
 ) -> bool {
@@ -522,6 +536,16 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     miframe: &mut majit_metainterp::MIFrame,
 ) -> bool {
+    // Name the declining bank and color under `PYRE_FBW_DEBUG_ABORT`, the way
+    // `build_multi_frame_miframe` names its own: "innermost declined" alone
+    // does not say which register had no concrete.
+    macro_rules! s2dbg {
+        ($($a:tt)*) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[s2-fill-decline] {}", format!($($a)*));
+            }
+        };
+    }
     for color in 0..miframe.int_values.len() {
         if let Some(value) = ctx
             .concrete_registers_i
@@ -544,6 +568,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
                 continue;
             }
             let Some(majit_ir::Value::Int(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
+                s2dbg!("int color={color} opref={opref:?} has no concrete");
                 return false;
             };
             miframe.int_values[color] = Some(value);
@@ -575,6 +600,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
         if let Some(value) = forwarded.or(from_shadow) {
             miframe.ref_values[color] = Some(value);
         } else if opref.is_some_and(|value| value != OpRef::NONE) {
+            s2dbg!("ref color={color} opref={opref:?} has no concrete");
             return false;
         }
     }
@@ -590,6 +616,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
             continue;
         }
         let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
+            s2dbg!("float color={color} opref={opref:?} has no concrete");
             return false;
         };
         miframe.float_values[color] = Some(value.to_bits() as i64);

@@ -661,6 +661,63 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
 /// the root register banks come straight from the bridge-seeded `root_sym`
 /// rather than a live caller [`WalkContext`] (the root walk has not started —
 /// this resumes mid-flight).
+/// `blackhole.py:1711 `_copy_data_from_miframe`: the concrete register image a
+/// paused caller resumes from when a descendant abort converts the framestack
+/// into blackhole interpreters.
+///
+/// [`capture_inline_parent_blackhole`] builds this for a caller the walker is
+/// still standing in, by reading its live concrete shadow banks. A frame
+/// rebuilt from a guard's resume data has no such bank — its per-color boxes
+/// are all this side holds. They carry the same intrinsic concrete upstream
+/// reads (`history.py:803` `*FrontendOp(pos, value)`; `box.getint()` /
+/// `box.getref_base()` at :1718/:1724), so resolve them through
+/// `concrete_of_opref` instead.
+///
+/// `OpRef::NONE` is upstream's `if box is not None` skip. A live box whose
+/// concrete is unknown declines the whole capture: an MIFrame that silently
+/// left one live register at its default resumes on a stale value.
+fn capture_reconstructed_parent_blackhole(
+    ctx: &TraceCtx,
+    resume_pc: usize,
+    int_boxes: &[(usize, OpRef)],
+    ref_boxes: &[(usize, OpRef)],
+    float_boxes: &[(usize, OpRef)],
+) -> Option<InlineParentBlackhole> {
+    let mut int_values = Vec::with_capacity(int_boxes.len());
+    for &(color, opref) in int_boxes {
+        if opref == OpRef::NONE {
+            continue;
+        }
+        let Some(majit_ir::Value::Int(value)) = ctx.concrete_of_opref(opref) else {
+            return None;
+        };
+        int_values.push((color, value));
+    }
+    let mut ref_values = Vec::with_capacity(ref_boxes.len());
+    for &(color, opref) in ref_boxes {
+        if opref == OpRef::NONE {
+            continue;
+        }
+        let Some(majit_ir::Value::Ref(value)) = ctx.concrete_of_opref(opref) else {
+            return None;
+        };
+        ref_values.push((color, value.as_usize() as pyre_object::PyObjectRef));
+    }
+    // Floats keep their OpRefs — `build_multi_frame_miframe` resolves them
+    // while the trace context is still live, the same as the walker capture.
+    let float_values = float_boxes
+        .iter()
+        .copied()
+        .filter(|&(_, opref)| opref != OpRef::NONE)
+        .collect();
+    Some(InlineParentBlackhole {
+        resume_pc,
+        int_values,
+        ref_values,
+        float_values,
+    })
+}
+
 pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     root_sym: &Sym,
     trace_ctx: &mut TraceCtx,
@@ -691,11 +748,11 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         .bridge_registers_r()
         .cloned()
         .unwrap_or_else(|| root_sym.registers_r().to_vec());
-    if let Some(result_color) = unsafe { &(*root_sym.jitcode()).payload }
+    let result_color = unsafe { &(*root_sym.jitcode()).payload }
         .result_color_trivia_for_jitcode_pc(root_pc)
         .map(|c| c as usize)
-        .filter(|&c| c != u16::MAX as usize)
-    {
+        .filter(|&c| c != u16::MAX as usize);
+    if let Some(result_color) = result_color {
         if result_color < regs_r.len() {
             regs_r[result_color] = trace_ctx.const_ref(pyre_object::PY_NULL as i64);
         }
@@ -725,11 +782,40 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         None,
         &[],
     );
+    // The concrete image this paused root resumes from when a descendant
+    // sub-walk aborts and the drain converts the chain instead of rewinding to
+    // the guard. The Ref bank skips the call-result color for the same reason
+    // it was NULLed above: the callee's blackhole writes it on return.
+    let blackhole = crate::state::try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+        jitcode_index as i32,
+        root_liveness_word,
+    )
+    .and_then(|live| {
+        let pairs = |colors: &[u32], regs: &[OpRef]| -> Vec<(usize, OpRef)> {
+            colors
+                .iter()
+                .map(|&color| color as usize)
+                .map(|color| (color, regs.get(color).copied().unwrap_or(OpRef::NONE)))
+                .collect()
+        };
+        let ref_pairs: Vec<(usize, OpRef)> = pairs(&live.ref_, &regs_r)
+            .into_iter()
+            .filter(|&(color, _)| Some(color) != result_color)
+            .collect();
+        capture_reconstructed_parent_blackhole(
+            trace_ctx,
+            root_pc,
+            &pairs(&live.int, root_sym.registers_i()),
+            &ref_pairs,
+            &pairs(&live.float, root_sym.registers_f()),
+        )
+    });
+
     Some(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: None,
         call_stack_overrides: Vec::new(),
-        blackhole: None,
+        blackhole,
         resume_coord: ParentResumeCoord::Backxlat(root_pc),
         // Parent-frame words are never branch-tagged; negative tags belong to
         // a branch guard's own top-frame word.
@@ -820,14 +906,19 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     let maps = crate::state::bridge_semantic_maps_from_pc(recipe.jitcode_index, recipe.jitcode_pc);
     let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
     let mut boxes = Vec::with_capacity(banks.total_len());
+    // Per-color `(color, box)` pairs for the blackhole capture below, collected
+    // alongside the liveness-ordered box list the snapshot consumes.
+    let mut bh_int = Vec::with_capacity(banks.int.len());
+    let mut bh_ref = Vec::with_capacity(banks.ref_.len());
+    let mut bh_float = Vec::with_capacity(banks.float.len());
     for &color in &banks.int {
-        boxes.push(
-            recipe
-                .registers_i
-                .get(color as usize)
-                .copied()
-                .unwrap_or(OpRef::NONE),
-        );
+        let opref = recipe
+            .registers_i
+            .get(color as usize)
+            .copied()
+            .unwrap_or(OpRef::NONE);
+        boxes.push(opref);
+        bh_int.push((color as usize, opref));
     }
     // Ref bank, in liveness-color order — mirror the retired MIFrame encoder
     // `get_list_of_active_boxes` (trace_opcode.rs) box-for-box:
@@ -852,35 +943,49 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         let is_portal_red_scratch = semantic_idx.is_none()
             && ((color == frame_reg && frame_reg != sentinel)
                 || (color == ec_reg && ec_reg != sentinel));
-        if is_portal_red_scratch {
-            boxes.push(if color == frame_reg {
+        let opref = if is_portal_red_scratch {
+            if color == frame_reg {
                 frame_box
             } else {
                 ec_box
-            });
-            continue;
-        }
-        let slot = semantic_idx.or_else(|| (c < recipe.valuestackdepth).then_some(c))?;
-        boxes.push(recipe.registers_r.get(slot).copied().unwrap_or(OpRef::NONE));
+            }
+        } else {
+            let slot = semantic_idx.or_else(|| (c < recipe.valuestackdepth).then_some(c))?;
+            recipe.registers_r.get(slot).copied().unwrap_or(OpRef::NONE)
+        };
+        boxes.push(opref);
+        bh_ref.push((c, opref));
     }
     for &color in &banks.float {
-        boxes.push(
-            recipe
-                .registers_f
-                .get(color as usize)
-                .copied()
-                .unwrap_or(OpRef::NONE),
-        );
+        let opref = recipe
+            .registers_f
+            .get(color as usize)
+            .copied()
+            .unwrap_or(OpRef::NONE);
+        boxes.push(opref);
+        bh_float.push((color as usize, opref));
     }
     if boxes.iter().any(|b| b.is_none()) {
         return None;
     }
 
+    // Same capture as the bridge root's, off the recipe's decoded boxes. The
+    // reconstructed `frame`/`ec` reds are freshly emitted here, so a portal-red
+    // scratch color has no concrete yet and declines — leaving the drain's
+    // pre-existing rollback rather than a half-filled blackhole frame.
+    let blackhole = capture_reconstructed_parent_blackhole(
+        ctx,
+        recipe.jitcode_pc as usize,
+        &bh_int,
+        &bh_ref,
+        &bh_float,
+    );
+
     Some(InlineParentFrame {
         jitcode_index: recipe.jitcode_index as u32,
         call_jitcode_pc: call_jit_pc,
         call_stack_overrides: Vec::new(),
-        blackhole: None,
+        blackhole,
         // The recipe's resolved word was `backxlat_py_pc(jitcode_index,
         // jitcode_pc)` by construction, exactly the bridge-root flavor.
         resume_coord: ParentResumeCoord::Backxlat(recipe.jitcode_pc as usize),
@@ -1125,7 +1230,23 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 v,
             );
         }
-        walk(callee_code, entry, &mut sub_wc)
+        let outcome = walk(callee_code, entry, &mut sub_wc);
+        // `pyjitpl.py:2914 handle_guard_failure` wraps `_handle_guard_failure`
+        // in `except SwitchToBlackhole as stb:
+        // self.run_blackhole_interp_to_cancel_tracing(stb)` (:2930-2931), which
+        // converts the frames `interpret()` reached and runs them forward
+        // (`blackhole.py:1799`); `_handle_guard_failure` itself ends
+        // `assert False, "should always raise"` (:2956).  An aborted bridge is
+        // never rewound to its guard upstream.  This sub-walk has already
+        // concrete-executed the reconstructed callee's residual calls (the
+        // `is_authoritative_executor` contract above), so the caller's rollback
+        // would replay them.  Capture the frames while this `WalkContext` still
+        // owns their banks — `drive_bridge_carrier_walk`'s abort tail adopts
+        // the image, and a decline there leaves the pre-existing rollback.
+        if let Err(ref error) = outcome {
+            let _ = latch_abort_blackhole(&sub_wc, error.stop_pc());
+        }
+        outcome
     };
     drop(parent_guards);
     Some(outcome)

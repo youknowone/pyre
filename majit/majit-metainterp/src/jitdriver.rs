@@ -457,7 +457,12 @@ pub(crate) fn spdiag_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_SPDIAG").is_some())
 }
-fn no_bridge_enabled() -> bool {
+/// `MAJIT_NO_BRIDGE`: suppress bridge recording so every guard failure resumes
+/// through the blackhole.  Public because a frontend that owns its own
+/// guard-failure entry point has to honour it there too — gating only the
+/// jitdriver-internal paths leaves the variable set but inert, which reads as
+/// "bridges are off" while they keep recording.
+pub fn no_bridge_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_NO_BRIDGE").is_some())
 }

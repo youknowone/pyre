@@ -2111,6 +2111,67 @@ impl DispatchError {
         }
     }
 
+    /// The jitcode coordinate the walk stopped at.  Every variant records the
+    /// `pc` of the instruction that could not be walked, and none of them ran
+    /// that instruction's arm, so this doubles as the resume coordinate a
+    /// blackhole conversion has to `setposition` to (`blackhole.py:1804`
+    /// `copy_data_from_miframe` reads each level's `frame.pc` the same way).
+    /// One arm per variant so a new variant fails to compile until it says
+    /// where it stopped.
+    pub(crate) fn stop_pc(&self) -> usize {
+        match self {
+            Self::UndecodableOpcode { pc, .. }
+            | Self::UnsupportedOpname { pc, .. }
+            | Self::RegisterOutOfRange { pc, .. }
+            | Self::RegisterReadUnbound { pc, .. }
+            | Self::DescrIndexOutOfRange { pc, .. }
+            | Self::ExpectedJitCodeDescr { pc, .. }
+            | Self::SubJitCodeNotFound { pc, .. }
+            | Self::InlineCallArityMismatch { pc, .. }
+            | Self::InlineCallIntArityMismatch { pc, .. }
+            | Self::InlineCallFloatArityMismatch { pc, .. }
+            | Self::UnexpectedVoidSubReturn { pc, .. }
+            | Self::UnexpectedNonVoidSubReturn { pc, .. }
+            | Self::ReraiseWithoutLastExcValue { pc, .. }
+            | Self::LastExcValueWithoutActiveException { pc, .. }
+            | Self::CatchExceptionWithActiveException { pc, .. }
+            | Self::ResidualCallDescrNotCallDescr { pc, .. }
+            | Self::ResidualCallArgUnbound { pc, .. }
+            | Self::ExpectedSwitchDescr { pc, .. }
+            | Self::SwitchValueNotConcrete { pc, .. }
+            | Self::GotoIfNotValueNotConcrete { pc, .. }
+            | Self::IntOvfOperandNotConcrete { pc, .. }
+            | Self::NotInTraceRequiresConcreteExecution { pc, .. }
+            | Self::JitForceVirtualRequiresConcreteResolver { pc, .. }
+            | Self::VableBoxNotSeeded { pc, .. }
+            | Self::VableArrayDescrMalformed { pc, .. }
+            | Self::VableArrayMissingVirtualizableInfo { pc, .. }
+            | Self::VableArrayIndexOutOfRange { pc, .. }
+            | Self::VableArrayIndexNotConcrete { pc, .. }
+            | Self::AbortMarkerReached { pc, .. }
+            | Self::ConcreteShadowAllocationFailed { pc, .. }
+            | Self::AbortPermanentMarkerReached { pc, .. }
+            | Self::MayForceNullRefArgUnsupported { pc, .. }
+            | Self::VableEscapedDuringResidualCall { pc, .. }
+            | Self::GuardSnapshotVableUntyped { pc, .. }
+            | Self::GuardResumeCoordinateUnavailable { pc, .. }
+            | Self::LastExceptionWithoutActiveException { pc, .. }
+            | Self::JitMergePointGreenKeyUnresolved { pc, .. }
+            | Self::LoopHeaderJdIndexUnresolved { pc, .. }
+            | Self::SubWalkClosedLoop { pc, .. }
+            | Self::BranchGuardKeptStackUnsupported { pc, .. }
+            | Self::NonStandardVableFinishPortalUnsupported { pc, .. }
+            | Self::LoopBearingCalleeInlineUnsupported { pc, .. }
+            | Self::FieldDescrMissingParentDescr { pc, .. }
+            | Self::OrthodoxSubWalkTraceUnsupported { pc, .. }
+            | Self::UnfoldableListAppendResidualUnsupported { pc, .. }
+            | Self::BranchGuardUnrestorableKeptStackPermanent { pc, .. }
+            | Self::InplaceContainerMutationUnsupported { pc, .. }
+            | Self::ExcEdgeNoInFrameCatch { pc, .. }
+            | Self::TraceTooLong { pc, .. } => *pc,
+        }
+    }
+
     /// Construct the callee-inline decline.  The
     /// `LoopBearingCalleeInlineUnsupported` variant is emitted from ~20 sites
     /// (multi-frame seed preconditions, snapshot capture, hazard scan), so
@@ -2327,7 +2388,7 @@ pub fn walk<Sym: WalkSym>(
         //
         // `blackhole_if_trace_too_long` raises AFTER `run_one_step`, so the
         // forward image must carry `pc`, the already-advanced `next_pc`, rather
-        // than `opcode_position`.  `latch_trace_too_long_blackhole` copies the
+        // than `opcode_position`.  `latch_abort_blackhole` copies the
         // live MIFrame registers while this WalkContext still owns them; the
         // run-per-fn epilogue drives that image forward exactly like RPython's
         // `run_blackhole_interp_to_cancel_tracing`.
@@ -2349,7 +2410,7 @@ pub fn walk<Sym: WalkSym>(
             // replay would resume the caller without delivering the return or
             // raise that this step produced.
             let snapshot_safe = trace_too_long_blackhole_snapshot_safe(&outcome);
-            let blackhole_latched = snapshot_safe && latch_trace_too_long_blackhole(ctx, pc);
+            let blackhole_latched = snapshot_safe && latch_abort_blackhole(ctx, pc);
             if trace_too_long_abort_safe(&outcome, blackhole_latched, fbw_executed_effect_count()) {
                 let ops = ctx.trace_ctx.num_recorded_ops();
                 crate::state::note_root_trace_too_long(
