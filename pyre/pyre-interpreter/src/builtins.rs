@@ -5351,8 +5351,19 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     if has_real_kwargs(kwargs) {
         return Err(exc_no_keywords_error(w_self, "SyntaxError"));
     }
+    // `fixedview` runs the details object's own iteration protocol and can
+    // reach a collection safepoint, but the positional arguments live in a
+    // native slice the gateway copied off the shadow stack, which a collection
+    // does not rewrite.  Publish the receiver and the arguments first, then
+    // read each one back from its slot.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut flat = Vec::with_capacity(positional.len() + 1);
+    flat.push(w_self);
+    flat.extend_from_slice(positional);
+    let base = pyre_object::gc_roots::pin_roots(&flat);
     if positional.len() == 2 {
-        let details = crate::baseobjspace::fixedview(positional[1], -1)?;
+        let details =
+            crate::baseobjspace::fixedview(pyre_object::gc_roots::shadow_stack_get(base + 2), -1)?;
         match details.len() {
             4 | 6 => {}
             5 => {
@@ -5361,9 +5372,9 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
                 ));
             }
             n if n < 4 => {
-                return Err(crate::PyError::type_error(
-                    "function missing required argument 'info[3]' (pos 4)",
-                ));
+                return Err(crate::PyError::type_error(format!(
+                    "function takes at least 4 arguments ({n} given)"
+                )));
             }
             n => {
                 return Err(crate::PyError::type_error(format!(
@@ -5372,10 +5383,15 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             }
         }
     }
+    let args_list = pyre_object::w_list_new(
+        (0..positional.len())
+            .map(|index| pyre_object::gc_roots::shadow_stack_get(base + 1 + index))
+            .collect(),
+    );
     unsafe {
         pyre_object::interp_exceptions::w_exception_set_args(
-            w_self,
-            pyre_object::w_list_new(positional.to_vec()),
+            pyre_object::gc_roots::shadow_stack_get(base),
+            args_list,
         );
     }
     Ok(pyre_object::w_none())
