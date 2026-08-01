@@ -401,6 +401,16 @@ pub struct TraceCtx {
     /// jump), consumed and reset by the following `jit_merge_point`
     /// (pyjitpl.py:1559-1562).  `-1` = not seen.
     pub seen_loop_header_for_jdindex: i32,
+    /// pyjitpl.py:1570/1577 `saved_pc = self.pc` / `self.pc = saved_pc`.
+    ///
+    /// Upstream consults a merge point once per visit and then resumes the
+    /// frame just after it, so the loop body runs before the next consult.
+    /// Pyre fuses the merge point onto the guest instruction hosting it, so a
+    /// walk re-entered at the same guest pc — the `current_merge_points.append`
+    /// path, which keeps tracing instead of ending the trace — would re-consult
+    /// it with nothing recorded in between. Set on that re-entry and consumed
+    /// by the next `BC_JIT_MERGE_POINT`, which then falls straight through.
+    pub merge_point_resumed: bool,
     /// pyjitpl.py: `metainterp.staticdata.callinfocollection`. Needed by
     /// `ResumeDataBoxReader.concat_strings` / `slice_string` / `concat_unicodes`
     /// / `slice_unicode` (resume.py:1143-1188) which look up the
@@ -1446,6 +1456,7 @@ impl TraceCtx {
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
+            merge_point_resumed: false,
             callinfocollection: None,
             call_pure_results: indexmap::IndexMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
@@ -1529,6 +1540,7 @@ impl TraceCtx {
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
+            merge_point_resumed: false,
             callinfocollection: None,
             call_pure_results: indexmap::IndexMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,

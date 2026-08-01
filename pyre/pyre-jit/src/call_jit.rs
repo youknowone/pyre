@@ -3506,7 +3506,6 @@ pub fn trace_and_compile_from_bridge(
     // point rather than mid-body or past a dropped loop iteration (a
     // value-stack underflow / off-by-one-iteration result otherwise).
     let resume_state = frame.snapshot_for_tracing();
-    let trace_frame = frame.snapshot_for_tracing();
     let live_frame_addr = frame as *const PyFrame as usize;
     let mut adopted_walk_end_state = false;
     // Arm the bridge `Terminate` no-replay shortcut for this walk.  The walk
@@ -3546,6 +3545,14 @@ pub fn trace_and_compile_from_bridge(
             &env,
             || {},
             |meta, sym| {
+                // pyjitpl.py:1571-1578: a merge point that only appends to
+                // `current_merge_points` restores `self.pc` and goes on
+                // interpreting, so the driver re-enters this walk instead of
+                // handing the guest back.  Each entry starts from the frame
+                // as the previous segment left it, so the snapshot is taken
+                // here rather than once outside — `FrameBox` owns a shadow
+                // stack root guard and cannot be cloned.
+                let trace_frame = bridge_frame_root.frame().snapshot_for_tracing();
                 let (action, executed) = trace_bytecode(
                     meta,
                     sym,

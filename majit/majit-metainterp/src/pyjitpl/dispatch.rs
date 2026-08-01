@@ -4711,6 +4711,24 @@ where
                 {
                     return TraceAction::Continue;
                 }
+                // pyjitpl.py:1570-1578: `reached_loop_header` is called with
+                // `self.pc = orgpc`, and when it returns WITHOUT raising the
+                // frame restores `self.pc = saved_pc` — the position just AFTER
+                // the jit_merge_point — and goes on executing. The merge point
+                // is therefore consulted once per visit; the loop body runs
+                // before it is consulted again.
+                //
+                // Pyre fuses the merge point onto the guest instruction that
+                // hosts it, so a walk re-entered at the same guest pc (the
+                // `current_merge_points.append` path, jitdriver.rs `merge_point`)
+                // arrives back at this op with nothing recorded in between and
+                // would close again on the spot. This latch is `saved_pc`: skip
+                // the ladder exactly once, so the resumed walk executes the
+                // instruction's own arm and only re-consults the merge point a
+                // full iteration later.
+                if ctx.take_merge_point_resumed() {
+                    return TraceAction::Continue;
+                }
                 // MAJIT_PCSEQ (W4/D2 diagnostic): log the interpreter green pc
                 // captured at EVERY merge-point re-entry (not gated on
                 // seen_loop_header like MAJIT_MPTRACE). Confirms the walk holds a

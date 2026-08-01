@@ -5305,6 +5305,12 @@ impl TraceCtx {
     /// `u64`, losing the per-header identity, so the explicit `header_pc`
     /// disambiguator restores it for re-entrant loop headers within one
     /// code object.
+    /// See [`TraceCtx::merge_point_resumed`] — pyjitpl.py:1570/1577
+    /// `saved_pc`. Read-and-clear: the skip applies to exactly one visit.
+    pub fn take_merge_point_resumed(&mut self) -> bool {
+        std::mem::take(&mut self.merge_point_resumed)
+    }
+
     pub fn has_merge_point_at(&self, key: u64, header_pc: usize) -> bool {
         self.current_merge_points
             .iter()

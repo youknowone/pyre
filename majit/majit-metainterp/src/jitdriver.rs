@@ -2541,9 +2541,9 @@ impl<S: JitState> JitDriver<S> {
     /// });
     /// ```
     #[inline]
-    pub fn merge_point<F>(&mut self, trace_fn: F)
+    pub fn merge_point<F>(&mut self, mut trace_fn: F)
     where
-        F: FnOnce(&mut MetaInterp<S::Meta>, &mut S::Sym) -> TraceAction,
+        F: FnMut(&mut MetaInterp<S::Meta>, &mut S::Sym) -> TraceAction,
     {
         if !self.meta.is_tracing() {
             return;
@@ -2561,6 +2561,34 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
 
+        // pyjitpl.py:1571-1578: when `reached_loop_header` returns WITHOUT
+        // raising — the `current_merge_points.append` path at :3058-3060 — the
+        // metainterp restores its pc and keeps executing the guest under
+        // recording:
+        //
+        // ```python
+        // self.pc = saved_pc
+        // ...
+        // # and the same MIFrame goes on with `opcode = ...; dispatch`
+        // ```
+        //
+        // No guest instruction runs outside the recorder while the trace is
+        // live. This driver's caller works the other way round: a merge point
+        // that returns hands control back to the NATIVE dispatch loop, which
+        // executes the instruction the merge point sits on
+        // (`#pc = __sp_pc; continue;` in the `jit_merge_point!` expansion).
+        // For every other outcome that is correct — the trace has ended. For
+        // the append path it would execute one guest instruction with no IR op
+        // recorded for it, and the next walk segment would resume a whole
+        // instruction later with the sym still holding the previous
+        // iteration's boxes. So the append path re-enters the walk HERE
+        // instead of returning, which is what makes it upstream's "keep
+        // interpreting" rather than "hand the guest back".
+        //
+        // Self-limiting the way upstream's scan is: the flag is set only when
+        // the scan found NO same-greenkey merge point, and the same call
+        // registers one, so the next visit takes the retrace/abort branch.
+        loop {
         // Phase 1: split-borrow self into meta and sym, run closure.
         // self.meta and self.sym are disjoint fields → standard split-borrow.
         let mut action = {
@@ -3056,10 +3084,29 @@ impl<S: JitState> JitDriver<S> {
                 // the metainterp goes on recording into the next iteration.
                 // Dropping `self.sym` is how this driver says "the trace ended
                 // here" (`merge_point` aborts on a None sym), so that one path
-                // has to keep it.
-                if !self.meta.take_keep_tracing_after_close() {
-                    self.sym = None;
+                // has to keep it — and it must re-enter the walk rather than
+                // let the native dispatch loop run the merge point's own
+                // instruction unrecorded (see the loop header above).
+                if self.meta.take_keep_tracing_after_close() {
+                    // The walk-final handoff staged at the top of this arm
+                    // describes a trace that ENDED. Discard it: publishing it
+                    // would make the `jit_merge_point!` expansion write the
+                    // walk state into native `state` and resume the guest at
+                    // the merge-point pc, which is exactly the instruction the
+                    // next walk segment still has to record.
+                    self.meta.single_pass_outcome = None;
+                    self.meta.single_pass_scalar_values = None;
+                    self.meta.single_pass_virt_array_values = None;
+                    // pyjitpl.py:1577 `self.pc = saved_pc` — the resumed walk
+                    // re-enters at the merge point's own guest pc, so the
+                    // merge-point op must fall through once instead of
+                    // closing again with nothing recorded in between.
+                    if let Some(ctx) = self.meta.trace_ctx() {
+                        ctx.merge_point_resumed = true;
+                    }
+                    continue;
                 }
+                self.sym = None;
             }
             TraceAction::CloseLoopWithArgs {
                 jump_args,
@@ -3504,6 +3551,8 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.clear_trace_session();
             }
         }
+        break;
+        }
     }
 
     /// pyjitpl.py:2788-2807 `blackhole_if_trace_too_long` + pyjitpl.py:2760
@@ -3650,7 +3699,7 @@ impl<S: JitState> JitDriver<S> {
         trace_fn: F,
     ) -> Option<DetailedDriverRunOutcome>
     where
-        F: FnOnce(&mut MetaInterp<S::Meta>, &mut S::Sym) -> TraceAction,
+        F: FnMut(&mut MetaInterp<S::Meta>, &mut S::Sym) -> TraceAction,
     {
         // RPython JC_TRACING parity: in RPython, MetaInterp._interpret()
         // runs all bytecodes within the same portal call. In pyre,
