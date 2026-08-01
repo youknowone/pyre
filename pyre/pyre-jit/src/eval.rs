@@ -1266,7 +1266,7 @@ fn register_traced_storage_box<T: 'static>(
 
 /// Build and configure the MiniMarkGC with all type registrations,
 /// vtable mappings, and subclass ranges.
-fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
+fn build_gc() -> Box<MiniMarkGC> {
     // translationoption.py:185 `taggedpointers` — kept in lockstep with the
     // pyre-object representation switch so the collector-core immediate
     // guards (`is_tagged_immediate`) go live exactly when small ints start

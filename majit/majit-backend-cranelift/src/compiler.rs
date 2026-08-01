@@ -1445,7 +1445,7 @@ fn with_cranelift_gc<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Option<R> 
         });
     }
     if majit_gc::gc_sync::is_initialized() {
-        return Some(majit_gc::gc_sync::gc_op(f));
+        return Some(majit_gc::gc_sync::gc_op(|gc| f(gc)));
     }
     None
 }

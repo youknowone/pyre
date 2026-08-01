@@ -8,6 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
+// `gc_sync` hands out the concrete collector; the trait must be in scope for
+// its methods to resolve on that type.
+use majit_gc::GcAllocator;
 use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
@@ -125,7 +128,9 @@ pub(crate) fn with_dynasm_active_gc<R>(f: impl Fn(&dyn majit_gc::GcAllocator) ->
         return Some(r);
     }
     if majit_gc::gc_sync::is_initialized() {
-        return Some(majit_gc::gc_sync::gc_query_reentrant(f));
+        // The singleton is the concrete collector; the box path above is what
+        // keeps this forwarder's argument a trait object.
+        return Some(majit_gc::gc_sync::gc_query_reentrant(|gc| f(gc)));
     }
     None
 }
@@ -170,7 +175,7 @@ pub(crate) fn with_dynasm_active_gc_mut<R>(
         });
     }
     if majit_gc::gc_sync::is_initialized() {
-        return Some(majit_gc::gc_sync::gc_op(f));
+        return Some(majit_gc::gc_sync::gc_op(|gc| f(gc)));
     }
     None
 }

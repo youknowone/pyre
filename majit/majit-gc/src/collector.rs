@@ -873,7 +873,7 @@ impl MiniMarkGC {
     /// indistinguishable from the slow path's, so a side table would
     /// not stay in sync.
     #[inline]
-    fn is_managed_heap_object(&self, addr: usize) -> bool {
+    pub fn is_managed_heap_object(&self, addr: usize) -> bool {
         self.is_valid_gc_object(addr) && (self.nursery.contains(addr) || self.oldgen.contains(addr))
     }
 
@@ -885,6 +885,10 @@ impl MiniMarkGC {
 
     /// Allocate a fixed-size object with the given type ID and size (excluding header).
     /// Returns a GcRef pointing to the object payload (after the header).
+    ///
+    /// Split into an inline bump and an out-of-line tail like
+    /// [`alloc_with_type_rooted`](Self::alloc_with_type_rooted).
+    #[inline]
     pub fn alloc_with_type(&mut self, type_id: u32, payload_size: usize) -> GcRef {
         // gc_stress: force a full collection *before* allocating so that any
         // object live at this allocation point but unreachable from a
@@ -905,58 +909,59 @@ impl MiniMarkGC {
             return GcRef(0);
         };
 
+        if total_size <= self.config.large_object_threshold {
+            let ptr = self.nursery.alloc(total_size);
+            if !ptr.is_null() {
+                return self.finish_nursery_object(ptr, type_id);
+            }
+        }
+        self.alloc_with_type_slow(type_id, total_size)
+    }
+
+    /// The outcomes [`alloc_with_type`](Self::alloc_with_type) leaves out of
+    /// line: a large object, and a nursery too full to serve the bump.
+    #[cold]
+    #[inline(never)]
+    fn alloc_with_type_slow(&mut self, type_id: u32, total_size: usize) -> GcRef {
         // Large objects go directly to old gen.
         if total_size > self.config.large_object_threshold {
             return self.alloc_in_oldgen(type_id, total_size);
         }
 
-        let ptr = self.nursery.alloc(total_size);
-        if ptr.is_null() {
-            // Nursery full: trigger minor collection and retry.
-            // minimark.py:1282 collect_and_reserve parity. Carry the triggering
-            // allocation size so a bounded major collection applies the
-            // PYPY_GC_MAX out-of-memory policy against it (threshold_reached).
-            self.pending_reserving_size = total_size;
-            self.do_collect_nursery();
-            self.pending_reserving_size = 0;
-            // incminimark.py:2603-2615 — a bounded major collection that leaves
-            // the heap over `max_heap_size` asks this allocation to fail so the
-            // caller raises MemoryError: NULL propagates to the compiled-code
-            // `CHECK_MEMORY_ERROR` path and to the interpreter allocation
-            // chokepoint. Never taken in the unbounded default (`PYPY_GC_MAX`
-            // unset), so the fallback below is unchanged there.
-            if std::mem::take(&mut self.oom_pending) {
-                return GcRef(0);
-            }
-            let ptr = self.nursery.alloc(total_size);
-            let ptr = if ptr.is_null() {
-                self.reserve_nursery_gap(total_size)
-            } else {
-                ptr
-            };
-            if ptr.is_null() && Self::nursery_allocation_size(total_size) > self.nursery.size() {
-                // Production incminimark keeps `nonlarge_max` below the
-                // nursery size. Tiny backend tests can configure the two
-                // independently; retain their external-allocation fallback
-                // only for an object that cannot physically fit anywhere.
-                return self.alloc_in_oldgen(type_id, total_size);
-            }
-            assert!(
-                !ptr.is_null(),
-                "collect_and_reserve could not find nursery space for a non-large object"
-            );
-            Self::init_nursery_object(ptr, type_id);
-            let obj = GcRef((ptr as usize) + GcHeader::SIZE);
-            self.register_weakref_if_needed(type_id, obj.0);
-            self.register_destructor_if_needed(type_id, obj.0);
-            return obj;
+        // Nursery full: trigger minor collection and retry.
+        // minimark.py:1282 collect_and_reserve parity. Carry the triggering
+        // allocation size so a bounded major collection applies the
+        // PYPY_GC_MAX out-of-memory policy against it (threshold_reached).
+        self.pending_reserving_size = total_size;
+        self.do_collect_nursery();
+        self.pending_reserving_size = 0;
+        // incminimark.py:2603-2615 — a bounded major collection that leaves
+        // the heap over `max_heap_size` asks this allocation to fail so the
+        // caller raises MemoryError: NULL propagates to the compiled-code
+        // `CHECK_MEMORY_ERROR` path and to the interpreter allocation
+        // chokepoint. Never taken in the unbounded default (`PYPY_GC_MAX`
+        // unset), so the fallback below is unchanged there.
+        if std::mem::take(&mut self.oom_pending) {
+            return GcRef(0);
         }
-
-        Self::init_nursery_object(ptr, type_id);
-        let obj = GcRef((ptr as usize) + GcHeader::SIZE);
-        self.register_weakref_if_needed(type_id, obj.0);
-        self.register_destructor_if_needed(type_id, obj.0);
-        obj
+        let ptr = self.nursery.alloc(total_size);
+        let ptr = if ptr.is_null() {
+            self.reserve_nursery_gap(total_size)
+        } else {
+            ptr
+        };
+        if ptr.is_null() && Self::nursery_allocation_size(total_size) > self.nursery.size() {
+            // Production incminimark keeps `nonlarge_max` below the
+            // nursery size. Tiny backend tests can configure the two
+            // independently; retain their external-allocation fallback
+            // only for an object that cannot physically fit anywhere.
+            return self.alloc_in_oldgen(type_id, total_size);
+        }
+        assert!(
+            !ptr.is_null(),
+            "collect_and_reserve could not find nursery space for a non-large object"
+        );
+        self.finish_nursery_object(ptr, type_id)
     }
 
     /// `malloc_fixedsize` / `collect_and_reserve` with one native-stack root.
@@ -968,10 +973,18 @@ impl MiniMarkGC {
     /// required; this preserves the upstream fast path instead of doing a
     /// root-set add/remove for every allocation.
     ///
+    /// Split into a `malloc_fast` body and its exceptional tail the way
+    /// `framework.py:361-382` does: the copy it declares `inline=True` carries
+    /// only the bump, so a caller pays a bump and a branch, while a large
+    /// object or a full nursery costs a call. Without the split the whole
+    /// function is a frame that saves ten callee-saved registers before it
+    /// can reach a ten-instruction bump.
+    ///
     /// # Safety
     /// `root` must point to a valid mutable `GcRef` slot until this call
     /// returns. `needs_write_barrier` must point to a valid mutable `bool`
     /// slot.
+    #[inline]
     pub unsafe fn alloc_with_type_rooted(
         &mut self,
         type_id: u32,
@@ -992,6 +1005,29 @@ impl MiniMarkGC {
             return GcRef(0);
         };
 
+        if total_size <= self.config.large_object_threshold {
+            let ptr = self.nursery.alloc(total_size);
+            if !ptr.is_null() {
+                return self.finish_nursery_object(ptr, type_id);
+            }
+        }
+        unsafe { self.alloc_with_type_rooted_slow(type_id, total_size, root, needs_write_barrier) }
+    }
+
+    /// The outcomes [`alloc_with_type_rooted`] leaves out of line: a large
+    /// object, and a nursery too full to serve the bump.
+    ///
+    /// # Safety
+    /// Same contract as [`alloc_with_type_rooted`].
+    #[cold]
+    #[inline(never)]
+    unsafe fn alloc_with_type_rooted_slow(
+        &mut self,
+        type_id: u32,
+        total_size: usize,
+        root: *mut GcRef,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
         // Large objects never trigger a nursery collection, so the native
         // slot needs no temporary registration.
         if total_size > self.config.large_object_threshold {
@@ -999,37 +1035,35 @@ impl MiniMarkGC {
             return self.alloc_in_oldgen(type_id, total_size);
         }
 
-        let ptr = self.nursery.alloc(total_size);
-        if ptr.is_null() {
-            self.pending_reserving_size = total_size;
-            unsafe { self.roots.add(root) };
-            self.do_collect_nursery();
-            self.roots.remove(root);
-            self.pending_reserving_size = 0;
-            if std::mem::take(&mut self.oom_pending) {
-                return GcRef(0);
-            }
-            let ptr = self.nursery.alloc(total_size);
-            let ptr = if ptr.is_null() {
-                self.reserve_nursery_gap(total_size)
-            } else {
-                ptr
-            };
-            if ptr.is_null() && Self::nursery_allocation_size(total_size) > self.nursery.size() {
-                unsafe { *needs_write_barrier = true };
-                return self.alloc_in_oldgen(type_id, total_size);
-            }
-            assert!(
-                !ptr.is_null(),
-                "collect_and_reserve could not find nursery space for a non-large object"
-            );
-            Self::init_nursery_object(ptr, type_id);
-            let obj = GcRef((ptr as usize) + GcHeader::SIZE);
-            self.register_weakref_if_needed(type_id, obj.0);
-            self.register_destructor_if_needed(type_id, obj.0);
-            return obj;
+        self.pending_reserving_size = total_size;
+        unsafe { self.roots.add(root) };
+        self.do_collect_nursery();
+        self.roots.remove(root);
+        self.pending_reserving_size = 0;
+        if std::mem::take(&mut self.oom_pending) {
+            return GcRef(0);
         }
+        let ptr = self.nursery.alloc(total_size);
+        let ptr = if ptr.is_null() {
+            self.reserve_nursery_gap(total_size)
+        } else {
+            ptr
+        };
+        if ptr.is_null() && Self::nursery_allocation_size(total_size) > self.nursery.size() {
+            unsafe { *needs_write_barrier = true };
+            return self.alloc_in_oldgen(type_id, total_size);
+        }
+        assert!(
+            !ptr.is_null(),
+            "collect_and_reserve could not find nursery space for a non-large object"
+        );
+        self.finish_nursery_object(ptr, type_id)
+    }
 
+    /// The tail every nursery bump shares: `init_gc_object` plus the
+    /// weakref and destructor registration of incminimark.py:687-693.
+    #[inline]
+    fn finish_nursery_object(&mut self, ptr: *mut u8, type_id: u32) -> GcRef {
         Self::init_nursery_object(ptr, type_id);
         let obj = GcRef((ptr as usize) + GcHeader::SIZE);
         self.register_weakref_if_needed(type_id, obj.0);
@@ -1132,11 +1166,7 @@ impl MiniMarkGC {
             return self.alloc_in_oldgen(type_id, total_size);
         }
 
-        Self::init_nursery_object(ptr, type_id);
-        let obj = GcRef((ptr as usize) + GcHeader::SIZE);
-        self.register_weakref_if_needed(type_id, obj.0);
-        self.register_destructor_if_needed(type_id, obj.0);
-        obj
+        self.finish_nursery_object(ptr, type_id)
     }
 
     /// Fallible host-side counterpart of `alloc_with_type_no_collect`.
@@ -1162,9 +1192,13 @@ impl MiniMarkGC {
     /// fresh nursery allocation. The no-collect path can instead spill to
     /// old-gen, so report that exceptional placement to the initializer.
     ///
+    /// Split like [`alloc_with_type_rooted`](Self::alloc_with_type_rooted):
+    /// the bump inlines into the caller, the old-gen spill is a call.
+    ///
     /// # Safety
     /// `needs_write_barrier` must point to a valid mutable `bool` slot for the
     /// duration of this call.
+    #[inline]
     pub unsafe fn try_alloc_with_type_no_collect_with_placement(
         &mut self,
         type_id: u32,
@@ -1176,25 +1210,25 @@ impl MiniMarkGC {
             return GcRef(0);
         };
 
-        if total_size > self.config.large_object_threshold {
-            return self
-                .try_alloc_in_oldgen(type_id, total_size)
-                .unwrap_or(GcRef(0));
+        if total_size <= self.config.large_object_threshold {
+            let ptr = self.nursery.alloc(total_size);
+            if !ptr.is_null() {
+                let obj = self.finish_nursery_object(ptr, type_id);
+                unsafe { *needs_write_barrier = false };
+                return obj;
+            }
         }
+        self.spill_to_oldgen_or_null(type_id, total_size)
+    }
 
-        let ptr = self.nursery.alloc(total_size);
-        if ptr.is_null() {
-            return self
-                .try_alloc_in_oldgen(type_id, total_size)
-                .unwrap_or(GcRef(0));
-        }
-
-        Self::init_nursery_object(ptr, type_id);
-        let obj = GcRef((ptr as usize) + GcHeader::SIZE);
-        self.register_weakref_if_needed(type_id, obj.0);
-        self.register_destructor_if_needed(type_id, obj.0);
-        unsafe { *needs_write_barrier = false };
-        obj
+    /// The old-gen spill
+    /// [`try_alloc_with_type_no_collect_with_placement`](Self::try_alloc_with_type_no_collect_with_placement)
+    /// leaves out of line, for a large object or a nursery with no room.
+    #[cold]
+    #[inline(never)]
+    fn spill_to_oldgen_or_null(&mut self, type_id: u32, total_size: usize) -> GcRef {
+        self.try_alloc_in_oldgen(type_id, total_size)
+            .unwrap_or(GcRef(0))
     }
 
     /// incminimark.py:690-692 parity. When a freshly-allocated object
@@ -4322,7 +4356,7 @@ impl GcAllocator for MiniMarkGC {
     }
 
     fn is_managed_heap_object(&self, addr: usize) -> bool {
-        self.is_valid_gc_object(addr) && (self.nursery.contains(addr) || self.oldgen.contains(addr))
+        MiniMarkGC::is_managed_heap_object(self, addr)
     }
 
     fn is_nursery_object(&self, addr: usize) -> bool {

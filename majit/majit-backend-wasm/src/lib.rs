@@ -257,7 +257,7 @@ thread_local! {
 fn with_wasm_active_gc<R>(f: impl Fn(&dyn GcAllocator) -> R) -> Option<R> {
     if !majit_gc::gc_box_installed() {
         return majit_gc::gc_sync::is_initialized()
-            .then(|| majit_gc::gc_sync::gc_query_reentrant(f));
+            .then(|| majit_gc::gc_sync::gc_query_reentrant(|gc| f(gc)));
     }
     match WASM_ACTIVE_GC.with(|cell| cell.try_borrow().map(|g| g.as_deref().map(|gc| f(gc)))) {
         Ok(Some(r)) => return Some(r),
@@ -272,7 +272,7 @@ fn with_wasm_active_gc<R>(f: impl Fn(&dyn GcAllocator) -> R) -> Option<R> {
         }
     }
     if majit_gc::gc_sync::is_initialized() {
-        return Some(majit_gc::gc_sync::gc_query_reentrant(f));
+        return Some(majit_gc::gc_sync::gc_query_reentrant(|gc| f(gc)));
     }
     None
 }
@@ -294,7 +294,7 @@ fn with_wasm_active_gc_mut<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Opti
         });
     }
     if majit_gc::gc_sync::is_initialized() {
-        return Some(majit_gc::gc_sync::gc_op(f));
+        return Some(majit_gc::gc_sync::gc_op(|gc| f(gc)));
     }
     None
 }

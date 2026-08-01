@@ -28,13 +28,25 @@ use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
+use crate::collector::MiniMarkGC;
+// The singleton is concrete, but its `GcAllocator` methods still need the
+// trait in scope to resolve.
 use crate::GcAllocator;
 
 /// Process-global GC singleton storage.
 /// `UnsafeCell` provides interior mutability; access is serialised by
 /// `GC_SYNC.gc_mutex`. `Sync` is sound because all `&mut` access goes
 /// through the mutex.
-struct GcSingleton(UnsafeCell<Option<Box<dyn GcAllocator>>>);
+///
+/// The collector is named concretely rather than held behind
+/// `dyn GcAllocator`. `framework.py:132` resolves `GCClass` once from the
+/// translation config and `:272-338` `_declare_functions` binds every GC
+/// operation to `GCClass.<meth>.im_func`, so upstream reaches the collector
+/// through statically bound functions; nothing dispatches on an allocator
+/// value at run time. A trait object here would put a vtable call between
+/// every allocation site and the nursery bump, which is precisely what
+/// `:377-382` `getfn(malloc_fast, …, inline=True)` exists to avoid.
+struct GcSingleton(UnsafeCell<Option<Box<MiniMarkGC>>>);
 unsafe impl Sync for GcSingleton {}
 
 static GC_STORE: GcSingleton = GcSingleton(UnsafeCell::new(None));
@@ -81,7 +93,7 @@ static GC_SYNC: GcSync = GcSync {
 
 /// Store the GC singleton. Idempotent — subsequent calls are no-ops.
 /// Must be called before any `gc_op`.
-pub fn store_singleton(gc: Box<dyn GcAllocator>) {
+pub fn store_singleton(gc: Box<MiniMarkGC>) {
     if GC_INITIALIZED.load(Ordering::Acquire) {
         return;
     }
@@ -107,7 +119,7 @@ pub fn store_singleton(gc: Box<dyn GcAllocator>) {
 /// each per-worker test a pristine heap and empty root set, so a prior test's
 /// oldgen residue or stale registered roots cannot corrupt this test's
 /// collections.
-pub fn replace_singleton_leaking_old(gc: Box<dyn GcAllocator>) {
+pub fn replace_singleton_leaking_old(gc: Box<MiniMarkGC>) {
     let _guard = GC_SYNC.gc_mutex.lock().unwrap();
     // SAFETY: gc_mutex held; the gc_stress harness runs tests serially, so no
     // concurrent gc_op is in flight during the swap.
@@ -128,7 +140,7 @@ pub fn is_initialized() -> bool {
 
 /// Access the GC singleton mutably under gc_mutex protection.
 /// SAFETY: caller must hold gc_mutex.
-unsafe fn singleton_mut() -> &'static mut dyn GcAllocator {
+unsafe fn singleton_mut() -> &'static mut MiniMarkGC {
     // SAFETY: caller holds gc_mutex, so there is no concurrent access.
     unsafe { &mut *GC_STORE.0.get() }
         .as_deref_mut()
@@ -165,7 +177,7 @@ fn my_ident() -> usize {
     GC_THREAD.with(|t| t as *const GcThreadState as usize)
 }
 
-/// Ident of the thread currently holding the exclusive `&mut dyn GcAllocator`
+/// Ident of the thread currently holding the exclusive `&mut MiniMarkGC`
 /// (inside a `gc_op` closure); 0 when none. `in_gc_op` compares against
 /// `my_ident()`, the `rpy_fastgil == get_ident()` idiom (thread_gil.c:21).
 static GC_OP_OWNER: AtomicUsize = AtomicUsize::new(0);
@@ -177,7 +189,7 @@ static STW_OWNER: AtomicUsize = AtomicUsize::new(0);
 static STW_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 /// RAII marker: sets `GC_OP_OWNER` for the exact span of a closure that holds
-/// the exclusive `&mut dyn GcAllocator`. Wraps every `singleton_mut()` call.
+/// the exclusive `&mut MiniMarkGC`. Wraps every `singleton_mut()` call.
 struct OpGuard {
     prev: usize,
 }
@@ -227,7 +239,7 @@ pub fn in_gc_op() -> bool {
 /// collector. Re-derives from `GC_STORE.0.get()` each call (a pre-`&mut`-cached
 /// raw pointer would be invalidated by `singleton_mut`'s reborrow).
 #[inline]
-unsafe fn singleton_ref_reentrant() -> &'static dyn GcAllocator {
+unsafe fn singleton_ref_reentrant() -> &'static MiniMarkGC {
     unsafe { &*GC_STORE.0.get() }
         .as_deref()
         .expect("GC singleton not initialized — call store_singleton() first")
@@ -241,7 +253,7 @@ unsafe fn singleton_ref_reentrant() -> &'static dyn GcAllocator {
 /// `gc_mutex` (which would deadlock — the lock is non-recursive and, under STW,
 /// held by this very collector) or forming a second `&mut`.
 #[inline]
-pub fn gc_query_reentrant<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> R {
+pub fn gc_query_reentrant<R>(f: impl FnOnce(&MiniMarkGC) -> R) -> R {
     if in_gc_op() {
         // SAFETY: in_gc_op() ⇒ this thread holds the &mut and is the sole
         // running mutator (parked/spinning invariant); read-only, bounded to `f`.
@@ -417,7 +429,7 @@ pub fn stw_required() -> bool {
 // GC operation gate — fast path when single-threaded
 // ──────────────────────────────────────────────────────────────
 
-/// Execute a closure with exclusive `&mut dyn GcAllocator` access.
+/// Execute a closure with exclusive `&mut MiniMarkGC` access.
 ///
 /// **Fast path** (single registered thread, no STW): direct access after
 /// acquiring `IN_FAST_PATH`, without taking the Mutex.
@@ -425,7 +437,7 @@ pub fn stw_required() -> bool {
 /// **Slow path** (multiple threads or STW): acquires `gc_mutex`.
 /// Single-threaded production always takes the fast path.
 #[inline]
-pub fn gc_op<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
+pub fn gc_op<R>(f: impl FnOnce(&mut MiniMarkGC) -> R) -> R {
     let ident = my_ident();
     debug_assert!(
         !in_gc_op(),
@@ -458,7 +470,7 @@ pub fn gc_op<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
 
 /// Slow path: Mutex-guarded access with STW parking.
 #[cold]
-fn gc_op_slow<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
+fn gc_op_slow<R>(f: impl FnOnce(&mut MiniMarkGC) -> R) -> R {
     let ident = my_ident();
     let registered = GC_THREAD.with(|t| t.registered.get());
     if registered {
@@ -522,10 +534,10 @@ fn gc_op_slow<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
     result
 }
 
-/// Execute a closure with `&dyn GcAllocator` access (read-only query).
+/// Execute a closure with `&MiniMarkGC` access (read-only query).
 /// Same fast/slow path as `gc_op`.
 #[inline]
-pub fn gc_query<R>(f: impl FnOnce(&dyn GcAllocator) -> R) -> R {
+pub fn gc_query<R>(f: impl FnOnce(&MiniMarkGC) -> R) -> R {
     gc_op(|gc| f(gc))
 }
 
@@ -614,9 +626,9 @@ impl Drop for StwGuard {
 /// collector: it waits for all other threads to park, runs `collect_fn`
 /// with exclusive GC access, then resumes everyone.
 ///
-/// `collect_fn` receives `&mut dyn GcAllocator` — it can call
+/// `collect_fn` receives `&mut MiniMarkGC` — it can call
 /// `collect_nursery`, `collect_full`, etc.
-pub fn request_stw(collect_fn: impl FnOnce(&mut dyn GcAllocator)) {
+pub fn request_stw(collect_fn: impl FnOnce(&mut MiniMarkGC)) {
     gc_op(|gc| {
         let _stw = quiesce_mutators();
         collect_fn(gc);
@@ -632,7 +644,7 @@ pub fn request_stw(collect_fn: impl FnOnce(&mut dyn GcAllocator)) {
 /// forwarded value only after the operation owns the GC.
 pub fn gc_op_with_root<R>(
     root: crate::GcRef,
-    f: impl FnOnce(&mut dyn GcAllocator, crate::GcRef) -> R,
+    f: impl FnOnce(&mut MiniMarkGC, crate::GcRef) -> R,
 ) -> R {
     struct RootGuard(usize);
     impl Drop for RootGuard {
