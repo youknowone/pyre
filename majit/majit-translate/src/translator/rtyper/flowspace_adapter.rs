@@ -2309,7 +2309,7 @@ pub fn translate_op(
                             // (`tyref_input_class_root`) derives.  RPython
                             // forbids closures.
                             let colon_qual = format!("{owner_qual}::{name}");
-                            let is_closure_root = name == "closure"
+                            let is_closure_root = majit_charon_reader::ullbc::is_closure_leaf(name)
                                 && bk
                                     .pyre_struct_fields
                                     .borrow()

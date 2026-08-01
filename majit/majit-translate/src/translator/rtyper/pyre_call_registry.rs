@@ -399,7 +399,9 @@ impl PyreCallRegistry {
             // `.`-joined class the receiver getattr resolves to.  RPython
             // forbids closures (`_assert_rpythonic`), so there is no
             // upstream analogue.
-            if owner == "closure" && matches!(method.as_str(), "call_once" | "call" | "call_mut") {
+            if majit_charon_reader::ullbc::is_closure_leaf(owner)
+                && matches!(method.as_str(), "call_once" | "call" | "call_mut")
+            {
                 let stripped = segs[..segs.len() - 1].join("::");
                 let Some(&reg_key) = full_by_stripped.get(stripped.as_str()) else {
                     continue;

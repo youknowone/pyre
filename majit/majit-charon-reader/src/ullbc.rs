@@ -336,7 +336,21 @@ impl ItemMeta {
                 out.push_str("::");
             }
             match seg {
-                NameSeg::Ident { ident: (s, _) } => out.push_str(s),
+                NameSeg::Ident {
+                    ident: (s, disambiguator),
+                } => {
+                    out.push_str(s);
+                    // Multiple anonymous closures in one function all
+                    // carry the bare segment `closure`; only the
+                    // disambiguator index distinguishes them.  Keep it
+                    // (as `closure#N`) so co-located closure envs mint
+                    // distinct ClassDefs instead of collapsing their
+                    // captured `__pos_N` fields onto one shared row.
+                    if s == "closure" && *disambiguator > 0 {
+                        out.push('#');
+                        out.push_str(&disambiguator.to_string());
+                    }
+                }
                 NameSeg::Other(v) => {
                     let label = v
                         .as_object()
@@ -350,6 +364,13 @@ impl ItemMeta {
         }
         out
     }
+}
+
+/// Whether a struct-root leaf names a closure env — the bare `closure`
+/// or a disambiguated `closure#N` (see [`ItemMeta::name_path`]).  Leaf
+/// checks that special-case closures must accept both spellings.
+pub fn is_closure_leaf(leaf: &str) -> bool {
+    leaf == "closure" || leaf.starts_with("closure#")
 }
 
 #[derive(Debug, Deserialize)]
