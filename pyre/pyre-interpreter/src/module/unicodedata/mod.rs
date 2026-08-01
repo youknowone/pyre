@@ -3,9 +3,9 @@
 //! Real implementation backed by the runtime-independent
 //! `rustpython-unicode` crate.  The module-level functions read the latest
 //! bundled database; `unicodedata.ucd_3_2_0` reads the Unicode 3.2.0 view
-//! (used by `stringprep`).  `name` / `lookup` / `normalize` / `is_normalized`
-//! are version-independent, matching the crate, so the 3.2.0 instance shares
-//! those callables with the module.
+//! (used by `stringprep`).  `lookup` / `normalize` / `is_normalized` are
+//! version-independent, matching the crate, so the 3.2.0 instance shares those
+//! callables with the module.
 //!
 //! Signatures and error types/messages follow CPython 3.14.
 //!
@@ -187,17 +187,28 @@ fn numeric(args: &[PyObjectRef]) -> PyResult {
     numeric_impl(&MODERN, args)
 }
 
-// Version-independent queries: `name` / `lookup` / `normalize` /
-// `is_normalized` do not depend on the database version, so the 3.2.0 instance
-// binds the same callables.
+/// Short general-category name of an unassigned code point.
+const UNASSIGNED_CATEGORY: &str = "Cn";
 
-fn name(args: &[PyObjectRef]) -> PyResult {
+fn name_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     let (cp, default) = char_and_default("name", args)?;
-    if let Some(name) = cp.to_char().and_then(ucd_core::character_name) {
+    // A view has no name for a code point its own release leaves unassigned,
+    // so the version's general category gates the name table: `ucd_3_2_0.name`
+    // rejects characters assigned after Unicode 3.2.0.
+    if db.category(cp) != UNASSIGNED_CATEGORY
+        && let Some(name) = cp.to_char().and_then(ucd_core::character_name)
+    {
         return Ok(w_str_new(&name));
     }
     default.ok_or_else(|| PyError::value_error("no such name"))
 }
+fn name(args: &[PyObjectRef]) -> PyResult {
+    name_impl(&MODERN, args)
+}
+
+// Version-independent queries: `lookup` / `normalize` / `is_normalized` do not
+// depend on the database version, so the 3.2.0 instance binds the same
+// callables.
 
 fn lookup(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 1 {
@@ -344,7 +355,10 @@ impl W_UCD {
         )
     }
     fn name(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        name(ucd_method_args(args))
+        name_impl(
+            if self.legacy { &LEGACY } else { &MODERN },
+            ucd_method_args(args),
+        )
     }
     fn lookup(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         lookup(ucd_method_args(args))
@@ -390,7 +404,7 @@ crate::py_module! {
         // `unicodedata.ucd_3_2_0` — a `UCD` instance pinned to the Unicode
         // 3.2.0 database (used by `stringprep`).  Version-sensitive queries
         // the typed UCD instance selects `Ucd::new(false)` while
-        // name/lookup/normalize/is_normalized share version-independent
+        // lookup/normalize/is_normalized share version-independent
         // implementations with the module callables.
         // Install the TypeDef before allocation so the generated allocator
         // can stamp the canonical Python class in `w_class`.
@@ -436,6 +450,28 @@ mod tests {
         assert_eq!(
             unsafe { w_str_get_wtf8(W_UCD::from_obj(obj).unwrap().unidata_version()) }.to_string(),
             "3.2.0"
+        );
+    }
+
+    #[test]
+    fn ucd_legacy_name_rejects_later_assignments() {
+        crate::typedef::init_typeobjects();
+        let _ = type_object();
+        let obj = W_UCD::allocate_stable(W_UCD {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            legacy: true,
+        });
+        // U+0221 was assigned in Unicode 4.0, so the 3.2.0 view has no name
+        // for it while the latest view does.
+        let ucd = W_UCD::from_obj(obj).expect("typed UCD instance");
+        assert!(ucd.name(&[obj, w_str_new("\u{221}")]).is_err());
+        let modern = name(&[w_str_new("\u{221}")]).expect("name");
+        assert_eq!(
+            unsafe { w_str_get_wtf8(modern) }.to_string(),
+            "LATIN SMALL LETTER D WITH CURL"
         );
     }
 }
