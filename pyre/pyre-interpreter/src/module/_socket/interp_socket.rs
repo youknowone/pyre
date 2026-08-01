@@ -2812,28 +2812,36 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let buffer = crate::baseobjspace::simple_buffer_bytes(args[1])?.ok_or_else(|| {
                 crate::PyError::type_error("send: buffer must be bytes-like")
             })?;
-            let buf = buffer.as_bytes();
             let flags = if args.len() >= 3 {
                 (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
             } else {
                 0
             };
-            let n = loop {
-                let r = unsafe {
-                    libc::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags)
-                };
-                if r >= 0 {
-                    break r;
+            // `PyBuffer_Release` after the call — `SimpleBufferBytes` has no
+            // `Drop`, so an export that is never released leaves a `bytearray`
+            // argument permanently exported and unable to be resized. The
+            // borrow of `buffer` is scoped to the closure so the release also
+            // covers the error paths.
+            let result = (|| -> Result<isize, crate::PyError> {
+                let buf = buffer.as_bytes();
+                loop {
+                    let r = unsafe {
+                        libc::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags)
+                    };
+                    if r >= 0 {
+                        return Ok(r);
+                    }
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EINTR) {
+                        return Err(socket_io_err(err));
+                    }
+                    // EINTR: deliver a pending signal, then retry
+                    // (`converted_error` eintr_retry).
+                    crate::module::signal::interp_signal::checksignals_now()?;
                 }
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EINTR) {
-                    return Err(socket_io_err(err));
-                }
-                // EINTR: deliver a pending signal, then retry
-                // (`converted_error` eintr_retry).
-                crate::module::signal::interp_signal::checksignals_now()?;
-            };
-            Ok(pyre_object::w_int_new(n as i64))
+            })();
+            buffer.release();
+            Ok(pyre_object::w_int_new(result? as i64))
         }),
     ) };
 
@@ -2849,34 +2857,41 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let buffer = crate::baseobjspace::simple_buffer_bytes(args[1])?.ok_or_else(|| {
                 crate::PyError::type_error("sendall: buffer must be bytes-like")
             })?;
-            let buf = buffer.as_bytes();
             let flags = if args.len() >= 3 {
                 (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
             } else {
                 0
             };
-            let mut off = 0usize;
-            while off < buf.len() {
-                let n = unsafe {
-                    libc::send(
-                        fd,
-                        buf[off..].as_ptr() as *const libc::c_void,
-                        buf.len() - off,
-                        flags,
-                    )
-                };
-                if n < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() == Some(libc::EINTR) {
-                        // `rsocket.py:1132` signal_checker — deliver a pending
-                        // signal, then retry the remaining bytes.
-                        crate::module::signal::interp_signal::checksignals_now()?;
-                        continue;
+            // See `send` above: the export is released once the borrow of
+            // `buffer` ends, on the error path as well.
+            let result = (|| -> Result<(), crate::PyError> {
+                let buf = buffer.as_bytes();
+                let mut off = 0usize;
+                while off < buf.len() {
+                    let n = unsafe {
+                        libc::send(
+                            fd,
+                            buf[off..].as_ptr() as *const libc::c_void,
+                            buf.len() - off,
+                            flags,
+                        )
+                    };
+                    if n < 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() == Some(libc::EINTR) {
+                            // `rsocket.py:1132` signal_checker — deliver a
+                            // pending signal, then retry the remaining bytes.
+                            crate::module::signal::interp_signal::checksignals_now()?;
+                            continue;
+                        }
+                        return Err(socket_io_err(err));
                     }
-                    return Err(socket_io_err(err));
+                    off += n as usize;
                 }
-                off += n as usize;
-            }
+                Ok(())
+            })();
+            buffer.release();
+            result?;
             Ok(pyre_object::w_none())
         }),
     ) };
@@ -2940,7 +2955,6 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let buffer = crate::baseobjspace::simple_buffer_bytes(args[1])?.ok_or_else(|| {
                 crate::PyError::type_error("sendto: buffer must be bytes-like")
             })?;
-            let buf = buffer.as_bytes();
             // 3-arg form: (buf, flags, addr).  4-arg form: (self, buf, flags, addr).
             // We always take self-as-args[0], so 3 args = (self, buf, addr) [no flags]
             // and 4 args = (self, buf, flags, addr).
@@ -2952,31 +2966,38 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     args[3],
                 )
             };
-            let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-            let (storage, slen) = pack_inet_addr(family, addr_obj)?;
-            let n = loop {
-                let r = unsafe {
-                    libc::sendto(
-                        fd,
-                        buf.as_ptr() as *const libc::c_void,
-                        buf.len(),
-                        flags,
-                        &storage as *const _ as *const libc::sockaddr,
-                        slen,
-                    )
-                };
-                if r >= 0 {
-                    break r;
+            // See `send` above: the export is released once the borrow of
+            // `buffer` ends, on the error path as well. `pack_inet_addr` runs
+            // Python, so it is inside the released scope too.
+            let result = (|| -> Result<isize, crate::PyError> {
+                let buf = buffer.as_bytes();
+                let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
+                let (storage, slen) = pack_inet_addr(family, addr_obj)?;
+                loop {
+                    let r = unsafe {
+                        libc::sendto(
+                            fd,
+                            buf.as_ptr() as *const libc::c_void,
+                            buf.len(),
+                            flags,
+                            &storage as *const _ as *const libc::sockaddr,
+                            slen,
+                        )
+                    };
+                    if r >= 0 {
+                        return Ok(r);
+                    }
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EINTR) {
+                        return Err(socket_io_err(err));
+                    }
+                    // EINTR: deliver a pending signal, then retry
+                    // (`converted_error` eintr_retry).
+                    crate::module::signal::interp_signal::checksignals_now()?;
                 }
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EINTR) {
-                    return Err(socket_io_err(err));
-                }
-                // EINTR: deliver a pending signal, then retry
-                // (`converted_error` eintr_retry).
-                crate::module::signal::interp_signal::checksignals_now()?;
-            };
-            Ok(pyre_object::w_int_new(n as i64))
+            })();
+            buffer.release();
+            Ok(pyre_object::w_int_new(result? as i64))
         }),
     ) };
 

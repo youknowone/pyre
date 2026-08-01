@@ -2076,13 +2076,18 @@ fn reject_non_exception_channel_value(
     site: &str,
     context: impl FnOnce() -> String,
 ) -> ! {
-    let tag = unsafe { pyre_object::interp_exceptions::w_exception_kind_byte(obj) };
-    // Report the raw header before touching anything reached *through* it: if
+    // Nothing has been read out of `obj` yet, and this function only runs for a
+    // value already known not to be a `W_BaseException` — a small integer or an
+    // address at the end of a mapping reaches here too, and every read below
+    // can fault. Emit the pointer first so that a fault still leaves evidence.
+    eprintln!("[jit][BUG] {site}: not a W_BaseException: obj={obj:p}");
+    // Then the raw header, before touching anything reached *through* it: if
     // `ob_type` is itself garbage the name lookup below faults, and then this
     // line is all the evidence there is.
+    let tag = unsafe { pyre_object::interp_exceptions::w_exception_kind_byte(obj) };
     let words = unsafe { std::slice::from_raw_parts(obj as *const u64, 4) };
     eprintln!(
-        "[jit][BUG] {site}: not a W_BaseException: obj={obj:p} tag_byte={tag} \
+        "[jit][BUG] {site}: obj={obj:p} tag_byte={tag} \
          words=[{:#018x} {:#018x} {:#018x} {:#018x}]",
         words[0], words[1], words[2], words[3],
     );
@@ -2621,7 +2626,22 @@ pub fn blackhole_resume_via_rd_numb(
             // A copy, not a probe: a ref register may hold a raw non-object
             // word (a force token, an erased unboxed buffer), so anything that
             // dereferences these belongs on the failure path only.
-            let bh_regs_r = bh.registers_r.clone();
+            //
+            // The copy has to be taken here because `release_bh_rd` below ends
+            // the borrow before the diagnostic closure runs, but it is only
+            // ever read when `exit_frame_exception_ref` rejects the value, so
+            // the same screen decides whether to pay for it. A move between
+            // here and the closure does not change the answer: the class of the
+            // propagating value is what is being screened.
+            let bh_regs_r = if unsafe {
+                pyre_object::interp_exceptions::w_exception_kind_checked(exc_value as PyObjectRef)
+            }
+            .is_none()
+            {
+                bh.registers_r.clone()
+            } else {
+                Vec::new()
+            };
             let bh_code_window: Vec<u8> = bh
                 .jitcode
                 .code
@@ -5124,18 +5144,29 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
     // `self.get_builtin().getdictvalue(space, varname)` (`pyopcode.py:979`).
     // This residual stopped after the globals leg, so a builtin name reached
     // here as a bogus `NameError`.
-    if !parent_frame_ptr.is_null() {
-        let w_builtin = unsafe { (*parent_frame_ptr).get_builtin() };
-        if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
-            let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
-            if !w_dict.is_null() {
-                match pyre_interpreter::baseobjspace::finditem_str(w_dict, varname) {
-                    Ok(Some(val)) => return val as i64,
-                    Ok(None) => {}
-                    Err(mut err) => {
-                        publish_residual_call_exception(err.to_exc_object() as i64);
-                        return 0;
-                    }
+    //
+    // A null frame is an anticipated input — the globals leg above already
+    // treats it as one — so the builtin module is derived from the globals'
+    // `__builtins__` in that case, the way `try_walker_load_global_cell_fold`
+    // does (specialize.rs:8904-8907) and the same object `pick_builtin`
+    // resolves.
+    let w_builtin = if !parent_frame_ptr.is_null() {
+        unsafe { (*parent_frame_ptr).get_builtin() }
+    } else if !w_globals.is_null() {
+        unsafe { pyre_object::w_dict_getitem_str(w_globals, "__builtins__") }
+            .unwrap_or(pyre_object::PY_NULL)
+    } else {
+        pyre_object::PY_NULL
+    };
+    if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
+        let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+        if !w_dict.is_null() {
+            match pyre_interpreter::baseobjspace::finditem_str(w_dict, varname) {
+                Ok(Some(val)) => return val as i64,
+                Ok(None) => {}
+                Err(mut err) => {
+                    publish_residual_call_exception(err.to_exc_object() as i64);
+                    return 0;
                 }
             }
         }

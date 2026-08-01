@@ -9378,8 +9378,15 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
     // so the `co_names` index is `namei >> 1` (mirror `bh_load_global_fn`).
     let name_idx = (namei as usize) >> 1;
     let name = unsafe {
-        let code = &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject);
+        // The wrapper being non-null does not make its `code_ptr` non-null:
+        // `w_code_new_with_hidden_applevel` (pycode.rs:386) leaves the field
+        // null for a gateway builtin or a test fixture, and every sibling
+        // name lookup screens it the same way.
+        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
+        if code_ptr.is_null() {
+            return Ok(false);
+        }
+        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
         match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
             Some(n) => n.to_string(),
             None => return Ok(false),

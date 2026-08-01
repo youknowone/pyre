@@ -1456,7 +1456,17 @@ fn spawn_thread(
     /// during bootstrap leaves the starter spinning forever.
     struct BootstrapSignal(std::sync::Arc<Bootstrap>);
     impl BootstrapSignal {
+        /// The word carries the ident *and* two reserved states, so an ident
+        /// equal to either would be misread: `0` leaves the starter looping
+        /// and `START_FAILED` raises "can't start new thread" for a thread
+        /// that started. `current_ident` is the OS thread id — `gettid` on
+        /// Linux, `pthread_threadid_np` on Darwin — and neither issues those
+        /// two values, which is the invariant this pins.
         fn publish(&self, ident: i64) {
+            debug_assert!(
+                ident as usize != 0 && ident as usize != START_FAILED,
+                "thread ident collides with a reserved rendezvous state"
+            );
             self.0.word.store(ident as usize, Ordering::Release);
         }
         /// Preserve the diagnostic the starter raises.  `os_thread.py:145`

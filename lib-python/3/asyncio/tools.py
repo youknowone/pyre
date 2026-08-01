@@ -244,6 +244,12 @@ def exit_with_permission_help_text():
 def _get_awaited_by_tasks(pid: int) -> list:
     try:
         return get_all_awaited_by(pid)
+    except ImportError as e:
+        # `get_all_awaited_by` defers the `_remote_debugging` import to call
+        # time, so an interpreter without that extension reports here rather
+        # than at `import asyncio.tools`.
+        print(f"Error retrieving tasks: {e}")
+        sys.exit(1)
     except RuntimeError as e:
         while e.__context__ is not None:
             e = e.__context__

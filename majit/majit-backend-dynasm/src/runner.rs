@@ -667,7 +667,9 @@ fn dynasm_get_referents(obj: majit_ir::GcRef, visitor: majit_gc::GetObjectsVisit
     {
         return;
     }
-    majit_gc::gc_sync::gc_op(|g| g.get_referents(obj, &mut visit));
+    // See `MajitGc::get_referents`: the fallback can park, so the argument is
+    // published and reloaded rather than passed as the raw local.
+    majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.get_referents(obj, &mut visit));
 }
 
 fn dynasm_is_tracked(obj: majit_ir::GcRef) -> bool {
@@ -676,7 +678,7 @@ fn dynasm_is_tracked(obj: majit_ir::GcRef) -> bool {
     {
         return tracked;
     }
-    majit_gc::gc_sync::gc_op(|g| g.is_tracked(obj))
+    majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.is_tracked(obj))
 }
 
 /// Non-moving old-gen-only major. Reclaims stable-allocated interp int/float

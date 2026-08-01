@@ -1013,10 +1013,17 @@ impl GcAllocator for GcHandle {
         gc_sync::gc_op(|gc| gc.get_objects(generation, visitor))
     }
     fn get_referents(&mut self, obj: GcRef, visitor: &mut dyn FnMut(GcRef)) {
-        gc_sync::gc_op(|gc| gc.get_referents(obj, visitor))
+        // Rooted like `write_barrier`: a contended `gc_op` parks this mutator,
+        // so another thread's minor collection can forward `obj` while the call
+        // waits. Reading the raw argument afterwards would hand the collector a
+        // forwarding stub, which `do_get_referents` rejects — reporting a live
+        // object as having no referents at all.
+        gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_referents(obj, visitor))
     }
     fn is_tracked(&mut self, obj: GcRef) -> bool {
-        gc_sync::gc_op(|gc| gc.is_tracked(obj))
+        // Same exposure as `get_referents`: a forwarded address is not a
+        // managed-heap object of the type the answer is read out of.
+        gc_sync::gc_op_with_root(obj, |gc, obj| gc.is_tracked(obj))
     }
     fn collect_oldgen_nonmoving(&mut self) {
         gc_sync::gc_op(|gc| gc.collect_oldgen_nonmoving())

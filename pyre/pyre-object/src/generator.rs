@@ -2,6 +2,13 @@
 //!
 //! Wraps a suspended frame. __next__() resumes the frame until
 //! YIELD_VALUE (produces a value) or RETURN_VALUE (raises StopIteration).
+//!
+//! # Safety
+//! The `w_generator_*` / `w_coroutine_*` accessors below cast their argument
+//! to [`GeneratorIterator`] and read or write a field at a fixed offset, with
+//! no kind check of their own. Each one therefore requires `obj` to point at a
+//! live `GeneratorIterator` — a generator, coroutine or async generator. Any
+//! other object reads or, worse, writes an unrelated byte of its payload.
 
 use crate::pyobject::*;
 use pyre_macros::pyre_class;

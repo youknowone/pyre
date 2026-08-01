@@ -1635,13 +1635,27 @@ fn get_objects_via_active_runtime(generation: i8, visitor: majit_gc::GetObjectsV
     with_cranelift_gc(|gc| gc.get_objects(generation, &mut visit));
 }
 
+/// Split the same way [`gc_write_barrier_via_active_runtime`] is: the TLS path
+/// cannot park, so the raw address is still current there, while the `gc_op`
+/// fallback can — and a minor collection during that wait would forward `obj`,
+/// leaving the collector to answer about a forwarding stub.
 fn get_referents_via_active_runtime(obj: GcRef, visitor: majit_gc::GetObjectsVisitorFn) {
     let mut visit = visitor;
-    with_cranelift_gc(|gc| gc.get_referents(obj, &mut visit));
+    if majit_gc::gc_box_installed() && CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
+        with_cranelift_gc(|gc| gc.get_referents(obj, &mut visit));
+    } else if majit_gc::gc_sync::is_initialized() {
+        majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_referents(obj, &mut visit));
+    }
 }
 
 fn is_tracked_via_active_runtime(obj: GcRef) -> bool {
-    with_cranelift_gc(|gc| gc.is_tracked(obj)).unwrap_or(false)
+    if majit_gc::gc_box_installed() && CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some()) {
+        return with_cranelift_gc(|gc| gc.is_tracked(obj)).unwrap_or(false);
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.is_tracked(obj));
+    }
+    false
 }
 
 /// Non-moving old-gen-only major trampoline — sweeps dead old-gen objects
