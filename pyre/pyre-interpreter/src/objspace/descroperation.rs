@@ -4869,7 +4869,20 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             while i < pyre_object::w_list_len(a) && i < pyre_object::w_list_len(b) {
                 let ea = pyre_object::w_list_getitem(a, i as i64).unwrap_or(PY_NULL);
                 let eb = pyre_object::w_list_getitem(b, i as i64).unwrap_or(PY_NULL);
-                if !crate::baseobjspace::eq_w(ea, eb)? {
+                // CPython 3.14 list comparison asks the elements' actual
+                // `==` operation, not ObjSpace's immutable-value identity
+                // fast path.  This keeps two distinct NaN objects unequal.
+                let equal = if std::ptr::eq(ea, eb) {
+                    true
+                } else if unsafe {
+                    pyre_object::pyobject::is_exact_type(ea, &pyre_object::FLOAT_TYPE)
+                        && pyre_object::pyobject::is_exact_type(eb, &pyre_object::FLOAT_TYPE)
+                } {
+                    crate::baseobjspace::is_true(compare(ea, eb, CompareOp::Eq)?)?
+                } else {
+                    crate::baseobjspace::eq_w(ea, eb)?
+                };
+                if !equal {
                     break;
                 }
                 i += 1;
