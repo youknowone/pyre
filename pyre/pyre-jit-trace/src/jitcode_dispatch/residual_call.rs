@@ -1563,6 +1563,12 @@ pub(crate) fn walker_abort_if_mayforce_null_ref_arg<Sym: WalkSym>(
     // (arg 1) is a checked `PY_NULL` sentinel (prepended as arg0 only when
     // non-null), so a concrete-NULL there is the normal plain-call shape.
     let is_call_kw = call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallKw;
+    // `bh_store_deref_value_fn(cell, value)` — `value` (arg 1) is a checked
+    // `PY_NULL` sentinel handed to `w_cell_set` unread; DELETE_DEREF lowers to
+    // exactly that shape.  Kept in step with the same exemption in
+    // `try_execute_residual_call_via_executor`.
+    let is_store_deref =
+        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::StoreDeref;
     for (i, &ty) in call_descr.arg_types().iter().enumerate() {
         if ty != majit_ir::Type::Ref {
             continue;
@@ -1577,6 +1583,9 @@ pub(crate) fn walker_abort_if_mayforce_null_ref_arg<Sym: WalkSym>(
             continue;
         }
         if is_raise_varargs && i + 1 == call_descr.arg_types().len() {
+            continue;
+        }
+        if is_store_deref && i == 1 {
             continue;
         }
         if let Some(&b) = allboxes.get(1 + i) {
@@ -1957,6 +1966,17 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // `walker_abort_if_mayforce_null_ref_arg`.
     let is_raise_varargs =
         call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs;
+    // `bh_store_deref_value_fn(cell, value)` — `value` (arg index 1) is a
+    // checked `PY_NULL` sentinel: DELETE_DEREF lowers to
+    // `store_deref_value(cell, none)` after its own bound check
+    // (`codewriter.rs` `Instruction::DeleteDeref`), and the helper hands the
+    // NULL straight to `w_cell_set` without ever dereferencing it.  Declining
+    // it left the clear-the-cell half of every `del <cellvar>` and every
+    // `except E as e` handler cleanup recorded but UNEXECUTED, which marks the
+    // walk unjournaled — so the walk-end flush declines and the caller replays
+    // the region on top of the residuals the walk already ran concretely.
+    let is_store_deref =
+        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::StoreDeref;
     for (i, &arg) in args.iter().enumerate() {
         if is_call_fn && i == 1 {
             continue;
@@ -1968,6 +1988,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             continue;
         }
         if is_raise_varargs && i + 1 == args.len() {
+            continue;
+        }
+        if is_store_deref && i == 1 {
             continue;
         }
         if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {

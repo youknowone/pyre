@@ -464,7 +464,7 @@ fn fill_user_function_args(
         let takes_str = if ndefaults > 0 {
             format!(
                 "from {} to {} positional arguments",
-                nparams - ndefaults,
+                nparams as isize - ndefaults as isize,
                 nparams
             )
         } else {
@@ -508,15 +508,21 @@ fn fill_user_function_args(
         } else {
             0
         };
-        let first_default = nparams - ndefaults;
+        // `argument.py:302-315` computes `def_first = co_argcount -
+        // len(defaults_w)` in signed arithmetic and keeps `defaults_w[defnum]`
+        // for every `defnum = i - def_first` that is not negative.  A
+        // `__defaults__` longer than the parameter list makes `def_first`
+        // negative, which selects the tail of the tuple; in `usize` the
+        // subtraction wrapped instead, no slot ever matched, and the call
+        // raised a missing-argument `TypeError`.
+        let first_default = nparams as isize - ndefaults as isize;
         for i in n_pos_copied..nparams {
-            if i >= first_default {
-                let default_idx = i - first_default;
-                if let Some(val) =
+            let default_idx = i as isize - first_default;
+            if default_idx >= 0
+                && let Some(val) =
                     unsafe { pyre_object::w_tuple_getitem(defaults, default_idx as i64) }
-                {
-                    filled_args[i] = val;
-                }
+            {
+                filled_args[i] = val;
             }
         }
     }
