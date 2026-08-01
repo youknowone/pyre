@@ -3340,6 +3340,15 @@ fn emit_listslice_alloc_and_copy(
     newlength: &Variable,
 ) {
     let items_ptr = items_array_ptr_lltype(item_lltype);
+    // The result repr (`hop.r_result`) is a fixed list when the slice is never
+    // resized (`ListDef.offspring` keeps `resized=False`), so `ll_newlist`
+    // returns a bare `Ptr(GcArray)` with no `items` field; a resized result is
+    // a header reaching its array through `items`.  Read the result layout off
+    // its pointer lltype and branch `dst_items` the same way `src_items`
+    // branches on `source_layout` (`ll_arraycopy` uses `dest.ll_items()`,
+    // rlist.py:555-559, which is `ll_fixed_items(l) = l` for a fixed list).
+    let result_layout = list_layout_from_lltype(&result_ptr_lltype)
+        .expect("getslice result lltype must be a list pointer");
     // l = RESLIST.ll_newlist(newlength).
     let new_lst = variable_with_lltype("new_lst", result_ptr_lltype);
     block.borrow_mut().operations.push(SpaceOperation::new(
@@ -3351,8 +3360,7 @@ fn emit_listslice_alloc_and_copy(
         Hlvalue::Variable(new_lst.clone()),
     ));
     // src items (per source layout): a fixed list IS its items array; a resized
-    // header reaches the array through `items`. The result is always resized
-    // (`hop.r_result`), so its items come through `items`.
+    // header reaches the array through `items`.
     let src_items = match source_layout {
         ListLayout::Fixed => Hlvalue::Variable(l.clone()),
         ListLayout::Resized => {
@@ -3365,15 +3373,22 @@ fn emit_listslice_alloc_and_copy(
             Hlvalue::Variable(items)
         }
     };
-    let dst_items = variable_with_lltype("dst_items", items_ptr);
-    block.borrow_mut().operations.push(SpaceOperation::new(
-        "getfield",
-        vec![
-            Hlvalue::Variable(new_lst.clone()),
-            void_field_const("items"),
-        ],
-        Hlvalue::Variable(dst_items.clone()),
-    ));
+    // dst items (per result layout): mirror the source branch above.
+    let dst_items = match result_layout {
+        ListLayout::Fixed => Hlvalue::Variable(new_lst.clone()),
+        ListLayout::Resized => {
+            let items = variable_with_lltype("dst_items", items_ptr);
+            block.borrow_mut().operations.push(SpaceOperation::new(
+                "getfield",
+                vec![
+                    Hlvalue::Variable(new_lst.clone()),
+                    void_field_const("items"),
+                ],
+                Hlvalue::Variable(items.clone()),
+            ));
+            Hlvalue::Variable(items)
+        }
+    };
     // ll_arraycopy(src_items, dst_items, src_start, 0, newlength).
     let copy_void = variable_with_lltype("v", LowLevelType::Void);
     block.borrow_mut().operations.push(SpaceOperation::new(
@@ -3381,7 +3396,7 @@ fn emit_listslice_alloc_and_copy(
         vec![
             Hlvalue::Constant(copy_const),
             src_items,
-            Hlvalue::Variable(dst_items),
+            dst_items,
             src_start,
             signed_const(0),
             Hlvalue::Variable(newlength.clone()),
@@ -3797,13 +3812,14 @@ fn rtype_bltn_list_via_ll_copy(
 ///     return hop.gendirectcall(ll_listslice, cRESLIST, v_lst, *vlist)
 /// ```
 ///
-/// `hop.r_result` is always the resized `ListRepr` (`listdef.offspring` yields
-/// a fresh growable list, unaryop.py:420-423); the receiver's `source_layout`
-/// varies (a `FixedSizeListRepr` slice source is possible). Mints
+/// `hop.r_result` is `listdef.offspring` (unaryop.py:420-423), a fresh list
+/// whose repr is `FixedSizeListRepr` when the slice is never resized and
+/// `ListRepr` otherwise; the receiver's `source_layout` likewise varies. Mints
 /// `ll_arraycopy` (general 5-arg), `ll_newlist`, and the per-`kind`
 /// `ll_listslice_%s` helper in dependency order, then `gendirectcall`s it. The
 /// `cRESLIST` Void const is implicit — the result repr is `hop.r_result`, which
-/// the helper builders read directly.
+/// the helper builders read directly (and off whose lltype they select the
+/// result layout for the destination-items copy).
 fn rtype_getslice_via_ll_listslice(
     hop: &HighLevelOp,
     source_layout: ListLayout,
@@ -6083,6 +6099,74 @@ mod tests {
         }
     }
 
+    /// A runtime `start` that is NOT proved non-negative must be rejected by
+    /// `decompose_slice_args` (rtyper.py:768-770) with "slice start must be
+    /// proved non-negative", the guard that keeps an unsupported slice form off
+    /// the `ll_listslice_*` path. Same hop as the startstop test but with a
+    /// `nonneg == false` start annotation.
+    #[test]
+    fn translate_operation_getslice_non_nonneg_start_is_rejected() {
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::SpaceOperation;
+        use std::cell::RefCell as StdRef;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_list: Arc<dyn Repr> =
+            Arc::new(ListRepr::new(&rtyper, r_int.clone()).expect("ListRepr::new"));
+        let list_lltype = r_list.lowleveltype().clone();
+
+        let v_lst = Variable::new();
+        v_lst.set_concretetype(Some(list_lltype));
+        let v_start = Variable::new();
+        v_start.set_concretetype(Some(LowLevelType::Signed));
+        let v_stop = Variable::new();
+        v_stop.set_concretetype(Some(LowLevelType::Signed));
+        let v_lst_h = Hlvalue::Variable(v_lst);
+        let v_start_h = Hlvalue::Variable(v_start);
+        let v_stop_h = Hlvalue::Variable(v_stop);
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            "getslice".to_string(),
+            vec![v_lst_h.clone(), v_start_h.clone(), v_stop_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_lst_h);
+        hop.args_s.borrow_mut().push(SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_list.clone()));
+        // A runtime start that is NOT proved non-negative.
+        hop.args_v.borrow_mut().push(v_start_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(
+                /* nonneg */ false, false,
+            )));
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        hop.args_v.borrow_mut().push(v_stop_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(
+                /* nonneg */ true, false,
+            )));
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        *hop.r_result.borrow_mut() = Some(r_list.clone());
+
+        let err = rtyper
+            .translate_operation(&hop)
+            .expect_err("a non-nonneg slice start must fail decompose_slice_args");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("slice start must be proved non-negative"),
+            "expected the non-negative start rejection, got {msg:?}"
+        );
+    }
+
     /// `l[start:]` — non-constant nonneg start, constant `None` stop —
     /// decomposes to `"startonly"` (rtyper.py:778-779) and lowers to
     /// `gendirectcall(ll_listslice_startonly, l, start)` (rlist.py:883-890).
@@ -6159,6 +6243,96 @@ mod tests {
         assert!(
             names.iter().any(|n| n == "ll_listslice_startonly"),
             "getslice [start:] must mint an ll_listslice_startonly helper graph, got {names:?}"
+        );
+    }
+
+    /// A `[start:]` slice whose result is never resized takes a
+    /// `FixedSizeListRepr` result (`listdef.offspring` keeps `resized=False`),
+    /// so `ll_newlist` returns a bare `Ptr(GcArray)` with no `items` field. The
+    /// minted `ll_listslice_startonly` helper must therefore select `dst_items`
+    /// as the result array ITSELF (`ll_fixed_items(l) = l`, rlist.py:411) and
+    /// emit NO `getfield("items")` — a fixed source AND a fixed result yield a
+    /// getfield-free copy body. A regression that hardcodes `getfield(new_lst,
+    /// "items")` would target a nonexistent field and reintroduce a getfield.
+    #[test]
+    fn translate_operation_getslice_startonly_fixed_result_has_no_dst_items_getfield() {
+        use crate::annotator::model::{SomeInteger, SomeValue, s_none};
+        use crate::flowspace::model::{Constant, SpaceOperation};
+        use std::cell::RefCell as StdRef;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        // Both the source and the result are FIXED lists: the receiver is a
+        // never-resized `&[T]`-shaped list and the slice result is likewise
+        // never resized, so both reach their array without an `items` field.
+        let r_list: Arc<dyn Repr> = Arc::new(
+            FixedSizeListRepr::new(&rtyper, r_int.clone()).expect("FixedSizeListRepr::new"),
+        );
+        let list_lltype = r_list.lowleveltype().clone();
+
+        let v_lst = Variable::new();
+        v_lst.set_concretetype(Some(list_lltype));
+        let v_start = Variable::new();
+        v_start.set_concretetype(Some(LowLevelType::Signed));
+        let v_lst_h = Hlvalue::Variable(v_lst);
+        let v_start_h = Hlvalue::Variable(v_start);
+        let c_stop = Hlvalue::Constant(Constant::new(ConstValue::None));
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            "getslice".to_string(),
+            vec![v_lst_h.clone(), v_start_h.clone(), c_stop.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_lst_h);
+        hop.args_s.borrow_mut().push(SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_list.clone()));
+        hop.args_v.borrow_mut().push(v_start_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(
+                /* nonneg */ true, false,
+            )));
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        hop.args_v.borrow_mut().push(c_stop);
+        hop.args_s.borrow_mut().push(s_none());
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        // The slice result is a fresh FIXED list (never resized).
+        *hop.r_result.borrow_mut() = Some(r_list.clone());
+
+        rtyper
+            .translate_operation(&hop)
+            .expect("translate_operation getslice must dispatch to rtype_getslice")
+            .expect("getslice returns the fresh list Variable");
+
+        // Inspect the minted `ll_listslice_startonly` helper body: with a fixed
+        // source and a fixed result, neither `src_items` nor `dst_items` reads
+        // an `items` field, so the copy body carries zero `getfield` ops.
+        let translator = ann.translator.clone();
+        let graphs = translator.graphs.borrow();
+        let helper = graphs
+            .iter()
+            .find(|g| g.borrow().name == "ll_listslice_startonly")
+            .expect("getslice [start:] must mint an ll_listslice_startonly helper graph");
+        // The listslice helper is a single-block graph; its whole copy body
+        // lives in the startblock.
+        let getfields: usize = helper
+            .borrow()
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .filter(|op| op.opname == "getfield")
+            .count();
+        assert_eq!(
+            getfields, 0,
+            "a fixed-source, fixed-result getslice must not read an `items` field \
+             (ll_newlist returns a bare array); found {getfields} getfield op(s)"
         );
     }
 

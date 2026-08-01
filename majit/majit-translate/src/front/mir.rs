@@ -4489,7 +4489,8 @@ impl<'a> Lowering<'a> {
                 // the recognizer is a capstone that cannot plant its unwired
                 // `getslice` + Void `ConstNone` into the co-wall-blocked
                 // `&args[1..]` graphs without crashing the legacy walker (see
-                // the post-pass note in `simplify_and_finalize`).  Re-enable
+                // the companion note in
+                // `lower_unstructured_with_static_addrs_and_attrs`).  Re-enable
                 // the `slice_index_rangefrom_sites` push here + the post-pass
                 // once those graphs' co-walls close.
                 // Surface every operand through a separate FieldWrite so
@@ -7071,10 +7072,12 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `<[T]>::as_ptr` / `Vec::as_ptr` — the slice's data pointer is
-                // the receiver value in the erased array-pointer model.  Alias
-                // the result to the receiver (twin of the `as_slice` identity
-                // above and `NonNull::as_ptr`).
+                // `<[T]>::as_ptr` — the slice's data pointer is the receiver
+                // value in the erased array-pointer model.  Alias the result to
+                // the receiver (twin of the `as_slice` identity above and
+                // `NonNull::as_ptr`).  A `Vec::as_ptr` is deliberately excluded
+                // (its items live behind a getfield, not the receiver) — see
+                // `is_container_as_ptr_identity`.
                 if args.len() == 1 && self.is_container_as_ptr_identity(&reg) {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
@@ -9410,15 +9413,24 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// `<[T]>::as_ptr` / `Vec::as_ptr` — the data-pointer projection of a
-    /// slice or vector receiver.  In the erased value-model a `&[T]` collapses
-    /// to a single GC array pointer (its length is read from the array header
-    /// by `ArrayLen`, not a companion fat-pointer word), so the slice's data
-    /// pointer IS the receiver value.  Alias the result to the receiver — the
-    /// same identity fold as `NonNull::as_ptr` (`nonnull_new_identity_alias`)
-    /// and `as_slice` above — instead of leaving an unregistered
-    /// `core::slice::<Impl>::as_ptr` residual whose only prior handling was a
-    /// `FOREIGN_STDLIB_EXTERNALS` `Address` annotation with no host address.
+    /// `<[T]>::as_ptr` — the data-pointer projection of a slice receiver.  In
+    /// the erased value-model a `&[T]` collapses to a single GC array pointer
+    /// (its length is read from the array header by `ArrayLen`, not a companion
+    /// fat-pointer word), so the slice's data pointer IS the receiver value.
+    /// Alias the result to the receiver — the same identity fold as
+    /// `NonNull::as_ptr` (`nonnull_new_identity_alias`) and `as_slice` above —
+    /// instead of leaving an unregistered `core::slice::<Impl>::as_ptr`
+    /// residual whose only prior handling was a `FOREIGN_STDLIB_EXTERNALS`
+    /// `Address` annotation with no host address.
+    ///
+    /// This is a fixed-array identity ONLY: it mirrors `ll_fixed_items(l) = l`
+    /// (`rlist.py:399`, a `FixedSizeListRepr` IS its items array).  A resized
+    /// list / `Vec` reaches its items buffer through `ll_items(l) = l.items`
+    /// (`rlist.py:368`, a `getfield`), so `alloc::vec::<Impl>::as_ptr` is NOT
+    /// an identity on the receiver and must not fold here — it stays a residual
+    /// (the only two callers, `IntArray`/`FloatArray::from_vec`, are host
+    /// builtins residualised to their compiled bodies, so no traced consumer
+    /// dereferences the folded header).
     fn is_container_as_ptr_identity(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -9426,7 +9438,7 @@ impl<'a> Lowering<'a> {
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             matches!(
                 fd.item_meta.name_path().as_str(),
-                "core::slice::<Impl>::as_ptr" | "alloc::vec::<Impl>::as_ptr"
+                "core::slice::<Impl>::as_ptr"
             )
         })
     }

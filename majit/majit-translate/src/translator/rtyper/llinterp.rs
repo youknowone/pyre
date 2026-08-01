@@ -1486,6 +1486,54 @@ mod tests {
     }
 
     #[test]
+    fn getoperationhandler_malloc_varsize_rejects_negative_length() {
+        // A `malloc_varsize` whose length is negative must fail before any
+        // allocation: the `usize::try_from(n_signed)` guard turns a `-1` length
+        // into a `TaskError` ("negative varsize length") rather than allocating
+        // a wrapped-huge array. Same graph shape as the write-through test,
+        // stopped at the single failing malloc.
+        use crate::flowspace::model::Constant as FlowConstant;
+        use crate::translator::rtyper::lltypesystem::lltype::Array;
+
+        let char_array = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Char)));
+        let type_c = Hlvalue::Constant(FlowConstant::new(ConstValue::LowLevelType(Box::new(
+            char_array,
+        ))));
+        let flavor_c = Hlvalue::Constant(FlowConstant::new(ConstValue::Dict(
+            std::collections::HashMap::new(),
+        )));
+        let neg_len = Hlvalue::Constant(FlowConstant::new(ConstValue::Int(-1)));
+
+        let arr = Variable::named("arr");
+        let start = Block::shared(vec![]);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "malloc_varsize",
+            vec![type_c, flavor_c, neg_len],
+            arr.clone().into(),
+        ));
+
+        let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "malloc_neg",
+            start.clone(),
+            arr.clone().into(),
+        )));
+        let returnblock = graph.borrow().returnblock.clone();
+        start.closeblock(vec![
+            Link::new(vec![arr.into()], Some(returnblock), None).into_ref(),
+        ]);
+
+        let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
+        let err = interp
+            .eval_graph(graph as Rc<dyn Any>, Vec::new(), false)
+            .expect_err("negative varsize length must abort evaluation before allocating");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("negative varsize length"),
+            "expected a negative-length rejection, got {msg:?}"
+        );
+    }
+
+    #[test]
     fn build_ll_int2dec_executes_to_decimal_strings() {
         // Slice C: run the synthesised `ll_int2dec` helper graph
         // (`lltypesystem/rstr.rs`) end-to-end through the interpreter and read

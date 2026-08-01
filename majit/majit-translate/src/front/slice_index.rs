@@ -306,12 +306,19 @@ fn range_feeds_only_index(
             if !reads_range {
                 continue;
             }
-            // A construction `FieldWrite` (base in the closure) writes the
-            // `RangeFrom`'s `start`; the `slice::index` op reads the range as
-            // its `range` operand. Both are removed / rewritten; anything else
-            // is a genuine second consumer.
+            // A construction `FieldWrite` on the `RangeFrom` value writes its
+            // `start`; the `slice::index` op reads the range as its `range`
+            // operand. Both are removed / rewritten; anything else is a genuine
+            // second consumer. The base must be the range value ITSELF, not any
+            // aliased inputarg in the closure: `rewire_one_slice_index_site`'s
+            // removal sweep drops only a `FieldWrite` with `base == range`, so
+            // accepting an aliased-base write here would leave that write
+            // behind after its ctor is removed — an undefined-operand shape
+            // `flowspace_adapter` rejects. `front::mir` emits the ctor and the
+            // `start` write in one block (`base == range`), so this loses no
+            // real site; a range threaded across a block edge declines cleanly.
             let is_construction_write =
-                matches!(&op.kind, OpKind::FieldWrite { base, .. } if in_closure(base));
+                matches!(&op.kind, OpKind::FieldWrite { base, .. } if base == range_result);
             let is_index = op.result.as_ref() == Some(index_result);
             if !(is_construction_write || is_index) {
                 return false;
