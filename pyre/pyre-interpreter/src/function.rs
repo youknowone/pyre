@@ -2757,6 +2757,20 @@ pub unsafe fn descr_method_getattribute(
     let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name) }) else {
         return Err(crate::PyError::type_error("attribute name must be string"));
     };
+    let function = unsafe { pyre_object::w_method_get_func(obj) };
+    // PyPy's Method.descr_method_getattribute delegates every miss to the
+    // wrapped function, so an inherited object.__subclasshook__ keeps the
+    // defining qualname.  CPython 3.14 exposes object.__subclasshook__ and
+    // object.__init_subclass__ as METH_CLASS builtins: their bound-method
+    // qualname uses the class they are currently bound to (`type` / `int` /
+    // ...), while the definitions still remain absent from those type dicts.
+    // Preserve that selected 3.14 delta without changing ordinary Python
+    // classmethods, whose qualname continues to name the defining class.
+    if name == "__qualname__" {
+        if let Some(qualname) = unsafe { method_class_bound_qualname(obj)? } {
+            return Ok(qualname);
+        }
+    }
     // function.py:604-614 — method attributes win, except `__doc__`;
     // an AttributeError falls back to the wrapped function.
     if name != "__doc__" {
@@ -2766,8 +2780,36 @@ pub unsafe fn descr_method_getattribute(
             Err(err) => return Err(err),
         }
     }
-    let function = unsafe { pyre_object::w_method_get_func(obj) };
     crate::baseobjspace::getattr_str(function, name)
+}
+
+/// Python 3.14's dynamic qualname for the two METH_CLASS methods inherited
+/// from `object`; `None` for every ordinary bound method.
+pub unsafe fn method_class_bound_qualname(
+    obj: PyObjectRef,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let function = unsafe { pyre_object::w_method_get_func(obj) };
+    let instance = unsafe { pyre_object::w_method_get_self(obj) };
+    if !unsafe { pyre_object::is_type(instance) } {
+        return Ok(None);
+    }
+    let function_qualname = unsafe { function_get_qualname(function) };
+    let inherited_name = if function_qualname == "object.__subclasshook__" {
+        "__subclasshook__"
+    } else if function_qualname == "object.__init_subclass__" {
+        "__init_subclass__"
+    } else {
+        return Ok(None);
+    };
+    let owner_qualname = crate::baseobjspace::getattr_str(instance, "__qualname__")?;
+    let Some(owner_qualname) = (unsafe { pyre_object::w_str_get_value_opt(owner_qualname) }) else {
+        return Err(crate::PyError::type_error(
+            "type.__qualname__ is not a unicode object",
+        ));
+    };
+    Ok(Some(pyre_object::w_str_new(&format!(
+        "{owner_qualname}.{inherited_name}"
+    ))))
 }
 
 #[inline]
