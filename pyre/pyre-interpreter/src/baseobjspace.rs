@@ -11441,10 +11441,11 @@ pub(crate) fn raiseattrerror(
     if w_descr.is_some() {
         let tp_name = unsafe {
             match crate::typedef::r#type(obj) {
-                // Python 3.14 `PyUnicode_FromFormat("%T")` calls
-                // `PyType_GetFullyQualifiedName`, which uses
-                // `<module>.<qualname>` for heap types.
-                Some(tp) => type_repr_qualified_name(tp.as_ptr()),
+                // CPython 3.14's generic set-attribute error uses
+                // `Py_TYPE(obj)->tp_name`, just like PyPy's `%T` here.  This
+                // deliberately differs from an empty member descriptor's
+                // read error, which uses the fully-qualified heap-type name.
+                Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
                 None => (*(*obj).ob_type).name.to_string(),
             }
         };
@@ -11460,7 +11461,7 @@ pub(crate) fn raiseattrerror(
             format!("type object '{}'", pyre_object::w_type_get_name(obj))
         } else {
             let tp_name = match crate::typedef::r#type(obj) {
-                Some(tp) => type_repr_qualified_name(tp.as_ptr()),
+                Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
                 None => (*(*obj).ob_type).name.to_string(),
             };
             format!("'{}' object", tp_name)
