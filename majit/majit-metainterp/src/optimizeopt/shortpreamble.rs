@@ -757,10 +757,17 @@ impl ShortBoxes {
         // `materialize_operand_at(arg)` lookup returns the same key (ptr_eq).
         let arg_res = ctx.materialize_operand_at(arg);
         let mut same_as = Op::new(OpCode::same_as_for_type(arg_type), &[arg_res.clone()]);
-        // ShortInputArg.preamble_op is the freshly renamed InputArg in
-        // RPython.  `ProducedShortOp` stores an OpRc, so majit uses a
-        // non-emitted SAME_AS stand-in whose result position is that renamed
-        // box; `res` above remains the original label box.
+        // `ProducedShortOp` stores an OpRc, so the fresh renamed InputArg
+        // that shortpreamble.py:257 carries as `preamble_op` is stood in for
+        // by this non-emitted SAME_AS. The stand-in stays at the ORIGINAL
+        // label box: exported entries carry original positions, and the
+        // rename is applied at import, where `produce_arg` maps the entry to
+        // its `short_inputargs` slot through `label_arg_idx`.
+        //
+        // Moving it to `renamed` splits the two halves of that contract —
+        // metadata stays seeded at the original while the replay consumes it
+        // from `preamble_op.pos` — and an input short box then loses its
+        // exported info and guards.
         same_as.pos.set(arg);
         // shortpreamble.py:259 `self.potential_ops[box] = ShortInputArg(...)`
         // — keyed by the label-arg Box itself; `arg_res` is its canonical
