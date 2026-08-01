@@ -30,10 +30,17 @@
 //! rather than a `PyObjectRef`, and the edge reaches the collector
 //! only through the hand-written `pytraceback_object_custom_trace`
 //! hook, which forwards it as a mutable slot but skips a frame the GC
-//! does not own (a `FrameBox::new_boxed` tracer snapshot).  The
-//! pointee must additionally never move, which is not an upstream
-//! requirement and is not caused by anything in this file — see
-//! `w_pytraceback_new`.
+//! does not own (a `FrameBox::new_boxed` tracer snapshot).
+//!
+//! The pointee must additionally never move.  That is not an upstream
+//! requirement and nothing in this file causes it: an executing frame
+//! is reached through a live Rust `&mut PyFrame` that spans every
+//! allocation the running opcode performs, and RPython's translator
+//! rewrites exactly those live references in their shadow-stack slots
+//! (`rpython/memory/gctransform/shadowstack.py:43-46`) where Rust has
+//! no equivalent pass.  `FrameBox::new` allocating non-moving stands
+//! in for that rewrite, and this file's conditional frame edge and
+//! `w_code` snapshot are downstream of it.
 
 use pyre_object::pyobject::*;
 

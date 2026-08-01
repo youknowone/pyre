@@ -535,23 +535,44 @@ so it rides the same gcmap-covered jitframe slots as every other ref across a
 collecting call, and `llsupport/assembler.py:301` notes it is deliberately "not
 in a register".
 
-What is left, then, is the remaining raw copies, and two of them are structural
-rather than mechanical:
+What is left is the remaining raw copies — and chasing them to the end shows the
+non-moving frame allocation is not a deferrable TODO but a forced adaptation.
 
-- `TraceCtx::virtualizable_heap_ptr` is a cached `*const u8` where upstream
-  unwraps the box per use.  It cannot simply become a forwarded slot: a root
-  portal seed deliberately points it at the `snapshot_for_tracing` copy, which
-  is a `FrameBox::new_boxed` allocation the GC does not own, so there is no slot
-  to forward until the snapshot-as-synchronization-target deviation goes first.
-- `eval_loop(frame: &mut PyFrame)` spans `safepoint()`.  Rust cannot re-read a
-  live `&mut`, so this needs the loop to re-derive the frame from a root after
-  each safepoint — mechanical but pervasive, in the hottest function in the
-  tree, and worth nothing until frames actually move.
+`eval_loop` holds `frame: &mut PyFrame` across the loop and hands it to
+`execute_opcode_step`, which allocates.  The JIT eval loop already runs the
+RPython discipline for its own copy — `FrameRoot` pushes the frame on the shadow
+stack, caches the `ShadowStackSlot`, and every collection point is followed by a
+fresh `let f: *mut PyFrame = frame_root.frame()`, with the comments naming
+`execute_opcode_step`, `handle_exception` and the ec block as the points.  It is
+load-bearing there because a JIT-inlined callee frame really can be nursery-
+resident (`emit_new_pyframe_inline_with_params` lowers to a nursery bump).
+
+But that discipline protects only the LOOP's copy.  The reference handed *into*
+`execute_opcode_step` is live across every allocation the opcode performs, and
+so is every frame reference below it.  Making frames movable therefore requires
+re-deriving the frame after each collection point inside every handler — which
+is precisely what RPython gets for free, because the translator rewrites live
+GCREF locals in their shadow-stack slots
+(`rpython/memory/gctransform/shadowstack.py:43-46`) and the interpreter never
+writes a reload by hand.  Rust has no such pass, and hand-writing it across the
+opcode implementations is neither reviewable nor maintainable.
+
+So the enabling condition for movable frames is a mechanism, not a patch: some
+automatic rewrite of live frame references across collection points.  Until one
+exists, `FrameBox::new` allocating non-moving is the thing standing in for it,
+and it should be read as pyre's stand-in for the translator's shadow-stack
+rewrite rather than as an accident awaiting cleanup.  The same holds for what it
+props up: `PyTraceback.w_code` stays, and so does the conditional frame edge.
+
+Two cached raw copies remain that are worth closing on their own merits, both
+narrower than the above:
+
+- `TraceCtx::virtualizable_heap_ptr` caches what upstream unwraps per use.  It
+  cannot simply become a forwarded slot: a root portal seed deliberately points
+  it at the `snapshot_for_tracing` copy, a `FrameBox::new_boxed` allocation the
+  GC does not own, so there is no slot to forward until the
+  snapshot-as-synchronization-target deviation goes first.
 - The blackhole's `virtualizable_ptr: i64`.
-
-Only after those does dropping the non-moving frame allocation become safe, and
-with it the `PyTraceback.w_code` snapshot, which exists solely because the frame
-edge is conditional.
 
 The invariant stays comment-enforced, and an attempt to check it turned up why
 it has to be.  A `debug_assert!` in `w_pytraceback_new` that the frame is not
