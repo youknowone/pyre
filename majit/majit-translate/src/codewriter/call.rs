@@ -1072,9 +1072,14 @@ fn is_known_by_value_struct(
     type_name: &str,
 ) -> bool {
     let type_name = type_name.trim();
-    if type_name.starts_with("*mut ")
-        || type_name.starts_with("*const ")
-        || type_name.starts_with('&')
+    // A by-value struct is spelled as a nominal path.  Every non-nominal
+    // carrier opens with a sigil — `*mut`/`*const`, `&`/`&mut`, `[T]`/`[T; N]`,
+    // `(A, B)`, `dyn`/`impl` — so reject on the leading token structurally
+    // instead of enumerating each spelling; the by-name list below then only
+    // has to cover nominal wrappers that are pointers underneath.
+    if !type_name.starts_with(|c: char| c.is_alphabetic() || c == '_')
+        || type_name.starts_with("dyn ")
+        || type_name.starts_with("impl ")
         || type_name.starts_with("Box<")
         || type_name.starts_with("Arc<")
         || type_name.starts_with("Rc<")
