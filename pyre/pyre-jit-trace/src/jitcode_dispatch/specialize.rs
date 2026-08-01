@@ -4121,6 +4121,171 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Does `tp` name a layout whose class overrides `is_w` with a value
+/// comparison?  `baseobjspace::is_w` gates one branch per overriding class,
+/// each demanding both operands be that exact type: `int`
+/// (`intobject.py:44`), `float` (`floatobject.py:196`), `complex`
+/// (`complexobject.py:287`), `tuple` (`tupleobject.py:47`), `bytes`
+/// (`bytesobject.py:25`), `str` (`unicodeobject.py:101`) and `frozenset`
+/// (`setobject.py:592`).  Every other class keeps the default pointer
+/// identity (`baseobjspace.py:246`).
+fn is_w_compares_by_value(tp: *const pyre_object::pyobject::PyType) -> bool {
+    [
+        &pyre_object::pyobject::INT_TYPE as *const pyre_object::pyobject::PyType,
+        &pyre_object::pyobject::FLOAT_TYPE as *const pyre_object::pyobject::PyType,
+        &pyre_object::pyobject::COMPLEX_TYPE as *const pyre_object::pyobject::PyType,
+        &pyre_object::pyobject::TUPLE_TYPE as *const pyre_object::pyobject::PyType,
+        &pyre_object::bytesobject::BYTES_TYPE as *const pyre_object::pyobject::PyType,
+        &pyre_object::pyobject::STR_TYPE as *const pyre_object::pyobject::PyType,
+        &pyre_object::setobject::FROZENSET_TYPE as *const pyre_object::pyobject::PyType,
+    ]
+    .iter()
+    .any(|special| std::ptr::eq(*special, tp))
+}
+
+/// Walker-native fold of the `IS_OP` residual — `bh_compare_fn(lhs, rhs,
+/// tag)` with tag 8 (`is`) or 9 (`is_not`), the tags
+/// `compare_op_tag_for_opname` assigns those two opnames.
+///
+/// `IS_OP` is `space.is_w(w_1, w_2)` plus a `newbool`
+/// (`pyopcode.py:1078-1092`), and `is_w` (`baseobjspace.py:833`) dispatches
+/// to `w_two.is_w(space, w_one)`, whose default is pointer identity.  Two
+/// tiers, mirroring `FASTPATHS_SAME_BOXES`' `ptr_eq`/`ptr_ne` entries
+/// (`pyjitpl.py:326-336`):
+///
+///   * Same box — `baseobjspace::is_w` answers at its opening `ptr::eq`
+///     whatever the class, so the result is the constant `True`/`False`.
+///     No op and no guard: this is the `b1 is b2` fast check itself.
+///   * Distinct boxes whose layouts both keep the default `is_w` — no
+///     value-comparison branch can fire, so `is_w` again reduces to that
+///     `ptr::eq`.  A `GuardClass` per operand pins the layout, then
+///     `ptr_eq`/`ptr_ne` replaces the may-force `compare_fn` and the
+///     `GuardNotForced` behind it.
+///
+/// Declining on a value-comparing layout is what keeps the second tier
+/// sound: `GuardClass` pins `ob_type`, and an `int` subclass instance
+/// shares `INT_TYPE` with a plain `int` while answering the exact-type gate
+/// differently, so the layout alone cannot separate them.  A tagged
+/// immediate is declined outright — it carries no `ob_type` to guard.
+pub(crate) fn try_walker_fold_is_op<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 2 || dst_bank != 'r' || !ctx.is_authoritative_executor {
+        return Ok(None);
+    }
+    let invert = match op_tag {
+        8 => false,
+        9 => true,
+        _ => return Ok(None),
+    };
+    let lhs = r_args[0];
+    let rhs = r_args[1];
+
+    if lhs.same_box(rhs) {
+        // `x is x` / `x is not x` — statically determined.
+        return walker_write_const_bool_result(ctx, op_pc, !invert, dst, dst_bank).map(Some);
+    }
+
+    let (Some(lhs_obj), Some(rhs_obj)) = (
+        walker_concrete_ref_object(ctx, lhs),
+        walker_concrete_ref_object(ctx, rhs),
+    ) else {
+        return Ok(None);
+    };
+    if lhs_obj.is_null() || rhs_obj.is_null() {
+        return Ok(None);
+    }
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(lhs_obj)
+            || pyre_object::tagged_int::is_tagged_int(rhs_obj))
+    {
+        return Ok(None);
+    }
+    let (lhs_type, rhs_type) = unsafe {
+        (
+            (*(lhs_obj as *const pyre_object::pyobject::PyObject)).ob_type,
+            (*(rhs_obj as *const pyre_object::pyobject::PyObject)).ob_type,
+        )
+    };
+    if is_w_compares_by_value(lhs_type) || is_w_compares_by_value(rhs_type) {
+        return Ok(None);
+    }
+    // The layout test above is the proof that `is_w` reduces to `ptr::eq`
+    // here; cross-check it against the real thing and decline rather than
+    // record a concrete the emitted `ptr_eq` disagrees with.
+    let same = std::ptr::eq(lhs_obj, rhs_obj);
+    if same != pyre_interpreter::baseobjspace::is_w(lhs_obj, rhs_obj) {
+        return Ok(None);
+    }
+
+    // --- commit to the fold: emit IR (no further declines) ---
+    for (operand, operand_type) in [(lhs, lhs_type), (rhs, rhs_type)] {
+        if operand.is_constant() || ctx.trace_ctx.heap_cache().is_class_known(operand) {
+            continue;
+        }
+        let type_addr = operand_type as usize as i64;
+        let type_const = ctx.trace_ctx.const_int(type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[operand, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(operand, type_addr);
+    }
+    let cmp = if invert {
+        OpCode::PtrNe
+    } else {
+        OpCode::PtrEq
+    };
+    let truth = ctx.trace_ctx.record_op(cmp, &[lhs, rhs]);
+    let result = same != invert;
+    ctx.trace_ctx
+        .set_opref_concrete(truth, majit_ir::Value::Int(result as i64));
+    // Same boxed-bool elision as the int compare specialization: when the
+    // Ref dst is provably consumed only by the following `is_true`, write
+    // the raw truth and let `bool_box_truth_record` resolve it.
+    if compare_box_provably_dead(ctx, op_pc, dst as u8) {
+        bool_box_truth_record(truth, truth);
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, truth)?;
+        return Ok(Some(()));
+    }
+    let boxed = crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, truth, false);
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::w_bool_from(result) as usize)),
+    );
+    bool_box_truth_record(boxed, truth);
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+/// Write an immortal `bool` singleton into a residual call's Ref dst, along
+/// with the raw truth `bool_box_truth_record` needs so an immediately
+/// following `is_true` (`POP_JUMP_IF_*`) folds to the constant instead of
+/// unboxing through a residual.
+fn walker_write_const_bool_result<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    value: bool,
+    dst: usize,
+    dst_bank: char,
+) -> Result<(), DispatchError> {
+    let result_obj = pyre_object::w_bool_from(value);
+    let const_bool = ctx.trace_ctx.const_ref(result_obj as i64);
+    ctx.trace_ctx.set_opref_concrete(
+        const_bool,
+        majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
+    );
+    let truth = ctx.trace_ctx.const_int(value as i64);
+    bool_box_truth_record(const_bool, truth);
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, const_bool)
+}
+
 /// Mixed W_LongObject/W_IntObject COMPARE_OP specialization.
 ///
 /// `pypy/objspace/std/longobject.py:_make_descr_cmp` selects the corresponding

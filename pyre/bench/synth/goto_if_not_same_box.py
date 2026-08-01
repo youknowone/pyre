@@ -12,7 +12,21 @@
 # exactly the concrete direction; a wrong predicate would drop the guard for a
 # genuine two-box compare and miscompile. The never-taken arms add a huge
 # sentinel so any wrong direction balloons the checksum.
-N = 125000
+#
+# `obj is obj` only reaches that fast path once the walker folds `IS_OP`
+# (`try_walker_fold_is_op`); before the fold it left as a `compare_fn`
+# may-force residual, and the ptr loop paid a `CALL_MAY_FORCE` plus its
+# `GUARD_NOT_FORCED` every iteration.
+#
+# `N` is sized by the GATE's noise model, not by the loop.  The ratio compares
+# startup-subtracted times, so a sample where pypy's execution is smaller than
+# pypy's own ~16ms startup is dominated by how far that one startup estimate
+# missed: at N=6000000 pypy executes in ~9ms and the gate swings past 6x on
+# startup noise alone.  At this N pypy executes in ~21ms, comfortably above its
+# startup, and the measured ratio settles near 2.2x.  A regression that puts
+# the residuals back is then a twenty-four-million-call blow-up, far outside
+# that margin.
+N = 12000000
 
 
 def same_box_int():

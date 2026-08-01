@@ -5223,6 +5223,16 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         ctx.last_exc_value_concrete = saved_last_exc_value_concrete;
                     }
                     folded
+                } else if (op_tag == 8 || op_tag == 9) && ctx.is_authoritative_executor {
+                    // `op_tag` 8 / 9 are `is` / `is_not` (`IS_OP`), which the
+                    // codewriter routes through the same `compare_fn`
+                    // residual as the six ordinary comparisons.  Fold them to
+                    // `ptr_eq` / `ptr_ne` — or, for a self-compare, straight
+                    // to the constant — so identity tests stop paying a
+                    // may-force call and its `GuardNotForced` per iteration.
+                    // Declines (falls through to the generic residual) for an
+                    // operand layout whose class compares `is_w` by value.
+                    try_walker_fold_is_op(ctx, op.pc, op_tag, &r_args, dst, dst_bank)?
                 } else {
                     // int compare first; then long (two-bigint operands keep
                     // bigint comparison); float (incl. mixed int/float) last.
