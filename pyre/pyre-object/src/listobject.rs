@@ -1134,6 +1134,15 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
+///
+/// `#[inline(never)]` is load-bearing and separate from the tracing policy: the
+/// body forwards verbatim to [`w_list_append`], so inlining the callee makes the
+/// two functions byte-identical, and both are registered residual-call targets
+/// (`jit_fnaddr.rs`). A linker that folds identical code — MSVC's `/OPT:ICF`,
+/// on by default — then gives them one address, and `runtime_fnaddr_patch`
+/// cannot tell which callee a `constants_i` entry meant. Keeping the forwarding
+/// call keeps the two bodies distinct.
+#[inline(never)]
 #[majit_macros::dont_look_inside]
 pub unsafe fn drain_list_append(obj: PyObjectRef, value: PyObjectRef) {
     w_list_append(obj, value)
