@@ -218,6 +218,15 @@ pub struct W_TypeObject {
     /// typeobject.py:166/216 `flag_abstract?` — set from the
     /// `__abstractmethods__` setattr hook; gates `object.__new__`.
     pub flag_abstract: std::sync::atomic::AtomicBool,
+    /// The hidden `mutate__version_tag` field for `typeobject.py:177
+    /// _immutable_fields_ = ['_version_tag?']` — see [`QuasiImmut`].
+    ///
+    /// Heap allocated on the first registration and null until then, exactly
+    /// like [`W_TypeObject::weak_subclasses`], which it also matches in never
+    /// being freed: this tree has no `W_TypeObject` teardown path. Holds no GC
+    /// pointers, so the `W_TYPE_GC_TYPE_ID` custom trace has nothing to walk
+    /// here.
+    pub quasi_immut_watchers: *mut QuasiImmut,
 }
 
 /// Source of fresh `version_tag` identities (`VersionTag()`, typeobject.py:73).
@@ -387,6 +396,8 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         // slot wrapper); only builtin disallow-types flip this.
         flag_disallow_instantiation: std::sync::atomic::AtomicBool::new(false),
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
+        // Allocated lazily on the first loop registration.
+        quasi_immut_watchers: std::ptr::null_mut(),
     };
     let (w_type, gc_managed) = if !raw.is_null() {
         unsafe { std::ptr::write(raw as *mut W_TypeObject, value) };
@@ -504,6 +515,8 @@ pub fn w_type_new_builtin(
         // `w_type_set_disallow_instantiation`.
         flag_disallow_instantiation: std::sync::atomic::AtomicBool::new(false),
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
+        // Allocated lazily on the first loop registration.
+        quasi_immut_watchers: std::ptr::null_mut(),
     }) as PyObjectRef;
     // A builtin type is Box-immortal, so its namespace values and `bases` are reachable only
     // through `walk_builtin_type_dicts_gc` (`pyre_interpreter::eval`).
@@ -721,10 +734,140 @@ pub unsafe fn w_type_get_version_tag(obj: PyObjectRef) -> u64 {
         .load(std::sync::atomic::Ordering::Acquire)
 }
 /// Store a new version-tag identity (typeobject.py:286 `mutated`).
+///
+/// Revokes the loops that baked the old identity as a constant before
+/// publishing the new one. This is the only writer of the field, so placing the
+/// `_version_tag?` invalidation here covers every way the tag can change —
+/// `mutated()`'s fresh identity and the two demotions to `0`
+/// (uncacheable) alike — rather than leaving each caller to remember it.
 pub unsafe fn w_type_set_version_tag(obj: PyObjectRef, v: u64) {
+    w_type_notify_quasi_immut_watchers(obj);
     (*(obj as *const W_TypeObject))
         .version_tag
         .store(v, std::sync::atomic::Ordering::Release);
+}
+
+/// `quasiimmut.py:55-109 QuasiImmut` — the loops that baked one quasi-immutable
+/// field's value as a constant, and must be revoked when it changes.
+///
+/// Upstream reaches this object through the hidden `mutate_<name>` field the
+/// rtyper adds for each `_immutable_fields_` entry spelled with a `?`
+/// (`get_mutate_field_name`), created on demand by
+/// `get_current_qmut_instance`. Pyre has no rtyper to synthesise the field, so
+/// [`W_TypeObject::quasi_immut_watchers`] is that field, spelled out and
+/// likewise allocated on the first registration.
+///
+/// The flag stands in for upstream's `looptoken` + `cpu.invalidate_loop`: the
+/// backend already routes `GUARD_NOT_INVALIDATED` through a per-artifact
+/// `AtomicBool`, so setting it is what `looptoken.invalidated = True` buys.
+pub struct QuasiImmut {
+    /// `quasiimmut.py:62-63` — weak so a retired loop drops out instead of
+    /// being kept alive by the type that it read.
+    looptokens_wrefs: Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>,
+    /// `quasiimmut.py:57 compress_limit = 30`.
+    compress_limit: usize,
+}
+
+impl Default for QuasiImmut {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QuasiImmut {
+    /// `quasiimmut.py:59-64 __init__`. The initial limit is the growth formula
+    /// in [`Self::compress_looptokens_list`] evaluated at length zero.
+    pub fn new() -> Self {
+        Self {
+            looptokens_wrefs: Vec::new(),
+            compress_limit: 30,
+        }
+    }
+
+    /// `quasiimmut.py:72-75 register_loop_token`.
+    fn register_loop_token(&mut self, flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        if self.looptokens_wrefs.len() > self.compress_limit {
+            self.compress_looptokens_list();
+        }
+        self.looptokens_wrefs.push(std::sync::Arc::downgrade(flag));
+    }
+
+    /// `quasiimmut.py:77-82 compress_looptokens_list` — drop the entries whose
+    /// loop is gone and re-derive the limit from what is left, so a type that
+    /// is recompiled many times and never mutated cannot grow without bound.
+    ///
+    /// Upstream's note that already-invalidated tokens must be kept applies
+    /// here too: the flag stays live while its artifact does, and re-flipping
+    /// an already-set flag is what keeps a multiply-invalidated loop revoked.
+    fn compress_looptokens_list(&mut self) {
+        self.looptokens_wrefs.retain(|w| w.strong_count() > 0);
+        self.compress_limit = (self.looptokens_wrefs.len() + 15) * 2;
+    }
+
+    /// `quasiimmut.py:84-109 invalidate` — every loop recorded here becomes
+    /// invalid, so each `GUARD_NOT_INVALIDATED` in it (and in its bridges) must
+    /// now fail. The list is emptied like upstream's `self.looptokens_wrefs =
+    /// []`; a loop that recompiles registers again.
+    ///
+    /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`):
+    /// upstream never reaches `invalidate` from traced code — it hangs off the
+    /// residual `jit_force_quasi_immutable` path — and the `Vec` walk has no
+    /// lowering either way. The caller's null check stays traced, so the
+    /// common no-watcher mutation still makes no call.
+    #[majit_macros::dont_look_inside]
+    fn invalidate(&mut self) {
+        for wref in std::mem::take(&mut self.looptokens_wrefs) {
+            if let Some(flag) = wref.upgrade() {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+}
+
+/// Register a compiled loop's invalidation flag against this type's
+/// `_version_tag?` (`quasiimmut.py:72-74 QuasiImmut.register_loop_token`).
+///
+/// The compile-time glue (`register_quasi_immutable_deps`) calls this once per
+/// type-keyed dependency the optimizer collected from a `QUASIIMMUT_FIELD`, so
+/// [`w_type_notify_quasi_immut_watchers`] can revoke the loop when the tag is
+/// bumped.
+///
+/// # Safety
+/// `obj` must be null or point at a valid `W_TypeObject`.
+pub unsafe fn w_type_register_quasi_immut_watcher(
+    obj: PyObjectRef,
+    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    if obj.is_null() || !is_type(obj) {
+        return;
+    }
+    let w_type = &mut *(obj as *mut W_TypeObject);
+    if w_type.quasi_immut_watchers.is_null() {
+        w_type.quasi_immut_watchers = Box::into_raw(Box::new(QuasiImmut::new()));
+    }
+    (*w_type.quasi_immut_watchers).register_loop_token(flag);
+}
+
+/// Revoke every loop that baked this type's `version_tag` as a constant
+/// (`quasiimmut.py:84-109 QuasiImmut.invalidate`).
+///
+/// Called from [`w_type_set_version_tag`] right before the new tag is
+/// published. Upstream runs the whole walk outside traced code — `invalidate`
+/// is reached from the residual `jit_force_quasi_immutable` path, never from a
+/// trace — so the sweep is residualised the same way. The null check stays
+/// traced, so mutating a type no loop depends on still makes no call.
+///
+/// # Safety
+/// `obj` must be null or point at a valid `W_TypeObject`.
+pub unsafe fn w_type_notify_quasi_immut_watchers(obj: PyObjectRef) {
+    if obj.is_null() || !is_type(obj) {
+        return;
+    }
+    let w_type = &mut *(obj as *mut W_TypeObject);
+    if w_type.quasi_immut_watchers.is_null() {
+        return;
+    }
+    (*w_type.quasi_immut_watchers).invalidate();
 }
 
 /// typeobject.py:183-185 `uses_object_getattribute` reader.  Returns the
@@ -1323,6 +1466,59 @@ mod tests {
             <W_TypeObject as crate::lltype::GcType>::SIZE,
             W_TYPE_OBJECT_SIZE
         );
+    }
+
+    /// `quasiimmut.py:84-109 invalidate` flips every registered flag and empties
+    /// the list, and a flag whose loop is gone is simply skipped.
+    #[test]
+    fn quasi_immut_invalidate_flips_live_flags_and_clears() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut qi = QuasiImmut::new();
+        let live = Arc::new(AtomicBool::new(false));
+        let dead = Arc::new(AtomicBool::new(false));
+        qi.register_loop_token(&live);
+        qi.register_loop_token(&dead);
+        drop(dead);
+
+        qi.invalidate();
+        assert!(live.load(Ordering::Acquire), "a live loop must be revoked");
+        assert!(
+            qi.looptokens_wrefs.is_empty(),
+            "invalidate empties the list; a recompile registers again",
+        );
+
+        // A second invalidate with nothing registered is a no-op, and the flag
+        // stays set — `GUARD_NOT_INVALIDATED` has no un-set edge.
+        qi.invalidate();
+        assert!(live.load(Ordering::Acquire));
+    }
+
+    /// `quasiimmut.py:72-82` — a type recompiled many times and never mutated
+    /// must not grow an unbounded watcher list.
+    #[test]
+    fn quasi_immut_register_compresses_dead_loop_tokens() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let mut qi = QuasiImmut::new();
+        assert_eq!(qi.compress_limit, 30, "quasiimmut.py:57 compress_limit");
+        for _ in 0..500 {
+            // Each "recompile" drops its artifact immediately, so every
+            // registered weak ref is already dead by the next round.
+            let flag = Arc::new(AtomicBool::new(false));
+            qi.register_loop_token(&flag);
+        }
+        assert!(
+            qi.looptokens_wrefs.len() <= qi.compress_limit + 1,
+            "compress must bound the list, got {} against limit {}",
+            qi.looptokens_wrefs.len(),
+            qi.compress_limit,
+        );
+        // With every entry dead the limit collapses back to the empty-list
+        // value rather than ratcheting upward.
+        assert_eq!(qi.compress_limit, 30);
     }
 
     #[test]

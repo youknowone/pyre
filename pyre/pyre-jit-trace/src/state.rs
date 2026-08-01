@@ -4429,6 +4429,33 @@ pub(crate) fn record_namespace_quasiimmut_field(
     }
 }
 
+/// pyjitpl.py:1074-1089 `opimpl_record_quasiimmut_field` for a real struct
+/// field, the [`record_namespace_quasiimmut_field`] twin.
+///
+/// The namespace variant keys on a synthetic `(dict, slot)` pair because a
+/// module-dict cell has no field descriptor; a genuine quasi-immutable field
+/// carries one, so the op is recorded with the descr and the heapcache keys on
+/// `descr.index()` the same way [`opimpl_getfield_gc_i`] does.
+///
+/// The caller has already resolved the field's value and is baking it as a
+/// constant, so unlike `opimpl_getfield_gc_i` this records no load — that is
+/// exactly what quasi-immutability buys.
+pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) {
+    let field_index = descr.index();
+    if ctx.heap_cache().is_quasi_immut_known(obj, field_index) {
+        ctx.profiler().count_ops(
+            OpCode::QuasiimmutField,
+            majit_metainterp::counters::HEAPCACHED_OPS,
+        );
+        return;
+    }
+    ctx.heap_cache_mut().quasi_immut_now_known(obj, field_index);
+    ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr);
+    if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
+        ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
+    }
+}
+
 /// virtualizable.py:44 + interp_jit.py:25-31 —
 /// `locals_cells_stack_w[*]` is declared as a W_Root array, so every
 /// item's JIT type is GCREF (Type::Ref). W_IntObject/W_FloatObject are

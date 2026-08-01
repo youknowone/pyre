@@ -4273,21 +4273,7 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     ctx.trace_ctx
         .heap_cache_mut()
         .replace_box(r_args[0], type_const);
-    let live_version = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        type_const,
-        crate::descr::type_version_tag_descr(),
-    );
-    let version_const = ctx.trace_ctx.const_int(version_tag as i64);
-    walker_emit_fold_guard_with_snapshot(
-        ctx,
-        op.pc,
-        OpCode::GuardValue,
-        &[live_version, version_const],
-    )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(live_version, version_const);
+    walker_pin_type_version_tag(ctx, op.pc, type_const)?;
 
     // The walker is the executor here, so the instance the rest of this walk
     // reads has to be a real one — the same split `trace_box_int` makes between
