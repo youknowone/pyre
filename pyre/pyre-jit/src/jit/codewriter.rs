@@ -6610,19 +6610,6 @@ impl CodeWriter {
             }};
         }
 
-        // Post-emit bookkeeping for a stack-pushing handler: append the
-        // produced FlowValue to the symbolic stack, bump `current_depth`,
-        // and emit the VSD sync.  Mirrors the inline triplet that every
-        // residual_call / HLOp-result emit runs after writing into the
-        // dst slot.
-        macro_rules! push_and_bump {
-            ($value:expr, $py_pc:expr $(,)?) => {{
-                current_state.stack.push($value);
-                current_depth += 1;
-                emit_vsd!(current_depth, $py_pc);
-            }};
-        }
-
         // Record a residual_call SpaceOperation on the current block.
         // Captures the two boilerplate arguments
         // (`&mut graph, &current_block.block()`) implicitly; positional
@@ -7892,6 +7879,29 @@ impl CodeWriter {
                 current_state.stack.push(loaded);
                 $depth += 1;
                 emit_vsd!($depth, load_fast_py_pc);
+            }};
+        }
+
+        // Post-emit bookkeeping for a stack-pushing handler: append the
+        // produced FlowValue to the symbolic stack and run the full
+        // `pyframe.py:389 pushvalue` lowering on it.
+        //
+        // `pushvalue` is one operation upstream, and `jtransform.py:1898
+        // do_fixed_list_setitem` lowers it to the pair
+        // `setarrayitem_vable_r(locals_cells_stack_w, depth, w_object)` +
+        // `setfield_vable_i(valuestackdepth, depth + 1)`.  Publishing the
+        // depth without the slot would tell the resume machinery that a
+        // slot exists at `depth` while withholding its value: every
+        // `capture_resumedata` (pyjitpl.py:2611-2622) carries the whole
+        // `virtualizable_boxes` list, and `virtualizable.py:126-137
+        // write_from_resume_data_partial` writes back every array element
+        // it describes.  An unbound slot therefore restores as NULL rather
+        // than as its live value.
+        macro_rules! push_and_bump {
+            ($value:expr, $py_pc:expr $(,)?) => {{
+                let pushed: super::flow::FlowValue = $value;
+                current_state.stack.push(pushed.clone());
+                emit_pushvalue_ref!(current_depth, current_depth, pushed, $py_pc);
             }};
         }
 
