@@ -1275,6 +1275,14 @@ pub struct MetaInterp<M: Clone> {
     /// Set by compile_bridge when optimizer returns retrace_requested=true.
     /// Checked by compile_bridge_trace to return RetraceNeeded.
     pub(crate) retrace_after_bridge: bool,
+    /// pyjitpl.py:3058-3060 — `reached_loop_header` found no matching merge
+    /// point, appended one and simply RETURNED. Upstream needs no flag for
+    /// that: the metainterp loop is the caller, so returning IS "keep
+    /// tracing". Pyre's driver expresses "the trace ended here" by dropping
+    /// `self.sym` at the tail of the close arm, so the append path has to say
+    /// so explicitly. Set by [`register_retrace_merge_point`], consumed once
+    /// by the driver.
+    pub(crate) keep_tracing_after_close: bool,
     /// Source guards `(trace_id, fail_index)` whose bridge the backend
     /// declined as structurally `Unsupported` (e.g. the wasm chaining
     /// backend cannot run a bridge needing more Ref-home slots than the
@@ -2667,6 +2675,7 @@ impl<M: Clone> MetaInterp<M> {
             last_quasi_immutable_deps: Vec::new(),
             compile_snapshot_refs: Vec::new(),
             retrace_after_bridge: false,
+            keep_tracing_after_close: false,
             declined_bridge_guards: std::collections::HashSet::new(),
             pending_preamble_tokens: indexmap::IndexMap::new(),
             pending_frontend_boxes: None,
@@ -5564,29 +5573,41 @@ impl<M: Clone> MetaInterp<M> {
                 // check same_greenkey and position match. Use header_pc
                 // for precise matching across root/inner key registrations.
                 //
-                // pyjitpl.py:3018-3031 is really a three-way SCAN — a
-                // same-greenkey entry at `retracing_from` retraces, one at
-                // another position raises ABORT_BAD_LOOP, and NO same-greenkey
-                // entry falls through to `current_merge_points.append` with the
-                // history still live so tracing continues to the next header
-                // visit. pyre cannot take that third branch yet: the walk emits
-                // a loop-close action at EVERY pc it steps to after a cancelled
-                // close (45, 49, 53, 57, … one per element), not only at the
-                // header, so "keep tracing until the same header comes round
-                // again" never terminates and the intervening close compiles a
-                // zero-iteration body (`Label; Jump`, an empty infinite loop).
-                // Until the walk only closes at real header visits, collapse to
-                // the two-way test: retrace when the pending merge point is at
-                // `retracing_from`, otherwise abandon.
-                let position_matches = self
+                // pyjitpl.py:3018-3031 is a SCAN with three outcomes, not a
+                // two-way test:
+                //
+                //   for j in ...current_merge_points...:
+                //       if not same_greenkey(...): continue
+                //       if self.partial_trace:
+                //           if start != self.retracing_from:
+                //               raise SwitchToBlackhole(ABORT_BAD_LOOP)
+                //           target_token = self.compile_retrace(...)
+                //   # no same-greenkey entry: fall out of the loop
+                //   start = self.history.get_trace_position()
+                //   self.current_merge_points.append((live_arg_boxes, start))
+                //
+                // A same-greenkey entry at `retracing_from` retraces; one
+                // somewhere else aborts; NO same-greenkey entry never enters the
+                // loop body at all, so control reaches the append and tracing
+                // continues. That third case is the state on the FIRST header
+                // visit after `retrace_needed`: a bridge trace starts with
+                // `current_merge_points` empty (pyjitpl.py:2908), so the entry
+                // `compile_retrace` matches on the NEXT visit is the one
+                // appended here — a full iteration later, which is what makes
+                // the retrace body non-empty.
+                let merge_position = self
                     .tracing
                     .as_ref()
-                    .and_then(|ctx| {
-                        ctx.get_merge_point_at(ctx.green_key, ctx.header_pc)
-                            .map(|mp| mp.position == retrace_pos)
-                    })
-                    .unwrap_or(false);
-                if position_matches {
+                    .and_then(|ctx| ctx.get_merge_point_at(ctx.green_key, ctx.header_pc))
+                    .map(|mp| mp.position);
+                if merge_position.is_none() {
+                    self.register_retrace_merge_point(jump_args);
+                    // pyjitpl.py:3059-3060: no loop compiled, so the caller
+                    // keeps tracing. `Cancelled` is the outcome that leaves
+                    // `self.tracing` and the session envelope live.
+                    return CompileOutcome::Cancelled;
+                }
+                if merge_position == Some(retrace_pos) {
                     let ok = self.compile_retrace(jump_args, meta.clone());
                     if ok {
                         self.cancel_count = 0;
@@ -6790,6 +6811,12 @@ impl<M: Clone> MetaInterp<M> {
         self.partial_trace.as_ref()
     }
 
+    /// See [`Self::keep_tracing_after_close`]. Read-and-clear: the answer is
+    /// only meaningful to the close that just ran.
+    pub fn take_keep_tracing_after_close(&mut self) -> bool {
+        std::mem::take(&mut self.keep_tracing_after_close)
+    }
+
     /// Clear retrace state (partial_trace, retracing_from, exported_state).
     ///
     /// RPython parity: does NOT reset cancel_count. cancel_count is
@@ -6800,6 +6827,53 @@ impl<M: Clone> MetaInterp<M> {
         self.partial_trace = None;
         self.retracing_from = None;
         self.exported_state = None;
+    }
+
+    /// pyjitpl.py:3058-3060 — the tail of `reached_loop_header`:
+    ///
+    /// ```python
+    /// start = self.history.get_trace_position()
+    /// self.current_merge_points.append((live_arg_boxes, start))
+    /// ```
+    ///
+    /// Reached when the scan at 3018-3031 matched nothing, which is exactly
+    /// the state right after `retrace_needed`: a bridge trace starts with
+    /// `current_merge_points` empty (2908), and the bridge attempt at 3006
+    /// left the history cut back to `potential_retrace_position`
+    /// (3195 `finally: self.history.cut(cut_at)`), so the position recorded
+    /// here IS `retracing_from`. The entry `compile_retrace` matches is this
+    /// one — on the NEXT visit, a full iteration of ops later, which is what
+    /// gives the retrace a non-empty body.
+    ///
+    /// `jump_args` is the same `live_arg_boxes` upstream appends, already
+    /// normalized by `remove_consts_and_duplicates`, so every element is a
+    /// typed box; a `None`/`TempVar` here would silently change the label's
+    /// arity against the closing JUMP (compile.py:334), so decline to
+    /// register rather than record a short list.
+    fn register_retrace_merge_point(&mut self, jump_args: &[OpRef]) {
+        let Some(ctx) = self.tracing.as_mut() else {
+            return;
+        };
+        let green_boxes: Vec<crate::trace_ctx::GreenBox> = jump_args
+            .iter()
+            .filter_map(|&op| op.ty().map(|ty| crate::trace_ctx::GreenBox::new(op, ty)))
+            .collect();
+        if green_boxes.len() != jump_args.len() {
+            return;
+        }
+        let key = ctx.green_key;
+        let header_pc = ctx.header_pc;
+        ctx.add_merge_point(key, green_boxes, header_pc);
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[jit] retrace merge point registered: key={} header_pc={} position={:?} retracing_from={:?}",
+                key,
+                header_pc,
+                ctx.get_trace_position(),
+                self.retracing_from,
+            );
+        }
+        self.keep_tracing_after_close = true;
     }
 
     /// compile.py: has_compiled_targets — check if a green key has

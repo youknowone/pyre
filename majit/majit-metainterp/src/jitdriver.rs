@@ -2819,8 +2819,18 @@ impl<S: JitState> JitDriver<S> {
                 };
                 // pyjitpl.py:2979-3036 reached_loop_header parity.
                 // Path 1: bridge — only if has_compiled_targets (line 2982).
-                let _has_partial_trace = self.meta.partial_trace().is_some();
-                if let Some(bridge) = self.meta.bridge_info() {
+                //
+                // pyjitpl.py:3003 `if not self.partial_trace:` gates the whole
+                // bridge attempt. Once `retrace_needed` has armed
+                // `partial_trace` the loop being closed is a RETRACE of an
+                // existing loop, so re-entering `compile_trace` would ask the
+                // optimizer to bridge into the very loop the retrace exists to
+                // respecialize — and on `RetraceNeeded` it would arm the
+                // retrace a second time. Fall straight through to the
+                // merge-point scan, which is the only consumer upstream leaves
+                // for a partial trace.
+                let has_partial_trace = self.meta.partial_trace().is_some();
+                if let Some(bridge) = self.meta.bridge_info().filter(|_| !has_partial_trace) {
                     let bridge_key = bridge.green_key;
                     let bridge_trace_id = bridge.trace_id;
                     let bridge_fail_index = bridge.fail_index;
@@ -3041,7 +3051,15 @@ impl<S: JitState> JitDriver<S> {
                     self.meta.abort_trace(false);
                     self.meta.clear_trace_session();
                 }
-                self.sym = None;
+                // pyjitpl.py:3058-3060: a `reached_loop_header` that only
+                // appended a merge point RETURNS — the trace is not over and
+                // the metainterp goes on recording into the next iteration.
+                // Dropping `self.sym` is how this driver says "the trace ended
+                // here" (`merge_point` aborts on a None sym), so that one path
+                // has to keep it.
+                if !self.meta.take_keep_tracing_after_close() {
+                    self.sym = None;
+                }
             }
             TraceAction::CloseLoopWithArgs {
                 jump_args,
