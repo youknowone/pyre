@@ -301,42 +301,6 @@ pub(crate) unsafe fn w_memoryview_new_formatted_nd(
     unsafe { w_memoryview_cast_nd(mv_src, fmt, itemsize, shape, strides) }
 }
 
-/// Build the live view returned by selecting one or more leading integer
-/// axes from an N-D memoryview (`memoryobject.py:1093-1110`).  The selected
-/// axes contribute to the byte offset; the remaining shape/stride tuples are
-/// retained so the result continues to alias the exporter.
-unsafe fn w_memoryview_new_nd_offset(
-    mv_src: PyObjectRef,
-    offset: i64,
-    shape: &[i64],
-    strides: &[i64],
-) -> PyObjectRef {
-    unsafe {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(mv_src);
-        pyre_object::gc_roots::pin_root(memoryview_wrap_dims(shape));
-        pyre_object::gc_roots::pin_root(memoryview_wrap_dims(strides));
-        let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
-        let r_src = pyre_object::gc_roots::shadow_stack_get(sp);
-        let r_shape = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-        let r_strides = pyre_object::gc_roots::shadow_stack_get(sp + 2);
-        let src_view = pyre_object::memoryview::w_memoryview_view(r_src);
-        let view = pyre_object::bufferview::BufferView::ViewNDOffset {
-            parent: Box::new(src_view.clone()),
-            w_obj: src_view.w_obj(),
-            offset,
-            ndim: shape.len() as i64,
-            w_shape: r_shape,
-            w_strides: r_strides,
-        };
-        let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
-        pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
-        backing_exports_incref(pyre_object::memoryview::w_memoryview_view(mv).backing());
-        mv
-    }
-}
-
 /// Build a `memoryview` over a plain contiguous 1-D exporter — a `SimpleView`
 /// (`bytes` / `bytearray`, derived format `'B'`) or a `RawBufferView`
 /// (`array.array`, explicit format).  The exporter's `Buffer` variant picks
@@ -1151,22 +1115,8 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             // user `__index__` which releases the view.
             memoryview_check_released(mv)?;
             if ndim != 1 {
-                let shape = w_memoryview_native_shape(mv);
-                let strides = w_memoryview_native_strides(mv);
-                let count = shape.first().copied().unwrap_or(0);
-                if i < 0 {
-                    i += count;
-                }
-                if i < 0 || i >= count {
-                    return Err(crate::PyError::index_error("index out of bounds"));
-                }
-                let offset =
-                    w_memoryview_offset(mv) + i * strides.first().copied().unwrap_or(itemsize);
-                return Ok(w_memoryview_new_nd_offset(
-                    mv,
-                    offset,
-                    &shape[1..],
-                    &strides[1..],
+                return Err(crate::PyError::not_implemented(
+                    "multi-dimensional sub-views are not implemented",
                 ));
             }
             let count = if itemsize > 0 { length / itemsize } else { 0 };
@@ -1191,24 +1141,8 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             if all_index {
                 let length = pyre_object::w_tuple_len(index) as i64;
                 if length < ndim {
-                    if length == 0 {
-                        return Err(crate::PyError::type_error("memoryview: invalid slice key"));
-                    }
-                    let shape = w_memoryview_native_shape(mv);
-                    let strides = w_memoryview_native_strides(mv);
-                    let mut offset = w_memoryview_offset(mv);
-                    for dim in 0..length as usize {
-                        let item =
-                            pyre_object::w_tuple_getitem(index, dim as i64).unwrap_or(w_none());
-                        let item_index = getindex_w(item)?;
-                        memoryview_check_released(mv)?;
-                        offset += memoryview_get_offset(mv, dim as i64, item_index)?;
-                    }
-                    return Ok(w_memoryview_new_nd_offset(
-                        mv,
-                        offset,
-                        &shape[length as usize..],
-                        &strides[length as usize..],
+                    return Err(crate::PyError::not_implemented(
+                        "sub-views are not implemented",
                     ));
                 }
                 if length > ndim {
