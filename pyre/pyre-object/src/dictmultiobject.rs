@@ -2734,7 +2734,7 @@ pub unsafe fn w_dict_setdefault_checked(
                 match index {
                     Some(i) => Some(*entries.get_index(i).unwrap().1),
                     None => {
-                        entries.insert(object_key, value);
+                        dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value);
                         w_dict_bump_keys_version(obj);
                         dict_write_barrier(obj);
                         Some(value)
@@ -2767,7 +2767,7 @@ pub unsafe fn w_dict_setdefault_checked(
         crate::dict_eq_hook::begin_callback_free_probe();
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
-        entries.insert(object_key, value);
+        dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value);
         let _ = crate::dict_eq_hook::end_callback_free_probe();
         w_dict_bump_keys_version(obj);
         dict_write_barrier(obj);
@@ -2911,7 +2911,7 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
                     *entries.get_index_mut(i).unwrap().1 = value;
                 }
                 None => {
-                    entries.insert(object_key, value);
+                    dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value);
                     dict.keys_version = dict.keys_version.wrapping_add(1);
                 }
             }
@@ -2942,7 +2942,7 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
             crate::dict_eq_hook::begin_callback_free_probe();
             let dict = &mut *(obj as *mut W_DictObject);
             let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
-            entries.insert(object_key, value);
+            dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value);
             let _ = crate::dict_eq_hook::end_callback_free_probe();
             dict.keys_version = dict.keys_version.wrapping_add(1);
         }
@@ -2974,7 +2974,9 @@ pub unsafe fn w_module_dict_store_inner(obj: PyObjectRef, key: PyObjectRef, valu
         w_module_dict_switch_to_object_strategy(obj);
     }
     let entries = w_module_dict_object_storage_mut(obj);
-    let inserted = entries.insert(object_key_for(key), value).is_none();
+    let object_key = object_key_for(key);
+    let inserted =
+        dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value).is_none();
     let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
     strategy.mutated();
     if inserted {
@@ -5772,7 +5774,7 @@ impl DictStrategy for UnicodeDictStrategy {
             }
             None => {
                 let stored_key = object_key_for_new_str(key);
-                entries.insert(stored_key, w_value);
+                dict_entries_insert_hashed(entries, stored_key.hash, stored_key.obj, w_value);
                 dict.keys_version = dict.keys_version.wrapping_add(1);
             }
         };
