@@ -8948,9 +8948,9 @@ pub unsafe fn load_method_fast_path(
 ///
 /// The metatype is read off the class (`getclass()`) and must be `type`
 /// itself, so a custom metaclass declines (its `__getattribute__` may not
-/// follow `type.__getattribute__`).  A name the metatype itself defines is
-/// declined too: a metatype attribute would shadow the class attribute (data
-/// descriptor) or be returned in its place.  An uncacheable type and any
+/// follow `type.__getattribute__`).  A name the metatype defines as a DATA
+/// DESCRIPTOR is declined too, since that is the one entry `descr_getattribute`
+/// selects ahead of the class's own MRO.  An uncacheable type and any
 /// non-`classmethod` descriptor also decline.
 ///
 /// # Safety
@@ -8973,9 +8973,12 @@ pub unsafe fn classmethod_on_type_fast_path(
     if !std::ptr::eq(metatype, crate::typedef::w_type()) {
         return None;
     }
-    // A metatype attribute of the same name would win over the class attribute,
-    // so decline any name the metatype defines.
-    if lookup_in_type(metatype, name).is_some() {
+    // `typeobject.py:813-823 descr_getattribute` orders the two lookups: the
+    // metatype entry preempts the class's own MRO only when it is a data
+    // descriptor, and otherwise `self.lookup(name)` is what gets selected.
+    // Decline exactly that case; a non-data metatype attribute loses to the
+    // class's classmethod, which is the value this fold emits.
+    if type_lookup_is_data_descr(metatype, name) {
         return None;
     }
     let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_type);

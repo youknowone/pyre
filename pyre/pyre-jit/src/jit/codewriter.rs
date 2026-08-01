@@ -2752,6 +2752,48 @@ fn emit_frontend_store_global(
     );
 }
 
+fn emit_frontend_delete_name(
+    _graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    frame: super::flow::FlowValue,
+    name: super::flow::FlowValue,
+    offset: i64,
+) {
+    // pyopcode.py DELETE_NAME -> `space.delitem(w_locals, w_varname)`, with a
+    // KeyError surfacing as NameError.  Frame-receiver call shape like
+    // `emit_frontend_store_name`, minus the value operand; lowers to
+    // `bh_delete_name_fn(frame, w_name)`
+    // (`flatten::lower_delete_name_hlop_to_insn`).
+    record_graph_op(
+        block,
+        "delete_name",
+        vec![frame.into(), name.into()],
+        None,
+        offset,
+    );
+}
+
+fn emit_frontend_delete_global(
+    _graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    frame: super::flow::FlowValue,
+    name: super::flow::FlowValue,
+    offset: i64,
+) {
+    // pyopcode.py DELETE_GLOBAL -> `space.delitem(w_globals, w_varname)`,
+    // bypassing `w_locals`.  Same frame-receiver shape as
+    // `emit_frontend_delete_name`; lowers to
+    // `bh_delete_global_fn(frame, w_name)`
+    // (`flatten::lower_delete_global_hlop_to_insn`).
+    record_graph_op(
+        block,
+        "delete_global",
+        vec![frame.into(), name.into()],
+        None,
+        offset,
+    );
+}
+
 fn emit_frontend_simple_call(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -3402,6 +3444,8 @@ struct FnPtrIndices {
     load_name_fn: HelperHandle,
     store_name_fn: HelperHandle,
     store_global_fn: HelperHandle,
+    delete_name_fn: HelperHandle,
+    delete_global_fn: HelperHandle,
     newtuple_from_array_fn: HelperHandle,
     newlist_from_array_fn: HelperHandle,
     unpack_sequence_fn: HelperHandle,
@@ -3717,6 +3761,16 @@ fn register_helper_fn_pointers(
     let store_global_fn = bind(
         assembler,
         cpu.store_global_fn as *const (),
+        CallFlavor::Plain,
+    );
+    let delete_name_fn = bind(
+        assembler,
+        cpu.delete_name_fn as *const (),
+        CallFlavor::Plain,
+    );
+    let delete_global_fn = bind(
+        assembler,
+        cpu.delete_global_fn as *const (),
         CallFlavor::Plain,
     );
     // `bh_store_attr_fn` calls `baseobjspace::setattr_str`, which can run
@@ -4166,6 +4220,8 @@ fn register_helper_fn_pointers(
         load_name_fn,
         store_name_fn,
         store_global_fn,
+        delete_name_fn,
+        delete_global_fn,
         newtuple_from_array_fn,
         newlist_from_array_fn,
         unpack_sequence_fn,
@@ -5457,6 +5513,16 @@ impl CodeWriter {
                     idx: store_global_fn_idx,
                     flavor: _store_global_fn_flavor,
                 },
+            delete_name_fn:
+                HelperHandle {
+                    idx: delete_name_fn_idx,
+                    flavor: _delete_name_fn_flavor,
+                },
+            delete_global_fn:
+                HelperHandle {
+                    idx: delete_global_fn_idx,
+                    flavor: _delete_global_fn_flavor,
+                },
             newtuple_from_array_fn:
                 HelperHandle {
                     idx: newtuple_from_array_fn_idx,
@@ -5934,6 +6000,8 @@ impl CodeWriter {
                 load_name_fn_idx,
                 store_name_fn_idx,
                 store_global_fn_idx,
+                delete_name_fn_idx,
+                delete_global_fn_idx,
                 newtuple_from_array_fn_idx,
                 newlist_from_array_fn_idx,
                 // `[u16; 15]` indexed by nargs (0..=14).  `call_fn_idx`
@@ -9767,6 +9835,43 @@ impl CodeWriter {
                                 py_pc as i64,
                             );
                         }
+                        Instruction::DeleteName { namei } => {
+                            // pyopcode.py DELETE_NAME — deletes the binding
+                            // from `w_locals` via the `delete_name` HLOp →
+                            // `bh_delete_name_fn(frame, w_name)` residual call,
+                            // which the full-body walker traces.  Touches no
+                            // operand-stack slot, so unlike the StoreName arm
+                            // it pops nothing.  A module-level `except X as e:`
+                            // compiles its implicit cleanup to this opcode, so
+                            // leaving it unlowered blacks out the whole
+                            // enclosing module loop.
+                            let name_idx = namei.get(op_arg) as usize;
+                            let name = super::flow::Constant::string(code.names[name_idx].as_str());
+                            emit_frontend_delete_name(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var.into(),
+                                name.into(),
+                                py_pc as i64,
+                            );
+                        }
+                        Instruction::DeleteGlobal { namei } => {
+                            // pyopcode.py DELETE_GLOBAL — deletes directly from
+                            // `w_globals` (bypassing `w_locals`) via the
+                            // `delete_global` HLOp →
+                            // `bh_delete_global_fn(frame, w_name)` residual
+                            // call.  Same void 2-Ref, zero-stack-effect shape
+                            // as the DeleteName arm.
+                            let name_idx = namei.get(op_arg) as usize;
+                            let name = super::flow::Constant::string(code.names[name_idx].as_str());
+                            emit_frontend_delete_global(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var.into(),
+                                name.into(),
+                                py_pc as i64,
+                            );
+                        }
                         Instruction::MakeFunction { .. } => {
                             // Pops the code object (TOS), pushes the built
                             // function. Net: 0.  `make_function_value(globals,
@@ -12302,9 +12407,7 @@ impl CodeWriter {
                         }
 
                         // Instructions that don't touch the operand stack (locals/cells only).
-                        Instruction::DeleteGlobal { .. }
-                        | Instruction::DeleteName { .. }
-                        | Instruction::SetupAnnotations => {
+                        Instruction::SetupAnnotations => {
                             emit_abort_permanent!(py_pc);
                         }
 

@@ -128,20 +128,19 @@ pub extern "C" fn jit_load_name_from_namespace(
             return v as i64;
         }
     }
-    // Globals miss: `pyopcode.py:958-967 _load_global` falls back to
-    // `self.get_builtin().getdictvalue(space, varname)`.  The frame's
-    // picked builtin (`pyframe.py:115 self.builtin =
-    // space.builtin.pick_builtin(w_globals)`) is the authoritative
-    // builtin reference; mid-execution `__builtins__` rebind would
-    // change the picked module without touching
-    // `namespace["__builtins__"]`'s raw entry, so the extern must
-    // route through `frame.w_builtin` rather than re-reading the dict
-    // slot.
+    // Globals miss: `_load_global` (pyopcode.py) falls back to
+    // `self.get_builtin().getdictvalue(space, varname)`.  Go through the
+    // accessor, never the raw slot: the constructor (pyframe.py) assigns
+    // `self.builtin` only under `honor__builtins__`, so with the option off
+    // (`baseobjspace::HONOR_BUILTINS`) the field stays unset and
+    // `get_builtin` answers `space.builtin` instead.  A
+    // frame the JIT materialized from a virtual never wrote the slot, so a
+    // raw read there resolves no builtin at all and every builtin name
+    // raises NameError.  The accessor still prefers the picked module when a
+    // frame does carry one, so a mid-execution `__builtins__` rebind is
+    // honoured exactly as before.
     let w_builtin = if frame_ptr != 0 {
-        unsafe {
-            let p = frame_ptr as *const u8;
-            *(p.add(crate::pyframe::PYFRAME_W_BUILTIN_OFFSET) as *const PyObjectRef)
-        }
+        unsafe { (*(frame_ptr as *const crate::pyframe::PyFrame)).get_builtin() }
     } else {
         std::ptr::null_mut()
     };

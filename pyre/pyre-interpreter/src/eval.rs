@@ -2359,13 +2359,15 @@ impl NamespaceOpcodeHandler for PyFrame {
                     && pyre_object::dictmultiobject::is_module_dict(w_globals)
             }
         };
-        // `pyopcode.py:979` reads the builtins through the METHOD
+        // `_load_global` (pyopcode.py) reads the builtins through the METHOD
         // `self.get_builtin()`, not the `builtin` field.  Under the default
-        // `honor__builtins__=False` that method answers `space.builtin` and
-        // never consults the frame at all (`pyframe.py:199-203`), so the field
-        // being unset must not be observable here.  Reading the raw field made
-        // the builtins leg silently find nothing on any frame with a null
-        // `w_builtin`, raising `NameError` for a builtin that plainly exists.
+        // `honor__builtins__=False` the constructor never assigns that field
+        // (pyframe.py) and the method answers `space.builtin` without
+        // consulting the frame at all, so the field being unset must not be
+        // observable here.  A frame the JIT materialized from a virtual is
+        // exactly such a frame: reading the raw field made the builtins leg
+        // silently find nothing there, raising `NameError` for a builtin that
+        // plainly exists.
         let w_builtin = self.get_builtin();
         if use_cache {
             let cache_hit: Option<PyObjectRef> = unsafe {

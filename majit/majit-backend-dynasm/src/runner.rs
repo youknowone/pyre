@@ -597,21 +597,25 @@ fn dynasm_collect_full() {
     majit_gc::gc_sync::gc_op(|g| g.collect_full());
 }
 
-fn debug_validate_oldgen_freeblocks(site: &str) {
-    if std::env::var_os("PYRE_GC_FREELIST_DIAG").is_none() {
+/// Takes `format_args!` rather than a built `String`: the callers sit on the
+/// per-residual-call and per-trace-entry paths, where formatting the site name
+/// for a diagnostic that is off costs a heap allocation every time.
+fn debug_validate_oldgen_freeblocks(site: std::fmt::Arguments<'_>) {
+    if !crate::gc_freelist_diag_enabled() {
         return;
     }
+    let site = site.to_string();
     if DYNASM_ACTIVE_GC
         .with(|c| {
             c.borrow()
                 .as_deref()
-                .map(|g| g.debug_validate_oldgen_freeblocks(site))
+                .map(|g| g.debug_validate_oldgen_freeblocks(&site))
         })
         .is_some()
     {
         return;
     }
-    majit_gc::gc_sync::gc_op(|g| g.debug_validate_oldgen_freeblocks(site));
+    majit_gc::gc_sync::gc_op(|g| g.debug_validate_oldgen_freeblocks(&site));
 }
 
 pub extern "C" fn dynasm_debug_validate_oldgen_freeblocks(site: u64, frame: usize) {
@@ -623,7 +627,7 @@ pub extern "C" fn dynasm_debug_validate_oldgen_freeblocks(site: u64, frame: usiz
             majit_gc::shadow_stack::is_libc_jitframe(top),
         );
     }
-    debug_validate_oldgen_freeblocks(&format!("after residual site {site}"));
+    debug_validate_oldgen_freeblocks(format_args!("after residual site {site}"));
 }
 
 fn dynasm_get_objects(generation: i8, visitor: majit_gc::GetObjectsVisitorFn) {
@@ -892,10 +896,10 @@ pub extern "C" fn dynasm_nursery_slowpath(total_size: u64) -> u64 {
         let raw = libc::calloc(1, total_size as usize) as u64;
         if raw == 0 { 0 } else { raw + gc_hdr as u64 }
     });
-    if std::env::var_os("PYRE_GC_FREELIST_DIAG").is_some() {
+    if crate::gc_freelist_diag_enabled() {
         let nursery = dynasm_gc_is_nursery_object(ptr as usize);
         eprintln!("[malloc-slow] total={total_size} payload={ptr:#x} nursery={nursery}");
-        debug_validate_oldgen_freeblocks("after malloc slowpath");
+        debug_validate_oldgen_freeblocks(format_args!("after malloc slowpath"));
     }
     if majit_ir::debug::have_debug_prints() {
         majit_ir::debug::log_one(
@@ -2574,7 +2578,7 @@ impl Backend for DynasmBackend {
 
         let bridge_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_size = compiled.buffer.len();
-        if std::env::var_os("PYRE_DYNASM_EXEC_DIAG").is_some() {
+        if crate::dynasm_exec_diag_enabled() {
             eprintln!(
                 "[dynasm-bridge] trace={trace_id} source={}:{} addr={bridge_addr:#x} len={code_size}",
                 fail_descr.trace_id(),
@@ -2803,7 +2807,7 @@ impl Backend for DynasmBackend {
         // manual push_jf/pop_jf_to around the call.
         let func: unsafe extern "C" fn(*mut JitFrame) -> *mut JitFrame =
             unsafe { std::mem::transmute(entry) };
-        if std::env::var_os("PYRE_DYNASM_EXEC_DIAG").is_some() {
+        if crate::dynasm_exec_diag_enabled() {
             eprintln!(
                 "[dynasm-exec] trace={} header={} entry={entry:p} len={} args={args:?}",
                 compiled.trace_id,
@@ -2811,9 +2815,9 @@ impl Backend for DynasmBackend {
                 compiled.buffer.len(),
             );
         }
-        debug_validate_oldgen_freeblocks(&format!("before trace {}", compiled.trace_id));
+        debug_validate_oldgen_freeblocks(format_args!("before trace {}", compiled.trace_id));
         let result_jf = unsafe { func(jf_ptr) };
-        debug_validate_oldgen_freeblocks(&format!("after trace {}", compiled.trace_id));
+        debug_validate_oldgen_freeblocks(format_args!("after trace {}", compiled.trace_id));
 
         if crate::majit_log_enabled() {
             eprintln!(

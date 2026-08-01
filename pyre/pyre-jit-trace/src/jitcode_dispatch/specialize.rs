@@ -1975,8 +1975,10 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
             unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_lineno_raw(concrete_obj) };
         // `get_lineno` answers the sentinel with `-1`, so the slot value is the
         // getter's value only once it is pinned against the sentinel.  A node
-        // that already carries it — built from a frame with no `pycode` — has
-        // nothing to pin, so decline before recording anything.
+        // that already carries it — built from a frame with no `pycode`, or
+        // handed the sentinel through `TracebackType(..., -sys.maxsize-1)` or
+        // the `tb_lineno` setter — has nothing to pin, so decline before
+        // recording anything.
         if live == pyre_interpreter::pytraceback::LINENO_NOT_COMPUTED {
             return Ok(None);
         }

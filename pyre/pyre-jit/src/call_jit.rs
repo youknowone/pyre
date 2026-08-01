@@ -5852,6 +5852,49 @@ pub extern "C" fn bh_store_global_fn(frame_ptr: i64, w_name: i64, value: i64) ->
     }
 }
 
+/// DELETE_NAME residual using the frame receiver and interned-name ABI.
+/// pyopcode.py DELETE_NAME deletes from `w_locals` and raises `NameError`
+/// when the binding is absent.
+pub extern "C" fn bh_delete_name_fn(frame_ptr: i64, w_name: i64) -> i64 {
+    use pyre_interpreter::pyopcode::OpcodeStepExecutor;
+    assert!(
+        frame_ptr != 0,
+        "bh_delete_name_fn requires a non-null PyFrame; every DELETE_NAME emit \
+         site must thread portal_frame_reg as the leading ref operand"
+    );
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let name =
+        unsafe { pyre_object::unicodeobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
+    match frame.delete_name(name) {
+        Ok(()) => 1,
+        Err(mut err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
+}
+
+/// DELETE_GLOBAL residual using the frame receiver and interned-name ABI.
+/// pyopcode.py DELETE_GLOBAL deletes directly from `w_globals`.
+pub extern "C" fn bh_delete_global_fn(frame_ptr: i64, w_name: i64) -> i64 {
+    use pyre_interpreter::pyopcode::OpcodeStepExecutor;
+    assert!(
+        frame_ptr != 0,
+        "bh_delete_global_fn requires a non-null PyFrame; every DELETE_GLOBAL emit \
+         site must thread portal_frame_reg as the leading ref operand"
+    );
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    let name =
+        unsafe { pyre_object::unicodeobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
+    match frame.delete_global(name) {
+        Ok(()) => 1,
+        Err(mut err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
+}
+
 /// Load a constant from the code object.
 /// jtransform.py parity: code comes from getfield_vable_r(frame, pycode).
 pub extern "C" fn bh_load_const_fn(w_code_ptr: i64, consti: i64) -> i64 {

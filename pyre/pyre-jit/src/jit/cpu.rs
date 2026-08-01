@@ -319,6 +319,14 @@ pub struct Cpu {
     /// lowering of `STORE_GLOBAL` (`pyopcode.py:567`); writes directly
     /// into `w_globals`, bypassing `w_locals`.
     pub store_global_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// `bh_delete_name_fn` — `(frame: Ref, w_name: Ref) → Void`, the
+    /// lowering of `DELETE_NAME`; deletes the binding from `w_locals` and
+    /// raises `NameError` when it is absent.
+    pub delete_name_fn: extern "C" fn(i64, i64) -> i64,
+    /// `bh_delete_global_fn` — `(frame: Ref, w_name: Ref) → Void`, the
+    /// lowering of `DELETE_GLOBAL`; deletes directly from `w_globals`,
+    /// bypassing `w_locals`.
+    pub delete_global_fn: extern "C" fn(i64, i64) -> i64,
     /// `newtuple(list_w)` (`objspace.py:332`) — (ref array) → new tuple.
     /// The array is the forced `popvalues` list; length travels inside
     /// the array, so any arity fits.
@@ -511,6 +519,8 @@ impl Cpu {
             load_name_fn: crate::call_jit::bh_load_name_fn,
             store_name_fn: crate::call_jit::bh_store_name_fn,
             store_global_fn: crate::call_jit::bh_store_global_fn,
+            delete_name_fn: crate::call_jit::bh_delete_name_fn,
+            delete_global_fn: crate::call_jit::bh_delete_global_fn,
             newtuple_from_array_fn: crate::call_jit::bh_newtuple_from_array,
             build_map_from_array_fn: crate::call_jit::bh_build_map_from_array,
             build_set_from_array_fn: crate::call_jit::bh_build_set_from_array,

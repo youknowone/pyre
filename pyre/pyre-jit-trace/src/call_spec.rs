@@ -135,6 +135,13 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
     },
     CallEffectSpec {
         target: CallTargetSpec::Method {
+            name: "delete_global",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
             name: "load_name",
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
@@ -171,6 +178,13 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
     CallEffectSpec {
         target: CallTargetSpec::Method {
             name: "store_name_value",
+            receiver_root: PYFRAME_CALL_OWNER_ROOT,
+        },
+        effect: CallEffectKind::Residual,
+    },
+    CallEffectSpec {
+        target: CallTargetSpec::Method {
+            name: "delete_name",
             receiver_root: PYFRAME_CALL_OWNER_ROOT,
         },
         effect: CallEffectKind::Residual,

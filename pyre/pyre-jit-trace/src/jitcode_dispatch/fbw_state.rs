@@ -1114,6 +1114,12 @@ thread_local! {
     /// Callee code keys whose deferred body reached a CALL residual the lever
     /// could not inline.  The gate declines them up front from then on, so the
     /// backstop abort costs one attempt per callee instead of storming.
+    ///
+    /// Per-thread for the reason [`FBW_HAZARDOUS_INLINE_DENY`] spells out, and
+    /// it is only a memo: what actually keeps a deferred body honest is the
+    /// live abort in [`fbw_abort_nested_unjournaled_residual`], armed by
+    /// [`FBW_FORITER_DEFERRED_INLINE`] above.  A thread that has not yet
+    /// recorded a denial pays one extra abort per callee, never a wrong answer.
     static FBW_FORITER_DEFERRED_DENY: std::cell::RefCell<std::collections::HashSet<usize>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
     /// Code keys of the callees [`fbw_inline_callee_hazardous`] named when the
