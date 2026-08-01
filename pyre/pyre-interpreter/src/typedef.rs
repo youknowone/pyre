@@ -2049,16 +2049,7 @@ unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef) {
                 crate::function::function_set_objclass(function, type_obj);
                 let qualname = format!("{}.{}", pyre_object::w_type_get_qualname(type_obj), key);
                 crate::function::function_set_qualname(function, pyre_object::w_str_new(&qualname));
-                // The slot half of the namespace keeps the fixed-code
-                // spelling; only the `tp_methods` half becomes a method
-                // descriptor. This is the same split the TypeDef sweep
-                // applies, and both sweeps reach a builtin namespace.
-                if is_plain_entry
-                    && !crate::gateway::is_slot_wrapper(
-                        pyre_object::w_type_get_name(type_obj),
-                        &key,
-                    )
-                {
+                if is_plain_entry {
                     crate::function::function_mark_method_descriptor(function);
                 }
             }
