@@ -54,6 +54,14 @@ pub struct ArenaCollection {
     /// pointer-chasing every bucket for arbitrary-word validity checks.
     /// It changes only when an arena is allocated or freed.
     arena_ranges: Vec<(usize, usize)>,
+    /// The range [`contains`] matched last.  Every field store that reaches the
+    /// write barrier asks the membership question once, and consecutive stores
+    /// name the same arena nearly always, so re-testing the previous answer
+    /// first replaces the binary search with two compares on that path.  A hit
+    /// can only be stale if the range left `arena_ranges`, so `free_arena`
+    /// clears it; inserting leaves every existing range where it was.
+    /// `(usize::MAX, 0)` is the empty state — no address satisfies it.
+    last_range_hit: std::cell::Cell<(usize, usize)>,
     min_empty_nfreepages: usize,
     pub num_uninitialized_pages: usize,
     pub total_memory_used: usize,
@@ -109,6 +117,7 @@ impl ArenaCollection {
             old_arenas_lists: vec![ptr::null_mut(); max_pages_per_arena],
             current_arena: ptr::null_mut(),
             arena_ranges: Vec::new(),
+            last_range_hit: std::cell::Cell::new((usize::MAX, 0)),
             min_empty_nfreepages: max_pages_per_arena,
             num_uninitialized_pages: 0,
             total_memory_used: 0,
@@ -492,10 +501,19 @@ impl ArenaCollection {
     /// this sorted flat index serves pyre's arbitrary-word membership query.
     #[inline]
     pub fn contains(&self, addr: usize) -> bool {
+        let (start, end) = self.last_range_hit.get();
+        if addr >= start && addr < end {
+            return true;
+        }
         let index = self
             .arena_ranges
             .partition_point(|&(start, _)| start <= addr);
-        index > 0 && addr < self.arena_ranges[index - 1].1
+        if index > 0 && addr < self.arena_ranges[index - 1].1 {
+            self.last_range_hit.set(self.arena_ranges[index - 1]);
+            true
+        } else {
+            false
+        }
     }
 
     unsafe fn free_arena(&mut self, arena: *mut ArenaReference) {
@@ -529,6 +547,7 @@ impl ArenaCollection {
                 .binary_search_by_key(&base, |&(start, _)| start)
                 .expect("freed arena missing from range index");
             self.arena_ranges.remove(index);
+            self.last_range_hit.set((usize::MAX, 0));
             alloc::dealloc((*arena).base, (*arena).layout);
             self.total_memory_alloced -= self.arena_size;
             self.arenas_count -= 1;
@@ -619,6 +638,22 @@ mod tests {
         assert_eq!(ac.total_memory_used, 0);
         assert_eq!(ac.arenas_count, 0);
         assert_eq!(ac.total_memory_alloced, 0);
+        assert!(!ac.contains(first));
+    }
+
+    #[test]
+    fn contains_cache_does_not_survive_the_arena_it_matched() {
+        let mut ac = ArenaCollection::new(ARENA_SIZE, PAGE_SIZE, THRESHOLD);
+        let first = ac.malloc(WORD) as usize;
+        while !ac.current_arena.is_null() {
+            ac.malloc(WORD);
+        }
+        // Prime the single-entry range cache on the arena about to be freed;
+        // without the invalidation in `free_arena` this hit would be replayed
+        // against returned memory.
+        assert!(ac.contains(first));
+        ac.mass_free(|_| true);
+        assert_eq!(ac.arenas_count, 0);
         assert!(!ac.contains(first));
     }
 

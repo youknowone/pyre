@@ -672,6 +672,13 @@ pub unsafe fn slot_get(slot: ShadowStackSlot, index: usize) -> GcRef {
 }
 
 /// Walk all entries on the GcRef shadow stack.
+///
+/// Null entries are skipped here, on the walk, and nowhere else: a slot may
+/// legitimately hold null, because the save side stores whatever the livevar
+/// holds without testing it (`shadowcolor.py`'s `expand_one_push_roots` emits a
+/// `gc_save_root` per live GCREF with no value test, and marks slots unused
+/// through the translation-time `make_bitmask` rather than at runtime). This is
+/// `walk_stack_root`'s `if content:` in `shadowstack.py`.
 pub fn walk_roots(mut visitor: impl FnMut(&mut GcRef)) {
     SHADOW_STACK.with(|ss| {
         let mut ss = ss.borrow_mut();
