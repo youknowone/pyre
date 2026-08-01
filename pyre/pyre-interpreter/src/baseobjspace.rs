@@ -7490,7 +7490,7 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                     "__code__" | "__globals__" | "__closure__" | "__defaults__" | "__kwdefaults__"
                 )
             {
-                return Err(raiseattrerror(obj, name, None));
+                return Err(raiseattrerror(obj, name, None, false));
             }
             match name {
                 "__code__" => {
