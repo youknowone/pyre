@@ -3269,6 +3269,28 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             )))
         }
 
+        // A classdef-less top instance — pyre's erased "top reference",
+        // e.g. a `&Foo` input whose Ref target `valuetype_to_someshell`
+        // dropped to `SomeInstance(None)` — absorbs an opaque low-level
+        // pointer denoting the same erased reference.  The Ref input
+        // lifts inconsistently (classdef-less `SomeInstance` on one CFG
+        // edge, `SomePtr` on another) and merges at `mergeinputargs`;
+        // both are type-erased pointers, so the union is the classdef-
+        // less top — the same result as the `_ => None` special case
+        // above where a classdef-less instance absorbs any instance.  A
+        // classdef-BEARING instance ∪ `Ptr` stays genuinely incompatible
+        // and falls through to the loud default.
+        (SomeValue::Instance(inst), SomeValue::Ptr(_))
+        | (SomeValue::Ptr(_), SomeValue::Instance(inst))
+            if inst.classdef.is_none() =>
+        {
+            Ok(SomeValue::Instance(SomeInstance::new(
+                None,
+                inst.can_be_none,
+                std::collections::BTreeMap::new(),
+            )))
+        }
+
         // binaryop.py forwards exception/instance and exception/None
         // through `SomeException.as_SomeInstance()`.
         (SomeValue::Exception(exc), SomeValue::Instance(inst)) => {
