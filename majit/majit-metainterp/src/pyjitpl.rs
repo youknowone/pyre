@@ -7520,6 +7520,40 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
+        // compile.py:390 `target_token = loop.operations[-1].getdescr()`: the
+        // retrace's closing JUMP names the label this very trace installs.
+        // Upstream's other outcome — `unroll.py:238-242 jump_to_preamble`,
+        // where the JUMP is retargeted at the ORIGINAL loop's start descr — is
+        // a jump into ANOTHER compiled trace
+        // (`x86/assembler.py:2461-2467 closing_jump` emits
+        // `JMP(imm(target_token._ll_loop_code))`), which this backend's
+        // function-per-trace model cannot emit. Compiling it anyway would
+        // leave a JUMP whose descr names no label in this trace, so take
+        // `compile.py:368-371`'s cancel shape instead: a retrace that cannot
+        // close onto its own label is not compiled.
+        let closes_on_own_label = {
+            let jump_descr = combined_ops
+                .iter()
+                .rev()
+                .find(|op| op.opcode == OpCode::Jump)
+                .and_then(|op| op.getdescr())
+                .map(|descr| descr.index());
+            let label_descr = combined_ops
+                .iter()
+                .rev()
+                .find(|op| op.opcode == OpCode::Label)
+                .and_then(|op| op.getdescr())
+                .map(|descr| descr.index());
+            jump_descr.is_some() && jump_descr == label_descr
+        };
+        if !closes_on_own_label {
+            crate::debug::log_one(
+                "jit-abort",
+                "compile_retrace: closing JUMP does not target this trace's label",
+            );
+            return false;
+        }
+
         let num_combined_ops = combined_ops.len();
         let has_guard = combined_ops.iter().any(|op| op.opcode.is_guard());
         if !has_guard {
