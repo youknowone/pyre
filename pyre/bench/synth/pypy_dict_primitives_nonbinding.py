@@ -122,4 +122,18 @@ if __pypy__ is not None:
     mte(noop, "r", last=True)  # "r" is already last -> no reorder
     assert first == "p" and list(it) == ["q", "r"]
 
+    # (7) typed-strategy dicts (int / bytes keys) reorder correctly, both
+    # directions, and reversed_dict enumerates them in reverse
+    di = {1: "a", 2: "b", 3: "c"}
+    mte(di, 1)
+    assert list(di) == [2, 3, 1]
+    mte(di, 3, last=False)
+    assert list(di) == [3, 2, 1]
+    assert list(rd(di)) == [1, 2, 3]
+    db = {b"x": 1, b"y": 2, b"z": 3}
+    mte(db, b"x")
+    assert list(db) == [b"y", b"z", b"x"]
+    mte(db, b"z", last=False)
+    assert list(db) == [b"z", b"y", b"x"]
+
 print("OK")

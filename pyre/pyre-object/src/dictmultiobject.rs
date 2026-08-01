@@ -3527,6 +3527,35 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
     Ok(true)
 }
 
+/// Reposition `k` to the back (`last`) or front of a native insertion-ordered
+/// typed store, bumping `keys_version` only on a real move.  Returns whether the
+/// key existed.  Shared by the Int/Bytes fast paths of
+/// [`w_dict_move_to_end_checked`]; the caller has proven the strategy so the
+/// `IndexMap<K, _>` cast matches `dstorage`.
+///
+/// # Safety
+/// `dict` must point to a valid `W_DictObject` whose `dstorage` is an
+/// `IndexMap<K, PyObjectRef>`.
+unsafe fn typed_move_to_end<K: std::hash::Hash + Eq>(
+    dict: *mut W_DictObject,
+    k: &K,
+    last: bool,
+) -> bool {
+    let dict = &mut *dict;
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<K, PyObjectRef>);
+    match entries.get_index_of(k) {
+        Some(index) => {
+            let target = if last { entries.len() - 1 } else { 0 };
+            if index != target {
+                entries.move_index(index, target);
+                dict.keys_version = dict.keys_version.wrapping_add(1);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
 /// PyPy `W_DictMultiObject.nondescr_move_to_end` (`dictmultiobject.py:221`):
 /// reposition an existing key to the back (`last`) or front of the insertion
 /// order, bypassing any subclass hooks.  Locates the entry callback-free,
@@ -3578,7 +3607,31 @@ pub unsafe fn w_dict_move_to_end_checked(
     }
 
     let strategy = (*(obj as *const W_DictObject)).dstrategy;
-    if strategy.strategy_kind() != StrategyKind::Object {
+    let kind = strategy.strategy_kind();
+
+    // Typed stores reorder in place, preserving the strategy — the
+    // `AbstractTypedStrategy.move_to_end` fast path (`dictmultiobject.py:1170`).
+    // Int and Bytes keep their native `IndexMap<i64>` / `IndexMap<Vec<u8>>`
+    // storage; the lookup compares native keys, so it is callback-free and
+    // needs no reentrant fallback.  A foreign-type key cannot be present in a
+    // typed store, so it falls through to the object-strategy path below.
+    if kind == StrategyKind::Int && crate::listobject::is_plain_int1(key) {
+        let k = crate::listobject::plain_int_w(key);
+        return Ok(typed_move_to_end::<i64>(obj as *mut W_DictObject, &k, last));
+    }
+    if kind == StrategyKind::Bytes && crate::is_exact_type(key, &crate::bytesobject::BYTES_TYPE) {
+        let k = crate::w_bytes_data(key).to_vec();
+        return Ok(typed_move_to_end::<Vec<u8>>(
+            obj as *mut W_DictObject,
+            &k,
+            last,
+        ));
+    }
+
+    // Object and Unicode share the `IndexMap<ObjectKey>` representation, so the
+    // reorder below runs in place; only a genuinely foreign store (a typed
+    // store reached with a non-native key, or Kwargs/Map/Empty) is converted.
+    if kind != StrategyKind::Object && kind != StrategyKind::Unicode {
         strategy.switch_to_object_strategy(obj);
     }
     let object_key = object_key_for_checked(key)?;
