@@ -5324,6 +5324,19 @@ fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     Ok(pyre_object::w_none())
 }
 
+/// `_PyArg_NoKeywords(type_name, kwds)` message for an exception initializer
+/// that a subclass inherits: the reported name is the receiver's own type, not
+/// the class the initializer was installed on.
+fn exc_no_keywords_error(w_self: PyObjectRef, fallback: &str) -> crate::PyError {
+    let type_name = unsafe {
+        match crate::typedef::r#type(w_self) {
+            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
+            None => fallback.to_string(),
+        }
+    };
+    crate::PyError::type_error(format!("{type_name}() takes no keyword arguments"))
+}
+
 /// `interp_exceptions.py:836-858 W_SyntaxError.descr_init` — validate the
 /// optional details sequence before forwarding the original positional
 /// arguments to `BaseException.__init__`.  The details tuple must contain
@@ -5336,9 +5349,7 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     })?;
     let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
     if has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
-            "SyntaxError() takes no keyword arguments",
-        ));
+        return Err(exc_no_keywords_error(w_self, "SyntaxError"));
     }
     if positional.len() == 2 {
         let details = crate::baseobjspace::fixedview(positional[1], -1)?;
