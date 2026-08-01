@@ -460,7 +460,9 @@ pub fn get_or_make_weakref(
         w_ref
     } else {
         // subclass: cannot cache
-        W_Weakref_new(w_subtype, w_obj, PY_NULL)
+        let w_ref = W_Weakref_new(w_subtype, w_obj, PY_NULL);
+        append_wref_to(self_lifeline, w_ref);
+        w_ref
     }
 }
 
@@ -1216,7 +1218,10 @@ pub fn proxy_descr__hash__(_args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
 pub fn callable_proxy_descr__call__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_self = args[0];
     let w_obj = force(w_self)?;
-    crate::call::call_function_impl_result(w_obj, &args[1..])
+    // `space.call_args(w_obj, __args__)` preserves both positional and keyword
+    // arguments. Re-split pyre's flat builtin kwargs marker before forwarding
+    // so the marker dict cannot leak into the referent as a positional value.
+    crate::builtins::call_forwarding_args(w_obj, &args[1..])
 }
 
 /// pypy/module/_weakref/interp__weakref.py:329-337 proxy
@@ -1447,31 +1452,65 @@ proxy_binary!(proxy_or, crate::baseobjspace::or_);
 proxy_binary_reflected!(proxy_ror, crate::baseobjspace::or_);
 proxy_binary!(proxy_xor, crate::baseobjspace::xor);
 proxy_binary_reflected!(proxy_rxor, crate::baseobjspace::xor);
+proxy_binary!(proxy_matmul, crate::baseobjspace::matmul);
+proxy_binary_reflected!(proxy_rmatmul, crate::baseobjspace::matmul);
 
 // Inplace ops — interp__weakref.py:367-369. PyPy forces every operand
-// (`forcing_count = arity`) and dispatches to `space.inplace_X`. pyre
-// has no separate `inplace_` space ops; the regular forward op is the
-// closest equivalent and matches the runtime fall-back PyPy uses for
-// any type without an in-place specialization.
-proxy_binary!(proxy_iadd, crate::baseobjspace::add);
-proxy_binary!(proxy_isub, crate::baseobjspace::sub);
-proxy_binary!(proxy_imul, crate::baseobjspace::mul);
-proxy_binary!(proxy_itruediv, crate::baseobjspace::truediv);
-proxy_binary!(proxy_ifloordiv, crate::baseobjspace::floordiv);
-proxy_binary!(proxy_imod, crate::baseobjspace::mod_);
-proxy_binary!(proxy_ipow, crate::baseobjspace::pow);
-proxy_binary!(proxy_ilshift, crate::baseobjspace::lshift);
-proxy_binary!(proxy_irshift, crate::baseobjspace::rshift);
-proxy_binary!(proxy_iand, crate::baseobjspace::and_);
-proxy_binary!(proxy_ior, crate::baseobjspace::or_);
-proxy_binary!(proxy_ixor, crate::baseobjspace::xor);
+// (`forcing_count = arity`) and dispatches to `space.inplace_X`. In pyre the
+// equivalent space operation is `opcode_ops::binary_value`: it tries the
+// `__i*__` slot first and only then falls back to the ordinary binary op.
+macro_rules! proxy_inplace {
+    ($name:ident, $op:ident) => {
+        pub fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+            let w_obj0 = force(args[0])?;
+            let w_obj1 = force(args[1])?;
+            crate::opcode_ops::binary_value(w_obj0, w_obj1, crate::bytecode::BinaryOperator::$op)
+        }
+    };
+}
+
+proxy_inplace!(proxy_iadd, InplaceAdd);
+proxy_inplace!(proxy_isub, InplaceSubtract);
+proxy_inplace!(proxy_imul, InplaceMultiply);
+proxy_inplace!(proxy_itruediv, InplaceTrueDivide);
+proxy_inplace!(proxy_ifloordiv, InplaceFloorDivide);
+proxy_inplace!(proxy_imod, InplaceRemainder);
+proxy_inplace!(proxy_ipow, InplacePower);
+proxy_inplace!(proxy_ilshift, InplaceLshift);
+proxy_inplace!(proxy_irshift, InplaceRshift);
+proxy_inplace!(proxy_iand, InplaceAnd);
+proxy_inplace!(proxy_ior, InplaceOr);
+proxy_inplace!(proxy_ixor, InplaceXor);
+proxy_inplace!(proxy_imatmul, InplaceMatrixMultiply);
 
 // 1-arg unary ops with a direct pyre space op.
 proxy_unary!(proxy_len, crate::baseobjspace::len);
 proxy_unary!(proxy_neg, crate::baseobjspace::neg);
 proxy_unary!(proxy_invert, crate::baseobjspace::invert);
 proxy_unary!(proxy_iter, crate::baseobjspace::iter);
-proxy_unary!(proxy_next, crate::baseobjspace::next);
+
+// interp__weakref.py:398-414 — these three operations are explicit rather
+// than generated from ObjSpace.MethodTable. In particular, __next__ has a
+// proxy-specific error when the live referent is not an iterator.
+pub fn proxy_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    forward_to_dunder(w_obj0, "__bytes__", &[])
+}
+
+pub fn proxy_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    forward_to_dunder(w_obj0, "__reversed__", &[])
+}
+
+pub fn proxy_next(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_obj0 = force(args[0])?;
+    if unsafe { crate::baseobjspace::lookup(w_obj0, "__next__") }.is_none() {
+        return Err(PyError::type_error(
+            "Weakref proxy referenced a non-iterator".to_string(),
+        ));
+    }
+    crate::baseobjspace::next(w_obj0)
+}
 
 // 1-arg unary ops without a direct space op — fall through to the
 // equivalent dunder so the proxy still delegates to the referent.
@@ -1848,6 +1887,20 @@ fn register_proxy_typedef_dict(ns: PyObjectRef, include_comparisons: bool) {
             make_builtin_function_with_arity("__rxor__", proxy_rxor, 2),
         )
     };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__matmul__",
+            make_builtin_function_with_arity("__matmul__", proxy_matmul, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__rmatmul__",
+            make_builtin_function_with_arity("__rmatmul__", proxy_rmatmul, 2),
+        )
+    };
     // baseobjspace.py:2159 divmod row — forward + reflected.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -1947,6 +2000,13 @@ fn register_proxy_typedef_dict(ns: PyObjectRef, include_comparisons: bool) {
             ns,
             "__ixor__",
             make_builtin_function_with_arity("__ixor__", proxy_ixor, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__imatmul__",
+            make_builtin_function_with_arity("__imatmul__", proxy_imatmul, 2),
         )
     };
 
@@ -2096,6 +2156,20 @@ fn register_proxy_typedef_dict(ns: PyObjectRef, include_comparisons: bool) {
             ns,
             "__next__",
             make_builtin_function_with_arity("__next__", proxy_next, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__bytes__",
+            make_builtin_function_with_arity("__bytes__", proxy_bytes, 1),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__reversed__",
+            make_builtin_function_with_arity("__reversed__", proxy_reversed, 1),
         )
     };
     unsafe {
@@ -2331,7 +2405,7 @@ mod tests {
     /// pypy/interpreter/baseobjspace.py:2159 — divmod must register
     /// both `__divmod__` and `__rdivmod__`.
     #[test]
-    fn test_proxy_typedef_dict_includes_metaclass_and_divmod_rows() {
+    fn test_proxy_typedef_dict_includes_all_explicit_rows() {
         let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let weakproxy = proxy_type();
@@ -2342,6 +2416,11 @@ mod tests {
                 assert!(crate::baseobjspace::lookup_in_type(tp, "__subclasscheck__").is_some());
                 assert!(crate::baseobjspace::lookup_in_type(tp, "__divmod__").is_some());
                 assert!(crate::baseobjspace::lookup_in_type(tp, "__rdivmod__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__matmul__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__rmatmul__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__imatmul__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__bytes__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__reversed__").is_some());
             }
         }
     }
