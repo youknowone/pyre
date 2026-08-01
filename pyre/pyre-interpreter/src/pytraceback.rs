@@ -397,14 +397,25 @@ pub unsafe fn record_application_traceback(
         crate::eval::set_in_flight_exception(w_exc_object);
         // `pytraceback.py:36 self.lineno = offset2lineno(self.frame
         // .pycode, self.lasti)` — pyre resolves the line number
-        // eagerly here rather than lazily in `get_lineno`; stamping at
-        // construction guarantees the value survives the frame's
-        // lifetime, since a frame the GC does not own is not kept alive
-        // by the traceback.  See `w_pytraceback_get_lineno` for what
-        // still depends on the eager stamp and which two `tb_lineno`
-        // answers it diverges on.  `frame.pycode` is the `PyCode`
-        // wrapper; the inner `CodeObject` is extracted via
-        // `pyframe_get_pycode`.
+        // eagerly here rather than lazily in `get_lineno`, so the slot
+        // never holds `LINENO_NOT_COMPUTED` for a node built here.
+        //
+        // Frame lifetime is NOT what blocks the lazy form: the `w_code`
+        // slot below is forwarded unconditionally and is the same
+        // `pycode` upstream reads, so resolving off `w_code` + `lasti`
+        // would be safe at any later point.  What blocks it is the JIT
+        // fold `walker_specialize_traceback_walk_field`
+        // (pyre-jit-trace), which reads this slot directly and declines
+        // on the sentinel; under a lazy `get_lineno` every freshly
+        // recorded node carries the sentinel on its first read, so the
+        // fold would have to emit a resolver call plus the memoizing
+        // write-back in place of today's plain `getfield`.  That trades
+        // a folded field read for a call on the `tb_lineno` walk.
+        // See `w_pytraceback_get_lineno` for the two `tb_lineno`
+        // answers the eager stamp diverges on.
+        //
+        // `frame.pycode` is the `PyCode` wrapper; the inner
+        // `CodeObject` is extracted via `pyframe_get_pycode`.
         //
         // The `PyCode` PyObjectRef is also captured into the `w_code`
         // slot so the traceback's source-path / function name metadata
