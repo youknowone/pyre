@@ -2961,12 +2961,15 @@ unsafe fn is_exact_numeric_builtin(obj: PyObjectRef) -> bool {
 }
 
 /// The builtin numeric base type backing `obj`'s storage — `int` for
-/// int/long, `float` for float, `None` for a non-numeric operand.
+/// int/long, `float` for float, `complex` for complex, `None` for a
+/// non-numeric operand.
 unsafe fn numeric_base_type(obj: PyObjectRef) -> Option<*const pyre_object::PyType> {
     if is_int(obj) || is_long(obj) {
         Some(&pyre_object::INT_TYPE)
     } else if is_float(obj) {
         Some(&pyre_object::FLOAT_TYPE)
+    } else if is_complex(obj) {
+        Some(&pyre_object::COMPLEX_TYPE)
     } else {
         None
     }
@@ -2992,7 +2995,7 @@ unsafe fn numeric_base_type_of_overriding_subclass(
 
 /// True when numeric operand `obj` (int/long/float storage) has a Python
 /// class that overrides `dunder` relative to its builtin base — int/long
-/// against `int`, float against `float`.  Mirrors [`dunder_overridden`]
+/// against `int`, float against `float`, complex against `complex`.  Mirrors [`dunder_overridden`]
 /// with the numeric base selected per operand.  Only an *overriding*
 /// subclass routes through dispatch: a non-overriding subclass keeps the
 /// Rust fast path, which both matches the builtin result and avoids
@@ -3073,22 +3076,25 @@ unsafe fn try_numeric_unaryop_override(
 
 pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if needs_numeric_binop_dispatch(a, b, "__add__", "__radd__") {
+        let numeric_override = needs_numeric_binop_dispatch(a, b, "__add__", "__radd__");
+        if numeric_override {
             if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
                 return Ok(result);
             }
         }
-        if is_int_like(a) && is_int_like(b) {
-            return int_add(a, b);
-        }
-        if is_int_or_long(a) && is_int_or_long(b) {
-            return long_add(a, b);
-        }
-        if is_float_pair(a, b) {
-            return float_add(a, b);
-        }
-        if is_complex_pair(a, b) {
-            return complex_add(a, b);
+        if !numeric_override {
+            if is_int_like(a) && is_int_like(b) {
+                return int_add(a, b);
+            }
+            if is_int_or_long(a) && is_int_or_long(b) {
+                return long_add(a, b);
+            }
+            if is_float_pair(a, b) {
+                return float_add(a, b);
+            }
+            if is_complex_pair(a, b) {
+                return complex_add(a, b);
+            }
         }
         if is_str(a) && is_str(b) {
             // descroperation.py:664 "unicode + string subclass" — a str
@@ -3149,8 +3155,10 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // `descroperation.py:_make_binop_impl` — try_dispatch_binary_special
         // already implements the reflected-first reordering rule for
         // subclass operands.
-        if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
-            return Ok(result);
+        if !numeric_override {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
+                return Ok(result);
+            }
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
@@ -3182,22 +3190,25 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                 return Ok(result);
             }
         }
-        if needs_numeric_binop_dispatch(a, b, "__sub__", "__rsub__") {
+        let numeric_override = needs_numeric_binop_dispatch(a, b, "__sub__", "__rsub__");
+        if numeric_override {
             if let Some(result) = try_dispatch_binary_special(a, b, "__sub__", "__rsub__")? {
                 return Ok(result);
             }
         }
-        if is_int_like(a) && is_int_like(b) {
-            return int_sub(a, b);
-        }
-        if is_int_or_long(a) && is_int_or_long(b) {
-            return long_sub(a, b);
-        }
-        if is_float_pair(a, b) {
-            return float_sub(a, b);
-        }
-        if is_complex_pair(a, b) {
-            return complex_sub(a, b);
+        if !numeric_override {
+            if is_int_like(a) && is_int_like(b) {
+                return int_sub(a, b);
+            }
+            if is_int_or_long(a) && is_int_or_long(b) {
+                return long_sub(a, b);
+            }
+            if is_float_pair(a, b) {
+                return float_sub(a, b);
+            }
+            if is_complex_pair(a, b) {
+                return complex_sub(a, b);
+            }
         }
         // set / frozenset difference — PyPy: setobject.py W_BaseSetObject.descr_sub.
         // descr_sub returns NotImplemented for a non-set rhs, so `-` requires
@@ -3208,8 +3219,10 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         {
             return crate::typedef::set_method_difference(&[a, b]);
         }
-        if let Some(result) = try_dispatch_binary_special(a, b, "__sub__", "__rsub__")? {
-            return Ok(result);
+        if !numeric_override {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__sub__", "__rsub__")? {
+                return Ok(result);
+            }
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
@@ -3221,22 +3234,25 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if needs_numeric_binop_dispatch(a, b, "__mul__", "__rmul__") {
+        let numeric_override = needs_numeric_binop_dispatch(a, b, "__mul__", "__rmul__");
+        if numeric_override {
             if let Some(result) = try_dispatch_binary_special(a, b, "__mul__", "__rmul__")? {
                 return Ok(result);
             }
         }
-        if is_int_like(a) && is_int_like(b) {
-            return int_mul(a, b);
-        }
-        if is_int_or_long(a) && is_int_or_long(b) {
-            return long_mul(a, b);
-        }
-        if is_float_pair(a, b) {
-            return float_mul(a, b);
-        }
-        if is_complex_pair(a, b) {
-            return complex_mul(a, b);
+        if !numeric_override {
+            if is_int_like(a) && is_int_like(b) {
+                return int_mul(a, b);
+            }
+            if is_int_or_long(a) && is_int_or_long(b) {
+                return long_mul(a, b);
+            }
+            if is_float_pair(a, b) {
+                return float_mul(a, b);
+            }
+            if is_complex_pair(a, b) {
+                return complex_mul(a, b);
+            }
         }
         // The `sq_repeat` fast paths below are valid for exact builtin
         // sequences.  A sequence subclass that overrides `__mul__`/`__rmul__`
@@ -3290,7 +3306,10 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                 Some(method) => try_call_special(method, &[a, b])?,
                 None => None,
             },
-            (false, false) => try_dispatch_binary_special(a, b, "__mul__", "__rmul__")?,
+            (false, false) if !numeric_override => {
+                try_dispatch_binary_special(a, b, "__mul__", "__rmul__")?
+            }
+            (false, false) => None,
         };
         if let Some(result) = dispatched {
             return Ok(result);
@@ -3321,24 +3340,31 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if needs_numeric_binop_dispatch(a, b, "__floordiv__", "__rfloordiv__") {
+        let numeric_override = needs_numeric_binop_dispatch(a, b, "__floordiv__", "__rfloordiv__");
+        if numeric_override {
             if let Some(result) =
                 try_dispatch_binary_special(a, b, "__floordiv__", "__rfloordiv__")?
             {
                 return Ok(result);
             }
         }
-        if is_int_like(a) && is_int_like(b) {
-            return int_floordiv(a, b);
+        if !numeric_override {
+            if is_int_like(a) && is_int_like(b) {
+                return int_floordiv(a, b);
+            }
+            if is_int_or_long(a) && is_int_or_long(b) {
+                return long_floordiv(a, b);
+            }
+            if is_float_pair(a, b) {
+                return float_floordiv(a, b);
+            }
         }
-        if is_int_or_long(a) && is_int_or_long(b) {
-            return long_floordiv(a, b);
-        }
-        if is_float_pair(a, b) {
-            return float_floordiv(a, b);
-        }
-        if let Some(result) = try_dispatch_binary_special(a, b, "__floordiv__", "__rfloordiv__")? {
-            return Ok(result);
+        if !numeric_override {
+            if let Some(result) =
+                try_dispatch_binary_special(a, b, "__floordiv__", "__rfloordiv__")?
+            {
+                return Ok(result);
+            }
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
@@ -3350,19 +3376,22 @@ pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if needs_numeric_binop_dispatch(a, b, "__mod__", "__rmod__") {
+        let numeric_override = needs_numeric_binop_dispatch(a, b, "__mod__", "__rmod__");
+        if numeric_override {
             if let Some(result) = try_dispatch_binary_special(a, b, "__mod__", "__rmod__")? {
                 return Ok(result);
             }
         }
-        if is_int_like(a) && is_int_like(b) {
-            return int_mod(a, b);
-        }
-        if is_int_or_long(a) && is_int_or_long(b) {
-            return long_mod(a, b);
-        }
-        if is_float_pair(a, b) {
-            return float_mod(a, b);
+        if !numeric_override {
+            if is_int_like(a) && is_int_like(b) {
+                return int_mod(a, b);
+            }
+            if is_int_or_long(a) && is_int_or_long(b) {
+                return long_mod(a, b);
+            }
+            if is_float_pair(a, b) {
+                return float_mod(a, b);
+            }
         }
         let is_str_lhs = is_str(a);
         let is_bytes_lhs = pyre_object::bytesobject::is_bytes_like(a);
@@ -3390,8 +3419,10 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                 crate::objspace::std::formatting::bytes_format_percent(a, b)
             };
         }
-        if let Some(result) = try_dispatch_binary_special(a, b, "__mod__", "__rmod__")? {
-            return Ok(result);
+        if !numeric_override {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__mod__", "__rmod__")? {
+                return Ok(result);
+            }
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
@@ -3411,7 +3442,8 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// "integer division result too large for a float".
 pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if needs_numeric_binop_dispatch(a, b, "__truediv__", "__rtruediv__") {
+        let numeric_override = needs_numeric_binop_dispatch(a, b, "__truediv__", "__rtruediv__");
+        if numeric_override {
             if let Some(result) = try_dispatch_binary_special(a, b, "__truediv__", "__rtruediv__")?
             {
                 return Ok(result);
@@ -3419,7 +3451,7 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         let a_num = is_int(a) || is_float(a) || is_long(a);
         let b_num = is_int(b) || is_float(b) || is_long(b);
-        if a_num && b_num {
+        if !numeric_override && a_num && b_num {
             if is_float(a) || is_float(b) {
                 return float_truediv(a, b);
             }
@@ -3451,11 +3483,14 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             }
             return Ok(w_float_new(as_float(a) / as_float(b)));
         }
-        if is_complex_pair(a, b) {
+        if !numeric_override && is_complex_pair(a, b) {
             return complex_truediv(a, b);
         }
-        if let Some(result) = try_dispatch_binary_special(a, b, "__truediv__", "__rtruediv__")? {
-            return Ok(result);
+        if !numeric_override {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__truediv__", "__rtruediv__")?
+            {
+                return Ok(result);
+            }
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
@@ -3469,10 +3504,12 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// fast paths nor `__pow__` / `__rpow__` produce a result.
 fn pow_binary(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
     unsafe {
-        if needs_numeric_binop_dispatch(a, b, "__pow__", "__rpow__") {
+        let numeric_override = needs_numeric_binop_dispatch(a, b, "__pow__", "__rpow__");
+        if numeric_override {
             if let Some(result) = try_dispatch_binary_special(a, b, "__pow__", "__rpow__")? {
                 return Ok(Some(result));
             }
+            return Ok(None);
         }
         if is_int_like(a) && is_int_like(b) {
             return int_pow(a, b).map(Some);
@@ -4154,15 +4191,17 @@ pub fn pow3(base: PyObjectRef, exp: PyObjectRef, modulus: PyObjectRef) -> PyResu
 /// fast path then forward + reverse special-method dispatch with the
 /// standard NotImplemented fallback.
 pub fn divmod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let numeric_override;
     unsafe {
-        if needs_numeric_binop_dispatch(a, b, "__divmod__", "__rdivmod__") {
+        numeric_override = needs_numeric_binop_dispatch(a, b, "__divmod__", "__rdivmod__");
+        if numeric_override {
             if let Some(result) = try_dispatch_binary_special(a, b, "__divmod__", "__rdivmod__")? {
                 return Ok(result);
             }
         }
         let lhs_num = is_int(a) || is_long(a) || is_float(a);
         let rhs_num = is_int(b) || is_long(b) || is_float(b);
-        if lhs_num && rhs_num {
+        if !numeric_override && lhs_num && rhs_num {
             // Python 3.14 target-version spelling; see `divmod_builtin` above
             // for the PyPy 3.11 difference.
             if !is_true(b)? {
@@ -4179,8 +4218,10 @@ pub fn divmod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return integer_divmod_pair(a, b);
         }
     }
-    if let Some(result) = try_dispatch_binary_special(a, b, "__divmod__", "__rdivmod__")? {
-        return Ok(result);
+    if !numeric_override {
+        if let Some(result) = try_dispatch_binary_special(a, b, "__divmod__", "__rdivmod__")? {
+            return Ok(result);
+        }
     }
     Err(binary_builtin_type_error("divmod()", a, b))
 }
@@ -4333,19 +4374,24 @@ fn float_pow_impl(x: f64, y: f64) -> PyResult {
 
 pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if needs_numeric_binop_dispatch(a, b, "__lshift__", "__rlshift__") {
+        let numeric_override = needs_numeric_binop_dispatch(a, b, "__lshift__", "__rlshift__");
+        if numeric_override {
             if let Some(result) = try_dispatch_binary_special(a, b, "__lshift__", "__rlshift__")? {
                 return Ok(result);
             }
         }
-        if is_int_like(a) && is_int_like(b) {
-            return int_lshift(a, b);
+        if !numeric_override {
+            if is_int_like(a) && is_int_like(b) {
+                return int_lshift(a, b);
+            }
+            if is_int_or_long(a) && is_int_or_long(b) {
+                return long_lshift(a, b);
+            }
         }
-        if is_int_or_long(a) && is_int_or_long(b) {
-            return long_lshift(a, b);
-        }
-        if let Some(result) = try_dispatch_binary_special(a, b, "__lshift__", "__rlshift__")? {
-            return Ok(result);
+        if !numeric_override {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__lshift__", "__rlshift__")? {
+                return Ok(result);
+            }
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
@@ -4359,19 +4405,24 @@ pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if needs_numeric_binop_dispatch(a, b, "__rshift__", "__rrshift__") {
+        let numeric_override = needs_numeric_binop_dispatch(a, b, "__rshift__", "__rrshift__");
+        if numeric_override {
             if let Some(result) = try_dispatch_binary_special(a, b, "__rshift__", "__rrshift__")? {
                 return Ok(result);
             }
         }
-        if is_int_like(a) && is_int_like(b) {
-            return int_rshift(a, b);
+        if !numeric_override {
+            if is_int_like(a) && is_int_like(b) {
+                return int_rshift(a, b);
+            }
+            if is_int_or_long(a) && is_int_or_long(b) {
+                return long_rshift(a, b);
+            }
         }
-        if is_int_or_long(a) && is_int_or_long(b) {
-            return long_rshift(a, b);
-        }
-        if let Some(result) = try_dispatch_binary_special(a, b, "__rshift__", "__rrshift__")? {
-            return Ok(result);
+        if !numeric_override {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__rshift__", "__rrshift__")? {
+                return Ok(result);
+            }
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
@@ -4391,7 +4442,8 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                 return Ok(result);
             }
         }
-        if needs_numeric_binop_dispatch(a, b, "__and__", "__rand__") {
+        let numeric_override = needs_numeric_binop_dispatch(a, b, "__and__", "__rand__");
+        if numeric_override {
             if let Some(result) = try_dispatch_binary_special(a, b, "__and__", "__rand__")? {
                 return Ok(result);
             }
@@ -4399,14 +4451,16 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // boolobject.py:74 W_BoolObject.descr_and — both operands bool
         // → space.newbool(op(a, b)). MRO ensures this runs before the
         // W_IntObject.descr_and fallback in int_bitand.
-        if is_bool(a) && is_bool(b) {
-            return Ok(pyre_object::bool_descr_and(a, b));
-        }
-        if is_int(a) && is_int(b) {
-            return int_bitand(a, b);
-        }
-        if is_int_or_long(a) && is_int_or_long(b) {
-            return long_bitand(a, b);
+        if !numeric_override {
+            if is_bool(a) && is_bool(b) {
+                return Ok(pyre_object::bool_descr_and(a, b));
+            }
+            if is_int(a) && is_int(b) {
+                return int_bitand(a, b);
+            }
+            if is_int_or_long(a) && is_int_or_long(b) {
+                return long_bitand(a, b);
+            }
         }
         // set / frozenset intersection — PyPy: setobject.py W_BaseSetObject.descr_and.
         // descr_and returns NotImplemented for a non-set rhs, so `&` requires
@@ -4417,8 +4471,10 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         {
             return crate::typedef::set_method_intersection(&[a, b]);
         }
-        if let Some(result) = try_dispatch_binary_special(a, b, "__and__", "__rand__")? {
-            return Ok(result);
+        if !numeric_override {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__and__", "__rand__")? {
+                return Ok(result);
+            }
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
@@ -4480,14 +4536,16 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         // boolobject.py:75 W_BoolObject.descr_or — both operands bool
         // → space.newbool(op(a, b)).
-        if is_bool(a) && is_bool(b) {
-            return Ok(pyre_object::bool_descr_or(a, b));
-        }
-        if is_int(a) && is_int(b) {
-            return int_bitor(a, b);
-        }
-        if is_int_or_long(a) && is_int_or_long(b) {
-            return long_bitor(a, b);
+        if !numeric {
+            if is_bool(a) && is_bool(b) {
+                return Ok(pyre_object::bool_descr_or(a, b));
+            }
+            if is_int(a) && is_int(b) {
+                return int_bitor(a, b);
+            }
+            if is_int_or_long(a) && is_int_or_long(b) {
+                return long_bitor(a, b);
+            }
         }
         // set / frozenset union — PyPy: setobject.py W_BaseSetObject.descr_or.
         // descr_or returns NotImplemented unless w_other is a set/frozenset,
@@ -4546,19 +4604,22 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                 return Ok(result);
             }
         }
-        if needs_numeric_binop_dispatch(a, b, "__xor__", "__rxor__") {
+        let numeric_override = needs_numeric_binop_dispatch(a, b, "__xor__", "__rxor__");
+        if numeric_override {
             if let Some(result) = try_dispatch_binary_special(a, b, "__xor__", "__rxor__")? {
                 return Ok(result);
             }
         }
-        if is_bool(a) && is_bool(b) {
-            return Ok(pyre_object::bool_descr_xor(a, b));
-        }
-        if is_int(a) && is_int(b) {
-            return int_bitxor(a, b);
-        }
-        if is_int_or_long(a) && is_int_or_long(b) {
-            return long_bitxor(a, b);
+        if !numeric_override {
+            if is_bool(a) && is_bool(b) {
+                return Ok(pyre_object::bool_descr_xor(a, b));
+            }
+            if is_int(a) && is_int(b) {
+                return int_bitxor(a, b);
+            }
+            if is_int_or_long(a) && is_int_or_long(b) {
+                return long_bitxor(a, b);
+            }
         }
         // set / frozenset symmetric difference — `pypy/objspace/std/
         // setobject.py W_BaseSetObject.descr_xor`.  Mirrors `and_`'s
@@ -4571,8 +4632,10 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         {
             return crate::typedef::set_method_symmetric_difference(&[a, b]);
         }
-        if let Some(result) = try_dispatch_binary_special(a, b, "__xor__", "__rxor__")? {
-            return Ok(result);
+        if !numeric_override {
+            if let Some(result) = try_dispatch_binary_special(a, b, "__xor__", "__rxor__")? {
+                return Ok(result);
+            }
         }
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
