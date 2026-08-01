@@ -11591,6 +11591,9 @@ pub(crate) fn exception_attr_delete(obj: PyObjectRef, name: &str) -> PyResult {
 /// Terminal `object.__delattr__` — bypasses user override.
 pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
+    if unsafe { pyre_object::function::is_method(obj) } && name == "__class__" {
+        return Err(PyError::type_error("can't delete __class__ attribute"));
+    }
     // descroperation.py:131-140 descr__delattr__: a data descriptor's
     // `__delete__` takes priority over the namespace delete. PyPy walks
     // `space.type(obj)`, so the lookup must run for any object whose type

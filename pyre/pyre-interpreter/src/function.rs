@@ -2094,6 +2094,21 @@ pub unsafe fn fset_func_code(obj: PyObjectRef, w_code: PyObjectRef) -> Result<()
                 "{name}() requires a code object with {closure_len} free vars, not {freevars_len}"
             )));
         }
+        // CPython 3.14 `func_set_code`: changing between a plain function,
+        // generator, coroutine, and async generator remains permitted for
+        // compatibility, but warns because the callable's result protocol
+        // changes underneath existing references.
+        let old_code = &*(get_pycode(obj) as *const crate::CodeObject);
+        let kind_mask = crate::CodeFlags::GENERATOR
+            | crate::CodeFlags::COROUTINE
+            | crate::CodeFlags::ASYNC_GENERATOR;
+        if old_code.flags.intersection(kind_mask).bits()
+            != (*raw_code).flags.intersection(kind_mask).bits()
+        {
+            crate::warn::warn_deprecation(
+                "Assigning a code object of non-matching type is deprecated (e.g., from a generator to a plain function)",
+            )?;
+        }
         // function.py:538 self.fget_func_doc(space) — see test_issue1293.
         // Resolves the OLD code's docstring into `w_doc` *before* the
         // pointer flip so the cached value reflects the function's

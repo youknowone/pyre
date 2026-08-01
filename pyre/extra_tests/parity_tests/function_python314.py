@@ -1,5 +1,6 @@
 import sys
 import types
+import warnings
 
 
 EXPECTED = {
@@ -53,6 +54,7 @@ assert f.__dict__ == {"marker": 42}
 replacement = {"other": 3}
 f.__dict__ = replacement
 assert f.__dict__ is replacement
+assert "other" in dir(f)
 
 try:
     f.__dict__ = []
@@ -60,6 +62,35 @@ except TypeError:
     pass
 else:
     raise AssertionError("function.__dict__ accepted a non-dict")
+
+for name, message in (
+    ("__dict__", "cannot delete __dict__"),
+    ("__name__", "__name__ must be set to a string object"),
+    ("__qualname__", "__qualname__ must be set to a string object"),
+    ("__code__", "__code__ must be set to a code object"),
+):
+    try:
+        delattr(f, name)
+    except TypeError as exc:
+        assert str(exc) == message
+    else:
+        raise AssertionError(f"function {name} was deletable")
+
+
+def generator():
+    yield 1
+
+
+original_code = f.__code__
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    f.__code__ = generator.__code__
+assert len(caught) == 1
+assert caught[0].category is DeprecationWarning
+assert "code object of non-matching type" in str(caught[0].message)
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", DeprecationWarning)
+    f.__code__ = original_code
 
 assert f.__annotate__ is None
 

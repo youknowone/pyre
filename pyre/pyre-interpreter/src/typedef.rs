@@ -11358,11 +11358,20 @@ fn init_function_type_common(ns: PyObjectRef) {
         unsafe { crate::function::fset_func_name(func, value)? };
         Ok(pyre_object::w_none())
     });
+    let name_deleter = make_builtin_function("__name__", |args| {
+        function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__name__",
+        )?;
+        Err(crate::PyError::type_error(
+            "__name__ must be set to a string object",
+        ))
+    });
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__name__",
-            make_getset_property(name_getter, name_setter, pyre_object::PY_NULL),
+            make_getset_property(name_getter, name_setter, name_deleter),
         )
     };
     // `typedef.py:782 getset_func_qualname = GetSetProperty(
@@ -11387,11 +11396,20 @@ fn init_function_type_common(ns: PyObjectRef) {
         unsafe { crate::function::fset_func_qualname(func, value)? };
         Ok(pyre_object::w_none())
     });
+    let qualname_deleter = make_builtin_function("__qualname__", |args| {
+        function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__qualname__",
+        )?;
+        Err(crate::PyError::type_error(
+            "__qualname__ must be set to a string object",
+        ))
+    });
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__qualname__",
-            make_getset_property(qualname_getter, qualname_setter, pyre_object::PY_NULL),
+            make_getset_property(qualname_getter, qualname_setter, qualname_deleter),
         )
     };
     // `typedef.py:768-770 getset___module__ = GetSetProperty(
@@ -11511,11 +11529,20 @@ fn init_function_type_common(ns: PyObjectRef) {
         unsafe { crate::function::fset_func_code(func, value)? };
         Ok(pyre_object::w_none())
     });
+    let code_deleter = make_builtin_function("__code__", |args| {
+        function_receiver(
+            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+            "__code__",
+        )?;
+        Err(crate::PyError::type_error(
+            "__code__ must be set to a code object",
+        ))
+    });
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__code__",
-            make_getset_property(code_getter, code_setter, pyre_object::PY_NULL),
+            make_getset_property(code_getter, code_setter, code_deleter),
         )
     };
     // `typedef.py:813 __closure__ = GetSetProperty(Function.fget_func_closure)`
@@ -11571,6 +11598,8 @@ fn init_function_type_common(ns: PyObjectRef) {
         let w_builtin = unsafe { crate::function::function_get_builtins(func) };
         if w_builtin.is_null() {
             Ok(pyre_object::w_none())
+        } else if unsafe { pyre_object::is_module(w_builtin) } {
+            Ok(unsafe { pyre_object::w_module_get_w_dict(w_builtin) })
         } else {
             Ok(w_builtin)
         }
@@ -11977,7 +12006,17 @@ fn init_function_type(ns: PyObjectRef) {
         },
         3,
     );
-    let dict_deleter = make_builtin_function_with_arity("__dict__", dict_del_rejected, 2);
+    let dict_deleter = make_builtin_function_with_arity(
+        "__dict__",
+        |args| {
+            function_receiver(
+                args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+                "__dict__",
+            )?;
+            Err(crate::PyError::type_error("cannot delete __dict__"))
+        },
+        2,
+    );
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,

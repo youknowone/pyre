@@ -10319,7 +10319,16 @@ unsafe fn classdir_recurse(
 pub(crate) fn object_dir_default(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let mut names: Vec<Wtf8Buf> = Vec::new();
     unsafe {
-        let w_dict = crate::baseobjspace::getdict(obj)?;
+        let mut w_dict = crate::baseobjspace::getdict(obj)?;
+        // `method.__dir__` forwards the underlying function's instance
+        // dictionary as well as the method type's attributes.  The bound
+        // method wrapper itself has no writable dict field.
+        if w_dict.is_null() && pyre_object::function::is_method(obj) {
+            let func = pyre_object::function::w_method_get_func(obj);
+            if !func.is_null() {
+                w_dict = crate::baseobjspace::getdict(func)?;
+            }
+        }
         if !w_dict.is_null() && pyre_object::is_dict(w_dict) {
             for (key, _) in pyre_object::w_dict_items(w_dict) {
                 if pyre_object::is_str(key) {
@@ -10501,15 +10510,11 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             }
         } else {
             // Fallback `_objectdir` (util.py:80) for builtin W_Root types
-            // (PyTraceback, dict, dict view, etc.) that have no instance dict:
-            // `_classdir` of their type.  Excluded for module/instance/type
-            // above because those have richer paths that combine instance and
-            // class entries.
-            if let Some(w_type) = crate::typedef::r#type(obj) {
-                if pyre_object::is_type(w_type.as_ptr()) {
-                    classdir_into(w_type.as_ptr(), &mut names)?;
-                }
-            }
+            // (Function, StaticMethod, PyTraceback, dict views, etc.).  Some
+            // W_Root subclasses own a typed dictionary field even though
+            // `is_instance()` is false, so use W_Root.getdict + _classdir
+            // rather than assuming this whole branch has no instance dict.
+            return object_dir_default(obj);
         }
     }
     names.sort();
