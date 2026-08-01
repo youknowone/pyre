@@ -11361,6 +11361,60 @@ mod tests {
     }
 
     #[test]
+    fn materialized_inline_frame_slots_skip_stream_covered_slots() {
+        // A slot the resume stream names is authoritative over the frame image
+        // (resume.py:1042-1057 consume_boxes), so the image must not be read
+        // for it: the caller's `overlay_stream_ref_slots` owns that slot and
+        // would otherwise be overwriting a stale array entry.
+        let code = compile_function_body("def f(a, b, c):\n    return a if b is None else c\n");
+        let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
+        let values = [w_int_new(11), w_int_new(22), w_int_new(33)];
+        for (index, value) in values.iter().copied().enumerate() {
+            frame.locals_w_mut()[index] = value;
+        }
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let frame_box = OpRef::input_arg_ref(0);
+        ctx.try_set_opref_concrete(frame_box, Value::Ref(majit_ir::GcRef(frame_ptr)));
+
+        let (registers_r, concrete_r) = reconstruct_materialized_frame_slots(
+            &mut ctx,
+            frame_box,
+            majit_ir::GcRef(frame_ptr),
+            values.len(),
+            None,
+            &[false, true, false],
+            &[],
+        )
+        .expect("forced frame slots should be reconstructable");
+
+        assert!(registers_r[1].is_none(), "stream-covered slot stays unread");
+        assert_eq!(concrete_r[1], Value::Void);
+        assert!(!registers_r[0].is_none());
+        assert!(!registers_r[2].is_none());
+        assert_eq!(
+            concrete_r[0],
+            Value::Ref(majit_ir::GcRef(values[0] as usize))
+        );
+        assert_eq!(
+            concrete_r[2],
+            Value::Ref(majit_ir::GcRef(values[2] as usize))
+        );
+
+        let tree_loop = ctx.into_tree_loop();
+        assert_eq!(
+            tree_loop
+                .ops
+                .iter()
+                .filter(|op| op.opcode == OpCode::GetarrayitemGcR)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn concrete_value_preserves_int_subclass_identity() {
         pyre_interpreter::typedef::init_typeobjects();
         let obj = pyre_object::intobject::w_int_new_unique(7);
