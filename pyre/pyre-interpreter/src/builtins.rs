@@ -14295,6 +14295,46 @@ fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `sum([0.1] * 10)` is exactly `1.0` rather than the naive partial sum
 /// `functional.py:_sum` produces.  A `str`/`bytes`/`bytearray` `start` is
 /// rejected up front.
+#[derive(Clone, Copy)]
+struct CompensatedSum {
+    hi: f64,
+    lo: f64,
+}
+
+/// CPython 3.14 `cs_from_double`.
+#[inline]
+fn compensated_sum_from_double(value: f64) -> CompensatedSum {
+    CompensatedSum { hi: value, lo: 0.0 }
+}
+
+/// CPython 3.14 `cs_add` (improved Kahan-Babuška / Neumaier summation).
+#[inline]
+fn compensated_sum_add(mut total: CompensatedSum, value: f64) -> CompensatedSum {
+    let next = total.hi + value;
+    total.lo += if total.hi.abs() >= value.abs() {
+        (total.hi - next) + value
+    } else {
+        (value - next) + total.hi
+    };
+    CompensatedSum {
+        hi: next,
+        lo: total.lo,
+    }
+}
+
+/// CPython 3.14 `cs_to_double`.
+#[inline]
+fn compensated_sum_to_double(total: CompensatedSum) -> f64 {
+    // Skipping an exact zero preserves a negative high part: `-0.0 + +0.0`
+    // would otherwise erase its sign.  A non-finite residual is skipped so
+    // `inf - inf` cannot turn an infinite running total into NaN.
+    if total.lo != 0.0 && total.lo.is_finite() {
+        total.hi + total.lo
+    } else {
+        total.hi
+    }
+}
+
 fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `sum(iterable, /, start=0)`: iterable is positional-only, start is
     // positional-or-keyword; at most two arguments total.
@@ -14350,8 +14390,8 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         i += 1;
     }
     if unsafe { is_exact_float_operand(last) } {
-        let mut total = unsafe { pyre_object::w_float_get_value(last) };
-        let mut compensation = 0.0f64;
+        let mut real_sum =
+            compensated_sum_from_double(unsafe { pyre_object::w_float_get_value(last) });
         while i < items.len() {
             let item = items[i];
             // A float *subclass* leaves the fast path — its `__add__` may be
@@ -14368,24 +14408,41 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     break;
                 }
             };
-            let t = total + x;
-            compensation += if total.abs() >= x.abs() {
-                (total - t) + x
-            } else {
-                (x - t) + total
-            };
-            total = t;
+            real_sum = compensated_sum_add(real_sum, x);
             i += 1;
         }
-        // The residual is folded back only while the total is still finite.
-        // Once it reaches an infinity the term degenerates — `(total - t)` is
-        // `inf - inf` — and adding that NaN in would report `sum([inf, 1.0])`
-        // as NaN instead of `inf`.
-        last = pyre_object::w_float_new(if total.is_finite() {
-            total + compensation
-        } else {
-            total
-        });
+        last = pyre_object::w_float_new(compensated_sum_to_double(real_sum));
+    }
+    // CPython 3.14's complex fast path carries independent compensated real
+    // and imaginary accumulators.  Exact complex items, all ints, and all
+    // floats stay on the path; an arbitrary numeric object falls back to the
+    // generic left-fold below.
+    if unsafe { is_exact_complex_operand(last) } {
+        let mut real_sum =
+            compensated_sum_from_double(unsafe { pyre_object::w_complex_get_real(last) });
+        let mut imag_sum =
+            compensated_sum_from_double(unsafe { pyre_object::w_complex_get_imag(last) });
+        while i < items.len() {
+            let item = items[i];
+            unsafe {
+                if is_exact_complex_operand(item) {
+                    real_sum = compensated_sum_add(real_sum, pyre_object::w_complex_get_real(item));
+                    imag_sum = compensated_sum_add(imag_sum, pyre_object::w_complex_get_imag(item));
+                } else if pyre_object::pyobject::is_int(item) {
+                    real_sum =
+                        compensated_sum_add(real_sum, pyre_object::w_int_get_value(item) as f64);
+                } else if pyre_object::is_float(item) {
+                    real_sum = compensated_sum_add(real_sum, pyre_object::w_float_get_value(item));
+                } else {
+                    break;
+                }
+            }
+            i += 1;
+        }
+        last = pyre_object::w_complex_new(
+            compensated_sum_to_double(real_sum),
+            compensated_sum_to_double(imag_sum),
+        );
     }
     for &item in &items[i..] {
         last = crate::baseobjspace::add(last, item)?;
@@ -14405,6 +14462,11 @@ unsafe fn is_exact_int_operand(obj: PyObjectRef) -> bool {
 /// `PyFloat_CheckExact` — an exact `float`, excluding any subclass.
 unsafe fn is_exact_float_operand(obj: PyObjectRef) -> bool {
     unsafe { pyre_object::is_float(obj) && pyre_object::is_exact_builtin_instance(obj) }
+}
+
+/// `PyComplex_CheckExact` — an exact `complex`, excluding any subclass.
+unsafe fn is_exact_complex_operand(obj: PyObjectRef) -> bool {
+    unsafe { pyre_object::is_complex(obj) && pyre_object::is_exact_builtin_instance(obj) }
 }
 
 /// `round(number, ndigits=None)` — PyPy: operation.py round
