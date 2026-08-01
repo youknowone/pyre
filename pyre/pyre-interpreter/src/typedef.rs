@@ -294,6 +294,10 @@ pub fn init_typeobjects() {
         // type — PyPy: typeobject.py, bases=(object,)
         // type.__new__(metatype, name, bases, dict) creates new types
         let type_type = new_typeobject_with_base("type", init_type_type, object_type);
+        // `type` is itself an immediate subclass of `object`; static type
+        // construction does not pass through heaptype subclass registration,
+        // so record this edge explicitly for `object.__subclasses__()`.
+        unsafe { pyre_object::typeobject::w_type_add_subclass(object_type, type_type) };
         // hasdict/weakrefable/acceptable now set by typedef.py:34,37,43 logic
         // in new_typeobject_with_base_and_layout from init_type_type's dict contents.
         // typeobject.py:691-701 W_TypeObject._lifeline_/getweakref/setweakref/
@@ -10741,6 +10745,12 @@ fn init_type_type(ns: PyObjectRef) {
             check_set_special_type_attr(cls, value, "__module__")?;
             unsafe {
                 if pyre_object::is_type(cls) {
+                    if !pyre_object::w_type_is_heaptype(cls) {
+                        let name = pyre_object::w_type_get_name(cls);
+                        return Err(crate::PyError::type_error(format!(
+                            "cannot set '__module__' attribute of immutable type '{name}'"
+                        )));
+                    }
                     crate::type_dict_store(cls, "__module__", value);
                     // CPython 3.14 type_set_module clears the compiler's
                     // source-location metadata when the owning module changes.

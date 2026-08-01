@@ -4726,9 +4726,20 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             for i in 0..min_len {
                 let ea = w_tuple_getitem(a, i as i64).unwrap_or(PY_NULL);
                 let eb = w_tuple_getitem(b, i as i64).unwrap_or(PY_NULL);
-                // tupleobject.py:137 `if not space.eq_w(items1[p], items2[p]):
-                //     return getattr(space, name)(items1[p], items2[p])`
-                if !crate::baseobjspace::eq_w(ea, eb)? {
+                // CPython 3.14 and PyPy preserve identity for the element
+                // fast path, but otherwise invoke the element's real `==`.
+                // This matters for distinct NaN objects.
+                let equal = if std::ptr::eq(ea, eb) {
+                    true
+                } else if unsafe {
+                    pyre_object::pyobject::is_exact_type(ea, &pyre_object::FLOAT_TYPE)
+                        && pyre_object::pyobject::is_exact_type(eb, &pyre_object::FLOAT_TYPE)
+                } {
+                    crate::baseobjspace::is_true(compare(ea, eb, CompareOp::Eq)?)?
+                } else {
+                    crate::baseobjspace::eq_w(ea, eb)?
+                };
+                if !equal {
                     return compare(ea, eb, op);
                 }
             }
