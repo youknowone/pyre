@@ -50,6 +50,7 @@ pub mod object_array;
 pub mod objectobject;
 pub mod operation;
 pub mod pyobject;
+pub mod quasiimmut;
 pub mod rbigint;
 pub mod rutf8;
 pub mod setobject;

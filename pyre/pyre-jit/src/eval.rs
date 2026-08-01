@@ -460,13 +460,7 @@ unsafe fn type_object_destructor(obj_addr: usize) {
     // get_current_qmut_instance`) is Rust-owned and off-GC too. A type that was
     // compiled against and never mutated afterwards still holds one, so without
     // this the box outlives the only pointer to it.
-    let quasi_immut_watchers = unsafe {
-        (*t).quasi_immut_watchers
-            .swap(std::ptr::null_mut(), std::sync::atomic::Ordering::AcqRel)
-    };
-    if !quasi_immut_watchers.is_null() {
-        drop(unsafe { Box::from_raw(quasi_immut_watchers) });
-    }
+    drop(unsafe { (*t).quasi_immut_watchers.take() });
 }
 
 /// Custom trace for `GeneratorIterator` (generator.py GeneratorIterator).

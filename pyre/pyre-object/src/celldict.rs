@@ -593,14 +593,20 @@ pub struct ModuleDictStrategy {
     pub caches: std::sync::Mutex<
         Option<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<GlobalCache>>>>,
     >,
-    /// JIT loop-invalidation flags watching the `version?` quasi-immutable
-    /// field.  Each compiled loop whose trace promoted `self.version`
-    /// (and folded a module-global lookup keyed on it) registers its
-    /// `JitCellToken` invalidation flag here.  `mutated()` reassigns
-    /// `version`, which under `_immutable_fields_ = ["version?"]` must
-    /// invalidate every such loop, so it flips all live flags.  Weak refs
-    /// so a dead loop token drops out without keeping the flag alive.
-    version_watchers: Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>,
+    /// The hidden `mutate_version` field for `celldict.py:34
+    /// _immutable_fields_ = ["version?"]`.  Each compiled loop whose trace
+    /// promoted `self.version` (and folded a module-global lookup keyed on it)
+    /// registers its `JitCellToken` invalidation flag here; `mutated()`
+    /// reassigns `version`, which under the `?` declaration must invalidate
+    /// every such loop.
+    ///
+    /// The same [`crate::quasiimmut::QuasiImmutField`] `W_TypeObject`'s
+    /// `_version_tag?` uses, as upstream's one `QuasiImmut` class serves every
+    /// quasi-immutable field.  Before that it was a bare `Vec` pushed to
+    /// without synchronisation while `mutated()` swept it from another thread,
+    /// and it had no `compress_looptokens_list`, so a module recompiled against
+    /// many times and never mutated grew one entry per compile.
+    version_watchers: crate::quasiimmut::QuasiImmutField,
 }
 
 /// Runtime-assigned GC type id for the [`ModuleDictStrategy`] box.
@@ -618,36 +624,6 @@ pub fn module_dict_strategy_gc_type_id() -> u32 {
     MODULE_DICT_STRATEGY_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Flip every live watcher flag and drop the dead weak refs — the non-empty
-/// half of [`ModuleDictStrategy::notify_version_watchers`].
-///
-/// This is the `version?` quasi-immutable invalidation walk, and upstream runs
-/// the whole of it outside traced code: `QuasiImmut.invalidate`
-/// (`metainterp/quasiimmut.py`) iterates `looptokens_wrefs` and calls
-/// `invalidate_loop` from the residual `jit_force_quasi_immutable` path, never
-/// from a trace.  Residualise it here for the same reason
-/// (`@dont_look_inside`, `rlib/jit.py:139`); the `Vec::retain` closure over
-/// `Weak::upgrade` has no lowering either way.  The `is_empty` early-out stays
-/// traced, so the common no-watcher mutation still makes no call.
-#[majit_macros::dont_look_inside]
-pub fn sweep_version_watchers(watchers: &mut Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>) {
-    // `QuasiImmut.invalidate` takes the list and empties it BEFORE walking it
-    // (`wrefs = self.looptokens_wrefs; self.looptokens_wrefs = []`), so a loop
-    // is invalidated exactly once and then drops out.  Keeping the live
-    // watchers instead would be doubly wrong: the flag is already `true`, so
-    // re-storing it does nothing, and the list would only ever grow — one
-    // entry per compiled loop that folded a module-global.  A module-level
-    // `except X as e:` runs `del e` every iteration, and `delitem` calls
-    // `mutated()`, so retaining would make each iteration walk every loop ever
-    // compiled in the module: O(compiled loops) per store, and the JIT
-    // compiling more loops would make the interpreter slower.
-    for w in std::mem::take(watchers) {
-        if let Some(flag) = w.upgrade() {
-            flag.store(true, std::sync::atomic::Ordering::Release);
-        }
-    }
-}
-
 impl Default for ModuleDictStrategy {
     fn default() -> Self {
         Self::new()
@@ -660,32 +636,32 @@ impl ModuleDictStrategy {
         Self {
             version: VersionTag::fresh(),
             caches: std::sync::Mutex::new(None),
-            version_watchers: Vec::new(),
+            version_watchers: crate::quasiimmut::QuasiImmutField::new(),
         }
     }
 
     /// Register a JIT loop's invalidation flag against the `version?`
-    /// quasi-immutable field.  The compile-time glue
-    /// (`register_quasi_immutable_deps` analogue) calls this once per
+    /// quasi-immutable field (`quasiimmut.py:116-126
+    /// get_current_qmut_instance` + `:72-75 register_loop_token`).  The
+    /// compile-time glue (`register_quasi_immutable_deps`) calls this once per
     /// version-keyed module-global dependency, passing the
-    /// `JitCellToken.invalidation_flag()`.  Mirrors
-    /// `DictStorage::register_slot_watcher` but keyed on the strategy
-    /// version rather than a per-slot index.
-    pub fn register_version_watcher(
-        &mut self,
-        flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) {
-        self.version_watchers.push(std::sync::Arc::downgrade(flag));
+    /// `JitCellToken.invalidation_flag()`.
+    pub fn register_version_watcher(&self, flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.version_watchers.register_loop_token(flag);
     }
 
-    /// Invalidate every loop watching `version`.  Sets each live flag to
-    /// `true` (the polarity `GuardNotInvalidated` tests) and drops dead
-    /// weak refs.  Mirrors `DictStorage::notify_slot_watchers`.
-    fn notify_version_watchers(&mut self) {
-        if self.version_watchers.is_empty() {
+    /// Invalidate every loop watching `version`
+    /// (`quasiimmut.py:129-134 _invalidate_now`).  Sets each live flag to
+    /// `true`, the polarity `GuardNotInvalidated` tests.
+    ///
+    /// The installed check stays traced and the sweep is residual, for the
+    /// reason upstream's own walk is out of line: it hangs off
+    /// `jit_force_quasi_immutable`, never a trace.
+    fn notify_version_watchers(&self) {
+        if !self.version_watchers.is_installed() {
             return;
         }
-        sweep_version_watchers(&mut self.version_watchers);
+        unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.version_watchers) };
     }
 
     /// `celldict.py:214-240 get_global_cache`:
@@ -1251,9 +1227,10 @@ mod tests {
         strategy.register_version_watcher(&flag);
         // Drop the only strong ref: the weak watcher can no longer upgrade.
         drop(flag);
-        // notify (via mutated) must not panic and must purge the dead weak.
+        // notify (via mutated) must not panic, and `_invalidate_now` unlinks
+        // the instance whether or not any flag could still be upgraded.
         strategy.mutated();
-        assert!(strategy.version_watchers.is_empty());
+        assert!(!strategy.version_watchers.is_installed());
     }
 
     #[test]
