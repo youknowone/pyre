@@ -809,38 +809,38 @@ fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyRe
     // not the copied native slice, so mirror the gateway's own root frame and
     // reload immediately before invoking the builtin.
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(code);
+    let root_base = _roots.base();
+    _roots.pin_root(code);
     for &arg in args {
-        pyre_object::gc_roots::pin_root(arg);
+        _roots.pin_root(arg);
     }
     // RPython's pop-roots reload produces ordinary live variables.  Spell the
     // common fixed-arity cases the same way so source translation sees no Rust
     // array slicing/indexing helpers between the live roots and the gateway
     // indirect call.  The uncommon variadic case stays a residual helper.
-    let current_code = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let current_code = _roots.get(root_base);
     match args.len() {
         0 => finish_builtin_code_positional(current_code, &[]),
         1 => {
-            let a0 = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+            let a0 = _roots.get(root_base + 1);
             finish_builtin_code_positional(current_code, &[a0])
         }
         2 => {
-            let a0 = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-            let a1 = pyre_object::gc_roots::shadow_stack_get(root_base + 2);
+            let a0 = _roots.get(root_base + 1);
+            let a1 = _roots.get(root_base + 2);
             finish_builtin_code_positional(current_code, &[a0, a1])
         }
         3 => {
-            let a0 = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-            let a1 = pyre_object::gc_roots::shadow_stack_get(root_base + 2);
-            let a2 = pyre_object::gc_roots::shadow_stack_get(root_base + 3);
+            let a0 = _roots.get(root_base + 1);
+            let a1 = _roots.get(root_base + 2);
+            let a2 = _roots.get(root_base + 3);
             finish_builtin_code_positional(current_code, &[a0, a1, a2])
         }
         4 => {
-            let a0 = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-            let a1 = pyre_object::gc_roots::shadow_stack_get(root_base + 2);
-            let a2 = pyre_object::gc_roots::shadow_stack_get(root_base + 3);
-            let a3 = pyre_object::gc_roots::shadow_stack_get(root_base + 4);
+            let a0 = _roots.get(root_base + 1);
+            let a1 = _roots.get(root_base + 2);
+            let a2 = _roots.get(root_base + 3);
+            let a3 = _roots.get(root_base + 4);
             finish_builtin_code_positional(current_code, &[a0, a1, a2, a3])
         }
         nargs => call_builtin_code_many_from_roots(root_base, nargs),
@@ -2683,10 +2683,10 @@ pub fn call_function_impl_result(
     // pointers, so establish the same roots before the first collecting call
     // and dispatch from freshly reloaded values.
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(callable);
+    let root_base = _roots.base();
+    _roots.pin_root(callable);
     for &arg in args {
-        pyre_object::gc_roots::pin_root(arg);
+        _roots.pin_root(arg);
     }
 
     // A JIT prologue may have published an overflow before entering this
@@ -2699,7 +2699,7 @@ pub fn call_function_impl_result(
     // their stack check in funccall_valuestack / the JIT callee prologue.
     crate::stack_check::drain_jit_pending_exception()?;
 
-    let callable = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let callable = _roots.get(root_base);
     // RPython's GC transform reloads `Arguments.arguments_w` livevars in
     // place; it does not allocate another list at every ObjSpace call.  Keep
     // the common small call shape allocation-free and retain a Vec only for
@@ -2709,13 +2709,13 @@ pub fn call_function_impl_result(
     let mut wide_args = Vec::new();
     let args = if args.len() <= INLINE_ARGS {
         for (i, slot) in inline_args[..args.len()].iter_mut().enumerate() {
-            *slot = pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i);
+            *slot = _roots.get(root_base + 1 + i);
         }
         &inline_args[..args.len()]
     } else {
         wide_args.reserve_exact(args.len());
         for i in 0..args.len() {
-            wide_args.push(pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i));
+            wide_args.push(_roots.get(root_base + 1 + i));
         }
         wide_args.as_slice()
     };
