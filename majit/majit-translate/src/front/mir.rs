@@ -1201,8 +1201,7 @@ fn register_synthetic_tuple_metadata(
             };
             if owner_path.is_empty()
                 && args.is_empty()
-                && name != "Tuple"
-                && majit_ir::descr::strip_instantiation_suffix(name) == "Tuple"
+                && majit_ir::descr::is_shaped_tuple_name(name)
             {
                 shapes.insert(name.clone());
             }

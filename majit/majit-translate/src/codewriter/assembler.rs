@@ -3251,12 +3251,11 @@ fn bh_size_spec_from_callcontrol(
     // `Result<U>::Ok` converge on the template variant. A tuple is different:
     // `TupleRepr` creates one low-level GcStruct per item shape, so preserve
     // its full `Tuple<T,...>` identity and layout.
-    let layout_owner =
-        if majit_ir::descr::strip_instantiation_suffix(owner) == "Tuple" && owner != "Tuple" {
-            std::borrow::Cow::Borrowed(owner)
-        } else {
-            majit_ir::descr::strip_generic_args(owner)
-        };
+    let layout_owner = if majit_ir::descr::is_shaped_tuple_name(owner) {
+        std::borrow::Cow::Borrowed(owner)
+    } else {
+        majit_ir::descr::strip_generic_args(owner)
+    };
     let layout_owner = layout_owner.as_ref();
     let mut size = cc
         .struct_layout_for(layout_owner)

@@ -409,12 +409,10 @@ pub fn struct_id_for_name(raw: &str) -> Option<StructId> {
         .trim_start_matches('&')
         .trim();
     // Generic nominal ADT instantiations share the defining TypeDecl's one
-    // physical layout. Tuples are the exception: RPython's `TupleRepr`
-    // creates a distinct `GcStruct` for each item shape, and Charon spells
-    // that synthetic identity as `Tuple<T,...>` because there is no nominal
-    // TypeDecl to resolve. Preserve the full tuple shape while continuing to
-    // collapse `Result<T>::Ok` and other nominal generics to their template.
-    let s = if strip_instantiation_suffix(s) == "Tuple" && s != "Tuple" {
+    // physical layout. Tuples are the exception (see [`is_shaped_tuple_name`]):
+    // preserve the full tuple shape while continuing to collapse
+    // `Result<T>::Ok` and other nominal generics to their template.
+    let s = if is_shaped_tuple_name(s) {
         std::borrow::Cow::Borrowed(s)
     } else {
         strip_generic_args(s)
@@ -497,6 +495,19 @@ pub fn canonical_struct_name(name: &str) -> String {
 /// `Result` (one template per generic ADT).  The narrowing resolver
 /// strips the suffix for that table lookup while the variant `ClassDef`
 /// key keeps it.
+/// Is `name` a tuple identity carrying its item shape (`Tuple<T, ...>`), as
+/// opposed to the bare `Tuple` root?
+///
+/// `TupleRepr` creates a distinct `GcStruct` per item shape
+/// (`rtyper/rtuple.py:115-125`), so `(A,)` and `(A, B)` are different
+/// low-level struct objects.  Charon spells that synthetic identity as
+/// `Tuple<T, ...>` because Rust's built-in tuple has no nominal `TypeDecl`,
+/// which makes it the one generic spelling that must NOT collapse onto its
+/// template the way `Result<T>::Ok` does.
+pub fn is_shaped_tuple_name(name: &str) -> bool {
+    name != "Tuple" && strip_instantiation_suffix(name) == "Tuple"
+}
+
 pub fn strip_instantiation_suffix(name: &str) -> &str {
     match name.find('<') {
         Some(i) => &name[..i],

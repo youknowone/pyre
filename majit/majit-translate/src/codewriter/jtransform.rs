@@ -2897,8 +2897,7 @@ impl<'a> Transformer<'a> {
         // with `Tuple` is a different allocation policy.
         if let CallTarget::SyntheticTransparentCtor { name, owner_path } = target
             && owner_path.is_empty()
-            && name != "Tuple"
-            && majit_ir::descr::strip_instantiation_suffix(name) == "Tuple"
+            && majit_ir::descr::is_shaped_tuple_name(name)
             && args.is_empty()
             && let ValueType::Ref(Some(owner)) = result_ty
         {
@@ -9135,6 +9134,54 @@ mod tests {
                 kind: OpKind::New { owner: allocated },
             }] if result == &result_var && allocated == &owner
         ));
+    }
+
+    /// The universal MIR tuple aggregate has no Rust nominal owner, so the
+    /// malloc arm is gated on an EMPTY `owner_path`.  A user ADT whose leaf
+    /// merely spells like a tuple shape carries an owner path and follows its
+    /// own allocation policy; it must not be captured by that arm.
+    #[test]
+    fn owned_tuple_named_synthetic_ctor_does_not_take_the_tuple_malloc_arm() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("owned_tuple_named_ctor");
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let owner = "mymod::Tuple<PyObjectRef>".to_string();
+        let target = CallTarget::synthetic_transparent_ctor_with_owner(
+            vec!["mymod".to_string()],
+            "Tuple<PyObjectRef>",
+        );
+        let result_ty = ValueType::Ref(Some(owner.clone()));
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![],
+                result_ty: result_ty.clone(),
+            },
+        };
+
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "owned_tuple_named_ctor",
+            &mut graph,
+        );
+        if let RewriteResult::Replace(ops) = &rewritten {
+            assert!(
+                !matches!(
+                    ops.as_slice(),
+                    [SpaceOperation {
+                        kind: OpKind::New { owner: allocated },
+                        ..
+                    }] if allocated == &owner
+                ),
+                "an owner-qualified `Tuple<...>` leaf must not lower through \
+                 the universal tuple-aggregate malloc arm",
+            );
+        }
     }
 
     /// The exact bare tuple tag is the empty tuple's `Void` representation,
