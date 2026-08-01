@@ -592,7 +592,15 @@ pub fn list_strategy_for(items: &[PyObjectRef]) -> ListStrategy {
 /// `W_ListObject`, so the barrier must run for every appended ref).
 #[majit_macros::dont_look_inside]
 pub extern "C" fn list_write_barrier(obj: PyObjectRef) {
-    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    list_write_barrier_impl(obj, false);
+}
+
+fn list_write_barrier_impl(obj: PyObjectRef, managed: bool) {
+    if managed {
+        crate::gc_hook::try_gc_write_barrier_managed(obj as *mut u8);
+    } else {
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    }
     // Phase L2: when the block is a GC-managed array, the list-ptr forward in
     // `list_object_custom_trace` relocates a young block but does NOT re-scan an
     // already-old block's items — a young element just stored into an old block
@@ -760,7 +768,11 @@ fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> 
     // young) initial elements; remember the old-gen list so the next minor GC
     // forwards them. Integer/Float blocks are old-gen — no young pointer to track.
     if strategy == ListStrategy::Object {
-        list_write_barrier(raw as PyObjectRef);
+        // `raw` came directly from `try_gc_alloc_stable_raw`; skip the
+        // defensive mixed-heap ownership query for the list itself.  The
+        // backing block retains its own check because its allocator can still
+        // fall back to `std::alloc`.
+        list_write_barrier_impl(raw as PyObjectRef, true);
     }
     raw as PyObjectRef
 }

@@ -3522,6 +3522,20 @@ impl MiniMarkGC {
         }
     }
 
+    /// `do_write_barrier` sibling for a pointer returned by this collector's
+    /// allocation API.  RPython's barrier receives only GC-managed structs;
+    /// the membership guard exists solely for pyre's mixed bootstrap heap and
+    /// is redundant for a freshly allocated managed result.
+    fn do_write_barrier_managed(&mut self, obj: GcRef) {
+        if obj.is_null() {
+            return;
+        }
+        let hdr = unsafe { header_of(obj.0) };
+        if unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
+            self.remember_young_pointer(obj);
+        }
+    }
+
     /// incminimark.py:1503-1529 _remember_young_pointer_inlined(addr):
     /// append the object to the remembered set (`old_objects_pointing_to_young`)
     /// and clear GCFLAG_TRACK_YOUNG_PTRS. Callers have already verified the flag
@@ -4279,6 +4293,10 @@ impl GcAllocator for MiniMarkGC {
 
     fn write_barrier(&mut self, obj: GcRef) {
         self.do_write_barrier(obj);
+    }
+
+    fn write_barrier_managed(&mut self, obj: GcRef) {
+        self.do_write_barrier_managed(obj);
     }
 
     fn jit_remember_young_pointer_from_array(&mut self, obj: GcRef) {

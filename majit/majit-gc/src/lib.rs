@@ -357,6 +357,15 @@ pub trait GcAllocator: Send {
     /// Must be called before storing a GC reference into `obj`.
     fn write_barrier(&mut self, obj: GcRef);
 
+    /// Write barrier for an object the caller has already proved belongs to
+    /// this collector.  Fresh results from `alloc_oldgen_typed` and the
+    /// collector's no-collect allocator satisfy this contract.  Collectors
+    /// may skip their defensive hybrid-heap membership query; the default
+    /// preserves the safe entry point for backends without that distinction.
+    fn write_barrier_managed(&mut self, obj: GcRef) {
+        self.write_barrier(obj);
+    }
+
     /// incminimark.py:1606 jit_remember_young_pointer_from_array:
     /// Called by JIT when TRACK_YOUNG_PTRS set but CARDS_SET not.
     /// Tries to set CARDS_SET if HAS_CARDS; else generic barrier.
@@ -2055,10 +2064,16 @@ pub fn gc_set_enabled(enabled: bool) {
 pub type WriteBarrierFn = fn(obj: GcRef);
 
 global_hook!(static ACTIVE_WRITE_BARRIER: WriteBarrierFn);
+global_hook!(static ACTIVE_WRITE_BARRIER_MANAGED: WriteBarrierFn);
 
 /// Install the active backend's write-barrier callback. Pass `None` to clear.
 pub fn set_active_write_barrier(hook: Option<WriteBarrierFn>) {
     ACTIVE_WRITE_BARRIER.set(hook);
+}
+
+/// Install the barrier entry for objects already known to be GC-managed.
+pub fn set_active_write_barrier_managed(hook: Option<WriteBarrierFn>) {
+    ACTIVE_WRITE_BARRIER_MANAGED.set(hook);
 }
 
 /// Perform a write barrier through the active backend.
@@ -2070,6 +2085,16 @@ pub fn set_active_write_barrier(hook: Option<WriteBarrierFn>) {
 pub fn gc_write_barrier(obj: GcRef) {
     if let Some(f) = ACTIVE_WRITE_BARRIER.get() {
         f(obj)
+    }
+}
+
+/// Perform a write barrier without repeating the hybrid-heap ownership query.
+/// Falls back to the safe barrier when a backend has no specialized entry.
+pub fn gc_write_barrier_managed(obj: GcRef) {
+    if let Some(f) = ACTIVE_WRITE_BARRIER_MANAGED.get() {
+        f(obj)
+    } else {
+        gc_write_barrier(obj)
     }
 }
 

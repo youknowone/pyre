@@ -643,7 +643,7 @@ impl FrameBox {
             // argument / locals objects; remember it for the next minor
             // tracer, exactly as `generator.rs:72` does for a stable
             // generator wrapping young frame contents.
-            pyre_object::gc_hook::try_gc_write_barrier(raw);
+            pyre_object::gc_hook::try_gc_write_barrier_managed(raw);
             let owner_root =
                 majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(ptr as usize));
             drop(frame_root);

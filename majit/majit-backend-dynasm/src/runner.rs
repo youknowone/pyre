@@ -221,6 +221,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_gc_is_nursery_object(Some(dynasm_gc_is_nursery_object));
     majit_gc::set_active_gc_id_or_identityhash(Some(dynasm_id_or_identityhash));
     majit_gc::set_active_write_barrier(Some(dynasm_gc_write_barrier));
+    majit_gc::set_active_write_barrier_managed(Some(dynasm_gc_write_barrier_managed));
     majit_gc::set_active_finalizer_hooks(
         Some(dynasm_register_finalizer),
         Some(dynasm_finalizer_next_dead),
@@ -764,6 +765,20 @@ fn dynasm_gc_write_barrier(obj: GcRef) {
         return;
     }
     majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.write_barrier(obj));
+}
+
+fn dynasm_gc_write_barrier_managed(obj: GcRef) {
+    if DYNASM_ACTIVE_GC
+        .with(|c| {
+            c.borrow_mut()
+                .as_deref_mut()
+                .map(|g| g.write_barrier_managed(obj))
+        })
+        .is_some()
+    {
+        return;
+    }
+    majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.write_barrier_managed(obj));
 }
 
 fn dynasm_id_or_identityhash(addr: usize) -> usize {

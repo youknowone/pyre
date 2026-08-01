@@ -227,7 +227,7 @@ pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> P
         // the collection relocates/marks the young elements, mirroring the
         // `write_barrier_from_array` an old-gen store emits
         // (incminimark.py:1495) and `w_tuple_new_array_backed`.
-        crate::gc_hook::try_gc_write_barrier(raw);
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
         return raw as PyObjectRef;
     }
     Box::into_raw(Box::new(W_SpecialisedTupleObject_oo {

@@ -294,7 +294,7 @@ pub fn malloc_typed_managed<T: GcType>(value: T) -> *mut T {
                 // nursery is full.  In that case the freshly-written payload
                 // can already contain nursery references and must enter the
                 // remembered set.  Nursery allocations ignore this barrier.
-                crate::gc_hook::try_gc_write_barrier(raw);
+                crate::gc_hook::try_gc_write_barrier_managed(raw);
             }
             return raw as *mut T;
         }
@@ -337,7 +337,7 @@ pub fn malloc_typed_stable<T: GcType>(value: T) -> *mut T {
             // young children, mirroring the hand-written barrier every other
             // stable allocator runs after its raw write (`w_list_new`,
             // `w_generator_new`, `tupleobject`).
-            crate::gc_hook::try_gc_write_barrier(raw);
+            crate::gc_hook::try_gc_write_barrier_managed(raw);
             raw as *mut T
         }
     }

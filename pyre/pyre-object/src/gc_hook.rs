@@ -578,15 +578,25 @@ pub fn gc_identity_hash(obj_addr: usize) -> usize {
 pub type GcWriteBarrierHookFn = fn(obj: *mut u8);
 
 majit_gc::global_hook!(static GC_WRITE_BARRIER_HOOK: GcWriteBarrierHookFn);
+majit_gc::global_hook!(static GC_WRITE_BARRIER_MANAGED_HOOK: GcWriteBarrierHookFn);
 
 /// Install the write-barrier callback.
 pub fn register_gc_write_barrier_hook(hook: GcWriteBarrierHookFn) {
     GC_WRITE_BARRIER_HOOK.set(Some(hook));
 }
 
+/// Install the callback for objects returned by a managed allocation hook.
+pub fn register_gc_write_barrier_managed_hook(hook: GcWriteBarrierHookFn) {
+    GC_WRITE_BARRIER_MANAGED_HOOK.set(Some(hook));
+}
+
 /// Remove the write-barrier callback.
 pub fn clear_gc_write_barrier_hook() {
     GC_WRITE_BARRIER_HOOK.set(None);
+}
+
+pub fn clear_gc_write_barrier_managed_hook() {
+    GC_WRITE_BARRIER_MANAGED_HOOK.set(None);
 }
 
 /// Run the active GC write barrier for `obj` when one is installed.
@@ -602,6 +612,19 @@ pub extern "C" fn try_gc_write_barrier(obj: *mut u8) -> bool {
             true
         }
         None => false,
+    }
+}
+
+/// Run the active barrier for a pointer returned by a managed allocation
+/// hook.  The backend may omit the general hybrid-heap ownership lookup.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn try_gc_write_barrier_managed(obj: *mut u8) -> bool {
+    match GC_WRITE_BARRIER_MANAGED_HOOK.get() {
+        Some(f) => {
+            f(obj);
+            true
+        }
+        None => try_gc_write_barrier(obj),
     }
 }
 

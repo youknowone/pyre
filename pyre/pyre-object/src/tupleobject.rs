@@ -274,7 +274,7 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
         // custom-trace hook) and relocates any young element. Mirrors the
         // `write_barrier_from_array` an old list/tuple store would emit
         // (incminimark.py:1495).
-        crate::gc_hook::try_gc_write_barrier(raw);
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
         return raw as PyObjectRef;
     }
     Box::into_raw(Box::new(W_TupleObject {

@@ -304,6 +304,10 @@ fn pyre_object_gc_write_barrier_trampoline(obj: *mut u8) {
     majit_gc::gc_write_barrier(majit_ir::GcRef(obj as usize));
 }
 
+fn pyre_object_gc_write_barrier_managed_trampoline(obj: *mut u8) {
+    majit_gc::gc_write_barrier_managed(majit_ir::GcRef(obj as usize));
+}
+
 /// `pypy/objspace/std/dictmultiobject.py:1209 ObjectDictStrategy` key
 /// equality bridge: ObjectDictStrategy stores its dstorage as
 /// `r_dict(space.eq_w, space.hash_w)` so user `__eq__` is honoured on
@@ -3807,6 +3811,9 @@ fn install_pyre_object_hooks() {
         pyre_object_gc_current_object_address_trampoline,
     );
     pyre_object::register_gc_write_barrier_hook(pyre_object_gc_write_barrier_trampoline);
+    pyre_object::register_gc_write_barrier_managed_hook(
+        pyre_object_gc_write_barrier_managed_trampoline,
+    );
     pyre_object::gc_hook::register_gc_identity_hash_hook(pyre_object_gc_identity_hash_trampoline);
     // Let a born-old allocation that crosses the next-major threshold request
     // a collection, the check `external_malloc` (incminimark.py:987-994) makes
