@@ -8948,6 +8948,9 @@ impl<'a> Lowering<'a> {
                     Some(crate::front::option_closure_select::ClosureCombinator::UnwrapOrElse)
                 }
                 "or_else" => Some(crate::front::option_closure_select::ClosureCombinator::OrElse),
+                "is_some_and" => {
+                    Some(crate::front::option_closure_select::ClosureCombinator::IsSomeAnd)
+                }
                 _ => None,
             }
             && let Some(site) = self.recognize_closure_select_site(
@@ -11309,12 +11312,14 @@ impl<'a> Lowering<'a> {
         // `Option<U>` and its closure returns `U` (the dest payload);
         // `and_then`'s dest is `Option<U>` returned directly; `or_else`'s dest
         // is `Option<T>` and its closure returns that same `Option<T>`;
-        // `unwrap_or_else`'s dest is the bare `T`.
+        // `unwrap_or_else`'s dest is the bare `T`; `is_some_and`'s closure and
+        // dest are both `bool`.
         let call_result_ty = match kind {
             ClosureCombinator::Map => self.tyref_option_payload_value_type(dest_ty)?,
             ClosureCombinator::AndThen
             | ClosureCombinator::OrElse
-            | ClosureCombinator::UnwrapOrElse => tyref_to_value_type(dest_ty, self.llbc),
+            | ClosureCombinator::UnwrapOrElse
+            | ClosureCombinator::IsSomeAnd => tyref_to_value_type(dest_ty, self.llbc),
         };
         let niche = self.tyref_is_niche_option_ptr(recv_ty);
         Some(crate::front::option_closure_select::ClosureSelectSite {
@@ -22867,6 +22872,50 @@ mod tests {
             lt_guards >= 1 && subs >= 1,
             "generic_alias_class_getitem: expected the a<b guard and the a-b subtraction \
              (lt={lt_guards}, sub={subs})"
+        );
+    }
+
+    /// Real-LLBC anchor for the `Option::is_some_and` closure-select fold:
+    /// `is_mmap` is `type(obj).is_some_and(|tp| ptr::eq(tp.as_ptr(),
+    /// mmap_type()))`.  After the `option_closure_select` post-pass there must
+    /// be no residual `is_some_and` `Method` call, and block A must branch two
+    /// ways (the `Some`/`None` discriminant diamond).  `#[ignore]`d (loads the
+    /// ~440MB real LLBC); run with `cargo test -p majit-translate --lib
+    /// is_some_and_is_mmap_real -- --ignored`.
+    #[test]
+    #[ignore]
+    fn is_some_and_is_mmap_real() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "is_mmap").expect("lower is_mmap");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                        if name == "is_some_and"
+                )
+            })
+            .count();
+        assert_eq!(
+            residual, 0,
+            "is_mmap: residual is_some_and call after the closure-select rewrite"
+        );
+        let branching = graph
+            .blocks
+            .iter()
+            .filter(|b| b.exits.len() == 2)
+            .count();
+        assert!(
+            branching >= 1,
+            "is_mmap: expected the Some/None discriminant branch (a 2-exit block)"
         );
     }
 
