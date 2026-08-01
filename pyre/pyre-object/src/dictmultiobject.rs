@@ -3663,6 +3663,12 @@ pub unsafe fn w_dict_move_to_end_checked(
     key: PyObjectRef,
     last: bool,
 ) -> Result<bool, DictKeyError> {
+    // `object_key_for_checked` hashes the key (`space.hash_w`, a collection
+    // point), and the strategy switch below reallocates the backing store, so
+    // pin and reload `obj`/`key` across the lock safepoint exactly as the other
+    // checked dict primitives do — a stale `obj` or `ObjectKey.obj` after a
+    // moving GC would corrupt the `IndexMap` access.
+    lock_dict_refs!(_dict_guard, obj, key);
     if is_module_dict(obj) {
         if !w_module_dict_is_object_strategy(obj) {
             w_module_dict_switch_to_object_strategy(obj);
@@ -3696,6 +3702,21 @@ pub unsafe fn w_dict_move_to_end_checked(
     }
 
     let strategy = (*(obj as *const W_DictObject)).dstrategy;
+    // `EmptyDictStrategy.move_to_end` (dictmultiobject.py:820-821) raises
+    // `KeyError` for the requested key without hashing it: an unhashable key
+    // reports `KeyError`, not the object strategy's unhashable `TypeError`, and
+    // no user `__hash__` runs.  Dispatch through the empty strategy before
+    // switching, matching `w_dict_delitem_checked`'s empty-strategy arm (which,
+    // being `del`, does hash).
+    if strategy_is(strategy, &crate::dictmultiobject::EMPTY_DICT_STRATEGY)
+        || strategy_is(
+            strategy,
+            &crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY,
+        )
+    {
+        return Ok(false);
+    }
+
     let kind = strategy.strategy_kind();
 
     // Typed stores reorder in place, preserving the strategy — the
@@ -3719,7 +3740,8 @@ pub unsafe fn w_dict_move_to_end_checked(
 
     // Object and Unicode share the `IndexMap<ObjectKey>` representation, so the
     // reorder below runs in place; only a genuinely foreign store (a typed
-    // store reached with a non-native key, or Kwargs/Map/Empty) is converted.
+    // store reached with a non-native key, or a Kwargs/Map store) is converted;
+    // the empty strategies are handled above.
     if kind != StrategyKind::Object && kind != StrategyKind::Unicode {
         strategy.switch_to_object_strategy(obj);
     }
