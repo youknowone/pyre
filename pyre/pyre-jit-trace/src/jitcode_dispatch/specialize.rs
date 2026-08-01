@@ -4237,11 +4237,7 @@ pub(crate) fn try_walker_fold_is_op<Sym: WalkSym>(
             .heap_cache_mut()
             .class_now_known(operand, type_addr);
     }
-    let cmp = if invert {
-        OpCode::PtrNe
-    } else {
-        OpCode::PtrEq
-    };
+    let cmp = if invert { OpCode::PtrNe } else { OpCode::PtrEq };
     let truth = ctx.trace_ctx.record_op(cmp, &[lhs, rhs]);
     let result = same != invert;
     ctx.trace_ctx
@@ -4413,10 +4409,9 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
         w_builtins_const,
         w_qualname_const,
     );
-    ctx.trace_ctx.heap_cache_mut().class_now_known(
-        func_op,
-        &pyre_interpreter::FUNCTION_TYPE as *const _ as i64,
-    );
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(func_op, &pyre_interpreter::FUNCTION_TYPE as *const _ as i64);
     // Tracing is execution: build the concrete function the rest of the walk
     // observes.  A fresh `Function` per evaluation is what MAKE_FUNCTION
     // produces anyway, so the trace allocating its own is not an identity

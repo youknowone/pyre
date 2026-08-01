@@ -628,7 +628,10 @@ pub fn emit_make_function_inline(
     );
     ctx.heap_cache_mut().new_object(new_op);
     for (descr, value) in [
-        (crate::descr::function_header_w_class_descr(), header_w_class),
+        (
+            crate::descr::function_header_w_class_descr(),
+            header_w_class,
+        ),
         (crate::descr::function_code_descr(), code),
         (
             crate::descr::function_can_change_code_descr(),
