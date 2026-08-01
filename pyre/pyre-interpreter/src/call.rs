@@ -257,6 +257,23 @@ pub fn enter_recursive_frame(frame: *const PyFrame) -> RecursionDepthGuard {
     }
 }
 
+/// Spend one unit of the recursion budget on a dispatch level that pushes no
+/// Python frame, returning the same guard [`enter_recursive_frame`] returns.
+///
+/// The self-referential `A.__call__ = A()` chain recurses through
+/// `user_call_slot` natively and never reaches a frame activation, so there is
+/// no activation to key on: the unit is spent unconditionally and
+/// `ACCOUNTED_ACTIVATION` is carried through unchanged, leaving the next real
+/// activation to account for itself.
+#[inline]
+pub fn enter_native_dispatch() -> RecursionDepthGuard {
+    PY_RECURSION_DEPTH.with(|d| d.set(d.get() + 1));
+    RecursionDepthGuard {
+        prev: ACCOUNTED_ACTIVATION.with(|c| c.get()),
+        spent: true,
+    }
+}
+
 /// RAII guard that releases the [`PY_RECURSION_DEPTH`] unit on drop.
 pub struct RecursionDepthGuard {
     prev: usize,
@@ -1390,7 +1407,7 @@ fn call_callable_with_mode(
         // natively.  The call-depth guard counts this dispatch level and, by
         // dropping only after the call returns, keeps it off the tail so LLVM
         // cannot rewrite the self-call into a loop that never grows the stack.
-        let _depth_guard = increment_call_depth();
+        let _depth_guard = enter_native_dispatch();
         return call_callable_with_mode(frame, target, args, mode);
     }
 
@@ -2633,7 +2650,7 @@ pub fn call_with_kwargs(
         // Depth guard: count this dispatch level and, dropping after the call,
         // keep it off the tail so a self-referential `A.__call__ = A()`
         // recurses natively for stack_check (see call_callable_with_mode).
-        let _depth_guard = increment_call_depth();
+        let _depth_guard = enter_native_dispatch();
         return call_with_kwargs(frame, target, pos_args, kwargs);
     }
 
@@ -2834,7 +2851,7 @@ pub fn call_function_impl_result(
             // Depth guard: count this dispatch level and, dropping after the
             // call, keep it off the tail so a self-referential
             // `A.__call__ = A()` recurses natively for stack_check.
-            let _depth_guard = increment_call_depth();
+            let _depth_guard = enter_native_dispatch();
             return call_function_impl_result(target, args);
         }
     }
