@@ -2485,10 +2485,21 @@ impl PyFrame {
     pub fn snapshot_for_tracing(&self) -> FrameBox {
         // A tracer holds this snapshot off the `CURRENT_FRAME` chain across
         // the whole `trace_bytecode` walk, during which a major GC cycle can
-        // complete; no root reaches it, so it must NOT have GC lifetime —
-        // `new_boxed` gives it a deterministic scope-end free.
+        // complete.  `FrameBox::new` is what makes that safe: it acquires a
+        // translated-livevar root for the frame, held for exactly the handle's
+        // lifetime, which is the walk (`trace_bytecode` takes the box by value
+        // and hands it back).  Before that root existed the snapshot had to be
+        // `new_boxed` — GC-invisible with a deterministic scope-end free —
+        // because nothing reached it.
+        //
+        // Being GC-owned is what lets the trace's synchronization target be a
+        // forwardable object: a `new_boxed` snapshot is an address the
+        // collector does not own, so `pytraceback_object_custom_trace` has to
+        // skip its frame edge and `TraceCtx::virtualizable_heap_ptr` has no
+        // slot to read back.  Same allocation shape as
+        // `snapshot_for_generator` below, for the same reason.
         let mut frame =
-            FrameBox::new_boxed(self.build_snapshot_frame(FrameLocalsArrayAllocation::StdAlloc));
+            FrameBox::new(self.build_snapshot_frame(FrameLocalsArrayAllocation::OldGenGc));
         // fix_array_ptrs AFTER Box allocation: inline_buf ptr must
         // point to the heap-allocated frame, not a stale stack address.
         frame.fix_array_ptrs();
