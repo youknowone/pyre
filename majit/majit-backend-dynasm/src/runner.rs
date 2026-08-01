@@ -975,7 +975,13 @@ pub extern "C" fn dynasm_nursery_slowpath_varsize(
             .0 as u64
     });
     result.unwrap_or_else(|| {
-        let total = base_size as usize + item_size as usize * length as usize + gc_hdr;
+        let Some(total) = (item_size as usize)
+            .checked_mul(length as usize)
+            .and_then(|var_size| (base_size as usize).checked_add(var_size))
+            .and_then(|payload_size| gc_hdr.checked_add(payload_size))
+        else {
+            return 0;
+        };
         unsafe {
             // `libc::calloc` returns NULL on real OOM; the previous
             // unconditional `raw + gc_hdr` masked failure as a tiny
@@ -1119,7 +1125,12 @@ fn dynasm_alloc_oldgen_varsize_typed_and_set_len(
     length_ofs: usize,
     length: usize,
 ) -> u64 {
-    let payload_size = base_size + item_size * length;
+    let Some(payload_size) = item_size
+        .checked_mul(length)
+        .and_then(|var_size| base_size.checked_add(var_size))
+    else {
+        return 0;
+    };
     let obj = dynasm_alloc_oldgen_typed(type_id, payload_size);
     let ptr = obj.0;
     if ptr != 0 {
@@ -3893,6 +3904,15 @@ mod tests {
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn varsize_slowpaths_return_null_on_size_overflow() {
+        assert_eq!(dynasm_nursery_slowpath_varsize(0, 2, u64::MAX), 0);
+        assert_eq!(
+            dynasm_alloc_oldgen_varsize_typed_and_set_len(1, 0, 2, 0, usize::MAX),
+            0
+        );
+    }
 
     fn install_test_libc_jitframe_tracer() {
         majit_gc::shadow_stack::register_libc_jitframe_tracer(

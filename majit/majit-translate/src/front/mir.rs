@@ -127,7 +127,7 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
     llbcs: &[Llbc],
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
-    build_semantic_program_from_llbcs_with_static_addrs_filtered(llbcs, static_addrs, None)
+    build_semantic_program_from_llbcs_with_static_addrs_filtered(llbcs, static_addrs, None, None)
 }
 
 pub fn build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
@@ -140,6 +140,37 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
         llbcs,
         static_addrs,
         module_filter.as_ref(),
+        None,
+    )
+}
+
+/// The `module_paths` entry point narrowed further to a set of leaf
+/// function names.
+///
+/// A fixture that asserts on a handful of named graphs pays for lowering
+/// every function the module filter admits, which for `pyre-interpreter`
+/// is thousands of bodies. `function_names` keeps the same whole-program
+/// metadata — the type and trait tables that decide how a body lowers are
+/// still derived from the entire `llbc` — and only skips building the
+/// bodies nothing will read. A name that matches in several modules
+/// lowers in each; the allowlist is a leaf name, not a path.
+///
+/// Only the bodies are dropped, so a fixture that reaches for a graph it
+/// forgot to list fails loudly on the missing lookup rather than
+/// silently asserting over a smaller program.
+pub fn build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+    llbcs: &[Llbc],
+    static_addrs: crate::HostStaticAddrs<'_>,
+    module_paths: &[&str],
+    function_names: &[&str],
+) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    let module_filter = normalize_module_filter(module_paths);
+    let function_filter = normalize_function_filter(function_names);
+    build_semantic_program_from_llbcs_with_static_addrs_filtered(
+        llbcs,
+        static_addrs,
+        module_filter.as_ref(),
+        function_filter.as_ref(),
     )
 }
 
@@ -147,6 +178,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
     llbcs: &[Llbc],
     static_addrs: crate::HostStaticAddrs<'_>,
     module_filter: Option<&std::collections::HashSet<String>>,
+    function_filter: Option<&std::collections::HashSet<String>>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
     // Dedup key combines `self_ty_root` (the impl owner, when known),
@@ -177,6 +209,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
             llbc,
             static_addrs,
             module_filter,
+            function_filter,
         )?;
         match &mut merged {
             None => {
@@ -288,6 +321,16 @@ fn normalize_module_filter(module_paths: &[&str]) -> Option<std::collections::Ha
         .map(str::to_string)
         .collect();
     (!modules.is_empty()).then_some(modules)
+}
+
+fn normalize_function_filter(function_names: &[&str]) -> Option<std::collections::HashSet<String>> {
+    let names: std::collections::HashSet<String> = function_names
+        .iter()
+        .copied()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!names.is_empty()).then_some(names)
 }
 
 /// Build a [`SemanticProgram`] by lowering every local function
@@ -636,7 +679,7 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
     llbc: &Llbc,
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
-    build_semantic_program_from_llbc_with_static_addrs_filtered(llbc, static_addrs, None)
+    build_semantic_program_from_llbc_with_static_addrs_filtered(llbc, static_addrs, None, None)
 }
 
 /// One block's slot-indexed `Option<Variable>` row, stored by bound slot.
@@ -740,6 +783,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     llbc: &Llbc,
     static_addrs: crate::HostStaticAddrs<'_>,
     module_filter: Option<&std::collections::HashSet<String>>,
+    function_filter: Option<&std::collections::HashSet<String>>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     // ── Pass 1: walk type_decls + trait_decls ─────────────────────
     let (
@@ -846,13 +890,6 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     let mut functions = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     for fd in llbc.iter_local_fns() {
-        // `FunDecl::body` is raw JSON and `unstructured()` re-parses it on
-        // every call, so hold the one projection this iteration needs: it
-        // is both the "has a lowerable body" gate and the input the
-        // lowering below reads.
-        let Some(body) = fd.unstructured() else {
-            continue;
-        };
         // Charon emits static / const initialiser bodies (e.g. the
         // body that builds `static NONE_SINGLETON`) as ordinary
         // `FunDecl` entries with `is_global_initializer` set to the
@@ -879,6 +916,9 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         if !should_lower_module(module_filter, &module_path) {
             continue;
         }
+        if !should_lower_function(function_filter, &name) {
+            continue;
+        }
         let fn_path = if module_path.is_empty() {
             name.clone()
         } else {
@@ -887,6 +927,15 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         if not_rpython.contains(&fn_path) {
             continue;
         }
+        // `FunDecl::body` is raw JSON and `unstructured()` re-parses it on
+        // every call, so hold the one projection this iteration needs: it
+        // is both the "has a lowerable body" gate and the input the
+        // lowering below reads.  Every gate above reads the declaration's
+        // name path or header alone, so they run first and a filtered-out
+        // declaration never pays for the parse.
+        let Some(body) = fd.unstructured() else {
+            continue;
+        };
         // A single function whose body the driver does not yet handle
         // should not abort the whole-program build.  Capture
         // per-function errors into a side bucket and continue; they are
@@ -1089,6 +1138,18 @@ fn should_lower_module(
     // under `pyre_interpreter::module::*`, whose large dispatch/register
     // bodies are not part of the JIT portal closure.
     !(module_path == "module" || module_path.starts_with("module::"))
+}
+
+/// Leaf-name allowlist companion to [`should_lower_module`].
+///
+/// `None` lowers every name the module gate admitted — the production
+/// pipeline's shape, where the entry-point closure rather than a name list
+/// decides what matters.
+fn should_lower_function(
+    function_filter: Option<&std::collections::HashSet<String>>,
+    name: &str,
+) -> bool {
+    function_filter.is_none_or(|names| names.contains(name))
 }
 
 /// Derive whole-program type-metadata fields of `SemanticProgram` from
