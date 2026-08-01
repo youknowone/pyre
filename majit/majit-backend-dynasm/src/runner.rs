@@ -620,9 +620,10 @@ fn debug_validate_oldgen_freeblocks(site: std::fmt::Arguments<'_>) {
 }
 
 pub extern "C" fn dynasm_debug_validate_oldgen_freeblocks(site: u64, frame: usize) {
-    if !crate::gc_freelist_diag_enabled() {
-        return;
-    }
+    // The call itself is only emitted under `PYRE_TRACE_CALL_DIAG`, which is
+    // what selects the failure-frame report below. The freelist walk is the
+    // only half `PYRE_GC_FREELIST_DIAG` owns, and it gates itself — so no
+    // early return here, or enabling one diagnostic would need the other.
     if site >= 1_000_000 {
         let top = majit_gc::shadow_stack::jf_top_ptr().0;
         eprintln!(
