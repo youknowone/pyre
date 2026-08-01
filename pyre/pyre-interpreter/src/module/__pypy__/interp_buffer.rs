@@ -87,13 +87,19 @@ pub(crate) fn newmemoryview(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
     };
     let w_obj = pyre_object::gc_roots::shadow_stack_get(sp);
     let nbytes = unsafe { pyre_object::memoryview::w_memoryview_length(w_obj) };
+    // `lgt`/`old_size` name the source geometry the diagnostics report.  The
+    // element count is derived from the byte extent rather than `len(w_obj)`
+    // so that an N-D source, whose `shape[0]` covers only the outermost
+    // dimension, still reports every element it exposes.
+    let old_size = unsafe { pyre_object::memoryview::w_memoryview_itemsize(w_obj) };
+    let lgt = if old_size == 0 { 0 } else { nbytes / old_size };
     let shape = if shape.is_empty() {
         if itemsize == 0 {
             return Err(PyError::value_error("cannot guess shape when itemsize==0"));
         }
         if nbytes % itemsize != 0 {
             return Err(PyError::value_error(format!(
-                "itemsize {itemsize} does not match buffer size {nbytes}"
+                "itemsize {itemsize} does not match obj len/itemsize {lgt}/{old_size}"
             )));
         }
         vec![nbytes / itemsize]
@@ -114,9 +120,11 @@ pub(crate) fn newmemoryview(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
         result
     } else {
         if strides.len() != shape.len() {
-            return Err(PyError::value_error(
-                "shape and strides must have the same length",
-            ));
+            // The reference raises before its shape accumulator is filled, so
+            // it always names an empty shape here; report the parsed one.
+            return Err(PyError::value_error(format!(
+                "shape {shape:?} does not match strides {strides:?}"
+            )));
         }
         strides
     };
@@ -126,7 +134,9 @@ pub(crate) fn newmemoryview(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
         let mut span = 1i64;
         for i in (0..shape.len()).rev() {
             if span != 0 && strides[i] % span != 0 {
-                return Err(PyError::value_error("strides do not match shape"));
+                return Err(PyError::value_error(
+                    "strides does not match shape, itemsize",
+                ));
             }
             let step = if span == 0 { 0 } else { strides[i] / span };
             span = span
@@ -135,9 +145,10 @@ pub(crate) fn newmemoryview(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
                 .ok_or_else(|| PyError::value_error("shape exceeds buffer size"))?;
         }
         if span != nbytes {
-            return Err(PyError::value_error(
-                "shape and strides do not match buffer size",
-            ));
+            return Err(PyError::value_error(format!(
+                "shape * strides / itemsize {shape:?} * {strides:?} / {itemsize} \
+                 does not match obj data {lgt} * {old_size}"
+            )));
         }
     } else {
         let mut product = 1i64;
@@ -147,15 +158,17 @@ pub(crate) fn newmemoryview(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
                 .ok_or_else(|| PyError::value_error("shape exceeds buffer size"))?;
         }
         if product.saturating_mul(itemsize) != nbytes {
-            return Err(PyError::value_error(
-                "shape/itemsize does not match buffer size",
-            ));
+            return Err(PyError::value_error(format!(
+                "shape/itemsize {shape:?}/{itemsize} does not match obj len/itemsize {lgt}/{old_size}"
+            )));
         }
     }
     if nbytes > 0 {
         for (&stride, &dim) in strides.iter().zip(&shape) {
             if stride.saturating_mul(dim) > nbytes {
-                return Err(PyError::value_error("shape and strides exceed object size"));
+                return Err(PyError::value_error(format!(
+                    "shape {shape:?} and strides {strides:?} exceed object size {nbytes}"
+                )));
             }
         }
     }
