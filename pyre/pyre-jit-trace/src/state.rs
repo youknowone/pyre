@@ -13404,6 +13404,61 @@ pub(crate) fn setup_reconstructed_callee_frame(
         w_globals_const,
         ec_const,
     );
+    // `perform_call` gives every MIFrame a real recording-time frame object
+    // before `setup_call` installs its argument boxes (`pyjitpl.py:2445-2476`),
+    // and the forward-inline callee mirrors that with a GC-managed `FrameBox`
+    // whose pointer is stamped onto the emitted vable
+    // (`inline_call.rs:3551-3569`).  The reconstructed carrier callee needs the
+    // same object: its residual calls run through
+    // `execute_inline_residual_call(frame, nargs)`, and the abort image names
+    // this framestack level by its frame pointer.  A vable with no concrete
+    // makes both decline — the residual call on its frame argument, and the
+    // blackhole preflight on the unset frame pointer — so the drain aborts
+    // after its sub-walk already executed a side effect and the rollback to the
+    // guard then replays it.
+    if !w_code.is_null() {
+        // `FrameBox::new` allocates, so the slot values captured at guard
+        // failure must be forwarded through real shadow-stack slots first
+        // (`gctransform/framework.py` push_roots/pop_roots around a collection
+        // point).  Mirror the vable image exactly: a slot with no box is the
+        // `NewArrayClear` zero-fill, i.e. an unbound local, and stays PY_NULL.
+        let arg_roots = pyre_object::gc_roots::push_roots();
+        let arg_root_base = pyre_object::gc_roots::shadow_stack_len();
+        for (k, &opref) in locals_boxes.iter().enumerate() {
+            let obj = match recipe.concrete_r.get(k) {
+                Some(&majit_ir::Value::Ref(majit_ir::GcRef(ptr)))
+                    if ptr != 0 && !opref.is_none() =>
+                {
+                    ptr as pyre_object::PyObjectRef
+                }
+                _ => PY_NULL,
+            };
+            pyre_object::gc_roots::pin_root(obj);
+        }
+        let concrete_locals: Vec<pyre_object::PyObjectRef> = (0..locals_boxes.len())
+            .map(|k| pyre_object::gc_roots::shadow_stack_get(arg_root_base + k))
+            .collect();
+        let mut frame = pyre_interpreter::pyframe::FrameBox::new(
+            pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
+                w_code,
+                &concrete_locals,
+                w_globals,
+                execution_context,
+                PY_NULL,
+                pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+            ),
+        );
+        drop(arg_roots);
+        let concrete_frame_ptr = frame.as_mut_ptr();
+        ctx.set_opref_concrete(
+            frame_vable,
+            majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
+        );
+        // GC-managed `FrameBox::drop` relinquishes only the host handle; the
+        // frontend op above keeps the frame reachable through
+        // `MetaInterp::walk_active_trace_refs`.
+        drop(frame);
+    }
 
     let mut pending = assemble_bridge_inline_pending(ctx, recipe, execution_context, parent_frames);
     pending.sym.frame = frame_vable;
