@@ -8879,7 +8879,103 @@ fn union_mro_entries_method(args: &[PyObjectRef]) -> crate::PyResult {
     )))
 }
 
+/// `UnionType.__ne__` — the inverse of structural union equality, preserving
+/// `NotImplemented` for non-union operands.
+fn union_ne_method(args: &[PyObjectRef]) -> crate::PyResult {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let other = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    if !unsafe { pyre_object::is_union(self_) } {
+        return Err(crate::PyError::type_error(
+            "descriptor '__ne__' requires a 'types.UnionType' object",
+        ));
+    }
+    if !unsafe { pyre_object::is_union(other) } {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    Ok(pyre_object::w_bool_from(
+        !crate::_pypy_generic_alias::union_set_eq(self_, other)?,
+    ))
+}
+
+/// `UnionType` has no ordering relation.  Expose the four slots explicitly,
+/// as CPython does, while retaining the normal rich-compare fallback.
+fn union_ordering_method(args: &[PyObjectRef]) -> crate::PyResult {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if !unsafe { pyre_object::is_union(self_) } {
+        return Err(crate::PyError::type_error(
+            "descriptor comparison requires a 'types.UnionType' object",
+        ));
+    }
+    Ok(pyre_object::w_not_implemented())
+}
+
+/// `UnionType.__getattribute__` — the explicit type-dict entry delegates to
+/// the ordinary object lookup, just like the C slot.
+fn union_getattribute_method(args: &[PyObjectRef]) -> crate::PyResult {
+    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if !unsafe { pyre_object::is_union(self_) } {
+        return Err(crate::PyError::type_error(
+            "descriptor '__getattribute__' requires a 'types.UnionType' object",
+        ));
+    }
+    let name =
+        crate::baseobjspace::text_w(args.get(1).copied().unwrap_or_else(pyre_object::w_none))?;
+    crate::baseobjspace::object_getattribute(self_, name)
+}
+
 fn init_union_type(ns: PyObjectRef) {
+    // `_pypy_generic_alias.py:241-246 UnionType` docstring, plus CPython
+    // 3.14's three read-only identity getsets on union instances.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            pyre_object::w_str_new("Represent a union type\n\nE.g. for int | str"),
+        )
+    };
+    for (name, getter) in [
+        (
+            "__name__",
+            (|args: &[PyObjectRef]| {
+                let self_ = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                if !unsafe { pyre_object::is_union(self_) } {
+                    return Err(crate::PyError::type_error(
+                        "descriptor '__name__' requires a 'types.UnionType' object",
+                    ));
+                }
+                Ok(pyre_object::w_str_new("Union"))
+            }) as DunderFn,
+        ),
+        ("__qualname__", |args: &[PyObjectRef]| {
+            let self_ = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            if !unsafe { pyre_object::is_union(self_) } {
+                return Err(crate::PyError::type_error(
+                    "descriptor '__qualname__' requires a 'types.UnionType' object",
+                ));
+            }
+            Ok(pyre_object::w_str_new("Union"))
+        }),
+        ("__origin__", |args: &[PyObjectRef]| {
+            let self_ = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            if !unsafe { pyre_object::is_union(self_) } {
+                return Err(crate::PyError::type_error(
+                    "descriptor '__origin__' requires a 'types.UnionType' object",
+                ));
+            }
+            Ok(gettypeobject(&pyre_object::UNION_TYPE))
+        }),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_descriptor_named(
+                    make_builtin_function_with_arity(name, getter, 2),
+                    name,
+                ),
+            )
+        };
+    }
     // Python 3.14's shared `types.UnionType` / `typing.Union` runtime type
     // exposes `__module__` on union *instances* as well as on the type.  Keep
     // the value in the typedef namespace so generic object attribute lookup
@@ -9033,6 +9129,43 @@ fn init_union_type(ns: PyObjectRef) {
             ns,
             "__mro_entries__",
             make_builtin_function_with_arity("__mro_entries__", union_mro_entries_method, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ne__",
+            make_builtin_function_with_arity("__ne__", union_ne_method, 2),
+        )
+    };
+    for (name, method) in [
+        ("__lt__", union_ordering_method as DunderFn),
+        ("__le__", union_ordering_method),
+        ("__gt__", union_ordering_method),
+        ("__ge__", union_ordering_method),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_builtin_function_with_arity(name, method, 2),
+            )
+        };
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__getattribute__",
+            make_builtin_function_with_arity("__getattribute__", union_getattribute_method, 2),
+        )
+    };
+    // `_pypy_generic_alias.py:322`: prevent the sequence protocol from using
+    // `__getitem__` as an iteration fallback.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__iter__",
+            pyre_object::w_none(),
         )
     };
 }

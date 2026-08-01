@@ -7034,6 +7034,40 @@ assert GA.__lt__(list[int], list[str]) is NotImplemented
         result.expect("GenericAlias explicit slot-method surface failed");
     }
 
+    #[test]
+    fn test_union_type_exposes_cpython_314_richcompare_surface() {
+        let source = r#"
+UT = type(int | str)
+required = {
+    '__getattribute__', '__ne__', '__lt__', '__le__', '__gt__', '__ge__',
+    '__name__', '__qualname__', '__origin__', '__iter__', '__doc__',
+}
+assert required <= UT.__dict__.keys()
+u = int | str
+assert UT.__getattribute__(u, '__args__') == (int, str)
+assert u.__name__ == 'Union'
+assert u.__qualname__ == 'Union'
+assert u.__origin__ is UT
+assert u.__module__ == 'typing'
+assert UT.__dict__['__iter__'] is None
+try:
+    iter(u)
+except TypeError:
+    pass
+else:
+    raise AssertionError('UnionType must disable __getitem__ iteration fallback')
+assert UT.__ne__(u, int | str) is False
+assert UT.__ne__(u, int | bytes) is True
+assert UT.__ne__(u, int) is NotImplemented
+assert UT.__lt__(u, int | bytes) is NotImplemented
+assert UT.__le__(u, int | bytes) is NotImplemented
+assert UT.__gt__(u, int | bytes) is NotImplemented
+assert UT.__ge__(u, int | bytes) is NotImplemented
+"#;
+        let (result, _frame) = run_exec_frame(source);
+        result.expect("UnionType explicit rich-compare surface failed");
+    }
+
     /// `pypy/interpreter/typedef.py BuiltinFunction.typedef.acceptable_as_base_class
     /// = False` plus CPython 3.14's null `tp_new` enforce that `type(len)()`
     /// raises `TypeError("cannot create 'builtin_function_or_method'
