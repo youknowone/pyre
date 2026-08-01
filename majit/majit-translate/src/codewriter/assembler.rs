@@ -3633,11 +3633,23 @@ fn fielddescrof(
         let mut found_parent_field = false;
         if let Some(parent_spec) = parent.as_ref() {
             let full_name = bh_field_name(owner, &field.name);
-            if let Some(spec) = parent_spec.all_fielddescrs.iter().find(|spec| {
-                spec.name == full_name
-                    || spec.field_key() == field.name
-                    || spec.name.ends_with(&format!(".{}", field.name))
-            }) {
+            // `all_fielddescrs` is flattened depth-first, so a nested
+            // `Outer.inner.x` precedes the `Outer.x` the caller named. A
+            // single `find` over the disjunction would let that nested row
+            // win on the dotted-suffix arm alone; run the exact spellings to
+            // exhaustion first and keep the suffix match as the fallback.
+            let dotted_suffix = format!(".{}", field.name);
+            let matched = parent_spec
+                .all_fielddescrs
+                .iter()
+                .find(|spec| spec.name == full_name || spec.field_key() == field.name)
+                .or_else(|| {
+                    parent_spec
+                        .all_fielddescrs
+                        .iter()
+                        .find(|spec| spec.name.ends_with(&dotted_suffix))
+                });
+            if let Some(spec) = matched {
                 offset = spec.offset;
                 field_size = spec.field_size;
                 field_type = spec.field_type;
