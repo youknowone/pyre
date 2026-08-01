@@ -9641,13 +9641,20 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // includes ONLY_AST and enables constant folding.
         let syntax_check_only = flags & PYCF_OPTIMIZED_AST == PYCF_ONLY_AST;
         return if source_is_ast {
-            crate::module::_ast::convert::preprocess_object_to_object(
-                source,
-                "",
-                mode,
-                opts,
-                syntax_check_only,
-            )
+            // An already materialised AST under plain `PyCF_ONLY_AST` is
+            // handed straight back, so `compile(tree, ..., PyCF_ONLY_AST) is
+            // tree`.  Re-converting it would hand out a copy instead.
+            if syntax_check_only {
+                Ok(source)
+            } else {
+                crate::module::_ast::convert::preprocess_object_to_object(
+                    source,
+                    "",
+                    mode,
+                    opts,
+                    syntax_check_only,
+                )
+            }
         } else {
             crate::module::_ast::convert::parse_to_object_with_opts(
                 source_str
