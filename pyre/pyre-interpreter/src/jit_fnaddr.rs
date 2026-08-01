@@ -1921,6 +1921,78 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::dict_entries_pop_last",
         pyre_object::dictmultiobject::dict_entries_pop_last as *const (),
     );
+    // The positional slot reads the post-scan lookup arms and the reentrant
+    // key scan perform: an index the caller already settled on, so no
+    // comparison runs behind these boundaries.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_value_at",
+        "pyre_object::dict_entries_value_at",
+        pyre_object::dictmultiobject::dict_entries_value_at as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_key_obj_at",
+        "pyre_object::dict_entries_key_obj_at",
+        pyre_object::dictmultiobject::dict_entries_key_obj_at as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_key_hash_at",
+        "pyre_object::dict_entries_key_hash_at",
+        pyre_object::dictmultiobject::dict_entries_key_hash_at as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_key_is_at",
+        "pyre_object::dict_entries_key_is_at",
+        pyre_object::dictmultiobject::dict_entries_key_is_at as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_capacity",
+        "pyre_object::dict_entries_capacity",
+        pyre_object::dictmultiobject::dict_entries_capacity as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_value_set_at",
+        "pyre_object::dict_entries_value_set_at",
+        pyre_object::dictmultiobject::dict_entries_value_set_at as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_insert_object",
+        "pyre_object::dict_entries_insert_object",
+        pyre_object::dictmultiobject::dict_entries_insert_object as *const (),
+    );
+    // The index-returning twins of the `dict_entries_probe_*` pair, for
+    // `setitem_str`'s borrow-key membership test.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_index_of_str_hashed",
+        "pyre_object::dict_entries_index_of_str_hashed",
+        pyre_object::dictmultiobject::dict_entries_index_of_str_hashed as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_index_of_object",
+        "pyre_object::dict_entries_index_of_object",
+        pyre_object::dictmultiobject::dict_entries_index_of_object as *const (),
+    );
+    // The module-dict storage's own `String`-keyed probe / store pair.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::celldict::module_dict_entries_get",
+        "pyre_object::module_dict_entries_get",
+        pyre_object::celldict::module_dict_entries_get as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::celldict::module_dict_entries_insert",
+        "pyre_object::module_dict_entries_insert",
+        pyre_object::celldict::module_dict_entries_insert as *const (),
+    );
     // A runtime-mutable global counter, not a build-time constant: bind the
     // read seam by address so the JIT calls it instead of folding whatever
     // serial the build process saw.
@@ -1974,6 +2046,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::identitydict::w_dict_delete_identity_strategy",
         "pyre_object::w_dict_delete_identity_strategy",
         pyre_object::identitydict::w_dict_delete_identity_strategy as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::identitydict::w_dict_store_identity_strategy",
+        "pyre_object::w_dict_store_identity_strategy",
+        pyre_object::identitydict::w_dict_store_identity_strategy as *const (),
     );
     push_alias_pair(
         &mut entries,

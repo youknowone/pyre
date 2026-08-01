@@ -116,6 +116,32 @@ pub unsafe fn w_dict_delete_identity_strategy(obj: PyObjectRef, key: PyObjectRef
         .is_some()
 }
 
+/// `dictmultiobject.py:1061-1067 setitem`'s identity-keyed store — insert
+/// `value` under the address-identity of `key`, reporting whether the slot was
+/// newly filled so the caller bumps the keys-version only on a real insert.
+///
+/// Residualise the storage insert alone (`@dont_look_inside`,
+/// `rlib/jit.py:139`), the store twin of [`w_dict_lookup_identity_strategy`]:
+/// upstream's `_ll_dict_setitem_lookup_done` (`rordereddict.py:674`) is
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))`, and an
+/// `IndexMap` can never be virtual to this front end, so neither conjunct can
+/// hold and the residual arm is the only one reachable.  [`IdentityKey`]
+/// hashes and compares by address, so the store runs no user Python code at
+/// all; the keys-version bump and the GC write barrier stay traced.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject` on [`IDENTITY_DICT_STRATEGY`].
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_store_identity_strategy(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    value: PyObjectRef,
+) -> bool {
+    identity_storage_mut(obj)
+        .insert(IdentityKey(key), value)
+        .is_none()
+}
+
 /// `dictmultiobject.py:1143-1150 AbstractTypedStrategy.switch_to_object_strategy`
 /// instantiation for IdentityDictStrategy — `wrap` is identity (`:26-27`), so
 /// the migration ports each `IdentityKey(obj)` into
@@ -252,8 +278,7 @@ impl DictStrategy for IdentityDictStrategy {
     /// on mismatch, promote to Object.
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
         if Self::is_correct_type(w_key) {
-            let entries = identity_storage_mut(w_dict);
-            if entries.insert(IdentityKey(w_key), w_value).is_none() {
+            if w_dict_store_identity_strategy(w_dict, w_key, w_value) {
                 crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
             }
             crate::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
