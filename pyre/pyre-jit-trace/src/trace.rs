@@ -1526,6 +1526,22 @@ fn inject_root_call_result<Sym: WalkSym>(
                 result_reg,
             )
         })
+        // The raw-color fallback is load-bearing and simultaneously wrong,
+        // so neither keeping nor deleting it is the answer:
+        //
+        //   fib_recursive, dynasm, the one resume that misses the map —
+        //   `pc=569 reg=0 nlocals=1 stack_only=2 vsd=3`, entries
+        //   `[(1,0,4),(1,2,1),(1,3,2)]`.  Color 0 IS mapped, to semantic slot
+        //   4; the inversion rejects it because `4 - nlocals` is at/above the
+        //   runtime `stack_only`, which is what that gate is for.  The
+        //   fallback then answers slot 0 — a LOCAL, not the operand-stack slot
+        //   the map named.  Deleting it declines this bridge and costs 16x
+        //   (0.86s -> 14.2s), so the decline is not an option either.
+        //
+        // The result slot is by construction the one about to be pushed, i.e.
+        // at/above the resume's live depth, so resolving it needs a query that
+        // does not gate on that depth.  Until that resolves at this
+        // coordinate, keep the fallback and its measured cost visible.
         .or_else(|| (result_reg < valuestackdepth).then_some(result_reg));
     let Some(semantic_result_slot) = semantic_result_slot else {
         return false;
