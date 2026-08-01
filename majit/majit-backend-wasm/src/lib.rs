@@ -1699,17 +1699,28 @@ impl majit_backend::Backend for WasmBackend {
         //
         // The nursery here is a deliberate deviation from the dynasm runner,
         // which materializes blackhole structs and arrays in the old
-        // generation. Routing these three entry points to
-        // `alloc_oldgen_typed` miscompiles `synth/recursion_memo_branch`: a
-        // resumed frame reads a nursery-range address that no object has ever
-        // occupied as the `in` operand, while the dict the operand names is
-        // intact. It needs minor collections (a nursery large enough to
-        // suppress them runs clean) but is not a missed old->young edge —
-        // forcing every old-generation object into the remembered set on every
-        // minor does not change it — nor a descr/tid layout mismatch, nor
-        // major-collection sweep, nor the old-generation allocator's
-        // eval-breaker arming. Restore the old generation here only together
-        // with a fix for that.
+        // generation. Routing these three entry points to `alloc_oldgen_typed`
+        // miscompiles `synth/recursion_memo_branch`.
+        //
+        // One cause is established. A born-old materialized `PyFrame` takes a
+        // young `f_backref`, and nothing records the edge: the store is
+        // barrier-free on purpose, because for an *entered* frame the chain is
+        // a root set that `walk_pyframe_roots` forwards in place, and a
+        // materialized frame is not on that chain. The object therefore reaches
+        // neither the remembered set nor the root walk, and the minor leaves
+        // `f_backref` naming the pre-copy nursery address. Nursery allocation
+        // hid this: being young was enough to have the fields traced.
+        // Remembering the block at birth (`gc_write_barrier` on the fresh
+        // pointer, whose `TRACK_YOUNG_PTRS` is already set) removes that
+        // violation, verified with a checker that scans every born-old block
+        // for an untraced nursery reference at the end of each minor.
+        //
+        // It is not the whole story: with that in place the benchmark still
+        // fails, and the checker reports no remaining violation on any
+        // blackhole block. The surviving holder is therefore not a born-old
+        // object — the checker's other reports reproduce unchanged on the
+        // nursery form, so they are dead old-generation blocks, not this bug.
+        // Restore the old generation here only together with that second cause.
         let type_id = sizedescr.resolve_gc_tid();
         with_wasm_active_gc_mut(|gc| gc.alloc_nursery_no_collect_typed(type_id, size).0 as i64)
             .unwrap_or(0)
