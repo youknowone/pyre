@@ -5496,21 +5496,27 @@ pub(crate) fn try_walker_specialize_math_log_trig<Sym: WalkSym>(
     if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
         return Ok(None);
     }
-    let raw_fn =
+    // Carry `is_log` out of the branch that knows it. Recovering it afterwards
+    // by comparing `raw_fn` against `math_log_positive_jit` would make the
+    // domain guard below depend on the three helpers keeping distinct
+    // addresses, which is a linker property, not a source one.
+    let (raw_fn, is_log) =
         if pyre_interpreter::module::math::interp_math::is_math_log_function(concrete_callable) {
-            crate::trace_opcode::math_log_positive_jit as *const ()
+            (
+                crate::trace_opcode::math_log_positive_jit as *const (),
+                true,
+            )
         } else if pyre_interpreter::module::math::interp_math::is_math_cos_function(
             concrete_callable,
         ) {
-            crate::trace_opcode::math_cos_finite_jit as *const ()
+            (crate::trace_opcode::math_cos_finite_jit as *const (), false)
         } else if pyre_interpreter::module::math::interp_math::is_math_sin_function(
             concrete_callable,
         ) {
-            crate::trace_opcode::math_sin_finite_jit as *const ()
+            (crate::trace_opcode::math_sin_finite_jit as *const (), false)
         } else {
             return Ok(None);
         };
-    let is_log = raw_fn == crate::trace_opcode::math_log_positive_jit as *const ();
     let (is_int, val) = unsafe {
         if !pyre_object::is_exact_builtin_instance(arg_obj) {
             return Ok(None);
