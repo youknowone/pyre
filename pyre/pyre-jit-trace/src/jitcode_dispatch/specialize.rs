@@ -2559,14 +2559,7 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
 
     // typeobject.py `promote(self.version_tag())`: class mutation or method
     // reassignment bumps `_version_tag`, so the old `w_descr` side-exits.
-    let vt_op = walker_record_getfield_gc_i_uncached(
-        ctx,
-        w_type_const,
-        crate::descr::type_version_tag_descr(),
-    );
-    let vt_const = ctx.trace_ctx.const_int(version_tag as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[vt_op, vt_const])?;
-    ctx.trace_ctx.heap_cache_mut().replace_box(vt_op, vt_const);
+    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
 
     // Re-prove the shadowing precondition: growing an instance attribute named
     // like the method must side-exit before the constant descriptor is reused.
@@ -2658,14 +2651,7 @@ pub(crate) fn try_walker_specialize_load_classmethod_attr<Sym: WalkSym>(
     // typeobject.py `promote(self.version_tag())`: class mutation or classmethod
     // reassignment in the class or any base bumps `_version_tag`, so the pinned
     // `__func__` side-exits.
-    let vt_op = walker_record_getfield_gc_i_uncached(
-        ctx,
-        w_type_const,
-        crate::descr::type_version_tag_descr(),
-    );
-    let vt_const = ctx.trace_ctx.const_int(version_tag as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[vt_op, vt_const])?;
-    ctx.trace_ctx.heap_cache_mut().replace_box(vt_op, vt_const);
+    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
 
     let func_const = ctx.trace_ctx.const_ref(w_func as i64);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, func_const)?;
@@ -2756,14 +2742,7 @@ pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
 
     // typeobject.py `promote(self.version_tag())`: reassigning the method on
     // the type bumps the tag, so the constant `w_descr` side-exits.
-    let vt_op = walker_record_getfield_gc_i_uncached(
-        ctx,
-        w_type_const,
-        crate::descr::type_version_tag_descr(),
-    );
-    let vt_const = ctx.trace_ctx.const_int(version_tag as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[vt_op, vt_const])?;
-    ctx.trace_ctx.heap_cache_mut().replace_box(vt_op, vt_const);
+    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
 
     // `w_method_new(w_descr, obj, w_type)` + the header stamp its allocation
     // performs (`ob_type` comes from the NewWithVtable's size descr).
@@ -6994,27 +6973,13 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
             .heap_cache_mut()
             .replace_box(callable_op, expected);
     }
-    if let Some(version_tag) = subclass_version_tag {
-        // Guard the promoted class version that made both MRO descriptor
+    if subclass_version_tag.is_some() {
+        // Pin the promoted class version that made both MRO descriptor
         // identities constant.  `W_TypeObject.mutated` recursively changes
         // subclass tags (`typeobject.py`), so mutating this class or a
-        // base side-exits before reusing the folded constructor.
+        // base revokes the loop before the folded constructor is reused.
         let class_const = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        let live_version = crate::state::opimpl_getfield_gc_i(
-            ctx.trace_ctx,
-            class_const,
-            crate::descr::type_version_tag_descr(),
-        );
-        let version_const = ctx.trace_ctx.const_int(version_tag as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[live_version, version_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(live_version, version_const);
+        walker_pin_type_version_tag(ctx, op.pc, class_const)?;
     }
 
     if fills_os_error_slots && exact_os_error {

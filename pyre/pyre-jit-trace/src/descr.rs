@@ -2184,24 +2184,34 @@ pub fn w_list_size_descr() -> DescrRef {
 
 /// `typeobject.py:162 _version_tag` — the method-cache version (`u64`, 8
 /// bytes, unsigned) on `W_TypeObject`. The `LOAD_METHOD` fast path reads it
-/// LIVE and `guard_value`s it (`promote(self.version_tag())`,
-/// typeobject.py:506) so the `_pure_lookup_where_with_method_cache`
-/// `CALL_PURE_R` folds on a green version. Mutable (not immutable /
-/// quasi-immutable): `mutated()` (typeobject.py:285-286) bumps it on any
-/// type-dict change, and the per-iteration `guard_value` re-checks it.
+/// through `promote(self.version_tag())` (typeobject.py:506) so the
+/// `_pure_lookup_where_with_method_cache` `CALL_PURE_R` folds on a green
+/// version.
 ///
-/// Upstream `_version_tag?` is quasi-immutable, so the JIT folds the read
-/// away and relies on the write barrier to invalidate dependent traces; the
-/// convergence path here is a `QUASIIMMUT_FIELD` once pyre wires that write
-/// barrier into `mutated()`. Until then a live read + `guard_value` is the
-/// sound interim.
-pub fn type_version_tag_descr() -> DescrRef {
-    make_field_descr(
+/// Quasi-immutable, per `typeobject.py:177 _immutable_fields_ =
+/// ['_version_tag?']`: the read is replaced by a `QUASIIMMUT_FIELD` plus one
+/// `GUARD_NOT_INVALIDATED` per trace, and `mutated()` (typeobject.py:285-286)
+/// revokes the dependent loops through
+/// [`pyre_object::typeobject::w_type_set_version_tag`] instead of the trace
+/// re-checking a live value every iteration. A residual call cannot flush a
+/// quasi-immutable field, which is the whole point — the interim live read +
+/// `guard_value` had to be re-done after every un-inlined call in the body.
+///
+/// One object per run, for the identity reason documented on
+/// [`W_CLASS_FIELD_DESCR`], and load-bearing here: `heap.rs:3274` keys
+/// `quasi_immut_cache` on `field_cache_identity`, which is the `Arc` pointer,
+/// so a per-call descriptor would miss its own cache on every read.
+static TYPE_VERSION_TAG_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    make_quasi_immutable_field_descr(
         core::mem::offset_of!(pyre_object::typeobject::W_TypeObject, version_tag),
         8,
         Type::Int,
         false,
     )
+});
+
+pub fn type_version_tag_descr() -> DescrRef {
+    TYPE_VERSION_TAG_FIELD_DESCR.clone()
 }
 
 /// `W_ObjectObject` SizeDescr group (`objectobject.rs:34-46`) — the instance

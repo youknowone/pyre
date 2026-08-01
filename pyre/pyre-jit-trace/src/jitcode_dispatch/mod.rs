@@ -7149,25 +7149,11 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     }
 
     // The instance map pins the storage layout, but class mutation can change
-    // lookup precedence without changing that map. Re-read the receiver type's
-    // live version tag at every trace entry and deopt before the folded storage
-    // access when it changes.
+    // lookup precedence without changing that map. Pin the receiver type's
+    // version tag so such a mutation revokes the loop before the folded
+    // storage access is reused.
     let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    let version_op = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        w_type_const,
-        crate::descr::type_version_tag_descr(),
-    );
-    let version_const = ctx.trace_ctx.const_int(version_tag as i64);
-    walker_emit_fold_guard_with_snapshot(
-        ctx,
-        op_pc,
-        OpCode::GuardValue,
-        &[version_op, version_const],
-    )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(version_op, version_const);
+    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
 
     // guard_value(getfield_gc_i(obj, map), C_map): `jit.promote(self.map)`
     // (`mapdict.py`).  The map nodes are interned + immortal, so the
@@ -7235,21 +7221,7 @@ fn walker_guard_exception_attr_slot<Sym: WalkSym>(
         .replace_box(live_w_class, w_class_const);
 
     let type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    let live_version = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        type_const,
-        crate::descr::type_version_tag_descr(),
-    );
-    let version_const = ctx.trace_ctx.const_int(version_tag as i64);
-    walker_emit_fold_guard_with_snapshot(
-        ctx,
-        op_pc,
-        OpCode::GuardValue,
-        &[live_version, version_const],
-    )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(live_version, version_const);
+    walker_pin_type_version_tag(ctx, op_pc, type_const)?;
     Ok(())
 }
 
@@ -7276,6 +7248,34 @@ fn walker_record_getfield_gc_i_uncached<Sym: WalkSym>(
     // purity from the descr. There is no pure getfield opnum.
     ctx.trace_ctx
         .record_op_with_descr(OpCode::GetfieldGcI, &[obj], descr)
+}
+
+/// Pin a type's method-cache version without reading it, per
+/// `typeobject.py:177 _immutable_fields_ = ['_version_tag?']`.
+///
+/// `promote(self.version_tag())` (typeobject.py:506) needs the tag green so the
+/// `_pure_lookup_where_with_method_cache` fold can run. On a quasi-immutable
+/// field that costs a `QUASIIMMUT_FIELD` marker plus one
+/// `GUARD_NOT_INVALIDATED` per trace, not a load and a `GUARD_VALUE` per read:
+/// `mutated()` revokes the loop instead of the trace re-proving the tag. The
+/// difference is load-bearing inside a body with un-inlined calls, since a
+/// residual `CALL_MAY_FORCE` flushes a mutable field's cache but cannot flush a
+/// quasi-immutable one.
+///
+/// `w_type_const` must already be pinned to the receiver's type — the caller
+/// guards `w_class` first, so the marker attaches to a constant the optimizer
+/// can hand to `register_quasi_immutable_deps` as the watched object.
+fn walker_pin_type_version_tag<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    w_type_const: OpRef,
+) -> Result<(), DispatchError> {
+    crate::state::record_quasiimmut_field(
+        ctx.trace_ctx,
+        w_type_const,
+        crate::descr::type_version_tag_descr(),
+    );
+    walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
 fn walker_record_getfield_gc_r_uncached<Sym: WalkSym>(

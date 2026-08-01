@@ -5275,10 +5275,20 @@ fn register_quasi_immutable_deps(_green_key: u64) {
     // place without bumping the version and is observed by the live
     // `cell.w_value` read instead.  `ns_ptr` is the `const_ref`-folded
     // `w_globals` object pointer; `slot` is unused for version keying.
-    for (ns_ptr, _slot) in deps {
-        let obj = ns_ptr as pyre_object::PyObjectRef;
+    //
+    // `typeobject.py:177 _immutable_fields_ = ['_version_tag?']`: the
+    // LOAD_METHOD / LOAD_ATTR method-cache fold bakes a type's `version_tag`
+    // as a constant under a `QUASIIMMUT_FIELD(w_type)`, so the same loop flag
+    // registers against the type. `mutated()` (typeobject.py:285-291) bumps
+    // the tag and walks subclasses, and the setter revokes each level's loops.
+    //
+    // Both registrations self-filter on the object's kind, so a dep of either
+    // kind reaches exactly its own watcher list.
+    for (dep_ptr, _slot) in deps {
+        let obj = dep_ptr as pyre_object::PyObjectRef;
         unsafe {
             pyre_object::dictmultiobject::module_dict_register_version_watcher(obj, &flag);
+            pyre_object::typeobject::w_type_register_quasi_immut_watcher(obj, &flag);
         }
     }
 }
