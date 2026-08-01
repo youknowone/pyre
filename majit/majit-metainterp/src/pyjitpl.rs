@@ -7272,7 +7272,12 @@ impl<M: Clone> MetaInterp<M> {
         // gcreftracer.py parity: GC may have moved objects between Phase 1
         // and Phase 2. Refresh GcRef values from shadow stack before use.
         start_state.refresh_from_gc();
-        let _bridge_trace = self.bridge_info();
+        // `compile.py:392 resumekey.compile_and_attach(metainterp, loop,
+        // inputargs)` — the resumekey decides how a finished retrace is
+        // installed, and a retrace grown from a guard failure carries a
+        // `ResumeGuardDescr` (`pyjitpl.py:2890 handle_guard_failure(self,
+        // resumedescr, deadframe)` stores it as `self.resumekey`).
+        let retrace_resumekey = self.bridge_info_cloned();
         let vable_config = self.current_virtualizable_optimizer_config();
         self.force_finish_trace = false;
         let retracing_from = self.retracing_from.take();
@@ -7561,6 +7566,41 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
+        // `compile.py:392-393` — `resumekey.compile_and_attach(metainterp,
+        // loop, inputargs)` dispatches on the resumekey's class:
+        //
+        // * `ResumeGuardDescr` (compile.py:797-809) sets
+        //   `new_loop.original_jitcell_token =
+        //   metainterp.resumekey_original_loop_token` and calls
+        //   `send_bridge_to_backend` — the retrace is PATCHED ONTO the guard
+        //   it grew from, under the source loop's token, and is only ever
+        //   entered through that guard's exit.
+        // * `ResumeFromInterpDescr` (compile.py:1006-1023) makes a new
+        //   jitcell token, calls `send_loop_to_backend` and installs it as
+        //   the green key's front door ("to be called directly the next
+        //   time"). That resumekey belongs to the entry bridge.
+        //
+        // The two differ in the entry CONTRACT, not just in bookkeeping. A
+        // front door is entered positionally, one host value per loop-carried
+        // position; a retrace's entry is `new_loop.inputargs`
+        // (compile.py:802), which `VirtualState::make_inputargs`
+        // (virtualstate.py:655-670) mints one-per-`position_in_notvirtuals`
+        // — two positions that resolve to the same box share one entry
+        // (virtualstate.py:712-728). Installing a retrace as the front door
+        // therefore feeds a collapsed arg list from a positional value list.
+        if let Some(bridge) = retrace_resumekey {
+            return self.attach_retrace_to_source_guard(
+                bridge,
+                green_key,
+                loop_jitcell_token,
+                inputargs,
+                combined_ops,
+                constants,
+                &mut unroll_opt,
+                num_combined_ops,
+            );
+        }
+
         // compile.py:504-511 send_loop_to_backend virtualizable hook —
         // retrace paths also need the preamble loads so the loop's inputarg
         // contract is reds-only and virtualizable fields are reloaded from
@@ -7787,6 +7827,279 @@ impl<M: Clone> MetaInterp<M> {
                 self.stats.loops_aborted += 1;
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one("jit-abort", &format!("compile_retrace failed: {e}"));
+                }
+                self.warm_state.abort_tracing(green_key, false);
+                false
+            }
+        }
+    }
+
+    /// `compile.py:797-809 ResumeGuardDescr.compile_and_attach` — install a
+    /// finished retrace on the guard it grew from.
+    ///
+    /// ```python
+    /// new_loop.original_jitcell_token = metainterp.resumekey_original_loop_token
+    /// inputargs = new_loop.inputargs
+    /// propagate_original_jitcell_token(new_loop)
+    /// send_bridge_to_backend(metainterp.jitdriver_sd, metainterp.staticdata,
+    ///                        self, inputargs, new_loop.operations,
+    ///                        new_loop.original_jitcell_token,
+    ///                        metainterp.box_names_memo)
+    /// record_loop_or_bridge(metainterp.staticdata, new_loop)
+    /// ```
+    ///
+    /// No new `JitCellToken` is minted and no `compiled_loops` front-door
+    /// install happens: the green key keeps entering through the parent
+    /// loop's `start_label` + preamble (`compile.py:327-328`), and this trace
+    /// is reached only through the source guard's exit.
+    ///
+    /// `send_loop_to_backend`'s virtualizable hook (`compile.py:509-511`) is
+    /// deliberately not run — `send_bridge_to_backend` (`compile.py:569-576`)
+    /// has no counterpart, because a bridge's entry contract is the source
+    /// guard's failargs, not a fresh reds-only inputarg list with the
+    /// virtualizable fields reloaded at the top.
+    #[allow(clippy::too_many_arguments)]
+    fn attach_retrace_to_source_guard(
+        &mut self,
+        bridge: BridgeTraceInfo,
+        green_key: u64,
+        loop_jitcell_token: Arc<JitCellToken>,
+        inputargs: Vec<InputArg>,
+        combined_ops: Vec<majit_ir::OpRc>,
+        constants: majit_ir::ConstMap<majit_ir::Value>,
+        unroll_opt: &mut crate::optimizeopt::unroll::UnrollOptimizer,
+        num_combined_ops: usize,
+    ) -> bool {
+        let Some(fail_descr) = bridge.source_descr.as_fail_descr() else {
+            crate::debug::log_one(
+                "jit-abort",
+                "compile_retrace: source resumekey is not a FailDescr",
+            );
+            return false;
+        };
+        // `compile.py:801 assert metainterp.resumekey_original_loop_token is
+        // not None`; pyre resolves the same object through the descr's
+        // `rd_loop_token` weakref, which can already be dead.  That is
+        // `compile.py:2898`'s `compile.giveup()` shape, not an assert.
+        let Some(source_jct) = majit_backend::descr_owning_jct(fail_descr) else {
+            crate::debug::log_one(
+                "jit-abort",
+                "compile_retrace: rd_loop_token weakref dead → giveup",
+            );
+            return false;
+        };
+        let fail_index = fail_descr.fail_index_per_trace();
+        let source_trace_id = fail_descr.trace_id();
+        let bridge_trace_id = self.alloc_trace_id();
+
+        let compiled_constants_typed =
+            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
+        self.backend
+            .set_constants_pool(compiled_constants_typed.clone());
+        self.backend
+            .set_callinfocollection(self.callinfocollection.clone());
+        self.backend.set_next_trace_id(bridge_trace_id);
+        self.backend.set_next_header_pc(green_key);
+        self.backend
+            .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
+        self.take_back_all_descrs(std::mem::take(&mut unroll_opt.all_descrs));
+
+        // Read both backend inputs out of `compiled_loops` before the
+        // `&mut self.backend` borrow; see `compile_bridge` for what each is.
+        let previous_tokens_strong: Vec<Arc<JitCellToken>> = self
+            .compiled_loops
+            .get(&green_key)
+            .map(|compiled| {
+                compiled
+                    .previous_tokens
+                    .iter()
+                    .filter_map(|weak| weak.upgrade())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let caller_recovery_layout = self
+            .compiled_loops
+            .get(&green_key)
+            .and_then(|compiled| compiled.traces.get(&source_trace_id))
+            .and_then(|tr| tr.exit_layouts.get(&fail_index))
+            .and_then(|sl| sl.recovery_layout.clone());
+
+        // compile.py:589-599 `debug_start("jit-backend") +
+        // profiler.start_backend() ... try: do_compile_bridge ... finally:
+        // ... profiler.end_backend() + debug_stop("jit-backend")`.
+        let bridge_result = {
+            let _backend_scope = self.staticdata.profiler.enter_backend();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.backend.compile_bridge(
+                    fail_descr,
+                    &inputargs,
+                    &combined_ops,
+                    &source_jct,
+                    &previous_tokens_strong,
+                    caller_recovery_layout.as_ref(),
+                )
+            }))
+        };
+        let result = match bridge_result {
+            Ok(r) => r,
+            Err(payload) => {
+                self.note_jit_panic_or_reraise(
+                    payload,
+                    "attach_retrace_to_source_guard backend",
+                    green_key,
+                );
+                Err(majit_backend::BackendError::CompilationFailed(
+                    "panic during retrace bridge compilation".to_string(),
+                ))
+            }
+        };
+
+        match result {
+            Ok(_) => {
+                self.last_compiled_artifact_invalidation_flag =
+                    source_jct.latest_bridge_invalidation_flag();
+                // compile.py:826-830 store_hash for bridge guards.
+                self.assign_bridge_guard_hashes(source_jct.as_ref(), source_trace_id, fail_index);
+                // `compile.py:463-468 propagate_original_jitcell_token` — every
+                // LABEL's TargetToken in the finished trace is rebound to
+                // `new_loop.original_jitcell_token`, which
+                // `compile_and_attach` just set to the SOURCE loop's token.
+                // `unroll.py:290-297` separately appended the freshly minted
+                // one to `loop_jitcell_token.target_tokens`
+                // (`compile.py:356`'s `get_procedure_token(greenkey)`), which
+                // is what `pyjitpl.py:3923 has_compiled_targets` reads.
+                for target_token in &unroll_opt.target_tokens {
+                    target_token.set_original_jitcell_token_number(source_jct.number);
+                    loop_jitcell_token.record_target_token(target_token.as_jump_target_descr());
+                }
+                // `unroll.py:213-215 if cell_token.retraced_count < limit:
+                // cell_token.retraced_count += 1` — the counter lives on the
+                // procedure token this retrace specializes, the same one
+                // `unroll_opt.retraced_count` was seeded from.
+                loop_jitcell_token.set_retraced_count(unroll_opt.retraced_count);
+                self.last_quasi_immutable_deps =
+                    std::mem::take(&mut unroll_opt.quasi_immutable_deps);
+                // compile.py:811 `record_loop_or_bridge(metainterp.staticdata,
+                // new_loop)` with `new_loop.original_jitcell_token` = the
+                // source JCT (compile.py:801), so every bridge-internal
+                // `ResumeDescr.rd_loop_token` inherits the source identity.
+                let mut combined_ops = combined_ops;
+                self.record_loop_or_bridge(&source_jct, &mut combined_ops, bridge_trace_id);
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] attached retrace to guard at key={green_key}, guard={fail_index}, \
+                         num_inputs={}",
+                        inputargs.len()
+                    );
+                }
+                let fvc = self.active_frame_value_count_fn();
+                if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
+                    // `unroll.py:290-297 finalize_short_preamble` appends the
+                    // newly minted TargetToken to `jitcelltoken.target_tokens`
+                    // — the SAME list `unroll.py:198/239/277` scans when a
+                    // later trace looks for a label to jump onto. majit keeps
+                    // that scan list on the compiled entry, so the token has to
+                    // land there whichever way the artifact is installed;
+                    // otherwise no later bridge can ever reach this retrace's
+                    // label and each one grows another guard-attached retrace.
+                    // majit additionally overloads this list as the front-entry
+                    // selector, which upstream never does. The write-back is
+                    // order-preserving (`unroll_opt.target_tokens` opens as a
+                    // clone of this list and only appends), so
+                    // `selected_front_target_token`'s "first non-preamble"
+                    // pick is unchanged whenever the parent already has one.
+                    // If the parent has only preamble targets, the appended
+                    // retrace label is selected but
+                    // `compact_label_values_for_selected_target` cannot find
+                    // that descr among the PARENT's ops and returns `None`, so
+                    // the direct-entry path declines rather than entering the
+                    // retrace. Splitting the scan list from the front-entry
+                    // selector is the follow-up that removes the overload.
+                    if !unroll_opt.target_tokens.is_empty() {
+                        compiled.front_target_tokens = unroll_opt.target_tokens.clone();
+                    }
+                    let (mut resume_data, mut exit_layouts) =
+                        compile::build_guard_metadata(&inputargs, &combined_ops, green_key, fvc);
+                    let mut terminal_exit_layouts =
+                        compile::build_terminal_exit_layouts(&inputargs, &combined_ops);
+                    if let Some(backend_layouts) = self.backend.compiled_bridge_fail_descr_layouts(
+                        source_jct.as_ref(),
+                        source_trace_id,
+                        fail_index,
+                    ) {
+                        compile::merge_backend_exit_layouts(
+                            &mut exit_layouts,
+                            &backend_layouts,
+                            &combined_ops,
+                        );
+                    }
+                    if let Some(backend_layouts) =
+                        self.backend.compiled_bridge_terminal_exit_layouts(
+                            source_jct.as_ref(),
+                            source_trace_id,
+                            fail_index,
+                        )
+                    {
+                        compile::merge_backend_terminal_exit_layouts(
+                            &mut terminal_exit_layouts,
+                            &backend_layouts,
+                            &combined_ops,
+                        );
+                    }
+                    let bridge_trace_info = self
+                        .backend
+                        .compiled_trace_info(source_jct.as_ref(), bridge_trace_id);
+                    compile::enrich_guard_resume_layouts_for_trace(
+                        &mut resume_data,
+                        &mut exit_layouts,
+                        bridge_trace_id,
+                        &inputargs,
+                        bridge_trace_info.as_ref(),
+                    );
+                    compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
+                    compile::patch_backend_terminal_recovery_layouts_for_trace(
+                        &mut self.backend,
+                        source_jct.as_ref(),
+                        bridge_trace_id,
+                        &mut terminal_exit_layouts,
+                    );
+                    // Box Identity Phase E.2b parity: see compile_loop site.
+                    let new_high_water = compute_next_global_opref(&inputargs, &combined_ops);
+                    compiled.next_global_opref = compiled.next_global_opref.max(new_high_water);
+                    compiled.traces.insert(
+                        bridge_trace_id,
+                        CompiledTrace {
+                            inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+                            ops: combined_ops,
+                            constants: compiled_constants_typed,
+                            exit_layouts,
+                            terminal_exit_layouts,
+                        },
+                    );
+                }
+                self.warm_state.log_bridge_compile(fail_index);
+                self.stats.bridges_compiled += 1;
+                if let Some(ref hook) = self.hooks.on_compile_bridge {
+                    hook(green_key, fail_index, num_combined_ops);
+                }
+                true
+            }
+            Err(e) => {
+                // Same decline handling as `compile_bridge`: a structural
+                // `Unsupported` reproduces on every retrace of this guard, so
+                // backends that report it as terminal get the guard recorded
+                // and it resolves through blackhole resume from then on.
+                if matches!(e, majit_backend::BackendError::Unsupported(_))
+                    && self.backend.bridge_decline_is_terminal()
+                {
+                    self.declined_bridge_guards
+                        .insert((source_trace_id, fail_index));
+                }
+                self.stats.loops_aborted += 1;
+                let msg = format!("Retrace bridge compilation failed: {e}");
+                crate::debug::log_one("jit-summary", &msg);
+                if let Some(ref cb) = self.hooks.on_compile_error {
+                    cb(green_key, &msg);
                 }
                 self.warm_state.abort_tracing(green_key, false);
                 false
