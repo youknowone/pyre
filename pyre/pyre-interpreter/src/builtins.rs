@@ -5770,8 +5770,11 @@ fn require_setstate_dict(state: PyObjectRef) -> Result<bool, crate::PyError> {
     Ok(true)
 }
 
-/// `interp_exceptions.py:239-241 BaseException.descr_setstate` —
-/// `self.getdict(space).update(state)`.
+/// CPython 3.14 `BaseException.__setstate__` — restore every state entry
+/// through `PyObject_SetAttr`.  PyPy's older `descr_setstate` updates the
+/// instance dict directly, but 3.14 deliberately routes names such as
+/// `args` through their descriptors for backward-compatible exception
+/// pickles.
 fn base_exception_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__setstate__() missing 1 required positional argument: 'self'")
@@ -5782,13 +5785,108 @@ fn base_exception_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     if !require_setstate_dict(w_state)? {
         return Ok(pyre_object::w_none());
     }
-    let w_olddict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(w_self) };
-    if crate::baseobjspace::call_method(w_olddict, "update", &[w_state]).is_null() {
-        if let Some(e) = crate::call::take_call_error() {
-            return Err(e);
-        }
+
+    // `setattr` may allocate and collect.  Root the receiver, state dict, and
+    // the materialised key/value snapshot for the complete PyDict_Next loop.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_self, w_state]);
+    let entries =
+        unsafe { pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(base + 1)) };
+    let entry_base = pyre_object::gc_roots::shadow_stack_len();
+    for &(key, value) in &entries {
+        pyre_object::gc_roots::pin_roots(&[key, value]);
+    }
+    for index in 0..entries.len() {
+        let key = pyre_object::gc_roots::shadow_stack_get(entry_base + index * 2);
+        let value = pyre_object::gc_roots::shadow_stack_get(entry_base + index * 2 + 1);
+        crate::baseobjspace::setattr(pyre_object::gc_roots::shadow_stack_get(base), key, value)?;
     }
     Ok(pyre_object::w_none())
+}
+
+/// CPython 3.14 `AttributeError_getstate` — copy the instance dict, then add
+/// the `name` and `args` slots.  `obj` is intentionally omitted because the
+/// object that triggered an attribute lookup is frequently unpicklable
+/// (GH-103352).
+fn attribute_error_getstate_value(w_self: PyObjectRef) -> PyObjectRef {
+    use pyre_object::interp_exceptions;
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_self]);
+    let stored = unsafe {
+        interp_exceptions::w_exception_peek_dict(pyre_object::gc_roots::shadow_stack_get(base))
+    };
+    let state = if stored.is_null() {
+        pyre_object::w_dict_new()
+    } else {
+        unsafe { pyre_object::w_dict_copy(stored) }
+    };
+    pyre_object::gc_roots::pin_root(state);
+    let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_name = unsafe {
+        interp_exceptions::w_exception_get_name(pyre_object::gc_roots::shadow_stack_get(base))
+    };
+    if !w_name.is_null() {
+        unsafe {
+            pyre_object::w_dict_setitem_str(
+                pyre_object::gc_roots::shadow_stack_get(state_slot),
+                "name",
+                w_name,
+            )
+        };
+    }
+    let w_args = unsafe {
+        interp_exceptions::w_exception_get_args(pyre_object::gc_roots::shadow_stack_get(base))
+    };
+    pyre_object::gc_roots::pin_root(w_args);
+    let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    unsafe {
+        pyre_object::w_dict_setitem_str(
+            pyre_object::gc_roots::shadow_stack_get(state_slot),
+            "args",
+            pyre_object::gc_roots::shadow_stack_get(args_slot),
+        )
+    };
+    pyre_object::gc_roots::shadow_stack_get(state_slot)
+}
+
+fn attribute_error_getstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__getstate__() missing 1 required positional argument: 'self'")
+    })?;
+    Ok(attribute_error_getstate_value(w_self))
+}
+
+/// CPython 3.14 `AttributeError_reduce` — always return the three-item form
+/// so the typed `name` slot survives pickling while `obj` is discarded.
+fn attribute_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__reduce__() missing 1 required positional argument: 'self'")
+    })?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_self]);
+    let cls = crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(base))
+        .map(|p| p.as_ptr())
+        .unwrap_or_else(|| {
+            crate::baseobjspace::exception_getclass(pyre_object::gc_roots::shadow_stack_get(base))
+        });
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_args = unsafe {
+        pyre_object::interp_exceptions::w_exception_get_args(
+            pyre_object::gc_roots::shadow_stack_get(base),
+        )
+    };
+    pyre_object::gc_roots::pin_root(w_args);
+    let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let state = attribute_error_getstate_value(pyre_object::gc_roots::shadow_stack_get(base));
+    pyre_object::gc_roots::pin_root(state);
+    let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    Ok(pyre_object::w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        pyre_object::gc_roots::shadow_stack_get(args_slot),
+        pyre_object::gc_roots::shadow_stack_get(state_slot),
+    ]))
 }
 
 /// `interp_exceptions.py:379-391 W_ImportError.descr_reduce` plus the
@@ -6010,11 +6108,13 @@ fn exc_attribute_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     })?;
     let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
     kwarg_reject_unknown(kwargs, &["name", "obj"], "AttributeError")?;
-    let w_name = kwarg_get(kwargs, "name").unwrap_or_else(pyre_object::w_none);
-    let w_obj = kwarg_get(kwargs, "obj").unwrap_or_else(pyre_object::w_none);
+    // CPython 3.14 retains the distinction between an omitted member (NULL)
+    // and an explicitly supplied `None`; AttributeError_getstate serializes
+    // the latter as `{"name": None}`.
+    let w_name = kwarg_get(kwargs, "name").unwrap_or(std::ptr::null_mut());
+    let w_obj = kwarg_get(kwargs, "obj").unwrap_or(std::ptr::null_mut());
     unsafe {
-        // `self.w_name = w_name` / `self.w_obj = w_obj` (WrappedDefault(None))
-        // — unconditional re-stamp so a repeated `__init__` resets stale slots.
+        // Unconditional re-stamp so a repeated `__init__` resets stale slots.
         interp_exceptions::w_exception_set_name(w_self, w_name);
         interp_exceptions::w_exception_set_attr_obj(w_self, w_obj);
         let args_list = pyre_object::w_list_new(positional.to_vec());
@@ -6868,6 +6968,28 @@ fn make_exc_type_with_init(
                         ns,
                         "__setstate__",
                         make_builtin_function_with_arity("__setstate__", import_error_setstate, 2),
+                    )
+                };
+            }
+            // CPython 3.14 gives AttributeError a producer-specific pickle
+            // state: preserve `name` and `args`, but deliberately omit `obj`.
+            if name == "AttributeError" {
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__getstate__",
+                        make_builtin_function_with_arity(
+                            "__getstate__",
+                            attribute_error_getstate,
+                            1,
+                        ),
+                    )
+                };
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__reduce__",
+                        make_builtin_function_with_arity("__reduce__", attribute_error_reduce, 1),
                     )
                 };
             }
