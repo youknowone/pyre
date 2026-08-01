@@ -2166,6 +2166,49 @@ impl TraceCtx {
         }
     }
 
+    /// Write a normalized element block back over
+    /// `virtualizable_boxes[..len-1]`.
+    ///
+    /// pyjitpl.py:2985-2988 normalizes the list IN PLACE and only then appends
+    /// it:
+    ///
+    /// ```python
+    /// self.remove_consts_and_duplicates(self.virtualizable_boxes,
+    ///                                   len(self.virtualizable_boxes)-1,
+    ///                                   duplicates)
+    /// live_arg_boxes += self.virtualizable_boxes
+    /// ```
+    ///
+    /// so the rewrite is visible to every later reader of
+    /// `virtualizable_boxes`, not just to this merge point's JUMP.
+    /// `collect_jump_args_with_boxes` splices a COPY of the element block into
+    /// the loop-carried list, so the normalization has to be handed back
+    /// explicitly for the two to stay the same list.
+    ///
+    /// They must: the LABEL a later cut mints declares one inputarg per
+    /// element position, while the compiled entry supplies one value per
+    /// element position. A repeat collapses the LABEL by one arg and every
+    /// position after it is fed its predecessor's value.
+    ///
+    /// `elements` is `virtualizable_boxes[..len-1]` after normalization — the
+    /// identity sits outside the `endindex = len - 1` window and is never
+    /// rewritten.
+    pub fn adopt_normalized_virtualizable_elements(&mut self, elements: &[OpRef]) {
+        let Some(boxes) = self.virtualizable_boxes.as_mut() else {
+            return;
+        };
+        let Some(end) = boxes.len().checked_sub(1) else {
+            return;
+        };
+        assert_eq!(
+            end,
+            elements.len(),
+            "adopt_normalized_virtualizable_elements: element block is \
+             virtualizable_boxes[..len-1]",
+        );
+        boxes[..end].copy_from_slice(elements);
+    }
+
     /// [`collect_virtualizable_boxes`] with each slot paired with its declared
     /// [`Type`] (`virtualizable_slot_type`); identity LAST, as always.
     ///

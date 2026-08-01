@@ -2840,6 +2840,21 @@ impl<S: JitState> JitDriver<S> {
                         };
                         if let Some(ctx) = self.meta.trace_ctx() {
                             ctx.remove_consts_and_duplicates_untyped(&mut boxes);
+                            // pyjitpl.py:2985-2988 normalizes
+                            // `self.virtualizable_boxes` IN PLACE and appends
+                            // the mutated list, so the rewrite reaches every
+                            // later reader. The element block is a strict
+                            // SUFFIX of the loop-carried list
+                            // (`collect_jump_args_with_boxes`), so its tail is
+                            // what goes back.
+                            if let Some(n) = vable_boxes
+                                .as_ref()
+                                .map(|b| b.len().saturating_sub(1))
+                                .filter(|n| *n > 0 && *n <= boxes.len())
+                            {
+                                let tail = boxes[boxes.len() - n..].to_vec();
+                                ctx.adopt_normalized_virtualizable_elements(&tail);
+                            }
                         }
                         boxes
                     }
