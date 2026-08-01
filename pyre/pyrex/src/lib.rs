@@ -779,19 +779,11 @@ fn real_main(binary_name: &str) {
             }
         }
         RunMode::Script(path) => {
-            // Under sandbox the script is read through the seam so the controller
-            // VFS mediates it, the same channel module imports use; off sandbox
-            // read bytes first and apply the tokenizer's BOM / PEP 263 decoding.
-            #[cfg(feature = "sandbox")]
-            let source = match importing::read_source_to_string(Path::new(&path)) {
-                Ok(source) => source,
-                Err(e) => {
-                    eprintln!("{binary_name}: cannot open '{path}': {e}");
-                    std::process::exit(1);
-                }
-            };
-            #[cfg(not(feature = "sandbox"))]
-            let source = match std::fs::read(&path) {
+            // The script is read through the import machinery's source
+            // provider, so under sandbox the controller VFS mediates it over
+            // the same channel module imports use.  The bytes then go through
+            // the tokenizer's BOM / PEP 263 decoding in every build.
+            let source = match importing::read_source_bytes(Path::new(&path)) {
                 Ok(bytes) => match pyre_interpreter::decode_source_bytes(&bytes, &path, false) {
                     Ok(source) => source,
                     Err(error) => {

@@ -224,7 +224,7 @@ mod host_fs_provider {
             let p = path.to_string_lossy();
             unsafe { host_is_dir(p.as_ptr(), p.len() as u32) != 0 }
         }
-        fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
             let p = path.to_string_lossy();
             let size = unsafe { host_file_size(p.as_ptr(), p.len() as u32) };
             if size < 0 {
@@ -249,8 +249,7 @@ mod host_fs_provider {
                 )));
             }
             buf.truncate(n as usize);
-            String::from_utf8(buf)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            Ok(buf)
         }
     }
 

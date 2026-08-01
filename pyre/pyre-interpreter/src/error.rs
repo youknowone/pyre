@@ -2899,8 +2899,11 @@ fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
         // On wasm32 the provider is the embedder's — the host-FS bridge for the
         // native-host build, `NullSourceProvider` in a browser — so the same
         // call renders the offending line wherever one is actually reachable.
-        let content =
-            crate::importing::read_source_to_string(std::path::Path::new(filename)).ok()?;
+        let bytes = crate::importing::read_source_bytes(std::path::Path::new(filename)).ok()?;
+        // `linecache` opens with `tokenize.open`, so the BOM and the PEP 263
+        // cookie decide the encoding; a plain UTF-8 read drops the whole line
+        // for a file declaring anything else.
+        let content = crate::compile::decode_source_bytes(&bytes, filename, false).ok()?;
         content
             .lines()
             .nth((lineno - 1) as usize)

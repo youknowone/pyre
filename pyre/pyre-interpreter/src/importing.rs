@@ -108,8 +108,9 @@ pub trait SourceProvider {
     fn is_file(&self, path: &Path) -> bool;
     /// True when `path` names a directory.
     fn is_dir(&self, path: &Path) -> bool;
-    /// Read the whole file at `path` as UTF-8 source.
-    fn read_to_string(&self, path: &Path) -> std::io::Result<String>;
+    /// Read the whole file at `path` as raw bytes.  Source files carry a BOM
+    /// or a PEP 263 cookie, so decoding belongs to the caller, not here.
+    fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>>;
 }
 
 #[cfg(feature = "host_env")]
@@ -148,8 +149,22 @@ fn with_source_provider<R>(f: impl FnOnce(&dyn SourceProvider) -> R) -> R {
 /// uses this so it honours the same jail as the import machinery instead of
 /// reaching `std::fs` for a guest-controlled path.
 #[cfg(feature = "host_env")]
+pub fn read_source_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    with_source_provider(|p| p.read_to_bytes(path))
+}
+
+/// [`read_source_bytes`] decoded as plain UTF-8, for callers that hold a
+/// text file rather than Python source.  Source readers decode through
+/// `decode_source_bytes` instead so the BOM and the PEP 263 cookie apply.
+#[cfg(feature = "host_env")]
 pub fn read_source_to_string(path: &Path) -> std::io::Result<String> {
-    with_source_provider(|p| p.read_to_string(path))
+    let bytes = read_source_bytes(path)?;
+    String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })
 }
 
 #[cfg(all(
@@ -194,8 +209,8 @@ impl SourceProvider for HostFsProvider {
     fn is_dir(&self, path: &Path) -> bool {
         path.is_dir()
     }
-    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
-        host_fs::read_to_string(path)
+    fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        host_fs::read(path)
     }
 }
 
@@ -225,7 +240,7 @@ impl SourceProvider for SeamSourceProvider {
     fn is_dir(&self, path: &Path) -> bool {
         Self::stat_mode(path).is_some_and(|m| m & libc::S_IFMT as u32 == libc::S_IFDIR as u32)
     }
-    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+    fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         use std::os::unix::ffi::OsStrExt;
         fn to_io(e: crate::host_seam::SeamError) -> std::io::Error {
             match e {
@@ -247,8 +262,7 @@ impl SourceProvider for SeamSourceProvider {
             }
         }
         let _ = crate::host_seam::ops::close(fd);
-        String::from_utf8(data)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "source not utf-8"))
+        Ok(data)
     }
 }
 
@@ -265,7 +279,7 @@ impl SourceProvider for NullSourceProvider {
     fn is_dir(&self, _path: &Path) -> bool {
         false
     }
-    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+    fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("no source provider installed: {}", path.display()),
@@ -348,9 +362,9 @@ impl SourceProvider for VfsProvider {
     fn is_dir(&self, path: &Path) -> bool {
         matches!(self.map.get(path), Some(VfsEntry::Dir))
     }
-    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+    fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         match self.map.get(path) {
-            Some(VfsEntry::File(src)) => Ok(src.to_string()),
+            Some(VfsEntry::File(src)) => Ok(src.as_bytes().to_vec()),
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("not in embedded stdlib: {}", path.display()),
@@ -2337,7 +2351,7 @@ fn load_source_module(
     package_dir: Option<&Path>,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let source = with_source_provider(|p| p.read_to_string(pathname)).map_err(|e| {
+    let bytes = with_source_provider(|p| p.read_to_bytes(pathname)).map_err(|e| {
         crate::PyError::new(
             crate::PyErrorKind::ImportError,
             format!("cannot read '{}': {e}", pathname.display()),
@@ -2345,6 +2359,9 @@ fn load_source_module(
     })?;
 
     let pathname_str = pathname.to_string_lossy();
+    // A source file carries its own encoding in a BOM or a PEP 263 cookie; a
+    // bad declaration is the tokenizer's SyntaxError, not an ImportError.
+    let source = crate::compile::decode_source_bytes(&bytes, &pathname_str, false)?;
 
     let _root = pyre_object::gc_roots::push_roots();
     // The two importlib bootstrap sources are imported by the native importer
