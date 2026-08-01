@@ -3393,7 +3393,10 @@ mod tests {
         assert_eq!(bindings["module::_random::Random::genrand32"], expected);
     }
 
+    /// `BUILTIN_WRAPPER_DESCRIPTORS` is only pushed into the binding table off
+    /// wasm32, so the lookup below has nothing to find there.
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn jit_trace_fnaddrs_covers_int_bit_length_gateway_wrapper() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
         let expected =
