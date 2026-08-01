@@ -6,7 +6,7 @@ d[a] = ("idx_a", a)
 assert a in d and b not in d     # identity, not equality
 assert d.get(a)[0] == "idx_a"
 assert len(d) == 1
-assert d.keys() == [a]
+assert len(d.keys()) == 1 and d.keys()[0] is a
 assert d.values() == [("idx_a", a)]
 try:
     iter(d)

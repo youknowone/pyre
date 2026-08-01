@@ -1348,9 +1348,13 @@ pub mod unpack_iter {
     ) -> Result<PyObjectRef, crate::PyError> {
         // Force the type's method table to be built before allocating (the
         // `unpack_iterator` type is not exposed as a module attribute, so
-        // nothing else triggers `type_object()`).
+        // nothing else triggers `type_object()`).  The dict entries and the
+        // TypeDef flags below are constant, so they are installed once: every
+        // `iter_unpack()` call otherwise rewrites the shared type dict, which
+        // both allocates and races other threads reading it.
+        static TYPE_SETUP: std::sync::Once = std::sync::Once::new();
         let iter_type = type_object();
-        unsafe {
+        TYPE_SETUP.call_once(|| unsafe {
             let ns = pyre_object::w_type_get_dict_ptr(iter_type) as PyObjectRef;
             pyre_object::w_dict_setitem_str(ns, "__module__", w_str_new("_struct"));
             pyre_object::w_dict_setitem_str_no_proxy(
@@ -1362,14 +1366,12 @@ pub mod unpack_iter {
                     2,
                 ),
             );
-        }
-        // W_UnpackIter.typedef has no `__new__` in PyPy.  Preserve that
-        // TypeDef shape: the implementation type is returned by `type(it)`
-        // but cannot be instantiated or used as a base class.
-        unsafe {
+            // W_UnpackIter.typedef has no `__new__` in PyPy.  Preserve that
+            // TypeDef shape: the implementation type is returned by `type(it)`
+            // but cannot be instantiated or used as a base class.
             pyre_object::w_type_set_acceptable_as_base_class(iter_type, false);
             pyre_object::w_type_set_disallow_instantiation(iter_type);
-        }
+        });
         // `readbuf_w` may dispatch a Python-level `__buffer__` hook.  Keep
         // both operands rooted across that call and the stable allocation:
         // PyPy's W_UnpackIter stores the live `self.view` lease on the
