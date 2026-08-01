@@ -5002,20 +5002,32 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         return Ok(None);
     }
 
+    // Name every bail, as the CallFn inline path does: a BINARY_OP that stays
+    // residual costs a full interpreter dispatch per execution, and without a
+    // reason line the only observable is the runtime.
+    macro_rules! decline {
+        ($why:expr) => {{
+            if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+                eprintln!("[binop-inline-decline] pc={} why={}", op.pc, $why);
+            }
+            return Ok(None);
+        }};
+    }
+
     let Some(op_kind) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) else {
-        return Ok(None);
+        decline!(format_args!("unknown binary op tag {op_tag}"));
     };
     let Some(dunder) = user_binop_forward_dunder(op_kind) else {
-        return Ok(None);
+        decline!(format_args!("no forward dunder for {op_kind:?}"));
     };
 
     let lhs = r_args[0];
     let rhs = r_args[1];
     let Some(concrete_lhs) = walker_concrete_ref_object(ctx, lhs) else {
-        return Ok(None);
+        decline!("lhs has no concrete ref");
     };
     let Some(concrete_rhs) = walker_concrete_ref_object(ctx, rhs) else {
-        return Ok(None);
+        decline!("rhs has no concrete ref");
     };
 
     // A tagged immediate is an exact builtin `int` with C-level operator slots:
@@ -5027,36 +5039,45 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         && (pyre_object::tagged_int::is_tagged_int(concrete_lhs)
             || pyre_object::tagged_int::is_tagged_int(concrete_rhs))
     {
-        return Ok(None);
+        decline!("tagged immediate operand");
     }
 
     let w_class = unsafe { (*concrete_lhs).w_class };
     if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
-        return Ok(None);
+        decline!("lhs w_class is not a type");
     }
     let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
     if version_tag == 0 {
-        return Ok(None);
+        decline!(format_args!("lhs class {} has no version tag", unsafe {
+            pyre_object::typeobject::w_type_get_name(w_class)
+        }));
     }
 
     let Some(w_typ_r) = pyre_interpreter::typedef::r#type(concrete_rhs) else {
-        return Ok(None);
+        decline!("rhs has no type");
     };
     if !std::ptr::eq(w_class, w_typ_r.as_ptr())
         && unsafe { pyre_object::typeobject::w_type_issubtype(w_typ_r.as_ptr(), w_class) }
     {
-        return Ok(None);
+        decline!("rhs is a proper subclass; its reflected dunder has priority");
     }
 
     let Some(method) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, dunder) })
     else {
-        return Ok(None);
+        decline!(format_args!("{} has no {dunder}", unsafe {
+            pyre_object::typeobject::w_type_get_name(w_class)
+        }));
     };
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
-        return Ok(None);
+        decline!(format_args!(
+            "{}.{dunder} is not inlinable Python code",
+            unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+        ));
     };
     if nparams != 2 {
-        return Ok(None);
+        decline!(format_args!("{}.{dunder} takes {nparams} params", unsafe {
+            pyre_object::typeobject::w_type_get_name(w_class)
+        }));
     }
 
     let arg_concretes = vec![
@@ -5095,7 +5116,9 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         None,
     )?
     else {
-        return Ok(None);
+        decline!(format_args!("callee inline of {}.{dunder} declined", unsafe {
+            pyre_object::typeobject::w_type_get_name(w_class)
+        }));
     };
 
     if matches!(inlined.0, DispatchOutcome::Continue) {
@@ -5105,6 +5128,13 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             ConcreteValue::Ref(obj)
                 if std::ptr::eq(obj, pyre_object::special::w_not_implemented())
         ) {
+            if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+                eprintln!(
+                    "[binop-inline-abort] pc={} why={}.{dunder} returned NotImplemented",
+                    op.pc,
+                    unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+                );
+            }
             return Err(DispatchError::callee_inline_unsupported(op.pc));
         }
         if !result.is_constant() {
