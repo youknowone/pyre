@@ -3388,6 +3388,16 @@ fn bh_result_variant_field_specs(
     let mut specs = Vec::new();
     let mut offset = 8usize;
     for (field_name, field_type_str) in fields {
+        // This builder lays out the variant's own payload rows, which start
+        // past the inherited tag at byte 8.  The registry can also carry the
+        // enum base's synthetic `__discriminant` row (`layout.rs`,
+        // `front/semantic.rs`); emitting it here would place the tag at
+        // offset 8 alongside the payload AND make the caller's
+        // `any(field_key() == "__discriminant")` check skip the slot-0 /
+        // offset-0 tag it synthesizes.  Leave the tag to the caller.
+        if field_name == "__discriminant" {
+            continue;
+        }
         let (field_flag, field_type, field_size) = type_flag_from_str(field_type_str);
         if field_type == majit_ir::value::Type::Void || field_size == 0 {
             continue;

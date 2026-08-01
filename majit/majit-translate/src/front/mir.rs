@@ -1238,6 +1238,22 @@ fn register_synthetic_tuple_metadata(
     }
 }
 
+/// Byte size of the explicit `Result` shell that carries `field_offsets`.
+///
+/// The shell is a non-overlapping `[tag@0 | payload@8 | ...]` laid out by this
+/// module rather than borrowed from Rust's enum layout, so its size follows
+/// from the offsets recorded for it: the last field's offset plus its word.
+/// A fixed 16 would truncate any shell that ever records more than one payload
+/// word.  The floor keeps a tag-only shell at the full `[tag | payload]` width,
+/// matching the `size.max(16)` the codewriter applies to the same shell.
+fn result_shell_size(field_offsets: &std::collections::HashMap<String, u64>) -> u64 {
+    field_offsets
+        .values()
+        .copied()
+        .max()
+        .map_or(16, |last| (last + 8).max(16))
+}
+
 /// Split `A,B<C,D>,[E;2]` at top-level commas only.
 fn split_top_level_type_args(input: &str) -> Vec<&str> {
     let mut out = Vec::new();
@@ -1587,7 +1603,7 @@ fn derive_program_metadata(
                         exact_layouts.insert(
                             base_sid,
                             crate::front::semantic::ExactLayout {
-                                size: Some(16),
+                                size: Some(result_shell_size(&base_offsets)),
                                 align: Some(8),
                                 field_offsets: base_offsets,
                             },
@@ -1660,7 +1676,7 @@ fn derive_program_metadata(
                         record_struct_id(&mut struct_ids, variant_canon.clone(), vsid);
                         if synthetic_result_shell {
                             let exact = crate::front::semantic::ExactLayout {
-                                size: Some(16),
+                                size: Some(result_shell_size(&voffsets)),
                                 align: Some(8),
                                 field_offsets: voffsets,
                             };
