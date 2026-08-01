@@ -4440,23 +4440,6 @@ fn filter_liveness_in_place(
     let nlocals = code.varnames.len();
     let live_markers_out = live_markers.clone();
 
-    // Snapshot original marker contents BEFORE any mutation so that
-    // when multiple Python PCs share a single post-merge `-live-`
-    // marker (possible once `remove_repeated_live` folds adjacent
-    // markers without protection), each PC's narrowing pass reads
-    // the SSA union — not a previously-narrowed set.
-    let original_markers: Vec<Vec<SsaOperand>> = live_markers
-        .iter()
-        .map(|&idx| {
-            ssarepr
-                .insns
-                .get(idx)
-                .and_then(|i| i.live_args())
-                .map(|args| args.to_vec())
-                .unwrap_or_default()
-        })
-        .collect();
-
     // Group `(py_pc, insn_idx)` pairs by `insn_idx` so a shared
     // marker accumulates the UNION of per-PC narrowed sets (resume
     // from any sharing PC reads a conservative superset, which is
@@ -4471,6 +4454,54 @@ fn filter_liveness_in_place(
         }
     }
 
+    // The after-residual-call `-live-` is a resume coordinate of exactly the
+    // same class as the per-PC marker: `get_list_of_active_boxes` reads the
+    // marker AFTER the call whenever `in_a_call` or `after_residual_call`
+    // holds and the one before the op otherwise (`pyjitpl.py:194-198`), and
+    // `compute_liveness` (`liveness.py:19-23`) is one uniform pass over every
+    // `-live-` in the stream.  The LV∩SSA narrowing below is pyre's adaptation
+    // for a tracer that materializes Python-frame slots only; restricting it
+    // to the per-PC markers left the after-call markers naming SSA-live
+    // scratch Ref colors no trace-time writer populates, which read back
+    // `OpRef::NONE` and force the resume snapshot to decline.  Narrow both.
+    let per_pc_markers: std::collections::BTreeSet<usize> =
+        groups.iter().map(|&(insn_idx, _)| insn_idx).collect();
+    let mut after_call_groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    for (py_pc, anchor) in after_call_post_merge.iter().enumerate() {
+        let Some(insn_idx) = *anchor else { continue };
+        if per_pc_markers.contains(&insn_idx) {
+            // Folded onto a per-PC marker — already narrowed by that group.
+            continue;
+        }
+        if let Some(entry) = after_call_groups
+            .iter_mut()
+            .find(|(idx, _)| *idx == insn_idx)
+        {
+            entry.1.push(py_pc);
+        } else {
+            after_call_groups.push((insn_idx, vec![py_pc]));
+        }
+    }
+
+    // Snapshot original marker contents BEFORE any mutation so that
+    // when multiple Python PCs share a single post-merge `-live-`
+    // marker (possible once `remove_repeated_live` folds adjacent
+    // markers without protection), each PC's narrowing pass reads
+    // the SSA union — not a previously-narrowed set.
+    let original_markers: std::collections::BTreeMap<usize, Vec<SsaOperand>> = groups
+        .iter()
+        .chain(after_call_groups.iter())
+        .map(|&(insn_idx, _)| {
+            let args = ssarepr
+                .insns
+                .get(insn_idx)
+                .and_then(|i| i.live_args())
+                .map(|args| args.to_vec())
+                .unwrap_or_default();
+            (insn_idx, args)
+        })
+        .collect();
+
     // #348 Part (2): marker-consistent per-PC color→slot map. A folded marker
     // carries the UNION of its group's Ref colors (`union_r` below); a single
     // PC's `pcdep_color_slots` entry covers only its own colors, so a runtime
@@ -4481,10 +4512,18 @@ fn filter_liveness_in_place(
     // semantics a per-program-point coloring guarantees.
     let mut marker_pcdep: Vec<Vec<(u8, u16, u16)>> = vec![Vec::new(); walker_tracked.len()];
 
-    for (insn_idx, py_pcs) in groups {
+    let all_groups = groups
+        .into_iter()
+        .map(|(insn_idx, py_pcs)| (insn_idx, py_pcs, false))
+        .chain(
+            after_call_groups
+                .into_iter()
+                .map(|(insn_idx, py_pcs)| (insn_idx, py_pcs, true)),
+        );
+    for (insn_idx, py_pcs, after_residual_call) in all_groups {
         // Original snapshot is the same for every PC in the group
         // (they all point at the same marker).
-        let original = &original_markers[py_pcs[0]];
+        let original = &original_markers[&insn_idx];
         let non_register: Vec<SsaOperand> = original
             .iter()
             .filter(|op| !matches!(op, SsaOperand::Register(_)))
@@ -4583,6 +4622,29 @@ fn filter_liveness_in_place(
                 }
                 if portal_ec_reg != u16::MAX {
                     s.insert(portal_ec_reg);
+                }
+                // The call's own result register is defined by the call this
+                // marker follows and holds no Python-frame slot at the marker,
+                // so the frame-slot retain would drop it — yet it is precisely
+                // the register the resume must carry: `get_list_of_active_boxes`
+                // names it explicitly (`ord(self.bytecode[self.pc - 1])`,
+                // `pyjitpl.py:186`) to clear the not-yet-defined box in a paused
+                // caller, and the resumed frame reads it back as the call result.
+                if after_residual_call {
+                    for prev in ssarepr.insns[..insn_idx].iter().rev() {
+                        if prev.is_live() {
+                            continue;
+                        }
+                        if let super::flatten::Insn::Op {
+                            result: Some(result),
+                            ..
+                        } = prev
+                            && result.kind == SsaKind::Ref
+                        {
+                            s.insert(result.index);
+                        }
+                        break;
+                    }
                 }
                 s
             };
@@ -4741,7 +4803,10 @@ fn filter_liveness_in_place(
         // out of `registers_r` range or decode to NONE under the int-typed
         // trace, so the inversion is a no-op the overlay then fills — keeps the
         // map non-empty and the runtime on the correct (overlay) path.
-        {
+        // Only the per-PC marker owns a Python PC's published map: both markers
+        // of one PC share the single `marker_pcdep[py_pc]` entry, and the
+        // runtime inverts a resume color through the PC's own coloring.
+        if !after_residual_call {
             let pcdep = pcdep_color_slots;
             // Publish each member PC's OWN per-PC color→slot entry, NOT
             // the cross-PC union. The folded `-live-` marker's `union_r` makes
