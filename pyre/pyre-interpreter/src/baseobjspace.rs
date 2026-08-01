@@ -2014,25 +2014,9 @@ pub(crate) fn range_count_method(args: &[PyObjectRef]) -> PyResult {
             ));
         }
     }
-    // `space.sequence_count(self, w_item)` — scan the whole sequence, not
-    // merely until the first match.  Keep the counter unbounded like PyPy's
-    // wrapped integer accumulator.
-    let it = iter(obj)?;
-    // The iterator and equality operation can execute Python between
-    // increments; RPython keeps the bigint accumulator in its root map.
-    let mut count = RBigIntGcRoot::new(BigInt::from(0));
-    loop {
-        match next(it) {
-            Ok(item) => {
-                if is_true(compare(item, needle, CompareOp::Eq)?)? {
-                    *count = count.int_add(1);
-                }
-            }
-            Err(e) if e.kind == PyErrorKind::StopIteration => break,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(pyre_object::range_bigint_to_obj(count.translated_alias()))
+    // `space.sequence_count(self, w_item)` — elementwise scan of the whole
+    // sequence.
+    sequence_count(obj, needle)
 }
 
 /// `range.index(value)` — `functional.py W_Range.descr_index`.
@@ -2057,26 +2041,9 @@ pub(crate) fn range_index_method(args: &[PyObjectRef]) -> PyResult {
                 crate::display::py_repr(needle)?
             )));
         }
-        // `space.sequence_index` — elementwise scan.
-        let it = iter(obj)?;
-        let mut i: i64 = 0;
-        loop {
-            match next(it) {
-                Ok(item) => {
-                    if is_true(compare(item, needle, CompareOp::Eq)?)? {
-                        return Ok(w_int_new(i));
-                    }
-                    i += 1;
-                }
-                Err(e) if e.kind == PyErrorKind::StopIteration => break,
-                Err(e) => return Err(e),
-            }
-        }
     }
-    // `space.sequence_index` miss (`descroperation.py` `sequence_index`).
-    Err(PyError::value_error(
-        "sequence.index(x): x not in sequence".to_string(),
-    ))
+    // `space.sequence_index` — elementwise scan (raises ValueError on miss).
+    sequence_index(obj, needle)
 }
 
 /// `descroperation.py:538 sequence_index` — the first index whose element
@@ -2109,6 +2076,62 @@ pub(crate) fn sequence_index(w_container: PyObjectRef, w_item: PyObjectRef) -> P
     Err(PyError::value_error(
         "sequence.index(x): x not in sequence".to_string(),
     ))
+}
+
+/// `descroperation.py:525 sequence_count` — how many elements `eq_w`-match
+/// `w_item` (`w is w_item or w == w_item`), scanning `w_container` through the
+/// iterator protocol.
+pub(crate) fn sequence_count(w_container: PyObjectRef, w_item: PyObjectRef) -> PyResult {
+    let w_iter = iter(w_container)?;
+    // `next`/`eq_w` re-enter Python and may collect; a raw local is not a root,
+    // so the iterator and needle live on the shadow stack.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_iter);
+    let item_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_item);
+    let mut count: i64 = 0;
+    loop {
+        match next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
+            Ok(w_next) => {
+                if eq_w(w_next, pyre_object::gc_roots::shadow_stack_get(item_slot))? {
+                    count += 1;
+                }
+            }
+            Err(e) if e.kind == PyErrorKind::StopIteration => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(w_int_new(count))
+}
+
+/// `descroperation.py:510 sequence_contains` — whether any element `eq_w`-matches
+/// `w_item` (`w is w_item or w == w_item`), scanning `w_container` through the
+/// iterator protocol.
+pub(crate) fn sequence_contains(
+    w_container: PyObjectRef,
+    w_item: PyObjectRef,
+) -> Result<bool, PyError> {
+    let w_iter = iter(w_container)?;
+    // `next`/`eq_w` re-enter Python and may collect; a raw local is not a root,
+    // so the iterator and needle live on the shadow stack.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_iter);
+    let item_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_item);
+    loop {
+        match next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
+            Ok(w_next) => {
+                if eq_w(w_next, pyre_object::gc_roots::shadow_stack_get(item_slot))? {
+                    return Ok(true);
+                }
+            }
+            Err(e) if e.kind == PyErrorKind::StopIteration => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(false)
 }
 
 /// `range.__iter__()` — fresh `range_iterator` (word-fit or bignum cursor).
@@ -17620,19 +17643,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                 return Ok(pyre_object::w_range_contains_bigint(haystack, &item));
             }
             // `space.sequence_contains` — elementwise scan.
-            let it = iter(haystack)?;
-            loop {
-                match next(it) {
-                    Ok(item) => {
-                        if is_true(compare(item, needle, CompareOp::Eq)?)? {
-                            return Ok(true);
-                        }
-                    }
-                    Err(e) if e.kind == PyErrorKind::StopIteration => break,
-                    Err(e) => return Err(e),
-                }
-            }
-            return Ok(false);
+            return sequence_contains(haystack, needle);
         }
     }
     unsafe {
