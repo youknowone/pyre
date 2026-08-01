@@ -93,7 +93,7 @@ BENCH_COMPARE_BUFFER_S = 0.005
 # Windows process CPU accounting advances in scheduler ticks (normally 1/64 s).
 # Keep the execution floor at least one observable tick on that platform.
 WIN_TIMER_QUANTUM_S = 1.0 / 64
-# Empty-program user-CPU startup is MEASURED per interpreter/backend (median of
+# Empty-program user-CPU startup is MEASURED per interpreter/backend (minimum of
 # STARTUP_SAMPLES runs) and subtracted from every timed run before ratios and
 # perf gates are computed, so a large fixed startup — notably wasmtime
 # recompiling the ~14MB module on every process spawn (~0.12s user-CPU) — does
@@ -102,12 +102,22 @@ WIN_TIMER_QUANTUM_S = 1.0 / 64
 # to <= 0 and blow up a ratio.
 #
 # The startup is a divisor for every short bench: the baseline's exec time is
-# `bench - startup`, so a startup sample that lands high collapses that
+# `bench - startup`, so a startup estimate that lands high collapses that
 # denominator and inflates every ratio computed against it.  A CI runner
 # measured pypy startup at 0.031s where the same job on the same platform had
 # measured 0.013s, and three unrelated benches failed their gates in that run
-# while their pyre exec times had gone *down*.  Five samples make the median
-# robust to two outliers instead of one.
+# while their pyre exec times had gone *down*.
+#
+# The estimator is the MINIMUM, not the median, because the quantity is a fixed
+# per-process cost and every source of error on it is one-sided: contention,
+# cache pressure and page faults only ever ADD user CPU.  The minimum of a set
+# of samples of a fixed cost is that cost; the median tracks how loaded the
+# machine was.  That distinction is what raising the sample count cannot buy —
+# under sustained load every sample is inflated, so the median is inflated with
+# them, while the minimum still recovers the floor.  Under-estimating instead is
+# the harmless direction: it inflates both exec times by the same few
+# milliseconds, which is negligible against a bench and cannot collapse a
+# denominator.
 STARTUP_SAMPLES = 5
 EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
 # A single slow sample is retried before failing a performance gate. Windows
@@ -948,7 +958,7 @@ class Check:
         """Measure each timed interpreter/backend's empty-program user-CPU cost.
 
         Runs an empty script STARTUP_SAMPLES times per interpreter and records
-        the median user-CPU in self.startup. This is the fixed per-process cost
+        the minimum user-CPU in self.startup. This is the fixed per-process cost
         (interpreter init; for wasm, wasmtime recompiling the module) added to
         every bench regardless of workload; subtracting it yields an
         execution-only comparison. No-op under --no-startup-subtract.
@@ -980,11 +990,11 @@ class Check:
                         samples = []
                         break
                     samples.append(elapsed)
-                startup = statistics.median(samples) if samples else 0.0
+                startup = min(samples) if samples else 0.0
                 self.startup[key] = startup
                 parts.append(f"{key}={startup:.3f}s")
             print(dim(
-                f"startup (empty-program user-CPU, median {STARTUP_SAMPLES}; "
+                f"startup (empty-program user-CPU, min of {STARTUP_SAMPLES}; "
                 f"ratios/gates are execution-only): " + " ".join(parts)
             ))
         finally:
@@ -1455,10 +1465,23 @@ class Check:
             ratio = "-"
         else:
             ratio = f"{float(exec_m) / float(exec_b):.1f}x"
-        return (
+        # A baseline sitting exactly on EXEC_TIME_FLOOR_S was clamped: the
+        # subtraction put it at or below the floor, so its execution time could
+        # not be separated from its own startup and the ratio computed against
+        # it is an artifact of the clamp rather than a measurement.  Say so on
+        # the line, because the printed denominator otherwise reads like one.
+        clamped = (
+            not self.args.no_startup_subtract
+            and exec_b not in (None, "-")
+            and float(exec_b) <= EXEC_TIME_FLOOR_S
+        )
+        detail = (
             f"exec {exec_m:.2f}s > {baseline} {exec_b:.2f}s  "
             f"ratio {ratio} > gate {float(limit):g}x"
         )
+        if clamped:
+            detail += f"  [{baseline} exec clamped to floor; ratio not a measurement]"
+        return detail
 
     def _run_backend_bench(
         self, backend, name, script, timeout,
