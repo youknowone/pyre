@@ -2493,9 +2493,10 @@ fn build_gc() -> Box<dyn majit_gc::GcAllocator> {
     // `W_ObjectObject.storage` block — the mapdict instance attribute-value
     // array (`mapdict.py:910`, `Ptr(GcArray(OBJECTPTR))`).  Registered as a
     // varsize leaf: the custom trace on the W_ObjectObject instance walks
-    // each boxed storage slot by consulting the map to skip unboxed slots
-    // (`instance_walk_boxed_storage`), and forwards this block pointer to
-    // keep the (non-moving, stable-allocated) block marked live.  The block is
+    // every storage slot (`instance_walk_boxed_storage`) — each one is a
+    // reference, a boxed attribute value or an unboxed attribute's longlong
+    // GcArray — and forwards this block pointer to keep the (non-moving,
+    // stable-allocated) block marked live.  The block is
     // an `ItemsBlock` (`W_ObjectObject.storage`), so its shape is that block's
     // token — the same one tid 9 registers, differing only in the leaf flag.
     // Registered here, immediately after `W_COMPLEX_GC_TYPE_ID = 54`, so it

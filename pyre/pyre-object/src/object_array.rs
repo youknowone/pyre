@@ -28,14 +28,14 @@ pub const GC_FLOAT_ARRAY_GC_TYPE_ID: u32 = 42;
 /// GC type id for the `W_ObjectObject.storage` block — the mapdict instance
 /// attribute-value array (`mapdict.py:910` `self.storage`, a
 /// `Ptr(GcArray(OBJECTPTR))`). Distinct from `PY_OBJECT_ARRAY_GC_TYPE_ID` (9,
-/// list/tuple items) because the mapdict storage is a MIXED array: most slots
-/// are boxed `PyObjectRef`, but a `firstunwrapped` `UnboxedPlainAttribute` slot
-/// holds a raw erased `*mut Vec<i64>` that must NOT be forwarded as an object.
-/// So this tid is registered as a GC **leaf** (`items_have_gc_ptrs=false`) — the
-/// collector does not walk the block's interior; the owning instance's
-/// `object_object_custom_trace` walks it instead, consulting the map to skip
-/// unboxed slots (`instance_walk_boxed_storage`). Registered at the tail of the
-/// tid chain (after `W_COMPLEX_GC_TYPE_ID = 54`) so no hardcoded constant shifts.
+/// list/tuple items) so the block keeps its own identity even though every slot
+/// is now a reference: a boxed attribute's value, or an
+/// `UnboxedPlainAttribute`'s longlong list as a varsize leaf GcArray. The tid is
+/// registered as a GC **leaf** (`items_have_gc_ptrs=false`) — the collector does
+/// not walk the block's interior; the owning instance's
+/// `object_object_custom_trace` walks it (`instance_walk_boxed_storage`).
+/// Registered at the tail of the tid chain (after `W_COMPLEX_GC_TYPE_ID = 54`)
+/// so no hardcoded constant shifts.
 pub const W_MAPDICT_STORAGE_GC_TYPE_ID: u32 = 55;
 
 /// The `(base_size, item_size, len_offset)` triple describing one varsize
@@ -239,30 +239,18 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
 /// the block is safe to expose to the collector immediately. Falls back to the
 /// `std::alloc` [`alloc_items_block`] when no GC hook is installed (pure
 /// interpreter / early startup). A 0-length `values` yields a header-only block.
-pub unsafe fn alloc_instance_items_block(
-    values: &[PyObjectRef],
-    boxed_indices: &[usize],
-) -> *mut ItemsBlock {
+pub unsafe fn alloc_instance_items_block(values: &[PyObjectRef]) -> *mut ItemsBlock {
     let cap = values.len();
     let _roots = crate::gc_roots::push_roots();
-    let boxed_values: Vec<PyObjectRef> = boxed_indices.iter().map(|&i| values[i]).collect();
-    let values_base = crate::gc_roots::pin_roots(&boxed_values);
+    let values_base = crate::gc_roots::pin_roots(values);
     unsafe {
         let block = alloc_mapdict_storage_block(cap);
         crate::gc_roots::pin_root(block as PyObjectRef);
         let block =
-            crate::gc_roots::shadow_stack_get(values_base + boxed_values.len()) as *mut ItemsBlock;
+            crate::gc_roots::shadow_stack_get(values_base + values.len()) as *mut ItemsBlock;
         let base = items_block_items_base(block);
-        let mut boxed_cursor = 0;
         for i in 0..values.len() {
-            if boxed_cursor < boxed_indices.len() && boxed_indices[boxed_cursor] == i {
-                *base.add(i) = crate::gc_roots::shadow_stack_get(values_base + boxed_cursor);
-                boxed_cursor += 1;
-            } else {
-                // Erased unboxed `Vec<i64>` pointer: not a GCREF and therefore
-                // deliberately absent from the shadow stack.
-                *base.add(i) = values[i];
-            }
+            *base.add(i) = crate::gc_roots::shadow_stack_get(values_base + i);
         }
         block
     }
