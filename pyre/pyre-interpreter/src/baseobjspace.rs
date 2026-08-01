@@ -11289,6 +11289,12 @@ pub unsafe fn exception_attr_slot_fold(
         return None;
     }
     let w_type = crate::typedef::r#type(obj)?;
+    // mapdict.py:1495-1499 `LOAD_ATTR_slowpath` — a custom `__getattribute__`
+    // handles the access and never reaches the descriptor, so no slot read is
+    // equivalent to it.
+    if unsafe { getattribute_if_not_from_object(w_type.as_ptr()) }.is_some() {
+        return None;
+    }
     // Any hit other than the class's own `interp_exceptions.py` typedef
     // getset precedes the slot; that one *is* the slot, reached through
     // `exception_attr_get`, so folding past it keeps the same value.  The
