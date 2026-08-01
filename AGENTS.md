@@ -198,7 +198,17 @@ execution-context-local, or genuinely thread-local.
 
 ## Before Committing
 - Always run `cargo check` and `cargo test` with `--features dynasm`.
-- Run full benchmark suite (all 8 benchmarks) after JIT changes - do not commit if any regress.
+- Run the full benchmark suite (all 8 benchmarks) after JIT changes. A regression
+  is a finding to explain, not an automatic veto. The `/parity` skill's
+  Principle 4 governs: *"Performance can temporarily regress. If a benchmark
+  slows down because parity-correct code replaced a clever local shortcut,
+  accept it. Performance is recovered by further line-by-line porting of the
+  upstream optimization, not by reintroducing the shortcut."* So: if the slower
+  code is the line-by-line port and the faster code was the shortcut, the port
+  stands — record the regression and name the upstream optimization that would
+  recover it. Revert only when the regression has no such explanation. This file
+  is loaded every session and Principle 4 is not; do not restate the rule here
+  in a form that contradicts it.
 - Check `git status` and `git rev-parse --show-toplevel` before staging to confirm correct worktree.
 - When rebasing/cherry-picking, verify the fix isn't already on main first (`git log main --grep=...`).
 
