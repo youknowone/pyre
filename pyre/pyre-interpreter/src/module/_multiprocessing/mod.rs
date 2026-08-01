@@ -283,12 +283,18 @@ fn w_semlock_acquire(
 ) -> Result<bool, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::pin_roots(&[self_obj]);
+    // Every field helper can collect — `semlock_get_i64` materialises the
+    // instance dict, `semlock_set_i64` boxes the value — so the receiver is
+    // read back from its slot at each use rather than kept in a local. Only
+    // `pin_roots` normalises a forwarded pointer on the way in; the reads do
+    // not, so a stale binding would have them consult a moved object's dict.
+    let me = || pyre_object::gc_roots::shadow_stack_get(self_slot);
     // check whether we already own the lock
-    if semlock_get_i64(self_obj, "kind") == RECURSIVE_MUTEX && semlock_ismine(self_obj) {
-        semlock_set_i64(self_obj, "count", semlock_get_i64(self_obj, "count") + 1);
+    if semlock_get_i64(me(), "kind") == RECURSIVE_MUTEX && semlock_ismine(me()) {
+        semlock_set_i64(me(), "count", semlock_get_i64(me(), "count") + 1);
         return Ok(true);
     }
-    let handle = semlock_get_handle(self_obj);
+    let handle = semlock_get_handle(me());
     if handle.is_null() {
         return Err(crate::PyError::value_error("SemLock handle is null"));
     }
@@ -297,10 +303,10 @@ fn w_semlock_acquire(
         // `interp_semaphore.py:512-516` — these steps need to be as close as
         // possible to acquiring the semlock for `_ismine` to support multiple
         // threads.  The wait can run signal handlers, so the receiver comes
-        // back off the shadow stack.
-        let self_obj = pyre_object::gc_roots::shadow_stack_get(self_slot);
-        semlock_set_i64(self_obj, "last_tid", crate::module::thread::current_ident());
-        semlock_set_i64(self_obj, "count", semlock_get_i64(self_obj, "count") + 1);
+        // back off the shadow stack, and again after the `last_tid` store
+        // boxes its value.
+        semlock_set_i64(me(), "last_tid", crate::module::thread::current_ident());
+        semlock_set_i64(me(), "count", semlock_get_i64(me(), "count") + 1);
     }
     Ok(got)
 }
@@ -311,27 +317,29 @@ fn w_semlock_acquire(
 fn w_semlock_release(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::pin_roots(&[self_obj]);
-    let kind = semlock_get_i64(self_obj, "kind");
+    // As in `w_semlock_acquire`: every field helper can collect, so the
+    // receiver is read back from its slot at each use.
+    let me = || pyre_object::gc_roots::shadow_stack_get(self_slot);
+    let kind = semlock_get_i64(me(), "kind");
     if kind == RECURSIVE_MUTEX {
-        if !semlock_ismine(self_obj) {
+        if !semlock_ismine(me()) {
             return Err(crate::PyError::new(
                 crate::error::PyErrorKind::AssertionError,
                 "attempt to release recursive lock not owned by thread",
             ));
         }
-        let count = semlock_get_i64(self_obj, "count");
+        let count = semlock_get_i64(me(), "count");
         if count > 1 {
-            semlock_set_i64(self_obj, "count", count - 1);
+            semlock_set_i64(me(), "count", count - 1);
             return Ok(());
         }
     }
-    let handle = semlock_get_handle(self_obj);
+    let handle = semlock_get_handle(me());
     if handle.is_null() {
         return Err(crate::PyError::value_error("SemLock handle is null"));
     }
-    semlock_release(handle, kind, semlock_get_i64(self_obj, "maxvalue"))?;
-    let self_obj = pyre_object::gc_roots::shadow_stack_get(self_slot);
-    semlock_set_i64(self_obj, "count", semlock_get_i64(self_obj, "count") - 1);
+    semlock_release(handle, kind, semlock_get_i64(me(), "maxvalue"))?;
+    semlock_set_i64(me(), "count", semlock_get_i64(me(), "count") - 1);
     Ok(())
 }
 
