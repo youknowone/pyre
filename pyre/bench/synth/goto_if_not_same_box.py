@@ -12,7 +12,7 @@
 # exactly the concrete direction; a wrong predicate would drop the guard for a
 # genuine two-box compare and miscompile. The never-taken arms add a huge
 # sentinel so any wrong direction balloons the checksum.
-N = 1000
+N = 125000
 
 
 def same_box_int():

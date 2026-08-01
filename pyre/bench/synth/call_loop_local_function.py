@@ -14,7 +14,7 @@
 # (regalloc.py:496-499) reached the dynasm and wasm backends.  With the
 # identity guard gone this fixture no longer exercises that bucketing —
 # `bridges_compiled` stays 0 either way.
-N = 20000
+N = 1500000
 
 
 def run(n):
