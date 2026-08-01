@@ -1011,6 +1011,16 @@ fn maybe_print_jit_stats() {
         stats.guard_failures,
         stats.internal_compile_panics,
     );
+    // How those `guard_failures` are distributed: a handful of guards eating
+    // most of them means the deopt keeps returning to the runtime for a guard
+    // that should already have a bridge, while a wide flat spread means many
+    // guards each below `trace_eagerness`. Off unless `MAJIT_GUARD_CENSUS`.
+    if std::env::var_os("MAJIT_GUARD_CENSUS").is_some() {
+        eprintln!(
+            "[jit-stats] {}",
+            majit_metainterp::guard_census_summary(12)
+        );
+    }
     // The descr-universe invariants. `descr_set_stale_absent` re-asks the
     // `AbsentContainer` question against the universe as it stands now, so it
     // has to be read here, after the run published everything it is going to.

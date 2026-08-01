@@ -2063,6 +2063,7 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
         self.stats.guard_failures += 1;
+        crate::guard_census_record(green_key, fail_index);
         self.warm_state.log_guard_failure(fail_index);
         if let Some(ref hook) = self.hooks.on_guard_failure {
             hook(green_key, fail_index, 0);

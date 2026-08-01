@@ -712,6 +712,60 @@ pub fn mc_diag_summary() -> String {
         .join(" ")
 }
 
+/// Per-guard deopt census, keyed by `(green_key, fail_index)`.
+///
+/// `guard_failures` alone cannot tell a guard that keeps returning to the
+/// runtime because no bridge was ever attached to it from a wide spread of
+/// cold guards that each fail below `trace_eagerness`. The two want opposite
+/// fixes, and the distinction is a distribution, not a total.
+///
+/// Off unless `MAJIT_GUARD_CENSUS` is set: the map write sits on the deopt
+/// path, which is exactly the path under study.
+static GUARD_CENSUS: std::sync::Mutex<Option<Vec<((u64, u32), u64)>>> =
+    std::sync::Mutex::new(None);
+
+fn guard_census_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAJIT_GUARD_CENSUS").is_some())
+}
+
+pub fn guard_census_record(green_key: u64, fail_index: u32) {
+    if !guard_census_enabled() {
+        return;
+    }
+    let Ok(mut slot) = GUARD_CENSUS.lock() else {
+        return;
+    };
+    let rows = slot.get_or_insert_with(Vec::new);
+    match rows.iter_mut().find(|(k, _)| *k == (green_key, fail_index)) {
+        Some((_, count)) => *count += 1,
+        None => rows.push(((green_key, fail_index), 1)),
+    }
+}
+
+/// Render the census as `distinct=N total=M` plus the heaviest guards.
+pub fn guard_census_summary(top: usize) -> String {
+    let Ok(slot) = GUARD_CENSUS.lock() else {
+        return "guard_census=lock-poisoned".to_string();
+    };
+    let Some(rows) = slot.as_ref() else {
+        return "guard_census=off".to_string();
+    };
+    let mut rows = rows.clone();
+    rows.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    let total: u64 = rows.iter().map(|(_, c)| c).sum();
+    let heaviest = rows
+        .iter()
+        .take(top)
+        .map(|((key, fail_index), count)| format!("{key}/{fail_index}:{count}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "guard_census distinct={} total={total} top={heaviest}",
+        rows.len()
+    )
+}
+
 /// Read an `MC_DIAG` tally (saturating). Surfaced via `pyre_jit_mc_diag`.
 pub fn mc_diag(i: usize) -> u64 {
     MC_DIAG
