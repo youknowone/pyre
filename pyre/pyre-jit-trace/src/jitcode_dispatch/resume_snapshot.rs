@@ -1264,11 +1264,12 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
         if let Some((_opref, Value::Ref(value))) = ctx.trace_ctx.virtualizable_entry_at(base + slot)
         {
             // Only a positively-resolved (non-null) shadow value is a faithful
-            // stack slot.  The live vstack/color sources above already emit
-            // every genuine null-or-self sentinel they can resolve
-            // (`concrete_ref_for_opref` yields an explicit null Ref for a
-            // PUSH_NULL box).  A slot that reaches this shadow fallback with a
-            // NULL Ref is one the walk could not resolve — e.g. an
+            // stack slot.  The live vstack/color sources above emit a genuine
+            // null-or-self sentinel only where they hold a box for the slot at
+            // all — the `PUSH_NULL` position has none, which is what the
+            // `call_null_or_self_slot` pass below exists to cover.  A slot that
+            // reaches this shadow fallback with a NULL Ref is one the walk could
+            // not resolve — e.g. an
             // unmaterialized `LOAD_CONST` operand whose concrete value was
             // never mirrored — not a real null.  Leaving it ABSENT makes the
             // outer-call flush validation decline, so the legacy replay
@@ -1279,7 +1280,44 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
             }
         }
     }
+    // The `null_or_self` operand a `PUSH_NULL` leaves under a `CALL` is the one
+    // stack slot NO source above can speak for: nothing pushes a value there,
+    // so the walk holds no box and no live color for it, and the shadow's NULL
+    // is the same NULL an unmirrored slot reads back as. It therefore stays
+    // absent and declines the outer-call flush — on a slot whose correct value
+    // is exactly that null. The CALL's own operand layout names it without
+    // guessing: `[callable, null_or_self, arg0 .. arg_{argc-1}]` ends at
+    // `stack_end`, so the sentinel sits `argc + 1` below it, right under the
+    // arguments and right above the callable.
+    if let Some(slot) = call_null_or_self_slot(caller_sym, call_jitcode_pc, stack_end)
+        && slot >= nlocals
+        && !overrides.iter().any(|&(present, _)| present == slot)
+    {
+        overrides.push((slot, std::ptr::null_mut::<u8>() as pyre_object::PyObjectRef));
+    }
     overrides
+}
+
+/// Absolute frame slot holding the `null_or_self` operand of the `CALL` whose
+/// JitCode coordinate is `call_jitcode_pc`, for a caller whose operand stack
+/// ends at `stack_end`. `None` when that coordinate does not invert to a plain
+/// `CALL` — every other resume shape keeps the conservative decline.
+fn call_null_or_self_slot<Sym: WalkSym>(
+    caller_sym: &Sym,
+    call_jitcode_pc: usize,
+    stack_end: usize,
+) -> Option<usize> {
+    let jc = unsafe { caller_sym.jitcode().as_ref()? };
+    let code = unsafe { (jc.payload.code_ptr as *const pyre_interpreter::CodeObject).as_ref()? };
+    let py_pc =
+        crate::jitcode_dispatch::python_pc_for_jitcode_pc(&jc.payload.metadata, call_jitcode_pc)
+            as usize;
+    let (pyre_interpreter::Instruction::Call { argc }, op_arg) =
+        pyre_interpreter::decode_instruction_at(code, py_pc)?
+    else {
+        return None;
+    };
+    stack_end.checked_sub(argc.get(op_arg) as usize + 1)
 }
 
 fn capture_inline_parent_blackhole<Sym: WalkSym>(
