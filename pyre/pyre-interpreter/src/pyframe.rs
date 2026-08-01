@@ -604,26 +604,28 @@ impl FrameBox {
         // translated livevars across the frame allocation. Publish every field
         // before the first GC operation; a contended stable allocation parks
         // this mutator and lets another collector run.
-        let input_roots = [
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
-                frame.ob_header.w_class as usize,
-            )),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.pycode as usize)),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
-                frame.locals_cells_stack_w as usize,
-            )),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.debugdata as usize)),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.lastblock as usize)),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
-                frame.f_generator_nowref as usize,
-            )),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
-                frame.w_yielding_from as usize,
-            )),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.f_backref as usize)),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.w_builtin as usize)),
-            majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame.w_globals as usize)),
-        ];
+        //
+        // One `push_roots(hop)` bracket over the whole set, not ten
+        // independently-owned slots: their lifetime is exactly this function
+        // body, which is the lexical shape `gc_enter_roots_frame` /
+        // `gc_leave_roots_frame` express (`shadowcolor.py:462-606`), and
+        // `pin_roots` is the one-phase publish `push_roots` performs — pinning
+        // them one at a time would query for forwarding after the first write
+        // and let a foreign collection run before the later values were
+        // visible.
+        let frame_root = pyre_object::gc_roots::push_roots();
+        let inputs = pyre_object::gc_roots::pin_roots(&[
+            frame.ob_header.w_class,
+            frame.pycode as pyre_object::PyObjectRef,
+            frame.locals_cells_stack_w as pyre_object::PyObjectRef,
+            frame.debugdata as pyre_object::PyObjectRef,
+            frame.lastblock as pyre_object::PyObjectRef,
+            frame.f_generator_nowref,
+            frame.w_yielding_from,
+            frame.f_backref as pyre_object::PyObjectRef,
+            frame.w_builtin,
+            frame.w_globals,
+        ]);
         let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
             PYFRAME_GC_TYPE_ID,
             std::mem::size_of::<PyFrame>(),
@@ -635,19 +637,20 @@ impl FrameBox {
             // GC operation: a contended barrier is an entry safepoint, so an
             // unrooted fresh frame could otherwise be swept by another
             // collector between this allocation and the barrier below.
-            let frame_root = pyre_object::gc_roots::push_roots();
             pyre_object::gc_roots::pin_root(raw as pyre_object::PyObjectRef);
-            frame.ob_header.w_class = input_roots[0].get().0 as pyre_object::PyObjectRef;
-            frame.pycode = input_roots[1].get().0 as *const ();
+            // Read back through the bracket's own cell rather than
+            // `shadow_stack_get`, which resolves the thread-local per slot.
+            frame.ob_header.w_class = frame_root.get(inputs);
+            frame.pycode = frame_root.get(inputs + 1) as *const ();
             frame.locals_cells_stack_w =
-                input_roots[2].get().0 as *mut pyre_object::FixedObjectArray;
-            frame.debugdata = input_roots[3].get().0 as *mut FrameDebugData;
-            frame.lastblock = input_roots[4].get().0 as *mut FrameBlock;
-            frame.f_generator_nowref = input_roots[5].get().0 as pyre_object::PyObjectRef;
-            frame.w_yielding_from = input_roots[6].get().0 as pyre_object::PyObjectRef;
-            frame.f_backref = input_roots[7].get().0 as *mut PyFrame;
-            frame.w_builtin = input_roots[8].get().0 as pyre_object::PyObjectRef;
-            frame.w_globals = input_roots[9].get().0 as pyre_object::PyObjectRef;
+                frame_root.get(inputs + 2) as *mut pyre_object::FixedObjectArray;
+            frame.debugdata = frame_root.get(inputs + 3) as *mut FrameDebugData;
+            frame.lastblock = frame_root.get(inputs + 4) as *mut FrameBlock;
+            frame.f_generator_nowref = frame_root.get(inputs + 5);
+            frame.w_yielding_from = frame_root.get(inputs + 6);
+            frame.f_backref = frame_root.get(inputs + 7) as *mut PyFrame;
+            frame.w_builtin = frame_root.get(inputs + 8);
+            frame.w_globals = frame_root.get(inputs + 9);
             debug_assert!(pyre_object::gc_hook::try_gc_owns_object(
                 frame.locals_cells_stack_w as *mut u8
             ));
