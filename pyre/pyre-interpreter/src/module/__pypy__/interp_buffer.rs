@@ -229,7 +229,7 @@ impl W_Bufferable {
 
 }
 
-#[crate::pyre_class("__pypy__.PickleBuffer")]
+#[crate::pyre_class("pickle.PickleBuffer")]
 pub struct W_PickleBuffer {
     /// The wrapped buffer-supporting object, or `None` after `release()`.
     w_obj: PyObjectRef,
@@ -314,6 +314,19 @@ impl W_PickleBuffer {
         // Normalize to the raw byte layout via `cast('B')` so an `array('i')`
         // or other non-`'B'` source still yields a byte view.
         crate::module::_pickle::call_meth(mv, "cast", &[pyre_object::unicodeobject::w_str_new("B")])
+    }
+
+    /// PEP 688 exporter slot exposed by CPython 3.14's `pickle.PickleBuffer`.
+    /// Returning the normalized raw view keeps the wrapper's acquired export
+    /// alive until the PickleBuffer itself is released.
+    fn __buffer__(&self, _flags: PyObjectRef) -> Result<PyObjectRef, PyError> {
+        self.raw()
+    }
+
+    /// The view passed to this callback owns only its temporary carrier; the
+    /// PickleBuffer's own export remains active until `release()` or finalise.
+    fn __release_buffer__(&mut self, _view: PyObjectRef) -> Result<(), PyError> {
+        Ok(())
     }
 
     /// `release()` — drop the reference to the underlying buffer.
