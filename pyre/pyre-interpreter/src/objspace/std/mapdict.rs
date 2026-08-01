@@ -1809,6 +1809,11 @@ pub unsafe fn store_attr_add_fast_path(
     {
         return None;
     }
+    // The emitted transition allocates a `storage_needed + 1` block, so spare
+    // capacity would make it a shrink — which is exactly what
+    // `_set_mapdict_storage_and_map` refuses to do. An instance that has had an
+    // attribute deleted therefore keeps the interpreter's add path, which fills
+    // the spare tail in place.
     if unsafe { pyre_object::object_array::items_block_capacity(inst.storage) } != storage_needed {
         return None;
     }
@@ -2307,28 +2312,19 @@ impl MapdictObject for pyre_object::W_ObjectObject {
                 owner._mapdict_write_storage(storageindex, unboxed);
             }
             // mapdict.py:935-938: truncate storage to the parent map's size.
-            // The block is exact-size, so shrink it to a fresh cap-N block; the
-            // dropped tail slots are gone with the old block. NULL-fill is
-            // implicit in `grow_instance_items_block` (new_cap <= live_len here).
+            // The block itself keeps its capacity (see
+            // `_set_mapdict_storage_and_map`); NULL the slots the parent map no
+            // longer names so their values are released.
             None => {
                 let storage_needed = unsafe { (*map).storage_needed() };
                 unsafe {
-                    let owner =
-                        &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
-                    let old = owner.storage;
-                    let old_len = pyre_object::object_array::items_block_capacity(old);
-                    let fresh = pyre_object::object_array::grow_instance_items_block(
-                        old,
-                        storage_needed,
-                        old_len,
-                    );
-                    pyre_object::gc_roots::pin_root(fresh as PyObjectRef);
-                    let fresh_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                    let owner =
-                        &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
-                    owner.storage = pyre_object::gc_roots::shadow_stack_get(fresh_slot) as *mut _;
-                    instance_write_barrier(owner as *mut Self as PyObjectRef);
-                    pyre_object::object_array::dealloc_instance_items_block(old);
+                    let cap = pyre_object::object_array::items_block_capacity(self.storage);
+                    if cap > storage_needed {
+                        let base = pyre_object::object_array::items_block_items_base(self.storage);
+                        for i in storage_needed..cap {
+                            *base.add(i) = pyre_object::PY_NULL;
+                        }
+                    }
                 }
             }
         }
@@ -2339,41 +2335,65 @@ impl MapdictObject for pyre_object::W_ObjectObject {
     }
     fn _set_mapdict_increase_storage1(&mut self, map: MapRef, value: PyObjectRef) {
         // grow storage by one, append value (mapdict.py:942-959). The first
-        // grow allocates the storage block (was `None`). The block is exact-size,
-        // so `old_len` is the current capacity and the new block has one more slot.
+        // grow allocates the storage block (was `None`). The new attribute's
+        // index comes from the map, not from the block's capacity: a delete
+        // leaves the capacity above `storage_needed()` (see
+        // `_set_mapdict_storage_and_map`), and that spare tail is where this
+        // write lands, so no block is allocated until the map outgrows it.
         let _roots = pyre_object::gc_roots::push_roots();
         let livevars = vec![self as *const Self as PyObjectRef, value];
         let self_slot = pyre_object::gc_roots::pin_roots(&livevars);
         let value_slot = self_slot + 1;
+        let needed = unsafe { (*map).storage_needed() };
         unsafe {
             let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
             let old = owner.storage;
-            let old_len = pyre_object::object_array::items_block_capacity(old);
-            let block =
-                pyre_object::object_array::grow_instance_items_block(old, old_len + 1, old_len);
-            pyre_object::gc_roots::pin_root(block as PyObjectRef);
-            let block_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            let block = pyre_object::gc_roots::shadow_stack_get(block_slot)
-                as *mut pyre_object::object_array::ItemsBlock;
+            let old_cap = pyre_object::object_array::items_block_capacity(old);
+            let block = if needed <= old_cap {
+                old
+            } else {
+                let grown =
+                    pyre_object::object_array::grow_instance_items_block(old, needed, old_cap);
+                pyre_object::gc_roots::pin_root(grown as PyObjectRef);
+                let block_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                pyre_object::gc_roots::shadow_stack_get(block_slot)
+                    as *mut pyre_object::object_array::ItemsBlock
+            };
             let base = pyre_object::object_array::items_block_items_base(block);
-            *base.add(old_len) = pyre_object::gc_roots::shadow_stack_get(value_slot);
+            *base.add(needed - 1) = pyre_object::gc_roots::shadow_stack_get(value_slot);
             let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
             owner.storage = block;
             owner.map = map as *const u8;
             instance_write_barrier(owner as *mut Self as PyObjectRef);
-            pyre_object::object_array::dealloc_instance_items_block(old);
+            if !std::ptr::eq(block, old) {
+                pyre_object::object_array::dealloc_instance_items_block(old);
+            }
         }
     }
     fn _set_mapdict_storage_and_map(&mut self, storage: Vec<PyObjectRef>, map: MapRef) {
         // mapdict.py:961-964. The incoming `Vec` comes from a lightweight
         // `Object` carrier (delete/copy transplant); convert it to a fresh
-        // exact-size storage block, freeing any prior block.
+        // storage block, freeing any prior block.
+        //
+        // A delete arrives here with fewer values than the instance already
+        // holds, but the block never shrinks. `_mapdict_read_storage` indexes
+        // without a bounds check, and the JIT folds an attribute access to that
+        // bare `storage[storageindex]` load with its map guard checked *before*
+        // it — so with no process GIL a concurrent shrink could leave a
+        // just-validated index past the new block's capacity. A monotone
+        // capacity keeps every index the guard ever accepted in range; the
+        // reader's worst case becomes a stale slot value, which is what an
+        // unsynchronised attribute read means anyway. The spare tail is NULL,
+        // so the dropped attributes' values are still released.
         let _roots = pyre_object::gc_roots::push_roots();
         let self_slot = pyre_object::gc_roots::pin_roots(&[self as *const Self as PyObjectRef]);
         unsafe {
             let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
             let old = owner.storage;
-            let fresh = pyre_object::object_array::alloc_instance_items_block(&storage);
+            let cap = storage
+                .len()
+                .max(pyre_object::object_array::items_block_capacity(old));
+            let fresh = pyre_object::object_array::alloc_instance_items_block(&storage, cap);
             pyre_object::gc_roots::pin_root(fresh as PyObjectRef);
             let fresh_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);

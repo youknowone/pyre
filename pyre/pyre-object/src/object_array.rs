@@ -232,15 +232,16 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
 // Therefore its inputs and fresh result need the same shadow-stack publication
 // as nursery allocation.
 
-/// Allocate a fresh stable `ItemsBlock` holding `values`, tagged
-/// `W_MAPDICT_STORAGE_GC_TYPE_ID` (leaf). Capacity is exactly `values.len()`
-/// (mapdict grows one attribute at a time, mapdict.py:942-959; the map is the
-/// length authority so no overallocation is needed). Every slot is written, so
-/// the block is safe to expose to the collector immediately. Falls back to the
-/// `std::alloc` [`alloc_items_block`] when no GC hook is installed (pure
-/// interpreter / early startup). A 0-length `values` yields a header-only block.
-pub unsafe fn alloc_instance_items_block(values: &[PyObjectRef]) -> *mut ItemsBlock {
-    let cap = values.len();
+/// Allocate a fresh stable `ItemsBlock` holding `values` in its first slots and
+/// NULL in the rest, tagged `W_MAPDICT_STORAGE_GC_TYPE_ID` (leaf). The map is
+/// the length authority (mapdict.py:942-959), so `cap` is an allocation bound
+/// rather than a length; a live instance passes the larger of its current
+/// capacity and `values.len()` so the capacity never shrinks. Every slot is
+/// written, so the block is safe to expose to the collector immediately. Falls
+/// back to the `std::alloc` [`alloc_items_block`] when no GC hook is installed
+/// (pure interpreter / early startup). `cap` 0 yields a header-only block.
+pub unsafe fn alloc_instance_items_block(values: &[PyObjectRef], cap: usize) -> *mut ItemsBlock {
+    debug_assert!(cap >= values.len());
     let _roots = crate::gc_roots::push_roots();
     let values_base = crate::gc_roots::pin_roots(values);
     unsafe {
@@ -251,6 +252,9 @@ pub unsafe fn alloc_instance_items_block(values: &[PyObjectRef]) -> *mut ItemsBl
         let base = items_block_items_base(block);
         for i in 0..values.len() {
             *base.add(i) = crate::gc_roots::shadow_stack_get(values_base + i);
+        }
+        for i in values.len()..cap {
+            *base.add(i) = PY_NULL;
         }
         block
     }
