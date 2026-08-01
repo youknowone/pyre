@@ -1355,15 +1355,11 @@ fn call_callable_with_mode(
         }
         // `user_call_slot`'s stack_check bounds a self-referential
         // `A.__call__ = A()` chain only while this self-dispatch recurses
-        // natively.  Left in tail position it is a candidate for LLVM's
-        // sibling-call optimization, which rewrites it into a loop that never
-        // grows the native stack — then neither the SP check nor the depth
-        // counter trips and the chain spins forever.  The black_box barrier
-        // keeps the call off the tail so the stack grows and the check fires.
-        // (The RPython C backend does not perform this optimization, so there
-        // is no matching guard upstream.)
-        let result = call_callable_with_mode(frame, target, args, mode);
-        return std::hint::black_box(result);
+        // natively.  The call-depth guard counts this dispatch level and, by
+        // dropping only after the call returns, keeps it off the tail so LLVM
+        // cannot rewrite the self-call into a loop that never grows the stack.
+        let _depth_guard = increment_call_depth();
+        return call_callable_with_mode(frame, target, args, mode);
     }
 
     // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
@@ -2602,11 +2598,11 @@ pub fn call_with_kwargs(
             call_args.extend_from_slice(pos_args);
             return call_with_kwargs(frame, target, &call_args, kwargs);
         }
-        // black_box: keep this self-dispatch off the tail so a self-referential
-        // `A.__call__ = A()` recurses natively for stack_check (see
-        // call_callable_with_mode).
-        let result = call_with_kwargs(frame, target, pos_args, kwargs);
-        return std::hint::black_box(result);
+        // Depth guard: count this dispatch level and, dropping after the call,
+        // keep it off the tail so a self-referential `A.__call__ = A()`
+        // recurses natively for stack_check (see call_callable_with_mode).
+        let _depth_guard = increment_call_depth();
+        return call_with_kwargs(frame, target, pos_args, kwargs);
     }
 
     // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
@@ -2803,11 +2799,11 @@ pub fn call_function_impl_result(
                 call_args.extend_from_slice(args);
                 return call_function_impl_result(target, &call_args);
             }
-            // black_box: keep this self-dispatch off the tail so a
-            // self-referential `A.__call__ = A()` recurses natively for
-            // stack_check (see call_callable_with_mode).
-            let result = call_function_impl_result(target, args);
-            return std::hint::black_box(result);
+            // Depth guard: count this dispatch level and, dropping after the
+            // call, keep it off the tail so a self-referential
+            // `A.__call__ = A()` recurses natively for stack_check.
+            let _depth_guard = increment_call_depth();
+            return call_function_impl_result(target, args);
         }
     }
     let type_name = crate::typedef::r#type(callable)

@@ -2098,6 +2098,38 @@ pub(crate) fn range_index_method(args: &[PyObjectRef]) -> PyResult {
     ))
 }
 
+/// `descroperation.py:538 sequence_index` — the first index whose element
+/// `eq_w`-matches `w_item` (`w is w_item or w == w_item`), iterating
+/// `w_container` through the iterator protocol; a miss raises `ValueError`.
+pub(crate) fn sequence_index(w_container: PyObjectRef, w_item: PyObjectRef) -> PyResult {
+    let w_iter = iter(w_container)?;
+    // `next`/`eq_w` re-enter Python (`__next__`/`__eq__`) and may collect while
+    // the iterator and needle are still needed on the next turn; a raw local is
+    // not scanned by the collector, so both live on the shadow stack.  (RPython
+    // stack slots are GC roots; Rust's are not.)
+    let _roots = pyre_object::gc_roots::push_roots();
+    let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_iter);
+    let item_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_item);
+    let mut index: i64 = 0;
+    loop {
+        match next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
+            Ok(w_next) => {
+                if eq_w(w_next, pyre_object::gc_roots::shadow_stack_get(item_slot))? {
+                    return Ok(w_int_new(index));
+                }
+                index += 1;
+            }
+            Err(e) if e.kind == PyErrorKind::StopIteration => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(PyError::value_error(
+        "sequence.index(x): x not in sequence".to_string(),
+    ))
+}
+
 /// `range.__iter__()` — fresh `range_iterator` (word-fit or bignum cursor).
 pub(crate) fn range_iter_method(args: &[PyObjectRef]) -> PyResult {
     iter(args[0])

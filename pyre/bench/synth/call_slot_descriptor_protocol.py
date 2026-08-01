@@ -22,6 +22,20 @@ class UsesInstance:
 assert UsesInstance()(1, 2) == (1, 2)
 
 
+# a real descriptor as __call__ — its __get__ resolves to a different callable,
+# which is then called without a host self
+class ResolvingDescriptor:
+    def __get__(self, obj, owner):
+        return lambda x: ("resolved", type(obj).__name__, x)
+
+
+class UsesDescriptor:
+    __call__ = ResolvingDescriptor()
+
+
+assert UsesDescriptor()(6) == ("resolved", "UsesDescriptor", 6)
+
+
 # already-bound method as __call__ — bound to its own receiver, no host self
 class Holder:
     def m(self, x):
@@ -58,6 +72,18 @@ class UsesInstanceKw:
 
 
 assert UsesInstanceKw()(1, x=2) == ((1,), {"x": 2})
+
+
+class ResolvingDescriptorKw:
+    def __get__(self, obj, owner):
+        return lambda a, b=0: ("resolved", a, b)
+
+
+class UsesDescriptorKw:
+    __call__ = ResolvingDescriptorKw()
+
+
+assert UsesDescriptorKw()(1, b=2) == ("resolved", 1, 2)
 
 
 class HolderKw:
