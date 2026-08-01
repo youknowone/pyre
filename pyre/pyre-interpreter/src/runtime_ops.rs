@@ -1217,10 +1217,12 @@ pub extern "C" fn jit_sequence_getitem(seq: i64, index: i64) -> i64 {
 pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObjectRef>, PyError> {
     // Fast path only for exact built-in sequence types. Subclasses and other
     // instances may define custom `__iter__` that must be honored.
-    // `ceval.c UNPACK_SEQUENCE` takes its length-aware fast path for an exact
-    // tuple or list only, and only there does a "too many" error name the
-    // source's total. A str is unpacked by the generic iterator loop, which
-    // stops one item past `count` and so has no total to report.
+    // CPython 3.14 `ceval.c:_PyEval_UnpackIterableStackRef` reports the total
+    // for exact lists, tuples, and dicts after finding one excess item.  Dicts
+    // still need the iterator path to produce keys, so their exact length is
+    // handled in the excess-item arm below rather than by `sequence_getitem`.
+    // A str is unpacked by the generic iterator loop, which stops one item past
+    // `count` and so has no total to report.
     let (exact_sequence_len, reports_total) = unsafe {
         if pyre_object::is_exact_tuple(seq) {
             (Some(w_tuple_len(seq)), true)
@@ -1267,6 +1269,22 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
         match crate::baseobjspace::next(iter) {
             Ok(val) => {
                 if items.len() == count {
+                    // CPython 3.14 ceval.c:2313-2320 checks the original
+                    // object's exact builtin kind only after `PyIter_Next`
+                    // found the first excess item.  Lists and tuples took the
+                    // fast path above; exact dicts reach this iterator path.
+                    // Keep dict subclasses generic so their `__len__` is not
+                    // observed and the message has no total.
+                    if unsafe {
+                        pyre_object::is_exact_type(seq, &pyre_object::DICT_TYPE)
+                    } {
+                        let len = unsafe { pyre_object::w_dict_len(seq) };
+                        if len > count {
+                            return Err(PyError::value_error(format!(
+                                "too many values to unpack (expected {count}, got {len})"
+                            )));
+                        }
+                    }
                     return Err(PyError::value_error(format!(
                         "too many values to unpack (expected {count})"
                     )));
