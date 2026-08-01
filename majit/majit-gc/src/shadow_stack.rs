@@ -876,6 +876,29 @@ pub fn jf_depth() -> usize {
 /// custom_trace), exactly as in RPython where `root_walker.walk_roots()`
 /// copies the jitframe, and then `jitframe_trace` (custom_trace hook)
 /// traces the gcmap-indicated ref slots during Phase 2.
+///
+/// The marker word is stepped over, not consumed. `walk_stack_root`
+/// (`shadowstack.py:44-70`) treats an odd slot as a skip bitmask: on a minor
+/// collection it negates an unmarked one and *returns* at an already-marked
+/// one, so the walk stops instead of descending further. Porting that loop
+/// here would be porting a no-op. Upstream keeps one root stack per thread, so
+/// the stoppers the JIT writes sit interleaved among interpreter roots and
+/// returning early skips those; this stack holds jitframe pointers only, and
+/// the deep interpreter stacks (`pyre_object::gc_roots`, `SHADOW_STACK`)
+/// carry no stopper to stop on. The early return becomes reachable once those
+/// stacks are one stack, not before.
+///
+/// It would also be unsound on its own: upstream disables the optimization for
+/// the first minor collection after a thread switch
+/// (`can_look_at_partial_stack`, `shadowstack.py:112-126`) and whenever the
+/// nursery holds objects pinned before the previous minor collection
+/// (`any_pinned_object_from_earlier`, `incminimark.py:1996-2006`). Neither
+/// condition has a counterpart here — `Collector::pinned_objects` does not
+/// distinguish pins carried over from an earlier cycle.
+///
+/// The marker is still written, by every backend, because the two-word entry
+/// is the layout the merge converges on; `test_jf_flat_array_layout` is what
+/// currently holds the writers to it.
 pub fn walk_jf_roots(mut visitor: impl FnMut(&mut GcRef)) {
     JF_ROOT_STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
