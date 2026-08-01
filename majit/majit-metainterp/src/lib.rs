@@ -89,7 +89,6 @@ pub mod optimize;
 pub mod optimizeopt;
 pub(crate) mod parity;
 mod pyjitpl;
-pub mod quasiimmut;
 pub mod recorder;
 pub mod resoperation;
 pub mod resume;
@@ -160,7 +159,6 @@ pub use pyjitpl::{
     set_record_inline_application_traceback_hook, struct_fields_write_effect_info, trace_jitcode,
     trace_jitcode_from_merge_point, trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
-pub use quasiimmut::QuasiImmut;
 pub use resume_box_reader::{
     BridgeVirtualCache, decode_fieldnum, default_bridge_array_descr, emit_pending_field_op,
     materialize_bridge_virtual, rebuilt_value_to_opref, replay_pending_fields,

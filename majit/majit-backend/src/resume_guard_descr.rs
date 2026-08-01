@@ -28,9 +28,7 @@
 //!   `bridge_dispatch_load()` necessarily holds such an `Arc` for the
 //!   borrow lifetime, so drop cannot interleave with the load → retain
 //!   window.
-//! - The only background thread spawned by the driver
-//!   (`jitdriver.rs:762 invalidation_thread`) touches a
-//!   `Mutex<QuasiImmut>` and never reaches into `ResumeGuardDescr`.
+//! - The driver spawns no background thread at all.
 //!
 //! These three facts together close the race CodeRabbit and Codex
 //! flagged on PR #68 (Critical #6/#10/#13).  Any future change that
