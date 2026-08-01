@@ -503,20 +503,36 @@ pub fn push(gcref: GcRef) -> usize {
 
 /// Pop entries from the shadow stack back to the given depth.
 ///
+/// `shadowstack.py:86-90 decr_stack` moves `root_stack_top` and returns it;
+/// the popped slots are not read back, and `pop_stack` (`:104-106`) is the
+/// separate operation for callers that want the value.  Shortening in place
+/// mirrors that.  Returning the popped entries instead — `Vec::split_off`,
+/// which this was — makes every root-scope exit a `malloc` + `memcpy` and
+/// leaves the caller a `free`, and no caller reads the result.
+///
+/// `depth` is asserted rather than saturated: every caller pairs this with a
+/// depth it pushed, so a too-large `depth` is an unbalanced scope, and
+/// silently shortening to nothing would strand roots the collector still
+/// needs.  A plain `assert!` and not `debug_assert!` — this crate is
+/// extracted to LLBC, where debug assertions are compiled in.
+///
 /// TODO: Rust drops thread-locals in reverse order on
 /// thread exit, and a TLS-owned `Drop` (e.g. `JitDriver`'s) may call
 /// this during its own teardown. If
 /// `SHADOW_STACK`'s destructor has already fired, `.with()` panics with
 /// `AccessError`. RPython has no analogous hazard — the GIL thread does
-/// not tear down TLS mid-run. Silently return an empty Vec so the
-/// exiting thread proceeds.
-pub fn pop_to(depth: usize) -> Vec<GcRef> {
-    SHADOW_STACK
-        .try_with(|ss| {
-            let mut ss = ss.borrow_mut();
-            ss.entries.split_off(depth)
-        })
-        .unwrap_or_default()
+/// not tear down TLS mid-run. Silently do nothing so the exiting thread
+/// proceeds.
+pub fn pop_to(depth: usize) {
+    let _ = SHADOW_STACK.try_with(|ss| {
+        let mut ss = ss.borrow_mut();
+        assert!(
+            depth <= ss.entries.len(),
+            "shadow stack pop_to({depth}) above depth {}",
+            ss.entries.len(),
+        );
+        ss.entries.truncate(depth);
+    });
 }
 
 /// Like `pop_to` but silently no-ops if the shadow stack thread-local
@@ -1432,11 +1448,22 @@ mod tests {
         push(b);
         assert_eq!(super::depth(), 2);
 
-        let popped = pop_to(depth);
-        assert_eq!(popped.len(), 2);
-        assert_eq!(popped[0], a);
-        assert_eq!(popped[1], b);
+        assert_eq!(super::get(0), a);
+        assert_eq!(super::get(1), b);
+
+        pop_to(depth);
         assert_eq!(super::depth(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "shadow stack pop_to")]
+    fn test_pop_to_above_depth_panics() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        clear();
+        push(GcRef(0x1000));
+        // An unbalanced scope must not silently no-op: truncating past the
+        // top would strand the roots below it.
+        pop_to(5);
     }
 
     #[test]
