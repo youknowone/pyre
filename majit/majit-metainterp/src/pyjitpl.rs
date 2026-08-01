@@ -12333,22 +12333,20 @@ impl<M: Clone> MetaInterp<M> {
         // RPython pyjitpl.py:2609 `create_history(max_num_inputargs)` — the
         // MetaInterp owns the history factory on the bridge path too.
         let recorder = crate::recorder::Trace::with_input_types(bridge_input_types);
-        // resume.py:1267-1282 `load_box_from_cpu`:
+        // No deadframe stamping here. `resume.py:1267-1282 load_box_from_cpu`
+        // runs once per LIVE box while `rebuild_from_resumedata` walks the
+        // resume data, not once per `fail_arg_types` slot, and `compile_bridge`
+        // already does exactly that: it zips `liveboxes` with `frontend_boxes`
+        // under `bridgeopt.py:126 assert len(frontend_boxes) == len(liveboxes)`
+        // and stamps only the InputArg whose OpRef IS a livebox.
         //
-        //     box = IntFrontendOp(num, self.cpu.get_int_value(self.deadframe, num))
-        //
-        // The frontend box for a resumed live value is CONSTRUCTED carrying
-        // the concrete value read out of the deadframe — that value is what
-        // `virtualstate.py:493-498` reads back as `runtime_box.getint()` when
-        // it decides whether an extra `int_ge`/`int_le` guard can bridge the
-        // gap to a target label's `IntBound`. Stamping the bridge's input
-        // boxes here is the same construction: `fail_values` IS the deadframe,
-        // in `fail_arg_types` order.
-        for (ia, &raw) in recorder.inputargs().iter().zip(fail_values.iter()) {
-            if ia.tp != Type::Void {
-                ia.set_value(heap_value_for(ia.tp, raw));
-            }
-        }
+        // Stamping every slot positionally instead gives a value to slots the
+        // resume data never resurrected. A dead Ref slot then reads back as the
+        // constant NULL, `virtualstate.py:400-405` finds it equal to a target
+        // label's LEVEL_CONSTANT and appends a GUARD_VALUE pinning it — a guard
+        // on a value nothing keeps stable. Measured on `defaults_reassigned_
+        // midloop`: 4 extra GUARD_VALUEs (two of them on `ptr(0x0)`),
+        // guard_failures 404 -> 812, bridges_compiled 2 -> 4.
         // compile.py:725-731 `_trace_and_compile_from_bridge`:
         //     loop_token = self.rd_loop_token.loop_token_wref()
         //     force_finish_trace = False
