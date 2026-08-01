@@ -453,7 +453,17 @@ pub struct CompiledWasmLoop {
     pub token_number: u64,
     pub trace_id: u64,
     pub input_types: Vec<Type>,
-    pub func_handle: u32,
+    /// Shared-table slot of the materialized wasm function.  Straight-line
+    /// function-entry traces may keep this at zero until their first actual
+    /// execution: an invalidated trace that never reaches `execute_token`
+    /// must not pay the host Wasmtime compilation cost.
+    pub(crate) func_handle: Cell<u32>,
+    /// Encoded module retained until lazy host materialization.  This is
+    /// backend assembler state, not metainterpreter state: the optimized trace
+    /// and all per-token descriptors have already been installed exactly as
+    /// in the eager path.
+    #[cfg_attr(any(not(target_arch = "wasm32"), target_os = "wasi"), allow(dead_code))]
+    pub(crate) pending_wasm_bytes: RefCell<Option<Vec<u8>>>,
     /// This loop's own guard/finish exit descriptors (positions `[0,
     /// num_guard_cells)`, per-trace order), followed by the descr slices of
     /// every chained bridge `compile_bridge` appended (positional bookkeeping
@@ -553,6 +563,43 @@ pub struct CompiledWasmLoop {
 }
 
 impl CompiledWasmLoop {
+    pub fn eager_func_handle(&self) -> u32 {
+        self.func_handle.get()
+    }
+
+    /// Materialize a lazily-installed root trace.  The wasm host is
+    /// single-threaded, matching the RefCell/Cell ownership used throughout
+    /// this structure, so one trace can only cross this gate once.
+    pub fn materialize_func_handle(&self) -> Result<u32, majit_backend::BackendError> {
+        let current = self.func_handle.get();
+        if current != 0 {
+            return Ok(current);
+        }
+        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        {
+            return Ok(0);
+        }
+        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        {
+            let pending = self.pending_wasm_bytes.borrow();
+            let Some(bytes) = pending.as_deref() else {
+                return Err(majit_backend::BackendError::Unsupported(
+                    "wasm trace has neither a function handle nor pending module bytes".into(),
+                ));
+            };
+            let handle = crate::glue::compile_module_cached(bytes);
+            if handle == 0 {
+                return Err(majit_backend::BackendError::Unsupported(
+                    "wasm host rejected the lazily compiled trace module".into(),
+                ));
+            }
+            self.func_handle.set(handle);
+            drop(pending);
+            self.pending_wasm_bytes.borrow_mut().take();
+            Ok(handle)
+        }
+    }
+
     /// Incorporate the normal (non-CA unless this bridge is the candidate)
     /// codegen census for a bridge after it has been chained onto this token.
     /// Every earlier bridge remains reachable from a later CA recursion's
@@ -579,7 +626,7 @@ impl Drop for CompiledWasmLoop {
             for &id in &self.label_descrs {
                 if id != 0 {
                     if let Some(t) = map.get(&id) {
-                        if t.func_handle == self.func_handle {
+                        if t.func_handle == self.func_handle.get() {
                             map.remove(&id);
                             crate::BRIDGE_DIAG[22]
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -600,7 +647,8 @@ mod tests {
             token_number: 0,
             trace_id: 0,
             input_types: Vec::new(),
-            func_handle: 0,
+            func_handle: Cell::new(0),
+            pending_wasm_bytes: RefCell::new(None),
             fail_descrs: RefCell::new(Vec::new()),
             num_inputs: 0,
             max_output_slots: 0,

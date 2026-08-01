@@ -63,6 +63,18 @@ pub fn jit_execute_count() -> u64 {
     glue::jit_execute_count()
 }
 
+/// Number of host modules materialized after the lazy-install gate.
+#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+pub fn jit_compile_count() -> u64 {
+    glue::jit_compile_count()
+}
+
+/// Number of materializations served by the byte-identical module cache.
+#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+pub fn jit_compile_cache_hits() -> u64 {
+    glue::jit_compile_cache_hits()
+}
+
 #[inline]
 fn diag_bump(i: usize) {
     BRIDGE_DIAG[i].fetch_add(1, Ordering::Relaxed);
@@ -1371,7 +1383,7 @@ fn general_int_call_assembler_target(
             return None;
         }
         let target_token = descr.call_target_token()?;
-        let registered = call_assembler_target(target_token)?;
+        let mut registered = call_assembler_target(target_token)?;
         let target = if let Some(self_) = pending_self.as_ref().filter(|self_| {
             target_token == self_.token_number
                 // A self target must be precisely the placeholder installed
@@ -1406,6 +1418,25 @@ fn general_int_call_assembler_target(
                 has_trampoline_calls: false,
             }
         } else {
+            // A straight-line function trace may have deferred host module
+            // compilation. CALL_ASSEMBLER is its first real consumer, so
+            // materialize it before baking the stable dispatch entry.
+            if registered.func_handle == 0 && registered.compiled_ptr != 0 {
+                let loop_ =
+                    unsafe { (registered.compiled_ptr as *const CompiledWasmLoop).as_ref() }?;
+                let handle = loop_.materialize_func_handle().ok()?;
+                if handle == 0 {
+                    return None;
+                }
+                registered.func_handle = handle;
+                ca_dispatch_publish(
+                    target_token,
+                    handle,
+                    registered.loop_finish_fi,
+                    registered.compiled_ptr as u32,
+                );
+                publish_call_assembler_target(target_token, registered.clone());
+            }
             if registered.input_types.as_slice() != arg_types
                 || registered.callee_frame_bytes == 0
                 || registered.callee_gcmap_ptr == 0
@@ -1891,10 +1922,28 @@ impl majit_backend::Backend for WasmBackend {
             .unwrap_or(0)
             .max(inputargs.len());
 
+        // Straight-line function-entry traces finish the current invocation
+        // concretely.  Do not ask the host to compile their wasm module until
+        // a later invocation actually enters the token: quasi-immutable
+        // invalidation can retire such a token before it ever executes (the
+        // module-global `except ... as e` stress case does exactly that).
+        // Loop-bearing and CALL_ASSEMBLER traces stay eager because their
+        // published label/CA targets need a live table slot immediately.
+        let defer_host_compile = !ops.iter().any(|op| {
+            op.opcode == majit_ir::OpCode::Label
+                || op.opcode == majit_ir::OpCode::Jump
+                || op.opcode.is_call_assembler()
+        });
+        let code_size = wasm_bytes.len();
+
         // Instantiate via the host binding on wasm32, or store bytes for
         // testing on native (no wasm host available).
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
-        let func_handle = glue::compile_module(&wasm_bytes);
+        let func_handle = if defer_host_compile {
+            0
+        } else {
+            glue::compile_module_cached(&wasm_bytes)
+        };
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         let func_handle = 0u32; // Placeholder — no wasm host available
 
@@ -1907,7 +1956,7 @@ impl majit_backend::Backend for WasmBackend {
         // Decline the compile so the metainterp keeps the interpreter fallback —
         // a backend capability limit, reported like any other unsupported shape.
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
-        if func_handle == 0 {
+        if !defer_host_compile && func_handle == 0 {
             return Err(BackendError::Unsupported(
                 "wasm host rejected the compiled trace module (oversized function body \
                  or invalid module)"
@@ -2028,7 +2077,8 @@ impl majit_backend::Backend for WasmBackend {
             token_number: token.number,
             trace_id,
             input_types: inputargs.iter().map(|ia| ia.tp).collect(),
-            func_handle,
+            func_handle: std::cell::Cell::new(func_handle),
+            pending_wasm_bytes: std::cell::RefCell::new(defer_host_compile.then_some(wasm_bytes)),
             fail_descrs: std::cell::RefCell::new(fail_descrs),
             num_inputs: inputargs.len(),
             max_output_slots,
@@ -2086,7 +2136,7 @@ impl majit_backend::Backend for WasmBackend {
         // modules load this stable entry at runtime.
         ca_dispatch_publish(
             token.number,
-            compiled.func_handle,
+            compiled.eager_func_handle(),
             loop_finish_fi,
             compiled as *const CompiledWasmLoop as usize as u32,
         );
@@ -2094,7 +2144,7 @@ impl majit_backend::Backend for WasmBackend {
             token.number,
             CallAssemblerTarget {
                 token_number: token.number,
-                func_handle: compiled.func_handle,
+                func_handle: compiled.eager_func_handle(),
                 input_types: compiled.input_types.clone(),
                 callee_frame_bytes: compiled.frame.ca_frame_bytes,
                 callee_gcmap_ptr,
@@ -2111,7 +2161,7 @@ impl majit_backend::Backend for WasmBackend {
 
         Ok(AsmInfo {
             code_addr: 0,
-            code_size: wasm_bytes.len(),
+            code_size,
         })
     }
 
@@ -2239,7 +2289,7 @@ impl majit_backend::Backend for WasmBackend {
             (
                 guard,
                 ca_reentry_safe,
-                source_loop.func_handle,
+                source_loop.materialize_func_handle()?,
                 source_loop.has_preamble,
                 source_loop.frame,
                 source_loop.ca_active.get(),
@@ -2897,6 +2947,10 @@ impl majit_backend::Backend for WasmBackend {
             .expect("no compiled code")
             .downcast_ref::<CompiledWasmLoop>()
             .expect("not CompiledWasmLoop");
+        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        let func_handle = compiled
+            .materialize_func_handle()
+            .expect("wasm backend failed to materialize a runnable trace");
 
         // Host entry allocates the complete frozen geometry, including the tail
         // call area. Chained bridges share these exact offsets; only CA callee
@@ -2970,7 +3024,7 @@ impl majit_backend::Backend for WasmBackend {
                 }
 
                 let saved = majit_gc::shadow_stack::push_jf(jf_ref);
-                glue::execute(compiled.func_handle, items_base as u32);
+                glue::execute(func_handle, items_base as u32);
 
                 let exc_value = jit_exc_take();
                 let fail_index = unsafe { *(items_base as *const i64) } as u32;
@@ -3024,7 +3078,7 @@ impl majit_backend::Backend for WasmBackend {
                 let slot = unsafe { frame.as_mut_ptr().add(home_base + h) } as *mut GcRef;
                 unsafe { wasm_gc_add_root(slot) };
             }
-            glue::execute(compiled.func_handle, frame_ptr);
+            glue::execute(func_handle, frame_ptr);
             for h in 0..compiled.frame.home_slots {
                 let slot = unsafe { frame.as_mut_ptr().add(home_base + h) } as *mut GcRef;
                 wasm_gc_remove_root(slot);
@@ -3152,6 +3206,29 @@ impl majit_backend::Backend for WasmBackend {
                 old.number, new.number
             )));
         }
+        if new_target.func_handle == 0 && new_target.compiled_ptr != 0 {
+            let new_loop = unsafe {
+                (new_target.compiled_ptr as *const CompiledWasmLoop)
+                    .as_ref()
+                    .expect("published CALL_ASSEMBLER target has a live compiled loop")
+            };
+            let handle = new_loop.materialize_func_handle()?;
+            #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+            if handle == 0 {
+                return Err(BackendError::Unsupported(format!(
+                    "call-assembler redirect to token {} could not materialize wasm code",
+                    new.number
+                )));
+            }
+            new_target.func_handle = handle;
+            ca_dispatch_publish(
+                new.number,
+                handle,
+                new_target.loop_finish_fi,
+                new_target.compiled_ptr as u32,
+            );
+            publish_call_assembler_target(new.number, new_target.clone());
+        }
         let movable_callee = new_target.callee_frame_bytes != 0
             && new_target.callee_gcmap_ptr != 0
             && new_target.compiled_ptr != 0
@@ -3195,9 +3272,37 @@ impl majit_backend::Backend for WasmBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_backend::Backend;
+    use majit_backend::{Backend, JitCellToken};
     use majit_gc::collector::MiniMarkGC;
     use majit_gc::trace::TypeInfo;
+
+    #[test]
+    fn straightline_trace_defers_host_module_until_execution() {
+        let mut backend = WasmBackend::new();
+        let token = JitCellToken::new(1);
+        let finish = Op::new(majit_ir::OpCode::Finish, &[]);
+        finish.pos.set(majit_ir::OpRef::void_op(0));
+        finish.set_fail_arg_types(Vec::new());
+        finish.setfailargs(Vec::new().into());
+
+        backend
+            .compile_loop(&[], &[std::rc::Rc::new(finish)], &token)
+            .expect("compile straight-line wasm trace");
+        let compiled = token
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+            .expect("compiled wasm metadata");
+
+        assert_eq!(compiled.eager_func_handle(), 0);
+        assert!(compiled.pending_wasm_bytes.borrow().is_some());
+
+        // Retiring an unentered token must leave the module unmaterialized;
+        // this is the exception/global-version invalidation-storm case.
+        token.invalidate();
+        assert_eq!(compiled.eager_func_handle(), 0);
+        assert!(compiled.pending_wasm_bytes.borrow().is_some());
+    }
 
     /// llsupport/gc.py:563 GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr

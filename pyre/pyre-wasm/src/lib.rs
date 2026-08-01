@@ -325,6 +325,20 @@ pub extern "C" fn pyre_jit_execute_count() -> u64 {
     majit_backend_wasm::jit_execute_count()
 }
 
+/// Diagnostic-only: modules that crossed the lazy materialization gate.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_compile_count() -> u64 {
+    majit_backend_wasm::jit_compile_count()
+}
+
+/// Diagnostic-only: byte-identical module cache hits.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_compile_cache_hits() -> u64 {
+    majit_backend_wasm::jit_compile_cache_hits()
+}
+
 /// Diagnostic-only: read a guard-failure → bridge-trace gate tally from the
 /// metainterp (`majit_metainterp::MC_DIAG`). Same export-not-import rationale
 /// as `pyre_jit_bridge_diag`.

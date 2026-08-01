@@ -15,8 +15,17 @@
 //! the rest of the backend stays binding-agnostic.
 
 use core::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 static JIT_EXECUTE_COUNT: AtomicU64 = AtomicU64::new(0);
+static JIT_COMPILE_COUNT: AtomicU64 = AtomicU64::new(0);
+static JIT_COMPILE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-global compiled-module cache.  The host function table and linear
+/// memory are process-global too, so this has the same owner as the handles it
+/// stores (and deliberately is not TLS).  `IndexMap` is used instead of an
+/// unordered side table so insertion/teardown diagnostics remain stable.
+static MODULE_CACHE: OnceLock<Mutex<indexmap::IndexMap<Box<[u8]>, u32>>> = OnceLock::new();
 
 #[cfg(all(feature = "web", feature = "host-import"))]
 compile_error!("features `web` and `host-import` are mutually exclusive; enable exactly one");
@@ -78,6 +87,26 @@ pub fn compile_module(wasm_bytes: &[u8]) -> u32 {
     }
 }
 
+/// Compile an encoded trace once per byte-identical module.
+///
+/// Token-specific immediates intentionally remain part of the key.  Sharing a
+/// module whose GUARD_NOT_INVALIDATED address or fail-descriptor base differs
+/// would cross-wire token ownership; relocation of those fields can extend
+/// this cache later without weakening that invariant.
+pub fn compile_module_cached(wasm_bytes: &[u8]) -> u32 {
+    let cache = MODULE_CACHE.get_or_init(|| Mutex::new(indexmap::IndexMap::new()));
+    if let Some(&handle) = cache.lock().unwrap().get(wasm_bytes) {
+        JIT_COMPILE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        return handle;
+    }
+    let handle = compile_module(wasm_bytes);
+    if handle != 0 {
+        JIT_COMPILE_COUNT.fetch_add(1, Ordering::Relaxed);
+        cache.lock().unwrap().insert(wasm_bytes.into(), handle);
+    }
+    handle
+}
+
 /// Execute a compiled JIT function with the given frame pointer.
 pub fn execute(func_id: u32, frame_ptr: u32) -> u32 {
     #[cfg(feature = "web")]
@@ -106,6 +135,14 @@ pub fn execute(func_id: u32, frame_ptr: u32) -> u32 {
 /// Number of guest-side JIT trace entries.
 pub fn jit_execute_count() -> u64 {
     JIT_EXECUTE_COUNT.load(Ordering::Relaxed)
+}
+
+pub fn jit_compile_count() -> u64 {
+    JIT_COMPILE_COUNT.load(Ordering::Relaxed)
+}
+
+pub fn jit_compile_cache_hits() -> u64 {
+    JIT_COMPILE_CACHE_HITS.load(Ordering::Relaxed)
 }
 
 /// Free a compiled JIT function.

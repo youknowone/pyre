@@ -607,6 +607,14 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
             .get_typed_func::<(), u64>(&mut store, "pyre_jit_execute_count")
             .and_then(|f| f.call(&mut store, ()))
             .ok();
+        let guest_jit_compile_count = instance
+            .get_typed_func::<(), u64>(&mut store, "pyre_jit_compile_count")
+            .and_then(|f| f.call(&mut store, ()))
+            .ok();
+        let guest_jit_compile_cache_hits = instance
+            .get_typed_func::<(), u64>(&mut store, "pyre_jit_compile_cache_hits")
+            .and_then(|f| f.call(&mut store, ()))
+            .ok();
         let host = store.data();
         eprintln!(
             "[jit-stats] compiles={} compile_ms={:.1} executes={} jit_calls={} linear_mem={} gc_oldgen={} gc_nursery={} \
@@ -623,6 +631,14 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
             heap_live_bytes,
             heap_live_count,
         );
+        if let (Some(materialized), Some(cache_hits)) =
+            (guest_jit_compile_count, guest_jit_compile_cache_hits)
+        {
+            eprintln!(
+                "[jit-stats] materialized={} compile_cache_hits={}",
+                materialized, cache_hits
+            );
+        }
         if !host.exec_hist.is_empty() {
             let mut v: Vec<_> = host.exec_hist.iter().collect();
             v.sort_by(|a, b| b.1.cmp(a.1));
