@@ -1073,12 +1073,34 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Mark a function as elidable (pure / constant-foldable).
 ///
 /// The JIT can eliminate calls to this function when all arguments are constants.
-/// `rlib/jit.py:14-73 elidable` sets `_elidable_function_ = True` (line 72) and
-/// nothing else.  This expansion carries that flag as the marker const
-/// [`rpython_attribute_const_for`] emits next to the function, which
-/// `front/llbc_hints.rs` harvests out of the extracted LLBC; the constant fold
-/// itself reaches the separate `__majit_call_target_*` trampoline, keyed by
-/// path.  Neither channel is a property of the function's codegen.
+/// `rlib/jit.py:72 elidable` sets `_elidable_function_ = True` and nothing else;
+/// the flag travels here as the marker const [`rpython_attribute_const_for`]
+/// emits, which `front/llbc_hints.rs` harvests from the extracted LLBC, and the
+/// constant fold reaches the separate `__majit_call_target_*` trampoline. None
+/// of that is a property of this function's codegen.
+///
+/// The backend inliner it leaves free is nonetheless a much narrower one than
+/// LLVM's, and that is why `#[inline(never)]` stays below. `auto_inlining`
+/// stops a graph at `weight >= threshold` (`backendopt/inline.py:654`) with
+/// `weight = 0.9999 * measure_median_execution_cost(graph) +
+/// static_instruction_count(graph)` (`:539 inlining_heuristic`, a hard reject
+/// at `count >= 200`), counting roughly one per lltype operation
+/// (`:479 OP_WEIGHTS`).  A straight-line graph is its own median path, so that
+/// weight is about twice its op count and the default
+/// `DEFL_INLINE_THRESHOLD = 32.4` buys on the order of sixteen operations —
+/// described at
+/// `config/translationoption.py:11-12` as "just enough to inline
+/// add__Int_Int() and just small enough to prevent inlining of some rlist
+/// functions". Elidable bodies are not that size: 54 of the 124 sites are in
+/// `descroperation.rs` and 25 in `longobject.rs`. Dropping the attribute hands
+/// them to a cost model that accepts them, which is not what leaving upstream's
+/// inliner free would have done.
+///
+/// Measurement offers nothing to weigh against that. Throughput was flat
+/// (1.0070 / 1.0000 on the shadow-stack probes, 1.0000 on a pure integer
+/// control), while the bodies inlining into the eval loop cost frame size:
+/// reachable Python recursion depth fell 167700 to 159700, read out through
+/// the SP-based `stack_check.rs current_sp()`.
 ///
 /// `#[elidable]` is the conservative `EF_ELIDABLE_CAN_RAISE` form
 /// (`rpython/jit/codewriter/effectinfo.py:21`), matching `call.py:297
@@ -1164,15 +1186,9 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
     };
     let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
 
-    // No `#[inline(never)]`: `rlib/jit.py:72` sets `_elidable_function_ = True`
-    // and leaves the backend's inliner alone.  Upstream keeps a separate flag,
-    // `_dont_inline_` (`objectmodel.py:214`, read by
-    // `translator/backendopt/inline.py:565`), for suppressing inlining, and no
-    // elidable helper upstream carries it.  The constant fold reaches the
-    // `__majit_call_target_*` trampoline below, whose address is taken and so
-    // codegen'd out of line regardless.
     let expanded = quote! {
         #(#attrs)*
+        #[inline(never)]
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
         #vis #sig {
@@ -1330,6 +1346,18 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
     // Residual call targets are likewise unaffected: they resolve through the
     // function-item coercions `pyre-interpreter/src/jit_fnaddr.rs` writes by
     // hand, not through a linker symbol.
+    //
+    // `#[elidable]` keeps its `#[inline(never)]` and this family drops it, and
+    // the split follows upstream's inlining budget rather than the attribute.
+    // `DEFL_INLINE_THRESHOLD = 32.4` (`config/translationoption.py:11-12`) is
+    // "just enough to inline add__Int_Int()" — on the order of sixteen lltype
+    // operations, since `inline.py:539 inlining_heuristic` charges a
+    // straight-line graph both its static count and its median execution cost.
+    // This family sits inside that budget —
+    // `gc_roots::shadow_stack_len` is one call, `pyopcode::label_arg_to_usize`
+    // one field read — so leaving them to the host inliner is what upstream's
+    // free inliner would also have done.  The elidable bodies do not, which is
+    // why the same edit measured worse there.
     let expanded = quote! {
         #(#attrs)*
         #[doc(hidden)]
@@ -1433,27 +1461,20 @@ fn expand_call_surface_attr(
     };
     let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
 
-    // Only the release-gil surface suppresses inlining upstream, and it does so
-    // for a GC reason rather than a tracing one: `rffi.py:219
-    // call_external_function._dont_inline_ = True` alongside `:220
+    // Only `jit_release_gil` has an upstream basis for `#[inline(never)]`, and
+    // it is a GC reason rather than a tracing one: `rffi.py:219
+    // call_external_function._dont_inline_ = True` sits beside `:220
     // _gctransformer_hint_close_stack_ = True`, explained at `:232` as "don't
     // inline, as a hack to guarantee that no GC pointer is alive anywhere in
     // call_external_function" — the body runs with the GIL released, so a
     // caller folded into it would put live GC pointers in that window.
-    // `_dont_inline_` (`objectmodel.py:214`) is the backend-inliner flag read by
-    // `translator/backendopt/inline.py:565`, orthogonal to tracing policy;
-    // `jit_may_force` has no upstream decorator at all
-    // (`EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` is derived from the analyzed ops in
-    // `effectinfo.py:401-404`) and `loop_invariant` sets only its own flag.
-    let dont_inline = if attr_name == "jit_release_gil" {
-        quote! { #[inline(never)] }
-    } else {
-        quote! {}
-    };
-
+    // `jit_may_force` and `loop_invariant` carry no such flag upstream, and keep
+    // it here for the reason recorded on [`elidable`]: their bodies are past
+    // the inlining budget the free RPython inliner would have applied, and
+    // dropping it measured flat to worse.
     let expanded = quote! {
         #(#attrs)*
-        #dont_inline
+        #[inline(never)]
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
         #vis #sig {
@@ -2135,9 +2156,8 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let expanded = quote! {
-        // rlib/jit.py:184-185 — elidable(func); original body hidden.
-        // `elidable` sets only `_elidable_function_`, and the exec-built
-        // promote wrapper (jit.py:188-200) sets no inlining flag either.
+        // rlib/jit.py:184-185 — elidable(func); original body hidden
+        #[inline(never)]
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
         fn #orig_name(#(#full_params),*) #output {
@@ -2294,8 +2314,7 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         // rlib/jit.py:231-233 — @dont_look_inside def trampoline(...): return func(...)
-        // `dont_look_inside` is a tracing-policy marker only (jit.py:139), so
-        // the trampoline carries no inlining attribute either.
+        #[inline(never)]
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
         fn #trampoline_name(#(#full_params),*) #output {
