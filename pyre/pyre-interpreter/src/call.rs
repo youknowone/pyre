@@ -1984,26 +1984,40 @@ pub(crate) fn resolve_kwargs(
 
     // Pack *args and **kwargs into scope — PyPy _match_signature lines 207-259.
     // This produces the final scope_w that maps directly to frame locals.
+    // `gct_fv_gc_malloc` bracket (`framework.py:853-856`) for the two tail
+    // objects: both are born in the nursery, and each allocation that follows
+    // — the other tail object, the key strings, `w_dict_store`'s strategy
+    // promotion — leaves RUNNING before taking `gc_mutex` (`gc_sync.rs:22`),
+    // so a collector on another thread relocates whatever the shadow stack
+    // does not name.  They enter `result` only after the last allocation.
+    let tail_roots = pyre_object::gc_roots::push_roots();
+    let varargs_slot = tail_roots.base();
     if has_varargs {
         let extra_pos: Vec<PyObjectRef> = if n_pos > n_pos_params {
             args[n_pos_params..n_pos].to_vec()
         } else {
             vec![]
         };
-        result.push(pyre_object::w_tuple_new(extra_pos));
+        tail_roots.pin_root(pyre_object::w_tuple_new(extra_pos));
     }
+    let varkw_slot = varargs_slot + usize::from(has_varargs);
     if has_varkw {
         // `dictmultiobject.py:77-80` — `space.newdict(kwargs=True)` selects
         // EmptyKwargsDictStrategy so the first unicode setitem promotes
         // directly to KwargsDictStrategy (parallel `(keys_w, values_w)`
         // shape) instead of stepping through UnicodeDictStrategy.
-        let kw_dict = pyre_object::w_dict_new_kwargs();
+        tail_roots.pin_root(pyre_object::w_dict_new_kwargs());
         for (key, value) in &extra_kwargs {
             unsafe {
-                pyre_object::w_dict_store(kw_dict, *key, *value);
+                pyre_object::w_dict_store(tail_roots.get(varkw_slot), *key, *value);
             }
         }
-        result.push(kw_dict);
+    }
+    if has_varargs {
+        result.push(tail_roots.get(varargs_slot));
+    }
+    if has_varkw {
+        result.push(tail_roots.get(varkw_slot));
     }
 
     Ok(result)
@@ -2134,22 +2148,32 @@ pub(crate) fn bind_kwargs_to_signature(
     }
 
     // Pack `*args` / `**kwargs` tails — argument.py _match_signature 207-259.
+    // Both tail objects are born young and stay livevars until they reach
+    // `result`; see the same bracket in `bind_kwargs`.
+    let tail_roots = pyre_object::gc_roots::push_roots();
+    let varargs_slot = tail_roots.base();
     if has_varargs {
         let extra_pos: Vec<PyObjectRef> = if n_pos > n_pos_params {
             pos_args[n_pos_params..n_pos].to_vec()
         } else {
             vec![]
         };
-        result.push(pyre_object::w_tuple_new(extra_pos));
+        tail_roots.pin_root(pyre_object::w_tuple_new(extra_pos));
     }
+    let varkw_slot = varargs_slot + usize::from(has_varargs);
     if has_varkw {
-        let kw_dict = pyre_object::w_dict_new_kwargs();
+        tail_roots.pin_root(pyre_object::w_dict_new_kwargs());
         for (key, value) in &extra_kwargs {
             unsafe {
-                pyre_object::w_dict_store(kw_dict, *key, *value);
+                pyre_object::w_dict_store(tail_roots.get(varkw_slot), *key, *value);
             }
         }
-        result.push(kw_dict);
+    }
+    if has_varargs {
+        result.push(tail_roots.get(varargs_slot));
+    }
+    if has_varkw {
+        result.push(tail_roots.get(varkw_slot));
     }
 
     Ok(result)
@@ -2314,20 +2338,26 @@ pub fn call_with_kwargs(
                 });
             }
             let mut full_args = pos_args.to_vec();
+            // `gct_fv_gc_malloc` bracket (`framework.py:853-856`) for the kwargs
+            // dict below.  `w_dict_new` allocates in the nursery, so the fresh
+            // dict is a young object no root names, and every step that follows
+            // allocates: the key strings, `w_dict_store`'s strategy promotion,
+            // and the call this frame ends in.  An allocation leaves RUNNING
+            // before taking `gc_mutex` (`gc_sync.rs:22`), so a collector on
+            // another thread runs there and relocates or reclaims anything the
+            // shadow stack does not name.  The scope reaches every `return`
+            // below, which is where the dict stops being a livevar.
+            let kw_roots = pyre_object::gc_roots::push_roots();
+            let kw_slot = kw_roots.base();
             if !kwargs.is_empty() {
-                let kwargs_dict = pyre_object::w_dict_new();
-                // Each key is born old-stable (non-moving) and this loop is
-                // straight-line native (str key hash/eq, non-collecting dict
-                // alloc): no safepoint fires between a key's allocation and its
-                // dict install, so an unrooted Rust temporary cannot be swept
-                // or relocated here — unlike a path that re-enters the eval loop.
+                kw_roots.pin_root(pyre_object::w_dict_new());
                 for (key, value) in kwargs {
                     unsafe {
-                        pyre_object::w_dict_store(
-                            kwargs_dict,
-                            pyre_object::w_str_from_wtf8_managed(key.clone()),
-                            *value,
-                        );
+                        // The key allocation runs first: as the second argument
+                        // it would be evaluated after the receiver, handing
+                        // `w_dict_store` the pre-collection dict address.
+                        let w_key = pyre_object::w_str_from_wtf8_managed(key.clone());
+                        pyre_object::w_dict_store(kw_roots.get(kw_slot), w_key, *value);
                     }
                 }
                 // Store the marker last so a user keyword literally named
@@ -2335,13 +2365,11 @@ pub fn call_with_kwargs(
                 // key always resolves to the sentinel value that detection
                 // compares by identity.
                 unsafe {
-                    pyre_object::w_dict_store(
-                        kwargs_dict,
-                        pyre_object::kw_marker::w_kw_marker_key(),
-                        pyre_object::kw_marker::w_kw_marker_sentinel(),
-                    );
+                    let marker_key = pyre_object::kw_marker::w_kw_marker_key();
+                    let marker_value = pyre_object::kw_marker::w_kw_marker_sentinel();
+                    pyre_object::w_dict_store(kw_roots.get(kw_slot), marker_key, marker_value);
                 }
-                full_args.push(kwargs_dict);
+                full_args.push(kw_roots.get(kw_slot));
                 // Step 2 of the Arguments port: when this is a profiled
                 // builtin call AND kwargs are present, route through
                 // `call_args_and_c_profile_args` with a structured
@@ -2367,6 +2395,9 @@ pub fn call_with_kwargs(
                         &keyword_names_w,
                         &keywords_w,
                     );
+                    // `keyword_names_w` allocated a string per keyword, so the
+                    // dict `full_args` carries may have moved since the push.
+                    *full_args.last_mut().expect("kwargs dict was pushed") = kw_roots.get(kw_slot);
                     let w_res = crate::baseobjspace::call_args_and_c_profile_args(
                         unsafe { &mut *frame_ptr },
                         callable,
@@ -2603,9 +2634,13 @@ pub fn call_with_kwargs(
                 pyre_object::gc_roots::pin_root(kw_dict);
                 for (key, value) in &extra_kwargs {
                     unsafe {
+                        // The key allocation runs first: as the second argument
+                        // it would be evaluated after the receiver, handing
+                        // `w_dict_store` the pre-collection dict address.
+                        let w_key = pyre_object::w_str_from_wtf8_managed(key.clone());
                         pyre_object::w_dict_store(
                             pyre_object::gc_roots::shadow_stack_get(kw_dict_slot),
-                            pyre_object::w_str_from_wtf8_managed(key.clone()),
+                            w_key,
                             pyre_object::gc_hook::try_gc_current_object_address(*value as *mut u8)
                                 as PyObjectRef,
                         );
@@ -3666,18 +3701,26 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             // `w_dict_items` already dispatches `is_module_dict` so a
             // class statement with `**module_dict` (rare but valid)
             // walks the strategy.
-            let extra = pyre_object::w_dict_new();
+            // Born young, and `w_dict_store` allocates on strategy promotion —
+            // the bracket in `call_with_kwargs`.
+            let extra_roots = pyre_object::gc_roots::push_roots();
+            let extra_slot = extra_roots.base();
+            extra_roots.pin_root(pyre_object::w_dict_new());
             unsafe {
                 for (k, v) in pyre_object::w_dict_items(last) {
                     if pyre_object::is_str(k) {
                         let key = pyre_object::w_str_get_wtf8(k).as_str();
                         if key != Ok("metaclass") && key != Ok("__pyre_kw__") {
-                            pyre_object::w_dict_store(extra, k, v);
+                            pyre_object::w_dict_store(extra_roots.get(extra_slot), k, v);
                         }
                     }
                 }
             }
-            (&args[2..args.len() - 1], w_metaclass, Some(extra))
+            (
+                &args[2..args.len() - 1],
+                w_metaclass,
+                Some(extra_roots.get(extra_slot)),
+            )
         } else {
             (&args[2..], None, None)
         }
@@ -4498,20 +4541,22 @@ fn build_class_inner(
 /// trailing dict that the builtin kwargs ABI (`split_builtin_kwargs`)
 /// consumes.  Mirrors the producer in `call_with_kwargs`.
 fn pack_pyre_kwargs(kw_items: &[(PyObjectRef, PyObjectRef)]) -> PyObjectRef {
-    let kw_dict = pyre_object::w_dict_new();
+    // The dict is born young, and `w_dict_store` allocates when it promotes the
+    // strategy — see the bracket in `call_with_kwargs`.
+    let kw_roots = pyre_object::gc_roots::push_roots();
+    let kw_slot = kw_roots.base();
+    kw_roots.pin_root(pyre_object::w_dict_new());
     unsafe {
         for (k, v) in kw_items {
-            pyre_object::w_dict_store(kw_dict, *k, *v);
+            pyre_object::w_dict_store(kw_roots.get(kw_slot), *k, *v);
         }
         // Marker stored last so a user keyword named `__pyre_kw__` cannot
         // overwrite the sentinel detection compares by identity.
-        pyre_object::w_dict_store(
-            kw_dict,
-            pyre_object::kw_marker::w_kw_marker_key(),
-            pyre_object::kw_marker::w_kw_marker_sentinel(),
-        );
+        let marker_key = pyre_object::kw_marker::w_kw_marker_key();
+        let marker_value = pyre_object::kw_marker::w_kw_marker_sentinel();
+        pyre_object::w_dict_store(kw_roots.get(kw_slot), marker_key, marker_value);
     }
-    kw_dict
+    kw_roots.get(kw_slot)
 }
 
 /// typeobject.py:1020-1026 `_init_subclass` — after a class is created,
