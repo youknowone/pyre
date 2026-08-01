@@ -6673,7 +6673,12 @@ fn nested_break_bridge_resume_hazard(code: &pyre_interpreter::CodeObject) -> boo
             continue;
         };
         let mut inner_header = None;
-        for header_pc in target..pop_pc {
+        // `target` is the ENCLOSING loop's own `FOR_ITER`. Scanning from it
+        // would name that header as the "inner" loop whenever the body has no
+        // nested one, turning every single-level loop whose body ends in a
+        // statement-result `POP_TOP` into a nested break. The inner loop starts
+        // strictly after the enclosing header.
+        for header_pc in (target + 1)..pop_pc {
             if matches!(
                 pyre_interpreter::decode_instruction_at(code, header_pc),
                 Some((pyre_interpreter::Instruction::ForIter { .. }, _))
@@ -12172,6 +12177,22 @@ mod tests {
 
         assert!(for_iter_bodies_all_jit_safe(&code));
         assert_eq!(unsupported_jit_shape(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn nested_break_hazard_ignores_single_level_loop_with_secondary_edge_guard() {
+        // One loop, no nested one: the `or` emits a POP_JUMP_IF_TRUE and the
+        // statement-result `sink(p)` emits the POP_TOP that precedes the
+        // backedge. Naming the enclosing FOR_ITER as the inner header would
+        // read this as a nested break.
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def f(rows, pred, sink):\n    for p in rows:\n        if pred(p) or pred(p):\n            sink(p)\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+
+        assert!(!nested_break_bridge_resume_hazard(&code));
     }
 
     #[test]
