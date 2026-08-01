@@ -1209,9 +1209,6 @@ pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef
         return;
     }
     let parent = &mut *(w_parent as *mut W_TypeObject);
-    // Builtin parents need the prebuilt root walk; this is harmless for a
-    // GC-managed heap parent.
-    crate::gc_roots::mark_prebuilt_roots_dirty();
     if parent.weak_subclasses.is_null() {
         parent.weak_subclasses = Box::into_raw(Box::new(Vec::new()));
     }
@@ -1228,11 +1225,34 @@ pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef
         }
         if existing.is_null() {
             subs[i] = newref;
-            crate::gc_hook::try_gc_write_barrier(w_parent as *mut u8);
+            note_weak_subclass_store(w_parent);
             return;
         }
     }
     subs.push(newref);
+    note_weak_subclass_store(w_parent);
+}
+
+/// Record the store of a freshly allocated weakref into `weak_subclasses`.
+///
+/// The mark covers builtin parents, whose list is off-GC and reachable only
+/// through `walk_builtin_type_dicts_gc`; the write barrier covers GC-managed
+/// heap parents, whose list is forwarded by the `W_TYPE_GC_TYPE_ID` custom
+/// trace.
+///
+/// Order matters, and it is the safepoint that fixes it, not the allocation:
+/// host-side allocation cannot collect (`dynasm_alloc_nursery_typed` routes to
+/// `try_alloc_nursery_no_collect_typed` and spills to old-gen on nursery full),
+/// but `try_gc_write_barrier` reaches `gc_sync::gc_op`, which leaves RUNNING and
+/// parks on `gc_mutex` — an entry-style safepoint where another thread's
+/// stop-the-world collection runs.  The dirty bit is consumable
+/// (`gc_roots::clear_prebuilt_roots_dirty` after each walk), so marking on the
+/// far side of that safepoint would let a collection walk the prebuilt family
+/// with the slot already updated and the bit still clear, and nothing else roots
+/// the young weakref.  Mark first, then take the barrier.
+#[inline]
+unsafe fn note_weak_subclass_store(w_parent: PyObjectRef) {
+    crate::gc_roots::mark_prebuilt_roots_dirty();
     crate::gc_hook::try_gc_write_barrier(w_parent as *mut u8);
 }
 
