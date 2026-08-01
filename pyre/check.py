@@ -169,25 +169,76 @@ def green(s):  return f"\033[32m{s}\033[0m"
 def dim(s):    return f"\033[2m{s}\033[0m"
 def bold(s):   return f"\033[1m{s}\033[0m"
 
-# ── Child-process user CPU time ──────────────────────────────────────
+# ── Child-process user CPU time and peak RSS ─────────────────────────
+
+# Peak RSS in MiB of the most recent `run_timed` child, or None when the run
+# timed out or the platform cannot report it. A single slot rather than a
+# return-tuple member: `run_timed`'s 4-tuple has many callers and only the
+# memory gate reads this. Runs are sequential, so the slot is unambiguous.
+_LAST_RUN_MAXRSS_MB = [None]
+
+
+def last_run_peak_rss_mb():
+    """Peak RSS (MiB) of the child `run_timed` most recently reaped."""
+    return _LAST_RUN_MAXRSS_MB[0]
+
+
 
 def _run_timed_unix(args, timeout_s, env=None):
-    import resource
-    before = resource.getrusage(resource.RUSAGE_CHILDREN)
-    try:
-        proc = subprocess.run(
-            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=timeout_s, env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return "", 0.0, 124, ""
-    after = resource.getrusage(resource.RUSAGE_CHILDREN)
-    utime = max(after.ru_utime - before.ru_utime, 0.0)
+    # `os.wait4` rather than `getrusage(RUSAGE_CHILDREN)` around
+    # `subprocess.run`: `ru_maxrss` on RUSAGE_CHILDREN is a running maximum
+    # over every reaped child, not a counter, so a before/after difference
+    # attributes nothing to this run. wait4 reports the rusage of this child
+    # alone, which is what a per-fixture memory gate needs. `ru_utime` comes
+    # from the same struct, so the timing path gains a per-child number too
+    # instead of a difference of process-wide totals.
+    #
+    # The child's pipes are replaced by temporary files: `communicate()` would
+    # reap the child itself and leave nothing for wait4, and draining pipes by
+    # hand risks the classic full-buffer deadlock.
+    import resource  # noqa: F401  (documents the rusage struct's origin)
+    import tempfile
+    import threading
+
+    timed_out = False
+
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        proc = subprocess.Popen(args, stdout=out_f, stderr=err_f, env=env)
+
+        def _kill():
+            nonlocal timed_out
+            timed_out = True
+            proc.kill()
+
+        timer = threading.Timer(timeout_s, _kill) if timeout_s else None
+        if timer is not None:
+            timer.start()
+        try:
+            _pid, status, usage = os.wait4(proc.pid, 0)
+        finally:
+            if timer is not None:
+                timer.cancel()
+        # Popen still believes the child is running; tell it otherwise so its
+        # finalizer neither waits nor warns.
+        proc.returncode = -(status & 0x7F) if status & 0x7F else (status >> 8)
+
+        if timed_out:
+            _LAST_RUN_MAXRSS_MB[0] = None
+            return "", 0.0, 124, ""
+
+        out_f.seek(0)
+        err_f.seek(0)
+        stdout_bytes = out_f.read()
+        stderr_bytes = err_f.read()
+
+    # ru_maxrss is kilobytes on Linux and bytes on macOS/BSD.
+    scale = 1024 * 1024 if sys.platform == "darwin" else 1024
+    _LAST_RUN_MAXRSS_MB[0] = usage.ru_maxrss / scale
     return (
-        proc.stdout.decode("utf-8", errors="replace"),
-        utime,
+        stdout_bytes.decode("utf-8", errors="replace"),
+        max(usage.ru_utime, 0.0),
         proc.returncode,
-        proc.stderr.decode("utf-8", errors="replace"),
+        stderr_bytes.decode("utf-8", errors="replace"),
     )
 
 
@@ -281,6 +332,8 @@ def run_timed(args, timeout_s=None, env=None):
     extras).
     """
     if sys.platform == "win32":
+        # No wait4 counterpart; the memory gate reads None and stays inert.
+        _LAST_RUN_MAXRSS_MB[0] = None
         out, t, rc, err = _run_timed_win32(args, timeout_s, env)
     else:
         out, t, rc, err = _run_timed_unix(args, timeout_s, env)
@@ -673,6 +726,38 @@ def synth_perf_gate(path):
             if ratio <= 0:
                 raise ValueError(f"synthetic performance gate must be positive in {path}")
             return ratio
+    return None
+
+
+def synth_rss_gate(path):
+    """Read an optional per-fixture peak-RSS ceiling from its header:
+        # pyre-check: max-rss-mb=200
+
+    A second axis beside `max-pypy-ratio`, not a replacement: the ratio gate
+    is blind to memory, so a change that trades retained bytes for speed
+    passes it while regressing badly. Frames are the standing example —
+    every interpreted call retains an old-gen frame, and nothing in this
+    harness has ever measured that.
+
+    Absent directive means no ceiling, so adding this gate cannot fail a
+    fixture that does not opt in. Read against native backends only, like
+    the ratio gate.
+    """
+    prefix = "# pyre-check: max-rss-mb="
+    with open(path, encoding="utf-8") as source:
+        for _ in range(20):
+            line = source.readline()
+            if not line:
+                break
+            if not line.startswith(prefix):
+                continue
+            try:
+                limit = float(line[len(prefix):].strip())
+            except ValueError as e:
+                raise ValueError(f"invalid synthetic memory gate in {path}: {line.strip()}") from e
+            if limit <= 0:
+                raise ValueError(f"synthetic memory gate must be positive in {path}")
+            return limit
     return None
 
 
@@ -1378,7 +1463,7 @@ class Check:
     def _run_backend_bench(
         self, backend, name, script, timeout,
         vs_cpython, vs_pypy, t_cpython, t_pypy, pypy_output,
-        wasm_float_tol=False,
+        wasm_float_tol=False, max_rss_mb=None,
     ):
         pyre_bin = self._pyre(backend)
         effective_timeout = scaled_timeout(timeout, self._timeout_scale(backend))
@@ -1389,6 +1474,8 @@ class Check:
         output, elapsed, code, stderr = run_timed(
             [pyre_bin, script], timeout_s=effective_timeout, env=pyre_env(),
         )
+        # Read before any gate re-runs the fixture and overwrites the slot.
+        peak_rss_mb = last_run_peak_rss_mb()
 
         panic_reason = _jit_panic_reason(stderr)
         if panic_reason:
@@ -1476,6 +1563,19 @@ class Check:
                 elapsed = checked_elapsed
                 t_pypy = checked_baseline
                 ratio = _ratio(elapsed, t_pypy)
+
+        # `# pyre-check: max-rss-mb=` — the axis the ratio gates cannot see.
+        # Checked after them so a fixture that is both slow and fat reports the
+        # slowness first, matching the existing gate order.
+        if max_rss_mb is not None and peak_rss_mb is not None and peak_rss_mb > max_rss_mb:
+            detail = f"peak RSS {peak_rss_mb:.0f}MB > {max_rss_mb:.0f}MB"
+            self._record(backend, False, name, detail)
+            print(f"{red('FATTER')}  pyre {detail}")
+            self._append_comparison(
+                backend, name, t_cpython, t_pypy,
+                fmt_time(f"{elapsed:.2f}"), f"({ratio} vs pypy)",
+            )
+            return
 
         snap_status, snap_reason = self._apply_snapshot_gate(
             backend, name, script, output, stderr, elapsed,
@@ -1635,6 +1735,7 @@ class Check:
         effective_timeout = scaled_timeout(timeout, self.args.timeout_scale)
         try:
             max_pypy_ratio = synth_perf_gate(path)
+            max_rss_mb = synth_rss_gate(path)
             skip_backends = synth_skip_backends(path)
         except ValueError as e:
             print(f"{red('ERROR')}: {e}")
@@ -1705,6 +1806,7 @@ class Check:
             self._run_backend_bench(
                 backend, name, path, timeout,
                 None, vs_pypy, t_cpython, t_pypy, pypy_output,
+                max_rss_mb=None if backend == "wasm" else max_rss_mb,
             )
 
     def run_synthetic_suite(self):
