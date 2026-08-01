@@ -164,6 +164,33 @@ static ONERBIGINT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static ONENEGATIVERBIGINT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static FIVERBIGINT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+/// The four owners above, in the order [`PREBUILT_DIGITS`] indexes them.
+fn prebuilt_slots() -> [&'static std::sync::OnceLock<usize>; 4] {
+    [&NULLRBIGINT, &ONERBIGINT, &ONENEGATIVERBIGINT, &FIVERBIGINT]
+}
+
+/// Digit-array identity of each prebuilt, held together and readable without
+/// touching the objects themselves.
+///
+/// A source line upstream spells `return NULLRBIGINT` — it hands back the
+/// module-global object, and nothing is rediscovered. pyre's `RBigInt` is a
+/// by-value handle that only becomes a heap object at the boxing step, so the
+/// boxing step is where that identity has to be recovered, on every allocation,
+/// almost always answering "not a prebuilt".
+///
+/// `prebuilt` gives each of the four its own one-element digit array, so that
+/// answer is decided by the digit pointer alone. Keeping the four pointers in
+/// one array makes the common case four plain loads out of a single cache line,
+/// instead of four `OnceLock` state words each followed by a dereference into a
+/// separately allocated payload. A candidate match still reads the object, so
+/// the test stays exactly as exact as it was.
+static PREBUILT_DIGITS: [std::sync::atomic::AtomicUsize; 4] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
 fn _check_digits(digits: &[Digit]) {
     for &digit in digits {
         debug_assert!(digit >= 0);
@@ -494,12 +521,27 @@ pub fn rbigint_gc_type_id() -> u32 {
 /// slot, not numeric equality, is intentional: upstream has a few internal
 /// zero results that must remain fresh because their digits are filled later.
 fn prebuilt_payload_pointer(value: &RBigInt) -> Option<*mut RBigInt> {
-    for slot in [&NULLRBIGINT, &ONERBIGINT, &ONENEGATIVERBIGINT, &FIVERBIGINT] {
-        let Some(&raw) = slot.get() else {
+    // All four are single-digit objects: `zero()` carries `_size == 0` and the
+    // other three `|_size| == 1` (rbigint.py:1652-1656). Their digit arrays are
+    // one element long, so a value holding two or more digits cannot alias any
+    // of them — and `_normalize` (rbigint.py:1601-1603) is the only route by
+    // which a computed result reaches the zero form, where it assigns
+    // `self._digits = NULLDIGITS` itself. Deciding that from the size leaves
+    // the table for the values that can actually match.
+    if !(-1..=1).contains(&value._size) {
+        return None;
+    }
+    let digits = value._digits as usize;
+    for index in 0..PREBUILT_DIGITS.len() {
+        // An unpublished slot reads 0, which no live digit array can equal.
+        if PREBUILT_DIGITS[index].load(std::sync::atomic::Ordering::Relaxed) != digits {
+            continue;
+        }
+        let Some(&raw) = prebuilt_slots()[index].get() else {
             continue;
         };
         let prebuilt = unsafe { &*(raw as *const RBigInt) };
-        if value._digits == prebuilt._digits && value._size == prebuilt._size {
+        if value._size == prebuilt._size {
             return Some(raw as *mut RBigInt);
         }
     }
@@ -694,8 +736,8 @@ impl RBigInt {
     }
 
     #[inline]
-    fn prebuilt(slot: &'static std::sync::OnceLock<usize>, digit: Digit, sign: i64) -> Self {
-        let raw = *slot.get_or_init(|| {
+    fn prebuilt(index: usize, digit: Digit, sign: i64) -> Self {
+        let raw = *prebuilt_slots()[index].get_or_init(|| {
             let block = unsafe { alloc_typed_items_block_immortal(1) };
             unsafe {
                 *(typed_items_block_items_base(block) as *mut Digit) = digit;
@@ -704,7 +746,12 @@ impl RBigInt {
                 _digits: block,
                 _size: sign,
             };
-            Box::into_raw(Box::new(value)) as usize
+            let raw = Box::into_raw(Box::new(value)) as usize;
+            // Publish the digit identity only once the object it names exists;
+            // `prebuilt_payload_pointer` matches on this word and then reads
+            // the object through the owner slot.
+            PREBUILT_DIGITS[index].store(block as usize, std::sync::atomic::Ordering::Release);
+            raw
         }) as *const Self;
         // RPython assignment returns the process-global rbigint itself. The
         // host needs a shallow owned handle; source translation aliases the
@@ -714,12 +761,12 @@ impl RBigInt {
 
     #[inline]
     fn negative_one() -> Self {
-        Self::prebuilt(&ONENEGATIVERBIGINT, ONEDIGIT, -1)
+        Self::prebuilt(2, ONEDIGIT, -1)
     }
 
     #[inline]
     fn five() -> Self {
-        Self::prebuilt(&FIVERBIGINT, 5, 1)
+        Self::prebuilt(3, 5, 1)
     }
 
     /// rbigint.py:159 `__init__(digits=NULLDIGITS, sign=0, size=0)`.
@@ -813,12 +860,12 @@ impl RBigInt {
 
     #[inline]
     pub fn zero() -> Self {
-        Self::prebuilt(&NULLRBIGINT, NULLDIGIT, 0)
+        Self::prebuilt(0, NULLDIGIT, 0)
     }
 
     #[inline]
     pub fn one() -> Self {
-        Self::prebuilt(&ONERBIGINT, ONEDIGIT, 1)
+        Self::prebuilt(1, ONEDIGIT, 1)
     }
 
     #[inline]
@@ -4644,7 +4691,7 @@ pub fn walk_rbigint_cache_digit_slots(mut visitor: impl FnMut(&mut *mut u8)) {
     // FIVERBIGINT are translated prebuilt roots.  Do not initialize a
     // previously-unused constant from inside the collector; visit only slots
     // already published by ordinary execution.
-    for slot in [&NULLRBIGINT, &ONERBIGINT, &ONENEGATIVERBIGINT, &FIVERBIGINT] {
+    for slot in prebuilt_slots() {
         if let Some(&raw) = slot.get() {
             let value = unsafe { &mut *(raw as *mut RBigInt) };
             visitor(unsafe {
