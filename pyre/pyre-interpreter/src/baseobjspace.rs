@@ -9141,6 +9141,26 @@ unsafe fn is_object_setattr_descr(w_descr: PyObjectRef) -> bool {
     }
 }
 
+/// The canonical `type.__setattr__` slot wrapper (`init_type_type`,
+/// typedef.rs), distinct from `object.__setattr__` for the Carlo Verre
+/// hackcheck but a thin forward to `object_setattr` — so it still reaches
+/// the terminal non-heaptype raise rather than diverting to user code.
+unsafe fn is_type_setattr_descr(w_descr: PyObjectRef) -> bool {
+    match lookup_in_type_where(crate::typedef::w_type(), "__setattr__") {
+        Some(d) => std::ptr::eq(w_descr, d),
+        None => false,
+    }
+}
+
+/// The `type.__delattr__` companion of [`is_type_setattr_descr`] — the
+/// canonical `type`'s own slot forwarding to `object_delattr`.
+unsafe fn is_type_delattr_descr(w_descr: PyObjectRef) -> bool {
+    match lookup_in_type_where(crate::typedef::w_type(), "__delattr__") {
+        Some(d) => std::ptr::eq(w_descr, d),
+        None => false,
+    }
+}
+
 /// typeobject.py:303-326 `getattribute_if_not_from_object` — returns the
 /// app-level `__getattribute__` if it is NOT `object.__getattribute__`,
 /// otherwise `None`.  In the interpreter the negative result is memoized
@@ -10285,16 +10305,25 @@ pub fn type_immutable_attr_raise_is_stable(obj: PyObjectRef, name: &str, is_dele
         if is_delete {
             // `delattr_str`'s type-receiver branch: a non-default metaclass
             // `__delattr__` routes to a descriptor call instead of the
-            // terminal raise.
+            // terminal raise.  The metaclass is the canonical `type` (checked
+            // above), whose own `__delattr__` slot forwards to
+            // `object_delattr` — that still reaches the immutable raise, so it
+            // is accepted alongside `object`'s default.
             if let Some(da) = lookup_in_type(metaclass, "__delattr__") {
                 let is_default = lookup_in_type(crate::typedef::w_object(), "__delattr__")
                     .is_some_and(|d| std::ptr::eq(da, d));
-                if !is_default {
+                if !is_default && !is_type_delattr_descr(da) {
                     return false;
                 }
             }
-        } else if setattr_if_not_from_object(metaclass).is_some() {
-            return false;
+        } else if let Some(sa) = setattr_if_not_from_object(metaclass) {
+            // Same reasoning for setattr: the canonical `type`'s own
+            // `__setattr__` slot forwards to `object_setattr`, so only a
+            // genuine metaclass override (neither `object`'s nor `type`'s
+            // standard slot) diverts away from the terminal raise.
+            if !is_type_setattr_descr(sa) {
+                return false;
+            }
         }
         // The terminal's metaclass-MRO descriptor walk runs before the
         // heaptype guard; any hit (`__name__`, `__dict__`, …) diverts.
