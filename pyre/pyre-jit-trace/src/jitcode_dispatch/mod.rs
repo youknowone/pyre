@@ -6238,6 +6238,25 @@ impl ActiveResumeFrame {
         let code = self.0.jitcode.code.as_slice();
         code.len() == sub_body.code.len() && code.as_ptr() == sub_body.code.as_ptr()
     }
+
+    /// Recursive closure calls need their own operand-stack mirror even
+    /// while the wider callee-mirror experiment remains opt-in.  RPython
+    /// pushes one MIFrame per recursive call, so a conditional expression in
+    /// the callee keeps its pre-branch operands on that frame.  The legacy
+    /// collapsed sub-walk cannot resume such a kept stack after an earlier
+    /// closure-set mutation: replaying from entry sees the mutation and skips
+    /// the rest of the call.  Restrict automatic admission to handler-free
+    /// closure callees whose code identity matches the live root frame;
+    /// exception-bearing callees still use the established path until their
+    /// cross-frame handler resume is complete.
+    fn is_handler_free_closure(&self) -> bool {
+        let code = self.0.code_ptr;
+        if code.is_null() {
+            return false;
+        }
+        let code = unsafe { &*code };
+        !code.freevars.is_empty() && code.exceptiontable.is_empty()
+    }
 }
 
 /// Walker-side port of `pyjitpl.py handle_possible_exception`'s

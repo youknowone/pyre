@@ -12,6 +12,29 @@
 
 use super::*;
 
+/// Whether `frame` is a recursive call to the live root portal closure.
+/// Compare against the live `PyFrame.pycode`, not `snapshot_sym.jitcode`:
+/// the latter is rebound while a callee sub-walk is active and therefore
+/// aliases every ordinary inlined closure to itself.
+fn is_recursive_root_closure<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    frame: &ActiveResumeFrame,
+) -> bool {
+    if !frame.is_handler_free_closure() || ctx.fbw_mode.snapshot_sym.is_null() {
+        return false;
+    }
+    let live_frame = unsafe { (*ctx.fbw_mode.snapshot_sym).live_vable_frame_addr() }
+        as *const pyre_interpreter::PyFrame;
+    if live_frame.is_null() {
+        return false;
+    }
+    let root_code = unsafe {
+        pyre_interpreter::w_code_get_ptr((*live_frame).pycode as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    !root_code.is_null() && root_code == frame.0.code_ptr
+}
+
 /// #73: classify `instr` for the [`VstackOpClass`] taxonomy.  Mirrors the
 /// stack-effect grouping in [`crate::liveness`]'s `stack_effects`, but
 /// collapsed to the three categories the operand-stack box maintenance
@@ -28,6 +51,15 @@ pub(crate) fn classify_vstack_opcode(
         // depth, leave the surviving slots intact.
         Instruction::Nop
         | Instruction::Resume { .. }
+        // COPY_FREE_VARS copies closure cells into the frame's locals/cells
+        // region and leaves the operand stack untouched.  It is the first
+        // opcode of a closure body, so classifying it as Unmodeled disabled
+        // the mirror for the whole function.  A later conditional expression
+        // could then abort after an earlier side effect and replay from entry,
+        // skipping the remaining work when that side effect was a seen-set
+        // insertion.  PyPy's MIFrame changes no value-stack register here;
+        // preserve the same no-op stack shape.
+        | Instruction::CopyFreeVars { .. }
         | Instruction::Cache
         | Instruction::NotTaken
         // Pyre's END_FOR is a no-op; the following POP_ITER removes the
@@ -715,17 +747,18 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
     // no meaning in the outer (`fbw_mode.snapshot_sym`) jitcode's py_pc→jitcode
     // tables.  `inline_subwalk` is also set for the carrier walk of root code,
     // where that premise does not hold and the mirror is simply never seeded.
-    // With `PYRE_FBW_CALLEE_VSTACK` off this branch documents intent only:
-    // `seed_callee_vstack_mirror` is gated by the same flag.
+    // The explicit diagnostic gate and the recursive-closure admission are
+    // shared with `seed_callee_vstack_mirror`.
     let (new_pypc, code_ptr, new_depth) = if ctx.fbw_mode.inline_subwalk {
-        if !fbw_callee_vstack_enabled() {
-            ctx.vstack_valid = false;
-            return;
-        }
         let Some(frame) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym) else {
             ctx.vstack_valid = false;
             return;
         };
+        let recursive_closure = is_recursive_root_closure(ctx, &frame);
+        if !fbw_callee_vstack_enabled() && !recursive_closure {
+            ctx.vstack_valid = false;
+            return;
+        }
         let Some(coord) = frame.vstack_step_coordinate_for_jitcode_pc(jit_pc, ctx.vstack_cur_pypc)
         else {
             ctx.vstack_valid = false;
@@ -800,12 +833,13 @@ pub(crate) fn seed_callee_vstack_mirror<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     frame: &ActiveResumeFrame,
 ) {
-    if !fbw_callee_vstack_enabled() {
-        return;
-    }
     let Some((first_pypc, _code_ptr, _depth)) = frame.vstack_coordinate_for_jitcode_pc(0) else {
         return;
     };
+    let recursive_closure = is_recursive_root_closure(ctx, frame);
+    if !fbw_callee_vstack_enabled() && !recursive_closure {
+        return;
+    }
     ctx.vstack_boxes.clear();
     ctx.vstack_depth = 0;
     ctx.vstack_cur_pypc = first_pypc;
