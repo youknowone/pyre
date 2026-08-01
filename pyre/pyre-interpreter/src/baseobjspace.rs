@@ -17881,5 +17881,17 @@ pub fn dict_delitem_if_value_is(
     }
 }
 
+/// PyPy `W_DictMultiObject.nondescr_move_to_end`: subclass-bypassing move of an
+/// existing key to the back (`last`) or front of the insertion order.
+/// `Ok(false)` means the key was absent (the caller raises `KeyError`).
+pub fn dict_move_to_end(obj: PyObjectRef, key: PyObjectRef, last: bool) -> Result<bool, PyError> {
+    unsafe {
+        match pyre_object::dictmultiobject::w_dict_move_to_end_checked(obj, key, last) {
+            Ok(found) => Ok(found),
+            Err(_) => Err(take_pending_dict_key_error(key)),
+        }
+    }
+}
+
 // py_str and py_repr are defined in display.rs (with __str__/__repr__ dispatch).
 // Re-exported via crate::display::*.

@@ -295,6 +295,11 @@ pub struct ExecutionContext {
     /// `Context.run`.  Execution-context-owned, not a process global or an
     /// independent Rust TLS side table.
     pub contextvar_context: PyObjectRef,
+    /// `objspace.py:131` `ec._py_repr` — the identity dict of objects currently
+    /// being `repr()`'d (`__pypy__.objects_in_repr()`), lazily created.
+    /// Recursive `__repr__` (e.g. `OrderedDict`) consults it to emit `...`
+    /// instead of recursing.  Execution-context-owned like `contextvar_context`.
+    pub py_repr: PyObjectRef,
 }
 
 pub type PyExecutionContext = ExecutionContext;
@@ -359,6 +364,7 @@ impl ExecutionContext {
             w_asyncgen_firstiter_fn: pyre_object::PY_NULL,
             w_asyncgen_finalizer_fn: pyre_object::PY_NULL,
             contextvar_context: pyre_object::PY_NULL,
+            py_repr: pyre_object::PY_NULL,
         }
     }
 
@@ -392,6 +398,7 @@ impl ExecutionContext {
         ec.w_asyncgen_firstiter_fn = pyre_object::PY_NULL;
         ec.w_asyncgen_finalizer_fn = pyre_object::PY_NULL;
         ec.contextvar_context = pyre_object::PY_NULL;
+        ec.py_repr = pyre_object::PY_NULL;
         ec
     }
 
@@ -411,6 +418,7 @@ impl ExecutionContext {
         visitor(unsafe {
             &mut *(&mut self.contextvar_context as *mut PyObjectRef as *mut majit_ir::GcRef)
         });
+        visitor(unsafe { &mut *(&mut self.py_repr as *mut PyObjectRef as *mut majit_ir::GcRef) });
     }
 
     pub fn __init__(&mut self, space: PyObjectRef) {

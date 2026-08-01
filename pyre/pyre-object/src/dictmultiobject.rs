@@ -3361,6 +3361,94 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
     Ok(true)
 }
 
+/// PyPy `W_DictMultiObject.nondescr_move_to_end` (`dictmultiobject.py:221`):
+/// reposition an existing key to the back (`last`) or front of the insertion
+/// order, bypassing any subclass hooks.  Locates the entry callback-free,
+/// falling back to the reentrant scan when a probing `__eq__`/`__hash__`
+/// escapes the builtin ladder, then shifts it with `IndexMap::move_index` (the
+/// in-place equivalent of `objectmodel.move_to_end`, `:1175`).  Returns whether
+/// the key existed; `false` maps to `KeyError` at the wrapper.  `keys_version`
+/// is bumped: a reorder invalidates index-keyed caches (dict-view cursors,
+/// module-dict global slots) and raises the mutation-during-iteration guard,
+/// matching `OrderedDict` under CPython 3.14.
+///
+/// # Safety
+/// `obj` must point to a valid dict backing (`W_DictObject` or module dict).
+pub unsafe fn w_dict_move_to_end_checked(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    last: bool,
+) -> Result<bool, DictKeyError> {
+    if is_module_dict(obj) {
+        if !w_module_dict_is_object_strategy(obj) {
+            w_module_dict_switch_to_object_strategy(obj);
+        }
+        let object_key = object_key_for_checked(key)?;
+        if let Some(result) = callback_free_dict_op!({
+            let entries = w_module_dict_object_storage_mut(obj);
+            match entries.get_index_of(&object_key) {
+                Some(index) => {
+                    let target = if last { entries.len() - 1 } else { 0 };
+                    // A key already at the target is a positional no-op; skip
+                    // the version bump so a live iterator is not spuriously
+                    // invalidated (as in w_dict_delitem_if_value_is_checked).
+                    if index != target {
+                        entries.move_index(index, target);
+                        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+                        strategy.mutated();
+                        w_dict_bump_keys_version(obj);
+                    }
+                    true
+                }
+                None => false,
+            }
+        }) {
+            return result;
+        }
+        // Module dicts key on interned strings, which compare callback-free; a
+        // key needing a user `__eq__` has no reentrant fallback here, matching
+        // w_dict_delitem_if_value_is_checked's module branch.
+        return Err(DictKeyError);
+    }
+
+    let strategy = (*(obj as *const W_DictObject)).dstrategy;
+    if strategy.strategy_kind() != StrategyKind::Object {
+        strategy.switch_to_object_strategy(obj);
+    }
+    let object_key = object_key_for_checked(key)?;
+    if let Some(result) = callback_free_dict_op!({
+        let dict = &mut *(obj as *mut W_DictObject);
+        let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+        match entries.get_index_of(&object_key) {
+            Some(index) => {
+                let target = if last { entries.len() - 1 } else { 0 };
+                if index != target {
+                    entries.move_index(index, target);
+                    dict.keys_version = dict.keys_version.wrapping_add(1);
+                }
+                true
+            }
+            None => false,
+        }
+    }) {
+        return result;
+    }
+    // A probing `__eq__` may have run and moved the container; the reentrant
+    // scan re-pins it and returns the current index (no `value` to carry).
+    let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
+    let Some(index) = found else {
+        return Ok(false);
+    };
+    let dict = &mut *(obj as *mut W_DictObject);
+    let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
+    let target = if last { entries.len() - 1 } else { 0 };
+    if index != target {
+        entries.move_index(index, target);
+        dict.keys_version = dict.keys_version.wrapping_add(1);
+    }
+    Ok(true)
+}
+
 /// Internal helper: `ObjectDictStrategy::delitem` body for pyre's
 /// W_DictObject — dstorage lookup + removal. Called only from the strategy trait impl to avoid
 /// recursion through `w_dict_delitem`.
