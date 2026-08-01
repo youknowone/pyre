@@ -2624,15 +2624,18 @@ impl ExtendedShortPreambleBuilder {
     /// For each base op, ensures missing deps from produced_short_boxes are
     /// inserted before the consumer (RPython use_box arg-handling parity).
     ///
-    /// Always returns `true`. Upstream's `setup` (shortpreamble.py:460-463)
-    /// is three field assignments and cannot fail, because the filtering
-    /// happened at EXPORT: `produce_arg` returning None makes
-    /// `add_op_to_short` return None and THAT ONE short_op is left out
-    /// (shortpreamble.py:283-296, 311-341). The loop below reproduces that
-    /// per-op drop here, where pyre first learns an arg is unresolvable —
-    /// its short boxes are exported against one label-arg set and replayed
-    /// against another. The `bool` is kept so the callers' existing
-    /// success/failure plumbing stays untouched.
+    /// Upstream's `setup` (shortpreamble.py:460-463) is three field
+    /// assignments and cannot fail, because the filtering happened at EXPORT:
+    /// `produce_arg` returning None makes `add_op_to_short` return None and
+    /// THAT ONE short_op is left out (shortpreamble.py:283-296, 311-341). The
+    /// loop below reproduces that per-op drop here, where pyre first learns an
+    /// arg is unresolvable — its short boxes are exported against one
+    /// label-arg set and replayed against another.
+    ///
+    /// Returns `false` only for the one case the per-op drop cannot express: a
+    /// dropped op whose result the short preamble's own JUMP carries, which
+    /// would leave `inline_short_preamble`'s `_map_args` (unroll.py:404) with
+    /// an unmapped key. The caller then falls back to `jump_to_preamble`.
     pub fn setup(
         &mut self,
         short_preamble: &ShortPreamble,
@@ -2707,6 +2710,30 @@ impl ExtendedShortPreambleBuilder {
                 self.insert_dep_recursive(arg.to_opref(), &inputargs_set, &constants_set)
             });
             if !resolvable {
+                // The per-op drop is only upstream's outcome while the dropped
+                // result stays invisible to the caller. `short_preamble.ops` and
+                // `short_preamble.jump_args` are filled in lockstep, so an op
+                // whose result the short preamble's own JUMP carries has no
+                // per-op answer: leaving it unmapped is what `_map_args`
+                // (unroll.py:404) raises KeyError on, and shortening the JUMP
+                // instead would disagree with the already-compiled target
+                // LABEL's arity. Decline the inline in that case, the way this
+                // whole loop used to, so `jump_to_existing_trace` falls back to
+                // `jump_to_preamble` (unroll.py:156).
+                if short_preamble.jump_args.contains(&op.pos.get()) {
+                    if crate::optimizeopt::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] short_preamble setup: dropping inline (unresolved arg in \
+                             jump-arg producer pos={:?} opcode={:?})",
+                            op.pos.get(),
+                            op.opcode
+                        );
+                    }
+                    self.short.clear();
+                    self.short_results.clear();
+                    self.label_args = label_args.to_vec();
+                    return false;
+                }
                 if crate::optimizeopt::majit_log_enabled() {
                     eprintln!(
                         "[jit] short_preamble setup: dropping op pos={:?} opcode={:?} (unresolved arg)",

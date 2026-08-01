@@ -7570,15 +7570,31 @@ impl<M: Clone> MetaInterp<M> {
 
         // compile.py:390 `target_token = loop.operations[-1].getdescr()`: the
         // retrace's closing JUMP names the label this very trace installs.
-        // Upstream's other outcome — `unroll.py:238-242 jump_to_preamble`,
-        // where the JUMP is retargeted at the ORIGINAL loop's start descr — is
-        // a jump into ANOTHER compiled trace
+        // Upstream's other outcome — `unroll.py:156/171 jump_to_preamble`,
+        // where the JUMP is retargeted at the ORIGINAL loop's start descr
+        // (`unroll.py:238-242`) — is a jump into ANOTHER compiled trace
         // (`x86/assembler.py:2461-2467 closing_jump` emits
-        // `JMP(imm(target_token._ll_loop_code))`), which this backend's
-        // function-per-trace model cannot emit. Compiling it anyway would
-        // leave a JUMP whose descr names no label in this trace, so take
-        // `compile.py:368-371`'s cancel shape instead: a retrace that cannot
-        // close onto its own label is not compiled.
+        // `JMP(imm(target_token._ll_loop_code))`), and upstream still compiles
+        // it: both `jump_to_preamble` sites return a full `UnrollInfo`, so
+        // `compile.py:373-393` assembles the trace and attaches it.
+        // `unroll.rs:1831-1878` ports that retargeting, so this arm IS
+        // reachable — the retrace limit, an `InvalidLoop` from
+        // `jump_to_existing_trace`, and the foreign-target fallback at
+        // `unroll.rs:1797-1810` all reach it.
+        //
+        // It is declined here for a BACKEND reason, and only one backend:
+        // `majit-backend-wasm` decides local-vs-external JUMP on `has_loop`
+        // (`codegen.rs:1983`), not on whether the descr resolves. A retrace has
+        // its own LABEL, so `find_loop_label_index`'s
+        // `.or_else(rposition(Label))` fallback (`codegen.rs:4785-4791`) makes
+        // `has_loop` true, the external arm at `codegen.rs:2195` is skipped,
+        // and `find_label_args` (`codegen.rs:4806-4810`) falls back to the
+        // trailing label — silently turning the preamble JUMP into a back-edge
+        // to this trace's own label. Cranelift has no such gap
+        // (`compiler.rs:13247-13302` resolves by descr and emits an external
+        // exit). Until the wasm dispatch is descr-driven, take
+        // `compile.py:368-371`'s cancel shape: declining costs the guard its
+        // retrace, compiling it would miscompile on wasm.
         let closes_on_own_label = {
             let jump_descr = combined_ops
                 .iter()

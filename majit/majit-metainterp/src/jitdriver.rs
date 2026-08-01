@@ -3048,6 +3048,19 @@ impl<S: JitState> JitDriver<S> {
                                         // (compile.py:392-393). Clearing it here
                                         // turned every such retrace into a
                                         // `ResumeFromInterpDescr` front-door install.
+                                        //
+                                        // Only the CLASS survives, not the
+                                        // attempt: upstream closes this gate
+                                        // through `partial_trace`
+                                        // (pyjitpl.py:3003), which
+                                        // `retrace_needed` always arms because
+                                        // compile.py:1079 calls it
+                                        // unconditionally. majit calls it only
+                                        // when `compile_bridge` produced an
+                                        // exported state (pyjitpl.rs:11823), so
+                                        // without the latch the gate would stay
+                                        // open on the `exported == None` edge.
+                                        self.bridge_attempt_declined = true;
                                         // Fall through — do NOT return.
                                     }
                                     // pyjitpl.py:3220 raise_if_successful() does not
@@ -3268,7 +3281,11 @@ impl<S: JitState> JitDriver<S> {
                                     // `retrace_needed` (pyjitpl.py:2438-2442), so
                                     // it has to survive into
                                     // `resumekey.compile_and_attach`
-                                    // (compile.py:392-393).
+                                    // (compile.py:392-393). The attempt latch is
+                                    // set for the same reason as on that twin —
+                                    // `partial_trace` only closes this gate when
+                                    // `compile_bridge` exported a state.
+                                    self.bridge_attempt_declined = true;
                                     // Fall through — do NOT return.
                                 }
                                 // pyjitpl.py:3220 raise_if_successful() does not
