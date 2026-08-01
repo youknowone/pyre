@@ -4583,23 +4583,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let w_sysconf_names = pyre_object::w_dict_new();
         let _sysconf_names_root = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(w_sysconf_names);
+        let names_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         for (name, value) in sysconf_names() {
+            // Build the value first: call arguments evaluate left to right, so
+            // reading the rooted dict inline would take its address before
+            // `w_int_new` allocates, and a collection there would leave the
+            // store writing through the pre-move address.
+            let w_value = pyre_object::w_int_new(*value as i64);
             unsafe {
                 pyre_object::w_dict_setitem_str(
-                    pyre_object::gc_roots::shadow_stack_get(
-                        pyre_object::gc_roots::shadow_stack_len() - 1,
-                    ),
+                    pyre_object::gc_roots::shadow_stack_get(names_slot),
                     name,
-                    pyre_object::w_int_new(*value as i64),
+                    w_value,
                 );
             }
         }
         crate::module_ns_store(
             ns,
             "sysconf_names",
-            pyre_object::gc_roots::shadow_stack_get(
-                pyre_object::gc_roots::shadow_stack_len() - 1,
-            ),
+            pyre_object::gc_roots::shadow_stack_get(names_slot),
         );
 
         // os.initgroups(username, gid) -> None
