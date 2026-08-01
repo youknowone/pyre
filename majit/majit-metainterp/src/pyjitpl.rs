@@ -7288,6 +7288,7 @@ impl<M: Clone> MetaInterp<M> {
         // gcreftracer.py parity: GC may have moved objects between Phase 1
         // and Phase 2. Refresh GcRef values from shadow stack before use.
         start_state.refresh_from_gc();
+        let start_state_quasi_immutable_deps = start_state.quasi_immutable_deps.clone();
         // `compile.py:392 resumekey.compile_and_attach(metainterp, loop,
         // inputargs)` — the resumekey decides how a finished retrace is
         // installed, and a retrace grown from a guard failure carries a
@@ -7487,6 +7488,13 @@ impl<M: Clone> MetaInterp<M> {
                 return false;
             }
         };
+        // compile.py:384-390: merge loop_info deps first, then deps carried
+        // from the exported start_state.
+        let mut quasi_immutable_deps = std::mem::take(&mut unroll_opt.quasi_immutable_deps);
+        crate::optimizeopt::unroll::merge_quasi_immutable_deps(
+            &mut quasi_immutable_deps,
+            &start_state_quasi_immutable_deps,
+        );
 
         // compile.py:379-382: partial_trace.operations + [label_op] + loop_ops.
         //
@@ -7614,6 +7622,7 @@ impl<M: Clone> MetaInterp<M> {
                 constants,
                 &mut unroll_opt,
                 num_combined_ops,
+                quasi_immutable_deps,
             );
         }
 
@@ -7835,8 +7844,7 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(green_key, 0, num_combined_ops);
                 }
-                self.last_quasi_immutable_deps =
-                    std::mem::take(&mut unroll_opt.quasi_immutable_deps);
+                self.last_quasi_immutable_deps = quasi_immutable_deps;
                 true
             }
             Err(e) => {
@@ -7885,6 +7893,7 @@ impl<M: Clone> MetaInterp<M> {
         constants: majit_ir::ConstMap<majit_ir::Value>,
         unroll_opt: &mut crate::optimizeopt::unroll::UnrollOptimizer,
         num_combined_ops: usize,
+        quasi_immutable_deps: Vec<(u64, u32)>,
     ) -> bool {
         let Some(fail_descr) = bridge.source_descr.as_fail_descr() else {
             crate::debug::log_one(
@@ -7993,8 +8002,7 @@ impl<M: Clone> MetaInterp<M> {
                 // procedure token this retrace specializes, the same one
                 // `unroll_opt.retraced_count` was seeded from.
                 loop_jitcell_token.set_retraced_count(unroll_opt.retraced_count);
-                self.last_quasi_immutable_deps =
-                    std::mem::take(&mut unroll_opt.quasi_immutable_deps);
+                self.last_quasi_immutable_deps = quasi_immutable_deps;
                 // compile.py:811 `record_loop_or_bridge(metainterp.staticdata,
                 // new_loop)` with `new_loop.original_jitcell_token` = the
                 // source JCT (compile.py:801), so every bridge-internal
