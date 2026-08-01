@@ -631,14 +631,21 @@ pub fn module_dict_strategy_gc_type_id() -> u32 {
 /// traced, so the common no-watcher mutation still makes no call.
 #[majit_macros::dont_look_inside]
 pub fn sweep_version_watchers(watchers: &mut Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>) {
-    watchers.retain(|w| {
+    // `QuasiImmut.invalidate` takes the list and empties it BEFORE walking it
+    // (`wrefs = self.looptokens_wrefs; self.looptokens_wrefs = []`), so a loop
+    // is invalidated exactly once and then drops out.  Keeping the live
+    // watchers instead would be doubly wrong: the flag is already `true`, so
+    // re-storing it does nothing, and the list would only ever grow — one
+    // entry per compiled loop that folded a module-global.  A module-level
+    // `except X as e:` runs `del e` every iteration, and `delitem` calls
+    // `mutated()`, so retaining would make each iteration walk every loop ever
+    // compiled in the module: O(compiled loops) per store, and the JIT
+    // compiling more loops would make the interpreter slower.
+    for w in std::mem::take(watchers) {
         if let Some(flag) = w.upgrade() {
             flag.store(true, std::sync::atomic::Ordering::Release);
-            true
-        } else {
-            false
         }
-    });
+    }
 }
 
 impl Default for ModuleDictStrategy {
@@ -856,9 +863,13 @@ impl ModuleDictStrategy {
     ///         cache.cell = w_value
     /// ```
     ///
-    /// Cell-indirection (`write_cell`) is stubbed to identity until
-    /// the `MutableCell` family ports.  Without cells, every write
-    /// reaches `storage[key] = w_value` and triggers `mutated()`.
+    /// `write_cell` absorbs a rewrite in place whenever the slot already
+    /// holds an `ObjectMutableCell` (or an `IntMutableCell` and the value is
+    /// a plain int), returning `None` so the version is left alone.  Only a
+    /// structural change — installing a key that had no cell, or replacing
+    /// the cell kind — reaches `mutated()`.  That is what keeps a hot
+    /// module-level counter increment from invalidating every loop that
+    /// folded a module-global.
     pub fn _setitem_str_cell_known(
         &mut self,
         cell: Option<PyObjectRef>,
