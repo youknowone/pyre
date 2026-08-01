@@ -673,15 +673,15 @@ impl FrameBox {
         FrameBox::new_boxed(frame)
     }
 
-    /// Allocate a frame that is NOT GC-managed even when the GC hook is
-    /// installed — a plain `std::alloc` `GcFramePrefix` box reclaimed by
-    /// `Drop`.  Used for tracer snapshots (`snapshot_for_tracing`), which
-    /// a tracer holds off the `CURRENT_FRAME` chain across an entire
-    /// `trace_bytecode` walk: a major cycle can complete mid-walk, and no
-    /// root reaches the snapshot, so GC lifetime would reclaim it while the
-    /// tracer still reads it.  A deterministic scope-end free is correct
-    /// for these transient, tracer-private copies.
-    pub fn new_boxed(frame: PyFrame) -> Self {
+    /// Allocate a frame outside the GC — a plain `std::alloc`
+    /// `GcFramePrefix` box reclaimed by `Drop`.
+    ///
+    /// The sole caller is [`Self::new`]'s fallback for the window before the
+    /// GC hook is installed (bootstrap, unit tests).  Nothing is collected in
+    /// that window, so a frame allocated here is never swept and never moves,
+    /// which is what lets the rest of the interpreter treat every frame
+    /// address as stable.
+    fn new_boxed(frame: PyFrame) -> Self {
         let raw = Box::into_raw(Box::new(GcFramePrefix {
             gc_header: 0,
             frame,
@@ -700,9 +700,9 @@ impl FrameBox {
     /// which is why RPython reads a GCREF local back out of its shadow-stack
     /// slot rather than from a register it filled before the last operation
     /// that could collect; the raw `ptr` field is that stale register, so
-    /// every read of the frame goes through the slot instead.  A `new_boxed`
-    /// snapshot holds no slot and is not GC-managed, so its address is fixed
-    /// and the field is the only answer.
+    /// every read of the frame goes through the slot instead.  A
+    /// [`Self::new_boxed`] frame holds no slot and is not GC-managed, so its
+    /// address is fixed and the field is the only answer.
     #[inline]
     fn frame_ptr(&self) -> *mut PyFrame {
         match &self.owner_root {

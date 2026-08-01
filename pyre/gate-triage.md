@@ -562,7 +562,10 @@ automatic rewrite of live frame references across collection points.  Until one
 exists, `FrameBox::new` allocating non-moving is the thing standing in for it,
 and it should be read as pyre's stand-in for the translator's shadow-stack
 rewrite rather than as an accident awaiting cleanup.  The same holds for what it
-props up: `PyTraceback.w_code` stays, and so does the conditional frame edge.
+props up: `PyTraceback.w_code` stays, and so does the conditional frame edge —
+though the edge's reachable case has narrowed to the pre-hook bootstrap frame
+(see `TraceCtx::virtualizable_heap_ptr` below), which is why the guard is now
+kept for its failure mode rather than for a case anyone has observed.
 
 Two cached raw copies were checked against upstream individually rather than
 left on a list.  Neither is a hazard, and only one is even the deviation it
@@ -585,12 +588,35 @@ place).  What the field does not do is forward *itself*, and that is exactly
 what the non-moving contract above makes unnecessary.  Rooting it would forward
 nothing.
 
-*`TraceCtx::virtualizable_heap_ptr` — blocked, and the blocker is named.*  It
-caches what upstream unwraps per use.  It cannot simply become a forwarded slot:
-a root portal seed deliberately points it at the `snapshot_for_tracing` copy, a
-`FrameBox::new_boxed` allocation the GC does not own, so there is no slot to
-forward.  Closing it means first retiring the snapshot-as-synchronization-target
-deviation, which is a tracer change, not a rooting change.
+*`TraceCtx::virtualizable_heap_ptr` — half closed; the rest is architectural.*
+It caches what upstream unwraps per use (`pyjitpl.py:3472-3474
+synchronize_virtualizable` re-derives the write target from
+`virtualizable_boxes[-1]` every time), and a root portal seed points it at the
+`snapshot_for_tracing` copy while baking the identity against the live frame,
+so the two name different objects where upstream has one.
+
+The half that was a rooting problem is gone.  The snapshot used to be a
+`FrameBox::new_boxed` allocation the GC did not own, which is what left the
+cached pointer with no slot to forward — and, downstream, what made the
+traceback the walk records against it (`pyjitpl.rs`
+`record_application_traceback(excvalue, self.vable_ptr, frame)`) carry a frame
+pointer that dangled as soon as the walk ended.  `FrameBox::new`'s `owner_root`
+now supplies the root that was missing, so `snapshot_for_tracing` allocates
+GC-owned, the traceback's conditional frame edge forwards and keeps it alive,
+and a full-corpus probe on that edge observed no non-GC frame reaching a
+traceback at all.
+
+The half that remains is not a rooting change and not a tracer change either.
+The two objects exist because pyre's tracer steps a *copy*: the walk executes
+the iteration concretely against the snapshot while the live frame stays parked
+at the loop header for the compiled loop to run from.  That forces the split in
+both directions — the identity must be the live frame or
+`patch_new_loop_to_load_virtualizable_fields` gets a frame unrelated to the
+boxes (`compile.py:458 assert i == len(inputargs)`), and the synchronization
+target must be the snapshot or `refresh_virtualizable_shadow_from_heap` reads a
+frame the walk never mutated and the shadow drifts.  Upstream needs one field
+because its metainterp *is* the interpreter for that iteration.  So this cache
+converges when the copy-walk does, and not before.
 
 **The invariant is narrower than "frames are non-moving", and that is by
 design.**  A compiled trace's own `NewWithVtable(pyframe_size_descr())` really

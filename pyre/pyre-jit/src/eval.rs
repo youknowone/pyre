@@ -554,9 +554,14 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
 ///     `pyframe_object_custom_trace` recurses into locals/cells/
 ///     valuestack and the `f_backref` chain, so a frame reachable only
 ///     through a live traceback (the whole point of `tb_frame`) is not
-///     reclaimed.  A non-Gc frame (a `FrameBox::new_boxed` tracer
-///     snapshot, freed at the end of its walk) is left dangling exactly
-///     as before — never dereferenced.
+///     reclaimed.  The condition covers the pre-hook bootstrap frame
+///     (`FrameBox::new`'s `new_boxed` fallback), whose address the
+///     collector does not own and must never be handed; such a pointer
+///     is left alone and is never dereferenced.  A tracer snapshot used
+///     to land here too — the walk records tracebacks against it
+///     (`pyjitpl.rs record_application_traceback(.., self.vable_ptr, ..)`)
+///     — but `snapshot_for_tracing` is GC-owned now, so that traceback
+///     keeps its frame alive instead of dangling.
 unsafe fn pytraceback_object_custom_trace(
     obj_addr: usize,
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
