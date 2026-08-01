@@ -466,7 +466,7 @@ pub struct MiniMarkGC {
     /// incminimark.py:407 `self.young_objects_with_destructors =
     /// self.AddressStack()`. Nursery-resident objects whose type carries
     /// a lightweight `TypeInfo.destructor`. Populated by
-    /// `register_destructor_if_needed` at allocation (incminimark.py:689
+    /// `register_young_object_if_needed` at allocation (incminimark.py:689
     /// `if needs_finalizer:`). Drained at end of minor cycle by
     /// `deal_with_young_objects_with_destructors` (incminimark.py:1868,
     /// :2884-2895): a dead object's destructor runs, a survivor moves to
@@ -1066,9 +1066,41 @@ impl MiniMarkGC {
     fn finish_nursery_object(&mut self, ptr: *mut u8, type_id: u32) -> GcRef {
         Self::init_nursery_object(ptr, type_id);
         let obj = GcRef((ptr as usize) + GcHeader::SIZE);
-        self.register_weakref_if_needed(type_id, obj.0);
-        self.register_destructor_if_needed(type_id, obj.0);
+        self.register_young_object_if_needed(type_id, obj.0);
         obj
+    }
+
+    /// incminimark.py:687-693's pair of `if`s, reached the way upstream reaches
+    /// them: with both flags already in hand.
+    ///
+    /// A WEAKREF (`T_IS_WEAKREF` in its TYPE_INFO) joins the young-weakref list
+    /// so the next minor collection can invalidate the single `weakptr` slot at
+    /// `weakref::WEAKPTR_OFFSET` inside the payload (gctypelayout.py:592) if its
+    /// target dies. A type carrying a lightweight `TypeInfo.destructor` joins
+    /// the young-destructor list, so that collection either runs the destructor
+    /// or promotes the entry to `old_objects_with_destructors`.
+    /// `obj_addr` is the payload base (post-header) in both cases.
+    ///
+    /// `malloc_fixedsize` takes `needs_finalizer` and `contains_weakptr` as
+    /// arguments, so its tail costs two tests on values the caller supplied —
+    /// and in the `malloc_fast` copy (`framework.py:371-382`, annotated
+    /// `s_False, s_False, s_False`) both fold away entirely. pyre resolves them
+    /// from the type table instead, which is one row lookup, not two: probing
+    /// separately repeats the bound test, the table base load and the stride
+    /// multiply that the first probe already performed.
+    #[inline]
+    fn register_young_object_if_needed(&mut self, type_id: u32, obj_addr: usize) {
+        if (type_id as usize) >= self.types.len() {
+            return;
+        }
+        let info = self.types.get(type_id);
+        let (is_weakref, has_destructor) = (info.is_weakref, info.destructor.is_some());
+        if is_weakref {
+            self.young_objects_with_weakrefs.push(obj_addr);
+        }
+        if has_destructor {
+            self.young_objects_with_destructors.push(obj_addr);
+        }
     }
 
     /// incminimark.py:865-930 `collect_and_reserve` pinned-barrier walk.
@@ -1229,39 +1261,6 @@ impl MiniMarkGC {
     fn spill_to_oldgen_or_null(&mut self, type_id: u32, total_size: usize) -> GcRef {
         self.try_alloc_in_oldgen(type_id, total_size)
             .unwrap_or(GcRef(0))
-    }
-
-    /// incminimark.py:690-692 parity. When a freshly-allocated object
-    /// is a WEAKREF (T_IS_WEAKREF in its TYPE_INFO), push it onto the
-    /// young-weakref list so the next minor collection can invalidate
-    /// its weakptr if the target dies.
-    ///
-    /// `obj_addr` is the payload base (post-header). The weakref's
-    /// single `weakptr` slot lives at `weakref::WEAKPTR_OFFSET`
-    /// inside that payload (gctypelayout.py:592).
-    fn register_weakref_if_needed(&mut self, type_id: u32, obj_addr: usize) {
-        if (type_id as usize) >= self.types.len() {
-            return;
-        }
-        if self.types.get(type_id).is_weakref {
-            self.young_objects_with_weakrefs.push(obj_addr);
-        }
-    }
-
-    /// incminimark.py:689-690 parity. When a freshly nursery-allocated
-    /// object's type carries a lightweight `TypeInfo.destructor`, push it
-    /// onto the young-destructor list so the next minor collection runs
-    /// the destructor if the object dies (or promotes it to the
-    /// old-destructor list if it survives).
-    ///
-    /// `obj_addr` is the payload base (post-header).
-    fn register_destructor_if_needed(&mut self, type_id: u32, obj_addr: usize) {
-        if (type_id as usize) >= self.types.len() {
-            return;
-        }
-        if self.types.get(type_id).destructor.is_some() {
-            self.young_objects_with_destructors.push(obj_addr);
-        }
     }
 
     /// Run the lightweight destructor registered for `obj_addr`'s type,
