@@ -6,6 +6,13 @@
   <meta name="description" content="Pyre is a PyPy-style meta-tracing JIT Python implementation, reimplemented in Rust.">
   <meta name="theme-color" content="#0f1720">
   <title>pyre</title>
+  <script>
+    try {
+      document.documentElement.dataset.theme = localStorage.getItem("pyre-theme") || "dark";
+    } catch {
+      document.documentElement.dataset.theme = "dark";
+    }
+  </script>
   <style>
     :root {
       --bg: #0f1720;
@@ -26,6 +33,25 @@
       --radius-lg: 22px;
       --radius-md: 16px;
       --max-width: 1160px;
+      --dark-mode-icon: #173f59;
+      --light-mode-icon: #f8fbfd;
+    }
+
+    [data-theme="light"] {
+      --bg: #eef3f7;
+      --bg-soft: #e3ebf2;
+      --panel: rgba(255, 255, 255, 0.88);
+      --panel-strong: rgba(255, 255, 255, 0.96);
+      --line: rgba(15, 23, 32, 0.12);
+      --line-strong: rgba(15, 23, 32, 0.2);
+      --text: #182532;
+      --muted: #526779;
+      --dim: #6b8191;
+      --accent: #245a78;
+      --accent-strong: #173f59;
+      --success: #16734c;
+      --danger: #a3313b;
+      --shadow: 0 24px 70px rgba(35, 59, 76, 0.14);
     }
 
     * {
@@ -45,6 +71,53 @@
         radial-gradient(circle at top left, rgba(56, 189, 248, 0.08), transparent 26%),
         radial-gradient(circle at bottom right, rgba(125, 211, 252, 0.06), transparent 24%),
         linear-gradient(180deg, #0b131c 0%, #0f1720 100%);
+    }
+
+    [data-theme="light"] body {
+      background:
+        radial-gradient(circle at top left, rgba(36, 90, 120, 0.1), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(125, 211, 252, 0.12), transparent 26%),
+        linear-gradient(180deg, #f8fbfd 0%, var(--bg) 100%);
+    }
+
+    [data-theme="light"] .nav {
+      background: rgba(248, 251, 253, 0.82);
+      border-bottom-color: var(--line);
+    }
+
+    [data-theme="light"] .button.primary {
+      color: #f3f8fb;
+      background: linear-gradient(180deg, #315f79, #173f59);
+      box-shadow: 0 14px 36px rgba(23, 63, 89, 0.22);
+    }
+
+    [data-theme="light"] .button.secondary,
+    [data-theme="light"] .theme-toggle {
+      border-color: transparent;
+      background: transparent;
+    }
+
+    [data-theme="light"] .button.secondary:hover,
+    [data-theme="light"] .button.secondary:focus-visible,
+    [data-theme="light"] .theme-toggle:hover,
+    [data-theme="light"] .theme-toggle:focus-visible {
+      background: rgba(36, 90, 120, 0.1);
+    }
+
+    [data-theme="light"] textarea,
+    [data-theme="light"] pre,
+    [data-theme="light"] .install-code {
+      background: #f8fbfd;
+      color: #1b2c39;
+    }
+
+    [data-theme="light"] .install-card,
+    [data-theme="light"] .link-card {
+      background: rgba(255, 255, 255, 0.62);
+    }
+
+    [data-theme="light"] .link-card a {
+      color: var(--accent-strong);
     }
 
     a {
@@ -130,8 +203,47 @@
       color: var(--text);
     }
 
+    .theme-toggle {
+      width: 36px;
+      min-height: 36px;
+      padding: 0;
+      color: var(--text);
+      font-size: 1.1rem;
+      border: 1px solid transparent;
+      border-radius: 9px;
+      background: transparent;
+      cursor: pointer;
+      display: inline-grid;
+      place-items: center;
+    }
+
+    .theme-toggle:hover,
+    .theme-toggle:focus-visible {
+      border-color: var(--accent);
+      background: rgba(255, 255, 255, 0.09);
+    }
+
+    .theme-icon {
+      width: 18px;
+      height: 18px;
+      fill: none;
+      stroke: currentColor;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-width: 1.8;
+    }
+
+    .theme-icon.moon-icon {
+      fill: var(--dark-mode-icon);
+      stroke: none;
+    }
+
+    .theme-icon.sun-icon {
+      stroke: var(--light-mode-icon);
+    }
+
     .hero {
-      padding: 72px 0 36px;
+      padding: 55px 0 36px;
     }
 
     .hero-grid {
@@ -245,6 +357,10 @@
       margin-top: 28px;
     }
 
+    section {
+      scroll-margin-top: 92px;
+    }
+
     .playground-card {
       padding: 26px;
       display: grid;
@@ -293,6 +409,7 @@
 
     .label {
       font-size: 0.85rem;
+      font-weight: 600;
       color: var(--dim);
       letter-spacing: 0.08em;
       text-transform: uppercase;
@@ -344,6 +461,14 @@
       cursor: pointer;
     }
 
+    .output-wrap .status {
+      min-height: 48px;
+      display: flex;
+      align-items: center;
+      justify-self: end;
+      margin-top: 0;
+    }
+
     .ghost {
       color: var(--text);
       background: rgba(255, 255, 255, 0.04);
@@ -368,7 +493,7 @@
 
     .install-grid {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 16px;
       margin-top: 18px;
     }
@@ -409,12 +534,43 @@
 
     .install-card .install-code,
     .install-card > .button {
+      margin-top: 14px;
+    }
+
+    .install-card:nth-child(1) .install-code,
+    .install-card:nth-child(2) .install-code {
+      min-height: 77px;
+    }
+
+    .install-card:nth-child(2) .install-code {
       margin-top: auto;
     }
 
     .install-card > .button {
-      width: 100%;
-      justify-content: center;
+      align-self: flex-start;
+    }
+
+    .release-card {
+      grid-column: 1 / -1;
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+    }
+
+    .release-card-copy {
+      flex: 1;
+    }
+
+    .release-card-copy p {
+      margin-bottom: 0;
+    }
+
+    .release-card > .button {
+      flex: 0 0 auto;
+      margin-top: 0;
+      align-self: center;
     }
 
     .link-card a {
@@ -474,6 +630,15 @@
       .section-card {
         padding: 20px;
       }
+
+      .release-card {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .release-card > .button {
+        align-self: flex-start;
+      }
     }
   </style>
 </head>
@@ -492,6 +657,12 @@
         <a href="#project">Project</a>
         <a href="#install">Install</a>
         <a href="https://github.com/youknowone/pyre">GitHub</a>
+        <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Switch to light mode" aria-pressed="false" title="Switch to light mode">
+          <svg class="theme-icon sun-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="4"></circle>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path>
+          </svg>
+        </button>
       </nav>
     </div>
   </header>
@@ -533,7 +704,6 @@
                 This runs the WASM build of pyre directly in the page. It is meant for quick experiments and basic examples.
               </p>
             </div>
-            <div class="status" id="playground-status">Loading WebAssembly module...</div>
           </div>
 
           <div class="playground-grid">
@@ -555,6 +725,7 @@ print(fib(100))</textarea>
             <div class="output-wrap">
               <div class="label">Output</div>
               <pre id="output">Initializing pyre...</pre>
+              <div class="status" id="playground-status">Loading WebAssembly module...</div>
             </div>
           </div>
         </div>
@@ -610,9 +781,11 @@ print(fib(100))</textarea>
               <pre class="install-code">cargo install pyrex</pre>
             </div>
 
-            <div class="install-card">
-              <h3>Binary releases</h3>
-              <p>Download a prebuilt binary from the latest GitHub release.</p>
+            <div class="install-card release-card">
+              <div class="release-card-copy">
+                <h3>Binary releases</h3>
+                <p>Download a prebuilt binary from the latest GitHub release.</p>
+              </div>
               <a class="button secondary" href="https://github.com/youknowone/pyre/releases">Open releases</a>
             </div>
           </div>
@@ -634,6 +807,30 @@ print(fib(100))</textarea>
     const outputNode = document.getElementById("output");
     const runButton = document.getElementById("run-button");
     const exampleButton = document.getElementById("example-button");
+    const themeToggle = document.getElementById("theme-toggle");
+    const sunIcon = '<svg class="theme-icon sun-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path></svg>';
+    const moonIcon = '<svg class="theme-icon moon-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.5 8.5 0 1 0 20.5 14.2Z"></path></svg>';
+
+    function applyTheme(theme) {
+      const isLight = theme === "light";
+      document.documentElement.dataset.theme = isLight ? "light" : "dark";
+      const nextModeLabel = isLight ? "Switch to dark mode" : "Switch to light mode";
+      themeToggle.innerHTML = isLight ? moonIcon : sunIcon;
+      themeToggle.setAttribute("aria-label", nextModeLabel);
+      themeToggle.title = nextModeLabel;
+      themeToggle.setAttribute("aria-pressed", String(isLight));
+    }
+
+    applyTheme(document.documentElement.dataset.theme);
+    themeToggle.addEventListener("click", () => {
+      const nextTheme = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+      applyTheme(nextTheme);
+      try {
+        localStorage.setItem("pyre-theme", nextTheme);
+      } catch {
+        // Theme switching still works when storage is unavailable.
+      }
+    });
 
     // Keep the source editor and output panel at the same height while either
     // native resize handle is being dragged.
