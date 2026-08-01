@@ -564,15 +564,33 @@ and it should be read as pyre's stand-in for the translator's shadow-stack
 rewrite rather than as an accident awaiting cleanup.  The same holds for what it
 props up: `PyTraceback.w_code` stays, and so does the conditional frame edge.
 
-Two cached raw copies remain that are worth closing on their own merits, both
-narrower than the above:
+Two cached raw copies were checked against upstream individually rather than
+left on a list.  Neither is a hazard, and only one is even the deviation it
+looked like:
 
-- `TraceCtx::virtualizable_heap_ptr` caches what upstream unwraps per use.  It
-  cannot simply become a forwarded slot: a root portal seed deliberately points
-  it at the `snapshot_for_tracing` copy, a `FrameBox::new_boxed` allocation the
-  GC does not own, so there is no slot to forward until the
-  snapshot-as-synchronization-target deviation goes first.
-- The blackhole's `virtualizable_ptr: i64`.
+*The blackhole's `virtualizable_ptr: i64` — not the field it resembles.*
+Upstream's `BlackholeInterpreter` has no such field: every vable bhimpl takes
+the virtualizable as an explicit argument (`blackhole.py:1374`
+`bhimpl_getarrayitem_vable_i(cpu, vable, index, fielddescr, arraydescr)`, and
+the same shape for the `set*`/`arraylen` family), sourced from the register
+bank, which pyre roots too (`push_bh_regs`).  Pyre's field is not that carrier.
+It is the frame identity pyre's blackhole traceback recording needs —
+`record_frame_traceback` passes it to `record_application_traceback_for_recording`
+— and upstream has no counterpart to that at all, because its blackhole does not
+record application tracebacks.  Lifetime is already covered: the frame is on the
+interpreter chain, and `run` additionally pushes the vable's array-field slots
+onto the resume-ref root stack for the whole run
+(`VirtualizableInfo::push_resume_ref_roots`, which forwards those slots in
+place).  What the field does not do is forward *itself*, and that is exactly
+what the non-moving contract above makes unnecessary.  Rooting it would forward
+nothing.
+
+*`TraceCtx::virtualizable_heap_ptr` — blocked, and the blocker is named.*  It
+caches what upstream unwraps per use.  It cannot simply become a forwarded slot:
+a root portal seed deliberately points it at the `snapshot_for_tracing` copy, a
+`FrameBox::new_boxed` allocation the GC does not own, so there is no slot to
+forward.  Closing it means first retiring the snapshot-as-synchronization-target
+deviation, which is a tracer change, not a rooting change.
 
 The invariant stays comment-enforced, and an attempt to check it turned up why
 it has to be.  A `debug_assert!` in `w_pytraceback_new` that the frame is not
