@@ -1613,6 +1613,20 @@ impl majit_backend::Backend for WasmBackend {
         // tid so the nursery object carries a header the collector can trace
         // (`gc.py:536-542`); a raw cache key read as a tid indexes past the
         // type table on the first minor collection.
+        //
+        // The nursery here is a deliberate deviation from the dynasm runner,
+        // which materializes blackhole structs and arrays in the old
+        // generation. Routing these three entry points to
+        // `alloc_oldgen_typed` miscompiles `synth/recursion_memo_branch`: a
+        // resumed frame reads a nursery-range address that no object has ever
+        // occupied as the `in` operand, while the dict the operand names is
+        // intact. It needs minor collections (a nursery large enough to
+        // suppress them runs clean) but is not a missed old->young edge —
+        // forcing every old-generation object into the remembered set on every
+        // minor does not change it — nor a descr/tid layout mismatch, nor
+        // major-collection sweep, nor the old-generation allocator's
+        // eval-breaker arming. Restore the old generation here only together
+        // with a fix for that.
         let type_id = sizedescr.resolve_gc_tid();
         with_wasm_active_gc_mut(|gc| gc.alloc_nursery_no_collect_typed(type_id, size).0 as i64)
             .unwrap_or(0)
