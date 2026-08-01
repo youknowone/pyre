@@ -2860,6 +2860,15 @@ pub(crate) fn s_int() -> SomeValue {
     SomeValue::Integer(SomeInteger::default())
 }
 
+/// `SomeInteger(unsigned=True)` — an r_uint value, the shell an unsigned
+/// scalar (`u8`..`u64`, `usize`) carries.  Matches `valuetype_to_someshell`'s
+/// `ValueType::Unsigned` projection so the string- and TyRef-derived field
+/// seeds agree; a signed shell here walls `r_uint ∪ int` when the write side
+/// keeps the unsigned knowntype.
+pub(crate) fn s_uint() -> SomeValue {
+    SomeValue::Integer(SomeInteger::new(false, true))
+}
+
 /// RPython `s_Str0 = SomeString(no_nul=True)` (model.py:693).
 pub(crate) fn s_str0() -> SomeValue {
     SomeValue::String(SomeString::new(false, true))

@@ -2467,8 +2467,11 @@ impl Bookkeeper {
             .trim_start_matches("*mut ")
             .trim();
         match stripped {
-            "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" => {
+            "i8" | "i16" | "i32" | "i64" | "isize" => {
                 return super::model::s_int();
+            }
+            "u8" | "u16" | "u32" | "u64" | "usize" => {
+                return super::model::s_uint();
             }
             "f32" => return SomeValue::SingleFloat(super::model::SomeSingleFloat::new()),
             "f64" => return SomeValue::Float(super::model::SomeFloat::new()),
