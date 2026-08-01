@@ -3329,6 +3329,46 @@ mod tests {
         assert_eq!(bindings["pyre_object::jit_list_append"], list_append);
     }
 
+    /// Two registered functions must never share an address.
+    ///
+    /// `pyre-jit-trace`'s `patch_constants_i_fnaddrs` rewrites residual-call
+    /// constants through a build-address → runtime-address map, so an address
+    /// standing for two functions sends one callee's call to the other.  Its
+    /// runtime assertion only fires once the patch path executes; this covers
+    /// the registry itself.
+    ///
+    /// Several path spellings for one function are deliberate — the module
+    /// path and the crate-root re-export both appear — and those agree on the
+    /// leaf name.  Two distinct leaf names on one address means the toolchain
+    /// folded unrelated functions together, which is the collision that
+    /// matters.  That is not hypothetical: MSVC links with `/OPT:ICF` by
+    /// default, and once `drain_list_append` lost `#[inline(never)]` its body
+    /// became byte-identical to `w_list_append` and the two folded.
+    ///
+    /// This covers only the address space it runs in.  The Windows fold
+    /// happened in the build-script binary while the test binary kept the two
+    /// apart, so a registry that passes here can still feed
+    /// `runtime_fnaddr_patch` an ambiguous build address — that direction is
+    /// what its own assertion catches.
+    #[test]
+    fn registered_paths_sharing_an_address_are_alias_spellings() {
+        let mut by_addr: HashMap<i64, Vec<&'static str>> = HashMap::new();
+        for (path, addr) in jit_trace_fnaddrs() {
+            by_addr.entry(addr).or_default().push(path);
+        }
+        for (addr, paths) in &by_addr {
+            let leaves: std::collections::BTreeSet<&str> = paths
+                .iter()
+                .map(|p| p.rsplit("::").next().unwrap_or(p))
+                .collect();
+            assert_eq!(
+                leaves.len(),
+                1,
+                "fnaddr {addr:#x} is claimed by unrelated functions {paths:?}",
+            );
+        }
+    }
+
     #[test]
     fn jit_static_pytype_addrs_covers_interpreter_function_types() {
         let bindings: HashMap<&'static str, i64> = jit_static_pytype_addrs().into_iter().collect();
