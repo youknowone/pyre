@@ -11503,12 +11503,15 @@ impl crate::listsort::SortLt<usize> for SortCompare {
 /// Pick the sorter the way `descr_sort` picks it from the list's strategy.
 ///
 /// pyre's list stores plain object references with no strategy to read, so the
-/// same decision is one pass over the values.  The predicates are exact-type
-/// checks (`py_type_check` compares `ob_type` identity), which is what makes
-/// the specialization equivalent: a subclass carrying its own `__lt__` fails
-/// them and takes the generic path, exactly as it would keep an
-/// object-strategy list upstream.  A `key=` sort is `CustomKeySort`, generic
-/// upstream as well.
+/// same decision is one pass over the values.  What makes the specialization
+/// equivalent is that a subclass carrying its own `__lt__` must fail the test
+/// and take the generic path, exactly as it would keep an object-strategy list
+/// upstream — so the test has to be `is_exact_type` (pyobject.rs:179), which
+/// compares the instance's `w_class` against the builtin's type object and so
+/// rejects a subclass, which retags `w_class` to its own.  `is_int` / `is_str`
+/// / `is_float` are NOT usable here: they are `py_type_check`, an `ob_type`
+/// layout test a subclass instance also passes because it shares the builtin
+/// vtable.  A `key=` sort is `CustomKeySort`, generic upstream as well.
 fn sort_compare_for(base: usize, len: usize, keyed: bool) -> SortCompare {
     if keyed {
         return SortCompare::Generic(base);
@@ -11517,9 +11520,13 @@ fn sort_compare_for(base: usize, len: usize, keyed: bool) -> SortCompare {
     for index in 0..len {
         let item = pyre_object::gc_roots::shadow_stack_get(base + index);
         unsafe {
-            all_int &= is_int(item);
-            all_float &= is_float(item);
-            all_str &= is_str(item);
+            // `bool` is admitted alongside `int` because it cannot be
+            // subclassed, so it can never carry an overriding `__lt__`, and
+            // `int_value` reads it the same way.
+            all_int &= pyre_object::is_exact_type(item, &pyre_object::INT_TYPE)
+                || pyre_object::is_exact_type(item, &pyre_object::BOOL_TYPE);
+            all_float &= pyre_object::is_exact_type(item, &pyre_object::FLOAT_TYPE);
+            all_str &= pyre_object::is_exact_type(item, &pyre_object::STR_TYPE);
         }
         if !(all_int || all_float || all_str) {
             return SortCompare::Generic(base);
