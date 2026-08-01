@@ -27,9 +27,10 @@ fn key_wrapper_new(cmp: PyObjectRef, object: PyObjectRef) -> PyObjectRef {
     // so force the TypeDef/typed-layout binding before allocating its payload.
     let _ = type_object();
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(cmp);
-    pyre_object::gc_roots::pin_root(object);
-    let slot = pyre_object::gc_roots::shadow_stack_len() - 2;
+    // Publish both livevars before the first forwarding query: `pin_root` can
+    // park behind another thread's collection, which would leave the operand
+    // still held in a Rust local naming a pre-move address.
+    let slot = pyre_object::gc_roots::pin_roots(&[cmp, object]);
     W_KeyWrapper::allocate_stable(W_KeyWrapper {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -51,10 +52,9 @@ fn key_wrapper_compare(
         ));
     };
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(this.cmp);
-    pyre_object::gc_roots::pin_root(this.object);
-    pyre_object::gc_roots::pin_root(other.object);
-    let slot = pyre_object::gc_roots::shadow_stack_len() - 3;
+    // `this` and `other` name payloads in the managed heap, so every operand
+    // has to reach the shadow stack before the first forwarding query.
+    let slot = pyre_object::gc_roots::pin_roots(&[this.cmp, this.object, other.object]);
     let result = crate::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(slot),
         &[
@@ -137,10 +137,10 @@ fn reduce(args: &[PyObjectRef]) -> crate::PyResult {
     }
 
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    for &arg in &effective {
-        pyre_object::gc_roots::pin_root(arg);
-    }
+    // Publish every operand before the first forwarding query: a `pin_root`
+    // per argument can park behind another thread's collection, leaving the
+    // ones still in `effective` naming pre-move addresses.
+    let base = pyre_object::gc_roots::pin_roots(&effective);
     let function_slot = base;
     let sequence_slot = base + 1;
     // `_functoolsmodule.c:reduce` reports the failed second argument itself
