@@ -634,10 +634,36 @@ group the same way costs:
 | `inline_helper` | 219 ms | 213 ms (0.97x) |
 | `nested_loop` | 298 ms | 302 ms (1.01x) |
 
-(startup-subtracted, round-interleaved, order-alternated; `check.py` turns the
-same thing into `FAIL dynasm fib_recursive timeout (>5s)`, 1 failed / 353
-passed, with no wrong output anywhere.)  So the nursery frame path is not merely
-reachable but hot on recursive calls, and uniformity is unaffordable.
+PERF-CLAIM-UNVERIFIED: this table.  The command that produced it, the sha of
+each arm, and the round count were never recorded, so it cannot be reproduced
+or falsified.  `check.py` did not produce it — `check.py:174` returns
+`("", 0.0, 124, "")` on `TimeoutExpired`, so the harness cannot report 9249 ms
+for a run it killed, and the 1193 ms denominator is stale (`fib_recursive` runs
+in ~650 ms today).  What *is* doubly attested is the `check.py` result of
+applying the change: `FAIL dynasm fib_recursive timeout (>5s)`, 1 failed / 353
+passed, with no wrong output anywhere.  Read the effect as **">4x, direction
+certain"** and the table as an unsourced elaboration of it.  The conclusion
+below does not depend on the precision.
+
+**Scope, which is the sharper limit on this experiment.** The flag it toggled
+has exactly one production reader — `rewrite.rs:1091`, on the JIT's
+`NewWithVtable` lowering.  `FrameBox::new` never consults a descr: it calls
+`try_gc_alloc_stable_raw` unconditionally (`pyre-interpreter/src/pyframe.rs`)
+and lands on `alloc_oldgen_typed` (`pyre-jit/src/eval.rs`).  Interpreter frames
+were therefore old-gen in **both** arms, and the measurement says nothing about
+them.  Every conclusion here is scoped to JIT-emitted frames.
+
+Also worth stating because it bounds how far this can be generalized: upstream
+cannot express the arm that was measured.  `rpython/jit/codewriter/jtransform.py:1012-1015`
+rejects the flag outright — `if d.get('nonmovable', False): raise UnsupportedMallocFlags(d)`
+— and upstream's own `malloc_big_fixedsize` still takes the nursery for
+frame-sized objects (`jit/backend/llsupport/rewrite.py:778-788`).  The penalty
+is the cost of enabling a behaviour with no upstream counterpart, not the cost
+of an upstream design pyre declined.
+
+So, within that scope: the nursery frame path is not merely reachable but hot on
+recursive calls, and making JIT-emitted frames uniform with interpreter frames
+is unaffordable.
 
 What the system actually maintains is the narrower rule: *a frame that escapes
 into raw-pointer-holding territory is old-gen; a frame that stays inside a

@@ -587,9 +587,10 @@ impl FrameBox {
     /// across its own allocations, so this allocation standing still is what
     /// takes the place of that rewrite.  It is not a rule about every frame —
     /// a compiled trace's inlined-callee frame is a nursery allocation, and
-    /// making that uniform costs `fib_recursive` 7.75x — so the crossing into
-    /// raw-pointer territory is guarded at the seams instead
-    /// (`gate-triage.md`).
+    /// making that uniform times `fib_recursive` out of its gate — so the
+    /// crossing into raw-pointer territory is guarded at the seams instead
+    /// (`gate-triage.md`, which also records why the ratio that experiment is
+    /// often quoted with is not reproducible).
     ///
     /// Before the hook is wired (bootstrap, tests) `try_gc_alloc_stable`
     /// returns `None`; fall back to the `std::alloc` `GcFramePrefix` box,

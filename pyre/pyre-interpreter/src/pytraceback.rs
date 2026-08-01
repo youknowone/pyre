@@ -43,8 +43,8 @@
 //!
 //! The rule holds for frames that reach here, not for every frame: a
 //! compiled trace's own inlined-callee frame is a nursery allocation,
-//! and making that uniform costs `fib_recursive` 7.75x, so the
-//! crossing is guarded at the seams instead (see `gate-triage.md`).
+//! and making that uniform times `fib_recursive` out of its gate, so
+//! the crossing is guarded at the seams instead (see `gate-triage.md`).
 //! `record_application_traceback` is one of those seams.
 
 use pyre_object::pyobject::*;
