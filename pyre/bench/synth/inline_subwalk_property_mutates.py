@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=80
+# pyre-check: max-pypy-ratio=50
 # gh#495 guard: inlined property residual mutates before branch and caught miss.
 # @property value-returning mutating + try/except-inside-callee raising branch
 N = 60000
