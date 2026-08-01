@@ -221,11 +221,12 @@ pub struct W_TypeObject {
     /// The hidden `mutate__version_tag` field for `typeobject.py:177
     /// _immutable_fields_ = ['_version_tag?']` — see [`QuasiImmut`].
     ///
-    /// Heap allocated on the first registration and null until then, exactly
-    /// like [`W_TypeObject::weak_subclasses`], which it also matches in never
-    /// being freed: this tree has no `W_TypeObject` teardown path. Holds no GC
-    /// pointers, so the `W_TYPE_GC_TYPE_ID` custom trace has nothing to walk
-    /// here.
+    /// Allocated on the first registration (`get_current_qmut_instance`,
+    /// quasiimmut.py:116-126), null until then, and unlinked + freed on
+    /// invalidation (`_invalidate_now`, quasiimmut.py:129-134), so a type nobody
+    /// has mutated since its last compile is the only one holding a box. Holds
+    /// no GC pointers, so the `W_TYPE_GC_TYPE_ID` custom trace has nothing to
+    /// walk here.
     pub quasi_immut_watchers: *mut QuasiImmut,
 }
 
@@ -807,7 +808,8 @@ impl QuasiImmut {
     /// `quasiimmut.py:84-109 invalidate` — every loop recorded here becomes
     /// invalid, so each `GUARD_NOT_INVALIDATED` in it (and in its bridges) must
     /// now fail. The list is emptied like upstream's `self.looptokens_wrefs =
-    /// []`; a loop that recompiles registers again.
+    /// []`; the caller then drops the instance itself, so a loop that recompiles
+    /// registers against a fresh one.
     ///
     /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`):
     /// upstream never reaches `invalidate` from traced code — it hangs off the
@@ -825,7 +827,9 @@ impl QuasiImmut {
 }
 
 /// Register a compiled loop's invalidation flag against this type's
-/// `_version_tag?` (`quasiimmut.py:72-74 QuasiImmut.register_loop_token`).
+/// `_version_tag?` (`quasiimmut.py:72-74 QuasiImmut.register_loop_token`),
+/// creating the instance on demand exactly like `get_current_qmut_instance`
+/// (quasiimmut.py:116-126).
 ///
 /// The compile-time glue (`register_quasi_immutable_deps`) calls this once per
 /// type-keyed dependency the optimizer collected from a `QUASIIMMUT_FIELD`, so
@@ -849,11 +853,23 @@ pub unsafe fn w_type_register_quasi_immut_watcher(
 }
 
 /// Revoke every loop that baked this type's `version_tag` as a constant
-/// (`quasiimmut.py:84-109 QuasiImmut.invalidate`).
+/// (`quasiimmut.py:129-134 make_invalidation_function._invalidate_now`).
 ///
-/// Called from [`w_type_set_version_tag`] right before the new tag is
-/// published. Upstream runs the whole walk outside traced code — `invalidate`
-/// is reached from the residual `jit_force_quasi_immutable` path, never from a
+/// ```text
+///  def _invalidate_now(p):
+///      qmut_ptr = getattr(p, mutatefieldname)
+///      setattr(p, mutatefieldname, lltype.nullptr(rclass.OBJECT))
+///      qmut = cast_base_ptr_to_instance(QuasiImmut, qmut_ptr)
+///      qmut.invalidate(descr_repr)
+/// ```
+///
+/// The field is unlinked *before* the sweep and the instance becomes garbage
+/// right after it, so the next registration allocates a fresh one; dropping the
+/// [`Box`] here is that collection. Called from [`w_type_set_version_tag`] right
+/// before the new tag is published.
+///
+/// Upstream runs the whole walk outside traced code — `_invalidate_now` is
+/// reached from the residual `jit_force_quasi_immutable` path, never from a
 /// trace — so the sweep is residualised the same way. The null check stays
 /// traced, so mutating a type no loop depends on still makes no call.
 ///
@@ -867,7 +883,9 @@ pub unsafe fn w_type_notify_quasi_immut_watchers(obj: PyObjectRef) {
     if w_type.quasi_immut_watchers.is_null() {
         return;
     }
-    (*w_type.quasi_immut_watchers).invalidate();
+    let qmut_ptr = std::mem::replace(&mut w_type.quasi_immut_watchers, std::ptr::null_mut());
+    let mut qmut = Box::from_raw(qmut_ptr);
+    qmut.invalidate();
 }
 
 /// typeobject.py:183-185 `uses_object_getattribute` reader.  Returns the

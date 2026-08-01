@@ -4449,10 +4449,66 @@ pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: Des
         );
         return;
     }
+    // quasiimmut.py:125 `self.constantfieldbox =
+    // self.get_current_constant_fieldvalue()` — the field's value at the moment
+    // the trace baked it.  `heap.py:803 is_still_valid_for` compares it against
+    // the live value and abandons the loop when they disagree, so it has to be
+    // captured here; by the time the optimizer runs, the change it is looking
+    // for has already happened.
+    let constantfieldbox = current_quasiimmut_field_value(ctx, obj, &descr);
     ctx.heap_cache_mut().quasi_immut_now_known(field_index, obj);
-    ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr);
+    // Upstream carries the captured value on the per-op `QuasiImmutDescr`
+    // (quasiimmut.py:113-159), a descr minted fresh for every recorded
+    // QUASIIMMUT_FIELD.  Pyre's descrs are registry-indexed singletons, so a
+    // fresh one per op would mint a fresh registry entry per read; the value
+    // rides on the op instead, as the `record_namespace_quasiimmut_field` twin
+    // already does with its slot index.
+    match constantfieldbox {
+        Some(value) => ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj, value], descr),
+        None => ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr),
+    };
     if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
         ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
+    }
+}
+
+/// quasiimmut.py:135-143 `QuasiImmutDescr.get_current_constant_fieldvalue`.
+///
+/// ```text
+///  def get_current_constant_fieldvalue(self):
+///      struct = self.struct
+///      fielddescr = self.fielddescr
+///      if self.fielddescr.is_pointer_field():
+///          return ConstPtr(self.cpu.bh_getfield_gc_r(struct, fielddescr))
+///      elif self.fielddescr.is_float_field():
+///          return ConstFloat(self.cpu.bh_getfield_gc_f(struct, fielddescr))
+///      else:
+///          return ConstInt(self.cpu.bh_getfield_gc_i(struct, fielddescr))
+/// ```
+///
+/// `field_sanity_load` is the `cpu.bh_getfield_gc_*` triple behind one
+/// `field_type()` dispatch.  `None` when the receiver is not a concrete
+/// pointer or the descr is not a field descr — the optimizer then skips the
+/// revalidation, matching heap.py:794-796, which ignores a QUASIIMMUT_FIELD
+/// whose struct did not fold to a constant.
+fn current_quasiimmut_field_value(
+    ctx: &mut TraceCtx,
+    obj: OpRef,
+    descr: &DescrRef,
+) -> Option<OpRef> {
+    let field_type = descr.as_field_descr()?.field_type();
+    let majit_ir::Value::Ref(struct_ref) = ctx.box_value(obj)? else {
+        return None;
+    };
+    let struct_ptr = struct_ref.0 as i64;
+    if struct_ptr == 0 || struct_ptr == usize::MAX as i64 {
+        return None;
+    }
+    match ctx.field_sanity_load(struct_ptr, descr, field_type)? {
+        majit_ir::Value::Int(n) => Some(ctx.const_int(n)),
+        majit_ir::Value::Ref(gcref) => Some(ctx.const_ref(gcref.0 as i64)),
+        majit_ir::Value::Float(f) => Some(ctx.const_float(f.to_bits() as i64)),
+        majit_ir::Value::Void => None,
     }
 }
 
