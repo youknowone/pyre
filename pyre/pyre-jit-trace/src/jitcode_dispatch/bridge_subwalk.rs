@@ -966,6 +966,22 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         bh_float.push((color as usize, opref));
     }
     if boxes.iter().any(|b| b.is_none()) {
+        // Name which bank left the hole.  `ReconstructRecipe`'s bank vectors are
+        // SEMANTIC-slot indexed (`trace_ctx.rs:628`), and every semantic slot in
+        // a `locals_cells_stack_w` array is a boxed ref — so the recipe decode
+        // fills the ref bank only, and the two loops above read `OpRef::NONE`
+        // for every live int/float COLOR.  A callee with any live unboxed
+        // register at its resume pc can therefore never be a carrier; that is a
+        // coverage bound, not a shape the walk could not have handled.
+        crate::jitcode_dispatch::census_record(
+            if bh_int.iter().any(|&(_, b)| b.is_none())
+                || bh_float.iter().any(|&(_, b)| b.is_none())
+            {
+                "P2Parent::UnboxedBankHole"
+            } else {
+                "P2Parent::RefBankHole"
+            },
+        );
         return None;
     }
 

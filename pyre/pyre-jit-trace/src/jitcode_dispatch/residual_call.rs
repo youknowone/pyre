@@ -572,8 +572,7 @@ pub(super) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
     resume_pc: usize,
 ) -> Option<majit_metainterp::MIFrame> {
     let mut miframe = majit_metainterp::MIFrame::new(jitcode, resume_pc);
-    fill_trace_too_long_register_banks(ctx, &mut miframe);
-    Some(miframe)
+    fill_trace_too_long_register_banks(ctx, &mut miframe).then_some(miframe)
 }
 
 /// Fill every currently-known register color, matching
@@ -587,25 +586,26 @@ pub(super) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
 /// all three complete MIFrame banks; do the same for this abort instead of
 /// relying on the narrower resume-liveness cache.
 ///
-/// A color the walk cannot supply a concrete for is **skipped**, not a reason
-/// to refuse the frame.  `blackhole.py:1713-1730 _copy_data_from_miframe`
-/// guards every bank entry with `if box is not None` and calls `setarg_*` only
-/// for the ones that have a value; it has no failing path, and neither does
-/// its caller `convert_and_run_from_pyjitpl` (`blackhole.py:1799-1821`).  An
-/// unfilled color is one the interpreter does not read at this pc — that is
-/// what makes it unfilled — so refusing the whole frame over it only cost the
-/// abort its handoff.
+/// `_copy_data_from_miframe` (`blackhole.py:1713-1730`) guards every bank entry
+/// with `if box is not None` and has no failing path — but there, a `None`
+/// register is a **dead** one the jitcode's liveness already cleared, and every
+/// register that survives holds a box with a value.  "Live, but the walk knows
+/// no value" has no upstream counterpart, and skipping such a color would leave
+/// its pre-sized blackhole register at zero for a resume that can follow
+/// arbitrary control flow to an instruction that reads it.  So `OpRef::NONE`
+/// (dead, upstream's `box is None`) is skipped, and a live color with no
+/// concrete refuses the whole frame.
 fn fill_trace_too_long_register_banks<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     miframe: &mut majit_metainterp::MIFrame,
-) {
-    // Name the skipped bank and color under `PYRE_FBW_DEBUG_ABORT`, the way
+) -> bool {
+    // Name the declining bank and color under `PYRE_FBW_DEBUG_ABORT`, the way
     // `build_multi_frame_miframe` names its own: "innermost declined" alone
     // does not say which register had no concrete.
     macro_rules! s2dbg {
         ($($a:tt)*) => {
             if fbw_debug_abort_enabled() {
-                eprintln!("[s2-fill-skip] {}", format!($($a)*));
+                eprintln!("[s2-fill-decline] {}", format!($($a)*));
             }
         };
     }
@@ -632,7 +632,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
             }
             let Some(majit_ir::Value::Int(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
                 s2dbg!("int color={color} opref={opref:?} has no concrete");
-                continue;
+                return false;
             };
             miframe.int_values[color] = Some(value);
         }
@@ -664,6 +664,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
             miframe.ref_values[color] = Some(value);
         } else if opref.is_some_and(|value| value != OpRef::NONE) {
             s2dbg!("ref color={color} opref={opref:?} has no concrete");
+            return false;
         }
     }
 
@@ -679,10 +680,11 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
         }
         let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
             s2dbg!("float color={color} opref={opref:?} has no concrete");
-            continue;
+            return false;
         };
         miframe.float_values[color] = Some(value.to_bits() as i64);
     }
+    true
 }
 
 #[derive(Clone, Copy)]
