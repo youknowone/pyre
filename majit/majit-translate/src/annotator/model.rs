@@ -209,6 +209,37 @@ pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
     }
 }
 
+/// True when two `ClassDef` name strings denote ONE struct reached by two
+/// frontend name spellings: a dot-joined crate-included constructor qualname
+/// (`pyre_object.celldict.VersionTag`, the flowspace_adapter
+/// `SyntheticTransparentCtor` arm) vs the crate-stripped `::` field-read
+/// spelling (`celldict::VersionTag`).  Pyre has no single class object to key
+/// identity on, so a non-header leaf struct minted from both spellings becomes
+/// two distinct base-less `ClassDef`s and `ClassDef::commonbase` finds no
+/// shared base — the union then fails "no common base class" even though it is
+/// one type.  Reduce the dotted crate-included spelling to the crate-stripped
+/// `::` form (the spelling `canonical_struct_name` already yields for the
+/// field-read side) and compare.
+///
+/// Deliberately a COMPARE-time identity, NOT an interning cache key: keying
+/// `pyre_struct_root_classes` on this collapse starves the header/base-chain
+/// walk for `ob_header`-bearing `W_*` structs (they mint base-less under
+/// first-mint-wins and lose their `W_Root` base — a measured +184 phaseA
+/// cascade across `_io`/`_pickle`).  This check fires only where
+/// `commonbase` is already None, which the base-bearing `W_*` structs never
+/// reach (they share `W_Root`), so it cannot perturb them.
+fn same_struct_identity(a: &str, b: &str) -> bool {
+    fn identity(name: &str) -> String {
+        if !name.contains("::") && !name.contains('<') && name.contains('.') {
+            if let Some((_crate, rest)) = name.split_once('.') {
+                return rest.replace('.', "::");
+            }
+        }
+        majit_ir::descr::canonical_struct_name(name)
+    }
+    identity(a) == identity(b)
+}
+
 // ---------------------------------------------------------------------------
 // SomeObject base — RPython `model.py:51-125`.
 // ---------------------------------------------------------------------------
@@ -3246,6 +3277,14 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             let merged_classdef = match (&a.classdef, &b.classdef) {
                 (Some(ca), Some(cb)) => match ClassDef::commonbase(ca, cb) {
                     Some(base) => Some(base),
+                    None if same_struct_identity(&ca.borrow().name, &cb.borrow().name) => {
+                        // One struct reached by two frontend name spellings
+                        // (dot-joined crate-included ctor qualname vs the
+                        // crate-stripped `::` field-read spelling): two
+                        // base-less leaves with no shared base but the same
+                        // canonical identity.  Unify to the lhs class.
+                        Some(ca.clone())
+                    }
                     None => {
                         // Name the two colliding classdefs so the
                         // skip-classified panic path is diagnosable
