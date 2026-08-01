@@ -1221,6 +1221,18 @@ pub struct JitDriver<S: JitState> {
     /// before the bridge body walk starts. Used to distinguish deterministic
     /// setup aborts from transient mid-trace aborts.
     bridge_body_start_op_count: Option<usize>,
+    /// Whether this session's bridge attempt was declined, or had no target to
+    /// close against -- the session PHASE, as distinct from the resumekey CLASS
+    /// that `MetaInterp::bridge_info` carries.
+    ///
+    /// Upstream needs no such flag: `reached_loop_header`
+    /// (pyjitpl.py:2979-3060) re-attempts `compile_trace` on every loop-header
+    /// visit while `not self.partial_trace`, and never writes `self.resumekey`
+    /// outside session start (pyjitpl.py:2905 / 2939). majit latches the
+    /// declined attempt instead, so the latch needs storage of its own --
+    /// clearing `bridge_info` to express it also destroys the class that
+    /// `compile.py:392-393 resumekey.compile_and_attach` dispatches on.
+    bridge_attempt_declined: bool,
     /// Additional entry points sharing this driver's compiled loops.
     entry_points: Vec<EntryPoint>,
     /// PyPy JitDriver(is_recursive=True): enables max_unroll_recursion
@@ -1369,6 +1381,7 @@ impl<S: JitState> JitDriver<S> {
             resume_data_result: None,
             last_bridge_is_exception_guard: false,
             bridge_body_start_op_count: None,
+            bridge_attempt_declined: false,
             entry_points: Vec::new(),
             is_recursive: false,
             blackhole_allocator: None,
@@ -2366,6 +2379,18 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Whether the driver is currently tracing a bridge.
+    ///
+    /// This reports the `self.resumekey` CLASS (pyjitpl.py:2905 / 2939), which
+    /// now survives a declined bridge attempt. Both consumers want a live
+    /// session rather than the bare class — `close_loop_args_at` reads it
+    /// mid-walk to decide whose LABEL types the JUMP must match, and
+    /// `eval_with_jit_inner` reads it to force concrete force-helper calls onto
+    /// the plain interpreter — but `self.sym` is not the liveness signal:
+    /// `start_bridge_tracing` sets `bridge_info` (through
+    /// `start_retrace_from_guard`) and then runs `rebuild_from_resumedata`
+    /// BEFORE `self.sym = Some(sym)`, so the protection window opens while
+    /// `sym` is still `None`. Narrowing this to a live session needs a signal
+    /// that spans the whole window, so it is left as the class for now.
     #[inline]
     pub fn is_bridge_tracing(&self) -> bool {
         self.meta.bridge_info().is_some()
@@ -2872,8 +2897,17 @@ impl<S: JitState> JitDriver<S> {
                 // retrace a second time. Fall straight through to the
                 // merge-point scan, which is the only consumer upstream leaves
                 // for a partial trace.
+                // pyjitpl.py:3003-3005 has no resumekey test in this gate:
+                // upstream re-attempts `compile_trace` on every header visit.
+                // majit keeps its declined-attempt latch here for now, so this
+                // commit changes no behavior at this site.
                 let has_partial_trace = self.meta.partial_trace().is_some();
-                if let Some(bridge) = self.meta.bridge_info().filter(|_| !has_partial_trace) {
+                let attempt_declined = self.bridge_attempt_declined;
+                if let Some(bridge) = self
+                    .meta
+                    .bridge_info()
+                    .filter(|_| !has_partial_trace && !attempt_declined)
+                {
                     let bridge_key = bridge.green_key;
                     let bridge_trace_id = bridge.trace_id;
                     let bridge_fail_index = bridge.fail_index;
@@ -3014,7 +3048,12 @@ impl<S: JitState> JitDriver<S> {
                                 // way reached_loop_header falls into its
                                 // merge-point scan.
                                 crate::pyjitpl::BridgeCompileResult::Declined => {
-                                    self.meta.take_bridge_info();
+                                    crate::mc_diag_bump(50); // bridge_declined_close
+                                    // The resumekey survives because upstream
+                                    // never clears it in this region
+                                    // (pyjitpl.py:2979-3060); only the attempt
+                                    // latch is set.
+                                    self.bridge_attempt_declined = true;
                                     // Fall through — do NOT return.
                                 }
                                 crate::pyjitpl::BridgeCompileResult::Failed => {
@@ -3032,8 +3071,12 @@ impl<S: JitState> JitDriver<S> {
                         }
                     } else {
                         // No targets: consume bridge_info, fall through to
-                        // compile_loop (pyjitpl.py:3014-3017).
-                        self.meta.take_bridge_info();
+                        // compile_loop (pyjitpl.py:3014-3017). The resumekey
+                        // survives because upstream never clears it in this
+                        // region (pyjitpl.py:2979-3060); only the attempt latch
+                        // is set.
+                        crate::mc_diag_bump(51); // bridge_no_targets_close
+                        self.bridge_attempt_declined = true;
                     }
                 }
                 let Some(trace_meta) = self.meta.trace_meta().cloned() else {
@@ -3150,8 +3193,17 @@ impl<S: JitState> JitDriver<S> {
                 // loop being closed is a RETRACE, and re-entering
                 // `compile_trace` would both bridge into the loop the retrace
                 // exists to respecialize and arm the retrace a second time.
+                // pyjitpl.py:3003-3005 has no resumekey test in this gate:
+                // upstream re-attempts `compile_trace` on every header visit.
+                // majit keeps its declined-attempt latch here for now, so this
+                // commit changes no behavior at this site.
                 let has_partial_trace = self.meta.partial_trace().is_some();
-                if let Some(bridge) = self.meta.bridge_info().filter(|_| !has_partial_trace) {
+                let attempt_declined = self.bridge_attempt_declined;
+                if let Some(bridge) = self
+                    .meta
+                    .bridge_info()
+                    .filter(|_| !has_partial_trace && !attempt_declined)
+                {
                     let bridge_key = bridge.green_key;
                     let bridge_trace_id = bridge.trace_id;
                     let bridge_fail_index = bridge.fail_index;
@@ -3215,7 +3267,12 @@ impl<S: JitState> JitDriver<S> {
                             // reached_loop_header falls into its merge-point
                             // scan.
                             crate::pyjitpl::BridgeCompileResult::Declined => {
-                                self.meta.take_bridge_info();
+                                crate::mc_diag_bump(50); // bridge_declined_close
+                                // The resumekey survives because upstream never
+                                // clears it in this region
+                                // (pyjitpl.py:2979-3060); only the attempt
+                                // latch is set.
+                                self.bridge_attempt_declined = true;
                                 // Fall through — do NOT return.
                             }
                             crate::pyjitpl::BridgeCompileResult::Failed => {
@@ -3226,8 +3283,12 @@ impl<S: JitState> JitDriver<S> {
                             }
                         }
                     } else {
-                        // No targets: consume bridge_info, fall through.
-                        self.meta.take_bridge_info();
+                        // No targets: consume bridge_info, fall through. The
+                        // resumekey survives because upstream never clears it
+                        // in this region (pyjitpl.py:2979-3060); only the
+                        // attempt latch is set.
+                        crate::mc_diag_bump(51); // bridge_no_targets_close
+                        self.bridge_attempt_declined = true;
                     }
                 }
                 // pyjitpl.py:2983: compile_trace already compiled a bridge
@@ -3430,16 +3491,23 @@ impl<S: JitState> JitDriver<S> {
                 if self.meta.bridge_info().is_some() {
                     crate::debug::log_one("jit-abort", "Abort during bridge tracing");
                 }
+                if self.bridge_attempt_declined {
+                    crate::mc_diag_bump(52); // abort_after_declined
+                }
                 let setup_aborted_bridge_descr = if matches!(action, TraceAction::Abort)
                     && self.meta.bridge_info().is_some()
-                    // `bridge_info` survives `RetraceNeeded` now that it stands
-                    // for the `self.resumekey` CLASS rather than "still
-                    // building the bridge", so it alone no longer says which
-                    // PHASE the session is in. The contract below is about the
-                    // bridge's own setup shape, so exclude the retrace phase
-                    // explicitly: an abort there belongs to the retrace, not to
-                    // the guard the session grew from, and must not permanently
-                    // decline that guard.
+                    && !self.bridge_attempt_declined
+                    // `bridge_info` survives `RetraceNeeded` and declined
+                    // attempts now that it stands for the `self.resumekey`
+                    // CLASS rather than "still building the bridge", so it
+                    // alone no longer says which PHASE the session is in. The
+                    // contract below is about the bridge's own setup shape, so
+                    // exclude both phases in which `bridge_info` is alive but
+                    // the setup is not: the retrace phase, by requiring
+                    // `partial_trace().is_none()`, and the declined-attempt
+                    // phase, by requiring `!bridge_attempt_declined`. Reaching
+                    // `record_declined_bridge_guard` from either would
+                    // permanently decline the source guard.
                     && self.meta.partial_trace().is_none()
                     && self.meta.tracing.as_ref().is_some_and(|ctx| {
                         let Some(start_ops) = self.bridge_body_start_op_count else {
@@ -3534,7 +3602,14 @@ impl<S: JitState> JitDriver<S> {
                 // Bridge/compiled guard-failure recovery owns a separate
                 // blackhole resume path below `back_edge_internal`; do not
                 // feed that path through this fresh-trace handoff.
-                if matches!(action, TraceAction::Abort) && self.meta.bridge_info().is_none() {
+                if matches!(action, TraceAction::Abort)
+                    && (self.meta.bridge_info().is_none() || self.bridge_attempt_declined)
+                {
+                    // This gate asks whether the session still has a bridge
+                    // artifact to resume into, which is the PHASE, not the
+                    // resumekey class. A declined attempt has none, so it takes
+                    // the fresh-trace handoff exactly as it did when the decline
+                    // arms cleared `bridge_info`.
                     let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
                     if let Some(pc) = pc {
                         self.meta.single_pass_outcome = Some((pc, Vec::new()));
@@ -3593,14 +3668,24 @@ impl<S: JitState> JitDriver<S> {
                 }
                 self.sym = None;
                 self.bridge_body_start_op_count = None;
+                self.bridge_attempt_declined = false;
                 self.meta.clear_trace_session();
             }
             TraceAction::AbortPermanent => {
                 if self.meta.bridge_info().is_some() {
                     crate::debug::log_one("jit-abort", "AbortPermanent during bridge tracing");
                 }
+                if self.bridge_attempt_declined {
+                    crate::mc_diag_bump(52); // abort_after_declined
+                }
                 self.meta.abort_trace(true);
                 self.sym = None;
+                // The session ends here, so the latch must not outlive it. The
+                // sibling `bridge_body_start_op_count` is cleared on the
+                // Abort/Decline arm and in `clear_tracing_session_state` but
+                // not here, which is why this arm needs its own reset rather
+                // than a shared teardown.
+                self.bridge_attempt_declined = false;
                 self.meta.clear_trace_session();
             }
         }
@@ -3632,6 +3717,7 @@ impl<S: JitState> JitDriver<S> {
     fn clear_tracing_session_state(&mut self) {
         self.sym = None;
         self.bridge_body_start_op_count = None;
+        self.bridge_attempt_declined = false;
         self.meta.clear_trace_session();
     }
 
@@ -5963,6 +6049,7 @@ impl<S: JitState> JitDriver<S> {
         // frame value counts through the per-thread store, so aim it here.
         self.republish_state_field_fvc();
         self.bridge_body_start_op_count = None;
+        self.bridge_attempt_declined = false;
         // compile.py:725-729 `_trace_and_compile_from_bridge` raises
         // `compile.giveup()` when the descr's owning JitCellToken weakref
         // is dead (memmgr-evicted).  Pyre signals the same outcome by

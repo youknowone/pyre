@@ -640,6 +640,10 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
                 "giveup_invalidloop",
                 "giveup_compileloop_err",
                 "giveup_bridge_aborted",
+                "bridge_declined_close",
+                "bridge_no_targets_close",
+                "abort_after_declined",
+                "ct_compile_bridge_false",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

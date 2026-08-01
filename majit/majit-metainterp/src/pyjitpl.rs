@@ -7195,6 +7195,7 @@ impl<M: Clone> MetaInterp<M> {
                         from_retry: false,
                     }
                 } else {
+                    crate::mc_diag_bump(53); // compile_bridge returned false
                     CompileOutcome::Cancelled
                 }
             }
