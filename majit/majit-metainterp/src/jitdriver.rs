@@ -2614,384 +2614,621 @@ impl<S: JitState> JitDriver<S> {
         // the scan found NO same-greenkey merge point, and the same call
         // registers one, so the next visit takes the retrace/abort branch.
         loop {
-        // Phase 1: split-borrow self into meta and sym, run closure.
-        // self.meta and self.sym are disjoint fields → standard split-borrow.
-        let mut action = {
-            let Some(sym) = self.sym.as_mut() else {
-                crate::debug::log_one("jit-abort", "mp: abort:sym_none2");
-                self.meta.abort_trace(false);
-                self.meta.clear_trace_session();
-                return;
-            };
-            trace_fn(&mut self.meta, sym)
-        }; // borrows dropped here
-
-        // pyjitpl.py:1618 force_finish_trace segmenting check.
-        //
-        // pyjitpl.py:1622 _create_segmented_trace_and_blackhole:
-        //   1. generate_guard(GUARD_ALWAYS_FAILS)
-        //   2. unreachable FINISH(exception_descr)
-        //   3. compile_simple_loop(patch_jumpop_at_end=False)  ← inserts Label
-        //   4. SwitchToBlackhole(ABORT_SEGMENTED_TRACE)
-        // pyjitpl.py:1618 force_finish_trace segmenting fallback.
-        // The proc-macro path handles this inside the closure (where __pc
-        // is captured). For non-macro consumers whose trace_fn doesn't
-        // emit SegmentedLoop, this fallback uses ctx.last_traced_pc
-        // (recorded by proc-macro or pyre trace_fn) as the guard-point pc.
-        if matches!(action, TraceAction::Continue) && self.meta.force_finish_trace {
-            let should_segment = self
-                .meta
-                .trace_ctx()
-                .map(|ctx| ctx.num_ops() > ctx.trace_limit() * 4 / 5)
-                .unwrap_or(false);
-            if should_segment {
-                // RPython `pyjitpl.py:2558-2602 MetaInterp.generate_guard`
-                // pairs every guard recording with `capture_resumedata`,
-                // and segmenting itself is independent of whether the
-                // sym-side framestack-lift override is wired:
-                // `_create_segmented_trace_and_blackhole`
-                // (`pyjitpl.py:1622`) always emits
-                // `generate_guard(GUARD_ALWAYS_FAILS) + Finish +
-                // SwitchToBlackhole`.  When
-                // `JitState::populate_frame_for_guard` is overridden
-                // (state-field-JIT macro consumers), pair the guard with
-                // the bridge snapshot.
-                //
-                // TODO: when the default no-op
-                // returns `None`, this low-level driver has no MIFrame
-                // to walk — it only knows the active jump boxes from
-                // `S::collect_jump_args`.  We feed those into
-                // `capture_snapshot_for_last_guard`, which records a
-                // single placeholder frame in lieu of the RPython
-                // `framestack` walk (`pyjitpl.py:2586
-                // capture_resumedata`).  Bounded scope: this branch is
-                // only reached on the segmented-loop force path of the
-                // low-level driver and dissolves once lifts
-                // `S::Sym` into `MIFrame::populate_for_guard` so every
-                // path captures uniformly via the framestack walk.
-                let op_live = self.meta.staticdata.op_live as u8;
-                let all_liveness = self.meta.staticdata.liveness_info.clone();
-                // pyjitpl.py:2586 `capture_resumedata(framestack,
-                // virtualizable_boxes, virtualref_boxes,
-                // last_snapshot)` — pull the live box lists off the
-                // active trace ctx before borrowing `self.meta.framestack`
-                // mutably below.  Cloning is acceptable because this is
-                // the segmented-loop force path (slow path).
-                let (vable_boxes, vref_boxes) = self
-                    .meta
-                    .trace_ctx()
-                    .map(|ctx| {
-                        (
-                            ctx.virtualizable_boxes.clone().unwrap_or_default(),
-                            ctx.virtualref_boxes.clone(),
-                        )
-                    })
-                    .unwrap_or_default();
-                let pre_snapshot = self.sym.as_ref().and_then(|sym| {
-                    S::populate_frame_for_guard(
-                        sym,
-                        &mut self.meta.framestack,
-                        op_live,
-                        &all_liveness,
-                        &vable_boxes,
-                        &vref_boxes,
-                    )
-                });
-                let mut current_live = self
-                    .sym
-                    .as_ref()
-                    .map(|sym| S::collect_jump_args(sym))
-                    .unwrap_or_default();
-                // RPython `pyjitpl.py:2586 capture_resumedata` reads
-                // `frame.jitcode.index` from the live framestack.  Pull
-                // the same value here so the placeholder snapshot
-                // captures real coordinates instead of `0`.
-                let frame_jitcode_index = self
-                    .meta
-                    .framestack
-                    .frames
-                    .last()
-                    .map(|f| f.jitcode.index() as u32)
-                    .unwrap_or(0);
-                if let Some(ctx) = self.meta.trace_ctx() {
-                    // pyjitpl.py:2594: use last_traced_pc
-                    // (= frame.pc at the guard point), not header_pc.
-                    let pc_opref = ctx.const_int(ctx.last_traced_pc as i64);
-                    current_live.push(pc_opref);
-                    // history.py:802 strict-types parity: every active
-                    // OpRef must resolve to a known Box.type; a miss is
-                    // a tracer bookkeeping bug, not a recoverable case.
-                    let live_types: Vec<majit_ir::Type> = current_live
-                        .iter()
-                        .map(|opref| {
-                            ctx.get_opref_type(*opref)
-                                .expect("force_finish_trace: active OpRef missing Box.type")
-                        })
-                        .collect();
-                    let guard_opref =
-                        ctx.record_guard_typed(majit_ir::OpCode::GuardAlwaysFails, &[], live_types);
-                    if let Some(snapshot) = pre_snapshot {
-                        let snapshot_id = ctx.capture_resumedata(snapshot);
-                        ctx.set_last_guard_resume_position(snapshot_id);
-                    } else {
-                        // TODO: see header comment.
-                        // No framestack-lift override available, so
-                        // capture the active low-level boxes via the
-                        // segmented-driver placeholder helper instead
-                        // of inventing a fail_args-only fallback.
-                        let frame_pc = ctx.last_traced_pc as u32;
-                        ctx.capture_snapshot_for_last_guard(
-                            &current_live,
-                            frame_jitcode_index,
-                            frame_pc,
-                        );
-                        ctx.set_fail_args(guard_opref, &current_live);
-                    }
-                    let dummy = ctx.const_int(0);
-                    ctx.record_finish(dummy, majit_ir::Type::Int);
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[jit] force_finish_trace: segmenting at {} ops (limit {}) pc={}",
-                            ctx.num_ops(),
-                            ctx.trace_limit(),
-                            ctx.last_traced_pc
-                        );
-                    }
-                }
-                action = TraceAction::SegmentedLoop;
-            }
-        }
-
-        // Phase 2: handle trace result with full access to self
-        match action {
-            TraceAction::Continue => {}
-            TraceAction::CompileTrace => {
-                // Successful compile-into-existing-target: raise_if_successful()
-                // raises ContinueRunningNormally (pyjitpl.py:3095-3123), which
-                // bypasses the `except SwitchToBlackhole` handler, so only the
-                // successful live history teardown runs — `aborted_tracing`
-                // accounting is NOT reached on success (the loop/bridge counter
-                // was already bumped at backend-compile time).
-                self.meta.finish_trace_live();
-                // No aborted_tracing follows on success, so drop the
-                // pending_abort_* payload finish_trace_live staged (else it
-                // attaches this key to a later, unrelated abort's hook).
-                self.meta.clear_pending_abort();
-                self.sym = None;
-                self.meta.clear_trace_session();
-                self.compile_trace_success = true;
-                self.continue_running_normally_payload = None;
-                return;
-            }
-            TraceAction::CloseLoop => {
-                // Snapshot the walk-final (pc, reds) off the active TraceCtx
-                // BEFORE `compile_loop` (below) drains it, stashing onto the
-                // MetaInterp so the `__merge` wrapper can read it after the
-                // trace closes. `None` whenever the walk did not populate the
-                // reds.
-                //
-                // Resume pc is the walk-final green pc the dispatch stashed
-                // (an interpreter program pc, NOT the JitCode op cursor). The
-                // reds vector published here is INTENTIONALLY empty. The
-                // merge-point hook transfers walk-final loop state without it:
-                // scalar state fields (e.g. selected) are captured here from
-                // the still-live sym (`single_pass_scalar_values`) and written
-                // into native `state` by the macro hook after the walk closes,
-                // then `recover` re-derives the storage-backed cache fields
-                // (stacksize, storage refs) from the walk-advanced shared
-                // storage. `dispatch` does populate `ctx.walk_final_reds` from
-                // the merge point's red-operand slots, but that register-bank
-                // snapshot is NOT a valid `restore_values` source for the
-                // state-field model — those slots are type-grouped operand
-                // order, not `collect_jump_args` order, and include reds (e.g.
-                // floats) with no state-field target, so restoring them would
-                // write the wrong values. A JIT whose merge point carries real
-                // red operands would instead source reds here, but none that
-                // close exist today.
-                let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
-                if let Some(p) = pc {
-                    self.meta.single_pass_outcome = Some((p, Vec::new()));
-                }
-                // Capture the walk-final scalar state-field values off the
-                // still-live sym in scalar index order (idx `0..num_scalars`),
-                // BEFORE `self.sym = None` at the end of this arm drops them.
-                // native `state` is not in scope here (only in the
-                // `jit_merge_point!` macro expansion), so stash the values on
-                // the MetaInterp for the macro hook to apply after the close.
-                // Empty when the state has no scalar fields.
-                if let Some(sym) = self.sym.as_ref() {
-                    let scalars = S::collect_scalar_state_field_values(sym);
-                    self.meta.single_pass_scalar_values = Some(scalars);
-                }
-                // Capture the walk-final loop-carried virt-array element values
-                // off the still-live trace ctx (the walk mutated the ctx shadow,
-                // not native `state`), before `compile_loop` drains the ctx. The
-                // macro hook writes them into native `state` so the compiled loop
-                // resumes at S_{k+1} instead of re-executing the peeled iteration
-                // (pyjitpl.py:2982-2989 live_arg_boxes += virtualizable_boxes).
-                // `None` when the state has no virtualizable array.
-                let virt_elems = self
-                    .meta
-                    .trace_ctx()
-                    .and_then(|ctx| ctx.collect_virtualizable_element_values());
-                if let Some(elems) = virt_elems {
-                    self.meta.single_pass_virt_array_values = Some(elems);
-                }
-                // pyjitpl.py:2974-2989: `live_arg_boxes` is built ONCE, here at
-                // the top of `reached_loop_header`, and every consumer below
-                // reads that same list — the bridge's closing JUMP
-                // (line 2988 `compile_trace`), the merge-point scan
-                // (line 3019), and `current_merge_points.append` (line 3059).
-                //
-                // `remove_consts_and_duplicates` RECORDS a `SAME_AS` op for
-                // every constant or duplicate it rewrites, so normalizing once
-                // per consumer appends a duplicate set of them. On the path
-                // where a bridge close falls through to the loop close
-                // (`RetraceNeeded` / `Declined`) that second set lands after
-                // `compile_trace` sampled `potential_retrace_position`, moving
-                // every later trace position off by the number of rewrites.
-                let live_arg_boxes: Vec<OpRef> = match self.sym.as_ref() {
-                    Some(sym) => {
-                        // pyjitpl.py:2982-2989: carry virtualizable_boxes[:-1]
-                        // into the list as well (owned clone releases the
-                        // trace-ctx borrow before the consumers below).
-                        let vable_boxes = self
-                            .meta
-                            .trace_ctx()
-                            .and_then(|ctx| ctx.collect_virtualizable_typed_boxes());
-                        let mut boxes = match vable_boxes {
-                            Some(ref b) => S::collect_jump_args_with_boxes(sym, b),
-                            None => S::collect_jump_args(sym),
-                        };
-                        if let Some(ctx) = self.meta.trace_ctx() {
-                            ctx.remove_consts_and_duplicates_untyped(&mut boxes);
-                            // pyjitpl.py:2985-2988 normalizes
-                            // `self.virtualizable_boxes` IN PLACE and appends
-                            // the mutated list, so the rewrite reaches every
-                            // later reader. The element block is a strict
-                            // SUFFIX of the loop-carried list
-                            // (`collect_jump_args_with_boxes`), so its tail is
-                            // what goes back.
-                            if let Some(n) = vable_boxes
-                                .as_ref()
-                                .map(|b| b.len().saturating_sub(1))
-                                .filter(|n| *n > 0 && *n <= boxes.len())
-                            {
-                                let tail = boxes[boxes.len() - n..].to_vec();
-                                ctx.adopt_normalized_virtualizable_elements(&tail);
-                            }
-                        }
-                        boxes
-                    }
-                    None => Vec::new(),
+            // Phase 1: split-borrow self into meta and sym, run closure.
+            // self.meta and self.sym are disjoint fields → standard split-borrow.
+            let mut action = {
+                let Some(sym) = self.sym.as_mut() else {
+                    crate::debug::log_one("jit-abort", "mp: abort:sym_none2");
+                    self.meta.abort_trace(false);
+                    self.meta.clear_trace_session();
+                    return;
                 };
-                // pyjitpl.py:2979-3036 reached_loop_header parity.
-                // Path 1: bridge — only if has_compiled_targets (line 2982).
-                //
-                // pyjitpl.py:3003 `if not self.partial_trace:` gates the whole
-                // bridge attempt. Once `retrace_needed` has armed
-                // `partial_trace` the loop being closed is a RETRACE of an
-                // existing loop, so re-entering `compile_trace` would ask the
-                // optimizer to bridge into the very loop the retrace exists to
-                // respecialize — and on `RetraceNeeded` it would arm the
-                // retrace a second time. Fall straight through to the
-                // merge-point scan, which is the only consumer upstream leaves
-                // for a partial trace.
-                // pyjitpl.py:3003-3005 has no resumekey test in this gate:
-                // upstream re-attempts `compile_trace` on every header visit.
-                // majit keeps its declined-attempt latch here for now, so this
-                // commit changes no behavior at this site.
-                let has_partial_trace = self.meta.partial_trace().is_some();
-                let attempt_declined = self.bridge_attempt_declined;
-                if let Some(bridge) = self
+                trace_fn(&mut self.meta, sym)
+            }; // borrows dropped here
+
+            // pyjitpl.py:1618 force_finish_trace segmenting check.
+            //
+            // pyjitpl.py:1622 _create_segmented_trace_and_blackhole:
+            //   1. generate_guard(GUARD_ALWAYS_FAILS)
+            //   2. unreachable FINISH(exception_descr)
+            //   3. compile_simple_loop(patch_jumpop_at_end=False)  ← inserts Label
+            //   4. SwitchToBlackhole(ABORT_SEGMENTED_TRACE)
+            // pyjitpl.py:1618 force_finish_trace segmenting fallback.
+            // The proc-macro path handles this inside the closure (where __pc
+            // is captured). For non-macro consumers whose trace_fn doesn't
+            // emit SegmentedLoop, this fallback uses ctx.last_traced_pc
+            // (recorded by proc-macro or pyre trace_fn) as the guard-point pc.
+            if matches!(action, TraceAction::Continue) && self.meta.force_finish_trace {
+                let should_segment = self
                     .meta
-                    .bridge_info()
-                    .filter(|_| !has_partial_trace && !attempt_declined)
-                {
-                    let bridge_key = bridge.green_key;
-                    let bridge_trace_id = bridge.trace_id;
-                    let bridge_fail_index = bridge.fail_index;
-                    // pyjitpl.py:2981-2982:
-                    //     ptoken = self.get_procedure_token(greenboxes)
-                    //     if has_compiled_targets(ptoken): ...
-                    // `greenboxes` is the *current* merge point's greens — the
-                    // one this trace just reached — not the bridge origin from
-                    // the failed guard.  A bridge that closes on an inner merge
-                    // point (the cross-loop cut) must JUMP into the loop living
-                    // AT that merge point: `pc` is a green, baked into each
-                    // compiled loop as a constant, so jumping into the origin
-                    // loop instead would enter it carrying another pc's reds.
-                    let close_greens = self
+                    .trace_ctx()
+                    .map(|ctx| ctx.num_ops() > ctx.trace_limit() * 4 / 5)
+                    .unwrap_or(false);
+                if should_segment {
+                    // RPython `pyjitpl.py:2558-2602 MetaInterp.generate_guard`
+                    // pairs every guard recording with `capture_resumedata`,
+                    // and segmenting itself is independent of whether the
+                    // sym-side framestack-lift override is wired:
+                    // `_create_segmented_trace_and_blackhole`
+                    // (`pyjitpl.py:1622`) always emits
+                    // `generate_guard(GUARD_ALWAYS_FAILS) + Finish +
+                    // SwitchToBlackhole`.  When
+                    // `JitState::populate_frame_for_guard` is overridden
+                    // (state-field-JIT macro consumers), pair the guard with
+                    // the bridge snapshot.
+                    //
+                    // TODO: when the default no-op
+                    // returns `None`, this low-level driver has no MIFrame
+                    // to walk — it only knows the active jump boxes from
+                    // `S::collect_jump_args`.  We feed those into
+                    // `capture_snapshot_for_last_guard`, which records a
+                    // single placeholder frame in lieu of the RPython
+                    // `framestack` walk (`pyjitpl.py:2586
+                    // capture_resumedata`).  Bounded scope: this branch is
+                    // only reached on the segmented-loop force path of the
+                    // low-level driver and dissolves once lifts
+                    // `S::Sym` into `MIFrame::populate_for_guard` so every
+                    // path captures uniformly via the framestack walk.
+                    let op_live = self.meta.staticdata.op_live as u8;
+                    let all_liveness = self.meta.staticdata.liveness_info.clone();
+                    // pyjitpl.py:2586 `capture_resumedata(framestack,
+                    // virtualizable_boxes, virtualref_boxes,
+                    // last_snapshot)` — pull the live box lists off the
+                    // active trace ctx before borrowing `self.meta.framestack`
+                    // mutably below.  Cloning is acceptable because this is
+                    // the segmented-loop force path (slow path).
+                    let (vable_boxes, vref_boxes) = self
                         .meta
                         .trace_ctx()
-                        .and_then(|ctx| ctx.close_greens.clone());
-                    let resolved_key = match close_greens.as_ref() {
-                        // Closed on a merge point: the token is the one keyed by
-                        // THOSE greens.  When no compiled loop lives there the
-                        // greenkey simply has no procedure token, and upstream
-                        // keeps tracing / compiles a loop (pyjitpl.py:3012-3060)
-                        // — it never falls back to the origin loop's token.
-                        Some(greens) => self.meta.compiled_key_for_greens(greens),
-                        // No merge-point greens recorded (the walk did not close
-                        // on one): the trace's own key stands in.
-                        None => self.current_trace_green_key(),
-                    };
-                    if crate::closedbg_enabled() {
-                        eprintln!(
-                            "@@@CLOSE BRIDGE-TARGET close_greens={close_greens:?} resolved_key={} origin_key={}",
-                            resolved_key.map(|k| k as i64).unwrap_or(-1),
-                            self.current_trace_green_key()
-                                .map(|k| k as i64)
-                                .unwrap_or(-1),
+                        .map(|ctx| {
+                            (
+                                ctx.virtualizable_boxes.clone().unwrap_or_default(),
+                                ctx.virtualref_boxes.clone(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    let pre_snapshot = self.sym.as_ref().and_then(|sym| {
+                        S::populate_frame_for_guard(
+                            sym,
+                            &mut self.meta.framestack,
+                            op_live,
+                            &all_liveness,
+                            &vable_boxes,
+                            &vref_boxes,
+                        )
+                    });
+                    let mut current_live = self
+                        .sym
+                        .as_ref()
+                        .map(|sym| S::collect_jump_args(sym))
+                        .unwrap_or_default();
+                    // RPython `pyjitpl.py:2586 capture_resumedata` reads
+                    // `frame.jitcode.index` from the live framestack.  Pull
+                    // the same value here so the placeholder snapshot
+                    // captures real coordinates instead of `0`.
+                    let frame_jitcode_index = self
+                        .meta
+                        .framestack
+                        .frames
+                        .last()
+                        .map(|f| f.jitcode.index() as u32)
+                        .unwrap_or(0);
+                    if let Some(ctx) = self.meta.trace_ctx() {
+                        // pyjitpl.py:2594: use last_traced_pc
+                        // (= frame.pc at the guard point), not header_pc.
+                        let pc_opref = ctx.const_int(ctx.last_traced_pc as i64);
+                        current_live.push(pc_opref);
+                        // history.py:802 strict-types parity: every active
+                        // OpRef must resolve to a known Box.type; a miss is
+                        // a tracer bookkeeping bug, not a recoverable case.
+                        let live_types: Vec<majit_ir::Type> = current_live
+                            .iter()
+                            .map(|opref| {
+                                ctx.get_opref_type(*opref)
+                                    .expect("force_finish_trace: active OpRef missing Box.type")
+                            })
+                            .collect();
+                        let guard_opref = ctx.record_guard_typed(
+                            majit_ir::OpCode::GuardAlwaysFails,
+                            &[],
+                            live_types,
                         );
-                    }
-                    let has_targets =
-                        resolved_key.is_some_and(|k| self.meta.has_compiled_targets(k));
-                    let target_key = resolved_key.unwrap_or(bridge_key);
-                    if crate::closedbg_enabled() {
-                        let hp = self
-                            .meta
-                            .trace_ctx()
-                            .map(|c| c.header_pc as i64)
-                            .unwrap_or(-1);
-                        let nops = self
-                            .meta
-                            .trace_ctx()
-                            .map(|c| c.num_ops() as i64)
-                            .unwrap_or(-1);
-                        eprintln!(
-                            "@@@CLOSE BRIDGE bridge_key={} target_key={} has_targets={} header_pc={} num_ops={} -> {}",
-                            bridge_key,
-                            target_key,
-                            has_targets as i32,
-                            hp,
-                            nops,
-                            if has_targets {
-                                "close_bridge"
-                            } else {
-                                "NEW-LOOP(degenerate?)"
-                            }
-                        );
-                    }
-                    if has_targets {
+                        if let Some(snapshot) = pre_snapshot {
+                            let snapshot_id = ctx.capture_resumedata(snapshot);
+                            ctx.set_last_guard_resume_position(snapshot_id);
+                        } else {
+                            // TODO: see header comment.
+                            // No framestack-lift override available, so
+                            // capture the active low-level boxes via the
+                            // segmented-driver placeholder helper instead
+                            // of inventing a fail_args-only fallback.
+                            let frame_pc = ctx.last_traced_pc as u32;
+                            ctx.capture_snapshot_for_last_guard(
+                                &current_live,
+                                frame_jitcode_index,
+                                frame_pc,
+                            );
+                            ctx.set_fail_args(guard_opref, &current_live);
+                        }
+                        let dummy = ctx.const_int(0);
+                        ctx.record_finish(dummy, majit_ir::Type::Int);
                         if crate::majit_log_enabled() {
                             eprintln!(
-                                "[bridge] CloseLoop -> close_bridge target_key={} (bridge_origin={}) trace={} fail={}",
-                                target_key, bridge_key, bridge_trace_id, bridge_fail_index
+                                "[jit] force_finish_trace: segmenting at {} ops (limit {}) pc={}",
+                                ctx.num_ops(),
+                                ctx.trace_limit(),
+                                ctx.last_traced_pc
                             );
                         }
-                        if self.sym.is_some() {
-                            // pyjitpl.py:2988 `compile_trace(live_arg_boxes,
-                            // ptoken)`: the bridge JUMP passes the very list
-                            // built above — not a second, separately
-                            // normalized one.
-                            let finish_args = live_arg_boxes.clone();
+                    }
+                    action = TraceAction::SegmentedLoop;
+                }
+            }
+
+            // Phase 2: handle trace result with full access to self
+            match action {
+                TraceAction::Continue => {}
+                TraceAction::CompileTrace => {
+                    // Successful compile-into-existing-target: raise_if_successful()
+                    // raises ContinueRunningNormally (pyjitpl.py:3095-3123), which
+                    // bypasses the `except SwitchToBlackhole` handler, so only the
+                    // successful live history teardown runs — `aborted_tracing`
+                    // accounting is NOT reached on success (the loop/bridge counter
+                    // was already bumped at backend-compile time).
+                    self.meta.finish_trace_live();
+                    // No aborted_tracing follows on success, so drop the
+                    // pending_abort_* payload finish_trace_live staged (else it
+                    // attaches this key to a later, unrelated abort's hook).
+                    self.meta.clear_pending_abort();
+                    self.sym = None;
+                    self.meta.clear_trace_session();
+                    self.compile_trace_success = true;
+                    self.continue_running_normally_payload = None;
+                    return;
+                }
+                TraceAction::CloseLoop => {
+                    // Snapshot the walk-final (pc, reds) off the active TraceCtx
+                    // BEFORE `compile_loop` (below) drains it, stashing onto the
+                    // MetaInterp so the `__merge` wrapper can read it after the
+                    // trace closes. `None` whenever the walk did not populate the
+                    // reds.
+                    //
+                    // Resume pc is the walk-final green pc the dispatch stashed
+                    // (an interpreter program pc, NOT the JitCode op cursor). The
+                    // reds vector published here is INTENTIONALLY empty. The
+                    // merge-point hook transfers walk-final loop state without it:
+                    // scalar state fields (e.g. selected) are captured here from
+                    // the still-live sym (`single_pass_scalar_values`) and written
+                    // into native `state` by the macro hook after the walk closes,
+                    // then `recover` re-derives the storage-backed cache fields
+                    // (stacksize, storage refs) from the walk-advanced shared
+                    // storage. `dispatch` does populate `ctx.walk_final_reds` from
+                    // the merge point's red-operand slots, but that register-bank
+                    // snapshot is NOT a valid `restore_values` source for the
+                    // state-field model — those slots are type-grouped operand
+                    // order, not `collect_jump_args` order, and include reds (e.g.
+                    // floats) with no state-field target, so restoring them would
+                    // write the wrong values. A JIT whose merge point carries real
+                    // red operands would instead source reds here, but none that
+                    // close exist today.
+                    let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
+                    if let Some(p) = pc {
+                        self.meta.single_pass_outcome = Some((p, Vec::new()));
+                    }
+                    // Capture the walk-final scalar state-field values off the
+                    // still-live sym in scalar index order (idx `0..num_scalars`),
+                    // BEFORE `self.sym = None` at the end of this arm drops them.
+                    // native `state` is not in scope here (only in the
+                    // `jit_merge_point!` macro expansion), so stash the values on
+                    // the MetaInterp for the macro hook to apply after the close.
+                    // Empty when the state has no scalar fields.
+                    if let Some(sym) = self.sym.as_ref() {
+                        let scalars = S::collect_scalar_state_field_values(sym);
+                        self.meta.single_pass_scalar_values = Some(scalars);
+                    }
+                    // Capture the walk-final loop-carried virt-array element values
+                    // off the still-live trace ctx (the walk mutated the ctx shadow,
+                    // not native `state`), before `compile_loop` drains the ctx. The
+                    // macro hook writes them into native `state` so the compiled loop
+                    // resumes at S_{k+1} instead of re-executing the peeled iteration
+                    // (pyjitpl.py:2982-2989 live_arg_boxes += virtualizable_boxes).
+                    // `None` when the state has no virtualizable array.
+                    let virt_elems = self
+                        .meta
+                        .trace_ctx()
+                        .and_then(|ctx| ctx.collect_virtualizable_element_values());
+                    if let Some(elems) = virt_elems {
+                        self.meta.single_pass_virt_array_values = Some(elems);
+                    }
+                    // pyjitpl.py:2974-2989: `live_arg_boxes` is built ONCE, here at
+                    // the top of `reached_loop_header`, and every consumer below
+                    // reads that same list — the bridge's closing JUMP
+                    // (line 2988 `compile_trace`), the merge-point scan
+                    // (line 3019), and `current_merge_points.append` (line 3059).
+                    //
+                    // `remove_consts_and_duplicates` RECORDS a `SAME_AS` op for
+                    // every constant or duplicate it rewrites, so normalizing once
+                    // per consumer appends a duplicate set of them. On the path
+                    // where a bridge close falls through to the loop close
+                    // (`RetraceNeeded` / `Declined`) that second set lands after
+                    // `compile_trace` sampled `potential_retrace_position`, moving
+                    // every later trace position off by the number of rewrites.
+                    let live_arg_boxes: Vec<OpRef> = match self.sym.as_ref() {
+                        Some(sym) => {
+                            // pyjitpl.py:2982-2989: carry virtualizable_boxes[:-1]
+                            // into the list as well (owned clone releases the
+                            // trace-ctx borrow before the consumers below).
+                            let vable_boxes = self
+                                .meta
+                                .trace_ctx()
+                                .and_then(|ctx| ctx.collect_virtualizable_typed_boxes());
+                            let mut boxes = match vable_boxes {
+                                Some(ref b) => S::collect_jump_args_with_boxes(sym, b),
+                                None => S::collect_jump_args(sym),
+                            };
+                            if let Some(ctx) = self.meta.trace_ctx() {
+                                ctx.remove_consts_and_duplicates_untyped(&mut boxes);
+                                // pyjitpl.py:2985-2988 normalizes
+                                // `self.virtualizable_boxes` IN PLACE and appends
+                                // the mutated list, so the rewrite reaches every
+                                // later reader. The element block is a strict
+                                // SUFFIX of the loop-carried list
+                                // (`collect_jump_args_with_boxes`), so its tail is
+                                // what goes back.
+                                if let Some(n) = vable_boxes
+                                    .as_ref()
+                                    .map(|b| b.len().saturating_sub(1))
+                                    .filter(|n| *n > 0 && *n <= boxes.len())
+                                {
+                                    let tail = boxes[boxes.len() - n..].to_vec();
+                                    ctx.adopt_normalized_virtualizable_elements(&tail);
+                                }
+                            }
+                            boxes
+                        }
+                        None => Vec::new(),
+                    };
+                    // pyjitpl.py:2979-3036 reached_loop_header parity.
+                    // Path 1: bridge — only if has_compiled_targets (line 2982).
+                    //
+                    // pyjitpl.py:3003 `if not self.partial_trace:` gates the whole
+                    // bridge attempt. Once `retrace_needed` has armed
+                    // `partial_trace` the loop being closed is a RETRACE of an
+                    // existing loop, so re-entering `compile_trace` would ask the
+                    // optimizer to bridge into the very loop the retrace exists to
+                    // respecialize — and on `RetraceNeeded` it would arm the
+                    // retrace a second time. Fall straight through to the
+                    // merge-point scan, which is the only consumer upstream leaves
+                    // for a partial trace.
+                    // pyjitpl.py:3003-3005 has no resumekey test in this gate:
+                    // upstream re-attempts `compile_trace` on every header visit.
+                    // majit keeps its declined-attempt latch here for now, so this
+                    // commit changes no behavior at this site.
+                    let has_partial_trace = self.meta.partial_trace().is_some();
+                    let attempt_declined = self.bridge_attempt_declined;
+                    if let Some(bridge) = self
+                        .meta
+                        .bridge_info()
+                        .filter(|_| !has_partial_trace && !attempt_declined)
+                    {
+                        let bridge_key = bridge.green_key;
+                        let bridge_trace_id = bridge.trace_id;
+                        let bridge_fail_index = bridge.fail_index;
+                        // pyjitpl.py:2981-2982:
+                        //     ptoken = self.get_procedure_token(greenboxes)
+                        //     if has_compiled_targets(ptoken): ...
+                        // `greenboxes` is the *current* merge point's greens — the
+                        // one this trace just reached — not the bridge origin from
+                        // the failed guard.  A bridge that closes on an inner merge
+                        // point (the cross-loop cut) must JUMP into the loop living
+                        // AT that merge point: `pc` is a green, baked into each
+                        // compiled loop as a constant, so jumping into the origin
+                        // loop instead would enter it carrying another pc's reds.
+                        let close_greens = self
+                            .meta
+                            .trace_ctx()
+                            .and_then(|ctx| ctx.close_greens.clone());
+                        let resolved_key = match close_greens.as_ref() {
+                            // Closed on a merge point: the token is the one keyed by
+                            // THOSE greens.  When no compiled loop lives there the
+                            // greenkey simply has no procedure token, and upstream
+                            // keeps tracing / compiles a loop (pyjitpl.py:3012-3060)
+                            // — it never falls back to the origin loop's token.
+                            Some(greens) => self.meta.compiled_key_for_greens(greens),
+                            // No merge-point greens recorded (the walk did not close
+                            // on one): the trace's own key stands in.
+                            None => self.current_trace_green_key(),
+                        };
+                        if crate::closedbg_enabled() {
+                            eprintln!(
+                                "@@@CLOSE BRIDGE-TARGET close_greens={close_greens:?} resolved_key={} origin_key={}",
+                                resolved_key.map(|k| k as i64).unwrap_or(-1),
+                                self.current_trace_green_key()
+                                    .map(|k| k as i64)
+                                    .unwrap_or(-1),
+                            );
+                        }
+                        let has_targets =
+                            resolved_key.is_some_and(|k| self.meta.has_compiled_targets(k));
+                        let target_key = resolved_key.unwrap_or(bridge_key);
+                        if crate::closedbg_enabled() {
+                            let hp = self
+                                .meta
+                                .trace_ctx()
+                                .map(|c| c.header_pc as i64)
+                                .unwrap_or(-1);
+                            let nops = self
+                                .meta
+                                .trace_ctx()
+                                .map(|c| c.num_ops() as i64)
+                                .unwrap_or(-1);
+                            eprintln!(
+                                "@@@CLOSE BRIDGE bridge_key={} target_key={} has_targets={} header_pc={} num_ops={} -> {}",
+                                bridge_key,
+                                target_key,
+                                has_targets as i32,
+                                hp,
+                                nops,
+                                if has_targets {
+                                    "close_bridge"
+                                } else {
+                                    "NEW-LOOP(degenerate?)"
+                                }
+                            );
+                        }
+                        if has_targets {
+                            if crate::majit_log_enabled() {
+                                eprintln!(
+                                    "[bridge] CloseLoop -> close_bridge target_key={} (bridge_origin={}) trace={} fail={}",
+                                    target_key, bridge_key, bridge_trace_id, bridge_fail_index
+                                );
+                            }
+                            if self.sym.is_some() {
+                                // pyjitpl.py:2988 `compile_trace(live_arg_boxes,
+                                // ptoken)`: the bridge JUMP passes the very list
+                                // built above — not a second, separately
+                                // normalized one.
+                                let finish_args = live_arg_boxes.clone();
+                                let continue_running_normally_values = {
+                                    let trace_meta = self.meta.trace_meta().cloned();
+                                    match (trace_meta, self.sym.as_ref()) {
+                                        (Some(meta), Some(sym)) => {
+                                            self.meta.trace_ctx().and_then(|ctx| {
+                                                S::close_loop_live_values(
+                                                    ctx,
+                                                    sym,
+                                                    &meta,
+                                                    &finish_args,
+                                                )
+                                            })
+                                        }
+                                        _ => None,
+                                    }
+                                };
+                                let result = self.meta.close_bridge(
+                                    target_key,
+                                    bridge_trace_id,
+                                    bridge_fail_index,
+                                    &finish_args,
+                                );
+                                match result {
+                                    crate::pyjitpl::BridgeCompileResult::Compiled => {
+                                        self.sym = None;
+                                        self.meta.clear_trace_session();
+                                        // pyjitpl.py:3095-3099 raise_if_successful():
+                                        // successful bridge closure terminates tracing.
+                                        self.note_continue_running_normally(
+                                            continue_running_normally_values,
+                                            None,
+                                        );
+                                        // Success edge: live teardown only, no
+                                        // aborted_tracing accounting (see the
+                                        // CompileTrace arm above).
+                                        self.meta.finish_trace_live();
+                                        self.meta.clear_pending_abort();
+                                        return;
+                                    }
+                                    // pyjitpl.py:2993-3007: after retrace_needed(),
+                                    // partial_trace is set on MetaInterp. Fall through
+                                    // to compile_loop → compile_retrace in same call.
+                                    crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
+                                        // `bridge_info` is pyre's `self.resumekey`
+                                        // class discriminator, and upstream writes
+                                        // that field exactly twice — pyjitpl.py:2905
+                                        // `ResumeFromInterpDescr(original_greenkey)`
+                                        // and pyjitpl.py:2939 `= resumedescr` — both
+                                        // at session start. `retrace_needed`
+                                        // (pyjitpl.py:2438-2442) sets only
+                                        // `partial_trace` / `retracing_from` /
+                                        // `exported_state` / `heapcache.reset()`, so
+                                        // the resumekey a guard-originated session
+                                        // carries must survive into
+                                        // `compile_retrace`'s
+                                        // `resumekey.compile_and_attach`
+                                        // (compile.py:392-393). Clearing it here
+                                        // turned every such retrace into a
+                                        // `ResumeFromInterpDescr` front-door install.
+                                        // Fall through — do NOT return.
+                                    }
+                                    // pyjitpl.py:3220 raise_if_successful() does not
+                                    // raise on a None target token, so the trace is
+                                    // not given up: fall through to compile_loop the
+                                    // way reached_loop_header falls into its
+                                    // merge-point scan.
+                                    crate::pyjitpl::BridgeCompileResult::Declined => {
+                                        crate::mc_diag_bump(50); // bridge_declined_close
+                                        // The resumekey survives because upstream
+                                        // never clears it in this region
+                                        // (pyjitpl.py:2979-3060); only the attempt
+                                        // latch is set.
+                                        self.bridge_attempt_declined = true;
+                                        // Fall through — do NOT return.
+                                    }
+                                    crate::pyjitpl::BridgeCompileResult::Failed => {
+                                        self.meta.abort_trace(false);
+                                        self.sym = None;
+                                        self.meta.clear_trace_session();
+                                        return;
+                                    }
+                                }
+                            } else {
+                                self.meta.abort_trace(false);
+                                self.sym = None;
+                                self.meta.clear_trace_session();
+                                return;
+                            }
+                        } else {
+                            // No targets: consume bridge_info, fall through to
+                            // compile_loop (pyjitpl.py:3014-3017). The resumekey
+                            // survives because upstream never clears it in this
+                            // region (pyjitpl.py:2979-3060); only the attempt latch
+                            // is set.
+                            crate::mc_diag_bump(51); // bridge_no_targets_close
+                            self.bridge_attempt_declined = true;
+                        }
+                    }
+                    let Some(trace_meta) = self.meta.trace_meta().cloned() else {
+                        self.meta.abort_trace(false);
+                        self.sym = None;
+                        self.meta.clear_trace_session();
+                        return;
+                    };
+                    let Some(sym) = self.sym.as_ref() else {
+                        self.meta.abort_trace(false);
+                        self.meta.clear_trace_session();
+                        return;
+                    };
+                    if S::validate_close(sym, &trace_meta) {
+                        // pyjitpl.py:3019/3059: the merge-point scan and the
+                        // `current_merge_points.append` both read the one
+                        // `live_arg_boxes` built at the top of this arm.
+                        let jump_args = live_arg_boxes;
+                        // pyjitpl.py:2993-3036 parity: compile_loop borrows the
+                        // frontend meta the same way `self.history` is a shared
+                        // mutable object on the RPython MetaInterp — the caller
+                        // does not drain it. Read via `trace_meta().cloned()` so
+                        // the `active_trace_session` envelope stays live for the
+                        // duration of the compile. `compile_loop` itself owns
+                        // the post-exit invariant that session lifetime tracks
+                        // `self.tracing` (see `compile_loop` wrapper).
+                        let provisional_meta = self.meta.trace_meta().cloned().unwrap();
+                        // When cross-loop cut redirects to a different header_pc,
+                        // rebuild meta from merge point to get the inner header's
+                        // frame layout (vsd, slot_types).
+                        let meta = {
+                            if let Some((cut_pc, ref cut_boxes)) = self.meta.cross_loop_cut_info() {
+                                S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_boxes)
+                            } else {
+                                provisional_meta
+                            }
+                        };
+                        let continue_running_normally_values = self
+                            .meta
+                            .trace_ctx()
+                            .and_then(|ctx| S::close_loop_live_values(ctx, sym, &meta, &jump_args));
+                        self.meta.single_pass_full_live_values =
+                            continue_running_normally_values.clone();
+                        let outcome = self.compile_and_record_loop(&jump_args, meta);
+                        match outcome {
+                            crate::CompileOutcome::Compiled { .. } => {
+                                // pyjitpl.py:3119-3123 raise_if_successful →
+                                // raise_continue_running_normally(live_arg_boxes).
+                                self.note_continue_running_normally(
+                                    continue_running_normally_values,
+                                    None,
+                                );
+                                // compile_loop already drained tracing+session.
+                            }
+                            crate::CompileOutcome::Cancelled => {
+                                // pyjitpl.py:3018-3032 parity: cancel_count is
+                                // incremented inside compile_loop and tracing
+                                // continues unless `cancelled_too_many_times`
+                                // escalates to Aborted. The wrapper restored
+                                // session↔tracing alignment so no extra cleanup
+                                // is required here — either the early-Cancelled
+                                // path kept both live (tracing continues) or a
+                                // late-Cancelled path drained both (next bound
+                                // reaches begins a fresh session).
+                            }
+                            crate::CompileOutcome::Aborted => {
+                                // pyjitpl.py:3028 SwitchToBlackhole(ABORT_BAD_LOOP)
+                                self.meta.abort_trace(false);
+                            }
+                        }
+                    } else {
+                        crate::debug::log_one("jit-abort", "mp: abort:validate_close");
+                        self.meta.abort_trace(false);
+                        self.meta.clear_trace_session();
+                    }
+                    // pyjitpl.py:3058-3060: a `reached_loop_header` that only
+                    // appended a merge point RETURNS — the trace is not over and
+                    // the metainterp goes on recording into the next iteration.
+                    // Dropping `self.sym` is how this driver says "the trace ended
+                    // here" (`merge_point` aborts on a None sym), so that one path
+                    // has to keep it — and it must re-enter the walk rather than
+                    // let the native dispatch loop run the merge point's own
+                    // instruction unrecorded (see the loop header above).
+                    if self.meta.take_keep_tracing_after_close() {
+                        // The walk-final handoff staged at the top of this arm
+                        // describes a trace that ENDED. Discard it: publishing it
+                        // would make the `jit_merge_point!` expansion write the
+                        // walk state into native `state` and resume the guest at
+                        // the merge-point pc, which is exactly the instruction the
+                        // next walk segment still has to record.
+                        self.meta.single_pass_outcome = None;
+                        self.meta.single_pass_scalar_values = None;
+                        self.meta.single_pass_virt_array_values = None;
+                        // pyjitpl.py:1577 `self.pc = saved_pc` — the resumed walk
+                        // re-enters at the merge point's own guest pc, so the
+                        // merge-point op must fall through once instead of
+                        // closing again with nothing recorded in between.
+                        if let Some(ctx) = self.meta.trace_ctx() {
+                            ctx.merge_point_resumed = true;
+                        }
+                        continue;
+                    }
+                    self.sym = None;
+                }
+                TraceAction::CloseLoopWithArgs {
+                    jump_args,
+                    loop_header_pc,
+                } => {
+                    // pyjitpl.py:2979-2990 reached_loop_header parity.
+                    //
+                    // pyjitpl.py:3003 `if not self.partial_trace:` gates the whole
+                    // bridge attempt, the same way it does on the `CloseLoop` twin
+                    // above: once `retrace_needed` has armed `partial_trace` the
+                    // loop being closed is a RETRACE, and re-entering
+                    // `compile_trace` would both bridge into the loop the retrace
+                    // exists to respecialize and arm the retrace a second time.
+                    // pyjitpl.py:3003-3005 has no resumekey test in this gate:
+                    // upstream re-attempts `compile_trace` on every header visit.
+                    // majit keeps its declined-attempt latch here for now, so this
+                    // commit changes no behavior at this site.
+                    let has_partial_trace = self.meta.partial_trace().is_some();
+                    let attempt_declined = self.bridge_attempt_declined;
+                    if let Some(bridge) = self
+                        .meta
+                        .bridge_info()
+                        .filter(|_| !has_partial_trace && !attempt_declined)
+                    {
+                        let bridge_key = bridge.green_key;
+                        let bridge_trace_id = bridge.trace_id;
+                        let bridge_fail_index = bridge.fail_index;
+                        let bridge_code_ptr = bridge.code_ptr;
+                        // pyjitpl.py:2982: ptoken = self.get_procedure_token(greenboxes)
+                        // Use the TARGET loop header's green key, not the bridge origin.
+                        let target_key = loop_header_pc
+                            .map(|pc| crate::green_key_from_code_ptr(bridge_code_ptr, pc))
+                            .unwrap_or(bridge_key);
+                        let has_targets = self.meta.has_compiled_targets(target_key);
+                        if has_targets {
                             let continue_running_normally_values = {
                                 let trace_meta = self.meta.trace_meta().cloned();
                                 match (trace_meta, self.sym.as_ref()) {
                                     (Some(meta), Some(sym)) => {
                                         self.meta.trace_ctx().and_then(|ctx| {
-                                            S::close_loop_live_values(ctx, sym, &meta, &finish_args)
+                                            S::close_loop_live_values(ctx, sym, &meta, &jump_args)
                                         })
                                     }
                                     _ => None,
@@ -3001,7 +3238,7 @@ impl<S: JitState> JitDriver<S> {
                                 target_key,
                                 bridge_trace_id,
                                 bridge_fail_index,
-                                &finish_args,
+                                &jump_args,
                             );
                             match result {
                                 crate::pyjitpl::BridgeCompileResult::Compiled => {
@@ -3011,7 +3248,7 @@ impl<S: JitState> JitDriver<S> {
                                     // successful bridge closure terminates tracing.
                                     self.note_continue_running_normally(
                                         continue_running_normally_values,
-                                        None,
+                                        loop_header_pc,
                                     );
                                     // Success edge: live teardown only, no
                                     // aborted_tracing accounting (see the
@@ -3024,33 +3261,25 @@ impl<S: JitState> JitDriver<S> {
                                 // partial_trace is set on MetaInterp. Fall through
                                 // to compile_loop → compile_retrace in same call.
                                 crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
-                                    // `bridge_info` is pyre's `self.resumekey`
-                                    // class discriminator, and upstream writes
-                                    // that field exactly twice — pyjitpl.py:2905
-                                    // `ResumeFromInterpDescr(original_greenkey)`
-                                    // and pyjitpl.py:2939 `= resumedescr` — both
-                                    // at session start. `retrace_needed`
-                                    // (pyjitpl.py:2438-2442) sets only
-                                    // `partial_trace` / `retracing_from` /
-                                    // `exported_state` / `heapcache.reset()`, so
-                                    // the resumekey a guard-originated session
-                                    // carries must survive into
-                                    // `compile_retrace`'s
+                                    // Same as the `CloseLoop` twin: `bridge_info`
+                                    // is the `self.resumekey` class discriminator
+                                    // and upstream writes it only at session start
+                                    // (pyjitpl.py:2905 / 2939), never in
+                                    // `retrace_needed` (pyjitpl.py:2438-2442), so
+                                    // it has to survive into
                                     // `resumekey.compile_and_attach`
-                                    // (compile.py:392-393). Clearing it here
-                                    // turned every such retrace into a
-                                    // `ResumeFromInterpDescr` front-door install.
+                                    // (compile.py:392-393).
                                     // Fall through — do NOT return.
                                 }
                                 // pyjitpl.py:3220 raise_if_successful() does not
-                                // raise on a None target token, so the trace is
-                                // not given up: fall through to compile_loop the
-                                // way reached_loop_header falls into its
-                                // merge-point scan.
+                                // raise on a None target token, so the trace is not
+                                // given up: fall through to compile_loop the way
+                                // reached_loop_header falls into its merge-point
+                                // scan.
                                 crate::pyjitpl::BridgeCompileResult::Declined => {
                                     crate::mc_diag_bump(50); // bridge_declined_close
-                                    // The resumekey survives because upstream
-                                    // never clears it in this region
+                                    // The resumekey survives because upstream never
+                                    // clears it in this region
                                     // (pyjitpl.py:2979-3060); only the attempt
                                     // latch is set.
                                     self.bridge_attempt_declined = true;
@@ -3064,437 +3293,218 @@ impl<S: JitState> JitDriver<S> {
                                 }
                             }
                         } else {
-                            self.meta.abort_trace(false);
-                            self.sym = None;
-                            self.meta.clear_trace_session();
-                            return;
+                            // No targets: consume bridge_info, fall through. The
+                            // resumekey survives because upstream never clears it
+                            // in this region (pyjitpl.py:2979-3060); only the
+                            // attempt latch is set.
+                            crate::mc_diag_bump(51); // bridge_no_targets_close
+                            self.bridge_attempt_declined = true;
                         }
-                    } else {
-                        // No targets: consume bridge_info, fall through to
-                        // compile_loop (pyjitpl.py:3014-3017). The resumekey
-                        // survives because upstream never clears it in this
-                        // region (pyjitpl.py:2979-3060); only the attempt latch
-                        // is set.
-                        crate::mc_diag_bump(51); // bridge_no_targets_close
-                        self.bridge_attempt_declined = true;
                     }
-                }
-                let Some(trace_meta) = self.meta.trace_meta().cloned() else {
-                    self.meta.abort_trace(false);
-                    self.sym = None;
-                    self.meta.clear_trace_session();
-                    return;
-                };
-                let Some(sym) = self.sym.as_ref() else {
-                    self.meta.abort_trace(false);
-                    self.meta.clear_trace_session();
-                    return;
-                };
-                if S::validate_close(sym, &trace_meta) {
-                    // pyjitpl.py:3019/3059: the merge-point scan and the
-                    // `current_merge_points.append` both read the one
-                    // `live_arg_boxes` built at the top of this arm.
-                    let jump_args = live_arg_boxes;
-                    // pyjitpl.py:2993-3036 parity: compile_loop borrows the
-                    // frontend meta the same way `self.history` is a shared
-                    // mutable object on the RPython MetaInterp — the caller
-                    // does not drain it. Read via `trace_meta().cloned()` so
-                    // the `active_trace_session` envelope stays live for the
-                    // duration of the compile. `compile_loop` itself owns
-                    // the post-exit invariant that session lifetime tracks
-                    // `self.tracing` (see `compile_loop` wrapper).
-                    let provisional_meta = self.meta.trace_meta().cloned().unwrap();
-                    // When cross-loop cut redirects to a different header_pc,
-                    // rebuild meta from merge point to get the inner header's
-                    // frame layout (vsd, slot_types).
-                    let meta = {
-                        if let Some((cut_pc, ref cut_boxes)) = self.meta.cross_loop_cut_info() {
-                            S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_boxes)
-                        } else {
-                            provisional_meta
-                        }
+                    // pyjitpl.py:2983: compile_trace already compiled a bridge
+                    // to the existing loop. Don't call compile_loop again.
+                    if self.compile_trace_success_pending() {
+                        self.sym = None;
+                        self.meta.clear_trace_session();
+                        return;
+                    }
+                    let Some(trace_meta) = self.meta.trace_meta().cloned() else {
+                        self.meta.abort_trace(false);
+                        self.sym = None;
+                        self.meta.clear_trace_session();
+                        return;
                     };
-                    let continue_running_normally_values = self
-                        .meta
-                        .trace_ctx()
-                        .and_then(|ctx| S::close_loop_live_values(ctx, sym, &meta, &jump_args));
-                    self.meta.single_pass_full_live_values =
-                        continue_running_normally_values.clone();
-                    let outcome = self.compile_and_record_loop(&jump_args, meta);
-                    match outcome {
-                        crate::CompileOutcome::Compiled { .. } => {
-                            // pyjitpl.py:3119-3123 raise_if_successful →
-                            // raise_continue_running_normally(live_arg_boxes).
-                            self.note_continue_running_normally(
-                                continue_running_normally_values,
-                                None,
-                            );
-                            // compile_loop already drained tracing+session.
-                        }
-                        crate::CompileOutcome::Cancelled => {
-                            // pyjitpl.py:3018-3032 parity: cancel_count is
-                            // incremented inside compile_loop and tracing
-                            // continues unless `cancelled_too_many_times`
-                            // escalates to Aborted. The wrapper restored
-                            // session↔tracing alignment so no extra cleanup
-                            // is required here — either the early-Cancelled
-                            // path kept both live (tracing continues) or a
-                            // late-Cancelled path drained both (next bound
-                            // reaches begins a fresh session).
-                        }
-                        crate::CompileOutcome::Aborted => {
-                            // pyjitpl.py:3028 SwitchToBlackhole(ABORT_BAD_LOOP)
-                            self.meta.abort_trace(false);
-                        }
-                    }
-                } else {
-                    crate::debug::log_one("jit-abort", "mp: abort:validate_close");
-                    self.meta.abort_trace(false);
-                    self.meta.clear_trace_session();
-                }
-                // pyjitpl.py:3058-3060: a `reached_loop_header` that only
-                // appended a merge point RETURNS — the trace is not over and
-                // the metainterp goes on recording into the next iteration.
-                // Dropping `self.sym` is how this driver says "the trace ended
-                // here" (`merge_point` aborts on a None sym), so that one path
-                // has to keep it — and it must re-enter the walk rather than
-                // let the native dispatch loop run the merge point's own
-                // instruction unrecorded (see the loop header above).
-                if self.meta.take_keep_tracing_after_close() {
-                    // The walk-final handoff staged at the top of this arm
-                    // describes a trace that ENDED. Discard it: publishing it
-                    // would make the `jit_merge_point!` expansion write the
-                    // walk state into native `state` and resume the guest at
-                    // the merge-point pc, which is exactly the instruction the
-                    // next walk segment still has to record.
-                    self.meta.single_pass_outcome = None;
-                    self.meta.single_pass_scalar_values = None;
-                    self.meta.single_pass_virt_array_values = None;
-                    // pyjitpl.py:1577 `self.pc = saved_pc` — the resumed walk
-                    // re-enters at the merge point's own guest pc, so the
-                    // merge-point op must fall through once instead of
-                    // closing again with nothing recorded in between.
-                    if let Some(ctx) = self.meta.trace_ctx() {
-                        ctx.merge_point_resumed = true;
-                    }
-                    continue;
-                }
-                self.sym = None;
-            }
-            TraceAction::CloseLoopWithArgs {
-                jump_args,
-                loop_header_pc,
-            } => {
-                // pyjitpl.py:2979-2990 reached_loop_header parity.
-                //
-                // pyjitpl.py:3003 `if not self.partial_trace:` gates the whole
-                // bridge attempt, the same way it does on the `CloseLoop` twin
-                // above: once `retrace_needed` has armed `partial_trace` the
-                // loop being closed is a RETRACE, and re-entering
-                // `compile_trace` would both bridge into the loop the retrace
-                // exists to respecialize and arm the retrace a second time.
-                // pyjitpl.py:3003-3005 has no resumekey test in this gate:
-                // upstream re-attempts `compile_trace` on every header visit.
-                // majit keeps its declined-attempt latch here for now, so this
-                // commit changes no behavior at this site.
-                let has_partial_trace = self.meta.partial_trace().is_some();
-                let attempt_declined = self.bridge_attempt_declined;
-                if let Some(bridge) = self
-                    .meta
-                    .bridge_info()
-                    .filter(|_| !has_partial_trace && !attempt_declined)
-                {
-                    let bridge_key = bridge.green_key;
-                    let bridge_trace_id = bridge.trace_id;
-                    let bridge_fail_index = bridge.fail_index;
-                    let bridge_code_ptr = bridge.code_ptr;
-                    // pyjitpl.py:2982: ptoken = self.get_procedure_token(greenboxes)
-                    // Use the TARGET loop header's green key, not the bridge origin.
-                    let target_key = loop_header_pc
-                        .map(|pc| crate::green_key_from_code_ptr(bridge_code_ptr, pc))
-                        .unwrap_or(bridge_key);
-                    let has_targets = self.meta.has_compiled_targets(target_key);
-                    if has_targets {
-                        let continue_running_normally_values = {
-                            let trace_meta = self.meta.trace_meta().cloned();
-                            match (trace_meta, self.sym.as_ref()) {
-                                (Some(meta), Some(sym)) => self.meta.trace_ctx().and_then(|ctx| {
-                                    S::close_loop_live_values(ctx, sym, &meta, &jump_args)
-                                }),
-                                _ => None,
+                    let Some(sym) = self.sym.as_ref() else {
+                        self.meta.abort_trace(false);
+                        self.meta.clear_trace_session();
+                        return;
+                    };
+                    if S::validate_close_with_jump_args(sym, &trace_meta, &jump_args) {
+                        // pyjitpl.py:2993-3036 parity: keep `active_trace_session`
+                        // alive across compile_loop — the session envelope mirrors
+                        // RPython's `self.history` which compile_loop borrows
+                        // without consuming.
+                        let provisional_meta = self.meta.trace_meta().cloned().unwrap();
+                        let meta = {
+                            if let Some((cut_pc, ref cut_boxes)) = self.meta.cross_loop_cut_info() {
+                                S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_boxes)
+                            } else {
+                                provisional_meta
                             }
                         };
-                        let result = self.meta.close_bridge(
-                            target_key,
-                            bridge_trace_id,
-                            bridge_fail_index,
-                            &jump_args,
-                        );
-                        match result {
-                            crate::pyjitpl::BridgeCompileResult::Compiled => {
-                                self.sym = None;
-                                self.meta.clear_trace_session();
-                                // pyjitpl.py:3095-3099 raise_if_successful():
-                                // successful bridge closure terminates tracing.
+                        let continue_running_normally_values = self
+                            .meta
+                            .trace_ctx()
+                            .and_then(|ctx| S::close_loop_live_values(ctx, sym, &meta, &jump_args));
+                        self.meta.single_pass_full_live_values =
+                            continue_running_normally_values.clone();
+                        let outcome = self.compile_and_record_loop(&jump_args, meta);
+                        match outcome {
+                            crate::CompileOutcome::Compiled { .. } => {
+                                // pyjitpl.py:3119-3123 raise_if_successful →
+                                // raise_continue_running_normally(live_arg_boxes).
                                 self.note_continue_running_normally(
                                     continue_running_normally_values,
                                     loop_header_pc,
                                 );
-                                // Success edge: live teardown only, no
-                                // aborted_tracing accounting (see the
-                                // CompileTrace arm above).
-                                self.meta.finish_trace_live();
-                                self.meta.clear_pending_abort();
-                                return;
                             }
-                            // pyjitpl.py:2993-3007: after retrace_needed(),
-                            // partial_trace is set on MetaInterp. Fall through
-                            // to compile_loop → compile_retrace in same call.
-                            crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
-                                // Same as the `CloseLoop` twin: `bridge_info`
-                                // is the `self.resumekey` class discriminator
-                                // and upstream writes it only at session start
-                                // (pyjitpl.py:2905 / 2939), never in
-                                // `retrace_needed` (pyjitpl.py:2438-2442), so
-                                // it has to survive into
-                                // `resumekey.compile_and_attach`
-                                // (compile.py:392-393).
-                                // Fall through — do NOT return.
+                            crate::CompileOutcome::Cancelled => {
+                                // pyjitpl.py:3018-3032 parity: no explicit abort,
+                                // tracing continues (or is already drained inside
+                                // compile_loop for late-cancel cases). The wrapper
+                                // maintains the session↔tracing invariant.
                             }
-                            // pyjitpl.py:3220 raise_if_successful() does not
-                            // raise on a None target token, so the trace is not
-                            // given up: fall through to compile_loop the way
-                            // reached_loop_header falls into its merge-point
-                            // scan.
-                            crate::pyjitpl::BridgeCompileResult::Declined => {
-                                crate::mc_diag_bump(50); // bridge_declined_close
-                                // The resumekey survives because upstream never
-                                // clears it in this region
-                                // (pyjitpl.py:2979-3060); only the attempt
-                                // latch is set.
-                                self.bridge_attempt_declined = true;
-                                // Fall through — do NOT return.
-                            }
-                            crate::pyjitpl::BridgeCompileResult::Failed => {
+                            crate::CompileOutcome::Aborted => {
+                                // pyjitpl.py:3028 SwitchToBlackhole
                                 self.meta.abort_trace(false);
-                                self.sym = None;
-                                self.meta.clear_trace_session();
-                                return;
                             }
                         }
                     } else {
-                        // No targets: consume bridge_info, fall through. The
-                        // resumekey survives because upstream never clears it
-                        // in this region (pyjitpl.py:2979-3060); only the
-                        // attempt latch is set.
-                        crate::mc_diag_bump(51); // bridge_no_targets_close
-                        self.bridge_attempt_declined = true;
-                    }
-                }
-                // pyjitpl.py:2983: compile_trace already compiled a bridge
-                // to the existing loop. Don't call compile_loop again.
-                if self.compile_trace_success_pending() {
-                    self.sym = None;
-                    self.meta.clear_trace_session();
-                    return;
-                }
-                let Some(trace_meta) = self.meta.trace_meta().cloned() else {
-                    self.meta.abort_trace(false);
-                    self.sym = None;
-                    self.meta.clear_trace_session();
-                    return;
-                };
-                let Some(sym) = self.sym.as_ref() else {
-                    self.meta.abort_trace(false);
-                    self.meta.clear_trace_session();
-                    return;
-                };
-                if S::validate_close_with_jump_args(sym, &trace_meta, &jump_args) {
-                    // pyjitpl.py:2993-3036 parity: keep `active_trace_session`
-                    // alive across compile_loop — the session envelope mirrors
-                    // RPython's `self.history` which compile_loop borrows
-                    // without consuming.
-                    let provisional_meta = self.meta.trace_meta().cloned().unwrap();
-                    let meta = {
-                        if let Some((cut_pc, ref cut_boxes)) = self.meta.cross_loop_cut_info() {
-                            S::build_meta_from_merge_point(&provisional_meta, cut_pc, cut_boxes)
-                        } else {
-                            provisional_meta
-                        }
-                    };
-                    let continue_running_normally_values = self
-                        .meta
-                        .trace_ctx()
-                        .and_then(|ctx| S::close_loop_live_values(ctx, sym, &meta, &jump_args));
-                    self.meta.single_pass_full_live_values =
-                        continue_running_normally_values.clone();
-                    let outcome = self.compile_and_record_loop(&jump_args, meta);
-                    match outcome {
-                        crate::CompileOutcome::Compiled { .. } => {
-                            // pyjitpl.py:3119-3123 raise_if_successful →
-                            // raise_continue_running_normally(live_arg_boxes).
-                            self.note_continue_running_normally(
-                                continue_running_normally_values,
-                                loop_header_pc,
+                        if crate::majit_log_enabled() {
+                            eprintln!(
+                                "[mp] abort:validate_close_with_jump_args actual_len={}",
+                                jump_args.len()
                             );
                         }
-                        crate::CompileOutcome::Cancelled => {
-                            // pyjitpl.py:3018-3032 parity: no explicit abort,
-                            // tracing continues (or is already drained inside
-                            // compile_loop for late-cancel cases). The wrapper
-                            // maintains the session↔tracing invariant.
-                        }
-                        crate::CompileOutcome::Aborted => {
-                            // pyjitpl.py:3028 SwitchToBlackhole
-                            self.meta.abort_trace(false);
-                        }
+                        self.meta.abort_trace(false);
+                        self.meta.clear_trace_session();
                     }
-                } else {
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[mp] abort:validate_close_with_jump_args actual_len={}",
-                            jump_args.len()
-                        );
-                    }
-                    self.meta.abort_trace(false);
-                    self.meta.clear_trace_session();
+                    self.sym = None;
                 }
-                self.sym = None;
-            }
-            TraceAction::Finish {
-                finish_args,
-                finish_arg_types,
-                exit_with_exception,
-                exc_value,
-            } => {
-                // A terminal dispatch return is also a valid single-pass
-                // handoff: the interpreted function has returned, so native
-                // execution must EXIT the dispatch loop and run its own
-                // post-loop work exactly once. The scalar/virt-array write-back
-                // still applies (post-loop reads the walk-final state), but the
-                // `single_pass_finish` flag tells the macro to `break` rather
-                // than resume at the captured pc. The captured pc (i0, past the
-                // terminal opcode) only lands past the program end — where
-                // `while pc < size` would exit on resume — when the terminal is
-                // the last opcode; a mid-program terminal would re-enter the
-                // loop body, so the exit is signalled explicitly.
-                let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
-                if let Some(p) = pc {
-                    self.meta.single_pass_outcome = Some((p, Vec::new()));
-                    self.meta.single_pass_finish = true;
-                }
-                if let Some(sym) = self.sym.as_ref() {
-                    let scalars = S::collect_scalar_state_field_values(sym);
-                    self.meta.single_pass_scalar_values = Some(scalars);
-                }
-                let virt_elems = self
-                    .meta
-                    .trace_ctx()
-                    .and_then(|ctx| ctx.collect_virtualizable_element_values());
-                if let Some(elems) = virt_elems {
-                    self.meta.single_pass_virt_array_values = Some(elems);
-                }
-                // The `raise` half of `pyjitpl.py:2558-2562`.  This arm is the
-                // consumer for `#[jit_interp]`-generated tracers, which reach
-                // it through `merge_point` and whose walk carries an escaping
-                // exception in `BH_LAST_EXC_VALUE` — the only channel a
-                // macro-front-end client has.  The producer
-                // (`dispatch.rs unwind_to_exception_handler`) closes that
-                // channel and hands the value over on the action, so re-open
-                // it here; dropping it would let the portal finish as if the
-                // frame had returned normally.
-                //
-                // Published *before* the compile: upstream snapshots
-                // `excvalue` into a local at :2531 and that local keeps the
-                // ref alive as a GC root across
-                // `compile_exit_frame_with_exception` (:2558).  A raw `i64`
-                // is no root, and `compile_finish_from_active_session`
-                // allocates, so the walked TLS cell has to hold the value
-                // across it.
-                if exit_with_exception && exc_value != 0 {
-                    crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_value));
-                }
-                // pyjitpl.py:3198-3220 + 3238-3245 parity — upstream's
-                // `compile_done_with_this_frame` and
-                // `compile_exit_frame_with_exception` both call
-                // `compile.compile_trace(self, self.resumekey, exits)` →
-                // `compile.giveup()` on failure.  Both live on
-                // `MetaInterp` in upstream; the shared helper
-                // `compile_finish_from_active_session` dispatches bridge
-                // vs root based on the session's `bridge_info` and picks
-                // the FINISH descr per `exit_with_exception`.  The
-                // TraceAction::Finish arm stays as a thin wrapper that
-                // routes the pyre-dispatch-layer finish emission
-                // (dispatch.rs:298) into the same helper, matching the
-                // `except SwitchToBlackhole as stb: self.aborted_tracing`
-                // shape at pyjitpl.py:2491.
-                if let Err(stb) = self.meta.compile_finish_from_active_session(
-                    &finish_args,
+                TraceAction::Finish {
+                    finish_args,
                     finish_arg_types,
                     exit_with_exception,
-                ) {
-                    self.meta.aborted_tracing(stb.reason);
-                }
-                self.sym = None;
-            }
-            TraceAction::SegmentedLoop => {
-                // pyjitpl.py:1658-1663 _create_segmented_trace_and_blackhole:
-                //   target_token = compile.compile_simple_loop(...)
-                //   warmstate.attach_procedure_to_interp(greenkey, token)
-                // + pyjitpl.py:1673 SwitchToBlackhole(ABORT_SEGMENTED_TRACE)
-                let meta = self.meta.take_trace_meta().unwrap();
-                if let Some(green_key) = self.meta.compile_simple_loop(meta) {
-                    // pyjitpl.py:1662-1663 line-by-line: pass the compiled
-                    // `target_token` returned by `compile_simple_loop` to
-                    // `attach_procedure_to_interp`, NOT a fresh synthetic
-                    // uncompiled JitCellToken.  pyre's `compile_simple_loop`
-                    // returns the green_key; the actual `Arc<JitCellToken>`
-                    // is the `token` field of the freshly-installed
-                    // `CompiledEntry` in `self.compiled_loops`.
-                    let install_token = self
-                        .meta
-                        .compiled_loops
-                        .get(&green_key)
-                        .expect(
-                            "compile_simple_loop returned Some(green_key) ⇒ \
-                             compiled_loops has the new CompiledEntry",
-                        )
-                        .live_token();
-                    // `warmstate.py:339-348` redirect+record_jump_to chain
-                    // routed through MetaInterp's caller-side helper.  Skip
-                    // the redirect when MemoryManager has already evicted
-                    // the freshly-installed token (rare; eviction is
-                    // independent of this insertion path).
-                    if let Some(install_token) = install_token {
-                        self.meta
-                            .attach_procedure_with_redirect(green_key, install_token);
+                    exc_value,
+                } => {
+                    // A terminal dispatch return is also a valid single-pass
+                    // handoff: the interpreted function has returned, so native
+                    // execution must EXIT the dispatch loop and run its own
+                    // post-loop work exactly once. The scalar/virt-array write-back
+                    // still applies (post-loop reads the walk-final state), but the
+                    // `single_pass_finish` flag tells the macro to `break` rather
+                    // than resume at the captured pc. The captured pc (i0, past the
+                    // terminal opcode) only lands past the program end — where
+                    // `while pc < size` would exit on resume — when the terminal is
+                    // the last opcode; a mid-program terminal would re-enter the
+                    // loop body, so the exit is signalled explicitly.
+                    let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
+                    if let Some(p) = pc {
+                        self.meta.single_pass_outcome = Some((p, Vec::new()));
+                        self.meta.single_pass_finish = true;
                     }
+                    if let Some(sym) = self.sym.as_ref() {
+                        let scalars = S::collect_scalar_state_field_values(sym);
+                        self.meta.single_pass_scalar_values = Some(scalars);
+                    }
+                    let virt_elems = self
+                        .meta
+                        .trace_ctx()
+                        .and_then(|ctx| ctx.collect_virtualizable_element_values());
+                    if let Some(elems) = virt_elems {
+                        self.meta.single_pass_virt_array_values = Some(elems);
+                    }
+                    // The `raise` half of `pyjitpl.py:2558-2562`.  This arm is the
+                    // consumer for `#[jit_interp]`-generated tracers, which reach
+                    // it through `merge_point` and whose walk carries an escaping
+                    // exception in `BH_LAST_EXC_VALUE` — the only channel a
+                    // macro-front-end client has.  The producer
+                    // (`dispatch.rs unwind_to_exception_handler`) closes that
+                    // channel and hands the value over on the action, so re-open
+                    // it here; dropping it would let the portal finish as if the
+                    // frame had returned normally.
+                    //
+                    // Published *before* the compile: upstream snapshots
+                    // `excvalue` into a local at :2531 and that local keeps the
+                    // ref alive as a GC root across
+                    // `compile_exit_frame_with_exception` (:2558).  A raw `i64`
+                    // is no root, and `compile_finish_from_active_session`
+                    // allocates, so the walked TLS cell has to hold the value
+                    // across it.
+                    if exit_with_exception && exc_value != 0 {
+                        crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_value));
+                    }
+                    // pyjitpl.py:3198-3220 + 3238-3245 parity — upstream's
+                    // `compile_done_with_this_frame` and
+                    // `compile_exit_frame_with_exception` both call
+                    // `compile.compile_trace(self, self.resumekey, exits)` →
+                    // `compile.giveup()` on failure.  Both live on
+                    // `MetaInterp` in upstream; the shared helper
+                    // `compile_finish_from_active_session` dispatches bridge
+                    // vs root based on the session's `bridge_info` and picks
+                    // the FINISH descr per `exit_with_exception`.  The
+                    // TraceAction::Finish arm stays as a thin wrapper that
+                    // routes the pyre-dispatch-layer finish emission
+                    // (dispatch.rs:298) into the same helper, matching the
+                    // `except SwitchToBlackhole as stb: self.aborted_tracing`
+                    // shape at pyjitpl.py:2491.
+                    if let Err(stb) = self.meta.compile_finish_from_active_session(
+                        &finish_args,
+                        finish_arg_types,
+                        exit_with_exception,
+                    ) {
+                        self.meta.aborted_tracing(stb.reason);
+                    }
+                    self.sym = None;
                 }
-                // Blackhole transition: clear all driver tracing state.
-                // `take_trace_meta` above drained the M-ownership side;
-                // `leave_profiler_tracing` fires the matching
-                // `pyjitpl.py:2934 finally: profiler.end_tracing()`.
-                // `clear_trace_session` is then a no-op for both effects
-                // (session already drained, profiler already left) and
-                // only cleans `bridge_info`.
-                self.sym = None;
-                self.meta.leave_profiler_tracing();
-                self.meta.clear_trace_session();
-            }
-            // Consumed inside the metainterp dispatch loop
-            // (PyreMetaInterp::step_inline_frame pops the inline frame and
-            // records the CALL_ASSEMBLER); it never reaches the jitdriver.
-            // Defensive: treat an escaped instance as a plain Abort.
-            action @ (TraceAction::RecursiveCallAssembler { .. }
-            | TraceAction::Abort
-            | TraceAction::Decline) => {
-                if self.meta.bridge_info().is_some() {
-                    crate::debug::log_one("jit-abort", "Abort during bridge tracing");
+                TraceAction::SegmentedLoop => {
+                    // pyjitpl.py:1658-1663 _create_segmented_trace_and_blackhole:
+                    //   target_token = compile.compile_simple_loop(...)
+                    //   warmstate.attach_procedure_to_interp(greenkey, token)
+                    // + pyjitpl.py:1673 SwitchToBlackhole(ABORT_SEGMENTED_TRACE)
+                    let meta = self.meta.take_trace_meta().unwrap();
+                    if let Some(green_key) = self.meta.compile_simple_loop(meta) {
+                        // pyjitpl.py:1662-1663 line-by-line: pass the compiled
+                        // `target_token` returned by `compile_simple_loop` to
+                        // `attach_procedure_to_interp`, NOT a fresh synthetic
+                        // uncompiled JitCellToken.  pyre's `compile_simple_loop`
+                        // returns the green_key; the actual `Arc<JitCellToken>`
+                        // is the `token` field of the freshly-installed
+                        // `CompiledEntry` in `self.compiled_loops`.
+                        let install_token = self
+                            .meta
+                            .compiled_loops
+                            .get(&green_key)
+                            .expect(
+                                "compile_simple_loop returned Some(green_key) ⇒ \
+                             compiled_loops has the new CompiledEntry",
+                            )
+                            .live_token();
+                        // `warmstate.py:339-348` redirect+record_jump_to chain
+                        // routed through MetaInterp's caller-side helper.  Skip
+                        // the redirect when MemoryManager has already evicted
+                        // the freshly-installed token (rare; eviction is
+                        // independent of this insertion path).
+                        if let Some(install_token) = install_token {
+                            self.meta
+                                .attach_procedure_with_redirect(green_key, install_token);
+                        }
+                    }
+                    // Blackhole transition: clear all driver tracing state.
+                    // `take_trace_meta` above drained the M-ownership side;
+                    // `leave_profiler_tracing` fires the matching
+                    // `pyjitpl.py:2934 finally: profiler.end_tracing()`.
+                    // `clear_trace_session` is then a no-op for both effects
+                    // (session already drained, profiler already left) and
+                    // only cleans `bridge_info`.
+                    self.sym = None;
+                    self.meta.leave_profiler_tracing();
+                    self.meta.clear_trace_session();
                 }
-                if self.bridge_attempt_declined {
-                    crate::mc_diag_bump(52); // abort_after_declined
-                }
-                let setup_aborted_bridge_descr = if matches!(action, TraceAction::Abort)
+                // Consumed inside the metainterp dispatch loop
+                // (PyreMetaInterp::step_inline_frame pops the inline frame and
+                // records the CALL_ASSEMBLER); it never reaches the jitdriver.
+                // Defensive: treat an escaped instance as a plain Abort.
+                action @ (TraceAction::RecursiveCallAssembler { .. }
+                | TraceAction::Abort
+                | TraceAction::Decline) => {
+                    if self.meta.bridge_info().is_some() {
+                        crate::debug::log_one("jit-abort", "Abort during bridge tracing");
+                    }
+                    if self.bridge_attempt_declined {
+                        crate::mc_diag_bump(52); // abort_after_declined
+                    }
+                    let setup_aborted_bridge_descr = if matches!(action, TraceAction::Abort)
                     && self.meta.bridge_info().is_some()
                     && !self.bridge_attempt_declined
                     // `bridge_info` survives `RetraceNeeded` and declined
@@ -3521,175 +3531,177 @@ impl<S: JitState> JitDriver<S> {
                                     .get(start_ops)
                                     .is_some_and(|op| op.opcode == majit_ir::OpCode::GetfieldRawI))
                     }) {
-                    self.meta
-                        .bridge_info_cloned()
-                        .map(|bridge| bridge.source_descr)
-                } else {
-                    None
-                };
-                if let Some(source_descr) = setup_aborted_bridge_descr {
-                    // pyjitpl.rs:9527-9532 structural-decline contract:
-                    // a bridge abort before bytecode-body ops is deterministic
-                    // setup failure from the fixed guard resume shape, so it
-                    // must not refire. The lone GetfieldRawI case is emitted
-                    // by bridge symbolic init before the body walker runs.
-                    self.meta.record_declined_bridge_guard(&source_descr);
-                }
-                // `pyjitpl.py:2491` `except SwitchToBlackhole as stb:
-                // self.aborted_tracing(stb.reason)` — the
-                // `aborted_tracing(reason)` accounting half of RPython's
-                // abort handling.  Dispatch-side
-                // `finalize_standard_virtualizable_may_force` stashes
-                // `SwitchToBlackhole(ABORT_ESCAPE, raising_exception=True)`
-                // (`pyjitpl.py:3389-3390`) on
-                // `TraceCtx::pending_switch_to_blackhole`; drain it
-                // here so `stb.reason` flows into
-                // `aborted_tracing(reason)`.  Falls back to the
-                // `blackhole_if_trace_too_long`-derived
-                // `AbortReason::Generic` for the
-                // `SwitchToBlackhole(ABORT_TOO_LONG)`
-                // path (`pyjitpl.py:2807`).
-                //
-                // The other half of `pyjitpl.py:2949
-                // run_blackhole_interp_to_cancel_tracing(stb)` —
-                // `convert_and_run_from_pyjitpl(self, stb.raising_exception)`
-                // — is staged below into `MetaInterp::pending_abort_blackhole`
-                // and run by [`JitDriver::run_pending_abort_blackhole`], which
-                // is the first point that also holds native `state`.  Both
-                // halves read the same drained `stb`, so take it whole rather
-                // than just its reason.
-                let pending_stb = self
-                    .meta
-                    .tracing
-                    .as_mut()
-                    .and_then(|t| t.pending_switch_to_blackhole.take());
-                // `history.py:37-43`: false unless the abort site raised at a
-                // point where `last_exc_value` still has to be raised
-                // (`pyjitpl.py:3389-3390` vable escape, `pyjitpl.py:3714-3716`
-                // `do_not_in_trace_call`).  The `ABORT_TOO_LONG` path below has
-                // no `stb` at all and defaults to false, as upstream's
-                // `SwitchToBlackhole(ABORT_TOO_LONG)` does.
-                let abort_raising_exception = pending_stb
-                    .as_ref()
-                    .is_some_and(|stb| stb.raising_exception);
-                // A walker raise site outside this crate cannot reach
-                // `TraceCtx::pending_switch_to_blackhole`, so its
-                // `Counters.ABORT_*` travels in `stage_abort_reason` instead.
-                // It ranks with `stb.reason` rather than below the too-long
-                // fallback: upstream raises at the site and never reaches the
-                // `blackhole_if_trace_too_long` check on that unwind.
-                let reason_int = match pending_stb
-                    .map(|stb| stb.reason)
-                    .or_else(|| self.meta.take_pending_abort_reason())
-                {
-                    Some(r) => r,
-                    None => self
+                        self.meta
+                            .bridge_info_cloned()
+                            .map(|bridge| bridge.source_descr)
+                    } else {
+                        None
+                    };
+                    if let Some(source_descr) = setup_aborted_bridge_descr {
+                        // pyjitpl.rs:9527-9532 structural-decline contract:
+                        // a bridge abort before bytecode-body ops is deterministic
+                        // setup failure from the fixed guard resume shape, so it
+                        // must not refire. The lone GetfieldRawI case is emitted
+                        // by bridge symbolic init before the body walker runs.
+                        self.meta.record_declined_bridge_guard(&source_descr);
+                    }
+                    // `pyjitpl.py:2491` `except SwitchToBlackhole as stb:
+                    // self.aborted_tracing(stb.reason)` — the
+                    // `aborted_tracing(reason)` accounting half of RPython's
+                    // abort handling.  Dispatch-side
+                    // `finalize_standard_virtualizable_may_force` stashes
+                    // `SwitchToBlackhole(ABORT_ESCAPE, raising_exception=True)`
+                    // (`pyjitpl.py:3389-3390`) on
+                    // `TraceCtx::pending_switch_to_blackhole`; drain it
+                    // here so `stb.reason` flows into
+                    // `aborted_tracing(reason)`.  Falls back to the
+                    // `blackhole_if_trace_too_long`-derived
+                    // `AbortReason::Generic` for the
+                    // `SwitchToBlackhole(ABORT_TOO_LONG)`
+                    // path (`pyjitpl.py:2807`).
+                    //
+                    // The other half of `pyjitpl.py:2949
+                    // run_blackhole_interp_to_cancel_tracing(stb)` —
+                    // `convert_and_run_from_pyjitpl(self, stb.raising_exception)`
+                    // — is staged below into `MetaInterp::pending_abort_blackhole`
+                    // and run by [`JitDriver::run_pending_abort_blackhole`], which
+                    // is the first point that also holds native `state`.  Both
+                    // halves read the same drained `stb`, so take it whole rather
+                    // than just its reason.
+                    let pending_stb = self
                         .meta
-                        .blackhole_if_trace_too_long()
-                        .unwrap_or(AbortReason::Generic)
-                        .as_int(),
-                };
-                // pyjitpl.py:2949-2956
-                // run_blackhole_interp_to_cancel_tracing: a fresh trace has
-                // executed its portal body forward with real residual heap
-                // effects.  Before dropping that live frame, publish its
-                // current source pc and scalar state for the single-pass
-                // jit_merge_point hook.  The hook restores those scalars,
-                // runs `recover_after_compiled_run`, and continues the native
-                // interpreter from this pc rather than replaying the committed
-                // trace prefix.
-                //
-                // Bridge/compiled guard-failure recovery owns a separate
-                // blackhole resume path below `back_edge_internal`; do not
-                // feed that path through this fresh-trace handoff.
-                if matches!(action, TraceAction::Abort)
-                    && (self.meta.bridge_info().is_none() || self.bridge_attempt_declined)
-                {
-                    // This gate asks whether the session still has a bridge
-                    // artifact to resume into, which is the PHASE, not the
-                    // resumekey class. A declined attempt has none, so it takes
-                    // the fresh-trace handoff exactly as it did when the decline
-                    // arms cleared `bridge_info`.
-                    let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
-                    if let Some(pc) = pc {
-                        self.meta.single_pass_outcome = Some((pc, Vec::new()));
-                        if let Some(sym) = self.sym.as_ref() {
-                            let scalars = S::collect_scalar_state_field_values(sym);
-                            self.meta.single_pass_scalar_values = Some(scalars);
-                        }
-                        let virt_elems = self
-                            .meta
-                            .trace_ctx()
-                            .and_then(|ctx| ctx.collect_virtualizable_element_values());
-                        if let Some(elems) = virt_elems {
-                            self.meta.single_pass_virt_array_values = Some(elems);
-                        }
-                    }
-                    // `pyjitpl.py:2954 convert_and_run_from_pyjitpl(self,
-                    // stb.raising_exception)`: the source pc above is only a
-                    // sound resume position when the walk happened to stop at a
-                    // source-opcode boundary.  Stage the framestack and the
-                    // sym's state-field image so the `jit_merge_point!` hook can
-                    // finish the half-executed opcodes in the blackhole and take
-                    // the resume position from the merge point they reach.
-                    let staged = self.meta.trace_ctx().and_then(|ctx| {
-                        let framestack = ctx.aborted_framestack.take()?;
-                        Some((
-                            framestack,
-                            ctx.collect_virtualizable_element_values(),
-                            ctx.virtualizable_heap_ptr().map_or(0, |p| p as i64),
-                        ))
-                    });
-                    if let (Some((framestack, virt_array_values, virtualizable_ptr)), Some(sym)) =
-                        (staged, self.sym.as_ref())
+                        .tracing
+                        .as_mut()
+                        .and_then(|t| t.pending_switch_to_blackhole.take());
+                    // `history.py:37-43`: false unless the abort site raised at a
+                    // point where `last_exc_value` still has to be raised
+                    // (`pyjitpl.py:3389-3390` vable escape, `pyjitpl.py:3714-3716`
+                    // `do_not_in_trace_call`).  The `ABORT_TOO_LONG` path below has
+                    // no `stb` at all and defaults to false, as upstream's
+                    // `SwitchToBlackhole(ABORT_TOO_LONG)` does.
+                    let abort_raising_exception = pending_stb
+                        .as_ref()
+                        .is_some_and(|stb| stb.raising_exception);
+                    // A walker raise site outside this crate cannot reach
+                    // `TraceCtx::pending_switch_to_blackhole`, so its
+                    // `Counters.ABORT_*` travels in `stage_abort_reason` instead.
+                    // It ranks with `stb.reason` rather than below the too-long
+                    // fallback: upstream raises at the site and never reaches the
+                    // `blackhole_if_trace_too_long` check on that unwind.
+                    let reason_int = match pending_stb
+                        .map(|stb| stb.reason)
+                        .or_else(|| self.meta.take_pending_abort_reason())
                     {
-                        self.meta.pending_abort_blackhole = Some(PendingAbortBlackhole {
-                            framestack,
-                            scalar_values: S::collect_scalar_state_field_values(sym),
-                            ref_scalar_values: S::collect_ref_scalar_state_field_values(sym),
-                            virt_array_values,
-                            virtualizable_ptr,
-                            // `blackhole.py:1811-1814` reads
-                            // `metainterp.last_exc_value` at conversion time;
-                            // snapshot it here because `abort_trace_live` below
-                            // tears down the tracing state it belongs to.
-                            last_exc_value: self.meta.last_exc_value,
-                            raising_exception: abort_raising_exception,
+                        Some(r) => r,
+                        None => self
+                            .meta
+                            .blackhole_if_trace_too_long()
+                            .unwrap_or(AbortReason::Generic)
+                            .as_int(),
+                    };
+                    // pyjitpl.py:2949-2956
+                    // run_blackhole_interp_to_cancel_tracing: a fresh trace has
+                    // executed its portal body forward with real residual heap
+                    // effects.  Before dropping that live frame, publish its
+                    // current source pc and scalar state for the single-pass
+                    // jit_merge_point hook.  The hook restores those scalars,
+                    // runs `recover_after_compiled_run`, and continues the native
+                    // interpreter from this pc rather than replaying the committed
+                    // trace prefix.
+                    //
+                    // Bridge/compiled guard-failure recovery owns a separate
+                    // blackhole resume path below `back_edge_internal`; do not
+                    // feed that path through this fresh-trace handoff.
+                    if matches!(action, TraceAction::Abort)
+                        && (self.meta.bridge_info().is_none() || self.bridge_attempt_declined)
+                    {
+                        // This gate asks whether the session still has a bridge
+                        // artifact to resume into, which is the PHASE, not the
+                        // resumekey class. A declined attempt has none, so it takes
+                        // the fresh-trace handoff exactly as it did when the decline
+                        // arms cleared `bridge_info`.
+                        let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
+                        if let Some(pc) = pc {
+                            self.meta.single_pass_outcome = Some((pc, Vec::new()));
+                            if let Some(sym) = self.sym.as_ref() {
+                                let scalars = S::collect_scalar_state_field_values(sym);
+                                self.meta.single_pass_scalar_values = Some(scalars);
+                            }
+                            let virt_elems = self
+                                .meta
+                                .trace_ctx()
+                                .and_then(|ctx| ctx.collect_virtualizable_element_values());
+                            if let Some(elems) = virt_elems {
+                                self.meta.single_pass_virt_array_values = Some(elems);
+                            }
+                        }
+                        // `pyjitpl.py:2954 convert_and_run_from_pyjitpl(self,
+                        // stb.raising_exception)`: the source pc above is only a
+                        // sound resume position when the walk happened to stop at a
+                        // source-opcode boundary.  Stage the framestack and the
+                        // sym's state-field image so the `jit_merge_point!` hook can
+                        // finish the half-executed opcodes in the blackhole and take
+                        // the resume position from the merge point they reach.
+                        let staged = self.meta.trace_ctx().and_then(|ctx| {
+                            let framestack = ctx.aborted_framestack.take()?;
+                            Some((
+                                framestack,
+                                ctx.collect_virtualizable_element_values(),
+                                ctx.virtualizable_heap_ptr().map_or(0, |p| p as i64),
+                            ))
                         });
+                        if let (
+                            Some((framestack, virt_array_values, virtualizable_ptr)),
+                            Some(sym),
+                        ) = (staged, self.sym.as_ref())
+                        {
+                            self.meta.pending_abort_blackhole = Some(PendingAbortBlackhole {
+                                framestack,
+                                scalar_values: S::collect_scalar_state_field_values(sym),
+                                ref_scalar_values: S::collect_ref_scalar_state_field_values(sym),
+                                virt_array_values,
+                                virtualizable_ptr,
+                                // `blackhole.py:1811-1814` reads
+                                // `metainterp.last_exc_value` at conversion time;
+                                // snapshot it here because `abort_trace_live` below
+                                // tears down the tracing state it belongs to.
+                                last_exc_value: self.meta.last_exc_value,
+                                raising_exception: abort_raising_exception,
+                            });
+                        }
                     }
+                    self.meta.abort_trace_live(false);
+                    // `pyjitpl.py:2785-2789` counts every SwitchToBlackhole abort,
+                    // including a bridge whose greenkey is None. `Decline` is a
+                    // pyre pre-trace coverage fallback, not a traced abort, so it
+                    // deliberately remains outside `aborted_tracing` accounting.
+                    if !matches!(action, TraceAction::Decline) {
+                        self.meta.aborted_tracing(reason_int);
+                    }
+                    self.sym = None;
+                    self.bridge_body_start_op_count = None;
+                    self.bridge_attempt_declined = false;
+                    self.meta.clear_trace_session();
                 }
-                self.meta.abort_trace_live(false);
-                // `pyjitpl.py:2785-2789` counts every SwitchToBlackhole abort,
-                // including a bridge whose greenkey is None. `Decline` is a
-                // pyre pre-trace coverage fallback, not a traced abort, so it
-                // deliberately remains outside `aborted_tracing` accounting.
-                if !matches!(action, TraceAction::Decline) {
-                    self.meta.aborted_tracing(reason_int);
+                TraceAction::AbortPermanent => {
+                    if self.meta.bridge_info().is_some() {
+                        crate::debug::log_one("jit-abort", "AbortPermanent during bridge tracing");
+                    }
+                    if self.bridge_attempt_declined {
+                        crate::mc_diag_bump(52); // abort_after_declined
+                    }
+                    self.meta.abort_trace(true);
+                    self.sym = None;
+                    // The session ends here, so the latch must not outlive it. The
+                    // sibling `bridge_body_start_op_count` is cleared on the
+                    // Abort/Decline arm and in `clear_tracing_session_state` but
+                    // not here, which is why this arm needs its own reset rather
+                    // than a shared teardown.
+                    self.bridge_attempt_declined = false;
+                    self.meta.clear_trace_session();
                 }
-                self.sym = None;
-                self.bridge_body_start_op_count = None;
-                self.bridge_attempt_declined = false;
-                self.meta.clear_trace_session();
             }
-            TraceAction::AbortPermanent => {
-                if self.meta.bridge_info().is_some() {
-                    crate::debug::log_one("jit-abort", "AbortPermanent during bridge tracing");
-                }
-                if self.bridge_attempt_declined {
-                    crate::mc_diag_bump(52); // abort_after_declined
-                }
-                self.meta.abort_trace(true);
-                self.sym = None;
-                // The session ends here, so the latch must not outlive it. The
-                // sibling `bridge_body_start_op_count` is cleared on the
-                // Abort/Decline arm and in `clear_tracing_session_state` but
-                // not here, which is why this arm needs its own reset rather
-                // than a shared teardown.
-                self.bridge_attempt_declined = false;
-                self.meta.clear_trace_session();
-            }
-        }
-        break;
+            break;
         }
     }
 
