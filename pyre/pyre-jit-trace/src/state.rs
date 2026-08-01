@@ -7865,49 +7865,55 @@ fn prepare_bridge_pending_fields(
             // concrete execution is observable immediately when the following
             // frame-section consume reads a materialized PyFrame's locals
             // array; recording alone would leave that consume one write stale.
-            let target_ptr = match ctx.box_value(target_op).unwrap_or(target_concrete) {
-                majit_ir::Value::Ref(ptr) if !ptr.is_null() => ptr.as_usize() as i64,
-                _ => continue,
-            };
-            if pending.item_index < 0 {
-                let Some(fielddescr) = descr.as_field_descr() else {
-                    continue;
+            // A target, descriptor or value shape this backend cannot execute
+            // still has to be RECORDED below: `_prepare_pendingfields` applies
+            // every decoded write, so leaving the loop here would drop the write
+            // from bridge entry entirely.  Leave the execution block instead.
+            'execute: {
+                let target_ptr = match ctx.box_value(target_op).unwrap_or(target_concrete) {
+                    majit_ir::Value::Ref(ptr) if !ptr.is_null() => ptr.as_usize() as i64,
+                    _ => break 'execute,
                 };
-                let bh_descr = majit_translate::jitcode::BhDescr::from_field_descr(fielddescr);
-                match (fielddescr.field_type(), value_concrete) {
-                    (Type::Ref, majit_ir::Value::Ref(value)) => {
-                        backend.bh_setfield_gc_r(target_ptr, value, &bh_descr)
+                if pending.item_index < 0 {
+                    let Some(fielddescr) = descr.as_field_descr() else {
+                        break 'execute;
+                    };
+                    let bh_descr = majit_translate::jitcode::BhDescr::from_field_descr(fielddescr);
+                    match (fielddescr.field_type(), value_concrete) {
+                        (Type::Ref, majit_ir::Value::Ref(value)) => {
+                            backend.bh_setfield_gc_r(target_ptr, value, &bh_descr)
+                        }
+                        (Type::Float, majit_ir::Value::Float(value)) => {
+                            backend.bh_setfield_gc_f(target_ptr, value, &bh_descr)
+                        }
+                        (Type::Int, majit_ir::Value::Int(value)) => {
+                            backend.bh_setfield_gc_i(target_ptr, value, &bh_descr)
+                        }
+                        _ => break 'execute,
                     }
-                    (Type::Float, majit_ir::Value::Float(value)) => {
-                        backend.bh_setfield_gc_f(target_ptr, value, &bh_descr)
+                } else {
+                    let Some(arraydescr) = descr.as_array_descr() else {
+                        break 'execute;
+                    };
+                    let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr(arraydescr);
+                    let index = i64::from(pending.item_index);
+                    match (arraydescr.item_type(), value_concrete) {
+                        (Type::Ref, majit_ir::Value::Ref(value)) => {
+                            backend.bh_setarrayitem_gc_r(target_ptr, index, value, &bh_descr);
+                            pending_ref_array_writes.push(PendingRefArrayWrite {
+                                target: target_op,
+                                item_index: pending.item_index as usize,
+                                value: value_op,
+                            });
+                        }
+                        (Type::Float, majit_ir::Value::Float(value)) => {
+                            backend.bh_setarrayitem_gc_f(target_ptr, index, value, &bh_descr)
+                        }
+                        (Type::Int, majit_ir::Value::Int(value)) => {
+                            backend.bh_setarrayitem_gc_i(target_ptr, index, value, &bh_descr)
+                        }
+                        _ => break 'execute,
                     }
-                    (Type::Int, majit_ir::Value::Int(value)) => {
-                        backend.bh_setfield_gc_i(target_ptr, value, &bh_descr)
-                    }
-                    _ => continue,
-                }
-            } else {
-                let Some(arraydescr) = descr.as_array_descr() else {
-                    continue;
-                };
-                let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr(arraydescr);
-                let index = i64::from(pending.item_index);
-                match (arraydescr.item_type(), value_concrete) {
-                    (Type::Ref, majit_ir::Value::Ref(value)) => {
-                        backend.bh_setarrayitem_gc_r(target_ptr, index, value, &bh_descr);
-                        pending_ref_array_writes.push(PendingRefArrayWrite {
-                            target: target_op,
-                            item_index: pending.item_index as usize,
-                            value: value_op,
-                        });
-                    }
-                    (Type::Float, majit_ir::Value::Float(value)) => {
-                        backend.bh_setarrayitem_gc_f(target_ptr, index, value, &bh_descr)
-                    }
-                    (Type::Int, majit_ir::Value::Int(value)) => {
-                        backend.bh_setarrayitem_gc_i(target_ptr, index, value, &bh_descr)
-                    }
-                    _ => continue,
                 }
             }
             // resume.py:993-1007 _prepare_pendingfields op-emission: replay the
