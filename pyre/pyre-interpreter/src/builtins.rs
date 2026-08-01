@@ -5787,8 +5787,18 @@ fn import_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let cls = crate::typedef::r#type(w_self)
         .map(|p| p.as_ptr())
         .unwrap_or_else(|| crate::baseobjspace::exception_getclass(w_self));
-    let w_args = unsafe { interp_exceptions::w_exception_get_args(w_self) };
-    let stored = unsafe { interp_exceptions::w_exception_peek_dict(w_self) };
+    // `w_exception_get_args` builds a fresh tuple, and the `copy` below runs a
+    // Python-level method, so both it and the receiver have to be published
+    // before that call rather than sit in untraced Rust locals across it.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_self, cls, unsafe {
+        interp_exceptions::w_exception_get_args(w_self)
+    }]);
+    // Read the instance dict back off the rooted receiver: the slot may be
+    // null, which `pin_roots` must not be handed.
+    let stored = unsafe {
+        interp_exceptions::w_exception_peek_dict(pyre_object::gc_roots::shadow_stack_get(base))
+    };
     let w_dict = if !stored.is_null() && unsafe { pyre_object::w_dict_len(stored) } > 0 {
         let copy = crate::baseobjspace::call_method(stored, "copy", &[]);
         if copy.is_null() {
@@ -5800,21 +5810,31 @@ fn import_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     } else {
         pyre_object::w_dict_new()
     };
-    for (key, w_value) in [
-        ("name", unsafe {
-            interp_exceptions::w_exception_get_name(w_self)
-        }),
-        ("path", unsafe {
-            interp_exceptions::w_exception_get_import_path(w_self)
-        }),
-        ("name_from", unsafe {
-            interp_exceptions::w_exception_get_import_name_from(w_self)
-        }),
+    pyre_object::gc_roots::pin_root(w_dict);
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    type ExcGetter = unsafe fn(PyObjectRef) -> PyObjectRef;
+    for (key, get) in [
+        ("name", interp_exceptions::w_exception_get_name as ExcGetter),
+        ("path", interp_exceptions::w_exception_get_import_path),
+        (
+            "name_from",
+            interp_exceptions::w_exception_get_import_name_from,
+        ),
     ] {
+        let w_value = unsafe { get(pyre_object::gc_roots::shadow_stack_get(base)) };
         if !w_value.is_null() && !unsafe { pyre_object::is_none(w_value) } {
-            unsafe { pyre_object::w_dict_setitem_str(w_dict, key, w_value) };
+            unsafe {
+                pyre_object::w_dict_setitem_str(
+                    pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                    key,
+                    w_value,
+                )
+            };
         }
     }
+    let cls = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let w_args = pyre_object::gc_roots::shadow_stack_get(base + 2);
+    let w_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
     if unsafe { pyre_object::w_dict_len(w_dict) } > 0 {
         Ok(pyre_object::w_tuple_new(vec![cls, w_args, w_dict]))
     } else {
@@ -6907,9 +6927,14 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             args.len().saturating_sub(1)
         )));
     }
-    let mut cls = args[0];
-    let message = args[1];
-    let w_exceptions = args[2];
+    // `py_repr`, `fixedview` and the `isinstance`/`issubclass` checks below all
+    // run Python, so the three operands cannot stay in untraced Rust locals
+    // across them.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1], args[2]]);
+    let mut cls = pyre_object::gc_roots::shadow_stack_get(base);
+    let message = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let w_exceptions = pyre_object::gc_roots::shadow_stack_get(base + 2);
     if !unsafe { crate::baseobjspace::isinstance_str_w(message) } {
         let type_name = crate::baseobjspace::object_functionstr_type_name(message);
         return Err(crate::PyError::type_error(format!(
@@ -6934,14 +6959,23 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // repr stable when the source sequence is later mutated, doing this here
     // deliberately propagates a raising or non-string custom `__repr__` from
     // the constructor.
-    let exceptions_repr = if is_list_or_tuple {
+    let repr_slot = if is_list_or_tuple {
         None
     } else {
-        Some(pyre_object::w_str_new(&unsafe {
-            crate::display::py_repr(w_exceptions)?
-        }))
+        let rendered = pyre_object::w_str_new(&unsafe {
+            crate::display::py_repr(pyre_object::gc_roots::shadow_stack_get(base + 2))?
+        });
+        pyre_object::gc_roots::pin_root(rendered);
+        Some(pyre_object::gc_roots::shadow_stack_len() - 1)
     };
-    let exceptions = crate::baseobjspace::fixedview(w_exceptions, -1)?;
+    let exceptions =
+        crate::baseobjspace::fixedview(pyre_object::gc_roots::shadow_stack_get(base + 2), -1)?;
+    // `fixedview` returns an untraced Vec and the membership checks below run
+    // Python, so publish every element before walking them.
+    let items = pyre_object::gc_roots::pin_roots(&exceptions);
+    let exceptions: Vec<_> = (0..exceptions.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(items + i))
+        .collect();
     if exceptions.is_empty() {
         return Err(crate::PyError::value_error(
             "second argument (exceptions) must be a non-empty sequence",
@@ -6978,22 +7012,55 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     } else {
         pyre_object::interp_exceptions::ExcKind::BaseException
     };
+    // `cls` may have been retargeted to `ExceptionGroup` above; publish
+    // whichever class the instance is about to be tagged with.
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    // Each allocation below is a safepoint, so the nascent group and the tuple
+    // it stores both go on the shadow stack before the next one runs.
     let exc = pyre_object::interp_exceptions::w_exception_new_empty(kind);
-    crate::typedef::tag_subclass_instance(exc, cls);
+    pyre_object::gc_roots::pin_root(exc);
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    crate::typedef::tag_subclass_instance(
+        pyre_object::gc_roots::shadow_stack_get(exc_slot),
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+    );
     unsafe {
         let tuple = pyre_object::w_tuple_new(exceptions);
-        let w_dict = pyre_object::interp_exceptions::w_exception_getdict(exc);
-        pyre_object::w_dict_setitem_str(w_dict, EG_MESSAGE_KEY, message);
-        pyre_object::w_dict_setitem_str(w_dict, EG_EXCEPTIONS_KEY, tuple);
-        if let Some(exceptions_repr) = exceptions_repr {
-            pyre_object::w_dict_setitem_str(w_dict, EG_EXCEPTIONS_REPR_KEY, exceptions_repr);
+        pyre_object::gc_roots::pin_root(tuple);
+        let tuple_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_dict = pyre_object::interp_exceptions::w_exception_getdict(
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+        );
+        pyre_object::gc_roots::pin_root(w_dict);
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        pyre_object::w_dict_setitem_str(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            EG_MESSAGE_KEY,
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+        );
+        pyre_object::w_dict_setitem_str(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            EG_EXCEPTIONS_KEY,
+            pyre_object::gc_roots::shadow_stack_get(tuple_slot),
+        );
+        if let Some(repr_slot) = repr_slot {
+            pyre_object::w_dict_setitem_str(
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                EG_EXCEPTIONS_REPR_KEY,
+                pyre_object::gc_roots::shadow_stack_get(repr_slot),
+            );
         }
+        let stored_args = pyre_object::w_list_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            pyre_object::gc_roots::shadow_stack_get(base + 2),
+        ]);
         pyre_object::interp_exceptions::w_exception_set_args(
-            exc,
-            pyre_object::w_list_new(vec![message, w_exceptions]),
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            stored_args,
         );
     }
-    Ok(exc)
+    Ok(pyre_object::gc_roots::shadow_stack_get(exc_slot))
 }
 
 enum ExceptionGroupCondition {
