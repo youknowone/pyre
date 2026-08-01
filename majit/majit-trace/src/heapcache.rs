@@ -349,10 +349,6 @@ pub struct HeapCache {
     /// traces — not a ref. RPython: CacheEntry 내부. Vec indexed by OpRef.0.
     known_class: Vec<Option<i64>>,
 
-    /// Quasi-immutable fields known in this trace.
-    /// heapcache.py: `quasi_immut_known`.
-    quasi_immut_known: IndexSet<(OpRef, u32)>,
-
     /// RPython: FrontendOp flag. BitSet indexed by OpRef.0.
     is_unescaped: BitSet,
 
@@ -415,7 +411,6 @@ impl HeapCache {
             heap_cache: vecset::VecMap::new(),
             heap_array_cache: vecset::VecMap::new(),
             known_class: Vec::new(),
-            quasi_immut_known: IndexSet::new(),
             is_unescaped: BitSet::new(),
             seen_allocation: BitSet::new(),
             known_nullity: Vec::new(),
@@ -1051,7 +1046,7 @@ impl HeapCache {
     /// emitted into the op-graph (`replaced_with_const` /
     /// `loopinvariant_result` / `CacheEntry` field values), so a stale one
     /// is a use-after-move. The `cache_anything` / `cache_seen_allocation`
-    /// / `quasi_immut_known` *keys* are deliberately left stale: a forwarded
+    /// / `quasiimmut_seen_refs` *keys* are deliberately left stale: a forwarded
     /// lookup key simply misses the stale-keyed entry and the cache
     /// repopulates (same contract as the `call_pure_results` cache), and an
     /// in-place key rewrite would break the sorted-`VecMap` ordering.
@@ -1756,16 +1751,83 @@ impl HeapCache {
         }
     }
 
-    // ── Quasi-immutable tracking (RPython heapcache.py quasi_immut_known) ──
+    // ── Quasi-immutable tracking (heapcache.py:604-627) ──
 
-    /// Record that a quasi-immutable field is known.
-    pub fn quasi_immut_now_known(&mut self, obj: OpRef, field_index: u32) {
-        self.quasi_immut_known.insert((obj, field_index));
+    /// The `quasiimmut_seen_refs` key: `box.getref_base()`
+    /// (heapcache.py:609/622).  Upstream reads the raw GC pointer off the
+    /// `ConstPtr` box; pyre's constant `OpRef` carries that pointer inline
+    /// (`OpRef::const_ptr(GcRef)`), so `inline_const_bits` is the same read.
+    fn quasiimmut_seen_ref_key(obj: OpRef) -> usize {
+        obj.inline_const_bits().unwrap_or(0) as usize
     }
 
-    /// Check if a quasi-immutable field is already known.
-    pub fn is_quasi_immut_known(&self, obj: OpRef, field_index: u32) -> bool {
-        self.quasi_immut_known.contains(&(obj, field_index))
+    /// heapcache.py:604-613
+    ///
+    /// ```text
+    ///  def is_quasi_immut_known(self, fielddescr, box):
+    ///      cache = self.heap_cache.get(fielddescr, None)
+    ///      if cache is not None:
+    ///          if isinstance(box, Const):
+    ///              if cache.quasiimmut_seen_refs is not None:
+    ///                  return box.getref_base() in cache.quasiimmut_seen_refs
+    ///          else:
+    ///              if cache.quasiimmut_seen is not None:
+    ///                  return box in cache.quasiimmut_seen
+    ///      return False
+    /// ```
+    ///
+    /// The two sets live on the per-descr [`CacheEntry`], so
+    /// `_clear_cache_on_write` and `_invalidate_unescaped` clear them
+    /// alongside the value caches.  That lifetime is load-bearing: a
+    /// residual call goes through `clear_caches_varargs`
+    /// (heapcache.py:341-370), which both arms
+    /// `need_guard_not_invalidated` and drops the "already marked" bit, so
+    /// the next read of the field re-emits `QUASIIMMUT_FIELD` and that op
+    /// in turn emits the second `GUARD_NOT_INVALIDATED`.
+    pub fn is_quasi_immut_known(&self, field_index: u32, obj: OpRef) -> bool {
+        let Some(cache) = self.heap_cache.get(&field_index) else {
+            return false;
+        };
+        if obj.is_constant() {
+            if let Some(seen) = &cache.quasiimmut_seen_refs {
+                return seen.contains(&Self::quasiimmut_seen_ref_key(obj));
+            }
+        } else if let Some(seen) = &cache.quasiimmut_seen {
+            return seen.contains(&obj);
+        }
+        false
+    }
+
+    /// heapcache.py:615-627
+    ///
+    /// ```text
+    ///  def quasi_immut_now_known(self, fielddescr, box):
+    ///      cache = self.heap_cache.get(fielddescr, None)
+    ///      if cache is None:
+    ///          cache = self.heap_cache[fielddescr] = CacheEntry(self)
+    ///      if isinstance(box, Const):
+    ///          if cache.quasiimmut_seen_refs is None:
+    ///              cache.quasiimmut_seen_refs = new_ref_dict()
+    ///          cache.quasiimmut_seen_refs[box.getref_base()] = None
+    ///      else:
+    ///          if cache.quasiimmut_seen is not None:
+    ///              cache.quasiimmut_seen[box] = None
+    ///          else:
+    ///              cache.quasiimmut_seen = {box: None}
+    /// ```
+    pub fn quasi_immut_now_known(&mut self, field_index: u32, obj: OpRef) {
+        let cache = self.heap_cache.entry(field_index).or_default();
+        if obj.is_constant() {
+            cache
+                .quasiimmut_seen_refs
+                .get_or_insert_with(IndexSet::new)
+                .insert(Self::quasiimmut_seen_ref_key(obj));
+        } else {
+            cache
+                .quasiimmut_seen
+                .get_or_insert_with(IndexSet::new)
+                .insert(obj);
+        }
     }
 
     // ── Nullity tracking (heapcache.py nullity_now_known / is_nullity_known) ──
@@ -2038,7 +2100,6 @@ impl HeapCache {
         // majit-only: standalone Vec<bool> flags are not version-gated, so
         // a version bump cannot invalidate them. Clear them explicitly.
         self.known_class.clear();
-        self.quasi_immut_known.clear();
         self.is_unescaped = BitSet::new();
         self.seen_allocation = BitSet::new();
         self.known_nullity.clear();
@@ -2512,6 +2573,59 @@ mod tests {
 
         cache.nullity_now_known(obj, false);
         assert_eq!(cache.is_nullity_known(obj, |_| None), Some(false));
+    }
+
+    /// heapcache.py:604-627 — the mark is per (fielddescr, box), and a
+    /// constant receiver keys on `getref_base()`, so two distinct `ConstPtr`
+    /// `OpRef`s naming the same object share it while a different object or a
+    /// different descr does not.
+    #[test]
+    fn quasi_immut_mark_is_keyed_per_descr_and_per_ref() {
+        let mut cache = HeapCache::new();
+        let obj = OpRef::const_ptr(GcRef(0x1000));
+        let same_obj = OpRef::const_ptr(GcRef(0x1000));
+        let other_obj = OpRef::const_ptr(GcRef(0x2000));
+
+        assert!(!cache.is_quasi_immut_known(7, obj));
+        cache.quasi_immut_now_known(7, obj);
+        assert!(cache.is_quasi_immut_known(7, obj));
+        assert!(cache.is_quasi_immut_known(7, same_obj));
+        assert!(!cache.is_quasi_immut_known(7, other_obj));
+        assert!(!cache.is_quasi_immut_known(8, obj));
+    }
+
+    /// heapcache.py:121-129 `invalidate_unescaped` clears
+    /// `quasiimmut_seen{,_refs}` — the lifetime that makes the second
+    /// `GUARD_NOT_INVALIDATED` possible.  `clear_caches_varargs`
+    /// (heapcache.py:341-370) runs this for every general call while also
+    /// arming `need_guard_not_invalidated`, so the next read of the field
+    /// re-emits `QUASIIMMUT_FIELD` and that op emits the guard.
+    ///
+    /// The receiver here is an escaped (non-allocated) box, which is what a
+    /// pinned type constant is.
+    #[test]
+    fn quasi_immut_mark_is_dropped_by_the_call_invalidation() {
+        let mut cache = HeapCache::new();
+        let obj = OpRef::const_ptr(GcRef(0x1000));
+
+        cache.quasi_immut_now_known(7, obj);
+        assert!(cache.is_quasi_immut_known(7, obj));
+
+        cache.invalidate_caches_for_escaped();
+        assert!(!cache.is_quasi_immut_known(7, obj));
+    }
+
+    /// heapcache.py:70-77 `_clear_cache_on_write` clears the same two sets, so
+    /// a store to the field drops the mark as well.
+    #[test]
+    fn quasi_immut_mark_is_dropped_by_a_store_to_the_field() {
+        let mut cache = HeapCache::new();
+        let obj = OpRef::const_ptr(GcRef(0x1000));
+        let value = OpRef::int_op(3);
+
+        cache.quasi_immut_now_known(7, obj);
+        cache.setfield_cached(obj, 7, value, IDENTITY_ORACLE);
+        assert!(!cache.is_quasi_immut_known(7, obj));
     }
 
     #[test]

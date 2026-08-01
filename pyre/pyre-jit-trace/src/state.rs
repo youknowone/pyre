@@ -3392,7 +3392,7 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     // generate_guard parity). Instead, set a flag on ctx so the caller
     // (PyreSym with_ctx block) can emit it with full resume data.
     if descr.is_quasi_immutable() {
-        if ctx.heap_cache().is_quasi_immut_known(obj, field_index) {
+        if ctx.heap_cache().is_quasi_immut_known(field_index, obj) {
             // pyjitpl.py:1077-1080 cache hit:
             //   if heapcache.is_quasi_immut_known(fielddescr, box):
             //       profiler.count_ops(rop.QUASIIMMUT_FIELD, HEAPCACHED_OPS)
@@ -3402,7 +3402,7 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
                 majit_metainterp::counters::HEAPCACHED_OPS,
             );
         } else {
-            ctx.heap_cache_mut().quasi_immut_now_known(obj, field_index);
+            ctx.heap_cache_mut().quasi_immut_now_known(field_index, obj);
             ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr.clone());
             if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
                 ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
@@ -3498,14 +3498,14 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         return cached;
     }
     if descr.is_quasi_immutable() {
-        if ctx.heap_cache().is_quasi_immut_known(obj, field_index) {
+        if ctx.heap_cache().is_quasi_immut_known(field_index, obj) {
             // pyjitpl.py:1077-1080 cache hit (see opimpl_getfield_gc_i above).
             ctx.profiler().count_ops(
                 OpCode::QuasiimmutField,
                 majit_metainterp::counters::HEAPCACHED_OPS,
             );
         } else {
-            ctx.heap_cache_mut().quasi_immut_now_known(obj, field_index);
+            ctx.heap_cache_mut().quasi_immut_now_known(field_index, obj);
             ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr.clone());
             if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
                 ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
@@ -4415,14 +4415,14 @@ pub(crate) fn record_namespace_quasiimmut_field(
     slot: OpRef,
     slot_index: u32,
 ) {
-    if ctx.heap_cache().is_quasi_immut_known(obj, slot_index) {
+    if ctx.heap_cache().is_quasi_immut_known(slot_index, obj) {
         ctx.profiler().count_ops(
             OpCode::QuasiimmutField,
             majit_metainterp::counters::HEAPCACHED_OPS,
         );
         return;
     }
-    ctx.heap_cache_mut().quasi_immut_now_known(obj, slot_index);
+    ctx.heap_cache_mut().quasi_immut_now_known(slot_index, obj);
     ctx.record_op(OpCode::QuasiimmutField, &[obj, slot]);
     if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
         ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
@@ -4442,14 +4442,14 @@ pub(crate) fn record_namespace_quasiimmut_field(
 /// exactly what quasi-immutability buys.
 pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) {
     let field_index = descr.index();
-    if ctx.heap_cache().is_quasi_immut_known(obj, field_index) {
+    if ctx.heap_cache().is_quasi_immut_known(field_index, obj) {
         ctx.profiler().count_ops(
             OpCode::QuasiimmutField,
             majit_metainterp::counters::HEAPCACHED_OPS,
         );
         return;
     }
-    ctx.heap_cache_mut().quasi_immut_now_known(obj, field_index);
+    ctx.heap_cache_mut().quasi_immut_now_known(field_index, obj);
     ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr);
     if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
         ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
