@@ -1105,6 +1105,17 @@ pub fn seed_bridge_virtualizable_boxes(
             cache,
         ));
     }
+    // pyjitpl.py:2985-2987 `remove_consts_and_duplicates(self.virtualizable_
+    // boxes, len(self.virtualizable_boxes)-1, duplicates)`: no entry of this
+    // list is a constant or appears twice, and both properties are assumed
+    // downstream unchecked ([`TraceCtx::remove_consts_and_duplicates`]).
+    //
+    // A bridge seeds the list from resume data instead of from a
+    // `reached_loop_header` visit, and `cache` legitimately hands one `OpRef`
+    // to two slots that hold the same value, so the invariant has to be
+    // restored where this list is produced. Same `endindex = len - 1` window
+    // as upstream — the identity is pushed after.
+    ctx.remove_consts_and_duplicates_untyped(&mut boxes);
     // virtualizable.py:143-144 "the returned list is in the format expected of
     // virtualizable_boxes, so it ends in the virtualizable itself".
     boxes.push(rebuilt_value_to_opref(
