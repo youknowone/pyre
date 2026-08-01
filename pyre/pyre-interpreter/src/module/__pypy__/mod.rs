@@ -120,6 +120,12 @@ fn move_to_end(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
 /// (`objspace.py:134`): the execution-context-owned identity dict of objects
 /// currently being `repr()`'d, lazily built and cached on the EC.  `identity_dict`
 /// stays an app-level class, so the instance is constructed by calling that type.
+///
+/// `get_objects_in_repr` builds `W_IdentityDict(self)` directly (`objspace.py:136`),
+/// so the recursion guard cannot be swapped through module monkeypatching.  pyre
+/// mirrors that by constructing from the canonical type captured at module init
+/// (`CANONICAL_IDENTITY_DICT_KEY`), not the publicly reassignable
+/// `__pypy__.identity_dict` attribute.
 fn objects_in_repr(_: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
     if ec.is_null() {
@@ -133,13 +139,22 @@ fn objects_in_repr(_: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     }
     let module = crate::importing::check_sys_modules("__pypy__")
         .ok_or_else(|| crate::PyError::runtime_error("__pypy__ module not loaded"))?;
-    let ty = crate::baseobjspace::getattr_str(module, "identity_dict")?;
+    let ty =
+        crate::baseobjspace::getattr_str(module, CANONICAL_IDENTITY_DICT_KEY).map_err(|_| {
+            crate::PyError::runtime_error("__pypy__: canonical identity_dict unavailable")
+        })?;
     let inst = crate::call::call_function_impl_result(ty, &[])?;
     // Stored immediately (no intervening allocation); thereafter forwarded by
     // `ExecutionContext::walk_builtin_roots`.
     unsafe { (*ec).py_repr = inst };
     Ok(inst)
 }
+
+/// Module-dict key holding the `identity_dict` type captured at module init.
+/// Not a valid Python identifier, so it cannot be reached — or rewritten —
+/// through `__pypy__.identity_dict` attribute access; the module dict is
+/// Box-immortal, so the entry roots the type for the lifetime of the process.
+const CANONICAL_IDENTITY_DICT_KEY: &str = "@objects_in_repr_identity_dict";
 
 crate::py_module! {
     "__pypy__",
@@ -163,6 +178,13 @@ crate::py_module! {
         // Mark as a package so `from __pypy__.builders import ...`
         // treats `__pypy__` as a package with submodules.
         crate::module_ns_store(ns, "__path__", pyre_object::w_list_new(vec![]));
+        // Snapshot the canonical `identity_dict` type before any app code can
+        // reassign `__pypy__.identity_dict`, keyed so attribute access cannot
+        // reach it.  `objects_in_repr` builds its recursion guard from this
+        // snapshot, matching PyPy's direct `W_IdentityDict` construction.
+        if let Some(ty) = crate::module_ns_get(ns, "identity_dict") {
+            crate::module_ns_store(ns, CANONICAL_IDENTITY_DICT_KEY, ty);
+        }
     }
 }
 
