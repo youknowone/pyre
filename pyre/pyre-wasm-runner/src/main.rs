@@ -794,6 +794,19 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
             for msg in recover_panic_messages(memory.data(&store)) {
                 eprintln!("pyre-wasm-runner: recovered panic: {msg}");
             }
+            // Everything the run wrote to fd 2 sits in the guest's buffer until
+            // `pyre_take_stderr` drains it, and the success path below is the
+            // only place that used to do so — so a trap discarded the whole
+            // channel at the one moment it carries the most: the diagnostics a
+            // fatal path emits just before aborting. A trap does not poison the
+            // store, so the export is still callable; ignore it if the module
+            // predates the export or the call itself fails.
+            if let Ok(bytes) = take_guest_stderr(&mut store, &instance, &memory)
+                && !bytes.is_empty()
+            {
+                use std::io::Write;
+                let _ = std::io::stderr().write_all(&bytes);
+            }
             return Err(e);
         }
     };
@@ -808,16 +821,7 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
     // The guest has no descriptors, so its fd-2 bytes and its exit status come
     // back through their own exports. Absent on a module predating them, in
     // which case the run keeps the old stdout-only, always-0 behaviour.
-    let mut err_bytes = Vec::new();
-    if let Ok(take_stderr) = instance.get_typed_func::<(), u64>(&mut store, "pyre_take_stderr") {
-        let packed = take_stderr.call(&mut store, ())?;
-        let (ptr, elen) = ((packed >> 32) as u32, (packed & 0xffff_ffff) as u32);
-        if elen != 0 {
-            err_bytes = vec![0u8; elen as usize];
-            memory.read(&store, ptr as usize, &mut err_bytes)?;
-            dealloc.call(&mut store, (ptr, elen))?;
-        }
-    }
+    let err_bytes = take_guest_stderr(&mut store, &instance, &memory)?;
     // `PYRE_FBW_DEBUG_ABORT` cannot select the walker's decline census in the
     // guest, and its `eprintln!` would reach nothing anyway, so the census
     // comes back through its own export and is printed here. Absent on a
@@ -1329,6 +1333,32 @@ fn jit_call_trampoline(
     };
     write_i64(&memory, &mut *caller, call_area, result)?;
     Ok(())
+}
+
+/// Drain the guest's fd-2 buffer through `pyre_take_stderr`.
+///
+/// The guest has no descriptors, so everything it writes to fd 2 accumulates in
+/// linear memory until this export hands it over. Returns empty on a module
+/// predating the export, which keeps the old stdout-only behaviour.
+fn take_guest_stderr(
+    store: &mut Store<Host>,
+    instance: &Instance,
+    memory: &Memory,
+) -> Result<Vec<u8>> {
+    let Ok(take_stderr) = instance.get_typed_func::<(), u64>(&mut *store, "pyre_take_stderr")
+    else {
+        return Ok(Vec::new());
+    };
+    let packed = take_stderr.call(&mut *store, ())?;
+    let (ptr, len) = ((packed >> 32) as u32, (packed & 0xffff_ffff) as u32);
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut bytes = vec![0u8; len as usize];
+    memory.read(&*store, ptr as usize, &mut bytes)?;
+    let dealloc = instance.get_typed_func::<(u32, u32), ()>(&mut *store, "pyre_dealloc")?;
+    dealloc.call(&mut *store, (ptr, len))?;
+    Ok(bytes)
 }
 
 /// Scan wasm linear memory for panic messages pyre-wasm's hook wrote there.

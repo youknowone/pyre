@@ -2184,20 +2184,33 @@ fn reject_non_exception_channel_value(
     // value already known not to be a `W_BaseException` — a small integer or an
     // address at the end of a mapping reaches here too, and every read below
     // can fault. Emit the pointer first so that a fault still leaves evidence.
-    eprintln!("[jit][BUG] {site}: not a W_BaseException: obj={obj:p}");
+    //
+    // Every line goes through the interpreter's own fd-2 seam, not `eprintln!`:
+    // the wasm guest has no process stderr, so an `eprintln!` here is a silent
+    // sink and this reporter — whose only job is producing evidence before the
+    // abort — would leave nothing but the panic string on the one backend where
+    // the value is hardest to reconstruct.
+    pyre_interpreter::host_seam::emit_stderr(
+        format!("[jit][BUG] {site}: not a W_BaseException: obj={obj:p}\n").as_bytes(),
+    );
     // Then the raw header, before touching anything reached *through* it: if
     // `ob_type` is itself garbage the name lookup below faults, and then this
     // line is all the evidence there is.
     let tag = unsafe { pyre_object::interp_exceptions::w_exception_kind_byte(obj) };
     let words = unsafe { std::slice::from_raw_parts(obj as *const u64, 4) };
-    eprintln!(
-        "[jit][BUG] {site}: obj={obj:p} tag_byte={tag} \
-         words=[{:#018x} {:#018x} {:#018x} {:#018x}]",
-        words[0], words[1], words[2], words[3],
+    pyre_interpreter::host_seam::emit_stderr(
+        format!(
+            "[jit][BUG] {site}: obj={obj:p} tag_byte={tag} \
+             words=[{:#018x} {:#018x} {:#018x} {:#018x}]\n",
+            words[0], words[1], words[2], words[3],
+        )
+        .as_bytes(),
     );
     // Second line, and only now: the context may probe words of unproven
     // provenance, so the header above must already be out.
-    eprintln!("[jit][BUG] {site}: context: {}", context());
+    pyre_interpreter::host_seam::emit_stderr(
+        format!("[jit][BUG] {site}: context: {}\n", context()).as_bytes(),
+    );
     // `words[0]` is `ob_type` and `words[1]` is `w_class`; only read through
     // either when the pointer has the shape of one.  `ob_type` names the
     // built-in layout ("object" for every instance of a Python class), so the
@@ -2797,7 +2810,10 @@ pub fn blackhole_resume_via_rd_numb(
                              last_opcode_position={last_opcode_position} opcode={:?} \
                              operand_reg={bh_raise_reg:?} registers_r.len={bh_regs_r_len} \
                              regs_holding_exception={:?} \
-                             code[-10..]={bh_code_window:?} bare_reraise={bare_reraise}",
+                             code[-10..]={bh_code_window:?} bare_reraise={bare_reraise} \
+                             guard_exc={guard_exc:x} py_pc={:?} entry_py_pc={:?} \
+                             deadframe_types={deadframe_types:?} deadframe={deadframe:x?} \
+                             registers_r={bh_regs_r:x?}",
                             bh_opcode_at,
                             // Which ref registers hold a real
                             // `W_BaseException`: a hit in a slot other than
@@ -2815,6 +2831,18 @@ pub fn blackhole_resume_via_rd_numb(
                                 })
                                 .map(|(i, _)| i)
                                 .collect::<Vec<_>>(),
+                            jitcode_index.and_then(|index| {
+                                pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(
+                                    index,
+                                    last_opcode_position as i32,
+                                )
+                            }),
+                            jitcode_index.and_then(|index| {
+                                pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(
+                                    index,
+                                    bh_entry_position as i32,
+                                )
+                            }),
                         )
                     });
                 // `attach_tb` deliberately stays true on the way out.  It
