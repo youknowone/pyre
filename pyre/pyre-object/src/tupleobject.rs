@@ -262,14 +262,53 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
     let relocated: Vec<PyObjectRef> = (0..len)
         .map(|i| crate::gc_roots::shadow_stack_get(save_point + i))
         .collect();
-    let items_block = unsafe { alloc_tuple_items_block_gc(&relocated) };
+    let mut items_block = unsafe { alloc_tuple_items_block_gc(&relocated) };
+    // `alloc_tuple_items_block_gc` roots the fresh block only inside its own
+    // `push_roots` frame, which it pops on return, so from here the block is a
+    // livevar of *this* frame across the barrier below. That barrier is a
+    // `gc_op`: it leaves RUNNING before taking `gc_mutex` (`gc_sync.rs:22`) and
+    // roots only the object it is handed, so a foreign collector runs there
+    // with the block reachable from nowhere. Inert for a null or std::alloc
+    // block, as in `w_list_new_with_strategy`.
+    let block_root: Option<usize> = if items_block.is_null() {
+        None
+    } else {
+        let s = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::pin_root(items_block as PyObjectRef);
+        Some(s)
+    };
     let raw = raw_slot
         .map(crate::gc_roots::shadow_stack_get)
         .unwrap_or(std::ptr::null_mut()) as *mut u8;
 
     if !raw.is_null() {
+        // The tuple lives in old-gen (`try_gc_alloc_stable`); its items
+        // may still be in the nursery. The element pointers are stored in
+        // the off-GC `items_block`, so the implicit write barrier on the
+        // tuple struct never fires — register the tuple explicitly so the
+        // next minor collection scans it (via the `wrappeditems`
+        // custom-trace hook) and relocates any young element. Mirrors the
+        // `write_barrier_from_array` an old list/tuple store would emit
+        // (incminimark.py:1495).
+        //
+        // This runs BEFORE the store, against the null-items image published
+        // above: remembering an old object that holds no young pointer yet is
+        // the harmless direction. Storing first would leave the young block
+        // named by a slot no collection traces for the whole parking window —
+        // `remember_young_pointer` clears `GCFLAG_TRACK_YOUNG_PTRS` and queues
+        // the tuple only once it runs (incminimark.py:1519-1522), and a minor that
+        // lands inside that window reclaims the block and poisons the nursery
+        // under it, leaving `wrappeditems` dangling for good.
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
+        // Re-read the block the barrier's park may have moved: the tuple is on
+        // the remembered set now, but its `wrappeditems` is still null, so no
+        // collection could have forwarded that slot for us.
+        if let Some(s) = block_root {
+            items_block = crate::gc_roots::shadow_stack_get(s) as *mut ItemsBlock;
+        }
         // The header went in before the root was published; only the items
-        // block is still outstanding.
+        // block is still outstanding. Nothing below can collect, so the
+        // remembered tuple keeps the block from here on.
         unsafe {
             std::ptr::write(
                 raw as *mut W_TupleObject,
@@ -281,15 +320,6 @@ pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
                 },
             );
         }
-        // The tuple lives in old-gen (`try_gc_alloc_stable`); its items
-        // may still be in the nursery. The element pointers are stored in
-        // the off-GC `items_block`, so the implicit write barrier on the
-        // tuple struct never fires — register the tuple explicitly so the
-        // next minor collection scans it (via the `wrappeditems`
-        // custom-trace hook) and relocates any young element. Mirrors the
-        // `write_barrier_from_array` an old list/tuple store would emit
-        // (incminimark.py:1495).
-        crate::gc_hook::try_gc_write_barrier_managed(raw);
         return raw as PyObjectRef;
     }
     Box::into_raw(Box::new(W_TupleObject {
