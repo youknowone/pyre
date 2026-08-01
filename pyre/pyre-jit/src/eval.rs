@@ -10348,8 +10348,22 @@ pub(crate) fn decode_and_restore_guard_failure(
         // (outer) frame's depth, and the matching pc value does not make it
         // correct.  Single-frame guards keep the prior `resume_pc != ni`
         // behavior.
+        //
+        // It addresses the PHYSICAL frame, so it applies only while the
+        // innermost section belongs to that frame's OWN code object.
+        // `consume_vable_info` (resume.py:1399-1408) writes the virtualizable
+        // from its own resume section and nothing re-points it at an inlined
+        // callee: a callee frame is a separate object the rebuild
+        // materializes, and its depth does not index the portal frame's
+        // `locals_cells_stack_w`.  Writing a foreign code object's depth here
+        // left the live frame BELOW its own stack base (`_Unframer.read`'s 3
+        // on `_Unpickler.load`, base 5), and the paired `clear_stack_above`
+        // then nulled two live locals.
         if resume_pc != ni || resumed_frames.len() > 1 {
-            if let Some(code) = innermost.map(|f| f.code as usize) {
+            if let Some(code) = innermost
+                .map(|f| f.code as usize)
+                .filter(|&code| code == jit_state.pycode_as_usize())
+            {
                 if let Some(corrected_vsd) =
                     pyre_jit_trace::state::depth_based_vsd_for_wcode(code, resume_pc)
                 {

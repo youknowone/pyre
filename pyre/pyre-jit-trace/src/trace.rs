@@ -2452,6 +2452,7 @@ fn try_adopt_multi_frame_blackhole(
         };
     }
     let Some(mut latched) = crate::jitcode_dispatch::take_multi_frame_blackhole() else {
+        mfdbg!("no latched multi-frame image");
         return false;
     };
     let depth = latched.framestack.len();
