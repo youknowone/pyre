@@ -108,6 +108,123 @@ pub fn majit_log_enabled() -> bool {
     *ENABLED
 }
 
+/// `MAJIT_GC_DRAIN_CENSUS` — aggregate how much each minor collection drains.
+///
+/// A `PYPY_GC_NURSERY` sweep can show that run time barely moves across an 8x
+/// range of nursery sizes without saying why.  Two very different causes have
+/// that shape: the nursery is simply too small for the allocation rate, or
+/// collections promote nearly everything they scan and therefore free nearly
+/// nothing, so the next allocation collects again no matter how large the
+/// nursery is.  The distinguishing number is the fraction of scanned bytes a
+/// collection leaves behind, which is what this census records.
+///
+/// Read once — same shape as [`gc_lifetime_log_enabled`].
+pub fn drain_census_enabled() -> bool {
+    drain_census_dump_interval().is_some()
+}
+
+/// Set `MAJIT_GC_DRAIN_CENSUS` to a positive integer to also dump the running
+/// summary every that many collections. The end-of-run summary is unreachable
+/// for the runs this census is most needed on — a collection storm that has to
+/// be killed rather than waited out — so those need the periodic line.
+fn drain_census_dump_interval() -> Option<u64> {
+    static INTERVAL: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
+        let value = std::env::var_os("MAJIT_GC_DRAIN_CENSUS")?;
+        Some(value.to_str().and_then(|v| v.parse().ok()).unwrap_or(0))
+    });
+    *INTERVAL
+}
+
+/// Survival-rate deciles: bucket `i` counts the collections that promoted
+/// `[i*10, (i+1)*10)` percent of the bytes they found in the nursery, with a
+/// fully-surviving collection landing in the last bucket.  Averages alone hide
+/// the case this census exists to detect — a run split between cheap
+/// collections and ones that copy the whole nursery.
+const DRAIN_DECILES: usize = 10;
+
+#[derive(Default)]
+struct DrainCensus {
+    minors: u64,
+    nursery_size: usize,
+    used_before: u64,
+    promoted: u64,
+    pinned: u64,
+    deciles: [u64; DRAIN_DECILES],
+}
+
+static DRAIN_CENSUS: std::sync::Mutex<Option<DrainCensus>> = std::sync::Mutex::new(None);
+
+/// Record one minor collection: the nursery bytes it found (`used_before`),
+/// the bytes it copied out to the old generation (`promoted`), and how many
+/// objects stayed behind pinned.
+pub fn drain_census_record(
+    used_before: usize,
+    promoted: usize,
+    pinned: usize,
+    nursery_size: usize,
+) {
+    let Ok(mut guard) = DRAIN_CENSUS.lock() else {
+        return;
+    };
+    let census = guard.get_or_insert_with(DrainCensus::default);
+    census.minors += 1;
+    census.nursery_size = nursery_size;
+    census.used_before += used_before as u64;
+    census.promoted += promoted as u64;
+    census.pinned += pinned as u64;
+    // A collection that found nothing drained nothing; count it as 0% rather
+    // than dividing by zero.
+    let percent = if used_before == 0 {
+        0
+    } else {
+        (promoted.min(used_before) * 100) / used_before
+    };
+    census.deciles[(percent / 10).min(DRAIN_DECILES - 1)] += 1;
+    if drain_census_dump_interval()
+        .is_some_and(|interval| interval > 0 && census.minors.is_multiple_of(interval))
+    {
+        eprintln!("[gc-drain] {}", census.summary());
+    }
+}
+
+impl DrainCensus {
+    fn summary(&self) -> String {
+        let minors = self.minors;
+        let survived = if self.used_before == 0 {
+            0.0
+        } else {
+            (self.promoted as f64 * 100.0) / self.used_before as f64
+        };
+        let deciles = self
+            .deciles
+            .iter()
+            .map(|count| count.to_string())
+            .collect::<Vec<_>>()
+            .join("/");
+        format!(
+            "gc_drain minors={minors} nursery={} used_avg={} promoted_avg={} \
+             freed_avg={} survived={survived:.1}% pinned_avg={:.2} deciles={deciles}",
+            self.nursery_size,
+            self.used_before / minors,
+            self.promoted / minors,
+            self.used_before.saturating_sub(self.promoted) / minors,
+            self.pinned as f64 / minors as f64,
+        )
+    }
+}
+
+/// One-line summary of [`drain_census_record`], or a note that nothing was
+/// recorded.
+pub fn drain_census_summary() -> String {
+    let Ok(guard) = DRAIN_CENSUS.lock() else {
+        return "gc_drain <poisoned>".to_string();
+    };
+    let Some(census) = guard.as_ref().filter(|census| census.minors > 0) else {
+        return "gc_drain minors=0".to_string();
+    };
+    census.summary()
+}
+
 /// Write barrier descriptor — information the JIT needs to emit write barrier checks.
 ///
 /// From rpython/jit/backend/llsupport/gc.py WriteBarrierDescr.

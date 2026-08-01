@@ -1018,6 +1018,11 @@ fn maybe_print_jit_stats() {
     if std::env::var_os("MAJIT_GUARD_CENSUS").is_some() {
         eprintln!("[jit-stats] {}", majit_metainterp::guard_census_summary(12));
     }
+    // What the minor collections those deopts drive actually reclaim. Off
+    // unless `MAJIT_GC_DRAIN_CENSUS`.
+    if majit_gc::drain_census_enabled() {
+        eprintln!("[jit-stats] {}", majit_gc::drain_census_summary());
+    }
     // The descr-universe invariants. `descr_set_stale_absent` re-asks the
     // `AbsentContainer` question against the universe as it stands now, so it
     // has to be read here, after the run published everything it is going to.

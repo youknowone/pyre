@@ -1590,6 +1590,12 @@ impl MiniMarkGC {
             );
         }
         self.minor_collections += 1;
+        // `bytes_made_old_since_cycle` is the running sum of every
+        // `copy_nursery_object` payload, so its delta across this collection is
+        // exactly what was promoted out of the nursery. The major-collection
+        // paths that reset it all run after the sample is taken below.
+        let drain_sample = crate::drain_census_enabled()
+            .then(|| (self.nursery.used(), self.bytes_made_old_since_cycle));
         // Phase 1: Process roots — copy nursery objects they point to.
         // We use raw pointers to avoid borrow checker issues since
         // copy_nursery_object mutates oldgen/nursery.
@@ -1825,6 +1831,16 @@ impl MiniMarkGC {
                         keep
                     });
             }
+        }
+
+        if let Some((used_before, promoted_before)) = drain_sample {
+            crate::drain_census_record(
+                used_before,
+                self.bytes_made_old_since_cycle
+                    .saturating_sub(promoted_before),
+                self.pinned_objects.len(),
+                self.nursery.size(),
+            );
         }
 
         // Reset nursery for new allocations, preserving pinned objects.

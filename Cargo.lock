@@ -2362,6 +2362,7 @@ version = "0.0.2"
 dependencies = [
  "dirs",
  "lexopt",
+ "majit-gc",
  "majit-metainterp",
  "mimalloc",
  "pyre-interpreter",

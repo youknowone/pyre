@@ -52,6 +52,7 @@ pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
 pyre-jit = { workspace = true }
 majit-metainterp = { workspace = true }
+majit-gc = { workspace = true }
 lexopt = { workspace = true }
 rustpython-compiler = { workspace = true }
 dirs = { workspace = true }
