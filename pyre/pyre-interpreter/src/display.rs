@@ -1556,13 +1556,20 @@ unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> Result<String, crate:
         if initial.is_null() || pyre_object::is_none(initial) {
             return Ok(String::new());
         }
-        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        // Each of these three reads can run Python — `int_w` walks
+        // `__index__` and `unicode_err_str_slot` calls `__str__` — so the
+        // receiver is refetched from its slot before every one of them
+        // rather than carried in a local across them.
         let start_slot =
-            unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_start(obj));
-        let end_slot =
-            unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_end(obj));
-        let reason =
-            unicode_err_str_slot(pyre_object::interp_exceptions::w_exception_get_reason(obj))?;
+            unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_start(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            ));
+        let end_slot = unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_end(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        ));
+        let reason = unicode_err_str_slot(pyre_object::interp_exceptions::w_exception_get_reason(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        ))?;
         // Formatting `reason` can run arbitrary Python and mutate the
         // exception.  CPython 3.14 rereads `object` before indexing it.
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
@@ -1647,16 +1654,24 @@ unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> Result<String, crate::Py
         if initial.is_null() || pyre_object::is_none(initial) {
             return Ok(String::new());
         }
-        let encoding = unicode_err_str_slot(
-            pyre_object::interp_exceptions::w_exception_get_encoding(obj),
-        )?;
-        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let encoding =
+            unicode_err_str_slot(pyre_object::interp_exceptions::w_exception_get_encoding(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            ))?;
+        // Each of these three reads can run Python — `int_w` walks
+        // `__index__` and `unicode_err_str_slot` calls `__str__` — so the
+        // receiver is refetched from its slot before every one of them
+        // rather than carried in a local across them.
         let start_slot =
-            unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_start(obj));
-        let end_slot =
-            unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_end(obj));
-        let reason =
-            unicode_err_str_slot(pyre_object::interp_exceptions::w_exception_get_reason(obj))?;
+            unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_start(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            ));
+        let end_slot = unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_end(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        ));
+        let reason = unicode_err_str_slot(pyre_object::interp_exceptions::w_exception_get_reason(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        ))?;
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let w_object = pyre_object::interp_exceptions::w_exception_get_object(obj);
         if w_object.is_null() || !pyre_object::is_bytes_like(w_object) {
@@ -1709,16 +1724,24 @@ unsafe fn unicode_encode_error_str(obj: PyObjectRef) -> Result<String, crate::Py
         if initial.is_null() || pyre_object::is_none(initial) {
             return Ok(String::new());
         }
-        let encoding = unicode_err_str_slot(
-            pyre_object::interp_exceptions::w_exception_get_encoding(obj),
-        )?;
-        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let encoding =
+            unicode_err_str_slot(pyre_object::interp_exceptions::w_exception_get_encoding(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            ))?;
+        // Each of these three reads can run Python — `int_w` walks
+        // `__index__` and `unicode_err_str_slot` calls `__str__` — so the
+        // receiver is refetched from its slot before every one of them
+        // rather than carried in a local across them.
         let start_slot =
-            unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_start(obj));
-        let end_slot =
-            unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_end(obj));
-        let reason =
-            unicode_err_str_slot(pyre_object::interp_exceptions::w_exception_get_reason(obj))?;
+            unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_start(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            ));
+        let end_slot = unicode_err_int_slot(pyre_object::interp_exceptions::w_exception_get_end(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        ));
+        let reason = unicode_err_str_slot(pyre_object::interp_exceptions::w_exception_get_reason(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        ))?;
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let w_object = pyre_object::interp_exceptions::w_exception_get_object(obj);
         if w_object.is_null() || !pyre_object::is_str(w_object) {
