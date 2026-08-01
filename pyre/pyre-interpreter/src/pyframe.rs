@@ -577,6 +577,20 @@ impl FrameBox {
     /// reaches it, so `Drop` performs no manual free
     /// (`executioncontext.py:91-107 leave` frees nothing either).
     ///
+    /// The non-moving part is pyre's, not upstream's: `pyframe.py:52 class
+    /// PyFrame(W_Root)` declares no placement hint and a minor collection
+    /// relocates it, rewriting every referring slot
+    /// (`rpython/memory/gc/incminimark.py:2237` / `:2252`) because the
+    /// translator delivers roots as slot addresses and rewrites live GCREF
+    /// locals in them (`rpython/memory/gctransform/shadowstack.py:43-46`).
+    /// Rust has no such pass, and a running opcode holds a `&mut PyFrame`
+    /// across its own allocations, so this allocation standing still is what
+    /// takes the place of that rewrite.  It is not a rule about every frame —
+    /// a compiled trace's inlined-callee frame is a nursery allocation, and
+    /// making that uniform costs `fib_recursive` 7.75x — so the crossing into
+    /// raw-pointer territory is guarded at the seams instead
+    /// (`gate-triage.md`).
+    ///
     /// Before the hook is wired (bootstrap, tests) `try_gc_alloc_stable`
     /// returns `None`; fall back to the `std::alloc` `GcFramePrefix` box,
     /// which `Drop` frees manually.  The two regimes share one memory
