@@ -208,6 +208,10 @@ pub struct RootScope {
     /// called. Will be replaced with a backend
     /// `RootSet::Handle` once the active GC consumes the stack.
     save_point: usize,
+    /// Resolved thread-local stack cell. RPython keeps the shadow-stack
+    /// base/top address live for the whole root bracket; caching the cell here
+    /// avoids resolving TLS again for every generated slot write/read.
+    stack_slot: *mut Vec<PyObjectRef>,
     /// A root bracket belongs to the thread whose shadow stack supplied this
     /// save point. Moving it could truncate an unrelated thread's stack.
     _not_send: PhantomData<*const ()>,
@@ -218,10 +222,45 @@ impl RootScope {
     /// [`push_roots`] so the API surface stays uniform across phases.
     #[inline]
     fn new() -> Self {
+        let (save_point, stack_slot) = SHADOW_STACK.with(|cell| {
+            let stack = unsafe { &*cell.get() };
+            (stack.len(), cell.get())
+        });
         Self {
-            save_point: shadow_stack_len(),
+            save_point,
+            stack_slot,
             _not_send: PhantomData,
         }
+    }
+
+    /// First slot owned by this root bracket.
+    #[inline]
+    pub fn base(&self) -> usize {
+        self.save_point
+    }
+
+    /// Scope-local [`pin_root`] using the already-resolved root-stack cell.
+    #[majit_macros::dont_look_inside]
+    pub fn pin_root(&self, root: PyObjectRef) {
+        #[cfg(debug_assertions)]
+        assert_shadow_stack_not_walking();
+        let index = unsafe {
+            let stack = &mut *self.stack_slot;
+            let index = stack.len();
+            stack.push(root);
+            index
+        };
+        let normalized =
+            crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
+        if normalized != root {
+            unsafe { (&mut *self.stack_slot)[index] = normalized };
+        }
+    }
+
+    /// Scope-local [`shadow_stack_get`] using the cached cell.
+    #[majit_macros::dont_look_inside]
+    pub fn get(&self, index: usize) -> PyObjectRef {
+        unsafe { (&*self.stack_slot)[index] }
     }
 }
 
@@ -233,11 +272,9 @@ impl Drop for RootScope {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
         assert_shadow_stack_not_walking();
-        with_shadow_stack_mut(|stack| {
-            // `truncate` is a no-op if `save_point >= len()`, which is
-            // the steady-state case for an empty bracket.
-            stack.truncate(self.save_point);
-        });
+        // `truncate` is a no-op if `save_point >= len()`, which is
+        // the steady-state case for an empty bracket.
+        unsafe { (&mut *self.stack_slot).truncate(self.save_point) };
     }
 }
 
@@ -590,16 +627,29 @@ mod tests {
         let _roots = push_roots();
     }
 
-    /// Currently `RootScope` carries a single `usize` save-point.
-    /// This will be swapped for a backend `RootSet::Handle` (still
-    /// pointer-sized on 64-bit hosts); this test traps unintended
-    /// growth beyond that.
+    /// `RootScope` carries the saved top plus the resolved root-stack cell,
+    /// matching RPython's base/top pair. Trap unintended growth beyond those
+    /// two words.
     #[test]
-    fn root_scope_payload_is_one_word() {
+    fn root_scope_payload_is_two_words() {
         assert_eq!(
             std::mem::size_of::<RootScope>(),
-            std::mem::size_of::<usize>()
+            2 * std::mem::size_of::<usize>()
         );
+    }
+
+    #[test]
+    fn scope_local_pin_and_get_share_the_cached_stack_cell() {
+        let before = shadow_stack_len();
+        {
+            let roots = push_roots();
+            assert_eq!(roots.base(), before);
+            roots.pin_root(dummy(0x1234));
+            roots.pin_root(dummy(0x5678));
+            assert_eq!(roots.get(before) as usize, 0x1234);
+            assert_eq!(roots.get(before + 1) as usize, 0x5678);
+        }
+        assert_eq!(shadow_stack_len(), before);
     }
 
     /// `pin_root` appends, the matching `Drop` truncates back to the

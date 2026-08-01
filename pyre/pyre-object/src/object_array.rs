@@ -1012,10 +1012,10 @@ impl FixedObjectArray {
             return;
         }
         let _roots = crate::gc_roots::push_roots();
-        let root_base = crate::gc_roots::shadow_stack_len();
-        crate::gc_roots::pin_root(self as *mut Self as PyObjectRef);
-        crate::gc_roots::pin_root(value);
-        let array = crate::gc_roots::shadow_stack_get(root_base) as *mut Self;
+        let root_base = _roots.base();
+        _roots.pin_root(self as *mut Self as PyObjectRef);
+        _roots.pin_root(value);
+        let array = _roots.get(root_base) as *mut Self;
         // Every mutable FixedObjectArray has a real header word: managed frame
         // locals carry the collector's header, while the StdAlloc snapshot
         // fallback is deliberately prefixed with a zeroed one
@@ -1027,8 +1027,8 @@ impl FixedObjectArray {
         // The barrier may wait behind a foreign collection. Reload the array
         // as well as the value before the store: RPython's setarrayitem_gc
         // keeps both live across the barrier.
-        let array = crate::gc_roots::shadow_stack_get(root_base) as *mut Self;
-        let value = crate::gc_roots::shadow_stack_get(root_base + 1);
+        let array = _roots.get(root_base) as *mut Self;
+        let value = _roots.get(root_base + 1);
         unsafe { (*array).items_mut_ptr().add(index).write(value) };
     }
 
