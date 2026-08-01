@@ -2990,7 +2990,22 @@ impl<S: JitState> JitDriver<S> {
                                 // partial_trace is set on MetaInterp. Fall through
                                 // to compile_loop → compile_retrace in same call.
                                 crate::pyjitpl::BridgeCompileResult::RetraceNeeded => {
-                                    self.meta.take_bridge_info();
+                                    // `bridge_info` is pyre's `self.resumekey`
+                                    // class discriminator, and upstream writes
+                                    // that field exactly twice — pyjitpl.py:2905
+                                    // `ResumeFromInterpDescr(original_greenkey)`
+                                    // and pyjitpl.py:2939 `= resumedescr` — both
+                                    // at session start. `retrace_needed`
+                                    // (pyjitpl.py:2438-2442) sets only
+                                    // `partial_trace` / `retracing_from` /
+                                    // `exported_state` / `heapcache.reset()`, so
+                                    // the resumekey a guard-originated session
+                                    // carries must survive into
+                                    // `compile_retrace`'s
+                                    // `resumekey.compile_and_attach`
+                                    // (compile.py:392-393). Clearing it here
+                                    // turned every such retrace into a
+                                    // `ResumeFromInterpDescr` front-door install.
                                     // Fall through — do NOT return.
                                 }
                                 // pyjitpl.py:3220 raise_if_successful() does not
