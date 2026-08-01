@@ -1243,9 +1243,14 @@ fn split_top_level_type_args(input: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0usize;
     let mut start = 0usize;
+    let mut prev = '\0';
     for (index, ch) in input.char_indices() {
         match ch {
             '<' | '(' | '[' => depth += 1,
+            // The `>` of a `->` return arrow closes nothing; treating it as a
+            // closer drops the depth a level early and splits a `Fn(A) -> B`
+            // argument at the next top-level comma.
+            '>' if prev == '-' => {}
             '>' | ')' | ']' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
                 let item = input[start..index].trim();
@@ -1256,6 +1261,7 @@ fn split_top_level_type_args(input: &str) -> Vec<&str> {
             }
             _ => {}
         }
+        prev = ch;
     }
     let tail = input[start..].trim();
     if !tail.is_empty() {
@@ -1268,8 +1274,12 @@ fn tuple_field_value_type(type_name: &str) -> ValueType {
     match type_name.trim() {
         "()" => ValueType::Void,
         "f64" => ValueType::Float,
-        "bool" | "char" | "f32" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8"
-        | "u16" | "u32" | "u64" | "u128" | "usize" => ValueType::Int,
+        // 128-bit fields are twice the machine word, so they carry their own
+        // kind rather than collapsing into `Int` like the word-sized integers.
+        "i128" => ValueType::Int128,
+        "u128" => ValueType::UInt128,
+        "bool" | "char" | "f32" | "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32"
+        | "u64" | "usize" => ValueType::Int,
         _ => ValueType::Ref(None),
     }
 }
