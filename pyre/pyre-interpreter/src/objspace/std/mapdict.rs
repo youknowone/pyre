@@ -2320,6 +2320,16 @@ impl MapdictObject for pyre_object::W_ObjectObject {
     }
     fn _mapdict_pop_attribute(&mut self, map: MapRef) {
         // mapdict.py:926-939; structure mirrors the MockObj test impl.
+        // Both arms can collect — the unboxed one through
+        // `_mapdict_write_storage`, the other through the storage shrink — so
+        // the receiver is published for the whole function and every write
+        // goes through the reloaded address, as in
+        // `_set_mapdict_increase_storage1` and `_set_mapdict_storage_and_map`.
+        // `&mut self` is a bare address that a moving collection invalidates;
+        // writing `map` through it would leave the live instance on its old
+        // map, claiming a storage slot the shrunk block no longer has.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let self_slot = pyre_object::gc_roots::pin_roots(&[self as *const Self as PyObjectRef]);
         let current_map = self.map as MapRef;
         let unboxed_slot: Option<(usize, usize)> = unsafe {
             match &(*current_map).as_plain().unboxed {
@@ -2339,16 +2349,16 @@ impl MapdictObject for pyre_object::W_ObjectObject {
                     let list: &Vec<i64> = &*unerase_unboxed(slot);
                     list[..listindex].to_vec()
                 };
-                self._mapdict_write_storage(storageindex, erase_unboxed(Box::new(new_list)));
+                let owner = unsafe {
+                    &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self)
+                };
+                owner._mapdict_write_storage(storageindex, erase_unboxed(Box::new(new_list)));
             }
             // mapdict.py:935-938: truncate storage to the parent map's size.
             // The block is exact-size, so shrink it to a fresh cap-N block; the
             // dropped tail slots are gone with the old block. NULL-fill is
             // implicit in `grow_instance_items_block` (new_cap <= live_len here).
             None => {
-                let _roots = pyre_object::gc_roots::push_roots();
-                let self_slot = pyre_object::gc_roots::shadow_stack_len();
-                pyre_object::gc_roots::pin_root(self as *const Self as PyObjectRef);
                 let storage_needed = unsafe { (*map).storage_needed() };
                 unsafe {
                     let owner =
@@ -2370,7 +2380,10 @@ impl MapdictObject for pyre_object::W_ObjectObject {
                 }
             }
         }
-        self.map = map as *const u8;
+        unsafe {
+            let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
+            owner.map = map as *const u8;
+        }
     }
     fn _set_mapdict_increase_storage1(&mut self, map: MapRef, value: PyObjectRef) {
         // grow storage by one, append value (mapdict.py:942-959). The first
