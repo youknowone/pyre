@@ -2700,11 +2700,25 @@ pub fn call_function_impl_result(
     crate::stack_check::drain_jit_pending_exception()?;
 
     let callable = pyre_object::gc_roots::shadow_stack_get(root_base);
-    let mut rooted_args: Vec<PyObjectRef> = Vec::with_capacity(args.len());
-    for i in 0..args.len() {
-        rooted_args.push(pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i));
-    }
-    let args = rooted_args.as_slice();
+    // RPython's GC transform reloads `Arguments.arguments_w` livevars in
+    // place; it does not allocate another list at every ObjSpace call.  Keep
+    // the common small call shape allocation-free and retain a Vec only for
+    // genuinely wide calls.
+    const INLINE_ARGS: usize = 8;
+    let mut inline_args = [PY_NULL; INLINE_ARGS];
+    let mut wide_args = Vec::new();
+    let args = if args.len() <= INLINE_ARGS {
+        for (i, slot) in inline_args[..args.len()].iter_mut().enumerate() {
+            *slot = pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i);
+        }
+        &inline_args[..args.len()]
+    } else {
+        wide_args.reserve_exact(args.len());
+        for i in 0..args.len() {
+            wide_args.push(pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i));
+        }
+        wide_args.as_slice()
+    };
 
     unsafe {
         if pyre_object::is_method(callable) {
