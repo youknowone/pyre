@@ -415,11 +415,11 @@ pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
 
 /// Whether a method-form callee body is free of `LoadAttr` residuals.
 ///
-/// Consulted only by the entries that pass `allow_method_load_attr = false`.
-/// A `self.attr` read in the body is what makes it answer `false`, which is the
-/// common shape (`def at(self, i): return self.v + i`), so an entry that opts
-/// out of the check trades a narrower inline surface for the ability to inline
-/// ordinary accessor methods.
+/// A `self.attr` read in the body is what makes it answer `false`, and that is
+/// the common shape (`def at(self, i): return self.v + i`).  No entry declines
+/// on it any more; it names the bodies that reach the inline only through the
+/// widened surface, which the two declines in
+/// `try_walker_inline_resolved_user_call` are scoped to.
 pub(crate) fn method_form_callee_body_supported(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
@@ -1749,7 +1749,6 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         has_closure,
         None,
         None,
-        true,
         false,
         None,
     )
@@ -2477,7 +2476,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     has_closure: bool,
     exception_receiver_guard: Option<ExceptionInlineReceiverGuard>,
     arg_class_guard: Option<ArgClassGuard>,
-    allow_method_load_attr: bool,
     require_str_result: bool,
     constructor_result: Option<(OpRef, ConcreteValue)>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -2724,11 +2722,10 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     if !bridge_rec_root_selfrec && fbw_hazardous_inline_denied(callee_code_key) {
         return Ok(None);
     }
-    // True when only the widened method-form surface reaches this callee: an
-    // unbound `self.attr` accessor body, which the narrow surface declines.
+    // An unbound method-form callee whose body reads `self.attr`.  Every entry
+    // inlines one; the two declines below are what that reach costs.
     let widened_method_form = method_form
         && bound_method.is_none()
-        && allow_method_load_attr
         && !method_form_callee_body_supported(body.code, callee_descr_refs);
     // A legacy, unseeded inline sub-walk inside a FOR_ITER body resumes a guard
     // at the caller's CALL boundary, so deopt re-executes the whole callee.
@@ -2767,12 +2764,12 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 // body is still admitted from there — it has nothing that can
                 // abort.
                 //
-                // The widened method-form surface stays out: its deferred call
-                // is the `self.attr` read's own dispatch, which the lever
-                // resolves to a builtin rather than a body it can inline, so the
-                // admission spends the abort and then denies the callee anyway.
-                // Declining here reaches the same residual call without retiring
-                // the enclosing loop.
+                // A body that reads `self.attr` stays out as well.  Admitting
+                // one costs an abort that retires the enclosing loop before the
+                // deny takes effect -- `synth/type_metatype_method_call` went
+                // `loops_aborted` 0 -> 1 and `bridges_compiled` 47 -> 44 on the
+                // admission alone.  Declining here reaches the same residual
+                // call with the loop intact.
                 foriter_deferred_admit = arg_class_guard.is_none()
                     && !widened_method_form
                     && !fbw_foriter_deferred_call_denied(callee_code_key);
@@ -2819,23 +2816,14 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // Decline here instead, where the call stays residual and the loop
         // still compiles.
         //
-        // Keyed on `widened_method_form`, not on `allow_method_load_attr`: five
-        // entries pass the latter, four of which did so before the body-reads-
-        // `self.attr` widening.  A raise-bearing body with no attribute read is
-        // one those four already inlined, and declining it here costs 3.6x on
+        // Both conjuncts are load-bearing.  Without `widened_method_form` this
+        // also withdraws a raise-bearing body that reads no attribute, which
+        // every entry inlined before the widening -- 3.6x on
         // `for i in range(400000): t += b.bump(i)` over
         // `def bump(self, n): if n < 0: raise ValueError(n); return n + 1`.
-        let declined = if allow_method_load_attr {
-            widened_method_form && callee_body_contains_raise(body.code)
-        } else {
-            !method_form_callee_body_supported(body.code, callee_descr_refs)
-        };
-        if declined {
+        if widened_method_form && callee_body_contains_raise(body.code) {
             if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
-                eprintln!(
-                    "[inline-method-form] decline pc={} allow_load_attr={allow_method_load_attr}",
-                    op.pc
-                );
+                eprintln!("[inline-method-form] decline pc={}", op.pc);
             }
             return Ok(None);
         }
@@ -4538,7 +4526,6 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         // `__init__` bodies are `self.x = ...` stores; the sub-walk folds them
         // to slot writes on the fresh instance exactly as the property-setter
         // route folds its own.
-        true,
         false,
         Some((instance, ConcreteValue::Ref(concrete_instance))),
     )?;
@@ -4686,7 +4673,6 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
         Some((r_args[2], concrete_receiver, w_class, version_tag)),
         None,
         true,
-        true,
         None,
     )?
     else {
@@ -4808,7 +4794,6 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
         // Getter bodies commonly read `self._slot` — a LOAD_ATTR the method-form
         // support gate would otherwise reject; the sub-walk folds it to a slot
         // read (same allowance the exception `__str__`/`__repr__` override uses).
-        true,
         false,
         None,
     )
@@ -4907,7 +4892,6 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
         has_closure,
         Some((obj, concrete_obj, w_type, version_tag)),
         None,
-        true,
         false,
         None,
     )
@@ -5064,7 +5048,6 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         Some((lhs, concrete_lhs, w_class, version_tag)),
         Some((rhs, concrete_rhs, w_typ_r.as_ptr())),
         false,
-        false,
         None,
     )?
     else {
@@ -5209,7 +5192,6 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         has_closure,
         Some((lhs, concrete_lhs, w_class, version_tag)),
         Some((rhs, concrete_rhs, w_typ_r.as_ptr())),
-        false,
         false,
         None,
     )?
