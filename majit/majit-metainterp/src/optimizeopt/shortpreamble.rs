@@ -2624,14 +2624,15 @@ impl ExtendedShortPreambleBuilder {
     /// For each base op, ensures missing deps from produced_short_boxes are
     /// inserted before the consumer (RPython use_box arg-handling parity).
     ///
-    /// Returns `true` on success; `false` if any op references an
-    /// unresolvable Phase 1 OpRef. RPython equivalent: `produce_arg`
-    /// returning None propagates up to `add_op_to_short` returning None,
-    /// and the entire short_op is dropped (shortpreamble.py:283-296,
-    /// 311-341). Pyre's structural counterpart is to bail out of `setup`
-    /// so the caller (`jump_to_existing_trace`) can fall back to
-    /// `jump_to_preamble` instead of attempting to inline a broken short
-    /// preamble.
+    /// Always returns `true`. Upstream's `setup` (shortpreamble.py:460-463)
+    /// is three field assignments and cannot fail, because the filtering
+    /// happened at EXPORT: `produce_arg` returning None makes
+    /// `add_op_to_short` return None and THAT ONE short_op is left out
+    /// (shortpreamble.py:283-296, 311-341). The loop below reproduces that
+    /// per-op drop here, where pyre first learns an arg is unresolvable —
+    /// its short boxes are exported against one label-arg set and replayed
+    /// against another. The `bool` is kept so the callers' existing
+    /// success/failure plumbing stays untouched.
     pub fn setup(
         &mut self,
         short_preamble: &ShortPreamble,
@@ -2678,22 +2679,42 @@ impl ExtendedShortPreambleBuilder {
             }
             // RPython use_box arg loop: insert missing deps before this op.
             // Recursive: deps of deps are also inserted (transitive closure).
-            for arg in op.getarglist().iter() {
-                let arg = arg.to_opref();
-                if !self.insert_dep_recursive(arg, &inputargs_set, &constants_set) {
-                    if crate::optimizeopt::majit_log_enabled() {
-                        eprintln!(
-                            "[jit] short_preamble setup: dropping inline (unresolved arg {:?} in op pos={:?} opcode={:?})",
-                            arg,
-                            op.pos.get(),
-                            op.opcode
-                        );
-                    }
-                    self.short.clear();
-                    self.short_results.clear();
-                    self.label_args = label_args.to_vec();
-                    return false;
+            //
+            // shortpreamble.py:128-139 `PureOp.add_op_to_short` (and the
+            // HeapOp/LoopInvariantOp siblings):
+            //
+            //     for arg in op.getarglist():
+            //         newarg = sb.produce_arg(arg)
+            //         if newarg is None:
+            //             return None
+            //
+            // and `add_op_to_short` (:311-341) then leaves THAT ONE op out of
+            // `produced_short_boxes`. Every other op still goes into the short
+            // preamble, and an op that depended on the dropped one drops in
+            // turn because its own `produce_arg` now misses — the transitive
+            // closure this loop reproduces through `short_results`.
+            //
+            // Upstream reaches the inline with that filtering already done, so
+            // its `ExtendedShortPreambleBuilder.setup` (:460-463) is three
+            // field assignments and CANNOT fail. Pyre's short boxes are
+            // exported against one label-arg set and replayed against another
+            // (a retrace runs no Phase 1 and imports the partial trace's
+            // exported state), so an arg that was produce-able at export can be
+            // unresolvable here. Dropping the single op is the upstream
+            // outcome; abandoning the WHOLE inline — which this used to do —
+            // has no upstream counterpart and costs the loop its self-close.
+            let resolvable = op.getarglist().iter().all(|arg| {
+                self.insert_dep_recursive(arg.to_opref(), &inputargs_set, &constants_set)
+            });
+            if !resolvable {
+                if crate::optimizeopt::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] short_preamble setup: dropping op pos={:?} opcode={:?} (unresolved arg)",
+                        op.pos.get(),
+                        op.opcode
+                    );
                 }
+                continue;
             }
             self.short_results.insert(op.pos.get());
             self.short.push(op);
@@ -2745,11 +2766,10 @@ impl ExtendedShortPreambleBuilder {
     /// Applies phase1_to_inputarg remap when reading from produced_short_boxes.
     ///
     /// Returns `true` if `arg` was resolved (or was already known); `false`
-    /// if it was an unresolvable Phase 1 reference. Mirrors RPython
-    /// `produce_arg → None` semantics (shortpreamble.py:283-296): a missing
-    /// dep means the entire short preamble cannot be inlined cleanly, so
-    /// the caller should bail out instead of leaving dangling args that
-    /// later trip `inline_short_preamble`'s `_map_args` (unroll.py:404).
+    /// if it was an unresolvable Phase 1 reference. This IS RPython's
+    /// `produce_arg → None` (shortpreamble.py:283-296): the consuming op is
+    /// left out of the short preamble, so it can never leave a dangling arg
+    /// for `inline_short_preamble`'s `_map_args` (unroll.py:404) to trip on.
     fn insert_dep_recursive(
         &mut self,
         arg: OpRef,
