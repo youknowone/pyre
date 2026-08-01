@@ -3904,36 +3904,6 @@ fn active_runtime_alloc_varsize_typed_and_set_len(
     }
 }
 
-/// Old-generation twin of [`active_runtime_alloc_varsize_typed_and_set_len`],
-/// used by `bh_new_array`. Same fallback contract: only a missing runtime
-/// (`None`) drops to the raw allocator; a real OOM propagates as 0.
-fn alloc_oldgen_varsize_typed_and_set_len(
-    type_id: u32,
-    base_size: usize,
-    item_size: usize,
-    length_ofs: usize,
-    length: usize,
-) -> u64 {
-    let payload_size = base_size + item_size * length;
-    let result = with_cranelift_gc(|gc| {
-        let obj = gc.alloc_oldgen_typed(type_id, payload_size);
-        if obj.is_null() {
-            0
-        } else {
-            unsafe {
-                *((obj.0 as *mut u8).add(length_ofs) as *mut usize) = length;
-            }
-            obj.0 as u64
-        }
-    });
-    match result {
-        Some(v) => v,
-        None => {
-            raw_varsize_alloc_typed_and_set_len(type_id, base_size, item_size, length_ofs, length)
-        }
-    }
-}
-
 extern "C" fn gc_malloc_array_helper(item_size: u64, type_id: u64, num_elem: u64) -> u64 {
     oom_signal_if_zero(active_runtime_alloc_varsize_typed_and_set_len(
         type_id as u32,
@@ -16705,24 +16675,39 @@ impl majit_backend::Backend for CraneliftBackend {
     /// llmodel.py:775 bh_new(sizedescr) → gc_ll_descr.gc_malloc(sizedescr).
     fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let size = sizedescr.as_size();
+        // Same non-moving requirement as `bh_new_with_vtable` below, and the
+        // same shape as Dynasm's `bh_alloc_struct`: the materialized struct is
+        // reached only through raw pointers held in the blackhole register
+        // file and the forward recursion, which the resume path never
+        // re-roots.  A nursery object is therefore never forwarded — neither
+        // the struct itself nor the outgoing edges it still holds — so the
+        // next minor collection leaves those captures reading a forwarding
+        // address where a payload word is expected.
+        //
+        // A headerless struct lives in the interpreter's own
+        // `headerless_structs` pool and carries no `type_id` word at
+        // `ref - 8`, so it takes the headerless nursery allocator:
+        // `alloc_oldgen_typed` returns `base + GcHeader::SIZE`, which would
+        // shift every field offset the descr carries.
+        //
         // `resolve_gc_tid` routes the serialized `path_hash` cache key back
         // through `gc_cache` to the allocated dense GC tid; the raw key read
         // as a tid loses gc identity and indexes past the type table.
-        //
-        // Non-moving old generation for the same reason as
-        // `bh_new_with_vtable`: resume materialization retains raw pointers
-        // across the forward blackhole run, and the nursery path could stale
-        // the materialized pointer at the next minor collection.
-        match with_cranelift_gc(|gc| {
-            gc.alloc_oldgen_typed(sizedescr.resolve_gc_tid(), size).0 as i64
-        }) {
-            Some(ptr) => ptr,
-            None => {
-                let layout = std::alloc::Layout::from_size_align(size, 8)
-                    .unwrap_or(std::alloc::Layout::new::<u8>());
-                unsafe { std::alloc::alloc_zeroed(layout) as i64 }
+        let gc_ptr = if sizedescr.is_headerless() {
+            majit_gc::alloc_nursery_headerless_no_collect(size).0 as i64
+        } else {
+            match sizedescr.resolve_gc_tid() {
+                0 => 0,
+                type_id => with_cranelift_gc(|gc| gc.alloc_oldgen_typed(type_id, size).0 as i64)
+                    .unwrap_or(0),
             }
+        };
+        if gc_ptr != 0 {
+            return gc_ptr;
         }
+        let layout =
+            std::alloc::Layout::from_size_align(size, 8).unwrap_or(std::alloc::Layout::new::<u8>());
+        unsafe { std::alloc::alloc_zeroed(layout) as i64 }
     }
 
     /// llmodel.py:778-782 bh_new_with_vtable(sizedescr).
@@ -16779,20 +16764,23 @@ impl majit_backend::Backend for CraneliftBackend {
         // Old-gen for the same reason as `bh_new_with_vtable`: a resume
         // materializes the inlined frame's `locals_cells_stack` array and the
         // blackhole holds it (via the frame) across the minor collections the
-        // deep forward recursion triggers.  A non-moving array keeps the frame's
-        // field valid without a cross-generation write barrier, and keeps the
-        // whole materialized graph in one generation.
+        // deep forward recursion triggers.  A non-moving array keeps the
+        // frame's field valid without a cross-generation write barrier, and
+        // keeps the whole materialized graph in one generation.  A moving
+        // nursery array instead leaves that field naming the pre-move block,
+        // whose header word is then a forwarding address — which a subsequent
+        // `get_array_length` reads as the length.
         //
-        // It also supplies the clearing `gct_do_malloc_varsize_clear`
-        // (`framework.py:1058-1079`) does: an old-gen payload is zero-filled at
-        // birth, which a GC-traced array needs because the tracer visits every
-        // item slot, including the ones past `valuestackdepth` that nobody has
-        // written yet.  The nursery is not zero-filled (`incminimark.py:211
-        // malloc_zero_filled = False`) and needed an explicit memclear here;
-        // the inline allocators in compiled code get theirs from the rewriter's
-        // ZERO_ARRAY (`rewrite.py:499`, `:521`) instead.
-        alloc_oldgen_varsize_typed_and_set_len(type_id, base_size, itemsize, len_offset, length)
-            as i64
+        // Old-gen blocks are handed out zero-filled and the helper stores the
+        // length, so the memclear the nursery path needed
+        // (`incminimark.py:211 malloc_zero_filled = False`, compensated by
+        // `framework.py:1058-1079 gct_do_malloc_varsize_clear`) is subsumed
+        // here.  Inline allocators in compiled code are unaffected: they get
+        // their clearing from the rewriter's ZERO_ARRAY (`rewrite.py:499`,
+        // `:521`) and stay memclear-free on the fast path.
+        active_runtime_alloc_oldgen_varsize_typed_and_set_len(
+            type_id, base_size, itemsize, len_offset, length,
+        ) as i64
     }
 
     /// llmodel.py:790 bh_new_array_clear = bh_new_array.
