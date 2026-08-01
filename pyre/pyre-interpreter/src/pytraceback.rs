@@ -41,6 +41,12 @@
 //! no equivalent pass.  `FrameBox::new` allocating non-moving stands
 //! in for that rewrite, and this file's conditional frame edge and
 //! `w_code` snapshot are downstream of it.
+//!
+//! The rule holds for frames that reach here, not for every frame: a
+//! compiled trace's own inlined-callee frame is a nursery allocation,
+//! and making that uniform costs `fib_recursive` 7.75x, so the
+//! crossing is guarded at the seams instead (see `gate-triage.md`).
+//! `record_application_traceback` is one of those seams.
 
 use pyre_object::pyobject::*;
 

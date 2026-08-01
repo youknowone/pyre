@@ -592,8 +592,35 @@ a root portal seed deliberately points it at the `snapshot_for_tracing` copy, a
 forward.  Closing it means first retiring the snapshot-as-synchronization-target
 deviation, which is a tracer change, not a rooting change.
 
-The invariant stays comment-enforced, and an attempt to check it turned up why
-it has to be.  A `debug_assert!` in `w_pytraceback_new` that the frame is not
+**The invariant is narrower than "frames are non-moving", and that is by
+design.**  A compiled trace's own `NewWithVtable(pyframe_size_descr())` really
+does lower to a nursery bump, so JIT-emitted frames are movable — the audit left
+this inferred, and it is now measured.  Making it uniform is one line, with a
+direct in-tree precedent: the `W_ObjectObject` group marks its size descr
+`non_moving` for the identical reason ("the instance layer reaches an instance
+through raw pointers it does not root"), and `rewrite.rs` then declines the
+nursery and lands on the old-gen `gen_malloc_fixedsize`.  Marking the PyFrame
+group the same way costs:
+
+| bench | nursery frames | non-moving frames |
+|---|---|---|
+| `fib_recursive` | 1193 ms | **9249 ms (7.75x)** |
+| `inline_helper` | 219 ms | 213 ms (0.97x) |
+| `nested_loop` | 298 ms | 302 ms (1.01x) |
+
+(startup-subtracted, round-interleaved, order-alternated; `check.py` turns the
+same thing into `FAIL dynasm fib_recursive timeout (>5s)`, 1 failed / 353
+passed, with no wrong output anywhere.)  So the nursery frame path is not merely
+reachable but hot on recursive calls, and uniformity is unaffordable.
+
+What the system actually maintains is the narrower rule: *a frame that escapes
+into raw-pointer-holding territory is old-gen; a frame that stays inside a
+compiled trace may be nursery.*  The two seam-local props below are how that is
+enforced — they are the design, not an unmaintained accident, and the audit
+reading them as belt-and-braces over an unreachable case was wrong.
+
+An attempt to check the rule with an assertion turned up a second reason it
+stays comment-enforced.  A `debug_assert!` in `w_pytraceback_new` that the frame is not
 nursery-resident cost three `getattr_*` perf gates (`9.1x > 6x`, `8.9x > 5x`,
 `8.1x > 5x`) even in a release build: `pyre-interpreter` is extracted to LLBC,
 so the assertion is in the JIT's view of the function regardless of the host
@@ -602,12 +629,15 @@ traced code builds — `rg gc_is_nursery_object build/llbc/pyre-interpreter.ullb
 confirms it landed there.  A `debug_assert!` is not free in an LLBC-extracted
 crate on a traced path.
 
-So the rule is upheld by two seam-local props: the dynasm runner routes a
-resume-materialized virtual `PyFrame` to oldgen on purpose, and the JIT's
-traceback recorder builds a fresh oldgen frame instead of handing
-`record_application_traceback` a materialized virtual.  A compiled trace's own
-inlined-callee frame, a `NewWithVtable` the rewriter lowers to a nursery bump,
-is what would break it.
+The two props that carry the narrow rule are therefore load-bearing: the dynasm
+runner routes a resume-materialized virtual `PyFrame` to oldgen on purpose, and
+the JIT's traceback recorder builds a fresh oldgen frame instead of handing
+`record_application_traceback` a materialized virtual.  Both sit exactly where a
+nursery frame would otherwise cross into raw-pointer territory, and the
+measurement above is why the crossing is guarded there rather than removed at
+the allocator.  This is also why the runtime half of the inlined-level traceback
+anchor stays declined: it would hand the recorder the one frame class the props
+exist to keep away from it.
 
 One thing the ON path already fixes: with a side-effecting inlined callee under
 a `while` loop that returns from inside the loop, the OFF path runs the callee's
