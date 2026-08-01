@@ -1482,6 +1482,26 @@ impl BlackholeInterpreter {
         unsafe {
             let mut current = Some(&mut *self);
             while let Some(frame) = current {
+                // `virtualizable_ptr` is a bare copy of the frame red this
+                // level was bound to, and the banks rooted just above do not
+                // cover it: a collection forwards the register the copy came
+                // from, never the copy.  A young virtualizable makes that
+                // difference observable — a compiled trace allocates an
+                // inlined callee's `PyFrame` with its own `NewWithVtable`,
+                // which the GC rewriter lowers to a nursery allocation, so the
+                // first minor collection `run_inner` triggers moves it and
+                // leaves this field naming the vacated block.  Every later
+                // reader takes that address: the vable opcodes below, and the
+                // traceback recorded for each frame an exception propagates
+                // through, which stores it into `PyTraceback.frame` — a slot
+                // the collector does trace, so the stale pointer surfaces as
+                // an invalid type id rather than as a wrong answer.  Root the
+                // SLOT so the walker rewrites it, the same shape
+                // `blackhole_from_resumedata` already applies to the resume
+                // reader's own `virtualizable_ptr` for the chain-build window.
+                majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(
+                    &mut frame.virtualizable_ptr,
+                ));
                 if !frame.virtualizable_info.is_null() {
                     let vinfo = &*frame.virtualizable_info;
                     vinfo.push_resume_ref_roots_for_registers(&frame.registers_r);
