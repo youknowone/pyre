@@ -3468,13 +3468,18 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             // the copied strings.  In particular, asyncio passes an
             // `itertools.islice` of memoryviews here, not a list or tuple.
             let _roots = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(args[1]);
-            let data_items = crate::baseobjspace::unpackiterable(args[1], -1)?;
-            for &item in &data_items {
-                pyre_object::gc_roots::pin_root(item);
-            }
+            let data_slot = pyre_object::gc_roots::pin_roots(&[args[1]]);
+            let data_items = crate::baseobjspace::unpackiterable(
+                pyre_object::gc_roots::shadow_stack_get(data_slot),
+                -1,
+            )?;
+            let items_base = pyre_object::gc_roots::pin_roots(&data_items);
             let mut data_buffers: Vec<Vec<u8>> = Vec::with_capacity(data_items.len());
-            for item in data_items {
+            // `simple_buffer_bytes` looks up `__buffer__` and builds a
+            // memoryview, so every iteration can collect; read each item back
+            // from its slot instead of consuming the unrooted vector.
+            for i in 0..data_items.len() {
+                let item = pyre_object::gc_roots::shadow_stack_get(items_base + i);
                 let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(item)? else {
                     return Err(crate::PyError::type_error(
                         "sendmsg: data items must be bytes-like",

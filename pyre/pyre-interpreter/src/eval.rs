@@ -709,6 +709,21 @@ unsafe fn chain_next_frame(f_backref: *mut PyFrame) -> *mut PyFrame {
     crate::executioncontext::vref_referent(f_backref)
 }
 
+/// How much of `locals_cells_stack_w` is reachable state.
+///
+/// `valuestackdepth` is an absolute index that starts at `stack_base()`
+/// (`pyframe.rs:2136`) and `pop` refuses to go below it, so for a running
+/// frame it already covers the locals/cells prefix. `PyFrame::descr_clear`
+/// is the one writer that breaks that: it rebinds every cell slot to a fresh
+/// `w_cell_new` and then sets `valuestackdepth = 0`. Clamping to the raw
+/// depth would walk zero slots for such a frame and drop cells that the
+/// array still points at, so the prefix is the floor. The array is
+/// `PY_NULL`-filled at allocation, so widening never reads uninitialised
+/// slots.
+unsafe fn walk_depth(f: &PyFrame, arr: &FixedObjectArray) -> usize {
+    f.valuestackdepth.max(f.stack_base()).min(arr.len())
+}
+
 /// Walk one captured thread's active frame and interpreter root state.
 ///
 /// # Safety
@@ -849,15 +864,12 @@ pub unsafe fn walk_pyframe_roots_area(
             // minor collection is always synchronous with respect to the
             // interpreter thread, so frames cannot be dropped mid-walk.
             //
-            // We walk the FULL fixed-length array (not just the live
-            // `valuestackdepth` prefix). Argument values in transit —
-            // popped from the caller's stack before the callee frame
-            // is installed — are briefly invisible from
-            // `valuestackdepth` alone, yet still reachable from the
-            // popped-slot storage. Non-ref slots are filtered by
-            // `is_nursery_object_start` inside the collector, so
-            // walking past the live depth is harmless for the
-            // bump-pointer nursery.
+            // The walk covers `[0, walk_depth)` — the locals/cells prefix
+            // plus the live operand stack. Slots above it are popped
+            // capacity, not roots. Non-ref slots are filtered by
+            // `is_nursery_object_start` inside the collector, so a slot
+            // holding a non-object word is harmless for the bump-pointer
+            // nursery.
             //
             // The walk runs for every frame on the chain, including
             // ones the GC owns. For nursery-allocated frames the
@@ -1002,7 +1014,7 @@ pub unsafe fn walk_pyframe_roots_area(
                     let arr = &*f.locals_cells_stack_w;
                     (
                         arr.items_ptr() as *mut PyObjectRef,
-                        f.valuestackdepth.min(arr.len()),
+                        walk_depth(f, arr),
                         next_frame,
                     )
                 }
@@ -1273,10 +1285,7 @@ pub fn walk_suspended_generator_frame(
         if !(*frame).locals_cells_stack_w.is_null() {
             let arr = &*(*frame).locals_cells_stack_w;
             let base = arr.items_ptr() as *mut PyObjectRef;
-            // Locals/cells occupy the fixed prefix and
-            // `valuestackdepth` extends it through the live operand stack.
-            // Slots above it are popped capacity, not GC roots.
-            let len = (*frame).valuestackdepth.min(arr.len());
+            let len = walk_depth(&*frame, arr);
             for i in 0..len {
                 visitor(&mut *(base.add(i) as *mut majit_ir::GcRef));
             }

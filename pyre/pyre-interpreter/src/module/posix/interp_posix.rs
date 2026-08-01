@@ -3600,8 +3600,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("kill() requires 2 arguments"));
                     }
-                    let pid = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::pid_t;
-                    let sig = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int;
+                    // interp_posix.py:1386 `@unwrap_spec(pid=c_int, signal=c_int)`.
+                    // Both arguments go through `c_int_w`: a raw payload read
+                    // would accept any object, and `is_int` is an exact-type
+                    // check, so an `int` subclass instance — `signal.SIGHUP` is
+                    // an `IntEnum` member — never reaches the checked path.
+                    let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
+                    let sig = crate::baseobjspace::c_int_w(args[1])? as libc::c_int;
                     let r = unsafe { libc::kill(pid, sig) };
                     if r < 0 {
                         return Err(io_err(std::io::Error::last_os_error(), ""));
@@ -3621,8 +3626,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("killpg() requires 2 arguments"));
                     }
-                    let pgid = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::pid_t;
-                    let sig = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int;
+                    // interp_posix.py:1394 `@unwrap_spec(pgid=c_int, signal=c_int)`.
+                    let pgid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
+                    let sig = crate::baseobjspace::c_int_w(args[1])? as libc::c_int;
                     let r = unsafe { libc::killpg(pgid, sig) };
                     if r < 0 {
                         return Err(io_err(std::io::Error::last_os_error(), ""));
@@ -4178,11 +4184,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }));
                 }
                 let keys = crate::baseobjspace::unpackiterable(keys_obj, -1)?;
+                // `getitem` runs the mapping's `__getitem__` and both encodes
+                // allocate, so the mapping and every key are published once and
+                // read back per iteration rather than kept in plain locals.
+                let _env_roots = pyre_object::gc_roots::push_roots();
+                let mapping_slot = pyre_object::gc_roots::pin_roots(&[mapping]);
+                let keys_base = pyre_object::gc_roots::pin_roots(&keys);
                 let mut env = Vec::with_capacity(keys.len());
-                for key_obj in keys {
-                    let value_obj = crate::baseobjspace::getitem(mapping, key_obj)?;
-                    let key = crate::gateway::fsencode_bytes_w(key_obj)?;
-                    let value = crate::gateway::fsencode_bytes_w(value_obj)?;
+                for i in 0..keys.len() {
+                    let _entry_roots = pyre_object::gc_roots::push_roots();
+                    let value_obj = crate::baseobjspace::getitem(
+                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
+                        pyre_object::gc_roots::shadow_stack_get(keys_base + i),
+                    )?;
+                    // Encoding the key can collect, so the value it was fetched
+                    // beside has to be published before that call.
+                    let value_slot = pyre_object::gc_roots::pin_roots(&[value_obj]);
+                    let key = crate::gateway::fsencode_bytes_w(
+                        pyre_object::gc_roots::shadow_stack_get(keys_base + i),
+                    )?;
+                    let value = crate::gateway::fsencode_bytes_w(
+                        pyre_object::gc_roots::shadow_stack_get(value_slot),
+                    )?;
                     if key.is_empty() || key.contains(&b'=') {
                         return Err(crate::PyError::value_error(
                             "illegal environment variable name",
@@ -4577,23 +4600,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let w_sysconf_names = pyre_object::w_dict_new();
         let _sysconf_names_root = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(w_sysconf_names);
+        let names_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         for (name, value) in sysconf_names() {
+            // Build the value first: call arguments evaluate left to right, so
+            // reading the rooted dict inline would take its address before
+            // `w_int_new` allocates, and a collection there would leave the
+            // store writing through the pre-move address.
+            let w_value = pyre_object::w_int_new(*value as i64);
             unsafe {
                 pyre_object::w_dict_setitem_str(
-                    pyre_object::gc_roots::shadow_stack_get(
-                        pyre_object::gc_roots::shadow_stack_len() - 1,
-                    ),
+                    pyre_object::gc_roots::shadow_stack_get(names_slot),
                     name,
-                    pyre_object::w_int_new(*value as i64),
+                    w_value,
                 );
             }
         }
         crate::module_ns_store(
             ns,
             "sysconf_names",
-            pyre_object::gc_roots::shadow_stack_get(
-                pyre_object::gc_roots::shadow_stack_len() - 1,
-            ),
+            pyre_object::gc_roots::shadow_stack_get(names_slot),
         );
 
         // os.initgroups(username, gid) -> None

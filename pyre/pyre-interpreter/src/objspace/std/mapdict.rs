@@ -2236,30 +2236,47 @@ fn instance_write_barrier(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
-/// Return the storage indices that contain real GCREFs for `map`; slots owned
-/// by the first `UnboxedPlainAttribute` contain erased `Vec<i64>` pointers and
-/// must never enter the shadow stack.
-unsafe fn boxed_storage_indices(map: MapRef, len: usize) -> Vec<usize> {
-    let mut unboxed = vec![false; len];
+/// Whether `index` is the storage slot of a `firstunwrapped` attribute in
+/// `map`'s chain. Such a slot holds an erased `Vec<i64>` unboxing bank, not a
+/// GCREF, and must never enter the shadow stack or the marking worklist.
+///
+/// The whole chain is scanned rather than stopping at the first
+/// `firstunwrapped` node. `_compute_storageindex_listindex`
+/// (mapdict.py:549-562) does imply a chain holds at most one — it breaks at
+/// the first `UnboxedPlainAttribute` ancestor and only sets `firstunwrapped`
+/// when it finds none — but the collector is the wrong place to depend on
+/// that, since under-reporting one slot hands the marker a raw `Vec` pointer.
+///
+/// Allocation-free by contract: the GC trace hook calls this while marking,
+/// where taking the global allocator would be a reentrancy hazard.
+unsafe fn storage_index_is_unboxed(map: MapRef, index: usize) -> bool {
     let mut node = map;
     while !node.is_null() {
         match unsafe { &*node } {
             MapNode::Plain(p) => {
-                if let Some(u) = &p.unboxed {
-                    if u.firstunwrapped && p.storageindex < len {
-                        unboxed[p.storageindex] = true;
-                    }
+                if let Some(u) = &p.unboxed
+                    && u.firstunwrapped
+                    && p.storageindex == index
+                {
+                    return true;
                 }
                 node = p.back;
             }
             MapNode::Terminator(_) => break,
         }
     }
-    (0..len).filter(|&i| !unboxed[i]).collect()
+    false
+}
+
+/// Return the storage indices that contain real GCREFs for `map`.
+unsafe fn boxed_storage_indices(map: MapRef, len: usize) -> Vec<usize> {
+    (0..len)
+        .filter(|&i| !unsafe { storage_index_is_unboxed(map, i) })
+        .collect()
 }
 
 unsafe fn storage_index_is_boxed(map: MapRef, index: usize) -> bool {
-    unsafe { boxed_storage_indices(map, index + 1).contains(&index) }
+    !unsafe { storage_index_is_unboxed(map, index) }
 }
 
 impl MapdictObject for pyre_object::W_ObjectObject {
@@ -2320,6 +2337,16 @@ impl MapdictObject for pyre_object::W_ObjectObject {
     }
     fn _mapdict_pop_attribute(&mut self, map: MapRef) {
         // mapdict.py:926-939; structure mirrors the MockObj test impl.
+        // Both arms can collect — the unboxed one through
+        // `_mapdict_write_storage`, the other through the storage shrink — so
+        // the receiver is published for the whole function and every write
+        // goes through the reloaded address, as in
+        // `_set_mapdict_increase_storage1` and `_set_mapdict_storage_and_map`.
+        // `&mut self` is a bare address that a moving collection invalidates;
+        // writing `map` through it would leave the live instance on its old
+        // map, claiming a storage slot the shrunk block no longer has.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let self_slot = pyre_object::gc_roots::pin_roots(&[self as *const Self as PyObjectRef]);
         let current_map = self.map as MapRef;
         let unboxed_slot: Option<(usize, usize)> = unsafe {
             match &(*current_map).as_plain().unboxed {
@@ -2339,16 +2366,16 @@ impl MapdictObject for pyre_object::W_ObjectObject {
                     let list: &Vec<i64> = &*unerase_unboxed(slot);
                     list[..listindex].to_vec()
                 };
-                self._mapdict_write_storage(storageindex, erase_unboxed(Box::new(new_list)));
+                let owner = unsafe {
+                    &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self)
+                };
+                owner._mapdict_write_storage(storageindex, erase_unboxed(Box::new(new_list)));
             }
             // mapdict.py:935-938: truncate storage to the parent map's size.
             // The block is exact-size, so shrink it to a fresh cap-N block; the
             // dropped tail slots are gone with the old block. NULL-fill is
             // implicit in `grow_instance_items_block` (new_cap <= live_len here).
             None => {
-                let _roots = pyre_object::gc_roots::push_roots();
-                let self_slot = pyre_object::gc_roots::shadow_stack_len();
-                pyre_object::gc_roots::pin_root(self as *const Self as PyObjectRef);
                 let storage_needed = unsafe { (*map).storage_needed() };
                 unsafe {
                     let owner =
@@ -2370,7 +2397,10 @@ impl MapdictObject for pyre_object::W_ObjectObject {
                 }
             }
         }
-        self.map = map as *const u8;
+        unsafe {
+            let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
+            owner.map = map as *const u8;
+        }
     }
     fn _set_mapdict_increase_storage1(&mut self, map: MapRef, value: PyObjectRef) {
         // grow storage by one, append value (mapdict.py:942-959). The first
@@ -3033,9 +3063,26 @@ unsafe fn node_materialize_dict<O: MapdictObject>(
 /// `obj` must be a live `W_ObjectObject`; `w_dict` a live `W_DictObject` on
 /// its post-switch strategy.
 unsafe fn materialize_dict(obj: PyObjectRef, w_dict: PyObjectRef) {
-    let inst = unsafe { &mut *(obj as *mut pyre_object::W_ObjectObject) };
-    let map = inst._get_mapdict_map();
-    let new_obj = unsafe { node_materialize_dict(map, &*inst, w_dict) };
+    // Filling `w_dict` allocates — boxed attribute names, the dict stores, and
+    // the rebuilt carrier's own transitions — so both operands are published
+    // and the transplant writes through the instance's post-collection address.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, w_dict]);
+    let dict_slot = obj_slot + 1;
+    let new_obj = unsafe {
+        let inst = &*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+            as *const pyre_object::W_ObjectObject);
+        let map = inst._get_mapdict_map();
+        node_materialize_dict(
+            map,
+            inst,
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+        )
+    };
+    let inst = unsafe {
+        &mut *(pyre_object::gc_roots::shadow_stack_get(obj_slot)
+            as *mut pyre_object::W_ObjectObject)
+    };
     inst._set_mapdict_storage_and_map(new_obj.storage, new_obj.map);
 }
 
@@ -3842,13 +3889,44 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
     // INSTANCE_DICT side table as a plain own-storage dict until subclass
     // instances grow mapdict storage (upstream `user_setup`, mapdict.py:758).
     if unsafe { pyre_object::is_instance(self_ref) } {
-        if let Some(w_dict) = unsafe { instance_get_dict_slot(self_ref) } {
+        // mapdict.py:828-830 `if w_dict is not None`.  RPython's `read` answers
+        // None both for an absent slot and for one holding None, and both mean
+        // "build the view" — so a null must not reach the caller.  It would be
+        // reported as "the receiver has no dict", which is how
+        // `descr__setattr__` decides an ordinary instance store is
+        // `"'%T' object attribute '%s' is read-only"` (descroperation.py:58-67).
+        if let Some(w_dict) = unsafe { instance_get_dict_slot(self_ref) }
+            && !w_dict.is_null()
+        {
             return w_dict;
         }
-        let w_dict = pyre_object::w_dict_new_with(&MAP_DICT_STRATEGY, self_ref as *mut u8);
-        let flag = unsafe { instance_set_dict_slot(self_ref, w_dict) };
-        debug_assert!(flag, "write to the \"dict\" SPECIAL slot failed");
-        w_dict
+        // Allocating the wrapper and claiming the SPECIAL slot both collect, so
+        // the instance is published first and every use below reads back the
+        // relocated address.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let self_slot = pyre_object::gc_roots::pin_roots(&[self_ref]);
+        let dict_slot = self_slot + 1;
+        pyre_object::gc_roots::pin_root(pyre_object::w_dict_new_with(
+            &MAP_DICT_STRATEGY,
+            pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut u8,
+        ));
+        unsafe {
+            let w_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
+            // `dstorage` is the view's only link to its backing instance
+            // (mapdict.py:1502) and `walk_gc_refs` forwards it — but only from
+            // the collection after the wrapper became reachable.  The
+            // allocation that produced the wrapper is not covered, so restate
+            // the back-pointer from the instance's current address.
+            (*(w_dict as *mut pyre_object::W_DictObject)).dstorage =
+                pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut u8;
+            pyre_object::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
+            let flag = instance_set_dict_slot(
+                pyre_object::gc_roots::shadow_stack_get(self_slot),
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            );
+            debug_assert!(flag, "write to the \"dict\" SPECIAL slot failed");
+        }
+        pyre_object::gc_roots::shadow_stack_get(dict_slot)
     } else {
         let existing = INSTANCE_DICT
             .lock()
@@ -3903,8 +3981,13 @@ pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*m
         // The storage block is exact-size (capacity == map.storage_needed()).
         let len = pyre_object::object_array::items_block_capacity(inst.storage);
         let base = pyre_object::object_array::items_block_items_base(inst.storage);
-        for i in boxed_storage_indices(inst.map as MapRef, len) {
-            f(base.add(i));
+        // Test each slot in place: this runs inside the collector's marking
+        // walk, where the previous `Vec` pair per traced instance was both a
+        // per-object cost and a reentrancy hazard.
+        for i in 0..len {
+            if !storage_index_is_unboxed(inst.map as MapRef, i) {
+                f(base.add(i));
+            }
         }
     }
 }
@@ -4152,7 +4235,12 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
         // delegating to the instance once the slot is overwritten — otherwise
         // `old = obj.__dict__; obj.__dict__ = {}` leaves `old` an empty shell
         // that still mirrors the live instance.
-        let w_olddict = _obj_getdict(self_ref);
+        // Materialising the old view and claiming the slot both allocate, so
+        // the receiver and the incoming dict are published across them.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let self_slot = pyre_object::gc_roots::pin_roots(&[self_ref, w_dict]);
+        let dict_slot = self_slot + 1;
+        let w_olddict = _obj_getdict(pyre_object::gc_roots::shadow_stack_get(self_slot));
         let old_backing = crate::type_methods::resolve_dict_backing(w_olddict);
         let is_map_view = unsafe {
             pyre_object::dictmultiobject::w_dict_get_strategy(old_backing).strategy_kind()
@@ -4161,7 +4249,12 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
         if is_map_view {
             unsafe { mapdict_switch_to_object_strategy(old_backing) };
         }
-        let flag = unsafe { instance_set_dict_slot(self_ref, w_dict) };
+        let flag = unsafe {
+            instance_set_dict_slot(
+                pyre_object::gc_roots::shadow_stack_get(self_slot),
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            )
+        };
         debug_assert!(flag, "write to the \"dict\" SPECIAL slot failed");
     } else {
         // Non-instance hasdict objects (property/member, baseobjspace
@@ -4910,6 +5003,42 @@ mod tests {
             assert_eq!(MAP_DICT_STRATEGY.length(w1), 1);
             assert_eq!(MAP_DICT_STRATEGY.getitem_str(w1, "x"), Some(sentinel(0x1)));
             assert_eq!(MAP_DICT_STRATEGY.getitem_str(w1, "dict"), None);
+        }
+    }
+
+    #[test]
+    fn obj_getdict_rebuilds_the_view_when_the_dict_slot_reads_null() {
+        use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
+        // mapdict.py:828-830 `if w_dict is not None` — RPython's `read` answers
+        // None both for an absent slot and for one holding None, and both mean
+        // "build the view".  Surfacing the null instead makes `getdict` report
+        // that the receiver has no dict, which is the single state
+        // `descr__setattr__` turns into
+        // `"'%T' object attribute '%s' is read-only"` — for any name the type
+        // carries, a class-variable default being enough to arm that branch.
+        crate::test_hooks::install_hash_hook();
+        unsafe {
+            let term = boxed_dict_terminator();
+            let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_ObjectObject);
+            obj._set_mapdict_map(term);
+
+            let w1 = _obj_getdict(obj_ref);
+            assert!(!w1.is_null());
+            assert_eq!(instance_get_dict_slot(obj_ref), Some(w1));
+
+            // The state a write that never landed leaves behind: the map still
+            // claims the SPECIAL attribute, its storage slot holds NULL.
+            assert!(instance_set_dict_slot(obj_ref, pyre_object::PY_NULL));
+            assert_eq!(instance_get_dict_slot(obj_ref), Some(pyre_object::PY_NULL));
+
+            let w2 = _obj_getdict(obj_ref);
+            assert!(!w2.is_null(), "a null SPECIAL slot must rebuild the view");
+            assert_eq!(instance_get_dict_slot(obj_ref), Some(w2));
+            let dict = &*(w2 as *const pyre_object::W_DictObject);
+            assert_eq!(dict.dstrategy.strategy_kind(), StrategyKind::Map);
+            // The rebuilt view backs onto the instance it was built for.
+            assert_eq!(dict.dstorage as PyObjectRef, obj_ref);
         }
     }
 

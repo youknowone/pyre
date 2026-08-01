@@ -7621,8 +7621,12 @@ pub(crate) fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         // baseobjspace.py:321-323 `w_impl = space.lookup(self, '__index__')`
         .or_else(|| unsafe { lookup(obj, "__index__") });
     let Some(method) = w_impl else {
-        // baseobjspace.py:323 `self._typed_unwrap_error(space, "integer")`
-        return Err(PyError::type_error("expected integer"));
+        // baseobjspace.py:323 `self._typed_unwrap_error(space, "integer")`,
+        // whose body (:316-318) is `"expected %s, got %T object"`.
+        return Err(PyError::type_error(format!(
+            "expected integer, got {} object",
+            object_functionstr_type_name(obj)
+        )));
     };
     // baseobjspace.py:324 `w_result = space.get_and_call_function(w_impl, self)`
     let w_type = crate::typedef::r#type(obj)

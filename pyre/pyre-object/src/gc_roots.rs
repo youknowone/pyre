@@ -303,6 +303,8 @@ pub fn pin_root(root: PyObjectRef) {
 /// Returns the first shadow-stack index occupied by `roots`.
 #[majit_macros::dont_look_inside]
 pub fn pin_roots(roots: &[PyObjectRef]) -> usize {
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
     let base = with_shadow_stack_mut(|stack| {
         let base = stack.len();
         stack.extend_from_slice(roots);
