@@ -594,6 +594,58 @@ pub fn emit_bound_method_inline(
     new_op
 }
 
+/// Emit inline `Function` creation for `MAKE_FUNCTION` — `NewWithVtable` plus
+/// the `SetfieldGc` set `function.py:47-57 Function.__init__` performs — instead
+/// of the opaque `jit_make_function_from_globals` residual.
+///
+/// `pyopcode.py:1457 MAKE_FUNCTION` builds a fresh function on every execution,
+/// so a `def` inside a loop allocates once per iteration; emitting the
+/// allocation as `New` + `SetField` lets the optimizer virtualize it away when
+/// the function never escapes, which is what upstream gets by tracing straight
+/// through `Function.__init__`.
+///
+/// Only the non-null slots are written.  Every other pointer slot of the
+/// struct is `PY_NULL` after construction and a virtual reads an unwritten
+/// field as null, so the emit does not spell them out; the size descr's census
+/// is what makes the materialized form agree (see `FUNCTION_DESCR_GROUP`).
+/// `can_change_code` is the one exception — a plain byte gets no NULL store
+/// behind the allocation, so its `True` is written explicitly.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_make_function_inline(
+    ctx: &mut TraceCtx,
+    header_w_class: OpRef,
+    code: OpRef,
+    can_change_code: OpRef,
+    name: OpRef,
+    w_func_globals: OpRef,
+    w_builtins: OpRef,
+    w_qualname: OpRef,
+) -> OpRef {
+    let new_op = ctx.record_op_with_descr(
+        OpCode::NewWithVtable,
+        &[],
+        crate::descr::w_function_size_descr(),
+    );
+    ctx.heap_cache_mut().new_object(new_op);
+    for (descr, value) in [
+        (crate::descr::function_header_w_class_descr(), header_w_class),
+        (crate::descr::function_code_descr(), code),
+        (
+            crate::descr::function_can_change_code_descr(),
+            can_change_code,
+        ),
+        (crate::descr::function_name_descr(), name),
+        (crate::descr::function_w_globals_descr(), w_func_globals),
+        (crate::descr::function_w_builtins_descr(), w_builtins),
+        (crate::descr::function_w_qualname_descr(), w_qualname),
+    ] {
+        let index = descr.index();
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, value], descr);
+        ctx.heapcache_setfield_cached(new_op, index, value);
+    }
+    new_op
+}
+
 /// Emit inline `W_ObjectObject` creation (`NewWithVtable` + `SetfieldGc` for
 /// the inherited header `PyObject.w_class` and `map`), mirroring
 /// `objectobject.rs w_instance_new`.

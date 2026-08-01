@@ -5965,7 +5965,7 @@ where
         ctx.make_function_fn_idx,
         vec![globals, code],
         CallFlavor::Plain,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::PyreHelperKind::MakeFunction,
         dst_reg,
     ))
 }

@@ -25,24 +25,15 @@ pub fn make_function_from_code_obj_with_globals_obj(
     code_obj: PyObjectRef,
     w_globals: PyObjectRef,
 ) -> PyObjectRef {
-    let code_ptr = unsafe { w_code_get_ptr(code_obj) };
-    let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
     // `function.py:51-53 __init__`:
     //   self.name = forcename or code.co_name
     //   self.qualname = qualname or self.name
     // so `name` is the bare `co_name` and `qualname` is the dotted
     // `co_qualname`.  `pyopcode.py:1457 MAKE_FUNCTION` then stamps the
     // qualified name from `codeobj.co_qualname`, which is why a later
-    // `__code__ = new_code` assignment does NOT change `__qualname__`.
-    let func = crate::function::function_new_with_closure(
-        code_obj as *const (),
-        code.obj_name.to_string(),
-        w_globals,
-        pyre_object::PY_NULL,
-    );
-    let qualname_obj = pyre_object::w_str_new(code.qualname.as_ref());
-    unsafe { crate::function::function_set_qualname(func, qualname_obj) };
-    func
+    // `__code__ = new_code` assignment does NOT change `__qualname__`.  Both
+    // are read straight off the code object, so neither allocates.
+    crate::function::function_new_from_code(code_obj, w_globals)
 }
 
 fn decode_name(name_ptr: i64, name_len: i64) -> Option<&'static str> {

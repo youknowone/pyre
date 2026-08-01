@@ -303,6 +303,10 @@ pub unsafe fn walk_raw_code_roots(
             visited.push(identity);
             let code = &mut *(value as *mut crate::pycode::PyCode);
             visitor(&mut *(&mut code.w_globals as *mut PyObjectRef as *mut majit_ir::GcRef));
+            // The realized `co_qualname` is an ordinary movable string object
+            // shared by every function built from this code; the wrapper is
+            // Box-immortal, so only this raw-root walker forwards it.
+            visitor(&mut *(&mut code.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
             if !code.co_consts_w.is_null() {
                 for slot in (&*code.co_consts_w).iter() {
                     let mut child = slot.load(std::sync::atomic::Ordering::Acquire);

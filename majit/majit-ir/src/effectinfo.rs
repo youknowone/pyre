@@ -881,6 +881,15 @@ pub enum PyreHelperKind {
     /// access) to a traced inline exception construction the optimizer
     /// can virtualize; every other shape keeps the generic residual.
     DeleteAttr,
+    /// `jit_make_function_from_globals(globals, code)` — the MAKE_FUNCTION
+    /// residual (`lower_make_function_hlop_to_insn` →
+    /// `function.py:47-57 Function.__init__`).  Both Ref operands are baked
+    /// constants: the defining frame's globals object and the popped code
+    /// object.  The full-body walker recognises this tag to emit the
+    /// construction as `NewWithVtable` + the `SetfieldGc` set, so a `def`
+    /// inside a loop virtualizes away instead of allocating a `Function` per
+    /// iteration through an opaque residual.
+    MakeFunction,
 }
 
 impl EffectInfo {

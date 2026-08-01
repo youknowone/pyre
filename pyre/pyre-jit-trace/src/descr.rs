@@ -956,8 +956,31 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// pre-invalidation equivalent.  A tuple's backing array has its own immutable
 /// descriptor and is read with `GetarrayitemGcPureR`.
 ///
-/// `field_descr_from_group` indexes positionally, so new fields append.
+/// The entries are in byte-offset order and each key is the struct's own field
+/// name, which is what makes the group's numbering agree with the analyzer's.
+/// `index_in_parent` is a field's slot number in the virtual
+/// (`virtualize.py:210 fielddescr.get_index()`) and its `PtrInfo._fields` key
+/// in the heap optimizer, so two fields sharing one number makes a read of
+/// either resolve to the other's cached value and a virtual keep only the
+/// later of the two stores.  Two things assign it: `descr.py:218-239` caches a
+/// FieldDescr per `(STRUCT, fieldname)` and a cache hit reports the analyzer's
+/// number, which counts the struct's own fields past the flattened header;
+/// a miss numbers the field by its position in this list.  Keeping the list in
+/// offset order — with the inherited `PyObject.w_class` last, since the
+/// analyzer's count does not include it — makes both answers the same one.
+/// Look fields up by offset (`function_field_descr`) so the accessors below
+/// cannot drift out of that order.
+///
+/// The census is COMPLETE — every pointer-shaped slot of `Function` is listed,
+/// not only the four the inline-call path reads.  `emit_make_function_inline`
+/// allocates a `Function` with `NewWithVtable`, and the nursery is not
+/// zero-filled: `rewrite.py:498-504 clear_gc_fields` emits the delayed NULL
+/// stores, and it walks exactly this group's `gc_fielddescrs`.  A pointer slot
+/// missing from the census would keep recycled nursery bytes and the collector
+/// would follow that word as a child reference.  `can_change_code` is a plain
+/// byte, so it gets no NULL store and the emit writes it explicitly.
 static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_interpreter::function as f;
     let field = |key, offset| {
         (
             key,
@@ -970,19 +993,65 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         )
     };
     build_object_descr_group_with_def_path(
-        pyre_interpreter::function::FUNCTION_OBJECT_SIZE,
+        f::FUNCTION_OBJECT_SIZE,
         FUNCTION_GC_TYPE_ID,
         &pyre_interpreter::FUNCTION_TYPE as *const _ as usize,
         &[
-            field("defs_w", pyre_interpreter::function::FUNCTION_DEFS_W_OFFSET),
-            field("code", pyre_interpreter::function::FUNCTION_CODE_OFFSET),
-            field(
-                "w_func_globals",
-                pyre_interpreter::function::FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET,
+            field("code", f::FUNCTION_CODE_OFFSET),
+            // `function.py:33 can_change_code = True`; `False` for the
+            // `FunctionWithFixedCode` / `BuiltinFunction` subclasses.  A plain
+            // byte, so `clear_gc_fields` leaves it alone and the value a
+            // materialized function reports comes from the emit's own store.
+            (
+                "can_change_code",
+                std::mem::offset_of!(pyre_interpreter::function::Function, can_change_code),
+                1,
+                Type::Int,
+                false,
+                false,
+                false,
             ),
-            field(
-                "closure",
-                pyre_interpreter::function::FUNCTION_CLOSURE_OFFSET,
+            // `function.py:51 self.name = forcename or code.co_name` — a
+            // pointer to the name string's storage.  It is pointer-shaped and
+            // the runtime walker visits it, so it belongs in the census; the
+            // storage itself may be GC-managed (a mortal function's own box) or
+            // permanent (a builtin's `malloc_raw` box, or the code object's
+            // borrowed `co_name`), which the walker's managed-heap guard sorts
+            // out.
+            field("name", f::FUNCTION_NAME_OFFSET),
+            field("closure", f::FUNCTION_CLOSURE_OFFSET),
+            field("defs_w", f::FUNCTION_DEFS_W_OFFSET),
+            field("w_kw_defs", f::FUNCTION_W_KW_DEFS_OFFSET),
+            field("w_module", f::FUNCTION_W_MODULE_OFFSET),
+            field("w_func_globals_obj", f::FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET),
+            field("w_builtins", f::FUNCTION_W_BUILTINS_OFFSET),
+            field("w_ann", f::FUNCTION_W_ANN_OFFSET),
+            field("w_annotate", f::FUNCTION_W_ANNOTATE_OFFSET),
+            field("w_func_dict", f::FUNCTION_W_FUNC_DICT_OFFSET),
+            field("w_typeparams", f::FUNCTION_W_TYPEPARAMS_OFFSET),
+            field("w_doc", f::FUNCTION_W_DOC_OFFSET),
+            field("w_qualname", f::FUNCTION_W_QUALNAME_OFFSET),
+            field("w_objclass", f::FUNCTION_W_OBJCLASS_OFFSET),
+            field("w_text_signature", f::FUNCTION_W_TEXT_SIGNATURE_OFFSET),
+            // `w_new_self` is absent from `FUNCTION_GC_PTR_OFFSETS` (it names a
+            // static-region type that is never relocated), but it is still a
+            // pointer slot an app-level `__self__` read dereferences, so it
+            // needs the census entry that gets it NULLed behind the allocation.
+            field("w_new_self", f::FUNCTION_W_NEW_SELF_OFFSET),
+            field("w_moduleobj", f::FUNCTION_W_MODULEOBJ_OFFSET),
+            // The inline emit can escape a guard and be materialized, so the
+            // inherited Python class is a proper virtual field of this group —
+            // same reasoning as the `Method` / `W_ListObject` entries.  It sits
+            // last, outside the offset ordering, because the analyzer counts
+            // only the struct's own fields.
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
             ),
         ],
         "Function",
@@ -2067,30 +2136,78 @@ pub fn method_w_function_descr() -> DescrRef {
     field_descr_from_group(&W_METHOD_DESCR_GROUP, 0)
 }
 
+/// Resolve one [`FUNCTION_DESCR_GROUP`] field by byte offset, so the accessors
+/// below stay correct however the census is ordered.
+fn function_field_descr(offset: usize) -> DescrRef {
+    let parent = FUNCTION_DESCR_GROUP.size_descr.clone() as DescrRef;
+    majit_ir::descr::field_descr_from_parent_by_offset(&parent, offset)
+}
+
 /// Live `Function.defs_w` field used by the positional-default inline path.
 /// See [`FUNCTION_DESCR_GROUP`] for why this is deliberately mutable until
 /// pyre wires the upstream quasi-immutable invalidation hook.
 pub fn function_defs_w_descr() -> DescrRef {
-    field_descr_from_group(&FUNCTION_DESCR_GROUP, 0)
+    function_field_descr(pyre_interpreter::function::FUNCTION_DEFS_W_OFFSET)
 }
 
 /// Live `Function.code` — the field `Function.getcode()` promotes
 /// (`function.py:95 jit.promote(self.code)`).  This is what identifies an
 /// inlined body, so the inline lever guards it instead of the function object.
 pub fn function_code_descr() -> DescrRef {
-    field_descr_from_group(&FUNCTION_DESCR_GROUP, 1)
+    function_field_descr(pyre_interpreter::function::FUNCTION_CODE_OFFSET)
 }
 
-/// Live `Function.w_func_globals` — the namespace an inlined callee's
+/// Live `Function.w_func_globals_obj` — the namespace an inlined callee's
 /// LOAD_GLOBAL folds against.
 pub fn function_w_globals_descr() -> DescrRef {
-    field_descr_from_group(&FUNCTION_DESCR_GROUP, 2)
+    function_field_descr(pyre_interpreter::function::FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET)
 }
 
 /// Live `Function.closure` — the freevar cell tuple threaded into the inlined
 /// callee's own frame.
 pub fn function_closure_descr() -> DescrRef {
-    field_descr_from_group(&FUNCTION_DESCR_GROUP, 3)
+    function_field_descr(pyre_interpreter::function::FUNCTION_CLOSURE_OFFSET)
+}
+
+/// `function.py:51 self.name` — the pointer to the name string's storage.
+pub fn function_name_descr() -> DescrRef {
+    function_field_descr(pyre_interpreter::function::FUNCTION_NAME_OFFSET)
+}
+
+/// `Function.w_builtins` — the builtin mapping resolved from the globals
+/// once at construction and then frozen (rebinding `globals['__builtins__']`
+/// afterwards does not change it).
+pub fn function_w_builtins_descr() -> DescrRef {
+    function_field_descr(pyre_interpreter::function::FUNCTION_W_BUILTINS_OFFSET)
+}
+
+/// `function.py:54 self.qualname = qualname or self.name` — the wrapped
+/// qualified name stamped at construction from the code object.
+pub fn function_w_qualname_descr() -> DescrRef {
+    function_field_descr(pyre_interpreter::function::FUNCTION_W_QUALNAME_OFFSET)
+}
+
+/// `function.py:33 can_change_code = True` — a plain byte, so a fresh
+/// allocation does not zero it and an emit must write it.
+pub fn function_can_change_code_descr() -> DescrRef {
+    function_field_descr(std::mem::offset_of!(
+        pyre_interpreter::function::Function,
+        can_change_code
+    ))
+}
+
+/// Inherited `PyObject.w_class` on a `Function` — the Python-level `function`
+/// class the constructor's header stamps.  Kept in the Function group (not the
+/// standalone `w_class_descr`) so an inline emit's store is a virtual field of
+/// the same size descr and materialization reproduces the header.
+pub fn function_header_w_class_descr() -> DescrRef {
+    function_field_descr(pyre_object::pyobject::W_CLASS_OFFSET)
+}
+
+/// Size descriptor for `Function` allocation via `NewWithVtable`
+/// (vtable = `&FUNCTION_TYPE`).
+pub fn w_function_size_descr() -> DescrRef {
+    FUNCTION_DESCR_GROUP.size_descr.clone()
 }
 
 pub fn dict_keys_version_descr() -> DescrRef {

@@ -354,11 +354,77 @@ pub fn function_new_with_closure(
     function_new_impl(
         &FUNCTION_TYPE,
         code,
-        name,
+        FunctionName::Owned(name),
         w_func_globals_obj,
         closure,
         true,
     )
+}
+
+/// Where a new function's `name` slot points.
+///
+/// `function.py:51 self.name = forcename or code.co_name` copies the code
+/// object's own string; RPython strings are immutable and shared, so no second
+/// allocation exists upstream.  Pyre's names live in explicit storage, so the
+/// two shapes are named here: `Owned` boxes a string the caller built, while
+/// `Borrowed` hands over a pointer whose storage outlives every function that
+/// names it.
+pub enum FunctionName {
+    /// Box the string — a GC storage box for a mortal (`PyCode`) function, a
+    /// `malloc_raw` box for an immortal builtin.
+    Owned(String),
+    /// Point at existing permanent storage: a `Box::into_raw`'d `CodeObject`'s
+    /// `co_name`, which is never rewritten in place (`code.replace()` clones
+    /// first) and is never freed.  The GC walker's managed-heap guard skips the
+    /// edge for the same reason it skips an immortal builtin's `malloc_raw`
+    /// name, and `function_set_func_name` replaces this pointer instead of
+    /// writing through it, so several functions may share one string.
+    Borrowed(*const String),
+}
+
+/// `pyopcode.py:1457 MAKE_FUNCTION` construction: both the name and the
+/// qualified name come off the code object, so neither allocates.
+///
+/// `function.py:51-54`:
+///
+/// ```python
+/// self.name = forcename or code.co_name
+/// self.qualname = qualname or self.name
+/// ```
+///
+/// `w_code` is the code wrapper the new function keeps in its `code` slot; it
+/// owns the borrowed `co_name` and the shared realized `co_qualname`.
+pub fn function_new_from_code(w_code: PyObjectRef, w_func_globals_obj: PyObjectRef) -> PyObjectRef {
+    let code_ptr = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;
+    let name = if code_ptr.is_null() {
+        FunctionName::Owned(String::new())
+    } else {
+        FunctionName::Borrowed(unsafe { &(*code_ptr).obj_name } as *const String)
+    };
+    // `function.py:54 self.qualname = qualname or self.name`.  The code object
+    // realizes one wrapped qualname and every function built from it names that
+    // object, so a later `__code__ = new_code` assignment leaves
+    // `__qualname__` alone (`pyopcode.py:1457` stamps it at construction).
+    // Realize it BEFORE the function so the one allocation that can collect
+    // runs while no unrooted function is live.
+    unsafe { crate::pycode::w_code_qualname_obj(w_code) };
+    let func = function_new_impl(
+        &FUNCTION_TYPE,
+        w_code as *const (),
+        name,
+        w_func_globals_obj,
+        PY_NULL,
+        true,
+    );
+    // `pick_builtin_obj` inside the constructor is a collection point, so read
+    // the realized qualname back through the Box-immortal code wrapper (whose
+    // slot the raw-root walker forwards) rather than through a stale pre-call
+    // copy.  This second call is a plain cache hit.
+    let w_qualname = unsafe { crate::pycode::w_code_qualname_obj(w_code) };
+    if !w_qualname.is_null() {
+        unsafe { function_set_qualname(func, w_qualname) };
+    }
+    func
 }
 
 /// Allocate a `Function` object, GC-managed for user code and immortal for
@@ -373,7 +439,7 @@ pub fn function_new_with_closure(
 pub(crate) fn function_new_impl(
     ob_type: &'static PyType,
     code: *const (),
-    name: String,
+    name: FunctionName,
     w_func_globals_obj: PyObjectRef,
     closure: PyObjectRef,
     can_change_code: bool,
@@ -435,13 +501,16 @@ pub(crate) fn function_new_impl(
     // is stored into the Function below.
     let is_builtin =
         !code.is_null() && unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) };
-    let name_ptr = if is_builtin {
-        pyre_object::lltype::malloc_raw(name) as *const String
-    } else {
-        pyre_object::gc_storage::gc_alloc_storage_box(
+    let name_ptr = match name {
+        // Already-permanent storage owned by the code object; nothing to box.
+        FunctionName::Borrowed(ptr) => ptr,
+        FunctionName::Owned(name) if is_builtin => {
+            pyre_object::lltype::malloc_raw(name) as *const String
+        }
+        FunctionName::Owned(name) => pyre_object::gc_storage::gc_alloc_storage_box(
             name,
             pyre_object::typeobject::name_storage_gc_type_id(),
-        ) as *const String
+        ) as *const String,
     };
     let function = Function {
         ob: PyObject {
@@ -507,7 +576,7 @@ pub fn function_new_with_fixed_code(
     function_new_impl(
         &FUNCTION_TYPE,
         code,
-        name,
+        FunctionName::Owned(name),
         w_func_globals_obj,
         PY_NULL,
         false,
@@ -542,7 +611,7 @@ pub fn function_new_builtin(
     function_new_impl(
         &BUILTIN_FUNCTION_TYPE,
         code,
-        name,
+        FunctionName::Owned(name),
         w_func_globals_obj,
         PY_NULL,
         false,
@@ -551,7 +620,14 @@ pub fn function_new_builtin(
 
 /// Allocate an immutable slot-wrapper descriptor backed by `BuiltinCode`.
 pub fn function_new_slot_wrapper(code: *const (), name: String) -> PyObjectRef {
-    function_new_impl(&SLOT_WRAPPER_TYPE, code, name, PY_NULL, PY_NULL, false)
+    function_new_impl(
+        &SLOT_WRAPPER_TYPE,
+        code,
+        FunctionName::Owned(name),
+        PY_NULL,
+        PY_NULL,
+        false,
+    )
 }
 
 /// Retag a freshly materialised `FunctionWithFixedCode` as the public
@@ -566,7 +642,14 @@ pub unsafe fn function_retag_method_descriptor(obj: PyObjectRef) {
 
 /// Allocate an immutable ordinary method descriptor backed by `BuiltinCode`.
 pub fn function_new_method_descriptor(code: *const (), name: String) -> PyObjectRef {
-    function_new_impl(&METHOD_DESCRIPTOR_TYPE, code, name, PY_NULL, PY_NULL, false)
+    function_new_impl(
+        &METHOD_DESCRIPTOR_TYPE,
+        code,
+        FunctionName::Owned(name),
+        PY_NULL,
+        PY_NULL,
+        false,
+    )
 }
 
 /// function.py:385-388 — `_check_code_mutable(attr)`:

@@ -231,12 +231,61 @@ pub struct PyCode {
     /// never resized; a `null` slot is unrealized.  The whole pointer is `null`
     /// when `code_ptr` is null or unaligned (test fixtures, gateway builtins).
     pub co_consts_w: *mut Vec<std::sync::atomic::AtomicPtr<PyObject>>,
+    /// `pycode.py:127 self.co_qualname = qualname` realized as one shared
+    /// wrapped object.
+    ///
+    /// `function.py:54 self.qualname = qualname or self.name` copies the code
+    /// object's interp-level string into every function built from it, so all
+    /// of them name the same immutable string. Pyre wraps names as objects, so
+    /// the code object owns the single realized instance and both
+    /// `MAKE_FUNCTION` and the `co_qualname` getter hand back that object
+    /// instead of allocating a fresh `W_UnicodeObject` per read.
+    ///
+    /// `PY_NULL` until first realized by [`w_code_qualname_obj`], which builds
+    /// it with `w_str_new` — `malloc_typed`-immortal, so the stored pointer is
+    /// fixed.  `eval::walk_raw_code_roots` forwards the slot anyway, for the
+    /// same reason it forwards `w_globals`: the wrapper is Box-immortal, so
+    /// nothing else would reach a movable object landing here.
+    pub w_qualname: PyObjectRef,
 }
 
 /// Field offset of `code_ptr` within `PyCode`.
 pub const CODE_PTR_OFFSET: usize = std::mem::offset_of!(PyCode, code_ptr);
 /// Field offset of `w_globals` within `PyCode`.
 pub const CODE_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyCode, w_globals);
+/// Field offset of `w_qualname` within `PyCode`.
+pub const CODE_W_QUALNAME_OFFSET: usize = std::mem::offset_of!(PyCode, w_qualname);
+
+/// `pycode.py:127 self.co_qualname = qualname` — the shared wrapped qualified
+/// name, realized on first demand and retained on the code object.
+///
+/// `function.py:54 self.qualname = qualname or self.name` and the `co_qualname`
+/// getter both hand out the code object's own string, so they name one
+/// immutable value; realizing it once here reproduces that identity instead of
+/// minting a `W_UnicodeObject` per `def` and per attribute read.  Returns
+/// `PY_NULL` for a wrapper with no code body (test stubs, gateway builtins),
+/// whose callers already handle the missing name.
+///
+/// # Safety
+/// `w_code` must point to a valid `PyCode`.
+pub unsafe fn w_code_qualname_obj(w_code: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let cached = (*(w_code as *const PyCode)).w_qualname;
+        if !cached.is_null() {
+            return cached;
+        }
+        let code_ptr = w_code_get_ptr(w_code) as *const crate::CodeObject;
+        if code_ptr.is_null() {
+            return pyre_object::PY_NULL;
+        }
+        // `w_str_new` is a collection point, but the wrapper is Box-immortal
+        // and so never relocates; the fresh string is stored through the
+        // still-valid `w_code` before any further allocation can sweep it.
+        let w_qualname = w_str_new(&(*code_ptr).qualname);
+        (*(w_code as *mut PyCode)).w_qualname = w_qualname;
+        w_qualname
+    }
+}
 
 /// Box-immortal `PyCode` wrappers that own off-GC `w_globals` and
 /// `co_consts_w` slots.
@@ -454,6 +503,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         globals_caches,
         mapdict_caches,
         co_consts_w,
+        w_qualname: pyre_object::PY_NULL,
     });
     let obj = Box::into_raw(obj) as PyObjectRef;
     register_prebuilt_code_root(obj);
@@ -667,7 +717,10 @@ pub unsafe fn code_get_field(obj: PyObjectRef, name: &str) -> Result<PyObjectRef
         "co_cellvars" => names_tuple(&code.cellvars),
         "co_filename" => w_str_new(&code.source_path),
         "co_name" => w_str_new(&code.obj_name),
-        "co_qualname" => w_str_new(&code.qualname),
+        // The realized qualname is shared with every function built from this
+        // code object (`function.py:54 self.qualname = qualname or self.name`),
+        // so the attribute yields the same object on each read.
+        "co_qualname" => unsafe { w_code_qualname_obj(obj) },
         "co_firstlineno" => w_int_new((*(obj as *const PyCode)).co_firstlineno_raw as i64),
         "co_linetable" => pyre_object::bytesobject::w_bytes_from_bytes(&code.linetable),
         "co_exceptiontable" => pyre_object::bytesobject::w_bytes_from_bytes(&code.exceptiontable),
