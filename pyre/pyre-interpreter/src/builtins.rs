@@ -2395,6 +2395,16 @@ fn memoryview_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// Python 3.14 `memoryview.count(value)` — iteration is intentional: element
 /// decoding and equality therefore follow the view's live format exactly.
 fn memoryview_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    unsafe { memoryview_check_released(args[0])? };
+    let ndim = unsafe { pyre_object::memoryview::w_memoryview_ndim(args[0]) };
+    if ndim > 1 {
+        // CPython 3.14's memoryobject.c routes multidimensional count
+        // through the unsupported sub-view path.  Keep the same explicit
+        // boundary rather than silently counting only the first dimension.
+        return Err(crate::PyError::not_implemented(
+            "multi-dimensional sub-views are not implemented",
+        ));
+    }
     let iterator = crate::baseobjspace::iter(args[0])?;
     let mut count = 0i64;
     loop {
