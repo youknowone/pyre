@@ -597,10 +597,8 @@ pub fn try_gc_remove_root(slot: *mut *mut u8) -> bool {
 /// window) use this to discriminate GC-managed blocks from
 /// `std::alloc`-backed ones at dealloc time.
 pub type GcOwnsObjectHookFn = fn(addr: usize) -> bool;
-pub type GcCurrentObjectAddressHookFn = fn(addr: usize) -> usize;
 
 majit_gc::global_hook!(static GC_OWNS_OBJECT_HOOK: GcOwnsObjectHookFn);
-majit_gc::global_hook!(static GC_CURRENT_OBJECT_ADDRESS_HOOK: GcCurrentObjectAddressHookFn);
 
 /// Install the GC-ownership predicate. Overwrites any previously-
 /// installed hook.
@@ -611,16 +609,6 @@ pub fn register_gc_owns_object_hook(hook: GcOwnsObjectHookFn) {
 /// Remove the GC-ownership predicate.
 pub fn clear_gc_owns_object_hook() {
     GC_OWNS_OBJECT_HOOK.set(None);
-}
-
-/// Install the non-rooting current-address lookup hook.
-pub fn register_gc_current_object_address_hook(hook: GcCurrentObjectAddressHookFn) {
-    GC_CURRENT_OBJECT_ADDRESS_HOOK.set(Some(hook));
-}
-
-/// Remove the current-address lookup hook.
-pub fn clear_gc_current_object_address_hook() {
-    GC_CURRENT_OBJECT_ADDRESS_HOOK.set(None);
 }
 
 /// Whether `addr` lies inside the active backend's managed GC heap.
@@ -641,14 +629,21 @@ pub extern "C" fn try_gc_owns_object(addr: *mut u8) -> bool {
 }
 
 /// Return the current address for `addr` without registering it as a root.
-/// When no hook is installed, or the active GC does not know the object, the
-/// address is unchanged.
+/// When the active GC does not know the object, the address is unchanged.
+///
+/// Unlike the allocation and barrier hooks around it this one calls
+/// `majit_gc` outright.  The module rule those hooks encode is that
+/// `pyre-object` must not bind itself to a GC *implementation*;
+/// `gc_current_object_address` is not one — it is a backend-agnostic query
+/// that dispatches internally through `gc_is_nursery_object`'s own published
+/// bounds and hook, and answers `addr` for every address no GC owns,
+/// including before any GC exists.  Routing it through a second fn-pointer
+/// cell therefore bought nothing but an opaque call: every root pin and every
+/// root reload pays it, and behind it sits a two-word range compare that
+/// wants to be inlined into the caller.
 #[inline]
 pub fn try_gc_current_object_address(addr: *mut u8) -> *mut u8 {
-    match GC_CURRENT_OBJECT_ADDRESS_HOOK.get() {
-        Some(f) => f(addr as usize) as *mut u8,
-        None => addr,
-    }
+    majit_gc::gc_current_object_address(addr as usize) as *mut u8
 }
 
 /// minimark.py:1900-1915 `identityhash` hook.

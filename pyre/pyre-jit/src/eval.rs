@@ -338,10 +338,6 @@ fn pyre_object_gc_owns_object_trampoline(addr: usize) -> bool {
     majit_gc::gc_owns_object(addr)
 }
 
-fn pyre_object_gc_current_object_address_trampoline(addr: usize) -> usize {
-    majit_gc::gc_current_object_address(addr)
-}
-
 fn pyre_object_gc_identity_hash_trampoline(addr: usize) -> usize {
     majit_gc::gc_id_or_identityhash(addr)
 }
@@ -3942,9 +3938,6 @@ fn install_pyre_object_hooks() {
         pyre_object_gc_remove_root_trampoline,
     );
     pyre_object::register_gc_owns_object_hook(pyre_object_gc_owns_object_trampoline);
-    pyre_object::register_gc_current_object_address_hook(
-        pyre_object_gc_current_object_address_trampoline,
-    );
     pyre_object::register_gc_write_barrier_hook(pyre_object_gc_write_barrier_trampoline);
     pyre_object::register_gc_write_barrier_managed_hook(
         pyre_object_gc_write_barrier_managed_trampoline,

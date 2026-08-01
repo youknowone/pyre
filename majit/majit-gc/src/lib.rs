@@ -2148,6 +2148,10 @@ pub fn disarm_published_nursery() {
 }
 
 /// Whether `addr` is a live object in the active backend's nursery.
+///
+/// `#[inline]`: the armed path is a two-word range compare, and the callers
+/// that matter are the per-pin / per-barrier queries next door.
+#[inline]
 pub fn gc_is_nursery_object(addr: usize) -> bool {
     if PUBLISHED_NURSERY_ARMED.load(std::sync::atomic::Ordering::Acquire) {
         // `is_nursery_object_start` = `is_valid_gc_object && is_in_nursery`.
@@ -2172,6 +2176,7 @@ pub fn gc_is_nursery_object(addr: usize) -> bool {
 /// Return the current address for a managed object without treating it as a
 /// root. During a minor collection this follows an already-installed nursery
 /// forwarding pointer; otherwise it returns `addr` unchanged.
+#[inline]
 pub fn gc_current_object_address(addr: usize) -> usize {
     // Only a nursery address can carry a forwarding stub: `_trace_drag_out`
     // installs one at the young object's old address, and the major collection
