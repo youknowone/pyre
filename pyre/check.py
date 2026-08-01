@@ -498,13 +498,12 @@ def _jit_stats_diff(saved, current, limit=6):
 # coverage gap that is tracked elsewhere — the synth fixtures below carry
 # `LoopBearingCalleeInlineUnsupported`, the walker's open gap on inlining a
 # loop-bearing callee. Either way the baseline pins the count those known
-# declines produce today and the gate fires on a rise, which means a loop that
-# used to compile has stopped compiling. `loops_compiled` and
-# `bridges_compiled` stay out: they move in both directions under ordinary
-# tuning, an equality gate on them would redden on every legitimate change, and
-# neither direction is a defect on its own. `guard_failures` also moves both
-# ways, but only its rise is a defect, so it gates through
-# JITSTATS_RISE_BOUNDED_FIELDS below rather than staying informational.
+# declines produce today and the gate fires on a rise, which means a loop the
+# tracer used to finish has stopped finishing. `bridges_compiled` stays out
+# entirely: it moves in both directions under ordinary tuning and neither
+# direction is a defect on its own. The other two count-valued counters each
+# have ONE defect direction and gate through their own tuple below —
+# `guard_failures` on a bounded rise, `loops_compiled` on any fall.
 #
 # `descr_set_absent`, `descr_set_ambiguous` and `descr_set_stale_absent` are the
 # descr-universe invariants. Upstream cannot reach any of the three —
@@ -528,15 +527,15 @@ JITSTATS_BADNESS_FIELDS = (
 # Counters gated on a bounded RISE rather than on any rise at all: a fall is
 # free, and a rise fails only past `base + max(base // 4, 2)`.
 #
-# `guard_failures` is what tracks the deopt-storm class. A loop whose guards are
-# unstable pays a full metainterp entry per failure, and that cost is invisible
-# to every other gate here: `max-pypy-ratio` is one absolute ceiling per fixture
-# (a fixture sitting at 8.9x under a limit of 20 absorbs a 1.5x regression and
-# still passes), and the badness floor above says nothing whenever the storm
-# traces cleanly. The counter is the direct measure — narrowing
-# `nested_break_bridge_resume_hazard` so recursion_memo_branch's `main` compiles
-# moves it 1757 -> 2613 (+49%) for a 1.2x-1.5x slowdown, and the ratio gate does
-# not notice.
+# `guard_failures` counts every guard failure that re-enters the metainterp, so
+# it is the counter that moves when a compiled loop's guards start failing more
+# often — a cost `max-pypy-ratio` cannot see, because that ceiling is one
+# absolute number per fixture: recursion_memo_branch sits near 8.9x under a
+# limit of 20, so it absorbs a 2x regression and still passes. Narrowing
+# `nested_break_bridge_resume_hazard` so that fixture's `main` compiles moves
+# the counter 1757 -> 2613 (+49%) and measures slower, and no other gate here
+# notices: nothing aborts, so the badness floor holds, and the ratio keeps 2.2x
+# of slack.
 #
 # It is deterministic by construction, not by luck: a guard's counter hash comes
 # from `JitCounter.fetch_next_hash` (counter.py:142-150), a pure sequence with
@@ -547,6 +546,26 @@ JITSTATS_BADNESS_FIELDS = (
 # term is for a fixture whose baseline is a handful of guards, where one more
 # guard is not yet a storm.
 JITSTATS_RISE_BOUNDED_FIELDS = ("guard_failures",)
+
+# Counters gated on any FALL below the baseline. `loops_compiled` closes the
+# blind spot the two tuples above leave open: a change that makes the tracer
+# stop admitting a frame at all — a widened `unsupported_jit_shape` predicate, a
+# pre-trace decline — aborts nothing (`loops_aborted` holds) and *lowers*
+# `guard_failures` (the compiled guards that used to fail are gone), so both
+# gates above read the loss as an improvement and the fixture goes green while
+# its hot loop runs interpreted.
+#
+# A fall is gated exactly, with no band, because this is the most stable counter
+# on the surface: across the 341 synthetic fixtures the dynasm and cranelift
+# baselines — two independent code generators — agree on `loops_compiled` for
+# 340 of them (99.7%), against 97.4% for `guard_failures`, which is why that one
+# needs a band and this one does not.
+#
+# A fall is not *always* a defect: two loops merging into one trace lowers the
+# count while raising coverage. That is the same bargain `loops_aborted` already
+# makes in the other direction — an intentional structural change re-records its
+# baseline, and the gate is what forces someone to look.
+JITSTATS_FALL_FIELDS = ("loops_compiled",)
 
 # What a committed `.jitstats` baseline is allowed to contain. `_jit_stats_snapshot`
 # merges every `[jit-stats]` line so the floor above cannot be disarmed by
@@ -578,29 +597,37 @@ def _jit_stats_regression_floor(saved, current):
     """Return a failure reason if a gated counter rose above what its committed
     baseline allows, else "". For JITSTATS_BADNESS_FIELDS the allowance is the
     baseline itself: a rise means the JIT started aborting traces or hitting
-    internal compile panics it did not before — a defect on any platform. For
-    JITSTATS_RISE_BOUNDED_FIELDS the allowance carries the band documented
-    there. A counter that falls (an improvement) or holds never gates.
+    internal compile panics it did not before — a defect on any platform.
+    JITSTATS_RISE_BOUNDED_FIELDS carries the band documented there, and
+    JITSTATS_FALL_FIELDS gates the opposite direction. A counter that moves the
+    way its group calls an improvement, or holds, never gates.
 
     A field missing from either side is read as 0 for the badness counters,
     whose healthy value IS 0, so they gate from the first run without
-    re-recording. A rise-bounded counter has no such healthy value, so a
-    baseline that does not name it is treated as not pinning it at all — a
-    baseline recorded before the field existed must not read as `0 -> 1757`."""
+    re-recording. The count-valued counters have no such healthy value, so a
+    baseline that does not name one is treated as not pinning it at all — a
+    baseline recorded before the field existed must not read as `0 -> 1757`,
+    and the wasm [jit-stats] line reports neither of them."""
     old_fields = _parse_jit_stats(saved)
     new_fields = _parse_jit_stats(current)
     regressions = []
-    for field in JITSTATS_BADNESS_FIELDS + JITSTATS_RISE_BOUNDED_FIELDS:
-        bounded = field in JITSTATS_RISE_BOUNDED_FIELDS
-        if bounded and field not in old_fields:
+    for field in (
+        JITSTATS_BADNESS_FIELDS + JITSTATS_RISE_BOUNDED_FIELDS + JITSTATS_FALL_FIELDS
+    ):
+        if field not in JITSTATS_BADNESS_FIELDS and field not in old_fields:
             continue
         try:
             base = int(old_fields.get(field, 0))
             cur = int(new_fields.get(field, 0))
         except ValueError:
             continue
-        allowed = base + max(base // 4, 2) if bounded else base
-        if cur > allowed:
+        if field in JITSTATS_RISE_BOUNDED_FIELDS:
+            regressed = cur > base + max(base // 4, 2)
+        elif field in JITSTATS_FALL_FIELDS:
+            regressed = cur < base
+        else:
+            regressed = cur > base
+        if regressed:
             regressions.append(f"{field} {base} -> {cur}")
     if regressions:
         return "jit-stats regression: " + ", ".join(regressions)
@@ -978,6 +1005,23 @@ class Check:
             )
             if floor:
                 return "fail", floor
+
+        # A benchmark with no committed baseline runs every gate above against
+        # nothing and prints PASS, so "never recorded" is indistinguishable from
+        # "recorded and clean" — which is how the floor came to cover 3 of 340
+        # synthetic fixtures without anyone noticing. Every benchmark that
+        # reaches here emitted a `[jit-stats]` line, so the baseline is always
+        # recordable; requiring it is what stops a newly added fixture from
+        # silently reopening that hole.
+        if (
+            self.args.snapshot_mode != "record"
+            and jitstats is not None
+            and not jitstats_path.exists()
+        ):
+            return "fail", (
+                f"no committed jit-stats baseline ({jitstats_path.name}) — record it with "
+                f"`pyre/check.py --snapshot --backend {backend}`"
+            )
 
         if self.args.snapshot_mode == "record":
             out_path.parent.mkdir(parents=True, exist_ok=True)
