@@ -717,6 +717,19 @@ impl FrameBox {
         self.ptr
     }
 
+    /// Does the collector own this frame, so that [`Drop`] leaves the memory
+    /// alive for whatever roots still reach it?
+    ///
+    /// `false` is the [`FrameBox::new_boxed`] fallback, whose `Drop` frees the
+    /// frame at scope end — a caller that publishes `as_mut_ptr` past its own
+    /// scope must ask this first.  Answered from the ownership decision
+    /// [`FrameBox::new`] already made, so it neither re-enters the collector
+    /// (an ownership query can park behind another thread's collection) nor
+    /// relies on an address range test.
+    pub fn is_gc_owned(&self) -> bool {
+        self.owner_root.is_some()
+    }
+
     /// pyframe.py:259 initialize_as_generator — wrap this frame in a generator
     /// object that takes ownership of it. PyPy does `GeneratorIterator(self)`:
     /// the generator references the same frame, no copy. FrameBox already holds

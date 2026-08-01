@@ -13585,6 +13585,16 @@ pub(crate) fn setup_reconstructed_callee_frame(
             pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
         ),
     );
+    // The `drop(concrete_frame)` below relinquishes only the host handle for a
+    // GC-owned frame. `FrameBox::new` falls back to `new_boxed` whenever the
+    // stable allocator answers null, and that box's `drop` FREES the frame —
+    // which would leave the `pending.sym.concrete_vable_ptr` published further
+    // down dangling for the rest of the recording. Decline rather than publish
+    // a pointer this scope is about to invalidate; the `FrameBox` then frees
+    // itself on the way out, as it should.
+    if !concrete_frame.is_gc_owned() {
+        return None;
+    }
     let concrete_frame_ptr = concrete_frame.as_mut_ptr();
     ctx.set_opref_concrete(
         frame_vable,
