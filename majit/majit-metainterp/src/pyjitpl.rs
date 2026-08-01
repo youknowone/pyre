@@ -7438,6 +7438,13 @@ impl<M: Clone> MetaInterp<M> {
         // Import the exported state from the first (failed) attempt so the
         // optimizer can continue from where it left off.
         unroll_opt.imported_state = Some(start_state);
+        // compile.py:381-382 `loop.operations + extra_same_as + [label_op] +
+        // loop_ops`: a retrace splices ONLY the loop label. The
+        // `[start_label]` of compile.py:327-328 is compile_loop's, and it
+        // goes FIRST there; emitting it here would leave a second LABEL
+        // sitting between the saved preamble and the loop label, declaring
+        // the pre-peel arg set for slots the loop label rebinds.
+        unroll_opt.emit_start_label = false;
 
         let optimize_result = unroll_opt.optimize_trace_with_constants_and_inputs_vable(
             &trace_ops,

@@ -266,6 +266,15 @@ pub struct UnrollOptimizer {
     /// When set, Phase 1 (preamble) is skipped and Phase 2 uses this state
     /// directly, matching UnrolledLoopData.optimize → optimize_peeled_loop.
     pub imported_state: Option<ExportedState>,
+    /// compile.py:327-328 vs compile.py:381-382: `compile_loop` assembles
+    /// `[start_label] + preamble_ops + ... + [label_op] + loop_ops`, but
+    /// `compile_retrace` assembles `loop.operations + extra_same_as +
+    /// [label_op] + loop_ops` — a retrace has NO start label, because its
+    /// entry is the failing guard the resumekey attaches it to, not a fresh
+    /// loop header. RPython splits this by having the two callers assemble
+    /// the op list themselves; majit's optimizer returns it pre-assembled,
+    /// so `compile_retrace` clears this flag instead.
+    pub emit_start_label: bool,
     /// Phase 1's finalized ExportedState, retained across the Phase 2 run
     /// so the caller of `optimize_trace_*` can consult the renamed inputarg
     /// types that the optimizer decided on. RPython does not need this
@@ -378,6 +387,7 @@ impl UnrollOptimizer {
             retrace_limit: 5,
             max_retrace_guards: 15,
             imported_state: None,
+            emit_start_label: true,
             final_exported_state: None,
             final_exported_label_source_positions: None,
             snapshot_boxes: Vec::new(),
@@ -1891,6 +1901,7 @@ impl UnrollOptimizer {
             &consts_p2,
             self.target_tokens
                 .first()
+                .filter(|_| self.emit_start_label)
                 .map(|target| target.as_jump_target_descr()),
             self.target_tokens
                 .last()
