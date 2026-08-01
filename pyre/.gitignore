@@ -1,15 +1,12 @@
 /target
 **/*.rs.bk
 Cargo.lock
-# check.py local scratch: .out/.time snapshots and synthetic .jitstats.
-# The committed benchmark baselines live at pyre/bench/*.jitstats.
+# check.py local scratch: the per-run .out/.time snapshots.
+#
+# The `.jitstats` baselines beside each benchmark are COMMITTED, synthetic ones
+# included. check.py's regression floor reads them on every invocation, so a
+# fixture with no committed baseline is not "ungated by default" — it is
+# silently ungated, which reads as green. That floor is also the only gate wasm
+# has at all: run_synthetic_bench passes vs_pypy=None for wasm, so no perf ratio
+# can catch a wasm-only trace-abort storm there.
 /check.snap/
-/bench/synth/*.jitstats
-# Exceptions: synthetic benches whose structural counters are a committed gate.
-# check.py's regression floor reads loops_aborted/internal_compile_panics from
-# these on every run, which is the only gate wasm has — run_synthetic_bench
-# passes vs_pypy=None for wasm, so no perf ratio can catch a wasm-only trace
-# abort storm there.
-!/bench/synth/comprehension_object_append_hot.*.jitstats
-!/bench/synth/const_arg_call_resume.*.jitstats
-!/bench/synth/nested_list_comprehension_hot.*.jitstats
