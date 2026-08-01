@@ -2236,45 +2236,47 @@ fn instance_write_barrier(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
-/// The one storage slot of `map` that holds the erased `Vec<i64>` unboxing
-/// bank, if the chain has one.
+/// Whether `index` is the storage slot of a `firstunwrapped` attribute in
+/// `map`'s chain. Such a slot holds an erased `Vec<i64>` unboxing bank, not a
+/// GCREF, and must never enter the shadow stack or the marking worklist.
 ///
-/// A chain has at most one: `_compute_storageindex_listindex`
-/// (mapdict.py:549-562) walks back and breaks at the first
-/// `UnboxedPlainAttribute` ancestor, reusing its `storageindex`, and only sets
-/// `firstunwrapped` when the walk finds none. Every later unboxed attribute
-/// therefore shares that same slot and differs only in `listindex`.
+/// The whole chain is scanned rather than stopping at the first
+/// `firstunwrapped` node. `_compute_storageindex_listindex`
+/// (mapdict.py:549-562) does imply a chain holds at most one — it breaks at
+/// the first `UnboxedPlainAttribute` ancestor and only sets `firstunwrapped`
+/// when it finds none — but the collector is the wrong place to depend on
+/// that, since under-reporting one slot hands the marker a raw `Vec` pointer.
 ///
 /// Allocation-free by contract: the GC trace hook calls this while marking,
 /// where taking the global allocator would be a reentrancy hazard.
-unsafe fn unboxed_storage_index(map: MapRef) -> Option<usize> {
+unsafe fn storage_index_is_unboxed(map: MapRef, index: usize) -> bool {
     let mut node = map;
     while !node.is_null() {
         match unsafe { &*node } {
             MapNode::Plain(p) => {
                 if let Some(u) = &p.unboxed
                     && u.firstunwrapped
+                    && p.storageindex == index
                 {
-                    return Some(p.storageindex);
+                    return true;
                 }
                 node = p.back;
             }
             MapNode::Terminator(_) => break,
         }
     }
-    None
+    false
 }
 
-/// Return the storage indices that contain real GCREFs for `map`; the slot
-/// owned by the first `UnboxedPlainAttribute` contains an erased `Vec<i64>`
-/// pointer and must never enter the shadow stack.
+/// Return the storage indices that contain real GCREFs for `map`.
 unsafe fn boxed_storage_indices(map: MapRef, len: usize) -> Vec<usize> {
-    let unboxed = unsafe { unboxed_storage_index(map) };
-    (0..len).filter(|&i| Some(i) != unboxed).collect()
+    (0..len)
+        .filter(|&i| !unsafe { storage_index_is_unboxed(map, i) })
+        .collect()
 }
 
 unsafe fn storage_index_is_boxed(map: MapRef, index: usize) -> bool {
-    unsafe { unboxed_storage_index(map) != Some(index) }
+    !unsafe { storage_index_is_unboxed(map, index) }
 }
 
 impl MapdictObject for pyre_object::W_ObjectObject {
@@ -3979,12 +3981,11 @@ pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*m
         // The storage block is exact-size (capacity == map.storage_needed()).
         let len = pyre_object::object_array::items_block_capacity(inst.storage);
         let base = pyre_object::object_array::items_block_items_base(inst.storage);
-        // Resolve the mask once and iterate in place: this runs inside the
-        // collector's marking walk, where a heap allocation per traced instance
-        // is both a per-object cost and a reentrancy hazard.
-        let unboxed = unboxed_storage_index(inst.map as MapRef);
+        // Test each slot in place: this runs inside the collector's marking
+        // walk, where the previous `Vec` pair per traced instance was both a
+        // per-object cost and a reentrancy hazard.
         for i in 0..len {
-            if Some(i) != unboxed {
+            if !storage_index_is_unboxed(inst.map as MapRef, i) {
                 f(base.add(i));
             }
         }
