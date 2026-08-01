@@ -1016,12 +1016,17 @@ impl FixedObjectArray {
         crate::gc_roots::pin_root(self as *mut Self as PyObjectRef);
         crate::gc_roots::pin_root(value);
         let array = crate::gc_roots::shadow_stack_get(root_base) as *mut Self;
-        if crate::gc_hook::try_gc_owns_object(array as *mut u8) {
-            crate::gc_hook::try_gc_write_barrier(array as *mut u8);
-        }
-        // Both ownership lookup and the barrier may wait behind a foreign
-        // collection.  Reload the array as well as the value before the store:
-        // RPython's setarrayitem_gc keeps both live across the barrier.
+        // Every mutable FixedObjectArray has a real header word: managed frame
+        // locals carry the collector's header, while the StdAlloc snapshot
+        // fallback is deliberately prefixed with a zeroed one
+        // (`alloc_fixed_array_with_header`).  This is therefore the ordinary
+        // RPython `setarrayitem_gc` shape: test the header flag directly and
+        // enter the membership-free slow path only when it is set.  The zeroed
+        // fallback header makes the same call a no-op without an arena lookup.
+        crate::gc_hook::try_gc_write_barrier_managed(array as *mut u8);
+        // The barrier may wait behind a foreign collection. Reload the array
+        // as well as the value before the store: RPython's setarrayitem_gc
+        // keeps both live across the barrier.
         let array = crate::gc_roots::shadow_stack_get(root_base) as *mut Self;
         let value = crate::gc_roots::shadow_stack_get(root_base + 1);
         unsafe { (*array).items_mut_ptr().add(index).write(value) };
