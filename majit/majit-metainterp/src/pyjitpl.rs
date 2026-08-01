@@ -813,6 +813,18 @@ pub(crate) struct CompiledEntry<M> {
     /// Front-end loop-version state, mirroring RPython's
     /// jitcell_token.target_tokens ownership across recompilations.
     pub(crate) front_target_tokens: Vec<crate::history::TargetToken>,
+    /// Index into `front_target_tokens` of the LABEL the Cranelift host
+    /// enters this loop through, decided once when the entry is installed.
+    ///
+    /// Upstream has no counterpart: `JitCellToken.target_tokens`
+    /// (history.py:440) is only ever scanned (unroll.py:198/239/277/325) and
+    /// appended to (unroll.py:297) — never consulted to choose an entry,
+    /// because PyPy's x86 backend keeps a machine-code address per
+    /// TargetToken (`_ll_loop_code`). Cranelift exposes one function entry,
+    /// so majit has to name the LABEL explicitly. Storing the choice here
+    /// means appending a newly specialized label to the scan list can never
+    /// move the front door.
+    pub(crate) front_entry_index: Option<usize>,
     /// Direct TargetToken LABEL entry source positions in the root/full entry
     /// vector. For unrolled loops this is the position of every non-constant
     /// `ExportedState.end_args` entry, matching `VirtualState.make_inputargs`'
@@ -6575,6 +6587,10 @@ impl<M: Clone> MetaInterp<M> {
                     if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
                         if compiled.front_target_tokens.is_empty() {
                             compiled.front_target_tokens = unroll_opt.target_tokens.clone();
+                            if compiled.front_entry_index.is_none() {
+                                compiled.front_entry_index =
+                                    Self::front_entry_index_for(&compiled.front_target_tokens);
+                            }
                         }
                     } else if !self
                         .pending_preamble_tokens
@@ -6701,6 +6717,7 @@ impl<M: Clone> MetaInterp<M> {
                 if crate::jitdriver::spdiag_enabled() {
                     eprintln!("@@@SPDIAG compiled_loops.insert green_key={green_key}");
                 }
+                let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
                 token.set_retraced_count(final_retraced_count);
                 self.compiled_loops.insert(
                     green_key,
@@ -6708,6 +6725,7 @@ impl<M: Clone> MetaInterp<M> {
                         token: Arc::downgrade(&token),
                         meta,
                         front_target_tokens,
+                        front_entry_index,
                         front_target_source_positions,
                         root_trace_id: trace_id,
                         traces,
@@ -7810,17 +7828,20 @@ impl<M: Clone> MetaInterp<M> {
                         "@@@SPDIAG FINISH-compile compiled_loops.insert green_key={green_key}"
                     );
                 }
+                let front_target_tokens = if unroll_opt.target_tokens.is_empty() {
+                    prior_front_target_tokens
+                } else {
+                    unroll_opt.target_tokens.clone()
+                };
+                let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
                 token.set_retraced_count(unroll_opt.retraced_count);
                 self.compiled_loops.insert(
                     green_key,
                     CompiledEntry {
                         token: Arc::downgrade(&token),
                         meta,
-                        front_target_tokens: if unroll_opt.target_tokens.is_empty() {
-                            prior_front_target_tokens
-                        } else {
-                            unroll_opt.target_tokens.clone()
-                        },
+                        front_target_tokens,
+                        front_entry_index,
                         front_target_source_positions: None,
                         root_trace_id: trace_id,
                         traces,
@@ -8026,21 +8047,12 @@ impl<M: Clone> MetaInterp<M> {
                     // land there whichever way the artifact is installed;
                     // otherwise no later bridge can ever reach this retrace's
                     // label and each one grows another guard-attached retrace.
-                    // majit additionally overloads this list as the front-entry
-                    // selector, which upstream never does. The write-back is
-                    // order-preserving (`unroll_opt.target_tokens` opens as a
-                    // clone of this list and only appends), so
-                    // `selected_front_target_token`'s "first non-preamble"
-                    // pick is unchanged whenever the parent already has one.
-                    // If the parent has only preamble targets, the appended
-                    // retrace label is selected but
-                    // `compact_label_values_for_selected_target` cannot find
-                    // that descr among the PARENT's ops and returns `None`, so
-                    // the direct-entry path declines rather than entering the
-                    // retrace. Splitting the scan list from the front-entry
-                    // selector is the follow-up that removes the overload.
                     if !unroll_opt.target_tokens.is_empty() {
                         compiled.front_target_tokens = unroll_opt.target_tokens.clone();
+                        if compiled.front_entry_index.is_none() {
+                            compiled.front_entry_index =
+                                Self::front_entry_index_for(&compiled.front_target_tokens);
+                        }
                     }
                     let (mut resume_data, mut exit_layouts) =
                         compile::build_guard_metadata(&inputargs, &combined_ops, green_key, fvc);
@@ -8672,12 +8684,14 @@ impl<M: Clone> MetaInterp<M> {
                     for target_token in &ft {
                         token.record_target_token(target_token.as_jump_target_descr());
                     }
+                    let front_entry_index = Self::front_entry_index_for(&ft);
                     self.compiled_loops.insert(
                         green_key,
                         CompiledEntry {
                             token: Arc::downgrade(&token),
                             meta,
                             front_target_tokens: ft,
+                            front_entry_index,
                             front_target_source_positions: None,
                             root_trace_id: trace_id,
                             traces,
@@ -9002,12 +9016,15 @@ impl<M: Clone> MetaInterp<M> {
                     next_global_opref = next_global_opref.max(old_entry.next_global_opref);
                     previous_tokens = self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
+                let front_target_tokens = vec![target_token];
+                let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
                 self.compiled_loops.insert(
                     green_key,
                     CompiledEntry {
                         token: Arc::downgrade(&token),
                         meta,
-                        front_target_tokens: vec![target_token],
+                        front_target_tokens,
+                        front_entry_index,
                         front_target_source_positions: None,
                         root_trace_id: trace_id,
                         traces,
@@ -9171,23 +9188,19 @@ impl<M: Clone> MetaInterp<M> {
         Some(packed)
     }
 
+    fn front_entry_index_for(tokens: &[crate::history::TargetToken]) -> Option<usize> {
+        tokens
+            .iter()
+            .position(|target| !target.is_preamble_target)
+            .or_else(|| if tokens.is_empty() { None } else { Some(0) })
+    }
+
     fn selected_front_target_token<'a>(
         compiled: &'a CompiledEntry<M>,
     ) -> Option<&'a crate::history::TargetToken> {
         compiled
             .front_target_tokens
-            .iter()
-            .find(|target| !target.is_preamble_target)
-            .or_else(|| compiled.front_target_tokens.first())
-    }
-
-    fn selected_front_target_token_from_slice<'a>(
-        front_target_tokens: &'a [crate::history::TargetToken],
-    ) -> Option<&'a crate::history::TargetToken> {
-        front_target_tokens
-            .iter()
-            .find(|target| !target.is_preamble_target)
-            .or_else(|| front_target_tokens.first())
+            .get(compiled.front_entry_index?)
     }
 
     fn compact_label_values_for_selected_target(
@@ -9197,7 +9210,8 @@ impl<M: Clone> MetaInterp<M> {
         trace: &TreeLoop,
         full_live_values: Option<&[Value]>,
     ) -> Option<(u64, Vec<Value>)> {
-        let front_target = Self::selected_front_target_token_from_slice(front_target_tokens)?;
+        let front_target =
+            front_target_tokens.get(Self::front_entry_index_for(front_target_tokens)?)?;
         let target_descr = front_target.as_jump_target_descr();
         let label = compiled_ops.iter().find(|op| {
             op.opcode == OpCode::Label
@@ -11385,6 +11399,7 @@ impl<M: Clone> MetaInterp<M> {
                     previous_tokens =
                         self.retire_compiled_entry(original_green_key, old_entry, &mut traces);
                 }
+                let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
                 token.set_retraced_count(retraced_count);
                 self.compiled_loops.insert(
                     original_green_key,
@@ -11392,6 +11407,7 @@ impl<M: Clone> MetaInterp<M> {
                         token: Arc::downgrade(&token),
                         meta,
                         front_target_tokens,
+                        front_entry_index,
                         front_target_source_positions: None,
                         root_trace_id: trace_id,
                         traces,
@@ -11841,6 +11857,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         if let Some(tokens) = crossed_target_tokens {
             if let Some(compiled) = self.compiled_loops.get_mut(&cell_token_key) {
+                compiled.front_entry_index = Self::front_entry_index_for(&tokens);
                 compiled.front_target_tokens = tokens;
             }
         }
@@ -20832,6 +20849,7 @@ mod tests {
                 token: std::sync::Arc::downgrade(&token),
                 meta: (),
                 front_target_tokens: vec![start_token],
+                front_entry_index: Some(0),
                 front_target_source_positions: None,
                 root_trace_id: trace_id,
                 traces,
@@ -21104,6 +21122,7 @@ mod tests {
                 token: std::sync::Arc::downgrade(&token),
                 meta: (),
                 front_target_tokens: Vec::new(),
+                front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: trace_id,
                 traces,
@@ -21198,6 +21217,7 @@ mod tests {
                 token: std::sync::Arc::downgrade(&token),
                 meta: (),
                 front_target_tokens: Vec::new(),
+                front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: trace_id,
                 traces,
@@ -21508,6 +21528,7 @@ mod tests {
                 token: std::sync::Arc::downgrade(&token_arc),
                 meta: (),
                 front_target_tokens: Vec::new(),
+                front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: trace_id,
                 traces,
@@ -22325,6 +22346,7 @@ mod tests {
                 token: std::sync::Arc::downgrade(&token),
                 meta: (),
                 front_target_tokens: Vec::new(),
+                front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 0,
                 traces: indexmap::IndexMap::new(),
@@ -23065,6 +23087,7 @@ mod bridge_cell_token_tests {
                 token: std::sync::Weak::new(),
                 meta: (),
                 front_target_tokens: Vec::new(),
+                front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: green_key,
                 traces: indexmap::IndexMap::new(),
@@ -23117,6 +23140,7 @@ mod loop_side_table_tests {
             token: std::sync::Weak::new(),
             meta: (),
             front_target_tokens: Vec::new(),
+            front_entry_index: None,
             front_target_source_positions: None,
             root_trace_id,
             traces: indexmap::IndexMap::new(),
