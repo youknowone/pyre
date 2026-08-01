@@ -5570,8 +5570,19 @@ impl<M: Clone> MetaInterp<M> {
                 // pyjitpl.py:2994: if start != self.retracing_from
                 // Find the merge point whose position matches retracing_from.
                 // pyjitpl.py:2994: iterate current_merge_points in reverse,
-                // check same_greenkey and position match. Use header_pc
-                // for precise matching across root/inner key registrations.
+                // check same_greenkey and position match.
+                //
+                // `same_greenkey(original_boxes, live_arg_boxes,
+                // num_green_args)` (pyjitpl.py:3021) compares a merge
+                // point's greens against the greens the trace is closing
+                // WITH — `live_arg_boxes`, this call's argument — not
+                // against anything carried on the session. `close_greens`
+                // is majit's `live_arg_boxes[:num_green_args]`;
+                // `ctx.header_pc` is the header the walk last registered,
+                // which a close on a different loop leaves stale. Matching
+                // on the stale pc finds a merge point whose greens differ
+                // from the close and retraces it, where upstream's
+                // `continue` falls out of the scan and appends instead.
                 //
                 // pyjitpl.py:3018-3031 is a SCAN with three outcomes, not a
                 // two-way test:
@@ -5598,7 +5609,7 @@ impl<M: Clone> MetaInterp<M> {
                 let merge_position = self
                     .tracing
                     .as_ref()
-                    .and_then(|ctx| ctx.get_merge_point_at(ctx.green_key, ctx.header_pc))
+                    .and_then(|ctx| ctx.get_merge_point_at(ctx.green_key, ctx.close_header_pc()))
                     .map(|mp| mp.position);
                 if merge_position.is_none() {
                     self.register_retrace_merge_point(jump_args);
@@ -6862,7 +6873,12 @@ impl<M: Clone> MetaInterp<M> {
             return;
         }
         let key = ctx.green_key;
-        let header_pc = ctx.header_pc;
+        // pyjitpl.py:3059-3060 `self.current_merge_points.append(
+        // (live_arg_boxes, start))` appends the greens the trace is closing
+        // WITH, which is the same list the `same_greenkey` scan above
+        // compares against. Register under those greens' header so the next
+        // visit's scan can find this entry.
+        let header_pc = ctx.close_header_pc();
         ctx.add_merge_point(key, green_boxes, header_pc);
         if crate::majit_log_enabled() {
             eprintln!(
