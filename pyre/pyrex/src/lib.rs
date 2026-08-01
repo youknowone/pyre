@@ -937,6 +937,7 @@ fn maybe_print_jit_stats() {
         }
     }
     maybe_print_mc_diag();
+    maybe_print_gc_diag();
     if std::env::var_os("MAJIT_STATS").is_none() {
         return;
     }
@@ -1003,6 +1004,27 @@ use majit_metainterp::MC_DIAG_LABELS as MC_DIAG_FIELDS;
 /// `_jit_stats_snapshot` keeps the LAST such line, so a second one would
 /// silently replace the committed per-bench baseline. Its own env gate keeps it
 /// off the default `check.py` run, which sets `MAJIT_STATS` for every bench.
+/// Print the GC's deterministic pressure counters.
+///
+/// The perf question this answers is the one a loaded machine's clock cannot:
+/// "did that change actually allocate less?".  A minor collection happens once
+/// per nursery-full, so `minor` is a direct proxy for cumulative allocation and
+/// is identical across runs of the same program — unlike wall or even user CPU
+/// time, which on this tree can swing by more than any single change is worth.
+///
+/// Same prefix discipline as [`maybe_print_mc_diag`]: not `[jit-stats]`, and
+/// behind its own env gate, so the committed per-bench baselines never see it.
+fn maybe_print_gc_diag() {
+    if std::env::var_os("PYRE_GC_DIAG").is_none() {
+        return;
+    }
+    let (minor, major, heap_bytes, nursery_bytes) = pyre_jit::gc_diag_counters();
+    eprintln!(
+        "[jit-gc-diag] minor={minor} major={major} heap_bytes={heap_bytes} \
+         nursery_bytes={nursery_bytes}"
+    );
+}
+
 fn maybe_print_mc_diag() {
     if std::env::var_os("PYRE_MC_DIAG").is_none() {
         return;

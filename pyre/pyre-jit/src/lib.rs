@@ -78,6 +78,28 @@ pub fn wasm_gc_collection_counts() -> (usize, usize) {
     majit_backend_wasm::active_gc_collection_counts()
 }
 
+/// `(minor_collections, major_collections, heap_bytes, nursery_bytes)` for the
+/// process GC, or all zeroes before one exists.
+///
+/// These are the GC-side counterpart of the `[jit-stats]` tallies, and they
+/// exist for the same reason: they are DETERMINISTIC. The same program run
+/// twice collects the same number of times, so a change that allocates less
+/// shows up here even on a machine whose clock cannot resolve it — a minor
+/// collection happens per nursery-full, so `minor_collections` is a direct
+/// proxy for cumulative allocation, which `heap_bytes` (a current-usage
+/// reading) is not.
+pub fn gc_diag_counters() -> (usize, usize, usize, usize) {
+    use majit_gc::GcAllocator;
+    if !majit_gc::gc_sync::is_initialized() {
+        return (0, 0, 0, 0);
+    }
+    majit_gc::gc_sync::gc_query_reentrant(|gc| {
+        let (minor, major) = gc.collection_counts();
+        let (heap, nursery) = gc.heap_byte_stats();
+        (minor, major, heap, nursery)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
