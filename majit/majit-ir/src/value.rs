@@ -227,6 +227,10 @@ impl SharedConstPool {
     ///
     /// The caller must be the exclusive GC root walker; no resume-data reader
     /// may run concurrently.
+    // The pool is `UnsafeCell`-backed precisely so the walker can mutate it
+    // through a shared reference; `mut_from_ref` is the signature that escape
+    // hatch has to have, and the contract above is what makes it sound.
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn as_mut_vec_for_gc(&self) -> &mut Vec<Const> {
         unsafe { &mut *self.values.get() }
     }

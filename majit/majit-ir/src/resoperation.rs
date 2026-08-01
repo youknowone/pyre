@@ -2179,6 +2179,10 @@ impl OpCode {
 
     // ── Category classification (mirrors rop.is_* static methods) ──
 
+    // `FINAL_FIRST` is `OpCode::Jump as u16` == 0, so the lower bound is
+    // vacuous today. It is kept symbolic to match the sibling classifiers and
+    // to stay correct if the category ever stops leading the enum.
+    #[allow(clippy::absurd_extreme_comparisons)]
     pub fn is_final(self) -> bool {
         let n = self.as_u16();
         FINAL_FIRST <= n && n <= FINAL_LAST

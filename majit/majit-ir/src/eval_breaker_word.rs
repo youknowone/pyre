@@ -139,6 +139,10 @@ pub fn take_gc() -> bool {
 /// Every flag must fit in the word the poll actually loads. Checked per target,
 /// so a flag too wide for a 32-bit `usize` fails the wasm32 build rather than
 /// silently reading as unarmed there.
+// `ineffective_bit_mask` reads the fold as a runtime `x | 16` tested against a
+// constant; both sides here are constants and the whole item is a static
+// assertion, so there is no operand to compare directly.
+#[allow(clippy::ineffective_bit_mask)]
 const _: () = assert!(
     (EB_ASYNC | EB_STW | EB_FINALIZING | EB_GC_INTERP | EB_GC)
         < (1 << (EVAL_BREAKER_WORD_SIZE * 8 - 1))
