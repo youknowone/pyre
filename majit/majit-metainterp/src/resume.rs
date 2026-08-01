@@ -546,6 +546,31 @@ pub struct ResumeStorage {
     pub rd_pendingfields: Vec<majit_ir::GuardPendingFieldEntry>,
 }
 
+impl ResumeStorage {
+    /// `compile.py:849 AbstractResumeGuardDescr.get_resumestorage(): return
+    /// self` — the failing guard descr *is* its own resume storage upstream,
+    /// because `rd_numb` / `rd_consts` / `rd_virtuals` / `rd_pendingfields`
+    /// are its `_attrs_` (`compile.py:855`).  Pyre additionally indexes the
+    /// same payload under `compiled_loops[green_key].traces[trace_id]`, and
+    /// that index can be dropped while a guard exit from the loop is still
+    /// being processed — compiled code re-enters the driver through residual
+    /// calls, and the re-entrant run may retire the green key.  Reading the
+    /// descr reproduces upstream's lookup-free path for exactly that case.
+    ///
+    /// `None` for descrs that carry no resume payload at all (the
+    /// `_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescrRef`),
+    /// matching the `_attrs_`-only-on-`AbstractResumeGuardDescr` contract.
+    pub fn from_fail_descr(descr: &dyn majit_ir::FailDescr) -> Option<Self> {
+        let rd_numb = descr.rd_numb()?.to_vec();
+        Some(Self {
+            rd_numb,
+            rd_consts: descr.rd_consts_arc()?,
+            rd_virtuals: descr.rd_virtuals().unwrap_or(&[]).to_vec(),
+            rd_pendingfields: descr.rd_pendingfields().unwrap_or(&[]).to_vec(),
+        })
+    }
+}
+
 // Pyre is single-threaded; UnsafeCell prevents auto-Send/Sync so
 // provide them explicitly (matches RPython's non-thread-safe
 // ResumeGuardDescr).

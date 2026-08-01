@@ -146,10 +146,17 @@ pub struct CompiledExitLayout {
 }
 
 /// Typed result from running compiled code.
-pub struct CompileResult<'a, M> {
+pub struct CompileResult<M> {
     pub values: Vec<i64>,
     pub typed_values: Vec<Value>,
-    pub meta: &'a M,
+    /// Snapshot of the compiled entry's metadata taken *before*
+    /// `execute_token`, mirroring `warmstate.py:398`'s hold on the
+    /// `loop_token` object across the run: the exit values being unpacked
+    /// were produced by the code this metadata describes.  A re-lookup
+    /// after the run would read whatever the compiled-loop index holds by
+    /// then, and compiled code re-enters the driver through residual calls,
+    /// so the entry can be recompiled or dropped mid-run.
+    pub meta: M,
     pub fail_index: u32,
     pub trace_id: u64,
     /// `cpu.get_latest_descr(deadframe)` (`history.py:125`) — the
@@ -173,10 +180,11 @@ pub struct CompileResult<'a, M> {
 }
 
 /// Raw (lightweight) result from running compiled code.
-pub struct RawCompileResult<'a, M> {
+pub struct RawCompileResult<M> {
     pub values: Vec<i64>,
     pub typed_values: Vec<Value>,
-    pub meta: &'a M,
+    /// Pre-run metadata snapshot — see `CompileResult::meta`.
+    pub meta: M,
     pub fail_index: u32,
     pub trace_id: u64,
     /// `cpu.get_latest_descr(deadframe)` (`history.py:125`,
