@@ -7663,6 +7663,19 @@ fn make_exception_group_type(name: &'static str, bases: &[PyObjectRef]) -> PyObj
     let cls = crate::typedef::make_builtin_type_with_bases(
         name,
         move |ns| {
+            if name == "ExceptionGroup" {
+                // CPython 3.14 creates ExceptionGroup as the heap type over
+                // BaseExceptionGroup + Exception.  Its own namespace therefore
+                // carries `__module__ = "builtins"`; BaseExceptionGroup is a
+                // static builtin and has no own entry.
+                unsafe {
+                    pyre_object::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__module__",
+                        pyre_object::w_str_new("builtins"),
+                    )
+                };
+            }
             if name != "BaseExceptionGroup" {
                 return;
             }
@@ -7739,6 +7752,13 @@ fn make_exception_group_type(name: &'static str, bases: &[PyObjectRef]) -> PyObj
                 unsafe { pyre_object::w_member_set_cls(member, cls) };
             }
         }
+    } else if name == "ExceptionGroup" {
+        // PyPy's app-level multiple-inheritance type receives the ordinary
+        // heap-instance weakref slot.  pyre constructs the equivalent type
+        // directly, so install the copied descriptor and flag explicitly.
+        let descr = crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), cls);
+        crate::type_dict_store(cls, "__weakref__", descr);
+        unsafe { pyre_object::w_type_set_weakrefable(cls, true) };
     }
     register_exc_class(name, cls)
 }

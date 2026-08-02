@@ -396,6 +396,13 @@ pub struct W_BaseException {
     /// Extra attributes (`e.note = ...`, PEP 678 `__notes__`) live
     /// here.
     pub w_dict: PyObjectRef,
+    /// Per-object weakref lifeline.  PyPy's app-level
+    /// `W_ExceptionGroup(W_BaseExceptionGroup, W_Exception)` acquires the
+    /// ordinary heap-type weakref slot even though `W_BaseExceptionGroup`
+    /// itself is not weakrefable.  Pyre flattens all exception payloads into
+    /// this struct, so the storage lives here and the `ExceptionGroup` type
+    /// flag controls whether it is observable.
+    pub w_weakreflifeline: PyObjectRef,
 }
 
 pub const EXC_KIND_OFFSET: usize = std::mem::offset_of!(W_BaseException, kind);
@@ -420,6 +427,7 @@ pub const EXC_W_IMPORT_NAME_FROM_OFFSET: usize =
     std::mem::offset_of!(W_BaseException, w_import_name_from);
 pub const EXC_W_IMPORT_MSG_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_import_msg);
 pub const EXC_W_DICT_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_dict);
+pub const EXC_W_WEAKREF_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_weakreflifeline);
 
 /// GC trace offsets for `W_BaseException` — `args_w` plus the three
 /// `PyObjectRef`-shaped chained-exception slots per
@@ -433,11 +441,12 @@ pub const EXC_W_DICT_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_dic
 /// NameError / AttributeError) and the W_AttributeError `w_attr_obj`
 /// slot, plus the three remaining W_ImportError per-class slots
 /// (w_import_path / w_import_name_from / w_import_msg), plus the
-/// lazily-allocated `w_dict`
+/// lazily-allocated `w_dict`, plus the heap-type weakref lifeline used by
+/// `ExceptionGroup`
 /// (interp_exceptions.py:113/222-231).  `kind` is a `u8` tag, `message`
 /// is a `*mut String` (raw heap), and `suppress_context` is a bool —
 /// none of those are GC-traced.
-pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 20] = [
+pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 21] = [
     EXC_ARGS_W_OFFSET,
     EXC_W_CAUSE_OFFSET,
     EXC_W_CONTEXT_OFFSET,
@@ -458,6 +467,7 @@ pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 20] = [
     EXC_W_IMPORT_NAME_FROM_OFFSET,
     EXC_W_IMPORT_MSG_OFFSET,
     EXC_W_DICT_OFFSET,
+    EXC_W_WEAKREF_OFFSET,
 ];
 
 /// GC type id assigned to `W_BaseException` at JitDriver init time.
@@ -605,6 +615,9 @@ fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
         // `interp_exceptions.py:113 w_dict = None` — allocated on the
         // first `getdict` (`:222-225`).
         w_dict: PY_NULL,
+        // Only ExceptionGroup exposes this slot; the shared flattened
+        // exception layout keeps it null for every other exception kind.
+        w_weakreflifeline: PY_NULL,
     };
     if !immortal {
         // GC-manage the exception object: allocate it in the non-moving
@@ -911,6 +924,29 @@ pub unsafe fn w_exception_peek_dict(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_BaseException)).w_dict = w_dict;
+        exception_write_barrier(obj);
+    }
+}
+
+/// Read the per-exception weakref lifeline.  Only `ExceptionGroup`'s type
+/// advertises this storage; keeping it on the flattened exception payload
+/// matches the object-owned lifeline used by PyPy heap instances.
+///
+/// # Safety
+/// `obj` must point to a valid `W_BaseException`.
+#[inline]
+pub unsafe fn w_exception_getweakref(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_BaseException)).w_weakreflifeline }
+}
+
+/// Store the per-exception weakref lifeline and remember an old-to-young edge.
+///
+/// # Safety
+/// `obj` must point to a valid `W_BaseException`.
+#[inline]
+pub unsafe fn w_exception_setweakref(obj: PyObjectRef, lifeline: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_BaseException)).w_weakreflifeline = lifeline;
         exception_write_barrier(obj);
     }
 }

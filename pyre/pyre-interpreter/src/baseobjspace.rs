@@ -4879,6 +4879,15 @@ pub fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
         let lifeline = unsafe { pyre_object::memoryview::w_memoryview_getweakref(obj) };
         return (!lifeline.is_null()).then_some(lifeline);
     }
+    if unsafe { pyre_object::interp_exceptions::is_exception(obj) } {
+        if crate::typedef::r#type(obj)
+            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
+        {
+            let lifeline = unsafe { pyre_object::interp_exceptions::w_exception_getweakref(obj) };
+            return (!lifeline.is_null()).then_some(lifeline);
+        }
+        return None;
+    }
     if unsafe { pyre_object::bytesobject::is_bytes(obj) } {
         if crate::typedef::r#type(obj)
             .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
@@ -4927,6 +4936,14 @@ pub fn setweakref(obj: PyObjectRef, weakreflifeline: PyObjectRef) -> Result<(), 
     if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
         unsafe { pyre_object::memoryview::w_memoryview_setweakref(obj, weakreflifeline) };
         return Ok(());
+    }
+    if unsafe { pyre_object::interp_exceptions::is_exception(obj) } {
+        if crate::typedef::r#type(obj)
+            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
+        {
+            unsafe { pyre_object::interp_exceptions::w_exception_setweakref(obj, weakreflifeline) };
+            return Ok(());
+        }
     }
     if unsafe { pyre_object::bytesobject::is_bytes(obj) } {
         if crate::typedef::r#type(obj)
@@ -4982,6 +4999,14 @@ pub fn delweakref(obj: PyObjectRef) {
     if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
         unsafe { pyre_object::memoryview::w_memoryview_setweakref(obj, PY_NULL) };
         return;
+    }
+    if unsafe { pyre_object::interp_exceptions::is_exception(obj) } {
+        if crate::typedef::r#type(obj)
+            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
+        {
+            unsafe { pyre_object::interp_exceptions::w_exception_setweakref(obj, PY_NULL) };
+            return;
+        }
     }
     if unsafe { pyre_object::bytesobject::is_bytes(obj) } {
         if crate::typedef::r#type(obj)
