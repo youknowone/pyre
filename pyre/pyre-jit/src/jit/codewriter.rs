@@ -3474,6 +3474,7 @@ struct FnPtrIndices {
     load_method_self_fn: HelperHandle,
     load_special_fn: HelperHandle,
     load_special_self_fn: HelperHandle,
+    with_except_start_fn: HelperHandle,
     store_attr_fn: HelperHandle,
     build_map_from_array_fn: HelperHandle,
     binary_slice_fn: HelperHandle,
@@ -3745,6 +3746,11 @@ fn register_helper_fn_pointers(
         assembler,
         cpu.load_special_self_fn as *const (),
         CallFlavor::Plain,
+    );
+    let with_except_start_fn = bind(
+        assembler,
+        cpu.with_except_start_fn as *const (),
+        CallFlavor::MayForce,
     );
     // `bh_load_name_fn` / `bh_store_name_fn` delegate to the interpreter
     // `NamespaceOpcodeHandler` impl (pyopcode.py:945 LOAD_NAME / :855
@@ -4249,6 +4255,7 @@ fn register_helper_fn_pointers(
         load_method_self_fn,
         load_special_fn,
         load_special_self_fn,
+        with_except_start_fn,
         store_attr_fn,
         build_map_from_array_fn,
         binary_slice_fn,
@@ -5743,6 +5750,11 @@ impl CodeWriter {
                 HelperHandle {
                     idx: load_special_self_fn_idx,
                     flavor: _load_special_self_fn_flavor,
+                },
+            with_except_start_fn:
+                HelperHandle {
+                    idx: with_except_start_fn_idx,
+                    flavor: _with_except_start_fn_flavor,
                 },
             store_attr_fn:
                 HelperHandle {
@@ -9831,14 +9843,56 @@ impl CodeWriter {
                         }
 
                         Instruction::WithExceptStart => {
-                            // `WITH_EXCEPT_START` leaves the existing stack
-                            // entries intact and pushes the exit-function result
-                            // on top. Preserve the net `+1` stack effect in the
-                            // shadow graph and fall back to the interpreter for
-                            // the actual helper call semantics.
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_vsd!(current_depth, py_pc);
+                            // pyopcode.py WITH_EXCEPT_START preserves its five
+                            // inputs and pushes `exit_func(type(val), val, tb)`.
+                            // This must be a real can-raise residual in JitCode:
+                            // a guard resume can first enter this handler under
+                            // blackhole replay, where a disconnected fresh Ref
+                            // has no producer and would make TO_BOOL suppress or
+                            // re-raise arbitrarily.
+                            // Read the three semantic operands from the live
+                            // virtualizable slots, exactly like PyFrame's
+                            // stack peeks.  Handler-entry Variables include
+                            // synthetic lasti/exception values and can legally
+                            // coalesce before the catch edge runs; using those
+                            // graph placeholders here can therefore alias the
+                            // caught exception onto `exit_func` during a
+                            // blackhole-only handler entry.
+                            let mut read_stack_slot = |depth_from_bottom: usize| {
+                                let slot = stack_base_absolute + depth_from_bottom;
+                                let slot_value: super::flow::FlowValue =
+                                    super::flow::Constant::signed(slot as i64).into();
+                                super::flow::FlowValue::from(emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "getarrayitem_vable_r",
+                                    vable_getarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        slot_value.into(),
+                                    ),
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                ))
+                            };
+                            let depth = current_depth as usize;
+                            let exit_func = read_stack_slot(depth.saturating_sub(5));
+                            let exit_self = read_stack_slot(depth.saturating_sub(4));
+                            let exc = read_stack_slot(depth.saturating_sub(1));
+                            let result = residual_call!(
+                                with_except_start_fn_idx,
+                                CallFlavor::MayForce,
+                                majit_ir::PyreHelperKind::None,
+                                vec![],
+                                vec![exit_func, exit_self, exc],
+                                vec![],
+                                vec![Kind::Ref, Kind::Ref, Kind::Ref],
+                                ResKind::Ref,
+                                py_pc as i64,
+                            )
+                            .map(super::flow::FlowValue::from)
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph).into());
+                            current_state.stack.push(result.clone());
+                            emit_pushvalue_ref!(current_depth, current_depth, result, py_pc);
                         }
 
                         Instruction::Copy { i } => {

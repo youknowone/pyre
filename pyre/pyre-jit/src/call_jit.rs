@@ -5825,6 +5825,23 @@ pub extern "C" fn bh_load_special_self_fn(_obj: i64, _attr: i64, _method_kind: i
     pyre_object::PY_NULL as i64
 }
 
+/// WITH_EXCEPT_START residual.  The generated JitCode carries the five
+/// handler-stack values, and this helper performs the same `__exit__` call as
+/// `PyFrame::with_except_start` from the three semantic operands.
+pub extern "C" fn bh_with_except_start_fn(exit_func: i64, exit_self: i64, val: i64) -> i64 {
+    let result = pyre_interpreter::eval::with_except_start_values(
+        exit_func as pyre_object::PyObjectRef,
+        exit_self as pyre_object::PyObjectRef,
+        val as pyre_object::PyObjectRef,
+    );
+    if result.is_null() {
+        let mut err = pyre_interpreter::call::take_call_error()
+            .unwrap_or_else(|| pyre_interpreter::PyError::type_error("__exit__ failed"));
+        publish_residual_call_exception(err.to_exc_object() as i64);
+    }
+    result as i64
+}
+
 /// `LOAD_NAME` residual for the standalone (blackhole / deopt)
 /// per-CodeObject jitcode.  `pyopcode.py:945-955 LOAD_NAME` — when
 /// `getorcreatedebug().w_locals is not get_w_globals_storage()` the lookup

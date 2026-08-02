@@ -3196,6 +3196,24 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
     }
 }
 
+/// Shared WITH_EXCEPT_START call semantics for the interpreter and generated
+/// JitCode residual.  Keeping the call here preserves the bytecode operation's
+/// exact `__exit__(type, value, traceback)` argument construction on both paths.
+pub fn with_except_start_values(
+    exit_func: PyObjectRef,
+    exit_self: PyObjectRef,
+    val: PyObjectRef,
+) -> PyObjectRef {
+    let exc_type = crate::typedef::r#type(val).map_or(pyre_object::w_none(), |p| p.as_ptr());
+    let exc_tb =
+        crate::baseobjspace::getattr_str(val, "__traceback__").unwrap_or(pyre_object::w_none());
+    if exit_self.is_null() {
+        crate::call_function(exit_func, &[exc_type, val, exc_tb])
+    } else {
+        crate::call_function(exit_func, &[exit_self, exc_type, val, exc_tb])
+    }
+}
+
 impl OpcodeStepExecutor for PyFrame {
     /// SETUP_ANNOTATIONS — ensure `__annotations__` exists in the
     /// current locals namespace. PyPy: pyopcode.py SETUP_ANNOTATIONS
@@ -3262,14 +3280,7 @@ impl OpcodeStepExecutor for PyFrame {
         let val = self.locals_w()[depth - 1];
         let exit_self = self.locals_w()[depth - 4];
         let exit_func = self.locals_w()[depth - 5];
-        let exc_type = crate::typedef::r#type(val).map_or(pyre_object::w_none(), |p| p.as_ptr());
-        let exc_tb =
-            crate::baseobjspace::getattr_str(val, "__traceback__").unwrap_or(pyre_object::w_none());
-        let res = if exit_self.is_null() {
-            crate::call_function(exit_func, &[exc_type, val, exc_tb])
-        } else {
-            crate::call_function(exit_func, &[exit_self, exc_type, val, exc_tb])
-        };
+        let res = with_except_start_values(exit_func, exit_self, val);
         if res.is_null() {
             return Err(crate::call::take_call_error()
                 .unwrap_or_else(|| crate::PyError::type_error("__exit__ failed"))
