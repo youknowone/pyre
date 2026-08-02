@@ -1935,6 +1935,30 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // `RPythonAnnotator` (`bookkeeper.annotator()` panics with
     // "backlink absent or dropped") only pay the lookup on the
     // failure path; success paths remain unaffected.
+    //
+    // Pre-pass — project each callee's declared LLBC fn-ptr signature onto
+    // its entry BEFORE any body is lifted.  The fn-const materialisation
+    // fallback (`flowspace_adapter::translate_op`) reads this to type an
+    // address-taken JIT-dead method-table entry whose pygraph is lifted but
+    // not yet rtyped: at populate time nothing is rtyped, so `getfunctionptr`
+    // (which walks the callee's args for their `concretetype`, all `None`)
+    // fails on every fn-const and, absent this, poisons every attr-lookup
+    // caller.  Runs ahead of the lift loop so a caller lifted early still
+    // sees a later callee's declared type.  A non-projectable signature
+    // leaves the slot `None` — the fallback declines and the site fails
+    // closed exactly as before.
+    {
+        let mut seeded: HashSet<*const PyreFunctionEntry> =
+            HashSet::with_capacity(by_canonical_path.len());
+        for (_key, graph, entry, _signature) in &pending {
+            if !seeded.insert(Rc::as_ptr(entry)) {
+                continue;
+            }
+            if let Some(ft) = declared_funcptr_type_from_legacy(graph) {
+                entry.set_declared_funcptr_type(ft);
+            }
+        }
+    }
     for (_key, graph, entry, signature) in &pending {
         let entry_ptr = Rc::as_ptr(entry);
         if !lifted.insert(entry_ptr) {
@@ -2299,8 +2323,19 @@ pub(crate) fn residual_return_shell(
             .expect("Ref(None) shells to a definite SomeInstance"),
         );
     }
-    let return_lltype = match token {
+    return_token_to_lltype(token).and_then(|ll| default_someshell_for_lltype(&ll))
+}
+
+/// Project a FUNC.RESULT token (the `return_type` string) to its
+/// `LowLevelType`.  `None`/`"()"` → `Void`; `"ref"` and the `*mut PyObject`
+/// token → `OBJECTPTR`; primitive tokens map directly; unrecognised → `None`
+/// (decline).  `i128`/`u128` have no token spelling here and so decline for
+/// the same `getkind`-at-the-codewriter reason [`residual_return_shell`]
+/// documents.
+fn return_token_to_lltype(token: Option<&str>) -> Option<LowLevelType> {
+    match token {
         None | Some("()") => Some(LowLevelType::Void),
+        Some("ref") => Some(crate::translator::rtyper::rclass::OBJECTPTR.clone()),
         Some("bool") => Some(LowLevelType::Bool),
         Some("i64") => Some(LowLevelType::Signed),
         Some("u64") => Some(LowLevelType::Unsigned),
@@ -2309,8 +2344,57 @@ pub(crate) fn residual_return_shell(
             Some(crate::translator::rtyper::rclass::OBJECTPTR.clone())
         }
         _ => None,
-    };
-    return_lltype.and_then(|ll| default_someshell_for_lltype(&ll))
+    }
+}
+
+/// Project a MIR `ValueType` to its rtyped `LowLevelType`, mirroring the
+/// rtyper's lowering of the `valuetype_to_someshell` annotation shell:
+/// `Str` → the string pointer, `Ref`/`State` → the erased object pointer
+/// (`OBJECTPTR`, what a classdef-less `SomeInstance` rtypes to), `Unknown`
+/// declines.  Used to build a callee's declared fn-ptr arg signature.
+fn valuetype_to_lltype(vt: &crate::model::ValueType) -> Option<LowLevelType> {
+    use crate::model::ValueType;
+    Some(match vt {
+        ValueType::Int => LowLevelType::Signed,
+        ValueType::Unsigned => LowLevelType::Unsigned,
+        ValueType::Int128 => LowLevelType::SignedLongLongLong,
+        ValueType::UInt128 => LowLevelType::UnsignedLongLongLong,
+        ValueType::Bool => LowLevelType::Bool,
+        ValueType::Float => LowLevelType::Float,
+        ValueType::Str => crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone(),
+        ValueType::Ref(_) | ValueType::State => {
+            crate::translator::rtyper::rclass::OBJECTPTR.clone()
+        }
+        ValueType::Void => LowLevelType::Void,
+        ValueType::Unknown => return None,
+    })
+}
+
+/// Project a callee's declared fn-ptr `FuncType` from its `FunctionGraph`
+/// startblock `Input` ValueTypes (in `inputargs` order) + return token,
+/// mirroring `derive_subject_inputcells`'s startblock reading.  Returns
+/// `None` if any arg lacks a startblock `Input` op or an unprojectable
+/// ValueType, or the return token is unrecognised — the fn-const
+/// materialisation fallback then declines (fail-closed).
+fn declared_funcptr_type_from_legacy(
+    legacy: &LegacyGraph,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::FuncType> {
+    use crate::model::OpKind;
+    let startblock = legacy.blocks.iter().find(|b| b.id == legacy.startblock)?;
+    let mut input_ty: HashMap<crate::flowspace::model::Variable, &crate::model::ValueType> =
+        HashMap::new();
+    for op in &startblock.operations {
+        if let (Some(result), OpKind::Input { ty, .. }) = (op.result.as_ref(), &op.kind) {
+            input_ty.insert(result.clone(), ty);
+        }
+    }
+    let mut args = Vec::with_capacity(startblock.inputargs.len());
+    for var in &startblock.inputargs {
+        let ty = input_ty.get(var)?;
+        args.push(valuetype_to_lltype(ty)?);
+    }
+    let result = return_token_to_lltype(legacy.return_type.as_deref())?;
+    Some(crate::translator::rtyper::lltypesystem::lltype::FuncType { args, result })
 }
 
 /// Register a batch of unsafe-fn stub

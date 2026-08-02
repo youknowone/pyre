@@ -112,6 +112,20 @@ impl FunctionPathKey {
 pub struct PyreFunctionEntry {
     pub host_object: HostObject,
     pub function_desc: Rc<RefCell<FunctionDesc>>,
+    /// Declared LLBC fn-ptr signature, projected once at registry
+    /// population from the callee's `FunctionGraph` startblock `Input`
+    /// ValueTypes + return token.  Read by the fn-const materialisation
+    /// fallback in `flowspace_adapter::translate_op`: at populate time no
+    /// graph is rtyped yet, so `getfunctionptr` (which walks the callee's
+    /// args for their `concretetype`, all `None`) fails on every fn-const.
+    /// The declared signature lets an address-taken JIT-dead method-table
+    /// entry materialise its fn-ptr from its faithful Rust signature (the
+    /// same fidelity class as `FOREIGN_STDLIB_EXTERNALS`) instead of
+    /// poisoning every attr-lookup caller.  `None` when the signature is
+    /// not fully projectable — the fallback then declines and the site
+    /// fails closed exactly as before.
+    pub declared_funcptr_type:
+        RefCell<Option<crate::translator::rtyper::lltypesystem::lltype::FuncType>>,
 }
 
 impl PyreFunctionEntry {
@@ -156,6 +170,23 @@ impl PyreFunctionEntry {
     /// would partial-codewrite with a pre-real residual kind.
     pub fn pyre_lift_error(&self) -> Option<String> {
         self.function_desc.borrow().pyre_lift_error_message()
+    }
+
+    /// Store the callee's declared LLBC fn-ptr signature (see
+    /// [`PyreFunctionEntry::declared_funcptr_type`]).
+    pub fn set_declared_funcptr_type(
+        &self,
+        ft: crate::translator::rtyper::lltypesystem::lltype::FuncType,
+    ) {
+        *self.declared_funcptr_type.borrow_mut() = Some(ft);
+    }
+
+    /// Read the callee's declared LLBC fn-ptr signature, if one was
+    /// projected at registry population.
+    pub fn declared_funcptr_type(
+        &self,
+    ) -> Option<crate::translator::rtyper::lltypesystem::lltype::FuncType> {
+        self.declared_funcptr_type.borrow().clone()
     }
 }
 
@@ -850,6 +881,7 @@ impl PyreCallRegistry {
         let entry = Rc::new(PyreFunctionEntry {
             host_object,
             function_desc,
+            declared_funcptr_type: RefCell::new(None),
         });
         self.entries.borrow_mut().insert(key, entry.clone());
         entry

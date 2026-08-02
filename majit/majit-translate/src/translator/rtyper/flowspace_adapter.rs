@@ -2822,23 +2822,64 @@ fn legacy_const_define_hlvalue(
                     key.segments()
                 ))
             })?;
-            if let Some(err) = entry.pyre_lift_error() {
-                return Err(TyperError::message(format!(
-                    "fn const {:?} resolved to an unbuildable callee: {err}",
-                    key.segments()
-                )));
-            }
+            // A fn-const is address-taken data for a static method table
+            // (`typedef` `[(name, fn, arity)]`).  Its LL carrier is
+            // unconditionally `ConstInt(fnaddr)` (the const-define arm below),
+            // it is never JIT-called in the compiled portal, so the `FuncType`
+            // is pure typing bookkeeping with no machine-code channel.  Taking
+            // the address does NOT need the callee's body — only its declared
+            // signature.  Three populate-time realities block the precise
+            // `getfunctionptr`, and all three fall back to the callee's
+            // DECLARED LLBC signature (projected at the populate pre-pass; same
+            // fidelity class as `FOREIGN_STDLIB_EXTERNALS`) so the caller's
+            // lift succeeds instead of recording a lazy-failure that poisons
+            // every attr-lookup caller:
+            //   1. no graph is rtyped yet (every arg `concretetype` is `None`);
+            //   2. the callee is not lifted yet (registry-population order),
+            //      so its pygraph is not cached;
+            //   3. the callee's BODY does not lift — e.g. an unregistered
+            //      iterator/container adapter, a separate front-lowering gap
+            //      (#65).  The address is still valid; only JIT-compiling the
+            //      body is blocked, and this entry is never JIT-called.
+            // A callee whose signature is not fully projectable leaves the slot
+            // `None`; the site then fails closed with the most specific
+            // diagnosis, exactly as before.
+            use crate::translator::rtyper::lltypesystem::lltype;
+            let lift_error = entry.pyre_lift_error();
             let graphs = entry.function_desc.borrow().getgraphs();
-            let graph = graphs.into_iter().next().ok_or_else(|| {
-                TyperError::message(format!(
-                    "fn const {:?} resolved to a registry entry without a cached graph",
-                    key.segments()
-                ))
-            })?;
-            let func_ptr = crate::translator::rtyper::lltypesystem::lltype::getfunctionptr(
-                &graph.graph,
-                crate::translator::rtyper::lltypesystem::lltype::_getconcretetype,
-            )?;
+            let maybe_graph = graphs.into_iter().next();
+            // Precise fn-ptr only when the callee is lifted (cached graph, no
+            // recorded lift error) AND rtyped; every other case routes to the
+            // declared-signature fallback below.
+            let precise = match (&maybe_graph, &lift_error) {
+                (Some(graph), None) => {
+                    lltype::getfunctionptr(&graph.graph, lltype::_getconcretetype).ok()
+                }
+                _ => None,
+            };
+            let func_ptr = match precise {
+                Some(func_ptr) => func_ptr,
+                None => match entry.declared_funcptr_type() {
+                    // Keep the graph backlink when a pygraph is cached;
+                    // otherwise the declared signature alone types the entry.
+                    Some(ft) => match &maybe_graph {
+                        Some(graph) => lltype::functionptr_for_graph_with_type(&graph.graph, ft),
+                        None => lltype::functionptr(ft, &key.segments().join("::"), None, None),
+                    },
+                    None => {
+                        return Err(TyperError::message(match lift_error {
+                            Some(err) => format!(
+                                "fn const {:?} resolved to an unbuildable callee: {err}",
+                                key.segments()
+                            ),
+                            None => format!(
+                                "fn const {:?} resolved to a registry entry without a cached graph",
+                                key.segments()
+                            ),
+                        }));
+                    }
+                },
+            };
             let func_ptr_type = crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(
                 Box::new(func_ptr._TYPE.clone()),
             );

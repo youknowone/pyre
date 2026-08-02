@@ -5939,16 +5939,35 @@ pub fn getfunctionptr<F>(graph: &GraphRef, getconcretetype: F) -> Result<_ptr, T
 where
     F: Fn(&Hlvalue) -> Result<ConcretetypePlaceholder, TyperError>,
 {
-    let graph_b = graph.borrow();
-    let mut llinputs = Vec::new();
-    for arg in graph_b.getargs() {
-        llinputs.push(getconcretetype(&arg)?);
-    }
-    let lloutput = getconcretetype(&graph_b.getreturnvar())?;
-    let ft = FuncType {
-        args: llinputs,
-        result: lloutput,
+    let ft = {
+        let graph_b = graph.borrow();
+        let mut llinputs = Vec::new();
+        for arg in graph_b.getargs() {
+            llinputs.push(getconcretetype(&arg)?);
+        }
+        let lloutput = getconcretetype(&graph_b.getreturnvar())?;
+        FuncType {
+            args: llinputs,
+            result: lloutput,
+        }
     };
+    Ok(functionptr_for_graph_with_type(graph, ft))
+}
+
+/// Build a function pointer for `graph` from an explicitly supplied
+/// `FuncType` instead of walking the graph's args for their (possibly
+/// not-yet-assigned) concretetypes.
+///
+/// [`getfunctionptr`] delegates here after deriving the `FuncType` from
+/// the rtyped args; the fn-const materialisation fallback
+/// (`flowspace_adapter::translate_op`) calls this directly with the
+/// callee's DECLARED LLBC signature when the callee's pygraph is lifted
+/// but not yet rtyped (populate-time, before Phase B), where every arg's
+/// `concretetype` is still `None`.  The name / `_callable` / attrs /
+/// graph-backlink are resolved identically to `getfunctionptr`, so the
+/// pointer differs from a rtyped one only in the arg/result placeholders.
+pub fn functionptr_for_graph_with_type(graph: &GraphRef, TYPE: FuncType) -> _ptr {
+    let graph_b = graph.borrow();
     let mut name = graph_b.name.clone();
     let mut callable = graph_b.func.as_ref().map(|func| func.name.clone());
     let mut attrs = HashMap::new();
@@ -5970,13 +5989,13 @@ where
         }
     }
     drop(graph_b);
-    Ok(functionptr_with_attrs(
-        ft,
+    functionptr_with_attrs(
+        TYPE,
         &name,
         Some(GraphKey::of(graph).as_usize()),
         callable,
         attrs,
-    ))
+    )
 }
 
 /// RPython `class SomePtr(SomeObject)` (lltype.py:1520-1528).
