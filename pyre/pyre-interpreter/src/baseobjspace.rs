@@ -4007,12 +4007,35 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
             return pyre_object::functional::range_obj_to_bigint(w_one)
                 == pyre_object::functional::range_obj_to_bigint(w_two);
         }
-        // PyPy's W_FloatObject.is_w / W_ComplexObject.is_w compare component
-        // bit patterns, but Python 3.14's identity operation is pointer
-        // identity (`Py_Is`).  Our 3.14 target therefore deliberately keeps
-        // distinct equal-valued float and complex allocations distinct.  An
-        // exact operand passed through float(x) / complex(x) is returned as-is
-        // by its constructor and already matched the pointer fast path above.
+        // `W_FloatObject.is_w` (floatobject.py:196-204): two plain
+        // `float`s are identical when their bit patterns are equal
+        // (`float2longlong`), so `0.0 is -0.0` is false and a NaN is its
+        // own identity. `float` subclasses (`user_overridden_class`) keep
+        // pointer identity — the exact-type gate excludes them.
+        //
+        // This has to stay in step with `function::immutable_unique_id`, which
+        // derives `id()` from the same bits, and with `FloatListStrategy`,
+        // which unboxes and reboxes list elements: pointer identity here would
+        // make `a is b` false while `id(a) == id(b)` stayed true, and would
+        // make `[a][0] is a` false.
+        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::FLOAT_TYPE)
+            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::FLOAT_TYPE)
+        {
+            return pyre_object::floatobject::w_float_get_value(w_one).to_bits()
+                == pyre_object::floatobject::w_float_get_value(w_two).to_bits();
+        }
+        // `W_ComplexObject.is_w` (complexobject.py:287-301): two plain
+        // `complex`es are identical when both component bit patterns are
+        // equal (`float2longlong`). `complex` subclasses
+        // (`user_overridden_class`) keep pointer identity.
+        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::COMPLEX_TYPE)
+            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::COMPLEX_TYPE)
+        {
+            return pyre_object::complexobject::w_complex_get_real(w_one).to_bits()
+                == pyre_object::complexobject::w_complex_get_real(w_two).to_bits()
+                && pyre_object::complexobject::w_complex_get_imag(w_one).to_bits()
+                    == pyre_object::complexobject::w_complex_get_imag(w_two).to_bits();
+        }
         // `W_AbstractTupleObject.is_w` (tupleobject.py:47-55): a `tuple` is
         // identical to another only when both are the empty tuple — "empty
         // tuples are unique-ified". Non-empty tuples keep pointer identity
