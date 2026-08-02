@@ -13179,13 +13179,25 @@ impl CodeWriter {
                 // `last_exc_value` SSARepr op at flatten time only — there
                 // is no graph SpaceOperation counterpart, the Variable
                 // flows through `link.last_exc_value` and is materialised
-                // by the flatten-time emission.  Allocate a fresh Ref
-                // Variable to carry the catch-landing's exception value
-                // through `current_state.stack` and the subsequent vable
-                // push, matching the variable-lifecycle shape upstream
-                // produces — without recording a graph `last_exc_value`
-                // SpaceOp the flatten driver would have to filter.
-                let exc_value: super::flow::FlowValue = fresh_ref_value(&mut graph);
+                // by the flatten-time emission.  Reuse the landing's own
+                // `last_exception` value Variable — the edge pair set by
+                // `exception_landing_state`, whose colour `generate_last_exc`
+                // writes into — as the pushed exception value, instead of a
+                // producerless fresh Ref.  A fresh Ref has no defining op, so
+                // regalloc treats it as dead-until-first-use and coalesces it
+                // onto a body colour (e.g. a local live across the `try`); on
+                // a guard-failure bridge that re-walks the handler the body
+                // colour's def sits in the skipped prefix, so the pushed value
+                // is read unbound (`RegisterReadUnbound`).  The landing value
+                // is produced by `generate_last_exc`, is re-derived on any
+                // bridge, and interferes with the surrounding live ranges so
+                // it earns a distinct colour.  Same fix as the PUSH_EXC_INFO
+                // handler at the `last_exc_value` re-read above.
+                let exc_value: super::flow::FlowValue = current_state
+                    .last_exception
+                    .as_ref()
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_else(|| fresh_ref_value(&mut graph));
                 current_state.stack.push(exc_value.clone());
                 // pyframe.py:503-510 + eval.rs:155-158 `dropvaluesuntil` parity:
                 //
