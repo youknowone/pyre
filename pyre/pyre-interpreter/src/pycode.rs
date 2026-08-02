@@ -177,13 +177,10 @@ pub struct PyCode {
     /// PyPy: `PyCode.w_globals` — the globals dict OBJECT (`W_DictMultiObject`,
     /// `pycode.py:105 "w_globals?"`).  Module globals are `malloc_typed`-
     /// immortal, but `exec`/custom-globals dicts are `try_gc_alloc` movable.
-    /// The code object is prebuilt-immortal, so the collector never reaches this
-    /// slot by tracing into it; every stamped code object is registered in
-    /// [`W_GLOBALS_STAMPED_CODES`] and forwarded from there on each
-    /// collection. `eval::walk_raw_code_roots` additionally forwards it
-    /// wherever a code object is already reached as a root (via
-    /// `walk_raw_function_roots` for `func.code` and the frame walk for
-    /// `frame.pycode`). Null until first stamped by `frame_stores_global`.
+    /// Managed wrappers trace this slot through `eval::walk_raw_code_roots`.
+    /// Bootstrap wrappers outside the collector are registered in
+    /// [`W_GLOBALS_STAMPED_CODES`] and forwarded from there. Null until first
+    /// stamped by `frame_stores_global`.
     pub w_globals: PyObjectRef,
     /// PyPy: `PyCode.hidden_applevel` (`pycode.py:111, 147`). Set by
     /// `pycompiler.compile(hidden_applevel=True)` for PyPy gateway/
@@ -262,8 +259,8 @@ pub struct PyCode {
     /// `PY_NULL` until first realized by [`w_code_qualname_obj`], which builds
     /// it with `w_str_new` — `malloc_typed`-immortal, so the stored pointer is
     /// fixed.  `eval::walk_raw_code_roots` forwards the slot anyway, for the
-    /// same reason it forwards `w_globals`: the wrapper is Box-immortal, so
-    /// nothing else would reach a movable object landing here.
+    /// same reason it forwards `w_globals`: the walker serves both the managed
+    /// custom trace and the bootstrap prebuilt-root walk.
     pub w_qualname: PyObjectRef,
     /// `pycode.py:137 self.co_name = name` realized as one shared wrapped
     /// object, the exact counterpart of `w_qualname` above.
@@ -312,7 +309,7 @@ pub unsafe fn w_code_qualname_obj(w_code: PyObjectRef) -> PyObjectRef {
         if code_ptr.is_null() {
             return pyre_object::PY_NULL;
         }
-        // `w_str_new` is a collection point, but the wrapper is Box-immortal
+        // `w_str_new` is a collection point, but the wrapper is stable-address
         // and so never relocates; the fresh string is stored through the
         // still-valid `w_code` before any further allocation can sweep it.
         let w_qualname = w_str_new(&(*code_ptr).qualname);
@@ -341,7 +338,7 @@ pub unsafe fn w_code_name_obj(w_code: PyObjectRef) -> PyObjectRef {
         if code_ptr.is_null() {
             return pyre_object::PY_NULL;
         }
-        // `w_str_new` is a collection point, but the wrapper is Box-immortal
+        // `w_str_new` is a collection point, but the wrapper is stable-address
         // and so never relocates; the fresh string is stored through the
         // still-valid `w_code` before any further allocation can sweep it.
         let w_name = w_str_new(&(*code_ptr).obj_name);
@@ -350,15 +347,15 @@ pub unsafe fn w_code_name_obj(w_code: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// Prebuilt-immortal `PyCode` wrappers that own off-GC `w_globals` and
+/// Bootstrap/prebuilt `PyCode` wrappers that own off-GC `w_globals` and
 /// `co_consts_w` slots.
 ///
 /// PyPy's `PyCode` is GC-managed, so ordinary graph tracing reaches these
 /// fields even when a code object is stored directly in a module/container
-/// without first becoming a function or frame. Pyre's wrappers are
-/// `malloc_typed`-immortal; retain their exact process-global lifetime and
-/// expose every wrapper through one small insertion-ordered registry instead
-/// of a TLS or per-value side table.
+/// without first becoming a function or frame. Only wrappers created before
+/// the runtime GC hook is installed stay outside the collector; expose that
+/// fallback family through one small insertion-ordered registry. Ordinary
+/// runtime wrappers are managed stable-oldgen objects.
 static PREBUILT_CODE_ROOTS: std::sync::OnceLock<std::sync::Mutex<Vec<usize>>> =
     std::sync::OnceLock::new();
 
@@ -373,9 +370,22 @@ fn register_prebuilt_code_root(code: PyObjectRef) {
     }
 }
 
-/// Trace every Box-immortal code wrapper exactly as PyPy traces every live
-/// GC-managed `PyCode`. Nested code constants are handled by the raw walker's
-/// own mark-state analogue.
+/// Retire a wrapper from the fallback prebuilt-root registry once its managed
+/// old-generation allocation is reclaimed.  The registry also contains the
+/// bootstrap `malloc_typed` family, which never reaches this destructor.
+fn unregister_prebuilt_code_root(code: PyObjectRef) {
+    let Some(roots) = PREBUILT_CODE_ROOTS.get() else {
+        return;
+    };
+    let mut roots = roots
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    roots.retain(|&identity| identity != code as usize);
+}
+
+/// Trace every bootstrap/prebuilt code wrapper exactly as PyPy traces every
+/// live GC-managed `PyCode`. Nested code constants are handled by the raw
+/// walker's own mark-state analogue.
 pub(crate) fn walk_prebuilt_code_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     let Some(roots) = PREBUILT_CODE_ROOTS.get() else {
         return;
@@ -558,7 +568,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
             .first_line_number
             .map_or(1, |line| line.get() as i32)
     };
-    let obj = pyre_object::lltype::malloc_typed(PyCode {
+    let obj = PyCode {
         ob_header: PyObject {
             ob_type: &CODE_TYPE as *const PyType,
             w_class: pyre_object::pyobject::get_instantiate(&CODE_TYPE),
@@ -576,8 +586,17 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         co_consts_w,
         w_qualname: pyre_object::PY_NULL,
         w_name: pyre_object::PY_NULL,
-    }) as PyObjectRef;
-    register_prebuilt_code_root(obj);
+    };
+    // PyPy's `PyCode` is an ordinary GC object.  Keep the address stable for
+    // the raw `code_ptr -> wrapper` JIT seam, but let the collector reclaim
+    // the wrapper so its `w_globals` field participates in cycles instead of
+    // making every `exec` namespace process-global.  Before GC installation,
+    // `malloc_typed_stable` falls back to the prebuilt family and the explicit
+    // root registry remains necessary.
+    let obj = pyre_object::lltype::malloc_typed_stable(obj) as PyObjectRef;
+    if !pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
+        register_prebuilt_code_root(obj);
+    }
     obj
 }
 
@@ -1900,8 +1919,8 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
     unsafe {
         (*(obj as *mut PyCode)).w_globals = w_globals;
     }
-    // Box-immortal code slot reached only by `walk_raw_code_roots`,
-    // skipped on clean minor collections; record the store.
+    // A bootstrap code slot is reached only by the prebuilt root walk, which
+    // clean minor collections may skip; record the store.
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     if !w_globals.is_null() {
         let code_ptr = unsafe { (*(obj as *const PyCode)).code_ptr };
@@ -1977,6 +1996,52 @@ pub fn live_code_wrapper(code_ptr: *const ()) -> PyObjectRef {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&(code_ptr as usize))
         .map_or(PY_NULL, |&w| w as PyObjectRef)
+}
+
+/// Collector destructor for a managed `PyCode` wrapper.
+///
+/// PyPy lets the GC reclaim the `PyCode` and its list-valued cache fields
+/// together.  Pyre's three cache vectors are raw Rust allocations, so release
+/// them here and retire the compatibility registries that used to assume every
+/// wrapper was immortal.  `code_ptr` deliberately remains allocated: compiled
+/// JitCodes currently retain that raw compiler-body address independently of
+/// the wrapper, and freeing it belongs to the later removal of that courier.
+///
+/// # Safety
+/// `obj_addr` must be a collector-owned `PyCode` payload and this function must
+/// run at most once for it.
+pub unsafe fn pycode_destructor(obj_addr: usize) {
+    let code = unsafe { &mut *(obj_addr as *mut PyCode) };
+    let wrapper = obj_addr as PyObjectRef;
+    unregister_prebuilt_code_root(wrapper);
+    {
+        let mut wrappers = live_code_wrappers()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if wrappers.get(&(code.code_ptr as usize)).copied() == Some(wrapper as usize) {
+            wrappers.remove(&(code.code_ptr as usize));
+        }
+    }
+    w_globals_stamped_codes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&obj_addr);
+    mapdict_method_cache_codes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&obj_addr);
+    if !code.globals_caches.is_null() {
+        drop(unsafe { Box::from_raw(code.globals_caches) });
+        code.globals_caches = std::ptr::null_mut();
+    }
+    if !code.mapdict_caches.is_null() {
+        drop(unsafe { Box::from_raw(code.mapdict_caches) });
+        code.mapdict_caches = std::ptr::null_mut();
+    }
+    if !code.co_consts_w.is_null() {
+        drop(unsafe { Box::from_raw(code.co_consts_w) });
+        code.co_consts_w = std::ptr::null_mut();
+    }
 }
 
 /// pycode.py:226-238 `_compute_flatcall`.
@@ -2207,7 +2272,7 @@ pub unsafe fn w_code_mapdict_caches_set(
         // The LOAD_METHOD fill (mapdict.py:1474) stores a movable
         // `w_method` reference; register this code object so
         // `walk_mapdict_method_cache_gc` forwards the slot.
-        if !entry.w_method.is_null() {
+        if !entry.w_method.is_null() && !pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
             mapdict_method_cache_codes()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2221,11 +2286,10 @@ pub unsafe fn w_code_mapdict_caches_set(
 
 /// Code objects whose `_mapdict_caches` hold (or once held) a filled
 /// `w_method` slot.  In PyPy `CacheEntry.w_method` (mapdict.py:1418)
-/// is traced through the GC-managed `PyCode`; pyre code objects are
-/// prebuilt-immortal (`w_code_new` → `malloc_typed`), so no field trace
-/// reaches the slot — the extra-root walker forwards it through
-/// this registry instead (same family as `walk_method_cache_gc`).
-/// The registry retires when code objects become GC-managed.
+/// is traced through the GC-managed `PyCode`; a managed wrapper's custom
+/// trace reaches the slot the same way, so only a bootstrap wrapper minted
+/// before the collector exists enters this registry and the extra-root
+/// walker forwards it from here (same family as `walk_method_cache_gc`).
 static MAPDICT_METHOD_CACHE_CODES: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashSet<usize>>,
 > = std::sync::OnceLock::new();
@@ -2239,17 +2303,15 @@ fn mapdict_method_cache_codes() -> &'static std::sync::Mutex<std::collections::H
 /// (`pycode.py:159-165 frame_stores_global`).  `w_globals` is a permanent
 /// strong field: the first globals object a code object runs in is kept
 /// for the code object's lifetime and never replaced.  Upstream that
-/// field is traced through the GC-managed `PyCode`; pyre code objects are
-/// prebuilt-immortal (`w_code_new` → `malloc_typed`), so the only paths that
-/// reach the slot are the opportunistic `walk_raw_code_roots` calls on
-/// `frame.pycode` and `func.code`.  Those miss any stamped code object
-/// that is off the frame chain and not held in a walked frame slot at
-/// collection time, which leaves a pre-move nursery address in
-/// `w_globals` once its dict is promoted — the next call through that
-/// code object then forwards a dangling pointer.  This registry makes the
-/// slot a root of its own, in the same family as
-/// [`MAPDICT_METHOD_CACHE_CODES`].  The registry retires when code objects
-/// become GC-managed.
+/// field is traced through the GC-managed `PyCode`, and a managed wrapper's
+/// custom trace does the same.  A bootstrap wrapper minted before the
+/// collector exists is reached only by the opportunistic
+/// `walk_raw_code_roots` calls on `frame.pycode` and `func.code`, which miss
+/// any stamped code object off the frame chain and not held in a walked frame
+/// slot at collection time; that leaves a pre-move nursery address in
+/// `w_globals` once its dict is promoted, and the next call through that code
+/// object forwards a dangling pointer.  This registry makes the slot a root of
+/// its own for that family, as [`MAPDICT_METHOD_CACHE_CODES`] does.
 static W_GLOBALS_STAMPED_CODES: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashSet<usize>>,
 > = std::sync::OnceLock::new();
@@ -2260,6 +2322,13 @@ fn w_globals_stamped_codes() -> &'static std::sync::Mutex<std::collections::Hash
 
 /// Record `obj` as a code object holding a stamped `w_globals` slot.
 fn register_w_globals_stamped_code(obj: PyObjectRef) {
+    // A managed PyCode's own custom trace owns this edge.  Only bootstrap
+    // wrappers outside the collector need the compatibility registry; making
+    // every managed code's globals an independent root would turn
+    // `code -> globals -> function/generator -> code` cycles immortal.
+    if pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
+        return;
+    }
     w_globals_stamped_codes()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

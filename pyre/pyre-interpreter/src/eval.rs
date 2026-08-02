@@ -242,9 +242,8 @@ unsafe fn walk_raw_function_roots(
         }
         let func = &mut *(value as *mut crate::function::Function);
         visitor(&mut *(&mut func.code as *mut *const () as *mut majit_ir::GcRef));
-        // The code object caches its own globals dict (`PyCode.w_globals`),
-        // a movable dict for custom-globals functions; the code is Box-immortal
-        // so the standard tracer never recurses into it.
+        // The code object caches its own globals dict (`PyCode.w_globals`).
+        // Reuse the same walk for managed custom tracing and bootstrap code.
         walk_raw_code_roots(func.code as PyObjectRef, visitor);
         visitor(&mut *(&mut func.closure as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.defs_w as *mut PyObjectRef as *mut majit_ir::GcRef));
@@ -267,14 +266,10 @@ unsafe fn walk_raw_function_roots(
     }
 }
 
-/// Forward a Box-immortal `PyCode`'s cached globals dict object and realized
-/// `co_consts_w` entries. Module globals are `malloc_typed`-immortal,
-/// but `exec`/`eval` with a plain dict (or a function built with custom
-/// globals) caches a `try_gc_alloc` movable dict here, which a minor collection
-/// relocates.  The code object itself is Box-immortal, so the standard tracer
-/// never recurses into it; visit the slot as a root the same way
-/// `walk_raw_function_roots` forwards `w_func_globals_obj`.  No-op for non-code
-/// values and inert when the cached dict is non-moving.
+/// Forward a `PyCode`'s cached globals, realized constants, qualname and
+/// mapdict-method entries. This is both the managed wrapper's custom trace and
+/// the explicit walk for bootstrap wrappers outside the collector. No-op for
+/// non-code values.
 pub unsafe fn walk_raw_code_roots(
     value: PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -291,8 +286,8 @@ pub unsafe fn walk_raw_code_roots(
             let identity = value as usize;
             // PyPy's GC traces the PyCode constant list transitively and its
             // mark state prevents revisiting shared/cyclic nodes. PyCode
-            // wrappers are outside pyre's collector, so mirror that small
-            // identity set directly while walking their constant graph.
+            // wrappers may be reached recursively without a collector mark
+            // check, so mirror that small identity set while walking constants.
             if visited.contains(&identity) {
                 return;
             }
@@ -300,8 +295,7 @@ pub unsafe fn walk_raw_code_roots(
             let code = &mut *(value as *mut crate::pycode::PyCode);
             visitor(&mut *(&mut code.w_globals as *mut PyObjectRef as *mut majit_ir::GcRef));
             // The realized `co_qualname` is an ordinary movable string object
-            // shared by every function built from this code; the wrapper is
-            // Box-immortal, so only this raw-root walker forwards it.
+            // shared by every function built from this code.
             visitor(&mut *(&mut code.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
             // `co_name` is realized and retained the same way.
             visitor(&mut *(&mut code.w_name as *mut PyObjectRef as *mut majit_ir::GcRef));
@@ -313,10 +307,21 @@ pub unsafe fn walk_raw_code_roots(
                     }
                     visitor(&mut *(&mut child as *mut PyObjectRef as *mut majit_ir::GcRef));
                     slot.store(child, std::sync::atomic::Ordering::Release);
-                    // A code wrapper is Box-immortal and therefore not traced
-                    // by the collector. Recurse through nested co_consts_w,
-                    // matching PyPy's transitively traced PyCode list.
+                    // Recurse through nested co_consts_w, matching PyPy's
+                    // transitively traced PyCode list.
                     walk(child, visitor, visited);
+                }
+            }
+            // mapdict.py:1418 CacheEntry.w_method is the cache's sole GC
+            // reference.  PyPy traces it as part of the live PyCode; do the
+            // same here now that managed code wrappers reach this walker from
+            // their custom trace (the registry walk remains for bootstrap
+            // prebuilt wrappers).
+            if !code.mapdict_caches.is_null() {
+                for entry in (&mut *code.mapdict_caches).iter_mut().flatten() {
+                    visitor(
+                        &mut *(&mut entry.w_method as *mut PyObjectRef as *mut majit_ir::GcRef),
+                    );
                 }
             }
         }
@@ -921,11 +926,7 @@ pub unsafe fn walk_pyframe_roots_area(
                 // pyframe.py:102 `self.pycode` — the running code object.
                 // Visited as a root so a code object reachable only via
                 // `frame.pycode` (e.g. `exec`'d code with no owning
-                // Function) stays alive once code objects become
-                // GC-managed.  While code objects remain Box-immortal the
-                // visitor's `is_nursery_object_start` /
-                // `is_managed_heap_object` guard short-circuits, so this is
-                // inert today.
+                // Function) stays alive now that code objects are GC-managed.
                 let pycode_slot = &mut (*(frame)).pycode as *mut *const ();
                 visitor(&mut *(pycode_slot as *mut majit_ir::GcRef));
                 // Forward the running code object's cached globals dict.  For
@@ -1231,7 +1232,7 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         return;
     }
     // PyPy's GC reaches standalone code objects through the ordinary object
-    // graph. Pyre's Box-immortal wrappers need the equivalent process-global
+    // graph. Pyre's bootstrap wrappers need the equivalent process-global
     // owner before walking module/type caches below.
     crate::pycode::walk_prebuilt_code_roots(visitor);
     unsafe {

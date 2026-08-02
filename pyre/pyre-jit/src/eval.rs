@@ -575,6 +575,23 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
     }
 }
 
+/// PyPy `PyCode` is a normal GC object whose `w_globals`, constants and
+/// mapdict cache entries are traced with the wrapper.  Pyre keeps those
+/// variable-sized cache vectors in Rust allocations, so the fixed-offset
+/// tracer cannot see through them; reuse the interpreter's raw-code walker for
+/// the complete field shape.
+unsafe fn pycode_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let code = unsafe { &mut *(obj_addr as *mut pyre_interpreter::pycode::PyCode) };
+    f(&mut code.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    let mut adapter = |slot: &mut majit_ir::GcRef| f(slot as *mut majit_ir::GcRef);
+    unsafe {
+        pyre_interpreter::eval::walk_raw_code_roots(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut adapter,
+        )
+    };
+}
+
 /// Custom trace for `PyTraceback` (`pytraceback.py:17 PyTraceback`).
 ///
 /// PyPy's `PyTraceback.frame` is a normal `PyFrame` W_Root, so its
@@ -2307,18 +2324,18 @@ fn build_gc() -> Box<MiniMarkGC> {
     // guard below.  This keeps the net register-call count up to
     // `W_MODULE_DICT_GC_TYPE_ID = 48` unchanged (one explicit
     // registration here, one fewer from the loop), so no downstream
-    // hardcoded tid shifts.  PyCode is allocated with `malloc_typed`, and its
-    // registered TypeInfo has empty `gc_ptr_offsets`, so its own trace is inert.
-    // Its one movable GCREF slot, `w_globals`
-    // (the cached globals dict object — movable for `exec`/custom-globals
-    // dicts), is instead forwarded as a root by
-    // `pyre_interpreter::eval::walk_raw_code_roots`, reached through
-    // `walk_raw_function_roots` (`func.code`) and the frame root walk
-    // (`frame.pycode`).
-    let w_code_tid = gc.register_type(TypeInfo::object_subclass(
-        std::mem::size_of::<pyre_interpreter::pycode::PyCode>(),
-        object_tid,
-    ));
+    // hardcoded tid shifts. `w_code_new` allocates the wrapper in stable
+    // oldgen. Its Rust-owned cache vectors require the custom walk, and their
+    // allocations are released with the wrapper just as PyPy's list fields
+    // are reclaimed with its `PyCode`.
+    let w_code_tid = gc.register_type(
+        TypeInfo::object_subclass_with_custom_trace(
+            std::mem::size_of::<pyre_interpreter::pycode::PyCode>(),
+            object_tid,
+            pycode_object_custom_trace,
+        )
+        .with_destructor_fn(pyre_interpreter::pycode::pycode_destructor),
+    );
     debug_assert_eq!(w_code_tid, pyre_interpreter::pycode::W_CODE_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
