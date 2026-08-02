@@ -3930,13 +3930,16 @@ fn run_perfn_walk<Sym: WalkSym>(
         // pyjitpl` (`blackhole.py:1799`) finishes the frames instead, which is
         // what the latch staged.
         //
-        // Three classes keep their own, more precise recovery and are excluded
+        // Four classes keep their own, more precise recovery and are excluded
         // so this general leg cannot pre-empt them:
         // `VableEscapedDuringResidualCall` latches a narrower resume-marker
         // image and has an escape-pc fallback (arm below);
         // `AbortPermanentMarkerReached` / `LoopBearingCalleeInlineUnsupported`
         // route to the gh#467 CALL-forward carrier, which resumes the OUTER
-        // frame at its CALL rather than inside the discarded callee attempt.
+        // frame at its CALL rather than inside the discarded callee attempt;
+        // `ForceQuasiImmutable` resumes AT the forcing opcode via
+        // `flush_qmut_abort_state` (arm below), which re-runs the write the
+        // walk stopped in front of instead of finishing the frame past it.
         //
         // And only for an abort whose image is COMPLETE
         // (`DispatchError::leaves_complete_image`).  Pyre's walker has a whole
@@ -3954,6 +3957,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                     | crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. }
                     | crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { .. }
                     | crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported { .. }
+                    | crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { .. }
             ))
             && walk_abort_leg_enabled()
             && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::WalkAbort);

@@ -2272,6 +2272,13 @@ impl DispatchError {
                 | Self::InlineCallArityMismatch { .. }
                 | Self::InlineCallIntArityMismatch { .. }
                 | Self::InlineCallFloatArityMismatch { .. }
+                // The direct counterpart of `pyjitpl.py:1116`
+                // `raise SwitchToBlackhole(Counters.ABORT_FORCE_QUASIIMMUT)`:
+                // taken with the registers bound, after `do_force_quasi_immutable`
+                // already ran.  Classified here for what it is; the general leg
+                // still steps aside for it, because it owns a narrower one that
+                // resumes AT the forcing opcode (`flush_qmut_abort_state`).
+                | Self::ForceQuasiImmutable { .. }
         )
     }
 
@@ -5944,6 +5951,17 @@ pub unsafe fn fbw_store_journal_root_walker_area(
         if latched.last_exc_value != 0 {
             visitor(unsafe { &mut *(&mut latched.last_exc_value as *mut i64).cast() });
         }
+        // The operand-stack image is resolved to concrete refs at latch time and
+        // then held plainly until the adopter publishes it, which is the same
+        // invisible-to-the-collector window as the Ref bank above.  The escape
+        // flush avoids the question by rooting its stack for the duration of the
+        // flush call (`push_resume_ref_roots`); this one outlives a single call,
+        // so it is forwarded here instead.
+        if let Some(mirror) = latched.mirror_stack.as_mut() {
+            for slot in mirror.slots.iter_mut() {
+                visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+            }
+        }
     }
     let multi_frame_blackhole = unsafe { &mut *(*area.multi_frame_blackhole).as_ptr() };
     if let Some(latched) = multi_frame_blackhole.as_mut() {
@@ -5954,6 +5972,12 @@ pub unsafe fn fbw_store_journal_root_walker_area(
         }
         if latched.last_exc_value != 0 {
             visitor(unsafe { &mut *(&mut latched.last_exc_value as *mut i64).cast() });
+        }
+        // Same window as the single-frame arm above.
+        if let Some(mirror) = latched.mirror_stack.as_mut() {
+            for slot in mirror.slots.iter_mut() {
+                visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+            }
         }
     }
     // The bridge/retrace iterator cursor journal holds a range iterator across
