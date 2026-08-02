@@ -1704,6 +1704,8 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     let nlocals = recipe.nlocals.min(recipe.concrete_r.len());
     let local_oprefs = &recipe.registers_r[..nlocals.min(recipe.registers_r.len())];
     let local_concretes = &recipe.concrete_r[..nlocals];
+    let stack_end = recipe.valuestackdepth.min(recipe.registers_r.len());
+    let resumed_stack_oprefs = &recipe.registers_r[nlocals.min(stack_end)..stack_end];
     // Increment 2b-i: drive the deepest callee as an inline SUB-WALK rooted on
     // the portal `sym` (is_top_level=false), so its `ref_return` surfaces
     // `SubReturn` instead of the top-level `Finish` pyre's own-portal model
@@ -1720,6 +1722,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         &argboxes_r,
         local_oprefs,
         local_concretes,
+        resumed_stack_oprefs,
         // Depth-N: tell the deepest sub-walk that all shallower frames are
         // paused so its in-callee guard snapshots encode the full
         // [root, ..middles.., deepest] chain (else the blackhole rebuilds a
@@ -2003,6 +2006,9 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     let middle_nlocals = middle.nlocals.min(middle.concrete_r.len());
     let middle_local_oprefs = &middle.registers_r[..middle_nlocals.min(middle.registers_r.len())];
     let middle_local_concretes = &middle.concrete_r[..middle_nlocals];
+    let middle_stack_end = middle.valuestackdepth.min(middle.registers_r.len());
+    let middle_stack_oprefs =
+        &middle.registers_r[middle_nlocals.min(middle_stack_end)..middle_stack_end];
     let middle_walk = crate::jitcode_dispatch::drive_bridge_middle_frame(
         ctx,
         session,
@@ -2015,6 +2021,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         &middle_argboxes_r,
         middle_local_oprefs,
         middle_local_concretes,
+        middle_stack_oprefs,
         paused_parents,
         child_result,
     );

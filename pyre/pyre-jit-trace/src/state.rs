@@ -2060,6 +2060,14 @@ pub(crate) fn semantic_slot_color_for_ref_slot(
     best
 }
 
+/// Resolve a resumed semantic Ref slot to its live register color.  Empty
+/// metadata is retained for skeleton/fixture compatibility; a partially
+/// populated per-PC map is authoritative, so an absent slot has no register.
+fn reconstructed_ref_slot_color(pcdep_entries: &[(u8, u16, u16)], slot: usize) -> Option<usize> {
+    semantic_slot_color_for_ref_slot(pcdep_entries, slot)
+        .or_else(|| pcdep_entries.is_empty().then_some(slot))
+}
+
 // Sentinel null JitCode for uninitialized PyreSym.
 //
 // Cannot be `static` because `Arc::new` is not const; use a thread_local
@@ -11203,6 +11211,15 @@ mod tests {
     use pyre_object::pyobject::{INT_TYPE, LIST_TYPE, PyType, is_list};
     use std::cell::{Cell, UnsafeCell};
 
+    #[test]
+    fn reconstructed_ref_slot_does_not_invent_color_in_mapped_frame() {
+        let pcdep = [(1, 4, 0), (1, 5, 2), (1, 6, 3)];
+
+        assert_eq!(reconstructed_ref_slot_color(&pcdep, 0), Some(4));
+        assert_eq!(reconstructed_ref_slot_color(&pcdep, 1), None);
+        assert_eq!(reconstructed_ref_slot_color(&[], 1), Some(1));
+    }
+
     thread_local! {
         static TEST_CALLBACKS_INIT: Cell<bool> = const { Cell::new(false) };
         static TEST_JIT_DRIVER: UnsafeCell<crate::driver::JitDriverPair> = UnsafeCell::new({
@@ -13872,7 +13889,17 @@ pub(crate) fn setup_reconstructed_callee_frame(
         if opref.is_none() {
             continue;
         }
-        let color = semantic_slot_color_for_ref_slot(&pcdep, k).unwrap_or(k);
+        let color = match reconstructed_ref_slot_color(&pcdep, k) {
+            Some(color) => color,
+            // An entirely uncolored skeleton/fixture retains the historical
+            // identity layout.  Once a per-PC color map exists, however, an
+            // unmapped semantic slot has no register at this coordinate (for
+            // example PUSH_NULL's call sentinel).  Treating its slot number as
+            // a color can overwrite a different mapped value: `_richcmp`'s
+            // `[op, NULL, lhs, rhs]` resume otherwise writes the NULL sentinel
+            // over `op`'s color and the bridge calls a null callable.
+            None => continue,
+        };
         if color >= argboxes_r.len() {
             argboxes_r.resize(color + 1, OpRef::NONE);
         }
@@ -13886,9 +13913,17 @@ pub(crate) fn setup_reconstructed_callee_frame(
         // any resumed operand. Skips constants (`constants.get_value` is
         // authoritative) and non-value (`Void`) slots.
         if !opref.is_constant() {
-            if let Some(v @ (majit_ir::Value::Ref(_) | majit_ir::Value::Int(_))) =
-                recipe.concrete_r.get(k).copied()
+            if let Some(v @ majit_ir::Value::Int(_)) = recipe.concrete_r.get(k).copied() {
+                ctx.set_opref_concrete(opref, v);
+            } else if let Some(v @ majit_ir::Value::Ref(gc)) = recipe.concrete_r.get(k).copied()
+                && !gc.is_null()
+                && gc != majit_ir::GcRef::NO_CONCRETE
             {
+                // A NULL recipe concrete is an unmaterialized frame-image
+                // hole, not evidence that the symbolic box is Python NULL.
+                // Keep any stronger fact already attached to the OpRef (for
+                // example the non-null callable pinned by GUARD_VALUE), just
+                // as the locals-prefix restamp above does.
                 ctx.set_opref_concrete(opref, v);
             }
         }

@@ -89,10 +89,11 @@ pub(crate) fn fbw_strict_fold_frame_reg<Sym: WalkSym>(ctx: &WalkContext<'_, '_, 
         .map_or(u16::MAX, |shadow| shadow.fold_frame_reg)
 }
 
-/// `PYRE_FBW_CALLEE_VSTACK` (default OFF) — maintain a callee-local
+/// `PYRE_FBW_CALLEE_VSTACK` (default ON) — maintain a callee-local
 /// operand-stack mirror while walking an inline sub-call.  The callee enters
 /// with an empty operand stack; subsequent boundaries must use the active
-/// callee jitcode metadata rather than the outer full-body tables.
+/// callee jitcode metadata rather than the outer full-body tables.  Set to
+/// `0` or `false` to retain the stabilization-period kill switch.
 pub(crate) fn fbw_callee_vstack_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_CALLEE_VSTACK") {
@@ -100,7 +101,7 @@ pub(crate) fn fbw_callee_vstack_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => false,
+        None => true,
     })
 }
 

@@ -2204,11 +2204,38 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     // `collect_outer_active_boxes`' virtualizable-slot recovery, and preserves
     // the one-red-frame-per-MIFrame shape instead of falling back to the root.
     let mut recovered_regs_r = ctx.registers_r.to_vec();
+    let code = unsafe { &*callee_pjc.code_ptr };
+    let (stack_base, _) = crate::state::callee_layout_for_call_assembler(code);
+    let maps = crate::state::bridge_semantic_maps_from_pc(callee_jitcode_index, callee_jitcode_pc);
+    // The kept-stack guard gate is certified by this callee frame's
+    // operand-stack mirror.  Publish the same boxes into the carried
+    // coordinate's Ref colors before collecting the frame snapshot, so the
+    // resume encoder consumes the exact per-frame state that admitted the
+    // guard.  RPython reads these values directly from the active MIFrame's
+    // register bank; the assignment below is pyre's slot-to-color lowering of
+    // that one-red-frame state, not a lookup through the outer portal frame.
+    if ctx.vstack_valid && ctx.vstack_depth <= ctx.vstack_boxes.len() {
+        for &(bank, color, slot) in &maps.pcdep_entries {
+            if bank != 1 {
+                continue;
+            }
+            let slot = slot as usize;
+            let Some(stack_slot) = slot.checked_sub(stack_base) else {
+                continue;
+            };
+            if stack_slot >= ctx.vstack_depth {
+                continue;
+            }
+            let value = ctx.vstack_boxes[stack_slot];
+            if value == OpRef::NONE || opref_is_null_const_ptr(value) {
+                continue;
+            }
+            if let Some(register) = recovered_regs_r.get_mut(color as usize) {
+                *register = value;
+            }
+        }
+    }
     if recovered_regs_r.iter().any(|value| value.is_none()) && !callee_pjc.code_ptr.is_null() {
-        let code = unsafe { &*callee_pjc.code_ptr };
-        let (stack_base, _) = crate::state::callee_layout_for_call_assembler(code);
-        let maps =
-            crate::state::bridge_semantic_maps_from_pc(callee_jitcode_index, callee_jitcode_pc);
         if let Some(shadow) = ctx.callee_shadow.as_ref() {
             for (color, value) in recovered_regs_r.iter_mut().enumerate() {
                 if !value.is_none() {

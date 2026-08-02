@@ -2177,6 +2177,14 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         receiver_op = Some(live_receiver);
     }
     if !callable_guard_op.is_constant() {
+        // `callable_guard_op` can be the live `Method.w_function` field read
+        // above.  The GuardValue pins it to `callable` at runtime; retain the
+        // same recording-time Box.value so a multi-frame bridge recipe does
+        // not mistake an unstamped field-read shadow for Python NULL.
+        ctx.trace_ctx.set_opref_concrete(
+            callable_guard_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(callable as usize)),
+        );
         let expected = ctx.trace_ctx.const_ref(callable as i64);
         ctx.trace_ctx
             .record_guard(OpCode::GuardValue, &[callable_guard_op, expected], 0);

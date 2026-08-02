@@ -6099,6 +6099,21 @@ impl ActiveResumeFrame {
         Some((py_pc, pjc.code_ptr, depth))
     }
 
+    /// Coordinate used while stepping an already-seeded operand-stack
+    /// mirror.  A block-head metadata entry is JitCode control-flow trivia,
+    /// not a Python opcode boundary: defer reconciliation until the first
+    /// real operation in that block, whose containing coordinate is exact.
+    fn vstack_step_coordinate_for_jitcode_pc(
+        &self,
+        jit_pc: usize,
+        current_py_pc: u32,
+    ) -> Option<(u32, *const pyre_interpreter::CodeObject, usize)> {
+        let (containing_py_pc, code_ptr, depth) = self.vstack_coordinate_for_jitcode_pc(jit_pc)?;
+        let py_pc = vstack_step_py_pc(&self.0.metadata, jit_pc, current_py_pc);
+        debug_assert!(py_pc == current_py_pc || py_pc == containing_py_pc);
+        Some((py_pc, code_ptr, depth))
+    }
+
     fn body_matches(&self, sub_body: &SubJitCodeBody) -> bool {
         let code = self.0.jitcode.code.as_slice();
         code.len() == sub_body.code.len() && code.as_ptr() == sub_body.code.as_ptr()
@@ -7063,8 +7078,21 @@ fn walker_emit_guard_with_snapshot<Sym: WalkSym>(
     opcode: OpCode,
     args: &[OpRef],
 ) -> Result<(), DispatchError> {
+    stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
     ctx.trace_ctx.record_guard(opcode, args, 0);
     walker_capture_snapshot_for_last_guard(ctx, op_pc)
+}
+
+/// A recording-path `GUARD_VALUE(box, const)` has already observed equality.
+/// Mirror `FrontendOp.value` by attaching that constant to the guarded box so
+/// bridge recipe construction sees the same fact as the runtime guard.
+fn stamp_guard_value_concrete(trace_ctx: &mut TraceCtx, opcode: OpCode, args: &[OpRef]) {
+    if opcode != OpCode::GuardValue || args.len() < 2 {
+        return;
+    }
+    if let Some(expected) = trace_ctx.concrete_of_opref(args[1]) {
+        trace_ctx.set_opref_concrete(args[0], expected);
+    }
 }
 
 /// Fold-specific guard snapshot: records the guard and delegates to the
@@ -7084,6 +7112,7 @@ fn walker_emit_fold_guard_with_snapshot<Sym: WalkSym>(
     opcode: OpCode,
     args: &[OpRef],
 ) -> Result<(), DispatchError> {
+    stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
     ctx.trace_ctx.record_guard(opcode, args, 0);
     walker_capture_snapshot_for_last_guard(ctx, op_pc)
 }

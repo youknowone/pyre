@@ -1031,6 +1031,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     argboxes_r: &[OpRef],
     local_oprefs: &[OpRef],
     local_concretes: &[majit_ir::Value],
+    resumed_stack_oprefs: &[OpRef],
     child_result: Option<OpRef>,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
@@ -1272,6 +1273,30 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 v,
             );
         }
+        // The decoded multi-frame recipe carries this callee's semantic
+        // operand stack after its locals/cells prefix.  Preserve that red
+        // frame state on the same per-frame shadow and seed the walk mirror
+        // from it; dropping these slots collapses bridge resume onto the root
+        // frame and later CALL operands reconstruct as NULL.
+        let stack_base = local_oprefs.len();
+        for (s, &opref) in resumed_stack_oprefs.iter().enumerate() {
+            sub_wc
+                .callee_shadow
+                .as_mut()
+                .unwrap()
+                .set_opref((stack_base + s) as i64, opref);
+        }
+        if let Some(frame) = ActiveResumeFrame::current(session, root_sym_ptr)
+            && frame.0.jitcode.code.as_ptr() == callee_code.as_ptr()
+            && frame.0.jitcode.code.len() == callee_code.len()
+            && let Some((py_pc, _code_ptr, depth)) = frame.vstack_coordinate_for_jitcode_pc(entry)
+            && depth == resumed_stack_oprefs.len()
+        {
+            sub_wc.vstack_boxes = resumed_stack_oprefs.to_vec();
+            sub_wc.vstack_depth = depth;
+            sub_wc.vstack_cur_pypc = py_pc;
+            sub_wc.vstack_valid = true;
+        }
         let outcome = walk(callee_code, entry, &mut sub_wc);
         // `pyjitpl.py:2914 handle_guard_failure` wraps `_handle_guard_failure`
         // in `except SwitchToBlackhole as stb:
@@ -1307,6 +1332,7 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
     argboxes_r: &[OpRef],
     local_oprefs: &[OpRef],
     local_concretes: &[majit_ir::Value],
+    resumed_stack_oprefs: &[OpRef],
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     drive_bridge_frame_subwalk(
@@ -1321,6 +1347,7 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
         argboxes_r,
         local_oprefs,
         local_concretes,
+        resumed_stack_oprefs,
         None,
         paused_parent_recipes,
     )
@@ -1339,6 +1366,7 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
     argboxes_r: &[OpRef],
     local_oprefs: &[OpRef],
     local_concretes: &[majit_ir::Value],
+    resumed_stack_oprefs: &[OpRef],
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
     child_result: OpRef,
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
@@ -1354,6 +1382,7 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
         argboxes_r,
         local_oprefs,
         local_concretes,
+        resumed_stack_oprefs,
         Some(child_result),
         paused_parent_recipes,
     )

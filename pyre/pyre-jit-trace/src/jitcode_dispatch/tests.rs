@@ -51,6 +51,9 @@ fn vstack_permuted_for_iter_entry_uses_block_head_target() {
     assert_eq!(vstack_initial_py_pc(&pyjit.metadata, 110, false), 17);
     assert_eq!(vstack_step_py_pc(&pyjit.metadata, 110, 18), 18);
     assert_eq!(vstack_step_py_pc(&pyjit.metadata, 110, 17), 17);
+    // Entering this marker from another block must not apply the containing
+    // predecessor opcode (17); the first real target op advances to 18.
+    assert_eq!(vstack_step_py_pc(&pyjit.metadata, 110, 12), 12);
     assert_eq!(vstack_step_py_pc(&pyjit.metadata, 120, 18), 18);
 }
 

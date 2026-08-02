@@ -519,15 +519,22 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     // with the NONE slot left in place; `stack_sync` (USE) omits any NONE
     // mirror slot, which resume re-materializes.
     if ctx.vstack_valid {
-        let skip_shadow_fill = ctx.fbw_mode.inline_subwalk && fbw_callee_vstack_enabled();
+        let callee_local_shadow = ctx.fbw_mode.inline_subwalk && fbw_callee_vstack_enabled();
         let hole = ctx
             .vstack_boxes
             .get(..new_depth)
             .map(|s| s.iter().any(|&b| b == OpRef::NONE))
             .unwrap_or(true);
-        if hole && !skip_shadow_fill {
-            // Best-effort fill from the shadow; leave un-fillable slots NONE.
-            let _ = reseed_vstack_from_shadow(ctx, new_depth);
+        if hole {
+            // Best-effort fill from this frame's own storage; leave
+            // un-fillable slots NONE.  An inline callee's locals/stack array
+            // belongs to its CalleeLocalsShadow, never to the outer portal
+            // virtualizable.
+            if callee_local_shadow {
+                let _ = reseed_vstack_from_callee_shadow(ctx, code, new_depth);
+            } else {
+                let _ = reseed_vstack_from_shadow(ctx, new_depth);
+            }
         }
     }
     if ctx.vstack_valid {
@@ -541,6 +548,38 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     if ctx.vstack_reorder_ceiling != u32::MAX && new_pypc > ctx.vstack_reorder_ceiling {
         ctx.vstack_reorder_ceiling = u32::MAX;
     }
+}
+
+/// Fill missing operand-stack boxes from the active inline frame's own
+/// localsplus shadow.  `CalleeLocalsShadow` is the Rust owner corresponding
+/// to that MIFrame's register/frame state; indexing begins after this code
+/// object's locals and cells, so no portal-frame slot can leak across the
+/// inline boundary.
+fn reseed_vstack_from_callee_shadow<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &pyre_interpreter::CodeObject,
+    new_depth: usize,
+) -> bool {
+    if ctx.vstack_boxes.len() < new_depth {
+        ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+    }
+    let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
+    let Some(shadow) = ctx.callee_shadow.as_ref() else {
+        return false;
+    };
+    let mut all_present = true;
+    for (s, slot) in ctx.vstack_boxes[..new_depth].iter_mut().enumerate() {
+        if *slot != OpRef::NONE {
+            continue;
+        }
+        match shadow.opref.get(&((stack_base + s) as i64)).copied() {
+            Some(value) if value != OpRef::NONE && !opref_is_null_const_ptr(value) => {
+                *slot = value;
+            }
+            _ => all_present = false,
+        }
+    }
+    all_present
 }
 
 /// #73: re-seed `ctx.vstack_boxes[0..new_depth]` from the virtualizable
@@ -641,7 +680,13 @@ pub(crate) fn vstack_step_py_pc(
     jit_pc: usize,
     current_py_pc: u32,
 ) -> u32 {
-    if metadata_block_head_py_pc(metadata, jit_pc) == Some(current_py_pc) {
+    // A block-head entry is a control-flow marker, not the lowering of a
+    // Python opcode.  Keep the current mirror coordinate until the first
+    // actual operation in the destination block.  In particular, the floor
+    // segment at a marker can still name the terminal opcode of the preceding
+    // block (for example its RETURN_VALUE); applying that opcode here corrupts
+    // the live caller stack before the destination block is entered.
+    if metadata_block_head_py_pc(metadata, jit_pc).is_some() {
         current_py_pc
     } else {
         vstack_containing_py_pc(metadata, jit_pc)
@@ -678,7 +723,8 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
             ctx.vstack_valid = false;
             return;
         };
-        let Some(coord) = frame.vstack_coordinate_for_jitcode_pc(jit_pc) else {
+        let Some(coord) = frame.vstack_step_coordinate_for_jitcode_pc(jit_pc, ctx.vstack_cur_pypc)
+        else {
             ctx.vstack_valid = false;
             return;
         };
