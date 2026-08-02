@@ -156,6 +156,15 @@ fn objects_in_repr(_: &[pyre_object::PyObjectRef]) -> crate::PyResult {
 /// Box-immortal, so the entry roots the type for the lifetime of the process.
 const CANONICAL_IDENTITY_DICT_KEY: &str = "@objects_in_repr_identity_dict";
 
+/// `interp_magic.py:280-290 write_unraisable` — turn the supplied exception
+/// value back into an OperationError and report it through `sys.unraisablehook`.
+fn write_unraisable(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
+    let where_desc = crate::baseobjspace::str_utf8_w(args[0])?;
+    let mut error = unsafe { crate::PyError::from_exc_object(args[1]) };
+    error.write_unraisable(pyre_object::w_none(), &where_desc, args[2]);
+    Ok(pyre_object::w_none())
+}
+
 crate::py_module! {
     "__pypy__",
     // `PickleBuffer` wraps a bytes-like object for proto-5 out-of-band
@@ -173,6 +182,7 @@ crate::py_module! {
         "reversed_dict" / 1 = reversed_dict,
         "move_to_end" / * = move_to_end,
         "objects_in_repr" / 0 = objects_in_repr,
+        "write_unraisable" / 3 = write_unraisable,
         "newmemoryview" / * = interp_buffer::newmemoryview,
     },
     extra_init: |ns| {

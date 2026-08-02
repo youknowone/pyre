@@ -1199,7 +1199,7 @@ fn bootstrap_importlib_modules(
 }
 
 /// PyPy object-space finalization / `threading._shutdown`: run the app-level
-/// callbacks before module teardown, then join native non-daemon handles.
+/// callback before module teardown, then join native non-daemon handles.
 fn run_threading_shutdown() {
     if let Some(threading) = importing::get_sys_module("threading")
         && let Ok(shutdown) =
@@ -1212,11 +1212,24 @@ fn run_threading_shutdown() {
             pyre_interpreter::eprint_exception(&err, true);
         }
     }
-    // PyPy's `threading._shutdown` first waits for non-daemon threads. Those
-    // threads may legally start further non-daemon threads while the shutdown
-    // drain is in progress. Only reject new thread creation once that app-level
-    // drain has returned and module/finalizer teardown is about to begin.
-    pyre_interpreter::module::thread::set_finalizing();
+}
+
+/// `baseobjspace.py:finish` — after joining non-daemon threads, import the
+/// builtin atexit module and run its app-level callback stack.  Any escaping
+/// error is unraisable and must not prevent the remaining shutdown phases.
+fn run_atexit_callbacks(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecutionContext) {
+    let result = importing::importhook("atexit", canonical, pyre_object::PY_NULL, 0, ec_ptr)
+        .and_then(|module| {
+            pyre_interpreter::getattr(module, pyre_object::w_str_new("_run_exitfuncs"))
+        })
+        .and_then(|callback| pyre_interpreter::call::call_function_impl_result(callback, &[]));
+    if let Err(mut error) = result {
+        error.write_unraisable(
+            pyre_object::w_none(),
+            "_run_exitfuncs",
+            pyre_object::w_none(),
+        );
+    }
 }
 
 fn collect_and_run_finalizers(ec_ptr: *const PyExecutionContext) {
@@ -1299,6 +1312,11 @@ fn release_frees_nothing(value: pyre_object::PyObjectRef) -> bool {
 /// can see is still defined.
 fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecutionContext) {
     run_threading_shutdown();
+    run_atexit_callbacks(canonical, ec_ptr);
+    // PyPy sets `sys.finalizing` only after atexit callbacks.  Those callbacks
+    // may still start threads; reject new starts only when module/finalizer
+    // teardown is actually about to begin.
+    pyre_interpreter::module::thread::set_finalizing();
     // baseobjspace.py:498-501 `finish()` runs every started module's shutdown
     // hook; `_io`'s (moduledef.py:37-40) flushes the streams that are still
     // alive.  The per-global teardown below reaches only the ones `__main__`

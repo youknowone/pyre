@@ -1463,16 +1463,14 @@ pub fn add_sys_path_0() {
 /// and the `&str` argument matches `lookup_exc_class`.
 #[majit_macros::dont_look_inside]
 pub(crate) fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
-    // Consult the Python-visible sys.modules dict first so that user code
-    // writing `sys.modules['foo'] = mod` is immediately visible to imports.
-    // PyPy: importing.py check_sys_modules reads space.sys.get('modules').
+    // Once installed, the Python-visible dict is the sole semantic module
+    // cache.  PyPy's `check_sys_modules` reads `space.sys.get('modules')` and
+    // a deleted key is genuinely absent; the process-owned registry below is
+    // only the bootstrap owner/root used before that dict exists.
     let dict = sys_modules_dict();
     if !dict.is_null() {
-        if let Some(m) = unsafe { pyre_object::w_dict_getitem_str(dict, name) } {
-            if !m.is_null() && !unsafe { pyre_object::is_none(m) } {
-                return Some(m);
-            }
-        }
+        return unsafe { pyre_object::w_dict_getitem_str(dict, name) }
+            .filter(|m| !m.is_null() && !unsafe { pyre_object::is_none(*m) });
     }
     sys_modules_registry_get(name)
 }
@@ -1522,8 +1520,7 @@ fn sys_modules_blocks(name: &str) -> bool {
     }
 }
 
-/// Look up a loaded module by name in `sys.modules` (Python-visible dict
-/// first, then the interpreter cache). Mirrors `check_sys_modules`.
+/// Look up a loaded module by name through [`check_sys_modules`].
 pub fn get_sys_module(name: &str) -> Option<PyObjectRef> {
     check_sys_modules(name)
 }
@@ -2516,7 +2513,7 @@ fn load_source_module(
     // the module back out of sys.modules rather than reusing the local: the
     // body just executed arbitrary code, and a collection in there relocates
     // a young module while only the dict entry is updated.
-    if modulename == "importlib._bootstrap" {
+    if modulename == "importlib._bootstrap" && importlib_bootstrap_needs_install() {
         if let Some(loaded) = check_sys_modules(modulename) {
             if let Err(e) = install_importlib_bootstrap(loaded, execution_context) {
                 // Unwind the partial install: `dunder_import` routes through
@@ -2536,6 +2533,23 @@ fn load_source_module(
     }
 
     Ok(module)
+}
+
+/// PyPy installs the importlib bootstrap once while constructing the object
+/// space.  A later source-copy import (the 3.14 importlib tests deliberately
+/// remove its module names) executes the source but must not append a second
+/// BuiltinImporter/FrozenImporter/PathFinder set to the interpreter state.
+#[cfg(feature = "host_env")]
+fn importlib_bootstrap_needs_install() -> bool {
+    let Some(sys) = get_interpreter_sys_module() else {
+        return true;
+    };
+    !crate::baseobjspace::findattr_result(sys, "_pyre_importlib_bootstrap_installed")
+        .ok()
+        .flatten()
+        .is_some_and(|value| unsafe {
+            pyre_object::is_bool(value) && pyre_object::w_bool_get_value(value)
+        })
 }
 
 /// Wire a freshly executed `importlib._bootstrap` into this interpreter.
@@ -2621,6 +2635,11 @@ fn install_importlib_bootstrap(
             pyre_object::w_list_insert(w_path_hooks, 0, shadow_stack_get(zipimporter_slot));
         }
     }
+    crate::baseobjspace::setattr_str(
+        shadow_stack_get(sys_slot),
+        "_pyre_importlib_bootstrap_installed",
+        pyre_object::w_bool_from(true),
+    )?;
     Ok(())
 }
 
@@ -2664,6 +2683,18 @@ fn set_frozen_alias_metadata(
         shadow_stack_get(module_slot),
         "__spec__",
         shadow_stack_get(spec_slot),
+    )?;
+    // `FrozenImporter._fix_up_module` consumes this when a fresh source copy
+    // of importlib repairs the already-loaded essential frozen aliases.
+    let origname = match name {
+        "_frozen_importlib" => "importlib._bootstrap",
+        "_frozen_importlib_external" => "importlib._bootstrap_external",
+        _ => name,
+    };
+    crate::baseobjspace::setattr_str(
+        shadow_stack_get(module_slot),
+        "__origname__",
+        pyre_object::w_str_new(origname),
     )?;
     Ok(())
 }
@@ -2848,6 +2879,18 @@ fn absolute_import(
         _ => None,
     };
     if let Some(target) = frozen_target {
+        // `sys.modules[name] = None` is an explicit import block.  In
+        // particular, `test.support.import_helper.import_fresh_module` uses
+        // it to force importlib's source bootstrap: the failed frozen import
+        // is what selects the `except ImportError` arm that calls
+        // `_bootstrap._setup(sys, _imp)`.  Do not turn that sentinel back
+        // into the source module through the frozen-name alias.
+        if sys_modules_blocks(modulename) {
+            return Err(crate::PyError::module_not_found_with_name(
+                format!("import of {modulename} halted; None in sys.modules"),
+                modulename,
+            ));
+        }
         if let Some(cached) = check_sys_modules(modulename) {
             return Ok(cached);
         }

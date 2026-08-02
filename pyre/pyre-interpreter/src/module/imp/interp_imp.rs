@@ -327,7 +327,7 @@ fn frozen_module(name: &Wtf8) -> Option<&'static FrozenModule> {
 fn is_bootstrap_frozen(name: &str) -> bool {
     matches!(
         name,
-        "_frozen_importlib" | "_frozen_importlib_external" | "zipimport"
+        "_frozen_importlib" | "_frozen_importlib_external"
     )
 }
 
@@ -758,6 +758,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         w_name,
                     );
                 };
+                // `PyImport_ImportFrozenModuleObject` leaves the source-table
+                // name for `FrozenImporter._fix_up_module`, which consumes it
+                // when constructing loader_state.  This is load-bearing when
+                // the 3.14 tests import a fresh source copy of importlib and
+                // its `_setup` repairs already-loaded frozen modules.
+                let w_origname = pyre_object::w_str_new(entry.origname.unwrap_or(entry.name));
+                unsafe {
+                    pyre_object::w_dict_setitem_str(
+                        pyre_object::gc_roots::shadow_stack_get(globals_slot),
+                        "__origname__",
+                        w_origname,
+                    );
+                }
                 // `PyImport_ImportFrozenModuleObject`: a frozen *package* gets
                 // `__path__` set to the empty list before its code runs, which
                 // is what makes `import __phello__.spam` resolve through it
