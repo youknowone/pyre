@@ -1991,6 +1991,14 @@ pub(crate) fn resolve_kwargs(
     // — leaves RUNNING before taking `gc_mutex` (`gc_sync.rs:22`), so a
     // collector on another thread relocates whatever the shadow stack does not
     // name.  Pin them all, then read every one back out.
+    //
+    // A signature with no star parameter allocates nothing here, so it skips
+    // the bracket entirely: `pin_root` is `dont_look_inside`, and a pin per
+    // bound parameter on every keyword call is a residual the tracer has to
+    // carry through the compiled loop.
+    if !has_varargs && !has_varkw {
+        return Ok(result);
+    }
     let roots = pyre_object::gc_roots::push_roots();
     let result_slot = roots.base();
     for &value in &result {
@@ -2168,7 +2176,11 @@ pub(crate) fn bind_kwargs_to_signature(
     // Pack `*args` / `**kwargs` tails — argument.py _match_signature 207-259.
     // The bound parameters, the unmatched keyword pairs and both tail objects
     // are all raw copies held across the packing allocations; see the same
-    // bracket in `resolve_kwargs`.
+    // bracket in `resolve_kwargs`, including why a star-less signature returns
+    // before it.
+    if !has_varargs && !has_varkw {
+        return Ok(result);
+    }
     let roots = pyre_object::gc_roots::push_roots();
     let result_slot = roots.base();
     for &value in &result {
@@ -3745,20 +3757,29 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     // PyPy: __build_class__(func, name, *bases, metaclass=None, **kwds)
     //
     // The class-definition keywords are collected into a fresh dict that only
-    // `build_class_inner` consumes, so the guard is opened here rather than
-    // inside the arm below: `update_bases` and both `w_tuple_new` calls run
-    // between the two, and a guard scoped to the arm would unpin the dict
-    // across them. `build_class_inner` re-pins its own parameter copy.
-    let extra_roots = pyre_object::gc_roots::push_roots();
-    let extra_slot = extra_roots.base();
-    let (base_args, metaclass, extra_kwargs) = if args.len() > 2 {
+    // `build_class_inner` consumes, so the guard is opened before the arm that
+    // fills it: `update_bases` and both `w_tuple_new` calls run between the
+    // two, and a guard scoped to the arm would unpin the dict across them.
+    // `build_class_inner` re-pins its own parameter copy. A class statement
+    // without keywords opens no scope at all — `pin_root` is
+    // `dont_look_inside`, so an unconditional one would residualise in every
+    // traced class body.
+    let kwds_dict = if args.len() > 2 {
         let last = args[args.len() - 1];
-        if unsafe { pyre_object::is_dict(last) }
+        let is_kwds = unsafe { pyre_object::is_dict(last) }
             && unsafe {
                 pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
                     .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
-            }
+            };
+        is_kwds.then_some(last)
+    } else {
+        None
+    };
+    let extra_roots = kwds_dict.map(|_| pyre_object::gc_roots::push_roots());
+    let (base_args, metaclass, extra_kwargs) = if let Some(last) = kwds_dict {
         {
+            let extra_roots = extra_roots.as_ref().expect("opened for a kwargs dict");
+            let extra_slot = extra_roots.base();
             let w_metaclass = unsafe { pyre_object::w_dict_getitem_str(last, "metaclass") };
             // Collect extra kwargs (not metaclass, not __pyre_kw__).
             // `w_dict_items` already dispatches `is_module_dict` so a
@@ -3782,8 +3803,6 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
                 w_metaclass,
                 Some(extra_roots.get(extra_slot)),
             )
-        } else {
-            (&args[2..], None, None)
         }
     } else {
         (&args[2..], None, None)
@@ -3842,7 +3861,10 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         name,
         bases_tuple,
         w_metaclass,
-        extra_kwargs.map(|_| extra_roots.get(extra_slot)),
+        extra_kwargs.map(|_| {
+            let roots = extra_roots.as_ref().expect("opened for a kwargs dict");
+            roots.get(roots.base())
+        }),
         w_orig_bases,
     )
 }
@@ -3858,14 +3880,16 @@ fn build_class_inner(
     // The class-definition keywords survive the class body call and the whole
     // metaclass construction below, and the parameter is a raw copy taken
     // before any of it. Pin it once and read it back at each of the three
-    // sites that consume it.
-    let _kwds_roots = pyre_object::gc_roots::push_roots();
-    let kwds_slot = extra_kwargs.map(|kw| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(kw);
-        slot
+    // sites that consume it. A class statement without keywords opens no
+    // scope: `pin_root` is `dont_look_inside`, so an unconditional one would
+    // residualise in every traced class body.
+    let kwds_roots = extra_kwargs.map(|kw| {
+        let scope = pyre_object::gc_roots::push_roots();
+        let slot = scope.base();
+        scope.pin_root(kw);
+        (scope, slot)
     });
-    let current_kwds = || kwds_slot.map(|slot| pyre_object::gc_roots::shadow_stack_get(slot));
+    let current_kwds = || kwds_roots.as_ref().map(|(scope, slot)| scope.get(*slot));
 
     let w_code = unsafe { crate::getcode(body_fn) };
     let w_globals = unsafe { function_get_globals_obj(body_fn) };
