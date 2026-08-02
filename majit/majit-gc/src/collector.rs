@@ -3923,14 +3923,19 @@ impl MiniMarkGC {
             return;
         }
         // `malloc_typed` bootstrap objects are incminimark's prebuilt family.
-        // A registered Python vtable proves that the leading word is a real
-        // GcHeader; raw jitframes and other host allocations remain ignored.
-        let vtable = unsafe { *(obj.0 as *const usize) };
-        if self.vtable_to_type_id.contains_key(&vtable) {
-            let hdr = unsafe { header_of(obj.0) };
-            if unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
-                self.remember_young_pointer(obj);
-            }
+        // The witness is `registered_pyobject_header`, not vtable membership
+        // alone: `w_tuple_new` / `w_specialisedtuple_new_*` fall back to a bare
+        // `Box::into_raw` when no GC is installed, and those objects carry the
+        // very same registered `ob_header` at offset 0 with NO preceding
+        // `GcHeader`. A vtable-only test therefore reads the allocator word in
+        // front of the box and — if its `TRACK_YOUNG_PTRS` bit happens to be
+        // set — has `remember_young_pointer` write flags back into that
+        // metadata. The tid equality is what separates the two families.
+        let Some(hdr) = self.registered_pyobject_header(obj.0) else {
+            return;
+        };
+        if unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
+            self.remember_young_pointer(obj);
         }
     }
 
@@ -6085,6 +6090,58 @@ mod tests {
         // `remember_young_pointer` clears TRACK_YOUNG_PTRS, so an unchanged
         // byte also proves the barrier never wrote through the fake header.
         assert_eq!(unsafe { *flag_byte }, flag_byte_before);
+
+        unsafe { std::alloc::dealloc(base, layout) };
+    }
+
+    #[test]
+    fn write_barrier_ignores_headerless_pyobject_with_registered_vtable() {
+        // `w_tuple_new` / `w_specialisedtuple_new_*` fall back to a bare
+        // `Box::into_raw` when `try_gc_alloc_stable` finds no installed
+        // collector, and the struct they build still starts with `ob_header` —
+        // the very vtable `register_vtable_for_type` knows. Such an object is
+        // in no managed generation, so `do_write_barrier` reaches its
+        // bootstrap-prebuilt arm; a vtable-only test there would read the
+        // allocator word in FRONT of the box as a `GcHeader` and, on a set
+        // `TRACK_YOUNG_PTRS` bit, have `remember_young_pointer` write flags
+        // back into that metadata. `registered_pyobject_header`'s tid equality
+        // is what rejects it.
+        let mut gc = test_gc(1024);
+        let tid = gc.register_type(TypeInfo::simple(2 * std::mem::size_of::<usize>()));
+        let vtable = 0x1234_5678usize;
+        crate::GcAllocator::register_vtable_for_type(&mut gc, vtable, tid);
+
+        // One leading word standing in for the allocator metadata a real
+        // `Box` keeps there, then the headerless object itself.
+        let layout = std::alloc::Layout::from_size_align(
+            GcHeader::SIZE + 2 * std::mem::size_of::<usize>(),
+            GcHeader::SIZE,
+        )
+        .unwrap();
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!base.is_null());
+        let obj = unsafe { base.add(GcHeader::SIZE) } as usize;
+        unsafe { (obj as *mut usize).write(vtable) };
+        assert!(!gc.is_managed_heap_object(obj));
+
+        // Make the fake header in front of the object look live: both the
+        // barrier's flag bit and a type id that is registered — but NOT this
+        // object's, which is the whole discriminator.
+        let other_tid = gc.register_type(TypeInfo::simple(8));
+        assert_ne!(other_tid, tid);
+        let fake = base as *mut GcHeader;
+        unsafe {
+            fake.write(GcHeader::new(other_tid));
+            (*fake).set_flag(flags::TRACK_YOUNG_PTRS);
+        }
+        let fake_bits_before = unsafe { (*fake).tid_and_flags };
+
+        gc.do_write_barrier(GcRef(obj));
+
+        assert_eq!(gc.remembered_set.len(), 0);
+        // `remember_young_pointer` clears TRACK_YOUNG_PTRS, so unchanged bits
+        // also prove the barrier never wrote through the fake header.
+        assert_eq!(unsafe { (*fake).tid_and_flags }, fake_bits_before);
 
         unsafe { std::alloc::dealloc(base, layout) };
     }
