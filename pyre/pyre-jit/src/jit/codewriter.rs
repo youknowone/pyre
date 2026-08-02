@@ -6750,11 +6750,38 @@ impl CodeWriter {
             }};
             // Terminal form: the marker ends this graph block.  Used by the
             // arms that `continue` out of the dispatch instead of completing
-            // their stack model — the `Call` nargs > 14 arm (which skips its
-            // `push_and_bump!`) and the `LoadFastCheck` unbound arm (which
-            // switches into a dedicated dead-end block that has no successor
-            // by construction).
+            // their stack model — the `Call` nargs > 14 arm (which bails
+            // before touching the operands, so nothing pushes the call result
+            // the fall-through PC expects) and the `LoadFastCheck` unbound arm
+            // (which switches into a dedicated dead-end block that has no
+            // successor by construction).  Both leave the value stack exactly
+            // as the interpreter will find it, so the resume coordinate below
+            // is emitted for this form too.
             ($py_pc:expr, closes_block) => {{
+                // Nothing follows to model the frame further, so the value
+                // stack the interpreter resumes on has to be the real one.
+                // `push_and_bump!` leaves a pushed value in its SSA register
+                // and syncs only `valuestackdepth` — the vable slot behind it
+                // still reads PY_NULL — so mirror every live slot before the
+                // bail (`pyframe.py`'s `pushvalue`, lowered by
+                // `jtransform.py`'s `do_fixed_list_setitem`).  These stores sit
+                // in a block that only ever runs into the marker, so no
+                // continuing path pays for them.
+                for (slot, value) in current_state.stack.iter().enumerate() {
+                    let v_idx: super::flow::FlowValue =
+                        super::flow::Constant::signed((stack_base_absolute + slot) as i64).into();
+                    record_graph_op(
+                        &current_block.block(),
+                        "setarrayitem_vable_r",
+                        vable_setarrayitem_ref_graph_args(
+                            frame_var.into(),
+                            v_idx.into(),
+                            value.clone().into(),
+                        ),
+                        None,
+                        ($py_pc) as i64,
+                    );
+                }
                 emit_abort_permanent!(@emit $py_pc, true)
             }};
             (@emit $py_pc:expr, $closes_block:expr) => {{
@@ -9079,6 +9106,24 @@ impl CodeWriter {
                         // Pop in reverse: args, null_or_self, callable.
                         Instruction::Call { argc } => {
                             let nargs = argc.get(op_arg) as usize;
+                            // No `call_fn_N` helper exists past nargs 14 (the
+                            // backend dispatch tops out at 16 i64 args =
+                            // callable + null_or_self + 14), so this opcode is
+                            // handed back to the interpreter.  Bail here,
+                            // ahead of the operand pops: `abort_permanent`
+                            // publishes `last_instr = py_pc - 1` and the
+                            // interpreter re-runs this CALL, which needs the
+                            // callable and its arguments still on the value
+                            // stack.  `emit_popvalue_ref!` nulls each slot it
+                            // pops and syncs the lowered `valuestackdepth`
+                            // into the vable, so a bail placed after them
+                            // resumes a wide call against an empty stack.
+                            // `closes_block`: nothing pushes the call result,
+                            // so the fall-through PC must not be walked.
+                            if nargs > 14 {
+                                emit_abort_permanent!(py_pc, closes_block);
+                                continue;
+                            }
                             let mut graph_arg_values_rev = Vec::with_capacity(nargs);
                             for _ in 0..nargs {
                                 let _arg_reg = emit_popvalue_ref!(current_depth, py_pc);
@@ -9176,50 +9221,38 @@ impl CodeWriter {
 
                             // RPython blackhole.py: call_int_function transmutes
                             // to the correct arity. Each nargs needs a matching
-                            // extern "C" fn with that many i64 parameters.
-                            // nargs > 14 → abort_permanent (no matching helper;
-                            // the backend dispatch tops out at 16 i64 args =
-                            // callable + null_or_self + 14).
-                            let call_result_value = if nargs > 14 {
-                                fresh_ref_value(&mut graph)
-                            } else {
-                                // Graph-side `simple_call(callable,
-                                // null_or_self, args...)` carries the RPython
-                                // rewrite_call shape (jtransform.py:414 — no
-                                // frame arg).  The canonical driver's
-                                // `lower_simple_call_hlop_to_insn` arm lowers
-                                // it to `residual_call_r_r(
-                                // ConstInt(call_fn_<nargs>_idx),
-                                // ListR([Reg(callable), Reg(null_or_self),
-                                // Reg(arg0), ...]), Descr) → Reg(dst)` with
-                                // `CallFlavor::MayForce` (every `call_fn_N` is
-                                // bound MayForce).  The ABI matches upstream
-                                // `bhimpl_residual_call_r_r` (no frame); the
-                                // parent frame is resolved at runtime from the
-                                // execution context inside `bh_call_fn_impl`,
-                                // which also prepends a non-null null_or_self
-                                // as arg0 (eval.rs:3216-3226).
-                                let graph_call_args: Vec<super::flow::FlowValue> =
-                                    graph_arg_values_rev.iter().rev().cloned().collect();
-                                let result = emit_frontend_simple_call(
+                            // extern "C" fn with that many i64 parameters, and
+                            // the arities past 14 were already handed back to
+                            // the interpreter above.
+                            //
+                            // Graph-side `simple_call(callable, null_or_self,
+                            // args...)` carries the shape `jtransform.py`'s
+                            // `rewrite_call` produces — no frame arg.  The
+                            // canonical driver's
+                            // `lower_simple_call_hlop_to_insn` arm lowers it to
+                            // `residual_call_r_r(
+                            // ConstInt(call_fn_<nargs>_idx),
+                            // ListR([Reg(callable), Reg(null_or_self),
+                            // Reg(arg0), ...]), Descr) → Reg(dst)` with
+                            // `CallFlavor::MayForce` (every `call_fn_N` is
+                            // bound MayForce).  The ABI matches upstream
+                            // `bhimpl_residual_call_r_r` (no frame); the
+                            // parent frame is resolved at runtime from the
+                            // execution context inside `bh_call_fn_impl`,
+                            // which also prepends a non-null null_or_self
+                            // as arg0 (`eval.rs`).
+                            let graph_call_args: Vec<super::flow::FlowValue> =
+                                graph_arg_values_rev.iter().rev().cloned().collect();
+                            let call_result_value: super::flow::FlowValue =
+                                emit_frontend_simple_call(
                                     &mut graph,
                                     &current_block.block(),
                                     callable_value,
                                     null_or_self_value.into(),
                                     graph_call_args,
                                     py_pc as i64,
-                                );
-                                result.into()
-                            };
-                            if nargs > 14 {
-                                // `closes_block`: this arm skips the
-                                // `push_and_bump!` below, so its stack model is
-                                // incomplete and the fall-through must not be
-                                // walked.  Do not record the synthetic call
-                                // result or any later operation on the block.
-                                emit_abort_permanent!(py_pc, closes_block);
-                                continue;
-                            }
+                                )
+                                .into();
                             push_and_bump!(call_result_value, py_pc);
                         }
 
@@ -12122,6 +12155,16 @@ impl CodeWriter {
 
                                 current_block = unbound_block;
                                 current_state = unbound_state;
+                                // The `push_and_bump!` above synced a
+                                // `valuestackdepth` for a LOAD_FAST_CHECK that
+                                // pushed its value.  This arm's opcode does
+                                // not: the interpreter re-runs it from the
+                                // marker and raises UnboundLocalError before
+                                // pushing.  The depth was walked back on the
+                                // abstract state only, so sync the physical
+                                // one too or the resumed frame carries a
+                                // phantom slot above its real top.
+                                emit_vsd!(current_depth, py_pc);
                                 // `closes_block`: the null arm's block is a
                                 // dead end by construction — the bound arm
                                 // already merged the fall-through PC above, so
