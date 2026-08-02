@@ -113,6 +113,14 @@ unsafe fn key_as_utf8(key: PyObjectRef) -> Option<&'static str> {
 /// fails loud rather than substituting a divergent structural hash.
 #[inline]
 pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
+    // `hash_w` runs the key's `__hash__` and is therefore a collection point,
+    // while this key caches the pointer — the hazard [`object_key_hashed`]
+    // documents. Publish `obj` across the call and build the key from the
+    // reloaded address, or the entry lands in the `IndexMap` under the
+    // pre-move pointer and every later probe dereferences reclaimed memory.
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(obj);
     let hash = crate::dict_eq_hook::try_hash_w(obj)
         .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook());
     if crate::dict_eq_hook::take_hash_error() {
@@ -123,6 +131,7 @@ pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
     // an infallible probe's own error is then swallowed by the next key
     // construction, never leaking into a later checked op.
     crate::dict_eq_hook::take_eq_error();
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     ObjectKey { hash, obj }
 }
 
@@ -538,6 +547,11 @@ unsafe fn object_key_for_new_str(key: &str) -> ObjectKey {
 /// error from the interpreter-side error slot.
 #[inline]
 pub unsafe fn object_key_for_checked(obj: PyObjectRef) -> Result<ObjectKey, DictKeyError> {
+    // Same publication as [`object_key_for`]: `hash_w` can collect and this
+    // key caches the pointer, so key on the reloaded address.
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::pin_root(obj);
     let hash = crate::dict_eq_hook::try_hash_w(obj)
         .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook());
     if crate::dict_eq_hook::take_hash_error() {
@@ -546,6 +560,7 @@ pub unsafe fn object_key_for_checked(obj: PyObjectRef) -> Result<ObjectKey, Dict
     // Clean slate for the bucket probe that follows in the caller; its
     // eq error is read back via `take_dict_key_error` after the access.
     crate::dict_eq_hook::take_eq_error();
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     Ok(ObjectKey { hash, obj })
 }
 
@@ -2978,10 +2993,20 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
     hash: Option<i64>,
 ) -> Result<(), DictKeyError> {
     debug_assert!(!value.is_null(), "w_dict_store_object_strategy: null value");
+    // `object_key_for_checked` hashes through the key's `__hash__`, so it is a
+    // collection point; the caller's `lock_dict_refs!` bindings are raw copies
+    // taken before it. Publish the receiver and the value here and reload them
+    // once the key exists, or the insert below writes a moved `value` and
+    // reaches the `IndexMap` through the dict's pre-move address.
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::pin_roots(&[obj, value]);
+    let value_slot = obj_slot + 1;
     let object_key = match hash {
         Some(hash) => object_key_hashed(key, hash),
         None => object_key_for_checked(key)?,
     };
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let value = crate::gc_roots::shadow_stack_get(value_slot);
     // Single setitem probe (matches `r_dict.setitem`'s one bucket scan), run
     // callback-free so no user `__eq__` mutates the dict while the `IndexMap`
     // borrow is live.  When every same-hash comparison stays inside the
