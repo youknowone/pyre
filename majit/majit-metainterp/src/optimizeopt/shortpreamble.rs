@@ -2697,34 +2697,60 @@ impl ExtendedShortPreambleBuilder {
             // turn because its own `produce_arg` now misses — the transitive
             // closure this loop reproduces through `short_results`.
             //
-            // Upstream reaches the inline with that filtering already done, so
-            // its `ExtendedShortPreambleBuilder.setup` (:460-463) is three
-            // field assignments and CANNOT fail. Pyre's short boxes are
-            // exported against one label-arg set and replayed against another
-            // (a retrace runs no Phase 1 and imports the partial trace's
-            // exported state), so an arg that was produce-able at export can be
-            // unresolvable here. Dropping the single op is the upstream
-            // outcome; abandoning the WHOLE inline — which this used to do —
-            // has no upstream counterpart and costs the loop its self-close.
+            // That filtering is an EXPORT-time rule, and it is the only drop
+            // upstream has. By the time upstream reaches the inline it is done:
+            // `ExtendedShortPreambleBuilder.setup` (:460-463) is three field
+            // assignments and cannot fail, and `inline_short_preamble`
+            // (unroll.py:372-410) then replays EVERY op in `short` — guards
+            // included, through their own `sop.is_guard()` arm — with
+            // `_map_args` (unroll.py:364-370) raising KeyError rather than
+            // dropping anything. So there is no upstream counterpart for a drop
+            // HERE, at inline time, against a body already optimized under the
+            // exported facts.
+            //
+            // Pyre needs one anyway: its short boxes are exported against one
+            // label-arg set and replayed against another (a retrace runs no
+            // Phase 1 and imports the partial trace's exported state), so an arg
+            // that was produce-able at export can be unresolvable here. The drop
+            // is therefore bounded to the only case where it changes nothing the
+            // target body can observe — a PURE producer whose result the short
+            // preamble's own JUMP does not carry. Anything else declines the
+            // whole inline, which is what this loop used to do unconditionally,
+            // so `jump_to_existing_trace` falls back to `jump_to_preamble`
+            // (unroll.py:154/167).
             let resolvable = op.getarglist().iter().all(|arg| {
                 self.insert_dep_recursive(arg.to_opref(), &inputargs_set, &constants_set)
             });
             if !resolvable {
-                // The per-op drop is only upstream's outcome while the dropped
-                // result stays invisible to the caller. `short_preamble.ops` and
-                // `short_preamble.jump_args` are filled in lockstep, so an op
-                // whose result the short preamble's own JUMP carries has no
-                // per-op answer: leaving it unmapped is what `_map_args`
-                // (unroll.py:404) raises KeyError on, and shortening the JUMP
-                // instead would disagree with the already-compiled target
-                // LABEL's arity. Decline the inline in that case, the way this
-                // whole loop used to, so `jump_to_existing_trace` falls back to
-                // `jump_to_preamble` (unroll.py:156).
-                if short_preamble.jump_args.contains(&op.pos.get()) {
+                // A GUARD carries the target body's assumption, not a value.
+                // `short_preamble.ops` holds `is_guard() || is_always_pure()`
+                // ops (see the inclusion rule where this list is built), and
+                // upstream replays the guards explicitly at
+                // `unroll.py:405-409`, restamping each with a
+                // `ResumeAtPositionDescr`. Dropping one lets the JUMP enter a
+                // body that was optimized under that guard's fact without ever
+                // checking it — a miscompile, not a lost optimization. A guard
+                // has no result box, so it can never appear in `jump_args` and
+                // the arity test below cannot catch it.
+                //
+                // A PRODUCER whose result the short preamble's own JUMP carries
+                // has no per-op answer either: `short_preamble.ops` and
+                // `short_preamble.jump_args` are filled in lockstep, leaving it
+                // unmapped is what `_map_args` (unroll.py:364-370) raises
+                // KeyError on, and shortening the JUMP instead would disagree
+                // with the already-compiled target LABEL's arity.
+                let decline = if op.opcode.is_guard() {
+                    Some("guard")
+                } else if short_preamble.jump_args.contains(&op.pos.get()) {
+                    Some("jump-arg producer")
+                } else {
+                    None
+                };
+                if let Some(reason) = decline {
                     if crate::optimizeopt::majit_log_enabled() {
                         eprintln!(
                             "[jit] short_preamble setup: dropping inline (unresolved arg in \
-                             jump-arg producer pos={:?} opcode={:?})",
+                             {reason} pos={:?} opcode={:?})",
                             op.pos.get(),
                             op.opcode
                         );
