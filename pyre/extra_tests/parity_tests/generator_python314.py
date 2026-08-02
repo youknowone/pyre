@@ -35,6 +35,8 @@ assert {
 } <= set(generator_type.__dict__)
 assert generator_type.__doc__ is None
 assert iter(generator) is generator
+assert generator.__next__.__func__ is generator_type.__next__
+assert generator.__next__.__doc__ == "Implement next(self)."
 assert generator.__name__ == "sample"
 assert generator.__qualname__.endswith("sample")
 assert generator.gi_code.co_name == "sample"
@@ -44,6 +46,15 @@ assert generator.gi_yieldfrom is None
 assert "generator object" in repr(generator)
 assert generator.__sizeof__() > 0
 assert weakref.ref(generator)() is generator
+
+try:
+    generator.gi_running = True
+except AttributeError as error:
+    assert str(error) == (
+        "attribute 'gi_running' of 'generator' objects is not writable"
+    )
+else:
+    raise AssertionError("gi_running must remain read-only")
 
 generator.__name__ = "renamed"
 generator.__qualname__ = "qualified.renamed"

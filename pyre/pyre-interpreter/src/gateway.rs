@@ -1316,6 +1316,19 @@ pub fn make_builtin_function_with_arity(
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// Fixed-arity builtin carrying the app-visible docstring that PyPy normally
+/// obtains from the wrapped interpreter-level function's `__doc__`.
+pub fn make_builtin_function_with_arity_and_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    arity: u16,
+    docstring: &'static str,
+) -> PyObjectRef {
+    debug_assert!(arity <= 4);
+    let code = builtin_code_new_full(name, func, Some(docstring), arity, std::ptr::null());
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
 /// Build a CPython-compatible slot-wrapper descriptor with a fixed arity.
 pub fn make_slot_wrapper_with_arity(
     name: &'static str,

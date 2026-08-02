@@ -5117,35 +5117,6 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
         }
     }
 
-    // Generator/coroutine methods — PyPy: generator.py GeneratorIterator
-    //
-    // Return W_Method(func, gen) so the generator is passed as args[0].
-    unsafe {
-        if pyre_object::generator::is_generator(obj) {
-            let (sname, func, arity): (&str, fn(&[PyObjectRef]) -> PyResult, Option<u16>) =
-                match name {
-                    "send" => ("send", generator_send_method, Some(2)),
-                    "throw" => ("throw", generator_throw_method, None),
-                    "close" => ("close", generator_close_method, Some(1)),
-                    "__next__" => ("__next__", generator_next_method, Some(1)),
-                    "__iter__" => ("__iter__", iter_self_method, Some(1)),
-                    _ => ("", generator_next_method, None), // sentinel — won't match
-                };
-            if !sname.is_empty() {
-                let func_obj = if let Some(a) = arity {
-                    crate::make_builtin_function_with_arity(sname, func, a)
-                } else {
-                    crate::make_builtin_function(sname, func)
-                };
-                return Ok(pyre_object::w_method_new(
-                    func_obj,
-                    obj,
-                    pyre_object::PY_NULL,
-                ));
-            }
-        }
-    }
-
     // Native itertools fallback methods.  The corresponding TypeDefs expose
     // these slots directly; this path remains for the iterator families whose
     // TypeDefs have not yet been installed.

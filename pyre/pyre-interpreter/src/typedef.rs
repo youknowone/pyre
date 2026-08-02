@@ -24686,6 +24686,18 @@ fn generator_descr_sizeof(_args: &[PyObjectRef]) -> crate::PyResult {
     ))
 }
 
+/// Python 3.14 `PyObject_GenericSetAttr` error for the read-only members in
+/// `gen_getsetlist`. PyPy's `GetSetProperty` reports `readonly attribute
+/// 'name'`; the selected 3.14 surface includes the owning type as well.
+fn generator_readonly_attribute(args: &[PyObjectRef]) -> crate::PyResult {
+    let descr = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let name_obj = read_descr_name(descr);
+    let name = unsafe { pyre_object::w_str_get_value_opt(name_obj) }.unwrap_or("<unknown>");
+    Err(crate::PyError::attribute_error(format!(
+        "attribute '{name}' of 'generator' objects is not writable"
+    )))
+}
+
 /// PyPy `generator.py GeneratorIterator.typedef`, augmented only by the
 /// concrete slots Python 3.14 exposes on `types.GeneratorType`.
 fn init_generator_type(ns: PyObjectRef) {
@@ -24699,13 +24711,17 @@ fn init_generator_type(ns: PyObjectRef) {
         ("__del__", crate::baseobjspace::generator_close_method, 1),
         ("__sizeof__", generator_descr_sizeof, 1),
     ] {
-        unsafe {
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
+        let function = if name == "__next__" {
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 name,
-                make_builtin_function_with_arity(name, function, arity),
+                function,
+                arity,
+                "Implement next(self).",
             )
+        } else {
+            make_builtin_function_with_arity(name, function, arity)
         };
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, function) };
     }
     unsafe {
         pyre_object::w_dict_setitem_str(
@@ -24729,12 +24745,18 @@ fn init_generator_type(ns: PyObjectRef) {
         ("gi_code", generator_get_code as DunderFn),
         ("gi_yieldfrom", generator_get_yieldfrom as DunderFn),
     ] {
+        let setter =
+            make_builtin_function_with_arity(name, generator_readonly_attribute as DunderFn, 3);
+        let deleter =
+            make_builtin_function_with_arity(name, generator_readonly_attribute as DunderFn, 2);
         unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_getset_descriptor_named(
+                make_getset_property_named(
                     make_builtin_function_with_arity(name, getter, 2),
+                    setter,
+                    deleter,
                     name,
                 ),
             )
