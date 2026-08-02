@@ -147,6 +147,33 @@ fn _load_unsigned_digit(x: Digit) -> UDigit {
     x as UDigit
 }
 
+/// Address of `l->items[x]`, the way `rtype_getitem` reaches it after
+/// translation.
+///
+/// `rtype_getitem` / `rtype_setitem` (rlist.py:247-266, :272-303) select
+/// `dum_checkidx` only where the source catches `IndexError`; every digit
+/// access takes the default `dum_nocheck`, under which `ll_getitem_nonneg`
+/// keeps `ll_assert(index >= 0, ...)` and folds the length test away. Going
+/// through a `&[Digit]` instead reloads the block's length header and branches
+/// on it once per digit, which the translated form never does.
+///
+/// # Safety
+///
+/// `digits` must be a live digit block and `x` an index within its capacity.
+#[majit_macros::always_inline]
+#[inline]
+unsafe fn digits_item(digits: *mut TypedItemsBlock, x: i64) -> *mut Digit {
+    debug_assert!(x >= 0, "unexpectedly negative digit index");
+    debug_assert!(!digits.is_null());
+    debug_assert!((x as usize) < unsafe { typed_items_block_capacity(digits) });
+    unsafe {
+        (digits as *mut u8)
+            .add(TYPED_ITEMS_BLOCK_ITEMS_OFFSET)
+            .cast::<Digit>()
+            .add(x as usize)
+    }
+}
+
 pub const NULLDIGIT: Digit = 0;
 pub const ONEDIGIT: Digit = 1;
 
@@ -889,51 +916,28 @@ impl RBigInt {
         self._size = self._size.abs() * sign;
     }
 
-    /// Address of digit `x`, the way `l->items[x]` reaches it after
-    /// translation.
-    ///
-    /// `rtype_getitem` (rlist.py:247-266) picks `dum_checkidx` only where the
-    /// source catches `IndexError`; every digit access here takes the default
-    /// `dum_nocheck`, which folds `ll_getitem_nonneg`'s length test away and
-    /// leaves `ll_assert(index >= 0, ...)` alone. Going through a `&[Digit]`
-    /// instead reloads the block's length header and branches on it once per
-    /// digit, which the translated form never does.
-    #[majit_macros::always_inline]
-    #[inline]
-    fn digit_slot(&self, x: i64) -> *mut Digit {
-        debug_assert!(x >= 0, "unexpectedly negative digit index");
-        debug_assert!(!self._digits.is_null());
-        debug_assert!((x as usize) < unsafe { typed_items_block_capacity(self._digits) });
-        unsafe {
-            (self._digits as *mut u8)
-                .add(TYPED_ITEMS_BLOCK_ITEMS_OFFSET)
-                .cast::<Digit>()
-                .add(x as usize)
-        }
-    }
-
     #[majit_macros::always_inline]
     #[inline]
     pub fn digit(&self, x: i64) -> Digit {
-        unsafe { *self.digit_slot(x) }
+        unsafe { *digits_item(self._digits, x) }
     }
 
     #[majit_macros::always_inline]
     #[inline]
     pub fn widedigit(&self, x: i64) -> WideDigit {
-        _widen_digit(self.digit(x))
+        _widen_digit(unsafe { *digits_item(self._digits, x) })
     }
 
     #[majit_macros::always_inline]
     #[inline]
     pub fn uwidedigit(&self, x: i64) -> UWideDigit {
-        _unsigned_widen_digit(self.digit(x))
+        _unsigned_widen_digit(unsafe { *digits_item(self._digits, x) })
     }
 
     #[majit_macros::always_inline]
     #[inline]
     pub fn udigit(&self, x: i64) -> UDigit {
-        _load_unsigned_digit(self.digit(x))
+        _load_unsigned_digit(unsafe { *digits_item(self._digits, x) })
     }
 
     #[majit_macros::always_inline]
@@ -941,7 +945,7 @@ impl RBigInt {
     fn setdigit(&mut self, x: i64, val: Digit) {
         let val = _mask_digit(val);
         debug_assert!(val >= 0);
-        unsafe { *self.digit_slot(x) = _store_digit(val) };
+        unsafe { *digits_item(self._digits, x) = _store_digit(val) };
     }
 
     // rbigint.py:208-212 `@specialize.argtype(2) setdigit`, Unsigned graph.
@@ -950,7 +954,7 @@ impl RBigInt {
     fn setdigit_udigit(&mut self, x: i64, val: UDigit) {
         let val = _mask_udigit(val);
         debug_assert!(val >= 0);
-        unsafe { *self.digit_slot(x) = _store_digit(val) };
+        unsafe { *digits_item(self._digits, x) = _store_digit(val) };
     }
 
     // rbigint.py:208-212 `@specialize.argtype(2) setdigit`, LONG_TYPE graph.
@@ -959,7 +963,7 @@ impl RBigInt {
     fn setdigit_widedigit(&mut self, x: i64, val: WideDigit) {
         let val = _mask_widedigit(val);
         debug_assert!(val >= 0);
-        unsafe { *self.digit_slot(x) = _store_digit(val) };
+        unsafe { *digits_item(self._digits, x) = _store_digit(val) };
     }
 
     // rbigint.py:208-212 `@specialize.argtype(2) setdigit`, ULONG_TYPE graph.
@@ -968,7 +972,7 @@ impl RBigInt {
     fn setdigit_uwidedigit(&mut self, x: i64, val: UWideDigit) {
         let val = _mask_uwidedigit(val);
         debug_assert!(val >= 0);
-        unsafe { *self.digit_slot(x) = _store_digit(val) };
+        unsafe { *digits_item(self._digits, x) = _store_digit(val) };
     }
 
     #[majit_macros::always_inline]
