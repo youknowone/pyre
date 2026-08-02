@@ -56,6 +56,23 @@ except AttributeError as error:
 else:
     raise AssertionError("gi_running must remain read-only")
 
+
+def context_generator():
+    yield
+    try:
+        raise TypeError
+    except TypeError as error:
+        assert isinstance(error.__context__, ValueError)
+    yield
+
+
+context = context_generator()
+next(context)
+try:
+    raise ValueError
+except ValueError:
+    next(context)
+
 generator.__name__ = "renamed"
 generator.__qualname__ = "qualified.renamed"
 assert generator.__name__ == "renamed"
