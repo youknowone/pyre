@@ -89,11 +89,29 @@ pub(crate) fn fbw_strict_fold_frame_reg<Sym: WalkSym>(ctx: &WalkContext<'_, '_, 
         .map_or(u16::MAX, |shadow| shadow.fold_frame_reg)
 }
 
-/// `PYRE_FBW_CALLEE_VSTACK` (default ON) — maintain a callee-local
+/// `PYRE_FBW_CALLEE_VSTACK` (default OFF) — maintain a callee-local
 /// operand-stack mirror while walking an inline sub-call.  The callee enters
 /// with an empty operand stack; subsequent boundaries must use the active
 /// callee jitcode metadata rather than the outer full-body tables.  Set to
-/// `0` or `false` to retain the stabilization-period kill switch.
+/// `1` to opt in.
+///
+/// Measured on the whole `pyre/bench/synth` corpus (dynasm): ON compiles two
+/// loops that OFF declines, and both then fail their guards with no bridge —
+/// 349 → 347 passing, no fixture improved, CPU time unchanged.  The two loops
+/// reach the bridge gaps that make the mirror unprofitable today:
+///
+///   * `getframe_inline_subwalk_multiframe` — the loop's failing guard is a
+///     GUARD_NOT_FORCED, which `compile.py:950-953
+///     ResumeGuardForcedDescr.handle_fail` never compiles ("always just
+///     blackholed"), so every one of its 8948 failures resumes through the
+///     blackhole.  No bridge is reachable for this shape by construction.
+///   * `or_chain_fresh_alloc_arg` — the failing guard needs a multi-frame
+///     inline resume, and `reconstruct_inline_recipe` declines the callee
+///     frame at `UnboxedLiveRegister`: the resumed `pick` frame holds a live
+///     int-bank register (color 0) that the per-PC `(bank, color, slot)` map
+///     gives no `locals_cells_stack_w` slot, i.e. a JitCode int temp with no
+///     boxed home in the rebuilt PyFrame.  `P2Drain::NoRecipes` then declines
+///     the guard permanently and its 9653 failures blackhole.
 pub(crate) fn fbw_callee_vstack_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_CALLEE_VSTACK") {
@@ -101,7 +119,7 @@ pub(crate) fn fbw_callee_vstack_enabled() -> bool {
             let v = v.to_string_lossy();
             v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        None => true,
+        None => false,
     })
 }
 
