@@ -12828,23 +12828,7 @@ fn init_slot_wrapper_type(ns: PyObjectRef) {
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__get__",
-            make_builtin_function_with_arity(
-                "__get__",
-                |args| {
-                    let obj = if pyre_object::is_none(args[1]) {
-                        pyre_object::PY_NULL
-                    } else {
-                        args[1]
-                    };
-                    let w_type = if pyre_object::is_none(args[2]) {
-                        pyre_object::PY_NULL
-                    } else {
-                        args[2]
-                    };
-                    bind_slot_wrapper(args[0], obj, w_type)
-                },
-                3,
-            ),
+            make_builtin_function("__get__", |args| wrap_descr_get(args, bind_slot_wrapper)),
         );
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
@@ -12957,6 +12941,32 @@ fn bind_slot_wrapper(descr: PyObjectRef, obj: PyObjectRef, w_type: PyObjectRef) 
         slot_wrapper_check_instance(descr, obj)?;
     }
     bind_fixed_code_descriptor(descr, obj, w_type, crate::function::method_wrapper_new)
+}
+
+/// `typeobject.c wrap_descr_get` — the `__get__` namespace entry every
+/// descriptor type shares.  `PyArg_UnpackTuple(args, "__get__", 1, 2)` makes
+/// the owner optional and `None` collapses to the absent operand in both
+/// positions, so `list.__dict__['append'].__get__([1])` binds while
+/// `__get__(None, None)` is rejected before the type's own binder runs.
+fn wrap_descr_get(
+    args: &[PyObjectRef],
+    bind: fn(PyObjectRef, PyObjectRef, PyObjectRef) -> crate::PyResult,
+) -> crate::PyResult {
+    crate::type_methods::arity_at_least(args, "__get__", 1)?;
+    crate::type_methods::arity_at_most(args, "__get__", 2)?;
+    let collapse = |value: PyObjectRef| {
+        if value.is_null() || unsafe { pyre_object::is_none(value) } {
+            PY_NULL
+        } else {
+            value
+        }
+    };
+    let obj = collapse(args[1]);
+    let w_type = collapse(args.get(2).copied().unwrap_or(PY_NULL));
+    if obj.is_null() && w_type.is_null() {
+        return Err(crate::PyError::type_error("__get__(None, None) is invalid"));
+    }
+    bind(args[0], obj, w_type)
 }
 
 /// Whether `obj` is a slot wrapper bound to a receiver — the `Method` payload
@@ -13217,23 +13227,9 @@ fn init_method_descriptor_type(ns: PyObjectRef) {
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__get__",
-            make_builtin_function_with_arity(
-                "__get__",
-                |args| {
-                    let obj = if pyre_object::is_none(args[1]) {
-                        pyre_object::PY_NULL
-                    } else {
-                        args[1]
-                    };
-                    let w_type = if pyre_object::is_none(args[2]) {
-                        pyre_object::PY_NULL
-                    } else {
-                        args[2]
-                    };
-                    bind_method_descriptor(args[0], obj, w_type)
-                },
-                3,
-            ),
+            make_builtin_function("__get__", |args| {
+                wrap_descr_get(args, bind_method_descriptor)
+            }),
         );
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
@@ -13292,11 +13288,58 @@ fn classmethod_descriptor_function(
     name: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
     if !crate::function::is_classmethod_descriptor(obj) {
+        let received = if obj.is_null() {
+            "object"
+        } else {
+            crate::typedef::r#type(obj)
+                .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
+                .unwrap_or("object")
+        };
         return Err(crate::PyError::type_error(format!(
-            "descriptor '{name}' requires a 'classmethod_descriptor' object"
+            "descriptor '{name}' for 'classmethod_descriptor' objects doesn't apply to a '{received}' object"
         )));
     }
     Ok(unsafe { pyre_object::function::w_classmethod_get_func(obj) })
+}
+
+/// `descrobject.c classmethod_get` — the owner argument must be a type, and a
+/// subtype of the one the descriptor was found on.  `funcobject.c
+/// cm_descr_get`, the user `@classmethod` half, has no such check, so this
+/// runs only for a `classmethod_descriptor`.
+fn classmethod_descriptor_check_owner(
+    function: PyObjectRef,
+    w_klass: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    let name = unsafe { crate::function::function_get_name(function) };
+    let owner = unsafe { crate::function::fget_func_objclass(function)? };
+    let owner_name = unsafe { pyre_object::w_type_get_name(owner) };
+    if w_klass.is_null() || !unsafe { pyre_object::is_type(w_klass) } {
+        let got = if w_klass.is_null() {
+            "object".to_string()
+        } else {
+            type_name_of(w_klass)
+        };
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' for type '{owner_name}' needs a type, \
+             not a '{got}' as arg 2"
+        )));
+    }
+    if !unsafe { crate::baseobjspace::issubtype_w(w_klass, owner) } {
+        let got = unsafe { pyre_object::w_type_get_name(w_klass) };
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' requires a subtype of '{owner_name}' but received '{got}'"
+        )));
+    }
+    Ok(())
+}
+
+fn bind_classmethod_descriptor(
+    descr: PyObjectRef,
+    obj: PyObjectRef,
+    w_type: PyObjectRef,
+) -> crate::PyResult {
+    classmethod_descriptor_function(descr, "__get__")?;
+    classmethod_descr_get(&[descr, obj, w_type])
 }
 
 fn init_classmethod_descriptor_type(ns: PyObjectRef) {
@@ -13349,14 +13392,9 @@ fn init_classmethod_descriptor_type(ns: PyObjectRef) {
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__get__",
-            make_builtin_function_with_arity(
-                "__get__",
-                |args| {
-                    classmethod_descriptor_function(args[0], "__get__")?;
-                    classmethod_descr_get(args)
-                },
-                3,
-            ),
+            make_builtin_function("__get__", |args| {
+                wrap_descr_get(args, bind_classmethod_descriptor)
+            }),
         );
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
@@ -13366,25 +13404,18 @@ fn init_classmethod_descriptor_type(ns: PyObjectRef) {
                 let descr = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
                 let function = classmethod_descriptor_function(descr, "__call__")?;
                 // `descrobject.c classmethoddescr_call` — the receiver is the
-                // class itself, so it must be a type rather than an instance.
-                let name = crate::function::function_get_name(function);
-                let owner_name =
-                    pyre_object::w_type_get_name(crate::function::fget_func_objclass(function)?);
-                match positional.get(1) {
-                    Some(&cls) if pyre_object::is_type(cls) => {}
-                    Some(&cls) => {
-                        let got = type_name_of(cls);
-                        return Err(crate::PyError::type_error(format!(
-                            "descriptor '{name}' for type '{owner_name}' needs a type, \
-                             not a '{got}' as arg 2"
-                        )));
-                    }
-                    None => {
-                        return Err(crate::PyError::type_error(format!(
-                            "descriptor '{name}' of '{owner_name}' object needs an argument"
-                        )));
-                    }
-                }
+                // class itself, and it is validated by binding it through
+                // `classmethod_get` before the wrapped callable runs.
+                let Some(&cls) = positional.get(1) else {
+                    let name = crate::function::function_get_name(function);
+                    let owner_name = pyre_object::w_type_get_name(
+                        crate::function::fget_func_objclass(function)?,
+                    );
+                    return Err(crate::PyError::type_error(format!(
+                        "descriptor '{name}' of '{owner_name}' object needs an argument"
+                    )));
+                };
+                classmethod_descriptor_check_owner(function, cls)?;
                 function_descr_call_impl(positional, kwargs, function)
             }),
         );
@@ -14715,8 +14746,10 @@ fn classmethod_descr_get(args: &[PyObjectRef]) -> crate::PyResult {
     let function = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
     // `classmethod_get` binds a `METH_CLASS` entry through `PyCMethod_New`, so
     // `dict.fromkeys` is a `builtin_function_or_method`, while a Python
-    // `@classmethod` binds to an ordinary `method`.
+    // `@classmethod` binds to an ordinary `method`.  Only the descriptor half
+    // validates the owner argument.
     let new_bound = if crate::function::is_classmethod_descriptor(cm) {
+        classmethod_descriptor_check_owner(function, w_klass)?;
         crate::function::builtin_bound_method_new
     } else {
         pyre_object::w_method_new
