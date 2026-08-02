@@ -270,6 +270,39 @@ pub struct PyJitCodeMetadata {
     pub is_drained: bool,
 }
 
+/// Body-shape verdicts the walker's inline recipes ask before admitting a
+/// callee.  Each is a pure function of this payload's assembled bytecode and
+/// its descr pool, so each is decided once here rather than by re-decoding the
+/// callee body at every call site the walker considers.
+///
+/// This is where upstream keeps the answer too: `look_inside_graph`
+/// (`jit/codewriter/policy.py:48-80`) runs once per graph at codewriter time
+/// and the verdict is baked into the jitcode by rewriting `direct_call` to
+/// `inline_call_*`, which is why `_opimpl_inline_call1/2/3`
+/// (`pyjitpl.py:1265-1276`) have no admissibility test left to run.
+///
+/// Carried on the payload for the reason `sub_descr_pool` is: a `replace_with`
+/// body refill must drop these together with the body they describe.  A side
+/// table keyed by the `w_code` address cannot — it outlives the body, and a
+/// freed-then-recycled address silently answers for the wrong callee.
+#[derive(Clone, Copy)]
+pub(crate) struct InlineBodyFacts {
+    /// `raise`-bearing body; the widened method-form route declines these.
+    pub(crate) contains_raise: bool,
+    /// Carries an `abort_permanent` marker.  Distinct from
+    /// [`PyJitCodePayload::has_abort`], which the codewriter keeps narrowly
+    /// scoped to `abort()` emissions.
+    pub(crate) has_abort_permanent: bool,
+    /// Body shape the method-form inline route supports.
+    pub(crate) method_form_supported: bool,
+    /// Straight-line body, the exception-override / property routes' entry test.
+    pub(crate) exc_override_straight_line: bool,
+    /// Effect-free enough to speculatively sample before emitting IR.
+    pub(crate) exc_override_sample_safe: bool,
+    /// Body performs a nested Python call.
+    pub(crate) exc_override_has_nested_call: bool,
+}
+
 /// Compiled JitCode plus pyre-only metadata.
 pub struct PyJitCodePayload {
     pub jitcode: std::sync::Arc<RuntimeJitCode>,
@@ -293,6 +326,9 @@ pub struct PyJitCodePayload {
     /// `exec.descrs` it borrows from. RPython has no equivalent table:
     /// the active MIFrame's JitCode carries its descriptors directly.
     pub(crate) sub_descr_pool: std::cell::OnceCell<crate::state::SubDescrPool>,
+    /// Lazily-decided [`InlineBodyFacts`], built on the first call site that
+    /// asks and dropped with the body by `replace_with`.
+    pub(crate) inline_body_facts: std::cell::OnceCell<InlineBodyFacts>,
 }
 
 /// Shared `PyJitCode` identity whose payload is filled in place.
@@ -452,6 +488,7 @@ impl PyJitCode {
             code_ptr,
             has_abort,
             sub_descr_pool: std::cell::OnceCell::new(),
+            inline_body_facts: std::cell::OnceCell::new(),
         })
     }
 
@@ -488,6 +525,7 @@ impl PyJitCode {
             code_ptr,
             has_abort,
             sub_descr_pool,
+            inline_body_facts,
         } = next.payload.into_inner();
         let next_jitcode = std::sync::Arc::try_unwrap(next_jitcode)
             .expect("freshly assembled PyJitCode must uniquely own its runtime JitCode");
@@ -504,6 +542,9 @@ impl PyJitCode {
             // `exec.descrs`, and the new body starts with no pool (built
             // lazily on first walker inline of the refilled callee).
             current.sub_descr_pool = sub_descr_pool;
+            // Same reasoning for the body verdicts: they describe the body
+            // being replaced, so they go with it rather than outliving it.
+            current.inline_body_facts = inline_body_facts;
             let current_jitcode = std::sync::Arc::as_ptr(&current.jitcode) as *mut RuntimeJitCode;
             *current_jitcode = next_jitcode;
             current.metadata = metadata;
