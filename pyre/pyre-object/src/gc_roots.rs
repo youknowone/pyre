@@ -570,6 +570,14 @@ pub fn shadow_stack_copy_range(base: usize, dst: &mut [PyObjectRef]) {
             base + dst.len() <= stack.len(),
             "shadow-stack range out of bounds"
         );
+        if dst.is_empty() {
+            // An empty range starting one past the last live slot is in
+            // bounds — `&stack[len..len]` was — but `slot(len)` is not, and
+            // `copy_nonoverlapping` wants a non-null source even for a
+            // zero-length copy.  Neither applies when there is nothing to
+            // copy.
+            return;
+        }
         // SAFETY: the whole range was just bounds-checked, and `dst` is a
         // distinct caller-owned slice.
         unsafe { std::ptr::copy_nonoverlapping(stack.slot(base), dst.as_mut_ptr(), dst.len()) };
@@ -851,6 +859,27 @@ mod tests {
             assert_eq!(shadow_stack_len(), before);
         }
         assert_eq!(shadow_stack_len(), before);
+    }
+
+    /// An empty range is in bounds anywhere up to and including the live
+    /// length — `&stack[len..len]` was, and `pop_roots` is emitted even for
+    /// zero livevars (`shadowstack.py:37-40`). The top-of-stack case is the
+    /// one a per-slot bounds check gets wrong.
+    #[test]
+    fn copy_range_accepts_an_empty_range_at_the_top_of_the_stack() {
+        let _roots = push_roots();
+        pin_root(dummy(0x1));
+        shadow_stack_copy_range(shadow_stack_len(), &mut []);
+    }
+
+    /// Past the live length it is out of bounds even when empty, which is
+    /// also what indexing did.
+    #[test]
+    #[should_panic(expected = "shadow-stack range out of bounds")]
+    fn copy_range_rejects_an_empty_range_past_the_top_of_the_stack() {
+        let _roots = push_roots();
+        pin_root(dummy(0x1));
+        shadow_stack_copy_range(shadow_stack_len() + 1, &mut []);
     }
 
     /// `walk_shadow_stack` exposes every pinned slot with mutable
