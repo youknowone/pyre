@@ -872,6 +872,79 @@ static W_BOOL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
+// RPython `descr.py:218-239 get_field_descr` returns a FieldDescr owned by
+// the cached parent SizeDescr.  Keep the Unicode fields in the same
+// object-descriptor group as every other runtime PyObject layout: in
+// particular, `str_len_descr()` must not mint a detached FieldDescr whose
+// weak `parent_descr` immediately upgrades to `None`.  The optimizer's
+// `protect_speculative_field` asks that parent for the expected type before a
+// pure length read, exactly as `llmodel.py:protect_speculative_field` does.
+static W_UNICODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        pyre_object::unicodeobject::W_UNICODE_OBJECT_SIZE,
+        W_UNICODE_GC_TYPE_ID,
+        &pyre_object::pyobject::STR_TYPE as *const _ as usize,
+        &[
+            (
+                "value",
+                pyre_object::unicodeobject::UNICODE_VALUE_OFFSET,
+                std::mem::size_of::<*mut rustpython_wtf8::Wtf8Buf>(),
+                Type::Ref,
+                false,
+                true,
+                false,
+            ),
+            (
+                "byte_len",
+                pyre_object::unicodeobject::UNICODE_BYTE_LEN_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                true,
+                false,
+            ),
+            (
+                "len",
+                pyre_object::unicodeobject::UNICODE_LEN_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                true,
+                false,
+            ),
+            (
+                "w_slots",
+                pyre_object::unicodeobject::UNICODE_W_SLOTS_OFFSET,
+                std::mem::size_of::<pyre_object::PyObjectRef>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "index_storage",
+                pyre_object::unicodeobject::UNICODE_INDEX_STORAGE_OFFSET,
+                std::mem::size_of::<*mut pyre_object::rutf8::Utf8IndexStorage>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "hash",
+                std::mem::offset_of!(pyre_object::unicodeobject::W_UnicodeObject, hash),
+                std::mem::size_of::<i64>(),
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+        ],
+        "W_UnicodeObject",
+        "unicodeobject::W_UnicodeObject",
+    )
+});
+
 static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_object::functional::W_IntRangeIterator>(),
@@ -2000,7 +2073,6 @@ use pyre_object::interp_exceptions::{
 };
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::{OB_TYPE_OFFSET, W_CLASS_OFFSET};
-use pyre_object::unicodeobject::UNICODE_LEN_OFFSET;
 use pyre_object::{
     BOOL_INTVAL_OFFSET, FLOAT_ARRAY_BLOCK_OFFSET, FLOAT_ARRAY_LEN_OFFSET, INT_ARRAY_BLOCK_OFFSET,
     INT_ARRAY_LEN_OFFSET, INT_INTVAL_OFFSET, W_ListObject, W_TupleObject,
@@ -2660,12 +2732,7 @@ pub fn str_len_descr() -> DescrRef {
     // `W_UnicodeObject.len` is a `usize`: 8 bytes on 64-bit, 4 on wasm32 — a
     // hardcoded 8 reads the adjacent field into the high half on a 32-bit
     // target (blackhole resume of `len(str)`).
-    make_immutable_field_descr(
-        UNICODE_LEN_OFFSET,
-        std::mem::size_of::<usize>(),
-        Type::Int,
-        false,
-    )
+    field_descr_from_group(&W_UNICODE_DESCR_GROUP, 2)
 }
 
 // ── Object header & allocation descriptors ──────────────────────────
@@ -3396,6 +3463,31 @@ pub fn pyframe_flags_descr() -> DescrRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn str_len_descr_keeps_its_unicode_parent_alive() {
+        let descr = str_len_descr();
+        let field = descr.as_field_descr().expect("str len FieldDescr");
+        assert_eq!(
+            field.offset(),
+            pyre_object::unicodeobject::UNICODE_LEN_OFFSET
+        );
+        assert!(field.is_immutable());
+
+        let parent = field
+            .get_parent_descr()
+            .expect("W_UnicodeObject.len must retain its parent SizeDescr");
+        let size = parent
+            .as_size_descr()
+            .expect("Unicode field parent must be a SizeDescr");
+        assert_eq!(
+            size.size(),
+            pyre_object::unicodeobject::W_UNICODE_OBJECT_SIZE
+        );
+        assert_eq!(size.type_id(), W_UNICODE_GC_TYPE_ID);
+        let parent_field = size.all_fielddescrs()[2].clone() as DescrRef;
+        assert!(std::sync::Arc::ptr_eq(&parent_field, &descr));
+    }
 
     #[test]
     fn pyobject_size_descrs_include_inherited_w_class_gc_field() {
@@ -5190,6 +5282,7 @@ pub(crate) fn publish_runtime_descr_groups() {
         &*W_FLOAT_DESCR_GROUP,
         &*W_LONG_DESCR_GROUP,
         &*W_BOOL_DESCR_GROUP,
+        &*W_UNICODE_DESCR_GROUP,
         &*RANGE_ITER_DESCR_GROUP,
         &*RANGE_DESCR_GROUP,
         &*W_METHOD_DESCR_GROUP,
