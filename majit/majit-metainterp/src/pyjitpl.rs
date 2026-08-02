@@ -7066,14 +7066,27 @@ impl<M: Clone> MetaInterp<M> {
             })
             .collect();
         // Same contract as the `bridge_ops` rebuild above: an `InputArg`
-        // minted from a type alone has an empty concrete-value slot, but the
-        // bridge trace must carry the values the recorder was seeded with at
-        // `start_retrace_from_guard` (resume.py:1274 `IntFrontendOp(num,
-        // cpu.get_int_value(deadframe, num))`). `closing_jump_runtime_boxes`
-        // reads them to build `runtime_boxes`, which is the only channel
-        // `virtualstate.py:493-498` has for deciding that an extra bound
-        // guard can retarget the bridge into the loop body instead of the
-        // preamble.
+        // minted from a type alone has an empty concrete-value slot, so carry
+        // over whatever the recorder's own inputargs hold.
+        //
+        // Which channel put them there matters, because it is no longer this
+        // one: `start_retrace_from_guard` used to stamp every inputarg from
+        // the deadframe by position, and that stamp is gone (it pinned dead
+        // Ref slots as constant NULL — see the `heap_value_for` note there).
+        // The values reaching here are the ones the FRONTEND wrote through
+        // `TraceCtx::try_set_opref_concrete` while it rebuilt the bridge's
+        // entry state — once per box the resume data actually resurrects,
+        // which is `resume.py:1267-1282 load_box_from_cpu`'s own granularity.
+        // `closing_jump_runtime_boxes` (compile_bridge) reads them to build
+        // `runtime_boxes`, the only channel `virtualstate.py:493-498` has for
+        // deciding that an extra bound guard can retarget the bridge into the
+        // loop body instead of the preamble.
+        //
+        // `compile_bridge`'s `PendingBridgeRd` zip also writes deadframe
+        // values onto inputargs, but it runs AFTER that read and its
+        // `liveboxes` are every bridge inputarg, not a resume-walked subset
+        // — so it must not be mistaken for the live-filtered channel. See
+        // task #37.
         let bridge_inputargs: Vec<majit_ir::InputArg> = ctx
             .recorder
             .inputargs()
