@@ -1954,9 +1954,10 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
 /// wrapper (and hence its `w_globals`) from a raw code pointer it already
 /// holds, so the JIT need not carry the wrapper identity as a separate
 /// `w_code` courier. First-write-wins, mirroring the first-store-wins
-/// `PyCode.w_globals` semantics in `w_code_frame_stores_global`. Wrappers
-/// are prebuilt-immortal and non-moving, so stored pointers never
-/// dangle and need no GC rooting.
+/// `PyCode.w_globals` semantics in `w_code_frame_stores_global`. Wrappers use
+/// stable GC allocation; `MetaInterpStaticData.jitcodes` roots the ones it
+/// retains and the collector destructor removes every other mapping before its
+/// pointer can dangle.
 ///
 /// Process-global, not per-thread: `pycode.py:159` keeps `w_globals` on the
 /// shared `PyCode` instance, and a code object stamped on one thread must be

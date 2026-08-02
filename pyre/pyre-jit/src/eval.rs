@@ -4592,7 +4592,10 @@ unsafe fn jitcode_constants_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
-    unsafe { pyre_jit_trace::state::walk_jitcode_constants_refs_area(data, visitor) };
+    unsafe {
+        pyre_jit_trace::state::walk_jitcode_code_roots_area(data, visitor);
+        pyre_jit_trace::state::walk_jitcode_constants_refs_area(data, visitor);
+    }
 }
 
 unsafe fn fbw_store_journal_root_walker_area(

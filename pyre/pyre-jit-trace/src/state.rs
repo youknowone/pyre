@@ -803,22 +803,44 @@ pub fn install_build_time_jitcode_at(index: usize, payload: std::sync::Arc<crate
 /// wrapper is recovered from its `payload.code_ptr` via the live-wrapper
 /// registry.
 ///
-/// Intentionally not yet registered as a root walker: PyCode is
-/// host-allocated via `Box::into_raw` (pycode.rs), not in the GC heap, so
-/// the moving collector never sweeps or relocates it and there is nothing
-/// to root.  When code objects become GC-managed this gets wired into
-/// `majit_gc::register_extra_root_walker`, at which point the recovered
-/// wrapper becomes a `GcRef` slot and `visit` lets a moving collector
-/// rewrite it in place.
-#[allow(dead_code)]
-pub fn walk_jitcode_code_roots(mut visit: impl FnMut(&mut *const ())) {
-    METAINTERP_SD.with(|r| {
-        for jc in r.borrow_mut().jitcodes.iter() {
-            let mut wrapper =
-                pyre_interpreter::live_code_wrapper(jc.payload.code_ptr as *const ()) as *const ();
-            visit(&mut wrapper);
-        }
+/// PyCode wrappers use stable GC allocation, so the visitor marks each
+/// wrapper but never needs to rewrite `LIVE_CODE_WRAPPERS`.  Keeping this walk
+/// on the same per-mutator area as the jitcode constants preserves the owner:
+/// RPython reaches both through `MetaInterpStaticData.jitcodes`.
+pub fn walk_jitcode_code_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    METAINTERP_SD.with(|state| {
+        walk_jitcode_code_roots_in(&state.borrow(), visitor);
     });
+}
+
+fn walk_jitcode_code_roots_in(
+    sd: &MetaInterpStaticData,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    for jc in sd.jitcodes.iter() {
+        let wrapper =
+            pyre_interpreter::live_code_wrapper(jc.payload.code_ptr as *const ()) as usize;
+        if wrapper != 0 {
+            let mut root = majit_ir::GcRef(wrapper);
+            visitor(&mut root);
+        }
+    }
+}
+
+/// # Safety
+/// `data` must come from [`capture_jitcode_constants_root_area`], and the
+/// owning thread must be quiesced.
+pub unsafe fn walk_jitcode_code_roots_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let state = unsafe { &*(data as *const RefCell<MetaInterpStaticData>) };
+    // A collection may be re-entrant while the owner has a shared borrow on
+    // the collecting thread. The interrupted owner is quiesced for the walk;
+    // reading through RefCell::as_ptr avoids dropping all jitcode roots merely
+    // because that suspended read borrow is live.
+    let sd = unsafe { &*state.as_ptr() };
+    walk_jitcode_code_roots_in(sd, visitor);
 }
 
 /// Install the complete `CodeWriter.make_jitcodes()` result into
@@ -1042,8 +1064,9 @@ pub fn jitcode_pc_is_bare_reraise(jitcode_index: i32, offset: i32) -> bool {
 /// the non-moving old-gen, build-time consts are `malloc_typed`-immortal —
 /// so the slots are marked in place without forwarding.
 pub fn walk_jitcode_constants_refs(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    let data = capture_jitcode_constants_root_area();
-    unsafe { walk_jitcode_constants_refs_area(data, visitor) };
+    METAINTERP_SD.with(|state| {
+        walk_jitcode_constants_refs_in(&state.borrow(), visitor);
+    });
 }
 
 pub fn capture_jitcode_constants_root_area() -> *const () {
@@ -1058,11 +1081,16 @@ pub unsafe fn walk_jitcode_constants_refs_area(
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
     let state = unsafe { &*(data as *const RefCell<MetaInterpStaticData>) };
-    // A collection can fire while the owner holds a shared borrow. Preserve
-    // the existing skip for that re-entrant single-thread case.
-    let Ok(sd) = state.try_borrow() else {
-        return;
-    };
+    // See `walk_jitcode_code_roots_area`: the owning mutator is quiesced even
+    // when the interrupted operation retains a RefCell borrow.
+    let sd = unsafe { &*state.as_ptr() };
+    walk_jitcode_constants_refs_in(sd, visitor);
+}
+
+fn walk_jitcode_constants_refs_in(
+    sd: &MetaInterpStaticData,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
     for jc in sd.jitcodes.iter() {
         for &slot in jc.payload.jitcode.constants_r.iter() {
             let mut gcref = majit_ir::GcRef(slot as usize);
