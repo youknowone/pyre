@@ -823,6 +823,13 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
 /// resume never materialized it, so there is no other object to name.  Unlike
 /// that case there is also no seeded frame it could be confused with: nothing
 /// else in this process can reach the discarded level either.
+///
+/// `py_pc` is the level's resume coordinate, which is `next_instr`-style — the
+/// same coordinate `exc_table_offset` converts with `saturating_sub(1)` and
+/// `set_last_instr_from_next_instr` converts for the live frame.  Everything
+/// below wants the instruction that RAN: the opcode decode that answers the
+/// bare-reraise question, `frame.last_instr`, and `record_application_traceback`'s
+/// `tb_lasti`.  Convert once, up front.
 pub(crate) extern "C" fn record_discarded_level_traceback(
     exc_value: i64,
     w_code_value: i64,
@@ -831,6 +838,7 @@ pub(crate) extern "C" fn record_discarded_level_traceback(
     if exc_value == 0 || w_code_value == 0 || py_pc < 0 {
         return;
     }
+    let last_instruction = py_pc.saturating_sub(1);
     let w_code = w_code_value as PyObjectRef;
     let raw_code =
         unsafe { pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject };
@@ -839,14 +847,15 @@ pub(crate) extern "C" fn record_discarded_level_traceback(
     }
     // Same RaiseWithExplicitTraceback rule the other two recorders follow: a
     // bare reraise preserves the traceback the original raise attached.
-    let bare_reraise =
-        match unsafe { pyre_interpreter::decode_instruction_at(&*raw_code, py_pc as usize) } {
-            Some((pyre_interpreter::Instruction::RaiseVarargs { .. }, op_arg)) => {
-                u32::from(op_arg) == 0
-            }
-            Some((pyre_interpreter::Instruction::Reraise { .. }, _)) => true,
-            _ => false,
-        };
+    let bare_reraise = match unsafe {
+        pyre_interpreter::decode_instruction_at(&*raw_code, last_instruction as usize)
+    } {
+        Some((pyre_interpreter::Instruction::RaiseVarargs { .. }, op_arg)) => {
+            u32::from(op_arg) == 0
+        }
+        Some((pyre_interpreter::Instruction::Reraise { .. }, _)) => true,
+        _ => false,
+    };
     if bare_reraise {
         return;
     }
@@ -864,11 +873,15 @@ pub(crate) extern "C" fn record_discarded_level_traceback(
     ) else {
         return;
     };
-    frame.last_instr = py_pc as isize;
+    frame.last_instr = last_instruction as isize;
     let frame_ptr = frame.into_raw();
     pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
     unsafe {
-        pyre_interpreter::pytraceback::record_application_traceback(w_exc, frame_ptr, py_pc);
+        pyre_interpreter::pytraceback::record_application_traceback(
+            w_exc,
+            frame_ptr,
+            last_instruction,
+        );
     }
 }
 
