@@ -498,16 +498,17 @@ pub fn new_instance_with_extra(
     // shape explicitly across the tuple/dict allocations instead of relying
     // on raw Rust Vec entries surviving a moving collection.
     let _roots = pyre_object::gc_roots::push_roots();
-    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(cls);
-    let items_slot = pyre_object::gc_roots::shadow_stack_len();
-    for item in &items {
-        pyre_object::gc_roots::pin_root(*item);
-    }
-    let extras_slot = pyre_object::gc_roots::shadow_stack_len();
-    for (_, value) in &extras {
-        pyre_object::gc_roots::pin_root(*value);
-    }
+    // Publish the class, every item and every extra as one batch: the
+    // forwarding query inside a first `pin_root` can park behind another
+    // thread's collection, which would leave the values still held only in
+    // these Rust vectors naming pre-move addresses.
+    let mut roots = Vec::with_capacity(1 + items.len() + extras.len());
+    roots.push(cls);
+    roots.extend_from_slice(&items);
+    roots.extend(extras.iter().map(|&(_, value)| value));
+    let cls_slot = pyre_object::gc_roots::pin_roots(&roots);
+    let items_slot = cls_slot + 1;
+    let extras_slot = items_slot + items.len();
     let rooted_items = (0..items.len())
         .map(|index| pyre_object::gc_roots::shadow_stack_get(items_slot + index))
         .collect();
