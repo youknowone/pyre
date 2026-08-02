@@ -6243,7 +6243,12 @@ exc_new_wrapper!(exc_syntax_error_new, exc_syntax_error);
 /// unlike, say, `BaseExceptionGroup.__str__`, which has no native arm and
 /// whose builtin the native path does have to call.
 pub(crate) unsafe fn is_native_exception_dunder(method: PyObjectRef) -> bool {
-    if method.is_null() || !crate::function::is_function(method) {
+    // Every fixed-code carrier, not just `is_function`: `__str__` and
+    // `__repr__` are slot names, so the namespace sweep publishes the three
+    // builtins below as `wrapper_descriptor`, which `is_function` excludes.
+    // Missing them here lets `exc_user_dunder_obj` call the native dunder back
+    // and recurse until the stack overflows.
+    if method.is_null() || !unsafe { crate::function::is_function_carrier(method) } {
         return false;
     }
     let code = crate::function::getcode(method) as PyObjectRef;

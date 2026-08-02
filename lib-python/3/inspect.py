@@ -165,21 +165,6 @@ from operator import attrgetter
 from collections import namedtuple, OrderedDict
 from weakref import ref as make_weakref
 
-# PyPy/pyre gateway functions are ordinary ``function`` objects carrying a
-# distinct builtin-code object.  CPython identifies native descriptors by
-# their callable object types; those aliases are broader on PyPy (notably
-# ``types.WrapperDescriptorType is types.FunctionType``), so retain the code
-# type discriminator used by PyPy's inspect port.
-try:
-    _builtin_code_type = type(dict.update.__code__)
-except AttributeError:
-    _builtin_code_type = None
-
-# ``types.WrapperDescriptorType`` cannot name the slot-wrapper type here:
-# ``object.__init__`` is an ordinary method descriptor, so that alias resolves
-# to ``MethodDescriptorType``.  ``int.__pow__`` is a real slot wrapper.
-_slot_wrapper_type = type(int.__pow__)
-
 # Create constants for the compiler flags in Include/code.h
 # We try to get them from dis to avoid duplication
 mod_dict = globals()
@@ -202,10 +187,7 @@ def isclass(object):
 
 def ismethod(object):
     """Return true if the object is an instance method."""
-    if not isinstance(object, types.MethodType):
-        return False
-    func = object.__func__
-    return not isinstance(func, types.MethodDescriptorType)
+    return isinstance(object, types.MethodType)
 
 def ispackage(object):
     """Return true if the object is a package."""
@@ -226,8 +208,7 @@ def ismethoddescriptor(object):
     tests return false from the ismethoddescriptor() test, simply because
     the other tests promise more -- you can, e.g., count on having the
     __func__ attribute (etc) when an object passes ismethod()."""
-    if (isclass(object) or ismethod(object) or isfunction(object)
-            or isbuiltin(object) or ismethodwrapper(object)):
+    if isclass(object) or ismethod(object) or isfunction(object):
         # mutual exclusion
         return False
     tp = type(object)
@@ -299,10 +280,7 @@ def isfunction(object):
         __dict__        namespace which is supporting arbitrary function attributes
         __closure__     a tuple of cells or None
         __type_params__ tuple of type parameters"""
-    if not isinstance(object, types.FunctionType):
-        return False
-    code = getattr(object, "__code__", None)
-    return not (_builtin_code_type and isinstance(code, _builtin_code_type))
+    return isinstance(object, types.FunctionType)
 
 def _has_code_flag(f, flag):
     """Return true if ``f`` is a function (or a method or functools.partial
@@ -458,26 +436,11 @@ def isbuiltin(object):
         __doc__         documentation string
         __name__        original name of this function or method
         __self__        instance to which a method is bound, or None"""
-    if isinstance(object, types.BuiltinFunctionType):
-        # A bound slot dunder shares this type; it is a method wrapper, and
-        # the two predicates are mutually exclusive.
-        return not ismethodwrapper(object)
-    if isinstance(object, types.MethodType):
-        name = getattr(object.__func__, "__name__", "")
-        if name.startswith("__") and name.endswith("__"):
-            return False
-        func = object.__func__
-        return isinstance(func, types.MethodDescriptorType)
-    return False
+    return isinstance(object, types.BuiltinFunctionType)
 
 def ismethodwrapper(object):
     """Return true if the object is a method wrapper."""
-    if not isinstance(object, types.MethodWrapperType):
-        return False
-    func = getattr(object, "__func__", None)
-    name = getattr(func, "__name__", "")
-    return (name.startswith("__") and name.endswith("__")
-            and isinstance(func, types.MethodDescriptorType))
+    return isinstance(object, types.MethodWrapperType)
 
 def isroutine(object):
     """Return true if the object is any kind of function or method."""
@@ -1945,7 +1908,7 @@ def getasyncgenlocals(agen):
 ###############################################################################
 
 
-_NonUserDefinedCallables = (# types.WrapperDescriptorType,  # function on PyPy
+_NonUserDefinedCallables = (types.WrapperDescriptorType,
                             types.MethodWrapperType,
                             types.ClassMethodDescriptorType,
                             types.BuiltinFunctionType)
@@ -1960,35 +1923,22 @@ def _signature_get_user_defined_method(cls, method_name, *, follow_wrapper_chain
         meth = getattr(cls, method_name, None)
     else:
         meth = getattr_static(cls, method_name, None)
-    # PYPY: the CPython callable-type gate is too broad here.  On PyPy and
-    # pyre WrapperDescriptorType aliases FunctionType, MethodWrapperType
-    # aliases MethodType, and ClassMethodDescriptorType aliases classmethod.
-    # Inspect the wrapped callable's concrete descriptor type instead.
     if meth is None:
         return None
-    if meth in (type.__call__, type.__init__, type.__new__,
-                object.__new__, object.__init__):
-        return None
-    if isinstance(meth, (classmethod, staticmethod)):
-        inner = meth.__func__
-    elif isinstance(meth, types.MethodType):
-        inner = meth.__func__
-        if isinstance(inner, (types.MethodDescriptorType, _slot_wrapper_type)):
-            # Bound BuiltinMethodType / MethodWrapperType remain unsupported
-            # here.  A bare FunctionWithFixedCode method descriptor below is
-            # handled separately.
-            return None
-    else:
-        inner = meth
+
+    # NOTE: The meth may wraps a non-user-defined callable.
+    # In this case, we treat the meth as non-user-defined callable too.
+    # (e.g. cls.__new__ generated by @warnings.deprecated)
+    unwrapped_meth = None
     if follow_wrapper_chains:
-        inner = unwrap(inner, stop=lambda m: hasattr(m, "__signature__"))
-    if isinstance(inner, types.BuiltinFunctionType):
+        unwrapped_meth = unwrap(meth, stop=(lambda m: hasattr(m, "__signature__")
+                                  or _signature_is_builtin(m)))
+
+    if (isinstance(meth, _NonUserDefinedCallables)
+          or isinstance(unwrapped_meth, _NonUserDefinedCallables)):
+        # Once '__signature__' will be added to 'C'-level
+        # callables, this check won't be necessary
         return None
-    if isinstance(inner, types.MethodDescriptorType):
-        own_new = (method_name == '__new__' and
-                   getattr(inner, '__objclass__', None) is cls)
-        if not getattr(inner, '__text_signature__', None) or own_new:
-            return None
     if method_name != '__new__':
         meth = _descriptor_get(meth, cls)
     return meth

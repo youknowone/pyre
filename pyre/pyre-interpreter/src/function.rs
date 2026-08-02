@@ -26,6 +26,27 @@ pub static METHOD_DESCRIPTOR_TYPE: PyType = pyre_object::pyobject::new_pytype("m
 /// payload deliberately reuses [`Function`]: both are immutable BuiltinCode
 /// carriers and therefore have identical GC edges and call ABI.
 pub static SLOT_WRAPPER_TYPE: PyType = pyre_object::pyobject::new_pytype("wrapper_descriptor");
+/// The bound form of a slot wrapper — `descrobject.c PyMethodWrapper_Type`.
+///
+/// A `wrapper_descriptor` accessed on an instance yields this, the way a
+/// `method_descriptor` yields a `builtin_function_or_method`.  Like that pair
+/// the payload stays PyPy's [`Method`], so only the public class differs; the
+/// separate type is what lets `inspect.ismethodwrapper` and `inspect.isbuiltin`
+/// tell the two bound forms apart.
+pub static METHOD_WRAPPER_TYPE: PyType = pyre_object::pyobject::new_pytype("method-wrapper");
+/// A `METH_CLASS` entry of a builtin type — `descrobject.c
+/// PyClassMethodDescr_Type`.
+///
+/// `type_ready_fill_dict` wraps such an entry in the same [`ClassMethod`]
+/// carrier a `@classmethod` uses, so the payload is shared and only the public
+/// class differs.  Keeping the two apart is what makes `dict.fromkeys` a
+/// descriptor while a user `@classmethod` stays an ordinary wrapper, which
+/// `inspect._signature_get_user_defined_method` relies on to decide whether a
+/// `__init__` / `__new__` / `__call__` was written in Python.
+///
+/// [`ClassMethod`]: pyre_object::function::ClassMethod
+pub static CLASSMETHOD_DESCRIPTOR_TYPE: PyType =
+    pyre_object::pyobject::new_pytype("classmethod_descriptor");
 
 /// User-defined function object.
 ///
@@ -564,6 +585,19 @@ pub unsafe fn function_retag_method_descriptor(obj: PyObjectRef) {
     }
 }
 
+/// Retag a freshly materialised `FunctionWithFixedCode` as the public
+/// slot-wrapper carrier — the `add_operators` half of the same namespace sweep
+/// [`function_retag_method_descriptor`] serves.
+///
+/// # Safety
+/// `obj` must be a valid, live `FunctionWithFixedCode` carrier.
+pub unsafe fn function_retag_slot_wrapper(obj: PyObjectRef) {
+    unsafe {
+        (*obj).ob_type = &SLOT_WRAPPER_TYPE as *const PyType;
+        (*obj).w_class = get_instantiate(&SLOT_WRAPPER_TYPE);
+    }
+}
+
 /// Allocate an immutable ordinary method descriptor backed by `BuiltinCode`.
 pub fn function_new_method_descriptor(code: *const (), name: String) -> PyObjectRef {
     function_new_impl(&METHOD_DESCRIPTOR_TYPE, code, name, PY_NULL, PY_NULL, false)
@@ -643,6 +677,60 @@ pub fn builtin_bound_method_new(
         pyre_object::function::w_method_set_module(method, pyre_object::w_none());
     }
     method
+}
+
+/// `descrobject.c PyWrapper_New` — bind a slot wrapper to its receiver.
+///
+/// Same `Method` payload as [`builtin_bound_method_new`]; only the public class
+/// differs, so `type(object().__str__)` reports `method-wrapper` while
+/// `type([].append)` reports `builtin_function_or_method`.  `PyMethodWrapper_Type`
+/// has no `__module__`, but the field is part of the shared payload, so it is
+/// filled the same way and simply left unpublished by the typedef.
+pub fn method_wrapper_new(
+    descr: PyObjectRef,
+    obj: PyObjectRef,
+    w_class: PyObjectRef,
+) -> PyObjectRef {
+    let method = pyre_object::w_method_new(descr, obj, w_class);
+    unsafe {
+        pyre_object::function::w_method_set_public_class(
+            method,
+            crate::typedef::gettypeobject(&METHOD_WRAPPER_TYPE),
+        );
+        pyre_object::function::w_method_set_module(method, pyre_object::w_none());
+    }
+    method
+}
+
+/// Publish a `ClassMethod` carrier built for a `METH_CLASS` entry as
+/// [`CLASSMETHOD_DESCRIPTOR_TYPE`].
+///
+/// The `ob_type` stays `CLASSMETHOD_TYPE`, so `is_classmethod` and every
+/// binding path that reads the payload keep working; only the type the
+/// namespace publishes changes.
+///
+/// A namespace swept before the type object exists is retagged again by the
+/// closing pass of `init_typeobjects`, so this is a no-op until then.
+pub fn classmethod_retag_descriptor(obj: PyObjectRef) {
+    let w_class = get_instantiate(&CLASSMETHOD_DESCRIPTOR_TYPE);
+    if w_class.is_null() {
+        return;
+    }
+    unsafe {
+        pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        (*obj).w_class = w_class;
+    }
+}
+
+/// Whether `obj` is a `ClassMethod` carrier published as a
+/// `classmethod_descriptor` rather than as an ordinary `classmethod`.
+pub fn is_classmethod_descriptor(obj: PyObjectRef) -> bool {
+    !obj.is_null()
+        && unsafe { pyre_object::function::is_classmethod(obj) }
+        && std::ptr::eq(
+            unsafe { (*obj).w_class },
+            get_instantiate(&CLASSMETHOD_DESCRIPTOR_TYPE),
+        )
 }
 
 /// Function-layout carriers accepted by the interpreter call machinery.
