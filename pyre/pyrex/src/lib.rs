@@ -1193,6 +1193,58 @@ fn collect_and_run_finalizers(ec_ptr: *const PyExecutionContext) {
     }
 }
 
+/// Whether releasing this binding can remove anything from the reachable set,
+/// and so whether the collection that follows it could find garbage an earlier
+/// one did not. Answering `false` skips a full mark-and-sweep of the whole
+/// heap, which is what the release loop below otherwise costs per name.
+///
+/// Two values answer `false` outright:
+///
+/// * An exact `int`, `float`, `bool`, `str`, `bytes` or `None`. It holds no
+///   reference to another object, so nothing but the value itself can lose its
+///   last referrer, and no builtin scalar type defines `__del__`, so nothing
+///   observes it going. `is_exact_type` is what makes this safe rather than
+///   `is_str`/`is_int`, which key off the layout `ob_type` a subclass keeps: a
+///   `class MyStr(str)` instance retags `w_class` and is rejected here, so its
+///   `__del__` and its own attributes stay on the collecting path.
+/// * A module still registered in `sys.modules` under its own `__name__`. It
+///   stays reachable from there no matter what `__main__` does, so the release
+///   removes no object at all from the reachable set. This is every `import`
+///   name. Reading the live `sys.modules` rather than assuming is what keeps a
+///   program that replaced or deleted the entry on the collecting path.
+///
+/// The point is not that these values are cheap to collect — it is that the
+/// collection cannot reach a different answer, so every `__del__` still runs at
+/// exactly the same place in the loop.
+fn release_frees_nothing(value: pyre_object::PyObjectRef) -> bool {
+    if value.is_null() {
+        return true;
+    }
+    unsafe {
+        if pyre_object::is_none(value)
+            || pyre_object::is_exact_type(value, &pyre_object::INT_TYPE)
+            || pyre_object::is_exact_type(value, &pyre_object::BOOL_TYPE)
+            || pyre_object::is_exact_type(value, &pyre_object::FLOAT_TYPE)
+            || pyre_object::is_exact_type(value, &pyre_object::STR_TYPE)
+            || pyre_object::is_exact_type(value, &pyre_object::BYTES_TYPE)
+        {
+            return true;
+        }
+        if pyre_object::is_module(value) {
+            // `Module.name` is the interpreter's own field, not the
+            // program-writable `__name__` attribute, so it is always a string —
+            // but `types.ModuleType.__new__` leaves it empty until `__init__`
+            // seeds it. An anonymous module proves nothing about reachability,
+            // so it takes the collecting path rather than a `sys.modules[""]`
+            // lookup that only an adversarial program could satisfy.
+            let name = pyre_object::w_module_get_name(value);
+            return !name.is_empty()
+                && importing::get_sys_module(name).is_some_and(|m| m == value);
+        }
+    }
+    false
+}
+
 /// PyPy `ObjSpace.finish()` / module teardown ordering: join non-daemon
 /// threads, collect already-unreachable cycles, then release `__main__`
 /// globals from newest to oldest while the older globals their `__del__`
@@ -1228,11 +1280,22 @@ fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecut
         if name == "__builtins__" {
             continue;
         }
+        // Re-read rather than trusting the snapshot: a `__del__` already run by
+        // this loop may have rebound the name, and the decision below is only
+        // sound about the value actually being released.
+        let value = unsafe { pyre_object::w_dict_getitem_str(canonical, &name) };
+        let frees_nothing = value.is_none_or(release_frees_nothing);
         unsafe {
             pyre_object::w_dict_setitem_str(canonical, &name, pyre_object::w_none());
         }
-        collect_and_run_finalizers(ec_ptr);
+        if !frees_nothing {
+            collect_and_run_finalizers(ec_ptr);
+        }
     }
+    // The loop ends on a collection whenever it releases anything collectable;
+    // this is the one for the case where the last releases were all skipped, so
+    // teardown still finishes with the heap swept and the queue drained.
+    collect_and_run_finalizers(ec_ptr);
 }
 
 /// Resolve a pending `SystemExit`'s status, then finalize and exit with it.
