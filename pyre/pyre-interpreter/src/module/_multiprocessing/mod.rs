@@ -150,11 +150,11 @@ fn semlock_acquire(
     // returning (`_check_signals(space)`).
     if block && timeout.is_none() {
         loop {
-            let r = unsafe { libc::sem_wait(handle) };
+            let (r, errno) =
+                crate::module::thread::call_external_function(|| unsafe { libc::sem_wait(handle) });
             if r == 0 {
                 break;
             }
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             if errno == libc::EINTR {
                 crate::module::signal::interp_signal::checksignals_now()?;
                 continue;
@@ -192,10 +192,14 @@ fn semlock_acquire(
             let mut delay = 0;
             loop {
                 use rustpython_host_env::multiprocessing::PollWaitStep;
-                match rustpython_host_env::multiprocessing::sem_timedwait_poll_step(
-                    handle, &deadline, delay,
-                )
-                .map_err(|error| {
+                // The poll step sleeps between `sem_trywait` attempts.
+                let step = {
+                    let _blocked = crate::module::thread::before_external_block();
+                    rustpython_host_env::multiprocessing::sem_timedwait_poll_step(
+                        handle, &deadline, delay,
+                    )
+                };
+                match step.map_err(|error| {
                     crate::PyError::os_error_with_errno(error.raw_os_error(), error.description())
                 })? {
                     PollWaitStep::Acquired => {
@@ -210,7 +214,11 @@ fn semlock_acquire(
         #[cfg(not(target_vendor = "apple"))]
         loop {
             use rustpython_host_env::multiprocessing::WaitStatus;
-            match rustpython_host_env::multiprocessing::sem_wait_status(handle, Some(&deadline)) {
+            let status = {
+                let _blocked = crate::module::thread::before_external_block();
+                rustpython_host_env::multiprocessing::sem_wait_status(handle, Some(&deadline))
+            };
+            match status {
                 WaitStatus::Acquired => {
                     crate::module::signal::interp_signal::checksignals_now()?;
                     return Ok(true);

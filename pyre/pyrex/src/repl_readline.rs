@@ -106,7 +106,11 @@ impl Readline {
         }
     }
 
+    /// Waiting for a line waits on the user, so the GIL is dropped for the
+    /// whole read: a `threading` timer or a daemon thread has to keep running
+    /// while the prompt sits there.
     pub fn readline(&mut self, prompt: &str) -> ReadlineResult {
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         match &mut self.backend {
             ReadlineBackend::Basic => read_basic_line(prompt),
             ReadlineBackend::Editor(editor) => {

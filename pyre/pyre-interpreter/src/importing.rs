@@ -1320,13 +1320,17 @@ pub(crate) fn detect_stdlib_path() -> Option<PathBuf> {
             return Some(path);
         }
         // Last resort: borrow a host CPython's stdlib.
-        let output = std::process::Command::new("python3")
-            .args([
-                "-c",
-                "import sysconfig; print(sysconfig.get_paths()['stdlib'])",
-            ])
-            .output()
-            .ok()?;
+        let output = {
+            // Spawning and reaping a child process blocks.
+            let _blocked = crate::module::thread::before_external_block();
+            std::process::Command::new("python3")
+                .args([
+                    "-c",
+                    "import sysconfig; print(sysconfig.get_paths()['stdlib'])",
+                ])
+                .output()
+        }
+        .ok()?;
         if !output.status.success() {
             return None;
         }

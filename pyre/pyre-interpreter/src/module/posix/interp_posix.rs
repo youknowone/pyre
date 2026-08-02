@@ -1269,9 +1269,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let flags = flags | libc::O_NOINHERIT;
                 let c_path = std::ffi::CString::new(path.as_bytes())
                     .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-                let fd = unsafe { libc::open(c_path.as_ptr(), flags, mode as libc::c_uint) };
+                // Opening a FIFO without O_NONBLOCK waits for a peer.
+                let (fd, errno) = crate::module::thread::call_external_function(|| unsafe {
+                    libc::open(c_path.as_ptr(), flags, mode as libc::c_uint)
+                });
                 if fd < 0 {
-                    return Err(io_err(std::io::Error::last_os_error(), &path));
+                    return Err(io_err(std::io::Error::from_raw_os_error(errno), &path));
                 }
                 fd
             };
@@ -1333,12 +1336,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 #[cfg(not(feature = "sandbox"))]
                 let buf = {
                     let mut buf = vec![0u8; n];
-                    let ret = {
-                        let _blocked = crate::module::thread::before_external_block();
-                        unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, n as _) }
-                    };
+                    let (ret, errno) = crate::module::thread::call_external_function(|| unsafe {
+                        libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, n as _)
+                    });
                     if ret < 0 {
-                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                        return Err(io_err(std::io::Error::from_raw_os_error(errno), ""));
                     }
                     buf.truncate(ret as usize);
                     buf
@@ -1420,14 +1422,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     .map_err(|_| crate::PyError::type_error("write() arg 2 must be bytes-like"))?;
                 #[cfg(not(feature = "sandbox"))]
                 let ret = {
-                    let ret = {
-                        let _blocked = crate::module::thread::before_external_block();
-                        unsafe {
-                            libc::write(fd, data.as_ptr() as *const libc::c_void, data.len() as _)
-                        }
-                    };
+                    let (ret, errno) = crate::module::thread::call_external_function(|| unsafe {
+                        libc::write(fd, data.as_ptr() as *const libc::c_void, data.len() as _)
+                    });
                     if ret < 0 {
-                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                        return Err(io_err(std::io::Error::from_raw_os_error(errno), ""));
                     }
                     ret as i64
                 };
@@ -3586,9 +3585,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // interp_posix.py:433-435 `fsync(space, w_fd)` unwraps
                     // through `space.c_filedescriptor_w`.
                     let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
-                    let r = unsafe { libc::fsync(fd) };
+                    let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
+                        libc::fsync(fd)
+                    });
                     if r < 0 {
-                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                        return Err(io_err(std::io::Error::from_raw_os_error(errno), ""));
                     }
                     Ok(pyre_object::w_none())
                 },
@@ -3613,12 +3614,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // interp_posix.py:443-446 `fdatasync(space, w_fd)` unwraps
                     // through `space.c_filedescriptor_w`.
                     let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
-                    #[cfg(any(target_os = "linux", target_os = "android"))]
-                    let r = unsafe { libc::fdatasync(fd) };
-                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                    let r = unsafe { libc::fsync(fd) };
+                    let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
+                        #[cfg(any(target_os = "linux", target_os = "android"))]
+                        {
+                            libc::fdatasync(fd)
+                        }
+                        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                        {
+                            libc::fsync(fd)
+                        }
+                    });
                     if r < 0 {
-                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                        return Err(io_err(std::io::Error::from_raw_os_error(errno), ""));
                     }
                     Ok(pyre_object::w_none())
                 },
@@ -4318,10 +4325,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         // libc::sendfile directly with a null pointer, matching
                         // rposix.sendfile_no_offset (rposix.py:3066-3069).
                         let count = count_raw as libc::size_t;
-                        let res =
-                            unsafe { libc::sendfile(out_fd, in_fd, core::ptr::null_mut(), count) };
+                        let (res, errno) =
+                            crate::module::thread::call_external_function(|| unsafe {
+                                libc::sendfile(out_fd, in_fd, core::ptr::null_mut(), count)
+                            });
                         if res < 0 {
-                            return Err(io_err(std::io::Error::last_os_error(), ""));
+                            return Err(io_err(std::io::Error::from_raw_os_error(errno), ""));
                         }
                         return Ok(pyre_object::w_int_new(res as i64));
                     }
@@ -4334,20 +4343,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 {
                     let count = count_raw as usize;
                     let mut offset: rustpython_host_env::crt_fd::Offset = offset_i64 as _;
-                    let n = host_posix::sendfile(out_b, in_b, &mut offset, count)
-                        .map_err(|e| io_err(e, ""))?;
+                    let n = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        host_posix::sendfile(out_b, in_b, &mut offset, count)
+                    }
+                    .map_err(|e| io_err(e, ""))?;
                     return Ok(pyre_object::w_int_new(n as i64));
                 }
                 #[cfg(target_os = "macos")]
                 {
-                    let (res, written) = host_posix::sendfile(
-                        in_b,
-                        out_b,
-                        offset_i64 as rustpython_host_env::crt_fd::Offset,
-                        count_raw,
-                        None,
-                        None,
-                    );
+                    let (res, written) = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        host_posix::sendfile(
+                            in_b,
+                            out_b,
+                            offset_i64 as rustpython_host_env::crt_fd::Offset,
+                            count_raw,
+                            None,
+                            None,
+                        )
+                    };
                     // rposix.py:3086-3095: BSD sendfile reports a partial
                     // transfer through sbytes even when the syscall result is
                     // EAGAIN/EBUSY. Return that progress so asyncio advances

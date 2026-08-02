@@ -924,7 +924,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         }
                         let mut signum: libc::c_int = 0;
                         // sigwait returns the error number directly, not via errno.
-                        let ret = unsafe { libc::sigwait(&set, &mut signum) };
+                        let ret = {
+                            let _blocked = crate::module::thread::before_external_block();
+                            unsafe { libc::sigwait(&set, &mut signum) }
+                        };
                         if ret != 0 {
                             return Err(errno_exception("OSError", ret));
                         }

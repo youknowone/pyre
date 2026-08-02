@@ -46,8 +46,23 @@ pub mod gil;
 
 /// `rffi.aroundstate.before()`: drop the GIL and leave the collector's RUNNING
 /// census for the duration of a blocking host call.
-pub(crate) fn before_external_block() -> majit_gc::gc_sync::BlockingGuard {
+pub fn before_external_block() -> majit_gc::gc_sync::BlockingGuard {
     majit_gc::gc_sync::before_external_block()
+}
+
+/// `rffi.py:193-211 call_external_function`: release the GIL, run the external
+/// call, read `errno`, and only then take the GIL back.  The returned `i32` is
+/// the saved `errno`, meaningful exactly when the call reports failure.
+///
+/// The read belongs inside the released window because `_errno_after` runs
+/// ahead of `rgil.acquire()` (rffi.py:207-210).  Taking the GIL back can enter
+/// the stealer loop, whose mutex and condvar waits overwrite `errno`, so a
+/// caller reading it after the guard drops can see the wrong value.
+pub(crate) fn call_external_function<R>(f: impl FnOnce() -> R) -> (R, i32) {
+    let _blocked = before_external_block();
+    let result = f();
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    (result, errno)
 }
 
 pub fn set_finalizing() {

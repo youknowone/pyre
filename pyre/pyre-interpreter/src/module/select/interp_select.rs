@@ -178,13 +178,13 @@ impl Poll {
         let mut cur_timeout = timeout;
         self.running = true;
         let ret = loop {
-            let r =
-                unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, cur_timeout) };
+            let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
+                libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, cur_timeout)
+            });
             if r >= 0 {
                 break r;
             }
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
+            if errno == libc::EINTR {
                 // `interp_select.py:94-100` — deliver a pending signal, then
                 // retry with a recomputed timeout.  Reset `running` first so
                 // a raised handler does not leave the poll object wedged
@@ -204,8 +204,9 @@ impl Poll {
                 continue;
             }
             self.running = false;
+            let e = std::io::Error::from_raw_os_error(errno);
             return Err(crate::PyError::os_error_with_errno(
-                e.raw_os_error().unwrap_or(0),
+                errno,
                 format!("poll: {e}"),
             ));
         };
@@ -356,13 +357,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             Some(&mut tv_storage)
                         }
                     };
-                    match host_select::select(
-                        nfds + 1,
-                        &mut rset,
-                        &mut wset,
-                        &mut xset,
-                        timeout_ref,
-                    ) {
+                    // `select` already carries its errno in the returned
+                    // `io::Error`, so the guard only has to span the call.
+                    let outcome = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        host_select::select(
+                            nfds + 1,
+                            &mut rset,
+                            &mut wset,
+                            &mut xset,
+                            timeout_ref,
+                        )
+                    };
+                    match outcome {
                         Ok(_) => break,
                         Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
                             // `interp_select.py:182` — deliver a pending

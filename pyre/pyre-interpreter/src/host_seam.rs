@@ -396,7 +396,12 @@ macro_rules! declare_seam {
             $(
                 fn $name($($a : seam_arg_ty!($aty)),*) -> SeamResult<seam_ret_ty!($rty)> {
                     let args = [ $( seam_marshal!($aty, $a) ),* ];
-                    let result = client::syscall($ll, &args, seam_result_kind!($rty))?;
+                    // Every trampolined op is a round trip to the controller
+                    // and blocks for its reply.
+                    let result = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        client::syscall($ll, &args, seam_result_kind!($rty))
+                    }?;
                     seam_unwrap!($rty, result)
                 }
             )*
@@ -593,44 +598,60 @@ mod real {
         CString::new(path).map_err(|_| SeamError::Value)
     }
 
+    /// `rffi.py:193-211 call_external_function` for the real-host bodies: an OS
+    /// call blocks, so drop the GIL around it.  `last_os_error` is read inside
+    /// `f`, which keeps it ahead of the re-acquire the way `_errno_after`
+    /// precedes `rgil.acquire()`.
+    #[inline]
+    fn blocking<R>(f: impl FnOnce() -> R) -> R {
+        let _blocked = crate::module::thread::before_external_block();
+        f()
+    }
+
     fn real_stat(path: &[u8], symlink: bool) -> SeamResult<StatBuf> {
         let c = cstr(path)?;
-        // SAFETY: stat(2)/lstat(2) into a zeroed, owned `libc::stat`.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let r = unsafe {
-            if symlink {
-                libc::lstat(c.as_ptr(), &mut st)
-            } else {
-                libc::stat(c.as_ptr(), &mut st)
+        blocking(|| {
+            // SAFETY: stat(2)/lstat(2) into a zeroed, owned `libc::stat`.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let r = unsafe {
+                if symlink {
+                    libc::lstat(c.as_ptr(), &mut st)
+                } else {
+                    libc::stat(c.as_ptr(), &mut st)
+                }
+            };
+            if r < 0 {
+                return Err(last_os_error());
             }
-        };
-        if r < 0 {
-            return Err(last_os_error());
-        }
-        Ok(StatBuf::from_libc(&st))
+            Ok(StatBuf::from_libc(&st))
+        })
     }
 
     impl SandboxableHost for RealHost {
         fn open(path: &[u8], flags: i32, mode: u32) -> SeamResult<i32> {
             let c = cstr(path)?;
-            // SAFETY: open(2) with an owned NUL-terminated path.
-            let fd = unsafe { libc::open(c.as_ptr(), flags, mode as libc::c_uint) };
-            if fd < 0 { Err(last_os_error()) } else { Ok(fd) }
+            blocking(|| {
+                // SAFETY: open(2) with an owned NUL-terminated path.
+                let fd = unsafe { libc::open(c.as_ptr(), flags, mode as libc::c_uint) };
+                if fd < 0 { Err(last_os_error()) } else { Ok(fd) }
+            })
         }
 
         fn close(fd: i32) -> SeamResult<()> {
-            if unsafe { libc::close(fd) } < 0 {
-                Err(last_os_error())
-            } else {
-                Ok(())
-            }
+            blocking(|| {
+                if unsafe { libc::close(fd) } < 0 {
+                    Err(last_os_error())
+                } else {
+                    Ok(())
+                }
+            })
         }
 
         fn read(fd: i32, size: i64) -> SeamResult<Vec<u8>> {
             let n = size.max(0) as usize;
             let mut buf = vec![0u8; n];
             // SAFETY: read(2) into a buffer we own and sized to `n`.
-            let got = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, n) };
+            let got = blocking(|| unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, n) });
             if got < 0 {
                 return Err(last_os_error());
             }
@@ -642,20 +663,24 @@ mod real {
             use std::io::Read;
             let n = size.max(0) as usize;
             let mut buf = vec![0u8; n];
-            std::fs::File::open("/dev/urandom")
-                .and_then(|mut f| f.read_exact(&mut buf))
-                .map_err(|_| last_os_error())?;
+            blocking(|| {
+                std::fs::File::open("/dev/urandom")
+                    .and_then(|mut f| f.read_exact(&mut buf))
+                    .map_err(|_| last_os_error())
+            })?;
             Ok(buf)
         }
 
         fn write(fd: i32, data: &[u8]) -> SeamResult<i64> {
-            // SAFETY: write(2) from a slice held for the call.
-            let n = unsafe { libc::write(fd, data.as_ptr() as *const c_void, data.len()) };
-            if n < 0 {
-                Err(last_os_error())
-            } else {
-                Ok(n as i64)
-            }
+            blocking(|| {
+                // SAFETY: write(2) from a slice held for the call.
+                let n = unsafe { libc::write(fd, data.as_ptr() as *const c_void, data.len()) };
+                if n < 0 {
+                    Err(last_os_error())
+                } else {
+                    Ok(n as i64)
+                }
+            })
         }
 
         fn lseek(fd: i32, pos: i64, how: i32) -> SeamResult<i64> {
@@ -676,17 +701,19 @@ mod real {
         }
 
         fn fstat(fd: i32) -> SeamResult<StatBuf> {
-            // SAFETY: fstat(2) into a zeroed, owned `libc::stat`.
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe { libc::fstat(fd, &mut st) } < 0 {
-                return Err(last_os_error());
-            }
-            Ok(StatBuf::from_libc(&st))
+            blocking(|| {
+                // SAFETY: fstat(2) into a zeroed, owned `libc::stat`.
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(fd, &mut st) } < 0 {
+                    return Err(last_os_error());
+                }
+                Ok(StatBuf::from_libc(&st))
+            })
         }
 
         fn access(path: &[u8], mode: i32) -> SeamResult<bool> {
             let c = cstr(path)?;
-            Ok(unsafe { libc::access(c.as_ptr(), mode) } == 0)
+            Ok(blocking(|| unsafe { libc::access(c.as_ptr(), mode) }) == 0)
         }
 
         fn isatty(fd: i32) -> SeamResult<bool> {
@@ -694,19 +721,23 @@ mod real {
         }
 
         fn getcwd() -> SeamResult<Vec<u8>> {
-            std::env::current_dir()
-                .map(|p| p.into_os_string().into_vec())
-                .map_err(|_| last_os_error())
+            blocking(|| {
+                std::env::current_dir()
+                    .map(|p| p.into_os_string().into_vec())
+                    .map_err(|_| last_os_error())
+            })
         }
 
         fn listdir(path: &[u8]) -> SeamResult<Vec<Vec<u8>>> {
             let p = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
-            let mut names = Vec::new();
-            for entry in std::fs::read_dir(p).map_err(|_| last_os_error())? {
-                let entry = entry.map_err(|_| last_os_error())?;
-                names.push(entry.file_name().into_vec());
-            }
-            Ok(names)
+            blocking(|| {
+                let mut names = Vec::new();
+                for entry in std::fs::read_dir(p).map_err(|_| last_os_error())? {
+                    let entry = entry.map_err(|_| last_os_error())?;
+                    names.push(entry.file_name().into_vec());
+                }
+                Ok(names)
+            })
         }
 
         fn getenv(name: &[u8]) -> SeamResult<Option<Vec<u8>>> {
@@ -749,20 +780,24 @@ mod real {
 
         fn unlink(path: &[u8]) -> SeamResult<()> {
             let c = cstr(path)?;
-            if unsafe { libc::unlink(c.as_ptr()) } < 0 {
-                Err(last_os_error())
-            } else {
-                Ok(())
-            }
+            blocking(|| {
+                if unsafe { libc::unlink(c.as_ptr()) } < 0 {
+                    Err(last_os_error())
+                } else {
+                    Ok(())
+                }
+            })
         }
 
         fn mkdir(path: &[u8], mode: u32) -> SeamResult<()> {
             let c = cstr(path)?;
-            if unsafe { libc::mkdir(c.as_ptr(), mode as libc::mode_t) } < 0 {
-                Err(last_os_error())
-            } else {
-                Ok(())
-            }
+            blocking(|| {
+                if unsafe { libc::mkdir(c.as_ptr(), mode as libc::mode_t) } < 0 {
+                    Err(last_os_error())
+                } else {
+                    Ok(())
+                }
+            })
         }
 
         fn time() -> SeamResult<f64> {
@@ -785,7 +820,7 @@ mod real {
 
         fn sleep(seconds: f64) -> SeamResult<()> {
             if seconds > 0.0 {
-                std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
+                blocking(|| std::thread::sleep(std::time::Duration::from_secs_f64(seconds)));
             }
             Ok(())
         }

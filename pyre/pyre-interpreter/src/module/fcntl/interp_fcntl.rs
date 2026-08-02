@@ -36,7 +36,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 } else {
                     0
                 };
-                match rustpython_host_env::fcntl::fcntl_int(fd, cmd, arg) {
+                // F_SETLKW waits for the lock, so this is a blocking call.
+                let outcome = {
+                    let _blocked = crate::module::thread::before_external_block();
+                    rustpython_host_env::fcntl::fcntl_int(fd, cmd, arg)
+                };
+                match outcome {
                     Ok(v) => Ok(pyre_object::w_int_new(v as i64)),
                     Err(e) => Err(crate::PyError::os_error_with_errno(
                         e.raw_os_error().unwrap_or(0),
@@ -80,7 +85,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 } else {
                     0
                 };
-                match rustpython_host_env::fcntl::ioctl_int(fd, request, arg) {
+                let outcome = {
+                    let _blocked = crate::module::thread::before_external_block();
+                    rustpython_host_env::fcntl::ioctl_int(fd, request, arg)
+                };
+                match outcome {
                     Ok(v) => Ok(pyre_object::w_int_new(v as i64)),
                     Err(e) => Err(crate::PyError::os_error_with_errno(
                         e.raw_os_error().unwrap_or(0),
@@ -117,7 +126,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                     let op = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
-                    match rustpython_host_env::fcntl::flock(fd, op) {
+                    // Without LOCK_NB this waits for the lock.
+                    let outcome = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        rustpython_host_env::fcntl::flock(fd, op)
+                    };
+                    match outcome {
                         Ok(_) => Ok(pyre_object::w_none()),
                         Err(e) => Err(crate::PyError::os_error_with_errno(
                             e.raw_os_error().unwrap_or(0),
@@ -172,7 +186,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 } else {
                     0
                 };
-                match rustpython_host_env::fcntl::lockf(fd, cmd, len, start, whence) {
+                // F_LOCK waits for the lock.
+                let outcome = {
+                    let _blocked = crate::module::thread::before_external_block();
+                    rustpython_host_env::fcntl::lockf(fd, cmd, len, start, whence)
+                };
+                match outcome {
                     // `interp_fcntl.py:226 fcntl_lockf` returns
                     // space.w_None; the integer return value of the C
                     // helper was an internal pyre detail.

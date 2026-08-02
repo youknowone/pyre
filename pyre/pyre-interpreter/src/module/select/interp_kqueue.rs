@@ -166,7 +166,7 @@ impl W_Kqueue {
             None
         };
         let nfds = loop {
-            let r = unsafe {
+            let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
                 libc::kevent(
                     self.kqfd,
                     pchangelist,
@@ -175,12 +175,11 @@ impl W_Kqueue {
                     max_events as libc::c_int,
                     ptimeout,
                 )
-            };
+            });
             if r >= 0 {
                 break r;
             }
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
+            if errno == libc::EINTR {
                 // `interp_kqueue.py:223-226` — deliver a pending signal, then
                 // retry with the remaining timeout recomputed.
                 crate::module::signal::interp_signal::checksignals_now()?;
@@ -196,8 +195,9 @@ impl W_Kqueue {
                 }
                 continue;
             }
+            let e = std::io::Error::from_raw_os_error(errno);
             return Err(crate::PyError::os_error_with_errno(
-                e.raw_os_error().unwrap_or(0),
+                errno,
                 format!("kevent: {e}"),
             ));
         };

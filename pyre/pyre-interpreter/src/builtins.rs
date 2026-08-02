@@ -12789,13 +12789,14 @@ fn fd_read_into(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     loop {
         // `count` is `size_t` on Unix but `c_uint` on Windows; `as _` casts
         // to whichever the platform's `libc::read` expects.
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as _) };
+        let (n, errno) = crate::module::thread::call_external_function(|| unsafe {
+            libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as _)
+        });
         if n < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
+            if errno == libc::EINTR {
                 continue;
             }
-            return Err(e);
+            return Err(std::io::Error::from_raw_os_error(errno));
         }
         return Ok(n as usize);
     }
@@ -13026,11 +13027,11 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             #[cfg(not(feature = "sandbox"))]
             let n = {
                 // `count` is `size_t` on Unix but `c_uint` on Windows.
-                let n = unsafe {
+                let (n, errno) = crate::module::thread::call_external_function(|| unsafe {
                     libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len() as _)
-                };
+                });
                 if n < 0 {
-                    return Err(fd_io_err(std::io::Error::last_os_error()));
+                    return Err(fd_io_err(std::io::Error::from_raw_os_error(errno)));
                 }
                 n as i64
             };
