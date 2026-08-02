@@ -7339,12 +7339,20 @@ fn reconstruct_inline_recipe(
     }
     // virtualizable.py:86-98: at a bytecode boundary (every resume pc is one)
     // the frame's locals_cells_stack_w is a W_Root array — all live slots are
-    // boxed Ref. The encoder confirms this empirically (both reconstructed
-    // function_calls frames decode 0 int / 0 float registers). A reconstructed
-    // inline callee has no virtualizable array, so an int/float-bank register
-    // here would have no boxed-Ref source to seed `registers_r` (the reader
-    // always reads `registers_r[k]`, trace_opcode.rs). Fall back to
-    // the single-frame bridge rather than synthesize an unboxed local.
+    // boxed Ref. A reconstructed inline callee has no virtualizable array, so
+    // an int/float-bank register here would have no boxed-Ref source to seed
+    // `registers_r` (the reader always reads `registers_r[k]`,
+    // trace_opcode.rs). Fall back to the single-frame bridge rather than
+    // synthesize an unboxed local.
+    //
+    // This is a PARITY GAP, not a shape that cannot occur: `consume_boxes`
+    // fills all three banks (`resume.py rebuild_from_resumedata` passes
+    // `f.registers_i, f.registers_r, f.registers_f`), and a JitCode int temp
+    // with no `locals_cells_stack_w` home is a normal live register there.
+    // `synth/or_chain_fresh_alloc_arg` reaches this decline twice per run once
+    // the callee operand-stack mirror is enabled (`PYRE_FBW_CALLEE_VSTACK=1`),
+    // and the resulting `P2Drain::NoRecipes` is why that fixture's kept-stack
+    // guard never bridges.
     if !reg_indices.int.is_empty() || !reg_indices.float.is_empty() {
         decline!("UnboxedLiveRegister");
     }

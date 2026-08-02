@@ -1397,10 +1397,17 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
         // means the call would apply its effects a second time on top of the
         // committed ones.  Same zero-delta gate the entry carrier applies at
         // its own CALL (`try_walker_inline_user_call`) and the contract
-        // `FBW_EXECUTED_EFFECT_COUNT` documents; declining here leaves the
-        // legacy path, whose journal rollback makes the replay exactly-once.
-        // The snapshot travels with the latch so `commit_walk_end` re-checks
-        // it at the commit point, not just here.
+        // `FBW_EXECUTED_EFFECT_COUNT` documents.  The snapshot travels with the
+        // latch so `commit_walk_end` re-checks it at the commit point, not just
+        // here.
+        //
+        // Declining here leaves the legacy path, which is exactly-once only for
+        // the effects a journal covers.  `residual_call.rs` bumps the odometer
+        // for a non-pure residual that wrote live heap or entered a user Python
+        // frame, and neither is journaled, so a legacy drop after such a
+        // residual re-applies it.  That is not a property of this gate — the
+        // walk reaches the same state through any non-committing abort inside a
+        // sub-walk — so this gate does not attempt to repair it.
         let (outer_resume, stack_overrides) = {
             let session = ctx.session.borrow();
             let outermost = session
