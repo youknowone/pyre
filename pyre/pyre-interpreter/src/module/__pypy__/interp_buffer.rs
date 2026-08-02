@@ -74,26 +74,43 @@ pub(crate) fn newmemoryview(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
     }
     let fmt = unsafe { pyre_object::w_str_get_wtf8(fmt_obj) }.to_string();
     let shape_obj = pyre_object::gc_roots::shadow_stack_get(sp + 3);
-    let shape = if !unsafe { pyre_object::is_none(shape_obj) } {
+    // `if w_shape` / `if w_strides` are RPython reference tests, not truth
+    // tests: an empty sequence still counts as supplied, and only the default
+    // `None` selects the derive-it path.
+    let has_shape = !unsafe { pyre_object::is_none(shape_obj) };
+    let shape = if has_shape {
         dimensions(shape_obj)?
     } else {
         Vec::new()
     };
     let strides_obj = pyre_object::gc_roots::shadow_stack_get(sp + 4);
-    let strides = if !unsafe { pyre_object::is_none(strides_obj) } {
+    let has_strides = !unsafe { pyre_object::is_none(strides_obj) };
+    let strides = if has_strides {
         dimensions(strides_obj)?
     } else {
         Vec::new()
     };
+    if !has_shape && has_strides && strides.len() != 1 {
+        return Err(PyError::value_error(
+            "strides must have a single value if shape not provided",
+        ));
+    }
+    if has_shape && has_strides && shape.len() != strides.len() {
+        // The reference raises before its shape accumulator is filled, so the
+        // diagnostic names an empty shape rather than the supplied one.
+        return Err(PyError::value_error(format!(
+            "shape [] does not match strides {strides:?}"
+        )));
+    }
     let w_obj = pyre_object::gc_roots::shadow_stack_get(sp);
-    let nbytes = unsafe { pyre_object::memoryview::w_memoryview_length(w_obj) };
-    // `lgt`/`old_size` name the source geometry the diagnostics report.  The
-    // element count is derived from the byte extent rather than `len(w_obj)`
-    // so that an N-D source, whose `shape[0]` covers only the outermost
-    // dimension, still reports every element it exposes.
+    // `lgt` is the source's own length — for an N-D view that is the outermost
+    // dimension, not the element count — and the byte extent every check below
+    // compares against follows from it.
+    let lgt = crate::baseobjspace::len_w(w_obj)?;
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(sp);
     let old_size = unsafe { pyre_object::memoryview::w_memoryview_itemsize(w_obj) };
-    let lgt = if old_size == 0 { 0 } else { nbytes / old_size };
-    let shape = if shape.is_empty() {
+    let nbytes = lgt.saturating_mul(old_size);
+    let shape = if !has_shape {
         if itemsize == 0 {
             return Err(PyError::value_error("cannot guess shape when itemsize==0"));
         }
@@ -111,7 +128,6 @@ pub(crate) fn newmemoryview(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
             "number of dimensions must not exceed 64",
         ));
     }
-    let has_strides = !strides.is_empty();
     let strides = if !has_strides {
         let mut result = vec![itemsize; shape.len()];
         for i in (0..shape.len().saturating_sub(1)).rev() {
@@ -120,8 +136,6 @@ pub(crate) fn newmemoryview(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
         result
     } else {
         if strides.len() != shape.len() {
-            // The reference raises before its shape accumulator is filled, so
-            // it always names an empty shape here; report the parsed one.
             return Err(PyError::value_error(format!(
                 "shape {shape:?} does not match strides {strides:?}"
             )));
