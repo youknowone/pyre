@@ -595,6 +595,11 @@ pub(super) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
 /// arbitrary control flow to an instruction that reads it.  So `OpRef::NONE`
 /// (dead, upstream's `box is None`) is skipped, and a live color with no
 /// concrete refuses the whole frame.
+///
+/// One live Ref color carries a value neither concrete lookup can express: the
+/// dead-`box_bool` marker holds a comparison's raw truth Int in a Ref register.
+/// It is unfillable by construction rather than unknown, so the Ref bank
+/// reconstructs the singleton instead of refusing — see there.
 fn fill_trace_too_long_register_banks<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     miframe: &mut majit_metainterp::MIFrame,
@@ -660,7 +665,31 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
                     ConcreteValue::Ref(value) => Some(value as i64),
                     _ => None,
                 });
-        if let Some(value) = forwarded.or(from_shadow) {
+        // The dead-`box_bool` marker writes a comparison's RAW TRUTH Int
+        // straight into the Ref register rather than boxing it, on
+        // `compare_box_provably_dead`'s proof that no GUARD RESUME snapshot can
+        // observe the slot.  This bank copy is not a guard resume: the
+        // blackhole runs forward from a post-step pc, and the very next opcode
+        // is the `is_true` that reads exactly this color.  Neither arm above
+        // can represent an Int in a Ref bank, so the color would be skipped and
+        // the blackhole would read NULL — `is_true(NULL)` is false, which sends
+        // a `while` straight to its exit arm and drops every remaining
+        // iteration.  The truth value is known, so materialize the immortal
+        // singleton the box would have produced and keep the image exact.
+        //
+        // The marker is recognisable because its sites record the truth against
+        // ITSELF; a genuinely boxed bool records a distinct `boxed` key and its
+        // concrete is a Ref, so it is already served by `forwarded`.
+        let from_bool_marker = opref
+            .filter(|&value| value != OpRef::NONE)
+            .filter(|&value| bool_box_truth_lookup(value) == Some(value))
+            .and_then(|value| match ctx.trace_ctx.lookup_opref_concrete(value) {
+                Some(majit_ir::Value::Int(truth)) => {
+                    Some(pyre_object::w_bool_from(truth != 0) as i64)
+                }
+                _ => None,
+            });
+        if let Some(value) = forwarded.or(from_shadow).or(from_bool_marker) {
             miframe.ref_values[color] = Some(value);
         } else if opref.is_some_and(|value| value != OpRef::NONE) {
             s2dbg!("ref color={color} opref={opref:?} has no concrete");
@@ -4031,9 +4060,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // dual of the LoadName/LoadGlobal cell fold.  Fires when the target slot
     // holds a stabilised immovable `IntMutableCell` and the store value is a
     // provably-plain-int box; emits `QUASIIMMUT_FIELD` + `setfield_gc_i(cell,
-    // intvalue)`, eliding the boxing + residual dict setitem.  Same
-    // handler-free gate as the LoadName fold (the fold elides a can-raise
-    // residual a `catch_exception/L` could resume into).
+    // intvalue)`, eliding the boxing + residual dict setitem.  Carries the
+    // LoadName fold's handler-free gate, and for the reason recorded there —
+    // the retrace storm, not a raise the fold could reach.
     //
     // Two staleness bugs were fixed before enabling this unconditionally:
     // (1) the fold now eagerly applies the concrete
@@ -5111,10 +5140,8 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
 
     // LoadName fold: module-scope LOAD_NAME mirror of the LoadGlobal fold
     // above.  The residual is `bh_load_name_fn(frame, w_name, namei)`, so
-    // r_args = [frame, w_name].  Same handler-free gate (the fold elides a
-    // CanRaise residual a `catch_exception` could otherwise resume into);
-    // `try_walker_load_name_cell_fold` gates module scope at runtime and
-    // routes non-module frames back to this residual.
+    // r_args = [frame, w_name].  `try_walker_load_name_cell_fold` gates module
+    // scope at runtime and routes non-module frames back to this residual.
     if ctx.is_authoritative_executor && ei.pyre_helper == majit_ir::PyreHelperKind::LoadName {
         if let (Some(&frame_opref), Some(&name_opref)) = (r_args.first(), r_args.get(1)) {
             if let (
@@ -5138,6 +5165,23 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             ctx.trace_ctx.reads_module_global = true;
         }
     }
+
+    // The handler-free gate is NOT the raise argument the LoadGlobal fold above
+    // rebuts.  That argument transfers cleanly: both folds lower through
+    // `emit_namespace_cell_fold`, which fires only on a name already PRESENT in
+    // the module dict and watches that slot with `QUASIIMMUT_FIELD` +
+    // `GUARD_NOT_INVALIDATED`, so a rebind or a delete fails the loop instead of
+    // reaching a NameError, and a successful fold provably cannot raise.
+    //
+    // What the gate actually holds back is a RETRACE STORM in a raising module
+    // loop.  Lifted, `exception_reraise_tb_depth_jitstress` goes 0.90s -> 5.85s
+    // at loops_compiled 305 -> 1802 and `exception_reraise_tb_depth_hot`
+    // 0.25s -> 0.64s at 4 -> 137.  The LOAD fold is the one that storms —
+    // restoring the store gate alone does not avoid it.
+    //
+    // The scan is whole-body, so one `try` anywhere in a module also charges
+    // every name access in it a live dict lookup (~83ns each, linear in the
+    // count).  Narrowing that without waking the storm is unfinished work.
     if ctx.is_authoritative_executor
         && ei.pyre_helper == majit_ir::PyreHelperKind::LoadName
         && !jitcode_has_exception_handler(code)
