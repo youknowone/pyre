@@ -6650,6 +6650,36 @@ impl<'a> Lowering<'a> {
                         return Ok(());
                     }
                 }
+                // `we_are_jitted()` is true during tracing and blackholing
+                // (rlib/jit.py:355-358); the rtyper folds the surviving
+                // `_we_are_jitted` symbolic to a constant True
+                // (rlib/jit.py:403-406, jtransform.py:1636-1639).  Folding it
+                // to `ConstBool(true)` here — at the front, before annotation —
+                // lets `simplify_lowered_graph`'s `fold_constant_exitswitch`
+                // drop each JIT-dead `if not we_are_jitted()` interpreter arm
+                // before the graph is annotated, instead of at
+                // `fold_we_are_jitted_calls` (jtransform post-annotation).  A
+                // dead interpreter arm reading a residual-only static (e.g.
+                // `baseobjspace::METHOD_CACHE` behind
+                // `lookup_where_with_method_cache`) would otherwise fail the
+                // phaseA lift and drop the whole graph to the legacy walker.
+                if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+                    && let Some(fd) = self.llbc.fn_by_id(*id)
+                    && fd.item_meta.name_path() == "majit_metainterp::jit::we_are_jitted"
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ConstBool(true),
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Reflexive blanket `into` — the callsite selected
                 // `impl<T> From<T> for T`, a pure `T -> T` identity
                 // conversion.  Bind the destination local to the
@@ -9374,9 +9404,9 @@ impl<'a> Lowering<'a> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "pyre_object::object_array::<Impl>::set_ref")
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path() == "pyre_object::object_array::<Impl>::set_ref"
+        })
     }
 
     /// Pointer reinterprets `*const T::cast_mut` / `*mut T::cast_const`
@@ -22908,11 +22938,7 @@ mod tests {
             residual, 0,
             "is_mmap: residual is_some_and call after the closure-select rewrite"
         );
-        let branching = graph
-            .blocks
-            .iter()
-            .filter(|b| b.exits.len() == 2)
-            .count();
+        let branching = graph.blocks.iter().filter(|b| b.exits.len() == 2).count();
         assert!(
             branching >= 1,
             "is_mmap: expected the Some/None discriminant branch (a 2-exit block)"
@@ -22937,8 +22963,7 @@ mod tests {
             "/../../build/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
-        let graph =
-            super::lower_function(&llbc, "set_locals_w").expect("lower set_locals_w");
+        let graph = super::lower_function(&llbc, "set_locals_w").expect("lower set_locals_w");
         let residual = graph
             .blocks
             .iter()
@@ -22964,6 +22989,68 @@ mod tests {
         assert!(
             array_writes >= 1,
             "set_locals_w: expected at least one native ArrayWrite (setarrayitem_gc)"
+        );
+    }
+
+    /// Real-LLBC anchor for the `we_are_jitted()` → `ConstBool(true)` front
+    /// fold: `lookup_in_type_where` branches on `if not we_are_jitted()` and,
+    /// in the interpreter arm, calls `_cached_lookup_where_name`, whose body
+    /// reads the residual-only `METHOD_CACHE` static.  After the front fold the
+    /// interpreter arm is JIT-dead and the annotator prunes it, but the fold
+    /// itself already removes the `we_are_jitted` call and collapses its
+    /// two-way branch to the JIT arm's unconditional goto — so the lowered
+    /// graph carries no `we_are_jitted` call.  `#[ignore]`d (loads the ~440MB
+    /// real LLBC); run with `cargo test -p majit-translate --lib
+    /// we_are_jitted_lookup_in_type_where_real -- --ignored`.
+    #[test]
+    #[ignore]
+    fn we_are_jitted_lookup_in_type_where_real() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "lookup_in_type_where")
+            .expect("lower lookup_in_type_where");
+        let we_are_jitted_residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["jit", "we_are_jitted"])
+                )
+            })
+            .count();
+        assert_eq!(
+            we_are_jitted_residual, 0,
+            "lookup_in_type_where: residual we_are_jitted call after the front fold"
+        );
+        // The interpreter arm's `_cached_lookup_where_name` call (which reads
+        // the residual-only `METHOD_CACHE` static) is JIT-dead once
+        // `we_are_jitted()` folds to True.  The front fold collapses the branch
+        // to the JIT arm's unconditional goto, so the interpreter arm becomes
+        // unreachable and `simplify_lowered_graph`'s `clear_unreachable_blocks`
+        // empties its operations — no `_cached_lookup_where_name` call survives.
+        let cached_lookup_residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["baseobjspace", "_cached_lookup_where_name"])
+                )
+            })
+            .count();
+        assert_eq!(
+            cached_lookup_residual, 0,
+            "lookup_in_type_where: residual _cached_lookup_where_name (METHOD_CACHE reader) \
+             after the we_are_jitted fold pruned the interpreter arm"
         );
     }
 

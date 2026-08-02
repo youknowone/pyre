@@ -2390,24 +2390,80 @@ pub fn remove_assertion_errors(graph: &mut FunctionGraph) -> usize {
 /// [`clear_unreachable_blocks`].  Returns the number of folded
 /// switches.
 pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
+    use crate::flowspace::model::Variable;
+    use std::collections::HashMap;
+
+    // target block id → predecessor block ids.  A block with a single
+    // predecessor lets a constant defined upstream propagate into it
+    // through the link args, exactly as `constant_fold_graph`'s link
+    // folding does (`backendopt/constfold.py`).
+    let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for b in &graph.blocks {
+        for e in &b.exits {
+            preds.entry(e.target).or_default().push(b.id);
+        }
+    }
+
+    // Resolve `v` to its defining `OpKind` — first in `block`, then, when
+    // `v` is one of `block`'s inputargs, through a chain of
+    // single-predecessor links (positional inputarg ↔ link-arg).  A
+    // single predecessor dominates the block, so a `LinkArg::Value` whose
+    // backing Variable is defined in the predecessor propagates soundly.
+    fn resolve_def<'g>(
+        graph: &'g FunctionGraph,
+        preds: &HashMap<BlockId, Vec<BlockId>>,
+        mut block: BlockId,
+        mut v: Variable,
+    ) -> Option<&'g OpKind> {
+        let mut seen: std::collections::HashSet<BlockId> = std::collections::HashSet::new();
+        loop {
+            let b = &graph.blocks[block.0];
+            if let Some(op) = b
+                .operations
+                .iter()
+                .find(|op| op.result.as_ref() == Some(&v))
+            {
+                return Some(&op.kind);
+            }
+            // `v` is not defined by an op here; if it is an inputarg and the
+            // block has exactly one predecessor, hop to the link arg feeding
+            // that inputarg slot.
+            let Some(slot) = b.inputargs.iter().position(|a| a == &v) else {
+                return None;
+            };
+            if !seen.insert(block) {
+                return None;
+            }
+            let [pred] = preds.get(&block).map(Vec::as_slice).unwrap_or(&[]) else {
+                return None;
+            };
+            let pred_block = &graph.blocks[pred.0];
+            let link = pred_block.exits.iter().find(|e| e.target == block)?;
+            // Only a `LinkArg::Value` threads a variable identity onward; an
+            // inline `LinkArg::Const` literal is not a `ConstBool`/`ConstInt`
+            // op def (the front folds `we_are_jitted()` to a `ConstBool` op
+            // whose result is threaded as a `Value`, so the value chain
+            // covers it) — decline the rarer inline-const shape here.
+            let LinkArg::Value(pv) = link.args.get(slot)? else {
+                return None;
+            };
+            v = pv.clone();
+            block = *pred;
+        }
+    }
+
     let mut folded = 0usize;
     for block_idx in 0..graph.blocks.len() {
         let block = &graph.blocks[block_idx];
         let Some(ExitSwitch::Value(sw)) = block.exitswitch.clone() else {
             continue;
         };
-        let def_of = |v: &crate::flowspace::model::Variable| {
-            block
-                .operations
-                .iter()
-                .find(|op| op.result.as_ref() == Some(v))
-                .map(|op| &op.kind)
-        };
-        let mut kind = def_of(&sw);
+        let block_id = block.id;
+        let mut kind = resolve_def(graph, &preds, block_id, sw.clone());
         if let Some(OpKind::UnaryOp { op, operand, .. }) = kind
             && op == "bool"
         {
-            kind = def_of(operand);
+            kind = resolve_def(graph, &preds, block_id, operand.clone());
         }
         // The matched exitcase spellings: an `If` branch carries
         // `ExitCase::Bool` (`set_branch`), a MIR `SwitchInt` carries
@@ -2418,6 +2474,7 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
             Some(OpKind::ConstInt(n)) => ((*n == 0 || *n == 1).then(|| *n != 0), Some(*n)),
             _ => continue,
         };
+        let block = &graph.blocks[block_idx];
         let matches_case = |link: &Link| match &link.exitcase {
             Some(ExitCase::Bool(b)) => Some(*b) == bool_case,
             Some(ExitCase::Const(ConstValue::Int(n))) => Some(*n) == int_case,
@@ -5669,6 +5726,50 @@ mod tests {
         assert_eq!(graph.block(entry).operations.len(), 2);
         assert_eq!(graph.block(graph.returnblock).inputargs.len(), 1);
         assert_eq!(graph.block(graph.exceptblock).inputargs.len(), 2);
+    }
+
+    /// `fold_constant_exitswitch` folds a switch whose discriminant is a
+    /// constant defined not in the switch block itself but in a single
+    /// predecessor and threaded across the link arg — the shape the front
+    /// `we_are_jitted()` → `ConstBool(true)` fold produces (the `Call`
+    /// terminator splits the constant into a separate block from the
+    /// `!we_are_jitted()` branch).  Mirrors `constant_fold_graph`'s link
+    /// propagation (`backendopt/constfold.py`).
+    #[test]
+    fn fold_constant_exitswitch_resolves_single_pred_link_arg() {
+        let mut graph = FunctionGraph::new("cross_block_fold");
+        let entry = graph.startblock;
+        // entry: `c = ConstBool(true)`, then goto B(c).
+        let c = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .unwrap();
+        // B: one inputarg (the threaded constant); branch on it — false arm
+        // to `dead`, true arm to `live`.
+        let (b, b_args) = graph.create_block_with_arg_vars(1);
+        let dead = graph.create_block();
+        let live = graph.create_block();
+        graph.set_goto(entry, b, vec![c]);
+        graph.set_branch(b, b_args[0].clone(), live, vec![], dead, vec![]);
+        // Give the arms a benign terminator so the reachability sweep has a
+        // well-formed graph to walk.  Zero-arg return block so the arms need
+        // no threaded values.
+        graph.block_mut(graph.returnblock).inputargs.clear();
+        graph.set_goto(live, graph.returnblock, vec![]);
+        graph.set_goto(dead, graph.returnblock, vec![]);
+
+        let folded = fold_constant_exitswitch(&mut graph);
+        assert_eq!(folded, 1, "the cross-block constant switch must fold");
+        // B keeps exactly the taken (true) arm, unconditional.
+        let b_block = graph.block(b);
+        assert!(b_block.exitswitch.is_none(), "switch removed after fold");
+        assert_eq!(b_block.exits.len(), 1, "only the taken arm survives");
+        assert_eq!(b_block.exits[0].target, live, "the true arm is taken");
+        // After `clear_unreachable_blocks` the false arm is emptied.
+        clear_unreachable_blocks(&mut graph);
+        assert!(
+            graph.block(dead).operations.is_empty() && graph.block(dead).exits.is_empty(),
+            "the dead (false) arm is emptied by the reachability sweep"
+        );
     }
 
     #[test]
