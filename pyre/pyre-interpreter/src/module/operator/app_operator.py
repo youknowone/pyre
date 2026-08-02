@@ -1,18 +1,11 @@
 # app_operator.py — app-level helpers for the operator module.
-# countOf is a plain loop; attrgetter / itemgetter / methodcaller are callable
-# factory classes that the interp-level operator module cannot express as plain
-# functions.  Mirrors pypy/module/operator/app_operator.py.
+# attrgetter / itemgetter / methodcaller are callable factory classes that the
+# interp-level operator module cannot express as plain functions.  Mirrors
+# pypy/module/operator/app_operator.py, which also keeps countOf here; pyre
+# instead exposes countOf as a non-binding interp-level builtin
+# (space.sequence_count), matching _operator.c's C countOf.
 
 __name__ = 'operator'
-
-
-def countOf(a, b):
-    'countOf(a, b) -- Return the number of times b occurs in a.'
-    count = 0
-    for x in a:
-        if x is b or x == b:
-            count += 1
-    return count
 
 
 class attrgetter(object):

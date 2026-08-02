@@ -137,16 +137,18 @@ crate::py_module! {
     // the pure-Python `lib-python/3/operator.py`, which imports from here.
     // `moduledef.py:5` names it `_operator` too (`applevel_name`).
     "_operator",
-    // `moduledef.py` `app_names` — `countOf` (a plain `app_operator.py` loop)
-    // and the `attrgetter`/`itemgetter`/`methodcaller` factory classes (which
-    // cannot be plain interp-level functions) — are the only app-level names.
-    // Everything else is interp-level: `indexOf` delegates to
-    // `space.sequence_index` (`interp_operator.py:58`) and `concat`
-    // (`op_concat`, `interp_operator.py:20`) guards both operands for
+    // `moduledef.py` `app_names` — only the `attrgetter`/`itemgetter`/
+    // `methodcaller` factory classes (which cannot be plain interp-level
+    // functions) stay app-level.  `countOf` is interp-level here, a non-binding
+    // builtin delegating to `space.sequence_count`; PyPy keeps it in
+    // `app_operator.py`, but `_operator.c` ships `countOf` as a C function, so
+    // the interp-level form matches that non-binding exposure.  `indexOf`
+    // likewise delegates to `space.sequence_index` (`interp_operator.py:58`);
+    // `concat` (`op_concat`, `interp_operator.py:20`) guards both operands for
     // `__getitem__`.
     appleveldefs: {
         "app_operator.py" => [
-            "countOf", "itemgetter", "attrgetter", "methodcaller",
+            "itemgetter", "attrgetter", "methodcaller",
         ],
     },
     functions: {
@@ -195,6 +197,7 @@ crate::py_module! {
         "is_not_none" / 1 = |args| Ok(w_bool_from(!std::ptr::eq(args[0], w_none()))),
         "contains" / 2 = |args| Ok(w_bool_from(contains(args[0], args[1])?)),
         "indexOf"  / 2 = |args| baseobjspace::sequence_index(args[0], args[1]),
+        "countOf"  / 2 = |args| baseobjspace::sequence_count(args[0], args[1]),
         // `call(obj, /, *args, **kwargs)` == `obj(*args, **kwargs)`.
         // `call_forwarding_args` re-splits the `__pyre_kw__` marker back into
         // keyword arguments before dispatching.
