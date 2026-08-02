@@ -1876,7 +1876,12 @@ unsafe fn getitem_type(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // Python 3.9+ generic subscript: cls[X] → cls.__class_getitem__(X)
     // (`descroperation.py:366` getattr lookup).
     if let Some(method) = lookup_in_type_where(obj, "__class_getitem__") {
-        return get_and_call_function(method, obj, obj, &[index]);
+        // PyPy's generic lookup treats an explicit None as disabling the
+        // inherited subscription hook.  Other non-callable values still
+        // reach the call and raise their ordinary not-callable TypeError.
+        if !pyre_object::is_none(method) {
+            return get_and_call_function(method, obj, obj, &[index]);
+        }
     }
     // abstract.py descr_getitem — a class that defines neither a metaclass
     // __getitem__ nor __class_getitem__ is not subscriptable.

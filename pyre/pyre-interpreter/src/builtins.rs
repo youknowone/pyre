@@ -4760,6 +4760,25 @@ fn type_descr_new_with_metaclass(
         }
         let name = crate::baseobjspace::str_utf8_w(name_obj)?;
 
+        // typeobject.py:938-942 `_create_new_type` — direct three-argument
+        // `type()` never performs PEP 560 base rewriting.  A non-type base
+        // advertising `__mro_entries__` gets the dedicated diagnostic before
+        // metaclass calculation; class statements resolve it earlier in
+        // `__build_class__` and therefore never reach this branch.
+        let n_bases = unsafe { w_tuple_len(bases) };
+        for index in 0..n_bases {
+            let Some(base) = (unsafe { pyre_object::w_tuple_getitem(bases, index as i64) }) else {
+                continue;
+            };
+            if !unsafe { pyre_object::is_type(base) }
+                && unsafe { crate::baseobjspace::lookup(base, "__mro_entries__") }.is_some()
+            {
+                return Err(crate::PyError::type_error(
+                    "type() doesn't support MRO entry resolution; use types.new_class()",
+                ));
+            }
+        }
+
         // CPython: calculate_metaclass — if bases have a custom metaclass,
         // delegate to that metaclass instead of using type.__new__ directly.
         if w_metaclass.is_null() && !bases.is_null() && unsafe { is_tuple(bases) } {
