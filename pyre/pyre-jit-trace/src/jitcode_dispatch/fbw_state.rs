@@ -1386,6 +1386,13 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
         None
     };
     if nested && (foriter_deferred_inline.is_some() || hazardous_callee.is_some()) {
+        if std::env::var_os("PYRE_LB_SITE").is_some() {
+            eprintln!(
+                "[lb-arm] pc={pc} deferred={} hazard={}",
+                foriter_deferred_inline.is_some(),
+                hazardous_callee.is_some(),
+            );
+        }
         if let Some(callee_code_key) = foriter_deferred_inline {
             fbw_foriter_deny_deferred_call(callee_code_key);
         }
