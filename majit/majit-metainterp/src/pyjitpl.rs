@@ -10679,8 +10679,8 @@ impl<M: Clone> MetaInterp<M> {
                 crate::mc_diag_bump(36); // compile_entry_bridge: optimize_bridge InvalidLoop
                 if crate::majit_log_enabled() {
                     eprintln!(
-                        "[jit] compile_entry_bridge: {invalid_loop} target={green_key} \
-                         original={original_green_key}",
+                        "[jit] compile_entry_bridge: InvalidLoop({}) target={} original={}",
+                        invalid_loop.0, green_key, original_green_key
                     );
                 }
                 return false;
