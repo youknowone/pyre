@@ -814,13 +814,26 @@ pub fn execute_pure_call(
         // `f64::to_bits`; routing through `call_int_function` is bit-identical.
         //
         // That convention is a CALLER CONTRACT, not a property of the descr:
-        // it holds only when `func_ptr` is such a wrapper.  A funcbox baked by
-        // the codewriter instead carries the callee's own address, where the
-        // f64 comes back in the floating-point return register and this arm
-        // reads whatever was left in the integer one.  The two are
-        // indistinguishable here — `descr` records the signature, not which
-        // emitter produced the pointer — so the walker declines rather than
-        // guess (`residual_call.rs try_fold_pure_call_via_executor`).
+        // it holds only when `func_ptr` is that wrapper.  `add_fn_ptr(ptr)` is
+        // `add_call_target(ptr, ptr)` (`jitcode/assembler.rs:4617`), so a
+        // `concrete_ptr` registered that way — and every LLBC `ConstInt`
+        // fnaddr, which mints no `JitCallTarget` at all — is the callee's own
+        // address, whose f64 comes back in the floating-point return register
+        // while this arm reads whatever was left in the integer one.  `descr`
+        // records the signature, not the registration, so the two are
+        // indistinguishable here and the walker declines rather than guess
+        // (`residual_call.rs try_fold_pure_call_via_executor`).
+        //
+        // This arm is the outlier: `executor.py:66-72` dispatches FLOAT
+        // through `cpu.bh_call_f`, which pyre has already ported as
+        // `majit_backend::call_stub::bh_call_f_by_classes` and which BOTH other
+        // residual-call consumers already use on this same operand — the
+        // blackhole (`bhimpl_residual_call_irf_f`) and the metainterp's IRF_F
+        // dispatcher (`pyjitpl/dispatch.rs:6539`, on the very `concrete_ptr`
+        // the via-target emitter bakes).  Converging means choosing one
+        // registration convention, not adding a discriminator here; the
+        // CALL_ASSEMBLER arms are separate and genuinely do want the i64
+        // wrapper.
         majit_ir::Type::Float => crate::pyjitpl::call_int_function(func_ptr, args),
     }
 }
