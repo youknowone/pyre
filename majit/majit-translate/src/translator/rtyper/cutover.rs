@@ -2436,6 +2436,9 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
     // does not model destructors (the `Drop` terminator lowers to a
     // pass-through `Goto`), so a Void no-op stub is faithful.
     (&["core", "mem", "drop"], &["x"], LowLevelType::Void),
+    // `mem::forget(x)` consumes `x` without running its destructor and returns
+    // `()`; same Void no-op shape as `mem::drop`.
+    (&["core", "mem", "forget"], &["x"], LowLevelType::Void),
     // `mem::size_of::<T>() -> usize`.  A concrete-type call is folded to a
     // `ConstInt` in the front end (`Lowering::lower_call` /
     // `size_align_const_from_tyexpr`); the residual reaching the rtyper is the
@@ -2461,6 +2464,11 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         LowLevelType::Void,
     ),
     (
+        &["sync", "atomic", "AtomicU8", "store"],
+        &["self", "val", "order"],
+        LowLevelType::Void,
+    ),
+    (
         &["cell", "Cell", "set"],
         &["self", "val"],
         LowLevelType::Void,
@@ -2477,6 +2485,11 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
     ),
     (
         &["std", "f64", "<Impl>", "floor"],
+        &["self"],
+        LowLevelType::Float,
+    ),
+    (
+        &["std", "f64", "<Impl>", "ceil"],
         &["self"],
         LowLevelType::Float,
     ),
