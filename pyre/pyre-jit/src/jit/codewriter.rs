@@ -1630,6 +1630,23 @@ fn handler_entry_state_from_catch_sites(
     merged
 }
 
+/// Whether an exception handler must retain values below the exception slot.
+///
+/// Exception-table `depth > 0` is CPython's protected operand-stack prefix
+/// (for example the saved outer-comprehension local restored by
+/// `SWAP; STORE_FAST; RERAISE`). Those values already arrive through the
+/// catch EggBlocks and `mergeblock` inputargs. Reconstructing the handler
+/// state creates fresh Variables for the prefix after the block inputargs have
+/// been fixed, leaving the cleanup ops with no producer.
+fn handler_entry_has_protected_prefix(
+    catch_sites: &[ExceptionCatchSite],
+    handler_py_pc: usize,
+) -> bool {
+    catch_sites
+        .iter()
+        .any(|site| site.handler_py_pc == handler_py_pc && site.stack_depth > 0)
+}
+
 /// True for a handler whose reconstructed entry stack carries both a
 /// `push_lasti` box and an exception slot (`handler_entry_state_from_catch_site`
 /// pushes the lasti box below a `fresh_ref_value` exception slot). That
@@ -7943,15 +7960,16 @@ impl CodeWriter {
                         if start_pc != py_pc {
                             break;
                         }
-                        if preserve_exception_edge_states {
+                        if preserve_exception_edge_states
+                            || handler_entry_has_protected_prefix(&catch_sites, py_pc)
+                        {
                             // Each catch landing is the exception edge's
                             // EggBlock: it constructs the handler stack from
                             // its own link inputs, then `mergeblock` joins
                             // those states through ordinary link arguments.
                             // Keep that joined pending state while a caught
-                            // `raise value` can flow through this exception
-                            // graph, so PUSH_EXC_INFO retains the edge's
-                            // previous-exception identity.
+                            // `raise value` or a protected stack prefix must
+                            // retain its identity through handler cleanup.
                             current_depth = current_state.stack.len() as u16;
                             needs_fallthrough = false;
                         } else if let Some(handler_state) = handler_entry_state_from_catch_sites(
@@ -7960,11 +7978,8 @@ impl CodeWriter {
                             &catch_sites,
                             py_pc,
                         ) {
-                            // Non-explicit edges do not carry a raised
-                            // operand whose identity must survive the handler
-                            // cleanup. Their reconstructed state is equivalent
-                            // to the incoming EggBlock values and preserves
-                            // the established bare-reraise graph shape.
+                            // Implicit edges with no protected prefix retain
+                            // the established cross-site reconstruction.
                             current_depth = handler_state.stack.len() as u16;
                             current_state = handler_state;
                             needs_fallthrough = false;
@@ -15356,6 +15371,23 @@ mod tests {
             lasti_py_pc: 0,
             landing: landing.clone(),
         }
+    }
+
+    #[test]
+    fn protected_handler_prefix_uses_joined_eggblock_state() {
+        let graph = FunctionGraph::new("handler-prefix", Block::shared(Vec::new()), None);
+        let landing = SpamBlockRef::new(graph.new_block(Vec::new()), None);
+        let mut protected = synthetic_catch_site(&landing);
+        protected.handler_py_pc = 12;
+        protected.stack_depth = 2;
+
+        let mut empty_prefix = synthetic_catch_site(&landing);
+        empty_prefix.handler_py_pc = 20;
+
+        let sites = vec![protected, empty_prefix];
+        assert!(handler_entry_has_protected_prefix(&sites, 12));
+        assert!(!handler_entry_has_protected_prefix(&sites, 20));
+        assert!(!handler_entry_has_protected_prefix(&sites, 99));
     }
 
     fn fresh_variable_factory(start: u32) -> impl FnMut(Option<Kind>) -> Variable {

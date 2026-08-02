@@ -30,6 +30,9 @@ pub(crate) fn classify_vstack_opcode(
         | Instruction::Resume { .. }
         | Instruction::Cache
         | Instruction::NotTaken
+        // Pyre's END_FOR is a no-op; the following POP_ITER removes the
+        // iterator (codewriter.rs / pyopcode.rs).
+        | Instruction::EndFor
         | Instruction::ExtendedArg => VstackOpClass::PopOnlyOrSideStore,
 
         // Single value lands on the new TOS = the last Ref written.
@@ -243,6 +246,49 @@ pub(crate) fn classify_vstack_opcode(
         // TO_BOOL is modeled explicitly above rather than left to this arm.
         _ => VstackOpClass::Unmodeled,
     }
+}
+
+/// Whether a Python code body contains an opcode for which the FBW
+/// operand-stack mirror has no transition model.
+pub(crate) fn code_has_unmodeled_vstack_opcode(
+    code: &pyre_interpreter::bytecode::CodeObject,
+) -> bool {
+    code_from_pc_has_unmodeled_vstack_opcode(code, 0)
+}
+
+/// Range-scoped form used by a hot loop entry: prologue opcodes before the
+/// merge point have already executed and cannot invalidate this walk's mirror.
+pub(crate) fn code_from_pc_has_unmodeled_vstack_opcode(
+    code: &pyre_interpreter::bytecode::CodeObject,
+    start_pc: usize,
+) -> bool {
+    use pyre_interpreter::bytecode::Instruction;
+    for py_pc in start_pc..code.instructions.len() {
+        let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, py_pc) else {
+            continue;
+        };
+        if matches!(
+            classify_vstack_opcode(&instr, op_arg),
+            VstackOpClass::Unmodeled
+        ) {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[vstack-unmodeled] py_pc={py_pc} instr={instr:?}");
+            }
+            return true;
+        }
+        // The first backedge closes the hot region entered at `start_pc`.
+        // Tail bytecode after it (END_FOR / RETURN_CONST, for example) is an
+        // exit path and does not run before this loop's guard snapshots.
+        if matches!(
+            instr,
+            Instruction::JumpBackward { .. }
+                | Instruction::JumpBackwardNoInterrupt { .. }
+                | Instruction::EndFor
+        ) {
+            return false;
+        }
+    }
+    false
 }
 
 /// The boxed constant a value `LOAD_CONST` pushes, as a trace-constant OpRef,
