@@ -65,7 +65,10 @@ fn structseq_registry() -> &'static Mutex<IndexMap<usize, StructSeqDescr>> {
 /// Structseq types are unacceptable as bases but, unlike most types with that
 /// flag, their constructor accepts the `sequence=` and `dict=` keywords.
 pub(crate) fn is_structseq_type(obj: PyObjectRef) -> bool {
-    structseq_registry().lock().unwrap().contains_key(&(obj as usize))
+    structseq_registry()
+        .lock()
+        .unwrap()
+        .contains_key(&(obj as usize))
 }
 
 /// `lib_pypy/_structseq.py:31-37 structseqfield.__get__` —
@@ -245,7 +248,10 @@ fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             {
                 None
             } else if unsafe { pyre_object::is_str(key) } {
-                Some((unsafe { pyre_object::w_str_get_value(key) }.to_string(), value))
+                Some((
+                    unsafe { pyre_object::w_str_get_value(key) }.to_string(),
+                    value,
+                ))
             } else {
                 // Python call syntax guarantees string keyword names.  Keep a
                 // defensive non-string marker without invoking user `repr`
@@ -778,10 +784,7 @@ fn make_heap_structseq_type(
             mro.push(base);
         }
         pyre_object::w_type_set_mro(cls, mro);
-        crate::typedef::stamp_new_descr_self(
-            pyre_object::gc_roots::shadow_stack_get(ns_slot),
-            cls,
-        );
+        crate::typedef::stamp_new_descr_self(pyre_object::gc_roots::shadow_stack_get(ns_slot), cls);
         pyre_object::typeobject::w_type_ready(cls);
     }
     pyre_object::gc_roots::shadow_stack_get(cls_slot)
