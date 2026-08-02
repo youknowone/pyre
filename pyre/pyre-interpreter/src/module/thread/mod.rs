@@ -42,8 +42,10 @@ static ACTIVE_HANDLES: Mutex<Vec<usize>> = parking_lot::const_mutex(Vec::new());
 static EXECUTION_CONTEXTS: LazyLock<Mutex<indexmap::IndexMap<i64, usize>>> =
     LazyLock::new(|| Mutex::new(indexmap::IndexMap::new()));
 
-/// A blocking host call leaves the free-threaded collector's RUNNING census.
-/// This is a GC safepoint transition only; pyre has no process GIL.
+pub mod gil;
+
+/// `rffi.aroundstate.before()`: drop the GIL and leave the collector's RUNNING
+/// census for the duration of a blocking host call.
 pub(crate) fn before_external_block() -> majit_gc::gc_sync::BlockingGuard {
     majit_gc::gc_sync::before_external_block()
 }
@@ -1413,6 +1415,8 @@ fn spawn_thread(
     if parent_ec.is_null() {
         return Err(crate::PyError::runtime_error("no execution context"));
     }
+    // os_thread.py:172 `start_new_thread` begins with `setup_threads(space)`.
+    gil::setup_threads(unsafe { &mut *(parent_ec as *mut crate::PyExecutionContext) });
 
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
@@ -1532,6 +1536,10 @@ fn spawn_thread(
             // first, matching OSThreadLocals.enter_thread() installing the
             // ExecutionContext before thread bootstrap invokes Python code.
             ec.install_user_del_action();
+            // Each mutator owns its ticker, so the GIL-releasing action has to
+            // be registered on this thread's own actionflag; without it a
+            // worker would hold the GIL until its next external call.
+            gil::initialize(&mut ec);
             let ident = current_ident();
             if has_handle {
                 let h = W_ThreadHandle::from_obj(handle_addr as PyObjectRef).unwrap();

@@ -6,47 +6,29 @@
 //! unchanged inside the STW window — it already assumes a single-threaded
 //! world during collection.
 //!
-//! # The operation gate
+//! # The operation gate is the GIL
 //!
-//! Every GC operation (alloc, collect, barrier, query) runs under one word,
-//! `IN_FAST_PATH`, holding the claimant's ident — `rpy_fastgil`
-//! (thread_gil.c:1-31), down to the spelling of its protocol: a
-//! compare-and-swap claims it (`_rpygil_acquire_fast_path`,
-//! threadlocal.h:153-156), a plain store drops it (`_RPyGilRelease`,
-//! :163-167), and a thread recognises its own claim by comparing against its
-//! ident (thread_gil.c:19-21).
+//! GC operations (alloc, collect, barrier, query) take no lock of their own.
+//! Exclusion comes from [`crate::rgil`]: a thread holds the GIL for as long as
+//! it runs pyre code, so between two external calls arbitrarily many
+//! allocations run with no synchronisation, and [`gc_op`] is a bare borrow of
+//! the singleton — `malloc_fixedsize` bumps `nursery_free` under exactly the
+//! same terms (incminimark.py, framework.py:361-402).
 //!
-//! A claim **stands between operations**, as `rpy_fastgil` stays set for as
-//! long as its thread runs RPython code, so a repeated allocation only marks
-//! the claim it already holds instead of re-taking a free word. Only the sole
-//! registered mutator claims that way; once a second registers, claims are per
-//! operation and taken under `gc_mutex`.
-//!
-//! Upstream can leave a standing claim to its owner because every blocking
-//! call is `releasegil=True` and drops it. Pyre cannot assume that of arbitrary
-//! Rust blocking, so `revoke_standing_claim` takes it back instead, the way
-//! `RPyGilAcquireSlowPath` overwrites the holder's ident once it owns the real
-//! lock (:214-223). Waiting therefore never depends on the holder running
-//! again.
-//!
-//! What upstream reads off `mutex_gil` — whether the claimant is *using* the
-//! GIL or merely holding it — pyre keeps in `GATE_INSIDE`, the low bit of the
-//! same word. Upstream needs no such distinction (holding the GIL is being
-//! inside the GC); pyre does, because its collector re-enters for read-only
-//! queries. Keeping it in the claim makes entering one compare-and-swap and
-//! revocation one failed compare-and-swap, with no second word to interlock
-//! against.
+//! The GIL is therefore the safepoint too. A thread that does not hold it is
+//! either waiting for it in `RPyGilAcquireSlowPath` or blocked in an external
+//! call, and both leave the RUNNING census — so a collector, which by
+//! definition holds the GIL, never waits for a thread that is running pyre
+//! code.
 //!
 //! # Design
 //!
-//! This is not a GIL: the gate spans GC operations, not Python execution, and
-//! it is revocable by any thread that wants it. Collection begins only when
-//! every other registered thread is at an entry-style safepoint where all of
-//! its live GC references are rooted. A slow `gc_op` leaves RUNNING before
-//! blocking on `gc_mutex`, then rejoins RUNNING before its closure executes. A
-//! dispatch poll parks directly. There is no exit safepoint: a returned
-//! reference remains protected until the caller roots it before its next
-//! collection-capable call.
+//! Collection begins only when every other registered thread is at an
+//! entry-style safepoint where all of its live GC references are rooted.
+//! Waiting for the GIL and entering an external block are both such
+//! safepoints; a dispatch poll parks directly. There is no exit safepoint: a
+//! returned reference remains protected until the caller roots it before its
+//! next collection-capable call.
 
 use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -58,9 +40,8 @@ use crate::collector::MiniMarkGC;
 use crate::GcAllocator;
 
 /// Process-global GC singleton storage.
-/// `UnsafeCell` provides interior mutability; access is serialised by
-/// `GC_SYNC.gc_mutex`. `Sync` is sound because all `&mut` access goes
-/// through the mutex.
+/// `UnsafeCell` provides interior mutability; access is serialised by the GIL.
+/// `Sync` is sound because every `&mut` is formed by its holder.
 ///
 /// The collector is named concretely rather than held behind
 /// `dyn GcAllocator`. `framework.py:132` resolves `GCClass` once from the
@@ -78,15 +59,16 @@ static GC_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// STW safepoint state.
 pub struct GcSync {
-    /// Mutex serialising all GC operations. Held briefly per alloc/barrier
-    /// (P0). Held for full STW duration during collection.
-    gc_mutex: Mutex<()>,
+    /// Serialises installation of the singleton itself, which happens before
+    /// the installing thread has taken the GIL. Every *use* of the singleton
+    /// is serialised by the GIL instead.
+    install_mutex: Mutex<()>,
     /// Set while a collector is draining other mutators to entry-style
-    /// safepoints. Cleared before the collector releases `gc_mutex`.
+    /// safepoints. Cleared when the collector's `StwGuard` is dropped.
     stw_requested: AtomicBool,
-    /// RUNNING registered-mutator count. A slow `gc_op` removes itself before
-    /// waiting on `gc_mutex`, so a mutex-holding collector can drain every
-    /// other mutator while remaining counted itself.
+    /// RUNNING registered-mutator count. A thread waiting for the GIL removes
+    /// itself for the wait, so a collector — which holds the GIL — can drain
+    /// every other mutator while remaining counted itself.
     quiesce: Mutex<QuiesceState>,
     /// Signalled whenever RUNNING decreases toward the collector-inclusive
     /// drain target (one when the collector is counted, otherwise zero).
@@ -103,7 +85,7 @@ struct QuiesceState {
 }
 
 static GC_SYNC: GcSync = GcSync {
-    gc_mutex: Mutex::new(()),
+    install_mutex: Mutex::new(()),
     stw_requested: AtomicBool::new(false),
     quiesce: Mutex::new(QuiesceState { running: 0 }),
     quiesced: Condvar::new(),
@@ -121,12 +103,13 @@ pub fn store_singleton(gc: Box<MiniMarkGC>) {
     if GC_INITIALIZED.load(Ordering::Acquire) {
         return;
     }
-    let _guard = GC_SYNC.gc_mutex.lock().unwrap();
+    let _guard = GC_SYNC.install_mutex.lock().unwrap();
     // Double-check after acquiring mutex.
     if GC_INITIALIZED.load(Ordering::Acquire) {
         return;
     }
-    // SAFETY: gc_mutex held, no concurrent access.
+    // SAFETY: install_mutex held and no mutator has registered yet, so there is
+    // no concurrent access.
     unsafe {
         *GC_STORE.0.get() = Some(gc);
         crate::publish_singleton_nursery(&**(*GC_STORE.0.get()).as_ref().unwrap());
@@ -144,9 +127,9 @@ pub fn store_singleton(gc: Box<MiniMarkGC>) {
 /// oldgen residue or stale registered roots cannot corrupt this test's
 /// collections.
 pub fn replace_singleton_leaking_old(gc: Box<MiniMarkGC>) {
-    let _guard = GC_SYNC.gc_mutex.lock().unwrap();
-    // SAFETY: gc_mutex held; the gc_stress harness runs tests serially, so no
-    // concurrent gc_op is in flight during the swap.
+    let _guard = GC_SYNC.install_mutex.lock().unwrap();
+    // SAFETY: install_mutex held; the gc_stress harness runs tests serially, so
+    // no concurrent gc_op is in flight during the swap.
     unsafe {
         if let Some(old) = (*GC_STORE.0.get()).take() {
             std::mem::forget(old);
@@ -162,10 +145,10 @@ pub fn is_initialized() -> bool {
     GC_INITIALIZED.load(Ordering::Acquire)
 }
 
-/// Access the GC singleton mutably under gc_mutex protection.
-/// SAFETY: caller must hold gc_mutex.
+/// Access the GC singleton mutably.
+/// SAFETY: caller must hold the GIL.
 unsafe fn singleton_mut() -> &'static mut MiniMarkGC {
-    // SAFETY: caller holds gc_mutex, so there is no concurrent access.
+    // SAFETY: caller holds the GIL, so there is no concurrent access.
     unsafe { &mut *GC_STORE.0.get() }
         .as_deref_mut()
         .expect("GC singleton not initialized — call store_singleton() first")
@@ -177,18 +160,14 @@ unsafe fn singleton_mut() -> &'static mut MiniMarkGC {
 
 /// Per-thread GC-sync facts, kept in one struct like pypy_threadlocal_s
 /// (threadlocal.c:46-97). Its address doubles as this thread's ident in
-/// [`IN_FAST_PATH`] and [`STW_OWNER`], mirroring how _rpygil_get_my_ident reads
+/// `rpy_fastgil` and [`STW_OWNER`], mirroring how _rpygil_get_my_ident reads
 /// the ident out of the threadlocal struct (threadlocal.h:143-146).
-///
-/// Aligned so that idents leave [`GATE_INSIDE`] free; the fields alone would
-/// give this struct alignment 1.
-#[repr(align(8))]
 struct GcThreadState {
     /// Completed `register_thread`, represented in the RUNNING count.
     registered: Cell<bool>,
-    /// Registered mutators are normally RUNNING. Outermost slow gc_op
-    /// regions waiting on gc_mutex and dispatch safepoint parks flip this
-    /// to false.
+    /// Registered mutators are normally RUNNING. Waiting for the GIL,
+    /// entering an external block, and dispatch safepoint parks flip this to
+    /// false.
     running: Cell<bool>,
 }
 
@@ -201,7 +180,7 @@ thread_local! {
 /// Stable nonzero ident of the current thread: the address of its
 /// `GC_THREAD` struct.
 #[inline]
-fn my_ident() -> usize {
+pub(crate) fn my_ident() -> usize {
     GC_THREAD.with(|t| t as *const GcThreadState as usize)
 }
 
@@ -211,37 +190,15 @@ fn my_ident() -> usize {
 static STW_OWNER: AtomicUsize = AtomicUsize::new(0);
 static STW_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
-/// Restores [`IN_FAST_PATH`] on both normal return and unwind: to the bare
-/// ident for a claim that goes on standing, to 0 for one taken per operation.
-struct GateGuard {
-    restore: usize,
-}
-impl Drop for GateGuard {
-    #[inline]
-    fn drop(&mut self) {
-        IN_FAST_PATH.store(self.restore, Ordering::Release);
-    }
-}
-
-/// Whether this thread is already inside a `gc_op` / `request_stw` closure
-/// (i.e. a collection is running on this thread and holds the `&mut`). The
-/// `rpy_fastgil == get_ident()` idiom (thread_gil.c:19-21), read against the
-/// in-use form of this thread's claim.
-#[inline]
-pub fn in_gc_op() -> bool {
-    IN_FAST_PATH.load(Ordering::Relaxed) == my_ident() | GATE_INSIDE
-}
-
 /// Shared reference to the singleton, re-derived from the static `UnsafeCell`.
 ///
-/// SAFETY: only sound when [`in_gc_op`] holds on this thread — the collector
-/// already owns the exclusive `&mut`, all other mutators are parked (STW) or
-/// spinning (single-thread fast path), and the returned `&dyn` is used only for
-/// a read-only query whose lifetime ends before control returns to the
-/// collector. Re-derives from `GC_STORE.0.get()` each call (a pre-`&mut`-cached
-/// raw pointer would be invalidated by `singleton_mut`'s reborrow).
+/// SAFETY: only sound while this thread holds the GIL — no other mutator can
+/// then be running pyre code, and the returned reference is used only for a
+/// read-only query whose lifetime ends before control returns. Re-derives from
+/// `GC_STORE.0.get()` each call (a pre-`&mut`-cached raw pointer would be
+/// invalidated by `singleton_mut`'s reborrow).
 #[inline]
-unsafe fn singleton_ref_reentrant() -> &'static MiniMarkGC {
+unsafe fn singleton_ref() -> &'static MiniMarkGC {
     unsafe { &*GC_STORE.0.get() }
         .as_deref()
         .expect("GC singleton not initialized — call store_singleton() first")
@@ -250,135 +207,37 @@ unsafe fn singleton_ref_reentrant() -> &'static MiniMarkGC {
 /// Read-only query that is safe both at top level and reentrantly from inside a
 /// collection (an extra-root walker's `gc_owns_object` / ownership query).
 ///
-/// Top level (`!in_gc_op()`): takes the fully-synchronised [`gc_query`] path.
-/// Reentrant (`in_gc_op()`): reads the singleton directly, without re-locking
-/// `gc_mutex` (which would deadlock — the lock is non-recursive and, under STW,
-/// held by this very collector) or forming a second `&mut`.
+/// It cannot go through [`gc_op`]: a collection in progress already holds the
+/// exclusive `&mut`, and forming a second one from inside its own root walk
+/// would alias it. Holding the GIL is what makes the shared borrow sound in
+/// both cases.
 #[inline]
 pub fn gc_query_reentrant<R>(f: impl FnOnce(&MiniMarkGC) -> R) -> R {
-    if in_gc_op() {
-        // SAFETY: in_gc_op() ⇒ this thread holds the &mut and is the sole
-        // running mutator (parked/spinning invariant); read-only, bounded to `f`.
-        f(unsafe { singleton_ref_reentrant() })
-    } else {
-        gc_query(f)
-    }
+    debug_assert!(
+        crate::rgil::am_i_holding_the_gil(),
+        "a GC query needs the GIL"
+    );
+    // SAFETY: the GIL is held, so no other mutator is running pyre code;
+    // read-only and bounded to `f`.
+    f(unsafe { singleton_ref() })
 }
 
 // ──────────────────────────────────────────────────────────────
-// Mutator registry — single-thread fast path
+// Mutator registry
 // ──────────────────────────────────────────────────────────────
 
 /// Number of threads that have called `register_thread` and not yet
-/// `unregister_thread`.  When ≤ 1, `gc_op` skips the Mutex entirely.
+/// `unregister_thread`.
 static REGISTERED_THREADS: AtomicUsize = AtomicUsize::new(0);
 
-/// Fast-path lock word: 0 when free, otherwise the claimant's ident
-/// (`my_ident`) with [`GATE_INSIDE`] set while it is running a closure,
-/// following rpy_fastgil (thread_gil.c:7-31). Self-ownership is checked by
-/// comparing against `my_ident()`.
-///
-/// A claim stands across operations, the way `rpy_fastgil` stays set for as
-/// long as its thread runs RPython code (thread_gil.c:15-21). Only the fast
-/// path claims it that way; [`gc_op_slow`] claims and drops it per operation,
-/// so the word is transiently nonzero in multi-mutator runs too. A standing
-/// claim is dropped by its owner ([`release_gate`]) or taken from it
-/// ([`revoke_standing_claim`]).
-static IN_FAST_PATH: AtomicUsize = AtomicUsize::new(0);
-
-/// Set in [`IN_FAST_PATH`] while the claimant is inside a `gc_op` closure, so
-/// the claim and the exclusive `&mut` live in one word. Upstream needs no such
-/// bit — holding `rpy_fastgil` *is* being inside the GC — but pyre's collector
-/// re-enters for read-only queries ([`gc_query_reentrant`]) and has to tell the
-/// two states apart. Keeping it in the claim makes entering a claimed gate one
-/// compare-and-swap, and makes revocation a plain failed CAS instead of a
-/// cross-word handshake.
-const GATE_INSIDE: usize = 1;
-
-const _: () = assert!(
-    std::mem::align_of::<GcThreadState>() > GATE_INSIDE,
-    "idents must leave GATE_INSIDE free"
-);
-
-/// Drop this thread's standing claim, if it still has one.
-///
-/// `_RPyGilRelease` (threadlocal.h:163-167) is a plain store because upstream's
-/// word is only ever cleared by its owner. A standing claim here can also be
-/// revoked while its owner sits idle, so the release is a compare-and-swap:
-/// a plain store would drop whichever claim replaced it. Off the hot path —
-/// a standing claim is carried, not re-taken.
-#[inline]
-fn release_gate(ident: usize) {
-    let _ = IN_FAST_PATH.compare_exchange(ident, 0, Ordering::Release, Ordering::Relaxed);
-}
-
-/// Take a standing claim away from a thread that is not using it, so waiting
-/// never depends on the holder running again.
-///
-/// `RPyGilAcquireSlowPath` ends by overwriting whatever ident `rpy_fastgil`
-/// holds (thread_gil.c:214-223); it is safe there because `mutex_gil`, not the
-/// word, is the real exclusion. Here the exclusion is [`GATE_INSIDE`] in the
-/// same word, so the revoke is one compare-and-swap against the idle form of
-/// the claim: it fails outright while a closure is running, and a closure can
-/// only start by winning that same word.
-///
-/// The caller must hold `gc_mutex`, so no slow operation can be running and the
-/// word can only be carrying a standing claim. The cleared word may be
-/// re-claimed immediately by the revoked thread when it is still the only
-/// registered mutator; [`acquire_gate`] loops for that case.
-fn revoke_standing_claim(ident: usize) {
-    loop {
-        let claim = IN_FAST_PATH.load(Ordering::Acquire);
-        if claim == 0 || claim & !GATE_INSIDE == ident {
-            return;
-        }
-        if claim & GATE_INSIDE == 0
-            && IN_FAST_PATH
-                .compare_exchange(claim, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            return;
-        }
-        // In use: the closure publishes the idle form when it returns.
-        std::hint::spin_loop();
-    }
-}
-
-/// Claim the gate for `ident` and mark it in use, revoking a standing claim if
-/// one is in the way — the stealer loop of `RPyGilAcquireSlowPath`
-/// (thread_gil.c:203-223). Callers hold `gc_mutex`, which excludes every other
-/// slow claimant.
-fn acquire_gate(ident: usize) {
-    loop {
-        if IN_FAST_PATH
-            .compare_exchange(0, ident | GATE_INSIDE, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            return;
-        }
-        revoke_standing_claim(ident);
-        std::hint::spin_loop();
-    }
-}
-
-/// Register the current thread as a GC mutator. Paired with
-/// `unregister_thread`. An unregistered thread may still call `gc_op`; it is
-/// not counted for STW, but serialises through the same operation gate.
+/// Register the current thread as a GC mutator and take the GIL, which it then
+/// holds for as long as it runs pyre code. Paired with `unregister_thread`.
 pub fn register_thread() {
     assert!(
         !GC_THREAD.with(|t| t.registered.get()),
         "GC mutator thread registered twice"
     );
     let old = REGISTERED_THREADS.fetch_add(1, Ordering::SeqCst);
-    if old > 0 {
-        // A second thread is arriving, so no standing claim may survive: from
-        // here on every caller sees REGISTERED_THREADS > 1 and takes the Mutex
-        // path. The count was raised first, so the previous holder cannot make
-        // a new standing claim once this one is revoked. `gc_mutex` is what
-        // `revoke_standing_claim` requires of its callers.
-        let _guard = GC_SYNC.gc_mutex.lock().unwrap();
-        revoke_standing_claim(my_ident());
-    }
 
     let mut state = GC_SYNC.quiesce.lock().unwrap();
     state = GC_SYNC
@@ -390,6 +249,11 @@ pub fn register_thread() {
     GC_THREAD.with(|t| t.registered.set(true));
     drop(state);
 
+    // os_thread.py:bootstrap takes the GIL as its first act, through
+    // `rgil.acquire_maybe_in_new_thread` (rgil.py:186-193). Everything below
+    // this line already runs pyre code and so needs it held.
+    crate::rgil::acquire_maybe_in_new_thread();
+
     if old > 0 && is_initialized() {
         // gc.py:525-531 publishes the nursery slots used by generated inline
         // allocation. A shared free-threaded nursery cannot safely use its
@@ -399,17 +263,17 @@ pub fn register_thread() {
     }
 }
 
-/// Unregister the current thread. Subsequent `gc_op` calls remain serialised,
-/// but this thread no longer participates in STW quiescence.
+/// Unregister the current thread. It stops running pyre code, so it gives the
+/// GIL back and no longer participates in STW quiescence.
 pub fn unregister_thread() {
     assert!(
         GC_THREAD.with(|t| t.registered.get()),
         "unregistering an unregistered GC mutator thread"
     );
-    // A thread that carried the gate out of its last operation must not take
-    // it with it: nothing would ever release it again.
-    if IN_FAST_PATH.load(Ordering::Relaxed) == my_ident() {
-        release_gate(my_ident());
+    // A thread that took the GIL with it would leave nothing to release it
+    // again — os_thread.py:bootstrap likewise ends on `rgil.release`.
+    if crate::rgil::am_i_holding_the_gil() {
+        crate::rgil::release();
     }
     let mut state = GC_SYNC.quiesce.lock().unwrap();
     assert!(
@@ -426,21 +290,32 @@ pub fn unregister_thread() {
     GC_SYNC.quiesced.notify_all();
 }
 
-/// Temporarily remove the current mutator from the RUNNING census while it
-/// blocks in an external operation.
+/// Drop the GIL and leave the RUNNING census while the mutator blocks in an
+/// external operation — `rffi.aroundstate.before()` /
+/// `gil.before_external_call()`.
 ///
-/// This is the free-threaded counterpart of RPython's
-/// `rffi.aroundstate.before()` / `gil.before_external_call()`: a thread which
-/// is asleep in `pthread_cond_wait`, `join`, or `nanosleep` cannot poll the
-/// eval breaker, so it must not remain in the set that a collector waits to
-/// drain.  Dropping the guard waits for an in-flight STW request to finish and
-/// then makes the mutator RUNNING again.
+/// **Every blocking call must go through this.** A thread asleep in
+/// `pthread_cond_wait`, `join`, or `nanosleep` while still holding the GIL
+/// stops every other mutator until it wakes, and if what it waits for is
+/// another mutator's progress, forever. It also cannot poll the eval breaker,
+/// so it must not remain in the set a collector waits to drain.
+///
+/// Dropping the guard retakes the GIL, waits out an in-flight STW request, and
+/// makes the mutator RUNNING again.
 pub struct BlockingGuard {
     registered: bool,
+    held_gil: bool,
 }
 
 impl Drop for BlockingGuard {
     fn drop(&mut self) {
+        // `rffi.aroundstate.after()` retakes the GIL on return from a
+        // `releasegil=True` call (`_RPyGilAcquire`, threadlocal.h:158-161).
+        // Before rejoining RUNNING, so that the wait for the GIL itself is
+        // spent outside the census a collector drains.
+        if self.held_gil {
+            crate::rgil::acquire();
+        }
         if !self.registered {
             return;
         }
@@ -460,12 +335,11 @@ impl Drop for BlockingGuard {
 #[inline]
 pub fn before_external_block() -> BlockingGuard {
     // `rffi.aroundstate.before()` drops the GIL before a `releasegil=True`
-    // call (`_RPyGilRelease`, threadlocal.h:163-167). Dropping the standing
-    // claim here is not required for progress — `revoke_standing_claim` takes
-    // it back from a sleeping thread — but it spares the next claimant that
-    // work at a point which is already a syscall away.
-    if IN_FAST_PATH.load(Ordering::Relaxed) == my_ident() {
-        release_gate(my_ident());
+    // call (`_RPyGilRelease`, threadlocal.h:162-166), so that a thread asleep
+    // in the external call holds nothing another mutator needs.
+    let held_gil = crate::rgil::am_i_holding_the_gil();
+    if held_gil {
+        crate::rgil::release();
     }
     let registered = GC_THREAD.with(|t| t.registered.get());
     if registered {
@@ -480,7 +354,50 @@ pub fn before_external_block() -> BlockingGuard {
             .expect("RUNNING underflow entering external block");
         GC_SYNC.quiesced.notify_all();
     }
-    BlockingGuard { registered }
+    BlockingGuard {
+        registered,
+        held_gil,
+    }
+}
+
+/// Leave the RUNNING census for the duration of a wait for the GIL, and report
+/// whether rejoining is this caller's job.
+///
+/// A thread which does not hold the GIL runs no pyre code, so a collector must
+/// not wait for it. Upstream needs no counterpart: there the collector *is* the
+/// GIL holder, so waiting for the GIL and being drained are the same state.
+pub(crate) fn leave_running_for_gil() -> GilCensus {
+    if !GC_THREAD.with(|t| t.registered.get() && t.running.get()) {
+        return GilCensus { rejoin: false };
+    }
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
+    GC_THREAD.with(|t| t.running.set(false));
+    state.running = state
+        .running
+        .checked_sub(1)
+        .expect("RUNNING underflow entering a GIL wait");
+    GC_SYNC.quiesced.notify_all();
+    GilCensus { rejoin: true }
+}
+
+/// Rejoin the RUNNING census after [`leave_running_for_gil`]. The caller now
+/// holds the GIL, and a collector requesting STW holds it too, so there is
+/// never a pending request to wait out here.
+pub(crate) fn rejoin_running_after_gil(census: GilCensus) {
+    if !census.rejoin {
+        return;
+    }
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
+    debug_assert!(
+        !GC_SYNC.stw_requested.load(Ordering::Acquire),
+        "the GIL was acquired while a collector was draining mutators"
+    );
+    state.running += 1;
+    GC_THREAD.with(|t| t.running.set(true));
+}
+
+pub(crate) struct GilCensus {
+    rejoin: bool,
 }
 
 /// Number of registered GC mutators.
@@ -498,7 +415,9 @@ pub fn after_fork_child() {
     let registered = GC_THREAD.with(|t| t.registered.get());
     let running = GC_THREAD.with(|t| t.running.get());
     REGISTERED_THREADS.store(usize::from(registered), Ordering::SeqCst);
-    IN_FAST_PATH.store(0, Ordering::Release);
+    // `fork()` runs inside `request_stw`, so this thread held the GIL across
+    // it and still does; only the queue behind it has to be rebuilt.
+    crate::rgil::after_fork_child();
     STW_OWNER.store(0, Ordering::SeqCst);
     STW_DEPTH.store(0, Ordering::SeqCst);
     GC_SYNC.stw_requested.store(false, Ordering::Release);
@@ -524,131 +443,57 @@ pub fn stw_required() -> bool {
 }
 
 // ──────────────────────────────────────────────────────────────
-// GC operation gate — fast path when single-threaded
+// GC operations — unsynchronised under the GIL
 // ──────────────────────────────────────────────────────────────
 
 /// Execute a closure with exclusive `&mut MiniMarkGC` access.
 ///
-/// **Fast path** (single registered thread, no STW): direct access under
-/// `IN_FAST_PATH`, without taking the Mutex. A claim this thread already holds
-/// carries over from the previous operation, so the steady state is the single
-/// compare-and-swap that marks it in use.
+/// The caller holds the GIL — it has held it since it started running pyre
+/// code — so this is a bare borrow of the singleton with no atomic and no
+/// thread-ident read. `malloc_fixedsize` is unsynchronised for the same
+/// reason: framework.py's `malloc_fast` (:361-402) bumps `nursery_free` with
+/// nothing but the GIL behind it.
 ///
-/// **Slow path** (multiple threads or STW): acquires `gc_mutex`.
-/// Single-threaded production always takes the fast path.
+/// There is deliberately no exit safepoint. A returned reference is rooted by
+/// the caller before its next entry-style safepoint.
 #[inline]
 pub fn gc_op<R>(f: impl FnOnce(&mut MiniMarkGC) -> R) -> R {
-    let ident = my_ident();
     debug_assert!(
-        !in_gc_op(),
-        "reentrant &mut gc_op — a collection-time query must use gc_query_reentrant"
+        crate::rgil::am_i_holding_the_gil(),
+        "a GC operation needs the GIL"
     );
-    // This thread's claim is still standing. thread_gil.c:15-21 keeps
-    // `rpy_fastgil` set to the holder's ident for as long as it runs RPython
-    // code; re-acquiring once per operation has no upstream counterpart. One
-    // compare-and-swap both proves the claim survived revocation and publishes
-    // that a closure is running under it.
-    if IN_FAST_PATH
-        .compare_exchange(
-            ident,
-            ident | GATE_INSIDE,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        )
-        .is_ok()
-    {
-        // `stw_requested` needs no recheck: raising it requires owning the
-        // gate, and this thread owns it.
-        debug_assert!(
-            !GC_SYNC.stw_requested.load(Ordering::Relaxed),
-            "STW was requested by a thread that does not own the operation gate"
-        );
-        let _gate = GateGuard { restore: ident };
-        // SAFETY: the claim excludes every other fast and slow operation for
-        // as long as it stands.
-        return f(unsafe { singleton_mut() });
-    }
-    // First claim: threadlocal.h:153-156 `_rpygil_acquire_fast_path`. Reached
-    // once per standing claim, not once per operation.
-    if REGISTERED_THREADS.load(Ordering::Acquire) <= 1
-        && !GC_SYNC.stw_requested.load(Ordering::Acquire)
-        && IN_FAST_PATH
-            .compare_exchange(0, ident | GATE_INSIDE, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-    {
-        // Recheck under the claim: another thread may have registered or
-        // requested STW after the eligibility loads above.
-        if REGISTERED_THREADS.load(Ordering::Acquire) <= 1
-            && !GC_SYNC.stw_requested.load(Ordering::Acquire)
-        {
-            let _gate = GateGuard { restore: ident };
-            // SAFETY: as above — the claim is this thread's.
-            return f(unsafe { singleton_mut() });
-        }
-        // Ineligible after all — drop the claim entirely rather than leaving
-        // it standing for the slow path, which claims the gate again. Nothing
-        // else can touch the word while it is marked in use.
-        IN_FAST_PATH.store(0, Ordering::Release);
-    }
-    gc_op_slow(f)
+    let _reentry = ReentryGuard::enter();
+    // SAFETY: the GIL excludes every other mutator from running pyre code.
+    f(unsafe { singleton_mut() })
 }
 
-/// Slow path: Mutex-guarded access with STW parking.
-#[cold]
-fn gc_op_slow<R>(f: impl FnOnce(&mut MiniMarkGC) -> R) -> R {
-    let ident = my_ident();
-    let registered = GC_THREAD.with(|t| t.registered.get());
-    if registered {
-        let mut state = GC_SYNC.quiesce.lock().unwrap();
+/// Catches a second `&mut` formed from inside a collection, which the GIL
+/// cannot rule out because both borrows belong to the same thread. Only the
+/// GIL holder can reach it, so one plain global replaces per-thread state —
+/// and it compiles away entirely outside debug builds.
+struct ReentryGuard;
+
+#[cfg(debug_assertions)]
+static IN_GC_OP: AtomicBool = AtomicBool::new(false);
+
+impl ReentryGuard {
+    #[inline]
+    fn enter() -> Self {
+        #[cfg(debug_assertions)]
         assert!(
-            GC_THREAD.with(|t| t.running.replace(false)),
-            "GC mutator entered a gc_op safepoint twice"
+            !IN_GC_OP.swap(true, Ordering::Relaxed),
+            "reentrant &mut gc_op — a collection-time query must use gc_query_reentrant"
         );
-        state.running = state
-            .running
-            .checked_sub(1)
-            .expect("RUNNING underflow entering gc_op safepoint");
-        GC_SYNC.quiesced.notify_all();
+        ReentryGuard
     }
+}
 
-    // Blocking on gc_mutex is the park: this thread is already excluded from
-    // RUNNING, so a collector can hold the mutex while draining other threads.
-    let _guard = GC_SYNC.gc_mutex.lock().unwrap();
-
-    // Take the gate before borrowing the singleton. A fast claimant never waits
-    // on gc_mutex, and `acquire_gate` revokes a standing claim rather than
-    // waiting for its owner, so this terminates. This is what makes fast and
-    // slow singleton accesses mutually exclusive.
-    let carried = IN_FAST_PATH.load(Ordering::Acquire) == ident;
-    let _gate = if carried {
-        // This thread's own standing claim: mark it in use and leave it
-        // standing afterwards, as the fast path would have.
-        IN_FAST_PATH.store(ident | GATE_INSIDE, Ordering::Release);
-        GateGuard { restore: ident }
-    } else {
-        acquire_gate(ident);
-        GateGuard { restore: 0 }
-    };
-
-    if registered {
-        let mut state = GC_SYNC.quiesce.lock().unwrap();
-        // An STW requester holds gc_mutex and clears its request before
-        // releasing it, so a thread that acquired gc_mutex cannot need to wait.
-        debug_assert!(
-            !GC_SYNC.stw_requested.load(Ordering::Acquire),
-            "gc_mutex holder observed an active STW request"
-        );
-        state.running += 1;
-        assert!(
-            !GC_THREAD.with(|t| t.running.replace(true)),
-            "GC mutator re-entered RUNNING twice"
-        );
+impl Drop for ReentryGuard {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        IN_GC_OP.store(false, Ordering::Relaxed);
     }
-
-    // There is deliberately no exit park. A returned reference is rooted by the
-    // caller before its next entry-style safepoint, matching the single-thread
-    // allocation discipline.
-    f(unsafe { singleton_mut() })
 }
 
 /// Execute a closure with `&MiniMarkGC` access (read-only query).
@@ -754,11 +599,10 @@ pub fn request_stw(collect_fn: impl FnOnce(&mut MiniMarkGC)) {
 
 /// Run a GC operation whose object argument is a translated livevar.
 ///
-/// A contended [`gc_op`] temporarily removes this mutator from the RUNNING
-/// census before it acquires `gc_mutex`. Publish the argument on the
-/// per-mutator shadow stack first so a collector which runs during that wait
-/// preserves (and, for a moving minor, forwards) it. Reload the possibly
-/// forwarded value only after the operation owns the GC.
+/// Publish the argument on the per-mutator shadow stack first, so that a
+/// collection driven from inside the operation preserves (and, for a moving
+/// minor, forwards) it. Reload the possibly forwarded value only after the
+/// operation owns the GC.
 pub fn gc_op_with_root<R>(
     root: crate::GcRef,
     f: impl FnOnce(&mut MiniMarkGC, crate::GcRef) -> R,
@@ -778,13 +622,13 @@ pub fn gc_op_with_root<R>(
 }
 
 /// Register a caller-owned root slot without leaving its current value
-/// unprotected while a contended GC operation parks this mutator.
+/// unprotected across the registering operation.
 ///
 /// RPython publishes shadow-stack roots before entering a collecting slow
 /// path.  Pyre's host frames additionally register long-lived slots in
-/// [`crate::RootSet`]; the registration itself must use the same ordering or
-/// a collector already holding `gc_mutex` can reclaim the value before the
-/// slot becomes visible in that set.
+/// [`crate::RootSet`]; the registration itself must use the same ordering or a
+/// collection can reclaim the value before the slot becomes visible in that
+/// set.
 ///
 /// # Safety
 /// `slot` must remain valid for this call and until the matching
@@ -884,6 +728,14 @@ mod tests {
         unregister_thread();
     }
 
+    /// A mutator that blocks lets go of the GIL first — every
+    /// `releasegil=True` call does, and a test mutator that does not deadlocks
+    /// every thread waiting to register behind it.
+    fn blocking<R>(f: impl FnOnce() -> R) -> R {
+        let _blocked = before_external_block();
+        f()
+    }
+
     fn load_eval_breaker_word() -> usize {
         let addr = majit_ir::eval_breaker_word::eval_breaker_word_addr();
         assert_ne!(addr, 0);
@@ -978,6 +830,9 @@ mod tests {
     fn registered_and_unregistered_gc_ops_are_mutually_exclusive() {
         ensure_gc();
         register_test_mutator();
+        // Registration leaves the GIL standing on this thread. Hand it back so
+        // both threads contend for it once per operation.
+        crate::rgil::release();
 
         const OPS_PER_THREAD: usize = 100_000;
         let counter = Arc::new(GcOpCounter(UnsafeCell::new(0)));
@@ -986,10 +841,11 @@ mod tests {
             let counter = counter.clone();
             let start = start.clone();
             std::thread::spawn(move || {
-                // An unregistered thread's gc_op is legal and must serialize
-                // through the same fast-path lock as a registered caller.
+                // An unregistered thread's gc_op is legal, but like every other
+                // caller it has to take the GIL first.
                 start.wait();
                 for _ in 0..OPS_PER_THREAD {
+                    let _gil = crate::rgil::GilGuard::acquire();
                     gc_op(|_| unsafe { *counter.0.get() += 1 });
                 }
             })
@@ -997,10 +853,12 @@ mod tests {
 
         start.wait();
         for _ in 0..OPS_PER_THREAD {
+            let _gil = crate::rgil::GilGuard::acquire();
             gc_op(|_| unsafe { *counter.0.get() += 1 });
         }
         worker.join().unwrap();
 
+        crate::rgil::acquire();
         assert_eq!(unsafe { *counter.0.get() }, OPS_PER_THREAD * 2);
         unregister_test_mutator();
     }
@@ -1018,12 +876,11 @@ mod tests {
             0
         );
 
-        std::thread::spawn(|| {
+        let worker = std::thread::spawn(|| {
             register_test_mutator();
             unregister_test_mutator();
-        })
-        .join()
-        .unwrap();
+        });
+        blocking(|| worker.join()).unwrap();
 
         assert_eq!(
             gc_query(
@@ -1050,7 +907,7 @@ mod tests {
                 let b = barrier.clone();
                 std::thread::spawn(move || {
                     register_test_mutator();
-                    b.wait();
+                    blocking(|| b.wait());
                     for _ in 0..100 {
                         gc_op(|_gc| {
                             // Simulate work under GC lock
@@ -1064,10 +921,10 @@ mod tests {
             .collect();
 
         for h in handles {
-            h.join().unwrap();
+            blocking(|| h.join()).unwrap();
         }
 
-        // With gc_mutex serialisation, counter should be exactly 200.
+        // With the GIL serialising every operation, the counter is exactly 200.
         assert_eq!(counter.load(Ordering::Relaxed), 200);
         unregister_test_mutator();
     }
@@ -1080,18 +937,15 @@ mod tests {
 
         let stw_ran = Arc::new(AtomicBool::new(false));
         let stw_ran2 = stw_ran.clone();
+        let arrived = Arc::new(AtomicBool::new(false));
+        let arrived2 = arrived.clone();
 
-        // Spawn a thread that will try gc_op while STW is in progress.
-        let barrier = Arc::new(Barrier::new(2));
-        let b2 = barrier.clone();
-
+        // The collector holds the GIL for the whole episode, so this thread
+        // cannot reach its gc_op until the collection has finished and handed
+        // the GIL back — registering is where it waits.
         let worker = std::thread::spawn(move || {
+            arrived2.store(true, Ordering::Release);
             register_test_mutator();
-            b2.wait();
-            while !GC_SYNC.stw_requested.load(Ordering::Acquire) {
-                std::hint::spin_loop();
-            }
-            // This gc_op should block until STW finishes.
             gc_op(|_gc| {
                 assert!(
                     stw_ran2.load(Ordering::Acquire),
@@ -1101,15 +955,17 @@ mod tests {
             unregister_test_mutator();
         });
 
-        barrier.wait();
+        while !arrived.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
         request_stw(|_gc| {
             stw_ran.store(true, Ordering::Release);
             // Simulate collection work.
             std::thread::sleep(std::time::Duration::from_millis(20));
         });
 
-        worker.join().unwrap();
         unregister_test_mutator();
+        worker.join().unwrap();
     }
 
     #[test]
@@ -1136,10 +992,10 @@ mod tests {
             let finished = finished.clone();
             std::thread::spawn(move || {
                 register_test_mutator();
-                start.wait();
+                blocking(|| start.wait());
                 while finished.load(Ordering::Acquire) != MUTATORS {
                     gc_op(|gc| gc.collect_nursery());
-                    std::thread::yield_now();
+                    blocking(std::thread::yield_now);
                 }
                 unregister_test_mutator();
             })
@@ -1151,7 +1007,7 @@ mod tests {
                 let finished = finished.clone();
                 std::thread::spawn(move || {
                     register_test_mutator();
-                    start.wait();
+                    blocking(|| start.wait());
 
                     for round in 0..ROUNDS {
                         let expected =
@@ -1159,9 +1015,10 @@ mod tests {
                         let fresh = gc_op(|gc| gc.alloc_nursery_typed(0, 16));
                         unsafe { *(fresh.0 as *mut u64) = expected };
 
-                        // Widen the allocation-return window. Collection must
-                        // wait for the next entry safepoint, after this fresh
-                        // reference has been installed in the shadow stack.
+                        // Widen the allocation-return window. Holding the GIL
+                        // is what keeps this still-unrooted reference alive
+                        // until it reaches the shadow stack — so this yield is
+                        // deliberately *not* a `blocking` one.
                         std::thread::yield_now();
                         let root_depth = crate::shadow_stack::push(fresh);
                         gc_op(|gc| {
@@ -1208,7 +1065,7 @@ mod tests {
                 let start = start.clone();
                 std::thread::spawn(move || {
                     register_test_mutator();
-                    start.wait();
+                    blocking(|| start.wait());
 
                     let expected = 0xCAFE_0000_0000_0000u64 | thread_index as u64;
                     let root_depth = gc_op(|gc| {
@@ -1287,14 +1144,18 @@ mod tests {
                         let object = crate::shadow_stack::get(root_depth);
                         assert_eq!(unsafe { *(object.0 as *const u64) }, EXPECTED);
                     });
-                    std::thread::yield_now();
+                    // Let the collector thread in: it can only take the GIL
+                    // once this mutator gives it up.
+                    blocking(std::thread::yield_now);
                 }
                 while !done.load(Ordering::Acquire) {
                     gc_op(|_gc| {
                         let object = crate::shadow_stack::get(root_depth);
                         assert_eq!(unsafe { *(object.0 as *const u64) }, EXPECTED);
                     });
-                    std::thread::yield_now();
+                    // Let the collector thread in: it can only take the GIL
+                    // once this mutator gives it up.
+                    blocking(std::thread::yield_now);
                 }
                 gc_op(|_gc| {
                     let object = crate::shadow_stack::get(root_depth);
@@ -1307,7 +1168,7 @@ mod tests {
         };
 
         while !ready.load(Ordering::Acquire) {
-            std::thread::yield_now();
+            blocking(std::thread::yield_now);
         }
         for _ in 0..3 {
             gc_op(|gc| {
@@ -1323,7 +1184,7 @@ mod tests {
         }
 
         done.store(true, Ordering::Release);
-        worker.join().unwrap();
+        blocking(|| worker.join()).unwrap();
         unregister_test_mutator();
         assert_eq!(registered_threads(), 0);
     }

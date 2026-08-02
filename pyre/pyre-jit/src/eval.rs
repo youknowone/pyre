@@ -4024,10 +4024,6 @@ pub fn reset_gc_fresh_for_test() {
 /// `set_active_*` install.
 pub fn init_gc_subsystem() {
     build_gc_global();
-    // rbigint.py constructs `_parts_cache_10` at module import.  Force pyre's
-    // translated prebuilt equivalent before any collector root walk rather
-    // than lazily manufacturing it from inside the walker.
-    pyre_object::rbigint::initialize_rbigint_parts_cache();
     pyre_interpreter::call::register_thread_entry_hook(|| {
         init_jit_hooks();
         init_gc_root_walkers();
@@ -4040,6 +4036,11 @@ pub fn init_gc_subsystem() {
         install_gc_into_backend();
         GC_TLS_INSTALLED.with(|c| c.set(true));
     }
+    // rbigint.py constructs `_parts_cache_10` at module import.  Force pyre's
+    // translated prebuilt equivalent before any collector root walk rather
+    // than lazily manufacturing it from inside the walker. After registration,
+    // because it allocates and so needs this thread to hold the GIL.
+    pyre_object::rbigint::initialize_rbigint_parts_cache();
     PYRE_OBJECT_HOOKS_INSTALLED.call_once(install_pyre_object_hooks);
 }
 

@@ -288,6 +288,11 @@ pub struct ExecutionContext {
     /// pointer into the leaked action owned by `module::_signal`
     /// (`install_signal_handling`); `None` until installed.
     pub check_signal_action: Option<*mut dyn AsyncActionOps>,
+    /// `gil.py:20-23 GILThreadLocals.initialize` — the `GILReleaseAction`
+    /// registered on the ticker, which yields the GIL every
+    /// `sys.getcheckinterval()` bytecodes. Stored as a trait pointer into the
+    /// leaked action owned by `module::thread::gil`; `None` until installed.
+    pub gil_release_action: Option<*mut dyn AsyncActionOps>,
     /// `executioncontext.py sys_exc_operror` — the active exception for
     /// `sys.exc_info()` / bare `raise`, saved/restored across handler
     /// regions by PUSH_EXC_INFO / POP_EXCEPT.  Single source of truth
@@ -377,6 +382,7 @@ impl ExecutionContext {
             builtins_module,
             builtin_dict_cache: std::cell::Cell::new(pyre_object::PY_NULL),
             check_signal_action: None,
+            gil_release_action: None,
             sys_exc_value: pyre_object::PY_NULL,
             coroutine_origin_tracking_depth: 0,
             current_gen_or_coroutine: pyre_object::PY_NULL,
@@ -405,6 +411,9 @@ impl ExecutionContext {
         ec.profile_all_generation = 0;
         ec.thread_local_refs.clear();
         ec.actionflag = ActionFlag::new();
+        // The periodic actions are registered on the actionflag just replaced,
+        // so the new thread registers its own.
+        ec.gil_release_action = None;
         ec.user_del_action = std::ptr::null_mut();
         // The cached Module wrapper is execution-context-owned and movable.
         // A new thread lazily builds its own wrapper over the shared
