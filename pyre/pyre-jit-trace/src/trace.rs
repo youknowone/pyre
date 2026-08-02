@@ -1591,7 +1591,7 @@ fn carrier_root_catch_target<Sym: WalkSym>(sym: &Sym, root_pc: usize) -> Option<
     // and keep the backward scan for callers already at that coordinate.
     let candidate = crate::jitcode_dispatch::catch_target_after_resume_live(code, root_pc)
         .or_else(|| crate::jitcode_dispatch::find_catch_before_resume_live(code, root_pc));
-    if std::env::var_os("PYRE_P2_DIAG").is_some() {
+    if crate::jitcode_dispatch::p2_diag_enabled() {
         eprintln!("[p2-raise] root_pc={root_pc} catch_before={candidate:?}");
     }
     candidate
@@ -1645,7 +1645,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     let effects_at_entry = crate::jitcode_dispatch::fbw_executed_effect_count();
 
     let root_ec = sym.concrete_execution_context();
-    if std::env::var_os("PYRE_P2_DIAG").is_some() {
+    if crate::jitcode_dispatch::p2_diag_enabled() {
         let pcs: Vec<usize> = carrier
             .recipes
             .iter()
@@ -1859,7 +1859,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         }
     }
 
-    let p2_diag = std::env::var_os("PYRE_P2_DIAG").is_some();
+    let p2_diag = crate::jitcode_dispatch::p2_diag_enabled();
     match &walk {
         Some(Ok((outcome, end_pc))) => {
             if p2_diag {
@@ -5107,7 +5107,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
         }
         return TraceAction::Abort;
     }
-    if ctx.is_bridge_trace && std::env::var_os("PYRE_P2_DIAG").is_some() {
+    if ctx.is_bridge_trace && crate::jitcode_dispatch::p2_diag_enabled() {
         ctx.dump_trace_ops_diag("carrier-root-walk-end");
     }
     let action = match walk_result {

@@ -2092,7 +2092,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             .map(|m| m as i32)
             .unwrap_or(callee_op_pc as i32),
     };
-    let mf_diag = std::env::var_os("PYRE_FBW_MF_DIAG").is_some();
+    let mf_diag = fbw_mf_diag_enabled();
     let recipe_resultcolor_audit = pcmap_recipe_resultcolor_audit_enabled();
     if mf_diag || recipe_resultcolor_audit {
         let callee_py_pc = unsafe {

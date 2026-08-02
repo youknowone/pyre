@@ -39,6 +39,36 @@ pub(crate) fn pcmap_afterresidual_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_AFTERRESIDUAL_AUDIT").is_some())
 }
 
+/// `PYRE_FBW_STRICT_DIAG`: name the opcode that rejected a callee from the
+/// strict straight-line fast path.
+///
+/// Cached like the audit flags above, and for the reason `majit-backend-dynasm`
+/// states at `majit_log_enabled`: `std::env::var_os` takes a global lock and
+/// walks the env table on every call, and this one is read from inside
+/// `callee_fast_path_inlinable`'s per-opcode decode loop.
+pub(crate) fn fbw_strict_diag_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_STRICT_DIAG").is_some())
+}
+
+/// `PYRE_FBW_INLINE_DIAG`: name the reason a call site declined to inline.
+pub(crate) fn fbw_inline_diag_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some())
+}
+
+/// `PYRE_FBW_MF_DIAG`: multi-frame callee window diagnostics.
+pub(crate) fn fbw_mf_diag_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_MF_DIAG").is_some())
+}
+
+/// `PYRE_P2_DIAG`: self-recursive CALL_ASSEMBLER fold diagnostics.
+pub(crate) fn p2_diag_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_P2_DIAG").is_some())
+}
+
 pub(crate) fn pcmap_recipe_resultcolor_audit_probe(site: &'static str, verdict: &'static str) {
     if let Some(path) = std::env::var_os("PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE") {
         use std::io::Write;

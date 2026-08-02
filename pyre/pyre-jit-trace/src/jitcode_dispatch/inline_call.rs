@@ -223,7 +223,7 @@ pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
             return false;
         };
         if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
-            if std::env::var_os("PYRE_FBW_STRICT_DIAG").is_some() {
+            if fbw_strict_diag_enabled() {
                 eprintln!("[strict-reject] pc={} op={} (branch)", d.pc, d.opname);
             }
             return false;
@@ -244,7 +244,7 @@ pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
             && !inline_resolvable_static_vable_read(body_code, &d, callee_descr_refs, ctx)
             && !inline_resolvable_seeded_frame_op(body_code, &d, callee_frame_reg)
         {
-            if std::env::var_os("PYRE_FBW_STRICT_DIAG").is_some() {
+            if fbw_strict_diag_enabled() {
                 eprintln!(
                     "[strict-reject] pc={} op={} (non-static vable)",
                     d.pc, d.opname
@@ -332,7 +332,7 @@ pub(crate) fn callee_fast_path_inlinable_allowing_forward_branch<Sym: WalkSym>(
             && !inline_resolvable_static_vable_read(body_code, &d, callee_descr_refs, ctx)
             && !inline_resolvable_seeded_frame_op(body_code, &d, callee_frame_reg)
         {
-            if std::env::var_os("PYRE_FBW_STRICT_DIAG").is_some() {
+            if fbw_strict_diag_enabled() {
                 eprintln!(
                     "[strict-reject-mf] pc={} op={} base_reg={:?} frame_reg={callee_frame_reg} \
                      (non-static, foreign vable)",
@@ -573,7 +573,7 @@ pub(crate) fn collect_callee_active_boxes(
         carried_jitcode_pc,
     );
     let mut active = Vec::with_capacity(banks.int.len() + banks.ref_.len() + banks.float.len());
-    let diag = std::env::var_os("PYRE_FBW_MF_DIAG").is_some();
+    let diag = fbw_mf_diag_enabled();
     let read = |bank: &[OpRef], idx: u32, name: &str| -> Result<OpRef, DispatchError> {
         match bank.get(idx as usize).copied() {
             Some(v) if v != OpRef::NONE => Ok(v),
@@ -844,13 +844,13 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         match driver.get_or_make_portal_assembler_token_arc(callee_key, &greenboxes, &red_types) {
             Some(token) => token,
             None => {
-                if std::env::var_os("PYRE_P2_DIAG").is_some() {
+                if p2_diag_enabled() {
                     eprintln!("[p2-ca] decline pc={} reason=synth-failed", op.pc);
                 }
                 return Ok(None);
             }
         };
-    if std::env::var_os("PYRE_P2_DIAG").is_some() {
+    if p2_diag_enabled() {
         eprintln!("[p2-ca] EMIT pc={} token={}", op.pc, token.number);
     }
 
@@ -1567,7 +1567,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     if pyre_helper != majit_ir::PyreHelperKind::CallFn && !is_call_kw && !is_call_function_ex {
         return Ok(None);
     }
-    if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+    if fbw_inline_diag_enabled() {
         eprintln!(
             "[inline-entry] pc={} helper={:?} nrefargs={} subwalk={}",
             op.pc,
@@ -1582,7 +1582,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     // inline" and knowing why.
     macro_rules! decline {
         ($why:expr) => {{
-            if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+            if fbw_inline_diag_enabled() {
                 eprintln!("[inline-decline] pc={} why={}", op.pc, $why);
             }
             return Ok(None);
@@ -1651,7 +1651,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
             unsafe { pyre_object::type_name_of(callable) }
         ));
     };
-    if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+    if fbw_inline_diag_enabled() {
         // Name the callee: a pc alone does not say which function a decline
         // cost, and one trace reaches several.
         let name = unsafe {
@@ -2796,7 +2796,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 foriter_dirty_bound
             }
         };
-        if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+        if fbw_inline_diag_enabled() {
             eprintln!(
                 "[inline-foriter-gate] pc={} legacy_admit={legacy_admit} exact_numeric_args={} \
                  safety={safety:?} deferred_admit={foriter_deferred_admit}",
@@ -2832,7 +2832,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // `for i in range(400000): t += b.bump(i)` over
         // `def bump(self, n): if n < 0: raise ValueError(n); return n + 1`.
         if widened_method_form && body_facts.contains_raise {
-            if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+            if fbw_inline_diag_enabled() {
                 eprintln!("[inline-method-form] decline pc={}", op.pc);
             }
             return Ok(None);
@@ -5032,7 +5032,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     // reason line the only observable is the runtime.
     macro_rules! decline {
         ($why:expr) => {{
-            if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+            if fbw_inline_diag_enabled() {
                 eprintln!("[binop-inline-decline] pc={} why={}", op.pc, $why);
             }
             return Ok(None);
@@ -5154,7 +5154,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             ConcreteValue::Ref(obj)
                 if std::ptr::eq(obj, pyre_object::special::w_not_implemented())
         ) {
-            if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+            if fbw_inline_diag_enabled() {
                 eprintln!(
                     "[binop-inline-abort] pc={} why={}.{dunder} returned NotImplemented",
                     op.pc,

@@ -1953,7 +1953,7 @@ pub(crate) struct ExactNumericArg {
 /// looks alike.
 macro_rules! replay_dirty {
     ($why:expr, $pc:expr, $opname:expr) => {{
-        if std::env::var_os("PYRE_FBW_INLINE_DIAG").is_some() {
+        if fbw_inline_diag_enabled() {
             eprintln!("[replay-dirty] pc={} op={} why={}", $pc, $opname, $why);
         }
         return CalleeReplaySafety::Dirty;

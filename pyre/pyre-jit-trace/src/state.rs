@@ -7621,7 +7621,7 @@ fn reconstruct_inline_recipe(
                 continue;
             }
             if registers_r[s] == OpRef::NONE {
-                if std::env::var_os("PYRE_P2_DIAG").is_some() {
+                if crate::jitcode_dispatch::p2_diag_enabled() {
                     let sem: Vec<(u32, Option<usize>)> = reg_indices
                         .ref_
                         .iter()

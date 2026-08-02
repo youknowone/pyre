@@ -1654,7 +1654,7 @@ impl MIFrame {
                         sym_ec
                     }
                 } else {
-                    if is_portal_red && std::env::var_os("PYRE_P2_DIAG").is_some() {
+                    if is_portal_red && crate::jitcode_dispatch::p2_diag_enabled() {
                         eprintln!(
                             "[p2-trait-scratch] jitcode_pc={} color={} owned by frame slot; keeping bank box",
                             jit_pc, reg_idx

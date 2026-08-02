@@ -1783,7 +1783,7 @@ pub(crate) fn walker_abort_if_mayforce_null_ref_arg<Sym: WalkSym>(
                 // `PYRE_P2_DIAG` (the depth-2 framestack-walk diag flag) and
                 // computed only on the abort path, so the default trace path
                 // pays nothing.
-                if std::env::var_os("PYRE_P2_DIAG").is_some() {
+                if p2_diag_enabled() {
                     eprintln!(
                         "[p2-mayforce] NULL Ref arg: pc={pc} call_opcode={call_opcode:?} \
                          helper={:?} arg_index={i} nargs={} funcbox={:?}(={:?})",
