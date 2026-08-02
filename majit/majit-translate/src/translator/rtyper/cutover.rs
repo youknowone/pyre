@@ -2567,6 +2567,16 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &["self"],
         LowLevelType::Bool,
     ),
+    // `<[T]>::contains(&self, x: &T) -> bool` scans the slice for an element
+    // equal to `*x`.  Bool scalar result; the receiver is a slice value (same
+    // shape `is_empty` already residualises) and `x` is a by-reference operand,
+    // both passed through to the residual call.  The membership scan runs in
+    // the residual, so no element `PartialEq` graph is demanded here.
+    (
+        &["core", "slice", "<Impl>", "contains"],
+        &["self", "x"],
+        LowLevelType::Bool,
+    ),
     (
         &["std", "f64", "<Impl>", "floor"],
         &["self"],
