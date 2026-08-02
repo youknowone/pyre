@@ -2044,6 +2044,21 @@ fn validate_python314_spec_shape(
     spec: &Wtf8,
     type_name: &str,
 ) -> Result<(), crate::PyError> {
+    if let Some(first) = p.grouping
+        && matches!(p.ty, ',' | '_')
+    {
+        if first != p.ty {
+            return Err(crate::PyError::value_error(
+                "Cannot specify both ',' and '_'.",
+            ));
+        }
+        if !p.invalid_trailing {
+            return Err(crate::PyError::value_error(format!(
+                "Cannot specify '{first}' with '{}'.",
+                p.ty
+            )));
+        }
+    }
     if let Some(first) = p.fractional_grouping
         && matches!(p.ty, ',' | '_')
     {
