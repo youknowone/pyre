@@ -12226,6 +12226,17 @@ fn builtin_function_qualname(obj: PyObjectRef) -> crate::PyResult {
     if is_bound_builtin_method(obj) {
         let descr = unsafe { pyre_object::w_method_get_func(obj) };
         let instance = unsafe { pyre_object::w_method_get_self(obj) };
+        // A class receiver names the class that *defines* the method, not the
+        // metatype: a `classmethod_descriptor` binds the class itself, so
+        // `type(__self__)` would report `dict.fromkeys` as `type.fromkeys`.
+        // The defining class is already stamped on the descriptor's qualname
+        // (`stamp_method_owners`), which is also what `bool.from_bytes`
+        // reporting `int.from_bytes` requires.
+        if unsafe { pyre_object::is_type(instance) } {
+            return Ok(pyre_object::w_str_new(&unsafe {
+                crate::function::function_get_qualname(descr)
+            }));
+        }
         let actual_type =
             crate::typedef::r#type(instance).map_or(pyre_object::PY_NULL, |tp| tp.as_ptr());
         let type_qualname = crate::baseobjspace::getattr_str(actual_type, "__qualname__")?;
