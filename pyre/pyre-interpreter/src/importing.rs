@@ -391,6 +391,19 @@ pub fn mount_embedded_stdlib(mount: &Path) {
 // foreign STW root walks well-defined.
 static SYS_MODULES: LazyLock<Mutex<HashMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Every `Module` ever bound by [`set_sys_module`], keyed by address.
+///
+/// A builtin module is allocated immortal (`w_module_new_aliasing_dict` ->
+/// `malloc_typed`), so the collector never traces it and its `w_dict` is
+/// reachable only through [`walk_module_dicts_gc`].  Keying that walk on the
+/// name→module map alone loses the dict the moment a second module takes the
+/// name — `del sys.modules['_functools']` followed by a fresh `import`
+/// mints a new module, and the collection after that frees the first
+/// module's dict while Python still holds the module.  The module itself is
+/// immortal and can never be freed, so its dict has to stay valid for as
+/// long; entries are added and never removed.
+static MODULE_DICT_ROOTS: LazyLock<Mutex<std::collections::HashSet<usize>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 static SYS_MODULES_DICT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "host_env")]
 static SYS_PATH: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -1555,6 +1568,7 @@ pub fn set_sys_module(name: &str, module: PyObjectRef) {
     // A new module joins the `walk_module_dicts_gc` root set; its dict
     // may hold young values — rescan on the next minor collection.
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    MODULE_DICT_ROOTS.lock().unwrap().insert(module as usize);
     SYS_MODULES
         .lock()
         .unwrap()
@@ -1585,7 +1599,11 @@ pub fn remove_sys_module(name: &str) {
     }
 }
 
-/// GC root walk over every loaded module's dict storage.
+/// GC root walk over every bound module's dict storage.
+///
+/// The walk is keyed on [`MODULE_DICT_ROOTS`], not on the live name→module
+/// map: a module that lost its name to a later import is still immortal and
+/// still reachable from Python, so its dict must keep being marked.
 ///
 /// Modules (`malloc_typed`) are Box-immortal, while their non-moving
 /// `W_ModuleDictObject`s are GC-managed. Visit each `Module.w_dict` field
@@ -1604,18 +1622,25 @@ pub fn remove_sys_module(name: &str) {
 /// `visitor` must tolerate being called on every movable module-dict
 /// value slot reachable here.
 pub unsafe fn walk_module_dicts_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    {
-        for &module in SYS_MODULES.lock().unwrap().values() {
-            let module = module as PyObjectRef;
-            if module.is_null() || !unsafe { pyre_object::is_module(module) } {
-                continue;
-            }
-            unsafe {
-                let module = &mut *(module as *mut pyre_object::module::Module);
-                visitor(&mut module.w_dict);
-                let w_dict = module.w_dict;
-                pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(w_dict, visitor);
-            }
+    unsafe { walk_bound_module_dicts(visitor) };
+}
+
+/// The shared body of the two module-dict root walks.
+///
+/// # Safety
+/// `visitor` must tolerate being called on every movable module-dict value
+/// slot reachable here.
+unsafe fn walk_bound_module_dicts(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    for &module in MODULE_DICT_ROOTS.lock().unwrap().iter() {
+        let module = module as PyObjectRef;
+        if module.is_null() || !unsafe { pyre_object::is_module(module) } {
+            continue;
+        }
+        unsafe {
+            let module = &mut *(module as *mut pyre_object::module::Module);
+            visitor(&mut module.w_dict);
+            let w_dict = module.w_dict;
+            pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(w_dict, visitor);
         }
     }
 }
@@ -1671,18 +1696,7 @@ pub(crate) unsafe fn walk_process_import_roots(visitor: &mut dyn FnMut(&mut PyOb
     // `space.sys.modules` is process-owned in PyPy.  STW has quiesced every
     // mutator, so the process-global cache cannot be semantically mutated
     // while this walk holds its native lock.
-    for &module in SYS_MODULES.lock().unwrap().values() {
-        let module = module as PyObjectRef;
-        if module.is_null() || !unsafe { pyre_object::is_module(module) } {
-            continue;
-        }
-        unsafe {
-            let module = &mut *(module as *mut pyre_object::module::Module);
-            visitor(&mut module.w_dict);
-            let w_dict = module.w_dict;
-            pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(w_dict, visitor);
-        }
-    }
+    unsafe { walk_bound_module_dicts(visitor) };
     let mut dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
     if !dict.is_null() {
         visitor(&mut dict);
