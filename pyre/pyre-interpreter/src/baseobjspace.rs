@@ -15428,7 +15428,18 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     for &item in &items {
                         pyre_object::gc_roots::pin_root(item);
                     }
-                    Ok(pyre_object::w_tuple_new(items))
+                    // PyPy's `space.newtuple(items)` may select the `_ii` or
+                    // `_ff` value-backed arity-2 representation because its
+                    // object space gives plain numeric objects value identity.
+                    // Python 3.14 requires `zip` to retain the exact objects
+                    // returned by its input iterators.  Pyre uses pointer
+                    // identity, so keep the two references in the otherwise
+                    // equivalent inline `_oo` representation.
+                    if items.len() == 2 {
+                        Ok(pyre_object::w_specialised_tuple_oo_new(items[0], items[1]))
+                    } else {
+                        Ok(pyre_object::w_tuple_new(items))
+                    }
                 }
                 None => Err(PyError::stop_iteration()),
             };

@@ -28,7 +28,12 @@ pub mod deque_block {
     }
 
     pub fn new(leftlink: PyObjectRef, rightlink: PyObjectRef) -> PyObjectRef {
-        let data = w_list_new(vec![w_none(); super::BLOCKLEN as usize]);
+        // `interp_deque.py:14 Block.data = [None] * BLOCKLEN` is annotated by
+        // RPython as a list of `W_Root` references.  It must therefore keep
+        // ObjectListStrategy even when every live deque entry is an int or a
+        // float; a typed list strategy would unbox and later rebox the entry,
+        // breaking deque's shallow-copy identity semantics.
+        let data = w_list_new_object(vec![w_none(); super::BLOCKLEN as usize]);
         W_DequeBlock::allocate_stable(W_DequeBlock {
             ob: PyObject {
                 ob_type: std::ptr::null(),
