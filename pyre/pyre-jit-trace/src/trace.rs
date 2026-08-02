@@ -115,7 +115,7 @@ pub fn take_walk_end_flush_committed() -> bool {
 /// tried in the epilogue.  Recorded per walk so the census can distinguish
 /// them: they resume the interpreter at different pcs, and the ones that
 /// resume at a CALL re-execute it.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub(crate) enum WalkEndCommitLeg {
     /// Loop-header end flush for a `CloseLoop`/`Terminate` walk.
@@ -150,6 +150,14 @@ pub(crate) enum WalkEndCommitLeg {
     /// concrete-executing the reconstructed callee: its frames were converted
     /// and run forward instead of the drain rewinding to the guard.
     CarrierAbort = 10,
+    /// An aborting `DispatchError` from the walker capability-gap family
+    /// ([`crate::jitcode_dispatch::DispatchError::leaves_complete_image`])
+    /// whose mid-opcode MIFrame image was converted to blackhole frames and run
+    /// forward.  Same contract as [`Self::TraceTooLong`]; kept a separate leg
+    /// both so the census can tell a bounded-length abort from a capability
+    /// gap, and because the two take their operand stack from different
+    /// sources — see `capture_frame_stack_from_mirror`.
+    WalkAbort = 11,
 }
 
 /// Where a committing leg puts the interpreter, relative to the effects the
@@ -2283,6 +2291,19 @@ fn try_adopt_single_frame_blackhole(
     // carries the irrevocable, fully preflighted adoption contract.
     let trace_too_long = commit_leg == WalkEndCommitLeg::TraceTooLong
         && crate::jitcode_dispatch::fbw_executed_effect_count() != 0;
+    // Both full-image legs resume the blackhole at a post-step pc it may leave
+    // by arbitrary control flow, so the root operand stack has to be published
+    // with the locals (`fill_trace_too_long_register_banks`).  The vable-escape
+    // leg instead resumes immediately after one forcing residual and keeps its
+    // narrower resume-marker image.
+    //
+    // `WalkAbort` deliberately does NOT join `trace_too_long` above: that flag
+    // promotes a post-latch decline to a release assert, which the too-long arm
+    // earns by aborting only once `latch_abort_blackhole` has succeeded
+    // (`trace_too_long_abort_safe`).  A capability-gap abort fires regardless of
+    // the latch, so its adopt must still be able to decline into legacy replay.
+    let publishes_root_stack = commit_leg == WalkEndCommitLeg::TraceTooLong
+        || commit_leg == WalkEndCommitLeg::WalkAbort;
     let Some(mut latched) = crate::jitcode_dispatch::take_single_frame_blackhole() else {
         assert!(
             !trace_too_long,
@@ -2397,14 +2418,53 @@ fn try_adopt_single_frame_blackhole(
         );
         return false;
     };
-    let mut captured_stack = if commit_leg == WalkEndCommitLeg::TraceTooLong {
-        match crate::state::capture_frame_stack_for_publish(cf_addr, vable_frame) {
+    let mut captured_stack = if publishes_root_stack {
+        // The two sources side by side, so the reason this leg has its own is
+        // checkable at runtime rather than argued.  Measured on the one adopt
+        // in `list_length_hint_validate`: `snapshot-array=[0]` where
+        // `mirror=[0x99651ab18]` — the array reads NULL, the mirror holds the
+        // live operand.
+        if commit_leg == WalkEndCommitLeg::WalkAbort
+            && crate::jitcode_dispatch::fbw_debug_abort_enabled()
+        {
+            let from_array = crate::state::capture_frame_stack_for_publish(cf_addr, vable_frame)
+                .map(|stack| stack.roots_snapshot());
+            let from_mirror = latched
+                .mirror_stack
+                .as_ref()
+                .map(|mirror| (mirror.py_pc, mirror.slots.clone()));
+            eprintln!("[wa-stack] snapshot-array={from_array:x?} mirror={from_mirror:x?}");
+        }
+        // `ABORT_TOO_LONG` stops at an opcode boundary, where the snapshot
+        // array is the image RPython would copy.  `WalkAbort` stops INSIDE an
+        // opcode, and for a root walk that array was never written at all — it
+        // still holds the pre-walk stack (see `capture_frame_stack_from_mirror`).
+        // Take the walker's OpRef mirror, which the latch resolved while the
+        // concrete side tables were still live.
+        let captured = if commit_leg == WalkEndCommitLeg::WalkAbort {
+            latched.mirror_stack.as_ref().and_then(|mirror| {
+                crate::state::capture_frame_stack_from_mirror(
+                    vable_frame,
+                    mirror.py_pc,
+                    &mirror.slots,
+                )
+            })
+        } else {
+            crate::state::capture_frame_stack_for_publish(cf_addr, vable_frame)
+        };
+        match captured {
             Some(stack) => Some(stack),
             None => {
                 assert!(
                     !trace_too_long,
                     "preflighted trace-too-long operand stack became uncapturable"
                 );
+                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-blackhole] single-frame operand stack not capturable \
+                         (leg={commit_leg:?}) — legacy replay kept"
+                    );
+                }
                 return false;
             }
         }
@@ -2836,8 +2896,22 @@ fn try_adopt_multi_frame_blackhole(
         return false;
     };
     let mut root_stack = if latched.publish_root_stack {
-        let Some(stack) = crate::state::capture_frame_stack_for_publish(cf_addr, root_addr) else {
-            mfdbg!("frame 0: active stack not capturable");
+        // Same split as the single-frame arm.  The multi-frame `WalkAbort`
+        // latch carries no mirror (its `ctx` is the innermost callee, not
+        // frame 0), so this declines and the abort keeps the legacy replay.
+        let captured = if commit_leg == WalkEndCommitLeg::WalkAbort {
+            latched.mirror_stack.as_ref().and_then(|mirror| {
+                crate::state::capture_frame_stack_from_mirror(
+                    root_addr,
+                    mirror.py_pc,
+                    &mirror.slots,
+                )
+            })
+        } else {
+            crate::state::capture_frame_stack_for_publish(cf_addr, root_addr)
+        };
+        let Some(stack) = captured else {
+            mfdbg!("frame 0: active stack not capturable (leg={commit_leg:?})");
             restore_links(&saved_links);
             return false;
         };
@@ -3107,6 +3181,18 @@ fn publish_terminal_raise_coordinate(
             }
         }
     }
+}
+
+/// Kill switch for the `WalkAbort` leg: `PYRE_WALKABORT_OFF=1` puts every
+/// capability-gap abort back on the legacy entry replay.
+///
+/// Kept because this leg's blast radius is every non-carrier walk abort and it
+/// commits irrevocably once the blackhole runs, so an operator needs a way to
+/// take it out without a rebuild.  It is also the cheap A/B for a class of bug
+/// this leg sits in the middle of: one binary, one env var, no layout variable
+/// — the same shape as the `PYRE_ANCHOR_STRICT` probe.
+fn walk_abort_leg_enabled() -> bool {
+    std::env::var_os("PYRE_WALKABORT_OFF").is_none()
 }
 
 fn try_adopt_blackhole(
@@ -3838,6 +3924,42 @@ fn run_perfn_walk<Sym: WalkSym>(
                 &walk_result,
                 Err(crate::jitcode_dispatch::DispatchError::TraceTooLong { .. })
             ) && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::TraceTooLong);
+        // Every OTHER aborting error is the same situation: the walk executed
+        // residuals concretely and then stopped, so replaying the region from
+        // the trace entry re-applies those effects.  `convert_and_run_from_
+        // pyjitpl` (`blackhole.py:1799`) finishes the frames instead, which is
+        // what the latch staged.
+        //
+        // Three classes keep their own, more precise recovery and are excluded
+        // so this general leg cannot pre-empt them:
+        // `VableEscapedDuringResidualCall` latches a narrower resume-marker
+        // image and has an escape-pc fallback (arm below);
+        // `AbortPermanentMarkerReached` / `LoopBearingCalleeInlineUnsupported`
+        // route to the gh#467 CALL-forward carrier, which resumes the OUTER
+        // frame at its CALL rather than inside the discarded callee attempt.
+        //
+        // And only for an abort whose image is COMPLETE
+        // (`DispatchError::leaves_complete_image`).  Pyre's walker has a whole
+        // family of aborts upstream has no counterpart for — the abort IS the
+        // report that a register / concrete / descr could not be resolved — and
+        // for those the MIFrame the latch would build is missing exactly the
+        // value the blackhole resumes on.  Measured: adopting a single
+        // `RegisterReadUnbound` walk in `list_length_hint_validate` left the
+        // interpreter underflowing its operand stack, and
+        // `raise_reg_unbound_jitstress` aborted inside `bh_call_fn_0`.
+        let walk_abort_adopted = !trace_too_long_adopted
+            && matches!(&walk_result, Err(error) if error.leaves_complete_image() && !matches!(
+                error,
+                crate::jitcode_dispatch::DispatchError::TraceTooLong { .. }
+                    | crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. }
+                    | crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { .. }
+                    | crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported { .. }
+            ))
+            && walk_abort_leg_enabled()
+            && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::WalkAbort);
+        if walk_abort_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!("[fbw-blackhole] adopted WALK_ABORT forward resume");
+        }
         let vable_escaped = matches!(
             &walk_result,
             Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
@@ -3913,9 +4035,13 @@ fn run_perfn_walk<Sym: WalkSym>(
         // pc DID take over, the flush stands — `virtualizable.py:101-138
         // write_boxes` has no undo once the vable is forced, and the resumed
         // interpreter reads its fastlocals straight out of that array.
+        // `walk_abort_adopted` is a blackhole terminal in exactly that sense:
+        // the chain ran forward from the flushed frame, so restoring the
+        // pre-flush image here would roll the vable back underneath it.
         if crate::jitcode_dispatch::take_escape_flush_undo_pending()
             && !force_blackhole_adopted
             && !escape_pc_adopted
+            && !walk_abort_adopted
         {
             crate::jitcode_dispatch::restore_escape_flush_undo();
         }

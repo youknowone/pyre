@@ -5268,6 +5268,11 @@ impl CapturedFrameStack {
     pub(crate) fn roots_mut(&mut self) -> &mut [i64] {
         self.roots.as_mut_slice()
     }
+
+    /// Diagnostic copy of the captured slots.
+    pub(crate) fn roots_snapshot(&self) -> Vec<i64> {
+        self.roots.clone()
+    }
 }
 
 fn frame_stack_transfer_shape(
@@ -5331,6 +5336,66 @@ pub(crate) fn capture_frame_stack_for_publish(
             .iter()
             .map(|&value| value as i64)
             .collect(),
+    })
+}
+
+/// Build the same carrier from the walker's operand-stack MIRROR instead of
+/// the tracing snapshot's slot array.
+///
+/// [`capture_frame_stack_for_publish`] reads the detached snapshot frame, which
+/// only describes the walk for a coordinate the walk's vable writes reached:
+/// `setarrayitem_vable_via_metainterp` mirrors into a concrete frame through
+/// `current_inline_vable_target`, i.e. only for the frame an INLINE level owns.
+/// A root walk keeps its virtualizable symbolic, so that array still holds the
+/// pre-walk stack, and publishing it resumes the blackhole on a stack from
+/// before the walk ran.  Locals are unaffected — `write_back_outer_locals`
+/// takes those from the virtualizable shadow.
+///
+/// The mirror reflects the depth ON ENTRY to the opcode at `py_pc`, so it pairs
+/// with `last_instr = py_pc - 1`, the same coordinate
+/// [`flush_walk_end_state_to_frame_with_full_stack`] stores for its own
+/// full-stack override.  The height is checked against the forward analysis for
+/// the same reason that override is: a mirror describing another coordinate
+/// must decline, not publish a shifted stack.
+pub(crate) fn capture_frame_stack_from_mirror(
+    live_frame: usize,
+    py_pc: usize,
+    stack: &[PyObjectRef],
+) -> Option<CapturedFrameStack> {
+    let stack_base = concrete_nlocals(live_frame)?;
+    let valuestackdepth = stack_base.checked_add(stack.len())?;
+    let live_arr = unsafe {
+        *((live_frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *const pyre_object::FixedObjectArray)
+    };
+    if live_arr.is_null() || unsafe { &*live_arr }.as_slice().len() < valuestackdepth {
+        return None;
+    }
+    let w_code = unsafe {
+        *((live_frame as *const u8).add(crate::frame_layout::PYFRAME_PYCODE_OFFSET)
+            as *const *const ())
+    };
+    if w_code.is_null() {
+        return None;
+    }
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    let depth = crate::liveness::liveness_for(raw_code)
+        .depth_at_py_pc()
+        .get(py_pc)
+        .copied()?;
+    if depth as usize != stack.len() {
+        return None;
+    }
+    Some(CapturedFrameStack {
+        stack_base,
+        scalars: FrameScalars {
+            last_instr: py_pc as isize - 1,
+            valuestackdepth,
+        },
+        roots: stack.iter().map(|&value| value as i64).collect(),
     })
 }
 

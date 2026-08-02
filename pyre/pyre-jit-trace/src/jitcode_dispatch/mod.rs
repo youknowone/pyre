@@ -2240,6 +2240,41 @@ impl DispatchError {
         }
     }
 
+    /// Whether this abort leaves the walk's MIFrame image COMPLETE — the walker
+    /// stopped because it cannot MODEL the next operation, not because a value
+    /// it needs is missing.
+    ///
+    /// Only the first family has an upstream counterpart.  Every RPython
+    /// `SwitchToBlackhole` is a stop-tracing DECISION taken with the registers
+    /// bound (`ABORT_TOO_LONG`, `ABORT_BRIDGE`, …), which is why
+    /// `_copy_data_from_miframe` (`blackhole.py:1713-1730`) copies the banks
+    /// unconditionally and has no failing path.  Pyre's walker resolves
+    /// registers, descrs and concretes lazily against the live trace context,
+    /// so a second family exists here that upstream has no analog for: the
+    /// abort IS the report that a value is unavailable
+    /// (`RegisterReadUnbound`, `*NotConcrete`, `*ArgUnbound`, a malformed
+    /// descr).  Converting one of those to a blackhole resumes execution on
+    /// exactly the hole the walker refused to read, so those keep the legacy
+    /// entry replay.
+    ///
+    /// An allow-list, not a deny-list: a class left out only forgoes the
+    /// handoff, while a class wrongly let in resumes on missing data.
+    pub(crate) fn leaves_complete_image(&self) -> bool {
+        matches!(
+            self,
+            Self::UndecodableOpcode { .. }
+                | Self::UnsupportedOpname { .. }
+                | Self::OrthodoxSubWalkTraceUnsupported { .. }
+                | Self::UnfoldableListAppendResidualUnsupported { .. }
+                | Self::MayForceNullRefArgUnsupported { .. }
+                | Self::InplaceContainerMutationUnsupported { .. }
+                | Self::NonStandardVableFinishPortalUnsupported { .. }
+                | Self::InlineCallArityMismatch { .. }
+                | Self::InlineCallIntArityMismatch { .. }
+                | Self::InlineCallFloatArityMismatch { .. }
+        )
+    }
+
     /// Construct the callee-inline decline.  The
     /// `LoopBearingCalleeInlineUnsupported` variant is emitted from ~20 sites
     /// (multi-frame seed preconditions, snapshot capture, hazard scan), so
@@ -2475,7 +2510,53 @@ pub fn walk<Sym: WalkSym>(
     let mut pc = start_pc;
     loop {
         let opcode_position = pc;
-        let (outcome, next_pc) = step(code, pc, ctx)?;
+        let (outcome, next_pc) = match step(code, pc, ctx) {
+            Ok(stepped) => stepped,
+            Err(error) => {
+                // `pyjitpl.py:2949 run_blackhole_interp_to_cancel_tracing`
+                // parity.  Upstream has ONE abort path: every abort inside
+                // `_interpret` raises `SwitchToBlackhole`, and
+                // `blackhole.py:1799 convert_and_run_from_pyjitpl` FINISHES the
+                // frames the walk reached — it never returns to the caller and
+                // never replays the aborted region.  The walk executes
+                // residuals concretely, so replaying from the trace entry
+                // re-applies every effect it already committed.
+                //
+                // Only the `is_too_long()` arm below (and the bridge sub-walk,
+                // `bridge_subwalk.rs`) used to latch that image, which left
+                // every other `DispatchError` — the whole capability-gap family
+                // — aborting with no handoff at all.  Latch here instead, at
+                // the step that failed, so the class of the abort stops
+                // deciding whether the recovery exists.
+                //
+                // `latch_abort_blackhole` is fully gated: a non-authoritative
+                // walk, an incomplete register image, or an unsupported frame
+                // shape all decline and leave the legacy entry replay in place,
+                // so an unlatched abort is never worse than before.
+                //
+                // Kept in lockstep with the epilogue's own exclusions
+                // (`run_perfn_walk`, `WalkEndCommitLeg::WalkAbort`): the two
+                // gh#467 CALL-forward classes have a more precise recovery that
+                // resumes the OUTER frame at its CALL, so staging an image no
+                // consumer will take would only retain it to the next walk's
+                // reset.  `VableEscapedDuringResidualCall` needs no exclusion —
+                // it latches its narrower resume-marker image at force time,
+                // before the error unwinds here, so the guard below defers to it.
+                let carrier_owned = matches!(
+                    error,
+                    DispatchError::AbortPermanentMarkerReached { .. }
+                        | DispatchError::LoopBearingCalleeInlineUnsupported { .. }
+                );
+                // Kept in lockstep with the epilogue's own gate: an abort that
+                // reports a MISSING value cannot be converted, because the
+                // image it would hand the blackhole is the one that just
+                // failed to resolve ([`DispatchError::leaves_complete_image`]).
+                if error.leaves_complete_image() && !carrier_owned && !abort_blackhole_latched() {
+                    let _ = latch_abort_blackhole(ctx, error.stop_pc());
+                }
+                return Err(error);
+            }
+        };
         pc = next_pc;
         // pyjitpl.py:2865 `_interpret`: `blackhole_if_trace_too_long()` runs
         // after every `run_one_step()`. This loop is that loop's counterpart —
