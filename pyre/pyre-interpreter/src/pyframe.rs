@@ -3837,10 +3837,8 @@ impl PyFrame {
         for &arg in args {
             _roots.pin_root(arg);
         }
-        let w_builtin = crate::baseobjspace::frame_builtin_obj(
-            _roots.get(root_base + 1),
-            execution_context,
-        );
+        let w_builtin =
+            crate::baseobjspace::frame_builtin_obj(_roots.get(root_base + 1), execution_context);
         let mut current_args: Vec<PyObjectRef> = Vec::with_capacity(args.len());
         for i in 0..args.len() {
             current_args.push(_roots.get(root_base + 3 + i));
@@ -3885,9 +3883,8 @@ impl PyFrame {
         ]);
         let args_base = pyre_object::gc_roots::publish_roots(args);
         pyre_object::gc_roots::normalize_roots(root_base, 4 + args.len());
-        let code_ref = unsafe {
-            &*(crate::w_code_get_ptr(_roots.get(root_base)) as *const CodeObject)
-        };
+        let code_ref =
+            unsafe { &*(crate::w_code_get_ptr(_roots.get(root_base)) as *const CodeObject) };
         let num_locals = code_ref.varnames.len();
         let num_cells = ncells(code_ref);
         let max_stack = code_ref.max_stackdepth as usize;
@@ -3941,10 +3938,7 @@ impl PyFrame {
         // pyframe.py:103 — stamp `pycode.w_globals`; side effect only (the
         // gated debugdata snapshot retired in favour of `w_globals`).
         unsafe {
-            crate::w_code_frame_stores_global(
-                _roots.get(root_base),
-                _roots.get(root_base + 1),
-            );
+            crate::w_code_frame_stores_global(_roots.get(root_base), _roots.get(root_base + 1));
         }
 
         let mut frame = PyFrame {
