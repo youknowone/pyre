@@ -4082,7 +4082,8 @@ fn run_perfn_walk<Sym: WalkSym>(
         // residual executes).  Falling through to the plain `Abort` instead
         // rolls the journal back and replays the walked region from its start,
         // re-executing every residual the walk already ran.
-        if let Err(crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { pc }) = &walk_result
+        if let Err(crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { pc }) =
+            &walk_result
         {
             let abort_jit_pc = *pc;
             // A recorded-but-unexecuted residual is applied only by the replay
@@ -4106,14 +4107,13 @@ fn run_perfn_walk<Sym: WalkSym>(
                 // its absence (no boundary crossed, or a different opcode)
                 // leaves the leg unprovable — `walk_end_resume_provable`
                 // declines and the legacy replay stands.
-                let resume = match crate::jitcode_dispatch::fbw_opcode_entry_effects_at(
-                    resume_py_pc,
-                ) {
-                    Some(effects_at_resume_point) => WalkEndResume::Rewind {
-                        effects_at_resume_point,
-                    },
-                    None => WalkEndResume::RewindUnproven,
-                };
+                let resume =
+                    match crate::jitcode_dispatch::fbw_opcode_entry_effects_at(resume_py_pc) {
+                        Some(effects_at_resume_point) => WalkEndResume::Rewind {
+                            effects_at_resume_point,
+                        },
+                        None => WalkEndResume::RewindUnproven,
+                    };
                 if !walk_end_resume_provable(resume) {
                     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                         eprintln!(

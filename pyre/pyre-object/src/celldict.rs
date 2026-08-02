@@ -369,10 +369,7 @@ unsafe fn classify_cell_write(w_cell: Option<PyObjectRef>, w_value: PyObjectRef)
 ///
 /// # Safety
 /// `w_cell` (when `Some`) and `w_value` must point at live objects.
-pub unsafe fn store_would_bump_version(
-    w_cell: Option<PyObjectRef>,
-    w_value: PyObjectRef,
-) -> bool {
+pub unsafe fn store_would_bump_version(w_cell: Option<PyObjectRef>, w_value: PyObjectRef) -> bool {
     matches!(
         classify_cell_write(w_cell, w_value),
         CellWrite::StoreBare | CellWrite::Replace

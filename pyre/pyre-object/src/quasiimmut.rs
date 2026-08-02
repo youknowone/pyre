@@ -166,15 +166,23 @@ impl QuasiImmutField {
     /// could never fire during a recording.
     pub fn ensure_installed(&self) {
         // The null test is the fast path a hot read must not pay a lock for.
-        if !self.ptr.load(Ordering::Acquire).is_null() {
+        if self.is_installed() {
             return;
         }
         let _guard = self.lock.lock();
-        // Re-read under the lock: another thread may have installed it.
-        if self.ptr.load(Ordering::Acquire).is_null() {
-            let qmut_ptr = Box::into_raw(Box::new(QuasiImmut::new()));
-            self.ptr.store(qmut_ptr, Ordering::Release);
+        let _ = self.locked_get_current_qmut_instance();
+    }
+
+    /// `quasiimmut.py:116-126 get_current_qmut_instance`.  Caller holds
+    /// [`Self::lock`].
+    fn locked_get_current_qmut_instance(&self) -> *mut QuasiImmut {
+        let qmut_ptr = self.ptr.load(Ordering::Acquire);
+        if !qmut_ptr.is_null() {
+            return qmut_ptr;
         }
+        let fresh = Box::into_raw(Box::new(QuasiImmut::new()));
+        self.ptr.store(fresh, Ordering::Release);
+        fresh
     }
 
     /// `quasiimmut.py:116-126 get_current_qmut_instance` followed by
@@ -182,11 +190,7 @@ impl QuasiImmutField {
     /// null, then record this loop's invalidation flag on it.
     pub fn register_loop_token(&self, flag: &Arc<AtomicBool>) {
         let _guard = self.lock.lock();
-        let mut qmut_ptr = self.ptr.load(Ordering::Acquire);
-        if qmut_ptr.is_null() {
-            qmut_ptr = Box::into_raw(Box::new(QuasiImmut::new()));
-            self.ptr.store(qmut_ptr, Ordering::Release);
-        }
+        let qmut_ptr = self.locked_get_current_qmut_instance();
         // Safe: the pointer is only ever cleared under the same lock, and the
         // instance is freed by whoever wins that clear.
         unsafe { (*qmut_ptr).register_loop_token(flag) };

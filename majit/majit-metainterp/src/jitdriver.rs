@@ -3382,7 +3382,16 @@ impl<S: JitState> JitDriver<S> {
                 let abort_raising_exception = pending_stb
                     .as_ref()
                     .is_some_and(|stb| stb.raising_exception);
-                let reason_int = match pending_stb.map(|stb| stb.reason) {
+                // A walker raise site outside this crate cannot reach
+                // `TraceCtx::pending_switch_to_blackhole`, so its
+                // `Counters.ABORT_*` travels in `stage_abort_reason` instead.
+                // It ranks with `stb.reason` rather than below the too-long
+                // fallback: upstream raises at the site and never reaches the
+                // `blackhole_if_trace_too_long` check on that unwind.
+                let reason_int = match pending_stb
+                    .map(|stb| stb.reason)
+                    .or_else(|| self.meta.take_pending_abort_reason())
+                {
                     Some(r) => r,
                     None => self
                         .meta

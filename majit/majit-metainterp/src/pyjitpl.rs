@@ -7617,10 +7617,29 @@ impl<M: Clone> MetaInterp<M> {
         // one accounting event, as `aborted_tracing(stb.reason)` does for the
         // reason the `SwitchToBlackhole` raise carried.
         let reason = self
-            .pending_abort_reason
-            .take()
+            .take_pending_abort_reason()
             .unwrap_or(AbortReason::Generic.as_int());
         self.aborted_tracing(reason);
+    }
+
+    /// Name the `Counters.ABORT_*` reason the abort that is about to happen
+    /// carries, for callers that decide to give the trace up somewhere the
+    /// `abort_trace` call itself cannot see.
+    ///
+    /// RPython carries the reason on the `SwitchToBlackhole` instance from the
+    /// raise site to the `_interpret` catch (`pyjitpl.py:2906-2910`); pyre's
+    /// walker returns a `DispatchError` up through layers that do not spell
+    /// abort reasons, so the reason travels in this slot instead and
+    /// `abort_trace` consumes it exactly once.
+    pub fn stage_abort_reason(&mut self, reason: i32) {
+        self.pending_abort_reason = Some(reason);
+    }
+
+    /// Consume the reason [`MetaInterp::stage_abort_reason`] staged, for the
+    /// abort paths that do their own `abort_trace_live` + `aborted_tracing`
+    /// pair instead of calling `abort_trace`.
+    pub fn take_pending_abort_reason(&mut self) -> Option<i32> {
+        self.pending_abort_reason.take()
     }
 
     /// Live-cleanup half of `abort_trace` — no stats, no hooks.

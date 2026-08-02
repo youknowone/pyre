@@ -1256,12 +1256,7 @@ fn flush_escape_state_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: us
 /// ([`flush_qmut_abort_state`]): both resume the interpreter
 /// mid-expression, where the vable shadow's stack region reads NULL and only the
 /// walk's own mirror can say what the operands are.
-fn flush_with_latched_stack(
-    ctx: &TraceCtx,
-    frame: usize,
-    py_pc: usize,
-    oprefs: &[OpRef],
-) -> bool {
+fn flush_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: usize, oprefs: &[OpRef]) -> bool {
     {
         let mut stack = Vec::with_capacity(oprefs.len());
         for &opref in oprefs.iter() {
@@ -3751,8 +3746,9 @@ fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
     } {
         return None;
     }
-    let name =
-        unsafe { pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef) };
+    let name = unsafe {
+        pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
+    };
     let slot = crate::state::module_dict_cell_slot_direct(w_globals, name);
     let bumps = if is_store {
         let &value_opref = r_args.get(2)?;
@@ -4057,6 +4053,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'v'
         && try_walker_force_quasi_immut_namespace_write(ctx, ei.pyre_helper, &r_args).is_some()
     {
+        // Carry the reason to the `abort_trace` that follows, the way upstream
+        // carries it on the `SwitchToBlackhole` instance (pyjitpl.py:2906-2910).
+        // Without it the abort lands in the `Generic` catch-all and the
+        // `abort: force quasi-immut` counter stays at 0.
+        crate::state::note_force_quasi_immut_abort();
         return Err(DispatchError::ForceQuasiImmutable { pc: op.pc });
     }
 

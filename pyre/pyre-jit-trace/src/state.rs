@@ -3200,6 +3200,17 @@ pub(crate) fn note_root_trace_too_long(
     }
 }
 
+/// Name `Counters.ABORT_FORCE_QUASIIMMUT` as the reason for the abort the
+/// walker is returning (`pyjitpl.py:1116`), so the single `aborted_tracing`
+/// that follows counts it under `profiler.abort_force_quasiimmut` instead of
+/// the `Generic` catch-all.
+pub(crate) fn note_force_quasi_immut_abort() {
+    let (driver, _) = crate::driver::driver_pair();
+    driver
+        .meta_interp_mut()
+        .stage_abort_reason(majit_metainterp::counters::ABORT_FORCE_QUASIIMMUT);
+}
+
 pub(crate) fn wrapfloat(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     emit_box_float_inline(ctx, value, w_float_size_descr(), float_floatval_descr())
 }
