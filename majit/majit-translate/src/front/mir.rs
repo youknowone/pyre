@@ -1293,8 +1293,17 @@ fn tuple_field_value_type(type_name: &str) -> ValueType {
         // kind rather than collapsing into `Int` like the word-sized integers.
         "i128" => ValueType::Int128,
         "u128" => ValueType::UInt128,
-        "bool" | "char" | "f32" | "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32"
-        | "u64" | "usize" => ValueType::Int,
+        "bool" | "char" | "f32" | "i8" | "i16" | "i32" | "i64" | "isize" => ValueType::Int,
+        // A `u*` element shells to an unsigned `SomeInteger`
+        // (`valuetype_to_someshell(Unsigned)`), so an `r_uint` tuple element
+        // reconciles with the FORCE_ATTRIBUTES seed instead of walling
+        // `r_uint ∪ int`. Same register kind as `Int` (`getkind` = 'int').
+        "u8" | "u16" | "u32" | "u64" | "usize" => ValueType::Unsigned,
+        // A str-family element shells to `SomeString`
+        // (`valuetype_to_someshell(Str)`) rather than the classdef-less
+        // `Ref(None)` instance that walled `str ∪ Instance(classdef-less)`.
+        // `Str` is register kind 'ref'/`GcRef` downstream, identical to `Ref`.
+        "String" | "str" | "Wtf8" | "Wtf8Buf" => ValueType::Str,
         _ => ValueType::Ref(None),
     }
 }
