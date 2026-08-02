@@ -2733,6 +2733,26 @@ impl ExtendedShortPreambleBuilder {
                 // has no result box, so it can never appear in `jump_args` and
                 // the arity test below cannot catch it.
                 //
+                // An OVF PRODUCER carries a guard positionally rather than in
+                // its own arg list, so the `is_guard()` arm cannot see it.
+                // Upstream never separates the two: `use_box`
+                // (shortpreamble.py:398-400) SYNTHESIZES the
+                // `GUARD_NO_OVERFLOW` immediately after appending an
+                // `is_ovf()` op, so an orphan cannot exist. Pyre stores them
+                // as two entries — `extract_short_preamble` admits an
+                // `is_guard_overflow()` entry only as the paired successor of
+                // an included `is_ovf()` producer, and pushes the producer
+                // first — and that successor is ARGLESS, so it is vacuously
+                // resolvable and survives its producer's drop. What the
+                // orphan then does is worse than being lost:
+                // `optimize_GUARD_NO_OVERFLOW` (intbounds.py:210-220) reads
+                // `last_emitted_operation`, and either kills the guard
+                // outright, or — if an unrelated ovf op happens to precede it
+                // — mis-attaches and registers that op's inverse pure
+                // operations (intbounds.py:222-228) as facts. Either way the
+                // body's assumptions enter unchecked, which is the same class
+                // the `is_guard()` arm above closes.
+                //
                 // A PRODUCER whose result the short preamble's own JUMP carries
                 // has no per-op answer either: `short_preamble.ops` and
                 // `short_preamble.jump_args` are filled in lockstep, leaving it
@@ -2741,6 +2761,8 @@ impl ExtendedShortPreambleBuilder {
                 // with the already-compiled target LABEL's arity.
                 let decline = if op.opcode.is_guard() {
                     Some("guard")
+                } else if op.opcode.is_ovf() {
+                    Some("ovf producer")
                 } else if short_preamble.jump_args.contains(&op.pos.get()) {
                     Some("jump-arg producer")
                 } else {
