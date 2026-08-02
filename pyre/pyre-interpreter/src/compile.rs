@@ -200,10 +200,12 @@ pub fn decode_source_bytes(
 
 /// Compile a Python expression.
 pub fn compile_eval(source: &str) -> Result<CodeObject, CompileError> {
+    crate::module::thread::ensure_runtime_thread();
     compile_source(source, Mode::Eval)
 }
 
 /// Compile a Python script (module).
 pub fn compile_exec(source: &str) -> Result<CodeObject, CompileError> {
+    crate::module::thread::ensure_runtime_thread();
     compile_source(source, Mode::Exec)
 }

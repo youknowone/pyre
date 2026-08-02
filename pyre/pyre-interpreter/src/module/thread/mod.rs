@@ -50,6 +50,61 @@ pub fn before_external_block() -> majit_gc::gc_sync::BlockingGuard {
     majit_gc::gc_sync::before_external_block()
 }
 
+thread_local! {
+    /// Set once this thread owns a mutator registration, so the entry below
+    /// stays a single thread-local read on every later entry.
+    static RUNTIME_THREAD_ENTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Armed after `shadow_stack::register_mutator` has captured this thread's
+    /// root slots, so the destructor removes the registry entry before those
+    /// slots are destroyed and only then gives the GIL back.
+    static RUNTIME_THREAD: RuntimeThread = const { RuntimeThread };
+}
+
+struct RuntimeThread;
+
+impl Drop for RuntimeThread {
+    fn drop(&mut self) {
+        majit_gc::shadow_stack::unregister_mutator();
+        majit_gc::gc_sync::unregister_thread();
+    }
+}
+
+/// `rgil.py:186-193 acquire_maybe_in_new_thread`: a thread that has not run
+/// pyre code before becomes a GC mutator and takes the GIL before it runs any.
+///
+/// Upstream reaches every RPython thread through `rpython_startup_code` or
+/// rffi's callback path, both of which acquire before the first RPython
+/// instruction (entrypoint.c:49,78). pyre is entered from Rust at several
+/// points instead — the launcher, a spawned Python thread, and the unit tests
+/// that drive the interpreter directly — so the acquire is idempotent per
+/// thread and each entry point names it. The registration is given back by
+/// `RUNTIME_THREAD`'s destructor when the thread exits, which is what lets a
+/// second thread run pyre code afterwards.
+#[inline]
+pub fn ensure_runtime_thread() {
+    if RUNTIME_THREAD_ENTERED.with(|entered| entered.get()) {
+        return;
+    }
+    enter_runtime_thread();
+}
+
+#[cold]
+fn enter_runtime_thread() {
+    RUNTIME_THREAD_ENTERED.with(|entered| entered.set(true));
+    majit_gc::gc_sync::register_thread();
+    majit_gc::shadow_stack::register_mutator();
+    RUNTIME_THREAD.with(|_| {});
+}
+
+/// Whether this thread already owns its mutator registration.
+///
+/// pyre-jit's GC bootstrap has per-thread work of its own to hang off the same
+/// registration, so it asks rather than keeping a second flag.
+pub fn runtime_thread_entered() -> bool {
+    RUNTIME_THREAD_ENTERED.with(|entered| entered.get())
+}
+
 /// `rffi.py:193-211 call_external_function`: release the GIL, run the external
 /// call, read `errno`, and only then take the GIL back.  The returned `i32` is
 /// the saved `errno`, meaningful exactly when the call reports failure.

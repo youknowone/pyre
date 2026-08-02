@@ -122,6 +122,10 @@ mod tests {
     fn stack_overflow_probe_raises_into_pending_exception_slot() {
         use pyre_interpreter::stack_check;
 
+        // The slowpath is reached from generated code, which runs with the GIL
+        // held; driving it directly makes this thread the mutator instead.
+        pyre_interpreter::module::thread::ensure_runtime_thread();
+
         // Install the same backend bridge call_jit::install_jit_call_bridge
         // wires up at runtime, so the registered slowpath addresses
         // really are the ones the cranelift / dynasm prologues invoke.

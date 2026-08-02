@@ -2997,6 +2997,11 @@ impl PyFrame {
         w_inputvalue: Option<PyObjectRef>,
         operr: Option<crate::PyError>,
     ) -> crate::PyResult {
+        // A frame can be executed by a thread that has not run pyre code
+        // before — the launcher's interpreter thread, and the Rust tests that
+        // drive a frame directly — so this is one of the entry points that
+        // takes the GIL (rgil.py:186-193).
+        crate::module::thread::ensure_runtime_thread();
         // pyframe.py:360 `execute_frame.insert_stack_check_here = True`.
         // RPython's transform inserts the check at this graph entry, so
         // builtin/object-space calls remain usable while an existing frame is
