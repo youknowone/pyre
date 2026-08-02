@@ -1029,6 +1029,8 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     callee_w_globals: usize,
     entry: usize,
     argboxes_r: &[OpRef],
+    argboxes_i: &[OpRef],
+    argboxes_f: &[OpRef],
     local_oprefs: &[OpRef],
     local_concretes: &[majit_ir::Value],
     resumed_stack_oprefs: &[OpRef],
@@ -1124,6 +1126,30 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(box_ref) {
             concrete_r[i] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
         }
+    }
+    // `consume_boxes` refills all three banks (resume.py
+    // rebuild_from_resumedata), and the recipe's int/float banks are already
+    // COLOR-indexed, so they seed the leading slots directly.  A live color the
+    // callee's register file cannot hold means the recipe and this body
+    // disagree about the jitcode; decline rather than drop the register.
+    if argboxes_i.len() > num_regs_i || argboxes_f.len() > num_regs_f {
+        crate::jitcode_dispatch::census_record("P2Drain::UnboxedBankArity");
+        return None;
+    }
+    for (i, &box_ref) in argboxes_i.iter().enumerate() {
+        if box_ref.is_none() {
+            continue;
+        }
+        regs_i[i] = box_ref;
+        if let Some(majit_ir::Value::Int(v)) = ctx.box_value(box_ref) {
+            concrete_i[i] = ConcreteValue::Int(v);
+        }
+    }
+    for (i, &box_ref) in argboxes_f.iter().enumerate() {
+        if box_ref.is_none() {
+            continue;
+        }
+        regs_f[i] = box_ref;
     }
     if let Some(result) = child_result {
         let call_dst_reg = call_dst_reg_for_residual_return(jc.code.as_slice(), entry)?;
@@ -1330,6 +1356,8 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
     callee_w_globals: usize,
     entry: usize,
     argboxes_r: &[OpRef],
+    argboxes_i: &[OpRef],
+    argboxes_f: &[OpRef],
     local_oprefs: &[OpRef],
     local_concretes: &[majit_ir::Value],
     resumed_stack_oprefs: &[OpRef],
@@ -1345,6 +1373,8 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
         callee_w_globals,
         entry,
         argboxes_r,
+        argboxes_i,
+        argboxes_f,
         local_oprefs,
         local_concretes,
         resumed_stack_oprefs,
@@ -1364,6 +1394,8 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
     middle_w_globals: usize,
     entry: usize,
     argboxes_r: &[OpRef],
+    argboxes_i: &[OpRef],
+    argboxes_f: &[OpRef],
     local_oprefs: &[OpRef],
     local_concretes: &[majit_ir::Value],
     resumed_stack_oprefs: &[OpRef],
@@ -1380,6 +1412,8 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
         middle_w_globals,
         entry,
         argboxes_r,
+        argboxes_i,
+        argboxes_f,
         local_oprefs,
         local_concretes,
         resumed_stack_oprefs,

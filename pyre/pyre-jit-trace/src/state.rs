@@ -7337,25 +7337,71 @@ fn reconstruct_inline_recipe(
     if reg_indices.total_len() != values.len() {
         decline!("LivenessValueCountMismatch");
     }
-    // virtualizable.py:86-98: at a bytecode boundary (every resume pc is one)
-    // the frame's locals_cells_stack_w is a W_Root array — all live slots are
-    // boxed Ref. A reconstructed inline callee has no virtualizable array, so
-    // an int/float-bank register here would have no boxed-Ref source to seed
-    // `registers_r` (the reader always reads `registers_r[k]`,
-    // trace_opcode.rs). Fall back to the single-frame bridge rather than
-    // synthesize an unboxed local.
+    // resume.py rebuild_from_resumedata hands `consume_boxes` all three banks
+    // (`f.registers_i, f.registers_r, f.registers_f`), so decode them all here.
     //
-    // This is a PARITY GAP, not a shape that cannot occur: `consume_boxes`
-    // fills all three banks (`resume.py rebuild_from_resumedata` passes
-    // `f.registers_i, f.registers_r, f.registers_f`), and a JitCode int temp
-    // with no `locals_cells_stack_w` home is a normal live register there.
-    // `synth/or_chain_fresh_alloc_arg` reaches this decline twice per run once
-    // the callee operand-stack mirror is enabled (`PYRE_FBW_CALLEE_VSTACK=1`),
-    // and the resulting `P2Drain::NoRecipes` is why that fixture's kept-stack
-    // guard never bridges.
-    if !reg_indices.int.is_empty() || !reg_indices.float.is_empty() {
-        decline!("UnboxedLiveRegister");
+    // The int/float banks decode COLOR-indexed and STAY that way, unlike the
+    // Ref bank which is inverted to `locals_cells_stack_w` slots below.  That
+    // array is a W_Root array (virtualizable.py:86-98), so an unboxed temp has
+    // no slot to invert a color into; it has no home outside the register file
+    // in the first place, which is exactly how `registers_i` holds it upstream.
+    // `PyreSym::registers_i` is likewise read by color (trace_opcode.rs), and
+    // `assemble_bridge_inline_pending` copies the bank across unchanged.
+    //
+    // Decoded before the portal-callee branch below so both its returns carry
+    // the banks, and so the section offsets are computed once: the encoder
+    // enumerates live boxes in bank order and `values` mirrors it, so the Ref
+    // section starts at `int_len` (`pending_value_index` above already removed
+    // the pending call result from within that section).
+    let int_len = reg_indices.int.len();
+    let mut registers_i: Vec<OpRef> = Vec::new();
+    let mut registers_f: Vec<OpRef> = Vec::new();
+    for (pos, &reg_idx) in reg_indices.int.iter().enumerate() {
+        let (op, val) = bridge_decode_box(
+            ctx,
+            values[pos],
+            Type::Int,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        // The failarg's value at this guard, threaded onto the OpRef-keyed
+        // shadow the same way the frame red's is: without it the re-executed
+        // callee reads the register as symbolic-only and stops at the first
+        // condition it has to fold (`GotoIfNotValueNotConcrete`).
+        ctx.try_set_opref_concrete(op, val);
+        let reg_idx = reg_idx as usize;
+        if reg_idx >= registers_i.len() {
+            registers_i.resize(reg_idx + 1, OpRef::NONE);
+        }
+        registers_i[reg_idx] = op;
     }
+    let float_base = int_len + reg_indices.ref_.len();
+    for (pos, &reg_idx) in reg_indices.float.iter().enumerate() {
+        let (op, val) = bridge_decode_box(
+            ctx,
+            values[float_base + pos],
+            Type::Float,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        ctx.try_set_opref_concrete(op, val);
+        let reg_idx = reg_idx as usize;
+        if reg_idx >= registers_f.len() {
+            registers_f.resize(reg_idx + 1, OpRef::NONE);
+        }
+        registers_f[reg_idx] = op;
+    }
+    // The Ref section alone, so every `reg_indices.ref_` position below indexes
+    // it directly instead of carrying the `int_len` offset to each use site.
+    let ref_values: Vec<&majit_ir::resumedata::RebuiltValue> = values[int_len..float_base].to_vec();
 
     // Virtualizable-callee shape (pyre's "every function is its own portal"
     // model): the callee's live ref registers are the portal reds [frame, ec]
@@ -7477,10 +7523,10 @@ fn reconstruct_inline_recipe(
         // reconstructed bridge therefore reads the current frame image on
         // every execution, exactly as consume_boxes rebuilds a fresh MIFrame
         // from the current deadframe.
-        if !matches!(values[frame_pos], RebuiltValue::Virtual(_)) {
+        if !matches!(ref_values[frame_pos], RebuiltValue::Virtual(_)) {
             let (frame_box, frame_value) = bridge_decode_box(
                 ctx,
-                values[frame_pos],
+                ref_values[frame_pos],
                 Type::Ref,
                 rd_virtuals,
                 resume_data,
@@ -7506,7 +7552,7 @@ fn reconstruct_inline_recipe(
             overlay_stream_ref_slots(
                 ctx,
                 &stream_slots,
-                &values,
+                &ref_values,
                 &mut registers_r,
                 &mut concrete_r,
                 rd_virtuals,
@@ -7523,14 +7569,14 @@ fn reconstruct_inline_recipe(
                 jitcode_pc: frame.pc,
                 nlocals,
                 valuestackdepth,
-                registers_i: Vec::new(),
+                registers_i,
                 registers_r,
-                registers_f: Vec::new(),
+                registers_f,
                 concrete_r,
                 nargs: frame_nlocals,
             });
         }
-        let RebuiltValue::Virtual(frame_vidx) = values[frame_pos] else {
+        let RebuiltValue::Virtual(frame_vidx) = ref_values[frame_pos] else {
             decline!("FrameRedNotVirtual");
         };
         // The `frame` red virtual is a PyFrame VirtualInfo; its
@@ -7612,7 +7658,7 @@ fn reconstruct_inline_recipe(
         overlay_stream_ref_slots(
             ctx,
             &stream_slots,
-            &values,
+            &ref_values,
             &mut registers_r,
             &mut concrete_r,
             rd_virtuals,
@@ -7662,9 +7708,9 @@ fn reconstruct_inline_recipe(
             jitcode_pc: frame.pc,
             nlocals,
             valuestackdepth,
-            registers_i: Vec::new(),
+            registers_i,
             registers_r,
-            registers_f: Vec::new(),
+            registers_f,
             concrete_r,
             nargs: frame_nlocals,
         });
@@ -7710,37 +7756,17 @@ fn reconstruct_inline_recipe(
         }
     }
 
-    let mut registers_i: Vec<OpRef> = Vec::new();
-    let mut registers_f: Vec<OpRef> = Vec::new();
     // The Ref bank decodes COLOR-indexed (the liveness register `reg_idx` is the
     // post-regalloc color). The reconstructed inline frame's `registers_r`/
     // `concrete_r` are read SLOT-indexed (`assemble_bridge_inline_pending` seeds
     // `locals_cells_stack_w[k]` and the resumed tracer reads LOAD_FAST's
     // `nlocals + stack_idx`), so invert color→slot below — for a borrowed local
     // pushed on the stack the color ≠ slot, and a color-indexed seed lands the
-    // value at the wrong slot.
+    // value at the wrong slot.  The int/float banks were decoded above and need
+    // no inversion.
     let mut by_color_r: Vec<OpRef> = Vec::new();
     let mut by_color_c: Vec<majit_ir::Value> = Vec::new();
-    let mut value_cursor = 0usize;
-    for &reg_idx in &reg_indices.int {
-        let (op, _val) = bridge_decode_box(
-            ctx,
-            values[value_cursor],
-            Type::Int,
-            rd_virtuals,
-            resume_data,
-            fail_values,
-            fail_types,
-            backend,
-            cache,
-        );
-        let reg_idx = reg_idx as usize;
-        if reg_idx >= registers_i.len() {
-            registers_i.resize(reg_idx + 1, OpRef::NONE);
-        }
-        registers_i[reg_idx] = op;
-        value_cursor += 1;
-    }
+    let mut value_cursor = int_len;
     for &reg_idx in &reg_indices.ref_ {
         let (op, val) = bridge_decode_box(
             ctx,
@@ -7760,25 +7786,6 @@ fn reconstruct_inline_recipe(
         }
         by_color_r[reg_idx] = op;
         by_color_c[reg_idx] = val;
-        value_cursor += 1;
-    }
-    for &reg_idx in &reg_indices.float {
-        let (op, _val) = bridge_decode_box(
-            ctx,
-            values[value_cursor],
-            Type::Float,
-            rd_virtuals,
-            resume_data,
-            fail_values,
-            fail_types,
-            backend,
-            cache,
-        );
-        let reg_idx = reg_idx as usize;
-        if reg_idx >= registers_f.len() {
-            registers_f.resize(reg_idx + 1, OpRef::NONE);
-        }
-        registers_f[reg_idx] = op;
         value_cursor += 1;
     }
 
