@@ -1690,11 +1690,24 @@ pub(crate) fn walker_abort_if_mayforce_null_ref_arg<Sym: WalkSym>(
     // `try_execute_residual_call_via_executor`.
     let is_store_deref =
         call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::StoreDeref;
+    // `bh_load_global_fn(namespace_ptr, w_code, frame, namei)` — `namespace_ptr`
+    // (arg index 0) is never dereferenced.  The helper discards it and resolves
+    // the namespace from the executing frame or the callee's own promoted
+    // `w_code`, because an inlined / chained callee's frame register aliases an
+    // outer frame; the operand survives only as the cell-fold recogniser's hint.
+    // A nested function's `LOAD_GLOBAL` folds it to the NULL constant, so
+    // aborting on it stops the walk after an effectful residual has already run
+    // concretely and the caller replays that region.
+    let is_load_global =
+        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadGlobal;
     for (i, &ty) in call_descr.arg_types().iter().enumerate() {
         if ty != majit_ir::Type::Ref {
             continue;
         }
         if is_call_fn && i == 1 {
+            continue;
+        }
+        if is_load_global && i == 0 {
             continue;
         }
         if is_call_function_ex && (i == 1 || i == 3) {
@@ -2098,8 +2111,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // the region on top of the residuals the walk already ran concretely.
     let is_store_deref =
         call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::StoreDeref;
+    // Same `bh_load_global_fn` `namespace_ptr` exemption as
+    // `walker_abort_if_mayforce_null_ref_arg`: arg index 0 is discarded by the
+    // helper, so a concrete NULL there is the normal nested-function shape.
+    let is_load_global =
+        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadGlobal;
     for (i, &arg) in args.iter().enumerate() {
         if is_call_fn && i == 1 {
+            continue;
+        }
+        if is_load_global && i == 0 {
             continue;
         }
         if is_call_kw && i == 1 {
