@@ -176,32 +176,53 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
             "issubclass() arg 1 must be a class",
         ));
     }
+
+    // The hook, registry walk, and `__subclasses__` walk below can all run
+    // arbitrary Python.  Keep the two arguments live and reload them after
+    // every such call, matching the translated livevars carried by PyPy's
+    // `ABCMeta.__subclasscheck__`.
+    let roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = roots.base();
+    roots.pin_root(cls);
+    let subclass_slot = cls_slot + 1;
+    roots.pin_root(subclass);
+
     // _py_abc.py:122-130 — `ok = cls.__subclasshook__(subclass)`.
-    if let Ok(hook) = crate::baseobjspace::getattr_str(cls, "__subclasshook__") {
-        if !hook.is_null() {
-            let ok = crate::call::call_function_impl_result(hook, &[subclass])?;
-            if !unsafe { is_not_implemented(ok) } {
-                return crate::baseobjspace::is_true(ok);
-            }
+    let hook = crate::baseobjspace::getattr_str(roots.get(cls_slot), "__subclasshook__")?;
+    if !hook.is_null() {
+        let hook_roots = pyre_object::gc_roots::push_roots();
+        let hook_slot = hook_roots.base();
+        hook_roots.pin_root(hook);
+        let ok = crate::call::call_function_impl_result(
+            hook_roots.get(hook_slot),
+            &[roots.get(subclass_slot)],
+        )?;
+        if !unsafe { is_not_implemented(ok) } {
+            return crate::baseobjspace::is_true(ok);
         }
     }
     // _py_abc.py:131-134 — direct subclass via `__mro__`.
     unsafe {
-        let mro_ptr = w_type_get_mro(subclass);
+        let mro_ptr = w_type_get_mro(roots.get(subclass_slot));
         if !mro_ptr.is_null() {
             for &t in (*mro_ptr).as_slice() {
-                if std::ptr::eq(t, cls) {
+                if std::ptr::eq(t, roots.get(cls_slot)) {
                     return Ok(true);
                 }
             }
         }
     }
     // _py_abc.py:135-139 — subclass of a registered class (recursive).
-    if let Ok(registry) = crate::baseobjspace::getattr_str(cls, "_abc_registry") {
+    if let Ok(registry) = crate::baseobjspace::getattr_str(roots.get(cls_slot), "_abc_registry") {
         if !registry.is_null() && unsafe { is_list(registry) } {
-            let n = unsafe { w_list_len(registry) };
+            let registry_roots = pyre_object::gc_roots::push_roots();
+            let registry_slot = registry_roots.base();
+            registry_roots.pin_root(registry);
+            let n = unsafe { w_list_len(registry_roots.get(registry_slot)) };
             for i in 0..n {
-                if let Some(rcls) = unsafe { w_list_getitem(registry, i as i64) } {
+                if let Some(rcls) =
+                    unsafe { w_list_getitem(registry_roots.get(registry_slot), i as i64) }
+                {
                     // A registered entry that is not a class cannot be a base
                     // class, so it can never make `subclass` a subclass — skip
                     // it rather than letting `issubclass` raise.  `range` is
@@ -211,16 +232,44 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
                     if !unsafe { is_type(rcls) } {
                         continue;
                     }
-                    if crate::baseobjspace::issubclass(subclass, rcls)? {
+                    let item_roots = pyre_object::gc_roots::push_roots();
+                    let rcls_slot = item_roots.base();
+                    item_roots.pin_root(rcls);
+                    if crate::baseobjspace::issubclass(
+                        roots.get(subclass_slot),
+                        item_roots.get(rcls_slot),
+                    )? {
                         return Ok(true);
                     }
                 }
             }
         }
     }
-    // _py_abc.py:140-144 — subclass of a subclass (recursive).
-    for scls in unsafe { w_type_get_subclasses(cls, false) } {
-        if crate::baseobjspace::issubclass(subclass, scls)? {
+    // _py_abc.py:140-144 — `for scls in cls.__subclasses__():`.  This must go
+    // through normal attribute lookup, call, and iteration.  Reading the
+    // internal type subclass vector directly hides user overrides and their
+    // TypeError/custom exceptions, which are observable ABCMeta semantics.
+    let subclasses_method =
+        crate::baseobjspace::getattr_str(roots.get(cls_slot), "__subclasses__")?;
+    let walk_roots = pyre_object::gc_roots::push_roots();
+    let method_slot = walk_roots.base();
+    walk_roots.pin_root(subclasses_method);
+    let subclasses = crate::call::call_function_impl_result(walk_roots.get(method_slot), &[])?;
+    let subclasses_slot = method_slot + 1;
+    walk_roots.pin_root(subclasses);
+    let iterator = crate::baseobjspace::iter(walk_roots.get(subclasses_slot))?;
+    let iterator_slot = subclasses_slot + 1;
+    walk_roots.pin_root(iterator);
+    loop {
+        let scls = match crate::baseobjspace::next(walk_roots.get(iterator_slot)) {
+            Ok(scls) => scls,
+            Err(err) if err.kind == crate::PyErrorKind::StopIteration => break,
+            Err(err) => return Err(err),
+        };
+        let item_roots = pyre_object::gc_roots::push_roots();
+        let scls_slot = item_roots.base();
+        item_roots.pin_root(scls);
+        if crate::baseobjspace::issubclass(roots.get(subclass_slot), item_roots.get(scls_slot))? {
             return Ok(true);
         }
     }
