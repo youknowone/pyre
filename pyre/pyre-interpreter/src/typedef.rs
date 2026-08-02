@@ -11882,6 +11882,17 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
                     .unwrap_or_else(pyre_object::w_none),
             )
         }
+        pyre_object::MEMBER_STOP_ITERATION_VALUE => {
+            let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_value(obj) };
+            if !stored.is_null() {
+                return Ok(stored);
+            }
+            let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
+            Ok(
+                unsafe { pyre_object::w_tuple_getitem(args, 0) }
+                    .unwrap_or_else(pyre_object::w_none),
+            )
+        }
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
         pyre_object::MEMBER_DESCR_NAME => unsafe { descr_member_name(obj) },
         _ => Err(crate::PyError::attribute_error(unsafe {
@@ -11917,6 +11928,10 @@ pub(crate) unsafe fn direct_member_set(
             unsafe { pyre_object::w_dict_setitem_str_no_proxy(dict, "_metadata", value) };
             Ok(pyre_object::w_none())
         }
+        pyre_object::MEMBER_STOP_ITERATION_VALUE => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_value(obj, value) };
+            Ok(pyre_object::w_none())
+        }
         _ => Err(crate::PyError::attribute_error("readonly attribute")),
     }
 }
@@ -11947,6 +11962,12 @@ pub(crate) unsafe fn direct_member_delete(
         pyre_object::MEMBER_SYNTAX_ERROR_METADATA => {
             let dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) };
             unsafe { pyre_object::w_dict_delitem_str_no_proxy(dict, "_metadata") };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_STOP_ITERATION_VALUE => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_value(obj, pyre_object::w_none())
+            };
             Ok(pyre_object::w_none())
         }
         _ => Err(crate::PyError::attribute_error("readonly attribute")),

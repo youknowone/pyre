@@ -364,6 +364,10 @@ pub struct W_BaseException {
     /// argument, the args tuple for several) when the slot is unset, and
     /// a later `e.code = x` write persists here ahead of that fallback.
     pub w_code: PyObjectRef,
+    /// `interp_exceptions.py:494 W_StopIteration.w_value` — initialized to
+    /// None, replaced with the first argument by `descr_init`, and exposed as
+    /// the writable `value` attribute.
+    pub w_value: PyObjectRef,
     /// Shared `w_name` slot for the exception kinds that expose a
     /// `name` attribute: `W_ImportError.w_name`
     /// (`interp_exceptions.py:643`, `:680
@@ -420,6 +424,7 @@ pub const EXC_W_STRERROR_OFFSET: usize = std::mem::offset_of!(W_BaseException, w
 pub const EXC_W_FILENAME_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_filename);
 pub const EXC_W_FILENAME2_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_filename2);
 pub const EXC_W_CODE_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_code);
+pub const EXC_W_VALUE_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_value);
 pub const EXC_W_NAME_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_exc_name);
 pub const EXC_W_ATTR_OBJ_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_attr_obj);
 pub const EXC_W_IMPORT_PATH_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_import_path);
@@ -437,7 +442,8 @@ pub const EXC_W_WEAKREF_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_
 /// W_UnicodeTranslateError / W_UnicodeDecodeError / W_UnicodeEncodeError
 /// subclasses, plus the four W_OSError per-class slots (w_errno /
 /// w_strerror / w_filename / w_filename2), plus the W_SystemExit
-/// `w_code` slot, plus the shared `w_exc_name` slot (ImportError /
+/// `w_code` slot, the W_StopIteration `w_value` slot, plus the shared
+/// `w_exc_name` slot (ImportError /
 /// NameError / AttributeError) and the W_AttributeError `w_attr_obj`
 /// slot, plus the three remaining W_ImportError per-class slots
 /// (w_import_path / w_import_name_from / w_import_msg), plus the
@@ -446,7 +452,7 @@ pub const EXC_W_WEAKREF_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_
 /// (interp_exceptions.py:113/222-231).  `kind` is a `u8` tag, `message`
 /// is a `*mut String` (raw heap), and `suppress_context` is a bool —
 /// none of those are GC-traced.
-pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 21] = [
+pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 22] = [
     EXC_ARGS_W_OFFSET,
     EXC_W_CAUSE_OFFSET,
     EXC_W_CONTEXT_OFFSET,
@@ -461,6 +467,7 @@ pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 21] = [
     EXC_W_FILENAME_OFFSET,
     EXC_W_FILENAME2_OFFSET,
     EXC_W_CODE_OFFSET,
+    EXC_W_VALUE_OFFSET,
     EXC_W_NAME_OFFSET,
     EXC_W_ATTR_OBJ_OFFSET,
     EXC_W_IMPORT_PATH_OFFSET,
@@ -603,6 +610,9 @@ fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
         // `interp_exceptions.py:990` W_SystemExit class default
         // `w_code = None`.
         w_code: PY_NULL,
+        // `interp_exceptions.py:494` W_StopIteration class default
+        // `w_value = None`.
+        w_value: PY_NULL,
         // Shared `name` slot (ImportError / NameError / AttributeError)
         // + W_AttributeError `obj`; class default `None`.
         w_exc_name: PY_NULL,
@@ -1224,6 +1234,29 @@ pub unsafe fn w_exception_get_code(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_code(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_BaseException)).w_code = value;
+        exception_write_barrier(obj);
+    }
+}
+
+/// `interp_exceptions.py:508 readwrite_attrproperty_w('w_value', ...)` —
+/// `StopIteration.value` reader.
+///
+/// # Safety
+/// `obj` must point to a valid `W_BaseException`.
+#[inline]
+pub unsafe fn w_exception_get_value(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_BaseException)).w_value }
+}
+
+/// `interp_exceptions.py:508 readwrite_attrproperty_w('w_value', ...)` —
+/// `StopIteration.value = ...` writer.
+///
+/// # Safety
+/// `obj` must point to a valid `W_BaseException`.
+#[inline]
+pub unsafe fn w_exception_set_value(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_BaseException)).w_value = value;
         exception_write_barrier(obj);
     }
 }

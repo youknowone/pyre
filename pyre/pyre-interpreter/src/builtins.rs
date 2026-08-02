@@ -2871,7 +2871,12 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "StopIteration",
-        make_exc_type("StopIteration", exc_stop_iteration_new, exception),
+        make_exc_type_with_init(
+            "StopIteration",
+            exc_stop_iteration_new,
+            Some(exc_stop_iteration_init),
+            exception,
+        ),
     );
     crate::module_ns_store(
         ns,
@@ -5346,6 +5351,23 @@ fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     Ok(pyre_object::w_none())
 }
 
+/// `interp_exceptions.py:490-498 W_StopIteration.descr_init` — initialize
+/// `w_value` to the first positional argument (or None) independently of the
+/// `args_w` list, then run `W_Exception.descr_init`.
+fn exc_stop_iteration_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
+    })?;
+    let (positional, _) = split_builtin_kwargs(&args[1..]);
+    let w_value = positional
+        .first()
+        .copied()
+        .unwrap_or_else(pyre_object::w_none);
+    let result = exc_base_exception_init(args)?;
+    unsafe { pyre_object::interp_exceptions::w_exception_set_value(w_self, w_value) };
+    Ok(result)
+}
+
 /// `_PyArg_NoKeywords(type_name, kwds)` message for an exception initializer
 /// that a subclass inherits: the reported name is the receiver's own type, not
 /// the class the initializer was installed on.
@@ -6612,7 +6634,7 @@ fn exception_typedef_attrs(class_name: &str) -> &'static [&'static str] {
             "__traceback__",
         ],
         "SystemExit" => &["code"],
-        "StopIteration" => &["value"],
+        "StopIteration" => &[],
         "OSError" => &[
             "characters_written",
             "errno",
@@ -6794,6 +6816,20 @@ fn make_exc_type_with_init(
                             pyre_object::MEMBER_SYNTAX_ERROR_METADATA,
                             "_metadata".to_owned(),
                             "exception private metadata".to_owned(),
+                            pyre_object::PY_NULL,
+                        ),
+                    );
+                }
+            }
+            if name == "StopIteration" {
+                unsafe {
+                    pyre_object::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "value",
+                        pyre_object::w_member_new_direct_with_doc(
+                            pyre_object::MEMBER_STOP_ITERATION_VALUE,
+                            "value".to_owned(),
+                            "generator return value".to_owned(),
                             pyre_object::PY_NULL,
                         ),
                     );
@@ -7047,6 +7083,11 @@ fn make_exc_type_with_init(
     );
     if name == "SyntaxError" {
         if let Some(member) = crate::type_dict_lookup(cls, "_metadata") {
+            unsafe { pyre_object::w_member_set_cls(member, cls) };
+        }
+    }
+    if name == "StopIteration" {
+        if let Some(member) = crate::type_dict_lookup(cls, "value") {
             unsafe { pyre_object::w_member_set_cls(member, cls) };
         }
     }
