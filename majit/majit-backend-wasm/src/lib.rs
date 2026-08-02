@@ -1345,12 +1345,14 @@ fn normalize_ops_for_codegen(inputargs: &[InputArg], ops: &[OpRc]) -> Vec<Op> {
 
 /// Report why a trace cannot be compiled by the wasm backend, or `None` if it
 /// can. Declined traces fall back to the interpreter (correct, unaccelerated)
-/// instead of producing an invalid trace module. `is_loop` is true for
-/// `compile_loop`, false for `compile_bridge`. `allow_ca` (set by
-/// `compile_bridge` when every CALL_ASSEMBLER target is admitted) lifts the
-/// CALL_ASSEMBLER decline so the CA arm (guest→guest `call_indirect`) lowers
-/// it instead.
-fn wasm_unsupported_trace_reason(ops: &[Op], is_loop: bool, allow_ca: bool) -> Option<String> {
+/// instead of producing an invalid trace module. `allow_ca` (set when every
+/// CALL_ASSEMBLER target is admitted) lifts the CALL_ASSEMBLER decline so the
+/// CA arm (guest→guest `call_indirect`) lowers it instead.
+///
+/// A JUMP with no local LABEL — the cross-loop terminal jump — is not judged
+/// here: it is lowered to `return_call_indirect(external_jump_slot)` and both
+/// callers resolve that slot through [`resolve_cross_loop_jump_target`].
+fn wasm_unsupported_trace_reason(ops: &[Op], allow_ca: bool) -> Option<String> {
     for op in ops {
         if op.opcode.is_call_assembler() && !allow_ca {
             // CALL_ASSEMBLER inlines a loop-bearing callee by jumping into another
@@ -1363,26 +1365,84 @@ fn wasm_unsupported_trace_reason(ops: &[Op], is_loop: bool, allow_ca: bool) -> O
             ));
         }
     }
-    if is_loop {
-        // A JUMP with no local LABEL is lowered by codegen (`Jump if !has_loop`)
-        // to `return_call_indirect(external_jump_slot)`. Only `compile_bridge`
-        // knows the re-entry target (the source loop's table slot) and plumbs it
-        // through `external_jump_slot`; `compile_loop` passes 0, so such a trace
-        // here is a jump-to-existing-trace (terminal JUMP into a *different*
-        // loop) that would tail-call table slot 0 — the wrong function. Decline
-        // it; the interpreter performs the cross-loop jump correctly.
-        let has_label = ops.iter().any(|op| op.opcode == majit_ir::OpCode::Label);
-        let has_jump = ops.iter().any(|op| op.opcode == majit_ir::OpCode::Jump);
-        if has_jump && !has_label {
-            return Some(
-                "wasm backend: loop trace with cross-loop terminal JUMP (no local LABEL)".into(),
-            );
-        }
-    }
-    // A JUMP with no local LABEL inside a bridge (a loop-closing bridge) is
-    // lowered to a `return_call_indirect` into the source loop's table slot — a
-    // wasm tail call — so it is accepted.
     None
+}
+
+/// Whether a trace's terminal is a cross-loop `JUMP`: a JUMP with no local
+/// LABEL to close back onto, so codegen lowers it to a tail call into another
+/// module rather than a `br`.
+fn has_cross_loop_terminal_jump(ops: &[Op]) -> bool {
+    let has_label = ops.iter().any(|op| op.opcode == majit_ir::OpCode::Label);
+    let has_jump = ops.iter().any(|op| op.opcode == majit_ir::OpCode::Jump);
+    has_jump && !has_label
+}
+
+/// Resolve the re-entry target of a cross-loop terminal JUMP BY DESCR IDENTITY
+/// through the `LABEL_TARGETS` registry — the JUMP and its target LABEL share
+/// the loop-target descr Arc, and every compiled loop published its enterable
+/// labels there. The stamped `label_block_id` ordinal is NOT identity: a
+/// retraced loop has several sibling specializations whose start labels all
+/// carry ordinal 0, and a trace legitimately closes into a SIBLING
+/// (jump-to-existing-trace) — the registry resolves the owning module's table
+/// slot and resume key, so the tail call chains into the RIGHT loop.
+///
+/// Decline (`None`, after tallying which question answered) when the target is
+/// unpublished (descr stripped, or its loop declined/was dropped), the JUMP
+/// arity differs from the label's arg count (the resume loader reads exactly
+/// that many positional frame slots), or the label's args are not the complete
+/// live set of the target trace's remainder (`resume_safe` — resuming there
+/// would read a null local).
+///
+/// `source` is the frame a chained bridge already runs on, with the table slot
+/// of the loop that owns it. `compile_bridge` supplies it: that bridge shares
+/// the source token's frozen layout, so the target's geometry must agree with
+/// it exactly, and a target whose backend capture slots were filled by its own
+/// fall-through (`requires_own_frame`) is resumable only when it IS that source
+/// loop. `compile_loop` passes `None` for an entry bridge, which owns its
+/// module and its frame: it has no source slot, so `requires_own_frame` always
+/// declines, and instead of matching a geometry it ADOPTS the target's (the
+/// caller checks its own slots fit, then compiles against `t.frame`).
+fn resolve_cross_loop_jump_target(
+    ops: &[Op],
+    source: Option<(u32, codegen::FrameGeometry)>,
+) -> Option<LabelTarget> {
+    let closing_jump = ops
+        .iter()
+        .rev()
+        .find(|op| op.opcode == majit_ir::OpCode::Jump);
+    let target_descr_id = closing_jump
+        .and_then(|j| j.getdescr())
+        .map(|d| std::sync::Arc::as_ptr(&d) as *const () as usize)
+        .filter(|id| *id != 0);
+    let target = target_descr_id.and_then(label_target);
+    let arity = closing_jump.map_or(0, |j| j.getarglist().len());
+    match target {
+        // Descr stripped, or the target label was never published.
+        None => {
+            diag_bump(8);
+            diag_bump(if target_descr_id.is_none() { 17 } else { 18 });
+            None
+        }
+        Some(t) if arity != t.num_args => {
+            diag_bump(10); // arity mismatch
+            None
+        }
+        Some(t) if !t.resume_safe => {
+            diag_bump(9); // label args not the full live set
+            None
+        }
+        Some(t) if t.requires_own_frame && Some(t.func_handle) != source.map(|(slot, _)| slot) => {
+            // The target's high capture homes were populated by its own
+            // fall-through path, not by this sibling source loop.
+            diag_bump(9);
+            None
+        }
+        Some(t) if source.is_some_and(|(_, frame)| t.frame != frame) => {
+            diag_bump(4); // target uses different frozen frame offsets
+            None
+        }
+        Some(t) => Some(t),
+    }
 }
 
 /// Resolve every distinct compiled target used by CALL_ASSEMBLER ops in this
@@ -1827,11 +1887,49 @@ impl majit_backend::Backend for WasmBackend {
         let raw_frame_value_slots = codegen::frame_value_slots(inputargs, ops);
         let raw_num_ref_homes = codegen::count_ref_homes(inputargs, ops);
         let label_ref_slots = codegen::label_ref_capture_slots(inputargs, ops);
-        let frame = codegen::FrameGeometry::compact(
-            raw_frame_value_slots.max(FROZEN_CHAIN_VALUE_SLOTS),
-            raw_num_ref_homes.max(FROZEN_CHAIN_REF_HOMES) + label_ref_slots,
-            label_ref_slots,
-        );
+        // An entry bridge (`compile.py:1006-1022 ResumeFromInterpDescr`) is sent
+        // to the backend through `compile_loop` like any loop, but it is not one:
+        // it has no LABEL of its own and ends in a JUMP into an
+        // already-compiled loop. Resolve that loop the same way `compile_bridge`
+        // resolves a loop-closing bridge's target, and ADOPT its frozen
+        // geometry — `LabelTarget::frame` exists because a tail call reuses the
+        // caller's frame, so the two layouts must agree offset for offset, not
+        // merely in size. Compiling against the target's geometry makes them
+        // agree by construction.
+        let entry_bridge_target = if has_cross_loop_terminal_jump(ops) {
+            let Some(target) = resolve_cross_loop_jump_target(ops, None) else {
+                diag_bump(2); // declined: JUMP target not chainable
+                return Err(BackendError::Unsupported(
+                    "wasm backend: cross-loop terminal JUMP target is not a \
+                     chainable published label"
+                        .into(),
+                ));
+            };
+            // Same fit test a chained bridge gets against its source frame: the
+            // adopted layout must hold everything this trace spills.
+            if raw_frame_value_slots > target.frame.value_slots
+                || raw_num_ref_homes > target.frame.ordinary_home_slots()
+            {
+                diag_bump(4);
+                return Err(BackendError::Unsupported(format!(
+                    "wasm backend: entry bridge needs values={raw_frame_value_slots}, \
+                     homes={raw_num_ref_homes}; target frozen layout has values={}, homes={}",
+                    target.frame.value_slots,
+                    target.frame.ordinary_home_slots(),
+                )));
+            }
+            Some(target)
+        } else {
+            None
+        };
+        let frame = match entry_bridge_target {
+            Some(target) => target.frame,
+            None => codegen::FrameGeometry::compact(
+                raw_frame_value_slots.max(FROZEN_CHAIN_VALUE_SLOTS),
+                raw_num_ref_homes.max(FROZEN_CHAIN_REF_HOMES) + label_ref_slots,
+                label_ref_slots,
+            ),
+        };
         let input_types: Vec<majit_ir::Type> = inputargs.iter().map(|ia| ia.tp).collect();
         // Count with CA direct-lowering enabled.  This is the safety census
         // for a pending self target: no CompiledWasmLoop exists yet to inspect.
@@ -1857,15 +1955,11 @@ impl majit_backend::Backend for WasmBackend {
         // Decline traces the wasm backend cannot compile correctly, so the
         // metainterp falls back to the interpreter (correct, if unaccelerated)
         // rather than installing a structurally-invalid trace module:
-        //   * CALL_ASSEMBLER inlines a loop-bearing callee by jumping into
-        //     another trace's compiled token. The wasm backend has no
-        //     inter-module trace chaining (each trace is its own module), so it
-        //     cannot execute the target — declining is the #62 loop-callee gap.
-        //   * A JUMP with no LABEL targets a *different* existing loop
-        //     (jump-to-existing-trace); compile_loop cannot supply the target
-        //     table slot, so codegen would tail-call slot 0 — the wrong
-        //     function. Declined here (is_loop=true).
-        if let Some(reason) = wasm_unsupported_trace_reason(ops, true, allow_ca) {
+        // CALL_ASSEMBLER inlines a loop-bearing callee by jumping into another
+        // trace's compiled token. The wasm backend has no inter-module trace
+        // chaining (each trace is its own module), so it cannot execute the
+        // target — declining is the #62 loop-callee gap.
+        if let Some(reason) = wasm_unsupported_trace_reason(ops, allow_ca) {
             return Err(BackendError::Unsupported(reason));
         }
         if allow_ca {
@@ -1901,8 +1995,11 @@ impl majit_backend::Backend for WasmBackend {
                 Arc::as_ptr(&token.invalidated) as usize as u32,
                 gc_table_base,
                 fail_index_base,
-                0, // external_jump_slot: a loop's JUMP is a local back-edge `br`
-                0, // external_jump_key: unused without an external JUMP
+                // A real loop's JUMP is a local back-edge `br` and needs
+                // neither; an entry bridge tail-calls the target loop's table
+                // slot and resumes at the label `external_jump_key` selects.
+                entry_bridge_target.map_or(0, |t| t.func_handle),
+                entry_bridge_target.map_or(0, |t| t.key),
                 frame,
                 ca_targets.as_ref().map_or_else(
                     || codegen::CaParams {
@@ -1946,6 +2043,15 @@ impl majit_backend::Backend for WasmBackend {
         if let Some(table) = gc_table {
             Self::register_gc_table(token, table);
         }
+
+        // `runner.rs:2269` / `compiler.rs:15613` parity: the entry path reads
+        // this to size the live-value list it hands `execute_token`
+        // (`jitdriver.rs extend_compiled_live_values` →
+        // `warmstate.py:188 cell.loop_token`). Leaving it unset makes a trace
+        // whose inputargs outnumber the portal's live values be entered with
+        // the short list, so every frame slot past it reads as a zero the
+        // prologue then loads as a null Ref.
+        token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp).collect());
 
         let max_output_slots = guard_exits
             .iter()
@@ -2370,7 +2476,7 @@ impl majit_backend::Backend for WasmBackend {
             diag_bump(15);
             allow_ca = false;
         }
-        if let Some(reason) = wasm_unsupported_trace_reason(ops, false, allow_ca) {
+        if let Some(reason) = wasm_unsupported_trace_reason(ops, allow_ca) {
             diag_bump(1); // declined: CALL_ASSEMBLER
             return Err(BackendError::Unsupported(
                 ca_trampoline_decline.unwrap_or(reason.as_str()).to_string(),
@@ -2430,81 +2536,25 @@ impl majit_backend::Backend for WasmBackend {
         // `declined_bridge_guards` stops the metainterp re-tracing it.
         // Non-peeled loops (entry == LABEL) re-enter correctly and keep
         // chaining.
-        let bridge_is_loop_closing = {
-            let has_label = ops.iter().any(|op| op.opcode == majit_ir::OpCode::Label);
-            let has_jump = ops.iter().any(|op| op.opcode == majit_ir::OpCode::Jump);
-            has_jump && !has_label
-        };
+        let bridge_is_loop_closing = has_cross_loop_terminal_jump(ops);
         if bridge_is_loop_closing {
             diag_bump(6); // loop-closing shape
         }
         if source_has_preamble {
             diag_bump(7); // source loop has preamble
         }
-        // Resolve the terminal JUMP's target label BY DESCR IDENTITY through
-        // the `LABEL_TARGETS` registry — the JUMP and its target LABEL share
-        // the loop-target descr Arc, and every compiled loop published its
-        // enterable labels there. The stamped `label_block_id` ordinal is NOT
-        // identity: a retraced loop has several sibling specializations whose
-        // start labels all carry ordinal 0, and a bridge legitimately closes
-        // into a SIBLING (jump-to-existing-trace) — the registry resolves the
-        // owning module's table slot and resume key, so the tail call chains
-        // into the RIGHT loop, own or sibling. Decline when the target is
-        // unpublished (descr stripped, or its loop declined/was dropped), the
-        // JUMP arity differs from the label's arg count (the resume loader
-        // reads exactly that many positional frame slots), the label's args
-        // are not the complete live set of the target trace's remainder
-        // (`resume_safe` — resuming there would read a null local), or the
-        // target loop's frozen frame geometry differs from the source frame.
-        // A declined guard falls back to blackhole resume and
-        // `declined_bridge_guards` stops the metainterp re-tracing it.
         let mut external_jump_key: u32 = 0;
         let mut external_jump_slot: u32 = source_func_handle;
         let mut resumes_at_loop_header = false;
         if bridge_is_loop_closing {
-            let closing_jump = ops
-                .iter()
-                .rev()
-                .find(|op| op.opcode == majit_ir::OpCode::Jump);
-            let target_descr_id = closing_jump
-                .and_then(|j| j.getdescr())
-                .map(|d| std::sync::Arc::as_ptr(&d) as *const () as usize)
-                .filter(|id| *id != 0);
-            let target = target_descr_id.and_then(label_target);
-            let arity = closing_jump.map_or(0, |j| j.getarglist().len());
-            let accepted_target = match target {
-                // Descr stripped, or the target label was never published.
-                None => {
-                    diag_bump(8);
-                    diag_bump(if target_descr_id.is_none() { 17 } else { 18 });
-                    false
-                }
-                Some(t) if arity != t.num_args => {
-                    diag_bump(10); // arity mismatch
-                    false
-                }
-                Some(t) if !t.resume_safe => {
-                    diag_bump(9); // label args not the full live set
-                    false
-                }
-                Some(t) if t.requires_own_frame && t.func_handle != source_func_handle => {
-                    // The target's high capture homes were populated by its
-                    // own fall-through path, not by this sibling source loop.
-                    diag_bump(9);
-                    false
-                }
-                Some(t) if t.frame != source_frame => {
-                    diag_bump(4); // target uses different frozen frame offsets
-                    false
-                }
-                Some(t) => {
-                    external_jump_key = t.key;
-                    external_jump_slot = t.func_handle;
-                    resumes_at_loop_header = t.is_last_label;
-                    true
-                }
-            };
-            if !accepted_target {
+            let target =
+                resolve_cross_loop_jump_target(ops, Some((source_func_handle, source_frame)));
+            if let Some(t) = target {
+                external_jump_key = t.key;
+                external_jump_slot = t.func_handle;
+                resumes_at_loop_header = t.is_last_label;
+            }
+            if target.is_none() {
                 diag_bump(2); // declined: JUMP target not chainable
                 return Err(BackendError::Unsupported(
                     "wasm backend: loop-closing bridge JUMP target is not a \
