@@ -2765,14 +2765,49 @@ unsafe fn try_compare_override(
     };
     for (ov, recv, other) in order {
         if let Some((method, w_type)) = ov {
-            let result =
-                crate::baseobjspace::get_and_call_function(method, recv, w_type, &[other])?;
-            if !is_not_implemented(result) {
+            if let Some(result) = unsafe { invoke_comparison(method, recv, w_type, other) }? {
                 return Ok(Some(result));
             }
         }
     }
     Ok(None)
+}
+
+/// PyPy `descroperation.py:_invoke_comparison`.
+///
+/// A plain function is called directly, so every exception from its body is
+/// observable. Other descriptors bind through `space.get`; only an
+/// `AttributeError` raised by that binding step means that this comparison
+/// implementation is absent (notably `__eq__ = property(...)`).
+unsafe fn invoke_comparison(
+    w_descr: PyObjectRef,
+    w_obj: PyObjectRef,
+    w_type: PyObjectRef,
+    w_other: PyObjectRef,
+) -> Result<Option<PyObjectRef>, PyError> {
+    let direct_function = std::ptr::eq(
+        unsafe { (*w_descr).ob_type },
+        &crate::function::FUNCTION_TYPE as *const _,
+    ) || std::ptr::eq(
+        unsafe { (*w_descr).ob_type },
+        &crate::function::METHOD_DESCRIPTOR_TYPE as *const _,
+    );
+    let result = if direct_function {
+        crate::call::call_function_impl_result(w_descr, &[w_obj, w_other])?
+    } else {
+        let w_impl = match unsafe { crate::baseobjspace::get(w_descr, w_obj, w_type) } {
+            Ok(Some(w_impl)) => w_impl,
+            Ok(None) => w_descr,
+            Err(err) if err.kind == PyErrorKind::AttributeError => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        crate::call::call_function_impl_result(w_impl, &[w_other])?
+    };
+    if is_not_implemented(result) {
+        Ok(None)
+    } else {
+        Ok(Some(result))
+    }
 }
 
 /// Map forward dunder to reverse dunder.

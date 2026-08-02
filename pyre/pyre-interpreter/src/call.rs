@@ -4286,16 +4286,6 @@ fn build_class_inner(
             })
     };
 
-    // typeobject.c type_new: every class carries `__doc__` (None when the
-    // body has no docstring) so instances inherit it through the type MRO.
-    // The compiler only stores `__doc__` when a docstring is present.  Skip
-    // the default when `__doc__` is a declared slot — a class variable would
-    // collide with the member descriptor (typing._SpecialForm).
-    {
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        crate::builtins::type_new_set_doc(class_ns)?;
-    }
-
     // Create W_TypeObject from the class namespace
     // PyPy: type.__new__(type, name, bases, dict_w) + compute_mro + ready()
     // PyPy: typeobject.py — if not bases_w: bases_w = [space.w_object]
@@ -4434,6 +4424,13 @@ fn build_class_inner(
         // type.__new__ must not be repaired or overwritten here.
         result
     } else {
+        // typeobject.py:1554 `ensure_common_attributes` belongs to type
+        // construction, not to `__build_class__` namespace preparation.  A
+        // custom non-type metaclass must observe the compiler-produced
+        // namespace without an invented `__doc__` key; the default shortcut
+        // performs type.__new__'s step here before copying the type dict.
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        crate::builtins::type_new_set_doc(class_ns)?;
         // No metaclass observes the namespace on the default path, so
         // consume the explicit class cells here (type_new_classcell leaves
         // them out of the class `__dict__`); the captured `classcell` is

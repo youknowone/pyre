@@ -9339,9 +9339,21 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     // `syntax_error_subclass` can supply a replacement message, so it
     // runs before the located error is built.
     let subclass = syntax_error_subclass(&e, source);
-    let msg = match subclass {
-        Some((_, Some(replacement))) => replacement.to_string(),
-        _ => e.to_string(),
+    let msg = if let Some((_, Some(replacement))) = subclass {
+        replacement.to_string()
+    } else if let crate::compile::CompileError::Parse(parse_err) = &e {
+        // astcompiler/codegen.py:3048-3051 reports duplicate call/class
+        // keywords after parsing, using CPython 3.14's lower-case wording.
+        // Ruff detects the same condition in its parser, so normalize only
+        // that structured error rather than rewriting arbitrary messages.
+        match &parse_err.error {
+            ParseErrorType::DuplicateKeywordArgumentError(name) => {
+                format!("keyword argument repeated: {name}")
+            }
+            _ => e.to_string(),
+        }
+    } else {
+        e.to_string()
     };
     let (lineno, offset) = e.python_location();
     let mut error = if lineno == 0 {
