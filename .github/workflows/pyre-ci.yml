@@ -26,8 +26,12 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: pyre-ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # A PR's runs supersede each other — only the tip matters there. A push to a
+  # tracked branch must not be, or a merge train cancels every predecessor's run
+  # and the branch goes unverified: keying those by SHA gives each landed commit
+  # its own group, so nothing cancels and a red commit is attributable to itself.
+  group: pyre-ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
