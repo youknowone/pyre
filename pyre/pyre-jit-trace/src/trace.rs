@@ -2302,8 +2302,8 @@ fn try_adopt_single_frame_blackhole(
     // earns by aborting only once `latch_abort_blackhole` has succeeded
     // (`trace_too_long_abort_safe`).  A capability-gap abort fires regardless of
     // the latch, so its adopt must still be able to decline into legacy replay.
-    let publishes_root_stack = commit_leg == WalkEndCommitLeg::TraceTooLong
-        || commit_leg == WalkEndCommitLeg::WalkAbort;
+    let publishes_root_stack =
+        commit_leg == WalkEndCommitLeg::TraceTooLong || commit_leg == WalkEndCommitLeg::WalkAbort;
     let Some(mut latched) = crate::jitcode_dispatch::take_single_frame_blackhole() else {
         assert!(
             !trace_too_long,
@@ -3946,10 +3946,15 @@ fn run_perfn_walk<Sym: WalkSym>(
         // family of aborts upstream has no counterpart for — the abort IS the
         // report that a register / concrete / descr could not be resolved — and
         // for those the MIFrame the latch would build is missing exactly the
-        // value the blackhole resumes on.  Measured: adopting a single
-        // `RegisterReadUnbound` walk in `list_length_hint_validate` left the
-        // interpreter underflowing its operand stack, and
-        // `raise_reg_unbound_jitstress` aborted inside `bh_call_fn_0`.
+        // value the blackhole resumes on.  Measured over the 353 synth
+        // fixtures with the classification removed, 351 are unchanged and two
+        // break: `list_length_hint_validate` adopts its one
+        // `RegisterReadUnbound` walk (`pc=456 reg=3 bank=r`) and underflows the
+        // operand stack, and `getframe_while_subwalk_decline_shapes` — a
+        // fixture pinned precisely so that "the decline stays a decline rather
+        // than silently becoming a wrong answer" — adopts an inline-escape
+        // shape whose caller banks are incomplete and dies on an unwired
+        // blackhole opcode.
         let walk_abort_adopted = !trace_too_long_adopted
             && matches!(&walk_result, Err(error) if error.leaves_complete_image() && !matches!(
                 error,
