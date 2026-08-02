@@ -1,12 +1,14 @@
 //! _functools module — CPython accelerator imported by
 //! `lib-python/3/functools.py`.
 //!
-//! `cmp_to_key` returns the `keyobject` accelerator payload rather than the
-//! stdlib fallback's lexical `K`, so `type(cmp_to_key(f))` is
-//! `functools.KeyWrapper`. `partial` follows PyPy's `lib_pypy/_functools.py`:
-//! its public state is exposed through read-only properties backed by private
-//! slots. Placeholder argument merging follows the Python 3.14 `functools.py`
-//! implementation.
+//! `cmp_to_key` follows the stdlib fallback structurally: each invocation
+//! creates a lexical `K`, capturing `mycmp` instead of exposing it on K.
+//! `W_KeyWrapper` below carries the `keyobject` payload shape but is not what
+//! `cmp_to_key` hands out — its `__call__` is generated positional-only, while
+//! `keyobject` takes `obj` by keyword and reports `(obj)` to `inspect`.
+//! `partial` follows PyPy's `lib_pypy/_functools.py`: its public state is
+//! exposed through read-only properties backed by private slots. Placeholder
+//! argument merging follows the Python 3.14 `functools.py` implementation.
 
 use pyre_object::*;
 
@@ -455,40 +457,35 @@ class partial:
 
 
 partial.__module__ = "functools"
-"# => ["partial", "Placeholder", "_PlaceholderType"],
-    },
-    inline_functions: {
-        fn cmp_to_key(mycmp: PyObjectRef) -> PyObjectRef {
-            key_wrapper_new(mycmp, w_none())
-        }
+
+
+def cmp_to_key(mycmp):
+    class K(object):
+        __slots__ = ['obj']
+        def __init__(self, obj):
+            self.obj = obj
+        def __lt__(self, other):
+            return mycmp(self.obj, other.obj) < 0
+        def __gt__(self, other):
+            return mycmp(self.obj, other.obj) > 0
+        def __eq__(self, other):
+            return mycmp(self.obj, other.obj) == 0
+        def __le__(self, other):
+            return mycmp(self.obj, other.obj) <= 0
+        def __ge__(self, other):
+            return mycmp(self.obj, other.obj) >= 0
+        __hash__ = None
+    return K
+
+# `_functools.cmp_to_key` is an interp-level builtin in CPython.  Unlike an
+# app-level function, it therefore does not acquire an instance when a caller
+# stores it on a class (the CPython functools tests do exactly that).  A
+# callable staticmethod preserves the app-level implementation while giving
+# the exported object the same non-binding descriptor behavior.
+cmp_to_key = staticmethod(cmp_to_key)
+"# => ["cmp_to_key", "partial", "Placeholder", "_PlaceholderType"],
     },
     functions: {
         "reduce" / * = reduce,
-    },
-    extra_init: |ns| {
-        // `inspect.signature` reads the PEP 437 text signature from the
-        // builtin function carrier.  The Rust macro signature is used for
-        // keyword binding, but does not synthesize this user-visible field.
-        if let Some(cmp_to_key) =
-            unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(ns, "cmp_to_key") }
-        {
-            unsafe {
-                crate::function::fset_func_text_signature(cmp_to_key, w_str_new("(mycmp)"));
-            }
-        }
-        let key_type = type_object();
-        if let Some(call_method) =
-            unsafe { crate::baseobjspace::lookup_in_type(key_type, "__call__") }
-        {
-            // `inspect` retrieves the unbound descriptor then removes its
-            // first parameter for the bound key object.  The method wrapper
-            // is a regular function carrier, so use its public field setter
-            // rather than assuming the concrete carrier layout here.
-            let _ = crate::baseobjspace::setattr_str(
-                call_method,
-                "__text_signature__",
-                w_str_new("(self, obj)"),
-            );
-        }
     },
 }
