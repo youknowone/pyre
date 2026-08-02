@@ -1307,6 +1307,67 @@ pub fn get_awaitable_iter(w_obj: PyObjectRef, context: u32) -> PyResult {
 /// A missing `__set_name__` is a no-op.  When the call raises, the original
 /// exception is re-raised with an `"Error calling __set_name__ ..."` note
 /// attached (PEP 678), mirroring `_PyErr_FormatNote`.
+fn add_internal_exception_note(error: &mut PyError, text: &str) -> Result<(), PyError> {
+    // CPython 3.14 `_PyException_AddNote` writes the exception's `__notes__`
+    // list directly.  It does not dispatch through a Python override of
+    // `add_note`; this is interpreter bookkeeping, not a method call.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exc = error.to_exc_object();
+    pyre_object::gc_roots::pin_root(exc);
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let note = w_str_new(text);
+    pyre_object::gc_roots::pin_root(note);
+    let note_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    let rooted_exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    let dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(rooted_exc) };
+    pyre_object::gc_roots::pin_root(dict);
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let notes = match unsafe {
+        w_dict_getitem_str(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            "__notes__",
+        )
+    } {
+        Some(notes) if unsafe { isinstance_list_w(notes) } => notes,
+        Some(_) => {
+            let mut note_error = PyError::type_error("Cannot add note: __notes__ is not a list");
+            let note_exc = note_error.to_exc_object();
+            pyre_object::gc_roots::pin_root(note_exc);
+            let note_exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            crate::error::chain_context(
+                pyre_object::gc_roots::shadow_stack_get(note_exc_slot),
+                pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            );
+            note_error.exc_object = pyre_object::gc_roots::shadow_stack_get(note_exc_slot);
+            return Err(note_error);
+        }
+        None => {
+            let notes = w_list_new(Vec::new());
+            pyre_object::gc_roots::pin_root(notes);
+            let notes_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                    "__notes__",
+                    pyre_object::gc_roots::shadow_stack_get(notes_slot),
+                );
+            }
+            pyre_object::gc_roots::shadow_stack_get(notes_slot)
+        }
+    };
+    pyre_object::gc_roots::pin_root(notes);
+    let notes_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    unsafe {
+        w_list_append(
+            pyre_object::gc_roots::shadow_stack_get(notes_slot),
+            pyre_object::gc_roots::shadow_stack_get(note_slot),
+        );
+    }
+    error.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    Ok(())
+}
+
 pub(crate) unsafe fn set_name(
     w_owner: PyObjectRef,
     w_name: PyObjectRef,
@@ -1332,26 +1393,21 @@ pub(crate) unsafe fn set_name(
         )
     } {
         Ok(_) => Ok(()),
-        Err(e) => {
-            if !e.exc_object.is_null() {
-                let name_repr = if unsafe { is_str(w_name) } {
-                    crate::display::format_wtf8_repr(unsafe { w_str_get_wtf8(w_name) })
-                } else {
-                    String::new()
-                };
-                let val_type_name =
-                    unsafe { pyre_object::w_type_get_name(w_valtype.as_ptr()) }.to_string();
-                let owner_name = unsafe { pyre_object::w_type_get_name(w_owner) }.to_string();
-                let note = w_str_new(&format!(
+        Err(mut e) => {
+            let name_repr = if unsafe { is_str(w_name) } {
+                crate::display::format_wtf8_repr(unsafe { w_str_get_wtf8(w_name) })
+            } else {
+                String::new()
+            };
+            let val_type_name =
+                unsafe { pyre_object::w_type_get_name(w_valtype.as_ptr()) }.to_string();
+            let owner_name = unsafe { pyre_object::w_type_get_name(w_owner) }.to_string();
+            add_internal_exception_note(
+                &mut e,
+                &format!(
                     "Error calling __set_name__ on '{val_type_name}' instance {name_repr} in '{owner_name}'"
-                ));
-                if let Ok(add) = getattr_str(e.exc_object, "add_note") {
-                    // add_note is best-effort: a failure to attach the note must
-                    // not mask the original __set_name__ exception `e`, which is
-                    // re-raised below.
-                    if let Err(_e) = crate::call::call_function_impl_result(add, &[note]) {}
-                }
-            }
+                ),
+            )?;
             Err(e)
         }
     }
