@@ -11875,6 +11875,13 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
         pyre_object::MEMBER_EXCEPTION_GROUP_EXCEPTIONS => {
             Ok(crate::builtins::exception_group_fields(obj)?.1)
         }
+        pyre_object::MEMBER_SYNTAX_ERROR_METADATA => {
+            let dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) };
+            Ok(
+                unsafe { pyre_object::w_dict_getitem_str(dict, "_metadata") }
+                    .unwrap_or_else(pyre_object::w_none),
+            )
+        }
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
         pyre_object::MEMBER_DESCR_NAME => unsafe { descr_member_name(obj) },
         _ => Err(crate::PyError::attribute_error(unsafe {
@@ -11905,6 +11912,11 @@ pub(crate) unsafe fn direct_member_set(
             }
             Ok(pyre_object::w_none())
         }
+        pyre_object::MEMBER_SYNTAX_ERROR_METADATA => {
+            let dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) };
+            unsafe { pyre_object::w_dict_setitem_str_no_proxy(dict, "_metadata", value) };
+            Ok(pyre_object::w_none())
+        }
         _ => Err(crate::PyError::attribute_error("readonly attribute")),
     }
 }
@@ -11930,6 +11942,11 @@ pub(crate) unsafe fn direct_member_delete(
             } else {
                 unsafe { crate::function::fdel___module__(obj)? };
             }
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_METADATA => {
+            let dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) };
+            unsafe { pyre_object::w_dict_delitem_str_no_proxy(dict, "_metadata") };
             Ok(pyre_object::w_none())
         }
         _ => Err(crate::PyError::attribute_error("readonly attribute")),

@@ -6785,6 +6785,20 @@ fn make_exc_type_with_init(
             // `interp_exceptions.py` declares each class's typed attributes
             // as `GetSetProperty` entries on its own `TypeDef`.
             install_exception_getsets(ns, name);
+            if name == "SyntaxError" {
+                unsafe {
+                    pyre_object::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "_metadata",
+                        pyre_object::w_member_new_direct_with_doc(
+                            pyre_object::MEMBER_SYNTAX_ERROR_METADATA,
+                            "_metadata".to_owned(),
+                            "exception private metadata".to_owned(),
+                            pyre_object::PY_NULL,
+                        ),
+                    );
+                }
+            }
             // `interp_exceptions.py:291-292` registers `__str__` /
             // `__repr__` on `BaseException`'s typedef, and each of the
             // classes below registers a `descr_str` of its own on top.  A
@@ -7031,6 +7045,11 @@ fn make_exc_type_with_init(
         base,
         &pyre_object::interp_exceptions::EXCEPTION_TYPE as *const pyre_object::PyType,
     );
+    if name == "SyntaxError" {
+        if let Some(member) = crate::type_dict_lookup(cls, "_metadata") {
+            unsafe { pyre_object::w_member_set_cls(member, cls) };
+        }
+    }
     // Record the class so typedef::r#type can map a raised exception
     // back to its specific builtin class (TypeError, ValueError, ...).
     register_exc_class(name, cls)

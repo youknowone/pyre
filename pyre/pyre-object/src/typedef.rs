@@ -276,6 +276,8 @@ pub const MEMBER_DESCR_NAME: u32 = MEMBER_DIRECT_FLAG | 9;
 /// message and tuple of nested exceptions.
 pub const MEMBER_EXCEPTION_GROUP_MESSAGE: u32 = MEMBER_DIRECT_FLAG | 10;
 pub const MEMBER_EXCEPTION_GROUP_EXCEPTIONS: u32 = MEMBER_DIRECT_FLAG | 11;
+/// CPython 3.14 `SyntaxError_members._metadata`, a writable private slot.
+pub const MEMBER_SYNTAX_ERROR_METADATA: u32 = MEMBER_DIRECT_FLAG | 12;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {
