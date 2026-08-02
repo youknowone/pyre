@@ -61,6 +61,13 @@ fn structseq_registry() -> &'static Mutex<IndexMap<usize, StructSeqDescr>> {
     STRUCTSEQ_REGISTRY.get_or_init(|| Mutex::new(IndexMap::new()))
 }
 
+/// Whether `obj` is one of the heap types created by `structseqtype`.
+/// Structseq types are unacceptable as bases but, unlike most types with that
+/// flag, their constructor accepts the `sequence=` and `dict=` keywords.
+pub(crate) fn is_structseq_type(obj: PyObjectRef) -> bool {
+    structseq_registry().lock().unwrap().contains_key(&(obj as usize))
+}
+
 /// `lib_pypy/_structseq.py:31-37 structseqfield.__get__` —
 /// resolves the descriptor's name to a positional index via the
 /// per-type registry and returns `obj[index]`.
@@ -576,7 +583,7 @@ fn make_struct_seq_impl(
 
     let tuple_type = crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE);
 
-    let cls = crate::typedef::make_builtin_type_with_base(
+    let cls = make_heap_structseq_type(
         name,
         move |ns| {
             // `_structseq.py:79-80` — `__new__` / `__reduce__` /
@@ -712,4 +719,70 @@ fn make_struct_seq_impl(
     }
 
     cls
+}
+
+/// `lib_pypy/_structseq.py:43-87 structseqtype.__new__` creates an ordinary
+/// heap type through `type.__new__`, even though its instances use tuple
+/// storage.  Keep that ownership shape: structseq classes have mutable class
+/// dictionaries (and can therefore participate in cycles with instances),
+/// while remaining unacceptable as base classes like CPython 3.14 structseqs.
+fn make_heap_structseq_type(
+    full_name: &str,
+    init: impl FnOnce(PyObjectRef),
+    base: PyObjectRef,
+) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::w_dict_new();
+    pyre_object::gc_roots::pin_root(ns);
+    init(ns);
+
+    let (module, short_name) = full_name
+        .rsplit_once('.')
+        .map_or((None, full_name), |(module, name)| (Some(module), name));
+    if let Some(module) = module {
+        let w_module = pyre_object::w_str_new(module);
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                "__module__",
+                w_module,
+            )
+        };
+    }
+
+    let bases = pyre_object::w_tuple_new(vec![base]);
+    pyre_object::gc_roots::pin_root(bases);
+    let bases_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let cls = pyre_object::w_type_new(
+        short_name,
+        pyre_object::gc_roots::shadow_stack_get(bases_slot),
+        pyre_object::gc_roots::shadow_stack_get(ns_slot) as *mut u8,
+    );
+    pyre_object::gc_roots::pin_root(cls);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
+    unsafe {
+        let parent_layout = pyre_object::w_type_get_layout_ptr(base);
+        pyre_object::w_type_set_layout(cls, parent_layout);
+        pyre_object::w_type_set_hasdict(cls, pyre_object::w_type_get_hasdict(base));
+        pyre_object::w_type_set_weakrefable(cls, pyre_object::w_type_get_weakrefable(base));
+        // CPython's PyStructSequence types set no acceptable-base flag.
+        pyre_object::w_type_set_acceptable_as_base_class(cls, false);
+
+        let base_mro = pyre_object::w_type_get_mro(base);
+        let mut mro = vec![cls];
+        if !base_mro.is_null() {
+            mro.extend_from_slice((*base_mro).as_slice());
+        } else {
+            mro.push(base);
+        }
+        pyre_object::w_type_set_mro(cls, mro);
+        crate::typedef::stamp_new_descr_self(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            cls,
+        );
+        pyre_object::typeobject::w_type_ready(cls);
+    }
+    pyre_object::gc_roots::shadow_stack_get(cls_slot)
 }

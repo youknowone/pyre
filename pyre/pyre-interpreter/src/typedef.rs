@@ -2081,7 +2081,7 @@ pub(crate) unsafe fn stamp_builtin_owner(func: PyObjectRef, type_name: &str) {
 ///
 /// # Safety
 /// `ns` must be a valid, live `W_DictObject`; `type_obj` a valid type.
-unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef) {
+pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
     let save_point = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(ns);

@@ -2803,7 +2803,7 @@ pub fn call_with_kwargs(
         ) || std::ptr::eq(
             current_type(),
             crate::module::_contextvars::context_var_type(),
-        );
+        ) || crate::_structseq::is_structseq_type(current_type());
         if !kwargs.is_empty()
             && !accepts_keywords_despite_nonbase
             && !unsafe { pyre_object::w_type_get_acceptable_as_base_class(current_type()) }
