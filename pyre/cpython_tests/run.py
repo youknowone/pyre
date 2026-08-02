@@ -122,9 +122,20 @@ def jit_panic_reason(stderr: str) -> str | None:
     if not stderr:
         return None
     if "panicked" in stderr:
-        for line in stderr.splitlines():
+        lines = stderr.splitlines()
+        for idx, line in enumerate(lines):
             if "panicked" in line:
-                return f"rust panic: {line.strip()[:80]}"
+                reason = f"rust panic: {line.strip()[:80]}"
+                # Rust's default hook prints the panic MESSAGE on the line(s)
+                # after 'panicked at file:line:col:'. That body carries the
+                # actionable detail; the location line alone cannot triage a
+                # crash from a CI log, so append the first message line.
+                for follow in lines[idx + 1:]:
+                    follow = follow.strip()
+                    if follow:
+                        reason += f" | {follow[:200]}"
+                        break
+                return reason
         return "rust panic"
     for line in stderr.splitlines():
         if line.startswith("[jit-stats]") and "internal_compile_panics=" in line:
