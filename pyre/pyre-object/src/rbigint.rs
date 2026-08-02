@@ -18,7 +18,8 @@ use std::cmp::Ordering;
 use crate::object_array::{
     GC_INT_ARRAY_GC_TYPE_ID, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TypedItemsBlock,
     alloc_typed_items_block_immortal, alloc_typed_items_block_nursery,
-    try_alloc_typed_items_block_nursery, typed_items_block_capacity, typed_items_block_items_base,
+    try_alloc_typed_items_block_nursery, typed_items_block_capacity, typed_items_block_clear,
+    typed_items_block_items_base,
 };
 
 pub const SUPPORT_INT128: bool = true;
@@ -857,12 +858,15 @@ impl RBigInt {
         })
     }
 
-    /// Allocate the translated equivalent of `[NULLDIGIT] * size`.
+    /// Allocate the translated equivalent of `[NULLDIGIT] * size`:
+    /// `ll_alloc_and_set(LIST, size, 0)`, which is `ll_newlist` followed by
+    /// `rgc.ll_arrayclear` (rtyper/rlist.py:494-503).
     #[inline]
     fn with_size(size: i64, sign: i64) -> Self {
         debug_assert!(size >= 0);
         let block =
             unsafe { alloc_typed_items_block_nursery(size as usize, GC_INT_ARRAY_GC_TYPE_ID) };
+        unsafe { typed_items_block_clear(block) };
         Self {
             _digits: block,
             _size: size * sign,
@@ -879,6 +883,7 @@ impl RBigInt {
             try_alloc_typed_items_block_nursery(allocation_size, GC_INT_ARRAY_GC_TYPE_ID)
         }
         .ok_or(RBigIntError::Memory)?;
+        unsafe { typed_items_block_clear(block) };
         Ok(Self {
             _digits: block,
             _size: size * sign,

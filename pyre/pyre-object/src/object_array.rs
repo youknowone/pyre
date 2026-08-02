@@ -754,9 +754,17 @@ pub unsafe fn alloc_typed_items_block_nursery(cap: usize, tid: u32) -> *mut Type
 
 /// Fallible companion of [`alloc_typed_items_block_nursery`].
 ///
+/// `ll_newlist` (rlist.py:324-329) allocates the items array and writes the
+/// length header; the items keep whatever the nursery held, because
+/// `malloc_zero_filled` is false for incminimark (incminimark.py:211). Callers
+/// that need `[0] * n` clear it themselves with
+/// [`typed_items_block_clear`], which is what `ll_alloc_and_set` does
+/// (rtyper/rlist.py:494-503); callers building a list display write every slot.
+///
 /// # Safety
 /// `tid` must name a registered array type with no destructor and no weakref
-/// flag — the `GcArray(Signed)` / `GcArray(Float)` bodies this serves.
+/// flag — the `GcArray(Signed)` / `GcArray(Float)` bodies this serves. Every
+/// item the caller reads must be one it has written.
 pub unsafe fn try_alloc_typed_items_block_nursery(
     cap: usize,
     tid: u32,
@@ -771,27 +779,37 @@ pub unsafe fn try_alloc_typed_items_block_nursery(
             Some(raw) if raw.is_null() => return None,
             Some(raw) => {
                 let block = raw as *mut TypedItemsBlock;
-                unsafe {
-                    (*block).capacity = cap;
-                    std::ptr::write_bytes(
-                        typed_items_block_items_base(block),
-                        0,
-                        cap * std::mem::size_of::<u64>(),
-                    );
-                }
+                unsafe { (*block).capacity = cap };
                 return Some(block);
             }
             None => {}
         }
     }
     unsafe {
-        let raw = alloc_zeroed(layout);
+        let raw = alloc(layout);
         if raw.is_null() {
             return None;
         }
         let block = raw as *mut TypedItemsBlock;
         (*block).capacity = cap;
         Some(block)
+    }
+}
+
+/// `rgc.ll_arrayclear(l.ll_items())` — zero every item of a freshly allocated
+/// block, the second half of `ll_alloc_and_set(LIST, count, 0)`
+/// (rtyper/rlist.py:494-503).
+///
+/// # Safety
+/// `block` must be a live items block.
+#[inline]
+pub unsafe fn typed_items_block_clear(block: *mut TypedItemsBlock) {
+    unsafe {
+        std::ptr::write_bytes(
+            typed_items_block_items_base(block),
+            0,
+            (*block).capacity * std::mem::size_of::<u64>(),
+        );
     }
 }
 
