@@ -224,7 +224,7 @@ fn structseq_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 /// tuple body; any surplus positional items, then the optional dict, then
 /// `None` defaults, fill the named-only extra fields.
 fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    if args.len() < 2 {
+    if args.len() < 2 || args[1].is_null() {
         return Err(PyError::type_error("structseq() requires class + sequence"));
     }
     let cls = args[0];
@@ -245,7 +245,10 @@ fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             args.len() - 1
         )));
     }
-    let dict_arg = args.get(2).copied();
+    // Signature binding leaves an omitted optional argument as PY_NULL.  An
+    // explicit None is different and is rejected by both PyPy's
+    // `isinstance(dict, builtin_dict)` and CPython 3.14's `PyDict_Check`.
+    let dict_arg = args.get(2).copied().filter(|d| !d.is_null());
     if let Some(d) = dict_arg {
         if !unsafe { pyre_object::is_dict(d) } {
             return Err(PyError::type_error(format!(
@@ -291,15 +294,39 @@ fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let surplus = items.len() - n_seq;
     let surplus_vals: Vec<PyObjectRef> = items.split_off(n_seq);
     let body = items;
+
+    // CPython 3.14 consumes only named-only fields that have not already
+    // been supplied by surplus sequence items.  Any remaining key is either
+    // a duplicate positional value or an unknown field; both use the shared
+    // structseq diagnostic.  PyPy's older app-level constructor only noticed
+    // duplicates among extra fields, so the 3.14 rule wins here.
+    if let Some(d) = dict_arg {
+        let allowed = &extra_names[surplus..];
+        let has_unexpected = unsafe { pyre_object::w_dict_items(d) }
+            .into_iter()
+            .any(|(key, _)| {
+                if !unsafe { pyre_object::is_str(key) } {
+                    return true;
+                }
+                let key = unsafe { pyre_object::w_str_get_value(key) };
+                !allowed.iter().any(|name| name == &key)
+            });
+        if has_unexpected {
+            return Err(PyError::type_error(
+                "got duplicate or unexpected field name(s)",
+            ));
+        }
+    }
+
     let mut extras: Vec<(&str, PyObjectRef)> = Vec::with_capacity(extra_names.len());
     for (i, ename) in extra_names.iter().enumerate() {
         let in_dict = dict_arg
             .is_some_and(|d| unsafe { pyre_object::w_dict_getitem_str(d, ename).is_some() });
         let value = if i < surplus {
             if in_dict {
-                return Err(PyError::type_error(format!(
-                    "duplicate value for '{ename}'"
-                )));
+                return Err(PyError::type_error(
+                    "got duplicate or unexpected field name(s)",
+                ));
             }
             surplus_vals[i]
         } else if let Some(d) = dict_arg {
@@ -449,7 +476,16 @@ fn make_struct_seq_impl(
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "__new__",
-                    crate::typedef::make_new_descr(structseq_descr_new),
+                    crate::typedef::make_new_descr_with_signature(
+                        structseq_descr_new,
+                        crate::gateway::Signature::new(
+                            vec!["cls", "sequence", "dict"],
+                            None,
+                            None,
+                            0,
+                            1,
+                        ),
+                    ),
                 )
             };
             unsafe {
