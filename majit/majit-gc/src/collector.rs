@@ -2961,6 +2961,66 @@ impl MiniMarkGC {
     /// (incminimark.py:2739-2752) does not need this guard because RPython's
     /// type system guarantees every `Ptr(GcStruct)` is GC-managed; it converges
     /// away once every `gc_ptr_offsets` target is a real GC allocation.
+    /// Total size of `addr`, or `None` when its header does not decode to a
+    /// registered type. The panicking [`Self::object_total_size`] is unusable
+    /// from a diagnostic that is already reporting a corrupt heap.
+    fn try_object_total_size(&self, addr: usize) -> Option<usize> {
+        let type_id = unsafe { (*header_of(addr)).type_id() } as usize;
+        if type_id >= self.types.len() {
+            return None;
+        }
+        let type_info = self.types.get(type_id as u32);
+        let payload_size = if type_info.item_size > 0 {
+            let length = unsafe { *((addr + type_info.length_offset) as *const usize) };
+            type_info.total_instance_size(length)
+        } else {
+            type_info.size
+        };
+        Some(GcHeader::SIZE + payload_size)
+    }
+
+    /// Which object actually owns `slot_addr`.
+    ///
+    /// A `custom_trace` may hand the collector slots that live outside the
+    /// object it was called on — the mapdict storage block and the module-dict
+    /// storage boxes are walked that way. When the child in such a slot is
+    /// corrupt, the discriminating question is whether the *container* was
+    /// reclaimed (its own header would be a freelist link) or the child was, and
+    /// the panic's `holder_*` fields answer neither. Locate the container by
+    /// testing each of the holder's leading words for an extent that covers the
+    /// slot, and report its header.
+    fn describe_enclosing_container(
+        &self,
+        holder_addr: usize,
+        slot_addr: usize,
+        holder_words: &[usize],
+    ) -> String {
+        if let Some(size) = self.try_object_total_size(holder_addr)
+            && (holder_addr..holder_addr + size).contains(&slot_addr)
+        {
+            return "self".to_string();
+        }
+        for (index, &word) in holder_words.iter().enumerate() {
+            if !self.is_managed_heap_object(word) {
+                continue;
+            }
+            let Some(size) = self.try_object_total_size(word) else {
+                continue;
+            };
+            if !(word..word + size).contains(&slot_addr) {
+                continue;
+            }
+            let hdr = unsafe { *header_of(word) };
+            return format!(
+                "word{index}@{word:#x} tid={} tid_and_flags={:#x} size={size} slot_offset={}",
+                hdr.type_id(),
+                hdr.tid_and_flags,
+                slot_addr - word,
+            );
+        }
+        "unknown".to_string()
+    }
+
     fn grey_child(&mut self, addr: usize, holder_addr: usize, slot_addr: usize, site: &str) {
         if self.is_managed_heap_object(addr) && self.may_enter_marking_worklist(addr) {
             let hdr = unsafe { header_of(addr) };
@@ -2976,11 +3036,14 @@ impl MiniMarkGC {
                     *word = unsafe { *((addr as *const usize).add(index)) };
                 }
                 let child_vtable_type_id = self.vtable_to_type_id.get(&child_words[0]).copied();
+                let holder_hdr = unsafe { *header_of(holder_addr) };
                 panic!(
                     "GC BUG: invalid major child type_id={} at child_addr={:#x} \
                      holder_addr={:#x} holder_type_id={} slot_addr={:#x} \
                      holder_offset={:?} site={} holder_words={:#x?} \
-                     child_vtable_type_id={:?} child_words={:#x?}",
+                     child_vtable_type_id={:?} child_words={:#x?} \
+                     holder_tid_and_flags={:#x} holder_in_remembered={} \
+                     enclosing={} gc_state={:?} minors={} majors={}",
                     type_id,
                     addr,
                     holder_addr,
@@ -2991,6 +3054,12 @@ impl MiniMarkGC {
                     holder_words,
                     child_vtable_type_id,
                     child_words,
+                    holder_hdr.tid_and_flags,
+                    self.remembered_set.contains(&holder_addr),
+                    self.describe_enclosing_container(holder_addr, slot_addr, &holder_words),
+                    self.gc_state,
+                    self.minor_collections,
+                    self.major_collections,
                 );
             }
             if unsafe { !(*hdr).has_flag(flags::VISITED) } {
