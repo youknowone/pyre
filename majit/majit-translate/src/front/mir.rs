@@ -11425,8 +11425,9 @@ impl<'a> Lowering<'a> {
             .is_some_and(type_decl_is_fieldless_enum)
     }
 
-    /// `true` when `ty` is a niche-optimised `Option<NonNull<T>>` or
-    /// `Option<&mut T>`. Rust encodes each in ONE pointer
+    /// `true` when `ty` is a niche-optimised `Option<NonNull<T>>`,
+    /// `Option<&mut T>`, or `Option<&T>` with a thin (Sized) ADT pointee.
+    /// Rust encodes each in ONE pointer
     /// word (`None` = null, `Some(p)` = the non-null pointer), so
     /// `Discriminant` on it is a pointer-null test (`base != null`) and the
     /// `Some` payload read is the identity on that pointer — no aggregate
@@ -11440,7 +11441,31 @@ impl<'a> Lowering<'a> {
     /// as the payload. Mutable references are included explicitly: Rust
     /// guarantees their non-null representation, and generated
     /// `#[pyre_class]::from_obj` returns `Option<&mut Self>`. Shared
-    /// references are not — see [`type_node_is_mut_ref`].
+    /// references `&T` are included when the pointee is a thin (Sized)
+    /// nominal ADT — equally a one-word null niche — via
+    /// [`type_node_shared_ref_pointee`] + [`adt_node_def_id`]. Fat shared
+    /// references (`&str` / `&[T]` / `&dyn` / `&<?Sized>`, no ADT def-id) are
+    /// excluded: their two-word layout has no one-word niche payload.
+    ///
+    /// `front::iter_next` interaction (shared arm only). `Iterator::next()`
+    /// returns `Option<&T>`, and `front::iter_next` rewrites its
+    /// `__discriminant` match diamond into the native `[__iter_next]` op by
+    /// matching a literal `FieldRead __discriminant` + `Value` exitswitch
+    /// (`iter_next.rs` `rewire_one_next_site`). The `Discriminant` fold below
+    /// (`Rvalue::Discriminant`, this file) turns that into a pointer-null
+    /// `ne` bool switch when the recognizer accepts the receiver — for a
+    /// shared thin-ADT ref that would fire BEFORE iter_next runs and leave it
+    /// no diamond to match, so the residual `next()` call would survive as an
+    /// unregistered callee (a census Skip, not a miscompile). Currently
+    /// unreached: every `.iter()` for-loop that reaches iter_next iterates a
+    /// raw `*mut PyObject` / tuple / int element (none a thin nominal ADT), so
+    /// the shared arm never fires on a `next()` result — verified by a clean
+    /// census (0 `slice::iter::Iter::next` heads) and 370/370 check.py. The
+    /// `&mut` arm never had this exposure: iterator receivers come from
+    /// `.iter()` (`core::slice::…::iter`, a SHARED borrow), never `iter_mut`.
+    /// If a `.iter()` loop over `&[SizedStruct]` ever appears, teach
+    /// iter_next the null-test shape (its matcher must accept the
+    /// `niche_disc_vars` bool switch) BEFORE relying on the fold there.
     fn tyref_is_niche_option_ptr(&self, ty: &TyRef) -> bool {
         if !crate::front::result_exc::tyref_is_option(ty, self.llbc) {
             return false;
@@ -11459,6 +11484,21 @@ impl<'a> Lowering<'a> {
             return false;
         };
         if type_node_is_mut_ref(payload, self.llbc) {
+            return true;
+        }
+        // A shared reference `&T` is equally a one-word null-pointer niche
+        // (`Option<&T>` = nullable pointer, `Some(&T)` = the non-null pointer),
+        // but ONLY when the pointee is thin (Sized): a plain nominal ADT. A fat
+        // `&str` / `&[T]` / `&dyn Trait` / `&<?Sized generic>` is a two-word
+        // reference (data + length/vtable word), so aliasing the payload to the
+        // base pointer would read the metadata word — those carry no ADT
+        // def-id and are excluded. Read-only `#[pyre_class]` accessors reach
+        // here via `from_obj(...).map(|m| &*m) -> Option<&Self>` and
+        // `getdebug_data() -> Option<&FrameDebugData>`.
+        if let Some(shared_pointee) = type_node_shared_ref_pointee(payload, self.llbc)
+            && let Some(stripped) = strip_ty_wrappers(shared_pointee, self.llbc)
+            && adt_node_def_id(stripped).is_some()
+        {
             return true;
         }
         let Some(payload) = strip_ty_wrappers(payload, self.llbc) else {
@@ -15457,13 +15497,11 @@ fn cast_pointer_marker_op(root: String, arg: Variable) -> OpKind {
 /// itself: callers use the result to distinguish Rust's guaranteed non-null
 /// `&mut T` representation from nullable raw pointers.
 ///
-/// Shared references carry the same null niche, but are deliberately excluded.
-/// `Option<&T>` is the `Iterator::next` result shape, and `front::iter_next`
-/// rewrites its `__discriminant` match diamond into the `[__iter_next]` op —
-/// folding that discriminant to a pointer null test leaves the rewrite with no
-/// diamond to match, so the residual `Iterator::next()` call survives as the
-/// unregistered callee the rewrite exists to remove. Teach `front::iter_next`
-/// the null-test shape before widening this to shared references.
+/// Shared `&T` references carry the same null niche and are now recognised too,
+/// but separately — by [`type_node_shared_ref_pointee`] gated to a thin (Sized)
+/// ADT pointee inside `tyref_is_niche_option_ptr`, not by this helper (which
+/// stays `&mut`-only). See that recognizer's doc for the `front::iter_next`
+/// interaction the shared arm introduces.
 fn type_node_is_mut_ref<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> bool {
     for _ in 0..24 {
         let Some(obj) = node.as_object() else {
@@ -15493,6 +15531,40 @@ fn type_node_is_mut_ref<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> 
             .is_some_and(|kind| kind.to_ascii_lowercase().contains("mut"));
     }
     false
+}
+
+/// The pointee type node of a shared reference `&T` (`{"Ref": [region, ty,
+/// "Shared"]}`), after unwrapping `Deduplicated` / `HashConsedValue`
+/// indirection — or `None` when `node` is not a shared reference. The
+/// companion of [`type_node_is_mut_ref`]: that answers "is this `&mut`?",
+/// this returns the `&T` pointee so the caller can gate on its shape.
+fn type_node_shared_ref_pointee<'l>(
+    mut node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    for _ in 0..24 {
+        let obj = node.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            node = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        // `{"Ref": [region, ty, kind]}` — `kind` is `"Shared" | "Mut" | …`.
+        let arr = obj.get("Ref").and_then(serde_json::Value::as_array)?;
+        let kind = arr.get(2).and_then(serde_json::Value::as_str)?;
+        if kind.eq_ignore_ascii_case("shared") {
+            return arr.get(1);
+        }
+        return None;
+    }
+    None
 }
 
 /// Strip the indirection wrappers a Charon type node can carry —
@@ -23362,6 +23434,120 @@ mod tests {
                 .count(),
             1,
             "the discriminant comparison lowers to one int `BinOp(eq)`"
+        );
+    }
+
+    /// `get_w_locals` is `getdebug_data().map_or(PY_NULL, |data| data.w_locals)`
+    /// over `Option<&FrameDebugData>` — a SHARED-reference niche Option. Its
+    /// `Some` payload must alias the base pointer (no aggregate `__pos_0`
+    /// FieldRead), the same fold the `&mut`/`NonNull` niche arms already apply.
+    /// Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn shared_ref_niche_option_get_w_locals_no_pos0_read() {
+        use crate::model::OpKind;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "get_w_locals").expect("lower get_w_locals");
+        let pos0_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(
+                |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__pos_0"),
+            )
+            .count();
+        assert_eq!(
+            pos0_reads, 0,
+            "get_w_locals: shared-ref niche Option<&FrameDebugData> Some payload \
+             must alias the base pointer, not read an aggregate __pos_0"
+        );
+    }
+
+    /// Regression: a `&mut self` setter's niche `Option<&mut Self>` must STILL
+    /// fold (the widening must not perturb the pre-existing mut arm). Ignored
+    /// (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn mut_ref_niche_option_set_chunk_size_still_no_pos0_read() {
+        use crate::model::OpKind;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        // Any &mut-self __pyre_wrap setter; set__CHUNK_SIZE takes `&mut self`.
+        let graph =
+            super::lower_function(&llbc, "__pyre_wrap_set__CHUNK_SIZE").expect("lower setter");
+        let pos0_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(
+                |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__pos_0"),
+            )
+            .count();
+        assert_eq!(
+            pos0_reads, 0,
+            "the &mut niche arm must keep folding __pos_0"
+        );
+    }
+
+    /// The Sized gate: a shared reference to a fat pointee (`&[T]`, spelled
+    /// `{"Ref":[_, {"Slice": elem}, "Shared"]}`) has no ADT def-id, so
+    /// `type_node_shared_ref_pointee` + `adt_node_def_id` must NOT accept it;
+    /// while a shared ref to a nominal `{"Adt": {"id": {"Adt": N}}}` pointee
+    /// DOES. Uses the existing `Llbc::from_slice` minimal-fixture pattern
+    /// (mir.rs:22218 `llbc_with_trait_impls`), no real corpus.
+    #[test]
+    fn shared_ref_sized_gate_accepts_adt_rejects_slice() {
+        // Minimal Llbc: `type_node_shared_ref_pointee` only walks the node it
+        // is handed (no dedup ids in these inline fixtures), so an empty
+        // translated section suffices.
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [], "fun_decls": [], "global_decls": [],
+                "trait_decls": [], "trait_impls": [],
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+
+        // &[i64] — fat pointer, Slice pointee, no ADT def-id → rejected.
+        let slice_ref = serde_json::json!({
+            "Ref": ["'_", { "Slice": { "Literal": { "Int": "I64" } } }, "Shared"]
+        });
+        let slice_pointee = super::type_node_shared_ref_pointee(&slice_ref, &llbc)
+            .expect("shared-ref pointee extracted");
+        assert!(
+            super::adt_node_def_id(slice_pointee).is_none(),
+            "a &[T] fat-pointer pointee must not pass the Sized ADT gate"
+        );
+
+        // &SomeAdt — thin pointer, nominal ADT pointee, def-id present → accepted.
+        let adt_ref = serde_json::json!({
+            "Ref": ["'_", { "Adt": { "id": { "Adt": 196 }, "generics": {} } }, "Shared"]
+        });
+        let adt_pointee = super::type_node_shared_ref_pointee(&adt_ref, &llbc)
+            .expect("shared-ref pointee extracted");
+        assert_eq!(
+            super::adt_node_def_id(adt_pointee),
+            Some(196),
+            "a &SizedAdt pointee must pass the Sized ADT gate"
+        );
+
+        // &mut — the shared-ref helper must NOT match a Mut ref.
+        let mut_ref = serde_json::json!({
+            "Ref": ["'_", { "Adt": { "id": { "Adt": 196 }, "generics": {} } }, "Mut"]
+        });
+        assert!(
+            super::type_node_shared_ref_pointee(&mut_ref, &llbc).is_none(),
+            "type_node_shared_ref_pointee must not match a &mut ref"
         );
     }
 }
