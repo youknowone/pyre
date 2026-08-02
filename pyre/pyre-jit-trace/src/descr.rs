@@ -853,6 +853,36 @@ static W_LONG_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
+static W_UNICODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    // `str` needs a SizeDescr parent for its `len` FieldDescr so that a folded
+    // `len(const_str)` passes protect_speculative_field: descr.py:238 sets
+    // `parent_descr` unconditionally, and the fold reaches into the parent's
+    // vtable subclassrange (str's `&STR_TYPE`) to validate the constant.
+    // Single positional field mirrors the W_Int/W_Bool/W_Long groups; str is
+    // never inline-`NewWithVtable`'d (its value buffer is a residual-call
+    // allocation), so the GC-pointer slots traced by the runtime TypeInfo
+    // (value/w_slots/index_storage) stay out of the positional list.
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<pyre_object::unicodeobject::W_UnicodeObject>(),
+        W_UNICODE_GC_TYPE_ID,
+        &pyre_object::pyobject::STR_TYPE as *const _ as usize,
+        &[(
+            // `len` (codepoint count) is a `usize`: read at usize width so a
+            // wasm32 `GetfieldGcI` does not fold in the adjacent field's high
+            // half. Immutable: a str's length never changes.
+            "len",
+            UNICODE_LEN_OFFSET,
+            std::mem::size_of::<usize>(),
+            Type::Int,
+            false,
+            true,
+            false,
+        )],
+        "W_UnicodeObject",
+        "unicodeobject::W_UnicodeObject",
+    )
+});
+
 static W_BOOL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_object::boolobject::W_BoolObject>(),
@@ -2655,17 +2685,11 @@ pub fn long_value_descr() -> DescrRef {
 }
 
 pub fn str_len_descr() -> DescrRef {
-    // Python len(str) returns codepoint count.
-    // unicodeobject.py:165 W_UnicodeObject._len() → _length field.
-    // `W_UnicodeObject.len` is a `usize`: 8 bytes on 64-bit, 4 on wasm32 — a
-    // hardcoded 8 reads the adjacent field into the high half on a 32-bit
-    // target (blackhole resume of `len(str)`).
-    make_immutable_field_descr(
-        UNICODE_LEN_OFFSET,
-        std::mem::size_of::<usize>(),
-        Type::Int,
-        false,
-    )
+    // Python len(str) returns codepoint count (unicodeobject.py:165
+    // W_UnicodeObject._len() → `len` field). Routed through the descr group so
+    // the FieldDescr carries a parent SizeDescr; a folded `len(const_str)`
+    // otherwise fails protect_speculative_field on the missing parent.
+    field_descr_from_group(&W_UNICODE_DESCR_GROUP, 0)
 }
 
 // ── Object header & allocation descriptors ──────────────────────────
@@ -5189,6 +5213,7 @@ pub(crate) fn publish_runtime_descr_groups() {
         &*W_INT_DESCR_GROUP,
         &*W_FLOAT_DESCR_GROUP,
         &*W_LONG_DESCR_GROUP,
+        &*W_UNICODE_DESCR_GROUP,
         &*W_BOOL_DESCR_GROUP,
         &*RANGE_ITER_DESCR_GROUP,
         &*RANGE_DESCR_GROUP,
