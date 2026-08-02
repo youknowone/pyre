@@ -6741,6 +6741,12 @@ impl CodeWriter {
         // switchover. `dispatch_op` in `assembler.rs:510` already routes
         // `"abort_permanent"` to the builder, so the external push is
         // an exact mirror of the pre-existing internal behavior.
+        // The value stack as the opcode being walked was entered, refreshed per
+        // PC below and read by `emit_abort_permanent!`.  Declared out here
+        // rather than beside the refresh because a `macro_rules!` body resolves
+        // a non-parameter identifier in the macro's DEFINITION scope.
+        let mut pre_opcode_stack: Vec<super::flow::FlowValue> = Vec::new();
+
         macro_rules! emit_abort_permanent {
             // Straight-line form: the arm has modelled this opcode's stack
             // effect and the walk falls through to the next PC.  The block is
@@ -6754,20 +6760,27 @@ impl CodeWriter {
             // before touching the operands, so nothing pushes the call result
             // the fall-through PC expects) and the `LoadFastCheck` unbound arm
             // (which switches into a dedicated dead-end block that has no
-            // successor by construction).  Both leave the value stack exactly
-            // as the interpreter will find it, so the resume coordinate below
-            // is emitted for this form too.
+            // successor by construction).
             ($py_pc:expr, closes_block) => {{
-                // Nothing follows to model the frame further, so the value
-                // stack the interpreter resumes on has to be the real one.
-                // `push_and_bump!` leaves a pushed value in its SSA register
-                // and syncs only `valuestackdepth` — the vable slot behind it
-                // still reads PY_NULL — so mirror every live slot before the
-                // bail (`pyframe.py`'s `pushvalue`, lowered by
-                // `jtransform.py`'s `do_fixed_list_setitem`).  These stores sit
-                // in a block that only ever runs into the marker, so no
-                // continuing path pays for them.
-                for (slot, value) in current_state.stack.iter().enumerate() {
+                emit_abort_permanent!(@emit $py_pc, true)
+            }};
+            (@emit $py_pc:expr, $closes_block:expr) => {{
+                // Materialize the value stack the interpreter resumes on.
+                // `pyframe.py`'s `pushvalue` lowers every push to a
+                // `setarrayitem_vable_r` (`jtransform.py`'s
+                // `do_fixed_list_setitem`), but pyre's `push_and_bump!` keeps
+                // the pushed value in its SSA register and syncs only
+                // `valuestackdepth`, so a slot last written that way still
+                // reads PY_NULL out of the vable.  Every stack slot the
+                // resumed opcode reads has to be a real one, and the walk
+                // reaches the marker only on a run that is bailing, so nothing
+                // that keeps executing pays for these stores.
+                //
+                // The snapshot, not `current_state`: the marker resumes AT this
+                // opcode, and the arms model the opcode's stack effect before
+                // they bail, so `current_state` here is the state AFTER an
+                // opcode that has not run.
+                for (slot, value) in pre_opcode_stack.iter().enumerate() {
                     let v_idx: super::flow::FlowValue =
                         super::flow::Constant::signed((stack_base_absolute + slot) as i64).into();
                     record_graph_op(
@@ -6782,9 +6795,7 @@ impl CodeWriter {
                         ($py_pc) as i64,
                     );
                 }
-                emit_abort_permanent!(@emit $py_pc, true)
-            }};
-            (@emit $py_pc:expr, $closes_block:expr) => {{
+                emit_vsd!(pre_opcode_stack.len(), $py_pc);
                 // Publish `last_instr` to the vable before the bail so the
                 // blackhole hands the interpreter the right resume
                 // coordinate.  The blackhole replays codewriter jitcode that
@@ -8232,6 +8243,14 @@ impl CodeWriter {
                     // via setfield_vable_i (jtransform.py), NOT once at opcode
                     // entry. The per-push/per-pop emit_vsd! calls below mirror that.
                     // (The old single-entry flush is removed.)
+
+                    // Snapshot the entry stack for `emit_abort_permanent!`.  The
+                    // marker resumes the interpreter AT this opcode, so what it
+                    // has to hand back is the frame the opcode has not run yet —
+                    // and an arm that aborts has usually already modelled the
+                    // opcode's stack effect on `current_state`.
+                    pre_opcode_stack.clear();
+                    pre_opcode_stack.extend(current_state.stack.iter().cloned());
 
                     // RPython jtransform.py: rewrite_operation() dispatches per opname.
                     // Each match arm is the pyre equivalent of rewrite_op_*.
@@ -12155,16 +12174,6 @@ impl CodeWriter {
 
                                 current_block = unbound_block;
                                 current_state = unbound_state;
-                                // The `push_and_bump!` above synced a
-                                // `valuestackdepth` for a LOAD_FAST_CHECK that
-                                // pushed its value.  This arm's opcode does
-                                // not: the interpreter re-runs it from the
-                                // marker and raises UnboundLocalError before
-                                // pushing.  The depth was walked back on the
-                                // abstract state only, so sync the physical
-                                // one too or the resumed frame carries a
-                                // phantom slot above its real top.
-                                emit_vsd!(current_depth, py_pc);
                                 // `closes_block`: the null arm's block is a
                                 // dead end by construction — the bound arm
                                 // already merged the fall-through PC above, so
