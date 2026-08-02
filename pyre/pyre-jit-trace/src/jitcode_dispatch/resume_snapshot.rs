@@ -25,6 +25,22 @@ fn trailing_live_marker(payload: &crate::PyJitCode, call_pc: usize) -> Option<us
     (marker.opname == "live").then_some(marker.pc)
 }
 
+/// Select the resume marker for an after-residual-call guard.  The bytecode's
+/// immediate trailing `-live-` is the RPython authority; metadata twins are
+/// compatibility fallbacks for incomplete/fixture bodies.
+pub(crate) fn after_residual_guard_marker(
+    payload: &crate::PyJitCode,
+    op_pc: usize,
+    marker_call_jit_pc: Option<usize>,
+) -> Option<usize> {
+    trailing_live_marker(payload, op_pc).or_else(|| {
+        marker_call_jit_pc
+            .and_then(|call_jit_pc| payload.after_residual_call_resume_for_jitcode_pc(call_jit_pc))
+            .or_else(|| payload.after_residual_marker_for_jitcode_pc(op_pc))
+            .or_else(|| payload.after_residual_call_resume_for_jitcode_pc(op_pc))
+    })
+}
+
 /// Read the Python PC paired with a native resume word.  The codewriter builds
 /// this table from Python-PC keys, including the same forward trivia skip as
 /// `backxlat_py_pc`; capture deliberately never projects the word backwards.
@@ -886,22 +902,15 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // `-live-` marker). Fall back to the sentinel on a map miss.
                 let marker = unsafe {
                     let jc = &*sym.jitcode();
-                    match marker_call_jit_pc {
-                        Some(call_jit_pc) => jc
-                            .payload
-                            .after_residual_call_resume_for_jitcode_pc(call_jit_pc),
-                        None => {
-                            // Every plain post-call guard capture is emitted
-                            // after its fallthrough `-live-` marker, so this
-                            // populated twin is total at the capture point.
-                            jc.payload
-                                .after_residual_marker_for_jitcode_pc(op_pc)
-                                .or_else(|| {
-                                    jc.payload.after_residual_call_resume_for_jitcode_pc(op_pc)
-                                })
-                                .or_else(|| trailing_live_marker(&jc.payload, op_pc))
-                        }
-                    }
+                    // RPython `pyjitpl.py capture_resumedata(
+                    // after_residual_call=True)` snapshots the `-live-`
+                    // immediately following the residual call.  Read that
+                    // structural marker first for every after-call guard.  In
+                    // a try-block it sits before `catch_exception/L`, so its
+                    // liveness includes both the normal continuation and the
+                    // handler; a Python-PC fallthrough twin may instead name a
+                    // later normal-path marker and lose handler-only locals.
+                    after_residual_guard_marker(&jc.payload, op_pc, marker_call_jit_pc)
                 };
                 match marker {
                     Some(jp) => jp as i32,

@@ -40,6 +40,32 @@ fn test_outer_resume_jitcode_index() -> u32 {
 }
 
 #[test]
+fn after_residual_guard_uses_trailing_live_before_fallthrough_twin() {
+    let int_add = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("int_add/ii>i must be in the insns table");
+    let live = crate::state::op_live();
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("after_residual_marker_test");
+    runtime_jc.set_body(majit_translate::jitcode::JitCodeBody {
+        // The immediate marker at pc=4 models the call's trailing `-live-`;
+        // pc=7 models the later normal-fallthrough marker a Python-PC twin can
+        // resolve to after `catch_exception/L`.
+        code: vec![int_add, 0, 1, 2, live, 0, 0, live, 0, 0],
+        startpoints: Some([0_usize, 4, 7].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.after_residual_call_resume_pred_by_jit_pc = vec![(0, Some(7))];
+
+    assert_eq!(
+        super::resume_snapshot::after_residual_guard_marker(&pyjit, 0, Some(0)),
+        Some(4),
+        "handler liveness must come from the trailing live before catch_exception",
+    );
+}
+
+#[test]
 fn vstack_permuted_for_iter_entry_uses_block_head_target() {
     let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
     pyjit.metadata.n_py_instrs = 19;
