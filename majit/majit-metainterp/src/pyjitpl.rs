@@ -9,7 +9,8 @@ pub use dispatch::{
 };
 pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
 pub use dispatch::{
-    call_int_function, call_ref_function, call_void_function, call_void_function_typed,
+    call_float_function, call_int_function, call_ref_function, call_void_function,
+    call_void_function_typed,
 };
 pub use dispatch::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};
 pub use frame::{MIFrame, MIFrameStack};

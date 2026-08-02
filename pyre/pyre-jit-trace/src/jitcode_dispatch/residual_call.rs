@@ -1596,47 +1596,6 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
     if allboxes.is_empty() {
         return;
     }
-    // A float-returning callee cannot be executed here, because operand 0's
-    // float ABI is set by how its `JitCallTarget` was REGISTERED — not by which
-    // emitter ran — and the descr records neither:
-    //
-    //   * `add_fn_ptr(ptr)` is `add_call_target(ptr, ptr)`
-    //     (`jitcode/assembler.rs:4617`), so `concrete_ptr` IS the raw callee
-    //     address and the `f64` comes back in the floating-point return
-    //     register.  This is what pyre's own codewriter registers
-    //     (`pyre-jit/src/jit/codewriter.rs:3594`).
-    //   * the policy-macro lowering registers
-    //     `add_call_target_with_save_err(trace, concrete)` where `concrete` is
-    //     `#[jit_module]`'s `_concrete` wrapper, an `extern "C" fn(i64, ..)
-    //     -> i64` with the `f64` pre-packed via `f64::to_bits` — the one
-    //     convention `execute_pure_call`'s Float arm implements.
-    //   * the LLBC codewriter bakes `fnaddr_for_target` as a plain `ConstInt`
-    //     and never mints a `JitCallTarget` at all
-    //     (`majit-translate/src/codewriter/jtransform.rs direct_funcptr_value`).
-    //
-    // `residual_call_float_canonical_via_target_with_effect_info` bakes
-    // `target.concrete_ptr` for all of them, so the emitter family does not
-    // discriminate.  Running a raw address under the wrapper's convention
-    // yields whatever was left in the integer return register (probed: 7/7
-    // garbage against `jit_bigint_to_f64_or_inf`), and the walker would stamp
-    // it as the folded constant.  Leave the recorded `CallPure*` for the
-    // backend, which calls the same pointer with the descr's real signature
-    // (`majit-backend-wasm/src/codegen.rs:1133 residual_call_float_sig` builds
-    // an `f64`-returning `call_indirect` from it).
-    //
-    // `JitCodeExecState::call_descr_to_call_target` (`jitcode/mod.rs:367`) is
-    // the discriminator.  The walker never consults it; the metainterp's own
-    // IRF_F dispatcher does (`pyjitpl/dispatch.rs:6431`) — and calls the
-    // resulting `concrete_ptr` through `bh_call_f_by_classes` (:6539), i.e. as
-    // a real `f64` return, the opposite of what this arm assumes for the same
-    // pointer.  That disagreement, not the fold, is the thing to converge:
-    // upstream has one convention (`op.args[0]` is always the callee, and
-    // `CallDescr.create_call_stub` carries the ABI) and dispatches through
-    // `cpu.bh_call_f` (`executor.py:66-72`), which pyre has already ported as
-    // `bh_call_f_by_classes`.
-    if call_descr.result_type() == majit_ir::Type::Float {
-        return;
-    }
     // pyjitpl.py `_build_allboxes`: slot 0 is funcbox, slots
     // 1.. are user args in `descr.arg_types()` ABI order.  Walker's
     // [`build_allboxes`] preserves the same layout.

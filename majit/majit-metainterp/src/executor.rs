@@ -808,33 +808,27 @@ pub fn execute_pure_call(
             crate::pyjitpl::call_void_function_typed(func_ptr, args, descr.arg_types());
             0
         }
-        // See `execute_varargs`'s Float arm for the i64-bits ABI rationale:
-        // `#[jit_module]` Float helpers expose `concrete_ptr` as
-        // `extern "C" fn(...) -> i64` with the f64 pre-packed via
-        // `f64::to_bits`; routing through `call_int_function` is bit-identical.
+        // executor.py:66-68 `if rettype == FLOAT: cpu.bh_call_f(...)`.  The
+        // funcbox reaching this seam is always the callee's own address —
+        // `add_fn_ptr(ptr)` is `add_call_target(ptr, ptr)`
+        // (`jitcode/assembler.rs:4617`), which is what pyre's codewriter
+        // registers, and the LLBC path bakes a plain `ConstInt` fnaddr that
+        // mints no `JitCallTarget` at all.  So the f64 comes back in the
+        // floating-point return register, exactly as the blackhole
+        // (`bhimpl_residual_call_irf_f`) and the metainterp's own IRF_F
+        // dispatcher (`pyjitpl/dispatch.rs`) already assume for it.
         //
-        // That convention is a CALLER CONTRACT, not a property of the descr:
-        // it holds only when `func_ptr` is that wrapper.  `add_fn_ptr(ptr)` is
-        // `add_call_target(ptr, ptr)` (`jitcode/assembler.rs:4617`), so a
-        // `concrete_ptr` registered that way — and every LLBC `ConstInt`
-        // fnaddr, which mints no `JitCallTarget` at all — is the callee's own
-        // address, whose f64 comes back in the floating-point return register
-        // while this arm reads whatever was left in the integer one.  `descr`
-        // records the signature, not the registration, so the two are
-        // indistinguishable here and the walker declines rather than guess
-        // (`residual_call.rs try_fold_pure_call_via_executor`).
+        // The `f64::to_bits`-packing `_concrete` wrapper `#[jit_module]` emits
+        // for a Float helper reaches a residual call only through the explicit
+        // `*_float_wrapped` call policies, which no crate declares; the
+        // CALL_ASSEMBLER arms that genuinely do want that i64 wrapper are a
+        // separate opcode family and keep `call_int_function`.
         //
-        // This arm is the outlier: `executor.py:66-72` dispatches FLOAT
-        // through `cpu.bh_call_f`, which pyre has already ported as
-        // `majit_backend::call_stub::bh_call_f_by_classes` and which BOTH other
-        // residual-call consumers already use on this same operand — the
-        // blackhole (`bhimpl_residual_call_irf_f`) and the metainterp's IRF_F
-        // dispatcher (`pyjitpl/dispatch.rs:6539`, on the very `concrete_ptr`
-        // the via-target emitter bakes).  Converging means choosing one
-        // registration convention, not adding a discriminator here; the
-        // CALL_ASSEMBLER arms are separate and genuinely do want the i64
-        // wrapper.
-        majit_ir::Type::Float => crate::pyjitpl::call_int_function(func_ptr, args),
+        // The result is returned as raw bits so the caller's `f64::from_bits`
+        // stamp is unchanged (`longlong` float-storage parity).
+        majit_ir::Type::Float => {
+            crate::pyjitpl::call_float_function(func_ptr, args, descr.arg_types()).to_bits() as i64
+        }
     }
 }
 
@@ -885,11 +879,14 @@ pub fn execute_residual_call(
             crate::pyjitpl::call_void_function_typed(func_ptr, args, descr.arg_types());
             0
         }
-        // See `execute_varargs`'s Float arm for the i64-bits ABI
-        // rationale: `#[jit_module]` Float helpers expose
-        // `concrete_ptr` as `extern "C" fn(...) -> i64` with the f64
-        // pre-packed via `f64::to_bits`.
-        majit_ir::Type::Float => crate::pyjitpl::call_int_function(func_ptr, args),
+        // executor.py:66-68 `cpu.bh_call_f` — same funcbox provenance as
+        // `execute_pure_call`'s Float arm; see its comment for why the
+        // callee's own address, not the `f64::to_bits` wrapper, is what
+        // reaches this seam.  Returned as raw bits for the caller's
+        // `f64::from_bits` stamp.
+        majit_ir::Type::Float => {
+            crate::pyjitpl::call_float_function(func_ptr, args, descr.arg_types()).to_bits() as i64
+        }
     };
     let bh_exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| {
         let v = c.get();
@@ -989,9 +986,15 @@ mod execute_pure_call_tests {
         a.wrapping_add(b).wrapping_add(c)
     }
 
-    extern "C" fn pack_float_to_bits(x: i64) -> i64 {
-        let f = f64::from_bits(x as u64) * 2.0;
-        f.to_bits() as i64
+    extern "C" fn double_f64(x: f64) -> f64 {
+        x * 2.0
+    }
+
+    /// `jit_bigint_to_f64_or_inf`'s shape: an integer/ref parameter with a
+    /// genuine `f64` return, so the result arrives in xmm0 / d0 while nothing
+    /// occupies the FP argument file.
+    extern "C" fn halve_int_to_f64(x: i64) -> f64 {
+        x as f64 / 2.0
     }
 
     extern "C" fn void_no_op(_x: i64) {}
@@ -1016,17 +1019,33 @@ mod execute_pure_call_tests {
         assert_eq!(result, 123, "add3_i64(100, 20, 3) must return 123");
     }
 
+    /// executor.py:66-68 — a Float result is fetched through `cpu.bh_call_f`,
+    /// i.e. the floating-point return register, and a Float argument travels
+    /// in the FP argument file.  `args` carries the raw `f64::to_bits` for
+    /// both directions (`longlong` float-storage parity).
     #[test]
-    fn float_result_routes_through_call_int_function_with_bits_packing() {
+    fn float_result_and_float_arg_use_the_floating_point_register_file() {
         let descr = make_descr(vec![Type::Float], Type::Float);
-        let input_bits = 3.5_f64.to_bits() as i64;
         let result = execute_pure_call(
             &descr,
-            pack_float_to_bits as *const () as i64,
-            &[input_bits],
+            double_f64 as *const () as i64,
+            &[3.5_f64.to_bits() as i64],
         );
-        let result_f = f64::from_bits(result as u64);
-        assert_eq!(result_f, 7.0, "3.5 * 2.0 must equal 7.0");
+        assert_eq!(f64::from_bits(result as u64), 7.0, "double_f64(3.5) == 7.0");
+    }
+
+    /// The mixed shape that motivated the fix: an integer parameter with an
+    /// `f64` return.  Reading the integer return register here yielded the
+    /// argument still sitting in it rather than the result.
+    #[test]
+    fn float_result_with_an_integer_arg_reads_the_float_return_register() {
+        let descr = make_descr(vec![Type::Int], Type::Float);
+        let result = execute_pure_call(&descr, halve_int_to_f64 as *const () as i64, &[7]);
+        assert_eq!(
+            f64::from_bits(result as u64),
+            3.5,
+            "halve_int_to_f64(7) == 3.5; an integer-register read would see 7",
+        );
     }
 
     #[test]

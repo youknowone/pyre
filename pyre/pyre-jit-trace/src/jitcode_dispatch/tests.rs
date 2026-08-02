@@ -11403,20 +11403,21 @@ fn ref_compare_same_box_fastpath_covers_the_instance_ptr_spellings() {
     }
 }
 
-// A float-returning residual is never folded at record time: the funcbox's
-// ABI depends on which emitter baked it (the codewriter bakes the callee's own
-// `f64`-returning address; the runtime emitter's `*_canonical_via_target`
-// family bakes `JitCallTarget::concrete_ptr`, an `i64`-returning wrapper), and
-// the descr does not record which.  See the decline in
-// `try_fold_pure_call_via_executor`.
+// pyjitpl.py:2119-2121 concretely executes and stamps a Float `CALL_PURE`
+// like any other.  The funcbox is the callee's own address on every live
+// path — `add_fn_ptr(ptr)` is `add_call_target(ptr, ptr)` and the LLBC path
+// bakes a plain `ConstInt` fnaddr — so `execute_pure_call` fetches the result
+// from the floating-point return register (`executor.py:66-68 cpu.bh_call_f`).
 
-/// A real `f64`-returning callee, i.e. the shape the codewriter bakes.
+/// A real `f64`-returning callee with an integer parameter, i.e. the
+/// `jit_bigint_to_f64_or_inf` shape.  Reading the integer return register
+/// here returned the argument still sitting in it.
 extern "C" fn halve_f64_for_walker_test(x: i64) -> f64 {
     (x as f64) / 2.0
 }
 
 #[test]
-fn walker_declines_to_fold_a_float_result_pure_call() {
+fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
     let mut tc = fresh_trace_ctx();
     let funcbox = tc.const_int(halve_f64_for_walker_test as *const () as i64);
     let arg0 = tc.const_int(7);
@@ -11506,9 +11507,9 @@ fn walker_declines_to_fold_a_float_result_pure_call() {
     );
     assert_eq!(
         tc.box_value(recorded),
-        None,
-        "a float-result pure call must stay symbolic, not be stamped with \
-         whatever the integer return register held",
+        Some(majit_ir::Value::Float(3.5)),
+        "halve_f64_for_walker_test(7) == 3.5; reading the integer return \
+         register would stamp the argument 7 instead",
     );
 }
 

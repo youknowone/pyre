@@ -8432,6 +8432,54 @@ pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
     }
 }
 
+/// `bh_call_f` parity (`backend/model.py:270`, `llmodel.py:828`) for callers
+/// that hold their arguments in `descr.arg_types()` positional order rather
+/// than in the `args_i`/`args_r`/`args_f` banks the bytecode carries.
+///
+/// The C ABI returns `f64` in xmm0 / d0, so a float-returning callee cannot be
+/// reached through [`call_int_function`]'s `-> i64` transmute — that reads the
+/// integer return register.  Float *arguments* have the same problem in the
+/// other direction: they travel in the FP register file, so they are split out
+/// here and handed to [`bh_call_f_dispatch`], which is pyre's stand-in for the
+/// per-descr stub `descr.py:598-612 create_call_stub` generates upstream.
+///
+/// `args[i]` for a `Type::Float` slot carries the raw `f64::to_bits`, matching
+/// the `args_f` bank convention (`longlong` float storage).
+///
+/// # Panics
+/// `bh_call_f_dispatch`'s arity table is `fn(I × ints, F × floats)` — all
+/// integer/ref parameters precede all float ones.  A callee whose signature
+/// interleaves them cannot be expressed, so it panics rather than shuffle the
+/// arguments into the wrong registers.  Every float-returning helper in the
+/// tree today is non-interleaved (`jit_bigint_to_f64_or_inf(ref) -> f64`,
+/// `jit_float_abs(f64) -> f64`, `jit_float_fmod(f64, f64) -> f64`).
+pub fn call_float_function(func_ptr: *const (), args: &[i64], arg_types: &[Type]) -> f64 {
+    // Where a backend cannot build a `call_indirect` whose type matches the
+    // callee's real signature (wasm32), route through the host trampoline,
+    // which reflects the signature and returns an f64 result as its raw bits.
+    if let Some(hook) = majit_backend::call_stub::residual_host_call() {
+        return f64::from_bits(hook(func_ptr as usize, args) as u64);
+    }
+    let mut int_args: Vec<i64> = Vec::with_capacity(args.len());
+    let mut float_args: Vec<f64> = Vec::new();
+    for (i, &a) in args.iter().enumerate() {
+        match arg_types.get(i) {
+            Some(Type::Float) => float_args.push(f64::from_bits(a as u64)),
+            _ => {
+                assert!(
+                    float_args.is_empty(),
+                    "call_float_function: interleaved int/float parameters are \
+                     outside `bh_call_f_dispatch`'s `fn(I.., F..)` arity table"
+                );
+                int_args.push(a);
+            }
+        }
+    }
+    unsafe {
+        majit_backend::call_stub::bh_call_f_dispatch(func_ptr as usize, &int_args, &float_args)
+    }
+}
+
 /// `bh_call_r` parity (`backend/model.py:268`, `blackhole.py:1113`).
 ///
 /// Pyre's GC ref is a `*const PyObject` carried as `i64` via the
