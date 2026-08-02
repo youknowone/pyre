@@ -61,7 +61,7 @@ static FALSE_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 fn bool_singleton(slot: &'static std::sync::OnceLock<usize>, intval: i64) -> PyObjectRef {
     *slot.get_or_init(|| {
-        crate::lltype::malloc_typed(W_BoolObject {
+        crate::lltype::malloc_typed_immortal(W_BoolObject {
             ob_header: PyObject {
                 ob_type: &BOOL_TYPE as *const PyType,
                 w_class: std::ptr::null_mut(),

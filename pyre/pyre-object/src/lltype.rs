@@ -268,6 +268,30 @@ pub fn malloc_typed<T: GcType>(value: T) -> *mut T {
     majit_gc::header::alloc_with_gc_header(value, type_id)
 }
 
+/// [`malloc_typed`] for an immortal leaf singleton — the header carries
+/// `init_gc_object_immortal`'s `NO_HEAP_PTRS | TRACK_YOUNG_PTRS`, so the
+/// collector recognises it as a prebuilt root and stops there instead of
+/// reading a payload it has no trace shape for.
+///
+/// Restricted to payloads that hold no reference at all: `None`, `True`,
+/// `False`, `NotImplemented`, `Ellipsis`. A box with reference fields must use
+/// [`malloc_typed`] and be reached through the raw-root walkers instead —
+/// `NO_HEAP_PTRS` there would be a false claim, and
+/// `majit_gc::header::alloc_with_gc_header_immortal` records what that costs.
+#[inline]
+pub fn malloc_typed_immortal<T: GcType>(value: T) -> *mut T {
+    debug_assert_eq!(
+        std::mem::size_of::<T>(),
+        T::SIZE,
+        "GcType::SIZE drift from std::mem::size_of"
+    );
+    let type_id = match T::type_id() {
+        TypeIdCell::UNASSIGNED => 0,
+        id => id,
+    };
+    majit_gc::header::alloc_with_gc_header_immortal(value, type_id)
+}
+
 /// Managed typed allocation.
 ///
 /// `gct_fv_gc_malloc` / `init_gc_object(result, typeid, flags=0)`
@@ -385,17 +409,14 @@ mod tests {
     }
 
     #[test]
-    fn malloc_prepends_prebuilt_gc_header() {
+    fn malloc_prepends_zeroed_gc_header() {
         let p = malloc(0x1234_5678_u64);
         unsafe {
             assert_eq!(*p, 0x1234_5678);
-            // incminimark init_gc_object_immortal flags.
+            // A zeroed GcHeader precedes the payload, so the write barrier
+            // reads `*(obj - SIZE)` as TRACK_YOUNG_PTRS=0 and skips it.
             let hdr = majit_gc::header::header_of(p as usize);
-            assert_eq!((*hdr).type_id(), 0);
-            assert_eq!(
-                (*hdr).flags(),
-                majit_gc::flags::NO_HEAP_PTRS | majit_gc::flags::TRACK_YOUNG_PTRS
-            );
+            assert_eq!((*hdr).tid_and_flags, 0);
         }
     }
 
@@ -430,10 +451,7 @@ mod tests {
             // The header carries the real GC type id, not a 0 placeholder.
             let hdr = majit_gc::header::header_of(p as usize);
             assert_eq!((*hdr).type_id(), 0xDEAD_BEEF);
-            assert_eq!(
-                (*hdr).flags(),
-                majit_gc::flags::NO_HEAP_PTRS | majit_gc::flags::TRACK_YOUNG_PTRS
-            );
+            assert_eq!((*hdr).flags(), 0);
         }
     }
 }

@@ -28,7 +28,7 @@ static NONE_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 /// Get the None singleton as a PyObjectRef.
 pub fn w_none() -> PyObjectRef {
     *NONE_SINGLETON.get_or_init(|| {
-        crate::lltype::malloc_typed(W_NoneObject {
+        crate::lltype::malloc_typed_immortal(W_NoneObject {
             ob_header: PyObject {
                 ob_type: &NONE_TYPE as *const PyType,
                 w_class: std::ptr::null_mut(),

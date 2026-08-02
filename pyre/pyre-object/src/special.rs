@@ -23,7 +23,7 @@ static NOT_IMPLEMENTED_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLo
 /// Get the NotImplemented singleton.
 pub fn w_not_implemented() -> PyObjectRef {
     *NOT_IMPLEMENTED_SINGLETON.get_or_init(|| {
-        crate::lltype::malloc_typed(NotImplemented {
+        crate::lltype::malloc_typed_immortal(NotImplemented {
             ob_header: PyObject {
                 ob_type: &NOTIMPLEMENTED_TYPE as *const PyType,
                 w_class: std::ptr::null_mut(),
@@ -53,7 +53,7 @@ static ELLIPSIS_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new
 /// Get the Ellipsis singleton.
 pub fn w_ellipsis() -> PyObjectRef {
     *ELLIPSIS_SINGLETON.get_or_init(|| {
-        crate::lltype::malloc_typed(Ellipsis {
+        crate::lltype::malloc_typed_immortal(Ellipsis {
             ob_header: PyObject {
                 ob_type: &ELLIPSIS_TYPE as *const PyType,
                 w_class: std::ptr::null_mut(),

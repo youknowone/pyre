@@ -143,14 +143,36 @@ pub unsafe fn header_of(obj_addr: usize) -> *mut GcHeader {
 /// payload pointer (`block + SIZE`).
 ///
 /// `malloc_fixedsize` analog: reserve `size_gc_header + size` bytes,
-/// `init_gc_object_immortal(result, typeid)` at the block start, and return
-/// `obj = result + size_gc_header`. incminimark.py initializes a prebuilt
-/// object with `NO_HEAP_PTRS | TRACK_YOUNG_PTRS`. Callers
+/// `init_gc_object(result, typeid, flags=0)` at the block start, and return
+/// `obj = result + size_gc_header`. A freshly allocated object carries no
+/// flags, so the header word is exactly `type_id` (`GcHeader::new`). Callers
 /// pass the object's GC type id (`malloc_typed` threads `GcType::type_id()`;
 /// the untyped bridge and frames pass the object-root id 0).
 ///
-/// These leaked host allocations are pyre's translated prebuilt family. The
-/// first pointer write opens the object through the collector's write barrier.
+/// The header's flags are all clear, so a write barrier reading `*(obj - SIZE)`
+/// sees `TRACK_YOUNG_PTRS = 0` and skips the object. These objects are not yet
+/// routed through the managed nursery allocator; they are leaked host
+/// allocations, and the header is what lets the barrier read `*(obj - SIZE)`
+/// without dereferencing foreign memory.
+///
+/// These are NOT incminimark's prebuilt family and must not be stamped
+/// `NO_HEAP_PTRS | TRACK_YOUNG_PTRS` (`init_gc_object_immortal`). Upstream's
+/// prebuilt objects are translation-time constants whose fields name other
+/// prebuilt objects, which is what makes "an untouched prebuilt object is a
+/// leaf" (incminimark.py:2782-2800) true. These blocks are allocated at
+/// runtime and their reference fields are written directly at construction,
+/// with no write barrier — so an untouched one DOES hold heap pointers, and
+/// the targets are ordinary collectable objects that nothing else roots.
+/// Claiming the flag makes the first barrier on any *other* field enter the
+/// object into `prebuilt_root_objects`, after which a major traces every
+/// `gc_ptr_offsets` slot, including the never-barriered ones whose targets
+/// were already reclaimed. Measured on `synth/pickle_ctor_args`: the walk
+/// reaches a freed `W_ListObject` through
+/// `prebuilt+0x30 -> W_ListObject -> ItemsBlock[0]`, and under
+/// `MAJIT_GC_NURSERY_POISON=1` that list reads back `length = 0xAAAA_AAAA_AAAA_AAAA`.
+/// pyre's real prebuilt lifecycle is the interpreter-side dirty bit
+/// (`mark_prebuilt_roots_dirty` / `PYRE_GC_PREBUILT_REMEMBER`) with explicit
+/// per-structure walkers that resolve ownership before forwarding.
 ///
 /// # Safety
 /// - The result points past the header; it MUST NOT be passed to
@@ -158,6 +180,31 @@ pub unsafe fn header_of(obj_addr: usize) -> *mut GcHeader {
 /// - `align_of::<T>() <= GcHeader::SIZE`, enforced at monomorphisation: a
 ///   wider alignment would move the payload off the fixed `obj - SIZE` offset.
 pub fn alloc_with_gc_header<T>(value: T, type_id: u32) -> *mut T {
+    alloc_with_gc_header_flags(value, GcHeader::new(type_id))
+}
+
+/// [`alloc_with_gc_header`] for a genuine immortal leaf — `init_gc_object_immortal`
+/// (`NO_HEAP_PTRS | TRACK_YOUNG_PTRS`), incminimark's prebuilt shape.
+///
+/// `NO_HEAP_PTRS` asserts the object holds no reference the collector must
+/// follow, so only a payload that really is a leaf may use this: the `None` /
+/// `True` / `False` / `NotImplemented` / `Ellipsis` singletons, whose whole body
+/// is a `PyObject` header with a null `w_class`. An ordinary `#[pyre_class]`
+/// box does NOT qualify — its reference fields are written at construction with
+/// no write barrier, so once the first barrier on any other field opens the
+/// object, a major would follow those never-updated slots into freed memory.
+/// See [`alloc_with_gc_header`] for the measured failure that rule comes from.
+pub fn alloc_with_gc_header_immortal<T>(value: T, type_id: u32) -> *mut T {
+    alloc_with_gc_header_flags(
+        value,
+        GcHeader::with_flags(
+            type_id,
+            crate::flags::NO_HEAP_PTRS | crate::flags::TRACK_YOUNG_PTRS,
+        ),
+    )
+}
+
+fn alloc_with_gc_header_flags<T>(value: T, header: GcHeader) -> *mut T {
     const {
         assert!(
             std::mem::align_of::<T>() <= GcHeader::SIZE,
@@ -173,10 +220,7 @@ pub fn alloc_with_gc_header<T>(value: T, type_id: u32) -> *mut T {
         if raw.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
-        (raw as *mut GcHeader).write(GcHeader::with_flags(
-            type_id,
-            crate::flags::NO_HEAP_PTRS | crate::flags::TRACK_YOUNG_PTRS,
-        ));
+        (raw as *mut GcHeader).write(header);
         let ptr = raw.add(GcHeader::SIZE) as *mut T;
         ptr.write(value);
         ptr
@@ -240,12 +284,11 @@ mod tests {
         unsafe {
             assert_eq!(*p, 0xABCD);
             let hdr = header_of(p as usize);
-            // incminimark init_gc_object_immortal flags.
+            // type id recorded; flags clear (init_gc_object flags=0).
             assert_eq!((*hdr).type_id(), 0x1357);
-            assert_eq!(
-                (*hdr).flags(),
-                flags::NO_HEAP_PTRS | flags::TRACK_YOUNG_PTRS
-            );
+            assert_eq!((*hdr).flags(), 0);
+            assert!(!(*hdr).has_flag(flags::TRACK_YOUNG_PTRS));
+            assert!(!(*hdr).has_flag(flags::NO_HEAP_PTRS));
         }
     }
 

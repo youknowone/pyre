@@ -5905,6 +5905,14 @@ mod tests {
         let prebuilt = crate::header::alloc_with_gc_header([vtable, child.0], prebuilt_tid);
         let prebuilt_ref = GcRef(prebuilt as usize);
         let hdr = unsafe { header_of(prebuilt_ref.0) };
+        // `alloc_with_gc_header` is pyre's runtime host allocator, not a
+        // translated prebuilt (see its docstring), so it leaves the flags
+        // clear. Stamp incminimark's `init_gc_object_immortal` shape by hand
+        // to exercise the lifecycle this test is about.
+        unsafe {
+            (*hdr).set_flag(flags::NO_HEAP_PTRS);
+            (*hdr).set_flag(flags::TRACK_YOUNG_PTRS);
+        }
         assert!(unsafe { (*hdr).has_flag(flags::NO_HEAP_PTRS) });
 
         gc.do_write_barrier(prebuilt_ref);
