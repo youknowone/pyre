@@ -5631,6 +5631,9 @@ impl<M: Clone> MetaInterp<M> {
                     return CompileOutcome::Cancelled;
                 }
                 if merge_position == Some(retrace_pos) {
+                    // `compile_retrace` consumes `self.tracing`, so capture the
+                    // key the abort path needs before it is gone.
+                    let retrace_green_key = self.tracing.as_ref().map(|ctx| ctx.green_key);
                     let ok = self.compile_retrace(jump_args, meta.clone());
                     if ok {
                         self.cancel_count = 0;
@@ -5656,6 +5659,23 @@ impl<M: Clone> MetaInterp<M> {
                         // tracer" state. If compile_retrace consumed the
                         // tracing ctx, it was a hard backend failure and the
                         // caller must abort instead of continuing to trace.
+                        //
+                        // Tear the session down the way the two sibling abort
+                        // arms do. `abort_trace_live` cannot do it for us: its
+                        // whole body is inside `if let Some(ctx) =
+                        // self.tracing.take()`, so with `tracing` already None
+                        // it skips everything, leaving `active_trace_session`
+                        // and `bridge_info` set and — because
+                        // `leave_profiler_tracing` never runs —
+                        // `profiler_tracing_active` true. The next trace start
+                        // calls `enter_profiler_tracing`, whose release
+                        // `assert!` on that flag would then abort the process.
+                        self.clear_retrace_state();
+                        if let Some(green_key) = retrace_green_key {
+                            self.warm_state.abort_tracing(green_key, false);
+                        }
+                        // Keep tracing + session in lockstep (pyjitpl.py:3015).
+                        self.clear_trace_session();
                         return CompileOutcome::Aborted;
                     }
                     // Not too many — clear retrace state and fall through
@@ -7347,11 +7367,21 @@ impl<M: Clone> MetaInterp<M> {
             let green_key = ctx.green_key;
             let header_pc = ctx.header_pc;
             let driver_descriptor = ctx.driver_descriptor().cloned();
-            let retracing_from_armed = retracing_from.is_some();
-            let retrace_merge_point = retracing_from.and_then(|retrace_pos| {
-                ctx.get_merge_point_at(green_key, header_pc)
-                    .filter(|mp| mp.position == retrace_pos && mp.position._pos > 0)
-            });
+            // `compile.py:341-347` takes `start` as a parameter; there is no
+            // upstream `compile_retrace` without one. Requiring it here rather
+            // than degrading to the uncut path makes the `else { trace }` arm
+            // below provably dead, so it can be deleted outright once the
+            // selection is threaded down from the caller.
+            let Some(retrace_pos) = retracing_from else {
+                crate::debug::log_one(
+                    "jit-abort",
+                    "compile_retrace: entered with no retracing_from position",
+                );
+                return false;
+            };
+            let retrace_merge_point = ctx
+                .get_merge_point_at(green_key, header_pc)
+                .filter(|mp| mp.position == retrace_pos && mp.position._pos > 0);
             // compile.py:347 `trace = metainterp.history.trace.cut_trace_from(
             // start, inputargs)` is UNCONDITIONAL. `start` is read once, at the
             // caller's single merge-point selection (pyjitpl.py:3019), and
@@ -7371,7 +7401,7 @@ impl<M: Clone> MetaInterp<M> {
             //
             // Refuse instead; the caller reads `false` as pyjitpl.py:3004
             // "creation of the loop was cancelled".
-            if retracing_from_armed && retrace_merge_point.is_none() {
+            if retrace_merge_point.is_none() {
                 crate::debug::log_one(
                     "jit-abort",
                     "compile_retrace: no merge point at header_pc for retracing_from \
