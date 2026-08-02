@@ -1725,19 +1725,29 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
     !std::ptr::eq(code.w_globals, w_globals)
 }
 
-thread_local! {
-    /// Registry mapping a raw CodeObject pointer (`PyCode.code_ptr`) to the
-    /// live, globals-stamped `PyCode` wrapper. Populated where a frame stamps
-    /// the wrapper's `w_globals` — the only point both the raw pointer and the
-    /// live wrapper are in hand — and consumed by the JIT to recover the live
-    /// wrapper (and hence its `w_globals`) from a raw code pointer it already
-    /// holds, so the JIT need not carry the wrapper identity as a separate
-    /// `w_code` courier. First-write-wins, mirroring the first-store-wins
-    /// `PyCode.w_globals` semantics in `w_code_frame_stores_global`. Wrappers
-    /// are prebuilt-immortal and non-moving, so stored pointers never
-    /// dangle and need no GC rooting.
-    static LIVE_CODE_WRAPPERS: std::cell::RefCell<std::collections::HashMap<*const (), PyObjectRef>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+/// Registry mapping a raw CodeObject pointer (`PyCode.code_ptr`) to the
+/// live, globals-stamped `PyCode` wrapper. Populated where a frame stamps
+/// the wrapper's `w_globals` — the only point both the raw pointer and the
+/// live wrapper are in hand — and consumed by the JIT to recover the live
+/// wrapper (and hence its `w_globals`) from a raw code pointer it already
+/// holds, so the JIT need not carry the wrapper identity as a separate
+/// `w_code` courier. First-write-wins, mirroring the first-store-wins
+/// `PyCode.w_globals` semantics in `w_code_frame_stores_global`. Wrappers
+/// are prebuilt-immortal and non-moving, so stored pointers never
+/// dangle and need no GC rooting.
+///
+/// Process-global, not per-thread: `pycode.py:159` keeps `w_globals` on the
+/// shared `PyCode` instance, and a code object stamped on one thread must be
+/// recoverable from every thread that later runs it — a thread-local map made
+/// the JIT's `recover_inline_callee_globals` answer `PY_NULL` there and
+/// decline the inline. Keys and values are `usize` because a raw
+/// `PyObjectRef` is not `Send`, as in `interp_sre`'s pattern registry.
+static LIVE_CODE_WRAPPERS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, usize>>,
+> = std::sync::OnceLock::new();
+
+fn live_code_wrappers() -> &'static std::sync::Mutex<std::collections::HashMap<usize, usize>> {
+    LIVE_CODE_WRAPPERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// Record `wrapper` as the live wrapper for `code_ptr`, keeping the first one
@@ -1746,9 +1756,11 @@ pub fn register_live_code_wrapper(code_ptr: *const (), wrapper: PyObjectRef) {
     if code_ptr.is_null() || wrapper.is_null() {
         return;
     }
-    LIVE_CODE_WRAPPERS.with(|m| {
-        m.borrow_mut().entry(code_ptr).or_insert(wrapper);
-    });
+    live_code_wrappers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(code_ptr as usize)
+        .or_insert(wrapper as usize);
 }
 
 /// Recover the live wrapper previously registered for `code_ptr`, or `PY_NULL`
@@ -1757,7 +1769,11 @@ pub fn live_code_wrapper(code_ptr: *const ()) -> PyObjectRef {
     if code_ptr.is_null() {
         return PY_NULL;
     }
-    LIVE_CODE_WRAPPERS.with(|m| m.borrow().get(&code_ptr).copied().unwrap_or(PY_NULL))
+    live_code_wrappers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(code_ptr as usize))
+        .map_or(PY_NULL, |&w| w as PyObjectRef)
 }
 
 /// pycode.py:226-238 `_compute_flatcall`.
@@ -1989,9 +2005,10 @@ pub unsafe fn w_code_mapdict_caches_set(
         // `w_method` reference; register this code object so
         // `walk_mapdict_method_cache_gc` forwards the slot.
         if !entry.w_method.is_null() {
-            MAPDICT_METHOD_CACHE_CODES.with(|s| {
-                s.borrow_mut().insert(obj as usize);
-            });
+            mapdict_method_cache_codes()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(obj as usize);
             // Prebuilt-family store: the slot is reached only by
             // `walk_mapdict_method_cache_gc`, skipped on clean minors.
             pyre_object::gc_roots::mark_prebuilt_roots_dirty();
@@ -1999,60 +2016,69 @@ pub unsafe fn w_code_mapdict_caches_set(
     }
 }
 
-thread_local! {
-    /// Code objects whose `_mapdict_caches` hold (or once held) a filled
-    /// `w_method` slot.  In PyPy `CacheEntry.w_method` (mapdict.py:1418)
-    /// is traced through the GC-managed `PyCode`; pyre code objects are
-    /// prebuilt-immortal (`w_code_new` → `malloc_typed`), so no field trace
-    /// reaches the slot — the extra-root walker forwards it through
-    /// this registry instead (same family as `walk_method_cache_gc`).
-    /// Entries are immortal code pointers, so they never dangle; the
-    /// registry retires when code objects become GC-managed.
-    static MAPDICT_METHOD_CACHE_CODES: std::cell::RefCell<std::collections::HashSet<usize>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
-    /// Code objects whose `w_globals` has been stamped
-    /// (`pycode.py:159-165 frame_stores_global`).  `w_globals` is a permanent
-    /// strong field: the first globals object a code object runs in is kept
-    /// for the code object's lifetime and never replaced.  Upstream that
-    /// field is traced through the GC-managed `PyCode`; pyre code objects are
-    /// prebuilt-immortal (`w_code_new` → `malloc_typed`), so the only paths that
-    /// reach the slot are the opportunistic `walk_raw_code_roots` calls on
-    /// `frame.pycode` and `func.code`.  Those miss any stamped code object
-    /// that is off the frame chain and not held in a walked frame slot at
-    /// collection time, which leaves a pre-move nursery address in
-    /// `w_globals` once its dict is promoted — the next call through that
-    /// code object then forwards a dangling pointer.  This registry makes the
-    /// slot a root of its own, in the same family as
-    /// [`MAPDICT_METHOD_CACHE_CODES`].  Entries are immortal code pointers,
-    /// so they never dangle; the registry retires when code objects become
-    /// GC-managed.
-    static W_GLOBALS_STAMPED_CODES: std::cell::RefCell<std::collections::HashSet<usize>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
+/// Code objects whose `_mapdict_caches` hold (or once held) a filled
+/// `w_method` slot.  In PyPy `CacheEntry.w_method` (mapdict.py:1418)
+/// is traced through the GC-managed `PyCode`; pyre code objects are
+/// prebuilt-immortal (`w_code_new` → `malloc_typed`), so no field trace
+/// reaches the slot — the extra-root walker forwards it through
+/// this registry instead (same family as `walk_method_cache_gc`).
+/// The registry retires when code objects become GC-managed.
+static MAPDICT_METHOD_CACHE_CODES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<usize>>,
+> = std::sync::OnceLock::new();
+
+fn mapdict_method_cache_codes() -> &'static std::sync::Mutex<std::collections::HashSet<usize>> {
+    MAPDICT_METHOD_CACHE_CODES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Code objects whose `w_globals` has been stamped
+/// (`pycode.py:159-165 frame_stores_global`).  `w_globals` is a permanent
+/// strong field: the first globals object a code object runs in is kept
+/// for the code object's lifetime and never replaced.  Upstream that
+/// field is traced through the GC-managed `PyCode`; pyre code objects are
+/// prebuilt-immortal (`w_code_new` → `malloc_typed`), so the only paths that
+/// reach the slot are the opportunistic `walk_raw_code_roots` calls on
+/// `frame.pycode` and `func.code`.  Those miss any stamped code object
+/// that is off the frame chain and not held in a walked frame slot at
+/// collection time, which leaves a pre-move nursery address in
+/// `w_globals` once its dict is promoted — the next call through that
+/// code object then forwards a dangling pointer.  This registry makes the
+/// slot a root of its own, in the same family as
+/// [`MAPDICT_METHOD_CACHE_CODES`].  The registry retires when code objects
+/// become GC-managed.
+static W_GLOBALS_STAMPED_CODES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<usize>>,
+> = std::sync::OnceLock::new();
+
+fn w_globals_stamped_codes() -> &'static std::sync::Mutex<std::collections::HashSet<usize>> {
+    W_GLOBALS_STAMPED_CODES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
 /// Record `obj` as a code object holding a stamped `w_globals` slot.
 fn register_w_globals_stamped_code(obj: PyObjectRef) {
-    W_GLOBALS_STAMPED_CODES.with(|s| {
-        s.borrow_mut().insert(obj as usize);
-    });
-}
-
-pub(crate) fn capture_w_globals_stamped_code_root_area() -> *const () {
-    W_GLOBALS_STAMPED_CODES.with(|codes| codes as *const _ as *const ())
+    w_globals_stamped_codes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(obj as usize);
 }
 
 /// Forward the stamped `w_globals` slot of every registered code object.
 ///
-/// # Safety
-/// `data` must come from [`capture_w_globals_stamped_code_root_area`], and the
-/// owning thread must be quiesced.
-pub(crate) unsafe fn walk_w_globals_stamped_code_root_area(
-    data: *const (),
-    forward: &mut dyn FnMut(&mut PyObjectRef),
-) {
-    let codes = unsafe {
-        &*(*(data as *const std::cell::RefCell<std::collections::HashSet<usize>>)).as_ptr()
-    };
+/// A process-global walker, not a per-mutator root area: a code object is
+/// immortal and `w_globals` is first-store-wins, so the slot outlives whichever
+/// thread happened to stamp it.  Owning the root per-thread meant
+/// `unregister_mutator` dropped that thread's area at thread exit while the
+/// code object stayed live and callable, and the slot then went unforwarded.
+/// Same ownership argument as `interp_sre`'s pattern registry.
+///
+/// Reached only from the collector's root walk, where every mutator is at a
+/// safepoint — that is what makes handing out `&mut code.w_globals` sound.
+#[majit_macros::dont_look_inside]
+pub fn walk_w_globals_stamped_code_roots(forward: &mut dyn FnMut(&mut PyObjectRef)) {
+    let codes = w_globals_stamped_codes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for &code in codes.iter() {
         let code = unsafe { &mut *(code as *mut PyCode) };
         if code.w_globals.is_null() {
@@ -2068,39 +2094,15 @@ pub(crate) unsafe fn walk_w_globals_stamped_code_root_area(
 /// map/attr node pointers are immortal interned nodes and the
 /// `version_tag` is a `u64`, so `w_method` is the entry's only movable
 /// reference.
-pub(crate) unsafe fn walk_mapdict_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
-    MAPDICT_METHOD_CACHE_CODES.with(|s| {
-        for &code in s.borrow().iter() {
-            let code = unsafe { &*(code as *const PyCode) };
-            if code.mapdict_caches.is_null() {
-                continue;
-            }
-            let vec = unsafe { &mut *code.mapdict_caches };
-            for slot in vec.iter_mut() {
-                if let Some(entry) = slot.as_mut() {
-                    if !entry.w_method.is_null() {
-                        forward(&mut entry.w_method);
-                    }
-                }
-            }
-        }
-    });
-}
-
-pub(crate) fn capture_mapdict_method_cache_root_area() -> *const () {
-    MAPDICT_METHOD_CACHE_CODES.with(|codes| codes as *const _ as *const ())
-}
-
-/// # Safety
-/// `data` must come from [`capture_mapdict_method_cache_root_area`], and the
-/// owning thread must be quiesced.
-pub(crate) unsafe fn walk_mapdict_method_cache_root_area(
-    data: *const (),
-    forward: &mut dyn FnMut(&mut PyObjectRef),
-) {
-    let codes = unsafe {
-        &*(*(data as *const std::cell::RefCell<std::collections::HashSet<usize>>)).as_ptr()
-    };
+///
+/// Process-global for the same reason as
+/// [`walk_w_globals_stamped_code_roots`]: the holder is immortal and outlives
+/// the thread that filled the slot.
+#[majit_macros::dont_look_inside]
+pub fn walk_mapdict_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
+    let codes = mapdict_method_cache_codes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for &code in codes.iter() {
         let code = unsafe { &*(code as *const PyCode) };
         if code.mapdict_caches.is_null() {

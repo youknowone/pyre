@@ -893,6 +893,13 @@ impl MiniMarkGC {
     /// A registered vtable plus the exact matching header tid is the translated
     /// type-layout witness. The tid equality rejects headerless bootstrap
     /// objects whose preceding allocator word happens to look like flags.
+    ///
+    /// This is the ONLY admissible probe for an address outside both managed
+    /// generations, and both callers (`seed_major_root`, `do_write_barrier`)
+    /// must go through it. Recording every `alloc_with_gc_header` result in an
+    /// ownership table instead would make the answer exact, but that is a probe
+    /// on the allocation fast path — the same shape measured at −15% in the GC
+    /// box-probe experiment — so the tid witness stands.
     #[inline]
     fn registered_pyobject_header(&self, addr: usize) -> Option<*mut GcHeader> {
         if addr < GcHeader::SIZE || addr % GcHeader::ALIGN != 0 {

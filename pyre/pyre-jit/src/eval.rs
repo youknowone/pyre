@@ -2419,10 +2419,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         if pytype_ptr == &pyre_object::NONE_TYPE as *const _ as usize {
             debug_assert_eq!(tid, pyre_object::noneobject::W_NONE_GC_TYPE_ID);
         } else if pytype_ptr == &pyre_object::NOTIMPLEMENTED_TYPE as *const _ as usize {
-            debug_assert_eq!(
-                tid,
-                pyre_object::special::W_NOT_IMPLEMENTED_GC_TYPE_ID
-            );
+            debug_assert_eq!(tid, pyre_object::special::W_NOT_IMPLEMENTED_GC_TYPE_ID);
         } else if pytype_ptr == &pyre_object::ELLIPSIS_TYPE as *const _ as usize {
             debug_assert_eq!(tid, pyre_object::special::W_ELLIPSIS_GC_TYPE_ID);
         }
@@ -3845,6 +3842,15 @@ fn install_gc_root_walkers() {
     // pattern outlives the thread that compiled it, so its owner is a global
     // walker rather than a per-mutator area.
     majit_gc::shadow_stack::register_extra_root_walker(sre_pattern_root_walker);
+
+    // Same ownership argument for the two immortal-code-object registries.
+    // `w_globals` (`pycode.py:159-165 frame_stores_global`) is first-store-wins
+    // and `_mapdict_caches[i].w_method` (mapdict.py:1418) is filled once, so
+    // both slots outlive whichever thread stamped them; as per-mutator areas
+    // they lost their root at that thread's `unregister_mutator` while the
+    // code object stayed live and callable.
+    majit_gc::shadow_stack::register_extra_root_walker(w_globals_stamped_code_root_walker);
+    majit_gc::shadow_stack::register_extra_root_walker(mapdict_method_cache_root_walker);
 }
 
 fn register_thread_root_areas() {
@@ -4648,6 +4654,18 @@ fn signal_handler_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 
 fn sre_pattern_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     pyre_object::interp_sre::walk_sre_pattern_roots(|slot| {
+        visit_pyobject_root(slot, visitor);
+    });
+}
+
+fn w_globals_stamped_code_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    pyre_interpreter::pycode::walk_w_globals_stamped_code_roots(&mut |slot| {
+        visit_pyobject_root(slot, visitor);
+    });
+}
+
+fn mapdict_method_cache_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    pyre_interpreter::pycode::walk_mapdict_method_cache_gc(&mut |slot| {
         visit_pyobject_root(slot, visitor);
     });
 }
