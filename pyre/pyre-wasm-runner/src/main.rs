@@ -556,7 +556,11 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
                 );
             }
         }
-        // must_compile / start_retrace gate tallies (diagnostic).
+        // must_compile / start_retrace gate tallies (diagnostic). Positional
+        // mirror of `majit_metainterp::MC_DIAG_LABELS`; the runner links no
+        // majit crate, so a new slot must be appended in both. Appending keeps
+        // the existing indices, which is the only edit that cannot silently
+        // rename every tally after it.
         if let Ok(mc) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_mc_diag") {
             let labels = [
                 "mc_entered",
@@ -593,6 +597,12 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
                 "ct_entry_bridge_failed",
                 "ct_no_entry_data",
                 "ct_not_tracing",
+                "ceb_no_loop",
+                "ceb_dead_token",
+                "ceb_invalidloop",
+                "ceb_retrace_req",
+                "ceb_backend_panic",
+                "ceb_backend_err",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

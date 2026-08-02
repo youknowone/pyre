@@ -609,17 +609,26 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 /// bridge did not compile, 32 = `compile_trace` had neither a guard origin nor
 /// entry-bridge data to close against, 33 = `compile_trace` was called with no
 /// tracing session.
-pub static MC_DIAG: [std::sync::atomic::AtomicU64; 34] = {
+///
+/// 34-39 split slot 31 by which of `compile_entry_bridge`'s exits answered:
+/// 34 = the target green key has no compiled loop, 35 = its JitCellToken is
+/// dead, 36 = `optimize_bridge` raised `InvalidLoop`, 37 = the optimizer asked
+/// for a retrace instead, 38 = the backend's own `compile_loop` panicked,
+/// 39 = the backend returned `Err` from it. Slot 31 stays their total. The six
+/// are reachable for different reasons and only
+/// the split says which; the guest has no stderr, so `MAJIT_LOG`'s per-exit
+/// lines never reach a wasm run and this is the only channel that does.
+pub static MC_DIAG: [std::sync::atomic::AtomicU64; 40] = {
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     [
         Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
-        Z, Z, Z, Z,
+        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
     ]
 };
 
 /// Short label per [`MC_DIAG`] slot, in index order, so a tally cannot be added
 /// without naming it. Readers join these with the counter values.
-pub const MC_DIAG_LABELS: [&str; 34] = [
+pub const MC_DIAG_LABELS: [&str; 40] = [
     "mc_entered",
     "decl_shortcircuit",
     "descr0_skip",
@@ -654,6 +663,12 @@ pub const MC_DIAG_LABELS: [&str; 34] = [
     "ct_entry_bridge_failed",
     "ct_no_entry_data",
     "ct_not_tracing",
+    "ceb_no_loop",
+    "ceb_dead_token",
+    "ceb_invalidloop",
+    "ceb_retrace_req",
+    "ceb_backend_panic",
+    "ceb_backend_err",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.

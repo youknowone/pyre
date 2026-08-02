@@ -10532,6 +10532,7 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_frame_pcs: SnapshotFramePcs,
     ) -> bool {
         if !self.compiled_loops.contains_key(&green_key) {
+            crate::mc_diag_bump(34); // compile_entry_bridge: target has no compiled loop
             return false;
         }
 
@@ -10541,6 +10542,7 @@ impl<M: Clone> MetaInterp<M> {
         let (retraced_count, loop_num_inputs, parent_next_global_opref) = {
             let compiled = self.compiled_loops.get(&green_key).unwrap();
             let Some(tok) = compiled.live_token() else {
+                crate::mc_diag_bump(35); // compile_entry_bridge: target token dead
                 return false;
             };
             (
@@ -10672,11 +10674,12 @@ impl<M: Clone> MetaInterp<M> {
             // guard proven to always fail, or a speculative heap access proven
             // ill-typed (now surfaced as a deferred `InvalidLoop` signal rather
             // than a panic), abandons the function-entry bridge.
-            Err(_invalid_loop) => {
+            Err(invalid_loop) => {
+                crate::mc_diag_bump(36); // compile_entry_bridge: optimize_bridge InvalidLoop
                 if crate::majit_log_enabled() {
                     eprintln!(
-                        "[jit] compile_entry_bridge: InvalidLoop target={} original={}",
-                        green_key, original_green_key
+                        "[jit] compile_entry_bridge: {invalid_loop} target={green_key} \
+                         original={original_green_key}",
                     );
                 }
                 return false;
@@ -10694,6 +10697,7 @@ impl<M: Clone> MetaInterp<M> {
             {
                 tok.set_retraced_count(tok.get_retraced_count() + 1);
             }
+            crate::mc_diag_bump(37); // compile_entry_bridge: optimizer asked for a retrace
             if let Some(es) = optimizer.exported_loop_state.take() {
                 let renamed_inputargs: Vec<InputArg> = es
                     .renamed_inputargs
@@ -10776,6 +10780,7 @@ impl<M: Clone> MetaInterp<M> {
         let compile_result = match compile_result {
             Ok(r) => r,
             Err(payload) => {
+                crate::mc_diag_bump(38); // compile_entry_bridge: backend compile_loop panicked
                 self.note_jit_panic_or_reraise(payload, "compile_entry_bridge backend", green_key);
                 return false;
             }
@@ -10904,7 +10909,10 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 true
             }
-            Err(_) => false,
+            Err(_) => {
+                crate::mc_diag_bump(39); // compile_entry_bridge: backend refused the loop
+                false
+            }
         }
     }
 
