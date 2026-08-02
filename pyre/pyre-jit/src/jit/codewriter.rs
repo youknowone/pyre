@@ -4333,6 +4333,80 @@ fn group_py_pcs_by_insn(pairs: impl Iterator<Item = (usize, usize)>) -> Vec<(usi
     groups
 }
 
+/// Extra Ref colors a `-live-` marker must name because the PC it belongs to is
+/// covered by an exception-table entry: a raise there transfers to that entry's
+/// handler, so the handler's live-in has to survive the resume.
+///
+/// `compute_liveness` supplies that union only where the stream makes the edge
+/// explicit — `catch_exception L` carries `TLabel(L)`, so the backward pass
+/// folds the handler's alive set into the markers before it (`liveness.py:19-23`).
+/// The coordinate a bridge actually resumes at is the one the guard recorded,
+/// which for an after-residual-call guard sits PAST the `catch_exception` and so
+/// describes the no-exception arm alone.  Re-pointing that walk at the handler
+/// (`route_exc_edge`) then enters a block reading registers the marker never
+/// named, and the first such read aborts the walk `RegisterReadUnbound`.
+///
+/// Upstream needs no equivalent: `finishframe_exception` moves the pc of the
+/// SAME MIFrame, so the handler reads the register bank the raise left behind.
+/// A pyre bridge rebuilds its bank from one coordinate's resume data, so that
+/// coordinate must name what the handler reads.  Widening a `-live-` set is the
+/// conservative direction — the snapshot carries boxes the no-exception arm does
+/// not consume, which costs a slot and never mis-restores.
+///
+/// Returns `marker insn index -> extra Ref colors`.
+fn catch_target_extra_ref_colors(
+    ssarepr: &super::flatten::SSARepr,
+    live_markers: &[usize],
+    code: &CodeObject,
+) -> std::collections::BTreeMap<usize, std::collections::BTreeSet<u16>> {
+    use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
+    let mut out: std::collections::BTreeMap<usize, std::collections::BTreeSet<u16>> =
+        std::collections::BTreeMap::new();
+    if code.exceptiontable.is_empty() {
+        return out;
+    }
+    let marker_ref_colors = |py: usize| -> std::collections::BTreeSet<u16> {
+        live_markers
+            .get(py)
+            .and_then(|&idx| ssarepr.insns.get(idx))
+            .and_then(|insn| insn.live_args())
+            .map(|args| {
+                args.iter()
+                    .filter_map(|op| match op {
+                        SsaOperand::Register(reg) if reg.kind == SsaKind::Ref => Some(reg.index),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // `handler py -> live-in`, memoized: a try body of N PCs shares one handler.
+    let mut handler_refs: std::collections::HashMap<usize, std::collections::BTreeSet<u16>> =
+        std::collections::HashMap::new();
+    for py in 0..live_markers.len() {
+        let offset = u32::try_from(py * 2).expect("Python PC must fit an instruction offset");
+        let Some((target, _, _)) =
+            pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, offset)
+        else {
+            continue;
+        };
+        let handler_py = target as usize / 2;
+        if handler_py == py || handler_py >= live_markers.len() {
+            continue;
+        }
+        let refs = handler_refs
+            .entry(handler_py)
+            .or_insert_with(|| marker_ref_colors(handler_py));
+        if refs.is_empty() {
+            continue;
+        }
+        out.entry(live_markers[py])
+            .or_default()
+            .extend(refs.iter().copied());
+    }
+    out
+}
+
 /// RPython: `liveness.py:19-80` `compute_liveness(ssarepr)` —
 /// backward dataflow over the populated `SSARepr` that fills each
 /// `-live-` marker with the set of registers alive across it.
@@ -4473,6 +4547,7 @@ fn filter_liveness_in_place(
             .enumerate()
             .map(|(py_pc, &i)| (py_pc, i)),
     );
+    let catch_extra_refs = catch_target_extra_ref_colors(ssarepr, &live_markers, code);
 
     // The after-residual-call `-live-` is a resume coordinate of exactly the
     // same class as the per-PC marker: `get_list_of_active_boxes` reads the
@@ -4797,6 +4872,13 @@ fn filter_liveness_in_place(
                     }
                 }
             }
+        }
+
+        // A PC this marker serves is covered by an exception-table entry, so a
+        // resume here can be re-pointed at that entry's handler: the handler's
+        // live-in belongs in the marker's set as well.
+        if any_reachable && let Some(extra) = catch_extra_refs.get(&insn_idx) {
+            union_r.extend(extra.iter().copied());
         }
 
         // #348 Part (2): the marker's Ref colors are now final in `union_r`.
