@@ -6581,6 +6581,50 @@ pub(crate) fn type_set_annotate(obj: PyObjectRef, value: PyObjectRef) -> PyResul
     Ok(w_none())
 }
 
+/// CPython 3.14 `type_get___annotate__`: the compiler-facing
+/// `__annotate_func__` slot is exposed as `__annotate__` on heap types.
+/// Static types have no slot and raise AttributeError rather than returning
+/// None.  A class-body `__annotate__` entry is an ordinary own-class value
+/// and takes precedence over the compiler-facing slot.
+pub(crate) fn type_get_annotate(obj: PyObjectRef) -> PyResult {
+    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+        return Err(PyError::attribute_error(format!(
+            "type object '{}' has no attribute '__annotate__'",
+            unsafe { w_type_get_name(obj) },
+        )));
+    }
+    if let Some(value) = crate::type_dict_lookup(obj, "__annotate__") {
+        return Ok(value);
+    }
+    Ok(crate::type_dict_lookup(obj, "__annotate_func__").unwrap_or_else(w_none))
+}
+
+/// CPython 3.14 `type_get_type_params` / `type_set_type_params`: parameters
+/// belong to the receiver type itself, are never inherited, and default to
+/// the empty tuple.  Unlike function type parameters, the class slot accepts
+/// any object; the compiler normally stores a tuple.
+pub(crate) fn type_get_type_params(obj: PyObjectRef) -> PyResult {
+    if unsafe { pyre_object::w_type_is_heaptype(obj) } {
+        if let Some(value) = crate::type_dict_lookup(obj, "__type_params__") {
+            return Ok(value);
+        }
+    }
+    Ok(w_tuple_new(vec![]))
+}
+
+pub(crate) fn type_set_type_params(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
+    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+        return Err(PyError::type_error(format!(
+            "cannot set '__type_params__' attribute of immutable type '{}'",
+            unsafe { w_type_get_name(obj) },
+        )));
+    }
+    crate::type_dict_store(obj, "__type_params__", value);
+    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    unsafe { mutated(obj, Some("__type_params__")) };
+    Ok(w_none())
+}
+
 pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
     if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
         return Err(PyError::type_error(format!(
@@ -7236,30 +7280,21 @@ fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyRe
                 return type_get_annotations(obj);
             }
             if name == "__type_params__" {
-                // CPython 3.14 type_get_type_params: PEP 695 parameters are
-                // owned by the class itself and every other type, including
-                // static `object`, exposes an empty tuple.  Do not inherit a
-                // base class's parameters through the MRO.
-                if let Some(value) = crate::type_dict_lookup(obj, "__type_params__") {
-                    return Ok(value);
-                }
-                return Ok(w_tuple_new(vec![]));
+                return type_get_type_params(obj);
             }
             // PEP 649: `__annotate__` and `__annotate_func__` are the
             // same slot. Bytecode stores it as `__annotate_func__` in the
             // class dict; user code reads it as `__annotate__`. Forward
             // either name to the other, matching CPython's mapping in
             // typeobject.c type_get___annotate__.
-            if name == "__annotate__" || name == "__annotate_func__" {
+            if name == "__annotate__" {
+                return type_get_annotate(obj);
+            }
+            if name == "__annotate_func__" {
                 if let Some(v) = crate::type_dict_lookup(obj, name) {
                     return Ok(v);
                 }
-                let alt = if name == "__annotate__" {
-                    "__annotate_func__"
-                } else {
-                    "__annotate__"
-                };
-                if let Some(v) = crate::type_dict_lookup(obj, alt) {
+                if let Some(v) = crate::type_dict_lookup(obj, "__annotate__") {
                     return Ok(v);
                 }
                 return Ok(w_none());

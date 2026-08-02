@@ -10465,6 +10465,75 @@ fn init_type_type(ns: PyObjectRef) {
         )
     };
 
+    // CPython 3.14 typeobject.c `type_get___annotate__` and
+    // `type_get_type_params`.  These are data descriptors on `type`, not
+    // ordinary inherited class attributes; their values live in each heap
+    // type's own namespace.
+    let annotate_getter = make_builtin_function_with_arity(
+        "__annotate__",
+        |args| crate::baseobjspace::type_get_annotate(args[1]),
+        2,
+    );
+    let annotate_setter = make_builtin_function_with_arity(
+        "__annotate__",
+        |args| crate::baseobjspace::type_set_annotate(args[1], args[2]),
+        3,
+    );
+    let annotate_deleter = make_builtin_function_with_arity(
+        "__annotate__",
+        |_args| {
+            Err(crate::PyError::type_error(
+                "cannot delete __annotate__ attribute",
+            ))
+        },
+        2,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__annotate__",
+            make_getset_property_named(
+                annotate_getter,
+                annotate_setter,
+                annotate_deleter,
+                "__annotate__",
+            ),
+        )
+    };
+
+    let type_params_getter = make_builtin_function_with_arity(
+        "__type_params__",
+        |args| crate::baseobjspace::type_get_type_params(args[1]),
+        2,
+    );
+    let type_params_setter = make_builtin_function_with_arity(
+        "__type_params__",
+        |args| crate::baseobjspace::type_set_type_params(args[1], args[2]),
+        3,
+    );
+    let type_params_deleter = make_builtin_function_with_arity(
+        "__type_params__",
+        |args| {
+            Err(crate::PyError::type_error(format!(
+                "cannot delete '__type_params__' attribute of immutable type '{}'",
+                unsafe { pyre_object::w_type_get_name(args[1]) },
+            )))
+        },
+        2,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__type_params__",
+            make_getset_property_named(
+                type_params_getter,
+                type_params_setter,
+                type_params_deleter,
+                "__type_params__",
+            ),
+        )
+    };
+
     // typeobject.py:1306 W_TypeObject.typedef `__doc__` getset. Python 3.14
     // routes deletion through `type_set_doc(tp, NULL)` and rejects it.
     let doc_getter = make_builtin_function_with_arity(
