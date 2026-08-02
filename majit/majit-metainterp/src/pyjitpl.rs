@@ -7347,10 +7347,38 @@ impl<M: Clone> MetaInterp<M> {
             let green_key = ctx.green_key;
             let header_pc = ctx.header_pc;
             let driver_descriptor = ctx.driver_descriptor().cloned();
+            let retracing_from_armed = retracing_from.is_some();
             let retrace_merge_point = retracing_from.and_then(|retrace_pos| {
                 ctx.get_merge_point_at(green_key, header_pc)
                     .filter(|mp| mp.position == retrace_pos && mp.position._pos > 0)
             });
+            // compile.py:347 `trace = metainterp.history.trace.cut_trace_from(
+            // start, inputargs)` is UNCONDITIONAL. `start` is read once, at the
+            // caller's single merge-point selection (pyjitpl.py:3019), and
+            // handed straight down, so upstream has no "merge point not found"
+            // state here and there is nothing for a fallback to mirror.
+            //
+            // Proceeding with the UNCUT trace is not a lesser outcome, it is an
+            // undefined one: `combined_ops` still prepends `partial.ops`, which
+            // covers [0, retracing_from), to a body optimized from position 0,
+            // so the prefix appears twice; and `root_inputargs` keeps coming
+            // from `partial.inputargs` while the body references the recorder
+            // namespace. Nothing downstream is built to reject that shape —
+            // `normalize_root_loop_entry_contract` compares LABEL against JUMP
+            // arity within the same optimized output and passes
+            // `root_inputargs` through untouched, and the closing-JUMP cancel
+            // rejects only foreign-target closes, which a self-close is not.
+            //
+            // Refuse instead; the caller reads `false` as pyjitpl.py:3004
+            // "creation of the loop was cancelled".
+            if retracing_from_armed && retrace_merge_point.is_none() {
+                crate::debug::log_one(
+                    "jit-abort",
+                    "compile_retrace: no merge point at header_pc for retracing_from \
+                     — declining rather than assembling an uncut trace",
+                );
+                return false;
+            }
             let retrace_cut = retrace_merge_point.map(|mp| {
                 (
                     mp.green_boxes.clone(),
