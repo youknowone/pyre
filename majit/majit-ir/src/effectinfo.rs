@@ -676,7 +676,11 @@ pub enum OopSpecIndex {
 /// them so the production reghint / vstring passes treat them as ordinary
 /// calls, and the CanRaise members (`load_const` / `load_global` / `box_int`)
 /// would otherwise violate the `_OS_CANRAISE` invariant (effectinfo.py:198).
-/// Discriminants are pyre-internal (no upstream meaning).
+/// Discriminants are pyre-internal (no upstream meaning) and variant order is
+/// free: nothing decodes the tag numerically, and the one bincode artefact that
+/// carries it (`descrs.bin`) is written and read back within a single build
+/// whose codegen cache is content-keyed on this file.  Group a new helper with
+/// its siblings rather than appending it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum PyreHelperKind {
@@ -880,10 +884,6 @@ pub enum PyreHelperKind {
     /// binding half (`callmethod.py:25-85`).  The full-body walker recognises
     /// this tag to fold the pure `compute_load_method_bound` decision once the
     /// paired [`LoadAttr`] method-cache fold has made `attr` concrete.
-    ///
-    /// Keep this at the enum tail: [`PyreHelperKind`] is `repr(u8)`, and
-    /// inserting a helper in the middle changes existing discriminants consumed
-    /// by serialized/stable helper metadata.
     LoadMethodSelf,
     /// `bh_delete_attr_fn(obj, code, name_idx)` — the plain DELETE_ATTR
     /// residual (`lower_delete_attr_hlop_to_insn` → `space.delattr`), the

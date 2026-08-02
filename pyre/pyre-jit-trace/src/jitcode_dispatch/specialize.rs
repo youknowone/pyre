@@ -4364,7 +4364,8 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     // read below walks the same storage `pick_builtin_obj_checked`'s
     // `finditem_str` does.  This is also what `walker_pin_namespace_version`
     // needs, but that one emits IR, so it runs only once the fold commits.
-    if unsafe { pyre_object::dictmultiobject::w_module_dict_get_strategy(w_globals) }.is_null() {
+    if unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(w_globals) }.is_null()
+    {
         return Ok(None);
     }
     // `function_new_impl`'s `w_builtins` derivation, restricted to the branch
@@ -9553,6 +9554,7 @@ pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
 pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
+    helper: majit_ir::PyreHelperKind,
     frame_ptr: usize,
     w_name_ptr: usize,
     value_opref: OpRef,
@@ -9565,11 +9567,18 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
     if w_globals.is_null() {
         return Ok(false);
     }
-    // Module scope gate: `w_locals` aliases `w_globals` (same as the LOAD
-    // fold); a distinct `w_locals` routes to the live residual.
-    let w_locals = frame.get_w_locals();
-    if !w_locals.is_null() && !std::ptr::eq(w_locals, w_globals) {
-        return Ok(false);
+    // STORE_NAME writes `get_or_create_w_locals`, so only a module frame —
+    // where `w_locals` aliases `w_globals` — targets the dict this folds.  An
+    // ABSENT `w_locals` does NOT stand in for globals on the write path (unlike
+    // the LOAD fold): the store would land in a fresh locals mapping while the
+    // fold set the module cell.  STORE_GLOBAL names globals outright, and its
+    // frame is a function frame whose `w_locals` is legitimately null, so the
+    // gate must not apply to it.
+    if helper == majit_ir::PyreHelperKind::StoreName {
+        let w_locals = frame.get_w_locals();
+        if !std::ptr::eq(w_locals, w_globals) {
+            return Ok(false);
+        }
     }
     let name = unsafe {
         pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)

@@ -1915,6 +1915,28 @@ pub unsafe fn w_module_dict_get_strategy(
     (*(obj as *const W_ModuleDictObject)).mstrategy
 }
 
+/// [`w_module_dict_get_strategy`] for a caller that has not yet proven the
+/// layout — null for anything that is not a `W_ModuleDictObject`.
+///
+/// `mstrategy` sits at the same offset as `W_DictObject`'s `dstrategy`, which
+/// is a `&'static dyn DictStrategy` fat pointer, so the unchecked read on a
+/// plain dict returns one half of that pair.  Every strategy singleton is a
+/// zero-sized static, so the result is non-null and points into read-only
+/// memory: a caller testing `.is_null()` to mean "not a module dict" gets
+/// `false` and then reads — or atomically writes — past the static.
+///
+/// # Safety
+/// `obj` must be null or a valid `PyObjectRef`.
+#[inline]
+pub unsafe fn w_module_dict_strategy_or_null(
+    obj: PyObjectRef,
+) -> *mut crate::celldict::ModuleDictStrategy {
+    if obj.is_null() || !is_module_dict(obj) {
+        return std::ptr::null_mut();
+    }
+    w_module_dict_get_strategy(obj)
+}
+
 /// Strategy identity stamp used by `_new_next` parity (`dictmultiobject
 /// .py:829 self.strategy is self.w_dict.get_strategy()`).
 ///

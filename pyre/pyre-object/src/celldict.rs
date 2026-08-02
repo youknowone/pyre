@@ -1397,4 +1397,40 @@ mod tests {
             assert_eq!(crate::intobject::w_int_get_value(got), 8);
         }
     }
+
+    /// `store_would_bump_version` is the tracer's stand-in for the write it
+    /// never looks into, so it has to answer for the same five shapes
+    /// `classify_cell_write` distinguishes.  Pin both halves against one table
+    /// so neither can drift from the other.
+    #[test]
+    fn store_bump_prediction_matches_the_write() {
+        unsafe {
+            let int7 = crate::intobject::w_int_new(7);
+            let int8 = crate::intobject::w_int_new(8);
+            let s = crate::w_str_new("s");
+            let obj_cell = w_object_mutable_cell_new(s);
+            let int_cell = w_int_mutable_cell_new(7);
+
+            // (raw slot contents, value written, bumps?, what the write does)
+            let cases: [(Option<PyObjectRef>, PyObjectRef, bool, &str); 6] = [
+                (None, int7, true, "no cell: the value is stored bare"),
+                (Some(obj_cell), s, false, "object cell: written in place"),
+                (
+                    Some(int_cell),
+                    int8,
+                    false,
+                    "int cell + plain int: in place",
+                ),
+                (Some(int_cell), s, true, "int cell + non-int: fresh cell"),
+                (Some(s), s, false, "bare value, identical: unchanged"),
+                (Some(int7), int8, true, "bare value, different: fresh cell"),
+            ];
+            for (w_cell, w_value, bumps, what) in cases {
+                assert_eq!(store_would_bump_version(w_cell, w_value), bumps, "{what}");
+                // The write agrees: it returns a replacement slot value exactly
+                // when it bumps, and `None` (wrote through / no-op) otherwise.
+                assert_eq!(write_cell(w_cell, w_value).is_some(), bumps, "{what}");
+            }
+        }
+    }
 }

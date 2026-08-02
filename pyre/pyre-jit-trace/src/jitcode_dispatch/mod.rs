@@ -7460,7 +7460,7 @@ fn walker_pin_namespace_version<Sym: WalkSym>(
     op_pc: usize,
     ns: pyre_object::PyObjectRef,
 ) -> Result<bool, DispatchError> {
-    let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_get_strategy(ns) };
+    let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(ns) };
     if strategy.is_null() {
         return Ok(false);
     }

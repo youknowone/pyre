@@ -3731,16 +3731,22 @@ fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
     if w_globals.is_null() {
         return None;
     }
-    // A `*_NAME` opcode writes `w_locals`; only a module frame — where
-    // `w_locals` aliases `w_globals` — touches the namespace the folds pin.
-    // Same test as `try_walker_load_name_cell_fold`.
+    // A `*_NAME` opcode writes `get_or_create_w_locals`; only a module frame —
+    // where `w_locals` aliases `w_globals` — touches the namespace the folds
+    // pin.  An absent `w_locals` is a fresh throwaway mapping, not globals, so
+    // it declines rather than forcing for a write that never reaches here.
     if matches!(helper, K::StoreName | K::DeleteName) {
         let w_locals = frame.get_w_locals();
-        if !w_locals.is_null() && !std::ptr::eq(w_locals, w_globals) {
+        if !std::ptr::eq(w_locals, w_globals) {
             return None;
         }
     }
-    let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_get_strategy(w_globals) };
+    // A plain `W_DictObject` for globals (`exec(src, {})`,
+    // `FunctionType(code, {})`) has no `version?` field at all, so
+    // `hook_setfield` (rclass.py:714-718) emits no `jit_force_quasi_immutable`
+    // for its write and there is nothing to abandon the trace for.
+    let strategy =
+        unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(w_globals) };
     // `mutatebox.nonnull()` — nothing is watching, so there is nothing to
     // abandon the trace for. The write still runs its own invalidation.
     if !unsafe {
@@ -4035,8 +4041,14 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                 ctx.trace_ctx.box_value(frame_opref),
                 ctx.trace_ctx.box_value(name_opref),
             ) {
-                if try_walker_store_name_cell_fold(ctx, op.pc, frame_ptr, w_name_ptr, value_opref)?
-                {
+                if try_walker_store_name_cell_fold(
+                    ctx,
+                    op.pc,
+                    ei.pyre_helper,
+                    frame_ptr,
+                    w_name_ptr,
+                    value_opref,
+                )? {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
             }
