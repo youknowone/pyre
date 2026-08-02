@@ -4336,11 +4336,10 @@ fn register_helper_fn_pointers(
 /// produces one SSA-driven alive set as the sole authority, and
 /// `assembler.py:150-152` only splits that set by kind.
 ///
-/// Note: `live_r` carries an extra LV∩SSA
-/// `retain` step on top of the SSA bank — see the inline comment
-/// in the loop body below.  Removing it requires extending the
-/// encoder + symbolic-state pair to track scratch Ref colors,
-/// matching `pyjitpl.py:218-225` line by line.
+/// `live_r` is the SSA bank plus the frame-live colors backward
+/// liveness cannot reach — the portal reds and the FOR_ITER
+/// loop-carried operands — see the inline comments in the loop
+/// body below.
 ///
 /// Unreachable PCs still get emptied in place via the bytecode
 /// `LiveVars` analysis. The direct-dispatch walker emits one
@@ -4541,15 +4540,20 @@ fn filter_liveness_in_place(
                 }
             }
 
-            // Note: LV∩SSA retain narrows the Ref bank to post-rename
-            // colors that correspond to LV-live Python locals or live
-            // stack slots at this PC.  Scratch registers (temporaries
-            // SSA-live but with no Python-frame slot) remain
-            // `OpRef::NONE` in `registers_r` because no trace-time
-            // writer populates them.  Removing this retain requires
-            // either (a) populating scratch colors during tracing
-            // (graph regalloc) or (b) the encoder tolerating
-            // NONE for non-frame live registers.
+            // `pc_live_r` ships whole.  `liveness.py:5-12` expands a
+            // `-live-` marker's args to "all values that are alive at this
+            // point (written to before, and read afterwards)" — the SSA-live
+            // set, under no frame-slot condition.  Narrowing it to
+            // frame-backed colors drops a temporary that is SSA-live across
+            // the marker but whose value sits in no frame slot at that PC
+            // (`r = frame[12]` read before a guard and consumed after it,
+            // while slot 12 is itself dead at the guard): the guard's resume
+            // data then names no box for that color and a bridge resuming
+            // there reads it unbound.
+            //
+            // `lv_live` below is the converse set — colors that are
+            // frame-live but SSA-DEAD, which backward liveness cannot
+            // supply.  It feeds the portal reds and the FOR_ITER re-add.
             let lv_live: std::collections::BTreeSet<u16> = {
                 // #348 Part (2): the per-PC map's entries at this PC are the
                 // live frame colors — each slot's TRUE per-program-point SSA
@@ -4571,9 +4575,8 @@ fn filter_liveness_in_place(
                 // RPython force-alive mechanism (`liveness.py:11-12`):
                 // `emit_live_placeholder!` emits every PC's `-live-` op
                 // with explicit Register args for `portal_frame_reg` /
-                // `portal_ec_reg`.  Gate the portal colors past the
-                // LV∩SSA retain so the retain does not drop the
-                // RPython-tracked live registers.  Portal-bridge
+                // `portal_ec_reg`.  Carry the portal colors in `lv_live`
+                // so the re-add paths below name them.  Portal-bridge
                 // installs sentinel-skip (`u16::MAX`).
                 if portal_frame_reg != u16::MAX {
                     s.insert(portal_frame_reg);
@@ -4583,9 +4586,8 @@ fn filter_liveness_in_place(
                 }
                 s
             };
-            pc_live_r.retain(|idx| lv_live.contains(idx));
-            // Re-add the per-PC frame-live colors the SSA-backward retain
-            // dropped — FOR_ITER body PCs only.  A loop-carried operand-
+            // Re-add the per-PC frame-live colors backward liveness
+            // omitted — FOR_ITER body PCs only.  A loop-carried operand-
             // stack value (the iterator) is frame-live at a body PC but
             // SSA-backward-DEAD there, so `pc_live_r` omits it and the
             // guard snapshot leaves the slot `OpRef::NONE`.  Re-adding
@@ -4602,12 +4604,10 @@ fn filter_liveness_in_place(
             }
 
             // Restore the portal red args (`interp_jit.py:67 reds =
-            // ['frame', 'ec']`) on the splice path.  The retain above only
-            // KEEPS a color present in `pc_live_r`; it cannot re-add a color
-            // the marker dropped.  The walker's explicit per-PC `-live-`
-            // markers always carry `portal_frame_reg` / `portal_ec_reg`
-            // (RPython force-alive, `liveness.py:11-12`), so `pc_live_r`
-            // holds them and the retain keeps them.  The canonical
+            // ['frame', 'ec']`) on the splice path.  The walker's explicit
+            // per-PC `-live-` markers always carry `portal_frame_reg` /
+            // `portal_ec_reg` (RPython force-alive, `liveness.py:11-12`), so
+            // `pc_live_r` already holds them.  The canonical
             // `flatten_graph` stream's markers are filled by backward
             // `compute_liveness`, which drops a portal red never read in the
             // body (a leaf function's `ec`), leaving `pc_live_r` short.  The
@@ -15762,8 +15762,14 @@ mod tests {
         assert_eq!(state.variable_slot(&v_absent), None);
     }
 
+    /// `liveness.py:5-12` expands a `-live-` marker to "all values that are
+    /// alive at this point", under no frame-slot condition: a Ref color that
+    /// is SSA-live across the marker but names no frame slot at that PC stays
+    /// in the bank.  Narrowing it to frame-backed colors leaves the guard's
+    /// resume data naming no box for that color, and a bridge resuming there
+    /// reads the register unbound.
     #[test]
-    fn filter_liveness_drops_non_lv_live_colors_from_live_r() {
+    fn filter_liveness_keeps_ssa_live_ref_color_with_no_frame_slot() {
         let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
         let live_vars = pyre_jit_trace::state::liveness_for(&code as *const _);
         let reachable_pc = (0..code.instructions.len())
@@ -15785,8 +15791,8 @@ mod tests {
             ]));
         }
 
-        // Drive `lv_live` via the per-PC map: color 0 (the live local `x`) maps
-        // to slot 0, so the LV∩SSA retain keeps color 0 and drops color 7.
+        // Per-PC map: color 0 (the live local `x`) maps to slot 0; color 7
+        // maps to nothing, so it stands in for an SSA-live scratch temp.
         let pcdep_color_slots: Vec<Vec<(u8, u16, u16)>> =
             vec![vec![(1, 0, 0)]; code.instructions.len()];
         let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge, _) =
@@ -15812,9 +15818,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(
-            !refs.contains(&7),
-            "scratch-stand-in color 7 must be dropped by LV∩SSA retain",
+        assert_eq!(
+            refs,
+            std::collections::BTreeSet::from([0, 7]),
+            "the Ref bank must keep every SSA-live color, frame-backed or not",
         );
         let ints: std::collections::BTreeSet<u16> = live_args
             .iter()
@@ -15832,7 +15839,7 @@ mod tests {
 
     #[test]
     fn filter_liveness_clears_int_float_banks_under_splice() {
-        // Mirror of `filter_liveness_drops_non_lv_live_colors_from_live_r`
+        // Mirror of `filter_liveness_keeps_ssa_live_ref_color_with_no_frame_slot`
         // but with `clear_unboxed_banks = true` (the splice path).  Under
         // the splice, the canonical jitcode-level stream surfaces unboxed
         // int/float temporaries the interpreter-frame resume cannot supply;
