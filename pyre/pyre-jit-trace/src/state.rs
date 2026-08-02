@@ -4449,6 +4449,22 @@ pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: Des
         );
         return;
     }
+    // quasiimmut.py:124 `self.qmut = get_current_qmut_instance(cpu, struct,
+    // mutatefielddescr)` — the half that makes the value captured below
+    // answerable later.  The hidden `mutate_<name>` field is null until
+    // something installs it, and while it is null a write to the
+    // quasi-immutable field takes the no-watchers early return: the value moves
+    // and nothing is forced.  Installing at the record makes every write from
+    // here on run the invalidation, which is what both the tracer's own force
+    // check and the optimizer's revalidation read.
+    //
+    // Ordered before the value read for the reason upstream orders `__init__`
+    // that way: a write landing between the two must be one the watcher sees.
+    // Reading first leaves a window where the field moves with no watcher
+    // installed, so nothing invalidates and nothing bumps the force counter,
+    // and the trace keeps a value that is already stale.  Without a GIL that
+    // window is a real interleaving, not a theoretical one.
+    install_quasiimmut_field(ctx, obj, &descr);
     // quasiimmut.py:125 `self.constantfieldbox =
     // self.get_current_constant_fieldvalue()` — the field's value at the moment
     // the trace baked it.  `heap.py:803 is_still_valid_for` compares it against
@@ -4456,7 +4472,6 @@ pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: Des
     // captured here; by the time the optimizer runs, the change it is looking
     // for has already happened.
     let constantfieldbox = current_quasiimmut_field_value(ctx, obj, &descr);
-    install_quasiimmut_field(ctx, obj, &descr);
     ctx.heap_cache_mut().quasi_immut_now_known(field_index, obj);
     // Upstream carries the captured value on the per-op `QuasiImmutDescr`
     // (quasiimmut.py:113-159), a descr minted fresh for every recorded
