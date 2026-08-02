@@ -703,10 +703,15 @@ unsafe fn walk_shadow_stack_cell(
         // would strand a cached pointer in the freed one. Only pushes can
         // occur, so `end` stays within bounds.
         // SAFETY: `index < end <= len()`, so the slot is live.
-        let slot = unsafe { stack.base.get().add(index) };
-        // SAFETY: `slot` names the live element at `index`. The reference is
-        // handed directly to the visitor and is not used after it returns.
-        visitor(unsafe { &mut *slot });
+        let mut root = unsafe { *stack.base.get().add(index) };
+        visitor(&mut root);
+        // Store back through a re-read `base` rather than handing the visitor
+        // a `&mut` into the buffer: a re-entrant push that grows the stack
+        // frees the buffer the slot was read from, and a visitor that writes
+        // its reference after allocating would then write into the freed one.
+        // `grow` copies the live prefix, so `index` still names this slot.
+        // SAFETY: `index < end <= len()`, so the slot is live.
+        unsafe { *stack.base.get().add(index) = root };
         index += 1;
     }
 }

@@ -646,6 +646,12 @@ pub fn set_recursion_limit(new_limit: i32) -> Result<(), PyError> {
     // 0.001 * 163840))`.  Both of pyre's root stacks are sized off it: the
     // jitframe one compiled code pushes to, and the interpreter's `push_roots`
     // stack, which holds a slot per pinned livevar across a recursive call.
+    // The allocation is eager (`shadowstack.py:351-364` resizes on the spot),
+    // and the `MAX_RECURSION_LIMIT` clamp above is the only thing bounding it:
+    // `vm.py:83-88` adds that same 10**6 ceiling precisely "because huge values
+    // cause huge shadowstacks to be allocated (or MemoryErrors)".  A tighter
+    // bound here would cap the root stack below the recursion limit it is
+    // sized for.
     let root_stack_depth = (limit as f64 * 0.001 * 163840.0) as usize;
     majit_gc::shadow_stack::increase_root_stack_depth(root_stack_depth);
     pyre_object::gc_roots::increase_root_stack_depth(root_stack_depth);
