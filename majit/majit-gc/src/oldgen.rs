@@ -269,8 +269,20 @@ impl OldGen {
 
     /// Arena membership is intentionally an address-range answer, not a live
     /// block answer.  Rawmalloced objects retain exact payload membership.
+    ///
+    /// Split so the arena range test can inline into the caller and the payload
+    /// set cannot. Major marking asks this question once per root and once per
+    /// traced edge, and the arena answer settles almost all of them; keeping the
+    /// hashed lookup in the same body made the whole thing too large to inline,
+    /// so every edge paid a call.
+    #[inline]
     pub fn contains(&self, obj_addr: usize) -> bool {
-        self.ac.contains(obj_addr) || self.rawmalloced_payloads.contains(&obj_addr)
+        self.ac.contains(obj_addr) || self.rawmalloced_contains(obj_addr)
+    }
+
+    #[inline(never)]
+    fn rawmalloced_contains(&self, obj_addr: usize) -> bool {
+        !self.rawmalloced_payloads.is_empty() && self.rawmalloced_payloads.contains(&obj_addr)
     }
 
     pub fn mark_visited(obj_addr: usize) {

@@ -490,6 +490,7 @@ impl ArenaCollection {
     /// live blocks from free/uninitialized bytes inside a live arena.  The
     /// allocator's bucketed arena lists remain the source of allocation state;
     /// this sorted flat index serves pyre's arbitrary-word membership query.
+    #[inline]
     pub fn contains(&self, addr: usize) -> bool {
         let index = self
             .arena_ranges

@@ -5116,9 +5116,10 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         None,
     )?
     else {
-        decline!(format_args!("callee inline of {}.{dunder} declined", unsafe {
-            pyre_object::typeobject::w_type_get_name(w_class)
-        }));
+        decline!(format_args!(
+            "callee inline of {}.{dunder} declined",
+            unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+        ));
     };
 
     if matches!(inlined.0, DispatchOutcome::Continue) {

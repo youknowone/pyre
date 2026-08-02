@@ -2506,10 +2506,12 @@ impl MiniMarkGC {
         // incminimark.py:2717 collect_roots: root_walker.walk_roots()
         // walks the same root sets as minor collection.
         let mut result = Vec::new();
-        let roots: Vec<*mut GcRef> = self.roots.roots.iter().copied().collect();
-        for root_ptr in roots {
-            let gcref = unsafe { *root_ptr };
-            result.push(gcref);
+        // Read the registered roots in place. The minor path copies this list
+        // first because `drag_out_root` takes `&mut self` while it walks; here
+        // the walk only reads, so the copy would be one allocation and one pass
+        // over every registered root per collection for nothing.
+        for &root_ptr in &self.roots.roots {
+            result.push(unsafe { *root_ptr });
         }
 
         let walk_all_mutators = crate::gc_sync::mutators_quiesced();
