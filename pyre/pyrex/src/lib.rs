@@ -1197,6 +1197,22 @@ fn collect_and_run_finalizers(ec_ptr: *const PyExecutionContext) {
 /// threads, collect already-unreachable cycles, then release `__main__`
 /// globals from newest to oldest while the older globals their `__del__`
 /// methods may reference are still present.
+///
+/// Newest-to-oldest is what keeps those references working, and it is not
+/// interchangeable with the insertion order `_PyModule_ClearDict` uses. A name
+/// is bound before every name that could be finalized while reading it — most
+/// of all `import sys`, which is usually the very first — so releasing in
+/// insertion order strands `sys` at `None` and every finalizer that writes to
+/// `sys.stderr` dies with an `AttributeError` instead of running. Refcounting
+/// makes the question moot upstream: a finalizer there runs from the decref of
+/// the name being released, while every other slot still holds its original
+/// value, which is not reproducible without leaving dangling pointers in the
+/// dict.
+///
+/// The value is rebound to `None` rather than deleted, as `_PyModule_ClearDict`
+/// does: a `__del__` that reads an already-released name then sees `None`, the
+/// way it would upstream, instead of raising `NameError` at a name the program
+/// can see is still defined.
 fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecutionContext) {
     run_threading_shutdown();
     // baseobjspace.py:498-501 `finish()` runs every started module's shutdown
@@ -1213,7 +1229,7 @@ fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecut
             continue;
         }
         unsafe {
-            pyre_object::w_dict_delitem_str(canonical, &name);
+            pyre_object::w_dict_setitem_str(canonical, &name, pyre_object::w_none());
         }
         collect_and_run_finalizers(ec_ptr);
     }
