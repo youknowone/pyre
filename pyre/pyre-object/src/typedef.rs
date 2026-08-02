@@ -272,6 +272,10 @@ pub const MEMBER_COMPLEX_IMAG: u32 = MEMBER_DIRECT_FLAG | 7;
 /// receiver instead of reading one fixed offset.
 pub const MEMBER_DESCR_OBJCLASS: u32 = MEMBER_DIRECT_FLAG | 8;
 pub const MEMBER_DESCR_NAME: u32 = MEMBER_DIRECT_FLAG | 9;
+/// CPython 3.14 `BaseExceptionGroup_members`: the immutable constructor
+/// message and tuple of nested exceptions.
+pub const MEMBER_EXCEPTION_GROUP_MESSAGE: u32 = MEMBER_DIRECT_FLAG | 10;
+pub const MEMBER_EXCEPTION_GROUP_EXCEPTIONS: u32 = MEMBER_DIRECT_FLAG | 11;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {

@@ -11869,6 +11869,12 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
         pyre_object::MEMBER_COMPLEX_IMAG => Ok(pyre_object::w_float_new(unsafe {
             pyre_object::w_complex_get_imag(obj)
         })),
+        pyre_object::MEMBER_EXCEPTION_GROUP_MESSAGE => {
+            Ok(crate::builtins::exception_group_fields(obj)?.0)
+        }
+        pyre_object::MEMBER_EXCEPTION_GROUP_EXCEPTIONS => {
+            Ok(crate::builtins::exception_group_fields(obj)?.1)
+        }
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
         pyre_object::MEMBER_DESCR_NAME => unsafe { descr_member_name(obj) },
         _ => Err(crate::PyError::attribute_error(unsafe {

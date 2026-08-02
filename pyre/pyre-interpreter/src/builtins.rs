@@ -7069,7 +7069,7 @@ const EG_MESSAGE_KEY: &str = "__pyre_exception_group_message";
 const EG_EXCEPTIONS_KEY: &str = "__pyre_exception_group_exceptions";
 const EG_EXCEPTIONS_REPR_KEY: &str = "__pyre_exception_group_exceptions_repr";
 
-fn exception_group_fields(
+pub(crate) fn exception_group_fields(
     w_self: PyObjectRef,
 ) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
     let w_dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(w_self) };
@@ -7695,10 +7695,31 @@ fn make_exception_group_type(name: &'static str, bases: &[PyObjectRef]) -> PyObj
                         crate::_pypy_generic_alias::generic_alias_class_getitem,
                     )),
                 );
+                for (member_name, kind) in [
+                    ("message", pyre_object::MEMBER_EXCEPTION_GROUP_MESSAGE),
+                    ("exceptions", pyre_object::MEMBER_EXCEPTION_GROUP_EXCEPTIONS),
+                ] {
+                    pyre_object::w_dict_setitem_str_no_proxy(
+                        ns,
+                        member_name,
+                        pyre_object::w_member_new_direct(
+                            kind,
+                            member_name.to_owned(),
+                            pyre_object::PY_NULL,
+                        ),
+                    );
+                }
             };
         },
         bases,
     );
+    if name == "BaseExceptionGroup" {
+        for member_name in ["message", "exceptions"] {
+            if let Some(member) = crate::type_dict_lookup(cls, member_name) {
+                unsafe { pyre_object::w_member_set_cls(member, cls) };
+            }
+        }
+    }
     register_exc_class(name, cls)
 }
 
