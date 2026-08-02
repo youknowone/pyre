@@ -192,10 +192,19 @@ pub(crate) fn newmemoryview(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
 }
 
 fn dimensions(obj: PyObjectRef) -> Result<Vec<i64>, PyError> {
-    crate::baseobjspace::unpackiterable(obj, -1)?
-        .into_iter()
-        .map(crate::baseobjspace::int_w)
-        .collect()
+    let items = crate::baseobjspace::unpackiterable(obj, -1)?;
+    // Converting one element runs its `__index__`, which allocates and can
+    // relocate every element still sitting in this plain `Vec`.  Publish the
+    // whole batch first and read each one back through its root slot.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&items);
+    let mut values = Vec::with_capacity(items.len());
+    for index in 0..items.len() {
+        values.push(crate::baseobjspace::int_w(
+            pyre_object::gc_roots::shadow_stack_get(base + index),
+        )?);
+    }
+    Ok(values)
 }
 
 /// `pypy/module/__pypy__/interp_buffer.py:W_Bufferable`.

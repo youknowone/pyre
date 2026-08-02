@@ -160,7 +160,20 @@ const CANONICAL_IDENTITY_DICT_KEY: &str = "@objects_in_repr_identity_dict";
 /// value back into an OperationError and report it through `sys.unraisablehook`.
 fn write_unraisable(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     let where_desc = crate::baseobjspace::str_utf8_w(args[0])?;
-    let mut error = unsafe { crate::PyError::from_exc_object(args[1]) };
+    // `OperationError(space.type(w_exc), w_exc)` accepts any object, so the
+    // exception tag cannot be read unconditionally: it lives past the header
+    // of a `W_BaseException`, and a plain instance is smaller than that.
+    // Classify first, and fall back to the kind a bare `BaseException` maps to.
+    let mut error = match unsafe {
+        pyre_object::interp_exceptions::w_exception_kind_checked(args[1])
+    } {
+        Some(_) => unsafe { crate::PyError::from_exc_object(args[1]) },
+        None => {
+            let mut error = crate::PyError::new(crate::PyErrorKind::RuntimeError, String::new());
+            error.exc_object = args[1];
+            error
+        }
+    };
     error.write_unraisable(pyre_object::w_none(), &where_desc, args[2]);
     Ok(pyre_object::w_none())
 }

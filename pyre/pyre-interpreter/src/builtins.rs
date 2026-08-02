@@ -3643,23 +3643,26 @@ pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // Route through the live `sys.stderr`, not directly through the host
     // seam: tests and applications are allowed to replace `sys.stderr` and
     // `sys.__excepthook__` must honor that replacement.
-    let wrote = crate::importing::get_sys_module("sys")
-        .and_then(|sys| crate::baseobjspace::getattr_str(sys, "stderr").ok())
-        .filter(|stderr| !stderr.is_null() && unsafe { !pyre_object::is_none(*stderr) })
-        .is_some_and(|stderr| {
-            let text = String::from_utf8_lossy(&rendered).into_owned();
-            let w_text = pyre_object::w_str_new(&text);
-            let result = crate::baseobjspace::call_method(stderr, "write", &[w_text]);
-            if result.is_null() {
-                let _ = crate::call::take_call_error();
-                false
-            } else {
-                true
-            }
-        });
-    if !wrote {
-        crate::host_seam::emit_stderr(&rendered);
+    let stderr = crate::importing::get_sys_module("sys")
+        .and_then(|sys| crate::baseobjspace::getattr_str(sys, "stderr").ok());
+    if let Some(stderr) = stderr {
+        // An application that set `sys.stderr = None` disabled the stream, and
+        // `_PyErr_Display` returns without printing in that case.  Only a
+        // missing `sys` or a failing lookup may fall through to the host seam;
+        // treating the two alike leaks the render past the configured sink.
+        if stderr.is_null() || unsafe { pyre_object::is_none(stderr) } {
+            return Ok(w_none());
+        }
+        let text = String::from_utf8_lossy(&rendered).into_owned();
+        let w_text = pyre_object::w_str_new(&text);
+        let result = crate::baseobjspace::call_method(stderr, "write", &[w_text]);
+        if result.is_null() {
+            let _ = crate::call::take_call_error();
+        } else {
+            return Ok(w_none());
+        }
     }
+    crate::host_seam::emit_stderr(&rendered);
     Ok(w_none())
 }
 
