@@ -3,7 +3,9 @@
 //! `Context` is the app-level line-by-line port because its persistent Map
 //! operations and `run()`'s try/finally are already expressed exactly there.
 //! ContextVar and Token remain interpreter-level while their state operations
-//! are ported incrementally.
+//! are ported incrementally.  `copy_context` is interp-level too — a
+//! non-binding builtin over `current_context`; PyPy keeps it in
+//! `lib_pypy/_contextvars.py`, but `Python/context.c` ships it as a C function.
 
 use pyre_object::*;
 use std::sync::OnceLock;
@@ -401,6 +403,15 @@ crate::py_module! {
         "ContextVar" => context_var_type(),
         "Token" => token_type(),
     },
+    functions: {
+        // `copy_context()` — snapshot the current context; `Context.copy()`
+        // shares the persistent `_data` Map.  `current_context(true)` is the
+        // same "read-or-create the thread's Context" step `set`/`reset` use.
+        "copy_context" / 0 = |_| {
+            let context = current_context(true)?.expect("create=true returns a Context");
+            call_method_result(context, "copy", &[])
+        },
+    },
     extra_init: |ns| {
         let context_var = crate::module_ns_get(ns, "ContextVar")
             .expect("_contextvars.ContextVar must be installed first");
@@ -408,7 +419,7 @@ crate::py_module! {
             ns,
             include_str!("_contextvars_app.py"),
             "_contextvars_app.py",
-            &["Context", "copy_context"],
+            &["Context"],
             &[("ContextVar", context_var)],
         );
         let context = crate::module_ns_get(ns, "Context")

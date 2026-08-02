@@ -14,14 +14,6 @@ class Unsubclassable(type):
         return type.__new__(cls, name, bases, dict(dct))
 
 
-def get_context():
-    context = get_contextvar_context()
-    if context is None:
-        context = Context()
-        set_contextvar_context(context)
-    return context
-
-
 class Context(metaclass=Unsubclassable):
 
     #_data: Map
@@ -41,7 +33,7 @@ class Context(metaclass=Unsubclassable):
             raise RuntimeError(
                 f'cannot enter context: {self} is already entered')
 
-        # don't use get_context() here, to avoid creating a Context object
+        # read the raw context directly, to avoid creating a Context object
         _prev_context = get_contextvar_context()
         try:
             self._is_entered = True
@@ -100,10 +92,6 @@ class Context(metaclass=Unsubclassable):
         if not isinstance(other, Context):
             return NotImplemented
         return dict(self.items()) == dict(other.items())
-
-
-def copy_context():
-    return get_context().copy()
 
 
 Context.__module__ = '_contextvars'
