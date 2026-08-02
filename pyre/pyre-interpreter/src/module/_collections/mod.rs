@@ -642,6 +642,21 @@ fn deque_index(index: PyObjectRef, len_of: impl FnOnce() -> i64) -> Result<usize
     Ok(idx as usize)
 }
 
+/// Re-bound a converted index against the deque as it stands *under* the
+/// stripe guard.
+///
+/// `deque_index` bounds against the length it read while `__index__` was still
+/// running, so by the time the guard is held another thread may have shortened
+/// the deque. `locate` would then walk past the end of the chain and
+/// `Vec::remove` would panic instead of raising, so every indexed accessor
+/// re-checks here before it addresses storage.
+fn check_index_under_guard(self_obj: PyObjectRef, idx: i64) -> Result<(), crate::PyError> {
+    if idx < 0 || idx >= deque_len(self_obj) {
+        return Err(crate::PyError::index_error("index out of range"));
+    }
+    Ok(())
+}
+
 /// `W_Deque.locate`: choose the nearer endpoint and walk whole blocks.
 fn locate(self_obj: PyObjectRef, mut index: i64) -> (PyObjectRef, i64) {
     let deque = W_Deque::from_obj(self_obj).expect("deque");
@@ -899,6 +914,18 @@ impl W_Deque {
         }
         match pos {
             Some(pos) => {
+                // The guard cannot span the loop above: `eq_w` runs arbitrary
+                // Python, and holding a stripe across it would let user code
+                // reach a second deque and invert the acquisition order. It
+                // does cover the write-back, and the epoch is re-read under it
+                // so a mutation that landed after the last comparison is
+                // reported rather than silently overwritten by the snapshot.
+                let _deque_guard = unsafe { w_deque_lock(self_obj) };
+                if lock_state(self_obj) != lock {
+                    return Err(crate::PyError::index_error(
+                        "deque mutated during iteration",
+                    ));
+                }
                 items.remove(pos);
                 store(self_obj, items);
                 Ok(())
@@ -1093,6 +1120,7 @@ impl W_Deque {
         // it returns, so the pair has to exclude a concurrent `store`. The
         // index conversion runs Python and stays outside.
         let _deque_guard = unsafe { w_deque_lock(self_obj) };
+        check_index_under_guard(self_obj, idx)?;
         let (block_obj, block_index) = locate(self_obj, idx);
         Ok(block_get(block_obj, block_index))
     }
@@ -1108,6 +1136,7 @@ impl W_Deque {
         // valid and observe subsequently assigned elements (including after
         // pickle reconstruction).
         let _deque_guard = unsafe { w_deque_lock(self_obj) };
+        check_index_under_guard(self_obj, idx)?;
         let (block_obj, block_index) = locate(self_obj, idx);
         block_set(block_obj, block_index, value);
         Ok(())
@@ -1118,6 +1147,7 @@ impl W_Deque {
         // See `rotate`: the snapshot/store pair is the read-modify-write that
         // the stripe has to cover as one.
         let _deque_guard = unsafe { w_deque_lock(self_obj) };
+        check_index_under_guard(self_obj, idx as i64)?;
         let mut items = snapshot(self_obj);
         items.remove(idx);
         store(self_obj, items);
@@ -1194,6 +1224,10 @@ impl W_Deque {
             return Ok(pyre_object::w_not_implemented());
         }
         let num = unsafe { w_int_get_value(n) };
+        // Nothing between the snapshot and the write-back runs Python, so the
+        // whole read-modify-write fits under one stripe — without it a
+        // concurrent `append` lands between them and is dropped by `store`.
+        let _deque_guard = unsafe { w_deque_lock(self_obj) };
         let base = snapshot(self_obj);
         if base.is_empty() || num == 1 {
             return Ok(self_obj);

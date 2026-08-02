@@ -2950,17 +2950,6 @@ impl MiniMarkGC {
         GcHeader::SIZE + payload_size
     }
 
-    /// Grey one child reference: if it is a managed, not-yet-visited heap
-    /// object, set VISITED and push it onto the gray stack. The
-    /// `is_managed_heap_object` guard mirrors `seed_major_root`: a
-    /// `Ptr(GcStruct)` field can transiently point at memory outside the
-    /// GC-managed heap during the L1/L2 stepping-stone state (e.g.
-    /// `W_TupleObject.wrappeditems` → `std::alloc`'d ItemsBlock). In that
-    /// window calling `header_of` on the field would dereference memory before
-    /// the std::alloc'd block. Upstream RPython `_collect_obj`
-    /// (incminimark.py:2739-2752) does not need this guard because RPython's
-    /// type system guarantees every `Ptr(GcStruct)` is GC-managed; it converges
-    /// away once every `gc_ptr_offsets` target is a real GC allocation.
     /// Total size of `addr`, or `None` when its header does not decode to a
     /// registered type. The panicking [`Self::object_total_size`] is unusable
     /// from a diagnostic that is already reporting a corrupt heap.
@@ -2995,7 +2984,8 @@ impl MiniMarkGC {
         slot_addr: usize,
         holder_words: &[usize],
     ) -> String {
-        if let Some(size) = self.try_object_total_size(holder_addr)
+        if self.is_managed_heap_object(holder_addr)
+            && let Some(size) = self.try_object_total_size(holder_addr)
             && (holder_addr..holder_addr + size).contains(&slot_addr)
         {
             return "self".to_string();
@@ -3021,6 +3011,17 @@ impl MiniMarkGC {
         "unknown".to_string()
     }
 
+    /// Grey one child reference: if it is a managed, not-yet-visited heap
+    /// object, set VISITED and push it onto the gray stack. The
+    /// `is_managed_heap_object` guard mirrors `seed_major_root`: a
+    /// `Ptr(GcStruct)` field can transiently point at memory outside the
+    /// GC-managed heap during the L1/L2 stepping-stone state (e.g.
+    /// `W_TupleObject.wrappeditems` → `std::alloc`'d ItemsBlock). In that
+    /// window calling `header_of` on the field would dereference memory before
+    /// the std::alloc'd block. Upstream RPython `_collect_obj`
+    /// (incminimark.py:2739-2752) does not need this guard because RPython's
+    /// type system guarantees every `Ptr(GcStruct)` is GC-managed; it converges
+    /// away once every `gc_ptr_offsets` target is a real GC allocation.
     fn grey_child(&mut self, addr: usize, holder_addr: usize, slot_addr: usize, site: &str) {
         if self.is_managed_heap_object(addr) && self.may_enter_marking_worklist(addr) {
             let hdr = unsafe { header_of(addr) };

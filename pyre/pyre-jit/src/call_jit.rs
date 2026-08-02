@@ -5146,17 +5146,28 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
     // here as a bogus `NameError`.
     //
     // A null frame is an anticipated input — the globals leg above already
-    // treats it as one — so the builtin module is derived from the globals'
-    // `__builtins__` in that case, the way `try_walker_load_global_cell_fold`
-    // does (specialize.rs:8904-8907) and the same object `pick_builtin`
-    // resolves.
+    // treats it as one — so the builtin namespace is resolved from the globals
+    // through `pick_builtin_obj_checked`, the same resolver whose result
+    // `frame.get_builtin()` caches. Reading `globals["__builtins__"]` raw is
+    // not equivalent: `exec`/`eval` plant the builtins *dict* rather than the
+    // module (3.14 `PyEval_GetBuiltins`), and the `is_module` test below would
+    // reject that spelling and report a bogus `NameError` for every builtin
+    // name seen by a function created under an exec'd namespace.
+    // `try_walker_load_global_cell_fold` declines the fold in that case and
+    // leaves the name to this residual, so the handling has to live here.
     let w_builtin = if !parent_frame_ptr.is_null() {
         unsafe { (*parent_frame_ptr).get_builtin() }
-    } else if !w_globals.is_null() {
-        unsafe { pyre_object::w_dict_getitem_str(w_globals, "__builtins__") }
-            .unwrap_or(pyre_object::PY_NULL)
     } else {
-        pyre_object::PY_NULL
+        match pyre_interpreter::baseobjspace::pick_builtin_obj_checked(
+            w_globals,
+            pyre_interpreter::call::take_last_exec_ctx(),
+        ) {
+            Ok(w_builtin) => w_builtin,
+            Err(mut err) => {
+                publish_residual_call_exception(err.to_exc_object() as i64);
+                return 0;
+            }
+        }
     };
     if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
         let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };

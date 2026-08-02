@@ -4120,18 +4120,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 let path = extract_path(args[0])?;
                 // interp_posix.py:744 `@unwrap_spec(mode=c_int, ...)`.
-                let mode = crate::baseobjspace::c_int_w(args[1])? as u8;
+                let mode = crate::baseobjspace::c_int_w(args[1])?;
                 #[cfg(feature = "sandbox")]
                 {
                     return Ok(pyre_object::w_bool_from(
-                        crate::host_seam::ops::access(path.as_bytes(), mode as i32)
-                            .unwrap_or(false),
+                        crate::host_seam::ops::access(path.as_bytes(), mode).unwrap_or(false),
                     ));
                 }
                 #[cfg(not(feature = "sandbox"))]
-                match host_posix::check_access(std::path::Path::new(&path), mode) {
-                    Ok(ok) => Ok(pyre_object::w_bool_from(ok)),
-                    Err(_) => Ok(pyre_object::w_bool_from(false)),
+                {
+                    // `check_access` takes the mask as a `u8` and rejects any
+                    // bit outside `R_OK | W_OK | X_OK`. Narrowing before that
+                    // check would fold a mode like 256 onto `F_OK` and answer
+                    // "exists" for a mode `access(2)` rejects with EINVAL.
+                    let Ok(mode) = u8::try_from(mode) else {
+                        return Ok(pyre_object::w_bool_from(false));
+                    };
+                    match host_posix::check_access(std::path::Path::new(&path), mode) {
+                        Ok(ok) => Ok(pyre_object::w_bool_from(ok)),
+                        Err(_) => Ok(pyre_object::w_bool_from(false)),
+                    }
                 }
             }),
         );
