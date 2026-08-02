@@ -4311,6 +4311,21 @@ fn register_helper_fn_pointers(
     }
 }
 
+/// Collect `(py_pc, insn_idx)` pairs into one entry per `insn_idx`, preserving
+/// first-seen order.  Both `-live-` marker families are grouped this way, so a
+/// marker several Python PCs share accumulates the union of their narrowed sets.
+fn group_py_pcs_by_insn(pairs: impl Iterator<Item = (usize, usize)>) -> Vec<(usize, Vec<usize>)> {
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    for (py_pc, insn_idx) in pairs {
+        if let Some(entry) = groups.iter_mut().find(|(idx, _)| *idx == insn_idx) {
+            entry.1.push(py_pc);
+        } else {
+            groups.push((insn_idx, vec![py_pc]));
+        }
+    }
+    groups
+}
+
 /// RPython: `liveness.py:19-80` `compute_liveness(ssarepr)` —
 /// backward dataflow over the populated `SSARepr` that fills each
 /// `-live-` marker with the set of registers alive across it.
@@ -4445,14 +4460,12 @@ fn filter_liveness_in_place(
     // from any sharing PC reads a conservative superset, which is
     // safe — preserving more registers than strictly needed never
     // causes incorrect resume).
-    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
-    for (py_pc, &insn_idx) in live_markers.iter().enumerate() {
-        if let Some(entry) = groups.iter_mut().find(|(idx, _)| *idx == insn_idx) {
-            entry.1.push(py_pc);
-        } else {
-            groups.push((insn_idx, vec![py_pc]));
-        }
-    }
+    let groups = group_py_pcs_by_insn(
+        live_markers
+            .iter()
+            .enumerate()
+            .map(|(py_pc, &i)| (py_pc, i)),
+    );
 
     // The after-residual-call `-live-` is a resume coordinate of exactly the
     // same class as the per-PC marker: `get_list_of_active_boxes` reads the
@@ -4466,22 +4479,15 @@ fn filter_liveness_in_place(
     // `OpRef::NONE` and force the resume snapshot to decline.  Narrow both.
     let per_pc_markers: std::collections::BTreeSet<usize> =
         groups.iter().map(|&(insn_idx, _)| insn_idx).collect();
-    let mut after_call_groups: Vec<(usize, Vec<usize>)> = Vec::new();
-    for (py_pc, anchor) in after_call_post_merge.iter().enumerate() {
-        let Some(insn_idx) = *anchor else { continue };
-        if per_pc_markers.contains(&insn_idx) {
-            // Folded onto a per-PC marker — already narrowed by that group.
-            continue;
-        }
-        if let Some(entry) = after_call_groups
-            .iter_mut()
-            .find(|(idx, _)| *idx == insn_idx)
-        {
-            entry.1.push(py_pc);
-        } else {
-            after_call_groups.push((insn_idx, vec![py_pc]));
-        }
-    }
+    let after_call_groups =
+        group_py_pcs_by_insn(after_call_post_merge.iter().enumerate().filter_map(
+            |(py_pc, anchor)| {
+                // Folded onto a per-PC marker — already narrowed by that group.
+                anchor
+                    .filter(|idx| !per_pc_markers.contains(idx))
+                    .map(|idx| (py_pc, idx))
+            },
+        ));
 
     // Snapshot original marker contents BEFORE any mutation so that
     // when multiple Python PCs share a single post-merge `-live-`
