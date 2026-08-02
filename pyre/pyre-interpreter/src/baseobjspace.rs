@@ -6712,6 +6712,13 @@ pub(crate) fn type_del_doc(obj: PyObjectRef) -> PyResult {
 /// declares, so the caller continues its own lookup.
 pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
     match name {
+        "__dict__" => {
+            // interp_exceptions.py:293 BaseException.typedef installs
+            // `GetSetProperty(descr_get_dict, descr_set_dict)`.  Every
+            // exception owns a writable instance dict, allocated eagerly by
+            // pyre's flattened W_BaseException layout.
+            return Ok(unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) });
+        }
         "__traceback__" => {
             // `interp_exceptions.py:196-201 W_BaseException.descr_gettraceback`
             // returns the `w_traceback` slot stamped by
@@ -11655,6 +11662,10 @@ unsafe fn exception_deletable_slot(obj: PyObjectRef, name: &str) -> bool {
 /// `PY_NULL` means the name is not one this exception kind declares.
 pub(crate) fn exception_attr_delete(obj: PyObjectRef, name: &str) -> PyResult {
     match name {
+        "__dict__" => {
+            // Python 3.14 BaseException.__dict__ exposes no delete operation.
+            return Err(PyError::type_error("cannot delete __dict__"));
+        }
         "args" | "__cause__" | "__context__" | "__traceback__" => {
             return Err(PyError::type_error(format!("{name} may not be deleted")));
         }

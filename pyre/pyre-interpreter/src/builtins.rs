@@ -6604,6 +6604,7 @@ fn exception_repr_method(args: &[PyObjectRef]) -> crate::PyResult {
 fn exception_typedef_attrs(class_name: &str) -> &'static [&'static str] {
     match class_name {
         "BaseException" => &[
+            "__dict__",
             "args",
             "__cause__",
             "__context__",
