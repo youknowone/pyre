@@ -9777,6 +9777,12 @@ impl<'a> Lowering<'a> {
     /// instead of emitting the unregistered ctor.  The result then flows
     /// either to a residualized panic (`Abort` → `RaiseImplicit`) or to
     /// `alloc::fmt::format` (handled by [`Self::traces_to_str_const`]).
+    ///
+    /// `from_str_nonconst(s) { Arguments::from_str(s) }` is the identical
+    /// constructor the compiler emits when the no-placeholder `format_args!`
+    /// sits in a non-`const` body (the `#[new]`/setter gateways) — same
+    /// `&'static str` argument, same constant-string `Arguments` — so it
+    /// takes the same alias.
     fn is_arguments_from_str(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -9788,7 +9794,8 @@ impl<'a> Lowering<'a> {
         // "from_str"]` `FunctionPath` (via `impl_method_owner_for_fundecl`).
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             impl_method_owner_for_fundecl(self.llbc, fd).is_some_and(|(owner, leaf)| {
-                leaf == "from_str" && owner.ends_with("fmt::Arguments")
+                (leaf == "from_str" || leaf == "from_str_nonconst")
+                    && owner.ends_with("fmt::Arguments")
             })
         })
     }
@@ -10512,7 +10519,13 @@ impl<'a> Lowering<'a> {
         // into `Write::write_fmt` (whose own graph-less extern keeps those
         // subjects residual) — no `alloc::fmt::format` consumes one.  This
         // is the same transparent passthrough `must_use` / `identity` take.
-        if fmt_path_ends_with(segments, &["Arguments", "from_str"]) {
+        // `from_str_nonconst(s) { Arguments::from_str(s) }` is the identical
+        // constructor emitted for a no-placeholder `format_args!` in a
+        // non-`const` body (the C-module `#[new]`/setter gateways), so it
+        // aliases the same way.
+        if fmt_path_ends_with(segments, &["Arguments", "from_str"])
+            || fmt_path_ends_with(segments, &["Arguments", "from_str_nonconst"])
+        {
             return Some(arg.clone());
         }
         let [a, b, c] = segments else {
@@ -21496,6 +21509,48 @@ mod tests {
         );
         assert_eq!(chain.args.len(), 1);
         assert_eq!(chain.args[0].kind, FmtArgKind::Display);
+    }
+
+    /// Anchor the `Arguments::from_str_nonconst` alias to the real lowered IR
+    /// of `constructor_args` (the `_collections` deque-iterator `__new__`
+    /// helper), whose cold error branches build no-placeholder messages
+    /// (`type_error(format!("must be collections.deque, not {name}"))` renders
+    /// its one placeholder through the multi-arg chain; the arity guard's
+    /// `format!("…got {}", n)` and the descriptor-preamble
+    /// `concat!(…)`-message emit the const-string `from_str_nonconst`
+    /// constructor in this non-`const` body).  The identity alias must drop
+    /// every `fmt::Arguments::from_str_nonconst` extern — none may survive as
+    /// a residual Call to wall the rtyper.  Ignored by default (loads the real
+    /// LLBC).
+    #[test]
+    #[ignore]
+    fn arguments_from_str_nonconst_alias_real_constructor_args() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "constructor_args").expect("lower constructor_args");
+
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["Arguments", "from_str_nonconst"])
+                )
+            })
+            .count();
+        assert_eq!(
+            residual, 0,
+            "no residual Arguments::from_str_nonconst extern survives the identity alias"
+        );
     }
 
     /// Anchor compiler-core's exact
