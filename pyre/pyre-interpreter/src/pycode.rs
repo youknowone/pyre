@@ -418,6 +418,13 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 /// tables through direct raw allocations. Residualise the whole
 /// constructor — a `PyObjectRef` GCREF modelled by signature. Code objects are
 /// built at import/compile time, never on a traced hot path.
+///
+/// `pycode.py:93` makes `PyCode` an ordinary GC object, so upstream traces
+/// `w_globals` and the cache tables structurally through it. `malloc_typed`
+/// here makes it immortal and non-moving instead, which nothing traces into —
+/// so every GC-heap slot it owns needs an explicit root walker
+/// ([`walk_w_globals_stamped_code_roots`], [`walk_mapdict_method_cache_gc`]).
+/// Those registries retire when code objects become GC-managed.
 #[majit_macros::dont_look_inside]
 pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: bool) -> PyObjectRef {
     // RPython pointer alignment idiom (`rpython/memory/gc/minimarkpage.py:159

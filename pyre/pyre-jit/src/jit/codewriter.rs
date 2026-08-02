@@ -9845,6 +9845,14 @@ impl CodeWriter {
                         Instruction::WithExceptStart => {
                             // pyopcode.py WITH_EXCEPT_START preserves its five
                             // inputs and pushes `exit_func(type(val), val, tb)`.
+                            // Two slots carry the callable, not one:
+                            // `pyopcode.py:1350-1353` peeks a single already-bound
+                            // `__exit__` at depth 3, whereas LOAD_SPECIAL leaves
+                            // `exit_func` + `exit_self` (NULL when unbound) as
+                            // separate entries, so the pair is read at depths 5
+                            // and 4 and `with_except_start_values` prepends
+                            // `exit_self` only when non-NULL — the same split
+                            // `PyFrame::with_except_start` reads.
                             // This must be a real can-raise residual in JitCode:
                             // a guard resume can first enter this handler under
                             // blackhole replay, where a disconnected fresh Ref
