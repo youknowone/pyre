@@ -280,6 +280,8 @@ pub const MEMBER_EXCEPTION_GROUP_EXCEPTIONS: u32 = MEMBER_DIRECT_FLAG | 11;
 pub const MEMBER_SYNTAX_ERROR_METADATA: u32 = MEMBER_DIRECT_FLAG | 12;
 /// CPython 3.14 `StopIteration.value`, backed by PyPy's `w_value` field.
 pub const MEMBER_STOP_ITERATION_VALUE: u32 = MEMBER_DIRECT_FLAG | 13;
+/// CPython 3.14 `BaseException.__suppress_context__` boolean member.
+pub const MEMBER_EXCEPTION_SUPPRESS_CONTEXT: u32 = MEMBER_DIRECT_FLAG | 14;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {

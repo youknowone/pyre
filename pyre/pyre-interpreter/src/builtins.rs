@@ -6630,7 +6630,6 @@ fn exception_typedef_attrs(class_name: &str) -> &'static [&'static str] {
             "args",
             "__cause__",
             "__context__",
-            "__suppress_context__",
             "__traceback__",
         ],
         "SystemExit" => &["code"],
@@ -6830,6 +6829,19 @@ fn make_exc_type_with_init(
                             pyre_object::MEMBER_STOP_ITERATION_VALUE,
                             "value".to_owned(),
                             "generator return value".to_owned(),
+                            pyre_object::PY_NULL,
+                        ),
+                    );
+                }
+            }
+            if name == "BaseException" {
+                unsafe {
+                    pyre_object::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__suppress_context__",
+                        pyre_object::w_member_new_direct(
+                            pyre_object::MEMBER_EXCEPTION_SUPPRESS_CONTEXT,
+                            "__suppress_context__".to_owned(),
                             pyre_object::PY_NULL,
                         ),
                     );
@@ -7088,6 +7100,11 @@ fn make_exc_type_with_init(
     }
     if name == "StopIteration" {
         if let Some(member) = crate::type_dict_lookup(cls, "value") {
+            unsafe { pyre_object::w_member_set_cls(member, cls) };
+        }
+    }
+    if name == "BaseException" {
+        if let Some(member) = crate::type_dict_lookup(cls, "__suppress_context__") {
             unsafe { pyre_object::w_member_set_cls(member, cls) };
         }
     }

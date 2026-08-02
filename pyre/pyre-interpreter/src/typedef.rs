@@ -11893,6 +11893,9 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
                     .unwrap_or_else(pyre_object::w_none),
             )
         }
+        pyre_object::MEMBER_EXCEPTION_SUPPRESS_CONTEXT => Ok(pyre_object::w_bool_from(unsafe {
+            pyre_object::interp_exceptions::w_exception_get_suppress_context(obj)
+        })),
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
         pyre_object::MEMBER_DESCR_NAME => unsafe { descr_member_name(obj) },
         _ => Err(crate::PyError::attribute_error(unsafe {
@@ -11930,6 +11933,16 @@ pub(crate) unsafe fn direct_member_set(
         }
         pyre_object::MEMBER_STOP_ITERATION_VALUE => {
             unsafe { pyre_object::interp_exceptions::w_exception_set_value(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_EXCEPTION_SUPPRESS_CONTEXT => {
+            if !unsafe { pyre_object::is_bool(value) } {
+                return Err(crate::PyError::type_error(
+                    "attribute value type must be bool",
+                ));
+            }
+            let flag = unsafe { pyre_object::w_bool_get_value(value) };
+            unsafe { pyre_object::interp_exceptions::w_exception_set_suppress_context(obj, flag) };
             Ok(pyre_object::w_none())
         }
         _ => Err(crate::PyError::attribute_error("readonly attribute")),
@@ -11970,6 +11983,9 @@ pub(crate) unsafe fn direct_member_delete(
             };
             Ok(pyre_object::w_none())
         }
+        pyre_object::MEMBER_EXCEPTION_SUPPRESS_CONTEXT => Err(crate::PyError::type_error(
+            "can't delete numeric/char attribute",
+        )),
         _ => Err(crate::PyError::attribute_error("readonly attribute")),
     }
 }
