@@ -338,16 +338,46 @@ pub fn pin_root(root: PyObjectRef) {
 /// later values were visible.
 ///
 /// Returns the first shadow-stack index occupied by `roots`.
+///
+/// A livevar set that does not sit in one slice publishes each slice with
+/// [`publish_roots`] and normalizes the whole range once with
+/// [`normalize_roots`]. Calling this function per slice would reopen the
+/// window it exists to close: the first call's queries are safepoints, and
+/// the later slices are not yet on the stack when they run.
 #[majit_macros::dont_look_inside]
 pub fn pin_roots(roots: &[PyObjectRef]) -> usize {
+    let base = publish_roots(roots);
+    normalize_roots(base, roots.len());
+    base
+}
+
+/// The write half of `push_roots(hop)`: store `roots` in fresh root-stack
+/// slots and return the first index, querying the GC for nothing.
+///
+/// Split out for the callers whose livevar set spans several slices — they run
+/// every `publish_roots` before the first [`normalize_roots`], so no value is
+/// still invisible to a foreign collector once this mutator starts entering
+/// safepoints.
+#[majit_macros::dont_look_inside]
+pub fn publish_roots(roots: &[PyObjectRef]) -> usize {
     #[cfg(debug_assertions)]
     assert_shadow_stack_not_walking();
-    let base = with_shadow_stack_mut(|stack| {
+    with_shadow_stack_mut(|stack| {
         let base = stack.len();
         stack.extend_from_slice(roots);
         base
-    });
-    for index in base..base + roots.len() {
+    })
+}
+
+/// Resolve forwarding across the `len` published slots starting at `base` —
+/// the half of the pin that is itself a GC operation. See [`pin_root`] for why
+/// a value copied into the bracket from outside it can already name a
+/// forwarded nursery object.
+#[majit_macros::dont_look_inside]
+pub fn normalize_roots(base: usize, len: usize) {
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
+    for index in base..base + len {
         // Read the slot each time: a collection triggered by an earlier query
         // may already have rewritten every published root in place.
         let root = with_shadow_stack(|stack| stack[index]);
@@ -359,7 +389,6 @@ pub fn pin_roots(roots: &[PyObjectRef]) -> usize {
             with_shadow_stack_mut(|stack| stack[index] = current);
         }
     }
-    base
 }
 
 /// Current length of the thread-local shadow stack. Used by

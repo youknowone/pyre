@@ -3873,14 +3873,18 @@ impl PyFrame {
         // from those forwarded slots, matching gctransform/framework.py's
         // push_roots/pop_roots around a GC allocation.
         let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(code as PyObjectRef);
-        pyre_object::gc_roots::pin_root(w_globals);
-        pyre_object::gc_roots::pin_root(closure);
-        pyre_object::gc_roots::pin_root(w_builtin);
-        for &arg in args {
-            pyre_object::gc_roots::pin_root(arg);
-        }
+        // The scalars and `args` are two slices of one livevar set, so both are
+        // written before either is queried: a forwarding query is a safepoint,
+        // and `args` would still be off the root stack while the scalars ran
+        // theirs.
+        let root_base = pyre_object::gc_roots::publish_roots(&[
+            code as PyObjectRef,
+            w_globals,
+            closure,
+            w_builtin,
+        ]);
+        let args_base = pyre_object::gc_roots::publish_roots(args);
+        pyre_object::gc_roots::normalize_roots(root_base, 4 + args.len());
         let code_ref = unsafe {
             &*(crate::w_code_get_ptr(pyre_object::gc_roots::shadow_stack_get(root_base))
                 as *const CodeObject)
@@ -3894,10 +3898,10 @@ impl PyFrame {
         };
         // The allocation result is a translated livevar before it is stored in
         // the eventual PyFrame. Publish it before `w_cell_new`, the barrier,
-        // or any other GC operation can park this free-threaded mutator.
-        let _locals_owner_root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
-            locals_cells_stack_w as usize,
-        ));
+        // or any other GC operation can park this free-threaded mutator. It
+        // joins the bracket the call inputs already opened: its lifetime is
+        // the rest of this function body, so it needs no owner of its own.
+        pyre_object::gc_roots::pin_root(locals_cells_stack_w as PyObjectRef);
 
         {
             // Populate the freshly-allocated array via its mutable slice.
@@ -3906,7 +3910,7 @@ impl PyFrame {
             // Bind positional arguments directly -- no intermediate Vec.
             let nargs = args.len().min(num_locals);
             for i in 0..nargs {
-                arr[i] = pyre_object::gc_roots::shadow_stack_get(root_base + 4 + i);
+                arr[i] = pyre_object::gc_roots::shadow_stack_get(args_base + i);
             }
 
             // CPython 3.11+ `co_localsplusnames` unified slot layout:
