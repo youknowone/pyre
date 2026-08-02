@@ -7185,15 +7185,15 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `RBigInt::digits{,_mut}` is Rust's view adapter around the
-                // RPython `_digits` GcArray:
-                // `slice::from_raw_parts(typed_items_base(_digits), capacity)`.
-                // The typed-items base call above already aliases the header
-                // pointer so the gcarray descr re-applies `base_size`; the
-                // resulting slice is therefore the same array value in the
-                // translated model. Fold only these two enclosing accessors,
-                // not arbitrary raw slices.
-                if args.len() == 2 && self.is_rbigint_digits_from_raw_parts(&reg) {
+                // `RBigInt::digits{,_mut}` and `W_ListObject::object_items_slice
+                // {,_mut}` are Rust view adapters around an `ItemsBlock` /
+                // typed-items GcArray:
+                // `slice::from_raw_parts(items_base(block), len)`.  The items-base
+                // call above already aliases the header pointer so the gcarray
+                // descr re-applies `base_size`; the resulting slice is therefore
+                // the same array value in the translated model. Fold only these
+                // enclosing accessors, not arbitrary raw slices.
+                if args.len() == 2 && self.is_container_items_view_from_raw_parts(&reg) {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -9507,12 +9507,26 @@ impl<'a> Lowering<'a> {
             && regular_call_is_ptr_add(reg, self.llbc)
     }
 
-    /// `slice::from_raw_parts{,_mut}` in `RBigInt::digits{,_mut}` only.
-    /// RPython stores `_digits` as the array itself; the Rust slice is a
-    /// zero-copy source adapter and aliases that same translated GcArray.
-    fn is_rbigint_digits_from_raw_parts(&self, reg: &RegularCall) -> bool {
+    /// `slice::from_raw_parts{,_mut}` inside a container's items-view adapter:
+    /// `RBigInt::digits{,_mut}` and `W_ListObject::object_items_slice{,_mut}`.
+    /// The base argument is an `items_block_items_base` / typed-items accessor,
+    /// already aliased to the block header (`graph_is_items_block_base_accessor`)
+    /// so the object/digit gcarray descr re-applies `base_size`; the resulting
+    /// slice is that same array value in the translated model.  Both back an
+    /// `ItemsBlock`, whose consumers index through a descr (the offset-mediated
+    /// case), so the receiver alias is sound.  Fold only these enclosing
+    /// accessors, not arbitrary raw slices.
+    fn is_container_items_view_from_raw_parts(&self, reg: &RegularCall) -> bool {
         if !(self.graph.name.ends_with("rbigint::<Impl>::digits")
-            || self.graph.name.ends_with("rbigint::<Impl>::digits_mut"))
+            || self.graph.name.ends_with("rbigint::<Impl>::digits_mut")
+            || self
+                .graph
+                .name
+                .ends_with("listobject::<Impl>::object_items_slice")
+            || self
+                .graph
+                .name
+                .ends_with("listobject::<Impl>::object_items_slice_mut"))
         {
             return false;
         }
