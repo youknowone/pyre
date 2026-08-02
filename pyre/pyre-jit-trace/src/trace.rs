@@ -1568,33 +1568,101 @@ fn inject_root_call_result<Sym: WalkSym>(
     true
 }
 
-/// The ROOT frame's `except` handler jitcode pc covering the CALL paused at
-/// `root_pc`, for the carrier-boundary `finishframe_exception` (a depth-2
-/// inlined callee raised).  `root_pc` is the CALL's post-call resume `-live-`,
-/// with the enclosing try's `catch_exception/L` sitting BEHIND it (the same
-/// shape the single-frame exception-edge router scans), so read backward.
-/// The handler is accepted on the catch alone, as `finishframe_exception`
-/// (`pyjitpl.py:2530-2546`) does; where the handler leads is `finishframe`'s
-/// business (`pyjitpl.py:2503-2525`).
+/// The paused frame's `except` handler jitcode pc covering its CALL, for the
+/// carrier-boundary `finishframe_exception`.  The resume pc is the CALL's
+/// post-call `-live-`, with the enclosing `catch_exception/L` sitting behind
+/// it.  The handler is accepted on the catch alone, as
+/// `pyjitpl.py finishframe_exception` does; where it leads is `finishframe`'s
+/// business.
+fn carrier_catch_target(code: &[u8], pc: usize, frame: &str) -> Option<usize> {
+    // The paused caller's resume pc is the CALL's post-call `-live-`; the
+    // `catch_exception/L` for the enclosing try sits BEHIND it (between the
+    // CALL's post-call `-live-` and the next op), so scan backward — the same
+    // lookup the single-frame exception-edge router uses.
+    // `pc` is the CALL's OWN trailing `-live-`, one op short of the
+    // block-entry `-live-` the backward scan keys off, so read forward first
+    // and keep the backward scan for callers already at that coordinate.
+    let candidate = crate::jitcode_dispatch::catch_target_after_resume_live(code, pc)
+        .or_else(|| crate::jitcode_dispatch::find_catch_before_resume_live(code, pc));
+    if crate::jitcode_dispatch::p2_diag_enabled() {
+        eprintln!("[p2-raise] frame={frame} pc={pc} catch_before={candidate:?}");
+    }
+    candidate
+}
+
+/// The `PyTraceback` node a paused middle frame contributes as an exception
+/// crosses it on the drain's unwind.
+///
+/// `pyopcode.py handle_operation_error` runs
+/// `pytraceback.record_application_traceback` for EVERY frame the exception
+/// passes through, not only the one that catches; the walk-level sub-walk arm
+/// records it for an inlined callee the same way.  A frame this drain crosses
+/// is reconstructed from resume data and never becomes a real `PyFrame`, so
+/// nothing downstream would record it — the node has to be emitted here, and at
+/// runtime as well as for the recording pass, or a `tb_frame.f_code.co_name`
+/// walk comes up one level short on exactly the deopt iterations.
+///
+/// The recipe carries no materialized frame, so this takes the fabricating
+/// hook: it builds one from the promoted code / globals, which is what
+/// `record_inline_application_traceback` falls back to for an unseeded level.
+fn record_carrier_crossed_frame_traceback(
+    ctx: &mut TraceCtx,
+    recipe: &majit_metainterp::ReconstructRecipe,
+    exc: majit_ir::OpRef,
+    exc_concrete: crate::state::ConcreteValue,
+) {
+    let crate::state::ConcreteValue::Ref(exc_ptr) = exc_concrete else {
+        return;
+    };
+    if exc_ptr.is_null() {
+        return;
+    }
+    let w_code = crate::state::recover_inline_callee_code(recipe.code_ptr);
+    // A synthetic frame carries the sentinel or null instead of a real code
+    // object; the hook dereferences it, so both checks precede `is_code`, whose
+    // type check would deref the sentinel.
+    if w_code.is_null() || w_code as usize == usize::MAX {
+        return;
+    }
+    if !unsafe { pyre_interpreter::pycode::is_code(w_code) } {
+        return;
+    }
+    let w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr);
+    majit_metainterp::record_inline_application_traceback_for_recording(
+        exc_ptr as usize as i64,
+        w_code as usize as i64,
+        w_globals as usize as i64,
+        recipe.jitcode_index,
+        recipe.jitcode_pc,
+    );
+    let hook = majit_metainterp::record_inline_application_traceback_hook_address();
+    if hook.is_null() || exc.is_none() {
+        return;
+    }
+    let w_code_op = ctx.const_ref(w_code as usize as i64);
+    let w_globals_op = ctx.const_ref(w_globals as usize as i64);
+    let jitcode_op = ctx.const_int(i64::from(recipe.jitcode_index));
+    let opcode_op = ctx.const_int(i64::from(recipe.jitcode_pc));
+    ctx.call_void_typed_with_effect(
+        hook,
+        &[exc, w_code_op, w_globals_op, jitcode_op, opcode_op],
+        &[
+            majit_ir::Type::Ref,
+            majit_ir::Type::Ref,
+            majit_ir::Type::Ref,
+            majit_ir::Type::Int,
+            majit_ir::Type::Int,
+        ],
+        majit_metainterp::default_effect_info(),
+    );
+}
+
 fn carrier_root_catch_target<Sym: WalkSym>(sym: &Sym, root_pc: usize) -> Option<usize> {
     if sym.jitcode().is_null() {
         return None;
     }
     let payload = unsafe { &(*sym.jitcode()).payload };
-    let code = payload.jitcode.code.as_slice();
-    // The paused caller's resume pc is the CALL's post-call `-live-`; the
-    // `catch_exception/L` for the enclosing try sits BEHIND it (between the
-    // CALL's post-call `-live-` and the next op), so scan backward — the same
-    // lookup the single-frame exception-edge router uses.
-    // `root_pc` is the CALL's OWN trailing `-live-`, one op short of the
-    // block-entry `-live-` the backward scan keys off, so read forward first
-    // and keep the backward scan for callers already at that coordinate.
-    let candidate = crate::jitcode_dispatch::catch_target_after_resume_live(code, root_pc)
-        .or_else(|| crate::jitcode_dispatch::find_catch_before_resume_live(code, root_pc));
-    if crate::jitcode_dispatch::p2_diag_enabled() {
-        eprintln!("[p2-raise] root_pc={root_pc} catch_before={candidate:?}");
-    }
-    candidate
+    carrier_catch_target(payload.jitcode.code.as_slice(), root_pc, "root")
 }
 
 fn discard_bridge_carrier_walk<Sym: WalkSym>(
@@ -1813,13 +1881,13 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     }
 
     // `finishframe_exception` at the carrier boundary: the inlined callee's
-    // sub-walk raised and had no local handler, so it surfaced `SubRaise`.  The
-    // ROOT frame paused at the CALL; if its `except` handler covers the CALL and
-    // rejoins a loop, deliver the exception to that handler and continue the
-    // root walk from it (the same handler-entry reconstruction the walk-level
-    // SubRaise routing performs, threaded across the carrier the sub-walk
-    // crossed on its own).  Without this the raise is dropped and re-interpreted
-    // every iteration (deopt-storm).
+    // sub-walk raised and had no local handler, so it surfaced `SubRaise`.
+    // Scan paused middle frames from deepest to shallowest. A frame without a
+    // covering handler closes as the exception passes through; a middle-frame
+    // handler needs its own continuation walk, so that shape still declines.
+    // Once the exception reaches the ROOT frame, deliver it to a covering
+    // handler and continue the root walk. Without this the raise is dropped and
+    // re-interpreted every iteration (deopt-storm).
     //
     // A root frame with no covering handler is the framestack-exhausted arm of
     // the same walk: `finishframe_exception` runs out of frames to scan and
@@ -1834,7 +1902,50 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         _ => None,
     };
     if let Some((exc, exc_concrete)) = subwalk_raise {
-        if carrier.recipes.len() == 1 {
+        // `finishframe_exception` walks the framestack from the top down,
+        // popping each frame whose pc carries no `catch_exception`.  The
+        // deepest frame is the sub-walk that just raised and its
+        // `carrier_ec_leave` already ran; the middles between it and the root
+        // are `recipes[n-2]..recipes[0]`, and the root is handled below.
+        //
+        // Decide the whole chain BEFORE closing anything: `carrier_ec_leave`
+        // performs the concrete leave as well as recording it, so a mid-chain
+        // decline that had already closed a frame would leave the interpreter's
+        // `topframeref` one level short for the blackhole replay the abort
+        // epilogue hands the iteration to.
+        let n = carrier.recipes.len();
+        let middles = &carrier.recipes[..n.saturating_sub(1)];
+        let middles_ok = n >= 1
+            && n <= crate::jitcode_dispatch::fbw_max_multiframe_depth()
+            && middles.iter().rev().all(|middle| {
+                let Some(middle_pjc) = crate::state::pyjitcode_for_code(middle.code_ptr) else {
+                    crate::jitcode_dispatch::census_record("P2Drain::NoMiddlePjc");
+                    return false;
+                };
+                // A middle that catches has to be ENTERED at its handler and
+                // walked on from there, which can put every shallower frame
+                // back on the value path.  Decline that shape; the exception
+                // passes straight through the rest.
+                if carrier_catch_target(
+                    middle_pjc.jitcode.code.as_slice(),
+                    middle.jitcode_pc as usize,
+                    "middle",
+                )
+                .is_some()
+                {
+                    crate::jitcode_dispatch::census_record("P2Drain::MiddleCatchesRaise");
+                    return false;
+                }
+                true
+            });
+        if middles_ok {
+            // Deepest-first, the order the exception actually crosses them, so
+            // the nodes prepend into the same chain order the interpreter
+            // builds.
+            for middle in middles.iter().rev() {
+                record_carrier_crossed_frame_traceback(ctx, middle, exc, exc_concrete);
+                crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, true);
+            }
             let catch_target = carrier_root_catch_target(sym, root_pc);
             crate::jitcode_dispatch::set_carrier_raise_seed(
                 crate::jitcode_dispatch::CarrierRaiseSeed {

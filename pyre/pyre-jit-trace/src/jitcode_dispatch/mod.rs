@@ -4185,11 +4185,15 @@ fn bool_box_truth_lookup(boxed: OpRef) -> Option<OpRef> {
     })
 }
 
-/// Clear the [`BOOL_BOX_TRUTH`] map at the start of an authoritative walk so a
-/// prior aborted walk's entries never leak into the next one.  This is the
-/// reset boundary for the walk-local thread-local; it is called at the two FBW
-/// walk entry points (`trace.rs` `full_body_walk_trace` at walk start, and
-/// after `probe_walk_perfn_jitcode` discards its throwaway trace).
+/// Clear the [`BOOL_BOX_TRUTH`] map so a prior walk's entries never leak into
+/// the next one.  This is the reset boundary for the walk-local thread-local,
+/// and it is called wherever the ops a recorded key names stop existing: at
+/// walk start (`trace.rs` `full_body_walk_trace`, and the carrier drain), after
+/// `probe_walk_perfn_jitcode` discards its throwaway trace, and on every
+/// sub-walk rollback that follows `cut_trace` with a `heap_cache` reset.
+///
+/// A reset can only lose entries, never invent one, so a boundary placed too
+/// eagerly costs a fold and cannot mis-fold.
 pub fn bool_box_truth_reset() {
     BOOL_BOX_TRUTH.with(|m| m.borrow_mut().clear());
 }
@@ -5020,40 +5024,6 @@ struct InlineParentBlackhole {
     /// Float values have no concrete shadow bank; retain their OpRefs and
     /// resolve them at force time while the trace context is still live.
     float_values: Vec<(usize, OpRef)>,
-}
-
-/// Whether any frame the trace already models would catch an exception raised
-/// below it — i.e. whether a raise escaping the callee about to be inlined has
-/// to be routed back INTO the traced region.
-///
-/// Each paused caller on the framestack is asked whether its own pending CALL
-/// sits inside a try-block, the same `after_residual_call_resume` →
-/// `catch_exception/L` lookup [`decline_inline_caller_frame_for_catch_marker`]
-/// uses. Level 0's parent is the snapshot root, so the scan covers the root
-/// frame and every intermediate one; the innermost CALL needs no test here
-/// because a nested try-block CALL already declines multiframe on its own.
-///
-/// Unknown answers count as catching: a parent with no snapshot, an
-/// unresolvable jitcode, or a CALL with no recorded pc could all be hiding a
-/// handler, and admitting one wrongly costs a guard storm.
-pub(crate) fn inline_chain_catches_a_raise(session: &std::cell::RefCell<WalkSession>) -> bool {
-    session.borrow().framestack.iter().any(|frame| {
-        let Some(parent) = frame.parent.as_ref() else {
-            return true;
-        };
-        let Some(call_pc) = parent.call_jitcode_pc else {
-            return true;
-        };
-        let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)
-        else {
-            return true;
-        };
-        match pjc.after_residual_call_resume_for_jitcode_pc(call_pc) {
-            // No after-call resume marker: the CALL is not in a try-block.
-            None => false,
-            Some(resume) => try_catch_exception_at(pjc.jitcode.code.as_slice(), resume).is_some(),
-        }
-    })
 }
 
 /// The derivation flavor of a paused caller frame's Python resume pc.
