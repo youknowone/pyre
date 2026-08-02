@@ -11482,3 +11482,98 @@ fn walker_declines_to_fold_a_float_result_pure_call() {
          whatever the integer return register held",
     );
 }
+
+/// `bh_load_global_fn`'s `namespace` operand (arg 0) is never dereferenced —
+/// the helper resolves the globals from the executing frame or from `w_code`'s
+/// own live `w_globals`. The codewriter bakes it from `w_code_get_w_globals`,
+/// which is `PY_NULL` until some frame for that code object stamps it, so a
+/// jitcode built before the callee's first frame carries a concrete-NULL there.
+/// Aborting the walk on it is a false positive whose replay re-executes every
+/// residual the walk already ran concretely.
+#[test]
+fn mayforce_null_ref_arg_exempts_the_unread_load_global_namespace() {
+    fn descr_for(pyre_helper: majit_ir::PyreHelperKind) -> DescrRef {
+        let mut effect = majit_ir::EffectInfo::default();
+        effect.pyre_helper = pyre_helper;
+        std::sync::Arc::new(majit_ir::SimpleCallDescr::new(
+            9,
+            vec![Type::Ref, Type::Ref, Type::Ref, Type::Int],
+            Type::Ref,
+            false,
+            std::mem::size_of::<usize>(),
+            effect,
+        ))
+    }
+
+    let mut tc = fresh_trace_ctx();
+    // funcbox, then `bh_load_global_fn(namespace=NULL, w_code, frame, namei)`.
+    let allboxes = [
+        tc.const_int(0x1234),
+        tc.const_ref(0),
+        tc.const_ref(0xC0DE_1000),
+        tc.const_ref(0xC0DE_2000),
+        tc.const_int(2),
+    ];
+    let load_global = descr_for(majit_ir::PyreHelperKind::LoadGlobal);
+    let untagged = descr_for(majit_ir::PyreHelperKind::None);
+
+    let mut regs_i: Vec<OpRef> = Vec::new();
+    let mut regs_r: Vec<OpRef> = Vec::new();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut regs_r,
+        registers_i: &mut regs_i,
+        registers_f: &mut [],
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    assert_eq!(
+        walker_abort_if_mayforce_null_ref_arg(
+            majit_ir::OpCode::CallMayForceR,
+            &allboxes,
+            load_global.as_call_descr().expect("call descr"),
+            &wc,
+            186,
+        ),
+        Ok(()),
+    );
+    // Control: the same NULL in the same slot without the helper tag is still
+    // the broken baked-NULL shape the guard exists for.
+    assert!(matches!(
+        walker_abort_if_mayforce_null_ref_arg(
+            majit_ir::OpCode::CallMayForceR,
+            &allboxes,
+            untagged.as_call_descr().expect("call descr"),
+            &wc,
+            186,
+        ),
+        Err(DispatchError::MayForceNullRefArgUnsupported { pc: 186 }),
+    ));
+}
