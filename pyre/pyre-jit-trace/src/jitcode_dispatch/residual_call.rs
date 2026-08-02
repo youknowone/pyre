@@ -1302,7 +1302,17 @@ fn flush_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: usize, oprefs: 
                     // portal replaying the frame from its entry.
                     stack.push(r.as_usize() as pyre_object::PyObjectRef);
                 }
-                _ => return false,
+                other => {
+                    if fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-latched-flush] DECLINE at py_pc={py_pc}: slot {} of {} \
+                             opref={opref:?} concrete={other:?}",
+                            stack.len(),
+                            oprefs.len(),
+                        );
+                    }
+                    return false;
+                }
             }
         }
         // Why this latch exists, checkable at runtime.  Measured over
@@ -4061,8 +4071,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // holds a stabilised immovable `IntMutableCell` and the store value is a
     // provably-plain-int box; emits `QUASIIMMUT_FIELD` + `setfield_gc_i(cell,
     // intvalue)`, eliding the boxing + residual dict setitem.  Carries the
-    // LoadName fold's handler-free gate, and for the reason recorded there —
-    // the retrace storm, not a raise the fold could reach.
+    // LoadName fold's handler-free gate, for the reason recorded there.
     //
     // Two staleness bugs were fixed before enabling this unconditionally:
     // (1) the fold now eagerly applies the concrete
@@ -5173,15 +5182,26 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // `GUARD_NOT_INVALIDATED`, so a rebind or a delete fails the loop instead of
     // reaching a NameError, and a successful fold provably cannot raise.
     //
-    // What the gate actually holds back is a RETRACE STORM in a raising module
-    // loop.  Lifted, `exception_reraise_tb_depth_jitstress` goes 0.90s -> 5.85s
-    // at loops_compiled 305 -> 1802 and `exception_reraise_tb_depth_hot`
-    // 0.25s -> 0.64s at 4 -> 137.  The LOAD fold is the one that storms —
-    // restoring the store gate alone does not avoid it.
+    // The gate is load-bearing because the fold INSTALLS the module dict's
+    // `version?` watcher, and that watcher is what makes a later bumping write
+    // in the same program abandon the walk with `ForceQuasiImmutable`.  That
+    // abort resumes mid-expression off a latched operand mirror, and when one
+    // latched slot is unbound the flush declines to the legacy replay, which
+    // then REFUSES to re-deliver an in-flight FOR_ITER item once a body effect
+    // has committed — the iteration is dropped and its accumulator increment is
+    // silently lost.  Lifting the gate to `DELETE_NAME`/`DELETE_GLOBAL` only
+    // (the implicit `del e` an `except X as e:` emits) reaches exactly that:
+    // `bench/synth/pickle_terminal_raise_resume` then prints 214 under the JIT
+    // against 216 interpreted, off one dropped iteration.  Both halves of that
+    // chain — the unbound mirror slot and the silent drop the decline falls
+    // back to — have to be closed before the handler shape stops standing in.
     //
     // The scan is whole-body, so one `try` anywhere in a module also charges
     // every name access in it a live dict lookup (~83ns each, linear in the
-    // count).  Narrowing that without waking the storm is unfinished work.
+    // count).  Measured on a 200k-iteration
+    // `bench/synth/exc_info_module_loop_hot`, folding it is worth 1.87us ->
+    // 1.32us per iteration; at the fixture's own 3000 iterations the difference
+    // sits under this box's noise floor.
     if ctx.is_authoritative_executor
         && ei.pyre_helper == majit_ir::PyreHelperKind::LoadName
         && !jitcode_has_exception_handler(code)
