@@ -514,10 +514,15 @@ impl LabelResumeData {
         let mut per_label = Vec::new();
         let mut uncapturable = Vec::new();
 
+        // Only the labels the entry dispatch can land on need a capture plan;
+        // an in-body label is never resumed, so reserving frame slots for its
+        // live-ins would only inflate the frozen geometry.
+        let resumable = resumable_label_count(ops);
         for (label_pos, label) in ops
             .iter()
             .enumerate()
             .filter(|(_, op)| op.opcode == OpCode::Label)
+            .take(resumable)
         {
             let mut available = vec![false; num_vars as usize];
             let mut defined_before = vec![false; num_vars as usize];
@@ -2006,18 +2011,23 @@ fn build_function(
     // and the fall-through path `br`s over each loader. Key 0 (and any
     // out-of-range key) runs the function from its entry (the preamble).
     let key_dispatch = is_resumable_peeled(ops);
-    let num_labels = ops.iter().filter(|op| op.opcode == OpCode::Label).count();
-    let all_label_args: Vec<Vec<OpRef>> = if key_dispatch {
-        ops.iter()
-            .filter(|op| op.opcode == OpCode::Label)
-            .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
-            .collect()
+    // Labels after the loop header sit inside the `loop` and get no block pair
+    // (`resumable_label_count`); every count below is over the resumable
+    // prefix, which is exactly labels 0..=header in ops order.
+    let num_labels = if key_dispatch {
+        resumable_label_count(ops)
     } else {
-        Vec::new()
+        0
     };
+    let all_label_args: Vec<Vec<OpRef>> = ops
+        .iter()
+        .filter(|op| op.opcode == OpCode::Label)
+        .take(num_labels)
+        .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
+        .collect();
     if key_dispatch {
         // block $exit (A) — guard/Finish exits br here -> epilogue.
-        // Per label j (opened outermost = last label):
+        // Per resumable label j (opened outermost = the loop header):
         //   block $past_loader_j (B_j) — the fall-through path br's over the
         //     label-j resume loader.
         //   block $loader_j (C_j) — the `br_table` lands here (its end) for
@@ -2107,7 +2117,7 @@ fn build_function(
     let mut ovf_flag_live = false;
 
     for (op_idx, op) in ops.iter().enumerate() {
-        if op.opcode == OpCode::Label && key_dispatch {
+        if op.opcode == OpCode::Label && key_dispatch && labels_passed < num_labels {
             // End of the segment before label j (key-0 / earlier-label path).
             // Branch over the resume loader, then close C_j, emit the loader
             // (resume path only), and close B_j. From inside C_j, `br 1`
@@ -4702,10 +4712,11 @@ fn build_function(
 
 /// A peeled loop — real work (the unrolled first iteration = preamble) precedes
 /// the loop-header LABEL — whether it carries one LABEL or several. `loop` is
-/// emitted at the LAST label, so `build_function` wraps the trace in the
-/// resume-at-LABEL entry `br_table` (keyed on the frame dispatch-key slot,
-/// key = label ordinal + 1) and a loop-closing bridge re-enters at ANY of the
-/// loop's labels, in-module. `build_function` keys its wrapper on this
+/// emitted at the JUMP's target label, so `build_function` wraps the trace in
+/// the resume-at-LABEL entry `br_table` (keyed on the frame dispatch-key slot,
+/// key = label ordinal + 1) and a loop-closing bridge re-enters at any of the
+/// loop's labels up to and including the header, in-module
+/// (`resumable_label_count`). `build_function` keys its wrapper on this
 /// predicate; `compile_loop` records it on `CompiledWasmLoop` as
 /// `has_preamble`. `compile_bridge` accepts a loop-closing bridge only when
 /// its JUMP's descr identifies one of the source loop's OWN labels
@@ -4714,16 +4725,25 @@ pub fn is_resumable_peeled(ops: &[Op]) -> bool {
     let Some(loop_label) = find_loop_label_index(ops) else {
         return false;
     };
-    // The current entry br_table closes every label-loader block before it
-    // opens the wasm `loop`, so it supports only the shape whose actual JUMP
-    // target is the last LABEL. Other multi-label shapes still compile as a
-    // normal local loop but do not advertise in-module label re-entry.
-    if ops.iter().rposition(|op| op.opcode == OpCode::Label) != Some(loop_label) {
-        return false;
-    }
     ops[..loop_label]
         .iter()
         .any(|op| op.opcode != OpCode::Label)
+}
+
+/// How many of a peeled loop's LABELs the entry `br_table` can re-enter at:
+/// those at or before the loop header. Each resume point costs a
+/// (past_loader, loader) block pair opened before the wasm `loop`, so a pair
+/// belonging to a label INSIDE the loop body would have to close inside the
+/// loop — which structured control flow forbids. Such a label stays an in-body
+/// marker: it emits nothing and is not published as a target.
+pub fn resumable_label_count(ops: &[Op]) -> usize {
+    let Some(loop_label) = find_loop_label_index(ops) else {
+        return 0;
+    };
+    ops[..=loop_label]
+        .iter()
+        .filter(|op| op.opcode == OpCode::Label)
+        .count()
 }
 
 /// The single-label subset of `is_resumable_peeled`: exactly one LABEL.

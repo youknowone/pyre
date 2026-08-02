@@ -2165,8 +2165,12 @@ impl majit_backend::Backend for WasmBackend {
         // the label's arity equals that (the standard loop shape, whose
         // first label's args ARE the inputargs).
         if has_preamble {
-            let last = label_descrs.len().saturating_sub(1);
-            for (j, &id) in label_descrs.iter().enumerate() {
+            // Only labels at or before the loop header have a resume loader
+            // (`codegen::resumable_label_count`); the header is the last of
+            // them, and a bridge landing there re-runs no advancing segment.
+            let resumable = codegen::resumable_label_count(ops);
+            let header = resumable.saturating_sub(1);
+            for (j, &id) in label_descrs.iter().enumerate().take(resumable) {
                 if id == 0 {
                     continue;
                 }
@@ -2179,7 +2183,7 @@ impl majit_backend::Backend for WasmBackend {
                         num_args: label_num_args[j],
                         resume_safe: label_resume_info[j].0,
                         requires_own_frame: label_resume_info[j].1,
-                        is_last_label: j == last,
+                        is_last_label: j == header,
                         frame,
                     },
                 );

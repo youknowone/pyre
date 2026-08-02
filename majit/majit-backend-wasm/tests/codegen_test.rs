@@ -1145,9 +1145,11 @@ fn test_non_last_label_backedge_validates() {
         jump,
     ];
 
-    // The key-dispatch wrapper intentionally remains restricted to a last-label
-    // target, but ordinary local lowering must accept this shape.
-    assert!(!codegen::is_resumable_peeled(&ops));
+    // The wide entry label precedes the header, so it is a resume point; the
+    // narrow one sits inside the `loop` and gets no block pair, which is what
+    // keeps the wrapper's structured control flow well-formed here.
+    assert!(codegen::is_resumable_peeled(&ops));
+    assert_eq!(codegen::resumable_label_count(&ops), 1);
     let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
 }
