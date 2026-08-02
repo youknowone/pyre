@@ -1245,6 +1245,24 @@ fn flush_escape_state_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: us
         let Some(oprefs) = latched.as_ref() else {
             return false;
         };
+        flush_with_latched_stack(ctx, frame, py_pc, oprefs)
+    })
+}
+
+/// Resolve a latched operand-stack OpRef mirror to concrete refs and flush the
+/// walk-end state with it, keeping the resolved refs rooted across the call.
+///
+/// Shared by the escape flush above and the `ABORT_FORCE_QUASIIMMUT` leg
+/// ([`flush_qmut_abort_state`]): both resume the interpreter
+/// mid-expression, where the vable shadow's stack region reads NULL and only the
+/// walk's own mirror can say what the operands are.
+fn flush_with_latched_stack(
+    ctx: &TraceCtx,
+    frame: usize,
+    py_pc: usize,
+    oprefs: &[OpRef],
+) -> bool {
+    {
         let mut stack = Vec::with_capacity(oprefs.len());
         for &opref in oprefs.iter() {
             match ctx.concrete_of_opref(opref) {
@@ -1316,7 +1334,19 @@ fn flush_escape_state_with_latched_stack(ctx: &TraceCtx, frame: usize, py_pc: us
             crate::state::flush_walk_end_state_to_frame_with_full_stack(ctx, frame, py_pc, &stack);
         majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
         committed
-    })
+    }
+}
+
+/// The `ABORT_FORCE_QUASIIMMUT` leg's flush: resume the interpreter at the
+/// opcode carrying the forcing write, with the operand stack the walk mirrored
+/// on entry to it ([`fbw_qmut_abort_stack_take`]).
+pub(crate) fn flush_qmut_abort_state(
+    ctx: &TraceCtx,
+    frame: usize,
+    py_pc: usize,
+    oprefs: &[OpRef],
+) -> bool {
+    flush_with_latched_stack(ctx, frame, py_pc, oprefs)
 }
 
 /// Take the committed escape resume pc and which flush produced it (the
@@ -3636,6 +3666,133 @@ pub(crate) fn residual_call_is_proven_truth(
     };
     numeric_ref_regs[arg_reg as usize] || bool_ref_regs[arg_reg as usize]
 }
+/// `pyjitpl.py:1094-1118 opimpl_jit_force_quasi_immutable` for the module
+/// namespace's `version?` (`celldict.py:34 _immutable_fields_ = ["version?"]`),
+/// asked ahead of an opaque STORE_NAME / STORE_GLOBAL / DELETE_NAME /
+/// DELETE_GLOBAL residual.
+///
+/// ```text
+///  mutatebox = self.execute_with_descr(rop.GETFIELD_GC_R, mutatefielddescr, box)
+///  if mutatebox.nonnull():
+///      do_force_quasi_immutable(cpu, box.getref_base(), mutatefielddescr)
+///      raise SwitchToBlackhole(Counters.ABORT_FORCE_QUASIIMMUT)
+///  self.metainterp.generate_guard(rop.GUARD_ISNULL, mutatebox, resumepc=orgpc)
+/// ```
+///
+/// Upstream meets the rtyper's `jit_force_quasi_immutable` inside the traced
+/// write (`rclass.py:715-718`) and abandons the attempt cheaply, which is why
+/// PyPy reports thousands of `abort: force quasi-immut` on this program shape
+/// and still compiles its loops. Pyre's write runs inside a frontend helper the
+/// walker never looks into, so the walker asks the same question here instead of
+/// meeting the operation; without it the trace completes carrying a `version`
+/// constant that is already stale, and the optimizer's revalidation then
+/// discards the loop *and* every interpreter entry bridge.
+///
+/// `is_installed()` is `mutatebox.nonnull()`; the bump predicate is
+/// [`pyre_object::celldict::store_would_bump_version`], the side-effect-free
+/// twin of `write_cell`, because only the write that replaces the stored
+/// pointer reaches `mutated()` (`celldict.py:80-90`) — an in-place cell write
+/// leaves `version` alone and a hot module-scope loop must keep its trace.
+///
+/// Deliberately NO `GUARD_ISNULL` arm on the not-installed path. Upstream's
+/// guard licenses the traced *inline* setfield that bypasses the invalidation
+/// function (`pyjitpl.py:1095-1102`); pyre's write stays inside the residual,
+/// which runs `notify_version_watchers` itself at runtime, so there is no
+/// bypass to license.
+///
+/// Fires BEFORE the residual executes, so the write is still entirely ahead of
+/// the walk — that is what lets the abort resume the interpreter at this opcode
+/// and have the write happen exactly once.  Everything the walk applied EARLIER
+/// stays applied: [`DispatchError::ForceQuasiImmutable`] carries the abort to
+/// the flush leg that commits the journal instead of replaying the region.
+fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    helper: majit_ir::PyreHelperKind,
+    r_args: &[OpRef],
+) -> Option<()> {
+    use majit_ir::PyreHelperKind as K;
+    let is_store = matches!(helper, K::StoreName | K::StoreGlobal);
+    if !is_store && !matches!(helper, K::DeleteName | K::DeleteGlobal) {
+        return None;
+    }
+    let (&frame_opref, &name_opref) = (r_args.first()?, r_args.get(1)?);
+    let (
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr))),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(w_name_ptr))),
+    ) = (
+        ctx.trace_ctx.box_value(frame_opref),
+        ctx.trace_ctx.box_value(name_opref),
+    )
+    else {
+        return None;
+    };
+    if frame_ptr == 0 || w_name_ptr == 0 {
+        return None;
+    }
+    let frame = unsafe { &*(frame_ptr as *const pyre_interpreter::pyframe::PyFrame) };
+    let w_globals = frame.get_w_globals();
+    if w_globals.is_null() {
+        return None;
+    }
+    // A `*_NAME` opcode writes `w_locals`; only a module frame — where
+    // `w_locals` aliases `w_globals` — touches the namespace the folds pin.
+    // Same test as `try_walker_load_name_cell_fold`.
+    if matches!(helper, K::StoreName | K::DeleteName) {
+        let w_locals = frame.get_w_locals();
+        if !w_locals.is_null() && !std::ptr::eq(w_locals, w_globals) {
+            return None;
+        }
+    }
+    let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_get_strategy(w_globals) };
+    // `mutatebox.nonnull()` — nothing is watching, so there is nothing to
+    // abandon the trace for. The write still runs its own invalidation.
+    if !unsafe {
+        pyre_object::dictmultiobject::module_dict_strategy_version_qmut_installed(strategy)
+    } {
+        return None;
+    }
+    let name =
+        unsafe { pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef) };
+    let slot = crate::state::module_dict_cell_slot_direct(w_globals, name);
+    let bumps = if is_store {
+        let &value_opref = r_args.get(2)?;
+        let Some(majit_ir::Value::Ref(majit_ir::GcRef(value_ptr))) =
+            ctx.trace_ctx.box_value(value_opref)
+        else {
+            return None;
+        };
+        if value_ptr == 0 {
+            return None;
+        }
+        let cell = slot.and_then(|s| crate::state::module_dict_cell_value_direct(w_globals, s));
+        unsafe {
+            pyre_object::celldict::store_would_bump_version(
+                cell,
+                value_ptr as pyre_object::PyObjectRef,
+            )
+        }
+    } else {
+        // `celldict.py:106-126 delitem` reaches `mutated()` only after a
+        // successful removal — `delitem_str` returns early on a missing key.
+        slot.is_some()
+    };
+    if !bumps {
+        return None;
+    }
+    // pyjitpl.py:1113-1115: the tracer performs the invalidation itself and
+    // then abandons the attempt. Idempotent (`quasiimmut.py:47-48`), so the
+    // interpreter re-running the opcode forces nothing a second time.
+    unsafe { pyre_object::dictmultiobject::module_dict_strategy_force_version_qmut(strategy) };
+    // Offer the flush leg the operand stack this opcode began with.  Same
+    // preconditions as the escape latch: a sub-walk's mirror describes the
+    // CALLEE frame, and a bridge walk's abort path never reaches the epilogue
+    // that would adopt the flush.
+    if ctx.vstack_valid && !ctx.fbw_mode.inline_subwalk && !ctx.trace_ctx.is_bridge_trace {
+        fbw_qmut_abort_stack_latch(ctx.vstack_cur_pypc as usize, ctx.vstack_boxes.clone());
+    }
+    Some(())
+}
+
 pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -3886,6 +4043,21 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                 }
             }
         }
+    }
+
+    // pyjitpl.py:1094-1118 `opimpl_jit_force_quasi_immutable`, asked at the
+    // residual boundary because pyre's namespace write lives inside one.
+    //
+    // Ordered AFTER the cell fold above (a successful in-place fold IS the
+    // no-bump case) and BEFORE `try_execute_residual_call_via_executor`, so
+    // nothing has been applied when the abort fires and the resume re-runs the
+    // whole opcode cleanly. Executing first — the order `do_not_in_trace_call`
+    // uses for its own contract — would double-apply the store or the delete.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'v'
+        && try_walker_force_quasi_immut_namespace_write(ctx, ei.pyre_helper, &r_args).is_some()
+    {
+        return Err(DispatchError::ForceQuasiImmutable { pc: op.pc });
     }
 
     // pyjitpl.py OS_NOT_IN_TRACE guard — see helper docstring

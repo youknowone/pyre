@@ -4318,7 +4318,10 @@ where
         ctx.delete_name_fn_idx,
         vec![frame_operand, name_operand],
         CallFlavor::Plain,
-        majit_ir::PyreHelperKind::None,
+        // Tagged so the walker can run the `jit_force_quasi_immutable` test
+        // (`pyjitpl.py:1094-1118`) before executing the delete — `delitem_str`
+        // calls `mutated()` on a successful removal.
+        majit_ir::PyreHelperKind::DeleteName,
     ))
 }
 
@@ -4342,7 +4345,8 @@ where
         ctx.delete_global_fn_idx,
         vec![frame_operand, name_operand],
         CallFlavor::Plain,
-        majit_ir::PyreHelperKind::None,
+        // See [`lower_delete_name_hlop_to_insn`].
+        majit_ir::PyreHelperKind::DeleteGlobal,
     ))
 }
 

@@ -4073,6 +4073,83 @@ fn run_perfn_walk<Sym: WalkSym>(
             }
         }
 
+        // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)` (pyjitpl.py:1116) landed
+        // as a resume, not a replay.  Upstream's blackhole picks up at the
+        // `-live-` in front of the forcing write with every earlier residual
+        // already applied and never re-runs one; the walker's equivalent is to
+        // keep the journal and resume the interpreter AT the Python opcode the
+        // write belongs to, which has not run yet (the abort fires before the
+        // residual executes).  Falling through to the plain `Abort` instead
+        // rolls the journal back and replays the walked region from its start,
+        // re-executing every residual the walk already ran.
+        if let Err(crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { pc }) = &walk_result
+        {
+            let abort_jit_pc = *pc;
+            // A recorded-but-unexecuted residual is applied only by the replay
+            // this leg removes, so committing would DROP it; a sub-walk abort's
+            // resume coordinate names the callee's code object, not `sym`'s.
+            if crate::jitcode_dispatch::fbw_has_unjournaled_effect()
+                || session.borrow().abort_in_subwalk
+            {
+                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-qmut-flush] declined at abort_jit_pc={abort_jit_pc} \
+                         (unjournaled effect or inline sub-walk) — legacy replay kept"
+                    );
+                }
+            } else if let Some((resume_py_pc, oprefs)) =
+                crate::jitcode_dispatch::fbw_qmut_abort_stack_take()
+            {
+                // The resume RE-RUNS this opcode (`last_instr = pc - 1`), so it
+                // owes the `Rewind` proof: nothing of it may have been applied
+                // yet.  The sample is taken at the opcode boundary itself, and
+                // its absence (no boundary crossed, or a different opcode)
+                // leaves the leg unprovable — `walk_end_resume_provable`
+                // declines and the legacy replay stands.
+                let resume = match crate::jitcode_dispatch::fbw_opcode_entry_effects_at(
+                    resume_py_pc,
+                ) {
+                    Some(effects_at_resume_point) => WalkEndResume::Rewind {
+                        effects_at_resume_point,
+                    },
+                    None => WalkEndResume::RewindUnproven,
+                };
+                if !walk_end_resume_provable(resume) {
+                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-qmut-flush] declined at resume_py_pc={resume_py_pc} \
+                             (opcode already applied an effect, or no entry sample) \
+                             — legacy replay kept"
+                        );
+                    }
+                } else if crate::jitcode_dispatch::flush_qmut_abort_state(
+                    ctx,
+                    cf_addr,
+                    resume_py_pc,
+                    &oprefs,
+                ) {
+                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        eprintln!(
+                            "[fbw-qmut-flush] COMMIT abort_jit_pc={abort_jit_pc} \
+                             resume_py_pc={resume_py_pc}"
+                        );
+                    }
+                    let committed = commit_walk_end(WalkEndCommitLeg::AbortPc, resume);
+                    debug_assert!(committed, "provability re-checked after a pure flush");
+                } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-qmut-flush] declined at resume_py_pc={resume_py_pc} \
+                         (operand slot without concrete / depth / lastblock) — legacy replay kept"
+                    );
+                }
+            } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[fbw-qmut-flush] declined at abort_jit_pc={abort_jit_pc} \
+                     (no operand-stack mirror latched) — legacy replay kept"
+                );
+            }
+        }
+
         // #32 S2: a kept-stack branch guard whose not-taken arm cannot be
         // restored for the COMPILED trace aborts (`AbortPermanent` for the
         // unrestorable-Ref shape, decline + `Abort` for the depth>1
@@ -5137,6 +5214,13 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 | DE::NonStandardVableFinishPortalUnsupported { .. }
                 | DE::LoopBearingCalleeInlineUnsupported { .. }
                 | DE::UnfoldableListAppendResidualUnsupported { .. }
+                // Plain, retryable: `ABORT_FORCE_QUASIIMMUT` abandons THIS
+                // attempt because the version was live when the walk met the
+                // write.  The forcing already ran, so the next attempt finds a
+                // stabilised namespace and traces — the reason PyPy reports
+                // thousands of these and still compiles the loop.  Retiring the
+                // location would be strictly wrong.
+                | DE::ForceQuasiImmutable { .. }
                 | DE::ResidualCallArgUnbound { .. } => TraceAction::Abort,
                 // #68 multiframe: a data-dependent
                 // `goto_if_not` whose branch input is not concrete at trace-time

@@ -736,6 +736,13 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
     if new_pypc == ctx.vstack_cur_pypc {
         return;
     }
+    // The Python-opcode boundary: sample the executed-effect odometer for any
+    // abort leg that resumes the interpreter AT this opcode, which re-executes
+    // it whole (`FBW_OPCODE_ENTRY_EFFECTS`).  Top-level only — a sub-walk's
+    // `py_pc` indexes the callee's code object.
+    if !ctx.fbw_mode.inline_subwalk {
+        fbw_note_opcode_entry_effects(new_pypc as usize);
+    }
     let code = unsafe { &*code_ptr };
     reconcile_vstack_at_boundary(ctx, code, new_pypc, new_depth);
 }

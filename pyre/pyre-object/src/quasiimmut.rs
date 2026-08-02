@@ -150,6 +150,33 @@ impl QuasiImmutField {
         !self.ptr.load(Ordering::Acquire).is_null()
     }
 
+    /// `quasiimmut.py:116-126 get_current_qmut_instance` on its own — create the
+    /// instance when the field is still null and register nothing.
+    ///
+    /// Upstream installs while RECORDING the read: `pyjitpl.py:1081` builds a
+    /// `QuasiImmutDescr`, whose `__init__` calls `get_current_qmut_instance`,
+    /// which `bh_setfield_gc_r`s a fresh instance into the hidden field
+    /// (`quasiimmut.py:26`). No loop token exists yet at that point; the token
+    /// joins later through [`Self::register_loop_token`].
+    ///
+    /// Pyre only ever had the fused create-and-register, driven from compile
+    /// time (`pyre-jit/src/eval.rs register_quasi_immutable_deps`). Since every
+    /// invalidation uninstalls, the field was null for the whole of tracing, so
+    /// the write path's [`Self::is_installed`] — pyre's `mutatebox.nonnull()` —
+    /// could never fire during a recording.
+    pub fn ensure_installed(&self) {
+        // The null test is the fast path a hot read must not pay a lock for.
+        if !self.ptr.load(Ordering::Acquire).is_null() {
+            return;
+        }
+        let _guard = self.lock.lock();
+        // Re-read under the lock: another thread may have installed it.
+        if self.ptr.load(Ordering::Acquire).is_null() {
+            let qmut_ptr = Box::into_raw(Box::new(QuasiImmut::new()));
+            self.ptr.store(qmut_ptr, Ordering::Release);
+        }
+    }
+
     /// `quasiimmut.py:116-126 get_current_qmut_instance` followed by
     /// `:72-75 register_loop_token`: create the instance if the field is still
     /// null, then record this loop's invalidation flag on it.

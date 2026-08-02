@@ -1990,6 +1990,20 @@ pub enum DispatchError {
     /// through pyre's abort ceiling, so the permanent mapping records the
     /// structural nature of this abort without changing runtime behavior.
     BranchGuardUnrestorableKeptStackPermanent { pc: usize },
+    /// `pyjitpl.py:1112-1116 opimpl_jit_force_quasi_immutable`: the mutate
+    /// field was already non-null when the walk reached a write that bumps the
+    /// guarded version, so the tracer forced the invalidation itself and
+    /// abandons the attempt (`raise SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)`).
+    ///
+    /// Carried as a typed error rather than a `SwitchToBlackhole` OUTCOME so it
+    /// reaches the abort-pc flush leg: upstream's blackhole resumes at the
+    /// `-live-` in front of the write with every earlier residual already
+    /// applied, and pyre's only equivalent is committing the walk and resuming
+    /// the interpreter AT the enclosing Python opcode.  An `Ok` outcome falls
+    /// through to the plain `Abort`, whose journal rollback replays the walked
+    /// region from its start and re-executes every residual the walk already
+    /// ran (`pickle_terminal_raise_resume` is the corpus detector).
+    ForceQuasiImmutable { pc: usize },
     /// A callee compiled as its own Finish portal (reached via
     /// `call_user_function_with_eval`) accessed its frame through a
     /// `vable_*` op that found it to be a non-standard virtualizable,
@@ -2091,6 +2105,7 @@ impl DispatchError {
             Self::LoopHeaderJdIndexUnresolved { .. } => "LoopHeaderJdIndexUnresolved",
             Self::SubWalkClosedLoop { .. } => "SubWalkClosedLoop",
             Self::BranchGuardKeptStackUnsupported { .. } => "BranchGuardKeptStackUnsupported",
+            Self::ForceQuasiImmutable { .. } => "ForceQuasiImmutable",
             Self::NonStandardVableFinishPortalUnsupported { .. } => {
                 "NonStandardVableFinishPortalUnsupported"
             }
@@ -2160,6 +2175,7 @@ impl DispatchError {
             | Self::LoopHeaderJdIndexUnresolved { pc, .. }
             | Self::SubWalkClosedLoop { pc, .. }
             | Self::BranchGuardKeptStackUnsupported { pc, .. }
+            | Self::ForceQuasiImmutable { pc, .. }
             | Self::NonStandardVableFinishPortalUnsupported { pc, .. }
             | Self::LoopBearingCalleeInlineUnsupported { pc, .. }
             | Self::FieldDescrMissingParentDescr { pc, .. }
@@ -5253,6 +5269,35 @@ thread_local! {
     /// discarded and re-executed without risking a double.
     static FBW_EXECUTED_EFFECT_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+
+    /// `ABORT_FORCE_QUASIIMMUT` resume carrier: `(py_pc, operand-stack OpRef
+    /// mirror)` taken at the abort, for the flush leg that resumes the
+    /// interpreter at that opcode.
+    ///
+    /// The mirror is needed because the abort lands MID-EXPRESSION: the vable
+    /// shadow's stack region reads NULL outside a merge point, so the plain
+    /// flush declines on the first operand slot and the walk falls back to the
+    /// replay this leg exists to avoid.  Holds symbolic `OpRef`s only — the
+    /// concrete refs are resolved and rooted inside the flush.
+    static FBW_QMUT_ABORT_STACK: std::cell::RefCell<Option<(usize, Vec<OpRef>)>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// [`FBW_EXECUTED_EFFECT_COUNT`] sampled as the walk ENTERED the Python
+    /// opcode it is currently inside, as `(py_pc, odometer)`.
+    ///
+    /// A leg that resumes the interpreter at a Python opcode re-executes that
+    /// whole opcode — `flush_walk_end_state_to_frame` sets `last_instr = pc - 1`
+    /// — so it owes a proof that the opcode has applied nothing yet.  This is
+    /// that proof's sample point, and it must be the OPCODE boundary: a
+    /// per-`-live-` or per-jitcode-op sample would read zero for an opcode whose
+    /// earlier ops already ran effects.
+    ///
+    /// Recorded only on the top-level walk (`reconcile_vstack_at_boundary`, the
+    /// boundary detector).  A callee sub-walk's `py_pc` names a different code
+    /// object, so leaving the sample absent there makes the gate decline rather
+    /// than compare coordinates from two universes.
+    static FBW_OPCODE_ENTRY_EFFECTS: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
 
     /// Effect-count delta of the exact JitCode opcode that most recently
     /// returned `LoopBearingCalleeInlineUnsupported`.  The structural

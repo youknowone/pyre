@@ -292,29 +292,91 @@ pub unsafe fn write_cell(w_cell: Option<PyObjectRef>, w_value: PyObjectRef) -> O
     // prebuilt-family root walk; record the store so the next minor
     // collection rescans it (gc_roots.rs prebuilt-root write tracking).
     crate::gc_roots::mark_prebuilt_roots_dirty();
+    match classify_cell_write(w_cell, w_value) {
+        CellWrite::InPlaceObject(cell) => {
+            (*(cell as *mut ObjectMutableCell)).w_value = w_value;
+            None
+        }
+        CellWrite::InPlaceInt(cell, intvalue) => {
+            (*(cell as *mut IntMutableCell)).intvalue = intvalue;
+            None
+        }
+        CellWrite::Unchanged => None,
+        CellWrite::StoreBare => Some(w_value),
+        CellWrite::Replace => {
+            if crate::listobject::is_plain_int1(w_value) {
+                return Some(w_int_mutable_cell_new(crate::listobject::plain_int_w(
+                    w_value,
+                )));
+            }
+            Some(w_object_mutable_cell_new(w_value))
+        }
+    }
+}
+
+/// What [`write_cell`] will do with the slot.
+///
+/// Split out from the mutation so the tracer's bump predicate
+/// ([`store_would_bump_version`]) cannot drift from the write it predicts.
+enum CellWrite {
+    /// Write through the existing cell; the stored pointer, and therefore
+    /// `version?`, stands.
+    InPlaceObject(PyObjectRef),
+    InPlaceInt(PyObjectRef, i64),
+    /// The slot already holds this exact value.
+    Unchanged,
+    /// No cell yet: store the value itself, without a level of indirection.
+    /// A later write over it is what promotes the slot to a cell.
+    StoreBare,
+    /// A cell is there but cannot take the value in place, so the slot gets a
+    /// fresh one.
+    Replace,
+}
+
+/// The decision half of [`write_cell`]; performs no store.
+unsafe fn classify_cell_write(w_cell: Option<PyObjectRef>, w_value: PyObjectRef) -> CellWrite {
     let Some(w_cell) = w_cell else {
         // attribute does not exist at all, write it without a cell first
-        return Some(w_value);
+        return CellWrite::StoreBare;
     };
     if is_object_mutable_cell(w_cell) {
-        (*(w_cell as *mut ObjectMutableCell)).w_value = w_value;
-        return None;
+        return CellWrite::InPlaceObject(w_cell);
     }
     if is_int_mutable_cell(w_cell) && crate::listobject::is_plain_int1(w_value) {
-        (*(w_cell as *mut IntMutableCell)).intvalue = crate::listobject::plain_int_w(w_value);
-        return None;
+        return CellWrite::InPlaceInt(w_cell, crate::listobject::plain_int_w(w_value));
     }
     // If the new value and the current value are the same, don't
     // create a level of indirection, or mutate the version.
     if std::ptr::eq(w_cell, w_value) {
-        return None;
+        return CellWrite::Unchanged;
     }
-    if crate::listobject::is_plain_int1(w_value) {
-        return Some(w_int_mutable_cell_new(crate::listobject::plain_int_w(
-            w_value,
-        )));
-    }
-    Some(w_object_mutable_cell_new(w_value))
+    CellWrite::Replace
+}
+
+/// Whether storing `w_value` over the raw slot contents `w_cell` would reach
+/// `mutated()`, i.e. would assign the `version?` quasi-immutable field.
+///
+/// This is the tracer's stand-in for the rtyper-inserted
+/// `jit_force_quasi_immutable` that upstream places on that write
+/// (`rclass.py:715-718`). Pyre's store runs inside a residual helper the walker
+/// never looks into, so the walker has to ask the question ahead of the call
+/// instead of meeting the operation inside it. Side-effect-free by
+/// construction — it only classifies.
+///
+/// An in-place cell write must answer `false`: it leaves the stored pointer
+/// alone, so `version` stays valid and a hot module-scope loop must keep its
+/// compiled trace.
+///
+/// # Safety
+/// `w_cell` (when `Some`) and `w_value` must point at live objects.
+pub unsafe fn store_would_bump_version(
+    w_cell: Option<PyObjectRef>,
+    w_value: PyObjectRef,
+) -> bool {
+    matches!(
+        classify_cell_write(w_cell, w_value),
+        CellWrite::StoreBare | CellWrite::Replace
+    )
 }
 
 /// `pypy/objspace/std/celldict.py:20-21 VersionTag`:
@@ -683,6 +745,27 @@ impl ModuleDictStrategy {
     /// `JitCellToken.invalidation_flag()`.
     pub fn register_version_watcher(&self, flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
         self.version_watchers.register_loop_token(flag);
+    }
+
+    /// `quasiimmut.py:116-126 get_current_qmut_instance` alone — install the
+    /// instance while the trace is still recording, so a `mutated()` reached
+    /// later in the same trace finds the field non-null.
+    pub fn install_version_watcher(&self) {
+        self.version_watchers.ensure_installed();
+    }
+
+    /// `pyjitpl.py:1112 mutatebox.nonnull()` — whether some trace or loop is
+    /// watching `version?` right now.
+    pub fn version_qmut_installed(&self) -> bool {
+        self.version_watchers.is_installed()
+    }
+
+    /// `quasiimmut.py:46-51 do_force_quasi_immutable`, which the tracer calls
+    /// itself before aborting (`pyjitpl.py:1113-1115`). Idempotent: a field
+    /// already taken returns early, so the interpreter re-running the opcode
+    /// after the abort forces nothing a second time.
+    pub fn force_version_qmut(&self) {
+        self.version_watchers.invalidate();
     }
 
     /// Invalidate every loop watching `version`

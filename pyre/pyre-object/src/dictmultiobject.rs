@@ -1151,6 +1151,48 @@ pub unsafe fn module_dict_strategy_register_version_watcher(
     (*strategy).register_version_watcher(flag);
 }
 
+/// Install this strategy's `version?` qmut instance without registering a loop
+/// (`quasiimmut.py:116-126 get_current_qmut_instance`).
+///
+/// The recording-time half, for the reason spelled out on
+/// [`crate::typeobject::w_type_install_quasi_immut`].
+///
+/// # Safety
+/// `strategy` must be null or point at a valid `ModuleDictStrategy`.
+pub unsafe fn module_dict_strategy_install_version_watcher(
+    strategy: *mut crate::celldict::ModuleDictStrategy,
+) {
+    if strategy.is_null() {
+        return;
+    }
+    (*strategy).install_version_watcher();
+}
+
+/// `pyjitpl.py:1112 mutatebox.nonnull()` for this strategy's `version?`.
+///
+/// # Safety
+/// `strategy` must be null or point at a valid `ModuleDictStrategy`.
+pub unsafe fn module_dict_strategy_version_qmut_installed(
+    strategy: *const crate::celldict::ModuleDictStrategy,
+) -> bool {
+    !strategy.is_null() && (*strategy).version_qmut_installed()
+}
+
+/// `quasiimmut.py:46-51 do_force_quasi_immutable` for this strategy's
+/// `version?` — the invalidation the tracer performs itself before aborting
+/// (`pyjitpl.py:1113-1115`).
+///
+/// # Safety
+/// `strategy` must be null or point at a valid `ModuleDictStrategy`.
+pub unsafe fn module_dict_strategy_force_version_qmut(
+    strategy: *const crate::celldict::ModuleDictStrategy,
+) {
+    if strategy.is_null() {
+        return;
+    }
+    (*strategy).force_version_qmut();
+}
+
 /// Allocate a new empty dict per `dictmultiobject.py:67-69
 /// allocate_and_init_instance`:
 ///

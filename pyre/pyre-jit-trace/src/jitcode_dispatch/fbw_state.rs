@@ -355,6 +355,8 @@ pub(crate) fn fbw_store_journal_reset() {
     // gh#467: reset the executed-effect odometer and any stale
     // forward-flush carrier a prior aborted walk latched.
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(0));
+    FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(None));
+    FBW_QMUT_ABORT_STACK.with(|c| *c.borrow_mut() = None);
     FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS.with(|c| c.set(None));
     FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = None);
     // #57 Option C: drop any in-flight FOR_ITER items a prior aborted walk
@@ -1010,6 +1012,37 @@ pub(crate) fn fbw_executed_effect_count() -> usize {
 
 pub(crate) fn fbw_structural_abort_opcode_is_effect_free(pc: usize) -> bool {
     FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS.with(|c| c.get() == Some((pc, 0)))
+}
+
+/// Latch the resume coordinate + operand-stack mirror for an
+/// `ABORT_FORCE_QUASIIMMUT` abort (see [`FBW_QMUT_ABORT_STACK`]).
+pub(crate) fn fbw_qmut_abort_stack_latch(py_pc: usize, stack: Vec<OpRef>) {
+    FBW_QMUT_ABORT_STACK.with(|c| *c.borrow_mut() = Some((py_pc, stack)));
+}
+
+/// Take the latch above.  `None` when the abort could not offer a mirror (a
+/// sub-walk, a bridge walk, or an invalidated mirror), which leaves the flush
+/// leg to decline and the legacy replay to stand.
+pub(crate) fn fbw_qmut_abort_stack_take() -> Option<(usize, Vec<OpRef>)> {
+    FBW_QMUT_ABORT_STACK.with(|c| c.borrow_mut().take())
+}
+
+/// Record the executed-effect odometer as the walk enters Python opcode
+/// `py_pc` (see [`FBW_OPCODE_ENTRY_EFFECTS`]).
+pub(crate) fn fbw_note_opcode_entry_effects(py_pc: usize) {
+    FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(Some((py_pc, fbw_executed_effect_count()))));
+}
+
+/// The odometer sampled on entry to `py_pc`, for a leg that resumes the
+/// interpreter there.  `None` — no sample, or one taken at a different opcode —
+/// leaves the rewind unproven, which [`walk_end_resume_provable`] declines.
+///
+/// [`walk_end_resume_provable`]: crate::trace::walk_end_resume_provable
+pub(crate) fn fbw_opcode_entry_effects_at(py_pc: usize) -> Option<usize> {
+    FBW_OPCODE_ENTRY_EFFECTS.with(|c| match c.get() {
+        Some((sampled_py_pc, effects)) if sampled_py_pc == py_pc => Some(effects),
+        _ => None,
+    })
 }
 
 /// gh#467 bump the executed-effect odometer (see [`FBW_EXECUTED_EFFECT_COUNT`]).

@@ -782,6 +782,26 @@ pub unsafe fn w_type_register_quasi_immut_watcher(
         .register_loop_token(flag);
 }
 
+/// Install this type's `_version_tag?` qmut instance without registering a
+/// loop (`quasiimmut.py:116-126 get_current_qmut_instance`).
+///
+/// The recording half of the protocol: upstream's `QuasiImmutDescr.__init__`
+/// (`pyjitpl.py:1081`) installs while the trace is still being recorded, so a
+/// write reached later in that same trace sees a non-null `mutate_*` field and
+/// aborts the attempt. [`w_type_register_quasi_immut_watcher`] is the compile-
+/// time half and runs far too late to arm that test.
+///
+/// # Safety
+/// `obj` must be null or point at a valid `W_TypeObject`.
+pub unsafe fn w_type_install_quasi_immut(obj: PyObjectRef) {
+    if obj.is_null() || !is_type(obj) {
+        return;
+    }
+    (*(obj as *const W_TypeObject))
+        .quasi_immut_watchers
+        .ensure_installed();
+}
+
 /// Revoke every loop that baked this type's `version_tag` as a constant
 /// (`quasiimmut.py:129-134 make_invalidation_function._invalidate_now`).
 ///
