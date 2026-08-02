@@ -63,9 +63,13 @@ fn key_wrapper_compare(
         ],
     )?;
     pyre_object::gc_roots::pin_root(result);
+    // Build the comparison operand first: a custom numeric result makes
+    // `w_int_new` allocate, and reading the result slot before that would leave
+    // the argument naming a pre-move address.
+    let w_zero = w_int_new(0);
     crate::baseobjspace::compare(
         pyre_object::gc_roots::shadow_stack_get(slot + 3),
-        w_int_new(0),
+        w_zero,
         op,
     )
 }
