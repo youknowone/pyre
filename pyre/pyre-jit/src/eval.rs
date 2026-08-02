@@ -4064,6 +4064,9 @@ fn build_jit_driver_pair() -> JitDriverPair {
     majit_metainterp::set_record_inline_application_traceback_hook(Some(
         crate::call_jit::record_inline_traceback_for_recording,
     ));
+    majit_metainterp::set_record_discarded_level_traceback_hook(Some(
+        crate::call_jit::record_discarded_level_traceback,
+    ));
     let info = build_pyframe_virtualizable_info();
     let mut d = JitDriver::new(JIT_THRESHOLD);
     d.set_virtualizable_info(info.clone());

@@ -1571,10 +1571,21 @@ pub struct JitHooks {
 /// majit keeps only this crate-neutral ABI hook.
 pub type RecordApplicationTraceback = extern "C" fn(i64, i64, i64, i64);
 pub type RecordInlineApplicationTraceback = extern "C" fn(i64, i64, i64, i64, i64);
+/// Runtime callback for a frame the resume crossed and then DISCARDED.
+///
+/// `pyopcode.py:148` attaches a node on every frame an unwind passes through,
+/// which upstream gets for free because the unwind is traced code running on a
+/// rebuilt MIFrame stack.  A resume that re-points the live frame straight at
+/// its own handler has no such stack, and the only description left of the
+/// frames it skipped is the `(w_code, python pc)` pair in the resume data —
+/// so this hook takes a PYTHON pc where the two above take a jitcode one.
+pub type RecordDiscardedLevelTraceback = extern "C" fn(i64, i64, i64);
 
 static RECORD_APPLICATION_TRACEBACK: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static RECORD_INLINE_APPLICATION_TRACEBACK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static RECORD_DISCARDED_LEVEL_TRACEBACK: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 pub fn set_record_application_traceback_hook(hook: Option<RecordApplicationTraceback>) {
@@ -1593,12 +1604,23 @@ pub fn set_record_inline_application_traceback_hook(
     );
 }
 
+pub fn set_record_discarded_level_traceback_hook(hook: Option<RecordDiscardedLevelTraceback>) {
+    RECORD_DISCARDED_LEVEL_TRACEBACK.store(
+        hook.map_or(0, |callback| callback as usize),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
 pub fn record_application_traceback_hook_address() -> *const () {
     RECORD_APPLICATION_TRACEBACK.load(std::sync::atomic::Ordering::Acquire) as *const ()
 }
 
 pub fn record_inline_application_traceback_hook_address() -> *const () {
     RECORD_INLINE_APPLICATION_TRACEBACK.load(std::sync::atomic::Ordering::Acquire) as *const ()
+}
+
+pub fn record_discarded_level_traceback_hook_address() -> *const () {
+    RECORD_DISCARDED_LEVEL_TRACEBACK.load(std::sync::atomic::Ordering::Acquire) as *const ()
 }
 
 fn record_application_traceback(exc_value: i64, frame_ptr: *const u8, frame: &MIFrame) {
@@ -1665,6 +1687,28 @@ pub fn record_inline_application_traceback_for_recording(
         i64::from(jitcode_index),
         i64::from(opcode_position),
     );
+}
+
+/// Invoke the host callback for a frame the unwind crossed but the resume
+/// discarded, named by its `(w_code, python pc)` coordinate alone.
+///
+/// The two callbacks above both address their frame through a jitcode: one has
+/// the concrete frame pointer, the other the promoted metadata of a level the
+/// walk is still standing in.  A discarded level is neither — the resume data
+/// is the last thing that knows it existed, and what it carries is a Python
+/// coordinate.  Hence the third arity.
+pub fn record_discarded_level_traceback_for_recording(exc_value: i64, w_code: i64, py_pc: i64) {
+    if exc_value == 0 || w_code == 0 {
+        return;
+    }
+    let callback = RECORD_DISCARDED_LEVEL_TRACEBACK.load(std::sync::atomic::Ordering::Acquire);
+    if callback == 0 {
+        return;
+    }
+    // Safety: the only stored values come from a RecordDiscardedLevelTraceback
+    // function pointer in set_record_discarded_level_traceback_hook.
+    let callback: RecordDiscardedLevelTraceback = unsafe { std::mem::transmute(callback) };
+    callback(exc_value, w_code, py_pc);
 }
 
 /// framework.py `root_walker.walk_roots` per-op helper: visit every

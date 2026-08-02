@@ -807,6 +807,71 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     }
 }
 
+/// `pytraceback.py:104-109 record_application_traceback` for a frame the resume
+/// crossed and discarded — an inlined callee the exception-edge bridge unwound
+/// clear out of on its way to the live frame's own handler.
+///
+/// `pyopcode.py:148` runs BEFORE the `:152` exception-table lookup, so a frame
+/// that only propagates contributes a node exactly like one that catches.  The
+/// levels named here never reach a recorder that could speak for them: the
+/// route exists because the unwind discards them, and by the time the walk
+/// starts they are gone.
+///
+/// The node's frame is fabricated from the code object, as
+/// [`record_inline_traceback_for_recording`] does and for the same reason —
+/// the level's own `PyFrame` stayed virtual in the compiled trace and the
+/// resume never materialized it, so there is no other object to name.  Unlike
+/// that case there is also no seeded frame it could be confused with: nothing
+/// else in this process can reach the discarded level either.
+pub(crate) extern "C" fn record_discarded_level_traceback(
+    exc_value: i64,
+    w_code_value: i64,
+    py_pc: i64,
+) {
+    if exc_value == 0 || w_code_value == 0 || py_pc < 0 {
+        return;
+    }
+    let w_code = w_code_value as PyObjectRef;
+    let raw_code =
+        unsafe { pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject };
+    if raw_code.is_null() {
+        return;
+    }
+    // Same RaiseWithExplicitTraceback rule the other two recorders follow: a
+    // bare reraise preserves the traceback the original raise attached.
+    let bare_reraise =
+        match unsafe { pyre_interpreter::decode_instruction_at(&*raw_code, py_pc as usize) } {
+            Some((pyre_interpreter::Instruction::RaiseVarargs { .. }, op_arg)) => {
+                u32::from(op_arg) == 0
+            }
+            Some((pyre_interpreter::Instruction::Reraise { .. }, _)) => true,
+            _ => false,
+        };
+    if bare_reraise {
+        return;
+    }
+    let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(w_code) };
+    let w_exc = exc_value as PyObjectRef;
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_exc);
+    pyre_object::gc_roots::pin_root(w_code);
+    pyre_object::gc_roots::pin_root(w_globals);
+    let Ok(mut frame) = pyre_interpreter::createframe_obj(
+        w_code as *const (),
+        w_globals,
+        pyre_interpreter::call::getexecutioncontext(),
+        None,
+    ) else {
+        return;
+    };
+    frame.last_instr = py_pc as isize;
+    let frame_ptr = frame.into_raw();
+    pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
+    unsafe {
+        pyre_interpreter::pytraceback::record_application_traceback(w_exc, frame_ptr, py_pc);
+    }
+}
+
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     #[cfg(feature = "cranelift")]
@@ -3328,6 +3393,15 @@ pub fn trace_and_compile_from_bridge(
     let route_exc_edge = caught_in_frame
         && (!is_multiframe_resume || unwind_to_live_frame)
         && pyre_jit_trace::jitcode_dispatch::exc_edge_bridge_enabled();
+    // The levels this route is about to throw away: `resume_coords` minus the
+    // live frame, which keeps its own recorder at the handler entry.  Published
+    // unconditionally on the routing path — an empty slice for the single-frame
+    // shape — so a previous bridge's levels cannot survive into this walk.
+    pyre_jit_trace::jitcode_dispatch::set_exc_edge_discarded_levels(if route_exc_edge {
+        resume_coords.get(1..).unwrap_or(&[])
+    } else {
+        &[]
+    });
     if route_exc_edge && guard_exc != 0 {
         // Publish the grabbed exception (`cpu.grab_exc_value` result) so the
         // walker's `seed_standing_exception_for_walk` threads it into

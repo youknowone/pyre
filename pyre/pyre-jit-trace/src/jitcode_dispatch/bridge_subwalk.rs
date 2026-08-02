@@ -492,6 +492,14 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             wc.last_exc_value = Some(value_op);
             wc.last_exc_value_concrete = ConcreteValue::Ref(exc_edge_concrete);
             wc.fbw_mode.class_of_last_exc_is_const = true;
+            // The inlined callees this route unwound clear out of, innermost
+            // first, BEFORE the catching frame's own node: both recorders
+            // prepend, so emission order is the chain read outermost-first.
+            record_exc_edge_discarded_tracebacks(
+                &mut wc,
+                value_op,
+                ConcreteValue::Ref(exc_edge_concrete),
+            );
             record_bridge_handler_entry_traceback(
                 &mut wc,
                 value_op,

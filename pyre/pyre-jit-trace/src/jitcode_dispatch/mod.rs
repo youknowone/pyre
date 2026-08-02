@@ -562,6 +562,61 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
     }
 }
 
+/// One node per inlined level the exception-edge bridge resumed PAST, for the
+/// frames `set_exc_edge_discarded_levels` parked before the walk began.
+///
+/// `pyopcode.py:148 pytraceback.record_application_traceback` runs before the
+/// `:152` exception-table lookup, so a frame the unwind only PASSES THROUGH
+/// contributes a node just like the one that catches it.  Upstream never has to
+/// say so: it resumes onto a rebuilt MIFrame stack and the unwind is traced code
+/// that runs each level's own recorder.  The exc-edge route exists precisely
+/// because pyre discards those levels instead, which leaves this the only place
+/// their nodes can come from.
+///
+/// Innermost-first, because `record_application_traceback` PREPENDS: the deepest
+/// discarded frame must go on while the node the residual raise already attached
+/// is still the head.  The caller then records the catching frame last, so the
+/// chain reads outermost-first exactly as the interpreter builds it.
+///
+/// Emitted as IR, not merely executed: `trace_and_compile_from_bridge` runs once,
+/// and every later guard failure of this class enters the compiled bridge
+/// directly.
+fn record_exc_edge_discarded_tracebacks<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    exc: OpRef,
+    exc_concrete: ConcreteValue,
+) {
+    let levels = take_exc_edge_discarded_levels();
+    if levels.is_empty() {
+        return;
+    }
+    let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
+        return;
+    };
+    if exc_ptr.is_null() {
+        return;
+    }
+    let hook = majit_metainterp::record_discarded_level_traceback_hook_address();
+    for &(w_code, py_pc) in levels.iter().rev() {
+        majit_metainterp::record_discarded_level_traceback_for_recording(
+            exc_ptr as usize as i64,
+            w_code as i64,
+            py_pc as i64,
+        );
+        if hook.is_null() || exc.is_none() {
+            continue;
+        }
+        let w_code_op = ctx.trace_ctx.const_ref(w_code as i64);
+        let py_pc_op = ctx.trace_ctx.const_int(py_pc as i64);
+        ctx.trace_ctx.call_void_typed_with_effect(
+            hook,
+            &[exc, w_code_op, py_pc_op],
+            &[Type::Ref, Type::Ref, Type::Int],
+            default_effect_info(),
+        );
+    }
+}
+
 fn record_inline_application_traceback<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     exc: OpRef,
@@ -2304,6 +2359,35 @@ pub(crate) fn set_carrier_raise_seed(seed: CarrierRaiseSeed) {
 
 pub(crate) fn take_carrier_raise_seed() -> Option<CarrierRaiseSeed> {
     FBW_CARRIER_RAISE_SEED.with(|c| c.take())
+}
+
+thread_local! {
+    /// The inlined levels an exception-edge bridge resumes PAST, outermost-first
+    /// and excluding the live frame, as `(w_code, python pc)`.
+    ///
+    /// `call_jit.rs trace_and_compile_from_bridge` routes the exc edge only for
+    /// a raise that unwinds clear out of every inlined callee, and answers that
+    /// question from the per-level `resume_coords` it decoded.  Those coordinates
+    /// are the last description of the discarded levels anywhere in the process —
+    /// the walk that follows starts flat — so they are parked here for the walk's
+    /// handler entry to turn into traceback nodes.
+    static FBW_EXC_EDGE_DISCARDED_LEVELS: std::cell::RefCell<Vec<(usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Publish the levels an exc-edge route is about to discard.  Always called on
+/// the routing path, with an empty slice for a single-frame resume, so a
+/// previous bridge's levels can never leak into this one.
+pub fn set_exc_edge_discarded_levels(levels: &[(usize, usize)]) {
+    FBW_EXC_EDGE_DISCARDED_LEVELS.with(|c| {
+        let mut slot = c.borrow_mut();
+        slot.clear();
+        slot.extend_from_slice(levels);
+    });
+}
+
+pub(crate) fn take_exc_edge_discarded_levels() -> Vec<(usize, usize)> {
+    FBW_EXC_EDGE_DISCARDED_LEVELS.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
 /// Walk one opcode at `pc` and return the dispatch outcome plus the
