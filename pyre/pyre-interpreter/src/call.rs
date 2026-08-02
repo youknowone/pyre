@@ -1984,21 +1984,31 @@ pub(crate) fn resolve_kwargs(
 
     // Pack *args and **kwargs into scope — PyPy _match_signature lines 207-259.
     // This produces the final scope_w that maps directly to frame locals.
-    // `gct_fv_gc_malloc` bracket (`framework.py:853-856`) for the two tail
-    // objects: both are born in the nursery, and each allocation that follows
-    // — the other tail object, the key strings, `w_dict_store`'s strategy
-    // promotion — leaves RUNNING before taking `gc_mutex` (`gc_sync.rs:22`),
-    // so a collector on another thread relocates whatever the shadow stack
-    // does not name.  They enter `result` only after the last allocation.
-    let tail_roots = pyre_object::gc_roots::push_roots();
-    let varargs_slot = tail_roots.base();
+    // `gct_fv_gc_malloc` bracket (`framework.py:853-856`).  Every reference
+    // live across the packing is a raw copy: the parameters already bound into
+    // `result`, the unmatched keyword pairs, and the two tail objects.  Each
+    // allocation below — the tail objects, `w_dict_store`'s strategy promotion
+    // — leaves RUNNING before taking `gc_mutex` (`gc_sync.rs:22`), so a
+    // collector on another thread relocates whatever the shadow stack does not
+    // name.  Pin them all, then read every one back out.
+    let roots = pyre_object::gc_roots::push_roots();
+    let result_slot = roots.base();
+    for &value in &result {
+        roots.pin_root(value);
+    }
+    let extra_slot = result_slot + result.len();
+    for &(key, value) in &extra_kwargs {
+        roots.pin_root(key);
+        roots.pin_root(value);
+    }
+    let varargs_slot = extra_slot + extra_kwargs.len() * 2;
     if has_varargs {
         let extra_pos: Vec<PyObjectRef> = if n_pos > n_pos_params {
             args[n_pos_params..n_pos].to_vec()
         } else {
             vec![]
         };
-        tail_roots.pin_root(pyre_object::w_tuple_new(extra_pos));
+        roots.pin_root(pyre_object::w_tuple_new(extra_pos));
     }
     let varkw_slot = varargs_slot + usize::from(has_varargs);
     if has_varkw {
@@ -2006,18 +2016,25 @@ pub(crate) fn resolve_kwargs(
         // EmptyKwargsDictStrategy so the first unicode setitem promotes
         // directly to KwargsDictStrategy (parallel `(keys_w, values_w)`
         // shape) instead of stepping through UnicodeDictStrategy.
-        tail_roots.pin_root(pyre_object::w_dict_new_kwargs());
-        for (key, value) in &extra_kwargs {
+        roots.pin_root(pyre_object::w_dict_new_kwargs());
+        for i in 0..extra_kwargs.len() {
             unsafe {
-                pyre_object::w_dict_store(tail_roots.get(varkw_slot), *key, *value);
+                pyre_object::w_dict_store(
+                    roots.get(varkw_slot),
+                    roots.get(extra_slot + i * 2),
+                    roots.get(extra_slot + i * 2 + 1),
+                );
             }
         }
     }
+    let mut result: Vec<PyObjectRef> = (0..result.len())
+        .map(|i| roots.get(result_slot + i))
+        .collect();
     if has_varargs {
-        result.push(tail_roots.get(varargs_slot));
+        result.push(roots.get(varargs_slot));
     }
     if has_varkw {
-        result.push(tail_roots.get(varkw_slot));
+        result.push(roots.get(varkw_slot));
     }
 
     Ok(result)
@@ -2067,7 +2084,7 @@ pub(crate) fn bind_kwargs_to_signature(
     }
 
     // _match_keywords — match each keyword to a param name by index.
-    let mut extra_kwargs: Vec<(PyObjectRef, PyObjectRef)> = Vec::new();
+    let mut extra_kwargs: Vec<(Wtf8Buf, PyObjectRef)> = Vec::new();
     let mut unmatched_kw_names: Vec<Wtf8Buf> = Vec::new();
     // argument.py:469,481-484 — collected across the whole loop, reported
     // together instead of raising on the first violation found.
@@ -2105,11 +2122,12 @@ pub(crate) fn bind_kwargs_to_signature(
         }
         if !matched {
             if has_varkw {
-                // The key is born old-stable (non-moving) and is held in this
-                // Rust Vec only across native-only work (the rest of this loop,
-                // then w_tuple_new / w_dict_new_kwargs below): no safepoint fires
-                // before it is installed, so the unrooted buffer stays valid.
-                extra_kwargs.push((pyre_object::w_str_from_wtf8_managed(key.clone()), *value));
+                // The name stays a `Wtf8Buf` until the packing bracket below.
+                // Interning it here would allocate once per unmatched keyword,
+                // and every one of those is a safepoint that relocates the
+                // values already accumulated — and the bound parameters in
+                // `result` — while nothing names them.
+                extra_kwargs.push((key.clone(), *value));
             } else {
                 unmatched_kw_names.push(key.clone());
             }
@@ -2148,32 +2166,48 @@ pub(crate) fn bind_kwargs_to_signature(
     }
 
     // Pack `*args` / `**kwargs` tails — argument.py _match_signature 207-259.
-    // Both tail objects are born young and stay livevars until they reach
-    // `result`; see the same bracket in `bind_kwargs`.
-    let tail_roots = pyre_object::gc_roots::push_roots();
-    let varargs_slot = tail_roots.base();
+    // The bound parameters, the unmatched keyword pairs and both tail objects
+    // are all raw copies held across the packing allocations; see the same
+    // bracket in `resolve_kwargs`.
+    let roots = pyre_object::gc_roots::push_roots();
+    let result_slot = roots.base();
+    for &value in &result {
+        roots.pin_root(value);
+    }
+    let extra_slot = result_slot + result.len();
+    for &(_, value) in &extra_kwargs {
+        roots.pin_root(value);
+    }
+    let varargs_slot = extra_slot + extra_kwargs.len();
     if has_varargs {
         let extra_pos: Vec<PyObjectRef> = if n_pos > n_pos_params {
             pos_args[n_pos_params..n_pos].to_vec()
         } else {
             vec![]
         };
-        tail_roots.pin_root(pyre_object::w_tuple_new(extra_pos));
+        roots.pin_root(pyre_object::w_tuple_new(extra_pos));
     }
     let varkw_slot = varargs_slot + usize::from(has_varargs);
     if has_varkw {
-        tail_roots.pin_root(pyre_object::w_dict_new_kwargs());
-        for (key, value) in &extra_kwargs {
+        roots.pin_root(pyre_object::w_dict_new_kwargs());
+        for (i, (key, _)) in extra_kwargs.iter().enumerate() {
             unsafe {
-                pyre_object::w_dict_store(tail_roots.get(varkw_slot), *key, *value);
+                // The key allocation runs first: as the second argument it
+                // would be evaluated after the receiver, handing
+                // `w_dict_store` the pre-collection dict address.
+                let w_key = pyre_object::w_str_from_wtf8_managed(key.clone());
+                pyre_object::w_dict_store(roots.get(varkw_slot), w_key, roots.get(extra_slot + i));
             }
         }
     }
+    let mut result: Vec<PyObjectRef> = (0..result.len())
+        .map(|i| roots.get(result_slot + i))
+        .collect();
     if has_varargs {
-        result.push(tail_roots.get(varargs_slot));
+        result.push(roots.get(varargs_slot));
     }
     if has_varkw {
-        result.push(tail_roots.get(varkw_slot));
+        result.push(roots.get(varkw_slot));
     }
 
     Ok(result)
@@ -2337,7 +2371,6 @@ pub fn call_with_kwargs(
                     )
                 });
             }
-            let mut full_args = pos_args.to_vec();
             // `gct_fv_gc_malloc` bracket (`framework.py:853-856`) for the kwargs
             // dict below.  `w_dict_new` allocates in the nursery, so the fresh
             // dict is a young object no root names, and every step that follows
@@ -2347,17 +2380,27 @@ pub fn call_with_kwargs(
             // another thread runs there and relocates or reclaims anything the
             // shadow stack does not name.  The scope reaches every `return`
             // below, which is where the dict stops being a livevar.
+            //
+            // The positionals and the keyword values are already pinned by
+            // this function's entry bracket, so they are read back through
+            // `current_pos_arg` / `current_kwarg` instead of being copied —
+            // `pos_args.to_vec()` taken before these allocations would hand
+            // the callee pre-collection addresses.
             let kw_roots = pyre_object::gc_roots::push_roots();
             let kw_slot = kw_roots.base();
             if !kwargs.is_empty() {
                 kw_roots.pin_root(pyre_object::w_dict_new());
-                for (key, value) in kwargs {
+                for (index, (key, _)) in kwargs.iter().enumerate() {
                     unsafe {
                         // The key allocation runs first: as the second argument
                         // it would be evaluated after the receiver, handing
                         // `w_dict_store` the pre-collection dict address.
                         let w_key = pyre_object::w_str_from_wtf8_managed(key.clone());
-                        pyre_object::w_dict_store(kw_roots.get(kw_slot), w_key, *value);
+                        pyre_object::w_dict_store(
+                            kw_roots.get(kw_slot),
+                            w_key,
+                            current_kwarg(index),
+                        );
                     }
                 }
                 // Store the marker last so a user keyword literally named
@@ -2369,6 +2412,10 @@ pub fn call_with_kwargs(
                     let marker_value = pyre_object::kw_marker::w_kw_marker_sentinel();
                     pyre_object::w_dict_store(kw_roots.get(kw_slot), marker_key, marker_value);
                 }
+            }
+            let mut full_args: Vec<PyObjectRef> =
+                (0..pos_args.len()).map(current_pos_arg).collect();
+            if !kwargs.is_empty() {
                 full_args.push(kw_roots.get(kw_slot));
                 // Step 2 of the Arguments port: when this is a profiled
                 // builtin call AND kwargs are present, route through
@@ -2388,16 +2435,24 @@ pub fn call_with_kwargs(
                         .iter()
                         .map(|(k, _)| pyre_object::w_str_from_wtf8(k.clone()))
                         .collect();
+                    // `keyword_names_w` allocated a string per keyword, so
+                    // everything read before it — the positionals, the keyword
+                    // values, and the dict `full_args` carries — may have moved
+                    // since. Everything below reloads from the roots.
                     let keywords_w: Vec<pyre_object::PyObjectRef> =
-                        kwargs.iter().map(|(_, v)| *v).collect();
+                        (0..kwargs.len()).map(current_kwarg).collect();
+                    let refreshed_pos: Vec<pyre_object::PyObjectRef> =
+                        (0..pos_args.len()).map(current_pos_arg).collect();
                     let arguments = crate::argument::Arguments::with_kw(
-                        pos_args,
+                        &refreshed_pos,
                         &keyword_names_w,
                         &keywords_w,
                     );
-                    // `keyword_names_w` allocated a string per keyword, so the
-                    // dict `full_args` carries may have moved since the push.
-                    *full_args.last_mut().expect("kwargs dict was pushed") = kw_roots.get(kw_slot);
+                    full_args = refreshed_pos
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(kw_roots.get(kw_slot)))
+                        .collect();
                     let w_res = crate::baseobjspace::call_args_and_c_profile_args(
                         unsafe { &mut *frame_ptr },
                         callable,
@@ -3688,6 +3743,14 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
 
     // Check if last arg is a kwargs dict (from CALL_KW)
     // PyPy: __build_class__(func, name, *bases, metaclass=None, **kwds)
+    //
+    // The class-definition keywords are collected into a fresh dict that only
+    // `build_class_inner` consumes, so the guard is opened here rather than
+    // inside the arm below: `update_bases` and both `w_tuple_new` calls run
+    // between the two, and a guard scoped to the arm would unpin the dict
+    // across them. `build_class_inner` re-pins its own parameter copy.
+    let extra_roots = pyre_object::gc_roots::push_roots();
+    let extra_slot = extra_roots.base();
     let (base_args, metaclass, extra_kwargs) = if args.len() > 2 {
         let last = args[args.len() - 1];
         if unsafe { pyre_object::is_dict(last) }
@@ -3703,8 +3766,6 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             // walks the strategy.
             // Born young, and `w_dict_store` allocates on strategy promotion —
             // the bracket in `call_with_kwargs`.
-            let extra_roots = pyre_object::gc_roots::push_roots();
-            let extra_slot = extra_roots.base();
             extra_roots.pin_root(pyre_object::w_dict_new());
             unsafe {
                 for (k, v) in pyre_object::w_dict_items(last) {
@@ -3781,7 +3842,7 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         name,
         bases_tuple,
         w_metaclass,
-        extra_kwargs,
+        extra_kwargs.map(|_| extra_roots.get(extra_slot)),
         w_orig_bases,
     )
 }
@@ -3794,6 +3855,18 @@ fn build_class_inner(
     extra_kwargs: Option<PyObjectRef>,
     w_orig_bases: Option<PyObjectRef>,
 ) -> PyResult {
+    // The class-definition keywords survive the class body call and the whole
+    // metaclass construction below, and the parameter is a raw copy taken
+    // before any of it. Pin it once and read it back at each of the three
+    // sites that consume it.
+    let _kwds_roots = pyre_object::gc_roots::push_roots();
+    let kwds_slot = extra_kwargs.map(|kw| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(kw);
+        slot
+    });
+    let current_kwds = || kwds_slot.map(|slot| pyre_object::gc_roots::shadow_stack_get(slot));
+
     let w_code = unsafe { crate::getcode(body_fn) };
     let w_globals = unsafe { function_get_globals_obj(body_fn) };
     let closure = unsafe { function_get_closure(body_fn) };
@@ -3813,7 +3886,7 @@ fn build_class_inner(
                 // compiling.py:190-196 — call __prepare__ with the
                 // class-definition keywords ('metaclass' already popped by
                 // the caller).
-                let prepare_kwds: Vec<(Wtf8Buf, PyObjectRef)> = match extra_kwargs {
+                let prepare_kwds: Vec<(Wtf8Buf, PyObjectRef)> = match current_kwds() {
                     Some(kw) if unsafe { pyre_object::is_dict(kw) } => unsafe {
                         pyre_object::w_dict_str_entries_wtf8(kw)
                     },
@@ -4299,7 +4372,7 @@ fn build_class_inner(
             w_namespace_dict = pyre_object::gc_roots::shadow_stack_get(root);
         }
         clear_call_error();
-        let result = if let Some(kw) = extra_kwargs {
+        let result = if let Some(kw) = current_kwds() {
             // Only use kwargs path if there are actual extra kwargs
             let has_extra = unsafe { pyre_object::is_dict(kw) && pyre_object::w_dict_len(kw) > 0 };
             if has_extra {
@@ -4518,7 +4591,7 @@ fn build_class_inner(
     // which fires __init_subclass__ with the subset of keywords the
     // metaclass actually forwarded — so it must NOT be re-fired here.
     if w_metaclass.is_none() {
-        let init_subclass_kwargs: Vec<(PyObjectRef, PyObjectRef)> = match extra_kwargs {
+        let init_subclass_kwargs: Vec<(PyObjectRef, PyObjectRef)> = match current_kwds() {
             Some(kw) if unsafe { pyre_object::is_dict(kw) } => unsafe {
                 pyre_object::w_dict_items(kw)
                     .into_iter()
@@ -4542,13 +4615,24 @@ fn build_class_inner(
 /// consumes.  Mirrors the producer in `call_with_kwargs`.
 fn pack_pyre_kwargs(kw_items: &[(PyObjectRef, PyObjectRef)]) -> PyObjectRef {
     // The dict is born young, and `w_dict_store` allocates when it promotes the
-    // strategy — see the bracket in `call_with_kwargs`.
+    // strategy — see the bracket in `call_with_kwargs`. `kw_items` is the
+    // caller's array of raw references, so the pairs still to be installed are
+    // pinned as well: the first promotion relocates every one of them.
     let kw_roots = pyre_object::gc_roots::push_roots();
-    let kw_slot = kw_roots.base();
+    let item_slot = kw_roots.base();
+    for &(k, v) in kw_items {
+        kw_roots.pin_root(k);
+        kw_roots.pin_root(v);
+    }
+    let kw_slot = item_slot + kw_items.len() * 2;
     kw_roots.pin_root(pyre_object::w_dict_new());
     unsafe {
-        for (k, v) in kw_items {
-            pyre_object::w_dict_store(kw_roots.get(kw_slot), *k, *v);
+        for i in 0..kw_items.len() {
+            pyre_object::w_dict_store(
+                kw_roots.get(kw_slot),
+                kw_roots.get(item_slot + i * 2),
+                kw_roots.get(item_slot + i * 2 + 1),
+            );
         }
         // Marker stored last so a user keyword named `__pyre_kw__` cannot
         // overwrite the sentinel detection compares by identity.
