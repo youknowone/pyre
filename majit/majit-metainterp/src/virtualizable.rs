@@ -2785,13 +2785,19 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         for array in &self.array_fields {
             match array.storage {
                 VableArrayStorage::DirectPointer => {
-                    let slot = unsafe { vable_ptr.add(array.field_offset) as *mut i64 };
-                    let value = unsafe { *slot } as usize;
+                    // Pointer-width field: 4 bytes on wasm32. Reading 8 bytes
+                    // would fold in the adjacent field and writing 8 would
+                    // clobber it — `PyFrame.valuestackdepth` sits directly
+                    // after `locals_cells_stack_w`, and zeroing it makes every
+                    // later stack index address the wrong slot. Same width
+                    // contract as `read_field` / `write_field`.
+                    let slot = unsafe { vable_ptr.add(array.field_offset) as *mut usize };
+                    let value = unsafe { *slot };
                     if value != 0 && majit_gc::gc_owns_object(value) {
                         let current = majit_gc::gc_current_object_address(value);
                         if current != value {
                             unsafe {
-                                *slot = current as i64;
+                                *slot = current;
                             }
                         }
                         if array.array_type_id != 0 && majit_gc::gc_is_nursery_object(current) {
@@ -2802,9 +2808,12 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
                             }
                         }
                     }
+                    // One pointer-wide slot. `walk_resume_ref_roots` reinterprets
+                    // each entry as `&mut GcRef`, which is that same width, so a
+                    // one-element slice names exactly this field.
                     unsafe {
                         majit_gc::shadow_stack::push_resume_ref_roots(
-                            std::slice::from_raw_parts_mut(slot, 1),
+                            std::slice::from_raw_parts_mut(slot as *mut i64, 1),
                         );
                     }
                 }

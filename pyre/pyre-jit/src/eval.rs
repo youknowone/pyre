@@ -1135,7 +1135,23 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
         if walk_items {
             let arr = unsafe { &mut *array };
             let base = arr.items_mut_ptr();
-            for i in 0..frame.valuestackdepth.min(arr.len()) {
+            // `walk_depth` (`pyre-interpreter::eval`) floors the depth at
+            // `stack_base()` for the same reason: `valuestackdepth` is an
+            // absolute index that normally covers the locals/cells prefix, but
+            // a frame whose depth is still 0 — `descr_clear`, or one a
+            // blackhole resume has not finished filling — would otherwise walk
+            // zero slots and drop cells the array still points at. The floor
+            // reads the code object for the prefix width; `walk_depth` can do
+            // that unguarded because it only runs on entered frames, while this
+            // hook is type-directed and can reach one whose `pycode` a resume
+            // has not written yet.
+            let floor = if frame.pycode.is_null() {
+                0
+            } else {
+                frame.stack_base()
+            };
+            let depth = frame.valuestackdepth.max(floor).min(arr.len());
+            for i in 0..depth {
                 f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
             }
         }
@@ -10243,13 +10259,20 @@ fn materialize_virtual_from_rd(
                 unsafe {
                     let addr = (obj_ptr as *mut u8).add(descr.offset);
                     match descr.field_type {
+                        // Pointer-width store: 4 bytes on wasm32. A fixed
+                        // 8-byte write runs past the object whenever the ref
+                        // is the struct's last field, and the high half of a
+                        // 32-bit pointer is zero, so the neighbouring 4 bytes
+                        // are zeroed. Same width contract as
+                        // `VirtualizableInfo::write_field` and
+                        // `bh_setfield_gc_r`.
                         majit_ir::Type::Ref => {
                             let p = match val {
-                                Value::Ref(gc) => gc.0 as i64,
-                                Value::Int(n) => n,
+                                Value::Ref(gc) => gc.0,
+                                Value::Int(n) => n as usize,
                                 _ => 0,
                             };
-                            std::ptr::write(addr as *mut i64, p);
+                            std::ptr::write(addr as *mut usize, p);
                         }
                         majit_ir::Type::Float => {
                             let bits = match val {
