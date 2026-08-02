@@ -163,8 +163,9 @@ pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mu
 /// Allocate a new tuple from a Vec of items.
 ///
 /// Arity-2 tuples are routed through `makespecialisedtuple2`
-/// (`pypy/objspace/std/specialisedtupleobject.py:161-167`); other
-/// arities use the array-backed `W_TupleObject`.
+/// (`pypy/objspace/std/specialisedtupleobject.py:161-167`), except that
+/// Python 3.14's pointer identity requires exact float references to remain
+/// boxed. Other arities use the array-backed `W_TupleObject`.
 ///
 /// Residualized: tuple construction drives the moving collector through
 /// `push_roots` / `pin_root` / `try_gc_alloc_stable` shadow-stack
@@ -173,6 +174,12 @@ pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mu
 #[majit_macros::dont_look_inside]
 pub fn w_tuple_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     if items.len() == 2 {
+        // PyPy can use `_ff` here because its object space gives plain floats
+        // value identity.  Pyre follows Python 3.14 pointer identity: `(x, x)`
+        // must contain the exact `x` object, not two freshly boxed copies.
+        if unsafe { is_plain_float_strict(items[0]) && is_plain_float_strict(items[1]) } {
+            return w_specialised_tuple_oo_new(items[0], items[1]);
+        }
         return makespecialisedtuple2(items[0], items[1]);
     }
     w_tuple_new_array_backed(items)
@@ -612,16 +619,29 @@ mod tests {
     }
 
     #[test]
-    fn test_arity2_float_float_routes_to_specialised_ff() {
-        let tup = w_tuple_new(vec![
-            crate::floatobject::w_float_new(1.5),
-            crate::floatobject::w_float_new(2.25),
-        ]);
+    fn test_arity2_float_float_preserves_boxed_identity() {
+        let lhs = crate::floatobject::w_float_new(1.5);
+        let rhs = crate::floatobject::w_float_new(2.25);
+        let tup = w_tuple_new(vec![lhs, rhs]);
+        unsafe {
+            assert!(is_specialised_tuple_oo(tup));
+            assert!(is_tuple(tup));
+            assert_eq!(w_tuple_getitem(tup, 0).unwrap(), lhs);
+            assert_eq!(w_tuple_getitem(tup, 1).unwrap(), rhs);
+        }
+    }
+
+    #[test]
+    fn test_explicit_specialised_float_pair_keeps_pypy_ff_layout() {
+        let lhs = crate::floatobject::w_float_new(1.5);
+        let rhs = crate::floatobject::w_float_new(2.25);
+        let tup = makespecialisedtuple2(lhs, rhs);
         unsafe {
             assert!(is_specialised_tuple_ff(tup));
-            assert!(is_tuple(tup));
-            let v0 = w_tuple_getitem(tup, 0).unwrap();
-            assert_eq!(crate::floatobject::w_float_get_value(v0), 1.5);
+            assert_eq!(
+                crate::floatobject::w_float_get_value(w_tuple_getitem(tup, 0).unwrap()),
+                1.5
+            );
         }
     }
 
