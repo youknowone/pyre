@@ -6779,8 +6779,15 @@ impl OptContext {
                 .as_ref()
                 .and_then(|d| d.as_field_descr())
                 .expect("GETFIELD_GC_PURE_* descr must be a FieldDescr");
-            if self.cpu.protect_speculative_field(gcref, fd).is_err() {
-                self.signal_invalid_loop("protect_speculative_field");
+            if let Err(reason) = self.cpu.protect_speculative_field(gcref, fd) {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] {reason} — field={:?} descr={}",
+                        fd.field_name(),
+                        fd.repr_of_descr()
+                    );
+                }
+                self.signal_invalid_loop(reason);
             }
             return;
         }

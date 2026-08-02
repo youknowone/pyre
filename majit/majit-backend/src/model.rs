@@ -84,43 +84,50 @@ pub trait Cpu: Send + Sync {
     /// it unconditionally; if pyre cannot resolve the same metadata
     /// (parent_descr missing, vtable subclassrange unknown, typeid
     /// unresolvable, downcast fails), the speculative check fails
-    /// closed (`Err(())`) so the fold caller declines.  Matching
-    /// PyPy's "raise SpeculativeError" on any path where the
-    /// type-validity verdict cannot be produced.
+    /// closed so the fold caller declines.  Matching PyPy's "raise
+    /// SpeculativeError" on any path where the type-validity verdict
+    /// cannot be produced.  The `Err` names which of those paths fired, so
+    /// the `InvalidLoop` the caller signals says more than that one did.
     fn protect_speculative_field(
         &self,
         gcptr: GcRef,
         fielddescr: &dyn FieldDescr,
-    ) -> Result<(), ()> {
+    ) -> Result<(), &'static str> {
         if gcptr.is_null() {
-            return Err(());
+            return Err("protect_speculative_field: null gcptr");
         }
         if !majit_gc::supports_guard_gc_type() {
             return Ok(());
         }
-        let parent = fielddescr.get_parent_descr().ok_or(())?;
-        let sizedescr = parent.as_size_descr().ok_or(())?;
+        let parent = fielddescr
+            .get_parent_descr()
+            .ok_or("protect_speculative_field: field descr has no parent_descr")?;
+        let sizedescr = parent
+            .as_size_descr()
+            .ok_or("protect_speculative_field: parent_descr is not a size descr")?;
         if sizedescr.is_object() {
             if !majit_gc::check_is_object(gcptr) {
-                return Err(());
+                return Err("protect_speculative_field: gcptr is not an object");
             }
             // descr.py:217-229 is_valid_class_for — subclassrange
             // containment of gcref's typeptr inside sizedescr.vtable's
             // range.
-            let (expected_min, expected_max) =
-                majit_gc::subclass_range(sizedescr.vtable()).ok_or(())?;
+            let (expected_min, expected_max) = majit_gc::subclass_range(sizedescr.vtable())
+                .ok_or("protect_speculative_field: descr vtable has no range")?;
             let actual_vtable = self.cls_of_gcref(gcptr);
             if actual_vtable == 0 {
-                return Err(());
+                return Err("protect_speculative_field: gcptr has no class");
             }
-            let (actual_min, _) = majit_gc::subclass_range(actual_vtable as usize).ok_or(())?;
+            let (actual_min, _) = majit_gc::subclass_range(actual_vtable as usize)
+                .ok_or("protect_speculative_field: gcptr class has no range")?;
             if !(expected_min <= actual_min && actual_min <= expected_max) {
-                return Err(());
+                return Err("protect_speculative_field: class outside the descr's subclass range");
             }
         } else {
-            let actual_tid = majit_gc::get_actual_typeid(gcptr).ok_or(())?;
+            let actual_tid = majit_gc::get_actual_typeid(gcptr)
+                .ok_or("protect_speculative_field: gcptr has no typeid")?;
             if actual_tid != sizedescr.type_id() {
-                return Err(());
+                return Err("protect_speculative_field: typeid does not match the descr");
             }
         }
         Ok(())
