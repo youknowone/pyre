@@ -582,13 +582,6 @@ pub trait GcAllocator: Send {
     /// Address of the published nursery_top slot that JIT code reads.
     fn nursery_top_addr(&self) -> usize;
 
-    /// Enable or disable JIT inline nursery allocation.
-    ///
-    /// Collectors without a published nursery fast path need no action.
-    fn set_inline_alloc_enabled(&mut self, enabled: bool) {
-        let _ = enabled;
-    }
-
     /// Maximum size for nursery allocation (larger objects go to old gen directly).
     fn max_nursery_object_size(&self) -> usize;
 
@@ -1072,9 +1065,6 @@ impl GcAllocator for GcHandle {
     }
     fn nursery_top_addr(&self) -> usize {
         gc_sync::gc_query_reentrant(|gc| gc.nursery_top_addr())
-    }
-    fn set_inline_alloc_enabled(&mut self, enabled: bool) {
-        gc_sync::gc_op(|gc| gc.set_inline_alloc_enabled(enabled))
     }
     fn max_nursery_object_size(&self) -> usize {
         gc_sync::gc_query_reentrant(|gc| gc.max_nursery_object_size())

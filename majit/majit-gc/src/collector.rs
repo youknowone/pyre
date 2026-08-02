@@ -430,14 +430,10 @@ pub struct MiniMarkGC {
     /// The nursery (young generation).
     nursery: Nursery,
     /// gc.py:525-531 published nursery-top slot read by generated inline
-    /// allocation paths. Kept separately from the real top so free-threaded
-    /// execution can pin the published limit to zero without changing the
-    /// Rust allocator's nursery bounds. The atomic publishes limit changes to
-    /// generated code and Rust-side readers. The Box keeps its baked address
-    /// stable even if the containing GC value moves.
+    /// allocation paths. The atomic publishes limit changes to generated code
+    /// and Rust-side readers. The Box keeps its baked address stable even if
+    /// the containing GC value moves.
     published_nursery_top: Box<AtomicUsize>,
-    /// Whether generated code may use the shared nursery bump fast path.
-    inline_alloc_enabled: bool,
     /// The old generation.
     oldgen: OldGen,
     /// Type registry for tracing objects.
@@ -670,7 +666,6 @@ impl MiniMarkGC {
         let mut gc = MiniMarkGC {
             nursery,
             published_nursery_top,
-            inline_alloc_enabled: true,
             oldgen: OldGen::new(),
             types: TypeRegistry::new(),
             roots: RootSet::new(),
@@ -735,17 +730,10 @@ impl MiniMarkGC {
     }
 
     /// Refresh the gc.py:525-531 published nursery-top slot from the real
-    /// allocator bound, unless free-threading has disabled the non-atomic
-    /// shared bump fast path.
+    /// allocator bound.
     fn refresh_published_nursery_top(&mut self) {
-        self.published_nursery_top.store(
-            if self.inline_alloc_enabled {
-                self.nursery.top_ptr() as usize
-            } else {
-                0
-            },
-            Ordering::Release,
-        );
+        self.published_nursery_top
+            .store(self.nursery.top_ptr() as usize, Ordering::Release);
     }
 
     // ── incminimark.py:1292-1308 card marking geometry ──
@@ -4876,11 +4864,6 @@ impl GcAllocator for MiniMarkGC {
         self.published_nursery_top.as_ptr() as usize
     }
 
-    fn set_inline_alloc_enabled(&mut self, enabled: bool) {
-        self.inline_alloc_enabled = enabled;
-        self.refresh_published_nursery_top();
-    }
-
     fn max_nursery_object_size(&self) -> usize {
         self.config.large_object_threshold
     }
@@ -5525,34 +5508,6 @@ mod tests {
         let obj = gc.alloc_nursery(16);
         assert!(!obj.is_null());
         assert!(gc.is_in_nursery(obj.0));
-    }
-
-    #[test]
-    fn disabled_inline_alloc_keeps_published_top_zero_without_disabling_allocator() {
-        let mut gc = test_gc(4096);
-        gc.register_type(TypeInfo::simple(16));
-        let published_addr = gc.nursery_top_addr();
-
-        gc.set_inline_alloc_enabled(false);
-        assert_eq!(
-            unsafe { &*(published_addr as *const AtomicUsize) }.load(Ordering::Acquire),
-            0
-        );
-        assert!(!gc.alloc_nursery(16).is_null());
-        assert!(!gc.alloc_with_type(0, 16).is_null());
-
-        gc.collect_nursery();
-        assert_eq!(
-            unsafe { &*(published_addr as *const AtomicUsize) }.load(Ordering::Acquire),
-            0
-        );
-        assert!(!gc.alloc_nursery(16).is_null());
-
-        gc.set_inline_alloc_enabled(true);
-        assert_eq!(
-            unsafe { &*(published_addr as *const AtomicUsize) }.load(Ordering::Acquire),
-            gc.nursery_top() as usize
-        );
     }
 
     #[test]

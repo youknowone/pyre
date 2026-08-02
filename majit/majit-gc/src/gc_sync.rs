@@ -237,7 +237,7 @@ pub fn register_thread() {
         !GC_THREAD.with(|t| t.registered.get()),
         "GC mutator thread registered twice"
     );
-    let old = REGISTERED_THREADS.fetch_add(1, Ordering::SeqCst);
+    REGISTERED_THREADS.fetch_add(1, Ordering::SeqCst);
 
     let mut state = GC_SYNC.quiesce.lock().unwrap();
     state = GC_SYNC
@@ -253,14 +253,6 @@ pub fn register_thread() {
     // `rgil.acquire_maybe_in_new_thread` (rgil.py:186-193). Everything below
     // this line already runs pyre code and so needs it held.
     crate::rgil::acquire_maybe_in_new_thread();
-
-    if old > 0 && is_initialized() {
-        // gc.py:525-531 publishes the nursery slots used by generated inline
-        // allocation. A shared free-threaded nursery cannot safely use its
-        // non-atomic bump sequence, so the 1→2 transition pins that path off.
-        // This is sticky: unregistering threads never republishes the top.
-        gc_op(|gc| gc.set_inline_alloc_enabled(false));
-    }
 }
 
 /// Unregister the current thread. It stops running pyre code, so it gives the
@@ -863,18 +855,23 @@ mod tests {
         unregister_test_mutator();
     }
 
+    /// gc.py:525-531 publishes the nursery slots unconditionally, and
+    /// `llsupport/gc.py:525-531 get_nursery_free_addr/get_nursery_top_addr`
+    /// have no thread-count gate: the non-atomic bump in generated code is safe
+    /// because the GIL serialises the mutators that run it.  A second mutator
+    /// must therefore leave the published top alone.
     #[test]
-    #[ignore = "requires exclusive process — mutates the sticky singleton inline-allocation state"]
-    fn second_registered_thread_pins_published_nursery_top() {
+    #[ignore = "requires exclusive process — registers process-global mutators"]
+    fn second_registered_thread_leaves_published_nursery_top_live() {
         ensure_gc();
         register_test_mutator();
-        assert_ne!(
-            gc_query(
-                |gc| unsafe { &*(gc.nursery_top_addr() as *const AtomicUsize) }
-                    .load(Ordering::Acquire)
-            ),
-            0
-        );
+        fn published_top() -> usize {
+            gc_query(|gc| {
+                unsafe { &*(gc.nursery_top_addr() as *const AtomicUsize) }.load(Ordering::Acquire)
+            })
+        }
+        let before = published_top();
+        assert_ne!(before, 0);
 
         let worker = std::thread::spawn(|| {
             register_test_mutator();
@@ -882,13 +879,7 @@ mod tests {
         });
         blocking(|| worker.join()).unwrap();
 
-        assert_eq!(
-            gc_query(
-                |gc| unsafe { &*(gc.nursery_top_addr() as *const AtomicUsize) }
-                    .load(Ordering::Acquire)
-            ),
-            0
-        );
+        assert_eq!(published_top(), before);
         unregister_test_mutator();
     }
 
