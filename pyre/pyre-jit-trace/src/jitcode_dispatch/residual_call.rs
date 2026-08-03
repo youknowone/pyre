@@ -4583,6 +4583,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
+        if let Some(outcome) = try_walker_specialize_seqiter_getitem_next(
+            ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
+        )? {
+            return Ok(outcome);
+        }
     }
 
     // Emit MAKE_FUNCTION's `Function.__init__` as New + SetField so a `def` in a

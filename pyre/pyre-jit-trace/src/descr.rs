@@ -984,6 +984,54 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
     )
 });
 
+static SEQ_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<pyre_object::iterobject::W_SeqIterObject>(),
+        W_SEQ_ITER_GC_TYPE_ID,
+        &pyre_object::iterobject::SEQ_ITER_TYPE as *const _ as usize,
+        &[
+            (
+                "seq",
+                pyre_object::iterobject::SEQ_ITER_SEQ_OFFSET,
+                std::mem::size_of::<pyre_object::PyObjectRef>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "index",
+                pyre_object::iterobject::SEQ_ITER_INDEX_OFFSET,
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "length",
+                pyre_object::iterobject::SEQ_ITER_LENGTH_OFFSET,
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "empty_kind",
+                pyre_object::iterobject::SEQ_ITER_EMPTY_KIND_OFFSET,
+                1,
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "W_SeqIterObject",
+        "iterobject::W_SeqIterObject",
+    )
+});
+
 static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<W_Range>(),
@@ -2222,6 +2270,16 @@ pub fn range_iter_remaining_descr() -> DescrRef {
 /// Field descriptor for `W_IntRangeIterator.step` (i64, signed).
 pub fn range_iter_step_descr() -> DescrRef {
     field_descr_from_group(&RANGE_ITER_DESCR_GROUP, 2)
+}
+
+/// Field descriptor for `W_SeqIterObject.seq`.
+pub fn seq_iter_seq_descr() -> DescrRef {
+    field_descr_from_group(&SEQ_ITER_DESCR_GROUP, 0)
+}
+
+/// Field descriptor for `W_SeqIterObject.index`.
+pub fn seq_iter_index_descr() -> DescrRef {
+    field_descr_from_group(&SEQ_ITER_DESCR_GROUP, 1)
 }
 
 /// Field descriptor for `W_Range.start` (wrapped PyObjectRef).
@@ -5551,6 +5609,7 @@ pub(crate) fn publish_runtime_descr_groups() {
         &*W_BOOL_DESCR_GROUP,
         &*W_UNICODE_DESCR_GROUP,
         &*RANGE_ITER_DESCR_GROUP,
+        &*SEQ_ITER_DESCR_GROUP,
         &*RANGE_DESCR_GROUP,
         &*W_METHOD_DESCR_GROUP,
         &*W_OBJECT_MUTABLE_CELL_DESCR_GROUP,
