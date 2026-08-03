@@ -6643,7 +6643,7 @@ fn exception_typedef_attrs(class_name: &str) -> &'static [&'static str] {
         ],
         "ImportError" => &["msg", "name", "name_from", "path"],
         "NameError" => &["name"],
-        "AttributeError" => &["name", "obj"],
+        "AttributeError" => &[],
         "SyntaxError" => &[
             "end_lineno",
             "end_offset",
@@ -6845,6 +6845,29 @@ fn make_exc_type_with_init(
                             pyre_object::PY_NULL,
                         ),
                     );
+                }
+            }
+            if name == "AttributeError" {
+                for (member_name, kind, doc) in [
+                    (
+                        "name",
+                        pyre_object::MEMBER_ATTRIBUTE_ERROR_NAME,
+                        "attribute name",
+                    ),
+                    ("obj", pyre_object::MEMBER_ATTRIBUTE_ERROR_OBJ, "object"),
+                ] {
+                    unsafe {
+                        pyre_object::w_dict_setitem_str_no_proxy(
+                            ns,
+                            member_name,
+                            pyre_object::w_member_new_direct_with_doc(
+                                kind,
+                                member_name.to_owned(),
+                                doc.to_owned(),
+                                pyre_object::PY_NULL,
+                            ),
+                        );
+                    }
                 }
             }
             // `interp_exceptions.py:291-292` registers `__str__` /
@@ -7106,6 +7129,13 @@ fn make_exc_type_with_init(
     if name == "BaseException" {
         if let Some(member) = crate::type_dict_lookup(cls, "__suppress_context__") {
             unsafe { pyre_object::w_member_set_cls(member, cls) };
+        }
+    }
+    if name == "AttributeError" {
+        for member_name in ["name", "obj"] {
+            if let Some(member) = crate::type_dict_lookup(cls, member_name) {
+                unsafe { pyre_object::w_member_set_cls(member, cls) };
+            }
         }
     }
     // Record the class so typedef::r#type can map a raised exception

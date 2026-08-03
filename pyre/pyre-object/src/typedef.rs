@@ -282,6 +282,10 @@ pub const MEMBER_SYNTAX_ERROR_METADATA: u32 = MEMBER_DIRECT_FLAG | 12;
 pub const MEMBER_STOP_ITERATION_VALUE: u32 = MEMBER_DIRECT_FLAG | 13;
 /// CPython 3.14 `BaseException.__suppress_context__` boolean member.
 pub const MEMBER_EXCEPTION_SUPPRESS_CONTEXT: u32 = MEMBER_DIRECT_FLAG | 14;
+/// CPython 3.14 `AttributeError_members.name`, backed by PyPy's `w_name`.
+pub const MEMBER_ATTRIBUTE_ERROR_NAME: u32 = MEMBER_DIRECT_FLAG | 15;
+/// CPython 3.14 `AttributeError_members.obj`, backed by PyPy's `w_obj`.
+pub const MEMBER_ATTRIBUTE_ERROR_OBJ: u32 = MEMBER_DIRECT_FLAG | 16;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {
