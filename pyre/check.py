@@ -690,7 +690,23 @@ def _jit_stats_change(saved, current):
         if old_fields.get(field, "0") != new_fields.get(field, "0")
     ]
     if changes:
-        return "jit-stats change: " + ", ".join(changes)
+        # Report what the run compiled alongside what moved. A `guard_failures`
+        # change costs nothing to explain when the same run also compiled more
+        # loops or bridges — each new guard fails `trace_eagerness` times before
+        # its bridge attaches — but the gate names only the fields that moved,
+        # so the reader cannot tell that case from a real defect without
+        # re-running the bench. On a platform the developer does not have (the
+        # CI runners), re-running is not an option and the row is unjudgeable
+        # without this.
+        context = " ".join(
+            f"{f}={new_fields[f]}"
+            for f in ("loops_compiled", "bridges_compiled")
+            if f in new_fields
+        )
+        detail = ", ".join(changes)
+        if context:
+            detail += f" (observed {context})"
+        return "jit-stats change: " + detail
     return ""
 
 
