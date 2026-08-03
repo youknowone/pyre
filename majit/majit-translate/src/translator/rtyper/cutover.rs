@@ -2557,6 +2557,15 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &["self", "val"],
         LowLevelType::Void,
     ),
+    // `usize::saturating_mul(self, rhs) -> usize` clamps the product at the
+    // type max.  The residual computes the clamped product; only the
+    // `Unsigned` scalar result is modeled.  The census uses are all `usize`
+    // capacity/count growth (`IntArray`/`FloatArray::grow`, `deque_repeat`).
+    (
+        &["core", "num", "<Impl>", "saturating_mul"],
+        &["self", "rhs"],
+        LowLevelType::Unsigned,
+    ),
     (
         &["core", "f64", "<Impl>", "is_infinite"],
         &["self"],

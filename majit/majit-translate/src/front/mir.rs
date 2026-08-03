@@ -15212,7 +15212,10 @@ fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Option<String> {
 /// its `self.<capture>` reads would wall on.  RPython forbids closures.
 fn tyref_input_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     let leaf = tyref_class_root(ty, llbc);
-    if leaf.as_deref().is_some_and(majit_charon_reader::ullbc::is_closure_leaf) {
+    if leaf
+        .as_deref()
+        .is_some_and(majit_charon_reader::ullbc::is_closure_leaf)
+    {
         adt_path_of_tyref(ty, llbc).or(leaf)
     } else {
         leaf
