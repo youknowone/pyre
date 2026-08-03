@@ -11896,7 +11896,7 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
         pyre_object::MEMBER_EXCEPTION_SUPPRESS_CONTEXT => Ok(pyre_object::w_bool_from(unsafe {
             pyre_object::interp_exceptions::w_exception_get_suppress_context(obj)
         })),
-        pyre_object::MEMBER_ATTRIBUTE_ERROR_NAME => {
+        pyre_object::MEMBER_ATTRIBUTE_ERROR_NAME | pyre_object::MEMBER_NAME_ERROR_NAME => {
             let value = unsafe { pyre_object::interp_exceptions::w_exception_get_name(obj) };
             Ok(if value.is_null() {
                 pyre_object::w_none()
@@ -11961,7 +11961,7 @@ pub(crate) unsafe fn direct_member_set(
             unsafe { pyre_object::interp_exceptions::w_exception_set_suppress_context(obj, flag) };
             Ok(pyre_object::w_none())
         }
-        pyre_object::MEMBER_ATTRIBUTE_ERROR_NAME => {
+        pyre_object::MEMBER_ATTRIBUTE_ERROR_NAME | pyre_object::MEMBER_NAME_ERROR_NAME => {
             unsafe { pyre_object::interp_exceptions::w_exception_set_name(obj, value) };
             Ok(pyre_object::w_none())
         }
@@ -12010,7 +12010,7 @@ pub(crate) unsafe fn direct_member_delete(
         pyre_object::MEMBER_EXCEPTION_SUPPRESS_CONTEXT => Err(crate::PyError::type_error(
             "can't delete numeric/char attribute",
         )),
-        pyre_object::MEMBER_ATTRIBUTE_ERROR_NAME => {
+        pyre_object::MEMBER_ATTRIBUTE_ERROR_NAME | pyre_object::MEMBER_NAME_ERROR_NAME => {
             unsafe {
                 pyre_object::interp_exceptions::w_exception_set_name(obj, pyre_object::w_none())
             };
