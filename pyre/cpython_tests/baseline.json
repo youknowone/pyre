@@ -56,7 +56,8 @@
       "dynasm": "CRASH"
     },
     "test.test_asyncio": {
-      "dynasm": "CRASH"
+      "cranelift": "PASS",
+      "dynasm": "PASS"
     },
     "test.test_atexit": {
       "dynasm": "IMPORTERROR"

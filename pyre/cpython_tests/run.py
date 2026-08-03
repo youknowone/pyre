@@ -400,6 +400,11 @@ def main() -> int:
     env = dict(os.environ)
     env["MAJIT_STRICT"] = "1"
     env["MAJIT_STATS"] = "1"
+    # Several regression tests spawn sys.executable and assert the child's
+    # stdout/stderr exactly. Keep the machine-readable panic counters on the
+    # direct pyre process without leaking diagnostic output into its children.
+    env["PYRE_MAJIT_STATS_ROOT_ONLY"] = "1"
+    env.pop("PYRE_MAJIT_STATS_ANCESTOR", None)
     if args.no_jit:
         env["PYRE_NO_JIT"] = "1"
 
