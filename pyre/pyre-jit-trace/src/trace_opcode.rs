@@ -1777,12 +1777,20 @@ impl MIFrame {
         let vsd = self
             .concrete_valuestackdepth()
             .unwrap_or_else(|| self.sym().valuestackdepth) as i64;
-        // virtualizable.py:86-93 read_boxes: ALL static fields from the heap.
+        // `debugdata` keeps the box `read_boxes` seeded instead of being
+        // re-published as a recording-time ConstPtr.  DELETE_NAME resolves the
+        // name through `debugdata.w_locals`, so a constant pins the recording
+        // frame's mapping and the compiled loop then deletes through it once
+        // `exec(code, globals)` reuses the same code object with a fresh
+        // namespace.  virtualizable.py:86-93 `read_boxes` carries every static
+        // as a loop-carried box for exactly this reason; the remaining pointer
+        // statics keep their promoted-constant representation because the
+        // bytecode path cannot rebind them mid-loop.
         let last_instr_value = resume_pc as i64 - 1;
         let last_instr_op = ctx.const_int(last_instr_value);
         let pycode_op = ctx.const_ref(code_ptr as i64);
         let vsd_op = ctx.const_int(vsd);
-        let debugdata_op = ctx.const_ref(debugdata as i64);
+        let debugdata_op = self.sym().vable_debugdata;
         let lastblock_op = ctx.const_ref(lastblock as i64);
         let w_globals_op = ctx.const_ref(ns_ptr);
         let owns = {
@@ -1790,13 +1798,12 @@ impl MIFrame {
             s.vable_last_instr = last_instr_op;
             s.vable_pycode = pycode_op;
             s.vable_valuestackdepth = vsd_op;
-            s.vable_debugdata = debugdata_op;
             s.vable_lastblock = lastblock_op;
             s.vable_w_globals = w_globals_op;
             s.owns_virtualizable_shadow()
         };
         // pyjitpl.py:1188-1199 `_opimpl_setfield_vable` parity:
-        // mirror the heap-read seed into the canonical
+        // mirror the republished statics into the canonical
         // `metainterp.virtualizable_boxes` shadow so subsequent readers
         // (snapshot, JUMP-arg dedup) see the same identity that
         // `s.vable_*` carries.
