@@ -6321,7 +6321,7 @@ fn direct_call_release_gil<Sym: WalkSym>(
     // residual-call execution path — see
     // [`walker_vable_and_vrefs_before_residual_call`] for the IR-vs-heap
     // split rationale.
-    maybe_walker_vable_and_vrefs_before_residual_call(ctx);
+    maybe_walker_vable_and_vrefs_before_residual_call(ctx, pc);
     // pyjitpl.py: realfuncaddr, saveerr = effectinfo.call_release_gil_target
     let (realfuncaddr, saveerr) = ei.call_release_gil_target;
     // pyjitpl.py: funcbox/savebox ConstInt

@@ -3499,9 +3499,42 @@ pub(crate) fn walker_vable_and_vrefs_before_residual_call(ctx: &mut TraceCtx) {
 /// Kept as a thin pass-through so the dispatcher call sites stay
 /// readable; collapses to direct `walker_*` once the dispatchers
 /// inline.
+fn maybe_record_inline_callee_last_instr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) {
+    let Some(consts) = ctx.inline_callee_consts else {
+        return;
+    };
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index) else {
+        return;
+    };
+    let frame_reg = pjc.metadata.portal_frame_reg as usize;
+    let Some(&callee_frame) = ctx.registers_r.get(frame_reg) else {
+        return;
+    };
+    if callee_frame == OpRef::NONE {
+        return;
+    }
+
+    let callee_py_pc = python_pc_for_jitcode_pc(&pjc.metadata, jit_pc);
+    let last_instr = ctx.trace_ctx.const_int(callee_py_pc as i64);
+    let last_instr_descr = crate::descr::pyframe_next_instr_descr();
+    let last_instr_idx = last_instr_descr.index();
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[callee_frame, last_instr],
+        last_instr_descr,
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(callee_frame, last_instr_idx, last_instr);
+}
+
 pub(crate) fn maybe_walker_vable_and_vrefs_before_residual_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
 ) {
+    maybe_record_inline_callee_last_instr(ctx, jit_pc);
     walker_vable_and_vrefs_before_residual_call(ctx.trace_ctx);
 }
 
@@ -4714,7 +4747,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // [`walker_vable_and_vrefs_before_residual_call`] for the IR-vs-heap
         // split rationale.
         if emit_guard_not_forced {
-            maybe_walker_vable_and_vrefs_before_residual_call(ctx);
+            maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
         }
 
         // pyjitpl.py:2669-2682 `execute_and_record_varargs`; may-force
@@ -5756,7 +5789,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         // See `dispatch_residual_call_iRd_kind` for the upstream-citation
         // walkthrough.
         if emit_guard_not_forced {
-            maybe_walker_vable_and_vrefs_before_residual_call(ctx);
+            maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
         }
 
         if matches!(
@@ -5988,7 +6021,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         // See `dispatch_residual_call_iRd_kind` for the upstream-citation
         // walkthrough.
         if emit_guard_not_forced {
-            maybe_walker_vable_and_vrefs_before_residual_call(ctx);
+            maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
         }
 
         if matches!(
