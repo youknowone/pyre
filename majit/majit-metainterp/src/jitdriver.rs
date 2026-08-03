@@ -2616,7 +2616,7 @@ impl<S: JitState> JitDriver<S> {
         loop {
             // Phase 1: split-borrow self into meta and sym, run closure.
             // self.meta and self.sym are disjoint fields → standard split-borrow.
-            let mut action = {
+            let action = {
                 let Some(sym) = self.sym.as_mut() else {
                     crate::debug::log_one("jit-abort", "mp: abort:sym_none2");
                     self.meta.abort_trace(false);
@@ -2626,144 +2626,16 @@ impl<S: JitState> JitDriver<S> {
                 trace_fn(&mut self.meta, sym)
             }; // borrows dropped here
 
-            // pyjitpl.py:1618 force_finish_trace segmenting check.
-            //
-            // pyjitpl.py:1622 _create_segmented_trace_and_blackhole:
-            //   1. generate_guard(GUARD_ALWAYS_FAILS)
-            //   2. unreachable FINISH(exception_descr)
-            //   3. compile_simple_loop(patch_jumpop_at_end=False)  ← inserts Label
-            //   4. SwitchToBlackhole(ABORT_SEGMENTED_TRACE)
-            // pyjitpl.py:1618 force_finish_trace segmenting fallback.
-            // The proc-macro path handles this inside the closure (where __pc
-            // is captured). For non-macro consumers whose trace_fn doesn't
-            // emit SegmentedLoop, this fallback uses ctx.last_traced_pc
-            // (recorded by proc-macro or pyre trace_fn) as the guard-point pc.
-            if matches!(action, TraceAction::Continue) && self.meta.force_finish_trace {
-                let should_segment = self
-                    .meta
-                    .trace_ctx()
-                    .map(|ctx| ctx.num_ops() > ctx.trace_limit() * 4 / 5)
-                    .unwrap_or(false);
-                if should_segment {
-                    // RPython `pyjitpl.py:2558-2602 MetaInterp.generate_guard`
-                    // pairs every guard recording with `capture_resumedata`,
-                    // and segmenting itself is independent of whether the
-                    // sym-side framestack-lift override is wired:
-                    // `_create_segmented_trace_and_blackhole`
-                    // (`pyjitpl.py:1622`) always emits
-                    // `generate_guard(GUARD_ALWAYS_FAILS) + Finish +
-                    // SwitchToBlackhole`.  When
-                    // `JitState::populate_frame_for_guard` is overridden
-                    // (state-field-JIT macro consumers), pair the guard with
-                    // the bridge snapshot.
-                    //
-                    // TODO: when the default no-op
-                    // returns `None`, this low-level driver has no MIFrame
-                    // to walk — it only knows the active jump boxes from
-                    // `S::collect_jump_args`.  We feed those into
-                    // `capture_snapshot_for_last_guard`, which records a
-                    // single placeholder frame in lieu of the RPython
-                    // `framestack` walk (`pyjitpl.py:2586
-                    // capture_resumedata`).  Bounded scope: this branch is
-                    // only reached on the segmented-loop force path of the
-                    // low-level driver and dissolves once lifts
-                    // `S::Sym` into `MIFrame::populate_for_guard` so every
-                    // path captures uniformly via the framestack walk.
-                    let op_live = self.meta.staticdata.op_live as u8;
-                    let all_liveness = self.meta.staticdata.liveness_info.clone();
-                    // pyjitpl.py:2586 `capture_resumedata(framestack,
-                    // virtualizable_boxes, virtualref_boxes,
-                    // last_snapshot)` — pull the live box lists off the
-                    // active trace ctx before borrowing `self.meta.framestack`
-                    // mutably below.  Cloning is acceptable because this is
-                    // the segmented-loop force path (slow path).
-                    let (vable_boxes, vref_boxes) = self
-                        .meta
-                        .trace_ctx()
-                        .map(|ctx| {
-                            (
-                                ctx.virtualizable_boxes.clone().unwrap_or_default(),
-                                ctx.virtualref_boxes.clone(),
-                            )
-                        })
-                        .unwrap_or_default();
-                    let pre_snapshot = self.sym.as_ref().and_then(|sym| {
-                        S::populate_frame_for_guard(
-                            sym,
-                            &mut self.meta.framestack,
-                            op_live,
-                            &all_liveness,
-                            &vable_boxes,
-                            &vref_boxes,
-                        )
-                    });
-                    let mut current_live = self
-                        .sym
-                        .as_ref()
-                        .map(|sym| S::collect_jump_args(sym))
-                        .unwrap_or_default();
-                    // RPython `pyjitpl.py:2586 capture_resumedata` reads
-                    // `frame.jitcode.index` from the live framestack.  Pull
-                    // the same value here so the placeholder snapshot
-                    // captures real coordinates instead of `0`.
-                    let frame_jitcode_index = self
-                        .meta
-                        .framestack
-                        .frames
-                        .last()
-                        .map(|f| f.jitcode.index() as u32)
-                        .unwrap_or(0);
-                    if let Some(ctx) = self.meta.trace_ctx() {
-                        // pyjitpl.py:2594: use last_traced_pc
-                        // (= frame.pc at the guard point), not header_pc.
-                        let pc_opref = ctx.const_int(ctx.last_traced_pc as i64);
-                        current_live.push(pc_opref);
-                        // history.py:802 strict-types parity: every active
-                        // OpRef must resolve to a known Box.type; a miss is
-                        // a tracer bookkeeping bug, not a recoverable case.
-                        let live_types: Vec<majit_ir::Type> = current_live
-                            .iter()
-                            .map(|opref| {
-                                ctx.get_opref_type(*opref)
-                                    .expect("force_finish_trace: active OpRef missing Box.type")
-                            })
-                            .collect();
-                        let guard_opref = ctx.record_guard_typed(
-                            majit_ir::OpCode::GuardAlwaysFails,
-                            &[],
-                            live_types,
-                        );
-                        if let Some(snapshot) = pre_snapshot {
-                            let snapshot_id = ctx.capture_resumedata(snapshot);
-                            ctx.set_last_guard_resume_position(snapshot_id);
-                        } else {
-                            // TODO: see header comment.
-                            // No framestack-lift override available, so
-                            // capture the active low-level boxes via the
-                            // segmented-driver placeholder helper instead
-                            // of inventing a fail_args-only fallback.
-                            let frame_pc = ctx.last_traced_pc as u32;
-                            ctx.capture_snapshot_for_last_guard(
-                                &current_live,
-                                frame_jitcode_index,
-                                frame_pc,
-                            );
-                            ctx.set_fail_args(guard_opref, &current_live);
-                        }
-                        let dummy = ctx.const_int(0);
-                        ctx.record_finish(dummy, majit_ir::Type::Int);
-                        if crate::majit_log_enabled() {
-                            eprintln!(
-                                "[jit] force_finish_trace: segmenting at {} ops (limit {}) pc={}",
-                                ctx.num_ops(),
-                                ctx.trace_limit(),
-                                ctx.last_traced_pc
-                            );
-                        }
-                    }
-                    action = TraceAction::SegmentedLoop;
-                }
-            }
+            // pyjitpl.py:1617-1620 places the `force_finish_trace` segmenting
+            // check INSIDE the tracing loop, in `MIFrame.debug_merge_point`, so
+            // a JC_FORCE_FINISH key segments before the 1.0x too-long check can
+            // abort it.  Pyre's counterpart lives at the same place — the
+            // walker's `BC_JIT_MERGE_POINT` handler
+            // (`pyjitpl/dispatch.rs::create_segmented_trace`) — and reaches this
+            // driver as `TraceAction::SegmentedLoop`.  A check here instead
+            // would be unreachable: the walk returns `Continue` only once its
+            // framestack drains, and an over-budget walk returns `Abort` from
+            // inside its own loop.
 
             // Phase 2: handle trace result with full access to self
             match action {
@@ -3491,6 +3363,29 @@ impl<S: JitState> JitDriver<S> {
                     //   target_token = compile.compile_simple_loop(...)
                     //   warmstate.attach_procedure_to_interp(greenkey, token)
                     // + pyjitpl.py:1673 SwitchToBlackhole(ABORT_SEGMENTED_TRACE)
+                    //
+                    // pyjitpl.py:1671-1672 blackholes back to the interpreter
+                    // rather than jumping to compiled code.  Publish the
+                    // single-pass handoff first — the walk executed everything
+                    // it recorded, so the interpreter has to continue from where
+                    // the walk stopped (`create_segmented_trace` stashed that
+                    // pc) and with the walk's scalar / virtualizable state.
+                    // Read before `take_trace_meta` drains the session.
+                    let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
+                    if let Some(pc) = pc {
+                        self.meta.single_pass_outcome = Some((pc, Vec::new()));
+                        if let Some(sym) = self.sym.as_ref() {
+                            let scalars = S::collect_scalar_state_field_values(sym);
+                            self.meta.single_pass_scalar_values = Some(scalars);
+                        }
+                        let virt_elems = self
+                            .meta
+                            .trace_ctx()
+                            .and_then(|ctx| ctx.collect_virtualizable_element_values());
+                        if let Some(elems) = virt_elems {
+                            self.meta.single_pass_virt_array_values = Some(elems);
+                        }
+                    }
                     let meta = self.meta.take_trace_meta().unwrap();
                     if let Some(green_key) = self.meta.compile_simple_loop(meta) {
                         // pyjitpl.py:1662-1663 line-by-line: pass the compiled
@@ -3529,6 +3424,12 @@ impl<S: JitState> JitDriver<S> {
                     self.sym = None;
                     self.meta.leave_profiler_tracing();
                     self.meta.clear_trace_session();
+                    // pyjitpl.py:1673 `raise SwitchToBlackhole(
+                    // Counters.ABORT_SEGMENTED_TRACE)` — upstream's handler
+                    // (pyjitpl.py:2949) runs `aborted_tracing(stb.reason)`, so a
+                    // segmented trace counts as an abort with its own reason.
+                    self.meta
+                        .aborted_tracing(crate::counters::ABORT_SEGMENTED_TRACE);
                 }
                 // Consumed inside the metainterp dispatch loop
                 // (PyreMetaInterp::step_inline_frame pops the inline frame and

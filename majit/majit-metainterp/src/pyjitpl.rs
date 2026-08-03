@@ -8894,6 +8894,15 @@ impl<M: Clone> MetaInterp<M> {
         // the typed variant tag), so no raw-u32 type side-table
         // propagation is needed for either pooled constants or
         // inputargs.
+        //
+        // optimizer.py:34 `self.inputargs` — the run needs the trace's own
+        // InputArg list, not just its length.  Without it a guard snapshot
+        // naming an inputarg no op in the body consumes reaches
+        // `store_final_boxes_in_guard` with nothing to bind it to
+        // (`_number_boxes` → `Operand::from_opref` on a position-only ref).
+        // Same seeding as the no-unroll retry inside `compile_loop`.
+        let inputarg_types: Vec<majit_ir::Type> = trace.inputargs.iter().map(|ia| ia.tp).collect();
+        optimizer.trace_inputargs = majit_ir::OpRef::inputarg_refs(&inputarg_types);
 
         let (
             mut snapshot_map,

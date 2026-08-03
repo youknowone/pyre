@@ -1543,6 +1543,68 @@ where
         }
     }
 
+    /// pyjitpl.py:1622 `MIFrame._create_segmented_trace_and_blackhole`,
+    /// recording half.
+    ///
+    /// ```python
+    /// metainterp.generate_guard(rop.GUARD_ALWAYS_FAILS)
+    /// ...
+    /// metainterp.history.record1(rop.FINISH, exception_box, None, descr=token)
+    /// ```
+    ///
+    /// The trace is close enough to `trace_limit` that aborting it would
+    /// waste the whole recording, so it is terminated here instead: an
+    /// always-failing guard takes every execution back to the interpreter,
+    /// and the FINISH behind it exists only to give the segment a
+    /// terminator.  The compile half — `compile_simple_loop` plus
+    /// `attach_procedure_to_interp` (pyjitpl.py:1658-1663) — needs the
+    /// `MetaInterp` the walker does not hold, so it runs in the
+    /// [`TraceAction::SegmentedLoop`] arm of the driver.
+    ///
+    /// `compile_simple_loop` puts a LABEL at the segment's entry, which is
+    /// what lets a later trace close back into it; without it the segmented
+    /// loop could never be completed (pyjitpl.py:1641-1643).
+    fn create_segmented_trace(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        mp_opcode_pc: usize,
+        mp_green_pc: Option<i64>,
+    ) -> TraceAction {
+        // pyjitpl.py:1626 `generate_guard(rop.GUARD_ALWAYS_FAILS)`.  The
+        // resume position is the merge-point op, whose preceding `-live-`
+        // marker names the boxes the blackhole resumes with — the same
+        // `(pc, after_residual_call=false)` pair the GUARD_FUTURE_CONDITION
+        // emitted at loop close uses.
+        self.record_state_guard(
+            ctx,
+            sym,
+            OpCode::GuardAlwaysFails,
+            &[],
+            mp_opcode_pc,
+            /* after_residual_call */ false,
+        );
+        // pyjitpl.py:1633-1637: an unreachable FINISH carrying the
+        // AssertionError typeptr and `exit_frame_with_exception_descr_ref`.
+        // Pyre's FINISH takes neither — `record_finish` records the op with
+        // its result operand alone — and the op is unreachable behind a
+        // guard that always fails, so the operand is a placeholder.
+        let exception_box = ctx.const_int(0);
+        ctx.record_finish(exception_box, majit_ir::Type::Int);
+        // pyjitpl.py:1671-1673: "we now need to blackhole back to the
+        // interpreter instead of jumping to some existing code, because we
+        // are at a really arbitrary place here."  Under single-pass tracing
+        // the walk already RAN everything it recorded, so the interpreter
+        // must resume at this merge point's own green pc rather than at the
+        // one it was left holding — the same handoff the abort path
+        // publishes (`jitdriver.rs` `TraceAction::Abort` arm).  Without it
+        // the walked iterations are executed a second time.
+        ctx.walk_final_pc = mp_green_pc.map(|p| p as usize);
+        ctx.walk_final_reds = Vec::new();
+        // pyjitpl.py:1673 `raise SwitchToBlackhole(ABORT_SEGMENTED_TRACE)`.
+        TraceAction::SegmentedLoop
+    }
+
     /// Resolve the box operand for a vable opcode. The canonical
     /// bytecode (Stage 3a-3c) carries the live struct register as the
     /// leading `r` operand — pyjitpl.py:1166-1170
@@ -4850,6 +4912,37 @@ where
                 // A seen>=0 (or `no_loop_header` auto-stamped) depth>0 merge
                 // point falls through into the close protocol at the else-branch
                 // cut below (pyjitpl.py:1579-1602).
+                // pyjitpl.py:1617-1620 `debug_merge_point`, the tail of the
+                // method every `jit_merge_point` runs through:
+                //
+                //     if (metainterp.force_finish_trace and
+                //             (metainterp.history.length() >
+                //              warmrunnerstate.trace_limit * 0.8)):
+                //         self._create_segmented_trace_and_blackhole()
+                //
+                // A green key that already overflowed once carries
+                // JC_FORCE_FINISH (set by `prepare_trace_segmenting`,
+                // pyjitpl.py:2820).  Its next attempt must not overflow
+                // again: closing the trace as a segment here — strictly
+                // before `_interpret`'s 1.0x `blackhole_if_trace_too_long`
+                // (pyjitpl.py:2861-2867) can be reached — is what stops the
+                // key from retracing forever.  The check belongs at a merge
+                // point and nowhere else: the guard this records resumes
+                // through the `-live-` marker that precedes every
+                // `jit_merge_point` op, which an arbitrary mid-walk position
+                // has no counterpart for.
+                if ctx.force_finish_trace() && ctx.num_ops() > ctx.trace_limit() * 4 / 5 {
+                    // pyjitpl.py:1639-1640 `if metainterp.current_merge_points
+                    // and isinstance(metainterp.resumekey,
+                    // ResumeFromInterpDescr):` — the loop arm.  A bridge takes
+                    // upstream's `compile_trace(resumekey)` else-arm instead,
+                    // which is not ported; it keeps aborting, as before.
+                    let is_loop_trace = ctx.current_merge_points_first_greenkey().is_some()
+                        && ctx.resumekey_original_loop_token().is_none();
+                    if is_loop_trace {
+                        return self.create_segmented_trace(ctx, sym, mp_opcode_pc, mp_green_pc);
+                    }
+                }
                 // pyjitpl.py:1547 `jitdriver_sd =
                 // self.metainterp.staticdata.jitdrivers_sd[jdindex]` reads the
                 // owning driver's `no_loop_header`.  Upstream this is the same
