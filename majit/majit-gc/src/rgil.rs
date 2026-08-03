@@ -94,6 +94,15 @@ impl Mutex2 {
         self.cond.notify_one();
     }
 
+    /// thread_win7.c:594-600 `mutex2_signal`: wake a stealer sleeping in
+    /// [`Mutex2::lock_timeout`] without changing `locked`, so it can re-check
+    /// `rpy_fastgil`. Safe without the mutex held, and a missed wakeup is
+    /// benign because that wait has its own timeout.
+    #[cfg(windows)]
+    fn signal(&self) {
+        self.cond.notify_one();
+    }
+
     /// thread_pthread.c:576-578 `mutex2_loop_start`. The returned guard is the
     /// lock the stealer keeps for the whole steal loop, and is dropped in place
     /// of `mutex2_loop_stop` (:579-581).
@@ -232,8 +241,8 @@ pub fn acquire_maybe_in_new_thread() {
 
 /// threadlocal.h:162-166 `_RPyGilRelease`, called before an external call.
 ///
-/// A plain store: the word is only ever cleared by its owner. `RPyGilReleaseSignal`
-/// (thread_gil.c:258-276) has no counterpart because its body is `_WIN32`-only.
+/// A plain store — the word is only ever cleared by its owner — followed by
+/// [`release_signal`].
 #[inline]
 pub fn release() {
     debug_assert!(
@@ -241,7 +250,26 @@ pub fn release() {
         "releasing the GIL without holding it"
     );
     RPY_FASTGIL.store(0, Ordering::Release);
+    release_signal();
 }
+
+/// thread_gil.c:258-276 `RPyGilReleaseSignal`, whose body is `_WIN32`-only and
+/// says why: a stealer asleep in `mutex2_lock_timeout` would otherwise have to
+/// wait out its timed wait, and Windows' default 10-15 ms timer resolution
+/// makes that "severe latency for any code that releases the GIL". On POSIX
+/// the 0.1 ms timeout is short enough that the extra wakeup is not needed and
+/// its scheduling interference hangs `test_interrupt_non_main`.
+#[cfg(windows)]
+#[inline]
+fn release_signal() {
+    if RPY_WAITING_THREADS.load(Ordering::Relaxed) > 0 {
+        mutexes().gil.signal();
+    }
+}
+
+#[cfg(not(windows))]
+#[inline]
+fn release_signal() {}
 
 /// threadlocal.h:170-172 `_RPyGilGetHolder`.
 #[inline]
