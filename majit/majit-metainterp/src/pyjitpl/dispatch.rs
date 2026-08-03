@@ -174,8 +174,14 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                             );
                         }
                         // A name miss means the getfield names an inline
-                        // aggregate the flattened list only covers through its
-                        // leaves (see the note in the empty-list branch). Carry
+                        // aggregate (`ob_header`, `int_items`, an enum's
+                        // `__pos_0`) that the flattened list only covers
+                        // through its leaves — the same miss the keyed path
+                        // below takes.  `heaptracker.py:68-69` recurses into a
+                        // nested `lltype.Struct` without minting a descr for
+                        // the container, and `jtransform.py:942
+                        // rewrite_op_getsubstruct` lowers a raw one to
+                        // `int_add(ptr, offset)` with no descr at all.  Carry
                         // it as one more field of this fresh parent rather than
                         // falling through to the parentless placeholder, so
                         // `protect_speculative_field` still has a parent.
