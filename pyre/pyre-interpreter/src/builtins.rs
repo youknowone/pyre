@@ -2780,44 +2780,85 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     // W_TypeObject in space.builtin.
     let base_exc = make_exc_type_with_init(
         "BaseException",
+        Some("Common base class for all exceptions"),
         exc_base_exception_new,
         Some(exc_base_exception_init),
         crate::typedef::w_object(),
     );
     crate::module_ns_store(ns, "BaseException", base_exc);
 
-    let exception = make_exc_type("Exception", exc_exception_new, base_exc);
+    let exception = make_exc_type_with_doc(
+        "Exception",
+        "Common base class for all non-exit exceptions.",
+        exc_exception_new,
+        base_exc,
+    );
     crate::module_ns_store(ns, "Exception", exception);
 
-    let arithmetic = make_exc_type("ArithmeticError", exc_arithmetic_error_new, exception);
+    let arithmetic = make_exc_type_with_doc(
+        "ArithmeticError",
+        "Base class for arithmetic errors.",
+        exc_arithmetic_error_new,
+        exception,
+    );
     crate::module_ns_store(ns, "ArithmeticError", arithmetic);
     crate::module_ns_store(
         ns,
         "ZeroDivisionError",
-        make_exc_type("ZeroDivisionError", exc_zero_division_new, arithmetic),
+        make_exc_type_with_doc(
+            "ZeroDivisionError",
+            "Second argument to a division or modulo operation was zero.",
+            exc_zero_division_new,
+            arithmetic,
+        ),
     );
     crate::module_ns_store(
         ns,
         "OverflowError",
-        make_exc_type("OverflowError", exc_overflow_error_new, arithmetic),
+        make_exc_type_with_doc(
+            "OverflowError",
+            "Result too large to be represented.",
+            exc_overflow_error_new,
+            arithmetic,
+        ),
     );
     crate::module_ns_store(
         ns,
         "FloatingPointError",
-        make_exc_type("FloatingPointError", exc_arithmetic_error_new, arithmetic),
+        make_exc_type_with_doc(
+            "FloatingPointError",
+            "Floating-point operation failed.",
+            exc_arithmetic_error_new,
+            arithmetic,
+        ),
     );
 
-    let lookup_error = make_exc_type("LookupError", exc_lookup_error_new, exception);
+    let lookup_error = make_exc_type_with_doc(
+        "LookupError",
+        "Base class for lookup errors.",
+        exc_lookup_error_new,
+        exception,
+    );
     crate::module_ns_store(ns, "LookupError", lookup_error);
     crate::module_ns_store(
         ns,
         "IndexError",
-        make_exc_type("IndexError", exc_index_error_new, lookup_error),
+        make_exc_type_with_doc(
+            "IndexError",
+            "Sequence index out of range.",
+            exc_index_error_new,
+            lookup_error,
+        ),
     );
     crate::module_ns_store(
         ns,
         "KeyError",
-        make_exc_type("KeyError", exc_key_error_new, lookup_error),
+        make_exc_type_with_doc(
+            "KeyError",
+            "Mapping key not found.",
+            exc_key_error_new,
+            lookup_error,
+        ),
     );
 
     crate::module_ns_store(
@@ -2825,6 +2866,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         "AttributeError",
         make_exc_type_with_init(
             "AttributeError",
+            Some("Attribute not found."),
             exc_attribute_error_new,
             Some(exc_attribute_error_init),
             exception,
@@ -2833,12 +2875,23 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "TypeError",
-        make_exc_type("TypeError", exc_type_error_new, exception),
+        make_exc_type_with_doc(
+            "TypeError",
+            "Inappropriate argument type.",
+            exc_type_error_new,
+            exception,
+        ),
     );
-    let value_error = make_exc_type("ValueError", exc_value_error_new, exception);
+    let value_error = make_exc_type_with_doc(
+        "ValueError",
+        "Inappropriate argument value (of correct type).",
+        exc_value_error_new,
+        exception,
+    );
     crate::module_ns_store(ns, "ValueError", value_error);
     let name_error = make_exc_type_with_init(
         "NameError",
+        Some("Name not found globally."),
         exc_name_error_new,
         Some(exc_name_error_init),
         exception,
@@ -2848,16 +2901,27 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "UnboundLocalError",
-        make_exc_type("UnboundLocalError", exc_name_error_new, name_error),
+        make_exc_type_with_doc(
+            "UnboundLocalError",
+            "Local name referenced but not bound to a value.",
+            exc_name_error_new,
+            name_error,
+        ),
     );
 
-    let runtime_error = make_exc_type("RuntimeError", exc_runtime_error_new, exception);
+    let runtime_error = make_exc_type_with_doc(
+        "RuntimeError",
+        "Unspecified run-time error.",
+        exc_runtime_error_new,
+        exception,
+    );
     crate::module_ns_store(ns, "RuntimeError", runtime_error);
     crate::module_ns_store(
         ns,
         "NotImplementedError",
-        make_exc_type(
+        make_exc_type_with_doc(
             "NotImplementedError",
+            "Method or function hasn't been implemented yet.",
             exc_not_implemented_error_new,
             runtime_error,
         ),
@@ -2865,7 +2929,12 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "RecursionError",
-        make_exc_type("RecursionError", exc_recursion_error_new, runtime_error),
+        make_exc_type_with_doc(
+            "RecursionError",
+            "Recursion limit exceeded.",
+            exc_recursion_error_new,
+            runtime_error,
+        ),
     );
 
     crate::module_ns_store(
@@ -2873,6 +2942,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         "StopIteration",
         make_exc_type_with_init(
             "StopIteration",
+            Some("Signal the end from iterator.__next__()."),
             exc_stop_iteration_new,
             Some(exc_stop_iteration_init),
             exception,
@@ -2881,8 +2951,9 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "StopAsyncIteration",
-        make_exc_type(
+        make_exc_type_with_doc(
             "StopAsyncIteration",
+            "Signal the end from iterator.__anext__().",
             exc_stop_async_iteration_new,
             exception,
         ),
@@ -2890,13 +2961,19 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "GeneratorExit",
-        make_exc_type("GeneratorExit", exc_generator_exit_new, base_exc),
+        make_exc_type_with_doc(
+            "GeneratorExit",
+            "Request that a generator exit.",
+            exc_generator_exit_new,
+            base_exc,
+        ),
     );
     crate::module_ns_store(
         ns,
         "SystemExit",
         make_exc_type_with_init(
             "SystemExit",
+            Some("Request to exit from the interpreter."),
             exc_system_exit_new,
             Some(exc_system_exit_init),
             base_exc,
@@ -2905,11 +2982,17 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "KeyboardInterrupt",
-        make_exc_type("KeyboardInterrupt", exc_base_exception_new, base_exc),
+        make_exc_type_with_doc(
+            "KeyboardInterrupt",
+            "Program interrupted by user.",
+            exc_base_exception_new,
+            base_exc,
+        ),
     );
 
     let import_error = make_exc_type_with_init(
         "ImportError",
+        Some("Import can't find module, or can't find name in module."),
         exc_import_error_new,
         Some(exc_import_error_init),
         exception,
@@ -2918,16 +3001,27 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "ModuleNotFoundError",
-        make_exc_type("ModuleNotFoundError", exc_import_error_new, import_error),
+        make_exc_type_with_doc(
+            "ModuleNotFoundError",
+            "Module not found.",
+            exc_import_error_new,
+            import_error,
+        ),
     );
     crate::module_ns_store(
         ns,
         "AssertionError",
-        make_exc_type("AssertionError", exc_assertion_error_new, exception),
+        make_exc_type_with_doc(
+            "AssertionError",
+            "Assertion failed.",
+            exc_assertion_error_new,
+            exception,
+        ),
     );
 
     let os_error = make_exc_type_with_init(
         "OSError",
+        Some("Base class for I/O related errors."),
         exc_os_error_new,
         Some(exc_os_error_init),
         exception,
@@ -2939,58 +3033,127 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "FileNotFoundError",
-        make_exc_type("FileNotFoundError", exc_file_not_found_error_new, os_error),
+        make_exc_type_with_doc(
+            "FileNotFoundError",
+            "File not found.",
+            exc_file_not_found_error_new,
+            os_error,
+        ),
     );
     crate::module_ns_store(
         ns,
         "FileExistsError",
-        make_exc_type("FileExistsError", exc_os_error_new, os_error),
+        make_exc_type_with_doc(
+            "FileExistsError",
+            "File already exists.",
+            exc_os_error_new,
+            os_error,
+        ),
     );
     crate::module_ns_store(
         ns,
         "PermissionError",
-        make_exc_type("PermissionError", exc_os_error_new, os_error),
+        make_exc_type_with_doc(
+            "PermissionError",
+            "Not enough permissions.",
+            exc_os_error_new,
+            os_error,
+        ),
     );
     crate::module_ns_store(
         ns,
         "NotADirectoryError",
-        make_exc_type("NotADirectoryError", exc_os_error_new, os_error),
+        make_exc_type_with_doc(
+            "NotADirectoryError",
+            "Operation only works on directories.",
+            exc_os_error_new,
+            os_error,
+        ),
     );
     crate::module_ns_store(
         ns,
         "IsADirectoryError",
-        make_exc_type("IsADirectoryError", exc_os_error_new, os_error),
+        make_exc_type_with_doc(
+            "IsADirectoryError",
+            "Operation doesn't work on directories.",
+            exc_os_error_new,
+            os_error,
+        ),
     );
 
-    let warning = make_exc_type("Warning", exc_exception_new, exception);
+    let warning = make_exc_type_with_doc(
+        "Warning",
+        "Base class for warning categories.",
+        exc_exception_new,
+        exception,
+    );
     crate::module_ns_store(ns, "Warning", warning);
-    for warn_name in [
-        "UserWarning",
-        "DeprecationWarning",
-        "PendingDeprecationWarning",
-        "RuntimeWarning",
-        "FutureWarning",
-        "ImportWarning",
-        "UnicodeWarning",
-        "BytesWarning",
-        "ResourceWarning",
-        "SyntaxWarning",
-        "EncodingWarning",
+    for (warn_name, doc) in [
+        (
+            "UserWarning",
+            "Base class for warnings generated by user code.",
+        ),
+        (
+            "DeprecationWarning",
+            "Base class for warnings about deprecated features.",
+        ),
+        (
+            "PendingDeprecationWarning",
+            "Base class for warnings about features which will be deprecated\nin the future.",
+        ),
+        (
+            "RuntimeWarning",
+            "Base class for warnings about dubious runtime behavior.",
+        ),
+        (
+            "FutureWarning",
+            "Base class for warnings about constructs that will change semantically\nin the future.",
+        ),
+        (
+            "ImportWarning",
+            "Base class for warnings about probable mistakes in module imports",
+        ),
+        (
+            "UnicodeWarning",
+            "Base class for warnings about Unicode related problems, mostly\nrelated to conversion problems.",
+        ),
+        (
+            "BytesWarning",
+            "Base class for warnings about bytes and buffer related problems, mostly\nrelated to conversion from str or comparing to str.",
+        ),
+        (
+            "ResourceWarning",
+            "Base class for warnings about resource usage.",
+        ),
+        (
+            "SyntaxWarning",
+            "Base class for warnings about dubious syntax.",
+        ),
+        (
+            "EncodingWarning",
+            "Base class for warnings about encodings.",
+        ),
     ] {
         crate::module_ns_store(
             ns,
             warn_name,
-            make_exc_type(warn_name, exc_exception_new, warning),
+            make_exc_type_with_doc(warn_name, doc, exc_exception_new, warning),
         );
     }
 
-    let unicode_error = make_exc_type("UnicodeError", exc_unicode_error_new, value_error);
+    let unicode_error = make_exc_type_with_doc(
+        "UnicodeError",
+        "Unicode related error.",
+        exc_unicode_error_new,
+        value_error,
+    );
     crate::module_ns_store(ns, "UnicodeError", unicode_error);
     crate::module_ns_store(
         ns,
         "UnicodeDecodeError",
         make_exc_type_with_init(
             "UnicodeDecodeError",
+            Some("Unicode decoding error."),
             exc_unicode_decode_error_new,
             Some(exc_unicode_decode_error_init),
             unicode_error,
@@ -3001,6 +3164,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         "UnicodeEncodeError",
         make_exc_type_with_init(
             "UnicodeEncodeError",
+            Some("Unicode encoding error."),
             exc_unicode_encode_error_new,
             Some(exc_unicode_encode_error_init),
             unicode_error,
@@ -3011,6 +3175,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         "UnicodeTranslateError",
         make_exc_type_with_init(
             "UnicodeTranslateError",
+            Some("Unicode translation error."),
             exc_unicode_translate_error_new,
             Some(exc_unicode_translate_error_init),
             unicode_error,
@@ -3020,30 +3185,51 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "BufferError",
-        make_exc_type("BufferError", exc_exception_new, exception),
+        make_exc_type_with_doc("BufferError", "Buffer error.", exc_exception_new, exception),
     );
     crate::module_ns_store(
         ns,
         "MemoryError",
-        make_exc_type("MemoryError", exc_memory_error_new, exception),
+        make_exc_type_with_doc(
+            "MemoryError",
+            "Out of memory.",
+            exc_memory_error_new,
+            exception,
+        ),
     );
     crate::module_ns_store(
         ns,
         "ReferenceError",
-        make_exc_type("ReferenceError", exc_reference_error_new, exception),
+        make_exc_type_with_doc(
+            "ReferenceError",
+            "Weak ref proxy used after referent went away.",
+            exc_reference_error_new,
+            exception,
+        ),
     );
     crate::module_ns_store(
         ns,
         "SystemError",
-        make_exc_type("SystemError", exc_system_error_new, exception),
+        make_exc_type_with_doc(
+            "SystemError",
+            "Internal error in the Python interpreter.\n\nPlease report this to the Python maintainer, along with the traceback,\nthe Python version, and the hardware/OS platform and version.",
+            exc_system_error_new,
+            exception,
+        ),
     );
     crate::module_ns_store(
         ns,
         "EOFError",
-        make_exc_type("EOFError", exc_eof_error_new, exception),
+        make_exc_type_with_doc(
+            "EOFError",
+            "Read beyond end of file.",
+            exc_eof_error_new,
+            exception,
+        ),
     );
     let syntax_error = make_exc_type_with_init(
         "SyntaxError",
+        Some("Invalid syntax."),
         exc_syntax_error_new,
         Some(exc_syntax_error_init),
         exception,
@@ -3056,72 +3242,142 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "_IncompleteInputError",
-        make_exc_type("_IncompleteInputError", exc_syntax_error_new, syntax_error),
+        make_exc_type_with_doc(
+            "_IncompleteInputError",
+            "incomplete input.",
+            exc_syntax_error_new,
+            syntax_error,
+        ),
     );
-    let indentation_error = make_exc_type("IndentationError", exc_syntax_error_new, syntax_error);
+    let indentation_error = make_exc_type_with_doc(
+        "IndentationError",
+        "Improper indentation.",
+        exc_syntax_error_new,
+        syntax_error,
+    );
     crate::module_ns_store(ns, "IndentationError", indentation_error);
     crate::module_ns_store(
         ns,
         "TabError",
-        make_exc_type("TabError", exc_syntax_error_new, indentation_error),
+        make_exc_type_with_doc(
+            "TabError",
+            "Improper mixture of spaces and tabs.",
+            exc_syntax_error_new,
+            indentation_error,
+        ),
     );
     crate::module_ns_store(
         ns,
         "BlockingIOError",
-        make_exc_type("BlockingIOError", exc_os_error_new, os_error),
+        make_exc_type_with_doc(
+            "BlockingIOError",
+            "I/O operation would block.",
+            exc_os_error_new,
+            os_error,
+        ),
     );
     crate::module_ns_store(
         ns,
         "ChildProcessError",
-        make_exc_type("ChildProcessError", exc_os_error_new, os_error),
+        make_exc_type_with_doc(
+            "ChildProcessError",
+            "Child process error.",
+            exc_os_error_new,
+            os_error,
+        ),
     );
-    let connection_error = make_exc_type("ConnectionError", exc_os_error_new, os_error);
+    let connection_error = make_exc_type_with_doc(
+        "ConnectionError",
+        "Connection error.",
+        exc_os_error_new,
+        os_error,
+    );
     crate::module_ns_store(ns, "ConnectionError", connection_error);
     crate::module_ns_store(
         ns,
         "BrokenPipeError",
-        make_exc_type("BrokenPipeError", exc_os_error_new, connection_error),
+        make_exc_type_with_doc(
+            "BrokenPipeError",
+            "Broken pipe.",
+            exc_os_error_new,
+            connection_error,
+        ),
     );
     crate::module_ns_store(
         ns,
         "ConnectionAbortedError",
-        make_exc_type("ConnectionAbortedError", exc_os_error_new, connection_error),
+        make_exc_type_with_doc(
+            "ConnectionAbortedError",
+            "Connection aborted.",
+            exc_os_error_new,
+            connection_error,
+        ),
     );
     crate::module_ns_store(
         ns,
         "ConnectionRefusedError",
-        make_exc_type("ConnectionRefusedError", exc_os_error_new, connection_error),
+        make_exc_type_with_doc(
+            "ConnectionRefusedError",
+            "Connection refused.",
+            exc_os_error_new,
+            connection_error,
+        ),
     );
     crate::module_ns_store(
         ns,
         "ConnectionResetError",
-        make_exc_type("ConnectionResetError", exc_os_error_new, connection_error),
+        make_exc_type_with_doc(
+            "ConnectionResetError",
+            "Connection reset.",
+            exc_os_error_new,
+            connection_error,
+        ),
     );
     crate::module_ns_store(
         ns,
         "InterruptedError",
-        make_exc_type("InterruptedError", exc_os_error_new, os_error),
+        make_exc_type_with_doc(
+            "InterruptedError",
+            "Interrupted by signal.",
+            exc_os_error_new,
+            os_error,
+        ),
     );
     crate::module_ns_store(
         ns,
         "ProcessLookupError",
-        make_exc_type("ProcessLookupError", exc_os_error_new, os_error),
+        make_exc_type_with_doc(
+            "ProcessLookupError",
+            "Process not found.",
+            exc_os_error_new,
+            os_error,
+        ),
     );
     crate::module_ns_store(
         ns,
         "TimeoutError",
-        make_exc_type("TimeoutError", exc_os_error_new, os_error),
+        make_exc_type_with_doc(
+            "TimeoutError",
+            "Timeout expired.",
+            exc_os_error_new,
+            os_error,
+        ),
     );
-    let base_exception_group = make_exception_group_type("BaseExceptionGroup", &[base_exc]);
+    let base_exception_group = make_exception_group_type(
+        "BaseExceptionGroup",
+        Some("A combination of multiple unrelated exceptions."),
+        &[base_exc],
+    );
     crate::module_ns_store(ns, "BaseExceptionGroup", base_exception_group);
     let exception_group =
-        make_exception_group_type("ExceptionGroup", &[base_exception_group, exception]);
+        make_exception_group_type("ExceptionGroup", None, &[base_exception_group, exception]);
     crate::module_ns_store(ns, "ExceptionGroup", exception_group);
     crate::module_ns_store(
         ns,
         "PythonFinalizationError",
-        make_exc_type(
+        make_exc_type_with_doc(
             "PythonFinalizationError",
+            "Operation blocked during Python finalization.",
             exc_runtime_error_new,
             runtime_error,
         ),
@@ -6776,7 +7032,18 @@ pub(crate) fn make_exc_type(
     new_fn: crate::gateway::BuiltinCodeFn,
     base: PyObjectRef,
 ) -> PyObjectRef {
-    make_exc_type_with_init(name, new_fn, None, base)
+    make_exc_type_with_init(name, None, new_fn, None, base)
+}
+
+/// PyPy's `_new_exception` stores the supplied docstring directly in each
+/// builtin exception's TypeDef namespace.
+fn make_exc_type_with_doc(
+    name: &'static str,
+    doc: &'static str,
+    new_fn: crate::gateway::BuiltinCodeFn,
+    base: PyObjectRef,
+) -> PyObjectRef {
+    make_exc_type_with_init(name, Some(doc), new_fn, None, base)
 }
 
 /// Variant of `make_exc_type` that also installs a per-class `__init__`
@@ -6789,6 +7056,7 @@ pub(crate) fn make_exc_type(
 /// `_new` at `:274-284` (no per-arg validation).
 fn make_exc_type_with_init(
     name: &'static str,
+    doc: Option<&'static str>,
     new_fn: crate::gateway::BuiltinCodeFn,
     init_fn: Option<crate::gateway::BuiltinCodeFn>,
     base: PyObjectRef,
@@ -6805,6 +7073,13 @@ fn make_exc_type_with_init(
         name,
         move |ns| {
             unsafe {
+                if let Some(doc) = doc {
+                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__doc__",
+                        pyre_object::w_str_new(doc),
+                    );
+                }
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "__new__",
@@ -7990,24 +8265,39 @@ fn exception_group_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     )))
 }
 
-fn make_exception_group_type(name: &'static str, bases: &[PyObjectRef]) -> PyObjectRef {
+fn make_exception_group_type(
+    name: &'static str,
+    doc: Option<&'static str>,
+    bases: &[PyObjectRef],
+) -> PyObjectRef {
     if let Some(cls) = lookup_exc_class(name) {
         return cls;
     }
     let cls = crate::typedef::make_builtin_type_with_bases(
         name,
         move |ns| {
+            if let Some(doc) = doc {
+                unsafe {
+                    pyre_object::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "__doc__",
+                        pyre_object::w_str_new(doc),
+                    )
+                };
+            }
             if name == "ExceptionGroup" {
                 // CPython 3.14 creates ExceptionGroup as the heap type over
                 // BaseExceptionGroup + Exception.  Its own namespace therefore
-                // carries `__module__ = "builtins"`; BaseExceptionGroup is a
-                // static builtin and has no own entry.
+                // carries `__module__ = "builtins"` and `__doc__ = None`;
+                // BaseExceptionGroup is a static builtin and has no own module
+                // entry.
                 unsafe {
                     pyre_object::w_dict_setitem_str_no_proxy(
                         ns,
                         "__module__",
                         pyre_object::w_str_new("builtins"),
-                    )
+                    );
+                    pyre_object::w_dict_setitem_str_no_proxy(ns, "__doc__", pyre_object::w_none());
                 };
             }
             if name != "BaseExceptionGroup" {
