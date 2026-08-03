@@ -639,6 +639,21 @@ pub(crate) fn drain_backend_jit_exc() {
     majit_backend_wasm::jit_exc_clear();
 }
 
+/// Clear the two pyre carriers for a residual-call exception after a compiled
+/// frame has handled it and returned normally.
+///
+/// RPython keeps `MetaInterp.last_exc_value` on the metainterp that owns the
+/// call and `handle_possible_exception()` clears it when control reaches the
+/// handler.  Pyre's residual helpers publish to both this TLS stand-in and the
+/// backend `_store_exception` cells, so a successful compiled portal exit must
+/// leave both empty.  A caller exception that legitimately spans a nested JIT
+/// entry is removed and restored by `park_residual_call_exception`, outside
+/// this boundary.
+pub(crate) fn clear_residual_call_exception() {
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    drain_backend_jit_exc();
+}
+
 /// #73 measurement gate. When `PYRE_M73_LASTINSTR_AUDIT` is set, the three
 /// blackhole traceback sites compare the production inversion
 /// `containing_py_pc_for_jitcode_pc_public(last_opcode_position)` (= `orgpc`, the

@@ -3202,6 +3202,14 @@ fn try_adopt_blackhole(
         || try_adopt_single_frame_blackhole(ctx, cf_addr, live_root_addr, commit_leg)
 }
 
+fn blackhole_terminal_error(error: &crate::jitcode_dispatch::DispatchError) -> bool {
+    matches!(
+        error,
+        crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. }
+            | crate::jitcode_dispatch::DispatchError::TraceTooLong { .. }
+    ) || error.leaves_complete_image()
+}
+
 fn run_perfn_walk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     sym: &mut Sym,
@@ -4582,10 +4590,15 @@ fn run_perfn_walk<Sym: WalkSym>(
         )
         && crate::jitcode_dispatch::fbw_finish_concrete_peek().is_some()
         && !crate::jitcode_dispatch::fbw_has_unjournaled_effect();
+    // A terminal blackhole adoption is possible for the two dedicated
+    // handoff errors and for the general WalkAbort family.  The latter was
+    // added after this no-replay predicate and must be classified through the
+    // SAME complete-image allow-list as the adoption leg above; otherwise a
+    // `DoneWithThisFrame` result is discarded and interpreter replay resumes
+    // one opcode past RETURN_VALUE.
     let blackhole_terminal_no_replay = matches!(
         &walk_result,
-        Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
-            | Err(crate::jitcode_dispatch::DispatchError::TraceTooLong { .. })
+        Err(error) if blackhole_terminal_error(error)
     ) && WALK_END_FLUSH_COMMITTED.with(|slot| slot.get())
         && crate::jitcode_dispatch::fbw_finish_concrete_peek().is_some();
     if !terminate_no_replay && !blackhole_terminal_no_replay {
@@ -5637,6 +5650,28 @@ mod tests {
     use pyre_interpreter::bytecode::Instruction;
     use pyre_interpreter::compile_exec;
     use pyre_interpreter::decode_instruction_at;
+
+    #[test]
+    fn complete_image_walk_abort_keeps_blackhole_terminal_result() {
+        use crate::jitcode_dispatch::DispatchError;
+
+        assert!(super::blackhole_terminal_error(
+            &DispatchError::MayForceNullRefArgUnsupported { pc: 17 }
+        ));
+        assert!(super::blackhole_terminal_error(
+            &DispatchError::VableEscapedDuringResidualCall { pc: 17 }
+        ));
+        assert!(super::blackhole_terminal_error(
+            &DispatchError::TraceTooLong { pc: 17, ops: 1 }
+        ));
+        assert!(!super::blackhole_terminal_error(
+            &DispatchError::RegisterReadUnbound {
+                pc: 17,
+                reg: 3,
+                bank: "r",
+            }
+        ));
+    }
 
     #[test]
     fn walk_end_root_area_forwards_a_quiesced_foreign_mutator() {

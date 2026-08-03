@@ -9381,6 +9381,12 @@ fn handle_jit_outcome(
                     value as usize
                 );
             }
+            // pyjitpl.py `handle_possible_exception` parity: reaching a
+            // normal FINISH proves every residual exception raised inside
+            // this compiled frame was caught.  Its pyre TLS/backend carriers
+            // must not escape into a blackhole caller and turn this successful
+            // return into a raise.
+            crate::call_jit::clear_residual_call_exception();
             JitAction::Return(Ok(value))
         }
         DetailedDriverRunOutcome::Jump {
