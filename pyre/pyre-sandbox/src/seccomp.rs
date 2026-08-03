@@ -190,6 +190,19 @@ fn allowed_syscalls() -> Vec<u32> {
         libc::SYS_futex,
         libc::SYS_sched_yield,
         libc::SYS_sched_getaffinity,
+        // Which NUMA node the caller runs on. mimalloc stamps it on every new
+        // thread's TLD and on every arena it reserves (`mimalloc/src/init.c`
+        // `mi_tld_alloc`, `src/arena.c` `mi_arena_reserve`), and its
+        // `_mi_prim_numa_node` goes straight to the syscall rather than the
+        // vDSO. The lookup is skipped entirely while the cached node count is
+        // 1, so this is unreachable on a single-node machine and issued on
+        // every arena reservation on a multi-node one — which is why it can sit
+        // unnoticed until the sandbox runs on a two-socket host. The node count
+        // behind that cache is probed once, by reading `/sys/devices/system/
+        // node`, and is already warm here because the interpreter has allocated
+        // throughout startup. Reads topology, changes nothing — the same
+        // standing as `sched_getaffinity` above.
+        libc::SYS_getcpu,
         libc::SYS_getrandom,
         libc::SYS_set_robust_list,
         libc::SYS_set_tid_address,
