@@ -253,13 +253,6 @@ pub fn register_thread() {
     let old = REGISTERED_THREADS.fetch_add(1, Ordering::SeqCst);
     if old > 0 {
         FOREIGN_MUTATOR_SEEN.store(true, Ordering::Release);
-        // A second thread is arriving, so no standing claim may survive: from
-        // here on every caller sees REGISTERED_THREADS > 1 and takes the Mutex
-        // path. The count was raised first, so the previous holder cannot make
-        // a new standing claim once this one is revoked. `gc_mutex` is what
-        // `revoke_standing_claim` requires of its callers.
-        let _guard = GC_SYNC.gc_mutex.lock().unwrap();
-        revoke_standing_claim(my_ident());
     }
 
     let mut state = GC_SYNC.quiesce.lock().unwrap();
@@ -917,30 +910,11 @@ mod tests {
         });
         blocking(|| worker.join()).unwrap();
 
-<<<<<<< HEAD
-        assert_eq!(published_top(), before);
-||||||| parent of 3d06ccdce4b (gc: skip root forwarding queries before mutators are shared)
-        assert_eq!(
-            gc_query(
-                |gc| unsafe { &*(gc.nursery_top_addr() as *const AtomicUsize) }
-                    .load(Ordering::Acquire)
-            ),
-            0
-        );
-=======
         assert!(
             foreign_mutator_seen(),
             "the 1→2 mutator transition must remain sticky after unregister"
         );
-
-        assert_eq!(
-            gc_query(
-                |gc| unsafe { &*(gc.nursery_top_addr() as *const AtomicUsize) }
-                    .load(Ordering::Acquire)
-            ),
-            0
-        );
->>>>>>> 3d06ccdce4b (gc: skip root forwarding queries before mutators are shared)
+        assert_eq!(published_top(), before);
         unregister_test_mutator();
     }
 
