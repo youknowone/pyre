@@ -925,6 +925,49 @@ pub struct BhCallDescr {
     pub extra_info: majit_ir::descr::EffectInfo,
 }
 
+/// Widest `arg_classes` the blackhole's residual-call dispatch table can build
+/// a signature for once a float argument is present.
+///
+/// That table (`majit-backend` `call_stub.rs`, `dispatch_classes_body!`)
+/// enumerates one `extern "C"` signature per *ordered* argument-class sequence,
+/// so the arm count doubles with each argument a float signature may occupy;
+/// integer-only signatures need one arm per length and run to
+/// [`MAX_HOST_CALL_ARITY`](super::insns::MAX_HOST_CALL_ARITY).
+///
+/// Upstream has no such limit: `descr.py:604-605 create_call_stub`
+/// source-generates `FuncType(ARGS, RESULT)` per calldescr at translation time,
+/// so every sequence has a stub. Lifting it here means an ABI adapter that can
+/// place arguments for a signature only known at run time.
+pub const MAX_FLOAT_CARRYING_CALL_ARITY: usize = 5;
+
+/// Reject, at descr-build time, a signature the blackhole could not dispatch.
+///
+/// A compiled trace places arbitrary signatures itself and wasm32 routes through
+/// the host trampoline, so a too-wide descr does not fail when it is built or
+/// when the trace runs — it fails the first time a guard failure hands the call
+/// to the blackhole. Checking here points at whoever widened the callee instead
+/// of at that deopt.
+///
+/// `debug_assert` rather than a hard check: the dispatch table's own catch-all
+/// stays as the release backstop, and this costs nothing on the build path.
+fn debug_assert_dispatchable(arg_classes: &str) {
+    let arity = arg_classes.chars().count();
+    if arity > super::insns::MAX_HOST_CALL_ARITY {
+        // Past that width the residual call is never emitted in the first place
+        // (`pyre-jit-trace` `residual_call.rs` declines and leaves the call to
+        // the interpreter), so the descr exists but no blackhole ever dispatches
+        // it. Flagging it here would turn an orderly decline into a panic.
+        return;
+    }
+    debug_assert!(
+        !arg_classes.contains('f') || arity <= MAX_FLOAT_CARRYING_CALL_ARITY,
+        "calldescr arg_classes {arg_classes:?} carries a float argument across \
+         {arity} arguments; the residual-call dispatch table enumerates \
+         float-bearing signatures only up to {MAX_FLOAT_CARRYING_CALL_ARITY}, so \
+         the blackhole would panic on the first deopt that runs this call"
+    );
+}
+
 impl BhCallDescr {
     pub fn from_call_descr(cd: &dyn majit_ir::descr::CallDescr) -> Self {
         // RPython `descr.py:456 CallDescr.result_type` is the char
@@ -936,8 +979,10 @@ impl BhCallDescr {
         let (_, _, result_erased) = result_type_char_layout_key(result_class);
         let result_signed = cd.is_result_signed();
         let result_size = cd.result_size();
+        let arg_classes = cd.arg_classes();
+        debug_assert_dispatchable(&arg_classes);
         Self {
-            arg_classes: cd.arg_classes(),
+            arg_classes,
             result_type: result_class,
             result_signed,
             result_size,
@@ -960,6 +1005,7 @@ impl BhCallDescr {
         extra_info: majit_ir::descr::EffectInfo,
     ) -> Self {
         let (result_signed, result_size, result_erased) = result_type_char_layout_key(result_type);
+        debug_assert_dispatchable(&arg_classes);
         Self {
             arg_classes,
             result_type,
@@ -981,6 +1027,7 @@ impl BhCallDescr {
             | majit_ir::value::Type::Float => 8,
             majit_ir::value::Type::Void => 0,
         };
+        debug_assert_dispatchable(&arg_classes);
         Self {
             arg_classes,
             result_type: ir_type_to_result_char(result_type),

@@ -32,6 +32,14 @@ pub enum ArgClass {
 /// as `extern "C" fn(f64, i64)` rather than a class-blind
 /// `extern "C" fn(i64, f64)`. That preserves SysV/AAPCS register-file order
 /// and the Microsoft x64 positional argument slots alike.
+///
+/// Coverage: every ordered sequence up to 5 arguments, plus the all-`Int`
+/// sequences on to `MAX_HOST_CALL_ARITY`. The float-carrying bound is mirrored
+/// by `majit_translate::codewriter::jitcode::MAX_FLOAT_CARRYING_CALL_ARITY`,
+/// which flags such a signature where the calldescr is built instead of at the
+/// deopt that first runs it; widening the arms here means raising it there in
+/// the same change (`majit-translate` cannot call into `majit-backend`, so the
+/// bound is stated on both sides rather than shared).
 macro_rules! dispatch_classes_body {
     ($func:ident, $classes:ident, $args:ident, $ret:ty) => {{
         type I = i64;
@@ -1428,5 +1436,51 @@ mod tests {
             )
         };
         assert_eq!(result, 321.0);
+    }
+
+    extern "C" fn four_ints_then_float(a: i64, b: i64, c: i64, d: i64, e: f64) -> i64 {
+        a + b * 10 + c * 100 + d * 1000 + e as i64 * 10000
+    }
+
+    /// The widest float-carrying sequence the table covers, and the bound
+    /// `majit_translate::codewriter::jitcode::MAX_FLOAT_CARRYING_CALL_ARITY`
+    /// states on the descr-build side.
+    #[test]
+    fn call_stub_i_dispatches_a_float_in_the_last_covered_slot() {
+        let result = unsafe {
+            bh_call_i_dispatch(
+                four_ints_then_float as *const () as usize,
+                &[
+                    ArgClass::Int,
+                    ArgClass::Int,
+                    ArgClass::Int,
+                    ArgClass::Int,
+                    ArgClass::Float,
+                ],
+                &[1, 2, 3, 4, 5.0_f64.to_bits() as i64],
+            )
+        };
+        assert_eq!(result, 54321);
+    }
+
+    /// One argument past that bound the table has no arm, so the call is
+    /// refused instead of being placed against the wrong signature.
+    #[test]
+    #[should_panic(expected = "unsupported arg class sequence")]
+    fn call_stub_i_refuses_a_float_past_the_covered_width() {
+        unsafe {
+            bh_call_i_dispatch(
+                four_ints_then_float as *const () as usize,
+                &[
+                    ArgClass::Int,
+                    ArgClass::Int,
+                    ArgClass::Int,
+                    ArgClass::Int,
+                    ArgClass::Int,
+                    ArgClass::Float,
+                ],
+                &[1, 2, 3, 4, 5, 6.0_f64.to_bits() as i64],
+            );
+        }
     }
 }
