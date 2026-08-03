@@ -11217,6 +11217,47 @@ fn is_exception_typedef_getset(descr: PyObjectRef) -> bool {
     !fget.is_null() && std::ptr::eq(fget, crate::builtins::exception_getset_fget_obj())
 }
 
+/// The member-descriptor half of [`is_exception_typedef_getset`].
+///
+/// `Objects/exceptions.c` declares `errno` / `strerror` / `filename` /
+/// `filename2` / `code` / `name` / `obj` and the `UnicodeError` fields as
+/// `PyMemberDef` entries, so the class dict holds a `W_MemberDescr` for them
+/// rather than a getset.  `direct_member_get` reads exactly the slot accessor
+/// the fold reads and only diverges where the stored slot is NULL — which the
+/// fold declines anyway — so a lookup landing on the canonical member *is* the
+/// slot, and folding past it keeps the same value.  The kind is matched against
+/// the selected slot, so a member for a different field still declines.
+fn is_exception_typedef_member(descr: PyObjectRef, slot: ExceptionAttrSlot) -> bool {
+    if descr.is_null() || !unsafe { pyre_object::is_member(descr) } {
+        return false;
+    }
+    let kind = unsafe { pyre_object::w_member_get_direct_kind(descr) };
+    match slot {
+        ExceptionAttrSlot::Errno => kind == pyre_object::MEMBER_OS_ERROR_ERRNO,
+        ExceptionAttrSlot::Strerror => kind == pyre_object::MEMBER_OS_ERROR_STRERROR,
+        ExceptionAttrSlot::Filename => kind == pyre_object::MEMBER_OS_ERROR_FILENAME,
+        ExceptionAttrSlot::Filename2 => kind == pyre_object::MEMBER_OS_ERROR_FILENAME2,
+        ExceptionAttrSlot::Code => kind == pyre_object::MEMBER_SYSTEM_EXIT_CODE,
+        ExceptionAttrSlot::Name => matches!(
+            kind,
+            pyre_object::MEMBER_ATTRIBUTE_ERROR_NAME
+                | pyre_object::MEMBER_NAME_ERROR_NAME
+                | pyre_object::MEMBER_IMPORT_ERROR_NAME
+        ),
+        ExceptionAttrSlot::AttrObj => kind == pyre_object::MEMBER_ATTRIBUTE_ERROR_OBJ,
+        ExceptionAttrSlot::UnicodeObject => kind == pyre_object::MEMBER_UNICODE_ERROR_OBJECT,
+        ExceptionAttrSlot::UnicodeStart => kind == pyre_object::MEMBER_UNICODE_ERROR_START,
+        ExceptionAttrSlot::UnicodeEnd => kind == pyre_object::MEMBER_UNICODE_ERROR_END,
+        ExceptionAttrSlot::UnicodeReason => kind == pyre_object::MEMBER_UNICODE_ERROR_REASON,
+        ExceptionAttrSlot::UnicodeEncoding => kind == pyre_object::MEMBER_UNICODE_ERROR_ENCODING,
+        // `args` / `__context__` / `__cause__` / `__traceback__` stay getsets.
+        ExceptionAttrSlot::Args
+        | ExceptionAttrSlot::Context
+        | ExceptionAttrSlot::Cause
+        | ExceptionAttrSlot::Traceback => false,
+    }
+}
+
 /// Ingredients for the full-body walker's mirror of the typed exception-slot
 /// attribute arms.  This helper deliberately lives beside `getattr_str_impl`
 /// and `object_setattr`, whose branch order it audits.
@@ -11409,6 +11450,7 @@ pub unsafe fn exception_attr_slot_fold(
     // mutations.
     if let Some(descr) = unsafe { lookup_in_type_where(w_type.as_ptr(), name) }
         && !is_exception_typedef_getset(descr)
+        && !is_exception_typedef_member(descr, slot)
     {
         return None;
     }
