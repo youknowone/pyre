@@ -43,6 +43,24 @@ def wrapped(cls, value: int = 2) -> str:
 cm = classmethod(wrapped)
 assert cm.__func__ is wrapped
 assert cm.__wrapped__ is wrapped
+for name in ("__func__", "__wrapped__"):
+    member = classmethod.__dict__[name]
+    assert type(member).__name__ == "member_descriptor"
+    assert member.__objclass__ is classmethod
+    assert member.__name__ == name
+    assert member.__doc__ is None
+    try:
+        setattr(cm, name, wrapped)
+    except AttributeError as exc:
+        assert str(exc) == "readonly attribute"
+    else:
+        raise AssertionError(f"classmethod.{name} must be read-only")
+    try:
+        delattr(cm, name)
+    except AttributeError as exc:
+        assert str(exc) == "readonly attribute"
+    else:
+        raise AssertionError(f"classmethod.{name} must not be deletable")
 assert cm.__dict__ == {
     "__module__": __name__,
     "__name__": "wrapped",

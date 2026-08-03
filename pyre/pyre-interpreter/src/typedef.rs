@@ -12056,6 +12056,12 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
                 value
             })
         }
+        pyre_object::MEMBER_STATICMETHOD_FUNCTION => {
+            Ok(unsafe { pyre_object::function::w_staticmethod_get_func(obj) })
+        }
+        pyre_object::MEMBER_CLASSMETHOD_FUNCTION => {
+            Ok(unsafe { pyre_object::function::w_classmethod_get_func(obj) })
+        }
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
         pyre_object::MEMBER_DESCR_NAME => unsafe { descr_member_name(obj) },
         _ => Err(crate::PyError::attribute_error(unsafe {
@@ -15120,12 +15126,6 @@ fn staticmethod_descr_call(args: &[PyObjectRef]) -> crate::PyResult {
     })
 }
 
-fn staticmethod_func_attr(args: &[PyObjectRef]) -> crate::PyResult {
-    let sm = staticmethod_require(args.get(1).copied().unwrap_or(PY_NULL), "__func__")?;
-    let value = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
-    Ok(if value.is_null() { w_none() } else { value })
-}
-
 fn staticmethod_isabstract(args: &[PyObjectRef]) -> crate::PyResult {
     let sm = staticmethod_require(
         args.get(1).copied().unwrap_or(PY_NULL),
@@ -15261,19 +15261,19 @@ fn init_staticmethod_type(ns: PyObjectRef) {
         ),
         (
             "__func__",
-            make_getset_descriptor(make_builtin_function_with_arity(
-                "__func__",
-                staticmethod_func_attr,
-                2,
-            )),
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_STATICMETHOD_FUNCTION,
+                "__func__".to_owned(),
+                PY_NULL,
+            ),
         ),
         (
             "__wrapped__",
-            make_getset_descriptor(make_builtin_function_with_arity(
-                "__wrapped__",
-                staticmethod_func_attr,
-                2,
-            )),
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_STATICMETHOD_FUNCTION,
+                "__wrapped__".to_owned(),
+                PY_NULL,
+            ),
         ),
         (
             "__isabstractmethod__",
@@ -15409,12 +15409,6 @@ fn classmethod_descr_get(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(new_bound(function, w_klass, w_klass))
 }
 
-fn classmethod_func_attr(args: &[PyObjectRef]) -> crate::PyResult {
-    let cm = classmethod_require(args.get(1).copied().unwrap_or(PY_NULL), "__func__")?;
-    let value = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
-    Ok(if value.is_null() { w_none() } else { value })
-}
-
 fn classmethod_isabstract(args: &[PyObjectRef]) -> crate::PyResult {
     let cm = classmethod_require(
         args.get(1).copied().unwrap_or(PY_NULL),
@@ -15540,19 +15534,19 @@ fn init_classmethod_type(ns: PyObjectRef) {
         ),
         (
             "__func__",
-            make_getset_descriptor(make_builtin_function_with_arity(
-                "__func__",
-                classmethod_func_attr,
-                2,
-            )),
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_CLASSMETHOD_FUNCTION,
+                "__func__".to_owned(),
+                PY_NULL,
+            ),
         ),
         (
             "__wrapped__",
-            make_getset_descriptor(make_builtin_function_with_arity(
-                "__wrapped__",
-                classmethod_func_attr,
-                2,
-            )),
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_CLASSMETHOD_FUNCTION,
+                "__wrapped__".to_owned(),
+                PY_NULL,
+            ),
         ),
         (
             "__isabstractmethod__",

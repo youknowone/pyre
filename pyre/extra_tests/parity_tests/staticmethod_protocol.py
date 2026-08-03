@@ -43,6 +43,24 @@ def wrapped(a: int, *, b: int = 2) -> str:
 sm = staticmethod(wrapped)
 assert sm.__func__ is wrapped
 assert sm.__wrapped__ is wrapped
+for name in ("__func__", "__wrapped__"):
+    member = staticmethod.__dict__[name]
+    assert type(member).__name__ == "member_descriptor"
+    assert member.__objclass__ is staticmethod
+    assert member.__name__ == name
+    assert member.__doc__ is None
+    try:
+        setattr(sm, name, wrapped)
+    except AttributeError as exc:
+        assert str(exc) == "readonly attribute"
+    else:
+        raise AssertionError(f"staticmethod.{name} must be read-only")
+    try:
+        delattr(sm, name)
+    except AttributeError as exc:
+        assert str(exc) == "readonly attribute"
+    else:
+        raise AssertionError(f"staticmethod.{name} must not be deletable")
 assert sm.__dict__ == {
     "__module__": __name__,
     "__name__": "wrapped",

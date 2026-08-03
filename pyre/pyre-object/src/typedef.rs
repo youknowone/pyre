@@ -332,6 +332,12 @@ pub const MEMBER_UNICODE_ERROR_START: u32 = MEMBER_DIRECT_FLAG | 37;
 pub const MEMBER_UNICODE_ERROR_END: u32 = MEMBER_DIRECT_FLAG | 38;
 /// CPython 3.14 Unicode*Error `reason`, backed by PyPy's `w_reason`.
 pub const MEMBER_UNICODE_ERROR_REASON: u32 = MEMBER_DIRECT_FLAG | 39;
+/// CPython 3.14 `staticmethod_members`: both `__func__` and `__wrapped__`
+/// expose PyPy's `StaticMethod.w_function` field read-only.
+pub const MEMBER_STATICMETHOD_FUNCTION: u32 = MEMBER_DIRECT_FLAG | 40;
+/// CPython 3.14 `classmethod_members`: both `__func__` and `__wrapped__`
+/// expose PyPy's `ClassMethod.w_function` field read-only.
+pub const MEMBER_CLASSMETHOD_FUNCTION: u32 = MEMBER_DIRECT_FLAG | 41;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {
