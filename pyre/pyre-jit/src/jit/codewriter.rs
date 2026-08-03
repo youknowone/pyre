@@ -14236,6 +14236,13 @@ impl CodeWriter {
         // and is stored here.  Sorted by py_pc for binary search; sparse (the
         // trivia-forward-carry majority derives, so only the jump-target /
         // re-key residual remains).
+        //
+        // ⚠ Keeping only the trace-entry greens is NOT sound, however small the
+        // rest looks: `resolve_marker` below is also called on `skipped_py` and
+        // fallthrough coordinates, which are exactly the trivia / jump PCs this
+        // residual is made of.  Restricting the table to greens leaves every
+        // green resolving identically and still costs fannkuch ~1000x (0.6s →
+        // >10min) — measured, not hypothesised.
         let carryfwd_resume_pc: Vec<(u32, usize)> = pc_map_bytes
             .iter()
             .enumerate()
@@ -14248,6 +14255,54 @@ impl CodeWriter {
             })
             .map(|(py, &dense)| (py as u32, dense))
             .collect();
+
+        // `PYRE_PCMAP_RESIDUAL_CENSUS=1`: name every py_pc the derivation cannot
+        // reproduce, so the classes standing between `derive_resume_marker` and
+        // the dense map's retirement can be counted instead of guessed.  A
+        // derivation that covered them all would leave `pc_map_bytes` with a
+        // single consumer (`block_head_py_by_jit_pc`).  Build-time only; off by
+        // default.
+        //
+        // Synth corpus at the time of writing: 815 jitcodes / 68,322 py PCs /
+        // 1,410 residual (2.1%).  Every residual PC emitted no op of its own —
+        // the "own first op" tier reproduces the dense marker exactly, corpus
+        // wide.  By opcode: Cache 729, EndFor 266, ToBool 176, JumpForward 146,
+        // JumpBackwardNoInterrupt 74, rest <15.
+        if std::env::var_os("PYRE_PCMAP_RESIDUAL_CENSUS").is_some() {
+            eprintln!(
+                "[pcmap-residual-sum] code={} n_py={} residual={}",
+                code.obj_name,
+                pc_map_bytes.len(),
+                carryfwd_resume_pc.len()
+            );
+            let mut scan_state = OpArgState::default();
+            let mut op_at: Vec<String> = Vec::with_capacity(code.instructions.len());
+            for i in 0..code.instructions.len() {
+                let (instr, _) = scan_state.get(code.instructions[i]);
+                op_at.push(format!("{instr:?}"));
+            }
+            for &(py, dense) in &carryfwd_resume_pc {
+                let py = py as usize;
+                let own = first_jit_pc_by_py_pc
+                    .get(py)
+                    .copied()
+                    .is_some_and(|v| v != usize::MAX);
+                let derived = pyre_jit_trace::pyjitcode::derive_resume_marker(
+                    &first_jit_pc_by_py_pc,
+                    &block_head_py_by_jit_pc,
+                    py,
+                );
+                eprintln!(
+                    "[pcmap-residual] code={} py={} op={} own={} derived={:?} dense={}",
+                    code.obj_name,
+                    py,
+                    op_at.get(py).map_or("?", String::as_str),
+                    own as u8,
+                    derived,
+                    dense
+                );
+            }
+        }
 
         // Per-trace-entry green → walk-entry sidecar. Resolve each entry
         // with the runtime translator's exact precedence while the codewriter
