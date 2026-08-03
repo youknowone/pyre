@@ -31,7 +31,7 @@
 //! invariant.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use majit_translate::jitcode::JitCode;
 
@@ -54,9 +54,9 @@ fn build_time_fnaddr_bindings() -> Vec<(String, i64)> {
 
 /// Apply the build → runtime fnaddr correspondence to every JitCode the
 /// caller just deserialised.  Mutates each Arc in place — refcount must
-/// be 1 on entry (the canonical `ALL_JITCODES` LazyLock satisfies this
-/// because `bincode::deserialize` produces fresh `Arc::new(...)` shells
-/// before any consumer can clone them).
+/// be 1 on entry (the per-index loader satisfies this because
+/// `bincode::deserialize` produces a fresh `Arc::new(...)` shell before any
+/// consumer can clone it).
 ///
 /// `JitCode.fnaddr` carries the shell-level fnaddr the codewriter
 /// recorded in `CallControl::get_jitcode` (`call.rs:2647`); the per-
@@ -65,7 +65,36 @@ fn build_time_fnaddr_bindings() -> Vec<(String, i64)> {
 /// `emit_const_i_from_const` path (`assembler.rs:2453-2473`).  Both
 /// surfaces are patched so the walker sees the same address regardless
 /// of which lookup it routes through.
-pub fn patch_constants_i_fnaddrs(jitcodes: &mut Vec<Arc<JitCode>>) {
+pub fn patch_constants_i_fnaddrs(jitcodes: &mut [Arc<JitCode>]) {
+    let correspondence = &*FNADDR_CORRESPONDENCE;
+
+    if correspondence.is_empty() {
+        return;
+    }
+
+    for arc in jitcodes.iter_mut() {
+        let jc = Arc::get_mut(arc).expect(
+            "patch_constants_i_fnaddrs: Arc<JitCode> already shared before patch — \
+             every caller must run this before publishing the table to consumers",
+        );
+        if let Some(&runtime) = correspondence.get(&jc.fnaddr) {
+            jc.fnaddr = runtime;
+        }
+        // Some shells reach the persisted table without a committed body
+        // (e.g. `Default::default()` placeholders kept for `Arc<JitCode>::
+        // default()` consumers in `BlackholeInterpreter::new`); they carry
+        // empty `constants_i` so skipping the body-mut access is safe.
+        if jc.try_body().is_some() {
+            for c in jc.body_mut().constants_i.iter_mut() {
+                if let Some(&runtime) = correspondence.get(c) {
+                    *c = runtime;
+                }
+            }
+        }
+    }
+}
+
+static FNADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|| {
     let build_bindings = build_time_fnaddr_bindings();
     let runtime_bindings = pyre_interpreter::jit_trace_fnaddrs();
 
@@ -117,31 +146,8 @@ pub fn patch_constants_i_fnaddrs(jitcodes: &mut Vec<Arc<JitCode>>) {
         }
     }
 
-    if correspondence.is_empty() {
-        return;
-    }
-
-    for arc in jitcodes.iter_mut() {
-        let jc = Arc::get_mut(arc).expect(
-            "patch_constants_i_fnaddrs: Arc<JitCode> already shared before patch — \
-             every caller must run this before publishing the table to consumers",
-        );
-        if let Some(&runtime) = correspondence.get(&jc.fnaddr) {
-            jc.fnaddr = runtime;
-        }
-        // Some shells reach the persisted table without a committed body
-        // (e.g. `Default::default()` placeholders kept for `Arc<JitCode>::
-        // default()` consumers in `BlackholeInterpreter::new`); they carry
-        // empty `constants_i` so skipping the body-mut access is safe.
-        if jc.try_body().is_some() {
-            for c in jc.body_mut().constants_i.iter_mut() {
-                if let Some(&runtime) = correspondence.get(c) {
-                    *c = runtime;
-                }
-            }
-        }
-    }
-}
+    correspondence
+});
 
 /// Build-time `(name, build_addr)` snapshot for the host `PyType` singleton
 /// pointers the codewriter baked into `constants_i` (supplied through
@@ -181,22 +187,8 @@ fn build_time_ref_bindings() -> Vec<(String, i64)> {
 /// constant in `constants_r`, while one consumed as an integer lands in
 /// `constants_i`.  `JitCode.fnaddr` is left untouched (these are data, not
 /// call targets).
-pub fn patch_static_addr_constants(jitcodes: &mut Vec<Arc<JitCode>>) {
-    let mut runtime_map: HashMap<&'static str, i64> = HashMap::new();
-    runtime_map.extend(pyre_interpreter::jit_static_pytype_addrs());
-    runtime_map.extend(pyre_interpreter::jit_static_ref_addrs());
-
-    let mut correspondence: HashMap<i64, i64> = HashMap::new();
-    for (name, build_addr) in build_time_pytype_bindings()
-        .into_iter()
-        .chain(build_time_ref_bindings())
-    {
-        if let Some(&runtime_addr) = runtime_map.get(name.as_str()) {
-            if build_addr != runtime_addr {
-                correspondence.insert(build_addr, runtime_addr);
-            }
-        }
-    }
+pub fn patch_static_addr_constants(jitcodes: &mut [Arc<JitCode>]) {
+    let correspondence = &*STATIC_ADDR_CORRESPONDENCE;
 
     if correspondence.is_empty() {
         return;
@@ -220,6 +212,45 @@ pub fn patch_static_addr_constants(jitcodes: &mut Vec<Arc<JitCode>>) {
             }
         }
     }
+}
+
+static STATIC_ADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|| {
+    let mut runtime_map: HashMap<&'static str, i64> = HashMap::new();
+    runtime_map.extend(pyre_interpreter::jit_static_pytype_addrs());
+    runtime_map.extend(pyre_interpreter::jit_static_ref_addrs());
+
+    let mut correspondence: HashMap<i64, i64> = HashMap::new();
+    for (name, build_addr) in build_time_pytype_bindings()
+        .into_iter()
+        .chain(build_time_ref_bindings())
+    {
+        if let Some(&runtime_addr) = runtime_map.get(name.as_str()) {
+            if build_addr != runtime_addr {
+                correspondence.insert(build_addr, runtime_addr);
+            }
+        }
+    }
+
+    correspondence
+});
+
+/// Take both build -> runtime address snapshots now.
+///
+/// Both maps are `LazyLock`, so without this they would be built at whatever
+/// moment the first jitcode happens to be decoded.  Once jitcode bodies decode
+/// lazily that moment is mid-trace, long after `init_typeobjects` has retagged
+/// the `PyType` singletons — and the map, frozen there, would then patch every
+/// later-decoded body's `constants_r` with addresses that no longer name what
+/// the runtime holds.  Those constants reach a compiled loop's gc_table, so the
+/// collector drags a bad root out of it (`GC BUG: invalid type_id`, site
+/// `minor_root_target`).
+///
+/// Calling this from `ensure_finish_setup` restores the snapshot instant the
+/// whole-table loader had, when the first `all_jitcodes()` decoded everything
+/// against one consistent view.
+pub fn prime_address_correspondences() {
+    LazyLock::force(&FNADDR_CORRESPONDENCE);
+    LazyLock::force(&STATIC_ADDR_CORRESPONDENCE);
 }
 
 /// High 16 bits of a deferred prebuilt-string sentinel (see
@@ -252,14 +283,18 @@ fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64) -> i64 {
 /// sibling).  The build-time translator could not allocate a runtime STR
 /// block, so it pooled a non-canonical sentinel in the slot named by each
 /// descriptor's `constants_r_index`; here we allocate the immortal block and
-/// overwrite the sentinel with its live address.  Runs at load time, before
-/// `Box::leak` publishes the table — refcount must be 1 (`Arc::get_mut`), so
-/// no consumer can observe the sentinel as a forged GCREF.
+/// overwrite the sentinel with its live address. Runs before the per-index
+/// `OnceCell` publishes the entry — refcount must be 1 (`Arc::get_mut`), so no
+/// consumer can observe the sentinel as a forged GCREF.
 ///
 /// Identical literals are interned by bytes across the whole table so one
 /// immortal block (one identity) is shared, the runtime analog of the
-/// assembler's per-jitcode dedup.
-pub fn materialize_str_consts(jitcodes: &mut Vec<Arc<JitCode>>) {
+/// assembler's per-jitcode dedup.  `interned` is only a local fast path over
+/// that: [`materialize_prebuilt_str`] resolves through
+/// `box_str_constant`'s process-wide `STRING_INTERN_TABLE`, so the one-block
+/// identity holds across calls even though entries are materialized one
+/// jitcode at a time.
+pub fn materialize_str_consts(jitcodes: &mut [Arc<JitCode>]) {
     let mut interned: HashMap<Vec<u8>, i64> = HashMap::new();
     for arc in jitcodes.iter_mut() {
         // Body-less placeholder shells, and bodies with no deferred strings
@@ -383,6 +418,33 @@ mod tests {
             "identical literals must share one immortal W_UnicodeObject",
         );
         assert_ne!(a0, sentinel(0));
+    }
+
+    /// The lazy per-index loader materializes one entry per call, so the
+    /// call-local `interned` map cannot be what shares the block between two
+    /// jitcodes — `box_str_constant`'s process-wide intern table is.  Pins
+    /// that the one-block identity survives the split into separate calls.
+    #[test]
+    fn materialize_str_consts_interns_across_separate_calls() {
+        std::thread::spawn(|| {
+            let desc = || StrConstDescriptor {
+                constants_r_index: 0,
+                bytes: b"y".to_vec(),
+                precomputed_hash: 9,
+            };
+            let mut first = vec![jitcode_with_str_consts(vec![desc()])];
+            let mut second = vec![jitcode_with_str_consts(vec![desc()])];
+            materialize_str_consts(&mut first);
+            materialize_str_consts(&mut second);
+            assert_eq!(
+                first[0].body().constants_r[0],
+                second[0].body().constants_r[0],
+                "identical literals must share one immortal W_UnicodeObject \
+                 even when materialized one jitcode at a time",
+            );
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

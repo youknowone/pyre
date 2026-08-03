@@ -220,9 +220,9 @@ pub use diag::*;
 /// the bytecode bytes + register-bank sizes for the fresh callee
 /// frame.
 ///
-/// Body is always `'static` — production wires the lookup to
-/// `crate::jitcode_runtime::all_jitcodes()` whose `Arc<JitCode>`
-/// entries live inside a `LazyLock<Vec<...>>` (`'static`); tests
+/// Body is always `'static` — production wires the lookup to the
+/// per-index runtime cache whose `Arc<JitCode>` entries live inside a
+/// leaked cell table; tests
 /// either use static byte arrays or `Box::leak` to surface
 /// `'static`. Constraining the body's lifetime simplifies
 /// `WalkContext`'s lifetime parameters — otherwise the closure's
@@ -259,16 +259,15 @@ pub struct SubJitCodeBody {
 /// jitcode_index, .. }` and looks up `ALL_JITCODES[idx]`. Walker
 /// inverts the dependency: the caller supplies the lookup so the
 /// walker stays decoupled from the runtime's all-jitcodes table
-/// (production passes a closure over `crate::jitcode_runtime::all_jitcodes()`,
+/// (production passes the lazy per-index runtime lookup,
 /// tests pass synthetic closures over a local fixture map).
 pub type SubJitCodeLookup = dyn Fn(usize) -> Option<SubJitCodeBody>;
 
 /// Build a [`SubJitCodeBody`] view over the build-time `ALL_JITCODES[idx]`
-/// entry (`crate::jitcode_runtime::all_jitcodes`). Returns `None` for an
+/// entry. Returns `None` for an
 /// out-of-range index.
 ///
-/// The all-jitcodes table is `Box::leak`'d at load
-/// (`jitcode_runtime::load_all_jitcodes`), so the borrowed `code` /
+/// The per-index cell table is `Box::leak`'d at initialization, so the borrowed `code` /
 /// `constants_*` slices are `'static` as [`SubJitCodeBody`] requires.
 ///
 /// This is the production sub-jitcode lookup shape — the shadow walker,
@@ -277,17 +276,15 @@ pub type SubJitCodeLookup = dyn Fn(usize) -> Option<SubJitCodeBody>;
 /// callee body through it. RPython parity: a `BhDescr::JitCode {
 /// jitcode_index }` operand resolves to `ALL_JITCODES[jitcode_index]`.
 pub fn sub_jitcode_body_by_index(idx: usize) -> Option<SubJitCodeBody> {
-    crate::jitcode_runtime::all_jitcodes()
-        .get(idx)
-        .map(|jc| SubJitCodeBody {
-            code: jc.code.as_slice(),
-            num_regs_r: jc.num_regs_r(),
-            num_regs_i: jc.num_regs_i(),
-            num_regs_f: jc.num_regs_f(),
-            constants_i: jc.constants_i.as_slice(),
-            constants_r: jc.constants_r.as_slice(),
-            constants_f: jc.constants_f.as_slice(),
-        })
+    crate::jitcode_runtime::get_jitcode_ref_by_index(idx).map(|jc| SubJitCodeBody {
+        code: jc.code.as_slice(),
+        num_regs_r: jc.num_regs_r(),
+        num_regs_i: jc.num_regs_i(),
+        num_regs_f: jc.num_regs_f(),
+        constants_i: jc.constants_i.as_slice(),
+        constants_r: jc.constants_r.as_slice(),
+        constants_f: jc.constants_f.as_slice(),
+    })
 }
 
 /// State the walker reads from / writes to while stepping. RPython
@@ -1684,7 +1681,7 @@ pub enum DispatchError {
     ExpectedJitCodeDescr { pc: usize, descr_index: usize },
     /// `inline_call_*`'s descr resolved to a `jitcode_index`, but the
     /// caller's `sub_jitcode_lookup` returned `None`. Production wires
-    /// the lookup to `crate::jitcode_runtime::all_jitcodes()`; tests
+    /// the lookup to the lazy runtime jitcode cache; tests
     /// build synthetic maps. A `None` return means the codewriter
     /// emitted an index past the runtime's jitcode table.
     SubJitCodeNotFound { pc: usize, jitcode_index: usize },
@@ -3733,7 +3730,7 @@ fn dispatch_switch_id<Sym: WalkSym>(
 /// * `descr_refs`, `sub_jitcode_lookup` — caller-provided, same
 ///   contract as direct `walk()` callers. Production callers wire
 ///   `crate::jitcode_runtime::all_descrs()` + a JitCode-resolving
-///   closure over `crate::jitcode_runtime::all_jitcodes()`.
+///   closure over the lazy runtime jitcode cache.
 ///
 /// `is_top_level` selects the outer-frame semantic:
 ///

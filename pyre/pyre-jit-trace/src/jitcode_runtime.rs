@@ -8,9 +8,9 @@
 //!
 //! majit's build-time side lives in `majit_translate::jitcode::JitCode`
 //! (serde-serializable, emitted by `build.rs` into `$OUT_DIR/jitcodes.bin`).
-//! This module deserializes that blob once on first access and hands out
-//! `Arc<JitCode>` shells. The configured portal index is read from the
-//! separately serialized generic `CompiledJitDriver` metadata.
+//! This module uses the separately encoded name/offset index to deserialize
+//! each `Arc<JitCode>` on first access. The configured portal index is read
+//! from the separately serialized generic `CompiledJitDriver` metadata.
 //!
 //! No opcode-body side table is serialized: `pipeline.jitcodes`, in allocation
 //! order, remains the single executable store matching RPython's model
@@ -28,9 +28,13 @@ use majit_translate::jitcode::{BhDescr, JitCode};
 static REHYDRATED_CALL_DESCR_REFS: LazyLock<Mutex<Vec<Option<DescrRef>>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
+struct JitCodeIndex {
+    names: Vec<String>,
+    offsets: Vec<u32>,
+}
+
 thread_local! {
-    /// Per-thread cached `&'static` to the build-time `pipeline.jitcodes`
-    /// table.  Set on first access (see [`load_all_jitcodes`]).
+    /// Per-thread lazily populated build-time `pipeline.jitcodes` table.
     ///
     /// `thread_local!` rather than a process-wide `static` because the
     /// `JitCode` payload transitively holds `Variable` graphs whose
@@ -40,33 +44,73 @@ thread_local! {
     /// per-thread cache matches the RPython module-level dict semantics
     /// without forcing `Variable` to become thread-safe.
     ///
-    /// The cached value is a `&'static [Arc<JitCode>]` — produced via
-    /// `Box::leak` on the first call per thread so downstream consumers
-    /// can keep their existing `'static` lifetime contracts
+    /// The cached cells live in a leaked slice so downstream consumers can
+    /// keep their existing `'static` lifetime contracts
     /// (`SubJitCodeBody::code: &'static [u8]`, walker `WalkContext`
-    /// lifetimes, etc.).  The leak is one-time per thread; a typical
-    /// single-threaded JIT runtime leaks once for the process lifetime,
-    /// matching the previous `LazyLock<Vec<...>>` storage.
-    static ALL_JITCODES: OnceCell<&'static [Arc<JitCode>]> = const { OnceCell::new() };
+    /// lifetimes, etc.). Each cell is filled only after all runtime patching
+    /// and the dense-index assertion have completed.
+    static JITCODE_CELLS: OnceCell<&'static [OnceCell<Arc<JitCode>>]> = const { OnceCell::new() };
+
+    /// Decoded names and byte offsets; loading this never decodes a body.
+    static JITCODE_INDEX: OnceCell<&'static JitCodeIndex> = const { OnceCell::new() };
+
+    /// Compatibility accessor storage for tests and diagnostics that
+    /// explicitly request the complete table.
+    static FORCED_ALL_JITCODES: OnceCell<&'static [Arc<JitCode>]> = const { OnceCell::new() };
 
     /// Explicit build-time JIT-driver metadata for every configured driver.
     static COMPILED_JIT_DRIVERS: OnceCell<&'static [CompiledJitDriver]> = const { OnceCell::new() };
 
     /// Per-thread cached `&'static` to the frozen source-translation
     /// indirect-call-target family.  Same storage shape and the same
-    /// `Box::leak` rationale as [`ALL_JITCODES`], which it is derived from;
+    /// `Box::leak` rationale as [`JITCODE_CELLS`], which it is derived from;
     /// see [`indirectcalltargets`] for why the family is built once.
     static INDIRECTCALLTARGETS: OnceCell<&'static [Arc<majit_metainterp::jitcode::JitCode>]> =
         const { OnceCell::new() };
 }
 
-fn load_all_jitcodes() -> &'static [Arc<JitCode>] {
+fn load_jitcode_index() -> &'static JitCodeIndex {
+    const INDEX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jitcodes_index.bin"));
+    const BODY_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jitcodes.bin"));
+    let (names, offsets): (Vec<String>, Vec<u32>) = bincode::deserialize(INDEX_BYTES)
+        .unwrap_or_else(|e| {
+            panic!(
+                "pyre-jit-trace: failed to deserialize jitcodes_index.bin \
+                 ({} bytes): {e}",
+                INDEX_BYTES.len(),
+            )
+        });
+    assert_eq!(
+        offsets.len(),
+        names.len() + 1,
+        "pyre-jit-trace: jitcode index has {} names but {} offsets",
+        names.len(),
+        offsets.len(),
+    );
+    assert_eq!(offsets.first().copied(), Some(0));
+    assert_eq!(offsets.last().copied(), Some(BODY_BYTES.len() as u32));
+    assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+    Box::leak(Box::new(JitCodeIndex { names, offsets }))
+}
+
+fn jitcode_index() -> &'static JitCodeIndex {
+    JITCODE_INDEX.with(|cell| *cell.get_or_init(load_jitcode_index))
+}
+
+pub fn jitcode_count() -> usize {
+    jitcode_index().offsets.len() - 1
+}
+
+fn load_jitcode(index: usize) -> Arc<JitCode> {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jitcodes.bin"));
-    let mut vec: Vec<Arc<JitCode>> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
+    let offsets = &jitcode_index().offsets;
+    let start = offsets[index] as usize;
+    let end = offsets[index + 1] as usize;
+    let mut jitcode: Arc<JitCode> = bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
         panic!(
-            "pyre-jit-trace: failed to deserialize jitcodes.bin \
-             ({} bytes): {e}",
-            BYTES.len(),
+            "pyre-jit-trace: failed to deserialize jitcodes.bin entry {index} \
+             ({start}..{end} of {} bytes): {e}",
+            BYTES.len()
         )
     });
     // RPython's translator AOT-compiles every helper into the same binary so
@@ -75,31 +119,45 @@ fn load_all_jitcodes() -> &'static [Arc<JitCode>] {
     // build-time addresses; patch each Arc<JitCode> in place — refcount is
     // still 1 here, no consumer has cloned yet — using
     // `pyre_interpreter::jit_trace_fnaddrs()`'s runtime values.
-    crate::runtime_fnaddr_patch::patch_constants_i_fnaddrs(&mut vec);
+    crate::runtime_fnaddr_patch::patch_constants_i_fnaddrs(std::slice::from_mut(&mut jitcode));
     // The codewriter also baked stale build-time host-static *data* addresses
     // (`PyType` singletons + prebuilt refs from `HostStaticAddrs`) into
     // `constants_i` — e.g. `is_int`'s `&INT_TYPE` inlined into `w_list_append`.
     // Re-pair them with the runtime addresses while refcount is still 1.
-    crate::runtime_fnaddr_patch::patch_static_addr_constants(&mut vec);
+    crate::runtime_fnaddr_patch::patch_static_addr_constants(std::slice::from_mut(&mut jitcode));
     // Deferred prebuilt-string constants the codewriter could not allocate
     // at build time (separate process) carry a non-canonical sentinel in
     // `constants_r`; materialize their immortal STR blocks and overwrite the
     // sentinels here, while refcount is still 1 — before any consumer can
     // observe a sentinel as a forged GCREF.
-    crate::runtime_fnaddr_patch::materialize_str_consts(&mut vec);
+    crate::runtime_fnaddr_patch::materialize_str_consts(std::slice::from_mut(&mut jitcode));
     // RPython codewriter.py:80: `all_jitcodes[jitcode.index] is jitcode`.
-    // Check at load time so any regression in
+    // Check per entry so any regression in
     // `collect_jitcodes_in_alloc_order` is caught immediately.
-    for (i, jc) in vec.iter().enumerate() {
-        assert_eq!(
-            jc.index(),
-            i,
-            "pyre-jit-trace: jitcode[{i}].index = {} (expected {i}); \
-             RPython invariant `all_jitcodes[i].index == i` broken",
-            jc.index(),
-        );
-    }
-    Box::leak(vec.into_boxed_slice())
+    assert_eq!(
+        jitcode.index(),
+        index,
+        "pyre-jit-trace: jitcode[{index}].index = {} (expected {index}); \
+         RPython invariant `all_jitcodes[i].index == i` broken",
+        jitcode.index(),
+    );
+    jitcode
+}
+
+fn load_jitcode_cells() -> &'static [OnceCell<Arc<JitCode>>] {
+    let cells = (0..jitcode_count())
+        .map(|_| OnceCell::new())
+        .collect::<Vec<_>>();
+    Box::leak(cells.into_boxed_slice())
+}
+
+fn jitcode_cells() -> &'static [OnceCell<Arc<JitCode>>] {
+    JITCODE_CELLS.with(|cell| *cell.get_or_init(load_jitcode_cells))
+}
+
+pub(crate) fn get_jitcode_ref_by_index(index: usize) -> Option<&'static Arc<JitCode>> {
+    let cell = jitcode_cells().get(index)?;
+    Some(cell.get_or_init(|| load_jitcode(index)))
 }
 
 fn load_compiled_jit_drivers() -> &'static [CompiledJitDriver] {
@@ -114,17 +172,24 @@ fn load_compiled_jit_drivers() -> &'static [CompiledJitDriver] {
     Box::leak(vec.into_boxed_slice())
 }
 
-/// RPython: `metainterp_sd.jitcodes` — full all_jitcodes table.
+/// RPython: `metainterp_sd.jitcodes` — explicitly force the full table.
 pub fn all_jitcodes() -> &'static [Arc<JitCode>] {
-    ALL_JITCODES.with(|cell| *cell.get_or_init(load_all_jitcodes))
+    FORCED_ALL_JITCODES.with(|cell| {
+        *cell.get_or_init(|| {
+            let all = (0..jitcode_count())
+                .map(|index| get_jitcode_by_index(index).unwrap())
+                .collect::<Vec<_>>();
+            Box::leak(all.into_boxed_slice())
+        })
+    })
 }
 
 /// RPython: `metainterp_sd.jitcodes[index]` where `index == jitcode.index`.
 ///
-/// The dense invariant (`ALL_JITCODES[i].index == i`) is asserted at load
-/// time, so direct vec indexing is correct.
+/// The dense invariant (`all_jitcodes[i].index == i`) is asserted when each
+/// entry is decoded, so direct indexed lookup is correct.
 pub fn get_jitcode_by_index(index: usize) -> Option<Arc<JitCode>> {
-    all_jitcodes().get(index).cloned()
+    get_jitcode_ref_by_index(index).cloned()
 }
 
 /// The source translator's exact `Assembler.indirectcalltargets` set as
@@ -157,7 +222,7 @@ fn build_indirectcalltargets() -> &'static [Arc<majit_metainterp::jitcode::JitCo
                 panic!(
                     "pyre-jit-trace: indirect-call target index {index} is \
                      outside all_jitcodes (len={})",
-                    all_jitcodes().len()
+                    jitcode_count()
                 )
             });
             Arc::new(majit_metainterp::jitcode::JitCode::from_canonical(
@@ -179,8 +244,7 @@ fn build_indirectcalltargets() -> &'static [Arc<majit_metainterp::jitcode::JitCo
 thread_local! {
     /// Cached portal jitcode index for the current thread.  See
     /// `portal_jitcode` for the resolution semantics.  `thread_local!`
-    /// because its initializer iterates `ALL_JITCODES` (also
-    /// thread_local).
+    /// because its initializer resolves the thread-local jitcode table.
     static PORTAL_JITCODE_INDEX: OnceCell<Option<usize>> = const { OnceCell::new() };
 }
 
@@ -190,7 +254,7 @@ fn compute_portal_jitcode_index_for_key(key: &str) -> Option<usize> {
         .iter()
         .find(|driver| driver.portal.canonical_key() == key)?;
     let index = driver.main_jitcode_index;
-    let jitcode = all_jitcodes().get(index).unwrap_or_else(|| {
+    let jitcode = get_jitcode_ref_by_index(index).unwrap_or_else(|| {
         panic!("configured portal `{key}` refers to missing JitCode index {index}",)
     });
     assert!(
@@ -252,12 +316,11 @@ pub fn portal_jitcode_for_key(key: &str) -> Option<Arc<JitCode>> {
 // builds a by-index sub-walk from `get_jitcode_by_index`.
 thread_local! {
     /// Cached `ALL_JITCODES` index of `w_list_append` for the current
-    /// thread. `thread_local!` because the initializer iterates
-    /// `ALL_JITCODES` (also thread_local).
+    /// thread. `thread_local!` because the names index is also thread-local.
     static LIST_APPEND_JITCODE_INDEX: OnceCell<Option<usize>> = const { OnceCell::new() };
 }
 
-/// Scan `ALL_JITCODES` for the unique entry whose `name` equals `name`.
+/// Scan the build-time names index for the unique entry equal to `name`.
 ///
 /// Returns `None` when no entry matches (e.g. compact test inputs that
 /// omit the helper). Panics on a duplicate leaf name — the by-name
@@ -266,11 +329,11 @@ thread_local! {
 /// regression that must surface immediately rather than silently pick
 /// the wrong body.
 fn compute_named_jitcode_index(name: &str) -> Option<usize> {
-    let all = all_jitcodes();
-    let mut hits = all
+    let mut hits = jitcode_index()
+        .names
         .iter()
         .enumerate()
-        .filter(|(_, jc)| jc.name == name)
+        .filter(|(_, jitcode_name)| *jitcode_name == name)
         .map(|(i, _)| i);
     let first = hits.next();
     if hits.next().is_some() {
@@ -1599,6 +1662,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn index_queries_do_not_decode_jitcode_bodies() {
+        std::thread::spawn(|| {
+            assert!(jitcode_cells().iter().all(|cell| cell.get().is_none()));
+            assert!(compute_named_jitcode_index("__missing_jitcode_name__").is_none());
+            assert!(jitcode_cells().iter().all(|cell| cell.get().is_none()));
+
+            assert!(get_jitcode_by_index(0).is_some());
+            assert!(jitcode_cells()[0].get().is_some());
+            assert_eq!(
+                jitcode_cells()
+                    .iter()
+                    .filter(|cell| cell.get().is_some())
+                    .count(),
+                1
+            );
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

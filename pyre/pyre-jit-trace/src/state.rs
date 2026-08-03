@@ -409,7 +409,7 @@ impl MetaInterpStaticData {
     /// Keep the leading `jitcodes` slots that a build-time jitcode's baked
     /// `JitCode::index` can name out of the runtime append space.
     ///
-    /// The build-time table is dense (`all_jitcodes()[i].index == i`), so its
+    /// The build-time table is dense (`get_jitcode_by_index(i).index == i`), so its
     /// length is exactly that range, and
     /// [`install_build_time_jitcode_at`] writes into it verbatim — a resume
     /// frame records the baked index and resolves it as `sd.jitcodes[index]`.
@@ -420,7 +420,11 @@ impl MetaInterpStaticData {
     ///
     /// Idempotent: a no-op once the leading slots exist.
     fn reserve_build_time_index_space(&mut self) {
-        let reserved = crate::jitcode_runtime::all_jitcodes().len();
+        // Snapshot the build -> runtime address correspondences here, at the
+        // instant the whole-table loader used to take them, rather than
+        // wherever the first lazy body decode lands.
+        crate::runtime_fnaddr_patch::prime_address_correspondences();
+        let reserved = crate::jitcode_runtime::jitcode_count();
         while self.jitcodes.len() < reserved {
             let index = self.jitcodes.len() as i32;
             let payload = std::sync::Arc::new(crate::PyJitCode::skeleton(std::ptr::null()));
@@ -756,7 +760,7 @@ pub fn install_jitcode_for(
 /// at exactly that slot.
 ///
 /// The two index spaces no longer overlap: the leading
-/// `all_jitcodes().len()` slots are reserved for build-time indices
+/// `jitcode_count()` slots are reserved for build-time indices
 /// (`MetaInterpStaticData::reserve_build_time_index_space`) and runtime
 /// PyCode entries append above them, so the write below can only replace a
 /// reserved skeleton or an earlier install of the same portal.
@@ -1360,7 +1364,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
 /// CodeObject. A novable driver over an extracted interpreter body — jd1
 /// `unpackiterable_driver`, whose jitcode is the
 /// `_unpackiterable_unknown_length` graph plus its inlined build-time callees —
-/// numbers against `jitcode_runtime::all_jitcodes()`.
+/// numbers against the lazy build-time jitcode table.
 ///
 /// Decoding one space's index against the other's table does not fail loudly,
 /// which is why the store has to be picked per driver rather than tried and

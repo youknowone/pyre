@@ -11,7 +11,7 @@ use walkdir::WalkDir;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v4";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v5";
 /// Retained cache entries. Each is ~6 MB, and a handful covers the
 /// configurations one checkout switches between (native/wasm × release/dev).
 const CODEGEN_CACHE_MAX_ENTRIES: usize = 8;
@@ -21,6 +21,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "jit_trace_gen.rs",
     "jit_metadata.json",
     "jitcodes.bin",
+    "jitcodes_index.bin",
     "indirectcalltargets.bin",
     "jit_drivers.bin",
     "insns.bin",
@@ -83,10 +84,10 @@ fn emit_llbc_extraction_placeholders() {
     )
     .unwrap();
     std::fs::write(format!("{out_dir}/jit_metadata.json"), b"{}\n").unwrap();
+    std::fs::write(format!("{out_dir}/jitcodes.bin"), b"").unwrap();
     std::fs::write(
-        format!("{out_dir}/jitcodes.bin"),
-        bincode::serialize(&Vec::<std::sync::Arc<majit_translate::jitcode::JitCode>>::new())
-            .unwrap(),
+        format!("{out_dir}/jitcodes_index.bin"),
+        bincode::serialize(&(Vec::<String>::new(), vec![0_u32])).unwrap(),
     )
     .unwrap();
     std::fs::write(
@@ -505,13 +506,26 @@ fn real_main() {
     std::fs::write(format!("{out_dir}/jit_metadata.json"), &json).unwrap();
 
     // Persist `pipeline.jitcodes` (RPython `all_jitcodes` from
-    // codewriter.py:89) as a
-    // single bincode artifact. Runtime deserializes this once into the shared
+    // codewriter.py:89) as individually encoded entries plus a name/offset
+    // index. Runtime materializes entries lazily into the shared
     // MetaInterpStaticData jitcodes store — same single-store model as
     // RPython `warmspot.py:281-282` `self.metainterp_sd.jitcodes =
     // codewriter.make_jitcodes()`.
-    let jitcodes_bin = bincode::serialize(&pipeline.jitcodes).unwrap();
+    let mut jitcodes_bin = Vec::new();
+    let mut jitcode_names = Vec::with_capacity(pipeline.jitcodes.len());
+    let mut jitcode_offsets = Vec::with_capacity(pipeline.jitcodes.len() + 1);
+    jitcode_offsets.push(0_u32);
+    for jitcode in &pipeline.jitcodes {
+        jitcode_names.push(jitcode.name.clone());
+        jitcodes_bin.extend(bincode::serialize(jitcode).unwrap());
+        jitcode_offsets.push(
+            u32::try_from(jitcodes_bin.len())
+                .expect("serialized jitcodes.bin exceeds the u32 offset range"),
+        );
+    }
+    let jitcodes_index_bin = bincode::serialize(&(jitcode_names, jitcode_offsets)).unwrap();
     std::fs::write(format!("{out_dir}/jitcodes.bin"), &jitcodes_bin).unwrap();
+    std::fs::write(format!("{out_dir}/jitcodes_index.bin"), &jitcodes_index_bin).unwrap();
     let indirectcalltargets_bin = bincode::serialize(&pipeline.indirectcalltarget_indices).unwrap();
     std::fs::write(
         format!("{out_dir}/indirectcalltargets.bin"),
@@ -634,13 +648,14 @@ fn real_main() {
 
     // Report
     eprintln!(
-        "[pyre-jit-trace build.rs] canonical analysis: {} JIT drivers, {} functions, {} blocks, {} flat ops, {} all_jitcodes ({} bytes bincode), generated {} bytes",
+        "[pyre-jit-trace build.rs] canonical analysis: {} JIT drivers, {} functions, {} blocks, {} flat ops, {} all_jitcodes ({} bytes bodies + {} bytes index), generated {} bytes",
         pipeline.jit_drivers.len(),
         pipeline.functions.len(),
         pipeline.total_blocks,
         pipeline.total_ops,
         pipeline.jitcodes.len(),
         jitcodes_bin.len(),
+        jitcodes_index_bin.len(),
         code.len(),
     );
 
