@@ -133,6 +133,17 @@ pub struct W_TypeObject {
     pub hasdict: bool,
     /// typeobject.py:181 `weakrefable` — True when instances support weakrefs.
     pub weakrefable: bool,
+    /// CPython 3.14 `PyTypeObject.tp_basicsize`, exposed through the readonly
+    /// `type.__basicsize__` member.  PyPy has no public equivalent; pyre keeps
+    /// the compatibility value on the type object itself, matching CPython's
+    /// owner and avoiding a parallel type-keyed side table.
+    pub abi_basicsize: i64,
+    /// CPython 3.14 `PyTypeObject.tp_itemsize` compatibility value.
+    pub abi_itemsize: i64,
+    /// CPython 3.14 `PyTypeObject.tp_weaklistoffset` compatibility value.
+    pub abi_weakrefoffset: i64,
+    /// CPython 3.14 `PyTypeObject.tp_dictoffset` compatibility value.
+    pub abi_dictoffset: i64,
     /// typeobject.py:210 `hasuserdel` — True when instances have a user
     /// `__del__` (computed at type creation, typeobject.py:1406/1475, and
     /// kept fresh by `mutated`).
@@ -383,6 +394,10 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
+        abi_basicsize: std::mem::size_of::<PyObject>() as i64,
+        abi_itemsize: 0,
+        abi_weakrefoffset: 0,
+        abi_dictoffset: 0,
         hasuserdel: false,
         flag_map_or_seq: std::sync::atomic::AtomicU8::new(b'?'),
         compares_by_identity_status: std::sync::atomic::AtomicU8::new(COMPARES_BY_IDENTITY_UNKNOWN),
@@ -473,6 +488,7 @@ pub fn w_type_new_builtin(
     dict_ptr: *mut u8,
     _layout_pytype: *const PyType,
 ) -> PyObjectRef {
+    let abi = cpython314_builtin_abi(name);
     let qualname_value = name.rsplit('.').next().unwrap_or(name).to_string();
     let name = crate::lltype::malloc_raw(name.to_string());
     let qualname = crate::lltype::malloc_raw(qualname_value);
@@ -502,6 +518,10 @@ pub fn w_type_new_builtin(
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
+        abi_basicsize: abi.0,
+        abi_itemsize: abi.1,
+        abi_weakrefoffset: abi.2,
+        abi_dictoffset: abi.3,
         hasuserdel: false,
         // typeobject.py:216 default; built-in dict/list/tuple
         // override via `w_type_set_flag_map_or_seq` at typedef
@@ -535,6 +555,102 @@ pub fn w_type_new_builtin(
     // collection could otherwise reclaim a young namespace value.
     register_builtin_type_roots(w_type as usize);
     w_type
+}
+
+/// CPython 3.14's static `PyTypeObject` layout members for the builtin types
+/// materialised by pyre.  CPython spells these values on the individual
+/// static type objects; pyre's TypeDef registry funnels their construction
+/// through one helper, so the same declarations are centralised here and
+/// copied into each `W_TypeObject` exactly once.
+fn cpython314_builtin_abi(name: &str) -> (i64, i64, i64, i64) {
+    match name {
+        "object" => (16, 0, 0, 0),
+        "type" => (936, 40, 368, 264),
+        "int" | "bool" => (24, 4, 0, 0),
+        "float" => (24, 0, 0, 0),
+        "complex" => (32, 0, 0, 0),
+        "str" => (64, 0, 0, 0),
+        "bytes" => (33, 1, 0, 0),
+        "bytearray" => (56, 0, 0, 0),
+        "list" => (40, 0, 0, 0),
+        "tuple" => (32, 8, 0, 0),
+        "dict" => (48, 0, 0, 0),
+        "set" | "frozenset" => (200, 0, 192, 0),
+        "memoryview" => (144, 8, 136, 0),
+        "range" | "zip" => (48, 0, 0, 0),
+        "slice" | "super" | "map" => (40, 0, 0, 0),
+        "enumerate" => (56, 0, 0, 0),
+        "filter" | "reversed" => (32, 0, 0, 0),
+        "staticmethod" | "classmethod" => (32, 0, 0, 24),
+        "property" => (64, 0, 0, 0),
+        "AttributeError" => (88, 0, 0, 16),
+        "BaseExceptionGroup" => (88, 0, 0, 16),
+        "ExceptionGroup" => (88, 0, -32, 16),
+        "ImportError" | "ModuleNotFoundError" => (104, 0, 0, 16),
+        "NameError" | "UnboundLocalError" | "StopIteration" | "SystemExit" => (80, 0, 0, 16),
+        "SyntaxError" | "IndentationError" | "TabError" | "_IncompleteInputError" => {
+            (144, 0, 0, 16)
+        }
+        "UnicodeDecodeError"
+        | "UnicodeEncodeError"
+        | "UnicodeTranslateError"
+        | "OSError"
+        | "BlockingIOError"
+        | "BrokenPipeError"
+        | "ChildProcessError"
+        | "ConnectionAbortedError"
+        | "ConnectionError"
+        | "ConnectionRefusedError"
+        | "ConnectionResetError"
+        | "FileExistsError"
+        | "FileNotFoundError"
+        | "InterruptedError"
+        | "IsADirectoryError"
+        | "NotADirectoryError"
+        | "PermissionError"
+        | "ProcessLookupError"
+        | "TimeoutError" => (112, 0, 0, 16),
+        "BaseException"
+        | "Exception"
+        | "ArithmeticError"
+        | "AssertionError"
+        | "BufferError"
+        | "BytesWarning"
+        | "DeprecationWarning"
+        | "EOFError"
+        | "EncodingWarning"
+        | "FloatingPointError"
+        | "FutureWarning"
+        | "GeneratorExit"
+        | "IndexError"
+        | "KeyError"
+        | "KeyboardInterrupt"
+        | "LookupError"
+        | "MemoryError"
+        | "NotImplementedError"
+        | "OverflowError"
+        | "PendingDeprecationWarning"
+        | "PythonFinalizationError"
+        | "RecursionError"
+        | "ReferenceError"
+        | "ResourceWarning"
+        | "RuntimeError"
+        | "RuntimeWarning"
+        | "StopAsyncIteration"
+        | "SystemError"
+        | "TypeError"
+        | "UnicodeError"
+        | "UnicodeWarning"
+        | "UserWarning"
+        | "ValueError"
+        | "Warning"
+        | "ZeroDivisionError" => (72, 0, 0, 16),
+        // CPython's remaining fixed-size builtin objects are at least the
+        // two-word object header.  Their exact declarations can be added as
+        // each corresponding TypeDef is ported; the core builtins above are
+        // the complete `builtins` module surface.
+        _ => (std::mem::size_of::<PyObject>() as i64, 0, 0, 0),
+    }
 }
 
 /// `dictmultiobject.py:153 UNKNOWN` — cache miss; recompute via
@@ -732,6 +848,64 @@ pub unsafe fn w_type_get_hasdict(obj: PyObjectRef) -> bool {
 }
 pub unsafe fn w_type_set_hasdict(obj: PyObjectRef, v: bool) {
     (*(obj as *mut W_TypeObject)).hasdict = v;
+}
+
+/// CPython 3.14 `type_members` ABI layout accessors.
+pub unsafe fn w_type_get_abi_basicsize(obj: PyObjectRef) -> i64 {
+    (*(obj as *const W_TypeObject)).abi_basicsize
+}
+
+pub unsafe fn w_type_get_abi_itemsize(obj: PyObjectRef) -> i64 {
+    (*(obj as *const W_TypeObject)).abi_itemsize
+}
+
+pub unsafe fn w_type_get_abi_weakrefoffset(obj: PyObjectRef) -> i64 {
+    (*(obj as *const W_TypeObject)).abi_weakrefoffset
+}
+
+pub unsafe fn w_type_get_abi_dictoffset(obj: PyObjectRef) -> i64 {
+    (*(obj as *const W_TypeObject)).abi_dictoffset
+}
+
+/// Finish CPython 3.14 ABI-member layout for a heap type after PyPy's
+/// `create_all_slots` has established its best base, visible slots, dict and
+/// weakref capabilities.  CPython inherits the variable-item width and the
+/// base's native dict/weakref offsets; new managed dict/weakref storage uses
+/// its negative sentinel offsets.
+pub unsafe fn w_type_finish_heap_abi_layout(
+    obj: PyObjectRef,
+    best_base: PyObjectRef,
+    visible_newslots: u32,
+) {
+    let word = std::mem::size_of::<PyObjectRef>() as i64;
+    let (base_size, itemsize, base_weakref, base_dict) = if best_base.is_null() {
+        (std::mem::size_of::<PyObject>() as i64, 0, 0, 0)
+    } else {
+        let base = &*(best_base as *const W_TypeObject);
+        (
+            base.abi_basicsize,
+            base.abi_itemsize,
+            base.abi_weakrefoffset,
+            base.abi_dictoffset,
+        )
+    };
+    let ty = &mut *(obj as *mut W_TypeObject);
+    ty.abi_basicsize = base_size + i64::from(visible_newslots) * word;
+    ty.abi_itemsize = itemsize;
+    ty.abi_dictoffset = if base_dict != 0 {
+        base_dict
+    } else if ty.hasdict {
+        -1
+    } else {
+        0
+    };
+    ty.abi_weakrefoffset = if base_weakref != 0 {
+        base_weakref
+    } else if itemsize == 0 && ty.weakrefable {
+        -4 * word
+    } else {
+        0
+    };
 }
 
 /// typeobject.py:295 `self._version_tag` — the raw cache-version field

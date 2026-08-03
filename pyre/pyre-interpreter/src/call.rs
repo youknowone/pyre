@@ -5142,6 +5142,13 @@ pub unsafe fn create_all_slots(
         }
 
         // typeobject.py:1199-1204: layout computation
+        // `__dict_data__` is pyre's internal dict-subclass payload slot, not
+        // a Python-visible `__slots__` entry and therefore not part of
+        // CPython's `tp_basicsize` accounting.
+        let visible_newslots = newslotnames
+            .iter()
+            .filter(|name| name.as_str() != "__dict_data__")
+            .count() as u32;
         let nslots = base_nslots + newslotnames.len() as u32;
         let typedef = if base_layout.is_null() {
             &pyre_object::pyobject::INSTANCE_TYPE as *const _
@@ -5167,6 +5174,11 @@ pub unsafe fn create_all_slots(
             })
         };
         pyre_object::w_type_set_layout(w_type, layout);
+        pyre_object::typeobject::w_type_finish_heap_abi_layout(
+            w_type,
+            w_bestbase,
+            visible_newslots,
+        );
         Ok(())
     }
 }

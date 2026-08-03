@@ -10504,20 +10504,25 @@ fn init_type_type(ns: PyObjectRef) {
         )
     };
 
-    // CPython 3.14 typeobject.c `type_members`: the `tp_flags` field is a
-    // readonly member_descriptor.  Its value is computed from the same PyPy
-    // W_TypeObject flags as the former `descr__flags` GetSetProperty.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__flags__",
-            pyre_object::w_member_new_direct(
-                pyre_object::MEMBER_TYPE_FLAGS,
-                "__flags__".to_owned(),
-                PY_NULL,
-            ),
-        )
-    };
+    // CPython 3.14 typeobject.c `type_members`, in declaration order.  The
+    // values live on each W_TypeObject just as CPython stores them on each
+    // PyTypeObject; flags and best-base retain PyPy's computed semantics.
+    for (name, kind) in [
+        ("__basicsize__", pyre_object::MEMBER_TYPE_BASICSIZE),
+        ("__itemsize__", pyre_object::MEMBER_TYPE_ITEMSIZE),
+        ("__flags__", pyre_object::MEMBER_TYPE_FLAGS),
+        ("__weakrefoffset__", pyre_object::MEMBER_TYPE_WEAKREFOFFSET),
+        ("__base__", pyre_object::MEMBER_TYPE_BASE),
+        ("__dictoffset__", pyre_object::MEMBER_TYPE_DICTOFFSET),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                pyre_object::w_member_new_direct(kind, name.to_owned(), PY_NULL),
+            )
+        };
+    }
 
     // typeobject.py:1220-1230 `type_get_text_signature` and
     // W_TypeObject.typedef's `__text_signature__` GetSetProperty. Keeping
@@ -10905,22 +10910,6 @@ fn init_type_type(ns: PyObjectRef) {
                 bases_setter,
                 make_builtin_function_with_arity("__bases__", type_del_bases, 2),
                 "__bases__",
-            ),
-        )
-    };
-
-    // PyPy typeobject.py:973-975 `descr__base`, exposed with CPython 3.14's
-    // readonly `type_members.__base__` descriptor kind.  The direct getter
-    // still follows PyPy's best-base rule rather than blindly choosing
-    // `bases[0]`.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__base__",
-            pyre_object::w_member_new_direct(
-                pyre_object::MEMBER_TYPE_BASE,
-                "__base__".to_owned(),
-                PY_NULL,
             ),
         )
     };
@@ -12035,6 +12024,18 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
             let value = unsafe { pyre_object::typeobject::w_type_get_best_base(obj) };
             Ok(if value.is_null() { w_none() } else { value })
         }
+        pyre_object::MEMBER_TYPE_BASICSIZE => Ok(w_int_new(unsafe {
+            pyre_object::w_type_get_abi_basicsize(obj)
+        })),
+        pyre_object::MEMBER_TYPE_ITEMSIZE => Ok(w_int_new(unsafe {
+            pyre_object::w_type_get_abi_itemsize(obj)
+        })),
+        pyre_object::MEMBER_TYPE_WEAKREFOFFSET => Ok(w_int_new(unsafe {
+            pyre_object::w_type_get_abi_weakrefoffset(obj)
+        })),
+        pyre_object::MEMBER_TYPE_DICTOFFSET => Ok(w_int_new(unsafe {
+            pyre_object::w_type_get_abi_dictoffset(obj)
+        })),
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
         pyre_object::MEMBER_DESCR_NAME => unsafe { descr_member_name(obj) },
         _ => Err(crate::PyError::attribute_error(unsafe {
@@ -16612,18 +16613,6 @@ fn init_int_type(ns: PyObjectRef) {
             ns,
             "__new__",
             make_new_descr(int_descr_new),
-        )
-    };
-    // CPython 3.14 exposes the storage digit width on the type and reports
-    // the same four-byte, 30-bit ABI through `sys.int_info`.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__itemsize__", w_int_new(4))
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__basicsize__",
-            w_int_new(3 * std::mem::size_of::<usize>() as i64),
         )
     };
     // intobject.py descr_repr. CPython 3.14 inherits object.__str__, whose
