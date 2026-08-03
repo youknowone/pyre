@@ -7185,14 +7185,16 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `RBigInt::digits{,_mut}` and `W_ListObject::object_items_slice
-                // {,_mut}` are Rust view adapters around an `ItemsBlock` /
+                // `RBigInt::digits{,_mut}` is a Rust view adapter around a
                 // typed-items GcArray:
-                // `slice::from_raw_parts(items_base(block), len)`.  The items-base
-                // call above already aliases the header pointer so the gcarray
-                // descr re-applies `base_size`; the resulting slice is therefore
-                // the same array value in the translated model. Fold only these
-                // enclosing accessors, not arbitrary raw slices.
+                // `slice::from_raw_parts(items_base(block), capacity)`.  The
+                // items-base call above already aliases the header pointer so the
+                // gcarray descr re-applies `base_size`; the resulting slice is
+                // therefore the same array value in the translated model, and its
+                // length is the block capacity the descr reports.  Fold only these
+                // capacity-length enclosing accessors, not arbitrary raw slices
+                // (`object_items_slice` uses the logical list length, not the
+                // capacity — see [`is_container_items_view_from_raw_parts`]).
                 if args.len() == 2 && self.is_container_items_view_from_raw_parts(&reg) {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
@@ -9508,25 +9510,25 @@ impl<'a> Lowering<'a> {
     }
 
     /// `slice::from_raw_parts{,_mut}` inside a container's items-view adapter:
-    /// `RBigInt::digits{,_mut}` and `W_ListObject::object_items_slice{,_mut}`.
-    /// The base argument is an `items_block_items_base` / typed-items accessor,
+    /// `RBigInt::digits{,_mut}`.  The base argument is a typed-items accessor,
     /// already aliased to the block header (`graph_is_items_block_base_accessor`)
-    /// so the object/digit gcarray descr re-applies `base_size`; the resulting
-    /// slice is that same array value in the translated model.  Both back an
-    /// `ItemsBlock`, whose consumers index through a descr (the offset-mediated
-    /// case), so the receiver alias is sound.  Fold only these enclosing
-    /// accessors, not arbitrary raw slices.
+    /// so the digit gcarray descr re-applies `base_size`; the resulting slice is
+    /// that same array value in the translated model.  It backs an `ItemsBlock`,
+    /// whose consumers index through a descr, so the receiver alias is sound.
+    ///
+    /// Only capacity-length views qualify: `digits` builds its slice with
+    /// `from_raw_parts(base, capacity)` (the block header's own length), so the
+    /// header-alias descr (which reports capacity) preserves the length exactly.
+    /// `W_ListObject::object_items_slice{,_mut}` is deliberately EXCLUDED — it
+    /// uses `from_raw_parts(base, self.length)`, the *logical* list length,
+    /// which is `< capacity` when the block is over-allocated (e.g. after
+    /// `pop`).  Aliasing it to the header would make `items.len()` report
+    /// capacity, so `w_list_getitem` would accept an index in
+    /// `[length, capacity)` and return a stale slot instead of raising.  Fold
+    /// only the capacity-length enclosing accessors, not arbitrary raw slices.
     fn is_container_items_view_from_raw_parts(&self, reg: &RegularCall) -> bool {
         if !(self.graph.name.ends_with("rbigint::<Impl>::digits")
-            || self.graph.name.ends_with("rbigint::<Impl>::digits_mut")
-            || self
-                .graph
-                .name
-                .ends_with("listobject::<Impl>::object_items_slice")
-            || self
-                .graph
-                .name
-                .ends_with("listobject::<Impl>::object_items_slice_mut"))
+            || self.graph.name.ends_with("rbigint::<Impl>::digits_mut"))
         {
             return false;
         }
@@ -23493,6 +23495,77 @@ mod tests {
         assert_eq!(
             pos0_reads, 0,
             "the &mut niche arm must keep folding __pos_0"
+        );
+    }
+
+    /// `W_ListObject::object_items_slice` builds its slice with
+    /// `from_raw_parts(base, self.length)` (the LOGICAL list length, `<`
+    /// capacity for an over-allocated block), so it must NOT fold to the
+    /// items-block header (whose gcarray descr reports capacity). The residual
+    /// `from_raw_parts` call must survive. Loads the pyre-object LLBC (the
+    /// accessor lives in `pyre_object::listobject`), so ignored by default.
+    #[test]
+    #[ignore]
+    fn object_items_slice_keeps_residual_from_raw_parts_not_header_alias() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let graph =
+            super::lower_function(&llbc, "object_items_slice").expect("lower object_items_slice");
+        let from_raw_parts_calls = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some("from_raw_parts")
+                )
+            })
+            .count();
+        assert!(
+            from_raw_parts_calls >= 1,
+            "object_items_slice must keep its residual from_raw_parts (logical \
+             length != capacity), not alias to the items-block header"
+        );
+    }
+
+    /// Regression: `RBigInt::digits` uses `from_raw_parts(base, capacity)` — the
+    /// block's own length — so its header alias IS sound and must STILL fold
+    /// (the P1 fix removes only the object-list arm). The residual
+    /// `from_raw_parts` must be gone. Loads the pyre-object LLBC, ignored.
+    #[test]
+    #[ignore]
+    fn rbigint_digits_still_folds_capacity_length_view() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let graph = super::lower_function(&llbc, "rbigint::<Impl>::digits")
+            .or_else(|_| super::lower_function(&llbc, "digits"))
+            .expect("lower digits");
+        let from_raw_parts_calls = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some("from_raw_parts")
+                )
+            })
+            .count();
+        assert_eq!(
+            from_raw_parts_calls, 0,
+            "rbigint digits (capacity-length view) must still fold to the \
+             items-block header, leaving no residual from_raw_parts"
         );
     }
 
