@@ -14868,11 +14868,14 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
         return inner;
     }
     // `OpArg` and compiler-core's `newtype_oparg!` wrappers are transparent
-    // u32 bytecode operands.  Their dependency declarations are opaque in
-    // interpreter LLBC, so model the exact upstream family as bare integers
-    // (`tyref_is_oparg`).
+    // `u32` bytecode operands.  Their dependency declarations are opaque in
+    // interpreter LLBC, so model the exact upstream family as unsigned
+    // integers (`tyref_is_oparg`).  This is not merely a register-bank
+    // choice: `SomeInteger(unsigned=True)` carries the non-negative fact
+    // through annotation, which is required when an oparg-derived count is
+    // passed to a `u32`/`usize` helper.
     if tyref_is_oparg(ty, llbc) {
-        return ValueType::Int;
+        return ValueType::Unsigned;
     }
     // A fieldless (C-like) enum is represented by-value as its
     // discriminant integer — RPython has no enum type; a fieldless enum
