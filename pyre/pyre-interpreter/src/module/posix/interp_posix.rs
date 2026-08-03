@@ -4524,21 +4524,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "{fn_name}(): {arg_name} must be a list or tuple",
                     )));
                 };
-                items
-                    .into_iter()
-                    .map(|s| {
-                        // `interp_posix.py:1742 args = [space.fsencode_w(w_arg)
-                        // for w_arg in args_w]`: every argv/envp entry crosses
-                        // to the new process as filesystem bytes, and the same
-                        // converter decides what an entry may be.
-                        let bytes = crate::gateway::fsencode_bytes_w(s)?;
-                        std::ffi::CString::new(bytes).map_err(|_| {
-                            crate::PyError::value_error(format!(
-                                "{fn_name}(): embedded null in {arg_name}",
-                            ))
-                        })
-                    })
-                    .collect()
+                // `interp_posix.py:1742 args = [space.fsencode_w(w_arg)
+                // for w_arg in args_w]`: every argv/envp entry crosses
+                // to the new process as filesystem bytes, and the same
+                // converter decides what an entry may be.
+                // `fsencode_bytes_w` reaches `__fspath__` for a non-str, non-bytes entry, so
+                // encoding one entry can collect and move the entries not yet converted.
+                // Publish the sequence once and read each entry back per iteration.
+                let _seq_roots = pyre_object::gc_roots::push_roots();
+                let items_base = pyre_object::gc_roots::pin_roots(&items);
+                let mut out = Vec::with_capacity(items.len());
+                for i in 0..items.len() {
+                    let bytes = crate::gateway::fsencode_bytes_w(
+                        pyre_object::gc_roots::shadow_stack_get(items_base + i),
+                    )?;
+                    out.push(std::ffi::CString::new(bytes).map_err(|_| {
+                        crate::PyError::value_error(format!(
+                            "{fn_name}(): embedded null in {arg_name}",
+                        ))
+                    })?);
+                }
+                Ok(out)
             }
             fn decode_file_actions(
                 obj: pyre_object::PyObjectRef,
