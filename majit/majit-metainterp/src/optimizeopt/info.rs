@@ -522,10 +522,25 @@ impl PtrInfoExt for PtrInfo {
                         ));
                     }
                 } else if let Some(descr) = &info.descr {
+                    // info.py:346-352 reads `self.descr.get_vtable()`
+                    // unconditionally once the descr is present. Every pyre
+                    // producer of an `InstancePtrInfo` descr proves the
+                    // downcast: `ensure_ptr_info_arg0` unwraps the identical
+                    // `parent_descr` with `.expect` before it builds the info
+                    // (mod.rs:8362-8366), and `deserialize_optheap` asserts
+                    // the same shape on the same value (heap.rs:3691-3696).
+                    // A fabricated `0` would reach the backend as classptr 0
+                    // and panic in the subclass-range lookup
+                    // (aarch64/assembler.rs:3785-3792), naming the wrong layer.
+                    // A real `SizeDescr` whose `vtable()` is 0 is left alone:
+                    // that is the headerless state, not a manufactured one.
                     let vtable = descr
                         .as_size_descr()
-                        .map(|sd| sd.vtable() as i64)
-                        .unwrap_or(0);
+                        .expect(
+                            "InstancePtrInfo.descr must be a SizeDescr \
+                             (optimizer.py:480-481 InstancePtrInfo(parent_descr))",
+                        )
+                        .vtable() as i64;
                     let vtable_const = alloc_const(ctx, Value::Int(vtable));
                     short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
                     if !ctx.remove_gctypeptr {
@@ -548,24 +563,33 @@ impl PtrInfoExt for PtrInfo {
                 //       short.extend([GUARD_NONNULL[op],
                 //                     GUARD_GC_TYPE[op, c_typeid]])
                 short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
+                // `StructPtrInfo.descr` is a plain `DescrRef`
+                // (ptr_info.rs:232-239), so info.py:361 `if self.descr is not
+                // None` is unconditionally true here and the `SizeDescr`
+                // downcast cannot legitimately fail: `ensure_ptr_info_arg0`
+                // proves it on the same `parent_descr` one line before it
+                // builds the info (mod.rs:8362-8366), and the VirtualStruct
+                // force path hands its descr to `handle_new`, which unwraps a
+                // `SizeDescr` (majit-gc/src/rewrite.rs:1109-1112).  A tid may
+                // not be invented for a descr that cannot name one: the
+                // allocator never mints 0 (majit-ir/src/descr.rs:766-769,
+                // `next_type_id = 1`, `gctypelayout.py:328-331`) while the
+                // runtime header tid 0 is the live `rclass.OBJECT` root
+                // (pyre-jit-trace/src/descr.rs:475), so a fabricated 0 would
+                // pass on any plain `object` instance and certify a layout the
+                // optimizer never named.
+                let sd = info.descr.as_size_descr().expect(
+                    "StructPtrInfo.descr must be a SizeDescr \
+                     (optimizer.py:481 info.StructPtrInfo(parent_descr))",
+                );
                 // GUARD_GC_TYPE only for a real headered `GcStruct`: it
                 // reads a type-id word at `ref - 8` (the GC header).  A raw
                 // native struct and a headerless nursery allocation both lack
                 // that word, so the guard would read payload bytes and fail
                 // spuriously.  RPython emits GUARD_GC_TYPE only when a header
                 // exists; headerless structs get GUARD_NONNULL only.
-                // No descr → preserve the guard (default true).
-                let has_gc_type_header = info
-                    .descr
-                    .as_size_descr()
-                    .map(|sd| sd.is_gc_managed() && !sd.headerless())
-                    .unwrap_or(true);
-                if has_gc_type_header {
-                    let type_id = info
-                        .descr
-                        .as_size_descr()
-                        .map(|sd| sd.type_id() as i64)
-                        .unwrap_or(0);
+                if sd.is_gc_managed() && !sd.headerless() {
+                    let type_id = sd.type_id() as i64;
                     let type_id_const = alloc_const(ctx, Value::Int(type_id));
                     short.push(Op::new(
                         OpCode::GuardGcType,
@@ -587,6 +611,18 @@ impl PtrInfoExt for PtrInfo {
                 //       short.append(lenop)
                 //       self.lenbound.make_guards(lenop, short, optimizer)
                 short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
+                // `ArrayPtrInfo.descr` is a plain `DescrRef`
+                // (ptr_info.rs:245-255) and info.py:634 reads
+                // `self.descr.get_type_id()` unconditionally.  Every producer
+                // feeds an array-op descr (optimizer.py:485-487
+                // `info.ArrayPtrInfo(op.getdescr())`, mod.rs:8383-8388) — the
+                // same Arc the mandatory GC rewrite unwraps as an `ArrayDescr`
+                // (majit-gc/src/rewrite.rs:2038-2040, :2186-2189, :2469-2472),
+                // including for the ARRAYLEN_GC this arm itself emits below.
+                let ad = info.descr.as_array_descr().expect(
+                    "ArrayPtrInfo.descr must be an ArrayDescr \
+                     (optimizer.py:487 info.ArrayPtrInfo(op.getdescr()))",
+                );
                 // GUARD_GC_TYPE reads a type-id word at `ptr -
                 // GcHeader::SIZE`; a header-less raw native pointer-array
                 // (a `pool_arrays` base minted by `add_ptr_array_descr`,
@@ -594,18 +630,8 @@ impl PtrInfoExt for PtrInfo {
                 // would read content-dependent memory before the array
                 // and fail on every short-preamble re-entry.  Gate it the
                 // same way the `PtrInfo::Struct` arm gates a raw struct.
-                // No descr → preserve the guard (default true).
-                let is_gc_managed = info
-                    .descr
-                    .as_array_descr()
-                    .map(|ad| ad.is_gc_managed())
-                    .unwrap_or(true);
-                if is_gc_managed {
-                    let type_id = info
-                        .descr
-                        .as_array_descr()
-                        .map(|ad| ad.type_id() as i64)
-                        .unwrap_or(0);
+                if ad.is_gc_managed() {
+                    let type_id = ad.type_id() as i64;
                     let type_id_const = alloc_const(ctx, Value::Int(type_id));
                     short.push(Op::new(
                         OpCode::GuardGcType,
