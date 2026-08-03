@@ -55,8 +55,16 @@ pub(crate) fn newmemoryview(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
     })?;
     let fmt_obj = arg(2, "format")?
         .ok_or_else(|| PyError::type_error("newmemoryview() missing required argument 'format'"))?;
-    let shape_obj = arg(3, "shape")?.unwrap_or_else(pyre_object::w_none);
-    let strides_obj = arg(4, "strides")?.unwrap_or_else(pyre_object::w_none);
+    // `if w_shape` / `if w_strides` are RPython reference tests, not truth
+    // tests: only an omitted argument selects the derive-it path.  An empty
+    // sequence still counts as supplied, and so does an explicit `None`, which
+    // then fails in `dimensions` with "'NoneType' object is not iterable".
+    let shape_arg = arg(3, "shape")?;
+    let strides_arg = arg(4, "strides")?;
+    let has_shape = shape_arg.is_some();
+    let has_strides = strides_arg.is_some();
+    let shape_obj = shape_arg.unwrap_or_else(pyre_object::w_none);
+    let strides_obj = strides_arg.unwrap_or_else(pyre_object::w_none);
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     for value in [w_obj, itemsize_obj, fmt_obj, shape_obj, strides_obj] {
@@ -74,17 +82,12 @@ pub(crate) fn newmemoryview(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
     }
     let fmt = unsafe { pyre_object::w_str_get_wtf8(fmt_obj) }.to_string();
     let shape_obj = pyre_object::gc_roots::shadow_stack_get(sp + 3);
-    // `if w_shape` / `if w_strides` are RPython reference tests, not truth
-    // tests: an empty sequence still counts as supplied, and only the default
-    // `None` selects the derive-it path.
-    let has_shape = !unsafe { pyre_object::is_none(shape_obj) };
     let shape = if has_shape {
         dimensions(shape_obj)?
     } else {
         Vec::new()
     };
     let strides_obj = pyre_object::gc_roots::shadow_stack_get(sp + 4);
-    let has_strides = !unsafe { pyre_object::is_none(strides_obj) };
     let strides = if has_strides {
         dimensions(strides_obj)?
     } else {

@@ -11129,21 +11129,19 @@ fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    let obj = args[0];
-    let has_dict = unsafe {
-        pyre_object::is_instance(obj)
-            || pyre_object::is_type(obj)
-            || crate::is_function(obj)
-            || pyre_object::is_module(obj)
+    // app_inspect.py:21-24 — the attribute lookup itself decides whether the
+    // argument qualifies, so anything carrying a `__dict__` descriptor answers,
+    // including exceptions.  Only AttributeError becomes the TypeError.
+    let dict = match crate::baseobjspace::getattr_str(args[0], "__dict__") {
+        Ok(dict) => dict,
+        Err(error) if error.kind == crate::PyErrorKind::AttributeError => {
+            return Err(crate::PyError::type_error(
+                "vars() argument must have __dict__ attribute",
+            ));
+        }
+        Err(error) => return Err(error),
     };
-    if !has_dict {
-        return Err(crate::PyError::type_error(
-            "vars() argument must have __dict__ attribute",
-        ));
-    }
-    let dict = crate::baseobjspace::getattr_str(obj, "__dict__")
-        .map_err(|_| crate::PyError::type_error("vars() argument must have __dict__ attribute"))?;
-    if dict.is_null() || unsafe { pyre_object::is_none(dict) } {
+    if dict.is_null() {
         return Err(crate::PyError::type_error(
             "vars() argument must have __dict__ attribute",
         ));
