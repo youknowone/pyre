@@ -8438,10 +8438,11 @@ pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
 ///
 /// The C ABI returns `f64` in xmm0 / d0, so a float-returning callee cannot be
 /// reached through [`call_int_function`]'s `-> i64` transmute — that reads the
-/// integer return register.  Float *arguments* have the same problem in the
-/// other direction: they travel in the FP register file, so they are split out
-/// here and handed to [`bh_call_f_dispatch`], which is pyre's stand-in for the
-/// per-descr stub `descr.py:598-612 create_call_stub` generates upstream.
+/// integer return register. Float *arguments* have the same problem in the
+/// other direction: they travel in the FP register file, so the ordered C-ABI
+/// class sequence is handed to [`bh_call_f_dispatch`], which is pyre's
+/// stand-in for the per-descr stub `descr.py:574` / `descr.py:604-605
+/// create_call_stub` generates upstream.
 ///
 /// `args[i]` for a `Type::Float` slot carries the raw `f64::to_bits`, matching
 /// the `args_f` bank convention (`longlong` float storage).
@@ -8452,34 +8453,7 @@ pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
 /// Neither can arrive here: this seam is fed by `descr.arg_types()`, and
 /// `CallDescr::arg_classes` (`majit-ir/src/descr.rs`) maps `Type` onto
 /// `'i'`/`'r'`/`'f'`/`'v'` exhaustively, so a `Type::Float` slot is always
-/// class `'f'`.  Teaching `Type` those classes must extend both sites.
-///
-/// # Panics
-/// `bh_call_f_dispatch` recovers the callee signature from the *bucketed*
-/// `(ints, floats)` arity, i.e. `fn(I × ints, F × floats)`.  Reordering an
-/// interleaved signature into that shape is ABI-preserving only where the
-/// integer and floating-point parameters are assigned from two independent
-/// register files in their own relative order (SysV, AAPCS).  The Microsoft
-/// x64 convention instead assigns the first four arguments *by position* —
-/// `fn(f64, i64)` takes xmm0/rdx where `fn(i64, f64)` takes rcx/xmm1 — so the
-/// reordering would put both arguments in the wrong register there.  An
-/// interleaved signature is therefore rejected rather than dispatched
-/// differently per target.  Upstream needs no such restriction because
-/// `descr.py:598-612 create_call_stub` generates a stub carrying the descr's
-/// real `arg_classes` signature; the convergence path for pyre is the libffi
-/// dispatch already recorded at `call_stub.rs` `dispatch_arity_body!`'s
-/// catch-all arm.
-///
-/// An interleaved float-returning helper does exist —
-/// `jit_math_ldexp_raw(f64, i64) -> f64`, whose descr is minted with
-/// `arg_types = [Float, Int]` in `pyre-jit-trace`'s `specialize.rs`.  It does
-/// not reach here: the walker specializer records it straight onto the trace
-/// via `TraceCtx::call_float_typed_with_effect` and obtains its concrete result
-/// by calling the builtin separately, so the descr is consumed by the compiled
-/// backends and by the blackhole's `bh_call_f_by_classes` (which buckets by
-/// `arg_classes` with no such restriction).  This seam is fed only from the
-/// jitcode descr pool, and no descr there places an integer/ref slot after a
-/// float one.
+/// class `'f'`. Teaching `Type` those classes must extend both sites.
 pub fn call_float_function(func_ptr: *const (), args: &[i64], arg_types: &[Type]) -> f64 {
     // Where a backend cannot build a `call_indirect` whose type matches the
     // callee's real signature (wasm32), route through the host trampoline,
@@ -8487,25 +8461,26 @@ pub fn call_float_function(func_ptr: *const (), args: &[i64], arg_types: &[Type]
     if let Some(hook) = majit_backend::call_stub::residual_host_call() {
         return f64::from_bits(hook(func_ptr as usize, args) as u64);
     }
-    let mut int_args: Vec<i64> = Vec::with_capacity(args.len());
-    let mut float_args: Vec<f64> = Vec::new();
-    for (i, &a) in args.iter().enumerate() {
-        match arg_types.get(i) {
-            Some(Type::Float) => float_args.push(f64::from_bits(a as u64)),
-            _ => {
-                assert!(
-                    float_args.is_empty(),
-                    "call_float_function: an integer/ref parameter after a float \
-                     one cannot be bucketed into `bh_call_f_dispatch`'s \
-                     `fn(I.., F..)` signature without changing which register \
-                     each argument lands in on a positional-slot ABI"
-                );
-                int_args.push(a);
-            }
-        }
+    assert!(
+        args.len() <= MAX_HOST_CALL_ARITY,
+        "unsupported JitCode float call arity {} (max {})",
+        args.len(),
+        MAX_HOST_CALL_ARITY
+    );
+    let mut classes = [majit_backend::call_stub::ArgClass::Int; MAX_HOST_CALL_ARITY];
+    for i in 0..args.len() {
+        classes[i] = match arg_types.get(i) {
+            Some(Type::Float) => majit_backend::call_stub::ArgClass::Float,
+            Some(Type::Int | Type::Ref) | None => majit_backend::call_stub::ArgClass::Int,
+            Some(Type::Void) => panic!("call_float_function: void argument at slot {i}"),
+        };
     }
     unsafe {
-        majit_backend::call_stub::bh_call_f_dispatch(func_ptr as usize, &int_args, &float_args)
+        majit_backend::call_stub::bh_call_f_dispatch(
+            func_ptr as usize,
+            &classes[..args.len()],
+            args,
+        )
     }
 }
 
@@ -8927,23 +8902,16 @@ mod tests {
         x * k as f64
     }
 
-    /// The bucketing `call_float_function` performs is register-preserving
-    /// where the two register files are filled independently (SysV, AAPCS) and
-    /// not where the argument slots are positional (Microsoft x64), so an
-    /// integer/ref parameter following a float one is refused rather than
-    /// dispatched differently per target.  Locks that contract in place.
     #[test]
-    #[should_panic(expected = "cannot be bucketed")]
-    fn interleaved_int_after_float_is_refused() {
-        call_float_function(
+    fn interleaved_int_after_float_dispatches_in_declaration_order() {
+        let result = call_float_function(
             scale_f64 as *const (),
             &[2.5_f64.to_bits() as i64, 3],
             &[Type::Float, Type::Int],
         );
+        assert_eq!(result, 7.5, "scale_f64(2.5, 3) == 7.5");
     }
 
-    /// The same argument classes in non-interleaved order are dispatchable:
-    /// only the ordering is refused, not the presence of both classes.
     #[test]
     fn float_after_int_dispatches() {
         extern "C" fn scale_swapped(k: i64, x: f64) -> f64 {

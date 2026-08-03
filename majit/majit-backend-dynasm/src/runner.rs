@@ -3341,11 +3341,9 @@ impl Backend for DynasmBackend {
 
     /// llmodel.py:816 bh_call_i: ABI-correct dispatch via the shared call stub.
     ///
-    /// On ARM64/x86-64 the C ABI assigns integer and float args to independent
-    /// register files, so a typed `extern "C" fn(I × ints, F × floats) -> i64`
-    /// transmute lands them correctly regardless of original interleaving.
-    /// Routes through `majit_backend::call_stub::bh_call_i_dispatch` which
-    /// owns the arity table previously embedded in cranelift's `compiler.rs`.
+    /// Routes through `majit_backend::call_stub::bh_call_i_dispatch`, whose
+    /// signature is built in `arg_classes` declaration order to match
+    /// `descr.py:574` / `descr.py:604-605 create_call_stub`.
     fn bh_call_i(
         &self,
         func: i64,
@@ -3357,15 +3355,13 @@ impl Backend for DynasmBackend {
         if func == 0 {
             return 0;
         }
-        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+        let (classes, args) = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
             args_r,
             args_f,
         );
-        unsafe {
-            majit_backend::call_stub::bh_call_i_dispatch(func as usize, &int_args, &float_args)
-        }
+        unsafe { majit_backend::call_stub::bh_call_i_dispatch(func as usize, &classes, &args) }
     }
 
     /// llmodel.py:818 bh_call_r: GcRef-returning parallel of `bh_call_i`.
@@ -3385,19 +3381,18 @@ impl Backend for DynasmBackend {
         if func == 0 {
             return majit_ir::GcRef::NULL;
         }
-        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+        let (classes, args) = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
             args_r,
             args_f,
         );
-        let raw = unsafe {
-            majit_backend::call_stub::bh_call_i_dispatch(func as usize, &int_args, &float_args)
-        };
+        let raw =
+            unsafe { majit_backend::call_stub::bh_call_i_dispatch(func as usize, &classes, &args) };
         majit_ir::GcRef(raw as usize)
     }
 
-    /// llmodel.py:825 bh_call_f / descr.py:590-602 create_call_stub
+    /// llmodel.py:825 bh_call_f / descr.py:584-605 create_call_stub
     /// (`RESULT == lltype.Float`) parity: route through the f64-typed
     /// dispatcher so an f64-returning C callee delivers via xmm0 / d0
     /// instead of rax / x0. Without this override
@@ -3414,18 +3409,16 @@ impl Backend for DynasmBackend {
         if func == 0 {
             return 0.0;
         }
-        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+        let (classes, args) = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
             args_r,
             args_f,
         );
-        unsafe {
-            majit_backend::call_stub::bh_call_f_dispatch(func as usize, &int_args, &float_args)
-        }
+        unsafe { majit_backend::call_stub::bh_call_f_dispatch(func as usize, &classes, &args) }
     }
 
-    /// llmodel.py:834 bh_call_v / descr.py:590-602 create_call_stub
+    /// llmodel.py:834 bh_call_v / descr.py:590-605 create_call_stub
     /// (`RESULT == lltype.Void`) parity: dispatch the funcptr through
     /// the void-typed `bh_call_v_dispatch` so a genuinely void C callee
     /// is called with the right C-ABI signature. Re-routing through
@@ -3446,14 +3439,14 @@ impl Backend for DynasmBackend {
         if func == 0 {
             return;
         }
-        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+        let (classes, args) = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
             args_r,
             args_f,
         );
         unsafe {
-            majit_backend::call_stub::bh_call_v_dispatch(func as usize, &int_args, &float_args);
+            majit_backend::call_stub::bh_call_v_dispatch(func as usize, &classes, &args);
         }
     }
 

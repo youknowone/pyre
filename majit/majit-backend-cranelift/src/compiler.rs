@@ -16808,18 +16808,9 @@ impl majit_backend::Backend for CraneliftBackend {
 
     /// llmodel.py:816 bh_call_i: ABI-correct dispatch.
     ///
-    /// ARM64/x86-64 C ABI assigns integer and float args to independent register
-    /// files (x0-x7 + d0-d7 on ARM64; rdi,rsi,… + xmm0-xmm7 on x86-64).
-    /// We construct `fn(ints…, floats…) -> i64` which places each group in the
-    /// correct register file regardless of their original interleaving order.
-    ///
-    /// llmodel.py:816-820 bh_call_i(func, args_i, args_r, args_f, calldescr)
-    /// calldescr.call_stub_i(func, args_i, args_r, args_f).
-    ///
-    /// On ARM64/x86-64, the C ABI assigns integer and floating-point args to
-    /// independent register files (x0-x7 / d0-d7 on ARM64; rdi,rsi,... /
-    /// xmm0-xmm7 on x86-64). So we can always construct the function pointer
-    /// as `fn(ints..., floats...) -> i64` and get the correct register layout.
+    /// Routes through `majit_backend::call_stub::bh_call_i_dispatch`, whose
+    /// signature is built in `arg_classes` declaration order to match
+    /// `descr.py:574` / `descr.py:604-605 create_call_stub`.
     fn bh_call_i(
         &self,
         func: i64,
@@ -16831,15 +16822,13 @@ impl majit_backend::Backend for CraneliftBackend {
         if func == 0 {
             return 0;
         }
-        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+        let (classes, args) = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
             args_r,
             args_f,
         );
-        unsafe {
-            majit_backend::call_stub::bh_call_i_dispatch(func as usize, &int_args, &float_args)
-        }
+        unsafe { majit_backend::call_stub::bh_call_i_dispatch(func as usize, &classes, &args) }
     }
 
     /// llmodel.py:818 bh_call_r: GcRef-returning parallel of `bh_call_i`.
@@ -16859,19 +16848,18 @@ impl majit_backend::Backend for CraneliftBackend {
         if func == 0 {
             return majit_ir::GcRef::NULL;
         }
-        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+        let (classes, args) = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
             args_r,
             args_f,
         );
-        let raw = unsafe {
-            majit_backend::call_stub::bh_call_i_dispatch(func as usize, &int_args, &float_args)
-        };
+        let raw =
+            unsafe { majit_backend::call_stub::bh_call_i_dispatch(func as usize, &classes, &args) };
         majit_ir::GcRef(raw as usize)
     }
 
-    /// llmodel.py:825 bh_call_f / descr.py:590-602 create_call_stub
+    /// llmodel.py:825 bh_call_f / descr.py:584-605 create_call_stub
     /// (`RESULT == lltype.Float`): route through the f64-typed
     /// dispatcher so the result lands in xmm0 / d0 rather than rax /
     /// x0. Without this override `bhimpl_residual_call_*_f` would
@@ -16888,18 +16876,16 @@ impl majit_backend::Backend for CraneliftBackend {
         if func == 0 {
             return 0.0;
         }
-        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+        let (classes, args) = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
             args_r,
             args_f,
         );
-        unsafe {
-            majit_backend::call_stub::bh_call_f_dispatch(func as usize, &int_args, &float_args)
-        }
+        unsafe { majit_backend::call_stub::bh_call_f_dispatch(func as usize, &classes, &args) }
     }
 
-    /// llmodel.py:834 bh_call_v / descr.py:590-602 create_call_stub
+    /// llmodel.py:834 bh_call_v / descr.py:590-605 create_call_stub
     /// (`RESULT == lltype.Void`): dispatch via the void-typed stub so
     /// the funcptr is transmuted to `extern "C" fn(...) -> ()`. Without
     /// this override the canonical `residual_call_*_v` walker would
@@ -16913,7 +16899,7 @@ impl majit_backend::Backend for CraneliftBackend {
         args_f: Option<&[i64]>,
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
-        // llmodel.py:834 bh_call_v / descr.py:590-602 create_call_stub
+        // llmodel.py:834 bh_call_v / descr.py:590-605 create_call_stub
         // (`RESULT == lltype.Void`) parity: route through the void-typed
         // dispatcher so genuinely void C callees use the right C-ABI
         // signature instead of `extern "C" fn(...) -> i64` (which reads
@@ -16921,14 +16907,14 @@ impl majit_backend::Backend for CraneliftBackend {
         if func == 0 {
             return;
         }
-        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+        let (classes, args) = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
             args_r,
             args_f,
         );
         unsafe {
-            majit_backend::call_stub::bh_call_v_dispatch(func as usize, &int_args, &float_args);
+            majit_backend::call_stub::bh_call_v_dispatch(func as usize, &classes, &args);
         }
     }
 
