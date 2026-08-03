@@ -798,11 +798,13 @@ pub fn execute_pure_call(
     );
     let func_ptr = func_ptr as *const ();
     match descr.result_type() {
-        // RPython dispatches Int and Ref through the same backend primitive
-        // `cpu.bh_call_i` (returns i64); pyre's `call_int_function` does
-        // the same — Ref is bit-identical to Int at the ABI level.
+        // executor.py:52-65 dispatches Int through `cpu.bh_call_i` and Ref
+        // through `cpu.bh_call_r`; both return a machine word, so pyre shares
+        // one dispatcher — Ref is bit-identical to Int at the ABI level.  The
+        // descr goes along for the *arguments*: a Float parameter belongs in
+        // the floating-point register file whatever the result type is.
         majit_ir::Type::Int | majit_ir::Type::Ref => {
-            crate::pyjitpl::call_int_function(func_ptr, args)
+            crate::pyjitpl::call_int_function_typed(func_ptr, args, descr.arg_types())
         }
         majit_ir::Type::Void => {
             crate::pyjitpl::call_void_function_typed(func_ptr, args, descr.arg_types());
@@ -875,7 +877,7 @@ pub fn execute_residual_call(
     let func_ptr = func_ptr as *const ();
     let result = match descr.result_type() {
         majit_ir::Type::Int | majit_ir::Type::Ref => {
-            crate::pyjitpl::call_int_function(func_ptr, args)
+            crate::pyjitpl::call_int_function_typed(func_ptr, args, descr.arg_types())
         }
         majit_ir::Type::Void => {
             crate::pyjitpl::call_void_function_typed(func_ptr, args, descr.arg_types());
@@ -1001,6 +1003,23 @@ mod execute_pure_call_tests {
 
     extern "C" fn void_no_op(_x: i64) {}
 
+    /// An Int result with a Float parameter — the direction the Float-result
+    /// work did not cover.  The return encodes BOTH arguments: a callee taking
+    /// a single `f64` cannot tell a correct call from a wrong-register one,
+    /// because the value it wants may happen to be left in xmm0 by the caller.
+    extern "C" fn float_then_int_to_i64(x: f64, n: i64) -> i64 {
+        x as i64 * 100 + n
+    }
+
+    /// The interleaved void shape.  Records both arguments so the test can tell
+    /// a right-register call from one that shuffled them.
+    static VOID_INTERLEAVED_SEEN: std::sync::atomic::AtomicI64 =
+        std::sync::atomic::AtomicI64::new(0);
+
+    extern "C" fn void_float_then_int(x: f64, n: i64) {
+        VOID_INTERLEAVED_SEEN.store(x as i64 * 100 + n, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn make_descr(arg_types: Vec<Type>, result_type: Type) -> SimpleCallDescr {
         let mut effect = EffectInfo::default();
         effect.extraeffect = ExtraEffect::ElidableCannotRaise;
@@ -1019,6 +1038,42 @@ mod execute_pure_call_tests {
         let descr = make_descr(vec![Type::Int, Type::Int, Type::Int], Type::Int);
         let result = execute_pure_call(&descr, add3_i64 as *const () as i64, &[100, 20, 3]);
         assert_eq!(result, 123, "add3_i64(100, 20, 3) must return 123");
+    }
+
+    /// `executor.py:52-58` hands `descr` to `cpu.bh_call_i` just as `:66-72`
+    /// does to `cpu.bh_call_f`, so a Float parameter is class-`'f'` whatever
+    /// the result type is.
+    #[test]
+    fn int_result_reads_a_float_argument_from_the_float_register_file() {
+        let descr = make_descr(vec![Type::Float, Type::Int], Type::Int);
+        let result = execute_pure_call(
+            &descr,
+            float_then_int_to_i64 as *const () as i64,
+            &[7.0_f64.to_bits() as i64, 3],
+        );
+        assert_eq!(
+            result, 703,
+            "float_then_int_to_i64(7.0, 3) == 703; an all-i64 pass hands the \
+             callee the raw bits as its integer argument"
+        );
+    }
+
+    /// `executor.py:73-77 cpu.bh_call_v` takes the same `descr`, so a void
+    /// callee's Float parameter is placed the same way.
+    #[test]
+    fn void_result_places_an_interleaved_float_argument_in_order() {
+        VOID_INTERLEAVED_SEEN.store(0, std::sync::atomic::Ordering::SeqCst);
+        let descr = make_descr(vec![Type::Float, Type::Int], Type::Void);
+        execute_pure_call(
+            &descr,
+            void_float_then_int as *const () as i64,
+            &[7.0_f64.to_bits() as i64, 3],
+        );
+        assert_eq!(
+            VOID_INTERLEAVED_SEEN.load(std::sync::atomic::Ordering::SeqCst),
+            703,
+            "void_float_then_int(7.0, 3) must see 7.0 and 3 in declaration order"
+        );
     }
 
     /// A Float result is fetched through `cpu.bh_call_f` (`executor.py:66-68`),
