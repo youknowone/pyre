@@ -95,23 +95,33 @@ pub(crate) fn fbw_strict_fold_frame_reg<Sym: WalkSym>(ctx: &WalkContext<'_, '_, 
 /// callee jitcode metadata rather than the outer full-body tables.  Set to
 /// `1` to opt in.
 ///
-/// Measured on the whole `pyre/bench/synth` corpus (dynasm): ON compiles two
-/// loops that OFF declines, and both then fail their guards with no bridge —
-/// 349 → 347 passing, no fixture improved, CPU time unchanged.  The two loops
-/// reach the bridge gaps that make the mirror unprofitable today:
+/// Measured on the whole `pyre/bench/synth` corpus (dynasm, 370 fixtures): ON
+/// is 2 failed / 368 passed, and both failures are jit-stats gates on the two
+/// fixtures below.  Every other fixture reads identically either way.
 ///
-///   * `getframe_inline_subwalk_multiframe` — the loop's failing guard is a
-///     GUARD_NOT_FORCED, which `compile.py:950-953
-///     ResumeGuardForcedDescr.handle_fail` never compiles ("always just
-///     blackholed"), so every one of its 8948 failures resumes through the
-///     blackhole.  No bridge is reachable for this shape by construction.
-///   * `or_chain_fresh_alloc_arg` — the failing guard needs a multi-frame
-///     inline resume, and `reconstruct_inline_recipe` declines the callee
-///     frame at `UnboxedLiveRegister`: the resumed `pick` frame holds a live
-///     int-bank register (color 0) that the per-PC `(bank, color, slot)` map
-///     gives no `locals_cells_stack_w` slot, i.e. a JitCode int temp with no
-///     boxed home in the rebuilt PyFrame.  `P2Drain::NoRecipes` then declines
-///     the guard permanently and its 9653 failures blackhole.
+///   * `or_chain_fresh_alloc_arg` — `loops_compiled 2 -> 1`, which is the
+///     merge `JITSTATS_FALL_FIELDS` describes in `check.py` rather than a
+///     coverage loss.  OFF splits the program across two loops, one of them
+///     keeping `pick` as a residual (`call_may_force=1`), and aborts two
+///     traces, one of them permanently.  ON inlines the callee into a single
+///     164-op loop, aborts nothing (`loops_aborted 1 -> 0`), keeps the one
+///     bridge and the same ~200 guard failures, and runs the fixture in
+///     0.092s against OFF's 0.165s (min-of-7 child CPU time).
+///   * `getframe_inline_subwalk_multiframe` — `guard_failures 0 -> 8948`.
+///     This one is a real cost, and it belongs to `sys._getframe` being
+///     opaque to the tracer, not to the mirror: the trace carries three
+///     CALL_MAY_FORCE, and the guard after the middle one — the `_getframe(2)`
+///     itself — is what fails 8947 of those times.  A GUARD_NOT_FORCED
+///     failure is never compiled ("but always just blackholed",
+///     `compile.py:950-953 ResumeGuardForcedDescr.handle_fail`), so no bridge
+///     is reachable for it.  PyPy traces *through* `_getframe` instead of
+///     calling it residually and emits none of the three:
+///     `PYPYLOG=jit-summary` on this fixture reports `forcings: 0`,
+///     `virtualizables forced: 0`, one loop, no bridges and no aborts.  Until
+///     that call is transparent to the walker, ON only reaches the gap
+///     sooner — it compiles the loop OFF declines (`loops_compiled 0 -> 2`,
+///     `loops_aborted 15 -> 1`) and then blackholes out of it, for 0.136s
+///     against OFF's 0.129s.
 pub(crate) fn fbw_callee_vstack_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var_os("PYRE_FBW_CALLEE_VSTACK") {
