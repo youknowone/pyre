@@ -241,7 +241,7 @@ pub fn trace_int_compare(
 /// Unbox a Python float object: emit GuardClass + GetfieldGc(F|PureF).
 ///
 /// Returns the raw f64 OpRef.
-fn getfield_gc_f_pureornot(
+pub fn getfield_gc_f_pureornot(
     ctx: &mut crate::TraceCtx,
     obj: majit_ir::OpRef,
     descr: majit_ir::DescrRef,

@@ -12,6 +12,17 @@ fn propagated_subwalk_abort_cannot_rebind_its_pc_to_a_caller_frame() {
     assert!(!session.claim_abort_coordinate(false));
 }
 
+#[test]
+fn specialised_pair_unpack_recognises_the_float_layout() {
+    use super::specialize::{SpecialisedPairKind, specialised_pair_kind};
+    use pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_FF_TYPE;
+
+    assert_eq!(
+        specialised_pair_kind(&SPECIALISED_TUPLE_FF_TYPE),
+        Some(SpecialisedPairKind::Float),
+    );
+}
+
 fn test_fbw_mode() -> FbwWalkMode<crate::state::PyreSym> {
     FbwWalkMode::default()
 }

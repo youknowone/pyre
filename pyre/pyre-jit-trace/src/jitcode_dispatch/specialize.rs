@@ -1739,6 +1739,32 @@ pub(crate) fn try_walker_specialize_truediv_op_long<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SpecialisedPairKind {
+    Int,
+    Float,
+    Object,
+}
+
+/// Identify the three classes produced by
+/// `specialisedtupleobject.py:169-179 makespecialisedtuple2`.
+pub(crate) fn specialised_pair_kind(
+    seq_type: *const pyre_object::pyobject::PyType,
+) -> Option<SpecialisedPairKind> {
+    use pyre_object::specialisedtupleobject::{
+        SPECIALISED_TUPLE_FF_TYPE, SPECIALISED_TUPLE_II_TYPE, SPECIALISED_TUPLE_OO_TYPE,
+    };
+    if std::ptr::eq(seq_type, &SPECIALISED_TUPLE_II_TYPE) {
+        Some(SpecialisedPairKind::Int)
+    } else if std::ptr::eq(seq_type, &SPECIALISED_TUPLE_FF_TYPE) {
+        Some(SpecialisedPairKind::Float)
+    } else if std::ptr::eq(seq_type, &SPECIALISED_TUPLE_OO_TYPE) {
+        Some(SpecialisedPairKind::Object)
+    } else {
+        None
+    }
+}
+
 /// FBW fold of the UNPACK_SEQUENCE two-residual lowering (`unpack_sequence_fn`
 /// validator + per-index `unpack_item_fn` reader emitted by the codewriter
 /// UNPACK_SEQUENCE arm) for an arity-2 specialised tuple: guard the
@@ -1755,6 +1781,8 @@ pub(crate) fn try_walker_specialize_truediv_op_long<Sym: WalkSym>(
 ///     `getfield_gc_pure_i` + `wrapint` and the items stay unboxed through the
 ///     downstream BINARY_OP int fold (the walker analogue of the retired
 ///     MIFrame `W_SpecialisedTupleObject_ii` reads);
+///   * `ff` — the same shape with `getfield_gc_pure_f` + `wrapfloat`; this is
+///     the representation `zip` produces for a pair of exact floats;
 ///   * `oo` — `wraps[i]` for an object slot is the identity
 ///     (`specialisedtupleobject.py:26-27`), so the `getfield_gc_r` result is
 ///     already the item. This is the layout a `divmod(long, long)` result pair
@@ -1879,16 +1907,11 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
     // Both arity-2 specialisations fold; any other shape (a plain tuple, a
     // list, or a non-canonical tuple) falls through to the opaque residual
     // (correct, slower).
-    let spec_ii = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE
-        as *const pyre_object::pyobject::PyType;
-    let spec_oo = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE
-        as *const pyre_object::pyobject::PyType;
     let seq_type = unsafe { (*concrete_seq).ob_type };
-    let is_oo = std::ptr::eq(seq_type, spec_oo);
-    if !is_oo && !std::ptr::eq(seq_type, spec_ii) {
+    let Some(pair_kind) = specialised_pair_kind(seq_type) else {
         return Ok(None);
-    }
-    let spec_type = if is_oo { spec_oo } else { spec_ii };
+    };
+    let spec_type = seq_type;
     match helper {
         majit_ir::PyreHelperKind::UnpackSequence => {
             // Either specialisation is always arity 2, so the class guard
@@ -1911,7 +1934,7 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
             // which case this is a no-op; guard here too so a fold that only
             // catches the item reads still proves the layout it loads from.
             walker_guard_specialised_pair_class(ctx, op_pc, seq, spec_type)?;
-            if is_oo {
+            if pair_kind == SpecialisedPairKind::Object {
                 let descr = if int_val == 0 {
                     crate::descr::specialised_tuple_oo_value0_descr()
                 } else {
@@ -1924,11 +1947,34 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
                 write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, item)?;
                 return Ok(Some(()));
             }
-            // Authentic boxed element (small-int caching / identity); fall
-            // through to the opaque residual if it cannot be executed.
+            // Authentic boxed element supplies the concrete shadow / identity
+            // while the emitted field read and transparent wrapper replace
+            // the residual call in machine code. Fall through if execution
+            // raises or cannot provide that box.
             let Some(elem_ptr) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
                 return Ok(None);
             };
+            if pair_kind == SpecialisedPairKind::Float {
+                let descr = if int_val == 0 {
+                    crate::descr::specialised_tuple_ff_value0_descr()
+                } else {
+                    crate::descr::specialised_tuple_ff_value1_descr()
+                };
+                let raw =
+                    majit_metainterp::box_trace::getfield_gc_f_pureornot(ctx.trace_ctx, seq, descr);
+                let elem =
+                    unsafe { pyre_object::w_float_get_value(elem_ptr as pyre_object::PyObjectRef) };
+                ctx.trace_ctx
+                    .set_opref_concrete(raw, majit_ir::Value::Float(elem));
+                let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
+                ctx.trace_ctx.set_opref_concrete(
+                    boxed,
+                    majit_ir::Value::Ref(majit_ir::GcRef(elem_ptr as usize)),
+                );
+                write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+                return Ok(Some(()));
+            }
+            // `ii`: preserve authentic small-int caching / identity.
             let descr = if int_val == 0 {
                 crate::descr::specialised_tuple_ii_value0_descr()
             } else {
