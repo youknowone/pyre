@@ -3524,11 +3524,29 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// instance whose type has no `__del__` is a no-op, the hook gates on
 /// `hasuserdel` exactly as upstream does.
 pub(crate) fn tag_subclass_instance(obj: PyObjectRef, sub: PyObjectRef) -> PyObjectRef {
+    unsafe { store_subclass_tag(obj, sub) };
+    pyre_object::gc_hook::maybe_register_finalizer(obj);
+    obj
+}
+
+/// Store `sub` into a builtin-layout instance's class slot, through the write
+/// barrier.
+///
+/// The instance comes from a stable-address allocator, so it is born into the
+/// old generation — and an object born while a major cycle is marking is born
+/// black (`incminimark.py:1792-1799` turns exactly the barrier-recorded old
+/// objects back to gray, because nothing else rescans a black one). An
+/// unbarriered store therefore leaves `sub` white behind a live instance and
+/// the sweep reclaims the type under it. Barrier first, as the emitted
+/// `COND_CALL_GC_WB` precedes its `SETFIELD_GC`.
+///
+/// # Safety
+/// `obj` must point to a valid object whose header is writable.
+pub(crate) unsafe fn store_subclass_tag(obj: PyObjectRef, sub: PyObjectRef) {
+    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
     unsafe {
         (*obj).w_class = sub;
     }
-    pyre_object::gc_hook::maybe_register_finalizer(obj);
-    obj
 }
 
 /// When `cls` is a user subclass of the builtin `base` (not `base`
@@ -3585,9 +3603,7 @@ fn list_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     )?;
     let value = pyre_object::w_list_new(Vec::new());
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::LIST_TYPE)? {
-        unsafe {
-            (*value).w_class = sub;
-        }
+        unsafe { store_subclass_tag(value, sub) };
         // objspace.py `allocate_instance`: a builtin-layout subclass still
         // participates in the user-finalizer queue when its Python type has
         // `__del__`. Registration must follow `w_class` tagging so the hook
@@ -3658,9 +3674,7 @@ fn tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // Canonical array-backed layout (ob_type == TUPLE_TYPE) so the
         // subclass tag never lands on an arity-2 specialised tuple.
         let fresh = pyre_object::w_tuple_new_array_backed(items);
-        unsafe {
-            (*fresh).w_class = sub;
-        }
+        unsafe { store_subclass_tag(fresh, sub) };
         pyre_object::gc_hook::maybe_register_finalizer(fresh);
         return Ok(fresh);
     }
@@ -3801,9 +3815,7 @@ fn reversed_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     if unsafe { pyre_object::functional::is_reversed(value) } {
         let cls = unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) };
         if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::REVERSED_TYPE)? {
-            unsafe {
-                (*value).w_class = sub;
-            }
+            unsafe { store_subclass_tag(value, sub) };
         }
     }
     Ok(value)
@@ -3816,9 +3828,7 @@ fn range_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let value = crate::builtins::builtin_range(args.get(1..).unwrap_or(&[]))?;
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::RANGE_TYPE)? {
-        unsafe {
-            (*value).w_class = sub;
-        }
+        unsafe { store_subclass_tag(value, sub) };
     }
     Ok(value)
 }
@@ -3829,7 +3839,7 @@ fn super_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let cls = args.first().copied().unwrap_or(PY_NULL);
     let value = pyre_object::descriptor::w_super_new(PY_NULL, PY_NULL, PY_NULL);
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::descriptor::SUPER_TYPE)? {
-        unsafe { (*value).w_class = sub };
+        unsafe { store_subclass_tag(value, sub) };
     }
     Ok(value)
 }
@@ -4410,9 +4420,7 @@ fn set_alloc_for_class(
         pyre_object::w_set_new()
     };
     if !std::ptr::eq(cls, exact_type) {
-        unsafe {
-            (*obj).w_class = cls;
-        }
+        unsafe { store_subclass_tag(obj, cls) };
     }
     // objspace.py:486 `allocate_instance` registers every freshly allocated
     // instance whose class carries `hasuserdel`.  Set/frozenset subclasses use
