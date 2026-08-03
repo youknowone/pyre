@@ -15,6 +15,18 @@ required = {
 assert required <= set(super.__dict__)
 assert "super() -> same as" in super.__doc__
 
+member_docs = {
+    "__thisclass__": "the class invoking super()",
+    "__self__": "the instance invoking super(); may be None",
+    "__self_class__": "the type of the instance invoking super(); may be None",
+}
+for name, doc in member_docs.items():
+    member = super.__dict__[name]
+    assert type(member).__name__ == "member_descriptor"
+    assert member.__objclass__ is super
+    assert member.__name__ == name
+    assert member.__doc__ == doc
+
 
 class A:
     value = "A"
@@ -48,6 +60,22 @@ assert bound.value == "A"
 assert bound.method() == "A.method"
 assert B().method() == "A.method:B"
 assert B.class_method() == "B"
+
+for name in member_docs:
+    original = getattr(bound, name)
+    try:
+        setattr(bound, name, None)
+    except AttributeError as error:
+        assert str(error) == "readonly attribute"
+    else:
+        raise AssertionError(f"super.{name} must be read-only")
+    try:
+        delattr(bound, name)
+    except AttributeError as error:
+        assert str(error) == "readonly attribute"
+    else:
+        raise AssertionError(f"super.{name} must not be deletable")
+    assert getattr(bound, name) is original
 
 class_bound = super(B, B)
 assert class_bound.__self__ is B

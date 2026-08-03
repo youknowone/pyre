@@ -3894,51 +3894,6 @@ fn super_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     crate::call::call_function_impl_result(cls, &[start, obj])
 }
 
-fn super_getter(args: &[PyObjectRef], field: usize) -> Result<PyObjectRef, crate::PyError> {
-    let self_ = args.get(1).copied().unwrap_or(PY_NULL);
-    if !unsafe { pyre_object::descriptor::is_super(self_) } {
-        return Err(crate::PyError::type_error("descriptor is for 'super'"));
-    }
-    let start = unsafe { pyre_object::descriptor::w_super_get_type(self_) };
-    let bound = unsafe { pyre_object::descriptor::w_super_get_obj(self_) };
-    let bound_type = unsafe { pyre_object::descriptor::w_super_get_obj_type(self_) };
-    Ok(match field {
-        0 => {
-            if start.is_null() {
-                w_none()
-            } else {
-                start
-            }
-        }
-        1 => {
-            if bound.is_null() {
-                w_none()
-            } else {
-                bound
-            }
-        }
-        _ => {
-            if bound_type.is_null() {
-                w_none()
-            } else {
-                bound_type
-            }
-        }
-    })
-}
-
-fn super_get_thisclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    super_getter(args, 0)
-}
-
-fn super_get_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    super_getter(args, 1)
-}
-
-fn super_get_self_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    super_getter(args, 2)
-}
-
 /// PyPy `descriptor.py W_Super.typedef`, with Python 3.14's zero-argument
 /// documentation and concrete type surface.
 fn init_super_type(ns: PyObjectRef) {
@@ -3981,18 +3936,32 @@ fn init_super_type(ns: PyObjectRef) {
     ] {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
-    for (name, getter) in [
-        ("__thisclass__", super_get_thisclass as DunderFn),
-        ("__self__", super_get_self as DunderFn),
-        ("__self_class__", super_get_self_class as DunderFn),
+    for (name, kind, doc) in [
+        (
+            "__thisclass__",
+            pyre_object::MEMBER_SUPER_THISCLASS,
+            "the class invoking super()",
+        ),
+        (
+            "__self__",
+            pyre_object::MEMBER_SUPER_SELF,
+            "the instance invoking super(); may be None",
+        ),
+        (
+            "__self_class__",
+            pyre_object::MEMBER_SUPER_SELF_CLASS,
+            "the type of the instance invoking super(); may be None",
+        ),
     ] {
         unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_getset_descriptor_named(
-                    make_builtin_function_with_arity(name, getter, 2),
-                    name,
+                pyre_object::w_member_new_direct_with_doc(
+                    kind,
+                    name.to_owned(),
+                    doc.to_owned(),
+                    PY_NULL,
                 ),
             )
         };
@@ -12056,6 +12025,18 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
         }
         pyre_object::MEMBER_SLICE_STEP => {
             Ok(unsafe { pyre_object::sliceobject::w_slice_get_step(obj) })
+        }
+        pyre_object::MEMBER_SUPER_THISCLASS => {
+            let value = unsafe { pyre_object::descriptor::w_super_get_type(obj) };
+            Ok(if value.is_null() { w_none() } else { value })
+        }
+        pyre_object::MEMBER_SUPER_SELF => {
+            let value = unsafe { pyre_object::descriptor::w_super_get_obj(obj) };
+            Ok(if value.is_null() { w_none() } else { value })
+        }
+        pyre_object::MEMBER_SUPER_SELF_CLASS => {
+            let value = unsafe { pyre_object::descriptor::w_super_get_obj_type(obj) };
+            Ok(if value.is_null() { w_none() } else { value })
         }
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
         pyre_object::MEMBER_DESCR_NAME => unsafe { descr_member_name(obj) },

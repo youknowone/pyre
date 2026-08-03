@@ -358,6 +358,12 @@ pub const MEMBER_SLICE_START: u32 = MEMBER_DIRECT_FLAG | 49;
 pub const MEMBER_SLICE_STOP: u32 = MEMBER_DIRECT_FLAG | 50;
 /// CPython 3.14 `slice_members.step`, backed by PyPy's `w_step` field.
 pub const MEMBER_SLICE_STEP: u32 = MEMBER_DIRECT_FLAG | 51;
+/// CPython 3.14 `super_members.__thisclass__`, backed by PyPy's `w_starttype`.
+pub const MEMBER_SUPER_THISCLASS: u32 = MEMBER_DIRECT_FLAG | 52;
+/// CPython 3.14 `super_members.__self__`, backed by PyPy's `w_self`.
+pub const MEMBER_SUPER_SELF: u32 = MEMBER_DIRECT_FLAG | 53;
+/// CPython 3.14 `super_members.__self_class__`, backed by PyPy's `w_objtype`.
+pub const MEMBER_SUPER_SELF_CLASS: u32 = MEMBER_DIRECT_FLAG | 54;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {
