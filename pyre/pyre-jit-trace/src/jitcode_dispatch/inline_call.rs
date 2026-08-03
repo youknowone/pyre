@@ -2031,19 +2031,44 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     } else {
         (callable_operand, method_form.then_some(null_or_self))
     };
+    // Every decline below is silent otherwise, and they are not
+    // interchangeable: `not is_function` is a class call or another
+    // non-Function callable, while `no jitcode for address` names a builtin
+    // whose `BuiltinCode.func` is not a member of the PBC family
+    // `builtin_wrapper_indirect_graphs` builds — i.e. one registered without a
+    // `__pyre_wrap_*` gateway.  The address is what identifies the missing
+    // member, so print it.
+    macro_rules! builtin_inline_decline {
+        ($why:expr, $addr:expr) => {
+            if fbw_inline_diag_enabled() {
+                eprintln!(
+                    "[builtin-inline-decline] pc={} why={} callable={} operand={} fnaddr={:#x}",
+                    op.pc,
+                    $why,
+                    unsafe { pyre_object::type_name_of(callable) },
+                    unsafe { pyre_object::type_name_of(callable_operand) },
+                    $addr,
+                );
+            }
+        };
+    }
     if !unsafe { pyre_interpreter::is_function(callable) } {
+        builtin_inline_decline!("not is_function", 0usize);
         return Ok(None);
     }
     let builtin_code =
         unsafe { pyre_interpreter::function_get_code(callable) } as pyre_object::PyObjectRef;
     if builtin_code.is_null() || !unsafe { pyre_interpreter::is_builtin_code(builtin_code) } {
+        builtin_inline_decline!("not builtin_code", 0usize);
         return Ok(None);
     }
     let fnaddr = unsafe { pyre_interpreter::builtin_code_get(builtin_code) as usize };
     let Some(jitcode) = crate::state::bytecode_for_address(fnaddr) else {
+        builtin_inline_decline!("no jitcode for address", fnaddr);
         return Ok(None);
     };
     let Some(body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode.index()) else {
+        builtin_inline_decline!("no sub jitcode body", fnaddr);
         return Ok(None);
     };
     if body.num_regs_r < 1 {
