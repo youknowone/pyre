@@ -2339,18 +2339,33 @@ fn memoryview_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             "multi-dimensional sub-views are not implemented",
         ));
     }
-    let iterator = crate::baseobjspace::iter(args[0])?;
+    // Rooted as `builtin_all`: the element comparison runs a user `__eq__`, so
+    // the view, the sought value and the iterator are reloaded from their slots
+    // on every iteration rather than kept in raw locals across it.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
+    pyre_object::gc_roots::pin_root(args[1]);
+    let iterator = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(base))?;
+    let iterator_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(iterator);
+    // One reused slot for the element under test, so the loop does not grow the
+    // shadow stack once per view element.
+    let item_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_none());
     let mut count = 0i64;
     loop {
+        let iterator = pyre_object::gc_roots::shadow_stack_get(iterator_slot);
         match crate::baseobjspace::next(iterator) {
             Ok(item) => {
-                if std::ptr::eq(item, args[1])
+                pyre_object::gc_roots::shadow_stack_set(item_slot, item);
+                let equal = std::ptr::eq(item, pyre_object::gc_roots::shadow_stack_get(base + 1))
                     || crate::baseobjspace::is_true(crate::baseobjspace::compare(
-                        item,
-                        args[1],
+                        pyre_object::gc_roots::shadow_stack_get(item_slot),
+                        pyre_object::gc_roots::shadow_stack_get(base + 1),
                         crate::baseobjspace::CompareOp::Eq,
-                    )?)?
-                {
+                    )?)?;
+                if equal {
                     count += 1;
                 }
             }
@@ -2406,12 +2421,24 @@ fn memoryview_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     }
     stop = stop.min(n);
     start = start.min(stop);
+    // The comparison runs a user `__eq__`, so the view and the sought value are
+    // reloaded from their slots on every index rather than kept in raw locals.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(mv);
+    pyre_object::gc_roots::pin_root(args[1]);
+    let item_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_none());
     for index in start..stop {
-        let item = memoryview_getitem(&[mv, w_int_new(index)])?;
-        if std::ptr::eq(item, args[1])
+        let item = memoryview_getitem(&[
+            pyre_object::gc_roots::shadow_stack_get(base),
+            w_int_new(index),
+        ])?;
+        pyre_object::gc_roots::shadow_stack_set(item_slot, item);
+        if std::ptr::eq(item, pyre_object::gc_roots::shadow_stack_get(base + 1))
             || crate::baseobjspace::is_true(crate::baseobjspace::compare(
-                item,
-                args[1],
+                pyre_object::gc_roots::shadow_stack_get(item_slot),
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
                 crate::baseobjspace::CompareOp::Eq,
             )?)?
         {
@@ -5619,9 +5646,12 @@ fn exc_stop_iteration_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         .first()
         .copied()
         .unwrap_or_else(pyre_object::w_none);
-    let result = exc_base_exception_init(args)?;
+    // The reference stores `w_value` before delegating, and the order matters
+    // here beyond parity: `descr_init` allocates the replacement `args` list,
+    // so a moving collection between the two would leave this raw local — and
+    // `w_self` — pointing at vacated memory.
     unsafe { pyre_object::interp_exceptions::w_exception_set_value(w_self, w_value) };
-    Ok(result)
+    exc_base_exception_init(args)
 }
 
 /// `_PyArg_NoKeywords(type_name, kwds)` message for an exception initializer
