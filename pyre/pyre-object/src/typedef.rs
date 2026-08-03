@@ -368,8 +368,8 @@ pub unsafe fn w_member_get_cls(obj: PyObjectRef) -> PyObjectRef {
 /// gaining a young or unmarked `w_cls` must re-enter the collector's worklist.
 pub unsafe fn w_member_set_cls(obj: PyObjectRef, w_cls: PyObjectRef) {
     crate::gc_roots::mark_prebuilt_roots_dirty();
+    unsafe { (*(obj as *mut W_MemberDescr)).w_cls = w_cls };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
-    unsafe { (*(obj as *mut W_MemberDescr)).w_cls = w_cls }
 }
 
 /// `typedef.py:446 Member.index` — the slot index (`base_nslots + position`),
