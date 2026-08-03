@@ -413,6 +413,20 @@ pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
     false
 }
 
+/// True iff `body_code` carries a `jit_merge_point`, i.e. the callee owns a
+/// loop header of its own.
+///
+/// Reaching one during an inline sub-walk surfaces
+/// `SubLoopCalleeCallAssembler`, the one arm of
+/// [`try_walker_inline_resolved_user_call`] that consumes the residual's
+/// `funcptr` / `r_args` / `call_descr` — and it consumes them as a CALL's
+/// `[callable, null_or_self, args…]` operand list.  A route that enters with a
+/// callee it resolved itself (rather than off a CALL) carries a differently
+/// shaped operand list, so it declines such a body up front.
+pub(crate) fn callee_body_owns_loop_header(body_code: &[u8]) -> bool {
+    crate::jitcode_runtime::decoded_ops(body_code).any(|op| op.opname == "jit_merge_point")
+}
+
 /// Whether a method-form callee body is free of `LoadAttr` residuals.
 ///
 /// A `self.attr` read in the body is what makes it answer `false`, and that is
@@ -1532,6 +1546,7 @@ fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::
                 exc_override_has_nested_call: exception_string_override_has_nested_call(
                     body.code, descr_refs,
                 ),
+                owns_loop_header: callee_body_owns_loop_header(body.code),
             }),
     )
 }
@@ -5101,6 +5116,113 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
         vec![
             ConcreteValue::Ref(concrete_obj),
             ConcreteValue::Ref(concrete_value),
+        ],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        Some((obj, concrete_obj, w_type, version_tag)),
+        None,
+        false,
+        None,
+    )
+}
+
+/// Inline `obj[key]` into the receiver type's Python `__getitem__`.
+///
+/// `descroperation.py:356-381 DescrOperation.getitem` resolves `__getitem__`
+/// on the receiver's type and calls it; PyPy traces through that call and
+/// inlines the body.  pyre lowers BINARY_SUBSCR to one `binary_op` residual,
+/// and `try_walker_specialize_subscr` only recognizes the canonical tuple and
+/// exact-`list[int]` storage shapes — so a user `__getitem__` never reaches the
+/// inline plumbing at all and runs as a fresh interpreter frame behind a
+/// `CALL_MAY_FORCE` on every iteration.  This route closes that gap: pin the
+/// receiver class + version tag so the MRO lookup const-folds, then enter the
+/// resolved-callee inline with the receiver as `self`.
+///
+/// The gate is `getitem_fast_path`, which admits exactly the receivers whose
+/// subscript the type's own MRO owns — a user instance, or a builtin sequence
+/// layout that overrides `__getitem__`.  A callee owning a loop header is
+/// declined for the reason [`callee_body_owns_loop_header`] documents.  Unlike
+/// the property folds this admits a branching, raising body: `__getitem__`
+/// raising `IndexError` at the end of a sequence is the shape worth inlining,
+/// not an edge case.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+    // `binary_op_fn(obj, key, tag)` — the two Ref operands are the whole
+    // subscript; the operator tag rides the Int list.
+    let [obj, key] = r_args else {
+        return Ok(None);
+    };
+    let (obj, key) = (*obj, *key);
+    let (Some(concrete_obj), Some(concrete_key)) = (
+        walker_concrete_ref_object(ctx, obj),
+        walker_concrete_ref_object(ctx, key),
+    ) else {
+        return Ok(None);
+    };
+    let Some((w_type, version_tag, w_getitem)) =
+        (unsafe { pyre_interpreter::baseobjspace::getitem_fast_path(concrete_obj) })
+    else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_getitem) })
+    else {
+        return Ok(None);
+    };
+    // `__getitem__(self, key)` — any other arity is a shape
+    // `get_and_call_function` would reject before the body runs.
+    if nparams != 2 {
+        return Ok(None);
+    }
+    // Decided once per callee on its jitcode payload; `None` means no body or
+    // descr pool, which this route declines on either way.
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if body_facts.owns_loop_header {
+        return Ok(None);
+    }
+
+    // `[__getitem__, <self-placeholder>, obj, key]`: the method-form call
+    // header the inline plumbing expects, then the two positional args.
+    let arg_concretes = vec![
+        ConcreteValue::Ref(w_getitem),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_obj),
+        ConcreteValue::Ref(concrete_key),
+    ];
+    let getitem_const = ctx.trace_ctx.const_ref(w_getitem as i64);
+    try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        dst_bank,
+        dst,
+        w_getitem,
+        getitem_const,
+        w_getitem,
+        arg_concretes,
+        vec![obj, key],
+        vec![
+            ConcreteValue::Ref(concrete_obj),
+            ConcreteValue::Ref(concrete_key),
         ],
         true,
         None,

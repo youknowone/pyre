@@ -5808,6 +5808,16 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
                     );
                     if is_subscr {
+                        // A user-instance receiver resolves `__getitem__` on
+                        // its own type; inline that body instead of leaving
+                        // the subscript an opaque residual.  The storage folds
+                        // below are for builtin containers, which this
+                        // declines.
+                        if let Some(inlined) = try_walker_inline_subscr_getitem(
+                            ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
+                        )? {
+                            return Ok(inlined);
+                        }
                         // BINARY_SUBSCR list[int] getitem (int/float storage);
                         // falls through to the generic may-force leg otherwise.
                         try_walker_specialize_subscr(
