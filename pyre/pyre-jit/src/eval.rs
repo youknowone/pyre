@@ -2321,16 +2321,14 @@ fn build_gc() -> Box<MiniMarkGC> {
     // guard below.  This keeps the net register-call count up to
     // `W_MODULE_DICT_GC_TYPE_ID = 48` unchanged (one explicit
     // registration here, one fewer from the loop), so no downstream
-    // hardcoded tid shifts.  Allocation routes through `Box::into_raw`
-    // (`w_code_new`), so this TypeInfo trace never fires and it registers
-    // with empty gc_ptr offsets.  Its one movable GCREF slot, `w_globals`
+    // hardcoded tid shifts.  PyCode is allocated with `malloc_typed`, and its
+    // registered TypeInfo has empty `gc_ptr_offsets`, so its own trace is inert.
+    // Its one movable GCREF slot, `w_globals`
     // (the cached globals dict object — movable for `exec`/custom-globals
     // dicts), is instead forwarded as a root by
     // `pyre_interpreter::eval::walk_raw_code_roots`, reached through
     // `walk_raw_function_roots` (`func.code`) and the frame root walk
-    // (`frame.pycode`); a Box-immortal code object is never reachable by
-    // tracing into it.  This registration stays inert until `w_code_new`
-    // switches to `try_gc_alloc_stable`.
+    // (`frame.pycode`).
     let w_code_tid = gc.register_type(TypeInfo::object_subclass(
         std::mem::size_of::<pyre_interpreter::pycode::PyCode>(),
         object_tid,

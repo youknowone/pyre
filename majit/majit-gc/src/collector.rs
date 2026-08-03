@@ -895,8 +895,8 @@ impl MiniMarkGC {
     /// objects whose preceding allocator word happens to look like flags.
     ///
     /// This is the ONLY admissible probe for an address outside both managed
-    /// generations, and both callers (`seed_major_root`, `do_write_barrier`)
-    /// must go through it. Recording every `alloc_with_gc_header` result in an
+    /// generations, and its caller (`do_write_barrier`) must go through it.
+    /// Recording every `alloc_with_gc_header` result in an
     /// ownership table instead would make the answer exact, but that is a probe
     /// on the allocation fast path — the same shape measured at −15% in the GC
     /// box-probe experiment — so the tid witness stands.
@@ -2458,24 +2458,29 @@ impl MiniMarkGC {
     }
 
     fn seed_major_root(&mut self, gcref: GcRef) {
-        if gcref.is_null() {
+        // `incminimark.py:2739-2753 _collect_obj` performs NO probe on the root
+        // word — the type system guarantees every `Ptr(GcStruct)` reaching
+        // `_collect_ref_stk` is a real GC object, so the only tests are non-null
+        // and `is_in_nursery`. pyre's root banks are untyped `i64` slices
+        // (`shadow_stack::walk_bh_regs`, `walk_resume_ref_roots`) that can carry
+        // a stale word from a pooled blackhole interp, so the arena range check
+        // is what stands in for that guarantee and must precede every
+        // dereference.
+        //
+        // An object outside both generations reaches a major only through
+        // `prebuilt_root_objects`, which `collect_nonstack_roots`
+        // (`incminimark.py:2705-2707`) walks separately. `incminimark.py:2782`
+        // states the invariant that makes any other admission unsound: such an
+        // object "should be in 'prebuilt_root_objects', and the GCFLAG_VISITED
+        // will be reset at the end of the collection" — and the only reset pass
+        // walks exactly that list.
+        if gcref.is_null()
+            || !self.is_managed_heap_object(gcref.0)
+            || !self.may_enter_marking_worklist(gcref.0)
+        {
             return;
         }
-        let hdr = if let Some(hdr) = self.registered_pyobject_header(gcref.0) {
-            // incminimark.py:2782-2800: an untouched prebuilt object is a leaf.
-            if unsafe { (*hdr).has_flag(flags::NO_HEAP_PTRS) } {
-                return;
-            }
-            hdr
-        } else {
-            if !self.is_managed_heap_object(gcref.0) {
-                return;
-            }
-            unsafe { header_of(gcref.0) }
-        };
-        if !self.may_enter_marking_worklist(gcref.0) {
-            return;
-        }
+        let hdr = unsafe { header_of(gcref.0) };
         // SAFETY: header_of returns a raw pointer; keep each access
         // short-lived to avoid creating overlapping exclusive borrows.
         let newly_marked = unsafe {
@@ -3095,35 +3100,7 @@ impl MiniMarkGC {
     /// (incminimark.py:2739-2752) does not need this guard because RPython's
     /// type system guarantees every `Ptr(GcStruct)` is GC-managed; it converges
     /// away once every `gc_ptr_offsets` target is a real GC allocation.
-    fn grey_child(
-        &mut self,
-        addr: usize,
-        holder_addr: usize,
-        slot_addr: usize,
-        site: &str,
-        header_bearing: bool,
-    ) {
-        // Most custom-trace slots are PyObjectRefs. Their registered vtable
-        // gives the exact header type id, so a matching header restores
-        // incminimark.py:2739-2752's direct `_collect_obj` path without an
-        // arena-membership query. The equality check is load-bearing: pyre's
-        // same erased callback also exposes GC storage boxes, while legacy raw
-        // stepping stones can carry a Python vtable without a real header.
-        if header_bearing {
-            if let Some(hdr) = self.registered_pyobject_header(addr) {
-                if unsafe { (*hdr).has_flag(flags::NO_HEAP_PTRS) } {
-                    return;
-                }
-                if self.may_enter_marking_worklist(addr)
-                    && unsafe { !(*hdr).has_flag(flags::VISITED) }
-                {
-                    unsafe { (*hdr).set_flag(flags::VISITED) };
-                    self.incr_state.gray_stack.push(addr);
-                    self.note_nonmoving_nursery_mark(addr);
-                }
-                return;
-            }
-        }
+    fn grey_child(&mut self, addr: usize, holder_addr: usize, slot_addr: usize, site: &str) {
         if self.is_managed_heap_object(addr) && self.may_enter_marking_worklist(addr) {
             let hdr = unsafe { header_of(addr) };
             let type_id = unsafe { (*hdr).type_id() };
@@ -3232,7 +3209,6 @@ impl MiniMarkGC {
                             obj_addr,
                             slot_ptr as usize,
                             "major_custom_trace",
-                            true,
                         );
                     }
                 });
@@ -3247,7 +3223,6 @@ impl MiniMarkGC {
                         obj_addr,
                         obj_addr + offset,
                         "major_fixed_field",
-                        false,
                     );
                 }
             }
@@ -3265,7 +3240,6 @@ impl MiniMarkGC {
                             obj_addr,
                             items_start + i * item_size,
                             "major_varsize_item",
-                            false,
                         );
                     }
                 }
