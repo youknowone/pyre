@@ -7844,20 +7844,51 @@ fn compare_box_provably_dead<Sym: WalkSym>(
     compare_pc: usize,
     dst_reg: u8,
 ) -> bool {
+    matches!(
+        classify_compare_box_use(ctx, compare_pc, dst_reg),
+        CompareBoxUse::FeedsBranchOnly { arms_dead: true }
+    )
+}
+
+/// What the forward JitCode lookahead found the compare's boxed Ref dst
+/// register used for.  Splitting conditions 1-3 (the *shape*) from condition 4
+/// (the arm liveness) lets the two consumers ask for what each needs:
+/// [`compare_box_provably_dead`] wants both, while the guarded-`newbool`
+/// emission wants only the shape.
+pub(crate) enum CompareBoxUse {
+    /// Conditions 1-3: exactly one op reads `dst_reg`, it is the
+    /// `is_true`-shaped residual, and the scan terminates at the
+    /// `goto_if_not` that reads its result.  The box therefore only ever
+    /// decides a branch.
+    FeedsBranchOnly {
+        /// Condition 4: `dst_reg`'s color is dead at BOTH branch arms.
+        arms_dead: bool,
+    },
+    /// Anything else — an escape to a local, an arithmetic use, a second
+    /// reader, register reuse, a kept-on-stack short-circuit, or no branch at
+    /// all.
+    Other,
+}
+
+fn classify_compare_box_use<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    compare_pc: usize,
+    dst_reg: u8,
+) -> CompareBoxUse {
     let full_body_sym = ctx.fbw_mode.snapshot_sym;
     if full_body_sym.is_null() {
-        return false;
+        return CompareBoxUse::Other;
     }
     // SAFETY: same contract as walker_capture_snapshot_for_last_guard_impl —
     // pointer live for the full-body walk, immutable layout fields only.
     let (code, jitcode_index, payload): (&[u8], i32, &crate::PyJitCode) = unsafe {
         let sym = &*full_body_sym;
         if sym.jitcode().is_null() {
-            return false;
+            return CompareBoxUse::Other;
         }
         let jc = &*sym.jitcode();
         if jc.payload.code_ptr.is_null() {
-            return false;
+            return CompareBoxUse::Other;
         }
         (
             jc.payload.jitcode.code.as_slice(),
@@ -7866,7 +7897,7 @@ fn compare_box_provably_dead<Sym: WalkSym>(
         )
     };
     let Some(start) = crate::jitcode_runtime::decode_op_at(code, compare_pc) else {
-        return false;
+        return CompareBoxUse::Other;
     };
     let mut pc = start.next_pc;
     let mut readers = 0u32;
@@ -7874,7 +7905,7 @@ fn compare_box_provably_dead<Sym: WalkSym>(
     let mut goto_if_not_pc: Option<usize> = None;
     for _ in 0..64 {
         let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) else {
-            return false;
+            return CompareBoxUse::Other;
         };
         // Decode this op's operands, tracking reads/writes of dst_reg.
         let mut cursor = op.pc + 1;
@@ -7911,13 +7942,13 @@ fn compare_box_provably_dead<Sym: WalkSym>(
                     }
                     cursor += 1;
                 }
-                _ => return false,
+                _ => return CompareBoxUse::Other,
             }
         }
         if writes {
             // dst overwritten before/at a read — give up (the value we'd
             // elide is not the one this op produces; stay conservative).
-            return false;
+            return CompareBoxUse::Other;
         }
         if reads {
             readers += 1;
@@ -7929,19 +7960,19 @@ fn compare_box_provably_dead<Sym: WalkSym>(
             break;
         }
         if op.opname == "goto" || op.opname == "raise" || op.opname == "ref_return" {
-            return false;
+            return CompareBoxUse::Other;
         }
         pc = op.next_pc;
     }
-    // Conditions 1–3.
+    // Conditions 1-3.
     if readers != 1 || !reader_is_is_true {
-        return false;
+        return CompareBoxUse::Other;
     }
     let Some(gin_pc) = goto_if_not_pc else {
-        return false;
+        return CompareBoxUse::Other;
     };
     let Some(gin_op) = crate::jitcode_runtime::decode_op_at(code, gin_pc) else {
-        return false;
+        return CompareBoxUse::Other;
     };
     // Condition 4: `dst_reg`'s color must be dead at BOTH branch arms (the
     // POP_JUMP pops the tested bool regardless of direction, so the
@@ -7976,10 +8007,9 @@ fn compare_box_provably_dead<Sym: WalkSym>(
             crate::state::frame_liveness_reg_indices_by_bank_from_pc(jitcode_index, marker as i32);
         banks.ref_.iter().any(|&c| c as u8 == dst_reg)
     };
-    if arm_dst_live(fallthrough_jc) || arm_dst_live(target_jc) {
-        return false;
+    CompareBoxUse::FeedsBranchOnly {
+        arms_dead: !arm_dst_live(fallthrough_jc) && !arm_dst_live(target_jc),
     }
-    true
 }
 
 /// Global descr-pool sub-jitcode lookup (resolves a global jitcode index
