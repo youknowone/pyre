@@ -217,8 +217,67 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                     // (`llmodel.py:560`, which asserts the parent exists) has no
                     // type to validate against and fails closed, taking the
                     // whole bridge with it.
+                    if p.type_id == 0 {
+                        // Zero is the no-STRUCT-identity sentinel, not a type.
+                        // Publishing under `LLType::Struct(0)` would collapse
+                        // every type-id-less parent onto the first-inserted size
+                        // descr and field namespace, so the second one would
+                        // validate against the first one's size/vtable and could
+                        // attach this field to the wrong parent.  Mint fresh
+                        // instead — the same carve-out
+                        // `simple_descr_group_from_bh_size`
+                        // (`pyre-jit-trace/src/descr.rs`) takes.  Its group's
+                        // size descr is registered strongly by
+                        // `descr_registry::register_size`, so the field's Weak
+                        // parent back-reference still upgrades, and the factory's
+                        // `is_gc_managed`/`headerless` defaults are the only
+                        // shape that reaches here: the raw and header-less
+                        // producers all publish through `register_struct_layout`
+                        // (`struct_fields_write_effect_info` below), which routes
+                        // to the keyed factory carrying a real type id.
+                        if crate::majit_log_enabled() {
+                            eprintln!(
+                                "[jit] field_descr_ref_from_bh: fresh-minting a \
+                                 type-id-less parent for field={name:?} size={} vtable={:#x}",
+                                p.size, p.vtable
+                            );
+                        }
+                        let spec = majit_ir::descr::SimpleFieldDescrSpec {
+                            index: u32::MAX,
+                            field_key: name.clone(),
+                            name: name.clone(),
+                            offset: *offset,
+                            field_size: *field_size,
+                            field_type: *field_type,
+                            is_immutable: *is_immutable,
+                            is_quasi_immutable: *is_quasi_immutable,
+                            flag: *field_flag,
+                            virtualizable: false,
+                            index_in_parent: *index_in_parent,
+                        };
+                        let group = majit_ir::descr::make_simple_descr_group(
+                            u32::MAX,
+                            p.size,
+                            0,
+                            p.vtable as usize,
+                            std::slice::from_ref(&spec),
+                        );
+                        let fd = group.field_descrs[0].clone();
+                        return (*offset, fd as majit_ir::DescrRef);
+                    }
                     let struct_key = majit_ir::descr::LLType::Struct(p.type_id);
                     let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                    // `immutable_flag` is `descr.py:112
+                    // heaptracker.is_immutable_struct(STRUCT)`, which reads the
+                    // STRUCT's `immutable` hint.  A serialized parent spec
+                    // carries no such hint — size, type id, vtable, GC-managed
+                    // and headerless are its whole payload — so `false` is not a
+                    // choice made over an available alternative but the absence
+                    // of the declaration channel, the same absence
+                    // `get_field_descr`'s cache-hit branch already resolves for
+                    // per-field immutability.  The sibling keyed mint just above
+                    // lands on the same `false` through
+                    // `SimpleSizeDescr::with_vtable`.
                     gc.get_size_descr(struct_key.clone(), p.size, p.vtable as usize, false);
                     let fd = gc.get_field_descr(
                         struct_key,
