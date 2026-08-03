@@ -1555,37 +1555,78 @@ pub fn fsdecode_filename_bytes(data: &[u8]) -> pyre_object::PyObjectRef {
 pub fn fsencode_bytes_w_with_kind(
     obj: pyre_object::PyObjectRef,
 ) -> Result<(Vec<u8>, bool), crate::PyError> {
-    unsafe {
-        if pyre_object::is_str(obj) {
-            return Ok((fsencode_str_bytes(obj)?, false));
-        }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
+
+    let (data, is_bytes) = unsafe {
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         if pyre_object::bytesobject::is_bytes_like(obj) {
-            let data = pyre_object::bytesobject::bytes_like_data(obj);
-            return Ok((data.to_vec(), true));
-        }
-    }
-    // `type(path).__fspath__(path)` — the descriptor read off the type is
-    // unbound, so `path` is supplied as the sole argument.
-    if let Some(fspath_fn) = crate::typedef::r#type(obj)
-        .and_then(|pt| unsafe { crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__") })
-    {
-        let result = crate::call::call_function_impl_result(fspath_fn, &[obj])?;
-        unsafe {
-            if pyre_object::is_str(result) {
-                return Ok((fsencode_str_bytes(result)?, false));
+            // baseobjspace.py:1975-1977: pyre's readable-buffer set here is
+            // bytes | bytearray, so a buffer that is not bytes is bytearray.
+            if !pyre_object::bytesobject::is_bytes(obj) {
+                let type_name = crate::type_methods::arg_type_name(obj);
+                crate::warn::warn_deprecation(&format!(
+                    "path should be string, bytes, or os.PathLike, not {type_name}"
+                ))?;
             }
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            (
+                pyre_object::bytesobject::bytes_like_data(obj).to_vec(),
+                true,
+            )
+        } else if pyre_object::is_str(obj) {
+            (fsencode(obj)?, false)
+        } else {
+            // `type(path).__fspath__(path)` — the descriptor read off the type is
+            // unbound, so `path` is supplied as the sole argument.
+            let Some(fspath_fn) = crate::typedef::r#type(obj)
+                .and_then(|pt| crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__"))
+            else {
+                return Err(crate::PyError::type_error(format!(
+                    "expected str, bytes or os.PathLike object, not {}",
+                    crate::type_methods::arg_type_name(obj)
+                )));
+            };
+            let fspath_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(fspath_fn);
+            let result = crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(fspath_slot),
+                &[pyre_object::gc_roots::shadow_stack_get(obj_slot)],
+            )?;
+            let result_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(result);
+            let result = pyre_object::gc_roots::shadow_stack_get(result_slot);
             if pyre_object::bytesobject::is_bytes_like(result) {
-                let data = pyre_object::bytesobject::bytes_like_data(result);
-                return Ok((data.to_vec(), true));
+                (
+                    pyre_object::bytesobject::bytes_like_data(result).to_vec(),
+                    true,
+                )
+            } else if pyre_object::is_str(result) {
+                (fsencode(result)?, false)
+            } else {
+                // interp_posix.py:3053-3058 names both the object that was asked
+                // and the type its `__fspath__` answered with.
+                let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                return Err(crate::PyError::type_error(format!(
+                    "expected {}.__fspath__() to return str or bytes, not {}",
+                    crate::type_methods::arg_type_name(obj),
+                    crate::type_methods::arg_type_name(result)
+                )));
             }
         }
+    };
+    // baseobjspace.py:2016-2017 `bytesbuf0_w` rejects embedded nulls.
+    if data.contains(&0) {
+        return Err(crate::PyError::value_error("embedded null byte"));
     }
-    Err(crate::PyError::type_error(
-        "expected str, bytes or os.PathLike",
-    ))
+    Ok((data, is_bytes))
 }
 
-fn fsencode_str_bytes(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+/// `baseobjspace.py:1962 space.fsencode` — the plain filesystem encode of a
+/// `str`, with no argument conversion, `DeprecationWarning`, or embedded-null
+/// rejection. The caller must already have established that `obj` is a `str`.
+pub fn fsencode(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
     let wtf8 = unsafe { pyre_object::w_str_get_wtf8(obj) };
     let mut out = Vec::with_capacity(wtf8.len());
     for (pos, cp) in wtf8.code_points().enumerate() {

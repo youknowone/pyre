@@ -2182,10 +2182,10 @@ fn pack_inet_addr(
         // `interp_socket.py:157-159 w_address = space.fsencode(w_address)`,
         // with the upstream note that it deliberately avoids `fsencode_w`
         // because Linux allows embedded NULs in an abstract-namespace path.
-        // The encoder used here performs no null check either.
+        // The raw `fsencode` preserves that carve-out.
         let path_bytes_vec: Vec<u8> = unsafe {
             if pyre_object::is_str(path_obj) {
-                crate::gateway::fsencode_bytes_w(path_obj)?
+                crate::gateway::fsencode(path_obj)?
             } else if pyre_object::bytesobject::is_bytes_like(path_obj) {
                 pyre_object::bytesobject::bytes_like_data(path_obj).to_vec()
             } else {

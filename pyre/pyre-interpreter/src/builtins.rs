@@ -14811,35 +14811,9 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
 
-    // The OS path is a byte string.  A `str` path may carry surrogateescape
-    // code points, which spell bytes that are not valid UTF-8; folding those
-    // to U+FFFD would open a different file, so the encoded bytes are kept
-    // and handed to the seam verbatim.
-    let path_bytes = unsafe {
-        if pyre_object::is_str(path_obj) {
-            crate::gateway::fsencode_bytes_w(path_obj)?
-        } else if pyre_object::bytesobject::is_bytes_like(path_obj) {
-            pyre_object::bytesobject::bytes_like_data(path_obj).to_vec()
-        } else if let Some(fspath_fn) = crate::typedef::r#type(path_obj)
-            .and_then(|pt| crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__"))
-        {
-            // `type(path).__fspath__(path)` — unbound descriptor + single arg.
-            let result = crate::call::call_function_impl_result(fspath_fn, &[path_obj])?;
-            if pyre_object::is_str(result) {
-                crate::gateway::fsencode_bytes_w(result)?
-            } else if pyre_object::bytesobject::is_bytes_like(result) {
-                pyre_object::bytesobject::bytes_like_data(result).to_vec()
-            } else {
-                return Err(crate::PyError::type_error(
-                    "open(): path should be str, bytes, os.PathLike",
-                ));
-            }
-        } else {
-            return Err(crate::PyError::type_error(
-                "open(): path should be str, bytes, os.PathLike",
-            ));
-        }
-    };
+    // Keep the encoded bytes: surrogateescape code points can spell bytes
+    // that are not valid UTF-8, and the OS seam must receive them verbatim.
+    let path_bytes = crate::gateway::fsencode_bytes_w(path_obj)?;
     // `host_env::fs` takes a `Path`; only the seam consumes the raw bytes.
     #[cfg(unix)]
     let path = std::ffi::OsString::from_vec(path_bytes.clone());

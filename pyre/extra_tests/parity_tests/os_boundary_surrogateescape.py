@@ -35,6 +35,31 @@ os.waitpid(pid, 0)
 pid = os.posix_spawn(TRUE, [TRUE], {"PYRE_X": "v\udcff"})
 os.waitpid(pid, 0)
 
+for call in (
+    lambda: os.system("true a\x00b"),
+    lambda: os.posix_spawn(TRUE, [TRUE, "a\x00b"], {}),
+    lambda: open("a\x00b"),
+):
+    try:
+        call()
+    except ValueError as exc:
+        assert "embedded null byte" in str(exc), str(exc)
+    else:
+        raise AssertionError("embedded null byte was accepted")
+
+# `interp_socket.py:157-159` deliberately uses raw `space.fsencode`: a leading
+# null byte names Linux's abstract namespace and must reach the OS unchanged.
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    try:
+        s.bind("\x00pyre-os-boundary-%d" % os.getpid())
+    except ValueError:
+        raise AssertionError("AF_UNIX abstract path rejected its null") from None
+    except OSError:
+        pass
+finally:
+    s.close()
+
 # AF_UNIX: bind to a path whose last byte has no UTF-8 spelling.  Whether the
 # kernel accepts it is a platform question — macOS refuses a non-UTF-8 path
 # with EILSEQ — so the assertion is that the *encoding* is not what refuses:
