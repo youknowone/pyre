@@ -10511,9 +10511,21 @@ fn init_type_type(ns: PyObjectRef) {
                     unsafe { pyre_object::w_type_get_name(w_type) },
                 )));
             }
-            let abstract_ = crate::baseobjspace::is_true(value)?;
+            // `is_true` runs the value's own `__bool__`, so it is a collection
+            // point, and the gateway handed both operands over in a native
+            // slice no collector rewrites.  Publish them together, then read
+            // each one back from its slot.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::pin_roots(&[w_type, value]);
+            let abstract_ =
+                crate::baseobjspace::is_true(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
+            let w_type = pyre_object::gc_roots::shadow_stack_get(base);
             unsafe {
-                crate::type_dict_store(w_type, "__abstractmethods__", value);
+                crate::type_dict_store(
+                    w_type,
+                    "__abstractmethods__",
+                    pyre_object::gc_roots::shadow_stack_get(base + 1),
+                );
                 pyre_object::gc_hook::try_gc_write_barrier(w_type as *mut u8);
                 pyre_object::w_type_set_abstract(w_type, abstract_);
                 crate::baseobjspace::mutated(w_type, Some("__abstractmethods__"));
@@ -18403,17 +18415,23 @@ fn init_bool_type(ns: PyObjectRef) {
 /// objectobject.py:17-21 _abstract_method_error (CPython 3.12+ message form).
 fn abstract_instantiation_error(cls: PyObjectRef) -> crate::PyError {
     let type_name = unsafe { pyre_object::w_type_get_name(cls) };
+    // The setter marks any truthy value abstract without enforcing a set, and
+    // the reference reaches the attribute through `sorted(...)`, so a value
+    // that is not iterable surfaces its own TypeError here rather than this
+    // diagnostic.
+    let w_abstracts = match crate::baseobjspace::getattr_str(cls, "__abstractmethods__") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let items = match crate::baseobjspace::fixedview(w_abstracts, -1) {
+        Ok(items) => items,
+        Err(error) => return error,
+    };
     let mut methods: Vec<String> = Vec::new();
-    if let Ok(w_abstracts) = crate::baseobjspace::getattr_str(cls, "__abstractmethods__") {
-        // The setter marks any truthy value abstract without enforcing a set,
-        // so guard the unchecked casts: only iterate a genuine set of strings.
-        if unsafe { pyre_object::is_set_or_frozenset(w_abstracts) } {
-            for item in unsafe { pyre_object::w_set_items(w_abstracts) } {
-                if unsafe { pyre_object::is_str(item) } {
-                    if let Ok(s) = unsafe { pyre_object::w_str_get_wtf8(item) }.as_str() {
-                        methods.push(s.to_string());
-                    }
-                }
+    for item in items {
+        if unsafe { pyre_object::is_str(item) } {
+            if let Ok(s) = unsafe { pyre_object::w_str_get_wtf8(item) }.as_str() {
+                methods.push(s.to_string());
             }
         }
     }

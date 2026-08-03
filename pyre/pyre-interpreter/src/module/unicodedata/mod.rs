@@ -408,7 +408,12 @@ crate::py_module! {
         // implementations with the module callables.
         // Install the TypeDef before allocation so the generated allocator
         // can stamp the canonical Python class in `w_class`.
-        let _ = type_object();
+        let ucd_type = type_object();
+        // `interp_ucd.py:311 UCD.typedef` declares no `__new__`, so the two
+        // database instances the module exports are the only ones that exist;
+        // reaching generic allocation would hand back a `UCD` with no
+        // database at all.
+        unsafe { pyre_object::w_type_set_disallow_instantiation(ucd_type) };
         let ucd = W_UCD::allocate_stable(W_UCD {
             ob: PyObject {
                 ob_type: std::ptr::null(),
