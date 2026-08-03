@@ -33,6 +33,9 @@ class C(metaclass=Meta):
     only_own = 'own-only'
 
 
+N = 50000
+
+
 def main():
     # metatype data descriptor beats the class's own value
     print('data', C.data)
@@ -42,6 +45,20 @@ def main():
     print('plain', C.plain)
     # class-only attribute still resolves
     print('only_own', C.only_own)
+
+    total = 0
+    i = 0
+    while i < N:
+        if C.data == 'meta-data':
+            total += 1
+        if C.nondata == 'own-nondata':
+            total += 1
+        if C.plain == 'own-plain':
+            total += 1
+        if C.only_own == 'own-only':
+            total += 1
+        i += 1
+    print('loop', total)
 
 
 main()

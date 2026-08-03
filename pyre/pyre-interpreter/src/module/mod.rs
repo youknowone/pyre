@@ -11,6 +11,8 @@ pub mod _abc;
 #[allow(non_snake_case)]
 pub mod _ast;
 #[allow(non_snake_case)]
+pub mod _bisect;
+#[allow(non_snake_case)]
 pub mod _blake2;
 #[allow(non_snake_case)]
 pub mod _codecs;

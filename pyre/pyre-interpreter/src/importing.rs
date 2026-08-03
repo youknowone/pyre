@@ -581,6 +581,7 @@ pub fn install_builtin_modules() {
     #[cfg(all(windows, feature = "host_env"))]
     pyre_install_module!(msvcrt);
     pyre_install_module!(_abc);
+    pyre_install_module!(_bisect);
     pyre_install_module!(_functools);
     pyre_install_module!(_symtable);
     pyre_install_module!("_thread"(thread));
