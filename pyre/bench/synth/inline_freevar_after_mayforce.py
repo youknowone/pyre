@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=45
+# pyre-check: max-pypy-ratio=25
 # An inlined closure keeps its freevar cells in MIFrame.registers_r across a
 # may-force call.  The `Fraction` arithmetic in `forward` is that may-force
 # call and invalidates heap-cache facts; the following LOAD_DEREF must recover
@@ -6,14 +6,13 @@
 # GetarrayitemGcR and aborting at the result branch.
 #
 # The abort is what this fixture guards, and check.py's regression floor gates
-# `loops_aborted` at 0 independently of the ratio below.  The ratio itself has
-# measured 22-37x since the fixture landed (macOS dynasm 22.4x / cranelift
-# 28.9x, ubuntu dynasm 23.6x / cranelift 25.2x / wasm 37.1x) and has never met
-# the 20x it was first written with.  It stays high because the compiled loop
-# deopts on nearly every iteration: two guards take 16.4k of the 16.9k
-# `guard_failures` at N=10000 while `bridges_compiled` stays at 1, so the
-# guards are never patched.  That bridge gap is open work, not something this
-# gate should hide - keep the gate honest and lower it when the gap closes.
+# `loops_aborted` at 0 independently of the ratio below.  Bridge resume must
+# retain the callee frame's own globals identity: treating its valid pc=0 as a
+# failed decode leaves two guards failing on nearly every iteration, while
+# guarding the callee namespace through the portal/root frame compiles an
+# endless chain of equally failing bridges.  With both frame properties
+# preserved, guard failures fall from 16898 to 471 and local native ratios are
+# 10.3x dynasm / 15.9x cranelift versus PyPy (formerly 22-29x on macOS).
 from fractions import Fraction
 
 

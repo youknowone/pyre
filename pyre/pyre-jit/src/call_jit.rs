@@ -3156,23 +3156,17 @@ pub fn trace_and_compile_from_bridge(
     // live (outer) frame `eval_loop_jit` runs. Such a resume cannot be
     // completed by interpreting the live frame forward — see the
     // blackhole routing at the handoff below.
-    let (resume_pc, num_resume_frames, resume_coords) = if let Some(ref meta) = meta {
-        if let Some((_, pc, nframes, coords)) = crate::eval::decode_and_restore_guard_failure(
+    let decoded_resume = meta.as_ref().and_then(|meta| {
+        crate::eval::decode_and_restore_guard_failure(
             &mut jit_state_local,
             meta,
             raw_values,
             exit_layout,
-        ) {
-            (pc, nframes, coords)
-        } else {
-            (0, 0, Vec::new())
-        }
-    } else {
-        (0, 0, Vec::new())
-    };
-    if resume_pc == 0 {
+        )
+    });
+    let Some((_, resume_pc, num_resume_frames, resume_coords)) = decoded_resume else {
         return BridgeResolution::ResumeBlackhole;
-    }
+    };
     let is_multiframe_resume = num_resume_frames > 1;
     frame.set_last_instr_from_next_instr(resume_pc);
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };

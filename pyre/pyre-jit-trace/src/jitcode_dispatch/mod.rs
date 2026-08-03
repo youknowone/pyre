@@ -3858,6 +3858,18 @@ fn guard_current_frame_globals_identity<Sym: WalkSym>(
     {
         return Ok(false);
     }
+    // `pyframe.py:LOAD_GLOBAL` reads `self.get_w_globals()` from the live
+    // MIFrame.  A non-portal inline level has its own green pycode and thus
+    // its own constant `pycode.w_globals`; the metainterp-wide
+    // `virtualizable_boxes` still describes the portal/root frame and must not
+    // be used to guard this callee's namespace.  `inline_callee_consts` is the
+    // current inline frame's counterpart (also used by
+    // `try_resolve_inline_callee_static_field` above).  Checking that frame's
+    // identity here prevents a bridge-resumed callee from emitting
+    // `GUARD_VALUE(root.w_globals, callee.w_globals)`.
+    if let Some(consts) = ctx.inline_callee_consts {
+        return Ok(consts.w_globals == expected_globals as usize);
+    }
     let Some(w_globals_op) = ctx
         .trace_ctx
         .virtualizable_box_at(VABLE_NAMESPACE_FIELD_IDX)
