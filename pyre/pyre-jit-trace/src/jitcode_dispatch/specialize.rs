@@ -7089,7 +7089,13 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
         let jc = &*sym.jitcode();
         let jc_index = jc.index as u32;
         let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
-        let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc);
+        // Forward py twin first (#73 phase-3): equals the inversion-plus-trivia
+        // value by construction; the inversion survives for the empty-twin
+        // class, and the trivia skip below is an identity on the twin path.
+        let mut py = jc
+            .payload
+            .forward_py_pc_for_jitcode_pc(op.pc)
+            .unwrap_or_else(|| python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc));
         if jc.payload.code_ptr.is_null() {
             (py, sym.valuestackdepth() as i64, jc_index, marker)
         } else {

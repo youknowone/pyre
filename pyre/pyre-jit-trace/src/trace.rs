@@ -527,14 +527,11 @@ fn resolve_entry_carrier_call_py_pc(
     call_jitcode_pc: usize,
 ) -> Option<usize> {
     let outer = crate::state::pyjitcode_for_jitcode_index(outer_jitcode_index as i32);
-    let outer = outer.filter(|payload| !payload.code_ptr.is_null())?;
-    let call_py_pc =
-        crate::jitcode_dispatch::python_pc_for_jitcode_pc(&outer.metadata, call_jitcode_pc)
-            as usize;
-    Some(crate::jitcode_dispatch::skip_python_trivia_forward(
-        unsafe { &*outer.code_ptr },
-        call_py_pc,
-    ))
+    outer.filter(|payload| !payload.code_ptr.is_null())?;
+    Some(crate::state::forward_py_pc_or_backxlat(
+        outer_jitcode_index as i32,
+        call_jitcode_pc as i32,
+    ) as usize)
 }
 
 #[derive(Clone, Copy)]
@@ -560,13 +557,10 @@ fn resolve_midbody_flush_words(
     let callee = crate::state::pyjitcode_for_jitcode_index(payload.callee_jitcode_index as i32);
     let outer = outer.filter(|payload| !payload.code_ptr.is_null())?;
     let callee = callee.filter(|payload| !payload.code_ptr.is_null())?;
-    let call_py_pc =
-        crate::jitcode_dispatch::python_pc_for_jitcode_pc(&outer.metadata, payload.call_jitcode_pc)
-            as usize;
-    let call_py_pc = crate::jitcode_dispatch::skip_python_trivia_forward(
-        unsafe { &*outer.code_ptr },
-        call_py_pc,
-    );
+    let call_py_pc = crate::state::forward_py_pc_or_backxlat(
+        payload.outer_jitcode_index as i32,
+        payload.call_jitcode_pc as i32,
+    ) as usize;
     // #73 walker-as-tracer P1: the callee resume py is read from the scalar
     // forward-carried on the MidBodyPayload (`callee_py_pc`, stamped at capture
     // from the same jitcode->py inversion this once performed). The `callee`
@@ -1965,7 +1959,8 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                 "P2Drain::CompileRootRaiseEscape"
             });
             let root_py_pc =
-                crate::state::backxlat_py_pc(carrier.root_jitcode_index, root_pc as i32) as usize;
+                crate::state::forward_py_pc_or_backxlat(carrier.root_jitcode_index, root_pc as i32)
+                    as usize;
             let action =
                 full_body_walk_trace(ctx, sym, w_code, root_py_pc, cf_addr, WalkJournals::Keep);
             // Defensive: `dispatch_via_miframe` consumes the seed, but a

@@ -370,18 +370,24 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             let mut marker_call_jit_pc: Option<usize> = None;
             let (py_pc, jitcode_index, num_instrs) = unsafe {
                 let jc = &*sym.jitcode();
-                let mut py = python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc);
-                // The jitcode-pc→py-pc inversion can land on a Python trivia
-                // instruction's jitcode region (e.g. a branch target
-                // whose block lowers `NOT_TAKEN`).  A resume coordinate
-                // must be a real opcode: the interpreter resumes branches
-                // at `semantic_fallthrough_pc` / `jump_target_forward`,
-                // both of which forward-skip trivia.  Advance to the same
-                // real opcode so the resume reader's BACKWARD trivia
-                // backtrack (call_jit.rs) is a no-op — otherwise a
+                // Forward py twin first (#73 phase-3): equals the
+                // inversion-plus-trivia value by construction; the inversion
+                // survives for the empty-twin class (skeleton / fixture).
+                let mut py = jc
+                    .payload
+                    .forward_py_pc_for_jitcode_pc(op_pc)
+                    .unwrap_or_else(|| python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc));
+                // A resolved py must be a real opcode, never Python trivia
+                // (e.g. a branch target whose block lowers `NOT_TAKEN`): the
+                // interpreter resumes branches at `semantic_fallthrough_pc` /
+                // `jump_target_forward`, both of which forward-skip trivia.
+                // Land on the same real opcode so the resume reader's BACKWARD
+                // trivia backtrack (call_jit.rs) is a no-op — otherwise a
                 // `NOT_TAKEN` py_pc backtracks to the preceding branch
                 // opcode, whose block-entry liveness differs from the
-                // target's and desyncs the snapshot box-count.
+                // target's and desyncs the snapshot box-count.  The twin is
+                // already trivia-normalized, so the skip below is an identity
+                // on that path and normalizes only the inversion fallback.
                 if !jc.payload.code_ptr.is_null() {
                     let code = &*jc.payload.code_ptr;
                     py = skip_python_trivia_forward(code, py as usize) as u32;
@@ -1471,7 +1477,6 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         if jc.payload.code_ptr.is_null() || !jc.payload.is_populated() {
             return Err(InlineCallerFrameDecline::Unavailable);
         }
-        let call_py = python_pc_for_jitcode_pc(&jc.payload.metadata, call_jit_pc) as usize;
         // A CALL inside a try-block: inline it only when its exception handler
         // rejoins the loop (the exc-edge-bridgeable shape); otherwise decline so
         // the residual path handles the raise via its after-residual catch
@@ -1482,21 +1487,30 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
             jc.payload.jitcode.code.as_slice(),
             callee_has_freevars,
         )?;
-        let code = &*jc.payload.code_ptr;
-        let fallthrough = crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32;
-        // #73 Slice 4 (twin-first): certify the forward `after_residual_fallthrough`
-        // twin reproduces the inverted-then-fallthrough coordinate before any
-        // consumer cuts over to it.
-        if pcmap_afterresidual_audit_enabled()
-            && jc.payload.after_residual_fallthrough_py_pc_populated()
+        // #73 phase-3 (twin-first): the forward `after_residual_fallthrough`
+        // twin carries the inverted-then-fallthrough coordinate; the inversion
+        // survives for the empty-twin class and as the audit oracle.
+        let legacy_fallthrough = || unsafe {
+            let call_py = python_pc_for_jitcode_pc(&jc.payload.metadata, call_jit_pc) as usize;
+            let code = &*jc.payload.code_ptr;
+            crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32
+        };
+        let fallthrough = match jc
+            .payload
+            .after_residual_fallthrough_py_pc_for_jitcode_pc(call_jit_pc)
         {
-            assert_eq!(
-                jc.payload
-                    .after_residual_fallthrough_py_pc_for_jitcode_pc(call_jit_pc),
-                Some(fallthrough),
-                "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: inline-caller fallthrough-py twin diverged at jit_pc {call_jit_pc} (call_py {call_py})"
-            );
-        }
+            Some(ft) => {
+                if pcmap_afterresidual_audit_enabled() {
+                    assert_eq!(
+                        ft,
+                        legacy_fallthrough(),
+                        "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: inline-caller fallthrough-py twin diverged at jit_pc {call_jit_pc}"
+                    );
+                }
+                ft
+            }
+            None => legacy_fallthrough(),
+        };
         (
             jc.index as u32,
             fallthrough,
