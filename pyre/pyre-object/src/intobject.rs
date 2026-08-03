@@ -84,7 +84,9 @@ static SMALL_INTS: LazyLock<Vec<W_IntObject>> = LazyLock::new(|| {
 /// `W_INT_OBJECT_SIZE` via the [`crate::lltype::GcType`] impl above —
 /// the Rust analog of `gct_fv_gc_malloc`'s compile-time `c_type_id`
 /// / `c_size` (`rpython/memory/gctransform/framework.py:807-811`).
-/// `malloc_typed` is currently `Box::into_raw`; future GC integration
+/// `malloc_typed` prepends a `GcHeader` (`alloc_with_gc_header`) but
+/// allocates outside the collector's heap, so the box carries a readable
+/// type id while staying off the sweep set; future GC integration
 /// replaces only that body, this constructor stays unchanged.
 #[inline]
 pub fn w_int_new(value: i64) -> PyObjectRef {

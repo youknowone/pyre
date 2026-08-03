@@ -179,11 +179,11 @@ pub fn w_specialised_tuple_ff_new(value0: f64, value1: f64) -> PyObjectRef {
 }
 
 /// Allocate an arity-2 specialised object tuple. Carries
-/// `gc_ptr_offsets = [value0, value1]` (`eval.rs:350`); the values
-/// may transiently point at `Box::into_raw`'d W_IntObject /
-/// W_FloatObject during the L1 stepping-stone window. The mark
-/// walker's `is_managed_heap_object` guard (collector.rs:991/1008)
-/// keeps that case correctness-safe.
+/// `gc_ptr_offsets = [value0, value1]` (`eval.rs:350`); the values may
+/// transiently point at an off-heap `malloc_typed` W_IntObject /
+/// W_FloatObject during the L1 stepping-stone window — headered, but
+/// outside the collector's heap. The mark walker's
+/// `is_managed_heap_object` guard keeps that case correctness-safe.
 pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`):
     // both inputs are live PyObjectRef roots that must survive the
