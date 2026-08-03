@@ -4392,7 +4392,7 @@ fn group_py_pcs_by_insn(pairs: impl Iterator<Item = (usize, usize)>) -> Vec<(usi
 ///
 /// `compute_liveness` supplies that union only where the stream makes the edge
 /// explicit — `catch_exception L` carries `TLabel(L)`, so the backward pass
-/// folds the handler's alive set into the markers before it (`liveness.py:19-23`).
+/// folds `label2alive[L]` into the markers before it (`liveness.py:19-23`).
 /// The coordinate a bridge actually resumes at is the one the guard recorded,
 /// which for an after-residual-call guard sits PAST the `catch_exception` and so
 /// describes the no-exception arm alone.  Re-pointing that walk at the handler
@@ -4402,14 +4402,19 @@ fn group_py_pcs_by_insn(pairs: impl Iterator<Item = (usize, usize)>) -> Vec<(usi
 /// Upstream needs no equivalent: `finishframe_exception` moves the pc of the
 /// SAME MIFrame, so the handler reads the register bank the raise left behind.
 /// A pyre bridge rebuilds its bank from one coordinate's resume data, so that
-/// coordinate must name what the handler reads.  Widening a `-live-` set is the
-/// conservative direction — the snapshot carries boxes the no-exception arm does
-/// not consume, which costs a slot and never mis-restores.
+/// coordinate must name what the explicit catch edge reads.  Widening a
+/// `-live-` set is the conservative direction — the snapshot carries boxes the
+/// no-exception arm does not consume, which costs a slot and never mis-restores.
 ///
 /// Returns `marker insn index -> extra Ref colors`.
 fn catch_target_extra_ref_colors(
     ssarepr: &super::flatten::SSARepr,
     live_markers: &[usize],
+    after_call_markers: &[Option<usize>],
+    label2alive: &std::collections::HashMap<
+        String,
+        std::collections::HashSet<super::flatten::Register>,
+    >,
     code: &CodeObject,
 ) -> std::collections::BTreeMap<usize, std::collections::BTreeSet<u16>> {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
@@ -4418,38 +4423,40 @@ fn catch_target_extra_ref_colors(
     if code.exceptiontable.is_empty() {
         return out;
     }
-    let marker_ref_colors = |py: usize| -> std::collections::BTreeSet<u16> {
-        live_markers
-            .get(py)
-            .and_then(|&idx| ssarepr.insns.get(idx))
-            .and_then(|insn| insn.live_args())
-            .map(|args| {
-                args.iter()
-                    .filter_map(|op| match op {
-                        SsaOperand::Register(reg) if reg.kind == SsaKind::Ref => Some(reg.index),
-                        _ => None,
-                    })
-                    .collect()
+    let catch_ref_colors = |anchor: usize| -> std::collections::BTreeSet<u16> {
+        let Some(super::flatten::Insn::Op { opname, args, .. }) = ssarepr.insns.get(anchor + 1)
+        else {
+            return std::collections::BTreeSet::new();
+        };
+        if opname != "catch_exception" {
+            return std::collections::BTreeSet::new();
+        }
+        args.iter()
+            .filter_map(|op| match op {
+                SsaOperand::TLabel(label) => label2alive.get(&label.name),
+                _ => None,
             })
-            .unwrap_or_default()
+            .flat_map(|alive| alive.iter())
+            .filter_map(|reg| (reg.kind == SsaKind::Ref).then_some(reg.index))
+            .collect()
     };
-    // `handler py -> live-in`, memoized: a try body of N PCs shares one handler.
-    let mut handler_refs: std::collections::HashMap<usize, std::collections::BTreeSet<u16>> =
+    // `catch_exception` anchor -> label live-in, memoized: a try body of N PCs
+    // can share one catch edge in the flattened stream.
+    let mut anchor_refs: std::collections::HashMap<usize, std::collections::BTreeSet<u16>> =
         std::collections::HashMap::new();
     for py in 0..live_markers.len() {
         let offset = u32::try_from(py * 2).expect("Python PC must fit an instruction offset");
-        let Some((target, _, _)) =
+        let Some((_target, _, _)) =
             pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, offset)
         else {
             continue;
         };
-        let handler_py = target as usize / 2;
-        if handler_py == py || handler_py >= live_markers.len() {
+        let Some(anchor) = after_call_markers.get(py).and_then(|entry| *entry) else {
             continue;
-        }
-        let refs = handler_refs
-            .entry(handler_py)
-            .or_insert_with(|| marker_ref_colors(handler_py));
+        };
+        let refs = anchor_refs
+            .entry(anchor)
+            .or_insert_with(|| catch_ref_colors(anchor));
         if refs.is_empty() {
             continue;
         }
@@ -4575,7 +4582,7 @@ fn filter_liveness_in_place(
             first_insn_pre_merge[py_pc as usize] = Some(pos);
         }
     }
-    let (live_markers, after_call_post_merge, remap) =
+    let (live_markers, after_call_post_merge, remap, label2alive) =
         super::liveness::compute_liveness_with_pc_anchors(
             ssarepr,
             walker_tracked,
@@ -4600,7 +4607,13 @@ fn filter_liveness_in_place(
             .enumerate()
             .map(|(py_pc, &i)| (py_pc, i)),
     );
-    let catch_extra_refs = catch_target_extra_ref_colors(ssarepr, &live_markers, code);
+    let catch_extra_refs = catch_target_extra_ref_colors(
+        ssarepr,
+        &live_markers,
+        &after_call_post_merge,
+        &label2alive,
+        code,
+    );
 
     // The after-residual-call `-live-` is a resume coordinate of exactly the
     // same class as the per-PC marker: `get_list_of_active_boxes` reads the
