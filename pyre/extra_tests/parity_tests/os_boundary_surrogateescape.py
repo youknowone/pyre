@@ -52,4 +52,20 @@ with tempfile.TemporaryDirectory() as d:
     finally:
         s.close()
 
+# `socket.if_nametoindex` reads an interface name the same way.  A surrogate
+# escape must reach the OS, which answers ENODEV/ENXIO for a name no interface
+# carries; only the encoding is under test.
+try:
+    socket.if_nametoindex("lo\udcff")
+except UnicodeEncodeError:
+    raise AssertionError("interface name was encoded strictly") from None
+except OSError:
+    pass
+
+# The `'fsencode'` converter accepts bytes and `__fspath__` as well as str
+# (gateway.py:365 `space.fsencode_w`), so these boundaries do too.
+assert os.system(b"true") == 0
+os.waitpid(os.posix_spawn(TRUE, [TRUE.encode()], {}), 0)
+assert socket.if_nametoindex(socket.if_indextoname(1).encode()) == 1
+
 print("OK")

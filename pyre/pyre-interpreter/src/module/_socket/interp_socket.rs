@@ -1312,13 +1312,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "if_nametoindex",
                 |args| {
-                    if args.is_empty() || !unsafe { pyre_object::is_str(args[0]) } {
+                    if args.is_empty() {
                         return Err(crate::PyError::type_error(
-                            "if_nametoindex: name must be a string",
+                            "if_nametoindex() requires 1 argument",
                         ));
                     }
-                    let name = crate::baseobjspace::str_utf8_w(args[0])?.to_string();
-                    let c_name = std::ffi::CString::new(name.as_bytes())
+                    // An interface name is an OS string.  PyPy has no
+                    // `if_nametoindex`, so there is no `unwrap_spec` to port;
+                    // `socketmodule.c socket_if_nametoindex` reads it with
+                    // `PyUnicode_FSConverter`, which is the same filesystem
+                    // encoding `fsencode_w` applies and accepts the same
+                    // str / bytes / `__fspath__` argument.
+                    let name = crate::gateway::fsencode_bytes_w(args[0])?;
+                    let c_name = std::ffi::CString::new(name)
                         .map_err(|_| crate::PyError::value_error("embedded null in name"))?;
                     let idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
                     if idx == 0 {

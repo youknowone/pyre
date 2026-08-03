@@ -4251,18 +4251,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("system() requires 1 argument"));
                     }
-                    // `interp_posix.py:815 command='fsencode'`: the shell gets
-                    // the filesystem bytes, so a command naming a byte with no
-                    // UTF-8 spelling survives instead of being refused.
-                    let cmd = unsafe {
-                        if pyre_object::is_str(args[0]) {
-                            crate::gateway::fsencode_bytes_w(args[0])?
-                        } else {
-                            return Err(crate::PyError::type_error(
-                                "system(): command must be a string",
-                            ));
-                        }
-                    };
+                    // `interp_posix.py:815 command='fsencode'`, which
+                    // `gateway.py:365` unwraps with `space.fsencode_w`: the
+                    // shell gets the filesystem bytes, so a command naming a
+                    // byte with no UTF-8 spelling survives instead of being
+                    // refused, and `bytes` / `__fspath__` are accepted as the
+                    // converter accepts them.
+                    let cmd = crate::gateway::fsencode_bytes_w(args[0])?;
                     let c_cmd = std::ffi::CString::new(cmd)
                         .map_err(|_| crate::PyError::value_error("embedded null in command"))?;
                     let rc = rustpython_host_env::os::system(&c_cmd);
@@ -4534,18 +4529,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     .map(|s| {
                         // `interp_posix.py:1742 args = [space.fsencode_w(w_arg)
                         // for w_arg in args_w]`: every argv/envp entry crosses
-                        // to the new process as filesystem bytes.
-                        let bytes = unsafe {
-                            if pyre_object::is_str(s) {
-                                crate::gateway::fsencode_bytes_w(s)?
-                            } else if pyre_object::is_bytes(s) {
-                                pyre_object::w_bytes_data(s).to_vec()
-                            } else {
-                                return Err(crate::PyError::type_error(format!(
-                                    "{fn_name}(): {arg_name} entries must be str or bytes",
-                                )));
-                            }
-                        };
+                        // to the new process as filesystem bytes, and the same
+                        // converter decides what an entry may be.
+                        let bytes = crate::gateway::fsencode_bytes_w(s)?;
                         std::ffi::CString::new(bytes).map_err(|_| {
                             crate::PyError::value_error(format!(
                                 "{fn_name}(): embedded null in {arg_name}",
