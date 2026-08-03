@@ -37,6 +37,11 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static ACTIVE_FRAME_ESCAPE_STACK: std::cell::RefCell<Option<Vec<OpRef>>> =
         const { std::cell::RefCell::new(None) };
+    /// Step-0 attribution probe: classification of the most recent matched
+    /// escape, read at the force site to attribute the token clear (and hence
+    /// the abort) to the portal or the published-callee disjunct.
+    static LAST_ESCAPE_WAS_CALLEE_ONLY: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
     static COMMITTED_FRAME_ESCAPE_PC: std::cell::Cell<Option<(usize, EscapeResumeKind)>> =
         const { std::cell::Cell::new(None) };
     /// Pre-flush frame state captured by [`flush_active_frame_escape`] so a
@@ -1156,6 +1161,19 @@ impl Drop for ActiveFrameEscapeGuard {
 /// committed only when the state flush succeeds (a merge point with cached
 /// depth); a directly matched frame that cannot flush still escaped and must
 /// be forced, so for it the two signals are decoupled.
+/// Step-0 attribution probe: consume the classification recorded by the most
+/// recent matched escape and tally which disjunct owns this token clear.
+pub fn attribute_last_escape_force() {
+    if let Some(callee_only) = LAST_ESCAPE_WAS_CALLEE_ONLY.with(|c| c.take()) {
+        use crate::trace::fbw_diag;
+        fbw_diag::bump(if callee_only {
+            fbw_diag::ESCAPE_FORCE_BY_CALLEE_ONLY
+        } else {
+            fbw_diag::ESCAPE_FORCE_BY_PORTAL
+        });
+    }
+}
+
 pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::PyFrame) -> bool {
     // `executioncontext.py:104-106 leave` — a frame handed to application code
     // keeps a reference to its caller, so escaping the concrete frame an inline
@@ -1176,7 +1194,25 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
     });
     ACTIVE_FRAME_ESCAPE.with(|slot| {
         if let Some((expected, py_pc)) = slot.get()
-            && (expected == frame as usize || escaped_published)
+            && {
+                let escaped_portal = expected == frame as usize;
+                if escaped_portal || escaped_published {
+                    use crate::trace::fbw_diag;
+                    match (escaped_portal, escaped_published) {
+                        (true, false) => fbw_diag::bump(fbw_diag::ESCAPE_PORTAL_ONLY),
+                        (false, true) => fbw_diag::bump(fbw_diag::ESCAPE_PUBLISHED_CALLEE_ONLY),
+                        (true, true) => {
+                            fbw_diag::bump(fbw_diag::ESCAPE_PORTAL_AND_PUBLISHED_CALLEE)
+                        }
+                        (false, false) => {}
+                    }
+                    LAST_ESCAPE_WAS_CALLEE_ONLY
+                        .with(|c| c.set(Some(!escaped_portal && escaped_published)));
+                    true
+                } else {
+                    false
+                }
+            }
         {
             // Force #2+ within this residual (`enter` resets the committed pc
             // per residual): the live frame is already heap-authoritative

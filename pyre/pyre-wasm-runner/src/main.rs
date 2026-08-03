@@ -543,7 +543,7 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
         // which the guest cannot read. Slot layout in
         // `pyre_jit_trace::trace::fbw_diag`.
         if let Ok(fbw) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag") {
-            const RING_BASE: u32 = 6;
+            const RING_BASE: u32 = 11;
             const RING_ENTRIES: u32 = 24;
             const RING_STRIDE: u32 = 5;
             const NAME_SLOTS: u32 = 4;

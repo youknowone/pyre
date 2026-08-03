@@ -4339,6 +4339,11 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
         // with no committed resume pc, so the walk replays from entry —
         // double-applying the residual's non-journaled body effects.
         if traced_frame_escaped && let Some(ptr) = tracing_frame {
+            // Step-0 attribution probe: this clear of the PORTAL's token is
+            // what the post-residual probe reads as an escape and turns into
+            // `VableEscapedDuringResidualCall`, so attributing it names which
+            // disjunct actually owns each abort.
+            pyre_jit_trace::jitcode_dispatch::attribute_last_escape_force();
             force(ptr);
         }
         if live_frame_armed {

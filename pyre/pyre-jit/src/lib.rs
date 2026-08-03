@@ -63,6 +63,10 @@ pub use pyre_jit_trace::{
     trace_int_binop_ovf, trace_int_compare, trace_unbox_float, trace_unbox_int,
 };
 
+pub fn fbw_diag_counter(i: usize) -> u64 {
+    pyre_jit_trace::trace::fbw_diag::get(i)
+}
+
 /// Diagnostic only: `(oldgen_total_bytes, nursery_used_bytes)` of the wasm
 /// backend's GC on this thread. Lets the wasm runner attribute guest
 /// linear-memory growth to GC-retained objects vs. host-heap allocations.

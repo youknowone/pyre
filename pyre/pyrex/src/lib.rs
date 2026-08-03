@@ -998,6 +998,17 @@ fn maybe_print_jit_stats() {
         "[jit-stats] mc_diag {} all_descrs={all_descrs_len}",
         majit_metainterp::mc_diag_summary()
     );
+    eprintln!(
+        "[jit-stats] fbw_escape_split portal_only={} published_callee_only={} portal_and_published_callee={}",
+        pyre_jit::fbw_diag_counter(6),
+        pyre_jit::fbw_diag_counter(7),
+        pyre_jit::fbw_diag_counter(8),
+    );
+    eprintln!(
+        "[jit-stats] fbw_force_attrib by_portal={} by_callee_only={}",
+        pyre_jit::fbw_diag_counter(9),
+        pyre_jit::fbw_diag_counter(10),
+    );
     let stats = pyre_jit::eval::driver_pair().0.get_stats();
     eprintln!(
         "[jit-stats] loops_compiled={} bridges_compiled={} loops_aborted={} \

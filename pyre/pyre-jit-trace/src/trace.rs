@@ -5904,12 +5904,17 @@ pub mod fbw_diag {
     pub const MIDBODY_LATCH_NEW_UNJOURNALED: usize = 3;
     pub const ESCAPE_PLAIN_FALLBACK: usize = 4;
     pub const ESCAPE_PLAIN_FALLBACK_UNCLEAN: usize = 5;
+    pub const ESCAPE_PORTAL_ONLY: usize = 6;
+    pub const ESCAPE_PUBLISHED_CALLEE_ONLY: usize = 7;
+    pub const ESCAPE_PORTAL_AND_PUBLISHED_CALLEE: usize = 8;
+    pub const ESCAPE_FORCE_BY_PORTAL: usize = 9;
+    pub const ESCAPE_FORCE_BY_CALLEE_ONLY: usize = 10;
 
     /// One ring entry per walk: four slots of outcome name (8 ASCII bytes per
     /// slot, little-endian) followed by one slot of packed counters.  A `u64`
     /// export cannot carry a string, and the outcome set is far too large to
     /// spend a tally slot per variant.
-    pub const RING_BASE: usize = 6;
+    pub const RING_BASE: usize = 11;
     pub const RING_ENTRIES: usize = 24;
     pub const RING_STRIDE: usize = 5;
     pub const NAME_SLOTS: usize = 4;
