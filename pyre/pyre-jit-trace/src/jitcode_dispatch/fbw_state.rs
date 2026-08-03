@@ -1671,7 +1671,9 @@ pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
 /// merely redundant: `gen_store_back_in_vable` sets `forced_virtualizable`, and
 /// `store_token_in_vable` returns early on that (pyjitpl.py) — the two are
 /// alternatives, not a sequence — and its final store zeroes the token slot.
-fn fbw_force_virtualizable_before_return<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+pub(crate) fn fbw_force_virtualizable_before_return<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) {
     let Some(vbox) = ctx.trace_ctx.standard_virtualizable_box() else {
         return;
     };

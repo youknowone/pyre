@@ -3931,6 +3931,96 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
 }
 
 #[test]
+fn top_level_raise_settles_the_vable_token() {
+    // `pyjitpl.py:3261 compile_exit_frame_with_exception` opens with
+    // `store_token_in_vable()`, the same as `compile_done_with_this_frame`.
+    // Every residual call arms the token
+    // (`walker_vable_and_vrefs_before_residual_call`), so an exception exit
+    // that settles nothing leaves the frame naming a jitframe the backend
+    // frees on the way out of `execute_token`.  pyre settles by storing back
+    // — which zeroes the token — because its FORCE_TOKEN is the machine frame
+    // pointer, not upstream's heap-allocated GC `JITFRAME`.
+    let raise_byte = *insns_opname_to_byte()
+        .get("raise/r")
+        .expect("`raise/r` must be in insns table");
+    let code = [raise_byte, 0x02];
+    let mut tc = fresh_trace_ctx();
+    let mut vable_buf = vec![0u8; 65536];
+    bind_fake_vable(&mut tc, &mut vable_buf);
+    let mut regs = distinct_const_refs(&mut tc, 4);
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut regs,
+        registers_i: &mut [],
+        registers_f: &mut [],
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    fbw_finish_payload_reset();
+    let (outcome, _next_pc) = walk(&code, 0, &mut wc).expect("raise/r must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Terminate);
+    drop(wc);
+    let _ = fbw_finish_payload_take();
+    assert!(
+        tc.num_ops() > ops_before,
+        "the exception exit must record the virtualizable store-back",
+    );
+    let last = tc.ops().last().expect("recorded op must exist").clone();
+    assert_eq!(
+        last.opcode,
+        majit_ir::OpCode::SetfieldGc,
+        "the store-back's tail op is the token store",
+    );
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let recorded_descr = last.getdescr().expect("token store carries a field descr");
+    let field = recorded_descr
+        .as_field_descr()
+        .expect("token store's descr is a FieldDescr");
+    assert_eq!(
+        field.offset(),
+        info.token_offset,
+        "the tail store must target the vable_token slot",
+    );
+    let value = last
+        .getarglist()
+        .get(1)
+        .expect("SetfieldGc args are [obj, value]")
+        .to_opref();
+    assert_eq!(
+        tc.box_value(value),
+        Some(majit_ir::Value::Int(0)),
+        "the exception exit must leave vable_token cleared, not armed",
+    );
+}
+
+#[test]
 fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
     // The concrete shadow is mutable and
     // tracked by every `registers_r[dst]` write

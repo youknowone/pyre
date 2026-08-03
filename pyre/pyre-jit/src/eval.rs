@@ -4340,6 +4340,19 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
         // materialization never writes the slot, so the token read already
         // excludes it.
         //
+        // Dereferencing the token is only sound because every exit from a
+        // compiled activation leaves the slot cleared.  Upstream does not need
+        // that invariant: its FORCE_TOKEN is the heap-allocated GC `JITFRAME`
+        // the deadframe retains, so a surviving token still names live memory.
+        // pyre's is the machine frame pointer and the backend frees the whole
+        // `jf_forward` chain inside `execute_token`, so the slot has to be
+        // cleared on the way out instead — `gen_store_back_in_vable` on both
+        // portal exits (`fbw_terminate_with_finish` and the raise arm),
+        // `sync_after` on the loop back-edge, and
+        // `sync_virtualizable_after_guard_failure` on guard failure.  When that
+        // invariant breaks, the fault lands in `JitFrame::resolve` rather than
+        // here.
+        //
         // Comparing against `MetaInterp::vable_ptr` as well named the WRONG
         // frame.  That cell is rewritten by every `sync_before`, including the
         // entry a callee's own compiled loop takes from inside the caller's

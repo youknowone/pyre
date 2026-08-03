@@ -2881,6 +2881,30 @@ pub fn walk<Sym: WalkSym>(
                     // raise coordinate out of `frame.last_instr`.  Compiled
                     // code never wrote that field, so publish it here.
                     fbw_publish_exit_last_instr(ctx, recording_opcode_position);
+                    // `pyjitpl.py:3261 compile_exit_frame_with_exception` opens
+                    // with `store_token_in_vable()`, exactly as
+                    // `compile_done_with_this_frame` does — both frame exits
+                    // settle the token, and this one did not.  Every residual
+                    // call arms it (`walker_vable_and_vrefs_before_residual_call`
+                    // records FORCE_TOKEN + SETFIELD_GC through
+                    // `token_field_descr`), so an exit that leaves it armed
+                    // leaves the frame naming a jitframe the backend is about to
+                    // free in `execute_token`, and the next
+                    // `is_force_token_armed` walks `jf_forward` off freed
+                    // memory.
+                    //
+                    // Settle it the way the value/void arms do — store back,
+                    // which zeroes the token slot — rather than by arming it
+                    // like upstream.  Upstream can leave the token live because
+                    // its FORCE_TOKEN is the heap-allocated GC `JITFRAME`
+                    // (`jitframe.py` `lltype.malloc(JITFRAME, ...)`); pyre's is
+                    // the machine frame pointer (`mov Rq(r), rbp` / `mov X(r),
+                    // x29`), which stops being addressable the moment compiled
+                    // code returns.  `gen_store_back_in_vable` sets
+                    // `forced_virtualizable`, which is the same early-out
+                    // `store_token_in_vable` takes on `vbox is
+                    // self.forced_virtualizable`.
+                    fbw_force_virtualizable_before_return(ctx);
                     // RPython parity: framestack exhausted with no handler
                     // match → `compile_exit_frame_with_exception(last_exc_box)`.
                     // Stash the exception the same way the value-return arms
