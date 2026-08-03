@@ -194,13 +194,16 @@ pub fn decode_source_bytes(
         let encoding = encoding.as_deref().unwrap();
         let decoded =
             crate::typedef::decode_bytes_to_wtf8(source, encoding, "strict").map_err(|exc| {
-                if exc.kind == crate::PyErrorKind::LookupError {
-                    crate::PyError::syntax_error(format!(
-                        "unknown encoding for '{filename}': {encoding}"
-                    ))
-                } else {
-                    exc
-                }
+                // `pyparse.py:130-139` — a declared codec that does not exist
+                // and one that rejects the bytes are both the tokenizer's
+                // SyntaxError; the decoder's own text becomes the message and
+                // anything else propagates untouched.
+                let message = match exc.kind {
+                    crate::PyErrorKind::LookupError => format!("unknown encoding: {encoding}"),
+                    crate::PyErrorKind::UnicodeDecodeError => exc.message_text(),
+                    _ => return exc,
+                };
+                crate::PyError::syntax_error_located(message, filename, 0, 0, 0, 0, None)
             })?;
         Ok(decoded.to_string_lossy().into_owned())
     }

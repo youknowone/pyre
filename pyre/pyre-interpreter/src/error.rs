@@ -632,16 +632,16 @@ impl PyError {
         let lineno_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(pyre_object::w_int_new(lineno));
         let offset_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(offset));
+        pyre_object::gc_roots::pin_root(wrap_pos(offset));
         let text_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(match text {
             Some(t) => pyre_object::w_str_new(t),
             None => pyre_object::w_none(),
         });
         let end_lineno_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(end_lineno));
+        pyre_object::gc_roots::pin_root(wrap_pos(end_lineno));
         let end_offset_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(end_offset));
+        pyre_object::gc_roots::pin_root(wrap_pos(end_offset));
         let rooted_exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         unsafe {
             pyre_object::interp_exceptions::w_exception_set_syntax_filename(
@@ -1619,6 +1619,17 @@ impl PyError {
         } else {
             format!("{name}: {message}")
         }
+    }
+}
+
+/// `error.py:4-7 wrap_pos` — a zero position means "unknown" and reads back as
+/// `None`; every other value keeps its integer.  `lineno` deliberately skips
+/// this: a location-less parser error still reports line 0.
+fn wrap_pos(num: i64) -> PyObjectRef {
+    if num == 0 {
+        pyre_object::w_none()
+    } else {
+        pyre_object::w_int_new(num)
     }
 }
 
