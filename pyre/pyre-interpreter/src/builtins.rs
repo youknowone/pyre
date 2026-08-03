@@ -7852,6 +7852,20 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     Ok(pyre_object::gc_roots::shadow_stack_get(exc_slot))
 }
 
+/// `interp_group.py:26-29 W_BaseExceptionGroup.descr_init` — retain the first
+/// positional value in the shared exception value slot, then delegate the
+/// public `args` tuple update and keyword rejection to BaseException.
+fn exception_group_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
+    })?;
+    let (positional, _) = split_builtin_kwargs(&args[1..]);
+    if let Some(value) = positional.first().copied() {
+        unsafe { pyre_object::interp_exceptions::w_exception_set_value(w_self, value) };
+    }
+    exc_base_exception_init(args)
+}
+
 enum ExceptionGroupCondition {
     Class(PyObjectRef),
     Callable(PyObjectRef),
@@ -8343,6 +8357,11 @@ fn make_exception_group_type(
                     ns,
                     "__new__",
                     crate::typedef::make_new_descr(exception_group_new),
+                );
+                pyre_object::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__init__",
+                    make_builtin_function("__init__", exception_group_init),
                 );
                 pyre_object::w_dict_setitem_str_no_proxy(
                     ns,
