@@ -3049,6 +3049,23 @@ impl MiniMarkGC {
         Some(GcHeader::SIZE + payload_size)
     }
 
+    /// Which generation an address falls in.
+    ///
+    /// A corrupt child separates into two unrelated defects depending on the
+    /// answer: an old-gen holder naming a nursery child is a store that never
+    /// reached the remembered set, while an old-gen child is a sweep that
+    /// reclaimed a still-referenced object. The panic reports both ends so the
+    /// two are never confused.
+    fn describe_generation(&self, addr: usize) -> &'static str {
+        if self.nursery.contains(addr) {
+            "nursery"
+        } else if self.oldgen.contains(addr) {
+            "oldgen"
+        } else {
+            "outside"
+        }
+    }
+
     /// Which object actually owns `slot_addr`.
     ///
     /// A `custom_trace` may hand the collector slots that live outside the
@@ -3125,6 +3142,7 @@ impl MiniMarkGC {
                      holder_offset={:?} site={} holder_words={:#x?} \
                      child_vtable_type_id={:?} child_words={:#x?} \
                      holder_tid_and_flags={:#x} holder_in_remembered={} \
+                     child_gen={} holder_gen={} \
                      enclosing={} gc_state={:?} minors={} majors={}",
                     type_id,
                     addr,
@@ -3138,6 +3156,8 @@ impl MiniMarkGC {
                     child_words,
                     holder_hdr.tid_and_flags,
                     self.remembered_set.contains(&holder_addr),
+                    self.describe_generation(addr),
+                    self.describe_generation(holder_addr),
                     self.describe_enclosing_container(holder_addr, slot_addr, &holder_words),
                     self.gc_state,
                     self.minor_collections,
