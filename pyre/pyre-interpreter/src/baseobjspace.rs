@@ -9414,10 +9414,20 @@ pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef,
         unsafe { lookup_in_type(w_type, name) }
     }
     .ok_or_else(|| {
-        crate::PyError::attribute_error(format!(
-            "'{}' object has no attribute '{}'",
+        // PyPy `pyopcode.py BEFORE_WITH` / `BEFORE_ASYNC_WITH` converts a
+        // missing special method into the protocol-level TypeError here,
+        // rather than leaking the AttributeError from an ordinary attribute
+        // lookup.  Keep the sync/async distinction shared with the JIT
+        // residual as well.
+        let protocol = match name {
+            "__aenter__" | "__aexit__" => {
+                "asynchronous context manager protocol (no __aenter__/__aexit__ method)"
+            }
+            _ => "context manager protocol (no __enter__/__exit__ method)",
+        };
+        crate::PyError::type_error(format!(
+            "'{}' object does not support the {protocol}",
             object_functionstr_type_name(obj),
-            name,
         ))
     })?;
     let bound = unsafe { get(descr, obj, w_type) }?.unwrap_or(descr);

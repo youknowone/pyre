@@ -243,13 +243,13 @@
       "dynasm": "FAIL"
     },
     "test.test_contextlib": {
-      "dynasm": "CRASH"
+      "dynasm": "PASS"
     },
     "test.test_contextlib_async": {
       "dynasm": "FAIL"
     },
     "test.test_copy": {
-      "dynasm": "CRASH"
+      "dynasm": "PASS"
     },
     "test.test_copyreg": {
       "cranelift": "PASS",

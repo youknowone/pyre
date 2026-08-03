@@ -2330,25 +2330,7 @@ impl SharedOpcodeHandler for PyFrame {
     }
 
     fn load_special_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
-        let w_type = match crate::typedef::r#type(obj) {
-            Some(t) => t,
-            None => {
-                return Err(PyError::type_error(format!(
-                    "'{}' object does not support the context manager protocol",
-                    crate::baseobjspace::object_functionstr_type_name(obj)
-                )));
-            }
-        };
-        let descr = match unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), name) } {
-            Some(d) => d,
-            None => {
-                return Err(PyError::type_error(format!(
-                    "'{}' object does not support the context manager protocol",
-                    crate::baseobjspace::object_functionstr_type_name(obj)
-                )));
-            }
-        };
-        Ok(unsafe { crate::baseobjspace::get(descr, obj, w_type.as_ptr()) }?.unwrap_or(descr))
+        crate::baseobjspace::load_special_resolve(obj, name)
     }
 
     fn store_attr(
