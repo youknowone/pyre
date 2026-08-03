@@ -8468,9 +8468,18 @@ pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
 /// `descr.py:598-612 create_call_stub` generates a stub carrying the descr's
 /// real `arg_classes` signature; the convergence path for pyre is the libffi
 /// dispatch already recorded at `call_stub.rs` `dispatch_arity_body!`'s
-/// catch-all arm.  Every float-returning helper in the tree today is
-/// non-interleaved (`jit_bigint_to_f64_or_inf(ref) -> f64`,
-/// `jit_float_abs(f64) -> f64`, `jit_float_fmod(f64, f64) -> f64`).
+/// catch-all arm.
+///
+/// An interleaved float-returning helper does exist —
+/// `jit_math_ldexp_raw(f64, i64) -> f64`, whose descr is minted with
+/// `arg_types = [Float, Int]` in `pyre-jit-trace`'s `specialize.rs`.  It does
+/// not reach here: the walker specializer records it straight onto the trace
+/// via `TraceCtx::call_float_typed_with_effect` and obtains its concrete result
+/// by calling the builtin separately, so the descr is consumed by the compiled
+/// backends and by the blackhole's `bh_call_f_by_classes` (which buckets by
+/// `arg_classes` with no such restriction).  This seam is fed only from the
+/// jitcode descr pool, and no descr there places an integer/ref slot after a
+/// float one.
 pub fn call_float_function(func_ptr: *const (), args: &[i64], arg_types: &[Type]) -> f64 {
     // Where a backend cannot build a `call_indirect` whose type matches the
     // callee's real signature (wasm32), route through the host trampoline,
@@ -8913,6 +8922,40 @@ mod tests {
     use crate::jitcode::JitCodeBuilder;
     use crate::virtualizable::VirtualizableInfo;
     use majit_ir::Type;
+
+    extern "C" fn scale_f64(x: f64, k: i64) -> f64 {
+        x * k as f64
+    }
+
+    /// The bucketing `call_float_function` performs is register-preserving
+    /// where the two register files are filled independently (SysV, AAPCS) and
+    /// not where the argument slots are positional (Microsoft x64), so an
+    /// integer/ref parameter following a float one is refused rather than
+    /// dispatched differently per target.  Locks that contract in place.
+    #[test]
+    #[should_panic(expected = "cannot be bucketed")]
+    fn interleaved_int_after_float_is_refused() {
+        call_float_function(
+            scale_f64 as *const (),
+            &[2.5_f64.to_bits() as i64, 3],
+            &[Type::Float, Type::Int],
+        );
+    }
+
+    /// The same argument classes in non-interleaved order are dispatchable:
+    /// only the ordering is refused, not the presence of both classes.
+    #[test]
+    fn float_after_int_dispatches() {
+        extern "C" fn scale_swapped(k: i64, x: f64) -> f64 {
+            x * k as f64
+        }
+        let result = call_float_function(
+            scale_swapped as *const (),
+            &[3, 2.5_f64.to_bits() as i64],
+            &[Type::Int, Type::Float],
+        );
+        assert_eq!(result, 7.5, "scale_swapped(3, 2.5) == 7.5");
+    }
 
     #[derive(Default)]
     struct DummySym;
