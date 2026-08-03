@@ -177,7 +177,10 @@ pub fn drain_census_record(
     let percent = if used_before == 0 {
         0
     } else {
-        (promoted.min(used_before) * 100) / used_before
+        // Widen before scaling: on wasm32 a nursery past ~43 MB makes
+        // `used_before * 100` wrap a 32-bit `usize`, which buckets the sample
+        // wrong in release and trips the overflow check in debug.
+        ((promoted.min(used_before) as u64 * 100) / used_before as u64) as usize
     };
     census.deciles[(percent / 10).min(DRAIN_DECILES - 1)] += 1;
     if drain_census_dump_interval()

@@ -9538,7 +9538,6 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let exit_arity = exit_types.len();
-        let compiled = self.compiled_loops.get(&green_key).unwrap();
         // FINISH descrs are singletons (`DONE_WITH_THIS_FRAME_DESCR_*` /
         // `EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL`) with `trace_id == 0`
         // and `fail_index == u32::MAX`; they carry no per-trace exit
