@@ -231,6 +231,17 @@ pub fn gc_query_reentrant<R>(f: impl FnOnce(&MiniMarkGC) -> R) -> R {
 /// Number of threads that have called `register_thread` and not yet
 /// `unregister_thread`.
 static REGISTERED_THREADS: AtomicUsize = AtomicUsize::new(0);
+/// Sticky record that the process has ever had two registered mutators.
+///
+/// A host-side root copied before it is published can only have become a
+/// nursery forwarding stub if another mutator collected in that window.  The
+/// single-mutator process therefore needs no forwarding query at every root
+/// pin.  Once a second mutator appears the race becomes possible forever
+/// (that thread may collect and unregister before the pin observes the live
+/// census), so this deliberately never clears.  This is the same sticky 1→2
+/// boundary that permanently disables shared-nursery inline allocation in
+/// [`register_thread`].
+static FOREIGN_MUTATOR_SEEN: AtomicBool = AtomicBool::new(false);
 
 /// Register the current thread as a GC mutator and take the GIL, which it then
 /// holds for as long as it runs pyre code. Paired with `unregister_thread`.
@@ -239,7 +250,17 @@ pub fn register_thread() {
         !GC_THREAD.with(|t| t.registered.get()),
         "GC mutator thread registered twice"
     );
-    REGISTERED_THREADS.fetch_add(1, Ordering::SeqCst);
+    let old = REGISTERED_THREADS.fetch_add(1, Ordering::SeqCst);
+    if old > 0 {
+        FOREIGN_MUTATOR_SEEN.store(true, Ordering::Release);
+        // A second thread is arriving, so no standing claim may survive: from
+        // here on every caller sees REGISTERED_THREADS > 1 and takes the Mutex
+        // path. The count was raised first, so the previous holder cannot make
+        // a new standing claim once this one is revoked. `gc_mutex` is what
+        // `revoke_standing_claim` requires of its callers.
+        let _guard = GC_SYNC.gc_mutex.lock().unwrap();
+        revoke_standing_claim(my_ident());
+    }
 
     let mut state = GC_SYNC.quiesce.lock().unwrap();
     state = GC_SYNC
@@ -403,6 +424,16 @@ pub(crate) struct GilCensus {
 #[inline]
 pub fn registered_threads() -> usize {
     REGISTERED_THREADS.load(Ordering::Acquire)
+}
+
+/// Whether another registered mutator has ever existed in this process.
+///
+/// Unlike [`stw_required`], this is sticky across unregister: a foreign
+/// nursery collection may already have left a forwarding stub in a raw host
+/// local copied before its next root pin.
+#[inline]
+pub fn foreign_mutator_seen() -> bool {
+    FOREIGN_MUTATOR_SEEN.load(Ordering::Acquire)
 }
 
 /// RPython `rthread.thread_after_fork()` parity for the child process.
@@ -886,7 +917,30 @@ mod tests {
         });
         blocking(|| worker.join()).unwrap();
 
+<<<<<<< HEAD
         assert_eq!(published_top(), before);
+||||||| parent of 3d06ccdce4b (gc: skip root forwarding queries before mutators are shared)
+        assert_eq!(
+            gc_query(
+                |gc| unsafe { &*(gc.nursery_top_addr() as *const AtomicUsize) }
+                    .load(Ordering::Acquire)
+            ),
+            0
+        );
+=======
+        assert!(
+            foreign_mutator_seen(),
+            "the 1→2 mutator transition must remain sticky after unregister"
+        );
+
+        assert_eq!(
+            gc_query(
+                |gc| unsafe { &*(gc.nursery_top_addr() as *const AtomicUsize) }
+                    .load(Ordering::Acquire)
+            ),
+            0
+        );
+>>>>>>> 3d06ccdce4b (gc: skip root forwarding queries before mutators are shared)
         unregister_test_mutator();
     }
 
