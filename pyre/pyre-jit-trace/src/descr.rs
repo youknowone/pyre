@@ -2305,6 +2305,11 @@ pub fn range_start_descr() -> DescrRef {
     range_field_descr(RANGE_START_OFFSET)
 }
 
+/// Field descriptor for `W_Range.stop` (wrapped PyObjectRef).
+pub fn range_stop_descr() -> DescrRef {
+    range_field_descr(RANGE_STOP_OFFSET)
+}
+
 /// Field descriptor for `W_Range.step` (wrapped PyObjectRef).
 pub fn range_step_descr() -> DescrRef {
     range_field_descr(RANGE_STEP_OFFSET)
@@ -2951,6 +2956,12 @@ pub fn w_bool_size_descr() -> DescrRef {
 /// vtable = &RANGE_ITER_TYPE; type_id = 0.
 pub fn w_range_iter_size_descr() -> DescrRef {
     RANGE_ITER_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for W_Range allocation via NewWithVtable.
+/// vtable = &RANGE_TYPE.
+pub fn w_range_size_descr() -> DescrRef {
+    RANGE_DESCR_GROUP.size_descr.clone()
 }
 
 /// Size descriptor for W_FloatObject allocation via NewWithVtable.

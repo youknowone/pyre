@@ -4758,6 +4758,17 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // An exact `range(...)` constructor call becomes a virtual W_Range whose
+    // four wrapped-int fields can fold directly into GET_ITER virtualization.
+    // Non-canonical callables and arguments fall through to the residual.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && try_walker_specialize_builtin_range(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // `math.sqrt(x)` / `float(x)` on an exact numeric argument: inline the
     // domain-guarded pure `CALL_F(sqrt_nonneg_jit)` (ll_math.rs) resp. the
     // `CastIntToFloat` / identity conversion instead of the opaque

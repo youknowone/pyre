@@ -5981,6 +5981,198 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `range(stop)` / `range(start, stop)` / `range(start, stop, step)` with
+/// exact canonical machine-word ints: lower the opaque constructor residual
+/// to a virtual `W_Range` and four virtual wrapped-int fields.  This lets the
+/// existing GET_ITER specialization consume the range without forcing either
+/// allocation.  All other callables and argument shapes fall through to the
+/// generic residual.
+pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if !(3..=5).contains(&r_args.len()) {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
+        (arg_concretes[0], arg_concretes[1])
+    else {
+        return Ok(None);
+    };
+    let range_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::functional::RANGE_TYPE);
+    if concrete_callable.is_null()
+        || !null_or_self.is_null()
+        || !std::ptr::eq(concrete_callable, range_type)
+    {
+        return Ok(None);
+    }
+
+    let exact_int_class = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    let mut concrete_args = Vec::with_capacity(r_args.len() - 2);
+    let mut concrete_values = Vec::with_capacity(r_args.len() - 2);
+    for concrete in &arg_concretes[2..] {
+        let ConcreteValue::Ref(arg_obj) = *concrete else {
+            return Ok(None);
+        };
+        if arg_obj.is_null()
+            || unsafe {
+                !std::ptr::eq((*arg_obj).ob_type, &pyre_object::pyobject::INT_TYPE)
+                    || !std::ptr::eq((*arg_obj).w_class, exact_int_class)
+            }
+        {
+            return Ok(None);
+        }
+        concrete_args.push(arg_obj);
+        concrete_values.push(unsafe { pyre_object::w_int_get_value(arg_obj) });
+    }
+    if concrete_values.len() == 3 && concrete_values[2] == 0 {
+        return Ok(None);
+    }
+    // Produce the authentic result before emitting IR, keeping every decline
+    // point side-effect-free with respect to the trace under construction.
+    let authentic_range = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &concrete_args)
+    };
+    let Ok(authentic_range) = authentic_range else {
+        return Ok(None);
+    };
+    let (authentic_start, authentic_stop, authentic_step) =
+        unsafe { pyre_object::functional::w_range_fields(authentic_range) };
+    let authentic_length = unsafe { pyre_object::functional::w_range_length(authentic_range) };
+    let authentic_fields = [
+        authentic_start,
+        authentic_stop,
+        authentic_step,
+        authentic_length,
+    ];
+    if authentic_fields.iter().any(|&field| unsafe {
+        !std::ptr::eq((*field).ob_type, &pyre_object::pyobject::INT_TYPE)
+            || !std::ptr::eq((*field).w_class, exact_int_class)
+    }) {
+        return Ok(None);
+    }
+    let concrete_fields =
+        authentic_fields.map(|field| unsafe { pyre_object::w_int_get_value(field) });
+    let [
+        concrete_start,
+        concrete_stop,
+        concrete_step,
+        concrete_length,
+    ] = concrete_fields;
+
+    // The bound test below reads the unboxed `intval`, and that read is only
+    // safe behind the class guards emitted here, so the decline cannot be
+    // hoisted ahead of the emission — it rewinds instead.
+    let pre_emit_pos = ctx.trace_ctx.get_trace_position();
+
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let int_type_const = ctx.trace_ctx.const_int(int_type_addr);
+    let mut raw_args = Vec::with_capacity(concrete_values.len());
+    for (&arg_op, &concrete_value) in r_args[2..].iter().zip(&concrete_values) {
+        if !arg_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(arg_op) {
+            ctx.trace_ctx
+                .record_guard(OpCode::GuardClass, &[arg_op, int_type_const], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        }
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(arg_op, int_type_addr);
+        walker_guard_exact_w_class(ctx, op.pc, arg_op, exact_int_class)?;
+        let raw = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            arg_op,
+            crate::descr::int_intval_descr(),
+        );
+        ctx.trace_ctx
+            .set_opref_concrete(raw, majit_ir::Value::Int(concrete_value));
+        raw_args.push(raw);
+    }
+
+    let zero = ctx.trace_ctx.const_int(0);
+    let one = ctx.trace_ctx.const_int(1);
+    let (start, stop, step) = match raw_args.as_slice() {
+        [stop] => (zero, *stop, one),
+        [start, stop] => (*start, *stop, one),
+        [start, stop, step] => (*start, *stop, *step),
+        _ => unreachable!("range arity gate admitted an invalid argument count"),
+    };
+    // Trace-constant bounds only.  This is what makes `length` sound as a
+    // record-time constant: a bound that varies per iteration would pair a
+    // stale length with fresh start/stop/step.  The alternative — emitting
+    // `compute_range_length` — costs a division chain plus its overflow
+    // guards, and it regressed two shapes the gate pins: a bound that
+    // alternates empty and non-empty needs the emptiness folded in
+    // branchlessly (a guard side-exits every other call), and the resulting op
+    // run aborts the wasm trace when the `range` sits inside a self-recursive
+    // callee that is inlined per level.  A variable bound keeps the residual
+    // until that is worked out.
+    if !start.is_constant() || !stop.is_constant() || !step.is_constant() {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    }
+    let length = ctx.trace_ctx.const_int(concrete_length);
+
+    let new = ctx.trace_ctx.record_op_with_descr(
+        OpCode::NewWithVtable,
+        &[],
+        crate::descr::w_range_size_descr(),
+    );
+    ctx.trace_ctx.heap_cache_mut().new_object(new);
+
+    let field_descrs = [
+        crate::descr::range_start_descr(),
+        crate::descr::range_stop_descr(),
+        crate::descr::range_step_descr(),
+        crate::descr::range_length_descr(),
+    ];
+    let raw_fields = [start, stop, step, length];
+    for (((descr, raw), concrete_value), authentic_field) in field_descrs
+        .into_iter()
+        .zip(raw_fields)
+        .zip(concrete_fields)
+        .zip(authentic_fields)
+    {
+        let boxed = crate::state::wrapint(ctx.trace_ctx, raw);
+        ctx.trace_ctx.set_opref_concrete(
+            boxed,
+            majit_ir::Value::Ref(majit_ir::GcRef(authentic_field as usize)),
+        );
+        let descr_index = descr.index();
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::SetfieldGc, &[new, boxed], descr);
+        ctx.trace_ctx
+            .heapcache_setfield_cached(new, descr_index, boxed);
+    }
+
+    let range_type_addr = &pyre_object::functional::RANGE_TYPE as *const _ as i64;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(new, range_type_addr);
+    ctx.trace_ctx.set_opref_concrete(
+        new,
+        majit_ir::Value::Ref(majit_ir::GcRef(authentic_range as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', new)?;
+    Ok(Some(()))
+}
+
 /// `math.sqrt(x)` on an exact int/float argument: inline the domain-guarded
 /// pure `CALL_F(sqrt_nonneg_jit)` (ll_math.rs `ll_math_sqrt` → `sqrt_nonneg`,
 /// EF_ELIDABLE_CANNOT_RAISE) instead of the opaque
