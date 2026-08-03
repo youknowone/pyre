@@ -7085,40 +7085,33 @@ impl<M: Clone> MetaInterp<M> {
                 cloned
             })
             .collect();
-        // Same contract as the `bridge_ops` rebuild above: an `InputArg`
-        // minted from a type alone has an empty concrete-value slot, so carry
-        // over whatever the recorder's own inputargs hold.
+        // Mint the bridge's input args from types alone, WITHOUT carrying the
+        // values the recorder's own inputargs hold.
         //
-        // Which channel put them there matters, because it is no longer this
-        // one: `start_retrace_from_guard` used to stamp every inputarg from
-        // the deadframe by position, and that stamp is gone (it pinned dead
-        // Ref slots as constant NULL — see the `heap_value_for` note there).
-        // The values reaching here are the ones the FRONTEND wrote through
-        // `TraceCtx::try_set_opref_concrete` while it rebuilt the bridge's
-        // entry state — once per box the resume data actually resurrects,
-        // which is `resume.py:1267-1282 load_box_from_cpu`'s own granularity.
-        // `closing_jump_runtime_boxes` (compile_bridge) reads them to build
-        // `runtime_boxes`, the only channel `virtualstate.py:493-498` has for
-        // deciding that an extra bound guard can retarget the bridge into the
-        // loop body instead of the preamble.
+        // The channel that put those values there is not resume-walked:
+        // pyre's bridge setup (`state.rs seed_virtualizable_boxes` follow-up
+        // loop) stamps `try_set_opref_concrete` over *every* Ref input arg
+        // positionally, `Value::Ref(0)` included, where
+        // `resume.py:1267-1282 load_box_from_cpu` only ever constructs a box
+        // for a live resume entry. Copying those in makes a dead Ref slot
+        // reach `closing_jump_runtime_boxes` as a constant NULL, and the NULL
+        // then propagates into the trace as a folded operand: measured as a
+        // `mov x0, #0` feeding the `jit_next` FOR_ITER residual, i.e. a
+        // `next(NULL)` SIGSEGV in `test.test_strftime`. Measured on dynasm /
+        // macOS aarch64: 3/27 runs with this copy, 1/120 without, with
+        // `bridges_compiled` unchanged (21 vs 20) so compile volume is not
+        // what moved.
         //
-        // `compile_bridge`'s `PendingBridgeRd` zip also writes deadframe
-        // values onto inputargs, but it runs AFTER that read and its
-        // `liveboxes` are every bridge inputarg, not a resume-walked subset
-        // — so it must not be mistaken for the live-filtered channel. See
-        // task #37.
+        // `compile_bridge`'s `PendingBridgeRd` zip is likewise positional over
+        // every bridge inputarg rather than a resume-walked subset. See
+        // task #37 for the live-filtered channel this site needs before the
+        // values can be carried again.
         let bridge_inputargs: Vec<majit_ir::InputArg> = ctx
             .recorder
-            .inputargs()
+            .inputarg_types()
             .iter()
             .enumerate()
-            .map(|(i, src)| {
-                let ia = majit_ir::InputArg::from_type(src.tp, i as u32);
-                if let Some(v) = src.get_value() {
-                    ia.set_value(v);
-                }
-                ia
-            })
+            .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
             .collect();
         // The recorder carries Const values inline on the OpRef variants
         // (history.py:227/268/314), so there is no legacy TraceCtx
