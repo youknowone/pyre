@@ -98,7 +98,6 @@ pub fn trace_unbox_int(
     ctx: &mut crate::TraceCtx,
     obj: majit_ir::OpRef,
     int_type_addr: i64,
-    _ob_type_descr: majit_ir::DescrRef,
     intval_descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
@@ -128,7 +127,6 @@ pub fn trace_box_int(
     ctx: &mut crate::TraceCtx,
     value: majit_ir::OpRef,
     size_descr: majit_ir::DescrRef,
-    _ob_type_descr: majit_ir::DescrRef,
     intval_descr: majit_ir::DescrRef,
     int_type_addr: i64,
 ) -> majit_ir::OpRef {
@@ -165,25 +163,12 @@ pub fn trace_int_binop_ovf(
     b: majit_ir::OpRef,
     opcode: majit_ir::OpCode,
     int_type_addr: i64,
-    ob_type_descr: majit_ir::DescrRef,
     intval_descr: majit_ir::DescrRef,
     size_descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
-    let a_val = trace_unbox_int(
-        ctx,
-        a,
-        int_type_addr,
-        ob_type_descr.clone(),
-        intval_descr.clone(),
-    );
-    let b_val = trace_unbox_int(
-        ctx,
-        b,
-        int_type_addr,
-        ob_type_descr.clone(),
-        intval_descr.clone(),
-    );
+    let a_val = trace_unbox_int(ctx, a, int_type_addr, intval_descr.clone());
+    let b_val = trace_unbox_int(ctx, b, int_type_addr, intval_descr.clone());
     let result = ctx.record_op(opcode, &[a_val, b_val]);
     // Box(value) parity: derive the concrete result from the operands'
     // stamped Box.value carriers (BoxInt(value) — wrap semantics match
@@ -202,14 +187,7 @@ pub fn trace_int_binop_ovf(
     // (`trace_verify.rs`) without a synthetic snapshot — convergence
     // path is convergence to register-machine jitcode.
     ctx.record_guard_typed(OpCode::GuardNoOverflow, &[], Vec::new());
-    trace_box_int(
-        ctx,
-        result,
-        size_descr,
-        ob_type_descr,
-        intval_descr,
-        int_type_addr,
-    )
+    trace_box_int(ctx, result, size_descr, intval_descr, int_type_addr)
 }
 
 /// Emit a non-overflow binary int operation (bitwise ops, shifts).
@@ -219,24 +197,11 @@ pub fn trace_int_binop(
     b: majit_ir::OpRef,
     opcode: majit_ir::OpCode,
     int_type_addr: i64,
-    ob_type_descr: majit_ir::DescrRef,
     intval_descr: majit_ir::DescrRef,
     size_descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
-    let a_val = trace_unbox_int(
-        ctx,
-        a,
-        int_type_addr,
-        ob_type_descr.clone(),
-        intval_descr.clone(),
-    );
-    let b_val = trace_unbox_int(
-        ctx,
-        b,
-        int_type_addr,
-        ob_type_descr.clone(),
-        intval_descr.clone(),
-    );
+    let a_val = trace_unbox_int(ctx, a, int_type_addr, intval_descr.clone());
+    let b_val = trace_unbox_int(ctx, b, int_type_addr, intval_descr.clone());
     let result = ctx.record_op(opcode, &[a_val, b_val]);
     // Box(value) parity: derive the concrete result from the operands'
     // stamped Box.value carriers.
@@ -246,14 +211,7 @@ pub fn trace_int_binop(
         let folded = crate::eval_binop_i(opcode, la, rb);
         ctx.set_opref_concrete(result, majit_ir::Value::Int(folded));
     }
-    trace_box_int(
-        ctx,
-        result,
-        size_descr,
-        ob_type_descr,
-        intval_descr,
-        int_type_addr,
-    )
+    trace_box_int(ctx, result, size_descr, intval_descr, int_type_addr)
 }
 
 /// Emit a comparison between two Python ints.
@@ -263,23 +221,10 @@ pub fn trace_int_compare(
     b: majit_ir::OpRef,
     opcode: majit_ir::OpCode,
     int_type_addr: i64,
-    ob_type_descr: majit_ir::DescrRef,
     intval_descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
-    let a_val = trace_unbox_int(
-        ctx,
-        a,
-        int_type_addr,
-        ob_type_descr.clone(),
-        intval_descr.clone(),
-    );
-    let b_val = trace_unbox_int(
-        ctx,
-        b,
-        int_type_addr,
-        ob_type_descr.clone(),
-        intval_descr.clone(),
-    );
+    let a_val = trace_unbox_int(ctx, a, int_type_addr, intval_descr.clone());
+    let b_val = trace_unbox_int(ctx, b, int_type_addr, intval_descr.clone());
     let result = ctx.record_op(opcode, &[a_val, b_val]);
     // Box(value) parity: stamp the bool result from the operands' Box.value
     // carriers (BoxInt(0|1) — IntEq/IntNe/IntLt/IntLe/IntGt/IntGe all map
@@ -377,7 +322,6 @@ pub fn trace_unbox_float(
     ctx: &mut crate::TraceCtx,
     obj: majit_ir::OpRef,
     float_type_addr: i64,
-    _ob_type_descr: majit_ir::DescrRef,
     floatval_descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
@@ -394,7 +338,6 @@ pub fn trace_box_float(
     ctx: &mut crate::TraceCtx,
     value: majit_ir::OpRef,
     size_descr: majit_ir::DescrRef,
-    _ob_type_descr: majit_ir::DescrRef,
     floatval_descr: majit_ir::DescrRef,
     float_type_addr: i64,
 ) -> majit_ir::OpRef {
@@ -422,24 +365,11 @@ pub fn trace_float_binop(
     b: majit_ir::OpRef,
     opcode: majit_ir::OpCode,
     float_type_addr: i64,
-    ob_type_descr: majit_ir::DescrRef,
     floatval_descr: majit_ir::DescrRef,
     size_descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
-    let a_val = trace_unbox_float(
-        ctx,
-        a,
-        float_type_addr,
-        ob_type_descr.clone(),
-        floatval_descr.clone(),
-    );
-    let b_val = trace_unbox_float(
-        ctx,
-        b,
-        float_type_addr,
-        ob_type_descr.clone(),
-        floatval_descr.clone(),
-    );
+    let a_val = trace_unbox_float(ctx, a, float_type_addr, floatval_descr.clone());
+    let b_val = trace_unbox_float(ctx, b, float_type_addr, floatval_descr.clone());
     let result = ctx.record_op(opcode, &[a_val, b_val]);
     // Box(value) parity: derive the concrete result from the operands'
     // stamped Box.value carriers (BoxFloat(value)).
@@ -449,14 +379,7 @@ pub fn trace_float_binop(
         let bits = crate::eval_binop_f(opcode, a.to_bits() as i64, b.to_bits() as i64);
         ctx.set_opref_concrete(result, majit_ir::Value::Float(f64::from_bits(bits as u64)));
     }
-    trace_box_float(
-        ctx,
-        result,
-        size_descr,
-        ob_type_descr,
-        floatval_descr,
-        float_type_addr,
-    )
+    trace_box_float(ctx, result, size_descr, floatval_descr, float_type_addr)
 }
 
 /// Emit a comparison between two Python floats.
@@ -466,23 +389,10 @@ pub fn trace_float_compare(
     b: majit_ir::OpRef,
     opcode: majit_ir::OpCode,
     float_type_addr: i64,
-    ob_type_descr: majit_ir::DescrRef,
     floatval_descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
-    let a_val = trace_unbox_float(
-        ctx,
-        a,
-        float_type_addr,
-        ob_type_descr.clone(),
-        floatval_descr.clone(),
-    );
-    let b_val = trace_unbox_float(
-        ctx,
-        b,
-        float_type_addr,
-        ob_type_descr.clone(),
-        floatval_descr.clone(),
-    );
+    let a_val = trace_unbox_float(ctx, a, float_type_addr, floatval_descr.clone());
+    let b_val = trace_unbox_float(ctx, b, float_type_addr, floatval_descr.clone());
     let result = ctx.record_op(opcode, &[a_val, b_val]);
     // Box(value) parity: stamp the bool result from the operands' Box.value
     // carriers (BoxInt(0|1) — FloatLt/FloatLe/FloatEq/FloatNe/FloatGt/FloatGe

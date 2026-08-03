@@ -7100,7 +7100,6 @@ fn walker_unbox_int_typed<Sym: WalkSym>(
         ctx.trace_ctx,
         obj,
         type_addr,
-        crate::descr::ob_type_descr(),
         intval_descr,
     ))
 }
@@ -7193,7 +7192,6 @@ fn walker_unbox_float<Sym: WalkSym>(
         ctx.trace_ctx,
         obj,
         float_type_addr,
-        crate::descr::ob_type_descr(),
         crate::descr::float_floatval_descr(),
     ))
 }

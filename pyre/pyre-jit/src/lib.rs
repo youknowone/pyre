@@ -184,13 +184,11 @@ mod tests {
             majit_ir::OpRef,
             i64,
             majit_ir::DescrRef,
-            majit_ir::DescrRef,
         ) -> majit_ir::OpRef = trace_unbox_int;
 
         let _: fn(
             &mut majit_metainterp::TraceCtx,
             majit_ir::OpRef,
-            majit_ir::DescrRef,
             majit_ir::DescrRef,
             majit_ir::DescrRef,
             i64,
@@ -202,7 +200,6 @@ mod tests {
             majit_ir::OpRef,
             majit_ir::OpCode,
             i64,
-            majit_ir::DescrRef,
             majit_ir::DescrRef,
             majit_ir::DescrRef,
         ) -> majit_ir::OpRef = trace_int_binop_ovf;

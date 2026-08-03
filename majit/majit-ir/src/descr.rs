@@ -3546,7 +3546,7 @@ pub trait FieldDescr: Descr {
 
     /// descr.py:227 — field name. Format is either:
     /// - `"STRUCT.fieldname"` (from codewriter: descr.py:227)
-    /// - `"typeptr"` (from pyre tracer: ob_type_descr)
+    /// - `"object.typeptr"` (the vtable field, `make_vtable_field_descr`)
     /// - `""` (unnamed/dynamic field descriptors)
     fn field_name(&self) -> &str {
         ""
@@ -3565,8 +3565,9 @@ pub trait FieldDescr: Descr {
     /// already created, so we check the name at use time.
     ///
     /// Handles both formats:
-    /// - `"typeptr"` (pyre tracer ob_type_descr)
-    /// - `"STRUCT.typeptr"` (codewriter format, descr.py:227)
+    /// - `"STRUCT.typeptr"` (codewriter format, descr.py:227), which
+    ///   `make_vtable_field_descr` spells `"object.typeptr"`
+    /// - a bare `"typeptr"`, which no producer mints today
     fn is_typeptr(&self) -> bool {
         let name = self.field_name();
         name == "typeptr" || name.ends_with(".typeptr")

@@ -8,14 +8,8 @@ mod tests {
     use majit_ir::{OpCode, OpRef};
     use majit_metainterp::TraceCtx;
 
-    fn ob_type_descr() -> majit_ir::DescrRef {
-        make_field_descr(0, 8, majit_ir::Type::Int, false)
-    }
     fn intval_descr() -> majit_ir::DescrRef {
         make_field_descr(8, 8, majit_ir::Type::Int, true)
-    }
-    fn immutable_ob_type_descr() -> majit_ir::DescrRef {
-        make_immutable_field_descr(0, 8, majit_ir::Type::Int, false)
     }
     fn immutable_intval_descr() -> majit_ir::DescrRef {
         make_immutable_field_descr(8, 8, majit_ir::Type::Int, true)
@@ -53,13 +47,7 @@ mod tests {
     fn test_unbox_int_ops() {
         let mut ctx = TraceCtx::for_test(1);
         let obj = OpRef::input_arg_ref(0);
-        let _intval = crate::trace_unbox_int(
-            &mut ctx,
-            obj,
-            FAKE_INT_TYPE,
-            ob_type_descr(),
-            intval_descr(),
-        );
+        let _intval = crate::trace_unbox_int(&mut ctx, obj, FAKE_INT_TYPE, intval_descr());
         let ops = get_ops(ctx);
         // GUARD_CLASS(box, cls): backend loads typeptr from obj at offset 0
         // (llgraph/runner.py:1245), no explicit pre-read. Followed by the
@@ -75,7 +63,6 @@ mod tests {
             &mut ctx,
             OpRef::input_arg_ref(0),
             w_int_size_descr(),
-            ob_type_descr(),
             intval_descr(),
             FAKE_INT_TYPE,
         );
@@ -96,7 +83,6 @@ mod tests {
             OpRef::input_arg_ref(1),
             OpCode::IntAddOvf,
             FAKE_INT_TYPE,
-            ob_type_descr(),
             intval_descr(),
             w_int_size_descr(),
         );
@@ -121,13 +107,7 @@ mod tests {
     fn test_unbox_float_ops() {
         let mut ctx = TraceCtx::for_test(1);
         let obj = OpRef::input_arg_ref(0);
-        let _floatval = crate::trace_unbox_float(
-            &mut ctx,
-            obj,
-            FAKE_FLOAT_TYPE,
-            ob_type_descr(),
-            floatval_descr(),
-        );
+        let _floatval = crate::trace_unbox_float(&mut ctx, obj, FAKE_FLOAT_TYPE, floatval_descr());
         let ops = get_ops(ctx);
         assert_eq!(ops, vec![OpCode::GuardClass, OpCode::GetfieldGcF]);
         eprintln!("✓ trace_unbox_float: {:?}", ops);
@@ -137,13 +117,8 @@ mod tests {
     fn test_unbox_int_ops_read_immutable_descrs_as_plain_getfield() {
         let mut ctx = TraceCtx::for_test(1);
         let obj = OpRef::input_arg_ref(0);
-        let _intval = crate::trace_unbox_int(
-            &mut ctx,
-            obj,
-            FAKE_INT_TYPE,
-            immutable_ob_type_descr(),
-            immutable_intval_descr(),
-        );
+        let _intval =
+            crate::trace_unbox_int(&mut ctx, obj, FAKE_INT_TYPE, immutable_intval_descr());
         let ops = get_ops(ctx);
         // The tracer records the plain GetfieldGcI even for an immutable
         // descr; OptHeap re-derives purity from the descr. GuardClass takes
@@ -155,13 +130,8 @@ mod tests {
     fn test_unbox_float_ops_read_immutable_descrs_as_plain_getfield() {
         let mut ctx = TraceCtx::for_test(1);
         let obj = OpRef::input_arg_ref(0);
-        let _floatval = crate::trace_unbox_float(
-            &mut ctx,
-            obj,
-            FAKE_FLOAT_TYPE,
-            immutable_ob_type_descr(),
-            immutable_floatval_descr(),
-        );
+        let _floatval =
+            crate::trace_unbox_float(&mut ctx, obj, FAKE_FLOAT_TYPE, immutable_floatval_descr());
         let ops = get_ops(ctx);
         assert_eq!(ops, vec![OpCode::GuardClass, OpCode::GetfieldGcF]);
     }
@@ -173,7 +143,6 @@ mod tests {
             &mut ctx,
             OpRef::input_arg_ref(0),
             w_float_size_descr(),
-            ob_type_descr(),
             floatval_descr(),
             FAKE_FLOAT_TYPE,
         );
@@ -191,7 +160,6 @@ mod tests {
             OpRef::input_arg_ref(1),
             OpCode::FloatAdd,
             FAKE_FLOAT_TYPE,
-            ob_type_descr(),
             floatval_descr(),
             w_float_size_descr(),
         );

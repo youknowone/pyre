@@ -2076,7 +2076,7 @@ use pyre_object::interp_exceptions::{
     ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, W_BASE_EXCEPTION_SIZE, exc_kind_to_pytype,
 };
 use pyre_object::intobject::W_IntObject;
-use pyre_object::pyobject::{OB_TYPE_OFFSET, W_CLASS_OFFSET};
+use pyre_object::pyobject::W_CLASS_OFFSET;
 use pyre_object::{
     BOOL_INTVAL_OFFSET, FLOAT_ARRAY_BLOCK_OFFSET, FLOAT_ARRAY_LEN_OFFSET, INT_ARRAY_BLOCK_OFFSET,
     INT_ARRAY_LEN_OFFSET, INT_INTVAL_OFFSET, W_ListObject, W_TupleObject,
@@ -2740,32 +2740,6 @@ pub fn str_len_descr() -> DescrRef {
 }
 
 // ── Object header & allocation descriptors ──────────────────────────
-
-/// Field descriptor for ob_type (PyObject.ob_type pointer) — immutable.
-/// heaptracker.py:66: `if name == 'typeptr': continue`
-///
-/// One object per run, for the identity reason documented on
-/// [`W_CLASS_FIELD_DESCR`].
-static OB_TYPE_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(new_ob_type_field_descr);
-
-pub fn ob_type_descr() -> DescrRef {
-    OB_TYPE_FIELD_DESCR.clone() as DescrRef
-}
-
-fn new_ob_type_field_descr() -> Arc<dyn FieldDescr> {
-    Arc::new(PyreFieldDescr {
-        offset: OB_TYPE_OFFSET,
-        field_size: std::mem::size_of::<*const pyre_object::PyType>(),
-        field_type: Type::Int,
-        signed: false,
-        immutable: true,
-        quasi_immutable: false,
-        name: "typeptr",
-        index_in_parent: 0,
-        parent_descr: None,
-        ei_index: AtomicU32::new(u32::MAX),
-    })
-}
 
 /// Size descriptor for W_IntObject allocation via NewWithVtable.
 /// vtable = &INT_TYPE (ob_type for virtual materialization).

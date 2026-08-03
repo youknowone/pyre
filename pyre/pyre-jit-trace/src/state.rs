@@ -3627,13 +3627,7 @@ pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::Walk
             .heap_cache_mut()
             .class_now_known(obj, type_addr);
     }
-    crate::trace_unbox_int(
-        frame.ctx_mut(),
-        obj,
-        type_addr,
-        crate::descr::ob_type_descr(),
-        intval_descr,
-    )
+    crate::trace_unbox_int(frame.ctx_mut(), obj, type_addr, intval_descr)
 }
 
 /// Unbox a `W_LongObject` (whose BigInt fits in i64) into a raw i64 OpRef.
@@ -3717,7 +3711,6 @@ pub(crate) fn trace_unbox_float_with_resume<F: crate::walker_frame_ops::WalkerFr
         frame.ctx_mut(),
         obj,
         float_type_addr,
-        crate::descr::ob_type_descr(),
         crate::descr::float_floatval_descr(),
     )
 }
@@ -11237,10 +11230,9 @@ mod tests {
     use pyre_interpreter::bytecode::{CodeObject, ConstantData, Instruction};
     use pyre_interpreter::pyopcode::decode_instruction_at;
     use pyre_interpreter::{Mode, compile_exec, compile_source};
-    use pyre_object::OB_TYPE_OFFSET;
     use pyre_object::floatobject::w_float_get_value;
     use pyre_object::listobject::w_list_getitem;
-    use pyre_object::pyobject::{INT_TYPE, LIST_TYPE, PyType, is_list};
+    use pyre_object::pyobject::{INT_TYPE, PyType, is_list};
     use std::cell::{Cell, UnsafeCell};
 
     #[test]
@@ -12278,18 +12270,6 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_ob_type_descr_uses_immutable_header_field_descr() {
-        let descr = crate::descr::ob_type_descr();
-        let field = descr
-            .as_field_descr()
-            .expect("ob_type descr must be a field descr");
-        assert_eq!(field.offset(), OB_TYPE_OFFSET);
-        assert_eq!(field.field_type(), Type::Int);
-        assert!(descr.is_always_pure());
-        assert!(field.is_immutable());
-    }
-
-    #[test]
     fn test_pypyjit_driver_descriptor_matches_interp_jit_layout() {
         let descriptor = PyreJitState::pypyjit_driver_descriptor();
 
@@ -12879,10 +12859,6 @@ mod tests {
             descr: None,
             type_id: 0,
             fields: vec![
-                (
-                    crate::descr::ob_type_descr().index(),
-                    MaterializedValue::Value(&LIST_TYPE as *const PyType as usize as i64),
-                ),
                 (
                     crate::descr::list_length_descr().index(),
                     MaterializedValue::Value(2),

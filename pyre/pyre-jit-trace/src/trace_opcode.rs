@@ -510,9 +510,8 @@ fn concrete_list_strategy_id(concrete: PyObjectRef) -> Option<i64> {
 }
 
 use crate::descr::{
-    float_floatval_descr, int_intval_descr, list_strategy_descr, ob_type_descr,
-    slice_w_start_descr, slice_w_step_descr, slice_w_stop_descr, w_float_size_descr,
-    w_int_size_descr,
+    float_floatval_descr, int_intval_descr, list_strategy_descr, slice_w_start_descr,
+    slice_w_step_descr, slice_w_stop_descr, w_float_size_descr, w_int_size_descr,
 };
 use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_PYCODE_OFFSET,
@@ -1910,7 +1909,6 @@ impl MIFrame {
                         ctx,
                         value,
                         w_int_size_descr(),
-                        ob_type_descr(),
                         int_intval_descr(),
                         int_type_addr,
                     )
@@ -1921,7 +1919,6 @@ impl MIFrame {
                         ctx,
                         value,
                         w_float_size_descr(),
-                        ob_type_descr(),
                         float_floatval_descr(),
                         float_type_addr,
                     )
