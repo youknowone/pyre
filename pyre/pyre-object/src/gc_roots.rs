@@ -280,11 +280,13 @@ fn with_shadow_stack<R>(f: impl FnOnce(&RootStack) -> R) -> R {
 /// `increase_root_stack_depth(new_depth)` (`rlib/rgc.py:775-779` →
 /// `shadowstack.py:351-364`).  `sys.setrecursionlimit` scales the root stack
 /// with the limit at `pypy/module/sys/vm.py:97`; the depth can only grow.
+#[majit_macros::dont_look_inside]
 pub fn increase_root_stack_depth(new_depth: usize) {
     with_shadow_stack(|stack| stack.grow(new_depth));
 }
 
 /// `root_stack_depth` — the slot count this thread's root stack can hold.
+#[majit_macros::dont_look_inside]
 pub fn root_stack_depth() -> usize {
     with_shadow_stack(|stack| {
         let capacity = stack.capacity();
@@ -453,6 +455,7 @@ impl Drop for RootScope {
 /// execute the matching `pop_roots(hop, livevars)`. See the module
 /// docstring for the multi-phase plan.
 #[inline]
+#[majit_macros::dont_look_inside]
 pub fn push_roots() -> RootScope {
     RootScope::new()
 }
