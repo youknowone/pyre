@@ -16822,13 +16822,19 @@ impl majit_backend::Backend for CraneliftBackend {
         if func == 0 {
             return 0;
         }
-        let (classes, args) = majit_backend::call_stub::collect_call_args(
+        let collected = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
             args_r,
             args_f,
         );
-        unsafe { majit_backend::call_stub::bh_call_i_dispatch(func as usize, &classes, &args) }
+        unsafe {
+            majit_backend::call_stub::bh_call_i_dispatch(
+                func as usize,
+                collected.classes(),
+                collected.args(),
+            )
+        }
     }
 
     /// llmodel.py:818 bh_call_r: GcRef-returning parallel of `bh_call_i`.
@@ -16848,14 +16854,19 @@ impl majit_backend::Backend for CraneliftBackend {
         if func == 0 {
             return majit_ir::GcRef::NULL;
         }
-        let (classes, args) = majit_backend::call_stub::collect_call_args(
+        let collected = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
             args_r,
             args_f,
         );
-        let raw =
-            unsafe { majit_backend::call_stub::bh_call_i_dispatch(func as usize, &classes, &args) };
+        let raw = unsafe {
+            majit_backend::call_stub::bh_call_i_dispatch(
+                func as usize,
+                collected.classes(),
+                collected.args(),
+            )
+        };
         majit_ir::GcRef(raw as usize)
     }
 
@@ -16876,13 +16887,19 @@ impl majit_backend::Backend for CraneliftBackend {
         if func == 0 {
             return 0.0;
         }
-        let (classes, args) = majit_backend::call_stub::collect_call_args(
+        let collected = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
             args_r,
             args_f,
         );
-        unsafe { majit_backend::call_stub::bh_call_f_dispatch(func as usize, &classes, &args) }
+        unsafe {
+            majit_backend::call_stub::bh_call_f_dispatch(
+                func as usize,
+                collected.classes(),
+                collected.args(),
+            )
+        }
     }
 
     /// llmodel.py:834 bh_call_v / descr.py:590-605 create_call_stub
@@ -16907,14 +16924,18 @@ impl majit_backend::Backend for CraneliftBackend {
         if func == 0 {
             return;
         }
-        let (classes, args) = majit_backend::call_stub::collect_call_args(
+        let collected = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
             args_r,
             args_f,
         );
         unsafe {
-            majit_backend::call_stub::bh_call_v_dispatch(func as usize, &classes, &args);
+            majit_backend::call_stub::bh_call_v_dispatch(
+                func as usize,
+                collected.classes(),
+                collected.args(),
+            );
         }
     }
 

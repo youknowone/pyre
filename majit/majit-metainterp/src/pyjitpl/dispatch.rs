@@ -8480,9 +8480,14 @@ pub fn call_float_function(func_ptr: *const (), args: &[i64], arg_types: &[Type]
 /// (`descr.py:556-570 TYPE()`).
 ///
 /// Returns the fixed-size buffer so the residual-call path stays
-/// allocation-free; callers slice it to `args.len()`.  A positional slot with
-/// no declared type is forwarded as a machine word, matching the untyped
-/// [`call_int_function`] / [`call_void_function`] seams.
+/// allocation-free; callers slice it to `args.len()`.
+///
+/// `arg_types` must cover every positional slot: a slot the descr does not
+/// describe is forwarded as a machine word, which is the very mis-placement
+/// this projection exists to prevent if the undescribed slot is a `Float`.
+/// Both callers (`executor::execute_pure_call` / `execute_residual_call`) take
+/// the argument list and the type list from the same calldescr, so the two
+/// agree by construction.
 fn arg_classes_from_types(
     args_len: usize,
     arg_types: &[Type],
@@ -8490,6 +8495,12 @@ fn arg_classes_from_types(
     assert!(
         args_len <= MAX_HOST_CALL_ARITY,
         "unsupported JitCode typed call arity {args_len} (max {MAX_HOST_CALL_ARITY})"
+    );
+    debug_assert!(
+        arg_types.len() >= args_len,
+        "typed call: calldescr describes {} argument types for {args_len} positional \
+         arguments; an undescribed Float slot would travel in an integer register",
+        arg_types.len()
     );
     let mut classes = [majit_backend::call_stub::ArgClass::Int; MAX_HOST_CALL_ARITY];
     for (i, slot) in classes.iter_mut().enumerate().take(args_len) {
