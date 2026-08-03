@@ -2337,6 +2337,26 @@ pub(crate) fn census_dump() {
     });
 }
 
+/// The same tally [`census_dump`] prints, as text, and without the
+/// [`fbw_debug_abort_enabled`] gate.
+///
+/// wasm32 has no descriptors, so the guest's `eprintln!` reaches nothing and
+/// `std::env::var_os` is permanently empty there — the dump above is doubly
+/// unreachable on that target. The counters themselves are always accumulated
+/// (`census_record` bumps the map unconditionally), so handing them back as
+/// text lets `pyre-wasm` export them and the runner print them host-side, the
+/// same way the jit-stats counters cross the boundary.
+///
+/// Reading, not draining: safe to call more than once.
+pub fn census_report() -> String {
+    FBW_DECLINE_CENSUS.with(|c| {
+        c.borrow()
+            .iter()
+            .map(|(name, count)| format!("[fbw-census] {name}: {count}\n"))
+            .collect()
+    })
+}
+
 /// Carrier-boundary raise seed (`finishframe_exception` at the bridge carrier):
 /// set by [`crate::trace::drive_bridge_carrier_walk`] when a depth-2 inlined
 /// callee's sub-walk ended in `SubRaise`.

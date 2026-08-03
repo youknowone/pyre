@@ -120,6 +120,10 @@ struct Host {
 /// fails, so this is invisible to a green suite and present in every failure
 /// dump and interactive run).
 ///
+/// Where a guest-side probe has a host-side replacement, use that instead:
+/// `PYRE_FBW_DEBUG_ABORT`'s decline census is `PYRE_WASM_FBW_CENSUS` here,
+/// read back through the `pyre_fbw_census` export.
+///
 /// Exempt: the names this runner interprets host-side (`PYRE_WASM_*`,
 /// `PYRE_STDLIB`, `MAJIT_STATS`) and `check.py`'s own `PYRE_CHECK_*`
 /// interpreter paths. A knob that later becomes host-interpreted must be added
@@ -808,6 +812,24 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
             err_bytes = vec![0u8; elen as usize];
             memory.read(&store, ptr as usize, &mut err_bytes)?;
             dealloc.call(&mut store, (ptr, elen))?;
+        }
+    }
+    // `PYRE_FBW_DEBUG_ABORT` cannot select the walker's decline census in the
+    // guest, and its `eprintln!` would reach nothing anyway, so the census
+    // comes back through its own export and is printed here. Absent on a
+    // module predating the export, in which case there is nothing to print.
+    if std::env::var_os("PYRE_WASM_FBW_CENSUS").is_some()
+        && let Ok(census) = instance.get_typed_func::<(), u64>(&mut store, "pyre_fbw_census")
+    {
+        let packed = census.call(&mut store, ())?;
+        let (ptr, clen) = ((packed >> 32) as u32, (packed & 0xffff_ffff) as u32);
+        if clen != 0 {
+            let mut bytes = vec![0u8; clen as usize];
+            memory.read(&store, ptr as usize, &mut bytes)?;
+            dealloc.call(&mut store, (ptr, clen))?;
+            eprint!("{}", String::from_utf8_lossy(&bytes));
+        } else {
+            eprintln!("[fbw-census] (no declines recorded)");
         }
     }
     let exit_code = instance
