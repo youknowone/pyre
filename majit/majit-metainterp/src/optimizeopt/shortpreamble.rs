@@ -1585,11 +1585,7 @@ impl ProducedShortOp {
             Some(p) => {
                 debug_assert_eq!(
                     p.preamble_op.pos.get(),
-                    if self.invented_name {
-                        result_opref
-                    } else {
-                        source
-                    },
+                    result_opref,
                     "builder replay pos diverged from produce_pure replay rule"
                 );
                 crate::optimizeopt::ImportedShortPureOp {
@@ -1739,11 +1735,27 @@ impl ProducedShortOp {
         // them only through `PreambleOp(self.res, preamble_op, ...)`.
         //
         // DEVIATION: the forwarding below collapses the two onto one position.
-        // It is load-bearing as long as it stands — `force_op_from_preamble_op`
-        // keys `potential_extra_ops` off the forwarded box, and both the
-        // `force_box` pop and the post-hoc force sweep in unroll.rs carry a
-        // second lookup for the cases where the two resolutions disagree. The
-        // forwarding and those compensations have to come out together.
+        // It is what gives the imported field a body-namespace identity at all,
+        // so it cannot be lifted on its own. `self.res` names a Phase-1
+        // (preamble) OpRef; RPython has no such split, because `self.res` is one
+        // Box that both the preamble and the peeled body hold. Forwarding it to
+        // the Phase-2 replay slot is what makes the peeled body re-export the
+        // field as its own short box, which is in turn what extends the body
+        // JUMP with the slot the extended LABEL declares.
+        //
+        // Measured: dropping just this `make_equal_to` (and the GETARRAYITEM /
+        // LoopInvariant siblings) leaves the body JUMP one arg short, and
+        // `assemble_peeled_trace_with_jump_args`'s `unwrap_or(label_arg)`
+        // fallback then feeds the LABEL slot back to itself — a loop-carried
+        // `s -= 1` freezes at its entry value (`synth/unary_int_loop_carried`
+        // prints -44 instead of -29000). Removing the `force_box` dual-key pop
+        // and the unroll.rs force sweep alongside it does not address that;
+        // closing this needs the imported short box to carry a body-namespace
+        // position by construction.
+        //
+        // The non-invented Pure sibling of this collapse (the replay op sharing
+        // `source`) was a separate defect and is fixed — see mod.rs
+        // `ImportedShortPureOp::new`.
         let op_source = ctx
             .get_box_replacement_operand_opt(source)
             .unwrap_or_else(|| ctx.materialize_operand_at(source));
@@ -1887,7 +1899,8 @@ impl ProducedShortOp {
         // carried body result and the replayed GETARRAYITEM result stay
         // distinct upstream, joined only by PreambleOp bookkeeping. The same
         // DEVIATION as the GETFIELD path applies — the forwarding below
-        // collapses them.
+        // collapses them, and `produce_heap_field` records why it cannot be
+        // lifted on its own.
         let op_source = ctx
             .get_box_replacement_operand_opt(source)
             .unwrap_or_else(|| ctx.materialize_operand_at(source));
@@ -1933,7 +1946,8 @@ impl ProducedShortOp {
         // shortpreamble.py:152-159 stores `self.res` as the body-visible Box
         // and the replay call separately in PreambleOp. As with HeapOp the two
         // identities stay distinct upstream, and as with HeapOp the forwarding
-        // below is the DEVIATION that collapses them.
+        // below is the DEVIATION that collapses them; `produce_heap_field`
+        // records why it cannot be lifted on its own.
         let result_opref = *result_map.get(&source)?;
         let _ = result_type;
         let op_source = ctx

@@ -448,8 +448,12 @@ impl ImportedShortPureOp {
         // The body-visible `op` and the replay `preamble_op` are distinct
         // RPython Box objects for every PureOp, not only invented aliases.
         // Keep their OpRef identities distinct as well: `source` names
-        // self.res, while `result` names the replay operation.
-        replay.pos.set(if invented_name { result } else { source });
+        // self.res, while `result` names the replay operation — including
+        // the non-invented arm, where `add_op_to_short` (shortpreamble.py:140
+        // `op.copy_and_change(opnum, args=arglist)`) still hands
+        // `ProducedShortOp` a freshly allocated replay op rather than
+        // `self.res` itself.
+        replay.pos.set(result);
         if let Some(d) = descr.clone() {
             replay.setdescr(d);
         }
@@ -3152,8 +3156,7 @@ impl OptContext {
         // allocated before the constructor, so all emit-capable kinds use it.
         let replay_pos = |source: OpRef, produced_op: &ProducedShortOp| -> OpRef {
             let installs_replace_op = match produced_op.kind {
-                PreambleOpKind::Pure => produced_op.invented_name,
-                PreambleOpKind::Heap | PreambleOpKind::LoopInvariant => true,
+                PreambleOpKind::Pure | PreambleOpKind::Heap | PreambleOpKind::LoopInvariant => true,
                 PreambleOpKind::InputArg | PreambleOpKind::Guard => false,
             };
             if installs_replace_op {
