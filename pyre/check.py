@@ -673,8 +673,7 @@ def _jit_stats_regression_floor(saved, current):
     whose healthy value IS 0, so they gate from the first run without
     re-recording. The count-valued counters have no such healthy value, so a
     baseline that does not name one is treated as not pinning it at all — a
-    baseline recorded before the field existed must not read as `0 -> 1757`,
-    and the wasm [jit-stats] line reports neither of them."""
+    baseline recorded before the field existed must not read as `0 -> 1757`."""
     old_fields = _parse_jit_stats(saved)
     new_fields = _parse_jit_stats(current)
     regressions = []

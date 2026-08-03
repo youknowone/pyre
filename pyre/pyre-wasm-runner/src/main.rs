@@ -480,7 +480,7 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
         if let Ok(ab) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_abort_diag") {
             let labels = [
                 "too_long",
-                "bridge",
+                "bridge_or_generic",
                 "bad_loop",
                 "escape",
                 "force_quasiimmut",

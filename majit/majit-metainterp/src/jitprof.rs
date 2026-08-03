@@ -175,9 +175,20 @@ struct TimingState {
 /// lets the host read them by index and print the same breakdown.
 ///
 /// Order is the contract with that host: append only, never reorder.
+///
+/// `ABORT_BRIDGE` is labelled for what it actually counts here, not for its
+/// name. [`AbortReason::Generic`] maps to the same integer 13, and that is the
+/// value `jitdriver`'s reason ladder falls back to whenever a `TraceAction::
+/// Abort` arrives with no `SwitchToBlackhole`, no staged reason and a trace
+/// that is not too long — which is every walker decline except
+/// `ForceQuasiImmutable`. So a nonzero tally here is overwhelmingly
+/// "unclassified", and reading it as "a bridge aborted" sends the next reader
+/// looking for bridge activity that is not there.
+///
+/// [`AbortReason::Generic`]: crate::pyjitpl::AbortReason::Generic
 pub const ABORT_COUNTER_KINDS: &[(i32, &str)] = &[
     (counters::ABORT_TOO_LONG, "too_long"),
-    (counters::ABORT_BRIDGE, "bridge"),
+    (counters::ABORT_BRIDGE, "bridge_or_generic"),
     (counters::ABORT_BAD_LOOP, "bad_loop"),
     (counters::ABORT_ESCAPE, "escape"),
     (counters::ABORT_FORCE_QUASIIMMUT, "force_quasiimmut"),
