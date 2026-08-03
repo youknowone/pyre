@@ -247,6 +247,20 @@ pub struct PyCode {
     /// same reason it forwards `w_globals`: the wrapper is Box-immortal, so
     /// nothing else would reach a movable object landing here.
     pub w_qualname: PyObjectRef,
+    /// `pycode.py:137 self.co_name = name` realized as one shared wrapped
+    /// object, the exact counterpart of `w_qualname` above.
+    ///
+    /// `function.py:51 self.name = forcename or code.co_name` copies the code
+    /// object's interp-level string into every function built from it, so the
+    /// same "all of them name one immutable string" argument applies, and the
+    /// same realize-once treatment follows.  Without it the getter ran
+    /// `w_str_new` per read — two allocations, a `String` copy and a full
+    /// `chars().count()` — which a traceback walk pays on every hop
+    /// (`tb.tb_frame.f_code.co_name`).
+    ///
+    /// `PY_NULL` until first realized by [`w_code_name_obj`]; the storage,
+    /// immortality and root-walk argument are `w_qualname`'s verbatim.
+    pub w_name: PyObjectRef,
 }
 
 /// Field offset of `code_ptr` within `PyCode`.
@@ -255,6 +269,8 @@ pub const CODE_PTR_OFFSET: usize = std::mem::offset_of!(PyCode, code_ptr);
 pub const CODE_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyCode, w_globals);
 /// Field offset of `w_qualname` within `PyCode`.
 pub const CODE_W_QUALNAME_OFFSET: usize = std::mem::offset_of!(PyCode, w_qualname);
+/// Field offset of `w_name` within `PyCode`.
+pub const CODE_W_NAME_OFFSET: usize = std::mem::offset_of!(PyCode, w_name);
 
 /// `pycode.py:127 self.co_qualname = qualname` — the shared wrapped qualified
 /// name, realized on first demand and retained on the code object.
@@ -284,6 +300,35 @@ pub unsafe fn w_code_qualname_obj(w_code: PyObjectRef) -> PyObjectRef {
         let w_qualname = w_str_new(&(*code_ptr).qualname);
         (*(w_code as *mut PyCode)).w_qualname = w_qualname;
         w_qualname
+    }
+}
+
+/// `pycode.py:137 self.co_name = name` — the shared wrapped name, realized on
+/// first demand and retained on the code object.
+///
+/// The counterpart of [`w_code_qualname_obj`], for the same reason and with the
+/// same lifetime argument: `function.py:51 self.name = forcename or
+/// code.co_name` and the `co_name` getter both hand out the code object's own
+/// string, so they name one immutable value.
+///
+/// # Safety
+/// `w_code` must point to a valid `PyCode`.
+pub unsafe fn w_code_name_obj(w_code: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let cached = (*(w_code as *const PyCode)).w_name;
+        if !cached.is_null() {
+            return cached;
+        }
+        let code_ptr = w_code_get_ptr(w_code) as *const crate::CodeObject;
+        if code_ptr.is_null() {
+            return pyre_object::PY_NULL;
+        }
+        // `w_str_new` is a collection point, but the wrapper is Box-immortal
+        // and so never relocates; the fresh string is stored through the
+        // still-valid `w_code` before any further allocation can sweep it.
+        let w_name = w_str_new(&(*code_ptr).obj_name);
+        (*(w_code as *mut PyCode)).w_name = w_name;
+        w_name
     }
 }
 
@@ -510,6 +555,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         mapdict_caches,
         co_consts_w,
         w_qualname: pyre_object::PY_NULL,
+        w_name: pyre_object::PY_NULL,
     }) as PyObjectRef;
     register_prebuilt_code_root(obj);
     obj
@@ -721,7 +767,8 @@ pub unsafe fn code_get_field(obj: PyObjectRef, name: &str) -> Result<PyObjectRef
         "co_freevars" => names_tuple(&code.freevars),
         "co_cellvars" => names_tuple(&code.cellvars),
         "co_filename" => w_str_new(&code.source_path),
-        "co_name" => w_str_new(&code.obj_name),
+        // Shared realized object, like `co_qualname` below.
+        "co_name" => unsafe { w_code_name_obj(obj) },
         // The realized qualname is shared with every function built from this
         // code object (`function.py:54 self.qualname = qualname or self.name`),
         // so the attribute yields the same object on each read.
