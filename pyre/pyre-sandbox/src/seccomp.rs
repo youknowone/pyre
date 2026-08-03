@@ -22,6 +22,10 @@
 //! Over-listing a benign syscall here cannot widen the escape surface (every
 //! listed call is host-neutral); omitting one the runtime needs only
 //! over-restricts and kills the child — i.e. it fails in the safe direction.
+//! That reasoning is what keeps [`allowed_syscalls`] a plain list of numbers,
+//! and it is also why `prctl` is not on it: as a multiplexer it is host-neutral
+//! in only one of its options, so [`build_filter_program`] admits it on the
+//! option as well as the number.
 //!
 //! Because pyre has no genc backend, this is the *only* whole-program guarantee
 //! in the sandbox — the compile-time seam + clippy fence are selective, not a
@@ -46,9 +50,12 @@ const LD_ABS_W: u16 = BPF_LD | BPF_W | BPF_ABS; // load a 32-bit word at an abso
 const JEQ_K: u16 = BPF_JMP | BPF_JEQ | BPF_K; // jump-if-equal against an immediate
 const RET_K: u16 = BPF_RET | BPF_K; // return an immediate action
 
-// Byte offsets into `struct seccomp_data` (the BPF input): `nr` then `arch`.
+// Byte offsets into `struct seccomp_data` (the BPF input): `nr`, `arch`, then
+// the low half of `args[0]` (8-byte `instruction_pointer` sits between them, and
+// classic BPF loads 32 bits at a time — little-endian, so the low half is first).
 const SECCOMP_DATA_NR_OFFSET: u32 = 0;
 const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
+const SECCOMP_DATA_ARG0_LOW_OFFSET: u32 = 16;
 
 // AUDIT_ARCH_* (`linux/audit.h`) = EM_<arch> | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE.
 #[cfg(target_arch = "x86_64")]
@@ -220,6 +227,54 @@ fn allowed_syscalls() -> Vec<u32> {
     nums.iter().map(|&n| n as u32).collect()
 }
 
+/// Assemble the classic-BPF allowlist: `syscalls` pass on their number alone,
+/// `prctl` passes only for `PR_SET_VMA`, everything else traps.
+///
+/// `prctl` is a multiplexer, so listing it by number would hand untrusted code
+/// every option at once — `PR_SET_SPECULATION_CTRL` can drop this process's
+/// Spectre mitigations, `PR_SET_DUMPABLE`/`PR_SET_PTRACER` open its memory to a
+/// sibling. Only the naming of one's own anonymous mapping is host-neutral, and
+/// mimalloc (the default global allocator) issues exactly that after each of its
+/// `mmap`s (`mimalloc/src/prim/unix/prim.c` `unix_mmap_prim`), so the first
+/// region it reserves past lockdown would otherwise trap. `option` is an `int`,
+/// so the kernel sees only the low 32 bits this checks.
+fn build_filter_program(syscalls: &[u32]) -> Vec<libc::sock_filter> {
+    let n = syscalls.len();
+    // Layout (indices): 0 load-arch, 1 arch-check, 2 arch-mismatch kill, 3
+    // load-nr, 4..4+n per-syscall allow checks, 4+n prctl check, 4+n+1 default
+    // trap, 4+n+2 load-arg0, 4+n+3 option check, 4+n+4 trap, 4+n+5 allow.
+    let allow_idx = n + 9;
+    // The per-syscall jumps are the longest and are encoded in a `u8`; a list
+    // that outgrew the range would truncate them into the middle of the program
+    // and silently allow the wrong calls.
+    assert!(
+        allow_idx <= 4 + usize::from(u8::MAX),
+        "allowlist of {n} outgrew the reach of a u8 BPF jump",
+    );
+    let mut prog: Vec<libc::sock_filter> = Vec::with_capacity(allow_idx + 1);
+    prog.push(stmt(LD_ABS_W, SECCOMP_DATA_ARCH_OFFSET));
+    // arch == AUDIT_ARCH -> skip the next (kill) instruction; else fall into it.
+    prog.push(jeq(AUDIT_ARCH, 1));
+    prog.push(stmt(RET_K, libc::SECCOMP_RET_KILL_PROCESS));
+    prog.push(stmt(LD_ABS_W, SECCOMP_DATA_NR_OFFSET));
+    for (i, &sc) in syscalls.iter().enumerate() {
+        // From the check at index 4+i, taking jt lands at 4+i+1+jt, and the
+        // ALLOW terminator is at n+9, so jt = n + 4 - i.
+        prog.push(jeq(sc, (n + 4 - i) as u8));
+    }
+    // prctl reaches the option check one instruction past the default trap.
+    prog.push(jeq(libc::SYS_prctl as u32, 1));
+    // Default deny: trap to the SIGSYS handler, which names the syscall and
+    // exits. (The arch-mismatch path above stays an unconditional kill.)
+    prog.push(stmt(RET_K, libc::SECCOMP_RET_TRAP));
+    prog.push(stmt(LD_ABS_W, SECCOMP_DATA_ARG0_LOW_OFFSET));
+    prog.push(jeq(libc::PR_SET_VMA as u32, 1));
+    prog.push(stmt(RET_K, libc::SECCOMP_RET_TRAP));
+    prog.push(stmt(RET_K, libc::SECCOMP_RET_ALLOW));
+    debug_assert_eq!(prog.len(), allow_idx + 1);
+    prog
+}
+
 /// Install the syscall allowlist on the current (single) thread/process. After
 /// it returns `Ok`, any syscall outside [`allowed_syscalls`] traps to the
 /// SIGSYS handler ([`report_blocked_syscall`]), which writes the blocked
@@ -254,25 +309,7 @@ pub fn install_runtime_filter() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
-    let syscalls = allowed_syscalls();
-    let n = syscalls.len();
-    // Layout (indices): 0 load-arch, 1 arch-check, 2 arch-mismatch kill,
-    // 3 load-nr, 4..4+n per-syscall allow checks, 4+n default trap, 4+n+1 allow.
-    let mut prog: Vec<libc::sock_filter> = Vec::with_capacity(n + 6);
-    prog.push(stmt(LD_ABS_W, SECCOMP_DATA_ARCH_OFFSET));
-    // arch == AUDIT_ARCH -> skip the next (kill) instruction; else fall into it.
-    prog.push(jeq(AUDIT_ARCH, 1));
-    prog.push(stmt(RET_K, libc::SECCOMP_RET_KILL_PROCESS));
-    prog.push(stmt(LD_ABS_W, SECCOMP_DATA_NR_OFFSET));
-    for (i, &sc) in syscalls.iter().enumerate() {
-        // From the check at index 4+i, taking jt lands at 4+i+1+jt; the ALLOW
-        // terminator is at 4+n+1, so jt = n - i.
-        prog.push(jeq(sc, (n - i) as u8));
-    }
-    // Default deny: trap to the SIGSYS handler, which names the syscall and
-    // exits. (The arch-mismatch path above stays an unconditional kill.)
-    prog.push(stmt(RET_K, libc::SECCOMP_RET_TRAP));
-    prog.push(stmt(RET_K, libc::SECCOMP_RET_ALLOW));
+    let mut prog = build_filter_program(&allowed_syscalls());
 
     // A non-privileged process may only install a filter after NO_NEW_PRIVS, so
     // the filter can never be used to gain privileges via a set-uid exec.
@@ -294,4 +331,98 @@ pub fn install_runtime_filter() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run the filter the way the kernel would: the subset of classic BPF
+    /// [`build_filter_program`] emits, over a synthetic `seccomp_data`. Asserting
+    /// on the returned action rather than on instruction indices is what makes
+    /// the jump offsets — the part that silently breaks when a rule is added —
+    /// actually covered.
+    fn run_filter(prog: &[libc::sock_filter], arch: u32, nr: u32, arg0: u64) -> u32 {
+        let mut data = [0u8; 24];
+        data[0..4].copy_from_slice(&nr.to_le_bytes());
+        data[4..8].copy_from_slice(&arch.to_le_bytes());
+        data[16..24].copy_from_slice(&arg0.to_le_bytes());
+
+        let mut pc = 0usize;
+        let mut acc = 0u32;
+        for _ in 0..prog.len() {
+            let ins = &prog[pc];
+            match ins.code {
+                LD_ABS_W => {
+                    let off = ins.k as usize;
+                    acc = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+                    pc += 1;
+                }
+                JEQ_K => {
+                    pc += 1 + usize::from(if acc == ins.k { ins.jt } else { ins.jf });
+                }
+                RET_K => return ins.k,
+                other => panic!("unexpected opcode {other:#x} at {pc}"),
+            }
+        }
+        panic!("filter ran off the end without returning");
+    }
+
+    #[test]
+    fn filter_allows_listed_calls_and_traps_the_rest() {
+        let syscalls = allowed_syscalls();
+        let prog = build_filter_program(&syscalls);
+
+        // Every listed number reaches ALLOW — including the last one, whose jump
+        // is the longest and so the first to break on a layout change.
+        for &sc in &syscalls {
+            assert_eq!(
+                run_filter(&prog, AUDIT_ARCH, sc, 0),
+                libc::SECCOMP_RET_ALLOW,
+                "syscall {sc} should be allowed",
+            );
+        }
+        // An unlisted host-access call traps.
+        assert_eq!(
+            run_filter(&prog, AUDIT_ARCH, libc::SYS_openat as u32, 0),
+            libc::SECCOMP_RET_TRAP,
+        );
+        // A foreign syscall personality is killed outright, whatever the number.
+        assert_eq!(
+            run_filter(&prog, !AUDIT_ARCH, libc::SYS_read as u32, 0),
+            libc::SECCOMP_RET_KILL_PROCESS,
+        );
+    }
+
+    #[test]
+    fn filter_admits_prctl_only_for_vma_naming() {
+        let prog = build_filter_program(&allowed_syscalls());
+        let prctl = libc::SYS_prctl as u32;
+
+        // mimalloc's post-lockdown mapping tag.
+        assert_eq!(
+            run_filter(&prog, AUDIT_ARCH, prctl, libc::PR_SET_VMA as u64),
+            libc::SECCOMP_RET_ALLOW,
+        );
+        // The kernel truncates `option` to an `int`, so the high half is not
+        // ours to police — the low half still decides.
+        assert_eq!(
+            run_filter(&prog, AUDIT_ARCH, prctl, 0xdead_0000_5356_4d41),
+            libc::SECCOMP_RET_ALLOW,
+        );
+        // Every other option stays denied.
+        for option in [
+            libc::PR_SET_DUMPABLE,
+            libc::PR_SET_PTRACER,
+            libc::PR_SET_NAME,
+            libc::PR_SET_NO_NEW_PRIVS,
+            libc::PR_SET_SECCOMP,
+        ] {
+            assert_eq!(
+                run_filter(&prog, AUDIT_ARCH, prctl, option as u64),
+                libc::SECCOMP_RET_TRAP,
+                "prctl option {option} should be denied",
+            );
+        }
+    }
 }
