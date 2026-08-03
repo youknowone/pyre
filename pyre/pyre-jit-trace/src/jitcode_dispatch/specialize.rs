@@ -2059,6 +2059,15 @@ enum TracebackWalkField {
     /// the fold would have to carry the doubling rather than hand back the
     /// slot.
     TbLineno,
+    /// `code.co_name` — `code_get_field` answers it with `w_code_name_obj`,
+    /// which realizes the string once and retains it on the code object, so
+    /// every later read is the retained slot.
+    CoName,
+    /// `code.co_firstlineno` — the `co_firstlineno_raw` slot, reboxed.  The
+    /// other code fields are deliberately absent: they read the host
+    /// `CodeObject` behind `code_ptr` rather than a slot on the `PyCode`, so
+    /// folding one means a raw load through a second indirection.
+    CoFirstlineno,
 }
 
 /// Which walk hop, if any, this `(receiver, attribute)` pair is.
@@ -2078,7 +2087,35 @@ fn traceback_walk_field(
     if std::ptr::eq(ob_type, &pyre_interpreter::pyframe::FRAME_TYPE) && name == "f_code" {
         return Some(TracebackWalkField::FCode);
     }
+    if std::ptr::eq(ob_type, &pyre_interpreter::pycode::CODE_TYPE) {
+        return match name {
+            "co_name" => Some(TracebackWalkField::CoName),
+            "co_firstlineno" => Some(TracebackWalkField::CoFirstlineno),
+            _ => None,
+        };
+    }
     None
+}
+
+/// Prove the receiving code object still owns its host `CodeObject`, the
+/// `require_code` check every code-field getter runs before reading a slot.
+fn walker_guard_code_ptr_present<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+) -> Result<(), DispatchError> {
+    let code_ptr = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        obj,
+        crate::descr::pycode_code_ptr_descr(),
+    );
+    let live = unsafe { pyre_interpreter::w_code_get_ptr(concrete_obj) } as i64;
+    ctx.trace_ctx
+        .set_opref_concrete(code_ptr, majit_ir::Value::Int(live));
+    let zero = ctx.trace_ctx.const_int(0);
+    let absent = ctx.trace_ctx.record_op(OpCode::IntEq, &[code_ptr, zero]);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[absent])
 }
 
 /// Emit one traceback-walk hop as a guarded inline field read instead of the
@@ -2101,6 +2138,9 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
 
     let receiver_type = match field {
         TracebackWalkField::FCode => &pyre_interpreter::pyframe::FRAME_TYPE,
+        TracebackWalkField::CoName | TracebackWalkField::CoFirstlineno => {
+            &pyre_interpreter::pycode::CODE_TYPE
+        }
         _ => &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE,
     };
     let descr = match field {
@@ -2108,6 +2148,8 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
         TracebackWalkField::TbFrame => crate::descr::pytraceback_frame_descr(),
         TracebackWalkField::FCode => crate::descr::pyframe_code_descr(),
         TracebackWalkField::TbLineno => crate::descr::pytraceback_lineno_descr(),
+        TracebackWalkField::CoName => crate::descr::pycode_w_name_descr(),
+        TracebackWalkField::CoFirstlineno => crate::descr::pycode_co_firstlineno_descr(),
     };
     let w_type = pyre_interpreter::typedef::gettypeobject(receiver_type);
     let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
@@ -2120,6 +2162,41 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
     // recording a doomed trace.
     if unsafe { (*concrete_obj).w_class } != w_type {
         return Ok(None);
+    }
+
+    // Every code-field getter resolves the host `CodeObject` first
+    // (`code_get_field` -> `require_code`) and raises when it is absent, so a
+    // code fold owes that check.  It is a slot on the receiver, so the trace
+    // proves it the same way — a read plus a non-null guard — rather than
+    // trusting the record-time object.
+    let code_receiver = matches!(
+        field,
+        TracebackWalkField::CoName | TracebackWalkField::CoFirstlineno
+    );
+    if code_receiver
+        && unsafe { pyre_interpreter::w_code_get_ptr(concrete_obj) }
+            .cast::<u8>()
+            .is_null()
+    {
+        return Ok(None);
+    }
+
+    if field == TracebackWalkField::CoFirstlineno {
+        let live =
+            i64::from(unsafe { pyre_interpreter::pycode::w_code_firstlineno_raw(concrete_obj) });
+        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+        walker_guard_code_ptr_present(ctx, op_pc, obj, concrete_obj)?;
+        let raw_value = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, descr);
+        ctx.trace_ctx
+            .set_opref_concrete(raw_value, majit_ir::Value::Int(live));
+        // Reboxed for the same reason `TbLineno` is: the getter hands back a
+        // Python int, and the boxed op is a heap `NewWithVtable`.
+        let boxed = walker_box_int(ctx, op_pc, raw_value, live)?;
+        let live_ptr = pyre_object::w_int_new(live) as i64;
+        ctx.trace_ctx
+            .set_opref_concrete(boxed, box_int_concrete(live, live_ptr));
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+        return Ok(Some(()));
     }
 
     if field == TracebackWalkField::TbLineno {
@@ -2164,6 +2241,12 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
             (unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_frame(concrete_obj) })
                 as pyre_object::PyObjectRef
         }
+        // `w_name` is realized on first demand, so an unread code object
+        // carries a null here; that declines below and the residual realizes
+        // it for the next attempt.
+        TracebackWalkField::CoName => unsafe {
+            (*(concrete_obj as *const pyre_interpreter::pycode::PyCode)).w_name
+        },
         _ => (unsafe { (*(concrete_obj as *const PyFrame)).pycode }) as pyre_object::PyObjectRef,
     };
     // Only `tb_next` has a null with a defined meaning.  A null frame is a
@@ -2173,6 +2256,9 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
         return Ok(None);
     }
     walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+    if code_receiver {
+        walker_guard_code_ptr_present(ctx, op_pc, obj, concrete_obj)?;
+    }
     let raw_value = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, descr);
     let value = if stored.is_null() {
         // End of the chain.  There is no is-null guard opcode, so pin the

@@ -2787,6 +2787,78 @@ pub fn str_len_descr() -> DescrRef {
 
 // ── Object header & allocation descriptors ──────────────────────────
 
+/// `PyCode.code_ptr` — the host `CodeObject` every code-field getter resolves
+/// through (`code_get_field` -> `require_code`).  Read only to prove it is
+/// non-null, which is the check the getter would have run.
+///
+/// The three code descrs below are standalone rather than a positional group:
+/// a `PyCode` is never allocated from a trace, so the group's size / GC-edge
+/// half would have no consumer, and publishing a partial layout under the
+/// live `W_CODE_GC_TYPE_ID` would put a second answer in the registry for a
+/// type the collector already describes.
+static PYCODE_CODE_PTR_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(|| {
+    Arc::new(PyreFieldDescr {
+        offset: pyre_interpreter::pycode::CODE_PTR_OFFSET,
+        field_size: std::mem::size_of::<*const ()>(),
+        field_type: Type::Int,
+        signed: false,
+        immutable: false,
+        quasi_immutable: false,
+        name: "code_ptr",
+        index_in_parent: 0,
+        parent_descr: None,
+        ei_index: AtomicU32::new(u32::MAX),
+    })
+});
+
+pub fn pycode_code_ptr_descr() -> DescrRef {
+    PYCODE_CODE_PTR_FIELD_DESCR.clone() as DescrRef
+}
+
+/// `PyCode.w_name` — the realized `co_name` string.  `w_code_name_obj` builds
+/// it on first demand and retains it, so the slot IS the getter's value once
+/// it is non-null; a null slot declines to the residual, which realizes it.
+static PYCODE_W_NAME_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(|| {
+    Arc::new(PyreFieldDescr {
+        offset: pyre_interpreter::pycode::CODE_W_NAME_OFFSET,
+        field_size: std::mem::size_of::<pyre_object::PyObjectRef>(),
+        field_type: Type::Ref,
+        signed: false,
+        immutable: false,
+        quasi_immutable: false,
+        name: "w_name",
+        index_in_parent: 0,
+        parent_descr: None,
+        ei_index: AtomicU32::new(u32::MAX),
+    })
+});
+
+pub fn pycode_w_name_descr() -> DescrRef {
+    PYCODE_W_NAME_FIELD_DESCR.clone() as DescrRef
+}
+
+/// `PyCode.co_firstlineno_raw` — a signed 32-bit slot, because 3.14's
+/// `CodeType` constructor accepts zero and negative first lines that
+/// `CodeObject.first_line_number` cannot hold.
+static PYCODE_CO_FIRSTLINENO_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(|| {
+    Arc::new(PyreFieldDescr {
+        offset: pyre_interpreter::pycode::CODE_CO_FIRSTLINENO_RAW_OFFSET,
+        field_size: std::mem::size_of::<i32>(),
+        field_type: Type::Int,
+        signed: true,
+        immutable: false,
+        quasi_immutable: false,
+        name: "co_firstlineno_raw",
+        index_in_parent: 0,
+        parent_descr: None,
+        ei_index: AtomicU32::new(u32::MAX),
+    })
+});
+
+pub fn pycode_co_firstlineno_descr() -> DescrRef {
+    PYCODE_CO_FIRSTLINENO_FIELD_DESCR.clone() as DescrRef
+}
+
 /// Size descriptor for W_IntObject allocation via NewWithVtable.
 /// vtable = &INT_TYPE (ob_type for virtual materialization).
 pub fn w_int_size_descr() -> DescrRef {
