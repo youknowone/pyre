@@ -7,6 +7,8 @@
 //! `GILReleaseAction` is that hand-off — an action registered on the ticker
 //! which yields the GIL every `sys.getcheckinterval()` bytecodes.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::executioncontext::{
     AsyncAction, AsyncActionOps, ExecutionContext, PeriodicAsyncAction, PeriodicAsyncActionOps,
 };
@@ -87,12 +89,36 @@ pub fn shutdown(ec: &mut ExecutionContext) {
     drop(unsafe { Box::from_raw(action) });
 }
 
+/// gil.py:17-18 `GILThreadLocals.gil_ready`, quasi-immutable and "changed (to
+/// True) only if it was really False before". It belongs to the object space,
+/// and pyre runs one per process, so the space slot is a process-global. Its
+/// writer holds the GIL, which is what upstream's plain attribute assignment
+/// relies on too.
+static GIL_READY: AtomicBool = AtomicBool::new(false);
+
 /// gil.py:25-34 `GILThreadLocals.setup_threads` — "enable threads in the object
 /// space, if they haven't already been". Returns whether this call is the one
-/// that set them up.
+/// that set them up, which is a property of the space and not of the calling
+/// thread.
 pub fn setup_threads(ec: &mut ExecutionContext) -> bool {
-    let first = ec.gil_release_action.is_none();
-    majit_gc::rgil::allocate();
+    debug_assert!(
+        majit_gc::rgil::am_i_holding_the_gil(),
+        "setup_threads needs the GIL"
+    );
+    let first = !GIL_READY.load(Ordering::Acquire);
+    if first {
+        // gil.py:29-31 allocates before publishing the flag.
+        majit_gc::rgil::allocate();
+        GIL_READY.store(true, Ordering::Release);
+    }
+    // Registering the action is per-execution-context, unlike upstream's
+    // once-per-space `initialize`, because the ticker it hangs on is too.
     initialize(ec);
     first
+}
+
+/// gil.py:37-38 `GILThreadLocals.threads_initialized`, reached through
+/// `os_thread.py:155-156 threads_initialized(space)`.
+pub fn threads_initialized() -> bool {
+    GIL_READY.load(Ordering::Acquire)
 }
