@@ -163,21 +163,83 @@ fn socket_converted_error(
     err
 }
 
-/// baseobjspace.py `writebuf_w` — the writable byte slice backing a
-/// scatter/gather buffer argument.  PyPy accepts any object exporting a
-/// writable buffer; pyre's writable byte stores are `bytearray` and a
-/// `memoryview` over one, so those are resolved here and anything else is
-/// rejected as `writebuf_w` does.
+/// One `space.acquire_writebuf` export held for the whole of a `recv_into`
+/// family call, the way `with rwbuffer:` keeps it across `c_recv`.
+///
+/// The syscall runs with the GIL released, so without the export another
+/// thread could resize the exporter and reallocate the storage the kernel is
+/// writing through; the count is what makes that resize raise instead.  The
+/// requested object and the concrete storage owner are both rooted, because
+/// the release in `Drop` has to name the owner after whatever Python ran in
+/// between.
 #[cfg(unix)]
-fn socket_writebuf(obj: pyre_object::PyObjectRef) -> Result<&'static mut [u8], crate::PyError> {
+struct SocketWritableBuffer {
+    _roots: pyre_object::gc_roots::RootScope,
+    owner_slot: usize,
+    held: bool,
+    address: *mut u8,
+    length: usize,
+}
+
+#[cfg(unix)]
+impl SocketWritableBuffer {
+    unsafe fn acquire(obj: pyre_object::PyObjectRef) -> Result<Self, crate::PyError> {
+        let roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(obj);
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let (data, owner) =
+            socket_writebuf(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
+        pyre_object::gc_roots::pin_root(owner);
+        let owner_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let owner = pyre_object::gc_roots::shadow_stack_get(owner_slot);
+        let held = crate::builtins::buffer_export_incref(owner);
+        Ok(Self {
+            _roots: roots,
+            owner_slot,
+            held,
+            address: data.as_mut_ptr(),
+            length: data.len(),
+        })
+    }
+
+    unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
+        std::slice::from_raw_parts_mut(self.address, self.length)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SocketWritableBuffer {
+    fn drop(&mut self) {
+        if self.held {
+            let owner = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
+            unsafe { crate::builtins::buffer_export_decref(owner) };
+        }
+    }
+}
+
+/// baseobjspace.py `writebuf_w` — the writable byte slice backing a
+/// scatter/gather buffer argument, with the object the export count lives on.
+/// PyPy accepts any object exporting a writable buffer; pyre's writable byte
+/// stores are `bytearray` and a `memoryview` over one, so those are resolved
+/// here and anything else is rejected as `writebuf_w` does.
+#[cfg(unix)]
+fn socket_writebuf(
+    obj: pyre_object::PyObjectRef,
+) -> Result<(&'static mut [u8], pyre_object::PyObjectRef), crate::PyError> {
     if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
-        return Ok(unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(obj) });
+        return Ok((
+            unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(obj) },
+            obj,
+        ));
     }
     if unsafe { pyre_object::interp_array::is_array(obj) } {
         // `space.writebuf_w` accepts any writable buffer exporter; an
         // `array.array` exposes its element bytes as one writable window
         // regardless of typecode (recv writes raw bytes into them).
-        return Ok(unsafe { pyre_object::interp_array::w_array_vec_mut(obj).as_mut_slice() });
+        return Ok((
+            unsafe { pyre_object::interp_array::w_array_vec_mut(obj).as_mut_slice() },
+            obj,
+        ));
     }
     if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
         // `space.buffer_w` rejects a released view before exposing its storage.
@@ -199,6 +261,10 @@ fn socket_writebuf(obj: pyre_object::PyObjectRef) -> Result<&'static mut [u8], c
             ));
         }
         let view = unsafe { pyre_object::memoryview::w_memoryview_view(obj) };
+        // The view itself carries the export, as it does for `readinto`. Its
+        // backing is already held by the view's own construction, so nothing
+        // can resize the storage underneath while this one is alive either.
+        let owner = obj;
         // A writable view's backing is a `bytearray` or an `array.array`; both
         // expose a mutable byte store.  Honour the view window: write only into
         // `[offset, offset+length)` of the backing storage (itself already the
@@ -215,7 +281,7 @@ fn socket_writebuf(obj: pyre_object::PyObjectRef) -> Result<&'static mut [u8], c
                 "memoryview buffer is no longer valid",
             ));
         }
-        return Ok(&mut full[off..off + len]);
+        return Ok((&mut full[off..off + len], owner));
     }
     Err(crate::PyError::type_error(
         "a writable bytes-like object is required",
@@ -3081,7 +3147,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             }
             let obj = args[0];
             let buf_obj = args[1];
-            let slot = socket_writebuf(buf_obj)?;
+            let mut buffer = unsafe { SocketWritableBuffer::acquire(buf_obj) }?;
+            let slot = unsafe { buffer.as_mut_slice() };
             let buf_len = slot.len();
             let nbytes = if args.len() >= 3 {
                 if !unsafe { pyre_object::is_int(args[2]) } {
@@ -3146,7 +3213,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             }
             let obj = args[0];
             let buf_obj = args[1];
-            let slot = socket_writebuf(buf_obj)?;
+            let mut buffer = unsafe { SocketWritableBuffer::acquire(buf_obj) }?;
+            let slot = unsafe { buffer.as_mut_slice() };
             let buf_len = slot.len();
             let nbytes = if args.len() >= 3 {
                 if !unsafe { pyre_object::is_int(args[2]) } {
@@ -3367,7 +3435,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     pyre_object::w_tuple_len(seq)
                 }
             };
-            let mut buffers: Vec<&'static mut [u8]> = Vec::with_capacity(nbufs);
+            let mut buffers: Vec<SocketWritableBuffer> = Vec::with_capacity(nbufs);
             for i in 0..nbufs {
                 let item = unsafe {
                     if is_list {
@@ -3377,7 +3445,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     }
                 }
                 .ok_or_else(|| crate::PyError::type_error("recvmsg_into: buffer item missing"))?;
-                buffers.push(socket_writebuf(item)?);
+                buffers.push(unsafe { SocketWritableBuffer::acquire(item) }?);
             }
             let ancbufsize = if args.len() >= 3 {
                 if !unsafe { pyre_object::is_int(args[2]) } {
@@ -3408,10 +3476,13 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let fd = socket_fd(args[0])?;
 
             let mut iovs: Vec<libc::iovec> = buffers
-                .into_iter()
-                .map(|slice| libc::iovec {
+                .iter_mut()
+                .map(|buffer| {
+                    let slice = unsafe { buffer.as_mut_slice() };
+                    libc::iovec {
                     iov_base: slice.as_mut_ptr() as *mut libc::c_void,
                     iov_len: slice.len(),
+                    }
                 })
                 .collect();
             let mut control = vec![0u8; ancbufsize];
