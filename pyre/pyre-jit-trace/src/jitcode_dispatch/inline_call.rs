@@ -1865,6 +1865,25 @@ pub(crate) fn walker_ec_leave(
     concrete_ec: *mut pyre_interpreter::PyExecutionContext,
     got_exception: bool,
 ) {
+    // `pyopcode.py:184 handle_operation_error` marks the frame finished before
+    // an exception escapes into `ExecutionContext.leave`.  Ordinary returns
+    // already publish `PyFrame.finish_value` at the lowered `*_return`
+    // operation; this boundary supplies the exception sibling on this
+    // inlined callee's own red frame.  A declined sub-walk or callee-loop
+    // handoff has not finished executing and deliberately skips it.
+    if got_exception {
+        let flags_descr = crate::descr::pyframe_flags_descr();
+        let live_flags = crate::state::opimpl_getfield_gc_i(ctx, callee_frame, flags_descr.clone());
+        let finished_bit = ctx.const_int(i64::from(pyre_interpreter::PyFrame::FLAG_FRAME_FINISHED));
+        let new_flags = ctx.record_op(OpCode::IntOr, &[live_flags, finished_bit]);
+        ctx.record_op_with_descr(
+            OpCode::SetfieldGc,
+            &[callee_frame, new_flags],
+            flags_descr.clone(),
+        );
+        ctx.heapcache_setfield_cached(callee_frame, flags_descr.index(), new_flags);
+        unsafe { (*concrete_frame).set_frame_finished_execution(true) };
+    }
     // `self.topframeref = frame.f_backref` — no parens: the caller's vref
     // moves back unforced, so a caller frame that stayed virtual stays virtual.
     let concrete_f_backref = unsafe { (*concrete_frame).f_backref };

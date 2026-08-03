@@ -747,6 +747,78 @@ fn concrete_portal_frame<Sym: WalkSym>(
     (!frame.is_null()).then_some(frame as *mut pyre_interpreter::PyFrame)
 }
 
+/// Publish `PyFrame.frame_finished_execution = True` on the current
+/// MIFrame's own red frame.
+///
+/// `PyFrame.finish_value` performs this store before returning
+/// `StepResult::Return`.  The walker consumes the lowered `*_return` JitCode
+/// operation directly, so it must preserve that preceding interpreter state
+/// transition on both the emitted frame operand and its recording-time
+/// concrete shadow.
+fn finish_current_frame_execution<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+    let (frame, concrete_frame) = if ctx.is_top_level {
+        let sym = ctx.fbw_mode.snapshot_sym;
+        if sym.is_null() {
+            return;
+        }
+        // The emitted operand is the live red frame.  Do not mutate that live
+        // frame during a speculative top-level walk: the no-replay commit in
+        // `compile_and_run_once` performs the concrete transition only after
+        // the walk has produced a consumable Return payload.
+        (unsafe { (&*sym).frame() }, std::ptr::null_mut())
+    } else {
+        let jitcode_index = ctx
+            .inline_callee_consts
+            .map_or(-1, |consts| consts.jitcode_index);
+        let Some(jitcode) = crate::state::pyjitcode_for_jitcode_index(jitcode_index) else {
+            return;
+        };
+        let frame_reg = jitcode.metadata.portal_frame_reg as usize;
+        let frame = ctx
+            .registers_r
+            .get(frame_reg)
+            .copied()
+            .unwrap_or(OpRef::NONE);
+        let concrete = match ctx.concrete_registers_r.get(frame_reg).copied() {
+            Some(ConcreteValue::Ref(frame_ptr)) => frame_ptr as *mut pyre_interpreter::PyFrame,
+            _ => std::ptr::null_mut(),
+        };
+        (frame, concrete)
+    };
+    if frame.is_none() {
+        return;
+    }
+    if !ctx.is_top_level && (concrete_frame.is_null() || unsafe { !(*concrete_frame).escaped() }) {
+        // RPython records this store on a virtual MIFrame and
+        // optimizeopt.virtualize removes the whole frame when it never
+        // escapes.  The walker has already selected the concrete path and can
+        // make the same distinction before recording: an unescaped inline
+        // frame has no observer after return.  Escaped inline frames and the
+        // portal red frame keep the real store below.
+        return;
+    }
+
+    let flags_descr = crate::descr::pyframe_flags_descr();
+    let live_flags = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, frame, flags_descr.clone());
+    let finished_bit = ctx
+        .trace_ctx
+        .const_int(i64::from(pyre_interpreter::PyFrame::FLAG_FRAME_FINISHED));
+    let new_flags = ctx
+        .trace_ctx
+        .record_op(OpCode::IntOr, &[live_flags, finished_bit]);
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[frame, new_flags],
+        flags_descr.clone(),
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(frame, flags_descr.index(), new_flags);
+
+    if !concrete_frame.is_null() {
+        unsafe { (*concrete_frame).set_frame_finished_execution(true) };
+    }
+}
+
 fn recording_instruction_is_bare_reraise<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     opcode_position: usize,
@@ -9958,6 +10030,7 @@ fn handle<Sym: WalkSym>(
             //
             // Walker selects between the two via `ctx.is_top_level`.
             let result = read_ref_reg(code, op, 0, ctx)?;
+            finish_current_frame_execution(ctx);
             // PyPy `box.value = result` parity at the frame boundary:
             // the callee's slot-keyed concrete shadow (`concrete_registers_r`)
             // carries the live PyObject pointer; mirror it onto the
@@ -10012,6 +10085,7 @@ fn handle<Sym: WalkSym>(
             // `inline_call_*_i` would land the int OpRef in its `>i` slot.
             // Operand layout `i`: 1B int register at op.pc+1.
             let result = read_int_reg(code, op, 0, ctx)?;
+            finish_current_frame_execution(ctx);
             // PyPy `box.value = result` parity at the frame boundary —
             // see `ref_return/r` comment above for rationale.
             if !result.is_constant() {
@@ -10051,6 +10125,7 @@ fn handle<Sym: WalkSym>(
             // 1B signed const at op.pc+1.
             let value = code[op.pc + 1] as i8 as i64;
             let result = OpRef::ConstInt(value);
+            finish_current_frame_execution(ctx);
             if ctx.is_top_level {
                 fbw_finish_concrete_set(ConcreteValue::Int(value));
                 fbw_terminate_with_finish(ctx, result, op.pc)?;
@@ -10074,6 +10149,7 @@ fn handle<Sym: WalkSym>(
             // which bank to write into.
             // Operand layout `f`: 1B float register at op.pc+1.
             let result = read_float_reg(code, op, 0, ctx)?;
+            finish_current_frame_execution(ctx);
             if ctx.is_top_level {
                 // Slice b: portal-exit FINISH carries Type::Ref;
                 // `fbw_ensure_boxed_for_ca` re-boxes the float via
@@ -10108,6 +10184,7 @@ fn handle<Sym: WalkSym>(
             // register on the caller side (the codewriter emits no `>X`
             // marker for void calls).
             // No operand bytes (the `/` argcodes is empty).
+            finish_current_frame_execution(ctx);
             if ctx.is_top_level {
                 // Slice b: route the void portal exit through
                 // `TraceAction::Finish` (empty args) so the compile

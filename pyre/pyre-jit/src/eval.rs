@@ -8752,6 +8752,13 @@ fn compile_and_run_once(
         deliver_inflight_foriter_item(frame_root.frame());
         match pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
             Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Return(cv)) => {
+                // The synchronous walker/blackhole consumed the lowered
+                // `*_return` and hands its concrete value directly to the
+                // portal (the no-replay path below).  Preserve
+                // `PyFrame.finish_value`'s preceding lifecycle transition on
+                // the live red frame; the tracing snapshot is not the object
+                // `sys._getframe()` exposed through the frame chain.
+                frame_root.frame().set_frame_finished_execution(true);
                 let result = match cv {
                     pyre_jit_trace::state::ConcreteValue::Null => w_none(),
                     other => other.to_pyobj(),

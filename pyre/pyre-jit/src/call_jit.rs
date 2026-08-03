@@ -799,6 +799,11 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
         return;
     };
     frame.last_instr = last_instruction as isize;
+    // `pyopcode.py:184 handle_operation_error` marks a propagating frame
+    // finished before it leaves that frame.  This object materializes that
+    // already-unwound inline callee, so preserve the same lifecycle state;
+    // traceback.clear_frames() must not mistake it for a live activation.
+    frame.set_frame_finished_execution(true);
     let frame_ptr = frame.into_raw();
     pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
     unsafe {
@@ -877,6 +882,9 @@ pub(crate) extern "C" fn record_discarded_level_traceback(
         return;
     };
     frame.last_instr = last_instruction as isize;
+    // This discarded level has already propagated out during the inlined
+    // unwind, exactly the `pyopcode.py:184` finished-frame transition.
+    frame.set_frame_finished_execution(true);
     let frame_ptr = frame.into_raw();
     pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
     unsafe {
