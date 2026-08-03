@@ -12179,7 +12179,11 @@ fn generator_unpack_into(
     unsafe {
         // generator.py:325-327 — `frame is None: return`.
         if w_generator_is_running(gen_obj) {
-            return Err(PyError::value_error("generator already executing"));
+            // generator.py:112 `"%s already executing" % self.KIND`.
+            return Err(PyError::value_error(format!(
+                "{} already executing",
+                generator_kind(gen_obj)
+            )));
         }
         if w_generator_is_exhausted(gen_obj) {
             return Ok(());
@@ -16120,7 +16124,11 @@ unsafe fn generator_invoke_execute_frame(
 ) -> PyResult {
     use pyre_object::generator::*;
     if w_generator_is_running(gen_obj) {
-        return Err(PyError::value_error("generator already executing"));
+        // generator.py:112 `"%s already executing" % self.KIND`.
+        return Err(PyError::value_error(format!(
+            "{} already executing",
+            generator_kind(gen_obj)
+        )));
     }
     w_generator_set_running(gen_obj, true);
     let ec = crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
@@ -16137,22 +16145,25 @@ unsafe fn generator_invoke_execute_frame(
     let result = match result {
         Err(e) => {
             generator_frame_is_finished(gen_obj, frame);
-            if e.kind == crate::PyErrorKind::StopIteration {
-                let message = if is_async_generator(gen_obj) {
-                    "async generator raised StopIteration"
-                } else {
-                    "generator raised StopIteration"
-                };
-                Err(leak_generator_iteration(e, message))
+            // generator.py:166-179 `_leak_stopiteration` and
+            // `_leak_stopasynciteration`, which differ only in the name they
+            // format after KIND.  The second is reachable on async generators
+            // alone, which is why it tests the flavour and the first does not.
+            let leaked = if e.kind == crate::PyErrorKind::StopIteration {
+                Some("StopIteration")
             } else if is_async_generator(gen_obj)
                 && e.kind == crate::PyErrorKind::StopAsyncIteration
             {
-                Err(leak_generator_iteration(
-                    e,
-                    "async generator raised StopAsyncIteration",
-                ))
+                Some("StopAsyncIteration")
             } else {
-                Err(e)
+                None
+            };
+            match leaked {
+                Some(leaked) => {
+                    let message = format!("{} raised {leaked}", generator_kind(gen_obj));
+                    Err(leak_generator_iteration(e, &message))
+                }
+                None => Err(e),
             }
         }
         result => result,
@@ -16209,13 +16220,7 @@ fn generator_send_ex(
             if operr.is_none() && !w_arg.is_null() && !is_none(w_arg) {
                 return Err(PyError::type_error(format!(
                     "can't send non-None value to a just-started {}",
-                    if is_async_generator(gen_obj) {
-                        "async generator"
-                    } else if is_coroutine(gen_obj) {
-                        "coroutine"
-                    } else {
-                        "generator"
-                    }
+                    generator_kind(gen_obj)
                 )));
             }
         }
@@ -16345,7 +16350,10 @@ fn close_yield_from(w_yf: PyObjectRef) -> PyResult {
         if pyre_object::generator::is_generator_or_coroutine(w_yf) {
             let exit = PyError::new(PyErrorKind::GeneratorExit, String::new());
             return match generator_send_ex(w_yf, w_none(), Some(exit), None) {
-                Ok(_) => Err(PyError::runtime_error("generator ignored GeneratorExit")),
+                Ok(_) => Err(PyError::runtime_error(format!(
+                    "{} ignored GeneratorExit",
+                    generator_kind(w_yf)
+                ))),
                 Err(err)
                     if err.kind == PyErrorKind::StopIteration
                         || err.kind == PyErrorKind::GeneratorExit =>
@@ -16413,6 +16421,22 @@ fn stop_iteration_with_value(value: PyObjectRef) -> PyError {
         }
     }
     unsafe { PyError::from_exc_object(exc) }
+}
+
+/// generator.py:326 / :399 / :643 `KIND` — the class attribute every generator
+/// diagnostic is formatted against, so that one message site serves all three
+/// flavours.  `GeneratorIterator`, `Coroutine` and `AsyncGenerator` are three
+/// classes there and one object layout here, so the value is read back off the
+/// object instead of being a per-class constant.
+unsafe fn generator_kind(gen_obj: PyObjectRef) -> &'static str {
+    use pyre_object::generator::*;
+    if is_async_generator(gen_obj) {
+        "async generator"
+    } else if is_coroutine(gen_obj) {
+        "coroutine"
+    } else {
+        "generator"
+    }
 }
 
 /// generator.py:131-138 `_invoke_execute_frame` / `_leak_stopiteration`
@@ -16719,8 +16743,12 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
     let err = PyError::new(PyErrorKind::GeneratorExit, String::new());
     match generator_send_ex(gen_obj, w_none(), Some(err), None) {
         Ok(_) => {
-            // Generator yielded after GeneratorExit — RuntimeError
-            Err(PyError::runtime_error("generator ignored GeneratorExit"))
+            // Generator yielded after GeneratorExit — RuntimeError.
+            // generator.py:267-268 `"%s ignored GeneratorExit" % self.KIND`.
+            Err(PyError::runtime_error(format!(
+                "{} ignored GeneratorExit",
+                unsafe { generator_kind(gen_obj) }
+            )))
         }
         Err(mut e) if e.kind == PyErrorKind::StopIteration => {
             // Python 3.13+ / 3.14: close() returns the value produced when
