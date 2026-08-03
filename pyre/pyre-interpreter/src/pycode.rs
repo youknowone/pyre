@@ -156,6 +156,24 @@ pub struct PyCode {
     /// the zero/negative values accepted by Python 3.14's CodeType
     /// constructor, so preserve the exact Python integer on the PyCode itself.
     pub co_firstlineno_raw: i32,
+    /// `pycode.py:135 self.co_filename = filename`: the byte-exact filesystem
+    /// spelling owned by this `PyCode`. Null means that `code.source_path` is
+    /// already the exact UTF-8 spelling, avoiding an allocation for compiled
+    /// source paths and ordinary filename replacements.
+    ///
+    /// Do not add the derived `w_filename` cache from `pycode.py:136` while
+    /// `PyCode` is prebuilt-immortal. An unrooted movable child would only be
+    /// marked on the first major collection after `GCFLAG_VISITED` latches.
+    /// Such a cache requires forwarding on every collection, as `w_globals`
+    /// is registered in `W_GLOBALS_STAMPED_CODES` and forwarded by
+    /// `eval::walk_raw_code_roots`.
+    pub filename_bytes: *mut Vec<u8>,
+    /// Whether an unrealized nested compiler constant selected by
+    /// `importing.py:379-391 update_code_filenames`' `oldname` guard inherits
+    /// `filename_bytes` when pyre crosses its lazy wrapping boundary. False
+    /// for `pycode.py:431` constructor/replace filenames, which affect only
+    /// the code object being constructed.
+    pub filename_inherits_to_nested: bool,
     /// PyPy: `PyCode.w_globals` — the globals dict OBJECT (`W_DictMultiObject`,
     /// `pycode.py:105 "w_globals?"`).  Module globals are `malloc_typed`-
     /// immortal, but `exec`/custom-globals dicts are `try_gc_alloc` movable.
@@ -547,6 +565,8 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         },
         code_ptr,
         co_firstlineno_raw,
+        filename_bytes: std::ptr::null_mut(),
+        filename_inherits_to_nested: false,
         w_globals: pyre_object::PY_NULL,
         hidden_applevel,
         fast_natural_arity,
@@ -593,6 +613,50 @@ pub fn w_code_new(code_ptr: *const ()) -> PyObjectRef {
 pub fn box_code_constant(code: &crate::CodeObject) -> PyObjectRef {
     let code_ptr = Box::into_raw(Box::new(code.clone())) as *const ();
     w_code_new(code_ptr)
+}
+
+/// Box a nested compiler constant and inherit the enclosing `PyCode`'s raw
+/// filename when it belongs to the set selected by
+/// `importing.py:379-391 update_code_filenames`' `oldname` guard.
+fn box_code_constant_inheriting_filename(code: &crate::CodeObject, parent: &PyCode) -> PyObjectRef {
+    let obj = box_code_constant(code);
+    if parent.filename_inherits_to_nested
+        && code.source_path
+            == unsafe { &*(parent.code_ptr as *const crate::CodeObject) }.source_path
+        && !parent.filename_bytes.is_null()
+    {
+        let bytes = unsafe { (&*parent.filename_bytes).clone() };
+        unsafe { set_filename_bytes(obj, Some(bytes)) };
+        unsafe { (*(obj as *mut PyCode)).filename_inherits_to_nested = true };
+    }
+    obj
+}
+
+/// Replace the owned raw filename allocation. Code wrappers are immortal, so
+/// this is also the only point that retires an earlier spelling after a second
+/// `_fix_co_filename` call.
+unsafe fn set_filename_bytes(obj: PyObjectRef, bytes: Option<Vec<u8>>) {
+    let slot = unsafe { &mut (*(obj as *mut PyCode)).filename_bytes };
+    if let Some(bytes) = bytes {
+        if slot.is_null() {
+            *slot = Box::into_raw(Box::new(bytes));
+        } else {
+            unsafe { **slot = bytes };
+        }
+    } else if !slot.is_null() {
+        unsafe { drop(Box::from_raw(*slot)) };
+        *slot = std::ptr::null_mut();
+    }
+}
+
+unsafe fn filename_bytes(obj: PyObjectRef) -> Vec<u8> {
+    let pycode = unsafe { &*(obj as *const PyCode) };
+    if pycode.filename_bytes.is_null() {
+        let code = unsafe { &*(pycode.code_ptr as *const crate::CodeObject) };
+        code.source_path.as_bytes().to_vec()
+    } else {
+        unsafe { (&*pycode.filename_bytes).clone() }
+    }
 }
 
 fn box_code_constant_with_firstlineno(code: &crate::CodeObject, firstlineno: i32) -> PyObjectRef {
@@ -766,7 +830,14 @@ pub unsafe fn code_get_field(obj: PyObjectRef, name: &str) -> Result<PyObjectRef
         "co_varnames" => names_tuple(&code.varnames),
         "co_freevars" => names_tuple(&code.freevars),
         "co_cellvars" => names_tuple(&code.cellvars),
-        "co_filename" => w_str_new(&code.source_path),
+        "co_filename" => {
+            let filename_bytes = unsafe { (*(obj as *const PyCode)).filename_bytes };
+            if filename_bytes.is_null() {
+                w_str_new(&code.source_path)
+            } else {
+                crate::gateway::fsdecode_filename_bytes(unsafe { &*filename_bytes })
+            }
+        }
         // Shared realized object, like `co_qualname` below.
         "co_name" => unsafe { w_code_name_obj(obj) },
         // The realized qualname is shared with every function built from this
@@ -823,7 +894,7 @@ pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             "code: co_nlocals != len(co_varnames)"
         )));
     }
-    let source_path = unsafe { read_code_str(args[11], "filename")? };
+    let (source_path, filename_bytes) = unsafe { read_code_filename(args[11], "filename", None)? };
     let obj_name = unsafe { read_code_str(args[12], "name")? };
     let qualname = unsafe { read_code_str(args[13], "qualname")? };
     let first_line = unsafe { read_code_c_int(args[14])? } as i64;
@@ -893,6 +964,7 @@ pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         &code,
         first_line.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
     );
+    unsafe { set_filename_bytes(result, filename_bytes) };
     unsafe { w_code_fill_consts_from_tuple(result, args[8]) };
     Ok(result)
 }
@@ -1247,6 +1319,16 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     }
     let mut code = unsafe { (*code_ptr).clone() };
     let mut firstlineno_raw = unsafe { (*(w_self as *const PyCode)).co_firstlineno_raw };
+    let mut filename_bytes = unsafe {
+        let ptr = (*(w_self as *const PyCode)).filename_bytes;
+        if ptr.is_null() {
+            None
+        } else {
+            Some((&*ptr).clone())
+        }
+    };
+    let mut filename_inherits_to_nested =
+        unsafe { (*(w_self as *const PyCode)).filename_inherits_to_nested };
     let get = |name: &str| crate::builtins::kwarg_get(kwargs, name);
 
     if let Some(v) = get("co_argcount") {
@@ -1295,7 +1377,9 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         code.qualname = unsafe { read_code_str(v, "co_qualname")? };
     }
     if let Some(v) = get("co_filename") {
-        code.source_path = unsafe { read_code_str(v, "co_filename")? };
+        (code.source_path, filename_bytes) =
+            unsafe { read_code_filename(v, "co_filename", Some(&code.source_path))? };
+        filename_inherits_to_nested = false;
     }
     if let Some(v) = get("co_names") {
         code.names = unsafe { read_code_names(v, "co_names")? };
@@ -1317,6 +1401,7 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     }
     if let Some(v) = get("co_consts") {
         code.constants = unsafe { read_code_consts(v)? };
+        filename_inherits_to_nested = false;
     }
     if let Some(v) = get("co_code") {
         code.instructions = unsafe { read_code_units(v)? };
@@ -1361,6 +1446,10 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     );
 
     let result = box_code_constant_with_firstlineno(&code, firstlineno_raw);
+    unsafe { set_filename_bytes(result, filename_bytes) };
+    unsafe {
+        (*(result as *mut PyCode)).filename_inherits_to_nested = filename_inherits_to_nested;
+    }
     if let Some(constants) = get("co_consts") {
         unsafe { w_code_fill_consts_from_tuple(result, constants) };
     } else {
@@ -1400,6 +1489,32 @@ unsafe fn read_code_str(v: PyObjectRef, field: &str) -> Result<String, crate::Py
         return Err(crate::PyError::type_error(format!("{field} must be a str")));
     }
     Ok(unsafe { pyre_object::w_str_get_value(v) }.to_string())
+}
+
+/// `pycode.py:431 filename='fsencode'`: retain filesystem bytes that the
+/// compiler dependency's UTF-8 `source_path` cannot represent. A supplied
+/// `fallback` is the last valid UTF-8 spelling used by interpreter/JIT readers;
+/// a new code object uses a lossy compiler-only spelling until those readers
+/// can consume the byte-exact field directly.
+unsafe fn read_code_filename(
+    v: PyObjectRef,
+    field: &str,
+    fallback: Option<&str>,
+) -> Result<(String, Option<Vec<u8>>), crate::PyError> {
+    if !unsafe { pyre_object::is_str(v) } {
+        return Err(crate::PyError::type_error(format!("{field} must be a str")));
+    }
+    let bytes = crate::gateway::fsencode_bytes_w(v)?;
+    Ok(match String::from_utf8(bytes) {
+        Ok(source_path) => (source_path, None),
+        Err(error) => {
+            let bytes = error.into_bytes();
+            let source_path = fallback
+                .map(str::to_owned)
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+            (source_path, Some(bytes))
+        }
+    })
 }
 
 /// A `tuple[str]` `co_*` field (names / varnames / freevars / cellvars).
@@ -1604,7 +1719,12 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
         return existing;
     }
 
-    let mut realized = crate::pyframe::pyobject_from_constant(&constants[idx]);
+    let mut realized = match &constants[idx] {
+        crate::bytecode::ConstantData::Code { code } => {
+            box_code_constant_inheriting_filename(code, w_code)
+        }
+        constant => crate::pyframe::pyobject_from_constant(constant),
+    };
     // Keep the losing or winning candidate live until the CAS has either
     // published it or selected the concurrently-published canonical object.
     let candidate_root = &mut realized as *mut PyObjectRef as *mut *mut u8;
@@ -1689,13 +1809,42 @@ fn fix_code_filenames(code: &mut crate::CodeObject, oldname: &str, newname: &str
 ///
 /// # Safety
 /// `w_code` must point to a valid `PyCode` whose body is not currently running.
-pub unsafe fn fix_co_filename(w_code: PyObjectRef, newname: &str) {
+pub unsafe fn fix_co_filename(w_code: PyObjectRef, newname: &[u8]) {
     let code_ptr = unsafe { w_code_get_ptr(w_code) } as *mut crate::CodeObject;
     if code_ptr.is_null() {
         return;
     }
-    let oldname = unsafe { (*code_ptr).source_path.clone() };
-    unsafe { fix_code_filenames(&mut *code_ptr, &oldname, newname) };
+    let old_filename = unsafe { filename_bytes(w_code) };
+
+    // `importing.py:379-391 update_code_filenames` mutates already-wrapped
+    // nested `PyCode` constants. Pyre realizes that list lazily, so update the
+    // filled slots now; unrealized children inherit when they are boxed.
+    let pycode = unsafe { &*(w_code as *const PyCode) };
+    if !pycode.co_consts_w.is_null() {
+        for slot in unsafe { &*pycode.co_consts_w } {
+            let nested = slot.load(std::sync::atomic::Ordering::Acquire);
+            if !nested.is_null()
+                && unsafe { is_code(nested) }
+                && unsafe { filename_bytes(nested) } == old_filename
+            {
+                unsafe { fix_co_filename(nested, newname) };
+            }
+        }
+    }
+
+    let filename = match std::str::from_utf8(newname) {
+        Ok(newname) => {
+            let oldname = unsafe { (*code_ptr).source_path.clone() };
+            unsafe { fix_code_filenames(&mut *code_ptr, &oldname, newname) };
+            None
+        }
+        Err(_) => Some(newname.to_vec()),
+    };
+    unsafe { set_filename_bytes(w_code, filename) };
+    unsafe {
+        (*(w_code as *mut PyCode)).filename_inherits_to_nested =
+            std::str::from_utf8(newname).is_err();
+    }
 }
 
 /// Cached [`crate::pyframe::npure_cellvars`] for the code wrapper `obj`,
