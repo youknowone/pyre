@@ -376,6 +376,31 @@ def pyre_env():
     env["MAJIT_STRICT"] = "1"
     env["MAJIT_STATS"] = "1"
     env["PYRE_DESCR_SPELLING_GATE"] = "1"
+    # Pin the nursery, so the minor-collection schedule is a property of the
+    # tree rather than of the machine. `default_nursery_size` (collector.rs)
+    # falls back to `estimate_best_nursery_size`, which is half the L2 cache
+    # once that exceeds 8MB and `DEFAULT_NURSERY_SIZE` (4MB, env.py's
+    # `NURSERY_SIZE_UNKNOWN_CACHE`) otherwise. That probe is macOS-only —
+    # `get_l2cache` is `-1` under `cfg(not(target_os = "macos"))` — so two
+    # macOS machines can disagree while every Linux and Windows host already
+    # sits on the 4MB fallback.
+    #
+    # `guard_failures` is what moves: it counts bailouts, and a collection
+    # landing a little earlier or later moves them. Measured — a macos runner
+    # reported 19 differences against baselines recorded here, every one of
+    # them `guard_failures` and most of them identical on both backends (so the
+    # difference is in the schedule, not in codegen: no `loops_compiled` or
+    # `bridges_compiled` moved at all). Sweeping `PYPY_GC_NURSERY` reproduces
+    # that runner's numbers exactly at 6MB — `fib_loop` 189, `dict_set` 609,
+    # `listcomp_hot` 239, `nested_list_comprehension_hot` 402,
+    # `recursive_call_frame_relocation` 636, `str_fstring` 657,
+    # `closure_per_call` 415, `type_name_setter` 2, all eight — while 4MB
+    # reproduces the committed baselines. A 12MB L2 halves to exactly that.
+    #
+    # 4MB is the documented unknown-cache value and what the non-macOS hosts
+    # compute anyway, so pinning it costs nothing there and makes a macOS
+    # recorder agree with them.
+    env.setdefault("PYPY_GC_NURSERY", str(4 * 1024 * 1024))
     # Pin the vendored, `_sre.MAGIC`-matched stdlib so pyre never picks up a
     # version-mismatched host `python3` off the PATH. An explicit PYRE_STDLIB
     # in the environment wins.
