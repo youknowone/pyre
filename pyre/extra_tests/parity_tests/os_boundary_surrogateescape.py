@@ -8,13 +8,16 @@ instead of raising UnicodeEncodeError.
 """
 
 import os
-import socket
 import sys
-import tempfile
 
+# Every boundary below is POSIX-only, and `_socket` is not built on Windows,
+# so the platform check has to run before `socket` is imported.
 if sys.platform == "win32":
     print("OK")
     raise SystemExit
+
+import socket
+import tempfile
 
 
 # `os.system`: the surrogate escape reaches the shell as byte 0xff.  The
