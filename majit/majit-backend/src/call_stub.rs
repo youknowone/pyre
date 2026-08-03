@@ -1156,6 +1156,42 @@ impl CallArgs {
     }
 }
 
+/// `descr.py:615` `assert self.result_type in return_type` — the half of
+/// `verify_types` that [`collect_call_args`] does not cover.
+///
+/// `accepted` is the caller's `return_type`, the literal each `bh_call_*`
+/// passes in `llmodel.py:816/822/828/835`: `"iS"` (`history.INT + 'S'`),
+/// `"r"`, `"fL"` (`history.FLOAT + 'L'`) and `"v"`.
+///
+/// This is not redundant with the argument-class check. Nothing on the call
+/// path reads `result_type` to pick a dispatcher: the blackhole reaches one of
+/// the four entry points because the codewriter emitted
+/// `residual_call_*_i/_r/_f/_v`, so the two records can disagree. They
+/// disagree silently — the dispatcher would read the callee's result out of
+/// the register file the *opcode* named while the callee returned it in the
+/// one `result_type` names, e.g. an f64 result taken from `rax`. Comparing
+/// them here is what makes that a failure rather than a garbage value.
+///
+/// `debug_assert` mirrors upstream's `if not we_are_translated():` guard at
+/// each call site — a translated JIT does not run this. `majit-backend` is not
+/// one of the LLBC-extracted crates, so a release build really does drop it.
+///
+/// The callers check this *after* their `func == 0` early return, where
+/// upstream verifies first. That guard has no upstream counterpart: it is
+/// pyre's "no callee is installed" sentinel, and it pairs with a descr that has
+/// no result type either — `jitdriver.rs` builds a `BhJitDriverSd` whose
+/// `portal_runner_ptr` is `None` and whose `mainjitcode_calldescr` falls back
+/// to `Default`, so `result_type` is `'\0'`. Verifying the return register of a
+/// call that is not made would report that pairing instead of an ABI
+/// disagreement.
+pub fn verify_result_type(result_type: char, accepted: &str) {
+    debug_assert!(
+        accepted.contains(result_type),
+        "BhCallDescr.verify_types: result_type {result_type:?} is not one of {accepted:?}; \
+         the emitted residual_call opcode and the calldescr disagree about the return register"
+    );
+}
+
 /// Build the C-ABI class sequence and positional argument list from
 /// `args_i` / `args_r` / `args_f`, following `calldescr.arg_classes` order.
 ///
@@ -1547,5 +1583,40 @@ mod tests {
                 &[1, 2, 3, 4, 5, 6.0_f64.to_bits() as i64],
             );
         }
+    }
+
+    /// The four `return_type` literals `llmodel.py:816/822/828/835` pass, each
+    /// against every result class `type_to_argclass` can produce. `'L'` and
+    /// `'S'` ride along with the float and int sets the way upstream spells
+    /// them (`history.FLOAT + 'L'`, `history.INT + 'S'`).
+    #[test]
+    fn verify_result_type_accepts_exactly_its_caller_s_return_classes() {
+        for (accepted, ok) in [("iS", "iS"), ("r", "r"), ("fL", "fL"), ("v", "v")] {
+            for c in ok.chars() {
+                verify_result_type(c, accepted);
+            }
+        }
+    }
+
+    /// The mis-route this exists to catch: a float-returning callee reached
+    /// through the integer entry point would take its result from `rax`.
+    ///
+    /// Only meaningful where the assertion is compiled in — `verify_result_type`
+    /// is a `debug_assert`, so a release test binary would not panic.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "is not one of \"iS\"")]
+    fn verify_result_type_rejects_a_float_result_on_the_int_entry_point() {
+        verify_result_type('f', "iS");
+    }
+
+    /// `BhCallDescr::default()` leaves `result_type` at `char::default()`.
+    /// `jitdriver.rs` reaches that through `unwrap_or_default()`, so the
+    /// sentinel has to be rejected rather than silently matching some class.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "is not one of \"r\"")]
+    fn verify_result_type_rejects_the_default_descr_s_null_result_type() {
+        verify_result_type('\0', "r");
     }
 }

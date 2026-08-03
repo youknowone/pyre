@@ -2701,6 +2701,8 @@ pub trait Backend: Send {
         if func == 0 {
             return 0;
         }
+        // llmodel.py:818 `calldescr.verify_types(..., history.INT + 'S')`.
+        crate::call_stub::verify_result_type(calldescr.result_type, "iS");
         // SAFETY: `func` is a valid funcptr matching the ABI recovered from
         // `calldescr.arg_classes`.
         unsafe {
@@ -2727,6 +2729,8 @@ pub trait Backend: Send {
         if func == 0 {
             return GcRef::NULL;
         }
+        // llmodel.py:824 `calldescr.verify_types(..., history.REF)`.
+        crate::call_stub::verify_result_type(calldescr.result_type, "r");
         // SAFETY: see `bh_call_i`.
         let raw = unsafe {
             crate::call_stub::bh_call_i_by_classes(
@@ -2753,6 +2757,8 @@ pub trait Backend: Send {
         if func == 0 {
             return 0.0;
         }
+        // llmodel.py:830 `calldescr.verify_types(..., history.FLOAT + 'L')`.
+        crate::call_stub::verify_result_type(calldescr.result_type, "fL");
         // SAFETY: see `bh_call_i`.
         unsafe {
             crate::call_stub::bh_call_f_by_classes(
@@ -2778,6 +2784,8 @@ pub trait Backend: Send {
         if func == 0 {
             return;
         }
+        // llmodel.py:837 `calldescr.verify_types(..., history.VOID)`.
+        crate::call_stub::verify_result_type(calldescr.result_type, "v");
         // SAFETY: see `bh_call_i`.
         unsafe {
             crate::call_stub::bh_call_v_by_classes(
