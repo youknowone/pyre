@@ -346,6 +346,12 @@ pub const MEMBER_PROPERTY_FSET: u32 = MEMBER_DIRECT_FLAG | 43;
 pub const MEMBER_PROPERTY_FDEL: u32 = MEMBER_DIRECT_FLAG | 44;
 /// CPython 3.14 `property_members.__doc__`, the writable `w_doc` field.
 pub const MEMBER_PROPERTY_DOC: u32 = MEMBER_DIRECT_FLAG | 45;
+/// CPython 3.14 `range_members.start`, backed by PyPy's `w_start` field.
+pub const MEMBER_RANGE_START: u32 = MEMBER_DIRECT_FLAG | 46;
+/// CPython 3.14 `range_members.stop`, backed by PyPy's `w_stop` field.
+pub const MEMBER_RANGE_STOP: u32 = MEMBER_DIRECT_FLAG | 47;
+/// CPython 3.14 `range_members.step`, backed by PyPy's `w_step` field.
+pub const MEMBER_RANGE_STEP: u32 = MEMBER_DIRECT_FLAG | 48;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {

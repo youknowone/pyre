@@ -4078,31 +4078,6 @@ fn range_descr_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(w_bool_from(unsafe { pyre_object::w_range_bool(args[0]) }))
 }
 
-fn range_getter(args: &[PyObjectRef], field: usize) -> Result<PyObjectRef, crate::PyError> {
-    let self_ = args.get(1).copied().unwrap_or(PY_NULL);
-    if !unsafe { pyre_object::is_w_range(self_) } {
-        return Err(crate::PyError::type_error("descriptor is for 'range'"));
-    }
-    let (start, stop, step) = unsafe { pyre_object::w_range_fields(self_) };
-    Ok(match field {
-        0 => start,
-        1 => stop,
-        _ => step,
-    })
-}
-
-fn range_get_start(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    range_getter(args, 0)
-}
-
-fn range_get_stop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    range_getter(args, 1)
-}
-
-fn range_get_step(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    range_getter(args, 2)
-}
-
 /// PyPy `functional.py W_Range.typedef`, kept in the same entry order.
 fn init_range_type(ns: PyObjectRef) {
     unsafe {
@@ -4202,17 +4177,16 @@ fn init_range_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
-    for (name, getter_fn) in [
-        ("start", range_get_start as DunderFn),
-        ("stop", range_get_stop as DunderFn),
-        ("step", range_get_step as DunderFn),
+    for (name, kind) in [
+        ("start", pyre_object::MEMBER_RANGE_START),
+        ("stop", pyre_object::MEMBER_RANGE_STOP),
+        ("step", pyre_object::MEMBER_RANGE_STEP),
     ] {
-        let getter = make_builtin_function_with_arity(name, getter_fn, 2);
         unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_getset_descriptor_named(getter, name),
+                pyre_object::w_member_new_direct(kind, name.to_owned(), PY_NULL),
             )
         };
     }
@@ -12094,6 +12068,9 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
                 value
             })
         }
+        pyre_object::MEMBER_RANGE_START => Ok(unsafe { pyre_object::w_range_fields(obj).0 }),
+        pyre_object::MEMBER_RANGE_STOP => Ok(unsafe { pyre_object::w_range_fields(obj).1 }),
+        pyre_object::MEMBER_RANGE_STEP => Ok(unsafe { pyre_object::w_range_fields(obj).2 }),
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
         pyre_object::MEMBER_DESCR_NAME => unsafe { descr_member_name(obj) },
         _ => Err(crate::PyError::attribute_error(unsafe {

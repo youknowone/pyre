@@ -33,6 +33,26 @@ r = range(2, 13, 3)
 assert repr(r) == "range(2, 13, 3)"
 assert range.__repr__(r) == "range(2, 13, 3)"
 assert (r.start, r.stop, r.step) == (2, 13, 3)
+for name in ("start", "stop", "step"):
+    member = range.__dict__[name]
+    assert type(member).__name__ == "member_descriptor"
+    assert member.__objclass__ is range
+    assert member.__name__ == name
+    assert member.__doc__ is None
+    original = getattr(r, name)
+    try:
+        setattr(r, name, 9)
+    except AttributeError as exc:
+        assert str(exc) == "readonly attribute"
+    else:
+        raise AssertionError(f"range.{name} must be read-only")
+    try:
+        delattr(r, name)
+    except AttributeError as exc:
+        assert str(exc) == "readonly attribute"
+    else:
+        raise AssertionError(f"range.{name} must not be deletable")
+    assert getattr(r, name) is original
 assert len(r) == 4 and r.__len__() == 4 and bool(r)
 assert list(r) == [2, 5, 8, 11]
 assert r[1] == 5 and r[-1] == 11
@@ -92,13 +112,6 @@ for compare in (
         pass
     else:
         raise AssertionError("range ordering must remain unsupported")
-
-try:
-    r.start = 9
-except AttributeError:
-    pass
-else:
-    raise AssertionError("range fields must be read-only")
 
 huge = range(10**30)
 try:
