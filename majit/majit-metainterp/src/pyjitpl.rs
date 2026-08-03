@@ -7930,6 +7930,7 @@ impl<M: Clone> MetaInterp<M> {
                 // carries the real trace key instead of 0.
                 self.pending_abort_green_key = Some(green_key);
                 self.pending_abort_permanent = true;
+                crate::mc_diag_bump(47);
                 return Err(SwitchToBlackhole::giveup());
             }
         };
@@ -8220,6 +8221,7 @@ impl<M: Clone> MetaInterp<M> {
                 // analog is pending_abort_* staged here for the catch.
                 self.pending_abort_green_key = Some(green_key);
                 self.pending_abort_permanent = false;
+                crate::mc_diag_bump(48);
                 return Err(SwitchToBlackhole::giveup());
             }
         }
@@ -12992,6 +12994,14 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2761: profiler.count(reason) — reason-keyed bump
         // lands on the matching `staticdata.profiler.abort_*` atomic.
         self.count(reason, 1);
+        // Same reason on the diagnostic channel, which is the only one a wasm
+        // guest can be read through (`MC_DIAG` slots 40-46).
+        crate::mc_diag_bump(match reason {
+            counters::ABORT_TOO_LONG..=counters::ABORT_SEGMENTED_TRACE => {
+                40 + (reason - counters::ABORT_TOO_LONG) as usize
+            }
+            _ => 46,
+        });
         // pyjitpl.py:2786: self.staticdata.stats.aborted() — pyre's
         // mapping of the lifetime aborted-loop tally lives on
         // `JitStatsCounters.loops_aborted` (separate from the
@@ -13925,7 +13935,10 @@ impl<M: Clone> MetaInterp<M> {
                 // `SwitchToBlackhole(Counters.ABORT_BRIDGE)`.  The
                 // bridge FINISH path shares the same giveup reason as
                 // the root FINISH path.
-                CompileOutcome::Aborted => Err(SwitchToBlackhole::giveup()),
+                CompileOutcome::Aborted => {
+                    crate::mc_diag_bump(49);
+                    Err(SwitchToBlackhole::giveup())
+                }
             };
         }
         // Root branch: drain `trace_meta`, drive `finish_and_compile`.

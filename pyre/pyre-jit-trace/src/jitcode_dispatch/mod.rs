@@ -2310,6 +2310,17 @@ pub fn census_record_frame_shape_decline(code_ptr: usize, kind: &'static str) {
     }
 }
 
+/// The accumulated decline census as `(variant name, count)` pairs, sorted by
+/// name — the same content [`census_dump`] prints, for a reader that has no
+/// stderr to print it to.  A wasm guest is exactly that: `eprintln!` goes
+/// nowhere and `PYRE_FBW_DEBUG_ABORT` never reaches it (the runner has no
+/// environment to pass), so the `[fbw-census]` attribution of every
+/// `loops_aborted` is unreachable there unless it can be read back as data.
+/// `pyre-wasm` exports it per index; the host runner joins the pairs.
+pub fn census_entries() -> Vec<(&'static str, usize)> {
+    FBW_DECLINE_CENSUS.with(|c| c.borrow().iter().map(|(n, &v)| (*n, v)).collect())
+}
+
 /// Print the accumulated decline census as `[fbw-census] <name>: <count>`
 /// lines, sorted by name.  No-op unless [`fbw_debug_abort_enabled`].
 /// Safe to call repeatedly (a diagnostic dump, not a reset).

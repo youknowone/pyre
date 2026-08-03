@@ -618,17 +618,30 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 /// are reachable for different reasons and only
 /// the split says which; the guest has no stderr, so `MAJIT_LOG`'s per-exit
 /// lines never reach a wasm run and this is the only channel that does.
-pub static MC_DIAG: [std::sync::atomic::AtomicU64; 40] = {
+///
+/// 40-46 are the `Counters.ABORT_*` histogram of `aborted_tracing`, in
+/// `counters` order (`ABORT_TOO_LONG` .. `ABORT_SEGMENTED_TRACE`), with 46 for
+/// a reason outside that range. Their sum is the `loops_aborted` contribution
+/// of tracing aborts, so it also separates those from the backend-`Err`
+/// aborts, which do not pass through here. The reason already reaches
+/// `profiler.count(reason)`; these slots are the same value on the one channel
+/// a wasm guest can be read through.
+///
+/// 47-49 split slot 41 (`ABORT_BRIDGE`) by which `compile.giveup()` raised it,
+/// since upstream spends that one reason id on every generic bail: 47 = the
+/// optimizer deferred an `InvalidLoop` on the root trace, 48 = the root
+/// `compile_loop` returned `Err`, 49 = a bridge compile came back `Aborted`.
+pub static MC_DIAG: [std::sync::atomic::AtomicU64; 50] = {
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     [
         Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
-        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
+        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
     ]
 };
 
 /// Short label per [`MC_DIAG`] slot, in index order, so a tally cannot be added
 /// without naming it. Readers join these with the counter values.
-pub const MC_DIAG_LABELS: [&str; 40] = [
+pub const MC_DIAG_LABELS: [&str; 50] = [
     "mc_entered",
     "decl_shortcircuit",
     "descr0_skip",
@@ -669,6 +682,16 @@ pub const MC_DIAG_LABELS: [&str; 40] = [
     "ceb_retrace_req",
     "ceb_backend_panic",
     "ceb_backend_err",
+    "abrt_too_long",
+    "abrt_bridge",
+    "abrt_bad_loop",
+    "abrt_escape",
+    "abrt_force_qmut",
+    "abrt_segmented",
+    "abrt_other",
+    "giveup_invalidloop",
+    "giveup_compileloop_err",
+    "giveup_bridge_aborted",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.

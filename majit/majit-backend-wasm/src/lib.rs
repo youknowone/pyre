@@ -40,11 +40,18 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// that was never offered: 19 = labels published off a peeled loop, 20 =
 /// published off a non-peeled loop, 21 = a non-peeled loop's first label left
 /// unpublished (no descr, or its arity is not the inputarg count), 22 = a
-/// dropped loop retracted a published entry.
-pub static BRIDGE_DIAG: [AtomicU64; 23] = {
+/// dropped loop retracted a published entry. `compile_loop`'s own outcome
+/// split — every `Err` it returns is a `loops_aborted` bump in the metainterp,
+/// and the reason string never reaches the host from inside the guest, so the
+/// classification has to be a counter: 23 = compile_loop entered, 24 =
+/// compile_loop returned a token, 25 = declined by
+/// `wasm_unsupported_trace_reason` (the #62 loop-callee CALL_ASSEMBLER gap),
+/// 26 = the wasm host rejected the emitted module (`func_handle == 0`).
+/// Indices 2 and 4 double as compile_loop's other two declines.
+pub static BRIDGE_DIAG: [AtomicU64; 27] = {
     const Z: AtomicU64 = AtomicU64::new(0);
     [
-        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
+        Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z,
     ]
 };
 
@@ -1870,6 +1877,7 @@ impl majit_backend::Backend for WasmBackend {
         ops: &[OpRc],
         token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        diag_bump(23);
         // `x86/assembler.py:514` parity — bump
         // `cpu.tracker.total_compiled_loops` at the same point PyPy
         // creates the `CompiledLoopToken`.
@@ -1960,6 +1968,7 @@ impl majit_backend::Backend for WasmBackend {
         // chaining (each trace is its own module), so it cannot execute the
         // target — declining is the #62 loop-callee gap.
         if let Some(reason) = wasm_unsupported_trace_reason(ops, allow_ca) {
+            diag_bump(25);
             return Err(BackendError::Unsupported(reason));
         }
         if allow_ca {
@@ -2095,6 +2104,7 @@ impl majit_backend::Backend for WasmBackend {
         // a backend capability limit, reported like any other unsupported shape.
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
         if !defer_host_compile && func_handle == 0 {
+            diag_bump(26);
             return Err(BackendError::Unsupported(
                 "wasm host rejected the compiled trace module (oversized function body \
                  or invalid module)"
@@ -2301,6 +2311,7 @@ impl majit_backend::Backend for WasmBackend {
             }
         }
 
+        diag_bump(24);
         Ok(AsmInfo {
             code_addr: 0,
             code_size,

@@ -348,6 +348,41 @@ pub extern "C" fn pyre_jit_mc_diag(i: u32) -> u64 {
     majit_metainterp::mc_diag(i as usize)
 }
 
+/// Diagnostic-only: the full-body-walk decline census
+/// (`pyre_jit_trace::jitcode_dispatch::census_entries`), which names the
+/// `DispatchError` variant behind every aborted walk. The map is always
+/// populated; only its `[fbw-census]` print is gated on
+/// `PYRE_FBW_DEBUG_ABORT`, which a wasm guest can neither read nor print, so
+/// these three exports are the only channel that carries the attribution out.
+///
+/// The names are `&'static str` in guest memory: `..._name` returns
+/// `(ptr << 32) | len` for the host to slice out of the exported memory, and
+/// `..._count` returns that entry's tally. Both index the same sorted order as
+/// `census_entries`, which is stable for a given call — read the length first
+/// and do not interleave with anything that could record a new decline.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_fbw_census_len() -> u32 {
+    pyre_jit_trace::jitcode_dispatch::census_entries().len() as u32
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_fbw_census_name(i: u32) -> u64 {
+    match pyre_jit_trace::jitcode_dispatch::census_entries().get(i as usize) {
+        Some((name, _)) => ((name.as_ptr() as u64) << 32) | name.len() as u64,
+        None => 0,
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_fbw_census_count(i: u32) -> u64 {
+    pyre_jit_trace::jitcode_dispatch::census_entries()
+        .get(i as usize)
+        .map_or(0, |&(_, count)| count as u64)
+}
+
 /// Sign-stable JIT counters that read 0 in a healthy run, the same badness
 /// fields the native `[jit-stats]` line reports (`pyrex` maybe_print_jit_stats).
 /// A nonzero value means a trace aborted or an internal compile bug degraded

@@ -522,6 +522,10 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
                 "pub_flat",
                 "pub_flat_skipped",
                 "label_retracted",
+                "cl_entered",
+                "cl_ok",
+                "cl_decl_unsupported",
+                "cl_decl_host_reject",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
@@ -626,6 +630,16 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
                 "ceb_retrace_req",
                 "ceb_backend_panic",
                 "ceb_backend_err",
+                "abrt_too_long",
+                "abrt_bridge",
+                "abrt_bad_loop",
+                "abrt_escape",
+                "abrt_force_qmut",
+                "abrt_segmented",
+                "abrt_other",
+                "giveup_invalidloop",
+                "giveup_compileloop_err",
+                "giveup_bridge_aborted",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
@@ -635,6 +649,34 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
                 ));
             }
             eprintln!("[jit-stats] mc_diag {}", parts.join(" "));
+        }
+        // Full-body-walk decline census: the `DispatchError` variant behind
+        // every aborted walk, which is what `loops_aborted` counts. Unlike the
+        // fixed-slot tallies above this one is name-keyed, so the guest hands
+        // back `(ptr << 32) | len` into its own memory and the name is sliced
+        // out here — `PYRE_FBW_DEBUG_ABORT`, the native channel for the same
+        // attribution, never reaches a guest with no environment.
+        if let (Ok(len_fn), Ok(name_fn), Ok(count_fn)) = (
+            instance.get_typed_func::<(), u32>(&mut store, "pyre_jit_fbw_census_len"),
+            instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_fbw_census_name"),
+            instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_fbw_census_count"),
+        ) {
+            let n = len_fn.call(&mut store, ()).unwrap_or(0);
+            let mut parts = Vec::new();
+            for i in 0..n {
+                let packed = name_fn.call(&mut store, i).unwrap_or(0);
+                let count = count_fn.call(&mut store, i).unwrap_or(0);
+                let (ptr, len) = ((packed >> 32) as usize, (packed & 0xffff_ffff) as usize);
+                let data = memory.data(&store);
+                let name = data
+                    .get(ptr..ptr + len)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .unwrap_or("<unreadable>");
+                parts.push(format!("{name}={count}"));
+            }
+            if !parts.is_empty() {
+                eprintln!("[jit-stats] fbw_census {}", parts.join(" "));
+            }
         }
         let guest_jit_execute_count = instance
             .get_typed_func::<(), u64>(&mut store, "pyre_jit_execute_count")
