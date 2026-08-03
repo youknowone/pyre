@@ -1444,7 +1444,7 @@ fn select_recipe_entry(
         .flatten()
 }
 
-fn residual_ref_call_dst_before(code: &[u8], entry: usize) -> Option<usize> {
+fn residual_ref_call_before(code: &[u8], entry: usize) -> Option<(usize, usize)> {
     crate::jitcode_runtime::decoded_ops(code)
         .find(|op| op.next_pc == entry && op.opname.starts_with("residual_call"))
         .and_then(|op| {
@@ -1452,8 +1452,17 @@ fn residual_ref_call_dst_before(code: &[u8], entry: usize) -> Option<usize> {
                 .ends_with(">r")
                 .then(|| code.get(entry - 1).copied())
                 .flatten()
+                .map(|dst| (op.pc, usize::from(dst)))
         })
-        .map(usize::from)
+}
+
+/// `MIFrame.make_result_of_lastop` pushes a completed call's result at the
+/// top of the caller's post-call operand stack.  This semantic slot is
+/// independent of the post-regalloc result color.
+fn pending_call_result_semantic_slot(nlocals: usize, post_call_depth: usize) -> Option<usize> {
+    post_call_depth
+        .checked_sub(1)
+        .and_then(|top| nlocals.checked_add(top))
 }
 
 /// Issue #215 item 2 (P2 drain): drive a multiframe bridge-carrier resume via
@@ -1484,27 +1493,15 @@ fn residual_ref_call_dst_before(code: &[u8], entry: usize) -> Option<usize> {
 /// The result is always mirrored into `bridge_registers_r` for interior-entry
 /// bridge walks, whose Ref-bank seed is color-indexed. Opcode-entry bridge
 /// walks rebuild slot-indexed locals and operand-stack values from
-/// `bridge_local_oprefs` / `bridge_stack_oprefs`, so invert the destination
-/// color through the resume pc's color→semantic-slot map before mirroring it
-/// there. Treating a post-regalloc color as a localsplus slot corrupts an
-/// unrelated local whenever regalloc coalesces the call result.
+/// `bridge_local_oprefs` / `bridge_stack_oprefs`.  RPython's
+/// `MIFrame.make_result_of_lastop` puts the return value at the top of the
+/// caller's post-call operand stack, so derive that semantic slot from the
+/// codewriter's after-residual depth twin.  The result is not a live Variable
+/// at this coordinate and therefore need not have a pcdep color→slot entry.
+/// Treating its post-regalloc color as a localsplus slot corrupts an unrelated
+/// local whenever regalloc coalesces the call result.
 /// Returns `false` (caller declines the compile) when the register is
 /// unresolved.
-/// `PYRE_INJECT_RCA`: report each engagement of the raw-color result-slot
-/// fallback below, with its coordinate.
-fn inject_rca_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_INJECT_RCA").is_some())
-}
-
-/// `PYRE_INJECT_FALLBACK_DECLINE`: decline the bridge compile instead of
-/// engaging the raw-color fallback — the A/B control for attributing a
-/// wrong-slot injection.
-fn inject_fallback_decline_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_INJECT_FALLBACK_DECLINE").is_some())
-}
-
 fn inject_root_call_result<Sym: WalkSym>(
     sym: &mut Sym,
     root_pc: usize,
@@ -1514,13 +1511,13 @@ fn inject_root_call_result<Sym: WalkSym>(
         return false;
     }
     let payload = unsafe { &(*sym.jitcode()).payload };
-    let result_reg = residual_ref_call_dst_before(payload.jitcode.code.as_slice(), root_pc)
-        .or_else(|| {
-            payload
-                .result_color_trivia_for_jitcode_pc(root_pc)
-                .map(|c| c as usize)
-                .filter(|&c| c != u16::MAX as usize)
-        });
+    let residual_call = residual_ref_call_before(payload.jitcode.code.as_slice(), root_pc);
+    let result_reg = residual_call.map(|(_, dst)| dst).or_else(|| {
+        payload
+            .result_color_trivia_for_jitcode_pc(root_pc)
+            .map(|c| c as usize)
+            .filter(|&c| c != u16::MAX as usize)
+    });
     let Some(result_reg) = result_reg else {
         return false;
     };
@@ -1531,48 +1528,13 @@ fn inject_root_call_result<Sym: WalkSym>(
         }
         bridge_regs[result_reg] = result;
     }
-    let valuestackdepth = sym.valuestackdepth();
-    let stack_only = valuestackdepth.saturating_sub(nlocals);
-    let semantic_result_slot = payload
-        .jitcode
-        .try_index()
-        .map(|index| crate::state::bridge_semantic_maps_from_pc(index as i32, root_pc as i32))
-        .and_then(|maps| {
-            crate::state::semantic_ref_slot_for_reg_color(
-                nlocals,
-                stack_only,
-                &maps.pcdep_entries,
-                result_reg,
-            )
-        })
-        // The raw-color fallback is load-bearing and simultaneously wrong,
-        // so neither keeping nor deleting it is the answer:
-        //
-        //   fib_recursive, dynasm, the one resume that misses the map —
-        //   `pc=569 reg=0 nlocals=1 stack_only=2 vsd=3`, entries
-        //   `[(1,0,4),(1,2,1),(1,3,2)]`.  Color 0 IS mapped, to semantic slot
-        //   4; the inversion rejects it because `4 - nlocals` is at/above the
-        //   runtime `stack_only`, which is what that gate is for.  The
-        //   fallback then answers slot 0 — a LOCAL, not the operand-stack slot
-        //   the map named.  Deleting it declines this bridge and costs 16x
-        //   (0.86s -> 14.2s), so the decline is not an option either.
-        //
-        // The result slot is by construction the one about to be pushed, i.e.
-        // at/above the resume's live depth, so resolving it needs a query that
-        // does not gate on that depth.  Until that resolves at this
-        // coordinate, keep the fallback and its measured cost visible.
-        .or_else(|| {
-            if inject_rca_enabled() {
-                eprintln!(
-                    "[inject-rca] FALLBACK jitcode={:?} pc={root_pc} reg={result_reg} nlocals={nlocals} stack_only={stack_only} vsd={valuestackdepth}",
-                    payload.jitcode.try_index()
-                );
-            }
-            if inject_fallback_decline_enabled() {
-                return None;
-            }
-            (result_reg < valuestackdepth).then_some(result_reg)
-        });
+    let post_call_depth = residual_call
+        .and_then(|(call_pc, _)| payload.depth_after_residual_for_jitcode_pc(call_pc))
+        .map(usize::from);
+    let Some(post_call_depth) = post_call_depth else {
+        return false;
+    };
+    let semantic_result_slot = pending_call_result_semantic_slot(nlocals, post_call_depth);
     let Some(semantic_result_slot) = semantic_result_slot else {
         return false;
     };
@@ -1591,6 +1553,11 @@ fn inject_root_call_result<Sym: WalkSym>(
         }
         bridge[slot] = result;
     }
+    // `MIFrame.make_result_of_lastop` both stores the value and advances the
+    // caller's stack pointer.  Without the matching depth update,
+    // `init_symbolic` sizes its resumed stack from the pre-call depth and
+    // truncates the just-injected top slot.
+    sym.set_valuestackdepth(nlocals + post_call_depth);
     true
 }
 
@@ -1801,6 +1768,9 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     let local_concretes = &recipe.concrete_r[..nlocals];
     let stack_end = recipe.valuestackdepth.min(recipe.registers_r.len());
     let resumed_stack_oprefs = &recipe.registers_r[nlocals.min(stack_end)..stack_end];
+    let concrete_stack_end = recipe.valuestackdepth.min(recipe.concrete_r.len());
+    let resumed_stack_concretes =
+        &recipe.concrete_r[nlocals.min(concrete_stack_end)..concrete_stack_end];
     // Increment 2b-i: drive the deepest callee as an inline SUB-WALK rooted on
     // the portal `sym` (is_top_level=false), so its `ref_return` surfaces
     // `SubReturn` instead of the top-level `Finish` pyre's own-portal model
@@ -1820,6 +1790,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         local_oprefs,
         local_concretes,
         resumed_stack_oprefs,
+        resumed_stack_concretes,
         // Depth-N: tell the deepest sub-walk that all shallower frames are
         // paused so its in-callee guard snapshots encode the full
         // [root, ..middles.., deepest] chain (else the blackhole rebuilds a
@@ -2151,6 +2122,9 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     let middle_stack_end = middle.valuestackdepth.min(middle.registers_r.len());
     let middle_stack_oprefs =
         &middle.registers_r[middle_nlocals.min(middle_stack_end)..middle_stack_end];
+    let middle_concrete_stack_end = middle.valuestackdepth.min(middle.concrete_r.len());
+    let middle_stack_concretes = &middle.concrete_r
+        [middle_nlocals.min(middle_concrete_stack_end)..middle_concrete_stack_end];
     let middle_walk = crate::jitcode_dispatch::drive_bridge_middle_frame(
         ctx,
         session,
@@ -2166,6 +2140,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         middle_local_oprefs,
         middle_local_concretes,
         middle_stack_oprefs,
+        middle_stack_concretes,
         paused_parents,
         child_result,
     );
@@ -3661,6 +3636,29 @@ fn run_perfn_walk<Sym: WalkSym>(
                         let color = (nl + i) as u8;
                         seed(color, opref);
                     }
+                }
+                // The value just returned by an in-flight callee is the one
+                // non-pcdep operand at this opcode-entry coordinate.  RPython
+                // has already installed it in the caller MIFrame's result
+                // register via `make_result_of_lastop`; mirror that exact
+                // color from the resumed bank.  Slot-position seeding above
+                // cannot recover it under free register coloring (for
+                // Fraction.__rpow__, semantic slot 3 is color r9).
+                let pending_result_color =
+                    residual_ref_call_before(pjc.jitcode.code.as_slice(), entry)
+                        .map(|(_, dst)| dst)
+                        .or_else(|| {
+                            pjc.result_color_trivia_for_jitcode_pc(entry)
+                                .map(usize::from)
+                                .filter(|&color| color != usize::from(u16::MAX))
+                        });
+                if let Some((color, opref)) = pending_result_color.and_then(|color| {
+                    sym.bridge_registers_r()
+                        .and_then(|regs| regs.get(color).copied())
+                        .filter(|opref| !opref.is_none())
+                        .map(|opref| (color, opref))
+                }) {
+                    seed(color as u8, opref);
                 }
             }
         }
@@ -5787,6 +5785,15 @@ mod tests {
                 bank: "r",
             }
         ));
+    }
+
+    #[test]
+    fn pending_call_result_uses_post_call_stack_top_not_register_color() {
+        // The motivating coalesced shape has result color 0, nlocals=1, and
+        // post-call operand depth 4.  The result belongs to semantic slot 4;
+        // writing color 0 as slot 0 would overwrite the caller's local.
+        assert_eq!(super::pending_call_result_semantic_slot(1, 4), Some(4));
+        assert_eq!(super::pending_call_result_semantic_slot(1, 0), None);
     }
 
     #[test]

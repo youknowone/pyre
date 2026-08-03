@@ -1950,6 +1950,30 @@ pub(crate) fn semantic_ref_slot_for_reg_color(
     semantic_slot_for_reg_color(nlocals, stack_only, pcdep_entries, 1, reg)
 }
 
+/// Every live semantic Ref slot owned by one post-regalloc color at this PC.
+/// A COPY/short-circuit shape may deliberately map the same MIFrame register
+/// to more than one semantic stack slot; rebuilding pyre's slot-indexed frame
+/// mirror must fan that single register value out to all of them.
+pub(crate) fn semantic_ref_slots_for_reg_color(
+    nlocals: usize,
+    stack_only: usize,
+    pcdep_entries: &[(u8, u16, u16)],
+    reg: usize,
+) -> Vec<usize> {
+    let mut slots = Vec::new();
+    for &(bank, color, slot) in pcdep_entries {
+        if bank != 1 || color as usize != reg {
+            continue;
+        }
+        let slot = slot as usize;
+        let live = slot < nlocals || slot - nlocals < stack_only;
+        if live && slots.last().copied() != Some(slot) {
+            slots.push(slot);
+        }
+    }
+    slots
+}
+
 /// Per-PC `(bank, color, slot)` map inversion: given a register bank and
 /// color, return the semantic `locals_cells_stack_w` slot it maps to at the
 /// current PC. Prefer stack slots over locals (stack_match.or(local_match)).
@@ -2524,6 +2548,7 @@ pub trait WalkSym {
     fn registers_f_mut(&mut self) -> &mut Vec<OpRef>;
     fn nlocals(&self) -> usize;
     fn valuestackdepth(&self) -> usize;
+    fn set_valuestackdepth(&mut self, value: usize);
     fn jitcode(&self) -> *const JitCode;
     fn concrete_execution_context(&self) -> *const pyre_interpreter::PyExecutionContext;
     /// Interpreter-frame snapshot the authoritative walker steps concretely.
@@ -2626,6 +2651,11 @@ impl WalkSym for PyreSym {
     #[inline]
     fn valuestackdepth(&self) -> usize {
         self.valuestackdepth
+    }
+
+    #[inline]
+    fn set_valuestackdepth(&mut self, value: usize) {
+        self.valuestackdepth = value;
     }
 
     #[inline]
@@ -7496,27 +7526,33 @@ fn reconstruct_inline_recipe(
         let mut stream_slots: Vec<(usize, usize)> = Vec::new();
         let mut stream_covered = vec![false; valuestackdepth];
         for (pos, &color) in reg_indices.ref_.iter().enumerate() {
-            if color == pframe_reg || color == pec_reg {
-                continue;
-            }
-            let Some(slot) = semantic_ref_slot_for_reg_color(
+            let slots = semantic_ref_slots_for_reg_color(
                 nlocals,
                 stack_only,
                 &maps.pcdep_entries,
                 color as usize,
-            ) else {
-                continue;
-            };
-            // The pending call result is delivered by `make_result_of_lastop`,
-            // not from resumedata, so its slot stays unwritten here.
-            if slot >= valuestackdepth
-                || Some(slot) == pending_result_abs_slot
-                || stream_covered[slot]
-            {
+            );
+            if slots.is_empty() {
+                // A portal red is a scratch value only when this per-PC map
+                // gives its color no semantic owner.  The entry-time frame/ec
+                // colors may be reused for live operands at arbitrary resume
+                // PCs; in that case the resume stream is authoritative and
+                // must overlay the callee's own frame image below.
                 continue;
             }
-            stream_covered[slot] = true;
-            stream_slots.push((pos, slot));
+            for slot in slots {
+                // The pending call result is delivered by
+                // `make_result_of_lastop`, not from resumedata, so its slot
+                // stays unwritten here.
+                if slot >= valuestackdepth
+                    || Some(slot) == pending_result_abs_slot
+                    || stream_covered[slot]
+                {
+                    continue;
+                }
+                stream_covered[slot] = true;
+                stream_slots.push((pos, slot));
+            }
         }
         if !stream_slots.is_empty() {
             crate::jitcode_dispatch::census_record("P2Recipe::StreamSlotOverImage");
@@ -11808,6 +11844,22 @@ mod tests {
         assert_eq!(
             semantic_ref_slot_for_reg_color(2, 1, &[(1, 0, 0), (1, 0, 2), (1, 1, 1)], 0),
             Some(2),
+        );
+    }
+
+    #[test]
+    fn semantic_ref_slots_fan_out_a_copied_live_stack_color() {
+        // JUMP_IF_FALSE_OR_POP/COPY can keep the same MIFrame register in two
+        // semantic stack positions.  A slot-indexed reconstructed frame must
+        // restore both positions from that one resume-stream value.
+        assert_eq!(
+            semantic_ref_slots_for_reg_color(
+                2,
+                2,
+                &[(1, 0, 0), (1, 4, 2), (1, 4, 3), (1, 5, 4)],
+                4,
+            ),
+            vec![2, 3],
         );
     }
 

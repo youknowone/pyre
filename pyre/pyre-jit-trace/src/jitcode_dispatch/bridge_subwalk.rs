@@ -1034,6 +1034,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     local_oprefs: &[OpRef],
     local_concretes: &[majit_ir::Value],
     resumed_stack_oprefs: &[OpRef],
+    resumed_stack_concretes: &[majit_ir::Value],
     child_result: Option<OpRef>,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
@@ -1312,6 +1313,13 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 .unwrap()
                 .set_opref((stack_base + s) as i64, opref);
         }
+        for (s, &value) in resumed_stack_concretes.iter().enumerate() {
+            sub_wc.callee_shadow.as_mut().unwrap().set_concrete(
+                callee_pjc.metadata.portal_frame_reg,
+                (stack_base + s) as i64,
+                value,
+            );
+        }
         if let Some(frame) = ActiveResumeFrame::current(session, root_sym_ptr)
             && frame.0.jitcode.code.as_ptr() == callee_code.as_ptr()
             && frame.0.jitcode.code.len() == callee_code.len()
@@ -1377,6 +1385,7 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
     local_oprefs: &[OpRef],
     local_concretes: &[majit_ir::Value],
     resumed_stack_oprefs: &[OpRef],
+    resumed_stack_concretes: &[majit_ir::Value],
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     drive_bridge_frame_subwalk(
@@ -1394,6 +1403,7 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
         local_oprefs,
         local_concretes,
         resumed_stack_oprefs,
+        resumed_stack_concretes,
         None,
         paused_parent_recipes,
     )
@@ -1415,6 +1425,7 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
     local_oprefs: &[OpRef],
     local_concretes: &[majit_ir::Value],
     resumed_stack_oprefs: &[OpRef],
+    resumed_stack_concretes: &[majit_ir::Value],
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
     child_result: OpRef,
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
@@ -1433,6 +1444,7 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
         local_oprefs,
         local_concretes,
         resumed_stack_oprefs,
+        resumed_stack_concretes,
         Some(child_result),
         paused_parent_recipes,
     )
