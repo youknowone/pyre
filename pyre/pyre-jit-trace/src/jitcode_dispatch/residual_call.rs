@@ -2856,6 +2856,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
         }
         if forced {
+            disarm_folded_inline_callee_after_escape(ctx, op_pc)?;
             if fbw_debug_abort_enabled() {
                 eprintln!(
                     "[force-shape] helper={helper:?} rtype={:?} writes_live={writes_live_heap} \
@@ -3569,6 +3570,79 @@ fn maybe_record_inline_callee_last_instr<Sym: WalkSym>(
     );
     ctx.trace_ctx
         .heapcache_setfield_cached(callee_frame, last_instr_idx, last_instr);
+}
+
+fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+) -> Result<(), DispatchError> {
+    let Some(consts) = ctx.inline_callee_consts else {
+        return Ok(());
+    };
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index) else {
+        return Ok(());
+    };
+    let Some(shadow) = ctx.callee_shadow.as_ref() else {
+        return Ok(());
+    };
+    if shadow.fold_frame_reg == u16::MAX || shadow.frame_box == OpRef::NONE {
+        return Ok(());
+    }
+    let frame_reg = pjc.metadata.portal_frame_reg as usize;
+    let Some(&callee_frame) = ctx.registers_r.get(frame_reg) else {
+        return Ok(());
+    };
+    if callee_frame != shadow.frame_box {
+        return Ok(());
+    }
+    let Some(info) = ctx.trace_ctx.virtualizable_info() else {
+        return Ok(());
+    };
+    let Some(fdescr) = info.array_field_descrs().first().cloned() else {
+        return Ok(());
+    };
+    let Some(adescr) = info.array_descrs.first().cloned() else {
+        return Ok(());
+    };
+    let mut slots: Vec<(i64, OpRef, Value)> = shadow
+        .opref
+        .iter()
+        .filter_map(|(&slot, &value)| {
+            (slot >= 0).then(|| {
+                let concrete = shadow
+                    .concrete
+                    .get(&slot)
+                    .filter(|entry| entry.frame_reg == shadow.fold_frame_reg)
+                    .map(|entry| entry.value)
+                    .or_else(|| ctx.trace_ctx.concrete_of_opref(value))
+                    .unwrap_or(Value::Void);
+                (slot, value, concrete)
+            })
+        })
+        .collect();
+    slots.sort_by_key(|(slot, _, _)| *slot);
+
+    for (slot, value, concrete) in slots {
+        let index = ctx.trace_ctx.const_int(slot);
+        let guards_before = ctx.trace_ctx.num_guards();
+        ctx.trace_ctx.vable_setarrayitem_indexed(
+            pc,
+            callee_frame,
+            index,
+            slot,
+            fdescr.clone(),
+            adescr.clone(),
+            value,
+            concrete,
+        );
+        walker_capture_inline_nonstandard_vable_guard(ctx, pc, guards_before)?;
+    }
+    if let Some(shadow) = ctx.callee_shadow.as_mut()
+        && shadow.frame_box == callee_frame
+    {
+        shadow.fold_frame_reg = u16::MAX;
+    }
+    Ok(())
 }
 
 pub(crate) fn maybe_walker_vable_and_vrefs_before_residual_call<Sym: WalkSym>(
