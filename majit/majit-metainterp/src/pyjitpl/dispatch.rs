@@ -361,6 +361,35 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                     return (*offset, fd as majit_ir::DescrRef);
                 }
             }
+            // No owning STRUCT at all, so the descr gets no `parent_descr` —
+            // a state `descr.py:238` never produces, since `get_field_descr`
+            // always resolves one. It is not a lost parent: every descr that
+            // reaches here names a **raw, non-GC aggregate**, which upstream
+            // gives no FieldDescr in the first place. `jtransform.py:942
+            // rewrite_op_getsubstruct` accepts only `gckind == 'raw'` and
+            // lowers the access to `int_add(ptr, ofs)` with no descr; pyre
+            // still emits a `getfield_gc`, so the descr exists with nothing to
+            // own it. Porting that lowering is what removes this branch.
+            //
+            // Censused over the built descr table (`PYRE_FIELD_IDENTITY_CENSUS`,
+            // 2026-08-04): 65 of 1514 Field slots, in three families, all raw —
+            // `__pos_N` positional slots of closures / `Tuple<K,V>` /
+            // `core::alloc::layout::Layout` (the bulk), the four fields of
+            // `Arguments` (a plain Rust struct with no `#[jit_struct]`, so no
+            // GC header and no type id), and one owner-less `Adt_0`.
+            //
+            // They are built but cold: `MAJIT_LOG=1` counts zero resolutions
+            // through this branch across `fib_recursive`, `nbody` and
+            // `spectral_norm`. So the cost today is the descr table entries,
+            // not a declined speculation.
+            //
+            // The parent stays absent rather than being synthesised. Absent,
+            // `protect_speculative_field` (`llmodel.py:555-567`) returns the
+            // decline that its own `SpeculativeError` models — the speculation
+            // is dropped, which is correct for a pointer that carries no type
+            // id. A synthesised parent would instead hand its type-id compare a
+            // fabricated `sizedescr.type_id()`, turning a safe decline into an
+            // accept whenever that invented id happened to match.
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] field_descr_ref_from_bh: parentless placeholder for \
