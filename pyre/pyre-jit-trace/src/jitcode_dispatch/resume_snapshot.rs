@@ -1884,9 +1884,12 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
 }
 
 /// Capture the current inlined Python frame at a translated helper call's
-/// entry boundary. The helper has no blackhole frame, so a guard inside it
-/// must rebuild this frame at the CALL and re-execute the helper, while the
-/// already-paused outer frames remain below it.
+/// entry boundary. The helper has no Python/blackhole frame of its own, so a
+/// guard inside it must rebuild its Python caller at the CALL and re-execute
+/// the helper, while the already-paused outer frames remain below it. The
+/// caller still needs its own concrete blackhole image: without it the
+/// multi-frame conversion declines and the helper-local abort pc can escape
+/// into an outer frame's coordinate space.
 pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
@@ -1921,7 +1924,7 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
         jitcode_index,
         call_jitcode_pc: None,
         call_stack_overrides: Vec::new(),
-        blackhole: None,
+        blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc),
         resume_coord: ParentResumeCoord::Backxlat(resume_marker_jit_pc),
         resume_marker_jit_pc: Some(resume_marker_jit_pc),
         boxes,

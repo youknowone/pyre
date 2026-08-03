@@ -3,6 +3,15 @@ use crate::jitcode_runtime::{insns_opname_to_byte, named_jitcode};
 use majit_ir::Type;
 use majit_metainterp::make_fail_descr;
 
+#[test]
+fn propagated_subwalk_abort_cannot_rebind_its_pc_to_a_caller_frame() {
+    let mut session = WalkSession::default();
+
+    assert!(session.claim_abort_coordinate(true));
+    assert!(!session.claim_abort_coordinate(true));
+    assert!(!session.claim_abort_coordinate(false));
+}
+
 fn test_fbw_mode() -> FbwWalkMode<crate::state::PyreSym> {
     FbwWalkMode::default()
 }

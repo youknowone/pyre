@@ -468,10 +468,10 @@ pub struct WalkSession {
     /// `Snapshot.frames`; a caller is pushed at its inline CALL and popped
     /// when the callee sub-walk returns.
     pub framestack: Vec<InlineFrame>,
-    /// Whether the terminating permanent abort fired inside an inline
-    /// sub-walk. Its `op.pc` is then a callee coordinate with no meaning in
-    /// the outer snapshot root's py_pc→jitcode translation, so abort-point
-    /// flushing must decline after the sub-walk unwinds.
+    /// Whether an abort fired inside an inline sub-walk. Its `op.pc` is then a
+    /// callee coordinate with no meaning in an enclosing frame's JitCode, so
+    /// neither abort-point flushing nor a later caller-level blackhole latch
+    /// may consume it after the sub-walk unwinds.
     pub abort_in_subwalk: bool,
     /// Blackhole `tmpreg_r`/`tmpreg_i`/`tmpreg_f` (`blackhole.py`):
     /// the single-slot scratch that `insert_renamings` (`flatten.py`)
@@ -514,6 +514,24 @@ impl Default for WalkSession {
             recording_jitcode_index: -1,
             recording_opcode_position: 0,
         }
+    }
+}
+
+impl WalkSession {
+    /// Claim an abort coordinate for the frame whose `walk()` observed it.
+    ///
+    /// The first inline sub-walk to see the error owns its `pc` and may build
+    /// a multi-frame blackhole image from that coordinate. If that build
+    /// declines, enclosing `walk()` calls see the same `DispatchError`, but
+    /// its `pc` is still in the innermost JitCode. Returning `false` there
+    /// prevents a caller from pairing the callee coordinate with its own
+    /// frame — RPython keeps both on the same `MIFrame` throughout unwind.
+    pub(crate) fn claim_abort_coordinate(&mut self, inline_subwalk: bool) -> bool {
+        let claimed_by_deeper_frame = self.abort_in_subwalk;
+        if inline_subwalk {
+            self.abort_in_subwalk = true;
+        }
+        !claimed_by_deeper_frame
     }
 }
 
@@ -2634,6 +2652,10 @@ pub fn walk<Sym: WalkSym>(
                 // reset.  `VableEscapedDuringResidualCall` needs no exclusion —
                 // it latches its narrower resume-marker image at force time,
                 // before the error unwinds here, so the guard below defers to it.
+                let coordinate_belongs_to_this_frame = ctx
+                    .session
+                    .borrow_mut()
+                    .claim_abort_coordinate(ctx.fbw_mode.inline_subwalk);
                 let carrier_owned = matches!(
                     error,
                     DispatchError::AbortPermanentMarkerReached { .. }
@@ -2643,7 +2665,11 @@ pub fn walk<Sym: WalkSym>(
                 // reports a MISSING value cannot be converted, because the
                 // image it would hand the blackhole is the one that just
                 // failed to resolve ([`DispatchError::leaves_complete_image`]).
-                if error.leaves_complete_image() && !carrier_owned && !abort_blackhole_latched() {
+                if coordinate_belongs_to_this_frame
+                    && error.leaves_complete_image()
+                    && !carrier_owned
+                    && !abort_blackhole_latched()
+                {
                     let _ = latch_abort_blackhole(ctx, error.stop_pc());
                 }
                 return Err(error);

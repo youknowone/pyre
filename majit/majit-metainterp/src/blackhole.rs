@@ -3952,6 +3952,22 @@ mod tests {
             }
         }
 
+        /// `random.gauss` contains a float-to-int conversion. A guard failure
+        /// can resume forward through that byte, so RPython
+        /// `blackhole.py:66 setup_insns` must bind the already-ported
+        /// `bhimpl_cast_float_to_int` handler in the production builder.
+        #[test]
+        fn production_bh_builder_wires_cast_float_to_int() {
+            let builder = super::build_inline_call_only_bh_builder();
+            let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
+            let byte = majit_translate::insns::BC_CAST_FLOAT_TO_INT;
+            let slot = builder.dispatch_table[byte as usize];
+            assert_ne!(
+                slot as usize, placeholder as usize,
+                "`cast_float_to_int/f>i` (byte {byte}) is unwired in the production builder",
+            );
+        }
+
         /// The two `fnaddr` classifiers agree with the walker's gate.
         ///
         /// `residual_call.rs:1117` declines a funcptr with any bit ≥ 47 set;
@@ -8648,6 +8664,10 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // / `new_with_vtable` read `bh.cpu`, which this builder sets above.
     for (key, byte) in [
         ("arraylen_gc/rd>i", majit_translate::insns::BC_ARRAYLEN_GC),
+        (
+            "cast_float_to_int/f>i",
+            majit_translate::insns::BC_CAST_FLOAT_TO_INT,
+        ),
         (
             "cast_ptr_to_int/r>i",
             majit_translate::insns::BC_CAST_PTR_TO_INT,
