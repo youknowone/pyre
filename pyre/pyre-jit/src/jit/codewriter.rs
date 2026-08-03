@@ -1647,24 +1647,24 @@ fn handler_entry_has_protected_prefix(
         .any(|site| site.handler_py_pc == handler_py_pc && site.stack_depth > 0)
 }
 
-/// True for a handler whose reconstructed entry stack carries both a
-/// `push_lasti` box and an exception slot (`handler_entry_state_from_catch_site`
-/// pushes the lasti box below a `fresh_ref_value` exception slot). That
-/// exception slot has no defining op, so under the inline splice regalloc —
-/// which sources interference only from per-PC resume snapshots — it never
-/// interferes with the lasti box and coalesces onto its register, making the
-/// cleanup RERAISE raise the stale lasti integer. The caller gives the slot a
+/// True for a handler whose reconstructed entry stack carries an exception slot
+/// (`handler_entry_state_from_catch_site` always pushes one, below it a
+/// `push_lasti` box when the table entry is lasti-marked). That exception slot
+/// has no defining op, so under the inline splice regalloc — which sources
+/// interference only from per-PC resume snapshots — it never interferes with
+/// the values live across the handler and coalesces onto one of their
+/// registers, making the cleanup RERAISE raise whatever that register held: the
+/// stale lasti integer on a lasti-marked handler, and on any other handler
+/// whichever operand shares the colour. The caller gives the slot a
 /// `last_exc_value` producer so it enters the snapshots and earns a distinct
 /// colour.
-fn handler_entry_has_lasti_exception_slots(
+fn handler_entry_has_exception_slot(
     catch_sites: &[ExceptionCatchSite],
     handler_py_pc: usize,
 ) -> bool {
-    catch_sites.iter().any(|site| {
-        site.handler_py_pc == handler_py_pc
-            && site.push_lasti
-            && site.landing.framestate().is_some()
-    })
+    catch_sites
+        .iter()
+        .any(|site| site.handler_py_pc == handler_py_pc && site.landing.framestate().is_some())
 }
 
 /// True when an explicit raise can enter this cleanup handler.  Its
@@ -8014,9 +8014,18 @@ impl CodeWriter {
                     if block_switch_pending {
                         break;
                     }
-                    if start_pc == py_pc
-                        && handler_entry_has_lasti_exception_slots(&catch_sites, py_pc)
-                    {
+                    if start_pc == py_pc && handler_entry_has_exception_slot(&catch_sites, py_pc) {
+                        // A sentinel top means the `handler_depth_at` fallback
+                        // above rebuilt the stack from the depth alone, so there
+                        // is no slot Variable to define; mint one for the
+                        // producer below to write.
+                        if !matches!(
+                            current_state.stack.last(),
+                            Some(super::flow::FlowValue::Variable(_))
+                        ) && let Some(top) = current_state.stack.last_mut()
+                        {
+                            *top = fresh_ref_value(&mut graph);
+                        }
                         if let Some(exc_value) = current_state.stack.last().cloned() {
                             if matches!(
                                 pyre_interpreter::decode_instruction_at(code, py_pc),
@@ -13194,13 +13203,25 @@ impl CodeWriter {
                 // `last_exc_value` SSARepr op at flatten time only — there
                 // is no graph SpaceOperation counterpart, the Variable
                 // flows through `link.last_exc_value` and is materialised
-                // by the flatten-time emission.  Allocate a fresh Ref
-                // Variable to carry the catch-landing's exception value
-                // through `current_state.stack` and the subsequent vable
-                // push, matching the variable-lifecycle shape upstream
-                // produces — without recording a graph `last_exc_value`
-                // SpaceOp the flatten driver would have to filter.
-                let exc_value: super::flow::FlowValue = fresh_ref_value(&mut graph);
+                // by the flatten-time emission.  Reuse the landing's own
+                // `last_exception` value Variable — the edge pair set by
+                // `exception_landing_state`, whose colour `generate_last_exc`
+                // writes into — as the pushed exception value, instead of a
+                // producerless fresh Ref.  A fresh Ref has no defining op, so
+                // regalloc treats it as dead-until-first-use and coalesces it
+                // onto a body colour (e.g. a local live across the `try`); on
+                // a guard-failure bridge that re-walks the handler the body
+                // colour's def sits in the skipped prefix, so the pushed value
+                // is read unbound (`RegisterReadUnbound`).  The landing value
+                // is produced by `generate_last_exc`, is re-derived on any
+                // bridge, and interferes with the surrounding live ranges so
+                // it earns a distinct colour.  Same fix as the PUSH_EXC_INFO
+                // handler at the `last_exc_value` re-read above.
+                let exc_value: super::flow::FlowValue = current_state
+                    .last_exception
+                    .as_ref()
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_else(|| fresh_ref_value(&mut graph));
                 current_state.stack.push(exc_value.clone());
                 // pyframe.py:503-510 + eval.rs:155-158 `dropvaluesuntil` parity:
                 //
