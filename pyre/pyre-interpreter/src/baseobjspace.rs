@@ -6759,13 +6759,16 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
             if let Some(base_group) = crate::builtins::lookup_exc_class("BaseExceptionGroup")
                 && isinstance(obj, base_group)?
             {
-                let w_dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) };
-                let key = if name == "message" {
-                    "__pyre_exception_group_message"
-                } else {
-                    "__pyre_exception_group_exceptions"
+                // `interp_group.py:71-72` — both are `interp_attrproperty_w`
+                // slots on the instance, not instance-dictionary entries.
+                let value = unsafe {
+                    if name == "message" {
+                        pyre_object::interp_exceptions::w_exception_get_group_message(obj)
+                    } else {
+                        pyre_object::interp_exceptions::w_exception_get_group_exceptions(obj)
+                    }
                 };
-                if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, key) } {
+                if !value.is_null() {
                     return Ok(value);
                 }
             }

@@ -25,7 +25,7 @@ error.note = "n"
 assert vars(error) == {"note": "n"}
 
 group = ExceptionGroup("m", [ValueError("v")])
-assert isinstance(vars(group), dict)
+assert vars(group) == {}
 
 for argument in (1, [], "text", (), object()):
     try:

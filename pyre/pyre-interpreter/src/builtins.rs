@@ -7694,18 +7694,26 @@ pub(crate) fn make_exc_type_multi(
     register_exc_class(name, cls)
 }
 
-const EG_MESSAGE_KEY: &str = "__pyre_exception_group_message";
-const EG_EXCEPTIONS_KEY: &str = "__pyre_exception_group_exceptions";
-const EG_EXCEPTIONS_REPR_KEY: &str = "__pyre_exception_group_exceptions_repr";
-
+/// `interp_group.py:71-72` `message` / `exceptions` — the two
+/// `interp_attrproperty_w` slots `descr_new` stamps onto the instance.  They
+/// live in dedicated `W_BaseException` fields, not in `w_dict`, so the group's
+/// public `__dict__` stays empty and user code cannot rewrite them.
 pub(crate) fn exception_group_fields(
     w_self: PyObjectRef,
 ) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
-    let w_dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(w_self) };
-    let message = unsafe { pyre_object::w_dict_getitem_str(w_dict, EG_MESSAGE_KEY) }
-        .ok_or_else(|| crate::PyError::attribute_error("exception group has no message"))?;
-    let exceptions = unsafe { pyre_object::w_dict_getitem_str(w_dict, EG_EXCEPTIONS_KEY) }
-        .ok_or_else(|| crate::PyError::attribute_error("exception group has no exceptions"))?;
+    let message = unsafe { pyre_object::interp_exceptions::w_exception_get_group_message(w_self) };
+    if message.is_null() {
+        return Err(crate::PyError::attribute_error(
+            "exception group has no message",
+        ));
+    }
+    let exceptions =
+        unsafe { pyre_object::interp_exceptions::w_exception_get_group_exceptions(w_self) };
+    if exceptions.is_null() {
+        return Err(crate::PyError::attribute_error(
+            "exception group has no exceptions",
+        ));
+    }
     Ok((message, exceptions))
 }
 
@@ -7818,25 +7826,20 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         let tuple = pyre_object::w_tuple_new(exceptions);
         pyre_object::gc_roots::pin_root(tuple);
         let tuple_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_dict = pyre_object::interp_exceptions::w_exception_getdict(
+        // `interp_group.py:19-20` — the two attrproperty slots, plus the
+        // constructor-time sequence repr.  None of these writes allocates, so
+        // the shadow-stack reads below stay valid across all three.
+        pyre_object::interp_exceptions::w_exception_set_group_message(
             pyre_object::gc_roots::shadow_stack_get(exc_slot),
-        );
-        pyre_object::gc_roots::pin_root(w_dict);
-        let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        pyre_object::w_dict_setitem_str(
-            pyre_object::gc_roots::shadow_stack_get(dict_slot),
-            EG_MESSAGE_KEY,
             pyre_object::gc_roots::shadow_stack_get(base + 1),
         );
-        pyre_object::w_dict_setitem_str(
-            pyre_object::gc_roots::shadow_stack_get(dict_slot),
-            EG_EXCEPTIONS_KEY,
+        pyre_object::interp_exceptions::w_exception_set_group_exceptions(
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
             pyre_object::gc_roots::shadow_stack_get(tuple_slot),
         );
         if let Some(repr_slot) = repr_slot {
-            pyre_object::w_dict_setitem_str(
-                pyre_object::gc_roots::shadow_stack_get(dict_slot),
-                EG_EXCEPTIONS_REPR_KEY,
+            pyre_object::interp_exceptions::w_exception_set_group_exceptions_repr(
+                pyre_object::gc_roots::shadow_stack_get(exc_slot),
                 pyre_object::gc_roots::shadow_stack_get(repr_slot),
             );
         }
@@ -8249,10 +8252,9 @@ fn exception_group_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let cls = crate::typedef::r#type(w_self).unwrap();
     let name = unsafe { pyre_object::w_type_get_name(cls.as_ptr()) };
     let message_repr = unsafe { crate::display::py_repr(message)? };
-    let w_dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(w_self) };
-    let exceptions_repr = if let Some(saved) =
-        unsafe { pyre_object::w_dict_getitem_str(w_dict, EG_EXCEPTIONS_REPR_KEY) }
-    {
+    let saved =
+        unsafe { pyre_object::interp_exceptions::w_exception_get_group_exceptions_repr(w_self) };
+    let exceptions_repr = if !saved.is_null() {
         unsafe { pyre_object::w_str_get_value(saved) }.to_string()
     } else {
         // CPython 3.14 BaseExceptionGroup_repr: render the immutable internal

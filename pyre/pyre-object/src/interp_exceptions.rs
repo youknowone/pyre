@@ -409,6 +409,18 @@ pub struct W_BaseException {
     /// CPython 3.14's private `SyntaxError._metadata` member.  This is the
     /// 3.14-specific extension to PyPy's `W_SyntaxError` field set.
     pub w_syntax_metadata: PyObjectRef,
+    /// `interp_group.py:19 W_BaseExceptionGroup.descr_new` `exc.w_message`,
+    /// exposed as the read-only `message` attrproperty (`:71`).
+    pub w_group_message: PyObjectRef,
+    /// `interp_group.py:20` `exc.w_exceptions`, exposed as the read-only
+    /// `exceptions` attrproperty (`:72`).  This is the immutable tuple built at
+    /// construction time, independent of the `args` the caller passed.
+    pub w_group_exceptions: PyObjectRef,
+    /// The `repr` of the sequence `descr_new` received, rendered before it was
+    /// flattened into `w_group_exceptions`.  `BaseExceptionGroup.__repr__`
+    /// reproduces the constructor-time spelling, which a later mutation of
+    /// `args` must not change; `PY_NULL` selects the derive-from-args path.
+    pub w_group_exceptions_repr: PyObjectRef,
     /// `interp_exceptions.py:113 W_BaseException.w_dict = None` — the
     /// per-instance attribute dict, lazily allocated by `getdict`
     /// (`:222-225`) and replaced wholesale by `setdict` (`:227-231`).
@@ -462,6 +474,12 @@ pub const EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET: usize =
     std::mem::offset_of!(W_BaseException, w_syntax_print_file_and_line);
 pub const EXC_W_SYNTAX_METADATA_OFFSET: usize =
     std::mem::offset_of!(W_BaseException, w_syntax_metadata);
+pub const EXC_W_GROUP_MESSAGE_OFFSET: usize =
+    std::mem::offset_of!(W_BaseException, w_group_message);
+pub const EXC_W_GROUP_EXCEPTIONS_OFFSET: usize =
+    std::mem::offset_of!(W_BaseException, w_group_exceptions);
+pub const EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET: usize =
+    std::mem::offset_of!(W_BaseException, w_group_exceptions_repr);
 pub const EXC_W_DICT_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_dict);
 pub const EXC_W_WEAKREF_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_weakreflifeline);
 
@@ -478,13 +496,15 @@ pub const EXC_W_WEAKREF_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_
 /// NameError / AttributeError) and the W_AttributeError `w_attr_obj`
 /// slot, plus the three remaining W_ImportError per-class slots
 /// (w_import_path / w_import_name_from / w_import_msg), plus the eight
-/// W_SyntaxError fields and CPython 3.14 `_metadata`, plus the lazily-allocated
+/// W_SyntaxError fields and CPython 3.14 `_metadata`, plus the three
+/// `W_BaseExceptionGroup` slots (w_group_message / w_group_exceptions and the
+/// constructor-time sequence repr), plus the lazily-allocated
 /// `w_dict`, plus the heap-type weakref lifeline used by
 /// `ExceptionGroup`
 /// (interp_exceptions.py:113/222-231).  `kind` is a `u8` tag, `message`
 /// is a `*mut String` (raw heap), and `suppress_context` is a bool —
 /// none of those are GC-traced.
-pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 31] = [
+pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 34] = [
     EXC_ARGS_W_OFFSET,
     EXC_W_CAUSE_OFFSET,
     EXC_W_CONTEXT_OFFSET,
@@ -514,6 +534,9 @@ pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 31] = [
     EXC_W_SYNTAX_END_OFFSET_OFFSET,
     EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET,
     EXC_W_SYNTAX_METADATA_OFFSET,
+    EXC_W_GROUP_MESSAGE_OFFSET,
+    EXC_W_GROUP_EXCEPTIONS_OFFSET,
+    EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET,
     EXC_W_DICT_OFFSET,
     EXC_W_WEAKREF_OFFSET,
 ];
@@ -674,6 +697,11 @@ fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
         w_syntax_end_offset: PY_NULL,
         w_syntax_print_file_and_line: PY_NULL,
         w_syntax_metadata: PY_NULL,
+        // `interp_group.py:19-20` W_BaseExceptionGroup defaults, stamped by
+        // `descr_new` on the group kinds only.
+        w_group_message: PY_NULL,
+        w_group_exceptions: PY_NULL,
+        w_group_exceptions_repr: PY_NULL,
         // `interp_exceptions.py:113 w_dict = None` — allocated on the
         // first `getdict` (`:222-225`).
         w_dict: PY_NULL,
@@ -1554,6 +1582,51 @@ pub unsafe fn w_exception_get_syntax_metadata(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_exception_set_syntax_metadata(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_BaseException)).w_syntax_metadata = value;
+        exception_write_barrier(obj);
+    }
+}
+
+/// `interp_group.py:19` `exc.w_message` reader.
+#[inline]
+pub unsafe fn w_exception_get_group_message(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_BaseException)).w_group_message }
+}
+
+/// `interp_group.py:19` `exc.w_message` writer.
+#[inline]
+pub unsafe fn w_exception_set_group_message(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_BaseException)).w_group_message = value;
+        exception_write_barrier(obj);
+    }
+}
+
+/// `interp_group.py:20` `exc.w_exceptions` reader.
+#[inline]
+pub unsafe fn w_exception_get_group_exceptions(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_BaseException)).w_group_exceptions }
+}
+
+/// `interp_group.py:20` `exc.w_exceptions` writer.
+#[inline]
+pub unsafe fn w_exception_set_group_exceptions(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_BaseException)).w_group_exceptions = value;
+        exception_write_barrier(obj);
+    }
+}
+
+/// Constructor-time `repr` of the sequence `descr_new` received.
+#[inline]
+pub unsafe fn w_exception_get_group_exceptions_repr(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_BaseException)).w_group_exceptions_repr }
+}
+
+/// Constructor-time `repr` of the sequence `descr_new` received.
+#[inline]
+pub unsafe fn w_exception_set_group_exceptions_repr(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_BaseException)).w_group_exceptions_repr = value;
         exception_write_barrier(obj);
     }
 }
