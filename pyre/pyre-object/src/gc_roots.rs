@@ -963,4 +963,39 @@ mod tests {
         assert_eq!(shadow_stack_get(0) as usize, 0x11);
         assert_eq!(shadow_stack_get(1) as usize, 0x22);
     }
+
+    /// The read twin above only proves the walk *reads* from the relocated
+    /// buffer. A moving collector also *writes* the forwarded address back,
+    /// and that write happens after the visitor has had its chance to grow
+    /// the stack — so the store has to resolve the buffer address again
+    /// rather than reuse the one the slot was read from.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn walk_shadow_stack_write_back_follows_a_grow_inside_the_visitor() {
+        let _roots = push_roots();
+        pin_root(dummy(0x11));
+        pin_root(dummy(0x22));
+
+        let additional = with_shadow_stack(|stack| stack.capacity() - stack.len() + 1);
+        let mut pushed = false;
+        walk_shadow_stack(|slot| {
+            if !pushed {
+                pushed = true;
+                for offset in 0..additional {
+                    pin_root(dummy(0x1000 + offset));
+                }
+            }
+            // Forward the root the way a moving collector would, *after* the
+            // buffer has already moved under this slot.
+            *slot = dummy(*slot as usize + 0xA0_0000);
+        });
+
+        assert!(pushed);
+        // Slot 0 is the discriminator: it was read from the old buffer, and
+        // the grow happened before the visitor forwarded it. The write is
+        // only observable here if it went to the buffer the stack owns now.
+        // Slot 1 was read after the grow, so it lands correctly either way.
+        assert_eq!(shadow_stack_get(0) as usize, 0xA0_0011);
+        assert_eq!(shadow_stack_get(1) as usize, 0xA0_0022);
+    }
 }
