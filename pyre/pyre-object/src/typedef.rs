@@ -352,6 +352,12 @@ pub const MEMBER_RANGE_START: u32 = MEMBER_DIRECT_FLAG | 46;
 pub const MEMBER_RANGE_STOP: u32 = MEMBER_DIRECT_FLAG | 47;
 /// CPython 3.14 `range_members.step`, backed by PyPy's `w_step` field.
 pub const MEMBER_RANGE_STEP: u32 = MEMBER_DIRECT_FLAG | 48;
+/// CPython 3.14 `slice_members.start`, backed by PyPy's `w_start` field.
+pub const MEMBER_SLICE_START: u32 = MEMBER_DIRECT_FLAG | 49;
+/// CPython 3.14 `slice_members.stop`, backed by PyPy's `w_stop` field.
+pub const MEMBER_SLICE_STOP: u32 = MEMBER_DIRECT_FLAG | 50;
+/// CPython 3.14 `slice_members.step`, backed by PyPy's `w_step` field.
+pub const MEMBER_SLICE_STEP: u32 = MEMBER_DIRECT_FLAG | 51;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {

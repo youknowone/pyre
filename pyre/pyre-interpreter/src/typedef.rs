@@ -8739,20 +8739,6 @@ fn slice_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     Ok(pyre_object::sliceobject::w_slice_new(start, stop, step))
 }
 
-fn slice_getter(
-    args: &[PyObjectRef],
-    field: unsafe fn(PyObjectRef) -> PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
-    let self_ = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-    // sliceobject.py:191 `slicewprop.fget` — applied to a non-slice
-    // receiver raises TypeError("descriptor is for 'slice'").
-    if unsafe { pyre_object::sliceobject::is_slice(self_) } {
-        Ok(unsafe { field(self_) })
-    } else {
-        Err(crate::PyError::type_error("descriptor is for 'slice'"))
-    }
-}
-
 /// sliceobject.py `descr_repr` — `"slice(%r, %r, %r)"`.
 fn slice_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let self_ = slice_receiver(args, "__repr__")?;
@@ -9015,13 +9001,10 @@ fn init_slice_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "start",
-            make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "start",
-                    |args| slice_getter(args, pyre_object::sliceobject::w_slice_get_start),
-                    2,
-                ),
-                "start",
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_SLICE_START,
+                "start".to_owned(),
+                PY_NULL,
             ),
         )
     };
@@ -9029,13 +9012,10 @@ fn init_slice_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "stop",
-            make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "stop",
-                    |args| slice_getter(args, pyre_object::sliceobject::w_slice_get_stop),
-                    2,
-                ),
-                "stop",
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_SLICE_STOP,
+                "stop".to_owned(),
+                PY_NULL,
             ),
         )
     };
@@ -9043,13 +9023,10 @@ fn init_slice_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "step",
-            make_getset_descriptor_named(
-                make_builtin_function_with_arity(
-                    "step",
-                    |args| slice_getter(args, pyre_object::sliceobject::w_slice_get_step),
-                    2,
-                ),
-                "step",
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_SLICE_STEP,
+                "step".to_owned(),
+                PY_NULL,
             ),
         )
     };
@@ -12071,6 +12048,15 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
         pyre_object::MEMBER_RANGE_START => Ok(unsafe { pyre_object::w_range_fields(obj).0 }),
         pyre_object::MEMBER_RANGE_STOP => Ok(unsafe { pyre_object::w_range_fields(obj).1 }),
         pyre_object::MEMBER_RANGE_STEP => Ok(unsafe { pyre_object::w_range_fields(obj).2 }),
+        pyre_object::MEMBER_SLICE_START => {
+            Ok(unsafe { pyre_object::sliceobject::w_slice_get_start(obj) })
+        }
+        pyre_object::MEMBER_SLICE_STOP => {
+            Ok(unsafe { pyre_object::sliceobject::w_slice_get_stop(obj) })
+        }
+        pyre_object::MEMBER_SLICE_STEP => {
+            Ok(unsafe { pyre_object::sliceobject::w_slice_get_step(obj) })
+        }
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
         pyre_object::MEMBER_DESCR_NAME => unsafe { descr_member_name(obj) },
         _ => Err(crate::PyError::attribute_error(unsafe {

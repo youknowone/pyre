@@ -15,6 +15,27 @@ check(set(slice.__dict__) == surface, "slice TypeDef surface")
 
 a = slice(1, 2)
 b = slice(1, 3)
+components = slice(2, 9, 3)
+for name in ("start", "stop", "step"):
+    member = slice.__dict__[name]
+    check(type(member).__name__ == "member_descriptor", f"slice.{name} kind")
+    check(member.__objclass__ is slice, f"slice.{name} owner")
+    check(member.__name__ == name, f"slice.{name} name")
+    check(member.__doc__ is None, f"slice.{name} doc")
+    original = getattr(components, name)
+    try:
+        setattr(components, name, 1)
+    except AttributeError as error:
+        check(str(error) == "readonly attribute", f"slice.{name} set error")
+    else:
+        raise AssertionError(f"slice.{name} must be read-only")
+    try:
+        delattr(components, name)
+    except AttributeError as error:
+        check(str(error) == "readonly attribute", f"slice.{name} delete error")
+    else:
+        raise AssertionError(f"slice.{name} must not be deletable")
+    check(getattr(components, name) is original, f"slice.{name} identity")
 check(a < b and a <= b and not (a > b) and not (a >= b), "slice ordering")
 check(not (a < a) and a <= a and not (a > a) and a >= a, "slice identity ordering")
 check(slice.__lt__(a, 1) is NotImplemented, "slice foreign comparison")
