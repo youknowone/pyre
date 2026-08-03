@@ -180,6 +180,9 @@ Grep RPython:
 rg -t py 'lenbound|getlenbound|_x86_arglocs|_ll_loop_code' rpython/jit/
 ```
 
+For a *behavioural* question rather than a structural one — "does upstream
+really do this?" — grepping is the second step; see "The PyPy oracle" below.
+
 
 ### Workflow guideline
 
@@ -190,6 +193,40 @@ for `HashMap` only after you have proven that RPython itself uses a
 dict-like container in that exact spot. Apply the same test to TLS: locate the
 upstream owner, then preserve whether it is global, interpreter-local,
 execution-context-local, or genuinely thread-local.
+
+## The PyPy oracle: run it before you argue about orthodoxy
+
+Reading `rpython/` tells you what upstream *says*. Running a real `pypy3` tells
+you what upstream *does*. When the question is "is this JIT behaviour orthodox,
+or is it our deviation?", run the oracle FIRST — before reading source, before
+forming a theory, and certainly before recording a verdict.
+
+```
+PYPYLOG=jit-summary:- pypy3 pyre/bench/synth/<fixture>.py
+```
+
+Most `pyre/bench/synth` fixtures use no stdlib and run unmodified under the
+real interpreter, so this costs one command. Read these keys: `Total # of
+loops` / `Total # of bridges`, `forcings`, `virtualizables forced`, every
+`abort: *`, `nvirtuals`. Compare against `MAJIT_STATS=1` on the same file.
+
+**A counter that differs is a pointer, not the answer.** Go find the upstream
+line that produces it — the decision is usually one JIT hint
+(`@jit.look_inside_iff`, `@jit.dont_look_inside`, `@jit.elidable`,
+`@jit.unroll_safe`) sitting on the function in question. Cite it. If the
+summary is too coarse, `PYPYLOG=jit-log-opt:FILE` dumps the optimized trace.
+
+Worked example (2026-08-03). `getframe_inline_subwalk_multiframe` failed 8948
+GUARD_NOT_FORCED, and the standing conclusion was "a GUARD_NOT_FORCED never
+compiles a bridge (`compile.py:950-953`), so this is unfixable by construction."
+The oracle reported one loop, no bridges, **`forcings: 0`**, **`virtualizables
+forced: 0`**, no aborts — PyPy never forces here at all, so the guard should not
+exist. `pypy/module/sys/vm.py:41` then names the decision in one line:
+`@jit.look_inside_iff(lambda space, depth: jit.isconstant(depth))` on
+`getframe`, which pyre folds into a single opaque builtin. A verdict that had
+stood for weeks was overturned, and an unbounded "epic" turned into a named
+port, by one command. Note also `pypy3` is 3.11 — a fixture using newer syntax
+needs trimming to the subset that runs.
 
 ## RPython Parity Rules
 - When porting from RPython/PyPy, do STRICT line-by-line structural parity. Do NOT take shortcuts, reimplement from scratch, or declare phases 'complete' without the literal refactor.
