@@ -590,6 +590,47 @@ fn cpython314_builtin_abi(name: &str) -> (i64, i64, i64, i64) {
         "filter" | "reversed" => (32, 0, 0, 0),
         "staticmethod" | "classmethod" => (32, 0, 0, 24),
         "property" => (64, 0, 0, 0),
+        // The interpreter objects `types` re-exports.  They are not in the
+        // `builtins` namespace but `types.FunctionType.__basicsize__` and its
+        // siblings are just as reachable, so the fallback below would report a
+        // bare object header for a 152-byte layout.
+        "function" => (152, 0, 96, 88),
+        "module" => (56, 0, 40, 16),
+        "method" => (48, 0, 32, 0),
+        "builtin_function_or_method" => (56, 0, 40, 0),
+        "code" => (208, 2, 144, 0),
+        "generator" | "coroutine" | "async_generator" => (152, 8, 16, 0),
+        "frame" => (152, 8, 0, 0),
+        "traceback" => (40, 0, 0, 0),
+        "cell" | "mappingproxy" => (24, 0, 0, 0),
+        "types.SimpleNamespace" => (24, 0, 0, 16),
+        "types.GenericAlias" => (64, 0, 40, 0),
+        // `types.UnionType` is an alias for the canonically-named type.
+        "typing.Union" => (56, 0, 48, 0),
+        // Descriptor kinds.  `method-wrapper` is the bound form of
+        // `wrapper_descriptor`, hence the smaller header.
+        "wrapper_descriptor" | "method_descriptor" | "classmethod_descriptor" => (56, 0, 0, 0),
+        "getset_descriptor" | "member_descriptor" => (48, 0, 0, 0),
+        "method-wrapper" => (32, 0, 0, 0),
+        // Iterator kinds, grouped by the state each one carries: an index plus
+        // a container, a 64-bit range cursor, a hash-table position, or a
+        // dictionary position with its size guard.
+        "bytes_iterator"
+        | "bytearray_iterator"
+        | "list_iterator"
+        | "list_reverseiterator"
+        | "tuple_iterator"
+        | "str_ascii_iterator"
+        | "callable_iterator" => (32, 0, 0, 0),
+        "range_iterator" | "longrange_iterator" => (40, 0, 0, 0),
+        "set_iterator" | "memory_iterator" => (48, 0, 0, 0),
+        "dict_keyiterator"
+        | "dict_valueiterator"
+        | "dict_itemiterator"
+        | "dict_reversekeyiterator"
+        | "dict_reversevalueiterator"
+        | "dict_reverseitemiterator" => (56, 0, 0, 0),
+        "dict_keys" | "dict_values" | "dict_items" => (24, 0, 0, 0),
         "AttributeError" => (88, 0, 0, 16),
         "BaseExceptionGroup" => (88, 0, 0, 16),
         "ExceptionGroup" => (88, 0, -32, 16),
@@ -629,6 +670,7 @@ fn cpython314_builtin_abi(name: &str) -> (i64, i64, i64, i64) {
         | "FloatingPointError"
         | "FutureWarning"
         | "GeneratorExit"
+        | "ImportWarning"
         | "IndexError"
         | "KeyError"
         | "KeyboardInterrupt"
@@ -644,6 +686,7 @@ fn cpython314_builtin_abi(name: &str) -> (i64, i64, i64, i64) {
         | "RuntimeError"
         | "RuntimeWarning"
         | "StopAsyncIteration"
+        | "SyntaxWarning"
         | "SystemError"
         | "TypeError"
         | "UnicodeError"
@@ -654,8 +697,11 @@ fn cpython314_builtin_abi(name: &str) -> (i64, i64, i64, i64) {
         | "ZeroDivisionError" => (72, 0, 0, 16),
         // CPython's remaining fixed-size builtin objects are at least the
         // two-word object header.  Their exact declarations can be added as
-        // each corresponding TypeDef is ported; the core builtins above are
-        // the complete `builtins` module surface.
+        // each corresponding TypeDef is ported; the arms above cover the whole
+        // `builtins` namespace plus what `types` re-exports.  Structseq
+        // classes stay on the fallback on purpose — their header grows with
+        // the field count, so it belongs to the structseq constructor rather
+        // than to a per-name table.
         _ => (std::mem::size_of::<PyObject>() as i64, 0, 0, 0),
     }
 }
