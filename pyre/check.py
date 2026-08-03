@@ -676,9 +676,12 @@ def _jit_stats_change(saved, current):
 
     A field missing from either side reads as "0", so a baseline recorded before
     a counter existed still matches a run that reports it as 0, and adding an
-    invariant counter costs no re-record. The wasm [jit-stats] line reports only
-    the badness fields, so its baselines carry only those and stay equal on the
-    three it never prints."""
+    invariant counter costs no re-record. The cost of that convenience is that a
+    field absent from BOTH sides compares equal forever: a backend whose
+    [jit-stats] line stops naming a counter disarms that counter's gate on every
+    one of its baselines, silently. Whenever a backend's line changes shape,
+    re-record its whole baseline surface rather than trusting the run that
+    follows."""
     old_fields = _parse_jit_stats(saved)
     new_fields = _parse_jit_stats(current)
     changes = [
