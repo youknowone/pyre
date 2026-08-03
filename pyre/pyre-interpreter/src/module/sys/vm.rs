@@ -533,6 +533,146 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
 /// active context (set on eval-loop entry); see the helper's doc for
 /// the staleness gap relative to PyPy's `space.getexecutioncontext()`
 /// which always queries the thread state.
+/// `pypy/module/sys/vm.py:42 getframe` — the non-hidden frame-chain walk that
+/// `sys._getframe` hands out.
+///
+/// ```python
+/// @jit.look_inside_iff(lambda space, depth: jit.isconstant(depth))
+/// def getframe(space, depth):
+///     ec = space.getexecutioncontext()
+///     f = ec.gettopframe_nohidden()
+///     while True:
+///         if f is None:
+///             raise oefmt(space.w_ValueError, "call stack is not deep enough")
+///         if depth == 0:
+///             f.mark_as_escaped()
+///             audit(space, "sys._getframe", [f])
+///             return f
+///         depth -= 1
+///         f = ec.getnextframe_nohidden(f)
+/// ```
+///
+/// `hidden_applevel` gateway / bridge frames are skipped, matching `f_back`.
+/// The `f is None` test runs at the START of every iteration including the
+/// first, so a missing top frame raises rather than fabricating a stub, and a
+/// negative depth walks the chain to its end and raises there.
+///
+/// The returned object is the live `PyFrame` itself (`FRAME_TYPE` typedef), not
+/// a stub, so `frame.f_globals is globals()` holds and `f_back` chains lazily
+/// through `pyframe.py:767 GetSetProperty(PyFrame.fget_f_back)`.
+///
+/// DEVIATION — the two VIRTUALIZABLE forces. The distinction matters: the vref
+/// force is common to both worlds and is not optional
+/// (`ExecutionContext::gettopframe_raw`), so `gettopframe_nohidden` is not
+/// "force-free" — it is free of the *virtualizable* force that
+/// `gettopframe` adds. Upstream takes neither of those, because
+/// `look_inside_iff(isconstant(depth))` traces a constant `depth` THROUGH: the
+/// walk never becomes a residual call, and the frame it hands to app level
+/// materialises by escape analysis instead
+/// (`executioncontext::force_frame_before_locals_read` states that contract).
+/// Pyre calls this residually, so both forces are load-bearing here:
+/// `gettopframe()` because a JIT-inlined callee has no frame of its own until a
+/// force materialises one — an unforced walk would start at the caller and then
+/// read `f_back` off a frame that never existed — and `force_frame` because app
+/// code is about to read `f_lineno` / `f_locals` off a frame whose
+/// virtualizable fields the JIT may still be holding.
+///
+/// The price is that each call trips `vable_after_residual_call` and aborts the
+/// trace: measured 2026-08-03, 138 of the synth corpus's 219 `loops_aborted`,
+/// against `abort: vable escape: 0` and `forcings: 0` on the same fixtures
+/// under real pypy3.
+///
+/// A constant-depth traced-through arm does NOT reclaim that. It reaches 15 of
+/// the 138; 70 sit at call sites inside an inlined callee, whose virtual frame
+/// carries `last_instr = -1` (`pyre-jit-trace/src/helpers.rs`) with nothing
+/// updating it through the body, so folding them would compile a
+/// `_getframe().f_lineno` that reports the `def` line where the abort today
+/// falls back to the interpreter and answers correctly. Part of this abort
+/// count is load-bearing. The lever that could take the 70 is instead the
+/// escalation from a *callee* frame escape to a *portal* virtualizable force in
+/// `pyre-jit/src/eval.rs`, which has no upstream counterpart —
+/// `executioncontext.py:91-107 leave` forces the leaving frame's own vref and
+/// only *marks* `f_back`.
+pub fn getframe(depth: i64) -> crate::PyResult {
+    let ec = current_execution_context();
+    let mut current = if ec.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe {
+            (*ec).gettopframe();
+            (*ec).gettopframe_nohidden()
+        }
+    };
+    let mut remaining = depth;
+    loop {
+        if current.is_null() {
+            return Err(crate::PyError::value_error("call stack is not deep enough"));
+        }
+        if remaining == 0 {
+            break;
+        }
+        remaining -= 1;
+        current = crate::executioncontext::ExecutionContext::getnextframe_nohidden(current);
+    }
+    unsafe { (*current).mark_as_escaped() };
+    crate::executioncontext::force_frame(current);
+    Ok(current as PyObjectRef)
+}
+
+/// `pypy/module/sys/vm.py:29 _getframe` — `@unwrap_spec(depth=int)`, the
+/// argument surface in front of [`getframe`].
+///
+/// A named `fn` rather than a closure so [`is_builtin_getframe_function`] can
+/// compare builtin-code identity against it.
+fn sys_getframe(args: &[PyObjectRef]) -> crate::PyResult {
+    // `unwrap_spec` enforces a single optional int argument, so any extra
+    // positional arg must surface as TypeError before the depth walk runs.
+    if args.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "_getframe expected at most 1 argument, got {}",
+            args.len()
+        )));
+    }
+    let depth = if args.is_empty() {
+        0i64
+    } else if unsafe { pyre_object::is_int(args[0]) } {
+        unsafe { pyre_object::w_int_get_value(args[0]) }
+    } else {
+        return Err(crate::PyError::type_error(
+            "_getframe(): argument must be an int",
+        ));
+    };
+    // `vm.py:37-38 if depth < 0: raise ... "frame index must not be negative"`
+    // — the message differs from `getframe`'s exhausted-stack case.
+    if depth < 0 {
+        return Err(crate::PyError::value_error(
+            "frame index must not be negative",
+        ));
+    }
+    getframe(depth)
+}
+
+/// True iff `callable` is the canonical `sys._getframe` builtin.
+///
+/// `sys` is an ordinary mutable module, so the JIT walker has to key on
+/// builtin-code identity rather than the global name before it may reproduce
+/// [`getframe`] in a trace. Mirrors `builtins::is_builtin_len_function`.
+pub fn is_builtin_getframe_function(callable: PyObjectRef) -> bool {
+    unsafe {
+        if callable.is_null() || !crate::is_function(callable) {
+            return false;
+        }
+        let code = crate::function_get_code(callable) as PyObjectRef;
+        if code.is_null() || !crate::gateway::is_builtin_code(code) {
+            return false;
+        }
+        crate::gateway::builtin_code_fn_eq(
+            crate::gateway::builtin_code_get(code),
+            sys_getframe as crate::gateway::BuiltinCodeFn,
+        )
+    }
+}
+
 fn current_execution_context() -> *mut crate::PyExecutionContext {
     crate::call::getexecutioncontext() as *mut crate::PyExecutionContext
 }
@@ -967,93 +1107,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(ns, "__stdout__", stdout);
     module_ns_store(ns, "__stderr__", stderr);
     module_ns_store(ns, "__stdin__", stdin);
-    // `pypy/module/sys/vm.py:30 _getframe` walks the
-    // `space.getexecutioncontext().gettopframe_nohidden()` chain,
-    // following `f_back` `depth` times.  PyPy returns the frame
-    // object directly so `frame.f_globals is module.__dict__` /
-    // `frame.f_globals is globals()` (callee's scope) holds.  Pyre
-    // mirrors the depth walk through `CURRENT_FRAME` + `f_back`,
-    // populating the stub frame's attributes from the resolved
-    // PyFrame. `f_globals` / `f_locals` use the frame's canonical dict so the
-    // `is module.__dict__` invariant survives sys._getframe access.
+    // `vm.py:29 _getframe` (arguments) over `vm.py:42 getframe` (the walk) —
+    // see [`sys_getframe`] and [`getframe`], which keep upstream's split.
     module_ns_store(
         ns,
         "_getframe",
-        crate::make_builtin_function("_getframe", |args| {
-            // `pypy/module/sys/vm.py:28-39 _getframe`:
-            //   @unwrap_spec(depth=int) def _getframe(space, depth=0)
-            // `unwrap_spec` enforces a single optional int argument, so
-            // any extra positional arg must surface as TypeError before
-            // the depth walk runs.
-            if args.len() > 1 {
-                return Err(crate::PyError::type_error(format!(
-                    "_getframe expected at most 1 argument, got {}",
-                    args.len()
-                )));
-            }
-            let depth_signed = if args.is_empty() {
-                0i64
-            } else if unsafe { pyre_object::is_int(args[0]) } {
-                unsafe { pyre_object::w_int_get_value(args[0]) }
-            } else {
-                return Err(crate::PyError::type_error(
-                    "_getframe(): argument must be an int",
-                ));
-            };
-            // `vm.py:37-38 if depth < 0: raise ... "frame index must not
-            // be negative"` — the message string differs from the
-            // exhausted-stack case below.
-            if depth_signed < 0 {
-                return Err(crate::PyError::value_error(
-                    "frame index must not be negative",
-                ));
-            }
-            // `vm.py:44-54 getframe`: start from
-            // `ec.gettopframe_nohidden()` and walk
-            // `ec.getnextframe_nohidden(f)` `depth` times, so
-            // `hidden_applevel` gateway / bridge frames are skipped
-            // (matching `f_back`).  The `f is None` guard runs at the
-            // *start* of every iteration including the first, so a
-            // missing top frame raises rather than fabricating a stub.
-            let ec = current_execution_context();
-            let mut current = if ec.is_null() {
-                std::ptr::null_mut()
-            } else {
-                // Force the frame `topframeref` names BEFORE deciding which
-                // frame to hand out.  A JIT-inlined callee has no frame of its
-                // own until that force materialises one, so a walk started on
-                // the unforced chain would skip straight to the caller and
-                // then read `f_back` off a frame that never existed.
-                // `gettopframe` is the forcing accessor; the `_nohidden` walk
-                // is force-free by design (see `force_frame`).
-                unsafe {
-                    (*ec).gettopframe();
-                    (*ec).gettopframe_nohidden()
-                }
-            };
-            let mut remaining = depth_signed as usize;
-            loop {
-                if current.is_null() {
-                    return Err(crate::PyError::value_error("call stack is not deep enough"));
-                }
-                if remaining == 0 {
-                    break;
-                }
-                remaining -= 1;
-                current = crate::executioncontext::ExecutionContext::getnextframe_nohidden(current);
-            }
-            // `pyframe.py:767 f_back = GetSetProperty(PyFrame.fget_f_back)`.
-            // Return the live `PyFrame` itself as the user-visible `frame`
-            // object (`FRAME_TYPE` typedef); `f_back` chains lazily through
-            // the getset.  Mark it escaped so the JIT keeps the frame
-            // materialised for the exposed reference (`pyframe.py`
-            // `mark_as_escaped`), and force it now: app code is about to read
-            // `f_lineno` / `f_locals` off a frame whose virtualizable fields
-            // the JIT may still be holding.
-            unsafe { (*current).mark_as_escaped() };
-            crate::executioncontext::force_frame(current);
-            Ok(current as pyre_object::PyObjectRef)
-        }),
+        crate::make_builtin_function("_getframe", sys_getframe),
     );
     // `sys._getframemodulename(depth=0)` — the module name of the frame
     // `depth` levels up, or None when the walk runs off the stack.  Used by
