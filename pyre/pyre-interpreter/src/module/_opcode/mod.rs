@@ -94,16 +94,24 @@ fn stack_effect(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_int_new(effect as i64))
 }
 
+// Both enums already carry `Invalid = 0`, whose `desc()` is the
+// `INTRINSIC_*_INVALID` entry the table starts with, so `iter()` alone produces
+// the whole table. Prepending it again shifted every real name one slot up and
+// mislabelled every intrinsic in `dis` output.
 fn get_intrinsic1_descs(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mut descriptions = vec![w_str_new("INTRINSIC_1_INVALID")];
-    descriptions.extend(oparg::IntrinsicFunction1::iter().map(|value| w_str_new(value.desc())));
-    Ok(w_list_new(descriptions))
+    Ok(w_list_new(
+        oparg::IntrinsicFunction1::iter()
+            .map(|value| w_str_new(value.desc()))
+            .collect(),
+    ))
 }
 
 fn get_intrinsic2_descs(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mut descriptions = vec![w_str_new("INTRINSIC_2_INVALID")];
-    descriptions.extend(oparg::IntrinsicFunction2::iter().map(|value| w_str_new(value.desc())));
-    Ok(w_list_new(descriptions))
+    Ok(w_list_new(
+        oparg::IntrinsicFunction2::iter()
+            .map(|value| w_str_new(value.desc()))
+            .collect(),
+    ))
 }
 
 fn get_nb_ops(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
