@@ -687,7 +687,7 @@ impl PyError {
                 pyre_object::gc_roots::shadow_stack_get(msg_slot),
             );
         }
-        let args_list = pyre_object::w_list_new(vec![
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
             pyre_object::gc_roots::shadow_stack_get(msg_slot),
             pyre_object::gc_roots::shadow_stack_get(details_slot),
         ]);
@@ -760,7 +760,7 @@ impl PyError {
             pyre_object::gc_roots::shadow_stack_get(base + 7),
         ]);
         pyre_object::gc_roots::pin_root(rebuilt_details);
-        let rebuilt_args = pyre_object::w_list_new(vec![
+        let rebuilt_args = pyre_object::interp_exceptions::w_exception_args_new(vec![
             pyre_object::gc_roots::shadow_stack_get(base + 2),
             pyre_object::gc_roots::shadow_stack_get(base + 8),
         ]);
@@ -872,7 +872,7 @@ impl PyError {
             // keeps it alive, but a minor collection may have relocated the
             // young key, leaving this raw local pointing at the old address.
             let key = pyre_object::gc_roots::shadow_stack_get(key_slot);
-            let args_list = pyre_object::w_list_new(vec![key]);
+            let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![key]);
             unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
         }
         PyError {
@@ -974,7 +974,7 @@ impl PyError {
                 (*(exc as *mut pyre_object::PyObject)).w_class = w_target;
             }
         }
-        let args_list = pyre_object::w_list_new(vec![
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
             pyre_object::w_int_new(errno as i64),
             pyre_object::w_str_new(&strerror),
         ]);
@@ -1037,7 +1037,7 @@ impl PyError {
         let _roots = pyre_object::gc_roots::push_roots();
         let exc = w_exception_new(exc_kind, &strerror);
         pyre_object::gc_roots::pin_root(exc);
-        let args_list = pyre_object::w_list_new(vec![
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
             pyre_object::w_int_new(errno as i64),
             pyre_object::w_str_new(&strerror),
         ]);
@@ -1088,7 +1088,7 @@ impl PyError {
                 (*(exc as *mut pyre_object::PyObject)).w_class = w_target;
             }
         }
-        let args_list = pyre_object::w_list_new(vec![
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
             pyre_object::w_int_new(errno as i64),
             pyre_object::w_str_new(&strerror),
         ]);
@@ -1250,7 +1250,7 @@ impl PyError {
             let msg_slot = pyre_object::gc_roots::shadow_stack_len();
             let msg = pyre_object::w_str_new(&self.message);
             pyre_object::gc_roots::pin_root(msg);
-            let args_list = pyre_object::w_list_new(vec![msg]);
+            let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![msg]);
             unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
             // `ImportError` / `ModuleNotFoundError` expose the message through a
             // dedicated `msg` slot (`ImportError.__init__` stores `args[0]`

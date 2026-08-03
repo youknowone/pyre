@@ -7732,21 +7732,9 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // Decide the final runtime `args_w` list strategy and extract typed
-    // payloads.  OSError can rebind the list after parsing a filename, so its
-    // final slice is selected below after the concrete constructor exposes the
-    // value-dependent branch result.  The shared typed-list emitter reproduces
-    // `w_list_new`'s Integer layout, allowing the common `SystemExit(i)` shape
-    // to virtualize alongside message-bearing Object lists.  The Empty strategy
-    // (zero-argument `raise ValueError()` / `raise StopIteration()`, the most
-    // common raise shape) reproduces `w_list_new(vec![])`'s empty list, and the
-    // Float strategy reproduces its Float layout.
-    enum ArgsEmit {
-        Object,
-        Int(Vec<i64>),
-        Float(Vec<f64>),
-        Empty,
-    }
+    // OSError can rebind `args_w` after parsing a filename, so its final
+    // slice is selected below, once the concrete constructor has exposed the
+    // value-dependent branch result.
 
     let is_canonical = pyre_object::interp_exceptions::is_canonical_exc_class(concrete_callable);
     let mut subclass_lookups = None;
@@ -7901,41 +7889,6 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         && !unsafe { pyre_object::is_none(concrete_args[2]) };
     let final_args_len = if has_filename { 2 } else { args.len() };
     let final_args = &args[..final_args_len];
-    let final_concrete_args = &concrete_args[..final_args_len];
-    let args_emit = match pyre_object::listobject::list_strategy_for(final_concrete_args) {
-        pyre_object::listobject::ListStrategy::Object => ArgsEmit::Object,
-        pyre_object::listobject::ListStrategy::Integer => {
-            let int_ty = &pyre_object::pyobject::INT_TYPE as *const pyre_object::pyobject::PyType;
-            let mut values = Vec::with_capacity(final_concrete_args.len());
-            for &arg in final_concrete_args {
-                if pyre_object::tagged_int::CAN_BE_TAGGED
-                    && pyre_object::tagged_int::is_tagged_int(arg)
-                {
-                    return Ok(None);
-                }
-                let exact_int = unsafe {
-                    pyre_object::is_plain_int1(arg) && std::ptr::eq((*arg).ob_type, int_ty)
-                };
-                if !exact_int {
-                    return Ok(None);
-                }
-                values.push(unsafe { pyre_object::w_int_get_value(arg) });
-            }
-            ArgsEmit::Int(values)
-        }
-        pyre_object::listobject::ListStrategy::Float => {
-            // `all_floats` is strict `type(w) is W_FloatObject`, which reads
-            // `w_class`, so every element is an exact `W_FloatObject` here.
-            // The emit side pins that `w_class` as well: `walker_unbox_float`
-            // guards only the payload `ob_type`, which a subclass shares.
-            let mut values = Vec::with_capacity(final_concrete_args.len());
-            for &arg in final_concrete_args {
-                values.push(unsafe { pyre_object::w_float_get_value(arg) });
-            }
-            ArgsEmit::Float(values)
-        }
-        pyre_object::listobject::ListStrategy::Empty => ArgsEmit::Empty,
-    };
 
     // GuardClass pins each None-sensitive `_init_error` branch.  A tagged
     // immediate cannot be consumed by GuardClass; retain the residual path for
@@ -8012,67 +7965,10 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     }
 
     // Build `args_w` inline so its wrapper and backing block virtualize
-    // alongside the exception.
-    let args_list = match args_emit {
-        ArgsEmit::Object => crate::helpers::emit_object_list_inline(ctx.trace_ctx, final_args),
-        ArgsEmit::Empty => crate::helpers::emit_empty_list_inline(ctx.trace_ctx),
-        ArgsEmit::Float(values) => {
-            let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
-            let float_typeobj = pyre_object::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE);
-            let mut raws = Vec::with_capacity(final_args.len());
-            for (&arg, value) in final_args.iter().zip(values) {
-                // A float subclass instance carries the same payload
-                // `ob_type` and only retags `w_class`, so `walker_unbox_float`
-                // alone would let a later subclass argument stay on this trace
-                // and be unboxed into Float-strategy storage — `e.args[0]`
-                // would come back a plain float.  `FloatListStrategy.
-                // is_correct_type` rejects it, so pin the exact `w_class` and
-                // let such an argument side-exit to the residual.  A constant
-                // operand is the same object on every iteration, so its
-                // trace-time `w_class` already holds.
-                if !arg.is_constant() {
-                    walker_guard_exact_w_class(ctx, op.pc, arg, float_typeobj)?;
-                }
-                let raw = walker_unbox_float(ctx, op.pc, arg, float_type_addr)?;
-                ctx.trace_ctx
-                    .set_opref_concrete(raw, majit_ir::Value::Float(value));
-                raws.push(raw);
-            }
-            crate::helpers::emit_typed_list_inline(
-                ctx.trace_ctx,
-                &raws,
-                crate::state::float_gcarray_descr(),
-                crate::descr::list_float_items_len_descr(),
-                crate::descr::list_float_items_block_descr(),
-                pyre_object::listobject::ListStrategy::Float,
-            )
-        }
-        ArgsEmit::Int(values) => {
-            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-            let int_typeobj = pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE);
-            let mut raws = Vec::with_capacity(final_args.len());
-            for (&arg, value) in final_args.iter().zip(values) {
-                // Same subclass hole as the Float arm: `is_plain_int1` rejects
-                // an int subclass on `w_class`, but `walker_unbox_int` guards
-                // the shared payload `ob_type`.
-                if !arg.is_constant() {
-                    walker_guard_exact_w_class(ctx, op.pc, arg, int_typeobj)?;
-                }
-                let raw = walker_unbox_int(ctx, op.pc, arg, int_type_addr)?;
-                ctx.trace_ctx
-                    .set_opref_concrete(raw, majit_ir::Value::Int(value));
-                raws.push(raw);
-            }
-            crate::helpers::emit_typed_list_inline(
-                ctx.trace_ctx,
-                &raws,
-                crate::state::int_gcarray_descr(),
-                crate::descr::list_int_items_len_descr(),
-                crate::descr::list_int_items_block_descr(),
-                pyre_object::listobject::ListStrategy::Integer,
-            )
-        }
-    };
+    // alongside the exception.  `w_exception_args_new` pins the object
+    // representation at every arity, so this reproduces that one shape
+    // instead of picking a layout from the element types.
+    let args_list = crate::helpers::emit_object_list_inline(ctx.trace_ctx, final_args);
     // A raised exception can keep args_w live through the execution-context
     // slot, forcing the otherwise-virtual list.  Stamp the canonical list
     // class just as w_list_new does so that materialization preserves the
@@ -8402,7 +8298,7 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
 
     // Empty `args_w` list (zero-argument construction), stamped with the
     // canonical list class exactly as `w_list_new` does.
-    let args_list = crate::helpers::emit_empty_list_inline(ctx.trace_ctx);
+    let args_list = crate::helpers::emit_object_list_inline(ctx.trace_ctx, &[]);
     let list_w_class = pyre_object::get_instantiate(&pyre_object::pyobject::LIST_TYPE);
     let list_w_class = ctx.trace_ctx.const_ref(list_w_class as i64);
     let list_w_class_descr = crate::descr::list_w_class_descr();

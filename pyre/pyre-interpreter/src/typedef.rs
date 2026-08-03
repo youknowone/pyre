@@ -21668,8 +21668,9 @@ pub(crate) fn unicode_decode_error(
         pyre_object::interp_exceptions::w_exception_set_end(exc, w_end);
         pyre_object::interp_exceptions::w_exception_set_reason(exc, w_reason);
         // W_BaseException.descr_init: args_w = [encoding, object, start, end, reason]
-        let args_list =
-            pyre_object::w_list_new(vec![w_encoding, w_object, w_start, w_end, w_reason]);
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
+            w_encoding, w_object, w_start, w_end, w_reason,
+        ]);
         pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
         crate::PyError::from_exc_object(exc)
     }
@@ -21743,8 +21744,9 @@ pub(crate) fn unicode_encode_error(
         pyre_object::interp_exceptions::w_exception_set_end(exc, w_end);
         pyre_object::interp_exceptions::w_exception_set_reason(exc, w_reason);
         // W_BaseException.descr_init: args_w = [encoding, object, start, end, reason]
-        let args_list =
-            pyre_object::w_list_new(vec![w_encoding, w_object, w_start, w_end, w_reason]);
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
+            w_encoding, w_object, w_start, w_end, w_reason,
+        ]);
         pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
         crate::PyError::from_exc_object(exc)
     }

@@ -784,7 +784,8 @@ pub fn emit_mapdict_add_unboxed_attr_inline(
 /// constructs.
 ///
 /// Mirrors `listobject.rs::w_list_new` for the Object strategy:
-///   - `items` points at an `ItemsBlock` GcArray (capacity == `len`);
+///   - `items` points at an `ItemsBlock` GcArray whose capacity is
+///     `len.max(1)`, the capacity `alloc_list_items_block_gc` picks;
 ///     `pyobject_gcarray_descr` is byte-compatible with the runtime
 ///     `ItemsBlock` (both read `ITEMS_BLOCK_TOKEN`).
 ///   - `length` = `items.len()`.
@@ -793,10 +794,13 @@ pub fn emit_mapdict_add_unboxed_attr_inline(
 ///     the Object strategy); the explicit store keeps the heap cache and
 ///     optimizer field model in agreement.
 ///
-/// Caller must restrict to Object-strategy-eligible args (non-empty AND
-/// not all-int AND not all-float); the typed Integer / Float strategies
-/// use `int_items` / `float_items` with `items` null and are NOT emitted
-/// here.
+/// A `BUILD_LIST` caller must restrict to Object-strategy-eligible args
+/// (non-empty AND not all-int AND not all-float), since an app-level list
+/// picks its representation from the element types and the typed Integer /
+/// Float strategies use `int_items` / `float_items` with `items` null.
+/// An exception's `args_w` has no such restriction: `w_exception_args_new`
+/// pins this one representation at every arity, so the `raise Type(...)`
+/// emit reproduces it for any element types and for zero arguments.
 pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
     use crate::descr::{
         list_items_descr, list_length_descr, list_strategy_descr, w_list_size_descr,
@@ -804,12 +808,16 @@ pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
     use crate::state::pyobject_gcarray_descr;
 
     let len = items.len();
-    // Step 1 — allocate the ItemsBlock GcArray (capacity == len). Clear
-    // so the GcArray walker sees valid refs in every slot.
+    // Step 1 — allocate the ItemsBlock GcArray. `alloc_list_items_block_gc`
+    // takes `len.max(1)` as the capacity, so an empty list still owns a
+    // one-slot block; reproduce that or the emitted zero-argument `args_w`
+    // disagrees with the interpreter's. Clear so the GcArray walker sees
+    // valid refs in every slot.
+    let cap_ref = ctx.const_int(len.max(1) as i64);
     let len_ref = ctx.const_int(len as i64);
     let array_descr = pyobject_gcarray_descr();
     let items_block =
-        ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
+        ctx.record_op_with_descr(OpCode::NewArrayClear, &[cap_ref], array_descr.clone());
     ctx.heap_cache_mut().new_object(items_block);
 
     // Step 2 — items_block[i] = items[i].

@@ -11568,10 +11568,10 @@ pub unsafe fn exception_attr_slot_fold(
 /// (matching `descr_getargs: return space.newtuple(self.args_w)`).
 unsafe fn coerce_to_list_for_args(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
     if value.is_null() {
-        return Ok(w_list_new(vec![]));
+        return Ok(pyre_object::interp_exceptions::w_exception_args_new(vec![]));
     }
     let items = fixedview(value, -1)?;
-    Ok(w_list_new(items))
+    Ok(pyre_object::interp_exceptions::w_exception_args_new(items))
 }
 
 /// baseobjspace.py:52-57 W_Root.setdictvalue (default).
@@ -16635,7 +16635,7 @@ fn stop_iteration_with_value(value: PyObjectRef) -> PyError {
         // `interp_exceptions.py:121-124 W_BaseException.descr_init`
         // stores `args_w` as a list; pyre matches the shape so that
         // `e.args` materialises a fresh tuple each read.
-        let args_list = w_list_new(vec![value]);
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![value]);
         unsafe {
             w_exception_set_args(exc, args_list);
         }
