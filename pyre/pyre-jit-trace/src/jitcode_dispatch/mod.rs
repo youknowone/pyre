@@ -4896,10 +4896,12 @@ fn sync_intermediate_merge_point_last_instr(ctx: &mut TraceCtx, merge_pc: usize)
 /// alongside the already-explicit `after_residual_call`.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct GuardCaptureScope<'a> {
-    /// Request that a residual call's `GUARD_NO_EXCEPTION` route its resume
+    /// Request that a residual call's after-call guard route its resume
     /// through the call's OWN post-call `catch_exception` instead of the
-    /// generic post-call fallthrough. The snapshot helper only acts on this
-    /// when the call's CALL pc is directly covered by an enclosing
+    /// generic post-call fallthrough. This is derived automatically from the
+    /// guard opcode; scoped callers may also request it explicitly. The
+    /// snapshot helper only acts on this when the call's CALL pc is directly
+    /// covered by an enclosing
     /// exception-table handler: it then carries the CALL jitcode offset so a
     /// deopt resumes at the call's own catch. The blackhole's
     /// `handle_exception_in_frame` routes the raise to the enclosing handler

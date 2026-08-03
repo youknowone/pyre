@@ -84,6 +84,10 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_scoped<Sym: WalkSym>(
                 | OpCode::GuardAlwaysFails
         )
     );
+    let scope = GuardCaptureScope {
+        residual_call_catch_resume: scope.residual_call_catch_resume || after_residual_call,
+        ..scope
+    };
     walker_capture_snapshot_for_last_guard_impl(ctx, op_pc, after_residual_call, scope)
 }
 
