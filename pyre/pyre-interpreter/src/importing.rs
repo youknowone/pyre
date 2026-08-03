@@ -705,9 +705,6 @@ pub fn install_builtin_modules() {
     // ImportError` cannot recover from.  Leaving them unregistered lets the
     // pure-Python fallback take over: `_datetime` -> `_pydatetime`,
     // `_decimal` -> `_pydecimal`, `_asyncio` -> pure-Python asyncio.
-    for name in &["_heapq", "_bisect", "_stat", "_queue", "_zoneinfo"] {
-        register_builtin_module(name, empty_module_init);
-    }
     register_builtin_module_with_startup(
         "array",
         crate::module::array::init_array_module,

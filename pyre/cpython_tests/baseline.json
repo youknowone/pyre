@@ -24,7 +24,7 @@
       "dynasm": "FAIL"
     },
     "test.test_abc": {
-      "dynasm": "CRASH"
+      "dynasm": "PASS"
     },
     "test.test_abstract_numbers": {
       "dynasm": "FAIL"
@@ -92,7 +92,7 @@
       "dynasm": "FAIL"
     },
     "test.test_bisect": {
-      "dynasm": "CRASH"
+      "dynasm": "PASS"
     },
     "test.test_bool": {
       "dynasm": "FAIL"
@@ -204,7 +204,7 @@
       "dynasm": "FAIL"
     },
     "test.test_collections": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_colorsys": {
       "cranelift": "PASS",
@@ -538,7 +538,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_heapq": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_hmac": {
       "dynasm": "IMPORTERROR"
@@ -748,7 +748,7 @@
       "dynasm": "PASS"
     },
     "test.test_operator": {
-      "dynasm": "CRASH"
+      "dynasm": "PASS"
     },
     "test.test_optimizer": {
       "dynasm": "IMPORTERROR"

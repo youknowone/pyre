@@ -5335,6 +5335,50 @@ fn sync_intermediate_merge_point_last_instr(ctx: &mut TraceCtx, merge_pc: usize)
     );
 }
 
+/// Synchronize the full-body walk's live operand stack at a merge point.
+///
+/// RPython's `reached_loop_header` consumes the current MIFrame-backed
+/// `virtualizable_boxes` (`pyjitpl.py:2954-2989`).  Pyre's walker keeps the
+/// equivalent live stack in `vstack_boxes`; ordinary opcode lowering does not
+/// necessarily write those boxes through to the portal frame's shadow.  Make
+/// that single owner coherent before `append_virtualizable_boxes` registers or
+/// closes the merge point.  The concrete snapshot depth is updated for the
+/// existing `MIFrame::concrete_valuestackdepth` reader; no user-visible heap
+/// frame is involved.
+fn sync_merge_point_vstack_to_virtualizable<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+    if !ctx.vstack_valid {
+        return;
+    }
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return;
+    }
+    let sym = unsafe { &*sym_ptr };
+    if !sym.owns_virtualizable_shadow() {
+        return;
+    }
+
+    let nlocals = sym.nlocals();
+    let depth = ctx.vstack_depth.min(ctx.vstack_boxes.len());
+    let absolute_depth = nlocals + depth;
+    crate::state::set_concrete_stack_depth(sym.tracing_vable_frame_addr(), absolute_depth);
+    let vsd = ctx.trace_ctx.const_int(absolute_depth as i64);
+    crate::trace_opcode::mirror_vable_static_to_boxes(
+        ctx.trace_ctx,
+        "valuestackdepth",
+        vsd,
+        Value::Int(absolute_depth as i64),
+    );
+
+    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    for (stack_index, &value) in ctx.vstack_boxes[..depth].iter().enumerate() {
+        if value != OpRef::NONE {
+            ctx.trace_ctx
+                .set_virtualizable_box_at(nvs + nlocals + stack_index, value);
+        }
+    }
+}
+
 /// Call-scoped inputs for one guard-snapshot capture — the explicit-parameter
 /// port of `capture_resumedata`'s keyword arguments (pyjitpl.py),
 /// alongside the already-explicit `after_residual_call`.
@@ -11107,6 +11151,7 @@ fn handle<Sym: WalkSym>(
             // at the wrong bytecode (fannkuch permutation state never
             // reaches its exit condition → non-crashing infinite loop).
             sync_intermediate_merge_point_last_instr(ctx.trace_ctx, next_instr);
+            sync_merge_point_vstack_to_virtualizable(ctx);
 
             // Reds = the live loop args, in bytecode bank order
             // [int.., ref.., float..]. For pyre's portal jitdriver the

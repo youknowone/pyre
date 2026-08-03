@@ -2304,7 +2304,8 @@ impl MIFrame {
                 recovered_ec,
                 s.vable_last_instr,
                 s.vable_pycode,
-                s.vable_valuestackdepth,
+                ctx.virtualizable_box_at(2)
+                    .unwrap_or(s.vable_valuestackdepth),
                 s.vable_debugdata,
                 s.vable_lastblock,
                 s.vable_w_globals,
