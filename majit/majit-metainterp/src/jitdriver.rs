@@ -4884,6 +4884,14 @@ impl<S: JitState> JitDriver<S> {
         self.meta.get_stats()
     }
 
+    /// Read the `i`th reason-keyed abort tally, indexed as
+    /// [`crate::jitprof::ABORT_COUNTER_KINDS`]. Breaks a `loops_aborted`
+    /// total down by `Counters.ABORT_*` for a caller that cannot reach the
+    /// profiler directly.
+    pub fn abort_diag(&self, i: usize) -> u64 {
+        self.meta.staticdata.profiler.abort_diag(i)
+    }
+
     /// Get direct access to the underlying MetaInterp.
     pub fn meta_interp(&self) -> &MetaInterp<S::Meta> {
         &self.meta

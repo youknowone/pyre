@@ -360,6 +360,19 @@ pub extern "C" fn pyre_jit_loops_aborted() -> u64 {
     pyre_jit::eval::driver_pair().0.get_stats().loops_aborted as u64
 }
 
+/// The `Counters.ABORT_*` split behind `pyre_jit_loops_aborted`, indexed as
+/// `majit_metainterp::jitprof::ABORT_COUNTER_KINDS`. On the native backends
+/// that breakdown comes from `MAJIT_LOG`'s summary, but the wasm32 guest has
+/// no environment, so a `loops_aborted` regression that only reproduces here
+/// otherwise carries no reason at all. Exported rather than imported for the
+/// same reason as `pyre_jit_bridge_diag`. The host prints it at
+/// `PYRE_WASM_JIT_STATS` time.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_abort_diag(i: u32) -> u64 {
+    pyre_jit::eval::driver_pair().0.abort_diag(i as usize)
+}
+
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn pyre_jit_internal_compile_panics() -> u64 {

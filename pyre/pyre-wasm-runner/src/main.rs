@@ -470,6 +470,29 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
                 eprintln!("[jit-stats] heap_buckets {}", parts.join(" "));
             }
         }
+        // The `Counters.ABORT_*` split behind `loops_aborted` (diagnostic).
+        // The native backends get this from MAJIT_LOG's summary, which the
+        // guest cannot read; without it a wasm-only `loops_aborted` regression
+        // names no reason. Labels mirror
+        // `majit_metainterp::jitprof::ABORT_COUNTER_KINDS`, which is
+        // append-only, so a guest older than this runner just reads 0 for a
+        // trailing label.
+        if let Ok(ab) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_abort_diag") {
+            let labels = [
+                "too_long",
+                "bridge",
+                "bad_loop",
+                "escape",
+                "force_quasiimmut",
+                "segmented_trace",
+            ];
+            let mut parts = Vec::with_capacity(labels.len());
+            for (i, lbl) in labels.iter().enumerate() {
+                let n = ab.call(&mut store, i as u32).unwrap_or(0);
+                parts.push(format!("{lbl}={n}"));
+            }
+            eprintln!("[jit-stats] abort_diag {}", parts.join(" "));
+        }
         // compile_bridge outcome tallies (diagnostic). 0=entered 1=declCALL_ASM
         // 2=declMultiPeel 3=declNotDirect 4=declRefHome 5=BRIDGE_OK
         // 6=loopClosing 7=srcHasPreamble 15=declCAHostTrampoline,

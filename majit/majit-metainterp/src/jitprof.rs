@@ -165,6 +165,25 @@ struct TimingState {
 /// out-of-range id raises `IndexError` upstream, but that has only ever
 /// fired for hand-rolled counter ids that are not part of the
 /// canonical `Counters` enum — pyre never produces such ids).
+/// The reason-keyed `Counters.ABORT_*` tallies in a fixed order, with the
+/// short label each one carries in a `[jit-stats]` line.
+///
+/// `loops_aborted` is one number, and the split that explains it normally
+/// comes from `MAJIT_LOG`'s summary — a guest-side knob. The wasm32 guest has
+/// no environment, so on that backend the knob is inert and a `loops_aborted`
+/// regression arrives with no reason attached. Enumerating the tallies here
+/// lets the host read them by index and print the same breakdown.
+///
+/// Order is the contract with that host: append only, never reorder.
+pub const ABORT_COUNTER_KINDS: &[(i32, &str)] = &[
+    (counters::ABORT_TOO_LONG, "too_long"),
+    (counters::ABORT_BRIDGE, "bridge"),
+    (counters::ABORT_BAD_LOOP, "bad_loop"),
+    (counters::ABORT_ESCAPE, "escape"),
+    (counters::ABORT_FORCE_QUASIIMMUT, "force_quasiimmut"),
+    (counters::ABORT_SEGMENTED_TRACE, "segmented_trace"),
+];
+
 #[derive(Default, Debug)]
 pub struct JitProfiler {
     /// jit.py:1416 `Counters.TRACING` — RPython tracks this as wall-clock
@@ -511,6 +530,17 @@ impl JitProfiler {
         }
         self.field_for_kind(kind)
             .map(|field| field.load(Ordering::Relaxed))
+    }
+
+    /// Read the `i`th [`ABORT_COUNTER_KINDS`] tally.  Out of range reads 0,
+    /// so a reader holding a longer list than the profiler it queries — the
+    /// wasm host, which knows the labels but reaches the counters only by
+    /// index across the module boundary — degrades instead of trapping.
+    pub fn abort_diag(&self, i: usize) -> u64 {
+        ABORT_COUNTER_KINDS
+            .get(i)
+            .and_then(|&(kind, _)| self.get_counter(kind))
+            .unwrap_or(0) as u64
     }
 
     /// `cpu.tracker.total_freed_loops += 1` parity.  Fired from the
