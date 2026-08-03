@@ -12336,23 +12336,69 @@ impl CodeWriter {
                         // class body reached by the tracer at all — every one
                         // of them, once `threshold` is low — costs a
                         // `loops_aborted`.
+                        //
+                        // The two split on whether the receiver's identity can
+                        // change the answer, because in a non-portal callee
+                        // `frame_var` aliases the OUTERMOST frame (the same
+                        // aliasing the LoadGlobal namespace split above
+                        // describes, where it resolved the caller's `names`
+                        // table). Threading the callee's own frame is not an
+                        // option: an inlined callee has no materialised frame
+                        // at all (`frame_ptr == 0`, `portal_frame_reg`
+                        // unseeded), which is what inlining a virtualizable
+                        // means.
+                        //
+                        // `load_locals` returns THIS frame's `w_locals`
+                        // (`get_or_create_w_locals`), so an aliased receiver is
+                        // a wrong value with no guard able to catch it, and
+                        // there is no frame-free way to compute it. Portal
+                        // only; the non-portal side keeps the permanent
+                        // decline.
+                        //
+                        // `load_build_class` reads `frame.get_builtin()`, which
+                        // under `objspace.honor__builtins__` false is
+                        // `space.builtin` for every frame
+                        // (`baseobjspace::frame_builtin_obj`), so the answer
+                        // does not depend on which frame asks and the aliasing
+                        // is harmless. That is a property of the flag, not of
+                        // this arm, so assert it here: flipping the flag makes
+                        // the receiver significant and turns this into exactly
+                        // the LoadGlobal miscompile.
                         Instruction::LoadLocals | Instruction::LoadBuildClass => {
-                            let opname = if matches!(instruction, Instruction::LoadLocals) {
-                                "load_locals"
-                            } else {
-                                "load_build_class"
-                            };
-                            let loaded_dst_reg = stack_base + current_depth;
-                            let result_value = emit_frontend_frame_only_ref(
-                                &mut graph,
-                                &current_block.block(),
-                                opname,
-                                frame_var.into(),
-                                py_pc as i64,
+                            const _: () = assert!(
+                                !pyre_interpreter::baseobjspace::HONOR_BUILTINS,
+                                "honor__builtins__ makes frame.get_builtin() frame-specific, so \
+                                 load_build_class can no longer take the portal-aliased frame in \
+                                 a non-portal callee — gate it on is_true_portal like load_locals",
                             );
-                            let result_fv: super::flow::FlowValue = result_value.into();
-                            current_state.stack.push(result_fv.clone());
-                            emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_fv, py_pc);
+                            let is_locals = matches!(instruction, Instruction::LoadLocals);
+                            if is_locals && !is_true_portal {
+                                push_fresh_ref(&mut current_state, &mut graph);
+                                current_depth += 1;
+                                emit_abort_permanent!(py_pc);
+                            } else {
+                                let opname = if is_locals {
+                                    "load_locals"
+                                } else {
+                                    "load_build_class"
+                                };
+                                let loaded_dst_reg = stack_base + current_depth;
+                                let result_value = emit_frontend_frame_only_ref(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    opname,
+                                    frame_var.into(),
+                                    py_pc as i64,
+                                );
+                                let result_fv: super::flow::FlowValue = result_value.into();
+                                current_state.stack.push(result_fv.clone());
+                                emit_pushvalue_ref!(
+                                    current_depth,
+                                    loaded_dst_reg,
+                                    result_fv,
+                                    py_pc
+                                );
+                            }
                         }
 
                         // FormatSimple: pops value, pushes str(value). Net 0.
