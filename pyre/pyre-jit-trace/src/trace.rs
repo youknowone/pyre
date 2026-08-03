@@ -5121,30 +5121,6 @@ fn full_body_walk_trace<Sym: WalkSym>(
     cf_addr: usize,
     journals: WalkJournals,
 ) -> TraceAction {
-    // A branch-bearing portal needs the walk-level operand-stack mirror for
-    // every guard resume.  If its Python body contains an opcode the mirror
-    // cannot model, the later branch would deterministically reach
-    // `BranchGuardUnrestorableKeptStackPermanent` after partial recording.
-    // Decline before running the body instead.  This is the root-frame sibling
-    // of the pre-call gate in `callee_fast_path_inlinable_allowing_forward_branch`:
-    // PyPy's MIFrame has the complete valuestack, while pyre must conservatively
-    // interpret this portal until its per-frame red snapshot reaches parity.
-    if let Some(jitcode) = crate::state::pyjitcode_for_code(w_code) {
-        let has_branch = crate::jitcode_runtime::decoded_ops(jitcode.jitcode.code.as_slice())
-            .any(|op| op.opname.starts_with("goto_if_not"));
-        let has_unmodeled_stack = !jitcode.code_ptr.is_null()
-            && unsafe {
-                crate::jitcode_dispatch::code_from_pc_has_unmodeled_vstack_opcode(
-                    &*jitcode.code_ptr,
-                    start_pc,
-                )
-            };
-        if has_branch && has_unmodeled_stack {
-            crate::jitcode_dispatch::census_record("FullBodyWalk::UnmodeledBranchVstack");
-            fbw_decline(crate::driver::make_green_key(w_code, start_pc));
-            return TraceAction::Decline;
-        }
-    }
     // #125: decline up front when a loop body carries an `abort_permanent`
     // marker.  The authoritative walk would otherwise mis-seed the loop
     // guard, exit early, and concretely double-execute the post-loop tail;

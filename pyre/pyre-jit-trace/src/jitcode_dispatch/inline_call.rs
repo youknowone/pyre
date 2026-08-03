@@ -312,24 +312,7 @@ pub(crate) fn callee_fast_path_inlinable_allowing_forward_branch<Sym: WalkSym>(
     callee_descr_refs: &[DescrRef],
     ctx: &WalkContext<'_, '_, Sym>,
     callee_frame_reg: u16,
-    callee_jitcode: &crate::PyJitCode,
 ) -> bool {
-    // The forward-branch path needs a valid callee-local operand-stack mirror
-    // for its in-callee guard snapshots.  If the source contains an opcode the
-    // mirror cannot model, reject the inline before recording anything.  The
-    // old path entered the callee, invalidated the mirror (MATCH_SEQUENCE is a
-    // concrete example), then permanently aborted at a later kept-stack guard.
-    // The ordinary residual call is PyPy's `do_residual_call` fallback when a
-    // call cannot be followed.  PyPy itself has a complete MIFrame valuestack,
-    // so this gate is a temporary parity deviation, not a semantic limitation.
-    if !callee_jitcode.code_ptr.is_null() {
-        // SAFETY: the published PyJitCode holds its CodeObject alive and the
-        // instruction vector is immutable while the trace-side store owns it.
-        let code = unsafe { &*callee_jitcode.code_ptr };
-        if code_has_unmodeled_vstack_opcode(code) {
-            return false;
-        }
-    }
     let mut pc = 0usize;
     while pc < body_code.len() {
         let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
@@ -342,29 +325,6 @@ pub(crate) fn callee_fast_path_inlinable_allowing_forward_branch<Sym: WalkSym>(
             // `iL`: 2B LE label at operand offset 1 (after the 1B Int reg).
             let target = read_label(body_code, &d, 1);
             if target <= d.pc {
-                return false;
-            }
-            // A forward branch whose successor keeps an operand-stack value
-            // (`a or b`, `x if c else y`, chained comparisons) needs the
-            // callee-local valuestack capture on either guard arm.  That
-            // capture is not yet complete enough to replace PyPy's MIFrame
-            // valuestack: entering the sub-walk with its mirror disabled
-            // reaches `BranchGuardUnrestorableKeptStackPermanent` only after
-            // recording part of the callee, while enabling the experimental
-            // mirror changes the resulting guard/bridge behaviour.  Decide at
-            // the same pre-call gate instead and leave this callee as the
-            // ordinary residual call, preserving the enclosing loop.
-            //
-            // PyPy's `opimpl_goto_if_not` never needs this restriction because
-            // each inlined MIFrame owns a complete valuestack and resumedata.
-            // Remove this parity deviation when pyre's per-frame red-frame
-            // snapshot carries that same stack state.
-            let successor_keeps_stack = [d.next_pc, target].into_iter().any(|pc| {
-                callee_jitcode
-                    .depth_trivia_for_jitcode_pc(pc)
-                    .is_some_and(|d| d > 0)
-            });
-            if successor_keeps_stack {
                 return false;
             }
         }
@@ -3016,18 +2976,14 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     } else {
         fbw_max_multiframe_depth()
     };
-    let callee_jitcode = crate::state::pyjitcode_for_code(callee_code_key as *const ());
     let try_multiframe = multiframe_eligible
         && inline_depth < effective_multiframe_depth
-        && callee_jitcode.as_deref().is_some_and(|callee_jitcode| {
-            callee_fast_path_inlinable_allowing_forward_branch(
-                body.code,
-                callee_descr_refs,
-                ctx,
-                callee_frame_reg,
-                callee_jitcode,
-            )
-        });
+        && callee_fast_path_inlinable_allowing_forward_branch(
+            body.code,
+            callee_descr_refs,
+            ctx,
+            callee_frame_reg,
+        );
     // A strict straight-line callee at the top inline level is seeded with
     // its own frame red so guards can carry a real two-frame snapshot.  A
     // callee needing fresh cellvar allocation is not seeded — the seed block
