@@ -10282,6 +10282,61 @@ fn init_type_type(ns: PyObjectRef) {
             ),
         )
     };
+    // typeobject.py:811-828 `W_TypeObject.descr_getattribute`.  The terminal
+    // object-space routine already implements that exact three-stage lookup
+    // (metatype data descriptor, class MRO, metatype non-data descriptor);
+    // expose it as type's own descriptor as PyPy's TypeDef does.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__getattribute__",
+            make_builtin_function_with_arity(
+                "__getattribute__",
+                |args| {
+                    let w_type = args[0];
+                    if !pyre_object::is_type(w_type) {
+                        return Err(crate::PyError::type_error(format!(
+                            "descriptor '__getattribute__' requires a 'type' object but received a '{}'",
+                            crate::baseobjspace::object_functionstr_type_name(w_type),
+                        )));
+                    }
+                    if !pyre_object::is_str(args[1]) {
+                        return Err(crate::PyError::type_error("attribute name must be string"));
+                    }
+                    let name = pyre_object::w_str_get_wtf8(args[1]);
+                    match name.as_str() {
+                        Ok(name) => crate::baseobjspace::object_getattribute(w_type, name),
+                        Err(_) => crate::baseobjspace::object_getattribute_surrogate(
+                            w_type, args[1], name,
+                        ),
+                    }
+                },
+                2,
+            ),
+        )
+    };
+    // typeobject.py:1234-1236 `descr__dir__` delegates to util.py `_classdir`
+    // and materialises the result as a list.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__dir__",
+            make_builtin_function_with_arity(
+                "__dir__",
+                |args| {
+                    let w_type = args[0];
+                    if !pyre_object::is_type(w_type) {
+                        return Err(crate::PyError::type_error(format!(
+                            "descriptor '__dir__' for 'type' objects doesn't apply to a '{}' object",
+                            crate::baseobjspace::object_functionstr_type_name(w_type),
+                        )));
+                    }
+                    crate::builtins::type_dir_default(w_type)
+                },
+                1,
+            ),
+        )
+    };
     // typeobject.py:833-841 `W_TypeObject.descr_or` / `descr_ror` delegate
     // to `_pypy_generic_alias._create_union`.
     unsafe {
@@ -10387,6 +10442,93 @@ fn init_type_type(ns: PyObjectRef) {
             ns,
             "__annotations__",
             make_getset_property(annotations_getter, annotations_setter, annotations_deleter),
+        )
+    };
+
+    // typeobject.py:1249-1267 `__abstractmethods__` GetSetProperty.  Its
+    // value belongs to each W_TypeObject's own namespace; the descriptor on
+    // `type` deliberately raises for `type` itself and for classes without a
+    // stored value.  The abstract bit remains on W_TypeObject, exactly as in
+    // PyPy, and is updated only after truthiness succeeds.
+    let abstractmethods_getter = make_builtin_function_with_arity(
+        "__abstractmethods__",
+        |args| {
+            let w_type = args[1];
+            if !w_type.is_null()
+                && unsafe { pyre_object::is_type(w_type) }
+                && !std::ptr::eq(w_type, crate::typedef::w_type())
+            {
+                if let Some(value) = crate::type_dict_lookup(w_type, "__abstractmethods__") {
+                    return Ok(value);
+                }
+            }
+            Err(crate::PyError::attribute_error("__abstractmethods__"))
+        },
+        2,
+    );
+    let abstractmethods_setter = make_builtin_function_with_arity(
+        "__abstractmethods__",
+        |args| {
+            let w_type = args[1];
+            let value = args[2];
+            if !unsafe { pyre_object::is_type(w_type) } {
+                return Err(crate::PyError::type_error(
+                    "descriptor '__abstractmethods__' for 'type' objects doesn't apply",
+                ));
+            }
+            if !unsafe { pyre_object::w_type_is_heaptype(w_type) } {
+                return Err(crate::PyError::type_error(format!(
+                    "cannot set '__abstractmethods__' attribute of immutable type '{}'",
+                    unsafe { pyre_object::w_type_get_name(w_type) },
+                )));
+            }
+            let abstract_ = crate::baseobjspace::is_true(value)?;
+            unsafe {
+                crate::type_dict_store(w_type, "__abstractmethods__", value);
+                pyre_object::gc_hook::try_gc_write_barrier(w_type as *mut u8);
+                pyre_object::w_type_set_abstract(w_type, abstract_);
+                crate::baseobjspace::mutated(w_type, Some("__abstractmethods__"));
+            }
+            Ok(pyre_object::w_none())
+        },
+        3,
+    );
+    let abstractmethods_deleter = make_builtin_function_with_arity(
+        "__abstractmethods__",
+        |args| {
+            let w_type = args[1];
+            if !unsafe { pyre_object::is_type(w_type) } {
+                return Err(crate::PyError::type_error(
+                    "descriptor '__abstractmethods__' for 'type' objects doesn't apply",
+                ));
+            }
+            if !unsafe { pyre_object::w_type_is_heaptype(w_type) } {
+                return Err(crate::PyError::type_error(format!(
+                    "cannot delete '__abstractmethods__' attribute of immutable type '{}'",
+                    unsafe { pyre_object::w_type_get_name(w_type) },
+                )));
+            }
+            if crate::type_dict_delete(w_type, "__abstractmethods__") {
+                unsafe {
+                    pyre_object::w_type_set_abstract(w_type, false);
+                    crate::baseobjspace::mutated(w_type, Some("__abstractmethods__"));
+                }
+                return Ok(pyre_object::w_none());
+            }
+            Err(crate::PyError::attribute_error("__abstractmethods__"))
+        },
+        2,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__abstractmethods__",
+            make_getset_property_named(
+                abstractmethods_getter,
+                abstractmethods_setter,
+                abstractmethods_deleter,
+                "__abstractmethods__",
+            ),
         )
     };
 

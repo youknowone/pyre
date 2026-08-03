@@ -10946,6 +10946,25 @@ pub(crate) fn object_dir_default(obj: PyObjectRef) -> Result<PyObjectRef, crate:
     ))
 }
 
+/// util.py:62 `_classdir` / typeobject.py:1234 `descr__dir__`.
+///
+/// Unlike [`object_dir_default`], a type receiver contributes its own class
+/// namespace and recursively the namespaces of its bases; its metaclass is
+/// not part of the result.  Keep this as the direct `type.__dir__` target so
+/// installing that descriptor does not make `dir()` redispatch recursively.
+pub(crate) fn type_dir_default(w_type: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let mut names: Vec<Wtf8Buf> = Vec::new();
+    unsafe { classdir_into(w_type, &mut names) }?;
+    names.sort();
+    names.dedup();
+    Ok(w_list_new(
+        names
+            .into_iter()
+            .map(pyre_object::w_str_from_wtf8)
+            .collect(),
+    ))
+}
+
 /// `dir([obj])` — PyPy: pypy/module/__builtin__/app_inspect.py dir
 ///
 /// Without argument: names in the current local scope (not supported).
