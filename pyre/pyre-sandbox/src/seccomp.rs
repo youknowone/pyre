@@ -211,10 +211,9 @@ fn allowed_syscalls() -> Vec<u32> {
         // 1, so this is unreachable on a single-node machine and issued on
         // every arena reservation on a multi-node one — which is why it can sit
         // unnoticed until the sandbox runs on a two-socket host. The node count
-        // behind that cache is probed once, by reading `/sys/devices/system/
-        // node`, and is already warm here because the interpreter has allocated
-        // throughout startup. Reads topology, changes nothing — the same
-        // standing as `sched_getaffinity` above.
+        // behind that cache is what `install_runtime_filter` primes; this entry
+        // covers the lookups that keep happening afterwards. Reads topology,
+        // changes nothing — the same standing as `sched_getaffinity` above.
         libc::SYS_getcpu,
         libc::SYS_getrandom,
         libc::SYS_set_robust_list,
@@ -325,6 +324,28 @@ pub fn install_runtime_filter() -> io::Result<()> {
         let t: libc::time_t = 0;
         let mut tm: libc::tm = core::mem::zeroed();
         libc::gmtime_r(&t, &mut tm);
+    }
+
+    // mimalloc defers its NUMA detection to the first thread it builds a TLD
+    // for. The main thread uses a static `tld_main` that never asks; only
+    // `mi_tld_alloc` stamps `tld->numa_node = _mi_os_numa_node()`, and the
+    // first such call counts the nodes by `access`ing
+    // `/sys/devices/system/node/nodeN` until one is missing
+    // (`mimalloc/src/init.c`, `src/prim/unix/prim.c`). That probe is a path
+    // lookup the filter refuses, so without this a sandboxed program that
+    // starts a thread — `_thread`, `threading` — takes SIGSYS inside the new
+    // thread, and the handler's `_exit` tears down the whole child. The count
+    // is a process-global cached once and never recomputed, so priming it here,
+    // while path lookups are still allowed, settles it for every later thread.
+    // The thread has to actually allocate: mimalloc builds a thread's TLD on
+    // its first allocation, so a primer that only starts and exits leaves the
+    // detection exactly where it was.
+    if let Ok(primer) = std::thread::Builder::new().spawn(|| {
+        let n = core::hint::black_box(64usize);
+        let v: Vec<u8> = Vec::with_capacity(n);
+        core::hint::black_box(&v);
+    }) {
+        let _ = primer.join();
     }
 
     // Install the SIGSYS handler before the filter so a denied syscall is
