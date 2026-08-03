@@ -272,6 +272,22 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     // `fresh_virtualizable` OptVirtualize elision (jtransform.py).
     let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
     if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
+        let value = match value_bank {
+            'i' => read_int_reg(code, op, 1, ctx)?,
+            'r' => read_ref_reg(code, op, 1, ctx)?,
+            'f' => read_float_reg(code, op, 1, ctx)?,
+            _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
+        };
+        let descr = read_descr(code, op, 2, ctx)?;
+        if let (Some(Value::Int(value)), Some(field_index), Some(shadow)) = (
+            vable_value_concrete(code, op, 1, ctx, value_bank, value),
+            ctx.trace_ctx
+                .virtualizable_info()
+                .and_then(|info| info.static_field_by_descr(&descr)),
+            ctx.callee_shadow.as_ref(),
+        ) {
+            crate::state::store_live_frame_static_int(shadow.concrete_frame, field_index, value);
+        }
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
     let obj = read_ref_reg_raw(code, op, 0, ctx)?;
@@ -614,6 +630,23 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
             if let Some(shadow) = ctx.callee_shadow.as_mut() {
                 shadow.set_opref(slot, value);
                 shadow.set_concrete(fold_frame_reg, slot, concrete);
+            }
+            // `locals_cells_stack_w` is a `FixedObjectArray` of boxed refs, so a
+            // folded store should only ever carry one.  `store_live_frame_array_slot`
+            // already ignores anything else, so this stays a debug assertion rather
+            // than a release panic on a path the corpus does not exercise.
+            debug_assert!(
+                matches!(concrete, majit_ir::Value::Ref(_) | majit_ir::Value::Void),
+                "folded locals_cells_stack_w store must carry a Ref-compatible value"
+            );
+            if matches!(concrete, majit_ir::Value::Ref(_))
+                && let Some(shadow) = ctx.callee_shadow.as_ref()
+            {
+                crate::state::store_live_frame_array_slot(
+                    shadow.concrete_frame,
+                    slot as usize,
+                    concrete,
+                );
             }
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }

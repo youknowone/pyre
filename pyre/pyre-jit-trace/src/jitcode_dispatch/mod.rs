@@ -402,6 +402,11 @@ pub struct CalleeLocalsShadow {
     /// Portal frame register used to resolve own-frame vable operations.
     /// `u16::MAX` means that the strict fresh-frame fold is inactive.
     pub fold_frame_reg: u16,
+    /// Concrete `PyFrame*` backing the folded own-frame writes.
+    pub concrete_frame: usize,
+    /// Box seeded into `fold_frame_reg`; `OpRef::NONE` means the frame register
+    /// was not seeded, so the fold must not be disarmed into nonstandard ops.
+    pub frame_box: OpRef,
 }
 
 impl Default for CalleeLocalsShadow {
@@ -410,6 +415,8 @@ impl Default for CalleeLocalsShadow {
             opref: Default::default(),
             concrete: Default::default(),
             fold_frame_reg: u16::MAX,
+            concrete_frame: 0,
+            frame_box: OpRef::NONE,
         }
     }
 }

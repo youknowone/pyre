@@ -3995,6 +3995,11 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // Inert when `callee_portal_frame_reg == u16::MAX` (flip OFF / frame reg
         // unresolved).
         if callee_portal_frame_reg != u16::MAX {
+            {
+                let shadow = sub_wc.callee_shadow.as_mut().unwrap();
+                shadow.concrete_frame = concrete_callee_frame as usize;
+                shadow.frame_box = sub_wc.registers_r[callee_portal_frame_reg as usize];
+            }
             if !try_multiframe {
                 sub_wc.callee_shadow.as_mut().unwrap().fold_frame_reg = callee_portal_frame_reg;
             }
