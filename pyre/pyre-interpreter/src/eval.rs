@@ -7765,6 +7765,29 @@ except AttributeError as exc:
     }
 
     #[test]
+    fn test_missing_slot_store_error_uses_short_type_name() {
+        let source = "\
+def make_type():
+    class X:
+        __slots__ = 'a'
+    return X
+X = make_type()
+try:
+    X().b = 1
+except AttributeError as exc:
+    result = str(exc)";
+        let (res, frame) = run_exec_frame(source);
+        res.expect("member slot store AttributeError regression");
+        unsafe {
+            let value = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            assert_eq!(
+                w_str_get_wtf8(value).as_str(),
+                Ok("'X' object has no attribute 'b' and no __dict__ for setting new attributes")
+            );
+        }
+    }
+
+    #[test]
     fn test_default_metaclass_rejects_non_cell_classcell() {
         let source = "\
 rejected = False

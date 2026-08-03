@@ -278,7 +278,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_dataclasses": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_datetime": {
       "dynasm": "PASS"
@@ -314,7 +314,7 @@
       "dynasm": "PASS"
     },
     "test.test_descrtut": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_devpoll": {
       "dynasm": "IMPORTERROR"
@@ -805,7 +805,7 @@
       "dynasm": "FAIL"
     },
     "test.test_pkgutil": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_platform": {
       "dynasm": "IMPORTERROR"
