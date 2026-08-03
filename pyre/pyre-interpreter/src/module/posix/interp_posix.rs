@@ -1188,15 +1188,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// A filesystem name reported back to the caller: `bytes` when the path
     /// argument was `bytes` (`posixmodule.c path_converter`), else `str`.
     ///
-    /// The name arrives as raw bytes because bytes mode exists precisely for
-    /// entries the filesystem encoding cannot round-trip: `readdir`'s `d_name`
-    /// is handed back unchanged, so a name like `b"bad_\xff"` stays openable
-    /// instead of decoding to U+FFFD first.
+    /// The name arrives as raw bytes because `readdir`'s `d_name` is handed
+    /// back unchanged. Both arms keep it openable: bytes mode returns it
+    /// verbatim, and the `str` arm takes the filesystem decoding
+    /// (`interp_posix.py:1121 space.newfilename(f)`), so a name like
+    /// `b"bad_\xff"` still names the file on disk instead of carrying U+FFFD.
     fn fs_name_obj(bytes_mode: bool, name: &[u8]) -> PyObjectRef {
         if bytes_mode {
             pyre_object::bytesobject::w_bytes_from_bytes(name)
         } else {
-            pyre_object::w_str_new(&String::from_utf8_lossy(name))
+            crate::gateway::fsdecode_filename_bytes(name)
         }
     }
 
