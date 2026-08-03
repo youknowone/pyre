@@ -304,6 +304,8 @@ pub const MEMBER_OS_ERROR_STRERROR: u32 = MEMBER_DIRECT_FLAG | 23;
 pub const MEMBER_OS_ERROR_FILENAME: u32 = MEMBER_DIRECT_FLAG | 24;
 /// CPython 3.14 `OSError_members.filename2`, backed by PyPy's `w_filename2`.
 pub const MEMBER_OS_ERROR_FILENAME2: u32 = MEMBER_DIRECT_FLAG | 25;
+/// CPython 3.14 `SystemExit_members.code`, backed by PyPy's `w_code`.
+pub const MEMBER_SYSTEM_EXIT_CODE: u32 = MEMBER_DIRECT_FLAG | 26;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {

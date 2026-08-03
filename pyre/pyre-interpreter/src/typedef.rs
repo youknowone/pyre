@@ -11980,6 +11980,22 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
                 value
             })
         }
+        pyre_object::MEMBER_SYSTEM_EXIT_CODE => {
+            let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_code(obj) };
+            if !stored.is_null() {
+                return Ok(stored);
+            }
+            let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
+            let len = unsafe { pyre_object::w_tuple_len(args) };
+            if len == 1 {
+                if let Some(value) = unsafe { pyre_object::w_tuple_getitem(args, 0) } {
+                    return Ok(value);
+                }
+            } else if len > 1 {
+                return Ok(args);
+            }
+            Ok(pyre_object::w_none())
+        }
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
         pyre_object::MEMBER_DESCR_NAME => unsafe { descr_member_name(obj) },
         _ => Err(crate::PyError::attribute_error(unsafe {
@@ -12067,6 +12083,10 @@ pub(crate) unsafe fn direct_member_set(
         }
         pyre_object::MEMBER_OS_ERROR_FILENAME2 => {
             unsafe { pyre_object::interp_exceptions::w_exception_set_filename2(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYSTEM_EXIT_CODE => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_code(obj, value) };
             Ok(pyre_object::w_none())
         }
         _ => Err(crate::PyError::attribute_error("readonly attribute")),
@@ -12179,6 +12199,12 @@ pub(crate) unsafe fn direct_member_delete(
                     obj,
                     pyre_object::w_none(),
                 )
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYSTEM_EXIT_CODE => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_code(obj, pyre_object::w_none())
             };
             Ok(pyre_object::w_none())
         }

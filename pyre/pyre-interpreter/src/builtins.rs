@@ -6632,7 +6632,7 @@ fn exception_typedef_attrs(class_name: &str) -> &'static [&'static str] {
             "__context__",
             "__traceback__",
         ],
-        "SystemExit" => &["code"],
+        "SystemExit" => &[],
         "StopIteration" => &[],
         "OSError" => &["characters_written"],
         "ImportError" => &[],
@@ -6944,6 +6944,20 @@ fn make_exc_type_with_init(
                     }
                 }
             }
+            if name == "SystemExit" {
+                unsafe {
+                    pyre_object::w_dict_setitem_str_no_proxy(
+                        ns,
+                        "code",
+                        pyre_object::w_member_new_direct_with_doc(
+                            pyre_object::MEMBER_SYSTEM_EXIT_CODE,
+                            "code".to_owned(),
+                            "exception code".to_owned(),
+                            pyre_object::PY_NULL,
+                        ),
+                    );
+                }
+            }
             // `interp_exceptions.py:291-292` registers `__str__` /
             // `__repr__` on `BaseException`'s typedef, and each of the
             // classes below registers a `descr_str` of its own on top.  A
@@ -7229,6 +7243,11 @@ fn make_exc_type_with_init(
             if let Some(member) = crate::type_dict_lookup(cls, member_name) {
                 unsafe { pyre_object::w_member_set_cls(member, cls) };
             }
+        }
+    }
+    if name == "SystemExit" {
+        if let Some(member) = crate::type_dict_lookup(cls, "code") {
+            unsafe { pyre_object::w_member_set_cls(member, cls) };
         }
     }
     // Record the class so typedef::r#type can map a raised exception
