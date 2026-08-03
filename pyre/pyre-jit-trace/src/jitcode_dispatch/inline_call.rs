@@ -2823,7 +2823,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         return Ok(None);
     }
     // An unbound method-form callee whose body reads `self.attr`.  Every entry
-    // inlines one; the two declines below are what that reach costs.
+    // inlines one; the FOR_ITER deferred-admit decline below is what that reach
+    // still costs.
     let widened_method_form =
         method_form && bound_method.is_none() && !body_facts.method_form_supported;
     // A legacy, unseeded inline sub-walk inside a FOR_ITER body resumes a guard
@@ -2903,30 +2904,21 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             return Ok(None);
         }
     }
-    if method_form && bound_method.is_none() {
-        // The narrow surface declines any `self.attr` read in the body.
-        //
-        // The wide one admits it, and pays for the reach with a body that also
-        // raises: the sub-walk records into the handler region, and a guard
-        // whose resume coordinate lands on the `Reraise` needs ref registers
-        // the recorded path never wrote (`collect_callee_active_boxes`).  That
-        // decline arrives mid-recording on a non-effect-free opcode, so it has
-        // no mid-body carrier and the whole enclosing loop is discarded.
-        // Decline here instead, where the call stays residual and the loop
-        // still compiles.
-        //
-        // Both conjuncts are load-bearing.  Without `widened_method_form` this
-        // also withdraws a raise-bearing body that reads no attribute, which
-        // every entry inlined before the widening -- 3.6x on
-        // `for i in range(400000): t += b.bump(i)` over
-        // `def bump(self, n): if n < 0: raise ValueError(n); return n + 1`.
-        if widened_method_form && body_facts.contains_raise {
-            if fbw_inline_diag_enabled() {
-                eprintln!("[inline-method-form] decline pc={}", op.pc);
-            }
-            return Ok(None);
-        }
-    }
+    // A widened method-form body that also raises was declined here until the
+    // resume-liveness filter started keeping the raise operand.  The decline
+    // existed because a guard whose resume coordinate landed on the `Reraise`
+    // needed ref registers the recorded path never wrote
+    // (`collect_callee_active_boxes`), and that decline arrived mid-recording
+    // on a non-effect-free opcode with no mid-body carrier, discarding the
+    // whole enclosing loop.  With the operand retained the sub-walk records the
+    // handler region with the registers the coordinate names, so the body
+    // inlines like any other.
+    //
+    // The raise need not even execute to have been caught by it: a dead
+    // `if self.i < 0: raise` in an `o.m()` callee measured 1705 ns/call against
+    // 15.3 once admitted, and `self.i >= self.n` 1207 -> 15.9.  Swapping that
+    // `raise` for a `return` already measured 17.7, which is what named the
+    // token rather than the branch or the attribute compare.
     if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
         let mut pc = 0usize;
         let mut shown = 0;
