@@ -114,6 +114,7 @@ EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
 # needs more samples because its process CPU accounting is scheduler-tick
 # quantized (see WIN_TIMER_QUANTUM_S above).
 PERF_RETRY_RUNS = 5 if sys.platform == "win32" else 3
+SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S = 5
 CARGO_CONFIG = {
     "dynasm": {
         "extra": ["--no-default-features", "--features", "dynasm"],
@@ -697,7 +698,10 @@ def fmt_time(t):
         return "-"
     if isinstance(t, (int, float)):
         return f"{t:.2f}s"
-    return f"{t}s"
+    try:
+        return f"{float(t):.2f}s"
+    except ValueError:
+        return t
 
 
 def synth_perf_gate(path):
@@ -908,6 +912,9 @@ class Check:
         self.args = args
         self.results = []
         self.comparisons = []
+        # Synthetic fixtures whose cpython reference run exceeded its budget,
+        # so pypy alone was the baseline for them.
+        self.cpython_reference_skips = []
         # Per-backend bookkeeping, keyed by backend name so any backend
         # (dynasm / cranelift / wasm / a single `--pyre-path` binary) is tracked
         # uniformly.
@@ -1746,9 +1753,18 @@ class Check:
         sys.stdout.write(f"    {'cpython':<10s}")
         sys.stdout.flush()
         cpython_output, cpython_time, cpython_code, _ = run_timed(
-            [PYTHON3, path], timeout_s=effective_timeout,
+            [PYTHON3, path], timeout_s=SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S,
         )
-        if cpython_code != 0:
+        if cpython_code == 124:
+            # Not a crash: the fixture is sized for the JITs and cpython is
+            # only the reference. Drop it and let pypy be the baseline the
+            # backends are compared against, rather than spend the fixture's
+            # whole timeout on an interpreter nothing is gated on.
+            cpython_output = None
+            t_cpython = f"skip (>{SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S:g}s)"
+            print(dim(t_cpython))
+            self.cpython_reference_skips.append(name)
+        elif cpython_code != 0:
             print(f"{red('CRASH')} (exit {cpython_code})")
             cpython_output = None
             t_cpython = "-"
@@ -1812,6 +1828,8 @@ class Check:
     def run_synthetic_suite(self):
         pattern = self.args.synthetic_pattern
         paths = sorted(Path(SYNTHETIC_BENCH_DIR).glob(pattern))
+        if not paths and not Path(pattern).suffix:
+            paths = sorted(Path(SYNTHETIC_BENCH_DIR).glob(f"{pattern}.py"))
         paths = [p for p in paths if p.is_file() and p.suffix == ".py"]
         if not paths:
             print(f"{red('ERROR')}: no synthetic benchmarks matched {pattern!r}")
@@ -1822,6 +1840,19 @@ class Check:
         for path in paths:
             self.run_synthetic_bench(
                 str(path), self.args.synthetic_timeout,
+            )
+        # A fixture that loses its cpython reference also loses the
+        # cpython/pypy output cross-check, so the count belongs in the summary
+        # rather than only in the per-fixture line it scrolled past. A fixture
+        # appearing here for the first time is a fixture whose baseline just
+        # got weaker.
+        if self.cpython_reference_skips:
+            names = ", ".join(self.cpython_reference_skips)
+            print(
+                dim(
+                    f"cpython reference skipped (>{SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S:g}s) "
+                    f"for {len(self.cpython_reference_skips)}: {names}"
+                )
             )
 
     # ── printing ──

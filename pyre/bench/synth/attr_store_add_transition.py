@@ -10,7 +10,16 @@
 # copied into the wider block) — so the ratio measures the fold itself.  The
 # shapes the fold declines or that force materialization are exercised once
 # each in `edges()`, for agreement with the interpreter rather than for speed.
-N = 200000
+#
+# `N` is sized so the measured time clears the ratio's noise floor: check.py
+# subtracts each interpreter's empty-program startup, and below roughly ten
+# million iterations what is left on the pypy side is startup jitter rather
+# than the loop.  `total` accumulates a fixed amount per iteration, so it
+# scales exactly with `N`; dividing by the ratio to `OUTPUT_N` keeps stdout
+# stable across resizings, which is what every interpreter's output is
+# compared against.
+OUTPUT_N = 200000
+N = 64000000
 
 
 class Fresh:
@@ -69,7 +78,7 @@ def main():
         total = total + len(two.a) + len(two.b)
 
         i = i + 1
-    print(total, edges())
+    print(total // (N // OUTPUT_N), edges())
 
 
 main()
