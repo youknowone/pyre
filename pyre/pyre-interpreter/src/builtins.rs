@@ -8062,16 +8062,25 @@ fn make_exception_group_type(name: &'static str, bases: &[PyObjectRef]) -> PyObj
                         crate::_pypy_generic_alias::generic_alias_class_getitem,
                     )),
                 );
-                for (member_name, kind) in [
-                    ("message", pyre_object::MEMBER_EXCEPTION_GROUP_MESSAGE),
-                    ("exceptions", pyre_object::MEMBER_EXCEPTION_GROUP_EXCEPTIONS),
+                for (member_name, kind, doc) in [
+                    (
+                        "message",
+                        pyre_object::MEMBER_EXCEPTION_GROUP_MESSAGE,
+                        "exception message",
+                    ),
+                    (
+                        "exceptions",
+                        pyre_object::MEMBER_EXCEPTION_GROUP_EXCEPTIONS,
+                        "nested exceptions",
+                    ),
                 ] {
                     pyre_object::w_dict_setitem_str_no_proxy(
                         ns,
                         member_name,
-                        pyre_object::w_member_new_direct(
+                        pyre_object::w_member_new_direct_with_doc(
                             kind,
                             member_name.to_owned(),
+                            doc.to_owned(),
                             pyre_object::PY_NULL,
                         ),
                     );
