@@ -1939,15 +1939,6 @@ impl majit_backend::Backend for WasmBackend {
             ),
         };
         let input_types: Vec<majit_ir::Type> = inputargs.iter().map(|ia| ia.tp).collect();
-        // Publish the entry arity on the token, as the dynasm
-        // (`runner.rs:2269`) and cranelift (`compiler.rs:15613`) backends do.
-        // `jitdriver.rs extend_compiled_live_values` sizes the argument list
-        // handed to `execute_token` from `inputarg_types().len()`; an unset
-        // `OnceLock` reads 0, the virtualizable extension is skipped, and a
-        // trace with more inputargs than the portal's live values is entered
-        // with the short list — every slot past the args then reads the
-        // zero-filled frame as a null Ref.
-        token.set_inputarg_types(input_types.clone());
         // Count with CA direct-lowering enabled.  This is the safety census
         // for a pending self target: no CompiledWasmLoop exists yet to inspect.
         let pending_self_has_trampoline_calls = codegen::has_trampoline_calls(inputargs, ops, true);
