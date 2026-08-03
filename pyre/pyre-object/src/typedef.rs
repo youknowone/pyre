@@ -288,6 +288,14 @@ pub const MEMBER_ATTRIBUTE_ERROR_NAME: u32 = MEMBER_DIRECT_FLAG | 15;
 pub const MEMBER_ATTRIBUTE_ERROR_OBJ: u32 = MEMBER_DIRECT_FLAG | 16;
 /// CPython 3.14 `NameError_members.name`, backed by PyPy's `w_name`.
 pub const MEMBER_NAME_ERROR_NAME: u32 = MEMBER_DIRECT_FLAG | 17;
+/// CPython 3.14 `ImportError_members.msg`, backed by PyPy's `w_msg`.
+pub const MEMBER_IMPORT_ERROR_MSG: u32 = MEMBER_DIRECT_FLAG | 18;
+/// CPython 3.14 `ImportError_members.name`, backed by PyPy's `w_name`.
+pub const MEMBER_IMPORT_ERROR_NAME: u32 = MEMBER_DIRECT_FLAG | 19;
+/// CPython 3.14 `ImportError_members.name_from`, a pyre-flattened PyPy field.
+pub const MEMBER_IMPORT_ERROR_NAME_FROM: u32 = MEMBER_DIRECT_FLAG | 20;
+/// CPython 3.14 `ImportError_members.path`, backed by PyPy's `w_path`.
+pub const MEMBER_IMPORT_ERROR_PATH: u32 = MEMBER_DIRECT_FLAG | 21;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {

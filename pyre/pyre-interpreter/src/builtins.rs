@@ -6641,7 +6641,7 @@ fn exception_typedef_attrs(class_name: &str) -> &'static [&'static str] {
             "filename2",
             "strerror",
         ],
-        "ImportError" => &["msg", "name", "name_from", "path"],
+        "ImportError" => &[],
         "NameError" => &[],
         "AttributeError" => &[],
         "SyntaxError" => &[
@@ -6882,6 +6882,35 @@ fn make_exc_type_with_init(
                             pyre_object::PY_NULL,
                         ),
                     );
+                }
+            }
+            if name == "ImportError" {
+                for (member_name, kind, doc) in [
+                    (
+                        "msg",
+                        pyre_object::MEMBER_IMPORT_ERROR_MSG,
+                        "exception message",
+                    ),
+                    ("name", pyre_object::MEMBER_IMPORT_ERROR_NAME, "module name"),
+                    (
+                        "name_from",
+                        pyre_object::MEMBER_IMPORT_ERROR_NAME_FROM,
+                        "name imported from module",
+                    ),
+                    ("path", pyre_object::MEMBER_IMPORT_ERROR_PATH, "module path"),
+                ] {
+                    unsafe {
+                        pyre_object::w_dict_setitem_str_no_proxy(
+                            ns,
+                            member_name,
+                            pyre_object::w_member_new_direct_with_doc(
+                                kind,
+                                member_name.to_owned(),
+                                doc.to_owned(),
+                                pyre_object::PY_NULL,
+                            ),
+                        );
+                    }
                 }
             }
             // `interp_exceptions.py:291-292` registers `__str__` /
@@ -7155,6 +7184,13 @@ fn make_exc_type_with_init(
     if name == "NameError" {
         if let Some(member) = crate::type_dict_lookup(cls, "name") {
             unsafe { pyre_object::w_member_set_cls(member, cls) };
+        }
+    }
+    if name == "ImportError" {
+        for member_name in ["msg", "name", "name_from", "path"] {
+            if let Some(member) = crate::type_dict_lookup(cls, member_name) {
+                unsafe { pyre_object::w_member_set_cls(member, cls) };
+            }
         }
     }
     // Record the class so typedef::r#type can map a raised exception

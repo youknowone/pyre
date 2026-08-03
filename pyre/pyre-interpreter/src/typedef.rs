@@ -11912,6 +11912,42 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
                 value
             })
         }
+        pyre_object::MEMBER_IMPORT_ERROR_MSG => {
+            let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_import_msg(obj) };
+            if !stored.is_null() {
+                return Ok(stored);
+            }
+            let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
+            Ok(
+                unsafe { pyre_object::w_tuple_getitem(args, 0) }
+                    .unwrap_or_else(pyre_object::w_none),
+            )
+        }
+        pyre_object::MEMBER_IMPORT_ERROR_NAME => {
+            let value = unsafe { pyre_object::interp_exceptions::w_exception_get_name(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
+        pyre_object::MEMBER_IMPORT_ERROR_NAME_FROM => {
+            let value =
+                unsafe { pyre_object::interp_exceptions::w_exception_get_import_name_from(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
+        pyre_object::MEMBER_IMPORT_ERROR_PATH => {
+            let value = unsafe { pyre_object::interp_exceptions::w_exception_get_import_path(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
         pyre_object::MEMBER_DESCR_NAME => unsafe { descr_member_name(obj) },
         _ => Err(crate::PyError::attribute_error(unsafe {
@@ -11969,6 +12005,22 @@ pub(crate) unsafe fn direct_member_set(
             unsafe { pyre_object::interp_exceptions::w_exception_set_attr_obj(obj, value) };
             Ok(pyre_object::w_none())
         }
+        pyre_object::MEMBER_IMPORT_ERROR_MSG => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_import_msg(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_IMPORT_ERROR_NAME => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_name(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_IMPORT_ERROR_NAME_FROM => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_import_name_from(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_IMPORT_ERROR_PATH => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_import_path(obj, value) };
+            Ok(pyre_object::w_none())
+        }
         _ => Err(crate::PyError::attribute_error("readonly attribute")),
     }
 }
@@ -12019,6 +12071,39 @@ pub(crate) unsafe fn direct_member_delete(
         pyre_object::MEMBER_ATTRIBUTE_ERROR_OBJ => {
             unsafe {
                 pyre_object::interp_exceptions::w_exception_set_attr_obj(obj, pyre_object::w_none())
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_IMPORT_ERROR_MSG => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_import_msg(
+                    obj,
+                    pyre_object::w_none(),
+                )
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_IMPORT_ERROR_NAME => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_name(obj, pyre_object::w_none())
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_IMPORT_ERROR_NAME_FROM => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_import_name_from(
+                    obj,
+                    pyre_object::w_none(),
+                )
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_IMPORT_ERROR_PATH => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_import_path(
+                    obj,
+                    pyre_object::w_none(),
+                )
             };
             Ok(pyre_object::w_none())
         }
