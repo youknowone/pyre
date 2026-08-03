@@ -4995,11 +4995,43 @@ pub fn make_simple_descr_group(
     vtable: usize,
     field_specs: &[SimpleFieldDescrSpec],
 ) -> SimpleDescrGroup {
-    // No-cache legacy mint sites are JIT-allocated structs; default
-    // `is_gc_managed = true` (the raw-struct path goes through the keyed
-    // factory with an explicit flag).
-    let group =
-        make_simple_descr_group_inner(index, size, type_id, 0, vtable, true, false, field_specs);
+    // No-cache legacy mint sites are JIT-allocated structs, so they get the
+    // GC-managed, headered shape.  A caller that knows the STRUCT's actual
+    // shape passes it through `make_simple_descr_group_with_flags`.
+    make_simple_descr_group_with_flags(index, size, type_id, vtable, true, false, field_specs)
+}
+
+/// [`make_simple_descr_group`] with the GC-header shape supplied rather than
+/// defaulted.
+///
+/// `descr.py:105-127 get_size_descr` reads both flags off the STRUCT itself,
+/// so they describe the parent, not the cache slot — a caller that mints
+/// without a cache key still knows them and must not lose them.  Minting a raw
+/// or header-less parent as GC-managed and headered would hand the consumer a
+/// `GUARD_GC_TYPE` and a header offset the object does not have.
+///
+/// The mint stays uncached exactly as in [`make_simple_descr_group`]:
+/// `cache_key` is 0, so the keyed `_cache_*[key]` maps are untouched and
+/// repeated calls yield distinct groups.
+pub fn make_simple_descr_group_with_flags(
+    index: u32,
+    size: usize,
+    type_id: u32,
+    vtable: usize,
+    is_gc_managed: bool,
+    headerless: bool,
+    field_specs: &[SimpleFieldDescrSpec],
+) -> SimpleDescrGroup {
+    let group = make_simple_descr_group_inner(
+        index,
+        size,
+        type_id,
+        0,
+        vtable,
+        is_gc_managed,
+        headerless,
+        field_specs,
+    );
     // descr.py:236-247 `get_size_descr` cache-miss branch — snapshot
     // order only.
     crate::descr_registry::register_size(group.size_descr.clone() as DescrRef);

@@ -4220,11 +4220,20 @@ fn simple_descr_group_from_bh_size(
         // type_id-less STRUCTs don't collapse onto the first-inserted
         // descr group.  Per-STRUCT caching kicks in only when callers
         // route through a real `type_id` source.
-        return majit_ir::descr::make_simple_descr_group(
+        //
+        // The missing key says nothing about the STRUCT's shape, so carry
+        // `is_gc_managed`/`headerless` here exactly as the keyed arm below
+        // does.  `bh_size_spec_from_descr` (`majit-translate`) reads both
+        // straight off a descr while taking `type_id` from `cache_key()`, so
+        // a raw or header-less parent with no key reaches this arm; the
+        // defaulting factory would give it back a GC header it does not have.
+        return majit_ir::descr::make_simple_descr_group_with_flags(
             u32::MAX,
             spec.size,
             spec.type_id as u32,
             spec.vtable as usize,
+            spec.is_gc_managed,
+            spec.headerless,
             &field_specs,
         );
     }

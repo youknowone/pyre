@@ -161,11 +161,9 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         // carrier the orthodox reading is "each of these is a
                         // distinct STRUCT".
                         //
-                        // `is_gc_managed`/`headerless` are dropped the way the
-                        // trace-side twin drops them — the non-keyed factory
-                        // defaults to `(true, false)`, and the raw and
-                        // header-less producers all carry a real type id because
-                        // they publish through `register_struct_layout`.
+                        // The missing key says nothing about the STRUCT's
+                        // shape, so `is_gc_managed`/`headerless` are carried
+                        // through exactly as the keyed arm carries them.
                         if crate::majit_log_enabled() {
                             eprintln!(
                                 "[jit] field_descr_ref_from_bh: fresh-minting a \
@@ -204,11 +202,13 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                                 });
                                 specs.len() - 1
                             });
-                        let group = majit_ir::descr::make_simple_descr_group(
+                        let group = majit_ir::descr::make_simple_descr_group_with_flags(
                             u32::MAX,
                             p.size,
                             0,
                             p.vtable as usize,
+                            p.is_gc_managed,
+                            p.headerless,
                             &specs,
                         );
                         let fd = group.field_descrs[selected].clone();
@@ -300,12 +300,14 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         // (`pyre-jit-trace/src/descr.rs`) takes.  Its group's
                         // size descr is registered strongly by
                         // `descr_registry::register_size`, so the field's Weak
-                        // parent back-reference still upgrades, and the factory's
-                        // `is_gc_managed`/`headerless` defaults are the only
-                        // shape that reaches here: the raw and header-less
-                        // producers all publish through `register_struct_layout`
-                        // (`struct_fields_write_effect_info` below), which routes
-                        // to the keyed factory carrying a real type id.
+                        // parent back-reference still upgrades.  The missing key
+                        // says nothing about the STRUCT's shape, so
+                        // `is_gc_managed`/`headerless` are carried through
+                        // exactly as the keyed arm carries them:
+                        // `bh_size_spec_from_descr` (`majit-translate`) reads
+                        // both straight off a descr while taking `type_id` from
+                        // `cache_key()`, so a raw or header-less parent with no
+                        // key reaches here and must not regain a GC header.
                         if crate::majit_log_enabled() {
                             eprintln!(
                                 "[jit] field_descr_ref_from_bh: fresh-minting a \
@@ -326,11 +328,13 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                             virtualizable: false,
                             index_in_parent: *index_in_parent,
                         };
-                        let group = majit_ir::descr::make_simple_descr_group(
+                        let group = majit_ir::descr::make_simple_descr_group_with_flags(
                             u32::MAX,
                             p.size,
                             0,
                             p.vtable as usize,
+                            p.is_gc_managed,
+                            p.headerless,
                             std::slice::from_ref(&spec),
                         );
                         let fd = group.field_descrs[0].clone();
@@ -9317,6 +9321,50 @@ mod tests {
         );
         assert!(!std::sync::Arc::ptr_eq(&a, &other));
         assert_eq!(parent_size_of(&other), 48);
+    }
+
+    /// A missing cache key says nothing about the STRUCT's shape.
+    /// `bh_size_spec_from_descr` (`majit-translate`) reads
+    /// `is_gc_managed`/`headerless` straight off a descr while taking
+    /// `type_id` from `cache_key()`, so a raw, header-less parent arrives here
+    /// with no key — and minting it as GC-managed and headered would hand the
+    /// consumer a `GUARD_GC_TYPE` and a header offset the object does not have.
+    ///
+    /// Both zero arms are covered: with the flattened field list and without.
+    #[test]
+    fn a_type_id_less_parent_keeps_its_raw_header_less_shape() {
+        let make_raw = |field: &str, drop_fields: bool| {
+            let mut descr = field_descr_with_parent(field, 0, 16, 0xAA);
+            if let crate::blackhole::BhDescr::Field {
+                parent: Some(p), ..
+            } = &mut descr
+            {
+                p.is_gc_managed = false;
+                p.headerless = true;
+                if drop_fields {
+                    p.all_fielddescrs.clear();
+                }
+            }
+            descr
+        };
+
+        for (field, drop_fields) in [("raw_listed", false), ("raw_bare", true)] {
+            let fd = field_descr_ref_from_bh(&make_raw(field, drop_fields)).1;
+            let parent = fd
+                .as_field_descr()
+                .expect("field descr")
+                .get_parent_descr()
+                .expect("field descr must carry a parent");
+            let parent = parent.as_size_descr().expect("parent is a size descr");
+            assert!(
+                !parent.is_gc_managed(),
+                "{field}: a raw parent must not be reconstructed as GC-managed"
+            );
+            assert!(
+                parent.headerless(),
+                "{field}: a header-less parent must not regain a GC header"
+            );
+        }
     }
 
     #[test]
