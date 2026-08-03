@@ -2202,6 +2202,18 @@ def main():
             f"{B}/frame_lineno_mid_replay_regression.py",
             20,
         )
+        # The sibling shape: the frame handed out is the INLINED CALLEE's own,
+        # not the virtualizable its caller runs as. That frame carries the `-1`
+        # `last_instr` sentinel and is not what the escape flush writes, so its
+        # `f_lineno` / `f_locals` are only right because `sys._getframe` forces
+        # and the resulting abort finishes the iteration interpreted. Pins the
+        # answer so a change that retires that abort has to keep it -- the whole
+        # synthetic corpus stayed green while these three reads broke.
+        chk.run_selfcheck(
+            "frame_inlined_callee_own_image",
+            f"{B}/frame_inlined_callee_own_image_regression.py",
+            20,
+        )
         # The branchy-inlined-callee guard (gh#343) lives in the synthetic parity
         # suite as bridge_branchy_callee.py, gated against pypy by
         # `# pyre-check: max-pypy-ratio`; a decline that keeps every crossing
