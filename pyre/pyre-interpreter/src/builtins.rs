@@ -5405,6 +5405,14 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     flat.push(w_self);
     flat.extend_from_slice(positional);
     let base = pyre_object::gc_roots::pin_roots(&flat);
+    if !positional.is_empty() {
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_syntax_msg(
+                pyre_object::gc_roots::shadow_stack_get(base),
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            );
+        }
+    }
     if positional.len() == 2 {
         let details =
             crate::baseobjspace::fixedview(pyre_object::gc_roots::shadow_stack_get(base + 2), -1)?;
@@ -5424,6 +5432,32 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
                 return Err(crate::PyError::type_error(format!(
                     "function takes at most 6 arguments ({n} given)"
                 )));
+            }
+        }
+        let w_self = pyre_object::gc_roots::shadow_stack_get(base);
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_syntax_filename(w_self, details[0]);
+            pyre_object::interp_exceptions::w_exception_set_syntax_lineno(w_self, details[1]);
+            pyre_object::interp_exceptions::w_exception_set_syntax_offset(w_self, details[2]);
+            pyre_object::interp_exceptions::w_exception_set_syntax_text(w_self, details[3]);
+            if details.len() == 6 {
+                pyre_object::interp_exceptions::w_exception_set_syntax_end_lineno(
+                    w_self, details[4],
+                );
+                pyre_object::interp_exceptions::w_exception_set_syntax_end_offset(
+                    w_self, details[5],
+                );
+            } else {
+                // CPython 3.14 clears both end positions when a repeated
+                // `__init__` call supplies the four-field details form.
+                pyre_object::interp_exceptions::w_exception_set_syntax_end_lineno(
+                    w_self,
+                    pyre_object::w_none(),
+                );
+                pyre_object::interp_exceptions::w_exception_set_syntax_end_offset(
+                    w_self,
+                    pyre_object::w_none(),
+                );
             }
         }
     }
@@ -6638,16 +6672,7 @@ fn exception_typedef_attrs(class_name: &str) -> &'static [&'static str] {
         "ImportError" => &[],
         "NameError" => &[],
         "AttributeError" => &[],
-        "SyntaxError" => &[
-            "end_lineno",
-            "end_offset",
-            "filename",
-            "lineno",
-            "msg",
-            "offset",
-            "print_file_and_line",
-            "text",
-        ],
+        "SyntaxError" => &[],
         "UnicodeDecodeError" | "UnicodeEncodeError" | "UnicodeTranslateError" => {
             &["encoding", "end", "object", "reason", "start"]
         }
@@ -6801,17 +6826,61 @@ fn make_exc_type_with_init(
             // as `GetSetProperty` entries on its own `TypeDef`.
             install_exception_getsets(ns, name);
             if name == "SyntaxError" {
-                unsafe {
-                    pyre_object::w_dict_setitem_str_no_proxy(
-                        ns,
+                for (member_name, kind, doc) in [
+                    ("msg", pyre_object::MEMBER_SYNTAX_ERROR_MSG, "exception msg"),
+                    (
+                        "filename",
+                        pyre_object::MEMBER_SYNTAX_ERROR_FILENAME,
+                        "exception filename",
+                    ),
+                    (
+                        "lineno",
+                        pyre_object::MEMBER_SYNTAX_ERROR_LINENO,
+                        "exception lineno",
+                    ),
+                    (
+                        "offset",
+                        pyre_object::MEMBER_SYNTAX_ERROR_OFFSET,
+                        "exception offset",
+                    ),
+                    (
+                        "text",
+                        pyre_object::MEMBER_SYNTAX_ERROR_TEXT,
+                        "exception text",
+                    ),
+                    (
+                        "end_lineno",
+                        pyre_object::MEMBER_SYNTAX_ERROR_END_LINENO,
+                        "exception end lineno",
+                    ),
+                    (
+                        "end_offset",
+                        pyre_object::MEMBER_SYNTAX_ERROR_END_OFFSET,
+                        "exception end offset",
+                    ),
+                    (
+                        "print_file_and_line",
+                        pyre_object::MEMBER_SYNTAX_ERROR_PRINT_FILE_AND_LINE,
+                        "exception print_file_and_line",
+                    ),
+                    (
                         "_metadata",
-                        pyre_object::w_member_new_direct_with_doc(
-                            pyre_object::MEMBER_SYNTAX_ERROR_METADATA,
-                            "_metadata".to_owned(),
-                            "exception private metadata".to_owned(),
-                            pyre_object::PY_NULL,
-                        ),
-                    );
+                        pyre_object::MEMBER_SYNTAX_ERROR_METADATA,
+                        "exception private metadata",
+                    ),
+                ] {
+                    unsafe {
+                        pyre_object::w_dict_setitem_str_no_proxy(
+                            ns,
+                            member_name,
+                            pyre_object::w_member_new_direct_with_doc(
+                                kind,
+                                member_name.to_owned(),
+                                doc.to_owned(),
+                                pyre_object::PY_NULL,
+                            ),
+                        );
+                    }
                 }
             }
             if name == "StopIteration" {
@@ -7205,8 +7274,20 @@ fn make_exc_type_with_init(
         &pyre_object::interp_exceptions::EXCEPTION_TYPE as *const pyre_object::PyType,
     );
     if name == "SyntaxError" {
-        if let Some(member) = crate::type_dict_lookup(cls, "_metadata") {
-            unsafe { pyre_object::w_member_set_cls(member, cls) };
+        for member_name in [
+            "msg",
+            "filename",
+            "lineno",
+            "offset",
+            "text",
+            "end_lineno",
+            "end_offset",
+            "print_file_and_line",
+            "_metadata",
+        ] {
+            if let Some(member) = crate::type_dict_lookup(cls, member_name) {
+                unsafe { pyre_object::w_member_set_cls(member, cls) };
+            }
         }
     }
     if name == "StopIteration" {

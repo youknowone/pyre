@@ -11876,12 +11876,32 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
             Ok(crate::builtins::exception_group_fields(obj)?.1)
         }
         pyre_object::MEMBER_SYNTAX_ERROR_METADATA => {
-            let dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) };
-            Ok(
-                unsafe { pyre_object::w_dict_getitem_str(dict, "_metadata") }
-                    .unwrap_or_else(pyre_object::w_none),
-            )
+            Ok(crate::baseobjspace::syntax_error_attr(obj, "_metadata"))
         }
+        pyre_object::MEMBER_SYNTAX_ERROR_MSG => {
+            Ok(crate::baseobjspace::syntax_error_attr(obj, "msg"))
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_FILENAME => {
+            Ok(crate::baseobjspace::syntax_error_attr(obj, "filename"))
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_LINENO => {
+            Ok(crate::baseobjspace::syntax_error_attr(obj, "lineno"))
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_OFFSET => {
+            Ok(crate::baseobjspace::syntax_error_attr(obj, "offset"))
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_TEXT => {
+            Ok(crate::baseobjspace::syntax_error_attr(obj, "text"))
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_END_LINENO => {
+            Ok(crate::baseobjspace::syntax_error_attr(obj, "end_lineno"))
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_END_OFFSET => {
+            Ok(crate::baseobjspace::syntax_error_attr(obj, "end_offset"))
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_PRINT_FILE_AND_LINE => Ok(
+            crate::baseobjspace::syntax_error_attr(obj, "print_file_and_line"),
+        ),
         pyre_object::MEMBER_STOP_ITERATION_VALUE => {
             let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_value(obj) };
             if !stored.is_null() {
@@ -12027,8 +12047,47 @@ pub(crate) unsafe fn direct_member_set(
             Ok(pyre_object::w_none())
         }
         pyre_object::MEMBER_SYNTAX_ERROR_METADATA => {
-            let dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) };
-            unsafe { pyre_object::w_dict_setitem_str_no_proxy(dict, "_metadata", value) };
+            unsafe { pyre_object::interp_exceptions::w_exception_set_syntax_metadata(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_MSG => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_syntax_msg(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_FILENAME => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_syntax_filename(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_LINENO => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_syntax_lineno(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_OFFSET => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_syntax_offset(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_TEXT => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_syntax_text(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_END_LINENO => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_syntax_end_lineno(obj, value)
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_END_OFFSET => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_syntax_end_offset(obj, value)
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_PRINT_FILE_AND_LINE => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_syntax_print_file_and_line(
+                    obj, value,
+                )
+            };
             Ok(pyre_object::w_none())
         }
         pyre_object::MEMBER_STOP_ITERATION_VALUE => {
@@ -12117,8 +12176,84 @@ pub(crate) unsafe fn direct_member_delete(
             Ok(pyre_object::w_none())
         }
         pyre_object::MEMBER_SYNTAX_ERROR_METADATA => {
-            let dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) };
-            unsafe { pyre_object::w_dict_delitem_str_no_proxy(dict, "_metadata") };
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_syntax_metadata(
+                    obj,
+                    pyre_object::w_none(),
+                )
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_MSG => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_syntax_msg(
+                    obj,
+                    pyre_object::w_none(),
+                )
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_FILENAME => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_syntax_filename(
+                    obj,
+                    pyre_object::w_none(),
+                )
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_LINENO => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_syntax_lineno(
+                    obj,
+                    pyre_object::w_none(),
+                )
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_OFFSET => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_syntax_offset(
+                    obj,
+                    pyre_object::w_none(),
+                )
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_TEXT => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_syntax_text(
+                    obj,
+                    pyre_object::w_none(),
+                )
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_END_LINENO => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_syntax_end_lineno(
+                    obj,
+                    pyre_object::w_none(),
+                )
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_END_OFFSET => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_syntax_end_offset(
+                    obj,
+                    pyre_object::w_none(),
+                )
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_SYNTAX_ERROR_PRINT_FILE_AND_LINE => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_syntax_print_file_and_line(
+                    obj,
+                    pyre_object::w_none(),
+                )
+            };
             Ok(pyre_object::w_none())
         }
         pyre_object::MEMBER_STOP_ITERATION_VALUE => {

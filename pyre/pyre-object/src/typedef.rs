@@ -306,6 +306,22 @@ pub const MEMBER_OS_ERROR_FILENAME: u32 = MEMBER_DIRECT_FLAG | 24;
 pub const MEMBER_OS_ERROR_FILENAME2: u32 = MEMBER_DIRECT_FLAG | 25;
 /// CPython 3.14 `SystemExit_members.code`, backed by PyPy's `w_code`.
 pub const MEMBER_SYSTEM_EXIT_CODE: u32 = MEMBER_DIRECT_FLAG | 26;
+/// CPython 3.14 `SyntaxError_members.msg`, backed by PyPy's `w_msg`.
+pub const MEMBER_SYNTAX_ERROR_MSG: u32 = MEMBER_DIRECT_FLAG | 27;
+/// CPython 3.14 `SyntaxError_members.filename`, backed by PyPy's `w_filename`.
+pub const MEMBER_SYNTAX_ERROR_FILENAME: u32 = MEMBER_DIRECT_FLAG | 28;
+/// CPython 3.14 `SyntaxError_members.lineno`, backed by PyPy's `w_lineno`.
+pub const MEMBER_SYNTAX_ERROR_LINENO: u32 = MEMBER_DIRECT_FLAG | 29;
+/// CPython 3.14 `SyntaxError_members.offset`, backed by PyPy's `w_offset`.
+pub const MEMBER_SYNTAX_ERROR_OFFSET: u32 = MEMBER_DIRECT_FLAG | 30;
+/// CPython 3.14 `SyntaxError_members.text`, backed by PyPy's `w_text`.
+pub const MEMBER_SYNTAX_ERROR_TEXT: u32 = MEMBER_DIRECT_FLAG | 31;
+/// CPython 3.14 `SyntaxError_members.end_lineno`, backed by PyPy's field.
+pub const MEMBER_SYNTAX_ERROR_END_LINENO: u32 = MEMBER_DIRECT_FLAG | 32;
+/// CPython 3.14 `SyntaxError_members.end_offset`, backed by PyPy's field.
+pub const MEMBER_SYNTAX_ERROR_END_OFFSET: u32 = MEMBER_DIRECT_FLAG | 33;
+/// CPython 3.14 `SyntaxError_members.print_file_and_line`, backed by PyPy's field.
+pub const MEMBER_SYNTAX_ERROR_PRINT_FILE_AND_LINE: u32 = MEMBER_DIRECT_FLAG | 34;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {
