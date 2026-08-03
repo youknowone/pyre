@@ -761,7 +761,14 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
             return;
         };
         let recursive_closure = is_recursive_root_closure(ctx, &frame);
-        if !fbw_callee_vstack_enabled() && !recursive_closure {
+        // A carrier-resume walk is the rebuilt MIFrame of
+        // `resume.py rebuild_from_resumedata` being driven forward after guard
+        // failure.  Its per-frame operand stack is not an optional
+        // optimization: residual calls must read the exact boxes the
+        // reconstructed frame owns, so it is admitted alongside the recursive
+        // root closure even while the experimental fresh-inline mirror stays
+        // disabled for ordinary tracing.
+        if !fbw_callee_vstack_enabled() && !recursive_closure && !ctx.fbw_mode.carrier_resume {
             ctx.vstack_valid = false;
             return;
         }

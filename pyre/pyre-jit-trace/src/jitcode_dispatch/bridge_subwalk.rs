@@ -1323,6 +1323,22 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             sub_wc.vstack_cur_pypc = py_pc;
             sub_wc.vstack_valid = true;
         }
+        // `resume.py rebuild_from_resumedata` seeds the rebuilt MIFrame's
+        // operand stack directly from the frame recipe.  `ActiveResumeFrame`
+        // is only an optional richer coordinate source; a carrier recipe is
+        // already the authoritative per-frame state and must not be discarded
+        // when that helper object is absent.  Otherwise the first may-force
+        // call invalidates the heapcache, a later CALL reads a color-reloaded
+        // box with no runtime value, and an effectful sub-walk replays from the
+        // guard (the framed-pickle stream is consumed twice).
+        if !sub_wc.vstack_valid {
+            sub_wc.vstack_boxes = resumed_stack_oprefs.to_vec();
+            sub_wc.vstack_depth = resumed_stack_oprefs.len();
+            sub_wc.vstack_cur_pypc =
+                crate::py_coord::resume_py_pc_for_jitcode_word(consts.jitcode_index, entry as i32)
+                    as u32;
+            sub_wc.vstack_valid = true;
+        }
         let outcome = walk(callee_code, entry, &mut sub_wc);
         // `pyjitpl.py:2914 handle_guard_failure` wraps `_handle_guard_failure`
         // in `except SwitchToBlackhole as stb:
