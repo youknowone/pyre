@@ -206,7 +206,44 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         );
                         return (*offset, fd as majit_ir::DescrRef);
                     }
+                } else {
+                    // `all_fielddescrs` empty is not the same as "no owning
+                    // struct": `descr.py:238 parent_descr = get_size_descr(
+                    // gccache, STRUCT, vtable)` derives the parent from the
+                    // STRUCT itself, and the flattened field list only supplies
+                    // `index_in_parent` (`descr.py:228`).  Mint the SizeDescr
+                    // from what the producer did attach so the field carries a
+                    // parent; without one `protect_speculative_field`
+                    // (`llmodel.py:560`, which asserts the parent exists) has no
+                    // type to validate against and fails closed, taking the
+                    // whole bridge with it.
+                    let struct_key = majit_ir::descr::LLType::Struct(p.type_id);
+                    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                    gc.get_size_descr(struct_key.clone(), p.size, p.vtable as usize, false);
+                    let fd = gc.get_field_descr(
+                        struct_key,
+                        name,
+                        None,
+                        *offset,
+                        *field_size,
+                        *field_type,
+                        *is_immutable,
+                        *is_quasi_immutable,
+                        *field_flag,
+                        *index_in_parent as u32,
+                        false,
+                        *index_in_parent,
+                    );
+                    return (*offset, fd as majit_ir::DescrRef);
                 }
+            }
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] field_descr_ref_from_bh: parentless placeholder for \
+                     field={name:?} offset={offset} size={field_size} type={field_type:?} \
+                     has_parent={}",
+                    parent.is_some()
+                );
             }
             (
                 *offset,
