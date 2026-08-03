@@ -417,6 +417,35 @@ pub extern "C" fn pyre_jit_internal_compile_panics() -> u64 {
         .internal_compile_panics as u64
 }
 
+/// The rest of the native `[jit-stats]` line. These are not sign-stable, so
+/// each is gated on its own terms rather than against zero: `loops_compiled`
+/// fails on any FALL, `guard_failures` on a rise past a band, and
+/// `bridges_compiled` on neither direction, since it moves both ways under
+/// ordinary tuning.
+///
+/// They come out of the same `JitStats` the fields above read, and were simply
+/// never exported. Their absence was not neutral: a count-valued field missing
+/// from a recorded baseline is skipped silently, so a change that stopped
+/// compiling a loop altogether aborted nothing and *lowered* `guard_failures` —
+/// both remaining gates read the loss as an improvement.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_loops_compiled() -> u64 {
+    pyre_jit::eval::driver_pair().0.get_stats().loops_compiled as u64
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_bridges_compiled() -> u64 {
+    pyre_jit::eval::driver_pair().0.get_stats().bridges_compiled as u64
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_guard_failures() -> u64 {
+    pyre_jit::eval::driver_pair().0.get_stats().guard_failures as u64
+}
+
 /// The descr-universe invariants, the remaining `JITSTATS_BADNESS_FIELDS`. The
 /// native backends print these from `descr_set_jit_stats`; the guest has no
 /// stderr, so it exports the counts and the runner prints the line. Without
