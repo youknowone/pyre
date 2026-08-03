@@ -98,7 +98,10 @@ mod tests {
             .collect();
         assert_eq!(mangled.len(), 1, "premise: the bare mangle collapses");
 
-        let spread: HashSet<u8> = addresses.iter().map(|&a| (hash_of(a) >> 57) as u8).collect();
+        let spread: HashSet<u8> = addresses
+            .iter()
+            .map(|&a| (hash_of(a) >> 57) as u8)
+            .collect();
         assert!(
             spread.len() > 64,
             "control bytes still collapse: {} distinct",

@@ -115,6 +115,11 @@ pub fn w_memoryview_alloc_header(released: bool, owns_export: bool) -> PyObjectR
 
 /// Allocate CPython's `_buffer_wrapper(mv, obj)`, rooting both constructor
 /// arguments across the managed allocation.
+///
+/// Managed and non-moving, the same shape `w_memoryview_new` above uses: the
+/// wrapper's only job is to hold `w_mv`/`w_obj` alive, and a `malloc_typed`
+/// immortal is outside the sweep set, so the marker latches GCFLAG_VISITED on
+/// it at the first major and never re-marks those two children afterwards.
 pub fn w_buffer_wrapper_new(w_mv: PyObjectRef, w_obj: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let sp = crate::gc_roots::shadow_stack_len();
