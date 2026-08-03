@@ -2068,8 +2068,8 @@ use pyre_object::interp_exceptions::{
     EXC_W_END_OFFSET, EXC_W_ERRNO_OFFSET, EXC_W_FILENAME_OFFSET, EXC_W_FILENAME2_OFFSET,
     EXC_W_IMPORT_MSG_OFFSET, EXC_W_IMPORT_NAME_FROM_OFFSET, EXC_W_IMPORT_PATH_OFFSET,
     EXC_W_NAME_OFFSET, EXC_W_OBJECT_OFFSET, EXC_W_REASON_OFFSET, EXC_W_START_OFFSET,
-    EXC_W_STRERROR_OFFSET, EXC_W_TRACEBACK_OFFSET, ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS,
-    W_BASE_EXCEPTION_SIZE, exc_kind_to_pytype,
+    EXC_W_STRERROR_OFFSET, EXC_W_TRACEBACK_OFFSET, EXC_W_VALUE_OFFSET, EXC_W_WEAKREF_OFFSET,
+    ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, W_BASE_EXCEPTION_SIZE, exc_kind_to_pytype,
 };
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::{OB_TYPE_OFFSET, W_CLASS_OFFSET};
@@ -2982,6 +2982,15 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
+                "W_BaseException.w_value",
+                EXC_W_VALUE_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
                 "W_BaseException.w_exc_name",
                 EXC_W_NAME_OFFSET,
                 8,
@@ -3029,6 +3038,15 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_dict",
                 EXC_W_DICT_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_weakreflifeline",
+                EXC_W_WEAKREF_OFFSET,
                 8,
                 Type::Ref,
                 false,
