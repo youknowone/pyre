@@ -2602,6 +2602,43 @@ fn emit_frontend_accumulate_3(
     );
 }
 
+/// Reload an inlined-comprehension accumulator from its value-stack slot.
+///
+/// `BUILD_LIST` / `BUILD_SET` / `BUILD_MAP` leave the accumulator on the
+/// operand stack, and the operand stack is not loop-carried in registers
+/// (`jit_merge_point` reds are `[frame, ec]`), so the preamble's FlowValue is
+/// not a live register inside the resident loop.  Read the container back out
+/// of the vable image on every iteration — the same per-iteration
+/// re-materialization the `FOR_ITER` iterator reload uses — so the accumulate
+/// residual has a genuine in-loop reader for its receiver.  The symbolic peek
+/// (`peek_container_or_fresh`) leaves it reading an unbound register instead.
+///
+/// `depth_after_pops` is the operand depth once the accumulate opcode's own
+/// operands have been popped, so its `PEEK(oparg)` container sits at
+/// `depth_after_pops - oparg`.
+fn emit_accumulator_reload(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    frame_var: super::flow::Variable,
+    stack_base_absolute: usize,
+    depth_after_pops: u16,
+    oparg: usize,
+    offset: i64,
+) -> super::flow::FlowValue {
+    let slot_depth = depth_after_pops.saturating_sub(oparg as u16);
+    let abs_slot = (stack_base_absolute + slot_depth as usize) as i64;
+    let v_idx: super::flow::FlowValue = super::flow::Constant::signed(abs_slot).into();
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "getarrayitem_vable_r",
+        vable_getarrayitem_ref_graph_args(frame_var.into(), v_idx.into()),
+        Kind::Ref,
+        offset,
+    )
+    .into()
+}
+
 fn emit_frontend_getattr(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -11006,39 +11043,20 @@ impl CodeWriter {
                             let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // PEEK(oparg): after popping the value, the list sits
                             // at operand-stack depth `current_depth - oparg`.
-                            // Reload it from its value-stack slot via
-                            // `getarrayitem_vable_r`, the same per-iteration
-                            // re-materialization the FOR_ITER iterator reload uses
-                            // (see above): the comprehension accumulator lives on
-                            // the operand stack, which is NOT loop-carried in
-                            // registers (`jit_merge_point` reds are `[frame, ec]`),
-                            // so the preamble `BUILD_LIST` FlowValue is not a live
-                            // register inside the resident loop. Reading it from
-                            // the vable image each iteration gives it a genuine
-                            // in-loop reader, so the full-body walk resolves the
-                            // list receiver (else the `jit_list_append` residual
-                            // reads an unbound register and aborts
-                            // `ResidualCallArgUnbound`, never reaching the #171
-                            // append fold).
-                            let list_value: super::flow::FlowValue = {
-                                let list_slot_depth = current_depth.saturating_sub(oparg as u16);
-                                let list_abs_slot =
-                                    (stack_base_absolute + list_slot_depth as usize) as i64;
-                                let v_list_idx: super::flow::FlowValue =
-                                    super::flow::Constant::signed(list_abs_slot).into();
-                                let v_list = emit_graph_op_with_result(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    "getarrayitem_vable_r",
-                                    vable_getarrayitem_ref_graph_args(
-                                        frame_var.into(),
-                                        v_list_idx.into(),
-                                    ),
-                                    Kind::Ref,
-                                    py_pc as i64,
-                                );
-                                v_list.into()
-                            };
+                            // Reload it from its value-stack slot so the
+                            // full-body walk resolves the list receiver (else the
+                            // `jit_list_append` residual reads an unbound register
+                            // and aborts `ResidualCallArgUnbound`, never reaching
+                            // the #171 append fold).
+                            let list_value = emit_accumulator_reload(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var,
+                                stack_base_absolute,
+                                current_depth,
+                                oparg,
+                                py_pc as i64,
+                            );
                             let _ = residual_call!(
                                 list_append_fn_idx,
                                 CallFlavor::Plain,
@@ -11112,7 +11130,17 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            push_and_bump!(result_value.into(), py_pc);
+                            // Physically write the accumulator into its
+                            // value-stack slot rather than only bumping the
+                            // symbolic depth: `SET_ADD` / `MAP_ADD` read the
+                            // container back through `getarrayitem_vable_r`,
+                            // and the blackhole replays BUILD→accumulate from
+                            // the jitcode on a mid-frame resume, so the slot
+                            // must be populated by the emitted op.  Same
+                            // pairing as `BUILD_LIST` / `LIST_APPEND`.
+                            let pushed: super::flow::FlowValue = result_value.into();
+                            current_state.stack.push(pushed.clone());
+                            emit_pushvalue_ref!(current_depth, current_depth, pushed, py_pc);
                         }
 
                         // MapAdd(i): peek dict at stack[i], pop value + key. Net: -2.
@@ -11130,8 +11158,18 @@ impl CodeWriter {
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
                             let key = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let dict_value =
-                                peek_container_or_fresh(&current_state, oparg, &mut graph);
+                            // PEEK(oparg) is the comprehension accumulator, so it
+                            // comes from its value-stack slot rather than the
+                            // symbolic stack — see `emit_accumulator_reload`.
+                            let dict_value = emit_accumulator_reload(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var,
+                                stack_base_absolute,
+                                current_depth,
+                                oparg,
+                                py_pc as i64,
+                            );
                             emit_frontend_accumulate_3(
                                 &current_block.block(),
                                 "map_add",
@@ -11252,7 +11290,17 @@ impl CodeWriter {
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            push_and_bump!(result_value.into(), py_pc);
+                            // Physically write the accumulator into its
+                            // value-stack slot rather than only bumping the
+                            // symbolic depth: `SET_ADD` / `MAP_ADD` read the
+                            // container back through `getarrayitem_vable_r`,
+                            // and the blackhole replays BUILD→accumulate from
+                            // the jitcode on a mid-frame resume, so the slot
+                            // must be populated by the emitted op.  Same
+                            // pairing as `BUILD_LIST` / `LIST_APPEND`.
+                            let pushed: super::flow::FlowValue = result_value.into();
+                            current_state.stack.push(pushed.clone());
+                            emit_pushvalue_ref!(current_depth, current_depth, pushed, py_pc);
                         }
 
                         // BuildString(count): pops count strings, pushes 1. Net: -(count-1).
@@ -11485,8 +11533,18 @@ impl CodeWriter {
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
                             let value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let set_value =
-                                peek_container_or_fresh(&current_state, oparg, &mut graph);
+                            // PEEK(oparg) is the comprehension accumulator, so it
+                            // comes from its value-stack slot rather than the
+                            // symbolic stack — see `emit_accumulator_reload`.
+                            let set_value = emit_accumulator_reload(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var,
+                                stack_base_absolute,
+                                current_depth,
+                                oparg,
+                                py_pc as i64,
+                            );
                             emit_frontend_accumulate_2(
                                 &current_block.block(),
                                 "set_add",
