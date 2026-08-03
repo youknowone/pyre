@@ -32,6 +32,7 @@ pub mod helpers;
 pub mod jitcode_dispatch;
 pub mod jitcode_runtime;
 pub mod liveness;
+pub mod py_coord;
 pub mod pyjitcode;
 pub mod pyjitpl;
 pub mod pyre_cpu;

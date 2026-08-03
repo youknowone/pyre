@@ -1004,11 +1004,13 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         let caller_jitcode = unsafe { &*sym.jitcode() };
         let caller_code = unsafe { &*caller_jitcode.payload.code_ptr };
         // #73 Slice 4: forward after-residual fallthrough coordinate; the
-        // inversion survives only for the empty-twin class and as the audit
-        // oracle.
+        // containing lookup survives only for the empty-twin class and as the
+        // audit oracle.
         let legacy_resume_py_pc = || {
-            let call_py_pc =
-                python_pc_for_jitcode_pc(&caller_jitcode.payload.metadata, op.pc) as usize;
+            let call_py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(
+                &caller_jitcode.payload.metadata,
+                op.pc,
+            ) as usize;
             crate::pyjitpl::semantic_fallthrough_pc(caller_code, call_py_pc) as u32
         };
         let resume_py_pc = match caller_jitcode
@@ -2098,47 +2100,56 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     if sym.jitcode().is_null() {
         return Ok(None);
     }
-    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) =
-        if nested_helper_entry.is_some() {
-            (
-                ctx.entry_py_pc(),
-                0,
-                ctx.outer_jitcode_index,
-                ctx.outer_resume_marker_jit_pc,
-            )
-        } else {
-            unsafe {
-                let jc = &*sym.jitcode();
-                let jc_index = jc.index as u32;
-                let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
-                // Forward py twin first (#73 phase-3): equals the
-                // inversion-plus-trivia value by construction; the inversion
-                // survives for the empty-twin class, and the trivia skip below
-                // is an identity on the twin path.
-                let mut py = jc
-                    .payload
-                    .forward_py_pc_for_jitcode_pc(op.pc)
-                    .unwrap_or_else(|| python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc));
-                if jc.payload.code_ptr.is_null() {
-                    (py, sym.valuestackdepth() as i64, jc_index, marker)
+    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = if nested_helper_entry
+        .is_some()
+    {
+        (
+            ctx.entry_py_pc(),
+            0,
+            ctx.outer_jitcode_index,
+            ctx.outer_resume_marker_jit_pc,
+        )
+    } else {
+        unsafe {
+            let jc = &*sym.jitcode();
+            let jc_index = jc.index as u32;
+            let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
+            // Forward py twin first (#73 phase-3): equals the
+            // containing coordinate plus trivia normalization by
+            // construction; the containing lookup survives for the
+            // empty-twin class, and the trivia skip below is an identity
+            // on the twin path.
+            let mut py = jc
+                .payload
+                .forward_py_pc_for_jitcode_pc(op.pc)
+                .unwrap_or_else(|| {
+                    crate::py_coord::note_empty_twin_fallback(
+                        "builtin_call",
+                        jc.index,
+                        op.pc as i32,
+                    );
+                    crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op.pc)
+                });
+            if jc.payload.code_ptr.is_null() {
+                (py, sym.valuestackdepth() as i64, jc_index, marker)
+            } else {
+                let codeobj = &*jc.payload.code_ptr;
+                py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+                let depth = if jc.payload.depth_trivia_populated() {
+                    jc.payload.depth_trivia_for_jitcode_pc(op.pc)
                 } else {
-                    let codeobj = &*jc.payload.code_ptr;
-                    py = skip_python_trivia_forward(codeobj, py as usize) as u32;
-                    let depth = if jc.payload.depth_trivia_populated() {
-                        jc.payload.depth_trivia_for_jitcode_pc(op.pc)
-                    } else {
-                        crate::liveness::liveness_for(jc.payload.code_ptr)
-                            .depth_at_py_pc()
-                            .get(py as usize)
-                            .copied()
-                    };
-                    let vsd = depth
-                        .map(|d| (sym.nlocals() + d as usize) as i64)
-                        .unwrap_or(sym.valuestackdepth() as i64);
-                    (py, vsd, jc_index, marker)
-                }
+                    crate::liveness::liveness_for(jc.payload.code_ptr)
+                        .depth_at_py_pc()
+                        .get(py as usize)
+                        .copied()
+                };
+                let vsd = depth
+                    .map(|d| (sym.nlocals() + d as usize) as i64)
+                    .unwrap_or(sym.valuestackdepth() as i64);
+                (py, vsd, jc_index, marker)
             }
-        };
+        }
+    };
     let call_site_word = call_site_marker
         .map(|marker| marker as i32)
         .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
@@ -4091,7 +4102,9 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                     let callee_pjc =
                         crate::state::pyjitcode_for_code(w_code).ok_or("no callee pyjitcode")?;
                     let metadata = &callee_pjc.metadata;
-                    let callee_py_pc = python_pc_for_jitcode_pc(metadata, abort_pc) as usize;
+                    let callee_py_pc =
+                        crate::py_coord::containing_py_pc_for_jitcode_pc(metadata, abort_pc)
+                            as usize;
                     // Both abort kinds sit at the head of an opcode the walker
                     // could not take, behind at most that opcode's own vable
                     // spill; the marker kind is the narrower of the two.
@@ -4103,7 +4116,10 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                         body.code,
                         callee_py_pc,
                         abort_pc,
-                        |op_pc| python_pc_for_jitcode_pc(metadata, op_pc) as usize,
+                        |op_pc| {
+                            crate::py_coord::containing_py_pc_for_jitcode_pc(metadata, op_pc)
+                                as usize
+                        },
                     );
                     if !anchor_ok {
                         if fbw_debug_abort_enabled() {

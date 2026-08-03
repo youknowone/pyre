@@ -1,13 +1,12 @@
-//! pc-map inversion helpers and `PYRE_PCMAP_*` audit probes.
+//! pc-map audit probes.
 //!
-//! **Parity:** pyre-specific — the jitcode-pc <-> python-pc inversion and
-//! the `PYRE_PCMAP_*` audit probes have no `rpython/jit/metainterp/`
-//! counterpart (PyPy's pc handling is codewriter-side).
+//! **Parity:** pyre-specific — the `PYRE_PCMAP_*` audit probes have no
+//! `rpython/jit/metainterp/` counterpart (PyPy's pc handling is
+//! codewriter-side).
 //!
-//! Extracted verbatim from `jitcode_dispatch/mod.rs`: the jitcode-pc ->
-//! python-pc inversion (`python_pc_for_jitcode_pc` + floor-boundary
-//! helpers), the `skip_python_trivia_forward` boundary walker, and the
-//! report-only `PYRE_PCMAP_*` audit probes.
+//! Extracted verbatim from `jitcode_dispatch/mod.rs`: the
+//! `skip_python_trivia_forward` boundary walker and the report-only
+//! `PYRE_PCMAP_*` audit probes.
 
 use super::*;
 
@@ -31,7 +30,7 @@ pub(crate) fn pcmap_containing_audit_enabled() -> bool {
 
 /// `PYRE_PCMAP_AFTERRESIDUAL_AUDIT`: assert the Slice-C after-residual depth
 /// twin (`depth_after_residual_for_jitcode_pc`) equals the raw
-/// `depth_at_py_pc[semantic_fallthrough_pc(python_pc_for_jitcode_pc(jit_pc))]`
+/// `depth_at_py_pc[semantic_fallthrough_pc(containing_py_pc_for_jitcode_pc(jit_pc))]`
 /// read at each consumer seam. Off in production; the gated branch is the only
 /// added code.
 pub(crate) fn pcmap_afterresidual_audit_enabled() -> bool {
@@ -90,14 +89,16 @@ pub(crate) fn pcmap_recipe_resultcolor_audit_probe(site: &'static str, verdict: 
 pub(crate) fn resolve_parent_resume_py_pc(parent: &InlineParentFrame) -> Option<u32> {
     match parent.resume_coord {
         ParentResumeCoord::Backxlat(jitcode_pc) => {
-            // #73: read the forward py_pc twin (a codewriter-built,
-            // trivia-normalized twin of `backxlat_py_pc`'s result — proven equal
-            // corpus-wide in Slice 3'). The inversion survives only for the
-            // empty-twin class (skeleton / fixture jitcodes).
+            // #73: read the forward py_pc twin, a codewriter-built
+            // trivia-normalized twin of the containing coordinate. The
+            // containing lookup survives only for the empty-twin class.
             let twin = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)
                 .and_then(|pjc| pjc.forward_py_pc_for_jitcode_pc(jitcode_pc));
             Some(twin.unwrap_or_else(|| {
-                crate::state::backxlat_py_pc(parent.jitcode_index as i32, jitcode_pc as i32) as u32
+                crate::py_coord::trivia_normalized_py_pc_for_jitcode_pc(
+                    parent.jitcode_index as i32,
+                    jitcode_pc as i32,
+                ) as u32
             }))
         }
         ParentResumeCoord::CallFallthrough(call_jit_pc) => {
@@ -108,11 +109,13 @@ pub(crate) fn resolve_parent_resume_py_pc(parent: &InlineParentFrame) -> Option<
             if pjc.code_ptr.is_null() {
                 return None;
             }
-            // #73 Slice 4: read the forward after-residual fallthrough twin. The
-            // inversion survives only for the empty-twin class (populated code
-            // with no Python map) and as the audit oracle.
+            // #73 Slice 4: read the forward after-residual fallthrough twin.
+            // The containing lookup survives only for the empty-twin class
+            // (populated code with no Python map) and as the audit oracle.
             let legacy = || {
-                let call_py_pc = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
+                let call_py_pc =
+                    crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc)
+                        as usize;
                 let code = unsafe { &*pjc.code_ptr };
                 crate::pyjitpl::semantic_fallthrough_pc(code, call_py_pc) as u32
             };
@@ -137,43 +140,6 @@ pub(crate) fn resolve_parent_resume_py_pc(parent: &InlineParentFrame) -> Option<
     }
 }
 
-pub(crate) fn floor_boundary_at_or_after(
-    metadata: &crate::PyJitCodeMetadata,
-    jit_pc: usize,
-) -> Option<(usize, u32)> {
-    let table = &metadata.py_floor_by_jit_pc;
-    let idx = table.partition_point(|&(off, _)| (off as usize) < jit_pc);
-    table.get(idx).map(|&(off, py)| (off as usize, py))
-}
-
-pub(crate) fn first_floor_boundary_for_py(
-    metadata: &crate::PyJitCodeMetadata,
-    py_pc: u32,
-) -> Option<(usize, u32)> {
-    metadata
-        .py_floor_by_jit_pc
-        .iter()
-        .find(|&&(_, py)| py == py_pc)
-        .map(|&(off, py)| (off as usize, py))
-}
-
-pub(crate) fn python_pc_for_jitcode_pc(metadata: &crate::PyJitCodeMetadata, jit_pc: usize) -> u32 {
-    if !metadata.py_floor_by_jit_pc.is_empty() {
-        let pivot = metadata
-            .block_head_py_by_jit_pc
-            .binary_search_by_key(&jit_pc, |&(off, _)| off)
-            .ok()
-            .map(|i| metadata.block_head_py_by_jit_pc[i].1)
-            .or_else(|| {
-                crate::pyjitcode::floor_segment_for_jitcode_pc(&metadata.py_floor_by_jit_pc, jit_pc)
-                    .map(|(_, py)| py)
-            })
-            .expect("drained JitCode PC floor pivot must begin at byte offset zero");
-        return pivot;
-    }
-    0
-}
-
 /// Resolve an in-flight body channel exactly where a stash match needs its
 /// Python body pc. A missing JitCode entry is deliberately `None`: callers
 /// treat it as no match and retain the legacy replay/delivery fallback.
@@ -183,8 +149,9 @@ pub(crate) fn inflight_foriter_body_pc(body: InflightForiterBody) -> Option<usiz
         InflightForiterBody::Jit {
             outer_jitcode_index,
             op_pc,
-        } => crate::state::pyjitcode_for_jitcode_index(outer_jitcode_index as i32)
-            .map(|jc| python_pc_for_jitcode_pc(&jc.metadata, op_pc) as usize + 1),
+        } => crate::state::pyjitcode_for_jitcode_index(outer_jitcode_index as i32).map(|jc| {
+            crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.metadata, op_pc) as usize + 1
+        }),
     }
 }
 

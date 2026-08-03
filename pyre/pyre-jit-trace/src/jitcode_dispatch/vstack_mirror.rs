@@ -637,7 +637,7 @@ pub(crate) fn reseed_vstack_from_shadow<Sym: WalkSym>(
 }
 
 /// #73: map a jitcode pc to the Python opcode whose lowering region
-/// CONTAINS it, WITHOUT the `python_pc_for_jitcode_pc` block-head marker
+/// CONTAINS it, WITHOUT the `containing_py_pc_for_jitcode_pc` block-head marker
 /// special-case.  For the operand-stack mirror we want the containing
 /// opcode (where the walk physically is), not the resume block-head a
 /// `-live-` marker names — the marker case returns an EARLIER py_pc and

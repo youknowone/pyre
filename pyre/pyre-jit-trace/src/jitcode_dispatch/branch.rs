@@ -114,7 +114,7 @@ pub(crate) fn decode_side_other_target(
 /// genuine not-taken-arm jitcode offset (`derived` / other_target) DIRECTLY:
 /// `decode_side_other_target` picks the not-taken arm from `orgpc` + flavor and
 /// that jitcode offset IS the returned value. The former py_pc round-trip
-/// (`python_pc_for_jitcode_pc` -> `skip_python_trivia_forward` ->
+/// (`containing_py_pc_for_jitcode_pc` -> `skip_python_trivia_forward` ->
 /// historical Python-pc translation, with its `num_instrs` overshoot clamp) is
 /// deleted:
 /// it is byte-identical because the encode self-cert
@@ -225,8 +225,8 @@ pub(crate) fn branch_resume_target_stack_depth(
     }
     // Source the not-taken-arm depth off the genuine jitcode `target` through
     // the compile-time `depth_trivia` twin, retiring the
-    // `python_pc_for_jitcode_pc` inversion + runtime
-    // `skip_python_trivia_forward` + static-liveness read. The twin is built for
+    // `containing_py_pc_for_jitcode_pc` + runtime `skip_python_trivia_forward`
+    // + static-liveness read. The twin is built for
     // every drained real-code jitcode (codewriter.rs), and the encode census
     // (`PYRE_M73_ENCODE_AUDIT`) proved the empty-twin fallback is never reached
     // here (0 fallback trips / 162 programs; this reader 1181 hits, all

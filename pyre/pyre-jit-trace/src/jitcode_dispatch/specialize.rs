@@ -7089,20 +7089,28 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
         let jc = &*sym.jitcode();
         let jc_index = jc.index as u32;
         let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
-        // Forward py twin first (#73 phase-3): equals the inversion-plus-trivia
-        // value by construction; the inversion survives for the empty-twin
-        // class, and the trivia skip below is an identity on the twin path.
+        // Forward py twin first (#73 phase-3): equals the containing
+        // coordinate plus trivia normalization by construction; the containing
+        // lookup survives for the empty-twin class, and the trivia skip below
+        // is an identity on the twin path.
         let mut py = jc
             .payload
             .forward_py_pc_for_jitcode_pc(op.pc)
-            .unwrap_or_else(|| python_pc_for_jitcode_pc(&jc.payload.metadata, op.pc));
+            .unwrap_or_else(|| {
+                crate::py_coord::note_empty_twin_fallback(
+                    "list_append_commit",
+                    jc.index,
+                    op.pc as i32,
+                );
+                crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op.pc)
+            });
         if jc.payload.code_ptr.is_null() {
             (py, sym.valuestackdepth() as i64, jc_index, marker)
         } else {
             let codeobj = &*jc.payload.code_ptr;
             py = skip_python_trivia_forward(codeobj, py as usize) as u32;
             // Read the depth off the jitcode-pc-keyed trivia twin, which equals
-            // `depth_at_py_pc()[skip_python_trivia_forward(python_pc_for_jitcode_pc(op.pc))]`
+            // `depth_at_py_pc()[skip_python_trivia_forward(containing_py_pc_for_jitcode_pc(op.pc))]`
             // by construction; fall back to the py_pc-keyed static-liveness read
             // where the twin is unpopulated (skeleton / fixture install).
             let depth = if jc.payload.depth_trivia_populated() {

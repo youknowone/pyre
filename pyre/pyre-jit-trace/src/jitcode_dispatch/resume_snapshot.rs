@@ -43,7 +43,8 @@ pub(crate) fn after_residual_guard_marker(
 
 /// Read the Python PC paired with a native resume word.  The codewriter builds
 /// this table from Python-PC keys, including the same forward trivia skip as
-/// `backxlat_py_pc`; capture deliberately never projects the word backwards.
+/// `trivia_normalized_py_pc_for_jitcode_pc`; capture deliberately never derives
+/// it from the word.
 fn forward_snapshot_py_pc(jitcode_index: u32, pc: u32) -> Result<u32, DispatchError> {
     if pc == majit_ir::resumedata::NO_JITCODE_PC as u32 {
         return Ok(u32::MAX);
@@ -370,13 +371,23 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             let mut marker_call_jit_pc: Option<usize> = None;
             let (py_pc, jitcode_index, num_instrs) = unsafe {
                 let jc = &*sym.jitcode();
-                // Forward py twin first (#73 phase-3): equals the
-                // inversion-plus-trivia value by construction; the inversion
-                // survives for the empty-twin class (skeleton / fixture).
+                // Forward py twin first (#73 phase-3): equals the containing
+                // coordinate plus trivia normalization by construction; the
+                // containing lookup survives for the empty-twin class.
                 let mut py = jc
                     .payload
                     .forward_py_pc_for_jitcode_pc(op_pc)
-                    .unwrap_or_else(|| python_pc_for_jitcode_pc(&jc.payload.metadata, op_pc));
+                    .unwrap_or_else(|| {
+                        crate::py_coord::note_empty_twin_fallback(
+                            "capture_seam",
+                            jc.index,
+                            op_pc as i32,
+                        );
+                        crate::py_coord::containing_py_pc_for_jitcode_pc(
+                            &jc.payload.metadata,
+                            op_pc,
+                        )
+                    });
                 // A resolved py must be a real opcode, never Python trivia
                 // (e.g. a branch target whose block lowers `NOT_TAKEN`): the
                 // interpreter resumes branches at `semantic_fallthrough_pc` /
@@ -1034,8 +1045,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 )
             } else {
                 let entry = unsafe {
-                    first_floor_boundary_for_py(&(&*sym.jitcode()).payload.metadata, liveness_py_pc)
-                        .map(|(pc, _)| pc)
+                    crate::py_coord::first_floor_boundary_for_py(
+                        &(&*sym.jitcode()).payload.metadata,
+                        liveness_py_pc,
+                    )
+                    .map(|(pc, _)| pc)
                 };
                 match entry {
                     Some(pc) => (
@@ -1334,7 +1348,7 @@ fn call_null_or_self_slot<Sym: WalkSym>(
     let jc = unsafe { caller_sym.jitcode().as_ref()? };
     let code = unsafe { (jc.payload.code_ptr as *const pyre_interpreter::CodeObject).as_ref()? };
     let py_pc =
-        crate::jitcode_dispatch::python_pc_for_jitcode_pc(&jc.payload.metadata, call_jitcode_pc)
+        crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, call_jitcode_pc)
             as usize;
     let (pyre_interpreter::Instruction::Call { argc }, op_arg) =
         pyre_interpreter::decode_instruction_at(code, py_pc)?
@@ -1488,10 +1502,13 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
             callee_has_freevars,
         )?;
         // #73 phase-3 (twin-first): the forward `after_residual_fallthrough`
-        // twin carries the inverted-then-fallthrough coordinate; the inversion
-        // survives for the empty-twin class and as the audit oracle.
+        // twin carries the containing-then-fallthrough coordinate; the
+        // containing lookup survives for the empty-twin class and as the audit
+        // oracle.
         let legacy_fallthrough = || unsafe {
-            let call_py = python_pc_for_jitcode_pc(&jc.payload.metadata, call_jit_pc) as usize;
+            let call_py =
+                crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, call_jit_pc)
+                    as usize;
             let code = &*jc.payload.code_ptr;
             crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32
         };
@@ -1509,7 +1526,14 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
                 }
                 ft
             }
-            None => legacy_fallthrough(),
+            None => {
+                crate::py_coord::note_empty_twin_fallback(
+                    "inline_caller_fallthrough",
+                    jc.index,
+                    call_jit_pc as i32,
+                );
+                legacy_fallthrough()
+            }
         };
         (
             jc.index as u32,
@@ -1654,7 +1678,8 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         callee_has_freevars,
     )?;
     let legacy_fallthrough_py_pc = || unsafe {
-        let call_py = python_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
+        let call_py =
+            crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
         let code = &*pjc.code_ptr;
         crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32
     };
@@ -2115,7 +2140,10 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     if mf_diag || recipe_resultcolor_audit {
         let callee_py_pc = unsafe {
             let code = &*callee_pjc.code_ptr;
-            let mut py = python_pc_for_jitcode_pc(&callee_pjc.metadata, callee_op_pc);
+            let mut py = crate::py_coord::containing_py_pc_for_jitcode_pc(
+                &callee_pjc.metadata,
+                callee_op_pc,
+            );
             py = skip_python_trivia_forward(code, py as usize) as u32;
             if after_residual_call {
                 py = crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32;
@@ -2142,7 +2170,10 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             let verdict = match (scope.branch_guard_jitcode_pc, native_marker) {
                 (Some(_), _) => "branch_external",
                 (None, Some(marker)) => {
-                    let native_py = python_pc_for_jitcode_pc(&callee_pjc.metadata, marker) as usize;
+                    let native_py = crate::py_coord::containing_py_pc_for_jitcode_pc(
+                        &callee_pjc.metadata,
+                        marker,
+                    ) as usize;
                     if native_py == callee_py_pc as usize {
                         "eq"
                     } else {

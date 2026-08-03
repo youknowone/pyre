@@ -14377,14 +14377,14 @@ impl CodeWriter {
 
         // Predecessor-keyed jitcode-pc twins of
         // `pcdep_color_slots` and `depth_at_pc`, resolving a JitCode byte
-        // offset the way `python_pc_for_jitcode_pc` does — the block-head marker
+        // offset the way `containing_py_pc_for_jitcode_pc` does — the block-head marker
         // match first, else the largest `first_jit_pc_by_py_pc[py]` at-or-before
         // the offset (predecessor op containment).  Both tiers are baked into
         // ONE table: seed every op-start offset with its own py's value, then
         // OVERRIDE each block-head marker offset with the block-head py's value
-        // (marker precedence, `python_pc_for_jitcode_pc` :9009-9024).  A
+        // (marker precedence, `containing_py_pc_for_jitcode_pc` :9009-9024).  A
         // predecessor binary search (largest offset <= jit_pc) then reproduces
-        // `table[python_pc_for_jitcode_pc(jit_pc)]` for the carried resume
+        // `table[containing_py_pc_for_jitcode_pc(jit_pc)]` for the carried resume
         // coordinates that reach the decode re-inversion at `state.rs`
         // (`bridge_semantic_maps_at_with_jitcode_pc`), which are the guard's own
         // op offset or a block-head marker — never a mid-op byte.  Both sides
@@ -14408,14 +14408,14 @@ impl CodeWriter {
         // static depth.  A predecessor lookup then equals
         // `liveness_for(code).depth_at_py_pc()[skip_python_trivia_forward(inv(jit_pc))]`.
         // The trivia twin is split into the SAME two tiers as
-        // `python_pc_for_jitcode_pc` — a marker table matched EXACTLY (the block
+        // `containing_py_pc_for_jitcode_pc` — a marker table matched EXACTLY (the block
         // -head precedence tier, `block_head_py_by_jit_pc`'s depth analog) and an
         // op-start table matched by PREDECESSOR (`first_jit_pc_by_py_pc`'s depth
         // analog).  A single merged predecessor table is WRONG for an interior
         // query: a marker byte sits inside a preceding op's emitted region, so a
         // predecessor search for a coordinate past the op-start but before the
         // next op would land on that interior marker instead of the op-start.
-        // `python_pc_for_jitcode_pc` never returns a marker py for a non-exact
+        // `containing_py_pc_for_jitcode_pc` never returns a marker py for a non-exact
         // coordinate, so the marker tier must stay OUT of the predecessor scan.
         // The decode/bridge readers only ever query exact coordinates (guard op
         // offset or exact marker), which is why the phase-1 merged twins pass;
@@ -14480,7 +14480,7 @@ impl CodeWriter {
             }
             // Marker tier: exact-match, block-head precedence. Source the
             // corrected block-entry PC from the inversion table so the direct
-            // depth twin and `python_pc_for_jitcode_pc` cannot diverge.
+            // depth twin and `containing_py_pc_for_jitcode_pc` cannot diverge.
             for &(off, py) in &block_head_py_by_jit_pc {
                 let skipped_py =
                     pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py as usize);
@@ -14579,7 +14579,7 @@ impl CodeWriter {
                 after_residual_marker_marker_by_jit_pc.push((off, value));
                 // The retired runtime read took the fallthrough of the RAW
                 // block-head py (no trivia skip); match it exactly so the twin
-                // reproduces `result_color_at_pc[fallthrough(python_pc_for_jitcode_pc(off))]`.
+                // reproduces `result_color_at_pc[fallthrough(containing_py_pc_for_jitcode_pc(off))]`.
                 let ft_rc = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, py as usize);
                 result_color_after_residual_marker_by_jit_pc
                     .push((off, result_color_at_pc.get(ft_rc).copied()));

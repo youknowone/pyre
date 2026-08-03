@@ -528,7 +528,7 @@ fn resolve_entry_carrier_call_py_pc(
 ) -> Option<usize> {
     let outer = crate::state::pyjitcode_for_jitcode_index(outer_jitcode_index as i32);
     outer.filter(|payload| !payload.code_ptr.is_null())?;
-    Some(crate::state::forward_py_pc_or_backxlat(
+    Some(crate::py_coord::resume_py_pc_for_jitcode_word(
         outer_jitcode_index as i32,
         call_jitcode_pc as i32,
     ) as usize)
@@ -557,7 +557,7 @@ fn resolve_midbody_flush_words(
     let callee = crate::state::pyjitcode_for_jitcode_index(payload.callee_jitcode_index as i32);
     let outer = outer.filter(|payload| !payload.code_ptr.is_null())?;
     let callee = callee.filter(|payload| !payload.code_ptr.is_null())?;
-    let call_py_pc = crate::state::forward_py_pc_or_backxlat(
+    let call_py_pc = crate::py_coord::resume_py_pc_for_jitcode_word(
         payload.outer_jitcode_index as i32,
         payload.call_jitcode_pc as i32,
     ) as usize;
@@ -572,7 +572,7 @@ fn resolve_midbody_flush_words(
     if midbody_carry_audit_enabled() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static HITS: AtomicU64 = AtomicU64::new(0);
-        let callee_py_pc_convert = crate::jitcode_dispatch::python_pc_for_jitcode_pc(
+        let callee_py_pc_convert = crate::py_coord::containing_py_pc_for_jitcode_pc(
             &callee.metadata,
             payload.abort_jitcode_pc,
         ) as usize;
@@ -1104,7 +1104,8 @@ pub fn trace_bytecode<Sym: WalkSym>(
         start_pc
     };
     let lasti_pc = if let Some(ref c) = carrier {
-        crate::state::forward_py_pc_or_backxlat(c.root_jitcode_index, c.root_pc as i32) as usize
+        crate::py_coord::resume_py_pc_for_jitcode_word(c.root_jitcode_index, c.root_pc as i32)
+            as usize
     } else {
         start_pc
     };
@@ -1717,7 +1718,8 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             .recipes
             .iter()
             .map(|r| {
-                crate::state::forward_py_pc_or_backxlat(r.jitcode_index, r.jitcode_pc) as usize
+                crate::py_coord::resume_py_pc_for_jitcode_word(r.jitcode_index, r.jitcode_pc)
+                    as usize
             })
             .collect();
         eprintln!(
@@ -1859,7 +1861,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         if want_compile && middles_ok {
             if inject_root_call_result(sym, root_pc, result) {
                 crate::jitcode_dispatch::census_record("P2Drain::CompileRoot");
-                let root_py_pc = crate::state::forward_py_pc_or_backxlat(
+                let root_py_pc = crate::py_coord::resume_py_pc_for_jitcode_word(
                     carrier.root_jitcode_index,
                     root_pc as i32,
                 ) as usize;
@@ -1958,9 +1960,10 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             } else {
                 "P2Drain::CompileRootRaiseEscape"
             });
-            let root_py_pc =
-                crate::state::forward_py_pc_or_backxlat(carrier.root_jitcode_index, root_pc as i32)
-                    as usize;
+            let root_py_pc = crate::py_coord::resume_py_pc_for_jitcode_word(
+                carrier.root_jitcode_index,
+                root_pc as i32,
+            ) as usize;
             let action =
                 full_body_walk_trace(ctx, sym, w_code, root_py_pc, cf_addr, WalkJournals::Keep);
             // Defensive: `dispatch_via_miframe` consumes the seed, but a
@@ -1978,7 +1981,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             if p2_diag {
                 eprintln!(
                     "[p2-drain] callee sub-walk OK recipe_py_pc={} entry={entry} end_pc={end_pc} outcome={outcome:?}",
-                    crate::state::forward_py_pc_or_backxlat(
+                    crate::py_coord::resume_py_pc_for_jitcode_word(
                         recipe.jitcode_index,
                         recipe.jitcode_pc
                     )
@@ -2017,7 +2020,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                     "[p2-drain] callee sub-walk STOP callee={callee_name} \
                      source={source_path} recipe_py_pc={} entry={entry} \
                      stop_op={stop_op} err={e:?}",
-                    crate::state::forward_py_pc_or_backxlat(
+                    crate::py_coord::resume_py_pc_for_jitcode_word(
                         recipe.jitcode_index,
                         recipe.jitcode_pc
                     )
@@ -3161,7 +3164,9 @@ fn publish_terminal_raise_coordinate(
     let Ok(position) = i32::try_from(last_opcode_position) else {
         return;
     };
-    let Some(py_pc) = crate::state::python_pc_for_jitcode_pc_public(jitcode_index, position) else {
+    let Some(py_pc) =
+        crate::py_coord::containing_py_pc_for_jitcode_pc_public(jitcode_index, position)
+    else {
         return;
     };
     for &addr in frames {
@@ -3239,7 +3244,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         // else is a body that does not encode `start_pc`, which is exactly the
         // decline below.
         sidecar_entry.filter(|&off| {
-            crate::jitcode_dispatch::python_pc_for_jitcode_pc(&pjc.metadata, off) as usize
+            crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, off) as usize
                 >= start_pc
         })
     } else {
@@ -3287,7 +3292,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         if live_stack != entry_depth as usize && entry_is_resume_marker {
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 let marker_py =
-                    crate::jitcode_dispatch::python_pc_for_jitcode_pc(&pjc.metadata, entry);
+                    crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, entry);
                 eprintln!(
                     "[fbw-abort] start_pc={start_pc} entry={entry} live_stack={live_stack} \\
                      entry_depth={entry_depth} marker_py={marker_py}; declining marker-entry walk"
@@ -3805,7 +3810,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 _end_pc,
             )) => Some(loop_header_marker_jit_pc.map_or(*loop_header_pc, |marker| {
                 let marker_py =
-                    crate::jitcode_dispatch::python_pc_for_jitcode_pc(&pjc.metadata, marker)
+                    crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, marker)
                         as usize;
                 if marker_py == *loop_header_pc
                     && pjc.merge_entry_for(*loop_header_pc) != Some(marker)
@@ -4275,7 +4280,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                         );
                     }
                 } else if let Some(pjc) = pjc {
-                    let resume_py_pc = crate::jitcode_dispatch::python_pc_for_jitcode_pc(
+                    let resume_py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(
                         &pjc.metadata,
                         call_jitcode_pc,
                     ) as usize;

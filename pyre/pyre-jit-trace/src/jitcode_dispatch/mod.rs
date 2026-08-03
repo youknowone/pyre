@@ -672,7 +672,7 @@ fn record_inline_application_traceback<Sym: WalkSym>(
         // substitute `frame.last_instr`.  Whether an unmappable coordinate
         // should still contribute a node is a separate question from which
         // frame the node names.
-        let node_frame = crate::state::python_pc_for_jitcode_pc_public(
+        let node_frame = crate::py_coord::containing_py_pc_for_jitcode_pc_public(
             consts.jitcode_index,
             opcode_position as i32,
         )
@@ -811,8 +811,10 @@ fn traceback_node_site<Sym: WalkSym>(
         return None;
     }
     let jitcode = crate::state::pyjitcode_for_jitcode_index(jitcode_index)?;
-    let last_instruction =
-        crate::state::python_pc_for_jitcode_pc_public(jitcode_index, opcode_position as i32)?;
+    let last_instruction = crate::py_coord::containing_py_pc_for_jitcode_pc_public(
+        jitcode_index,
+        opcode_position as i32,
+    )?;
     let raw_code = crate::state::raw_code_for_jitcode_index(jitcode_index)?;
     let lineno =
         unsafe { pyre_interpreter::pyframe::offset2lineno(&*raw_code, last_instruction as isize) }
@@ -1081,8 +1083,9 @@ impl<Sym: WalkSym> Copy for FbwWalkMode<Sym> {}
 
 /// The outer snapshot's Python-PC coordinate. Non-root producers preserve the
 /// raw JitCode offset that produced the Python word, postponing the exact
-/// `backxlat_py_pc` inversion until a consumer needs it. Root entries and test
-/// fixtures have no such native coordinate and retain their Python value.
+/// `trivia_normalized_py_pc_for_jitcode_pc` lookup until a consumer needs it.
+/// Root entries and test fixtures have no such native coordinate and retain
+/// their Python value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EntryPyPc {
     Py(u32),
@@ -1387,7 +1390,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// was reconciled).
     pub vstack_depth: usize,
     /// #73: the Python pc of the opcode currently being walked.  A change
-    /// in `python_pc_for_jitcode_pc(jit_pc)` from this value marks a
+    /// in `containing_py_pc_for_jitcode_pc(jit_pc)` from this value marks a
     /// Python-opcode boundary, where the previous opcode's stack effect is
     /// reconciled into `vstack_boxes` (see [`reconcile_vstack_at_boundary`]).
     pub vstack_cur_pypc: u32,
@@ -1429,7 +1432,7 @@ impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
     fn entry_py_pc(&self) -> u32 {
         match self.entry_py_pc {
             EntryPyPc::Py(py_pc) => py_pc,
-            EntryPyPc::Jit(jitcode_pc) => crate::state::forward_py_pc_or_backxlat(
+            EntryPyPc::Jit(jitcode_pc) => crate::py_coord::resume_py_pc_for_jitcode_word(
                 self.outer_jitcode_index as i32,
                 jitcode_pc as i32,
             ) as u32,
@@ -5145,11 +5148,11 @@ struct InlineParentBlackhole {
 /// The derivation flavor of a paused caller frame's Python resume pc.
 #[derive(Clone, Copy)]
 enum ParentResumeCoord {
-    /// `resume_py_pc = backxlat_py_pc(jitcode_index, jitcode_pc)`. Used by
+    /// `resume_py_pc = trivia_normalized_py_pc_for_jitcode_pc(jitcode_index, jitcode_pc)`. Used by
     /// both bridge-root and reconstructed-recipe parent frames.
     Backxlat(usize),
     /// `resume_py_pc = semantic_fallthrough_pc(code,
-    /// python_pc_for_jitcode_pc(metadata, call_jitcode_pc))`.
+    /// containing_py_pc_for_jitcode_pc(metadata, call_jitcode_pc))`.
     CallFallthrough(usize),
 }
 
@@ -8068,7 +8071,8 @@ fn walker_foriter_green_key<Sym: WalkSym>(
     if w_code.is_null() {
         return None;
     }
-    let foriter_start_pc = python_pc_for_jitcode_pc(&jitcode.payload.metadata, op_pc) as usize;
+    let foriter_start_pc =
+        crate::py_coord::containing_py_pc_for_jitcode_pc(&jitcode.payload.metadata, op_pc) as usize;
     Some(crate::driver::make_green_key(w_code, foriter_start_pc))
 }
 
