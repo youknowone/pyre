@@ -11445,9 +11445,11 @@ impl<'a> Lowering<'a> {
     /// `#[pyre_class]::from_obj` returns `Option<&mut Self>`. Shared
     /// references `&T` are included when the pointee is a thin (Sized)
     /// nominal ADT — equally a one-word null niche — via
-    /// [`type_node_shared_ref_pointee`] + [`adt_node_def_id`]. Fat shared
-    /// references (`&str` / `&[T]` / `&dyn` / `&<?Sized>`, no ADT def-id) are
-    /// excluded: their two-word layout has no one-word niche payload.
+    /// [`type_node_shared_ref_pointee`] gated on the pointee's resolved layout
+    /// size being concrete. Fat shared references are excluded: `&str` / `&[T]`
+    /// / `&dyn` carry no ADT def-id, and an unsized nominal newtype (a DST such
+    /// as `Wtf8 { bytes: [u8] }`) DOES carry a def-id but has no concrete layout
+    /// size — both are two-word references with no one-word niche payload.
     ///
     /// `front::iter_next` interaction (shared arm only). `Iterator::next()`
     /// returns `Option<&T>`, and `front::iter_next` rewrites its
@@ -11490,16 +11492,26 @@ impl<'a> Lowering<'a> {
         }
         // A shared reference `&T` is equally a one-word null-pointer niche
         // (`Option<&T>` = nullable pointer, `Some(&T)` = the non-null pointer),
-        // but ONLY when the pointee is thin (Sized): a plain nominal ADT. A fat
-        // `&str` / `&[T]` / `&dyn Trait` / `&<?Sized generic>` is a two-word
-        // reference (data + length/vtable word), so aliasing the payload to the
-        // base pointer would read the metadata word — those carry no ADT
-        // def-id and are excluded. Read-only `#[pyre_class]` accessors reach
-        // here via `from_obj(...).map(|m| &*m) -> Option<&Self>` and
-        // `getdebug_data() -> Option<&FrameDebugData>`.
+        // but ONLY when the pointee is thin (Sized). A fat reference — `&str` /
+        // `&[T]` / `&dyn Trait`, and crucially an unsized nominal newtype like
+        // `rustpython_wtf8::Wtf8 { bytes: [u8] }` (`&Wtf8` = data + length word) —
+        // is two words, so aliasing the payload to the base pointer would read
+        // the metadata word. A def-id alone does NOT imply thin: a DST newtype
+        // is a nominal ADT with a def-id. Gate on the pointee's RESOLVED layout
+        // size being concrete (`Some`) — `None` is the DST/unsized signature.
+        // Read-only `#[pyre_class]` accessors reach here via
+        // `from_obj(...).map(|m| &*m) -> Option<&Self>` and
+        // `getdebug_data() -> Option<&FrameDebugData>`; every such `W_*` /
+        // `FrameDebugData` pointee is Sized (carries a concrete layout size).
         if let Some(shared_pointee) = type_node_shared_ref_pointee(payload, self.llbc)
             && let Some(stripped) = strip_ty_wrappers(shared_pointee, self.llbc)
-            && adt_node_def_id(stripped).is_some()
+            && let Some(def_id) = adt_node_def_id(stripped)
+            && self
+                .llbc
+                .type_by_id(def_id)
+                .and_then(|td| td.layout_for_target(&std::env::var("TARGET").unwrap_or_default()))
+                .and_then(|l| l.size)
+                .is_some()
         {
             return true;
         }
@@ -23621,6 +23633,84 @@ mod tests {
         assert!(
             super::type_node_shared_ref_pointee(&mut_ref, &llbc).is_none(),
             "type_node_shared_ref_pointee must not match a &mut ref"
+        );
+    }
+
+    /// The Sized gate must reject an UNSIZED nominal ADT: a DST newtype
+    /// (`rustpython_wtf8::Wtf8 { bytes: [u8] }`) IS a nominal ADT with a def-id,
+    /// but `&Wtf8` is a two-word fat pointer. The layout for such a type carries
+    /// `size: null`, so the layout-size predicate the recognizer composes must
+    /// see `None` (reject), while a sized `W_*` pointee carries a concrete size
+    /// (accept). Loads the real LLBC (needs Charon-resolved layouts), ignored.
+    #[test]
+    #[ignore]
+    fn sized_gate_rejects_unsized_wtf8_accepts_sized_wstruct() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let target = std::env::var("TARGET").unwrap_or_default();
+
+        // Resolve a type's layout size by its flattened name (as the recognizer
+        // does after `adt_node_def_id`): find its def-id, read layout.size.
+        let size_of = |suffix: &str| -> Option<Option<u64>> {
+            llbc.iter_type_decls()
+                .find(|td| td.item_meta.name_path().ends_with(suffix))
+                .map(|td| td.layout_for_target(&target).and_then(|l| l.size))
+        };
+
+        // Wtf8: a DST newtype → layout size is `None` → the gate rejects it.
+        assert_eq!(
+            size_of("rustpython_wtf8::Wtf8"),
+            Some(None),
+            "Wtf8 is an unsized DST newtype; its layout size must be None so the \
+             shared-ref niche gate rejects Option<&Wtf8>"
+        );
+        // FrameDebugData: a sized struct → concrete layout size → gate accepts.
+        assert!(
+            matches!(size_of("pyframe::FrameDebugData"), Some(Some(_))),
+            "FrameDebugData is Sized; its layout size must be Some so the \
+             shared-ref niche win keeps folding"
+        );
+    }
+
+    /// End-to-end: `str_slice_args -> Result<Option<&Wtf8>, PyError>` (matched by
+    /// `startswith`/`endswith`). Because `Wtf8` is an unsized DST, its
+    /// `Option<&Wtf8>` must NOT niche-fold — no pointer-null `ne` discriminant
+    /// against a `null_mut()` may appear, or the fat pointer's length word is
+    /// lost. The residual/aggregate Option handling must survive. Loads the real
+    /// LLBC, ignored.
+    #[test]
+    #[ignore]
+    fn str_slice_args_option_wtf8_not_niche_folded() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "str_slice_args").expect("lower str_slice_args");
+        // The niche discriminant fold emits `ne(base, null_mut())`; a declined
+        // Option keeps a `null_mut` builtin ONLY when genuinely niche. Assert no
+        // `null_mut` call is synthesised for this graph's Option<&Wtf8> — the fat
+        // ref must not be treated as a one-word niche.
+        let null_mut_calls = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some("null_mut")
+                )
+            })
+            .count();
+        assert_eq!(
+            null_mut_calls, 0,
+            "Option<&Wtf8> is a fat-ref DST option and must not niche-fold to a \
+             pointer-null test (no null_mut discriminant)"
         );
     }
 }
