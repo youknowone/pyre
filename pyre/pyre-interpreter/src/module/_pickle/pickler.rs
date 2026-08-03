@@ -30,6 +30,18 @@ fn cur_pickler(slot: usize) -> &'static mut W_Pickler {
     unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(slot) as *mut W_Pickler) }
 }
 
+/// Old-to-young / incremental-mark write barrier for a store into the
+/// pickler's own GC-pointer fields (`w_memo` / `w_dispatch_table` /
+/// `w_pers_func` / …). The GC transform emits `ll_writebarrier` after every
+/// such store (`rpython/memory/gctransform/framework.py:1423`); the
+/// hand-written port must call it, or an incremental major collection sweeps
+/// a freshly stored (white) child that the already-marked pickler still
+/// references — leaving a dangling field the next mark trips over.
+#[inline]
+fn pickler_write_barrier(obj: PyObjectRef) {
+    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
 #[crate::pyre_class("_pickle.Pickler")]
 pub struct W_Pickler {
     /// Output file (has a `write` method).
@@ -357,7 +369,7 @@ impl W_Pickler {
         // catch-all so the ctor keyword parameters (protocol/fix_imports/
         // buffer_callback) do not trip an unknown-argument error in `__new__`.
         let _ = _args;
-        W_Pickler::allocate(W_Pickler {
+        W_Pickler::allocate_stable(W_Pickler {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
@@ -444,7 +456,17 @@ impl W_Pickler {
 
     /// `Pickler.clear_memo` — reset the memo so the next `dump` starts fresh.
     fn clear_memo(&mut self) {
-        self.w_memo = pyre_object::listobject::w_list_new(Vec::new());
+        // `w_list_new` can collect, so re-read `self` from a pinned slot
+        // afterwards rather than storing through the stale `&mut` — the twin
+        // `UnpicklerMemoProxy::clear` already has this shape.
+        let self_obj = self as *mut W_Pickler as PyObjectRef;
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(self_obj);
+        let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let empty = pyre_object::listobject::w_list_new(Vec::new());
+        let me = cur_pickler(slot);
+        me.w_memo = empty;
+        pickler_write_barrier(me as *mut W_Pickler as PyObjectRef);
     }
 
     fn dump(&mut self, w_obj: PyObjectRef) -> Result<(), PyError> {
@@ -614,6 +636,7 @@ impl W_Pickler {
     #[setter]
     fn set_dispatch_table(&mut self, w_value: PyObjectRef) {
         self.w_dispatch_table = w_value;
+        pickler_write_barrier(self as *mut W_Pickler as PyObjectRef);
     }
 
     /// `_pickle.c:persistent_id` — the base implementation deliberately
@@ -658,6 +681,7 @@ impl W_Pickler {
     #[setter]
     fn set_persistent_id(&mut self, w_value: PyObjectRef) {
         self.w_pers_func = w_value;
+        pickler_write_barrier(self as *mut W_Pickler as PyObjectRef);
     }
 
     #[deleter("persistent_id")]
@@ -674,7 +698,7 @@ impl W_Pickler {
         pyre_object::gc_roots::pin_root(self_obj);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         memo_proxy::type_object();
-        let proxy = PicklerMemoProxy::allocate(PicklerMemoProxy {
+        let proxy = PicklerMemoProxy::allocate_stable(PicklerMemoProxy {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
@@ -685,6 +709,12 @@ impl W_Pickler {
         // its post-collection address.
         if let Some(px) = PicklerMemoProxy::from_obj(proxy) {
             px.w_pickler = pyre_object::gc_roots::shadow_stack_get(slot);
+            // `find_initializing_stores` would elide the barrier for a store
+            // into a just-malloc'd young object, but `allocate_stable` fires
+            // the managed barrier during construction and so consumes the
+            // proxy's fresh TRACK_YOUNG_PTRS; the exemption's premise no
+            // longer holds here.
+            pickler_write_barrier(proxy);
         }
         proxy
     }
@@ -749,6 +779,7 @@ impl W_Pickler {
         let me =
             unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut W_Pickler) };
         me.w_memo = list;
+        pickler_write_barrier(me as *mut W_Pickler as PyObjectRef);
         Ok(())
     }
 
@@ -849,6 +880,7 @@ mod memo_proxy {
             let p =
                 unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(slot) as *mut W_Pickler) };
             p.w_memo = empty;
+            pickler_write_barrier(p as *mut W_Pickler as PyObjectRef);
         }
     }
 }

@@ -103,7 +103,7 @@ impl W_Unpickler {
         // catch-all so the ctor keyword parameters (fix_imports/encoding/errors/
         // buffers) do not trip an unknown-argument error in `__new__`.
         let _ = _args;
-        W_Unpickler::allocate(W_Unpickler {
+        W_Unpickler::allocate_stable(W_Unpickler {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
@@ -465,7 +465,7 @@ impl W_Unpickler {
         pyre_object::gc_roots::pin_root(self_obj);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         memo_proxy::type_object();
-        let proxy = UnpicklerMemoProxy::allocate(UnpicklerMemoProxy {
+        let proxy = UnpicklerMemoProxy::allocate_stable(UnpicklerMemoProxy {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
@@ -476,6 +476,10 @@ impl W_Unpickler {
         // its post-collection address.
         if let Some(px) = UnpicklerMemoProxy::from_obj(proxy) {
             px.w_unpickler = pyre_object::gc_roots::shadow_stack_get(slot);
+            // See the pickler twin: `allocate_stable` already consumed the
+            // proxy's fresh TRACK_YOUNG_PTRS, so the initializing-store
+            // exemption does not apply.
+            unpickler_write_barrier(proxy);
         }
         proxy
     }

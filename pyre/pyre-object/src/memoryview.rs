@@ -120,7 +120,7 @@ pub fn w_buffer_wrapper_new(w_mv: PyObjectRef, w_obj: PyObjectRef) -> PyObjectRe
     let sp = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(w_mv);
     crate::gc_roots::pin_root(w_obj);
-    W_BufferWrapper::allocate(W_BufferWrapper {
+    W_BufferWrapper::allocate_stable(W_BufferWrapper {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
