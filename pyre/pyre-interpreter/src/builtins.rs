@@ -936,9 +936,7 @@ unsafe fn memoryview_slice_view(
         // result must keep the export alive and continue from its private
         // view snapshot (gh-92888).
         let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(mv);
-        pyre_object::gc_roots::pin_root(index);
+        let sp = pyre_object::gc_roots::pin_roots(&[mv, index]);
         let sliced = w_memoryview_alloc_header(false, true);
         let r_mv = pyre_object::gc_roots::shadow_stack_get(sp);
         let snapshot = w_memoryview_view(r_mv).clone();
@@ -2023,9 +2021,7 @@ fn memoryview_compare_eq(args: &[PyObjectRef], name: &str) -> Result<Option<bool
         }
 
         let _roots = pyre_object::gc_roots::push_roots();
-        let base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(mv);
-        pyre_object::gc_roots::pin_root(other);
+        let base = pyre_object::gc_roots::pin_roots(&[mv, other]);
         let other = pyre_object::gc_roots::shadow_stack_get(base + 1);
         let (rhs, temporary) = if pyre_object::memoryview::is_w_memoryview(other) {
             (other, false)
@@ -2343,9 +2339,11 @@ fn memoryview_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     // the view, the sought value and the iterator are reloaded from their slots
     // on every iteration rather than kept in raw locals across it.
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(args[0]);
-    pyre_object::gc_roots::pin_root(args[1]);
+    // One `pin_roots` rather than two `pin_root`s: the first pin's forwarding
+    // query is a safepoint, and `args` is a copied native slice a foreign
+    // collection would not rewrite, so the sought value has to be visible
+    // before that query runs.
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
     let iterator = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(base))?;
     let iterator_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(iterator);
@@ -2424,9 +2422,7 @@ fn memoryview_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     // The comparison runs a user `__eq__`, so the view and the sought value are
     // reloaded from their slots on every index rather than kept in raw locals.
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(mv);
-    pyre_object::gc_roots::pin_root(args[1]);
+    let base = pyre_object::gc_roots::pin_roots(&[mv, args[1]]);
     let item_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_none());
     for index in start..stop {
@@ -6191,11 +6187,15 @@ fn attribute_error_getstate_value(w_self: PyObjectRef) -> PyObjectRef {
         interp_exceptions::w_exception_get_name(pyre_object::gc_roots::shadow_stack_get(base))
     };
     if !w_name.is_null() {
+        // Mirrors the `args` twin below: both operands reach the dictionary
+        // from a root slot rather than from a raw read of the typed field.
+        pyre_object::gc_roots::pin_root(w_name);
+        let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         unsafe {
             pyre_object::w_dict_setitem_str(
                 pyre_object::gc_roots::shadow_stack_get(state_slot),
                 "name",
-                w_name,
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
             )
         };
     }

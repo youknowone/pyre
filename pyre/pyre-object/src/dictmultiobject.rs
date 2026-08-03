@@ -1643,11 +1643,14 @@ pub struct DictOperationGuard {
 impl DictOperationGuard {
     pub unsafe fn new(obj: PyObjectRef, refs: &[PyObjectRef]) -> Self {
         let roots = crate::gc_roots::push_roots();
-        let root_base = crate::gc_roots::shadow_stack_len();
-        crate::gc_roots::pin_root(obj);
-        for &value in refs {
-            crate::gc_roots::pin_root(value);
-        }
+        // The dictionary and its operands become visible in one write phase,
+        // before any query runs: `pin_root` resolves forwarding, that resolve
+        // is a safepoint, and `refs` is a caller-owned native slice no
+        // collection rewrites — so pinning `obj` first would leave every
+        // operand behind it naming a pre-collection address.
+        let root_base = crate::gc_roots::publish_roots(&[obj]);
+        crate::gc_roots::publish_roots(refs);
+        crate::gc_roots::normalize_roots(root_base, 1 + refs.len());
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let lock = unsafe { w_dict_lock_raw(obj) };
         Self {

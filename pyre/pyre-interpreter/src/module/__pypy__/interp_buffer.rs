@@ -66,10 +66,11 @@ pub(crate) fn newmemoryview(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
     let shape_obj = shape_arg.unwrap_or_else(pyre_object::w_none);
     let strides_obj = strides_arg.unwrap_or_else(pyre_object::w_none);
     let _roots = pyre_object::gc_roots::push_roots();
-    let sp = pyre_object::gc_roots::shadow_stack_len();
-    for value in [w_obj, itemsize_obj, fmt_obj, shape_obj, strides_obj] {
-        pyre_object::gc_roots::pin_root(value);
-    }
+    // One batch publish rather than five `pin_root`s: the first pin's forwarding
+    // query is itself a safepoint, so the four raw locals behind it would be
+    // read after a foreign collection could already have moved them.
+    let sp =
+        pyre_object::gc_roots::pin_roots(&[w_obj, itemsize_obj, fmt_obj, shape_obj, strides_obj]);
     let w_obj = pyre_object::gc_roots::shadow_stack_get(sp);
     if !unsafe { pyre_object::memoryview::is_w_memoryview(w_obj) } {
         return Err(PyError::value_error("memoryview expected"));
@@ -294,9 +295,10 @@ impl W_PickleBuffer {
         // __init__ phase.
         let (w_buffer, release_memoryview, w_release_exporter) = acquire_pickle_buffer(w_obj)?;
         let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_buffer);
-        pyre_object::gc_roots::pin_root(w_release_exporter);
+        // Both operands are Rust-stack copies out of `acquire_pickle_buffer`, so
+        // they have to become visible in one publish: pinning the first alone
+        // opens a safepoint the second copy would not survive.
+        let sp = pyre_object::gc_roots::pin_roots(&[w_buffer, w_release_exporter]);
         // `allocate` may collect; store the post-collection exporter rather
         // than the stale Rust-stack copy.
         let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
