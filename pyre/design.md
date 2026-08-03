@@ -146,18 +146,21 @@ de-specialization. majit expresses these as proc-macro attributes with the
 exact RPython names. Adding a new kind of hint to work around a translator
 weakness is the wrong direction; fix the translator (A1).
 
-### 3.3 Threading: the aspect argument, inverted to no-GIL
+### 3.3 Threading: the aspect argument, with no-GIL as the target
 
 D05.4 treats the GIL as one pluggable concurrency model among several and
 keeps all concurrency policy out of interpreter semantics. pyre accepts the
-framing and picks the other plug: **free-threaded from day one**. The same
-separation argument does the work — because PyPy's interpreter source never
-encoded GIL assumptions into *semantics*, a no-GIL port is even expressible.
-Consequences that are already policy:
+framing, and **free-threaded is the target, not the present mechanism**. The
+same separation argument is what makes that target reachable — because PyPy's
+interpreter source never encoded GIL assumptions into *semantics*, a no-GIL
+port is even expressible — but what ships today is a port of RPython's own GIL
+(`thread_gil.c` → `majit-gc/src/rgil.rs`); see "GC under free threading"
+below for why. Consequences that are already policy:
 
-- GIL-dependent RPython machinery (heapcache reset on GIL release,
-  `release_gil` effect info) keeps its names for parity but has no
-  production call sites.
+- GIL-dependent RPython machinery is ported, not merely named: `rgil` has
+  production call sites, and a thread holds the GIL for as long as it runs
+  pyre code. The pieces that remain name-only (heapcache reset on GIL
+  release, `release_gil` effect info) are the JIT-side ones.
 - Where RPython used ambient singletons justified by the GIL, pyre must
   justify each adaptation explicitly (TLS with a documented PyPy audit —
   the BACK_EDGE_BH_BUILDER precedent), never silently.
@@ -165,26 +168,36 @@ Consequences that are already policy:
   aspect-layer concern* (majit-gc), not by sprinkling atomics through
   pyre-object.
 
-**GC under free threading (settled 2026-07, gh#396).** The architecture is a
-**stop-the-world safepoint harness around an unchanged incminimark core** —
-the HotSpot/SGen shape, explicitly not PEP 703's non-moving route.
+**GC under free threading (gh#396).** The core is an unchanged incminimark;
+what supplies its exclusive-heap-access requirement has changed once.
 
+- *Settled 2026-07:* a **stop-the-world safepoint harness** — the HotSpot/SGen
+  shape, explicitly not PEP 703's non-moving route.
+- *Superseded 2026-08:* pyre supplies exclusive heap access with **a port of
+  RPython's own GIL** (`thread_gil.c` → `majit-gc/src/rgil.rs`). The harness's
+  per-`gc_op` gate could not be made cheap on its own terms — its entry needs
+  per-thread state, which on Mach-O is a `_tlv_get_addr` call on every
+  allocation — and upstream has no such gate at all (`rg threadlocalref_addr
+  rpython/memory/gctransform/framework.py rpython/memory/gc/incminimark.py`
+  has no hits: the allocation path reads no thread identity). Holding the GIL
+  across pyre code instead measured **−15.0%** on
+  `synth/int_mul_ovf_bignum_promote`, 12/12 rounds faster, and makes `gc_op` a
+  bare borrow of the singleton. The safepoint harness is still in the tree
+  behind the GIL; retiring it is tracked separately. TLABs and per-thread
+  store buffers were never built.
 - *Contract restatement.* What incminimark actually relies on is (a)
   exclusive heap access during each collection **step**, (b) enumerability
   of all roots at that instant, (c) all inter-step mutations caught by the
-  write barrier. The GIL was PyPy's implementation of (a); safepoints are
-  pyre's implementation of the same contract. The audit that this holds for
-  the *incremental* major is source-verified: major slices already execute
+  write barrier. Only (a) is what the two mechanisms above disagree about;
+  (b) and (c) are the same either way. The audit that this holds for the
+  *incremental* major is source-verified: major slices already execute
   at minor-collection time (`minor_collection_with_major_progress`,
   incminimark.py:824), hence inside STW windows; the barrier is deliberately
   newvalue-agnostic ("the incremental GC nowadays relies on this fact",
   incminimark.py:1516-1518) and its records are consumed at the next minor
   (VISITED clear + `more_objects_to_trace` re-append, incminimark.py:
-  2079-2083). Concurrency therefore lives entirely in the harness — mutator
-  registry, safepoint polls (allocation sites, runtime entry/exit, loop
-  back-edges: precisely the sites where the existing rooting invariant
-  already holds), TLABs, per-thread store buffers — and the ported
-  collection algorithms are not rewritten.
+  2079-2083). Concurrency therefore lives entirely in whatever supplies (a),
+  and the ported collection algorithms are not rewritten either way.
 - *Moving nursery is kept.* JIT inline nursery allocation is a performance
   pillar; embedder-boundary pointer stability is solved by pinning (upstream
   already has it: `GCFLAG_PINNED`, incminimark.py:148) or oldgen promotion,
@@ -198,7 +211,7 @@ the HotSpot/SGen shape, explicitly not PEP 703's non-moving route.
   `nursery_free` baked static address → thread-context-relative, with the
   inline fast-path shape unchanged; (4) the safepoint subsystem itself,
   which has no upstream counterpart (and therefore no merge surface).
-- *Non-options, with their failure mode*: a GIL (contradicts this section);
+- *Non-options, with their failure mode*:
   per-access locks on the GC handle (fixes the data race, not the
   moving-collector root-visibility race — demonstrated by the gh#396
   cargo-test heap corruption); interior mutability without synchronization

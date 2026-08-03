@@ -3894,12 +3894,7 @@ fn register_thread_root_areas() {
         register(forced_virtuals_root_walker_area, jit_driver);
         // The ephemeron half of the walker above, on the same `data` so the
         // prune reaches exactly the drivers the root walk reaches.
-        unsafe {
-            majit_gc::shadow_stack::register_mutator_pruner(
-                forced_virtuals_pruner_area,
-                jit_driver,
-            );
-        }
+        majit_gc::shadow_stack::register_mutator_pruner(forced_virtuals_pruner_area, jit_driver);
     }
 }
 

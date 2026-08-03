@@ -17,6 +17,7 @@ pub use rustpython_compiler_core::bytecode::{
 /// The `CompileError` is returned unflattened so the SyntaxError builders
 /// can read its `python_location` / `python_end_location` / `source_path`.
 pub fn compile_source(source: &str, mode: Mode) -> Result<CodeObject, CompileError> {
+    crate::module::thread::ensure_runtime_thread();
     rp_compile(source, mode, "<string>".into(), default_compile_opts())
 }
 
@@ -51,6 +52,7 @@ pub fn compile_source_with_opts(
     filename: &str,
     opts: CompileOpts,
 ) -> Result<CodeObject, CompileError> {
+    crate::module::thread::ensure_runtime_thread();
     rp_compile(source, mode, filename.into(), opts)
 }
 
@@ -200,12 +202,10 @@ pub fn decode_source_bytes(
 
 /// Compile a Python expression.
 pub fn compile_eval(source: &str) -> Result<CodeObject, CompileError> {
-    crate::module::thread::ensure_runtime_thread();
     compile_source(source, Mode::Eval)
 }
 
 /// Compile a Python script (module).
 pub fn compile_exec(source: &str) -> Result<CodeObject, CompileError> {
-    crate::module::thread::ensure_runtime_thread();
     compile_source(source, Mode::Exec)
 }

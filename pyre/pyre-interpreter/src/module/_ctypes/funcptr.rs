@@ -530,7 +530,15 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         use_errno,
         ..Default::default()
     };
-    let result = host_ctypes::call(addr, &host_args, restype, options).map_err(|e| match e {
+    // `clibffi.py:350-352` declares `ffi_call` with the default
+    // `releasegil='auto'`, i.e. released: the callee is arbitrary foreign code
+    // and may block on another Python thread's progress.  `owned` / `keepalive`
+    // hold the marshalled buffers across the released window.
+    let result = {
+        let _blocked = crate::module::thread::before_external_block();
+        host_ctypes::call(addr, &host_args, restype, options)
+    }
+    .map_err(|e| match e {
         host_ctypes::CallError::NullFunctionPointer => {
             crate::PyError::value_error("NULL function pointer")
         }

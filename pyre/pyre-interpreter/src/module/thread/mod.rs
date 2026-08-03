@@ -1374,6 +1374,9 @@ fn thread_is_stopping(ec: &mut crate::PyExecutionContext) {
             local.thread_is_stopping(ident);
         }
     }
+    // Last: nothing above runs bytecode, so nothing can reach the ticker this
+    // action is registered on after it is gone.
+    gil::shutdown(ec);
 }
 
 /// The calling thread's identity.

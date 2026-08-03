@@ -179,7 +179,8 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     #[cfg(feature = "sandbox")]
     {
         // The controller services the sleep; signal handling is its concern.
-        let _blocking = crate::module::thread::before_external_block();
+        // Every trampolined seam op already brackets its round trip, and the
+        // bracket does not nest — a second one would leave the census twice.
         crate::host_seam::ops::sleep(dur.as_secs_f64())
             .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
         Ok(w_none())

@@ -209,8 +209,10 @@ unsafe fn singleton_ref() -> &'static MiniMarkGC {
 ///
 /// It cannot go through [`gc_op`]: a collection in progress already holds the
 /// exclusive `&mut`, and forming a second one from inside its own root walk
-/// would alias it. Holding the GIL is what makes the shared borrow sound in
-/// both cases.
+/// would alias it. Holding the GIL is what rules out a *second thread*; what
+/// rules out the aliasing on this one is that the shared borrow dies with `f`
+/// and `f` reads only. A caller which resumed using the collection's `&mut`
+/// during `f` would still be forming overlapping borrows.
 #[inline]
 pub fn gc_query_reentrant<R>(f: impl FnOnce(&MiniMarkGC) -> R) -> R {
     debug_assert!(
@@ -294,9 +296,13 @@ pub fn unregister_thread() {
 ///
 /// Dropping the guard retakes the GIL, waits out an in-flight STW request, and
 /// makes the mutator RUNNING again.
+#[must_use = "the GIL is only released for as long as the guard is alive"]
 pub struct BlockingGuard {
     registered: bool,
     held_gil: bool,
+    /// The guard hands the GIL back to the thread that released it, and
+    /// rejoins *that* thread's census entry, so it must not cross threads.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl Drop for BlockingGuard {
@@ -349,6 +355,7 @@ pub fn before_external_block() -> BlockingGuard {
     BlockingGuard {
         registered,
         held_gil,
+        _not_send: std::marker::PhantomData,
     }
 }
 

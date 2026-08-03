@@ -651,9 +651,15 @@ mod real {
             let n = size.max(0) as usize;
             let mut buf = vec![0u8; n];
             // SAFETY: read(2) into a buffer we own and sized to `n`.
-            let got = blocking(|| unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, n) });
+            let (got, err) = blocking(|| {
+                let got = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, n) };
+                // Read `errno` before the guard hands the GIL back: the
+                // re-acquire can enter the stealer loop, whose mutex and
+                // condvar waits overwrite it.
+                (got, last_os_error())
+            });
             if got < 0 {
-                return Err(last_os_error());
+                return Err(err);
             }
             buf.truncate(got as usize);
             Ok(buf)

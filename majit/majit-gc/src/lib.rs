@@ -1028,7 +1028,7 @@ impl GcAllocator for GcHandle {
         gc_sync::gc_op(|gc| gc.disable())
     }
     fn isenabled(&self) -> bool {
-        gc_sync::gc_query(|gc| gc.isenabled())
+        gc_sync::gc_query_reentrant(|gc| gc.isenabled())
     }
     fn register_finalizer(&mut self, fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
         gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj, trigger))

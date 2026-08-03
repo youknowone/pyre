@@ -290,8 +290,11 @@ pub struct ExecutionContext {
     pub check_signal_action: Option<*mut dyn AsyncActionOps>,
     /// `gil.py:20-23 GILThreadLocals.initialize` — the `GILReleaseAction`
     /// registered on the ticker, which yields the GIL every
-    /// `sys.getcheckinterval()` bytecodes. Stored as a trait pointer into the
-    /// leaked action owned by `module::thread::gil`; `None` until installed.
+    /// `sys.getcheckinterval()` bytecodes. There is one per execution context,
+    /// because the ticker it is registered on is too, so unlike the
+    /// process-global signal action it is owned rather than leaked: the
+    /// pointer is the box `module::thread::gil::shutdown` gives back. `None`
+    /// until installed.
     pub gil_release_action: Option<*mut dyn AsyncActionOps>,
     /// `executioncontext.py sys_exc_operror` — the active exception for
     /// `sys.exc_info()` / bare `raise`, saved/restored across handler

@@ -10,12 +10,12 @@
 //! 1. [`RPY_FASTGIL`], a plain word. 0 means unlocked; otherwise it holds the
 //!    ident of the owning thread, so a thread checks whether it owns the GIL
 //!    with `rpy_fastgil == get_ident()`.
-//! 2. [`MUTEX_GIL`], a regular mutex which the fast path never unlocks.
+//! 2. `mutex_gil`, a regular mutex which the fast path never unlocks.
 //!
 //! Releasing is a plain store of 0; acquiring is a compare-and-swap against 0.
 //! Whoever loses the compare-and-swap enters [`acquire_slow_path`], becomes
-//! "the stealer" by taking [`MUTEX_GIL_STEALER`], and alternates between
-//! retrying the fast path and a timed wait on [`MUTEX_GIL`].
+//! "the stealer" by taking `mutex_gil_stealer`, and alternates between
+//! retrying the fast path and a timed wait on `mutex_gil`.
 //!
 //! # Lifetime
 //!
@@ -120,9 +120,50 @@ impl Mutex2 {
     }
 }
 
-/// thread_gil.c:89-90.
-static MUTEX_GIL_STEALER: Mutex<()> = Mutex::new(());
-static MUTEX_GIL: Mutex2 = Mutex2::new_locked();
+/// thread_gil.c:89-90. Held in one cell because `rpy_init_mutexes` re-creates
+/// both of them together, and a `std::sync::Mutex` can only be reset by
+/// overwriting it.
+struct GilMutexes {
+    stealer: Mutex<()>,
+    gil: Mutex2,
+}
+
+impl GilMutexes {
+    const fn new() -> Self {
+        GilMutexes {
+            stealer: Mutex::new(()),
+            gil: Mutex2::new_locked(),
+        }
+    }
+}
+
+struct GilMutexCell(std::cell::UnsafeCell<GilMutexes>);
+
+// SAFETY: the contents are `Sync`; the cell exists only so that
+// `init_mutexes` can replace them in a forked child, where this thread is the
+// only one alive.
+unsafe impl Sync for GilMutexCell {}
+
+static MUTEXES: GilMutexCell = GilMutexCell(std::cell::UnsafeCell::new(GilMutexes::new()));
+
+#[inline]
+fn mutexes() -> &'static GilMutexes {
+    // SAFETY: only `init_mutexes` ever writes, and only in a forked child
+    // before any other thread exists.
+    unsafe { &*MUTEXES.0.get() }
+}
+
+/// thread_gil.c:92-98 `rpy_init_mutexes`.
+///
+/// `mutex1_init` / `mutex2_init_locked` are `pthread_mutex_init` calls, which
+/// reset an already-locked mutex and abandon whatever state it held. The
+/// overwrite is the same operation: the old value is not dropped, because a
+/// thread which vanished in `fork()` may still "hold" it.
+fn init_mutexes() {
+    // SAFETY: reached only from the surviving thread of a `fork()`, which is
+    // the child's only thread, so no reference into the old value is live.
+    unsafe { std::ptr::write(MUTEXES.0.get(), GilMutexes::new()) };
+}
 
 // ──────────────────────────────────────────────────────────────
 // rgil.py surface
@@ -130,10 +171,11 @@ static MUTEX_GIL: Mutex2 = Mutex2::new_locked();
 
 /// rgil.py:161-167 `allocate` / thread_gil.c:100-109 `RPyGilAllocate`.
 ///
-/// The mutexes are const-initialised as statics, so all that is left of
-/// `rpy_init_mutexes` is publishing that the GIL may now be waited on. Until
-/// then [`acquire_slow_path`] is a fatal error, exactly as upstream: a program
-/// which never set threads up can only ever take the compare-and-swap.
+/// The mutexes are const-initialised, so all [`init_mutexes`] would do at
+/// startup is rewrite them with the value they already hold; what is left is
+/// publishing that the GIL may now be waited on. Until then
+/// [`acquire_slow_path`] is a fatal error, exactly as upstream: a program which
+/// never set threads up can only ever take the compare-and-swap.
 pub fn allocate() {
     let _ = RPY_WAITING_THREADS.compare_exchange(
         GIL_NOT_INITIALIZED,
@@ -146,8 +188,17 @@ pub fn allocate() {
 /// `rpy_init_mutexes` re-runs through `pthread_atfork` (thread_gil.c:105-107).
 /// Only the forking thread survives, so nothing can be waiting and the surviving
 /// holder's claim, if any, is restored by the caller.
+///
+/// Both mutexes are re-created rather than only re-flagged: a thread which was
+/// in [`acquire_slow_path`] when the parent forked holds `stealer` and the
+/// `gil.locked` guard, and the child inherits them locked by a thread that no
+/// longer exists.
 pub(crate) fn after_fork_child() {
-    *MUTEX_GIL.locked.lock().unwrap() = true;
+    debug_assert!(
+        am_i_holding_the_gil(),
+        "the forking thread must hold the GIL across fork()"
+    );
+    init_mutexes();
     RPY_WAITING_THREADS.store(0, Ordering::SeqCst);
 }
 
@@ -252,7 +303,7 @@ fn acquire_slow_path(ident: usize) {
             // pass, restoring the invariant that the GIL's two locks are both
             // held. Leaving here instead would hand the next stealer a mutex it
             // can take while we still own the word.
-            MUTEX_GIL.unlock();
+            mutexes().gil.unlock();
             break;
         }
     }
@@ -263,8 +314,9 @@ fn acquire_slow_path(ident: usize) {
     // Enter the waiting queue from the end. Assuming a roughly
     // first-in-first-out order, this gives the threads a round-robin chance.
     {
-        let _stealer = MUTEX_GIL_STEALER.lock().unwrap();
-        let mut gil = MUTEX_GIL.loop_start();
+        let mutexes = mutexes();
+        let _stealer = mutexes.stealer.lock().unwrap();
+        let mut gil = mutexes.gil.loop_start();
 
         // We are now the stealer thread. Steals!
         loop {
@@ -275,7 +327,7 @@ fn acquire_slow_path(ident: usize) {
             }
             // Sleep for one interval of time. We may be woken up earlier if
             // `mutex_gil` is released. Point (8.B).
-            let (guard, relocked) = MUTEX_GIL.lock_timeout(gil, MUTEX_GIL_POLL_INTERVAL);
+            let (guard, relocked) = mutexes.gil.lock_timeout(gil, MUTEX_GIL_POLL_INTERVAL);
             gil = guard;
             if relocked {
                 // `mutex_gil` was recently released and we just relocked it;
@@ -288,7 +340,12 @@ fn acquire_slow_path(ident: usize) {
 
     RPY_WAITING_THREADS.fetch_sub(1, Ordering::SeqCst);
     gc_sync::rejoin_running_after_gil(census);
-    debug_assert!(fastgil_locked());
+    // Both exits from the steal loop leave *this* thread's ident in the word,
+    // so the exit condition is ownership, not merely that the word is taken.
+    debug_assert!(
+        am_i_holding_the_gil(),
+        "acquire_slow_path returned without owning rpy_fastgil"
+    );
 }
 
 /// thread_gil.c:235-256 `RPyGilYieldThread`, driven by the periodic
@@ -304,7 +361,7 @@ pub fn yield_thread() -> bool {
     if RPY_WAITING_THREADS.load(Ordering::Relaxed) <= 0 {
         return false;
     }
-    MUTEX_GIL.unlock();
+    mutexes().gil.unlock();
     acquire();
     true
 }
@@ -336,8 +393,14 @@ impl Drop for GilGuard {
 mod tests {
     use super::*;
 
+    /// `RPY_FASTGIL` and `RPY_WAITING_THREADS` are process-global and the test
+    /// harness runs test functions on concurrent threads, so a second test
+    /// holding the GIL would be indistinguishable from a failure here.
+    static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
     #[test]
     fn fast_path_round_trip_leaves_the_word_free() {
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         allocate();
         let guard = GilGuard::acquire();
         assert!(am_i_holding_the_gil());
@@ -349,6 +412,7 @@ mod tests {
 
     #[test]
     fn yield_thread_without_waiters_keeps_the_gil() {
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         allocate();
         let _guard = GilGuard::acquire();
         assert!(!yield_thread());

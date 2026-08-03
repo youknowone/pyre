@@ -55,9 +55,9 @@ impl PeriodicAsyncActionOps for GilReleaseAction {}
 ///
 /// `use_bytecode_counter=True` is what puts it at the end of the periodic list
 /// (executioncontext.py:503-504: "hack to put the release-the-GIL one at the
-/// end of the list"), behind the signal check. Idempotent; the action is leaked
-/// deliberately because the actionflag holds a pointer into it for the whole
-/// run, exactly as `install_signal_handling` does.
+/// end of the list"), behind the signal check. Idempotent; the actionflag
+/// holds the action's heap address, so ownership stays with the execution
+/// context until [`shutdown`] gives it back.
 pub fn initialize(ec: &mut ExecutionContext) {
     if ec.gil_release_action.is_some() {
         return;
@@ -66,6 +66,25 @@ pub fn initialize(ec: &mut ExecutionContext) {
     let async_ptr: *mut dyn AsyncActionOps = &mut *action;
     action.register_periodic_action(&mut ec.actionflag, true);
     ec.gil_release_action = Some(async_ptr);
+}
+
+/// Reclaim what [`initialize`] registered.
+///
+/// Upstream has nothing to reclaim: one `GILReleaseAction` is registered on
+/// `space.actionflag` for the process. pyre gives each execution context its
+/// own ticker, so each one also allocates its own action, and a thread which
+/// leaves without giving it back leaks it.
+///
+/// The caller's execution context, and with it the actionflag that still names
+/// this action, is dropped immediately afterwards without running any Python
+/// in between.
+pub fn shutdown(ec: &mut ExecutionContext) {
+    let Some(action) = ec.gil_release_action.take() else {
+        return;
+    };
+    // SAFETY: the pointer is the one `initialize` leaked out of a `Box`, and
+    // this is the only place that takes it back.
+    drop(unsafe { Box::from_raw(action) });
 }
 
 /// gil.py:25-34 `GILThreadLocals.setup_threads` — "enable threads in the object
