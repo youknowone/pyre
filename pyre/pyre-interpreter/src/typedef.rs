@@ -10504,21 +10504,18 @@ fn init_type_type(ns: PyObjectRef) {
         )
     };
 
-    // typeobject.py:1237 descr__flags — the `tp_flags` bitmask.
-    let flags_getter = make_builtin_function_with_arity(
-        "__flags__",
-        |args| {
-            Ok(pyre_object::w_int_new(unsafe {
-                pyre_object::w_type_get_flags(args[1])
-            }))
-        },
-        2,
-    );
+    // CPython 3.14 typeobject.c `type_members`: the `tp_flags` field is a
+    // readonly member_descriptor.  Its value is computed from the same PyPy
+    // W_TypeObject flags as the former `descr__flags` GetSetProperty.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__flags__",
-            make_getset_descriptor(flags_getter),
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_TYPE_FLAGS,
+                "__flags__".to_owned(),
+                PY_NULL,
+            ),
         )
     };
 
@@ -10912,26 +10909,19 @@ fn init_type_type(ns: PyObjectRef) {
         )
     };
 
-    // PyPy typeobject.py:1164-1166 descr__base.  `object` has no best base,
-    // which is surfaced as None; for multiple inheritance this follows the
-    // most-derived instance layout rather than blindly choosing bases[0].
-    let base_getter = make_builtin_function_with_arity(
-        "__base__",
-        |args| unsafe {
-            let base = pyre_object::typeobject::w_type_get_best_base(args[1]);
-            if base.is_null() {
-                Ok(pyre_object::w_none())
-            } else {
-                Ok(base)
-            }
-        },
-        2,
-    );
+    // PyPy typeobject.py:973-975 `descr__base`, exposed with CPython 3.14's
+    // readonly `type_members.__base__` descriptor kind.  The direct getter
+    // still follows PyPy's best-base rule rather than blindly choosing
+    // `bases[0]`.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__base__",
-            make_getset_descriptor(base_getter),
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_TYPE_BASE,
+                "__base__".to_owned(),
+                PY_NULL,
+            ),
         )
     };
 }
@@ -12036,6 +12026,13 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
         }
         pyre_object::MEMBER_SUPER_SELF_CLASS => {
             let value = unsafe { pyre_object::descriptor::w_super_get_obj_type(obj) };
+            Ok(if value.is_null() { w_none() } else { value })
+        }
+        pyre_object::MEMBER_TYPE_FLAGS => {
+            Ok(w_int_new(unsafe { pyre_object::w_type_get_flags(obj) }))
+        }
+        pyre_object::MEMBER_TYPE_BASE => {
+            let value = unsafe { pyre_object::typeobject::w_type_get_best_base(obj) };
             Ok(if value.is_null() { w_none() } else { value })
         }
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
