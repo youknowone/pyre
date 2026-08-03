@@ -693,6 +693,7 @@ pub struct W_Range {
 }
 
 pub const RANGE_START_OFFSET: usize = std::mem::offset_of!(W_Range, start);
+pub const RANGE_STOP_OFFSET: usize = std::mem::offset_of!(W_Range, stop);
 pub const RANGE_STEP_OFFSET: usize = std::mem::offset_of!(W_Range, step);
 pub const RANGE_LENGTH_OFFSET: usize = std::mem::offset_of!(W_Range, length);
 

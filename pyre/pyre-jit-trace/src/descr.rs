@@ -1032,6 +1032,15 @@ static SEQ_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
+/// `stop` carries no accessor of its own — the GET_ITER virtualization derives
+/// the cursor from `start` / `step` / `length` — but it is a pointer-shaped
+/// slot, so it belongs in the census for the same reason `FUNCTION_DESCR_GROUP`
+/// lists every slot: `clear_gc_fields` walks exactly this group's
+/// `gc_fielddescrs` to emit a fresh object's delayed NULL stores, and a slot
+/// left out would keep recycled nursery bytes that the collector then follows
+/// as a child reference.  Its presence also keeps the list in byte-offset
+/// order, which is what makes the positional numbering agree with the
+/// analyzer's.
 static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<W_Range>(),
@@ -1047,6 +1056,7 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 true,
                 false,
             ),
+            ("stop", RANGE_STOP_OFFSET, 8, Type::Ref, false, true, false),
             ("step", RANGE_STEP_OFFSET, 8, Type::Ref, false, true, false),
             (
                 "length",
@@ -2144,7 +2154,7 @@ use pyre_object::floatobject::{
 };
 use pyre_object::functional::{
     RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_REMAINING_OFFSET, RANGE_ITER_STEP_OFFSET,
-    RANGE_LENGTH_OFFSET, RANGE_START_OFFSET, RANGE_STEP_OFFSET, W_Range,
+    RANGE_LENGTH_OFFSET, RANGE_START_OFFSET, RANGE_STEP_OFFSET, RANGE_STOP_OFFSET, W_Range,
 };
 use pyre_object::interp_exceptions::{
     EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_W_ATTR_OBJ_OFFSET, EXC_W_CAUSE_OFFSET,
@@ -2282,19 +2292,27 @@ pub fn seq_iter_index_descr() -> DescrRef {
     field_descr_from_group(&SEQ_ITER_DESCR_GROUP, 1)
 }
 
+/// Resolve one [`RANGE_DESCR_GROUP`] field by byte offset, so the accessors
+/// below stay correct however the census is ordered.  They were positional
+/// until `stop` joined the census and shifted every later slot.
+fn range_field_descr(offset: usize) -> DescrRef {
+    let parent = RANGE_DESCR_GROUP.size_descr.clone() as DescrRef;
+    majit_ir::descr::field_descr_from_parent_by_offset(&parent, offset)
+}
+
 /// Field descriptor for `W_Range.start` (wrapped PyObjectRef).
 pub fn range_start_descr() -> DescrRef {
-    field_descr_from_group(&RANGE_DESCR_GROUP, 0)
+    range_field_descr(RANGE_START_OFFSET)
 }
 
 /// Field descriptor for `W_Range.step` (wrapped PyObjectRef).
 pub fn range_step_descr() -> DescrRef {
-    field_descr_from_group(&RANGE_DESCR_GROUP, 1)
+    range_field_descr(RANGE_STEP_OFFSET)
 }
 
 /// Field descriptor for `W_Range.length` (wrapped PyObjectRef).
 pub fn range_length_descr() -> DescrRef {
-    field_descr_from_group(&RANGE_DESCR_GROUP, 2)
+    range_field_descr(RANGE_LENGTH_OFFSET)
 }
 
 /// `Method.w_function` — the underlying function (`Function` or
