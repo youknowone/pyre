@@ -1084,8 +1084,18 @@ impl BhFieldSpec {
     /// `BhDescr::Size.all_fielddescrs` matching `descr.py:188
     /// init_size_descr` parity.
     pub fn from_field_descr(fd: &dyn majit_ir::descr::FieldDescr) -> Self {
+        // descr.py:241-254 `get_type_flag`: a `Ptr` to a GC struct is
+        // FLAG_POINTER, and only a `Ptr` to a raw struct degrades to
+        // FLAG_UNSIGNED.  pyre models the raw case as `Type::Int`, so a
+        // pointer field always round-trips as `Pointer` — the same mapping the
+        // codewriter's own `value_type_to_field_flag` and
+        // `bh_field_flag_from_descr` already use.  Emitting `Unsigned` here
+        // made the round trip lossy: `SimpleFieldDescr::is_pointer_field()` is
+        // `flag == Pointer` (descr.py:173), so the rebuilt descr denied being
+        // a pointer field and `handle_write_barrier_setfield` dropped the
+        // store's write barrier.
         let field_flag = if fd.is_pointer_field() {
-            majit_ir::descr::ArrayFlag::Unsigned
+            majit_ir::descr::ArrayFlag::Pointer
         } else if fd.is_float_field() {
             majit_ir::descr::ArrayFlag::Float
         } else if fd.field_type() == majit_ir::value::Type::Void {
