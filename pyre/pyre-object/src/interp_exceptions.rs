@@ -250,7 +250,18 @@ impl ExcKind {
     /// `UnicodeEncodeError` / `UnicodeTranslateError` set `w_object` /
     /// `start` / `end` / `reason` (and `encoding` for the codec errors)
     /// (`builtins.rs::exc_unicode_*_error_init`,
-    /// interp_exceptions.py:433/1041/1159).
+    /// interp_exceptions.py:433/1041/1159); `SyntaxError` sets `msg` /
+    /// `filename` / `lineno` / `offset` / `text` / `end_lineno` /
+    /// `end_offset` (interp_exceptions.py:836); `StopIteration` sets
+    /// `value` (:496); `AttributeError` sets `name` / `obj` (:1134);
+    /// `NameError` sets `name` (:810); `SystemExit` sets `code` (:993);
+    /// `ImportError` / `ModuleNotFoundError` set `name` / `path` /
+    /// `name_from` (:363).
+    ///
+    /// The subclasses that inherit one of these initializers share their
+    /// parent's kind — `UnboundLocalError` is a `NameError`,
+    /// `IndentationError` and `TabError` are `SyntaxError`s — so naming the
+    /// parent covers them.
     ///
     /// A caller that reconstructs an exception from only
     /// `kind` / `w_class` / `args_w` (e.g. the traced inline
@@ -264,6 +275,13 @@ impl ExcKind {
                 | ExcKind::UnicodeDecodeError
                 | ExcKind::UnicodeEncodeError
                 | ExcKind::UnicodeTranslateError
+                | ExcKind::SyntaxError
+                | ExcKind::StopIteration
+                | ExcKind::AttributeError
+                | ExcKind::NameError
+                | ExcKind::SystemExit
+                | ExcKind::ImportError
+                | ExcKind::ModuleNotFoundError
         )
     }
 }
