@@ -730,7 +730,7 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
     // PYRE_WASM_JIT_STATS block above; which line they land on no longer
     // matters, since check.py merges every [jit-stats] line into one snapshot.
     // This line is the ONLY thing standing between a wasm-only descr-universe
-    // regression and a green gate, because `_jit_stats_regression_floor` reads a
+    // regression and a green gate, because `_jit_stats_change` reads a
     // field absent from the current run as zero — the healthy value. So a
     // counter that cannot be read must not resolve to zero: a module that
     // predates these exports would then look perfectly healthy while gating on
