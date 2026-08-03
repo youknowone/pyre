@@ -10337,6 +10337,35 @@ fn init_type_type(ns: PyObjectRef) {
             ),
         )
     };
+    // CPython 3.14 Objects/typeobject.c:6170-6188 `type.__sizeof__`.
+    // PyPy does not expose a type-specific override, so this is one of the
+    // explicit 3.14 compatibility additions: the object-side helper reads
+    // the canonical W_TypeObject heaptype/hasdict fields corresponding to
+    // CPython's PyHeapTypeObject and ht_cached_keys owners.
+    let sizeof_method = crate::gateway::make_builtin_function_with_arity_and_doc(
+        "__sizeof__",
+        |args| {
+            let w_type = args[0];
+            if !unsafe { pyre_object::is_type(w_type) } {
+                return Err(crate::PyError::type_error(format!(
+                    "descriptor '__sizeof__' for 'type' objects doesn't apply to a '{}' object",
+                    crate::baseobjspace::object_functionstr_type_name(w_type),
+                )));
+            }
+            Ok(pyre_object::w_int_new(unsafe {
+                pyre_object::w_type_get_abi_sizeof(w_type)
+            }))
+        },
+        1,
+        "Return memory consumption of the type object.",
+    );
+    unsafe {
+        crate::function::fset_func_text_signature(
+            sizeof_method,
+            pyre_object::w_str_new("($self, /)"),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__sizeof__", sizeof_method);
+    }
     // typeobject.py:833-841 `W_TypeObject.descr_or` / `descr_ror` delegate
     // to `_pypy_generic_alias._create_union`.
     unsafe {

@@ -1036,6 +1036,25 @@ pub unsafe fn w_type_get_abi_dictoffset(obj: PyObjectRef) -> i64 {
     (*(obj as *const W_TypeObject)).abi_dictoffset
 }
 
+/// CPython 3.14 `type.__sizeof__` (`Objects/typeobject.c:6175-6188`).
+///
+/// Static types occupy `PyTypeObject`. Heap types occupy
+/// `PyHeapTypeObject` and additionally own `ht_cached_keys` when their
+/// instances have a dictionary. PyPy's corresponding owner is the
+/// `W_TypeObject.hasdict` / mapdict terminator pair, so use that canonical
+/// field rather than introducing a parallel cache-presence table.
+pub unsafe fn w_type_get_abi_sizeof(obj: PyObjectRef) -> i64 {
+    const PYTYPEOBJECT_SIZE: i64 = 416;
+    const PYHEAPTYPEOBJECT_SIZE: i64 = 936;
+    const CACHED_KEYS_SIZE: i64 = 768;
+
+    let w_type = &*(obj as *const W_TypeObject);
+    if !w_type.flag_heaptype {
+        return PYTYPEOBJECT_SIZE;
+    }
+    PYHEAPTYPEOBJECT_SIZE + if w_type.hasdict { CACHED_KEYS_SIZE } else { 0 }
+}
+
 /// Finish CPython 3.14 ABI-member layout for a heap type after PyPy's
 /// `create_all_slots` has established its best base, visible slots, dict and
 /// weakref capabilities.  CPython inherits the variable-item width and the
