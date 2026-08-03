@@ -1189,13 +1189,8 @@ pub fn trace_bytecode<Sym: WalkSym>(
     }
     // Any path the walker did not trace above re-interprets without JIT for
     // this key. The location stays trace-eligible (no `DONT_TRACE_HERE`).
-    let action = if carrier.is_some() {
-        crate::jitcode_dispatch::census_record("Trait::CarrierAbort");
-        TraceAction::Abort
-    } else {
-        crate::jitcode_dispatch::census_record("Trait::DeclinedAbort");
-        TraceAction::Decline
-    };
+    crate::jitcode_dispatch::census_record("Trait::DeclinedAbort");
+    let action = TraceAction::Decline;
     finish_trace_namespace_dependency(meta);
     (action, concrete_frame)
 }

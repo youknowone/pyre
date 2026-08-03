@@ -818,18 +818,24 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
     // guest, and its `eprintln!` would reach nothing anyway, so the census
     // comes back through its own export and is printed here. Absent on a
     // module predating the export, in which case there is nothing to print.
-    if std::env::var_os("PYRE_WASM_FBW_CENSUS").is_some()
-        && let Ok(census) = instance.get_typed_func::<(), u64>(&mut store, "pyre_fbw_census")
-    {
-        let packed = census.call(&mut store, ())?;
-        let (ptr, clen) = ((packed >> 32) as u32, (packed & 0xffff_ffff) as u32);
-        if clen != 0 {
-            let mut bytes = vec![0u8; clen as usize];
-            memory.read(&store, ptr as usize, &mut bytes)?;
-            dealloc.call(&mut store, (ptr, clen))?;
-            eprint!("{}", String::from_utf8_lossy(&bytes));
-        } else {
-            eprintln!("[fbw-census] (no declines recorded)");
+    if std::env::var_os("PYRE_WASM_FBW_CENSUS").is_some() {
+        if let Ok(census) = instance.get_typed_func::<(), u64>(&mut store, "pyre_fbw_census") {
+            let census_result: Result<()> = (|| {
+                let packed = census.call(&mut store, ())?;
+                let (ptr, clen) = ((packed >> 32) as u32, (packed & 0xffff_ffff) as u32);
+                if clen != 0 {
+                    let mut bytes = vec![0u8; clen as usize];
+                    memory.read(&store, ptr as usize, &mut bytes)?;
+                    dealloc.call(&mut store, (ptr, clen))?;
+                    eprint!("{}", String::from_utf8_lossy(&bytes));
+                } else {
+                    eprintln!("[fbw-census] (no declines recorded)");
+                }
+                Ok(())
+            })();
+            if let Err(err) = census_result {
+                eprintln!("pyre-wasm-runner: fbw census failed: {err}");
+            }
         }
     }
     let exit_code = instance
