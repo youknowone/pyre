@@ -1213,8 +1213,9 @@ impl StructLayout {
     /// resolves on the inner struct directly (owner = the inner type), so
     /// the offset lookup never asks for an `{outer}.{inner}` name here; the
     /// by-value nested struct field's contribution to a sibling field's
-    /// **index** is recovered by the `get_fielddescr_index_in` recursion in
-    /// the `fielddescrof_concrete` walk ([`Self::recursive_field_count`]).
+    /// **index** is recovered by the
+    /// [`get_fielddescr_index_in`](crate::codewriter::heaptracker::get_fielddescr_index_in)
+    /// recursion the mint sites ask for that number.
     /// The header-embedding convention (`ob_header` / `base`) is flattened
     /// upstream by the subclass chain in `intern_class_by_qualname` (the
     /// embedded base's fields live on the base class, not in these `rows`).
@@ -1964,36 +1965,6 @@ impl CallControl {
         self.fielddescrof_concrete(idx, owner_root, owner_id, field_name)
     }
 
-    /// Number of leaf fielddescr slots a struct contributes to its parent
-    /// — `heaptracker.py:97-113 get_fielddescr_index_in`'s `-r - 1`
-    /// advancement.  Skips `Void` and `typeptr` and RECURSES into a
-    /// by-value nested struct field (`isinstance(FIELD, lltype.Struct)`),
-    /// so an embedded struct contributes its inner leaves' count, not one
-    /// slot.  A pointer-to-struct field has a non-struct type string
-    /// (`*const X` / `&X` / `Box<X>`), so `is_known_struct` returns false
-    /// and it counts as the single pointer slot it is.
-    fn recursive_field_count(&self, struct_name: &str) -> usize {
-        let Some(fields) = self.struct_fields.fields.get(struct_name) else {
-            return 1;
-        };
-        let mut count = 0;
-        for (fname, fty) in fields {
-            let (_flag, ir_type, _size) = get_type_flag(fty);
-            if matches!(ir_type, majit_ir::value::Type::Void) {
-                continue;
-            }
-            if fname == "typeptr" {
-                continue;
-            }
-            if self.is_known_struct(fty) {
-                count += self.recursive_field_count(fty);
-            } else {
-                count += 1;
-            }
-        }
-        count
-    }
-
     /// Trait-object sibling of [`Self::fielddescrof`] returning the
     /// resolved field-descr `Arc<dyn FieldDescr>` so analyzer and
     /// runtime share the SAME Arc — `set_ei_index` stamps land on
@@ -2034,19 +2005,6 @@ impl CallControl {
         use majit_ir::descr::{LLType, path_hash};
         let fields = self.struct_fields.fields.get(owner_root)?;
         let mut offset: usize = 0;
-        // `heaptracker.py:97-113 get_fielddescr_index_in(STRUCT, fieldname)`
-        // — positional index in `STRUCT._names`, skipping `Void` and
-        // `typeptr`.  Pyre's `struct_fields.fields[owner_root]` is the
-        // flat field list (no nested-struct inlining at analyzer time),
-        // so the enumeration position with `typeptr` skipped matches
-        // PyPy's `index_in_parent`.  Threaded into
-        // `gc_cache.get_field_descr` so the optimizer's
-        // `field_index_in_parent`-keyed slot maps
-        // (`optimizeopt/heap.rs FieldDescr::index_in_parent` consumer)
-        // get the slot-per-field discrimination PyPy's heaptracker
-        // assigns; the previous `0`-for-every-field stamp collided
-        // every field of one struct onto slot 0.
-        let mut field_pos: usize = 0;
         for (fname, fty) in fields {
             let (flag, ir_type, field_size) = get_type_flag(fty);
             if fname == "typeptr" {
@@ -2055,15 +2013,14 @@ impl CallControl {
             }
             // heaptracker.py:108-110: a by-value nested struct field is not
             // itself a leaf descr — `get_fielddescr_index_in` recurses into
-            // it, so it contributes its inner leaves' positions (and bytes),
-            // never matching as this `field_name` (an inner-field access
-            // resolves on the inner struct directly).  Checked before the
-            // name match to mirror the upstream `elif isinstance(FIELD,
-            // lltype.Struct)` ordering.  A pointer-to-struct field has a
-            // `*`/`&`/`Box<…>` type string, so `is_known_struct` is false
-            // and it stays a single pointer leaf.
+            // it, so it contributes its inner leaves' bytes, never matching
+            // as this `field_name` (an inner-field access resolves on the
+            // inner struct directly).  Checked before the name match to
+            // mirror the upstream `elif isinstance(FIELD, lltype.Struct)`
+            // ordering.  A pointer-to-struct field has a `*`/`&`/`Box<…>`
+            // type string, so `is_known_struct` is false and it stays a
+            // single pointer leaf.
             if self.is_known_struct(fty) {
-                field_pos += self.recursive_field_count(fty);
                 offset = offset.saturating_add(compute_struct_size(self, fty));
                 continue;
             }
@@ -2215,6 +2172,9 @@ impl CallControl {
                 // divergence that matters for enum variant payloads keyed
                 // by `{enum_leaf}::{variant}`.  Falls back to the
                 // accumulator only for a struct absent from `struct_layouts`.
+                // descr.py:228: index = heaptracker.get_fielddescr_index_in(
+                // STRUCT, fieldname).
+                let index_in_parent = field_pos_in(self, owner_root, field_name);
                 let descr = majit_ir::descr::gc_cache().lock().unwrap().get_field_descr(
                     struct_key,
                     field_name,
@@ -2227,7 +2187,7 @@ impl CallControl {
                     flag,
                     u32::MAX,
                     false,
-                    field_pos,
+                    index_in_parent,
                 );
                 descr.set_index(idx);
                 // Same arguments this `get_field_descr` miss just used, kept so
@@ -2243,13 +2203,12 @@ impl CallControl {
                         flag,
                         is_immutable,
                         is_quasi_immutable,
-                        index_in_parent: field_pos,
+                        index_in_parent,
                     },
                 );
                 return Some((descr as majit_ir::descr::DescrRef, member));
             }
             offset = offset.saturating_add(field_size);
-            field_pos += 1;
         }
         None
     }
@@ -2318,20 +2277,18 @@ impl CallControl {
         // FieldDescr / InteriorFieldDescr index namespace split.
         let fields = self.struct_fields.fields.get(&elem_name)?;
         let mut offset: usize = 0;
-        let mut field_pos: usize = 0;
         let mut found: Option<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> = None;
         for (fname, fty) in fields {
             let (flag, ir_type, field_size) = get_type_flag(fty);
             if fname == "typeptr" {
                 continue;
             }
-            // heaptracker.py:108-110: recurse past a by-value nested struct
-            // field so the inner FieldDescr's index matches
-            // `get_fielddescr_index_in`.  Mirrors the `fielddescrof_concrete`
-            // walk; the corpus's array-element structs carry no by-value
-            // nested struct field, so this never fires there.
+            // heaptracker.py:108-110: step past a by-value nested struct
+            // field's bytes; `get_fielddescr_index_in` recurses into it for
+            // the position.  Mirrors the `fielddescrof_concrete` walk; the
+            // corpus's array-element structs carry no by-value nested struct
+            // field, so this never fires there.
             if self.is_known_struct(fty) {
-                field_pos += self.recursive_field_count(fty);
                 offset = offset.saturating_add(compute_struct_size(self, fty));
                 continue;
             }
@@ -2381,7 +2338,11 @@ impl CallControl {
                 }
                 if found.is_none() {
                     // No runtime publish for this `(STRUCT, fieldname)` —
-                    // analyzer-only mint.
+                    // analyzer-only mint.  Index from the same walker
+                    // `fielddescrof_concrete` uses, so the inner FieldDescr of
+                    // an interior access and the direct field access agree
+                    // (`descr.py:228`, one numberer per STRUCT).
+                    let index_in_parent = field_pos_in(self, &elem_name, field_name);
                     let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
                     let mint = gc.get_field_descr(
                         struct_key,
@@ -2395,7 +2356,7 @@ impl CallControl {
                         flag,
                         u32::MAX,
                         false,
-                        field_pos,
+                        index_in_parent,
                     );
                     found = Some(mint as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
                 }
@@ -2469,7 +2430,6 @@ impl CallControl {
                 return Some((descr as majit_ir::descr::DescrRef, member));
             }
             offset = offset.saturating_add(field_size);
-            field_pos += 1;
         }
         None
     }
@@ -7373,6 +7333,31 @@ fn all_interiorfielddescrs(
     (result, item_size)
 }
 
+/// `descr.py:228 index = heaptracker.get_fielddescr_index_in(STRUCT, fieldname)`.
+///
+/// What makes `all_fielddescrs(S)[i].get_index() == i` a theorem upstream is
+/// that ONE walker answers both questions: `heaptracker.py:51-72
+/// all_fielddescrs` and `:97-113 get_fielddescr_index_in` share a skip set.
+/// The mint sites named that walker in their comments while counting the
+/// position themselves, and the two do not agree — a bare enumeration numbers
+/// `Void` fields, which `heaptracker.py:104-105` skips.
+///
+/// The negative return (`heaptracker.py:113` `-cur_index - 1`, "no such
+/// field") is not a state `descr.py:228` can reach: it asks only for fields
+/// the same walker already numbered. Both mint sites are inside the branch
+/// that matched `field_name`, so a refusal here means the two disagree about
+/// what a field is — reported rather than papered over with a second opinion.
+fn field_pos_in(cc: &CallControl, owner: &str, field_name: &str) -> usize {
+    let walked = crate::codewriter::heaptracker::get_fielddescr_index_in(cc, owner, field_name, 0);
+    usize::try_from(walked).unwrap_or_else(|_| {
+        panic!(
+            "get_fielddescr_index_in declined to number {owner}.{field_name} \
+             (returned {walked}) while the mint site had matched it \
+             (descr.py:228, heaptracker.py:97-113)"
+        )
+    })
+}
+
 /// RPython: `symbolic.get_array_token(ARRAY, tsc)[1]` — struct item_size.
 ///
 /// Layout source priority:
@@ -10120,12 +10105,21 @@ mod tests {
     }
 
     /// finding 3b: a by-value nested struct field contributes its inner
-    /// leaves' fielddescr slots (`heaptracker.py:108-110
+    /// leaves' fielddescr slots (`heaptracker.py:104-109
     /// get_fielddescr_index_in` recursion), not one container slot, so a
-    /// field after it gets the right `field_pos`.  A pointer-to-struct
-    /// field stays a single leaf.
+    /// field after it gets the right index.  A pointer-to-struct field stays
+    /// a single leaf.
+    ///
+    /// The embedded struct sits FIRST, which is the only position where
+    /// `heaptracker.py:108`'s `cur_index += -r - 1` is exact: the recursion
+    /// is seeded with the running `cur_index` (`:105`) and reports failure as
+    /// `-(cur_index + leaves) - 1` (`:113`), so the advancement is the leaf
+    /// count only while `cur_index` is still 0.  Both walkers upstream and
+    /// here rely on that — an inherited base is `_names[0]` in RPython
+    /// (`rclass` `super`) and `ob_header` is at offset 0 in pyre.
     #[test]
-    fn recursive_field_count_flattens_by_value_nested_struct() {
+    fn field_index_flattens_by_value_nested_struct() {
+        use crate::codewriter::heaptracker::get_fielddescr_index_in;
         let mut cc = CallControl::new();
         cc.struct_fields.fields.insert(
             "Inner".to_string(),
@@ -10134,23 +10128,26 @@ mod tests {
                 ("y".to_string(), "i64".to_string()),
             ],
         );
-        // Outer embeds Inner by value between two scalars, plus a
+        // Outer embeds Inner by value as its header, then two scalars and a
         // pointer-to-Inner that must NOT recurse.
         cc.struct_fields.fields.insert(
             "Outer".to_string(),
             vec![
+                ("hdr".to_string(), "Inner".to_string()),
                 ("a".to_string(), "i64".to_string()),
-                ("inner".to_string(), "Inner".to_string()),
                 ("p".to_string(), "&Inner".to_string()),
                 ("b".to_string(), "i64".to_string()),
             ],
         );
         cc.set_known_struct_names(["Inner".to_string()].into_iter().collect());
 
-        // Inner contributes its two leaves.
-        assert_eq!(cc.recursive_field_count("Inner"), 2);
-        // Outer: a(1) + inner→{x,y}(2) + `&Inner` pointer(1) + b(1) = 5.
-        assert_eq!(cc.recursive_field_count("Outer"), 5);
+        assert_eq!(get_fielddescr_index_in(&cc, "Inner", "y", 0), 1);
+        // Outer: hdr→{x,y} takes 0 and 1, a=2, `&Inner` pointer=3, b=4.
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "a", 0), 2);
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "p", 0), 3);
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "b", 0), 4);
+        // `heaptracker.py:113` `-cur_index - 1` over the 5 leaves above.
+        assert_eq!(get_fielddescr_index_in(&cc, "Outer", "missing", 0), -6);
     }
 
     #[test]
