@@ -521,6 +521,40 @@ unsafe fn walk_raw_getset_roots(value: PyObjectRef, visitor: &mut dyn FnMut(&mut
     }
 }
 
+/// Mark the GC-reachable children of the function a `staticmethod` /
+/// `classmethod` wraps.  A builtin type dict binds the wrapper, not the
+/// function, so `walk_raw_function_roots` applied to the dict value stops at
+/// the wrapper and never descends to `w_function`.  That function is
+/// Box-immortal — it never moves and so is never traced — while the metadata
+/// `TypeCache.build` stamps onto it (`w_qualname`, `w_objclass`) and its
+/// lazily allocated `w_func_dict` are ordinary young objects.  Without this
+/// walk a minor collection leaves those slots pointing into vacated nursery
+/// memory (`str.maketrans`, `dict.fromkeys`).  No-op for other values.
+unsafe fn walk_raw_wrapped_function_roots(
+    value: PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe {
+        if value.is_null() {
+            return;
+        }
+        // Positive predicates (see `walk_raw_getset_roots`): `!is_staticmethod`
+        // over a cross-crate bool is `UnaryNotUnknownOperand` to the annotator.
+        if pyre_object::function::is_staticmethod(value) {
+            walk_raw_function_roots(
+                pyre_object::function::w_staticmethod_get_func(value),
+                visitor,
+            );
+        }
+        if pyre_object::function::is_classmethod(value) {
+            walk_raw_function_roots(
+                pyre_object::function::w_classmethod_get_func(value),
+                visitor,
+            );
+        }
+    }
+}
+
 /// Box-immortal builtin types never have their `W_TYPE_GC_TYPE_ID` custom
 /// trace fired, but their namespaces, `bases`, and `weak_subclasses` can hold
 /// young GC objects after startup.  Walk every registered builtin type (and
@@ -1073,6 +1107,7 @@ pub unsafe fn walk_pyframe_roots_area(
                     // functions must be marked reachable here or the getter
                     // dangles after a collection.
                     walk_raw_getset_roots(*slot, visitor);
+                    walk_raw_wrapped_function_roots(*slot, visitor);
                 };
                 crate::importing::walk_import_roots_area(area.import_roots, &mut forward);
                 // The `_mapdict_caches` LOAD_METHOD `w_method` slots
@@ -1220,6 +1255,7 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
             walk_raw_function_roots(*slot, visitor);
             walk_raw_getset_roots(*slot, visitor);
+            walk_raw_wrapped_function_roots(*slot, visitor);
         };
         crate::baseobjspace::walk_method_cache_gc(&mut forward_cache);
     }
@@ -1240,6 +1276,7 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
             walk_raw_function_roots(*slot, visitor);
             walk_raw_getset_roots(*slot, visitor);
+            walk_raw_wrapped_function_roots(*slot, visitor);
         };
         walk_builtin_type_dicts_gc(&mut forward);
         // interp_codecs.CodecState is `space.fromcache(CodecState)` in PyPy:
