@@ -2247,6 +2247,13 @@ pub enum DispatchError {
     /// `pyjitpl.py get_procedure_token(greenboxes)` always receives
     /// concrete greens at a reached merge point.
     JitMergePointGreenKeyUnresolved { pc: usize },
+    /// The full-body walk reached a merge point with a live operand-stack
+    /// slot that has no Ref box in its MIFrame-equivalent `vstack_boxes`.
+    /// RPython's `reached_loop_header` receives a complete list of live boxes;
+    /// retaining the old virtualizable-shadow entry here would instead carry
+    /// a stale object across the backedge.  Decline the walk until the
+    /// unboxed Int/Float producer can be materialized as a W_Root box.
+    MergePointVstackUnbound { pc: usize, stack_index: usize },
     /// `loop_header/i` or `jit_merge_point/iIRFIRF` could not resolve its
     /// jdindex operand to a concrete Int. The assembler encodes the jdindex as a
     /// populated int-constant-pool slot (`assembler.rs loop_header`:
@@ -2400,6 +2407,7 @@ impl DispatchError {
                 "LastExceptionWithoutActiveException"
             }
             Self::JitMergePointGreenKeyUnresolved { .. } => "JitMergePointGreenKeyUnresolved",
+            Self::MergePointVstackUnbound { .. } => "MergePointVstackUnbound",
             Self::LoopHeaderJdIndexUnresolved { .. } => "LoopHeaderJdIndexUnresolved",
             Self::SubWalkClosedLoop { .. } => "SubWalkClosedLoop",
             Self::BranchGuardKeptStackUnsupported { .. } => "BranchGuardKeptStackUnsupported",
@@ -2467,6 +2475,7 @@ impl DispatchError {
             | Self::GuardResumeCoordinateUnavailable { pc, .. }
             | Self::LastExceptionWithoutActiveException { pc, .. }
             | Self::JitMergePointGreenKeyUnresolved { pc, .. }
+            | Self::MergePointVstackUnbound { pc, .. }
             | Self::LoopHeaderJdIndexUnresolved { pc, .. }
             | Self::SubWalkClosedLoop { pc, .. }
             | Self::BranchGuardKeptStackUnsupported { pc, .. }
@@ -5345,21 +5354,34 @@ fn sync_intermediate_merge_point_last_instr(ctx: &mut TraceCtx, merge_pc: usize)
 /// closes the merge point.  The concrete snapshot depth is updated for the
 /// existing `MIFrame::concrete_valuestackdepth` reader; no user-visible heap
 /// frame is involved.
-fn sync_merge_point_vstack_to_virtualizable<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+fn first_unbound_vstack_slot(vstack_boxes: &[OpRef], depth: usize) -> Option<usize> {
+    (0..depth).find(|&index| {
+        vstack_boxes
+            .get(index)
+            .is_none_or(|value| *value == OpRef::NONE)
+    })
+}
+
+fn sync_merge_point_vstack_to_virtualizable<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) -> Result<(), usize> {
     if !ctx.vstack_valid {
-        return;
+        return Ok(());
     }
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {
-        return;
+        return Ok(());
     }
     let sym = unsafe { &*sym_ptr };
     if !sym.owns_virtualizable_shadow() {
-        return;
+        return Ok(());
     }
 
     let nlocals = sym.nlocals();
-    let depth = ctx.vstack_depth.min(ctx.vstack_boxes.len());
+    let depth = ctx.vstack_depth;
+    if let Some(stack_index) = first_unbound_vstack_slot(&ctx.vstack_boxes, depth) {
+        return Err(stack_index);
+    }
     let absolute_depth = nlocals + depth;
     crate::state::set_concrete_stack_depth(sym.tracing_vable_frame_addr(), absolute_depth);
     let vsd = ctx.trace_ctx.const_int(absolute_depth as i64);
@@ -5372,11 +5394,10 @@ fn sync_merge_point_vstack_to_virtualizable<Sym: WalkSym>(ctx: &mut WalkContext<
 
     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
     for (stack_index, &value) in ctx.vstack_boxes[..depth].iter().enumerate() {
-        if value != OpRef::NONE {
-            ctx.trace_ctx
-                .set_virtualizable_box_at(nvs + nlocals + stack_index, value);
-        }
+        ctx.trace_ctx
+            .set_virtualizable_box_at(nvs + nlocals + stack_index, value);
     }
+    Ok(())
 }
 
 /// Call-scoped inputs for one guard-snapshot capture — the explicit-parameter
@@ -11150,8 +11171,13 @@ fn handle<Sym: WalkSym>(
             // instead of header-1=86 on fannkuch), resuming the interpreter
             // at the wrong bytecode (fannkuch permutation state never
             // reaches its exit condition → non-crashing infinite loop).
+            sync_merge_point_vstack_to_virtualizable(ctx).map_err(|stack_index| {
+                DispatchError::MergePointVstackUnbound {
+                    pc: op.pc,
+                    stack_index,
+                }
+            })?;
             sync_intermediate_merge_point_last_instr(ctx.trace_ctx, next_instr);
-            sync_merge_point_vstack_to_virtualizable(ctx);
 
             // Reds = the live loop args, in bytecode bank order
             // [int.., ref.., float..]. For pyre's portal jitdriver the

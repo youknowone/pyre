@@ -11362,6 +11362,25 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
     }
 }
 
+#[test]
+fn merge_point_vstack_rejects_holes_and_missing_tail() {
+    let mut tc = fresh_trace_ctx();
+    let first = tc.const_ref(0x1_0000);
+    let third = tc.const_ref(0x3_0000);
+
+    assert_eq!(
+        first_unbound_vstack_slot(&[first, OpRef::NONE, third], 3),
+        Some(1),
+        "an unboxed live slot must not retain the previous shadow value",
+    );
+    assert_eq!(
+        first_unbound_vstack_slot(&[first], 2),
+        Some(1),
+        "a short mirror must not silently truncate the live stack",
+    );
+    assert_eq!(first_unbound_vstack_slot(&[first, third], 2), None);
+}
+
 /// `loop_header/i` stamps `seen_loop_header_for_jdindex` from its
 /// int-constant operand and records nothing (pyjitpl.py).
 #[test]

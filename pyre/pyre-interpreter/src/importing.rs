@@ -705,6 +705,11 @@ pub fn install_builtin_modules() {
     // ImportError` cannot recover from.  Leaving them unregistered lets the
     // pure-Python fallback take over: `_datetime` -> `_pydatetime`,
     // `_decimal` -> `_pydecimal`, `_asyncio` -> pure-Python asyncio.
+    // `_stat` is the exception: frozen importlib imports it while bootstrapping
+    // a sandbox that deliberately mounts no stdlib files.  `stat.py` already
+    // defines its portable constants before the optional accelerator import,
+    // so the empty builtin remains sufficient for both paths.
+    register_builtin_module("_stat", empty_module_init);
     register_builtin_module_with_startup(
         "array",
         crate::module::array::init_array_module,
