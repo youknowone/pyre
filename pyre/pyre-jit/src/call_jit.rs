@@ -5965,6 +5965,44 @@ pub extern "C" fn bh_delete_name_fn(frame_ptr: i64, w_name: i64) -> i64 {
     }
 }
 
+/// `LOAD_LOCALS` residual using the frame receiver.
+/// `pyopcode.py:793-794` — `pushvalue(getorcreatedebug().w_locals)`, which
+/// must hand back the frame's own mapping so a metaclass `__prepare__` result
+/// keeps its type. Infallible, so unlike the name residuals there is no
+/// exception-publishing arm.
+pub extern "C" fn bh_load_locals_fn(frame_ptr: i64) -> i64 {
+    assert!(
+        frame_ptr != 0,
+        "bh_load_locals_fn requires a non-null PyFrame; every LOAD_LOCALS emit \
+         site must thread portal_frame_reg as its ref operand"
+    );
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    frame.get_or_create_w_locals() as i64
+}
+
+/// `LOAD_BUILD_CLASS` residual using the frame receiver.
+/// `pyopcode.py:866-870` — `get_builtin().getdictvalue('__build_class__')`,
+/// a NameError when the selected builtin mapping has no entry. Delegates to
+/// `eval.rs load_build_class_value` so the interpreter and the residual share
+/// one lookup, the same contract `bh_load_name_fn` documents. On error it
+/// publishes through both exception cells and returns 0.
+pub extern "C" fn bh_load_build_class_fn(frame_ptr: i64) -> i64 {
+    use pyre_interpreter::pyopcode::OpcodeStepExecutor;
+    assert!(
+        frame_ptr != 0,
+        "bh_load_build_class_fn requires a non-null PyFrame; every \
+         LOAD_BUILD_CLASS emit site must thread portal_frame_reg as its ref operand"
+    );
+    let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+    match frame.load_build_class_value() {
+        Ok(w_value) => w_value as i64,
+        Err(mut err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
+}
+
 /// DELETE_GLOBAL residual using the frame receiver and interned-name ABI.
 /// pyopcode.py DELETE_GLOBAL deletes directly from `w_globals`.
 pub extern "C" fn bh_delete_global_fn(frame_ptr: i64, w_name: i64) -> i64 {

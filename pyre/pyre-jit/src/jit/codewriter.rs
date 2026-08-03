@@ -2752,6 +2752,21 @@ fn emit_frontend_store_global(
     );
 }
 
+/// `LOAD_LOCALS` / `LOAD_BUILD_CLASS` — the two class-body frame methods whose
+/// only operand is the receiver. Frame-receiver call shape like
+/// `emit_frontend_load_name`; `opname` lowers to `bh_load_locals_fn(frame)` /
+/// `bh_load_build_class_fn(frame)` (`flatten::lower_load_locals_hlop_to_insn`,
+/// `flatten::lower_load_build_class_hlop_to_insn`).
+fn emit_frontend_frame_only_ref(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    opname: &'static str,
+    frame: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(graph, block, opname, vec![frame.into()], Kind::Ref, offset)
+}
+
 fn emit_frontend_delete_name(
     _graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -3504,6 +3519,8 @@ struct FnPtrIndices {
     match_mapping_fn: HelperHandle,
     match_keys_fn: HelperHandle,
     match_class_fn: HelperHandle,
+    load_locals_fn: HelperHandle,
+    load_build_class_fn: HelperHandle,
     load_from_dict_or_globals_fn: HelperHandle,
     call_function_ex_fn: HelperHandle,
     unary_not_fn: HelperHandle,
@@ -4213,6 +4230,23 @@ fn register_helper_fn_pointers(
         cpu.match_class_fn as *const (),
         CallFlavor::MayForce,
     );
+    // Class-body frame methods; neither runs user code. `bh_load_locals_fn`
+    // hands back the frame's own `w_locals`, allocating a dict only for the
+    // degenerate unbound case, and has no error path at all →
+    // `PlainCannotRaise`, which is also what `graph_op_can_raise` says about
+    // its opname. `bh_load_build_class_fn` reads one builtin-dict entry and
+    // raises `NameError` when it is absent → `Plain`. Appended last to
+    // preserve fn_ptr indices.
+    let load_locals_fn = bind(
+        assembler,
+        cpu.load_locals_fn as *const (),
+        CallFlavor::PlainCannotRaise,
+    );
+    let load_build_class_fn = bind(
+        assembler,
+        cpu.load_build_class_fn as *const (),
+        CallFlavor::Plain,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4296,6 +4330,8 @@ fn register_helper_fn_pointers(
         match_mapping_fn,
         match_keys_fn,
         match_class_fn,
+        load_locals_fn,
+        load_build_class_fn,
         load_from_dict_or_globals_fn,
         call_function_ex_fn,
         call_kw_fn_0,
@@ -5973,6 +6009,16 @@ impl CodeWriter {
                     idx: match_class_fn_idx,
                     flavor: _match_class_fn_flavor,
                 },
+            load_locals_fn:
+                HelperHandle {
+                    idx: load_locals_fn_idx,
+                    flavor: _load_locals_fn_flavor,
+                },
+            load_build_class_fn:
+                HelperHandle {
+                    idx: load_build_class_fn_idx,
+                    flavor: _load_build_class_fn_flavor,
+                },
             load_from_dict_or_globals_fn:
                 HelperHandle {
                     idx: load_from_dict_or_globals_fn_idx,
@@ -6238,6 +6284,8 @@ impl CodeWriter {
                 match_mapping_fn_idx,
                 match_keys_fn_idx,
                 match_class_fn_idx,
+                load_locals_fn_idx,
+                load_build_class_fn_idx,
                 load_from_dict_or_globals_fn_idx,
                 call_function_ex_fn_idx,
                 unary_not_fn_idx,
@@ -12237,14 +12285,37 @@ impl CodeWriter {
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
-                        // Both are portable (plain value-level reads), but both
-                        // occur only in a class body, which runs once per class
-                        // definition — never a hot loop body — so no residual has
-                        // been written.
+                        // Both are frame methods whose only operand is the
+                        // receiver, so both take the `emit_frontend_load_name`
+                        // shape: `bh_load_locals_fn(frame)` /
+                        // `bh_load_build_class_fn(frame)`.
+                        //
+                        // They occur only in a class body, which runs once per
+                        // class definition, and that is why this arm used to
+                        // emit `abort_permanent` instead. Execution frequency
+                        // is the wrong measure: the full-body walk covers a
+                        // frame statically, so one unlowerable op anywhere in
+                        // the reachable region retires the whole frame, and a
+                        // class body reached by the tracer at all — every one
+                        // of them, once `threshold` is low — costs a
+                        // `loops_aborted`.
                         Instruction::LoadLocals | Instruction::LoadBuildClass => {
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                            let opname = if matches!(instruction, Instruction::LoadLocals) {
+                                "load_locals"
+                            } else {
+                                "load_build_class"
+                            };
+                            let loaded_dst_reg = stack_base + current_depth;
+                            let result_value = emit_frontend_frame_only_ref(
+                                &mut graph,
+                                &current_block.block(),
+                                opname,
+                                frame_var.into(),
+                                py_pc as i64,
+                            );
+                            let result_fv: super::flow::FlowValue = result_value.into();
+                            current_state.stack.push(result_fv.clone());
+                            emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_fv, py_pc);
                         }
 
                         // FormatSimple: pops value, pushes str(value). Net 0.

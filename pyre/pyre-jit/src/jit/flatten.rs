@@ -2573,6 +2573,7 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "store_global"
             | "delete_name"
             | "delete_global"
+            | "load_build_class"
             | "simple_call"
             | "getattr"
             | "load_special"
@@ -3254,6 +3255,12 @@ pub struct LoweringContext {
     /// `delete_global_fn` descrs-pool index. DELETE_GLOBAL lowers to a void
     /// two-Ref residual with `[frame, w_name]` operands.
     pub delete_global_fn_idx: u16,
+    /// `load_locals_fn` descrs-pool index. LOAD_LOCALS lowers to a one-Ref
+    /// residual with `[frame]` and a Ref result.
+    pub load_locals_fn_idx: u16,
+    /// `load_build_class_fn` descrs-pool index. LOAD_BUILD_CLASS lowers to the
+    /// same one-Ref shape as [`Self::load_locals_fn_idx`].
+    pub load_build_class_fn_idx: u16,
     /// `bind(assembler, cpu.newtuple_from_array_fn as *const (),
     /// CallFlavor::Plain)` descrs-pool index for the production
     /// source.  BUILD_TUPLE records the rtyped `pyopcode.py:995-998`
@@ -4325,6 +4332,81 @@ where
     ))
 }
 
+/// Lower `LOAD_LOCALS` / `LOAD_BUILD_CLASS` — both `(frame) → Ref` frame
+/// methods with no operand beyond the receiver — to a one-Ref residual call.
+/// `CallFlavor::Plain`: `LOAD_BUILD_CLASS` can raise `NameError` and neither
+/// forces a virtual, the same classification `load_name` carries.
+fn lower_frame_only_ref_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    opname: &str,
+    fn_idx: u16,
+    pyre_helper: majit_ir::PyreHelperKind,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != opname || op.args.len() != 1 {
+        return None;
+    }
+    let frame_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_residual_call_r_r_insn_from_operands(
+        fn_idx,
+        vec![frame_operand],
+        CallFlavor::Plain,
+        pyre_helper,
+        dst_reg,
+    ))
+}
+
+/// Lower pyopcode.py LOAD_LOCALS to a one-Ref residual call.
+pub fn lower_load_locals_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    lower_frame_only_ref_hlop_to_insn(
+        op,
+        "load_locals",
+        ctx.load_locals_fn_idx,
+        majit_ir::PyreHelperKind::LoadLocals,
+        get_register,
+        lower_constant,
+    )
+}
+
+/// Lower pyopcode.py LOAD_BUILD_CLASS to a one-Ref residual call.
+pub fn lower_load_build_class_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    lower_frame_only_ref_hlop_to_insn(
+        op,
+        "load_build_class",
+        ctx.load_build_class_fn_idx,
+        majit_ir::PyreHelperKind::LoadBuildClass,
+        get_register,
+        lower_constant,
+    )
+}
+
 /// Lower pyopcode.py DELETE_GLOBAL to a void two-Ref residual call.
 pub fn lower_delete_global_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
@@ -5247,6 +5329,12 @@ where
         return Some(insn);
     }
     if let Some(insn) = lower_delete_global_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_load_locals_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_load_build_class_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
     if let Some(insn) = lower_tuple_build_hlop_to_insn(op, ctx, get_register, lower_constant) {

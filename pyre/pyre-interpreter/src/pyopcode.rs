@@ -1411,6 +1411,13 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn load_build_class(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("load_build_class not implemented").into())
     }
+    /// The value half of [`Self::load_build_class`], without the push.
+    /// The JIT's `LOAD_BUILD_CLASS` residual calls this so the lookup order
+    /// stays in one place, the way `load_name_checked_value` serves
+    /// `load_name`.
+    fn load_build_class_value(&mut self) -> Result<<Self as SharedOpcodeHandler>::Value, PyError> {
+        Err(crate::PyError::type_error("load_build_class not implemented").into())
+    }
     fn load_super_attr(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("load_super_attr not implemented").into())
     }

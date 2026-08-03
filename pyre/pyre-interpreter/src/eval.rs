@@ -4192,6 +4192,12 @@ impl OpcodeStepExecutor for PyFrame {
     // `self.get_builtin().getdictvalue('__build_class__')`.  Python 3.14
     // reports a NameError when the selected builtin mapping has no entry.
     fn load_build_class(&mut self) -> Result<(), PyError> {
+        let bc = self.load_build_class_value()?;
+        self.push(bc);
+        Ok(())
+    }
+
+    fn load_build_class_value(&mut self) -> Result<PyObjectRef, PyError> {
         let w_builtin = self.get_builtin();
         let bc = if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
             let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
@@ -4209,8 +4215,7 @@ impl OpcodeStepExecutor for PyFrame {
                 "__build_class__",
             ));
         };
-        self.push(bc);
-        Ok(())
+        Ok(bc)
     }
 
     // ── yield from / send ──

@@ -725,6 +725,15 @@ pub enum PyreHelperKind {
     /// `bh_delete_global_fn(frame, w_name)` — the DELETE_GLOBAL twin of
     /// [`PyreHelperKind::DeleteName`], recognised for the same reason.
     DeleteGlobal,
+    /// `bh_load_locals_fn(frame)` — the LOAD_LOCALS frame-receiver helper
+    /// (`pyopcode.py:793-794`). Carries no fold; the tag exists so the class
+    /// body's namespace read is a residual call like every other frame
+    /// method, rather than an untranslatable op.
+    LoadLocals,
+    /// `bh_load_build_class_fn(frame)` — the LOAD_BUILD_CLASS frame-receiver
+    /// helper (`pyopcode.py:866-870`). Same standing as
+    /// [`PyreHelperKind::LoadLocals`].
+    LoadBuildClass,
     /// `bh_call_fn_N(callable, null_or_self, args...)` — the CALL-family
     /// Python-call helper.  `null_or_self` (arg index 1) is a sentinel
     /// the helper checks before use (a non-null receiver is prepended as
