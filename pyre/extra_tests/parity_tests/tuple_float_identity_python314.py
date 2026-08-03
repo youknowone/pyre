@@ -1,8 +1,11 @@
-# Python 3.14 tuples retain their input object references. PyPy's unboxed
-# float-pair optimisation is observable in pyre because `is` uses pointers.
+# A tuple retains the element objects it was built from rather than
+# reconstructing them on read.  `is` between two plain floats answers by value
+# (`objspace/std/objspace.py:466 is_w` compares `W_FloatObject.floatval`), so
+# two equal floats are never distinguishable here; use different values for the
+# pair that has to stay distinguishable.
 
 x = float("0.125")
-y = float("0.125")
+y = float("0.25")
 assert x is not y
 
 same = (x, x)

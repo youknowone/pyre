@@ -35,7 +35,7 @@ assert {
 } <= set(generator_type.__dict__)
 assert generator_type.__doc__ is None
 assert iter(generator) is generator
-assert generator.__next__.__func__ is generator_type.__next__
+assert generator.__next__.__self__ is generator
 assert generator.__next__.__doc__ == "Implement next(self)."
 assert generator.__name__ == "sample"
 assert generator.__qualname__.endswith("sample")
