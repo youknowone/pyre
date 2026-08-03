@@ -3415,29 +3415,37 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             if !callee_code.cellvars.is_empty() {
                 return Ok(None);
             }
-            // A POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE that leaves operands on
-            // the value stack cannot be inlined: the branch guard's resume has
-            // to restore those kept slots, and inside an inline sub-walk the
-            // walk mirror does not model them, so the kept Ref resolves to NULL
-            // (`BranchGuardUnrestorableKeptStackPermanent`, the `reads_null_ref`
-            // arm).  That is a permanent abort, which discards the enclosing
-            // loop trace, so the shape has to be recognised here instead.
+            // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to an `is`/`is_not`
+            // identity residual call whose operands must be Ref (the codewriter
+            // PopJumpIfNone arm), then a branch guard.  When the multiframe inline
+            // int-specializes the tested local, the mid-body guard resume cannot
+            // source that operand's Ref form from the callee register banks
+            // (`collect_callee_active_boxes` would read a stale/mismatched box), so
+            // the encoded liveness stream disagrees with the decoder
+            // (`resume.rs decode_ref: unexpected tag`) and the caller frame is
+            // corrupted. Decline to the ordinary residual call until
+            // the multi-frame resume reboxes int-specialized identity operands.
+            // POP_JUMP_IF_TRUE/FALSE stay inlinable: their `bool` truth folds in the
+            // int bank, so no Ref rebox is needed.  A strict straight-line callee
+            // has no branch at all, so this scan never fires for it.
+            // Stored bound methods carry their explicit receiver and callee frame,
+            // so their Ref operands remain available to the resume path.
             //
-            // `stack_depth_at` is the depth BEFORE the instruction and the
-            // branch pops the tested value, so the surviving kept stack is
-            // `depth - 1`: a statement-level `if x is None:` or
-            // `while x is not None:` reads 1 and inlines, while the same test
-            // in expression position — `acc += 1 if x is None else 0` holds
-            // `acc` across the branch — reads 2 and declines.  An unreachable
-            // pc has no depth and cannot fire a guard.
+            // This precondition used to abort the enclosing trace rather than
+            // decline the inline, because residualizing it let loops compile that
+            // then printed traceback tuples missing their OUTERMOST frame.  That
+            // node is now recorded — the two bridge handler-entry arms attach the
+            // catching frame's own node — so the decline joins every other
+            // precondition here and returns `Ok(None)`.
             //
-            // POP_JUMP_IF_TRUE/FALSE need no such scan: their `bool` truth
-            // folds in the int bank, so the guard keeps no Ref.  Stored bound
-            // methods carry their explicit receiver and callee frame, so their
-            // kept Ref operands remain available to the resume path.
-            if bound_method.is_none() {
-                let liveness = crate::liveness::liveness_for(raw_callee_code);
-                let keeps_operands = (0..callee_code.instructions.len()).any(|pc| {
+            // The abort was expensive out of all proportion to the inline it was
+            // protecting: a callee that walks a traceback (`while tb is not None`)
+            // lowers to exactly this instruction, so any handler calling such a
+            // helper aborted every retrace of the enclosing loop.  The guard whose
+            // bridge the retrace was building therefore never got one and deopted
+            // on every delivery.
+            if bound_method.is_none()
+                && (0..callee_code.instructions.len()).any(|pc| {
                     matches!(
                         pyre_interpreter::decode_instruction_at(callee_code, pc),
                         Some((
@@ -3445,14 +3453,13 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                                 | pyre_interpreter::bytecode::Instruction::PopJumpIfNotNone { .. },
                             _
                         ))
-                    ) && liveness.stack_depth_at(pc).is_some_and(|depth| depth > 1)
-                });
-                if keeps_operands {
-                    if try_multiframe {
-                        return Ok(None);
-                    }
-                    break 'seed;
+                    )
+                })
+            {
+                if try_multiframe {
+                    return Ok(None);
                 }
+                break 'seed;
             }
             let nlocals = callee_code.varnames.len();
             let ncells = pyre_interpreter::ncells(callee_code);
