@@ -93,7 +93,7 @@ BENCH_COMPARE_BUFFER_S = 0.005
 # Windows process CPU accounting advances in scheduler ticks (normally 1/64 s).
 # Keep the execution floor at least one observable tick on that platform.
 WIN_TIMER_QUANTUM_S = 1.0 / 64
-# Empty-program user-CPU startup is MEASURED per interpreter/backend (minimum of
+# Empty-program user-CPU startup is MEASURED per interpreter/backend (median of
 # STARTUP_SAMPLES runs) and subtracted from every timed run before ratios and
 # perf gates are computed, so a large fixed startup — notably wasmtime
 # recompiling the ~14MB module on every process spawn (~0.12s user-CPU) — does
@@ -106,18 +106,21 @@ WIN_TIMER_QUANTUM_S = 1.0 / 64
 # denominator and inflates every ratio computed against it.  A CI runner
 # measured pypy startup at 0.031s where the same job on the same platform had
 # measured 0.013s, and three unrelated benches failed their gates in that run
-# while their pyre exec times had gone *down*.
+# while their pyre exec times had gone *down*.  Five samples make the median
+# robust to two outliers instead of one.
 #
-# The estimator is the MINIMUM, not the median, because the quantity is a fixed
-# per-process cost and every source of error on it is one-sided: contention,
-# cache pressure and page faults only ever ADD user CPU.  The minimum of a set
-# of samples of a fixed cost is that cost; the median tracks how loaded the
-# machine was.  That distinction is what raising the sample count cannot buy —
-# under sustained load every sample is inflated, so the median is inflated with
-# them, while the minimum still recovers the floor.  Under-estimating instead is
-# the harmless direction: it inflates both exec times by the same few
-# milliseconds, which is negligible against a bench and cannot collapse a
-# denominator.
+# The estimator is the MEDIAN and not the minimum, even though the quantity is a
+# fixed per-process cost whose error sources are all one-sided — contention,
+# cache pressure and page faults only ever add user CPU.  The minimum does
+# recover that cost, but it recovers it for an *idle* machine, and it is
+# subtracted from bench runs that were not idle: under load a bench carries an
+# inflated startup inside it, and taking the unloaded minimum away leaves that
+# inflation behind in `exec`.  Pairing median with median cancels it; pairing an
+# idle minimum with a loaded bench does not.  Measured on one CI job, the
+# minimum came in 15ms under the median for dynasm and 13ms for cranelift, which
+# carried nine short benches whose baseline was pinned to EXEC_TIME_FLOOR_S over
+# their gates at once.  The estimate has to come from the same load conditions
+# as the run it is subtracted from.
 STARTUP_SAMPLES = 5
 EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
 # A single slow sample is retried before failing a performance gate. Windows
@@ -958,7 +961,7 @@ class Check:
         """Measure each timed interpreter/backend's empty-program user-CPU cost.
 
         Runs an empty script STARTUP_SAMPLES times per interpreter and records
-        the minimum user-CPU in self.startup. This is the fixed per-process cost
+        the median user-CPU in self.startup. This is the fixed per-process cost
         (interpreter init; for wasm, wasmtime recompiling the module) added to
         every bench regardless of workload; subtracting it yields an
         execution-only comparison. No-op under --no-startup-subtract.
@@ -990,11 +993,11 @@ class Check:
                         samples = []
                         break
                     samples.append(elapsed)
-                startup = min(samples) if samples else 0.0
+                startup = statistics.median(samples) if samples else 0.0
                 self.startup[key] = startup
                 parts.append(f"{key}={startup:.3f}s")
             print(dim(
-                f"startup (empty-program user-CPU, min of {STARTUP_SAMPLES}; "
+                f"startup (empty-program user-CPU, median {STARTUP_SAMPLES}; "
                 f"ratios/gates are execution-only): " + " ".join(parts)
             ))
         finally:
