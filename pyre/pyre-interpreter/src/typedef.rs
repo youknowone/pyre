@@ -11948,6 +11948,38 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
                 value
             })
         }
+        pyre_object::MEMBER_OS_ERROR_ERRNO => {
+            let value = unsafe { pyre_object::interp_exceptions::w_exception_get_errno(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
+        pyre_object::MEMBER_OS_ERROR_STRERROR => {
+            let value = unsafe { pyre_object::interp_exceptions::w_exception_get_strerror(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
+        pyre_object::MEMBER_OS_ERROR_FILENAME => {
+            let value = unsafe { pyre_object::interp_exceptions::w_exception_get_filename(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
+        pyre_object::MEMBER_OS_ERROR_FILENAME2 => {
+            let value = unsafe { pyre_object::interp_exceptions::w_exception_get_filename2(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
         pyre_object::MEMBER_DESCR_NAME => unsafe { descr_member_name(obj) },
         _ => Err(crate::PyError::attribute_error(unsafe {
@@ -12019,6 +12051,22 @@ pub(crate) unsafe fn direct_member_set(
         }
         pyre_object::MEMBER_IMPORT_ERROR_PATH => {
             unsafe { pyre_object::interp_exceptions::w_exception_set_import_path(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_OS_ERROR_ERRNO => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_errno(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_OS_ERROR_STRERROR => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_strerror(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_OS_ERROR_FILENAME => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_filename(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_OS_ERROR_FILENAME2 => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_filename2(obj, value) };
             Ok(pyre_object::w_none())
         }
         _ => Err(crate::PyError::attribute_error("readonly attribute")),
@@ -12101,6 +12149,33 @@ pub(crate) unsafe fn direct_member_delete(
         pyre_object::MEMBER_IMPORT_ERROR_PATH => {
             unsafe {
                 pyre_object::interp_exceptions::w_exception_set_import_path(
+                    obj,
+                    pyre_object::w_none(),
+                )
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_OS_ERROR_ERRNO => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_errno(obj, pyre_object::w_none())
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_OS_ERROR_STRERROR => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_strerror(obj, pyre_object::w_none())
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_OS_ERROR_FILENAME => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_filename(obj, pyre_object::w_none())
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_OS_ERROR_FILENAME2 => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_filename2(
                     obj,
                     pyre_object::w_none(),
                 )

@@ -6634,13 +6634,7 @@ fn exception_typedef_attrs(class_name: &str) -> &'static [&'static str] {
         ],
         "SystemExit" => &["code"],
         "StopIteration" => &[],
-        "OSError" => &[
-            "characters_written",
-            "errno",
-            "filename",
-            "filename2",
-            "strerror",
-        ],
+        "OSError" => &["characters_written"],
         "ImportError" => &[],
         "NameError" => &[],
         "AttributeError" => &[],
@@ -6898,6 +6892,43 @@ fn make_exc_type_with_init(
                         "name imported from module",
                     ),
                     ("path", pyre_object::MEMBER_IMPORT_ERROR_PATH, "module path"),
+                ] {
+                    unsafe {
+                        pyre_object::w_dict_setitem_str_no_proxy(
+                            ns,
+                            member_name,
+                            pyre_object::w_member_new_direct_with_doc(
+                                kind,
+                                member_name.to_owned(),
+                                doc.to_owned(),
+                                pyre_object::PY_NULL,
+                            ),
+                        );
+                    }
+                }
+            }
+            if name == "OSError" {
+                for (member_name, kind, doc) in [
+                    (
+                        "errno",
+                        pyre_object::MEMBER_OS_ERROR_ERRNO,
+                        "POSIX exception code",
+                    ),
+                    (
+                        "strerror",
+                        pyre_object::MEMBER_OS_ERROR_STRERROR,
+                        "exception strerror",
+                    ),
+                    (
+                        "filename",
+                        pyre_object::MEMBER_OS_ERROR_FILENAME,
+                        "exception filename",
+                    ),
+                    (
+                        "filename2",
+                        pyre_object::MEMBER_OS_ERROR_FILENAME2,
+                        "second exception filename",
+                    ),
                 ] {
                     unsafe {
                         pyre_object::w_dict_setitem_str_no_proxy(
@@ -7188,6 +7219,13 @@ fn make_exc_type_with_init(
     }
     if name == "ImportError" {
         for member_name in ["msg", "name", "name_from", "path"] {
+            if let Some(member) = crate::type_dict_lookup(cls, member_name) {
+                unsafe { pyre_object::w_member_set_cls(member, cls) };
+            }
+        }
+    }
+    if name == "OSError" {
+        for member_name in ["errno", "strerror", "filename", "filename2"] {
             if let Some(member) = crate::type_dict_lookup(cls, member_name) {
                 unsafe { pyre_object::w_member_set_cls(member, cls) };
             }
