@@ -521,6 +521,60 @@ fn autodetect_jit_markers_redvars(
     reds_v
 }
 
+/// Read the rich graph's declared unsigned type for a value while production
+/// jtransform still consumes that graph instead of the rtyper-specialized
+/// flowspace graph. This is the signedness half of RPython's
+/// `Variable.concretetype == lltype.Unsigned`; JIT register kinds intentionally
+/// collapse Signed/Unsigned to `'i'`, so `get_value_kind_var` cannot answer it.
+fn variable_has_declared_unsigned_type(
+    graph: &FunctionGraph,
+    variable: &crate::flowspace::model::Variable,
+) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| {
+            if op.result.as_ref() != Some(variable) {
+                return false;
+            }
+            matches!(
+                &op.kind,
+                OpKind::Input {
+                    ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::FieldRead {
+                    ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::VableFieldRead {
+                    ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::ArrayRead {
+                    item_ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::InteriorFieldRead {
+                    item_ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::VableArrayRead {
+                    item_ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::Call {
+                    result_ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::IndirectCall {
+                    result_ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::BinOp {
+                    result_ty: ValueType::Unsigned,
+                    ..
+                } | OpKind::UnaryOp {
+                    result_ty: ValueType::Unsigned,
+                    ..
+                }
+            )
+        })
+}
+
 impl<'a> Transformer<'a> {
     /// RPython: `Transformer.__init__(cpu=None, callcontrol=None, portal_jd=None)`
     /// (`jtransform.py:62-66`). Pyre keeps `cpu` / `callcontrol` behind
@@ -1795,13 +1849,13 @@ impl<'a> Transformer<'a> {
             // runtime helpers reproduce the same IEEE-754 mantissa
             // decomposition so runtime and const-fold agree.
             //
-            // Coverage: today these arms are unreachable from pyre
-            // source — no producer emits the `cast_uint_to_float` /
-            // `cast_float_to_uint` opnames in practice, so these
-            // const-fold + residual-helper arms stay dormant.  The
-            // wiring is staged for the eventual producer flip;
-            // unsigned parameter classification lives in the MIR
-            // front-end (`front::mir`).
+            // The rich-graph compatibility path in
+            // `rewrite_op_direct_call` projects `float(r_uint)` onto this
+            // low-level opname, matching the real rtyper's
+            // `IntegerRepr.rtype_float` conversion.  Once production
+            // jtransform consumes the already-rtyped flowspace graph, that
+            // projection disappears and this arm receives the rtyper op
+            // directly.
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
@@ -2826,6 +2880,34 @@ impl<'a> Transformer<'a> {
             "CallTarget::Indirect must be lowered by translator/rtyper/rpbc.rs \
              before reaching rewrite_op_direct_call",
         );
+        // RPython `IntegerRepr.rtype_float` (`rint.py:144-147`) converts an
+        // Unsigned input to Float, emitting `cast_uint_to_float`; jtransform
+        // then applies `_do_builtin_call` (`jtransform.py:587`) and reaches
+        // `support.py:274 _ll_1_cast_uint_to_float`.
+        //
+        // Production still feeds jtransform the rich MIR graph while the
+        // real rtyper specializes an ephemeral flowspace graph (see
+        // `jtransform_shadow.rs`).  Project this one source-level
+        // `float(r_uint)` call to the exact low-level op the rtyper produced,
+        // then dispatch through the ordinary rewrite arm above.  This keeps
+        // the helper address/effect descriptor and unsigned rounding on the
+        // upstream path; it is removed when jtransform consumes the rtyped
+        // graph directly.
+        if matches!(target, CallTarget::FunctionPath { segments } if segments == &["float"])
+            && args.len() == 1
+            && matches!(result_ty, ValueType::Float)
+            && variable_has_declared_unsigned_type(graph, &args[0])
+        {
+            let cast_op = SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::UnaryOp {
+                    op: "cast_uint_to_float".into(),
+                    operand: args[0].clone(),
+                    result_ty: ValueType::Float,
+                },
+            };
+            return self.rewrite_operation(&cast_op, graph_name, graph);
+        }
         // RPython `jtransform.py:1658-1663 rewrite_op_jit_marker`:
         // marker calls never reach `guess_call_kind` — they dispatch straight
         // to `handle_jit_marker__*`. Upstream keys on `op.args[0].value`;
@@ -7714,6 +7796,49 @@ mod tests {
             other => panic!("expected CallResidual with runtime funcptr, got {other:?}"),
         }
         assert!(matches!(ops[3].kind, OpKind::Live));
+    }
+
+    #[test]
+    fn float_of_unsigned_projects_to_registered_cast_helper() {
+        let mut cc = crate::call::CallControl::new();
+        cc.register_macro_helper_trace_fnaddr("majit_metainterp::cast_uint_to_float", 0x1234);
+        let mut graph = FunctionGraph::new("cast_uint_to_float_test");
+        let arg = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "arg".into(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["float"]),
+                    args: vec![arg],
+                    result_ty: ValueType::Float,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        assert!(
+            transformed
+                .graph
+                .block(graph.startblock)
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ConstInt(0x1234)))
+        );
     }
 
     #[test]

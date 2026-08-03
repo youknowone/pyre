@@ -173,12 +173,19 @@ fn item_pool_descr_index(code: &[u8], at: usize) -> u32 {
 
 #[test]
 fn random_core_residuals_use_registered_genrand32_address() {
-    let expected = pyre_interpreter::jit_trace_fnaddrs()
-        .into_iter()
-        .find_map(|(path, address)| {
+    let bindings = pyre_interpreter::jit_trace_fnaddrs();
+    let expected = bindings
+        .iter()
+        .find_map(|&(path, address)| {
             (path == "module::_random::Random::genrand32").then_some(address)
         })
         .expect("genrand32 runtime fnaddr");
+    let cast_uint_to_float = bindings
+        .iter()
+        .find_map(|&(path, address)| {
+            (path == "majit_metainterp::cast_uint_to_float").then_some(address)
+        })
+        .expect("cast_uint_to_float runtime fnaddr");
     let random = crate::jitcode_runtime::all_jitcodes()
         .iter()
         .find(|jitcode| {
@@ -198,6 +205,15 @@ fn random_core_residuals_use_registered_genrand32_address() {
             .count(),
         1,
         "the two genrand32 calls share one runtime-patched constant-pool address"
+    );
+    assert_eq!(
+        random
+            .constants_i
+            .iter()
+            .filter(|&&address| address == cast_uint_to_float)
+            .count(),
+        1,
+        "the two unsigned-to-float conversions share the registered support-helper address"
     );
 }
 

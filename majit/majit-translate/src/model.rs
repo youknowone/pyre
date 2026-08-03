@@ -3015,18 +3015,16 @@ pub fn fuse_boxing_alloc(
 /// (`flowspace_adapter::function_graph_to_flowspace`) requires — every
 /// referenced operand defined as a block inputarg or op result.
 ///
-/// An operand is threaded only when its definition is reachable from the use
-/// block through a chain of single-predecessor blocks — i.e. the definition
-/// dominates the use along a strictly linear path, exactly the shape the
-/// boxing cluster's `alloc → cast → cast → return` chain has.  This is the
-/// precondition under which [`FunctionGraph::ensure_variable_at_block`] threads
-/// cleanly: with one predecessor at every step, every path into the use block
-/// passes through the definition, so no predecessor edge is left unable to
-/// supply the value.  An operand reaching a join or loop block (multiple
-/// predecessors), or one with no upstream definition at all, is left untouched
-/// — the adapter still Skips that graph, and the no-definition panic is never
-/// reached.  Graphs with no cross-block-undefined operand collect no work and
-/// stay byte-identical.
+/// An operand is threaded only when it is available on every predecessor path
+/// into the use block.  This is the same condition `SSA_to_SSI` enforces while
+/// adding one inputarg to every block and one argument to every incoming link
+/// (`rpython/translator/backendopt/ssa.py:171-190`).  Diamond joins are valid
+/// when the definition dominates the split; a value defined in only one arm,
+/// or one with no upstream definition, is left untouched so the adapter can
+/// Skip the malformed graph.  Back edges provisionally satisfy the recursive
+/// check, but a separate ancestor-definition check prevents a source-less SCC
+/// from manufacturing a definition.  Graphs with no cross-block-undefined
+/// operand collect no work and stay byte-identical.
 pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
     use crate::flowspace::model::Variable;
     use std::collections::{HashMap, HashSet};
@@ -3039,33 +3037,53 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
         }
     }
 
-    // `var` is defined in a block reachable from `block` by walking
-    // single-predecessor edges only.  Mirrors the success condition of
-    // `ensure_variable_at_block` for a linear predecessor chain.
-    fn defined_via_single_pred_chain(
+    fn ancestor_has_definition(
         graph: &FunctionGraph,
         preds: &HashMap<BlockId, Vec<BlockId>>,
         block: BlockId,
         var: &Variable,
+        seen: &mut HashSet<BlockId>,
     ) -> bool {
-        let mut cur = block;
-        let mut seen: HashSet<BlockId> = HashSet::new();
-        loop {
-            if !seen.insert(cur) {
-                return false;
-            }
-            let Some(ps) = preds.get(&cur) else {
-                return false;
-            };
-            if ps.len() != 1 {
-                return false;
-            }
-            let p = ps[0];
-            if graph.variable_defined_in_block(p, var) {
-                return true;
-            }
-            cur = p;
+        if !seen.insert(block) {
+            return false;
         }
+        graph.variable_defined_in_block(block, var)
+            || preds.get(&block).is_some_and(|ps| {
+                ps.iter()
+                    .any(|&pred| ancestor_has_definition(graph, preds, pred, var, seen))
+            })
+    }
+
+    fn available_on_every_predecessor_path(
+        graph: &FunctionGraph,
+        preds: &HashMap<BlockId, Vec<BlockId>>,
+        block: BlockId,
+        var: &Variable,
+        visiting: &mut HashSet<BlockId>,
+        memo: &mut HashMap<BlockId, bool>,
+    ) -> bool {
+        if graph.variable_defined_in_block(block, var) {
+            return true;
+        }
+        if let Some(&known) = memo.get(&block) {
+            return known;
+        }
+        // `ensure_variable_at_block` installs the target inputarg before
+        // following a back edge.  Treat the same in-progress cycle as
+        // available here; an acyclic entry path still has to reach a real
+        // definition, and `ancestor_has_definition` rejects a source-less SCC.
+        if !visiting.insert(block) {
+            return true;
+        }
+        let available = preds.get(&block).is_some_and(|ps| {
+            !ps.is_empty()
+                && ps.iter().all(|&pred| {
+                    available_on_every_predecessor_path(graph, preds, pred, var, visiting, memo)
+                })
+        });
+        visiting.remove(&block);
+        memo.insert(block, available);
+        available
     }
 
     let mut work: Vec<(BlockId, Variable)> = Vec::new();
@@ -3075,9 +3093,20 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
         }
         for op in &block.operations {
             for var in crate::inline::op_variable_refs(&op.kind) {
-                if !graph.variable_defined_in_block(block.id, &var)
-                    && defined_via_single_pred_chain(graph, &preds, block.id, &var)
-                {
+                if graph.variable_defined_in_block(block.id, &var) {
+                    continue;
+                }
+                let has_definition =
+                    ancestor_has_definition(graph, &preds, block.id, &var, &mut HashSet::new());
+                let available = available_on_every_predecessor_path(
+                    graph,
+                    &preds,
+                    block.id,
+                    &var,
+                    &mut HashSet::new(),
+                    &mut HashMap::new(),
+                );
+                if has_definition && available {
                     work.push((block.id, var));
                 }
             }
@@ -8010,6 +8039,129 @@ mod tests {
             1,
             "header → body_tail link args extended (body_tail demands v)",
         );
+    }
+
+    #[test]
+    fn thread_undefined_op_operand_across_diamond_when_definition_dominates_split() {
+        let mut graph = FunctionGraph::new("thread_operand_diamond");
+        let entry = graph.startblock;
+        let left = graph.create_block();
+        let right = graph.create_block();
+        let join = graph.create_block();
+        let value = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "value".into(),
+                    ty: ValueType::Float,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let cond = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "cond".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_branch(entry, cond, left, vec![], right, vec![]);
+        graph.set_goto(left, join, vec![]);
+        graph.set_goto(right, join, vec![]);
+        let base = graph
+            .push_op_var(
+                join,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("Box"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("Box".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.block_mut(join).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base,
+                field: FieldDescriptor {
+                    name: "payload".into(),
+                    owner_root: Some("Box".into()),
+                    owner_id: None,
+                },
+                value: LinkArg::Value(value.clone()),
+                ty: ValueType::Float,
+            },
+        });
+
+        thread_undefined_op_operands(&mut graph);
+
+        for block in [left, right, join] {
+            assert!(
+                graph.block(block).inputargs.contains(&value),
+                "dominating value is threaded through {block:?}",
+            );
+        }
+        assert!(graph.block(entry).exits.iter().all(|link| {
+            link.args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if v == &value))
+        }));
+    }
+
+    #[test]
+    fn thread_undefined_op_operand_declines_value_defined_in_one_diamond_arm() {
+        let mut graph = FunctionGraph::new("thread_operand_partial_diamond");
+        let entry = graph.startblock;
+        let left = graph.create_block();
+        let right = graph.create_block();
+        let join = graph.create_block();
+        let cond = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "cond".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_branch(entry, cond, left, vec![], right, vec![]);
+        let value = graph
+            .push_op_var(
+                left,
+                OpKind::Input {
+                    name: "left_only".into(),
+                    ty: ValueType::Float,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_goto(left, join, vec![]);
+        graph.set_goto(right, join, vec![]);
+        let result = graph.alloc_value_var();
+        graph.block_mut(join).operations.push(SpaceOperation {
+            result: Some(result),
+            kind: OpKind::UnaryOp {
+                op: "same_as".into(),
+                operand: value.clone(),
+                result_ty: ValueType::Float,
+            },
+        });
+
+        thread_undefined_op_operands(&mut graph);
+
+        assert!(
+            !graph.block(join).inputargs.contains(&value),
+            "one-arm definition must not be invented at the join",
+        );
+        assert!(graph.block(right).inputargs.is_empty());
     }
 
     /// `framestate.py:50-51 getvariables` walks `locals + flatten(stack) +

@@ -715,8 +715,9 @@ pub fn fbw_foriter_inflight_take_for_resume(
         // re-reached the consume, so this item's body already ran) must never
         // be delivered either — that is the header-flush-without-delivery
         // shape ([`fbw_foriter_inflight_completed_at_resume`]).  Also refuse if
-        // either journal is non-empty or an unjournaled effect stands (same
-        // signals as `fbw_foriter_inflight_take`).
+        // either journal is non-empty or an unjournaled effect stands. Unlike
+        // legacy replay delivery, this branch adopts the walk's end state, so
+        // recorded-but-unexecuted residual work also makes it unsafe to flush.
         if stack[at].body_effect_since_consume
             || stack[at].body_completed
             || fbw_store_journal_len() != 0
@@ -781,20 +782,21 @@ pub(crate) fn fbw_foriter_inflight_top_body_pc() -> Option<usize> {
     })
 }
 
-/// Whether ANY of the three R1 body-effect signals is currently present:
-/// the body-effect-since-consume flag, either journal non-empty, or the
-/// unjournaled-effect flag.  These are the exact signals
+/// Whether ANY R1 committed-body-effect signal is currently present: the
+/// body-effect-since-consume flag or either journal non-empty. These are the
+/// exact signals
 /// [`fbw_foriter_inflight_take`] consults to REFUSE delivery, and `take`
 /// leaves them untouched.  Exposed for the deliver-path loud-failure
 /// debug-assert (#57 Finding #3): a successful take (delivery) while any
 /// signal stands would be a silent double, so the deliver site asserts this
-/// is `false` in debug builds.
+/// is `false` in debug builds. An unjournaled effect is deliberately NOT a
+/// member: it is recorded-but-unexecuted work that only this legacy replay
+/// will apply, so it requires delivery rather than making delivery unsafe.
 pub fn fbw_foriter_any_body_effect_signal() -> bool {
     fbw_foriter_body_effect_since_consume()
         || fbw_store_journal_len() != 0
         || FBW_APPEND_JOURNAL.with(|j| j.borrow().len()) != 0
         || FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()) != 0
-        || fbw_has_unjournaled_effect()
 }
 
 /// Take the in-flight FOR_ITER continuation for delivery on a trace abort
@@ -805,7 +807,7 @@ pub fn fbw_foriter_any_body_effect_signal() -> bool {
 /// body, so any body op that ALREADY ran concretely during the aborted walk
 /// would be re-applied.  C may DELIVER only when it can PROVE no body effect
 /// committed for the in-flight iteration — then re-running the body cannot
-/// double.  Three signals together cover every committed body effect:
+/// double. Two signal classes cover every committed body effect:
 ///
 /// * `fbw_foriter_body_effect_since_consume()` — a non-elidable concrete
 ///   residual mutated the heap OUTSIDE the journals after the consume (a dict
@@ -817,12 +819,13 @@ pub fn fbw_foriter_any_body_effect_signal() -> bool {
 ///   `fbw_store_journal_rollback` empties these BEFORE this take, so this is
 ///   normally false here; the check is a belt-and-suspenders refusal in case
 ///   a future caller takes before the rollback.
-/// * `fbw_has_unjournaled_effect()` — a void/symbolic residual only the
-///   legacy replay applies, which the rollback cannot undo.
-///
 /// Any signal set → refuse delivery (drop the stash → the legacy bypass keeps
 /// the prior drop-on-abort behaviour for that shape, never a double).
-/// `for_mutate` aborts BEFORE the append's effect, so all three signals are
+/// `fbw_has_unjournaled_effect()` is the converse: the residual was recorded
+/// but NOT executed, and only the legacy replay applies it. It prevents an
+/// end-state commit, but it must not suppress delivery of the consumed item
+/// or that replay starts at the next iteration and drops this one.
+/// `for_mutate` aborts BEFORE the append's effect, so both signal classes are
 /// clear at the abort point — the clean continuation case.
 pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> {
     // Take the MOST-RECENT (top) entry and drop the rest, matching the
@@ -844,7 +847,7 @@ pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> 
     let append_len = FBW_APPEND_JOURNAL.with(|j| j.borrow().len());
     let cell_store_len = FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len());
     let unjournaled = fbw_has_unjournaled_effect();
-    if body_effect || store_len != 0 || append_len != 0 || cell_store_len != 0 || unjournaled {
+    if body_effect || store_len != 0 || append_len != 0 || cell_store_len != 0 {
         if fbw_debug_abort_enabled() {
             eprintln!(
                 "[fbw-foriter] deliver REFUSED (body effect committed since consume) body_pc={} \
@@ -864,6 +867,37 @@ pub fn fbw_foriter_inflight_take() -> Option<(pyre_object::PyObjectRef, usize)> 
         );
     }
     Some((stash.item, body_pc))
+}
+
+#[cfg(test)]
+mod foriter_delivery_tests {
+    use super::*;
+
+    #[test]
+    fn recorded_but_unexecuted_residual_keeps_consumed_item_for_replay() {
+        fbw_store_journal_reset();
+        let item = 1usize as pyre_object::PyObjectRef;
+        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34));
+        fbw_mark_unjournaled_effect(ResidualDecline::Symbolic);
+
+        assert!(!fbw_foriter_any_body_effect_signal());
+        assert_eq!(fbw_foriter_inflight_take(), Some((item, 34)));
+
+        fbw_store_journal_reset();
+    }
+
+    #[test]
+    fn executed_body_effect_still_refuses_consumed_item_delivery() {
+        fbw_store_journal_reset();
+        let item = 1usize as pyre_object::PyObjectRef;
+        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34));
+        fbw_mark_foriter_body_effect_since_consume();
+
+        assert!(fbw_foriter_any_body_effect_signal());
+        assert_eq!(fbw_foriter_inflight_take(), None);
+
+        fbw_store_journal_reset();
+    }
 }
 
 /// Non-commit epilogue: restore each displaced element in reverse push
