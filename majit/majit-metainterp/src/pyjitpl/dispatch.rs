@@ -5280,6 +5280,54 @@ where
                                 "@@@SPDIAG HEADER-CLOSE close_target_pc={close_target_pc} mp_green_pc={mp_green_pc:?} walk_reds={walk_reds:?}"
                             );
                         }
+                        // pyjitpl.py:3005 `get_procedure_token(greenboxes)` —
+                        // the greens of the merge point just reached.
+                        let close_greens = (
+                            mp_green_ints.clone(),
+                            mp_green_refs.clone(),
+                            mp_green_floats.clone(),
+                        );
+                        ctx.close_greens = Some(close_greens.clone());
+                        if ctx.is_bridge_trace {
+                            // pyjitpl.py:3001-3060: a guard-origin bridge
+                            // first consults the procedure token for the
+                            // merge point just reached.  If none has compiled
+                            // targets, it does NOT close on the first visit;
+                            // it falls through to the current_merge_points
+                            // scan, appends first visits, and only closes on a
+                            // repeated same-greenkey merge point.
+                            let already_compiled_here = ctx
+                                .compiled_key_for_greens_fn
+                                .as_ref()
+                                .and_then(|f| f(&close_greens))
+                                .is_some();
+                            let close_key = ctx.close_green_key_hash().unwrap_or(ctx.green_key);
+                            if !already_compiled_here
+                                && !ctx.has_merge_point_at(close_key, ctx.header_pc)
+                            {
+                                let vable_boxes =
+                                    ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
+                                let original_boxes = match sym.loop_carried_boxes(&vable_boxes) {
+                                    Some(mut boxes) => {
+                                        ctx.remove_consts_and_duplicates(&mut boxes);
+                                        boxes
+                                            .into_iter()
+                                            .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
+                                            .collect()
+                                    }
+                                    None => live_arg_boxes.clone(),
+                                };
+                                if crate::mptrace_enabled() {
+                                    eprintln!(
+                                        "@@@MPTRACE bridge-add-mp key={close_key} header_pc={} num_ops={}",
+                                        ctx.header_pc,
+                                        ctx.num_ops(),
+                                    );
+                                }
+                                ctx.add_merge_point(close_key, original_boxes, ctx.header_pc);
+                                return TraceAction::Continue;
+                            }
+                        }
                         if capture_walk_reds {
                             // Single-pass: stash the resume-aligned close pc (the
                             // interpreter green pc, NOT the JitCode op cursor) so
@@ -5291,13 +5339,6 @@ where
                             ctx.walk_final_pc = mp_green_pc.map(|p| p as usize);
                             ctx.walk_final_reds = std::mem::take(&mut walk_reds);
                         }
-                        // pyjitpl.py:3005 `get_procedure_token(greenboxes)` —
-                        // the greens of the merge point just reached.
-                        ctx.close_greens = Some((
-                            mp_green_ints.clone(),
-                            mp_green_refs.clone(),
-                            mp_green_floats.clone(),
-                        ));
                         // GUARD_FUTURE_CONDITION already emitted unconditionally at
                         // the reached_loop_header entry above (pyjitpl.py:2993).
                         return TraceAction::CloseLoop;

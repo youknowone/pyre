@@ -23,7 +23,7 @@ use crate::heapcache::HeapCache;
 use crate::opencoder::Box as OcBox;
 use crate::recorder::Trace;
 use indexmap::IndexMap;
-use majit_ir::{DescrRef, GreenKey, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GreenKey, GreenType, OpCode, OpRef, Type, Value};
 
 use majit_backend::JitCellToken;
 
@@ -2008,6 +2008,46 @@ impl TraceCtx {
     /// The structured green key values, if provided.
     pub fn green_key_values(&self) -> Option<&GreenKey> {
         self.green_key_values.as_ref()
+    }
+
+    /// pyjitpl.py:3183-3189: `compile_loop` keys the JitCell by
+    /// `original_boxes[:num_green_args]`, i.e. the greens captured at the
+    /// merge point that closed the trace. `close_greens` is grouped by
+    /// JitCode register bank; rebuild the declared green order before hashing
+    /// so this matches warmstate.py:584-593 `JitCell.get_uhash`.
+    pub fn close_green_key_hash(&self) -> Option<u64> {
+        let (ints, refs, floats) = self.close_greens.as_ref()?;
+        let spec = self
+            .green_key_values
+            .as_ref()
+            .map(|key| key.types.clone())
+            .or_else(|| self.driver_descriptor.as_ref().map(|d| d.green_args_spec()))?;
+
+        let mut values = Vec::with_capacity(spec.len());
+        let mut int_i = 0;
+        let mut ref_i = 0;
+        let mut float_i = 0;
+        for tp in &spec {
+            let value = match tp {
+                GreenType::Int | GreenType::Void => {
+                    let value = *ints.get(int_i)?;
+                    int_i += 1;
+                    value
+                }
+                GreenType::Ref | GreenType::Str | GreenType::Unicode => {
+                    let value = *refs.get(ref_i)?;
+                    ref_i += 1;
+                    value
+                }
+                GreenType::Float => {
+                    let value = *floats.get(float_i)?;
+                    float_i += 1;
+                    value
+                }
+            };
+            values.push(value);
+        }
+        Some(crate::green_key_hash_typed(&values, &spec))
     }
 
     /// Set the structured green key values.
