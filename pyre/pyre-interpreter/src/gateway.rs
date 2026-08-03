@@ -1550,6 +1550,14 @@ pub fn fsdecode_filename_bytes(data: &[u8]) -> pyre_object::PyObjectRef {
     crate::typedef::charp2uni(data)
 }
 
+/// [`fsdecode_filename_bytes`]'s buffer, for a caller that assembles the
+/// filename into a larger piece of text rather than handing it out as an
+/// object. A Rust `String` cannot hold the lone surrogate a non-UTF-8 path byte
+/// decodes to, so that text has to be built as WTF-8 throughout.
+pub fn fsdecode_filename_wtf8(data: &[u8]) -> rustpython_wtf8::Wtf8Buf {
+    crate::typedef::charp2uni_wtf8(data)
+}
+
 /// [`fsencode_bytes_w`] paired with the `bytes`-ness of the resolved object;
 /// see [`fsencode_w_with_kind`] for why the two are produced together.
 pub fn fsencode_bytes_w_with_kind(

@@ -219,9 +219,8 @@ fn setup_context(
         (w_str_new("sys"), 1, globals)
     } else {
         let frame = unsafe { &*frame };
-        let code = unsafe { &*crate::pyframe::pyframe_get_pycode(frame) };
         (
-            w_str_new(&code.source_path),
+            unsafe { crate::pycode::w_code_filename_obj(frame.fget_f_code()) },
             frame.get_last_lineno() as i64,
             frame.get_w_globals(),
         )

@@ -7561,7 +7561,9 @@ fn init_frame_type(ns: PyObjectRef) {
                     if f.is_null() {
                         return Ok(pyre_object::w_str_new("<frame (null)>"));
                     }
-                    Ok(pyre_object::w_str_new_managed(&unsafe { &*f }.descr_repr()))
+                    Ok(pyre_object::w_str_from_wtf8_managed(
+                        unsafe { &*f }.descr_repr(),
+                    ))
                 },
                 1,
             ),
@@ -21866,10 +21868,13 @@ fn invalid_byte_2_of_4(ch1: u8, ch2: u8) -> bool {
 /// `str(bytes, 'utf-8', 'surrogateescape')` does: valid UTF-8 passes
 /// through and any other byte becomes a lone `0xDC00 + byte` surrogate.
 /// `surrogateescape` rescues every byte, so the decode never fails.
+pub(crate) fn charp2uni_wtf8(data: &[u8]) -> Wtf8Buf {
+    decode_utf8_with_errors(data, "surrogateescape")
+        .expect("surrogateescape rescues every byte, so the decode never fails")
+}
+
 pub(crate) fn charp2uni(data: &[u8]) -> PyObjectRef {
-    let decoded = decode_utf8_with_errors(data, "surrogateescape")
-        .expect("surrogateescape rescues every byte, so the decode never fails");
-    pyre_object::w_str_from_wtf8_managed(decoded)
+    pyre_object::w_str_from_wtf8_managed(charp2uni_wtf8(data))
 }
 
 /// unicodehelper.py:377-537 _str_decode_utf8_slowpath

@@ -926,13 +926,13 @@ fn capture_coroutine_origin(ec: *const PyExecutionContext) -> PyObjectRef {
         }
         // `fget_f_lineno` below reads `last_instr`, a virtualizable field.
         crate::executioncontext::force_frame(frame);
-        let code = unsafe { (*frame).code() };
+        let w_code = unsafe { (*frame).fget_f_code() };
         let filename_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_str_new(&code.source_path));
+        pyre_object::gc_roots::pin_root(unsafe { crate::pycode::w_code_filename_obj(w_code) });
         let lineno_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(w_int_new(unsafe { (*frame).fget_f_lineno() } as i64));
         let funcname_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_str_new(&code.obj_name));
+        pyre_object::gc_roots::pin_root(unsafe { crate::pycode::w_code_name_obj(w_code) });
         let summary = w_tuple_new(vec![
             pyre_object::gc_roots::shadow_stack_get(filename_slot),
             pyre_object::gc_roots::shadow_stack_get(lineno_slot),
@@ -3196,15 +3196,22 @@ impl PyFrame {
 
     /// pyframe.py:849-853 descr_repr — `<frame at 0x…, file '…', line …,
     /// code …>` via `getrepr(space, "frame", moreinfo)`.
-    pub fn descr_repr(&self) -> String {
+    pub fn descr_repr(&self) -> rustpython_wtf8::Wtf8Buf {
         let code = self.code();
-        format!(
-            "<frame at {:p}, file '{}', line {}, code {}>",
-            self as *const PyFrame,
-            code.source_path.as_str(),
+        let mut out = rustpython_wtf8::Wtf8Buf::from_string(format!(
+            "<frame at {:p}, file '",
+            self as *const PyFrame
+        ));
+        let filename = crate::gateway::fsdecode_filename_wtf8(&unsafe {
+            crate::pycode::code_filename_bytes(self.pycode as pyre_object::PyObjectRef)
+        });
+        out.push_wtf8(&filename);
+        out.push_str(&format!(
+            "', line {}, code {}>",
             self.get_last_lineno(),
-            code.obj_name.as_str(),
-        )
+            code.obj_name.as_str()
+        ));
+        out
     }
 
     /// `frame_clear` (`frame.clear()`): clear most references held by the

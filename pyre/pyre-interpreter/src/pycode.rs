@@ -161,12 +161,12 @@ pub struct PyCode {
     /// already the exact UTF-8 spelling, avoiding an allocation for compiled
     /// source paths and ordinary filename replacements.
     ///
-    /// Do not add the derived `w_filename` cache from `pycode.py:136` while
-    /// `PyCode` is prebuilt-immortal. An unrooted movable child would only be
-    /// marked on the first major collection after `GCFLAG_VISITED` latches.
-    /// Such a cache requires forwarding on every collection, as `w_globals`
-    /// is registered in `W_GLOBALS_STAMPED_CODES` and forwarded by
-    /// `eval::walk_raw_code_roots`.
+    /// Do not add the derived `pycode.py:136 w_filename` cache without giving
+    /// the slot everything `w_globals` gets. The filesystem decode hands back a
+    /// movable managed string, so a retained slot has to be visited by a managed
+    /// wrapper's own custom trace and forwarded by `eval::walk_raw_code_roots`
+    /// for the bootstrap family; without both it holds a pre-move address after
+    /// the first collection that moves the string.
     pub filename_bytes: *mut Vec<u8>,
     /// Whether an unrealized nested compiler constant selected by
     /// `importing.py:379-391 update_code_filenames`' `oldname` guard inherits
@@ -344,6 +344,29 @@ pub unsafe fn w_code_name_obj(w_code: PyObjectRef) -> PyObjectRef {
         let w_name = w_str_new(&(*code_ptr).obj_name);
         (*(w_code as *mut PyCode)).w_name = w_name;
         w_name
+    }
+}
+
+/// `pycode.py:135 self.co_filename = filename` as an application-level object,
+/// decoded with the filesystem encoding (`objspace.py:438 newfilename`) so a
+/// path byte with no UTF-8 spelling survives instead of folding to U+FFFD.
+///
+/// Unlike [`w_code_name_obj`] and [`w_code_qualname_obj`] this realizes a fresh
+/// object per call rather than retaining one on the `PyCode`. Those two build
+/// their string with `w_str_new`, whose address is fixed, so the slot they store
+/// stays valid on its own; the filesystem decode returns a movable managed
+/// string, which the `filename_bytes` field doc explains a retained slot cannot
+/// hold unless it is traced and forwarded the way `w_globals` is.
+///
+/// # Safety
+/// `w_code` must point to a valid `PyCode` whose `code_ptr` is live.
+pub unsafe fn w_code_filename_obj(w_code: PyObjectRef) -> PyObjectRef {
+    let pycode = unsafe { &*(w_code as *const PyCode) };
+    if pycode.filename_bytes.is_null() {
+        let code = unsafe { &*(pycode.code_ptr as *const crate::CodeObject) };
+        w_str_new(&code.source_path)
+    } else {
+        crate::gateway::fsdecode_filename_bytes(unsafe { &*pycode.filename_bytes })
     }
 }
 
@@ -668,8 +691,8 @@ unsafe fn set_filename_bytes(obj: PyObjectRef, bytes: Option<Vec<u8>>) {
     }
 }
 
-unsafe fn filename_bytes(obj: PyObjectRef) -> Vec<u8> {
-    let pycode = unsafe { &*(obj as *const PyCode) };
+pub(crate) unsafe fn code_filename_bytes(w_code: PyObjectRef) -> Vec<u8> {
+    let pycode = unsafe { &*(w_code as *const PyCode) };
     if pycode.filename_bytes.is_null() {
         let code = unsafe { &*(pycode.code_ptr as *const crate::CodeObject) };
         code.source_path.as_bytes().to_vec()
@@ -849,14 +872,7 @@ pub unsafe fn code_get_field(obj: PyObjectRef, name: &str) -> Result<PyObjectRef
         "co_varnames" => names_tuple(&code.varnames),
         "co_freevars" => names_tuple(&code.freevars),
         "co_cellvars" => names_tuple(&code.cellvars),
-        "co_filename" => {
-            let filename_bytes = unsafe { (*(obj as *const PyCode)).filename_bytes };
-            if filename_bytes.is_null() {
-                w_str_new(&code.source_path)
-            } else {
-                crate::gateway::fsdecode_filename_bytes(unsafe { &*filename_bytes })
-            }
-        }
+        "co_filename" => unsafe { w_code_filename_obj(obj) },
         // Shared realized object, like `co_qualname` below.
         "co_name" => unsafe { w_code_name_obj(obj) },
         // The realized qualname is shared with every function built from this
@@ -1833,7 +1849,7 @@ pub unsafe fn fix_co_filename(w_code: PyObjectRef, newname: &[u8]) {
     if code_ptr.is_null() {
         return;
     }
-    let old_filename = unsafe { filename_bytes(w_code) };
+    let old_filename = unsafe { code_filename_bytes(w_code) };
 
     // `importing.py:379-391 update_code_filenames` mutates already-wrapped
     // nested `PyCode` constants. Pyre realizes that list lazily, so update the
@@ -1844,7 +1860,7 @@ pub unsafe fn fix_co_filename(w_code: PyObjectRef, newname: &[u8]) {
             let nested = slot.load(std::sync::atomic::Ordering::Acquire);
             if !nested.is_null()
                 && unsafe { is_code(nested) }
-                && unsafe { filename_bytes(nested) } == old_filename
+                && unsafe { code_filename_bytes(nested) } == old_filename
             {
                 unsafe { fix_co_filename(nested, newname) };
             }

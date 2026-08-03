@@ -2688,7 +2688,7 @@ fn write_traceback_chain_from_tb<W: Write>(
     let _roots = pyre_object::gc_roots::push_roots();
     // `StackSummary.format` dedup state: the previous frame's identity and how
     // many consecutive frames have carried it.
-    let mut last: Option<(String, i64, String)> = None;
+    let mut last: Option<(Vec<u8>, i64, String)> = None;
     let mut repeats: usize = 0;
     while !tb.is_null() {
         let tb_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2701,14 +2701,14 @@ fn write_traceback_chain_from_tb<W: Write>(
         let lineno = unsafe { crate::pytraceback::w_pytraceback_get_lineno(current_tb) };
         let lasti = unsafe { crate::pytraceback::w_pytraceback_get_lasti(current_tb) };
         let (filename, funcname, location) = if w_code.is_null() {
-            (String::from("<unknown>"), String::from("<unknown>"), None)
+            (b"<unknown>".to_vec(), String::from("<unknown>"), None)
         } else {
             // `w_code` is a GC-rooted `PyCode` pointer captured
             // at `record_application_traceback` time; the inner
             // `CodeObject` lives as long as `w_code` is reachable.
             let code_obj = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;
             if code_obj.is_null() {
-                (String::from("<unknown>"), String::from("<unknown>"), None)
+                (b"<unknown>".to_vec(), String::from("<unknown>"), None)
             } else {
                 let code = unsafe { &*code_obj };
                 let location = usize::try_from(lasti)
@@ -2723,7 +2723,7 @@ fn write_traceback_chain_from_tb<W: Write>(
                         )
                     });
                 (
-                    code.source_path.to_string(),
+                    unsafe { crate::pycode::code_filename_bytes(w_code) },
                     code.obj_name.to_string(),
                     location,
                 )
@@ -2742,11 +2742,15 @@ fn write_traceback_chain_from_tb<W: Write>(
             continue;
         }
         let (filename, lineno, funcname) = key;
-        writeln!(
-            writer,
-            "  File \"{}\", line {}, in {}",
-            filename, lineno, funcname
-        )?;
+        // The filesystem bytes, not their WTF-8 decoding: a lone surrogate has
+        // no UTF-8 spelling either way, and the byte form is the one that
+        // still names the file to whatever reads the stream.
+        writer.write_all(b"  File \"")?;
+        writer.write_all(&filename)?;
+        writeln!(writer, "\", line {lineno}, in {funcname}")?;
+        // A source path with no UTF-8 spelling simply does not resolve, and
+        // `error.py:150 linecache.getline` likewise renders nothing then.
+        let source_filename = String::from_utf8_lossy(&filename);
         // `FrameSummary._set_lines` collects every line the failing
         // instruction spans, so a statement written across several lines (a
         // class body, a multi-line call) shows all of them, dedented by the
@@ -2757,7 +2761,7 @@ fn write_traceback_chain_from_tb<W: Write>(
         {
             let span: Vec<String> = (start_line..=end_line)
                 .map(|n| {
-                    read_source_line(&filename, n as i64)
+                    read_source_line(&source_filename, n as i64)
                         .map_or(String::new(), |l| l.trim_end().to_string())
                 })
                 .collect();
@@ -2766,7 +2770,7 @@ fn write_traceback_chain_from_tb<W: Write>(
                     writeln!(writer, "    {line}")?;
                 }
             }
-        } else if let Some(line) = read_source_line(&filename, lineno) {
+        } else if let Some(line) = read_source_line(&source_filename, lineno) {
             let raw_line = line.trim_end_matches(['\n', '\r']);
             let shown_line = raw_line.trim_start();
             writeln!(writer, "    {shown_line}")?;

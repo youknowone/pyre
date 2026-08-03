@@ -484,6 +484,12 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
         }
         if !obj.is_null() {
             let tp = (*obj).ob_type;
+            // `pyframe.py:849-853 descr_repr` may carry a lone surrogate in
+            // the filename, so keep an exact frame on the WTF-8 path instead
+            // of delegating through `py_repr`'s Rust `String` result.
+            if std::ptr::eq(tp, &crate::pyframe::FRAME_TYPE as *const PyType) {
+                return Ok((&*(obj as *const crate::PyFrame)).descr_repr());
+            }
             // A builtin leaf subclass's `__repr__` override may return a
             // lone surrogate; read it as WTF-8 rather than folding to `&str`.
             if let Some(r) = builtin_subclass_dunder_obj(obj, tp, "__repr__")? {
