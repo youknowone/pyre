@@ -6859,6 +6859,22 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `Option::<&T>::copied` / `Option::<T>::cloned` on an `Option`
+                // receiver — reading the referent value out of an `Option<&T>`
+                // is an identity in the lifted value model (`&T` and `T` are one
+                // GC pointer word, and `Option<&T>` / `Option<T>` share the
+                // niche discriminant + word layout), so alias the destination to
+                // the receiver instead of emitting a `copied` method call the
+                // rtyper cannot route on the classdef-less `Option` receiver.
+                if args.len() == 1
+                    && self.is_option_copied_identity(&reg, first_arg_ty.as_ref(), &call.dest.ty)
+                {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Workspace `Index::index` / `IndexMut::index_mut`
                 // impls (`FixedObjectArray` and friends) bottom out at
                 // raw-slice construction (`as_mut_slice` →
@@ -9775,6 +9791,48 @@ impl<'a> Lowering<'a> {
         first_arg_ty.is_some_and(|ty| {
             tyref_is_string_adt(ty, self.llbc) || tyref_strips_to_str(ty, self.llbc)
         })
+    }
+
+    /// `Option::<&T>::copied` / `Option::<T: Clone>::cloned` — reads the
+    /// referent value out of an `Option<&T>` to yield an `Option<T>`.  In the
+    /// lifted value model a `&T` and a `T` are the same one GC pointer word
+    /// (`slice_first`'s payload note: the front has no pointer-to-slot op, so a
+    /// `.first()` payload is already the element VALUE, and `Option<&T>` /
+    /// `Option<T>` share the niche discriminant + one-word representation), so
+    /// `.copied()` / `.cloned()` is an identity on the receiver.  Without the
+    /// intercept the call keeps a `CallTarget::Method` `copied` getattr the
+    /// rtyper cannot route on the classdef-less `Option` receiver (the `getattr
+    /// (opt, "copied")` census wall — e.g. `_codecs::lookup_codec`'s
+    /// `args.first().copied()`, `split_builtin_kwargs`'s
+    /// `positional.first().copied()`).  Bind the destination to the receiver
+    /// instead, the same alias shape as `to_string` / `NonNull::as_ptr`.
+    ///
+    /// Gated on BOTH the receiver and the destination being `Option`: a
+    /// slice/iterator `.copied()` or a `Vec::clone` — a real copy, not an
+    /// identity — has a non-`Option` receiver/dest and keeps its ordinary
+    /// lowering.  (`Option::clone` on a `Copy` payload is itself an identity, so
+    /// the `cloned` arm is sound for the `Option` family.)
+    fn is_option_copied_identity(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let np = fd.item_meta.name_path();
+        let Some(leaf) = np.rsplit("::").next() else {
+            return false;
+        };
+        if !matches!(leaf, "copied" | "cloned") {
+            return false;
+        }
+        first_arg_ty.is_some_and(|ty| crate::front::result_exc::tyref_is_option(ty, self.llbc))
+            && crate::front::result_exc::tyref_is_option(dest_ty, self.llbc)
     }
 
     /// `alloc::fmt::format(args)` (the `format!` macro's String producer)
