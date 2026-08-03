@@ -4251,16 +4251,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("system() requires 1 argument"));
                     }
+                    // `interp_posix.py:815 command='fsencode'`: the shell gets
+                    // the filesystem bytes, so a command naming a byte with no
+                    // UTF-8 spelling survives instead of being refused.
                     let cmd = unsafe {
                         if pyre_object::is_str(args[0]) {
-                            crate::baseobjspace::str_utf8_w(args[0])?.to_string()
+                            crate::gateway::fsencode_bytes_w(args[0])?
                         } else {
                             return Err(crate::PyError::type_error(
                                 "system(): command must be a string",
                             ));
                         }
                     };
-                    let c_cmd = std::ffi::CString::new(cmd.as_bytes())
+                    let c_cmd = std::ffi::CString::new(cmd)
                         .map_err(|_| crate::PyError::value_error("embedded null in command"))?;
                     let rc = rustpython_host_env::os::system(&c_cmd);
                     Ok(pyre_object::w_int_new(rc as i64))
@@ -4529,9 +4532,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 items
                     .into_iter()
                     .map(|s| {
+                        // `interp_posix.py:1742 args = [space.fsencode_w(w_arg)
+                        // for w_arg in args_w]`: every argv/envp entry crosses
+                        // to the new process as filesystem bytes.
                         let bytes = unsafe {
                             if pyre_object::is_str(s) {
-                                crate::baseobjspace::str_utf8_w(s)?.as_bytes().to_vec()
+                                crate::gateway::fsencode_bytes_w(s)?
                             } else if pyre_object::is_bytes(s) {
                                 pyre_object::w_bytes_data(s).to_vec()
                             } else {

@@ -807,6 +807,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "sethostname() requires 1 argument",
                         ));
                     }
+                    // `interp_func.py:408` fsencodes the str branch, but the
+                    // seam this reaches (`host_env::socket::sethostname`) takes
+                    // a `&str`, so a name spelling a byte with no UTF-8 form
+                    // has nowhere to travel; encoding here would only be undone
+                    // at the call. Closing this needs the seam to take bytes.
                     let name = unsafe {
                         if !pyre_object::is_str(args[0]) {
                             return Err(crate::PyError::type_error(
@@ -2168,11 +2173,13 @@ fn pack_inet_addr(
         } else {
             addr
         };
+        // `interp_socket.py:157-159 w_address = space.fsencode(w_address)`,
+        // with the upstream note that it deliberately avoids `fsencode_w`
+        // because Linux allows embedded NULs in an abstract-namespace path.
+        // The encoder used here performs no null check either.
         let path_bytes_vec: Vec<u8> = unsafe {
             if pyre_object::is_str(path_obj) {
-                crate::baseobjspace::str_utf8_w(path_obj)?
-                    .to_string()
-                    .into_bytes()
+                crate::gateway::fsencode_bytes_w(path_obj)?
             } else if pyre_object::bytesobject::is_bytes_like(path_obj) {
                 pyre_object::bytesobject::bytes_like_data(path_obj).to_vec()
             } else {
