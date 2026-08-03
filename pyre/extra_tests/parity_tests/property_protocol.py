@@ -61,6 +61,28 @@ assert p.fdel is del_value
 assert p.__doc__ == "getter doc"
 assert p.__name__ == "value"
 assert p.__get__(None, Managed) is p
+for name in ("fget", "fset", "fdel", "__doc__"):
+    member = property.__dict__[name]
+    assert type(member).__name__ == "member_descriptor"
+    assert member.__objclass__ is property
+    assert member.__name__ == name
+    assert member.__doc__ is None
+
+for name in ("fget", "fset", "fdel"):
+    original = getattr(p, name)
+    try:
+        setattr(p, name, None)
+    except AttributeError as exc:
+        assert str(exc) == "readonly attribute"
+    else:
+        raise AssertionError(f"property.{name} must be read-only")
+    try:
+        delattr(p, name)
+    except AttributeError as exc:
+        assert str(exc) == "readonly attribute"
+    else:
+        raise AssertionError(f"property.{name} must not be deletable")
+    assert getattr(p, name) is original
 
 # Python 3.14 property_name: an explicit name wins, deletion clears only that
 # slot and reveals the getter's __name__ fallback again.
@@ -130,14 +152,6 @@ assert sub.__dict__["extra"] == 17
 property.__init__(sub)
 assert sub.__dict__ == {"__doc__": None, "extra": 17}
 assert sub.__doc__ is None
-
-try:
-    plain.fget = None
-except AttributeError:
-    pass
-else:
-    assert False, "property.fget must be read-only"
-
 
 class AbstractCallable:
     __isabstractmethod__ = True

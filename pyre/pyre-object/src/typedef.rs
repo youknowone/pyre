@@ -338,6 +338,14 @@ pub const MEMBER_STATICMETHOD_FUNCTION: u32 = MEMBER_DIRECT_FLAG | 40;
 /// CPython 3.14 `classmethod_members`: both `__func__` and `__wrapped__`
 /// expose PyPy's `ClassMethod.w_function` field read-only.
 pub const MEMBER_CLASSMETHOD_FUNCTION: u32 = MEMBER_DIRECT_FLAG | 41;
+/// CPython 3.14 `property_members.fget`, backed by PyPy's `w_fget` field.
+pub const MEMBER_PROPERTY_FGET: u32 = MEMBER_DIRECT_FLAG | 42;
+/// CPython 3.14 `property_members.fset`, backed by PyPy's `w_fset` field.
+pub const MEMBER_PROPERTY_FSET: u32 = MEMBER_DIRECT_FLAG | 43;
+/// CPython 3.14 `property_members.fdel`, backed by PyPy's `w_fdel` field.
+pub const MEMBER_PROPERTY_FDEL: u32 = MEMBER_DIRECT_FLAG | 44;
+/// CPython 3.14 `property_members.__doc__`, the writable `w_doc` field.
+pub const MEMBER_PROPERTY_DOC: u32 = MEMBER_DIRECT_FLAG | 45;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {

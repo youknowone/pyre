@@ -12062,6 +12062,38 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
         pyre_object::MEMBER_CLASSMETHOD_FUNCTION => {
             Ok(unsafe { pyre_object::function::w_classmethod_get_func(obj) })
         }
+        pyre_object::MEMBER_PROPERTY_FGET => {
+            let value = unsafe { pyre_object::descriptor::w_property_get_fget(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
+        pyre_object::MEMBER_PROPERTY_FSET => {
+            let value = unsafe { pyre_object::descriptor::w_property_get_fset(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
+        pyre_object::MEMBER_PROPERTY_FDEL => {
+            let value = unsafe { pyre_object::descriptor::w_property_get_fdel(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
+        pyre_object::MEMBER_PROPERTY_DOC => {
+            let value = unsafe { pyre_object::descriptor::w_property_get_doc(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
         pyre_object::MEMBER_DESCR_NAME => unsafe { descr_member_name(obj) },
         _ => Err(crate::PyError::attribute_error(unsafe {
@@ -12214,6 +12246,10 @@ pub(crate) unsafe fn direct_member_set(
             unsafe { pyre_object::interp_exceptions::w_exception_set_reason(obj, value) };
             Ok(pyre_object::w_none())
         }
+        pyre_object::MEMBER_PROPERTY_DOC => {
+            unsafe { pyre_object::descriptor::w_property_set_doc(obj, value) };
+            Ok(pyre_object::w_none())
+        }
         _ => Err(crate::PyError::attribute_error("readonly attribute")),
     }
 }
@@ -12331,6 +12367,10 @@ pub(crate) unsafe fn direct_member_delete(
         pyre_object::MEMBER_EXCEPTION_SUPPRESS_CONTEXT => Err(crate::PyError::type_error(
             "can't delete numeric/char attribute",
         )),
+        pyre_object::MEMBER_PROPERTY_DOC => {
+            unsafe { pyre_object::descriptor::w_property_set_doc(obj, pyre_object::PY_NULL) };
+            Ok(pyre_object::w_none())
+        }
         pyre_object::MEMBER_ATTRIBUTE_ERROR_NAME | pyre_object::MEMBER_NAME_ERROR_NAME => {
             unsafe {
                 pyre_object::interp_exceptions::w_exception_set_name(obj, pyre_object::w_none())
@@ -15802,43 +15842,6 @@ fn property_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_none())
 }
 
-fn property_fget(args: &[PyObjectRef]) -> crate::PyResult {
-    let prop = property_require(args.get(1).copied().unwrap_or(PY_NULL), "fget")?;
-    let value = unsafe { pyre_object::descriptor::w_property_get_fget(prop) };
-    Ok(if value.is_null() { w_none() } else { value })
-}
-
-fn property_fset(args: &[PyObjectRef]) -> crate::PyResult {
-    let prop = property_require(args.get(1).copied().unwrap_or(PY_NULL), "fset")?;
-    let value = unsafe { pyre_object::descriptor::w_property_get_fset(prop) };
-    Ok(if value.is_null() { w_none() } else { value })
-}
-
-fn property_fdel(args: &[PyObjectRef]) -> crate::PyResult {
-    let prop = property_require(args.get(1).copied().unwrap_or(PY_NULL), "fdel")?;
-    let value = unsafe { pyre_object::descriptor::w_property_get_fdel(prop) };
-    Ok(if value.is_null() { w_none() } else { value })
-}
-
-fn property_doc_get(args: &[PyObjectRef]) -> crate::PyResult {
-    let prop = property_require(args.get(1).copied().unwrap_or(PY_NULL), "__doc__")?;
-    let value = unsafe { pyre_object::descriptor::w_property_get_doc(prop) };
-    Ok(if value.is_null() { w_none() } else { value })
-}
-
-fn property_doc_set(args: &[PyObjectRef]) -> crate::PyResult {
-    let prop = property_require(args.get(1).copied().unwrap_or(PY_NULL), "__doc__")?;
-    let value = args.get(2).copied().unwrap_or(PY_NULL);
-    unsafe { pyre_object::descriptor::w_property_set_doc(prop, value) };
-    Ok(w_none())
-}
-
-fn property_doc_del(args: &[PyObjectRef]) -> crate::PyResult {
-    let prop = property_require(args.get(1).copied().unwrap_or(PY_NULL), "__doc__")?;
-    unsafe { pyre_object::descriptor::w_property_set_doc(prop, PY_NULL) };
-    Ok(w_none())
-}
-
 fn property_name_get(args: &[PyObjectRef]) -> crate::PyResult {
     let prop = property_require(args.get(1).copied().unwrap_or(PY_NULL), "__name__")?;
     let stored = unsafe { pyre_object::descriptor::w_property_get_name(prop) };
@@ -15920,23 +15923,34 @@ fn init_property_type(ns: PyObjectRef) {
         ),
         (
             "fget",
-            make_getset_descriptor(make_builtin_function_with_arity("fget", property_fget, 2)),
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_PROPERTY_FGET,
+                "fget".to_owned(),
+                PY_NULL,
+            ),
         ),
         (
             "fset",
-            make_getset_descriptor(make_builtin_function_with_arity("fset", property_fset, 2)),
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_PROPERTY_FSET,
+                "fset".to_owned(),
+                PY_NULL,
+            ),
         ),
         (
             "fdel",
-            make_getset_descriptor(make_builtin_function_with_arity("fdel", property_fdel, 2)),
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_PROPERTY_FDEL,
+                "fdel".to_owned(),
+                PY_NULL,
+            ),
         ),
         (
             "__doc__",
-            make_getset_property_named(
-                make_builtin_function_with_arity("__doc__", property_doc_get, 2),
-                make_builtin_function_with_arity("__doc__", property_doc_set, 3),
-                make_builtin_function_with_arity("__doc__", property_doc_del, 2),
-                "__doc__",
+            pyre_object::w_member_new_direct(
+                pyre_object::MEMBER_PROPERTY_DOC,
+                "__doc__".to_owned(),
+                PY_NULL,
             ),
         ),
         (
