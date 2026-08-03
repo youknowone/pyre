@@ -960,12 +960,18 @@ impl LiveLastInstrGuard {
     /// sub-walk's pc is in the callee's code (the same reason `escape_stack`
     /// declines to latch a sub-walk's mirror), and writing it onto the outer
     /// frame strands that frame's replay on a stack depth it never had.
-    fn enter(live_frame: usize, py_pc: u32) -> Option<Self> {
+    fn enter(live_frame: usize, py_pc: u32, inline_py_pc: Option<u32>) -> Option<Self> {
         let inline = current_inline_concrete_frame() as *mut pyre_interpreter::PyFrame;
-        let frame = if inline.is_null() {
-            live_frame as *mut pyre_interpreter::PyFrame
-        } else {
-            inline
+        // The frame and the pc have to name the same code.  Retargeting the
+        // frame to the callee while keeping the outer walk's `vstack_cur_pypc`
+        // publishes a pc from the CALLER's code onto the callee's frame — and
+        // for a sub-walk that mirror is never advanced (`vstack_valid` is
+        // false), so the published value is a constant 0 and a frame reader
+        // inside the callee reports the function's first line.
+        let (frame, py_pc) = match (inline.is_null(), inline_py_pc) {
+            (false, Some(callee_pc)) => (inline, callee_pc),
+            (false, None) => (inline, py_pc),
+            (true, _) => (live_frame as *mut pyre_interpreter::PyFrame, py_pc),
         };
         if frame.is_null() {
             return None;
@@ -2610,6 +2616,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     } else {
         unsafe { (*ctx.fbw_mode.snapshot_sym).live_vable_frame_addr() }
     };
+    // Resolved against the callee's OWN metadata, because `vstack_cur_pypc` is
+    // the outer walk's mirror and a sub-walk never advances it.
+    let inline_callee_pc = inline_callee_py_pc(ctx, op_pc);
     let vable_root_depth = if let Some(obj) = vable_obj_root.as_mut() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
         let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
@@ -2806,7 +2815,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // `executioncontext.py:85 enter` for the inlined callee this residual
         // runs inside of.
         let _frame_chain = ResidualFrameChainGuard::enter();
-        let _last_instr = LiveLastInstrGuard::enter(live_frame, ctx.vstack_cur_pypc);
+        let _last_instr =
+            LiveLastInstrGuard::enter(live_frame, ctx.vstack_cur_pypc, inline_callee_pc);
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
@@ -3535,6 +3545,16 @@ pub(crate) fn walker_vable_and_vrefs_before_residual_call(ctx: &mut TraceCtx) {
     // pyjitpl.py: force_token + SETFIELD_GC vable_token_descr
     let force_token = ctx.force_token();
     ctx.vable_setfield_descr(vable_ref, force_token, info.token_field_descr());
+}
+
+/// The python pc `jit_pc` names in the inline callee's OWN code, or `None`
+/// when this walk is not inside an inline callee.  A callee `jit_pc` has no
+/// meaning in the outer jitcode's py_pc tables, so every consumer that writes
+/// a pc onto the callee's frame has to go through the callee's own metadata.
+fn inline_callee_py_pc<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, jit_pc: usize) -> Option<u32> {
+    let consts = ctx.inline_callee_consts?;
+    let pjc = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
+    Some(python_pc_for_jitcode_pc(&pjc.metadata, jit_pc))
 }
 
 /// Convenience wrapper for [`walker_vable_and_vrefs_before_residual_call`].
