@@ -8257,10 +8257,11 @@ fn exception_group_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let exceptions_repr = if !saved.is_null() {
         unsafe { pyre_object::w_str_get_value(saved) }.to_string()
     } else {
-        // CPython 3.14 BaseExceptionGroup_repr: render the immutable internal
-        // tuple using the original list/tuple spelling.  `args` intentionally
-        // still retains the caller's original sequence, but its contents must
-        // not influence repr after construction.
+        // Fallback for a group whose constructor never recorded the spelling:
+        // render the immutable internal tuple, but as a list when `args` shows
+        // the caller supplied one.  The contents come from the internal tuple,
+        // so a later mutation of the caller's list is not reflected — matching
+        // PyPy rather than CPython 3.14, which re-renders `args[1]` live.
         let w_args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(w_self) };
         let original_was_list = unsafe {
             pyre_object::is_tuple(w_args)
