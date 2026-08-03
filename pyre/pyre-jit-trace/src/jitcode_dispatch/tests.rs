@@ -11410,8 +11410,8 @@ fn ref_compare_same_box_fastpath_covers_the_instance_ptr_spellings() {
 // from the floating-point return register (`executor.py:66-68 cpu.bh_call_f`).
 
 /// A real `f64`-returning callee with an integer parameter, i.e. the
-/// `jit_bigint_to_f64_or_inf` shape.  Reading the integer return register
-/// here returned the argument still sitting in it.
+/// `jit_bigint_to_f64_or_inf` shape.  The integer return register is undefined
+/// after such a call, so reading it here read residue, not the result.
 extern "C" fn halve_f64_for_walker_test(x: i64) -> f64 {
     (x as f64) / 2.0
 }

@@ -1651,12 +1651,15 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
     //
     // Pyre's walker folds from a different source of constants.  Its
     // getfield_gc_r handler propagates field reads (including pointer-valued
-    // fields like `PyFrame.f_back`) as concrete values whenever the parent
+    // fields like `PyFrame.f_backref`) as concrete values whenever the parent
     // struct is concrete-known, so a top-level frame stamps
-    // `Value::Ref(GcRef(0))` into the constant pool where upstream would still
-    // hold a symbolic box guarded by the `guard_nonnull` its optimizer inserts
-    // ahead of a pointer-deref residual call.  Executing `helper(NULL)` here
-    // would dereference NULL and SEGV before that guard exists.
+    // `Value::Ref(GcRef(0))` onto the recorded `GetfieldGcR` OpRef
+    // (`set_opref_concrete`), which `box_value` then hands straight to this
+    // fold.  Upstream never derives that NULL in the first place: a pointer
+    // becomes nonnull-known there only from the traced program's own null test
+    // (`pyjitpl.py:558-575 _establish_nullity`), so the box stays symbolic and
+    // the call is never folded on a NULL it invented.  Executing
+    // `helper(NULL)` here would dereference NULL and SEGV.
     //
     // So guard the executor entry against NULL Ref arguments and fall through
     // to recording the IR op as-is.  The downstream optimizer then sees the

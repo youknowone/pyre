@@ -3656,9 +3656,12 @@ impl JitCodeBuilder {
         // arm through an `extern "C" fn(..) -> f64` ABI, i.e. out of the
         // floating-point return register.  That is right for a raw callee
         // address — `add_fn_ptr(ptr)` is `add_call_target(ptr, ptr)` — and
-        // wrong for a `_concrete` wrapper, which `#[jit_module]` gives an
-        // `-> i64` signature carrying `f64::to_bits`.  Only the macro's
-        // `*_float_wrapped` call policies mint that divergence, and no crate
+        // wrong for a `_concrete` wrapper, which the helper policy attributes
+        // give an `-> i64` signature carrying `f64::to_bits`
+        // (`emit_helper_call_target_fn`, `majit-macros/src/lib.rs:605-614`).
+        // Only the `*_float_wrapped` call policies mint that divergence — for
+        // `jit_release_gil` it arrives via `_call_aroundstate_target_<name>`,
+        // whose first element is that same `_concrete` wrapper — and no crate
         // declares one; assert the invariant here so the first declaration
         // trips a build rather than silently stamping a float read out of the
         // integer return register.
