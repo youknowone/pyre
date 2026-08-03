@@ -24,6 +24,18 @@
 /// `descr.py:598-612 create_call_stub` parity: a single ARGS×RESULT shape
 /// per dispatch; we enumerate the same shape twice (once per RESULT) instead
 /// of generating one stub per descriptor.
+///
+/// The signature is recovered from the *bucketed* `(int, float)` arity, so a
+/// callee declaring `fn(f64, i64)` is dispatched as `fn(i64, f64)`. That is
+/// ABI-preserving only where integer and floating-point parameters are
+/// assigned from two independent register files in their own relative order:
+/// SysV (rdi.. / xmm0..) and AAPCS (x0.. / d0..). The Microsoft x64
+/// convention assigns the first four arguments *by position* — argument 0
+/// takes rcx or xmm0 depending on its type, argument 1 takes rdx or xmm1 —
+/// so there the bucketing would move both arguments to the wrong register.
+/// Callers that can hold an interleaved signature must reject it before
+/// reaching here; the general fix is the libffi dispatch named in the
+/// catch-all arm below, which also removes the arity ceiling.
 macro_rules! dispatch_arity_body {
     ($func:ident, $int_args:ident, $float_args:ident, $ret:ty) => {{
         type I = i64;
@@ -420,6 +432,12 @@ pub unsafe fn bh_call_f_dispatch(func: usize, int_args: &[i64], float_args: &[f6
 /// Mirrors `rpython/jit/backend/llsupport/descr.py:614-620 verify_types`:
 /// the per-class counts in `arg_classes` must match the corresponding list
 /// length, and any unknown class is a codegen bug.
+///
+/// The two returned buckets discard the interleaving `arg_classes` encodes;
+/// see `dispatch_arity_body!` for which ABIs that reordering is sound on. This
+/// function does not itself reject an interleaved `arg_classes` — the in-tree
+/// calldescrs it is fed carry non-interleaved signatures, and rejecting here
+/// would panic on calls that are ABI-correct under SysV/AAPCS.
 pub fn collect_call_args(
     arg_classes: &str,
     args_i: Option<&[i64]>,

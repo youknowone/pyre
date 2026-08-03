@@ -8446,12 +8446,30 @@ pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
 /// `args[i]` for a `Type::Float` slot carries the raw `f64::to_bits`, matching
 /// the `args_f` bank convention (`longlong` float storage).
 ///
+/// `descr.py:545-569 process` also encodes `'L'` (SignedLongLong — integer
+/// register file) and `'S'` (SingleFloat — `f32`) argument classes, which the
+/// bank-fed [`majit_backend::call_stub::collect_call_args`] carries arms for.
+/// Neither can arrive here: this seam is fed by `descr.arg_types()`, and
+/// `CallDescr::arg_classes` (`majit-ir/src/descr.rs`) maps `Type` onto
+/// `'i'`/`'r'`/`'f'`/`'v'` exhaustively, so a `Type::Float` slot is always
+/// class `'f'`.  Teaching `Type` those classes must extend both sites.
+///
 /// # Panics
-/// `bh_call_f_dispatch`'s arity table is `fn(I × ints, F × floats)` — all
-/// integer/ref parameters precede all float ones.  A callee whose signature
-/// interleaves them cannot be expressed, so it panics rather than shuffle the
-/// arguments into the wrong registers.  Every float-returning helper in the
-/// tree today is non-interleaved (`jit_bigint_to_f64_or_inf(ref) -> f64`,
+/// `bh_call_f_dispatch` recovers the callee signature from the *bucketed*
+/// `(ints, floats)` arity, i.e. `fn(I × ints, F × floats)`.  Reordering an
+/// interleaved signature into that shape is ABI-preserving only where the
+/// integer and floating-point parameters are assigned from two independent
+/// register files in their own relative order (SysV, AAPCS).  The Microsoft
+/// x64 convention instead assigns the first four arguments *by position* —
+/// `fn(f64, i64)` takes xmm0/rdx where `fn(i64, f64)` takes rcx/xmm1 — so the
+/// reordering would put both arguments in the wrong register there.  An
+/// interleaved signature is therefore rejected rather than dispatched
+/// differently per target.  Upstream needs no such restriction because
+/// `descr.py:598-612 create_call_stub` generates a stub carrying the descr's
+/// real `arg_classes` signature; the convergence path for pyre is the libffi
+/// dispatch already recorded at `call_stub.rs` `dispatch_arity_body!`'s
+/// catch-all arm.  Every float-returning helper in the tree today is
+/// non-interleaved (`jit_bigint_to_f64_or_inf(ref) -> f64`,
 /// `jit_float_abs(f64) -> f64`, `jit_float_fmod(f64, f64) -> f64`).
 pub fn call_float_function(func_ptr: *const (), args: &[i64], arg_types: &[Type]) -> f64 {
     // Where a backend cannot build a `call_indirect` whose type matches the
@@ -8468,8 +8486,10 @@ pub fn call_float_function(func_ptr: *const (), args: &[i64], arg_types: &[Type]
             _ => {
                 assert!(
                     float_args.is_empty(),
-                    "call_float_function: interleaved int/float parameters are \
-                     outside `bh_call_f_dispatch`'s `fn(I.., F..)` arity table"
+                    "call_float_function: an integer/ref parameter after a float \
+                     one cannot be bucketed into `bh_call_f_dispatch`'s \
+                     `fn(I.., F..)` signature without changing which register \
+                     each argument lands in on a positional-slot ABI"
                 );
                 int_args.push(a);
             }

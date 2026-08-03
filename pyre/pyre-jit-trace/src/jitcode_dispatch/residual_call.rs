@@ -1641,18 +1641,26 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
         };
         args.push(v);
     }
-    // Refuse to invoke the helper when any Ref argument is NULL.  Pyre's
-    // getfield_gc_r walker handler propagates field reads (including
-    // pointer-valued fields like `PyFrame.f_back`) as concrete values
-    // when the parent struct is concrete-known; a top-level frame
-    // returns NULL for `f_back`, stamping `Value::Ref(GcRef(0))` into
-    // the constant pool.  Folding `helper(NULL)` would then dereference
-    // NULL and SEGV.  PyPy avoids this because its optimizer inserts
-    // `guard_nonnull` ahead of any pointer-deref residual call; pyre's
-    // walker folds before that guard exists, so guard the executor
-    // entry against NULL receivers and fall through to recording the
-    // IR op as-is.  The downstream optimizer then sees the call op and
-    // emits the necessary guards.
+    // Refuse to invoke the helper when any Ref argument is NULL.
+    //
+    // `pyjitpl.py:3586-3603 record_result_of_call_pure` folds on the weaker
+    // test "every argbox is a Const", which admits `ConstPtr(NULL)`.  It can
+    // afford to: upstream reaches that line only *after* the call has already
+    // been executed for real, and its Const arguments come from boxes the
+    // interpreter itself made constant.
+    //
+    // Pyre's walker folds from a different source of constants.  Its
+    // getfield_gc_r handler propagates field reads (including pointer-valued
+    // fields like `PyFrame.f_back`) as concrete values whenever the parent
+    // struct is concrete-known, so a top-level frame stamps
+    // `Value::Ref(GcRef(0))` into the constant pool where upstream would still
+    // hold a symbolic box guarded by the `guard_nonnull` its optimizer inserts
+    // ahead of a pointer-deref residual call.  Executing `helper(NULL)` here
+    // would dereference NULL and SEGV before that guard exists.
+    //
+    // So guard the executor entry against NULL Ref arguments and fall through
+    // to recording the IR op as-is.  The downstream optimizer then sees the
+    // call op and emits the necessary guards.
     for (i, &arg) in args.iter().enumerate() {
         if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
             return;
