@@ -1221,12 +1221,17 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
             // write_boxes` has no decline) — otherwise the callee reads an
             // array of nulls.  That write claims no resume pc, and the undo
             // stays armed so the legacy replay re-enters the pre-flush frame.
-            // A directly matched frame escaped whether or not the flush
-            // committed, so the two signals stay decoupled.  A redirected one
-            // is reported only once the resume pc is committed: forcing
-            // without it would raise an escape the walk can only answer by
-            // replaying from entry, double-applying this residual's body.
-            return flushed || expected == frame as usize;
+            //
+            // Upstream reports the escape from the vable token state alone,
+            // independent of any resume-image write.  See
+            // `virtualizable.py:231-255` (`tracing_after_residual_call` /
+            // `force_now`), `virtualizable.py:311-330` (token states),
+            // `virtualref.py:157-167` (vref'd inlined callee), and
+            // `pyjitpl.py:3373-3390` (unconditional ABORT_ESCAPE).  Runtime
+            // forcing also resets the token before writing fields
+            // (`resume.py:1405-1408`).  Therefore a matched guard reports the
+            // escape even when the flush declined.
+            return true;
         }
         false
     })
