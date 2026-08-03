@@ -1,5 +1,7 @@
 """CPython 3.14 member-descriptor surface for values backed by PyPy type state."""
 
+import types
+
 
 member_names = (
     "__basicsize__",
@@ -114,6 +116,90 @@ for cls, expected in expected_layouts.items():
         cls.__dictoffset__,
     )
     assert actual == expected, (cls, actual, expected)
+
+expected_flags = {
+    object: 0x1502,
+    type: 0x80805D02,
+    int: 0x1401502,
+    bool: 0x1401102,
+    float: 0x401502,
+    complex: 0x1502,
+    str: 0x10401502,
+    bytes: 0x8401502,
+    bytearray: 0x401502,
+    list: 0x2405522,
+    tuple: 0x4405522,
+    dict: 0x20405542,
+    set: 0x405502,
+    frozenset: 0x405502,
+    memoryview: 0x5122,
+    range: 0x1122,
+    slice: 0x5102,
+    super: 0x5502,
+    enumerate: 0x5502,
+    filter: 0x5502,
+    map: 0x5502,
+    reversed: 0x5502,
+    zip: 0x5502,
+    staticmethod: 0x5502,
+    classmethod: 0x5502,
+    property: 0x5502,
+    type(None): 0x1102,
+    type(NotImplemented): 0x1102,
+    type(Ellipsis): 0x1102,
+    BaseException: 0x40005502,
+    AttributeError: 0x40005502,
+    BaseExceptionGroup: 0x40005502,
+    ExceptionGroup: 0x40005608,
+    SyntaxError: 0x40005502,
+    OSError: 0x40005502,
+    A: 0x561C,
+    B: 0x561C,
+    Slotted: 0x5600,
+    NoStorage: 0x5600,
+    IntSubclass: 0x1405610,
+    BytesSubclass: 0x8405610,
+    StrSubclass: 0x1040561C,
+    ListSubclass: 0x240563C,
+    SlottedList: 0x2405620,
+}
+for cls, expected in expected_flags.items():
+    assert cls.__flags__ == expected, (cls, hex(cls.__flags__), hex(expected))
+
+runtime_type_flags = {
+    types.FunctionType: 0x25902,
+    types.BuiltinFunctionType: 0x5982,
+    types.MethodType: 0x5902,
+    types.MethodDescriptorType: 0x25982,
+    types.WrapperDescriptorType: 0x25182,
+    types.MethodWrapperType: 0x5182,
+    types.ClassMethodDescriptorType: 0x5182,
+    types.GeneratorType: 0x5182,
+    types.CoroutineType: 0x5182,
+    types.AsyncGeneratorType: 0x5182,
+    types.CodeType: 0x1102,
+    types.FrameType: 0x5182,
+    types.TracebackType: 0x5102,
+    types.CellType: 0x5102,
+    types.ModuleType: 0x5502,
+    types.MappingProxyType: 0x5142,
+}
+for cls, expected in runtime_type_flags.items():
+    assert cls.__flags__ == expected, (cls, hex(cls.__flags__), hex(expected))
+
+# ExceptionGroup is the heap-type exception-group leaf in CPython 3.14;
+# BaseExceptionGroup remains an immutable static type.
+ExceptionGroup._pyre_type_flags_probe = 1
+assert ExceptionGroup._pyre_type_flags_probe == 1
+del ExceptionGroup._pyre_type_flags_probe
+
+for non_base in (slice, types.MappingProxyType):
+    try:
+        type("BadSubclass", (non_base,), {})
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"{non_base.__name__} must not be subclassable")
 
 assert "__basicsize__" not in int.__dict__
 assert "__itemsize__" not in int.__dict__

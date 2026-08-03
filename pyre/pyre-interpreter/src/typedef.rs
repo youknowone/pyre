@@ -441,9 +441,12 @@ pub fn init_typeobjects() {
         // copy/__or__/__ror__/__ior__/__reversed__/cmp methods) is
         // populated by `init_mappingproxy_type` so `cls.__dict__.keys()`
         // and friends dispatch through the registered descriptors.
+        let mappingproxy_type =
+            new_typeobject_with_base("mappingproxy", init_mappingproxy_type, object_type);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(mappingproxy_type, false) };
         reg.insert(
             &pyre_object::MAPPING_PROXY_TYPE as *const PyType as usize,
-            new_typeobject_with_base("mappingproxy", init_mappingproxy_type, object_type) as usize,
+            mappingproxy_type as usize,
         );
         // module — `pypy/interpreter/module.py Module.typedef`, bases=(object,).
         // `Module` carries a custom Rust layout (name + w_dict), so
@@ -809,9 +812,11 @@ pub fn init_typeobjects() {
         );
 
         // slice — PyPy: sliceobject.py, bases=(object,)
+        let slice_type = new_typeobject_with_base("slice", init_slice_type, object_type);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(slice_type, false) };
         reg.insert(
             &pyre_object::sliceobject::SLICE_TYPE as *const PyType as usize,
-            new_typeobject_with_base("slice", init_slice_type, object_type) as usize,
+            slice_type as usize,
         );
 
         // re.Pattern / re.Match — PyPy: module/_sre/interp_sre.py

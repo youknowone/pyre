@@ -8101,7 +8101,13 @@ fn make_exception_group_type(name: &'static str, bases: &[PyObjectRef]) -> PyObj
         // directly, so install the copied descriptor and flag explicitly.
         let descr = crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), cls);
         crate::type_dict_store(cls, "__weakref__", descr);
-        unsafe { pyre_object::w_type_set_weakrefable(cls, true) };
+        unsafe {
+            pyre_object::w_type_set_weakrefable(cls, true);
+            // CPython 3.14 declares ExceptionGroup as a heap type (unlike the
+            // static BaseExceptionGroup); this controls mutability as well as
+            // the public Py_TPFLAGS_HEAPTYPE/IMMUTABLETYPE bits.
+            pyre_object::w_type_set_heaptype(cls, true);
+        };
     }
     register_exc_class(name, cls)
 }
