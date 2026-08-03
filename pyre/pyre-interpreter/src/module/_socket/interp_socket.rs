@@ -2397,7 +2397,9 @@ fn unpack_inet_addr(storage: &libc::sockaddr_storage) -> pyre_object::PyObjectRe
             .position(|&b| b == 0)
             .unwrap_or(sun.sun_path.len());
         let bytes: Vec<u8> = sun.sun_path[..end].iter().map(|&b| b as u8).collect();
-        pyre_object::w_str_new(&String::from_utf8_lossy(&bytes))
+        // `interp_socket.py:47 space.newfilename(path)`: read-back uses the filesystem
+        // decoding so a byte with no UTF-8 spelling survives the round trip.
+        crate::gateway::fsdecode_filename_bytes(&bytes)
     } else {
         pyre_object::w_tuple_new(vec![])
     }
