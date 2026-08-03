@@ -1521,6 +1521,16 @@ impl MiniMarkGC {
         self.bytes_made_old_since_cycle =
             self.bytes_made_old_since_cycle.saturating_add(total_size);
         let obj_addr = (ptr as usize) + GcHeader::SIZE;
+        if crate::gc_lifetime_log_enabled() {
+            // Pairs with `[gc][free]`: whether a dangling reference names an
+            // object freed after the referrer was born, or one already dead
+            // when the referrer took it, decides between a missed marking edge
+            // and a stale cached pointer, and the free line alone cannot say.
+            eprintln!(
+                "[gc][alloc] addr={obj_addr:#x} type_id={type_id} kind=oldgen state={:?}",
+                self.gc_state
+            );
+        }
         if (type_id as usize) < self.types.len() {
             let info = self.types.get(type_id);
             // A destructor-bearing object that never passes through the
@@ -2203,6 +2213,12 @@ impl MiniMarkGC {
             }
         };
         let new_obj_addr = new_header_ptr as usize + GcHeader::SIZE;
+        if crate::gc_lifetime_log_enabled() {
+            eprintln!(
+                "[gc][alloc] addr={new_obj_addr:#x} type_id={type_id} kind=promotion state={:?}",
+                self.gc_state
+            );
+        }
         self.bytes_made_old_since_cycle =
             self.bytes_made_old_since_cycle.saturating_add(total_size);
 
