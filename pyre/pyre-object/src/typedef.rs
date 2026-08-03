@@ -322,6 +322,16 @@ pub const MEMBER_SYNTAX_ERROR_END_LINENO: u32 = MEMBER_DIRECT_FLAG | 32;
 pub const MEMBER_SYNTAX_ERROR_END_OFFSET: u32 = MEMBER_DIRECT_FLAG | 33;
 /// CPython 3.14 `SyntaxError_members.print_file_and_line`, backed by PyPy's field.
 pub const MEMBER_SYNTAX_ERROR_PRINT_FILE_AND_LINE: u32 = MEMBER_DIRECT_FLAG | 34;
+/// CPython 3.14 Unicode*Error `encoding`, backed by PyPy's `w_encoding`.
+pub const MEMBER_UNICODE_ERROR_ENCODING: u32 = MEMBER_DIRECT_FLAG | 35;
+/// CPython 3.14 Unicode*Error `object`, backed by PyPy's `w_object`.
+pub const MEMBER_UNICODE_ERROR_OBJECT: u32 = MEMBER_DIRECT_FLAG | 36;
+/// CPython 3.14 Unicode*Error `start`, backed by PyPy's `w_start`.
+pub const MEMBER_UNICODE_ERROR_START: u32 = MEMBER_DIRECT_FLAG | 37;
+/// CPython 3.14 Unicode*Error `end`, backed by PyPy's `w_end`.
+pub const MEMBER_UNICODE_ERROR_END: u32 = MEMBER_DIRECT_FLAG | 38;
+/// CPython 3.14 Unicode*Error `reason`, backed by PyPy's `w_reason`.
+pub const MEMBER_UNICODE_ERROR_REASON: u32 = MEMBER_DIRECT_FLAG | 39;
 
 /// Create a new Member descriptor.
 pub fn w_member_new(index: u32, name: String, w_cls: PyObjectRef) -> PyObjectRef {

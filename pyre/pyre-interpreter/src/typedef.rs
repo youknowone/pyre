@@ -12016,6 +12016,46 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
             }
             Ok(pyre_object::w_none())
         }
+        pyre_object::MEMBER_UNICODE_ERROR_ENCODING => {
+            let value = unsafe { pyre_object::interp_exceptions::w_exception_get_encoding(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
+        pyre_object::MEMBER_UNICODE_ERROR_OBJECT => {
+            let value = unsafe { pyre_object::interp_exceptions::w_exception_get_object(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
+        pyre_object::MEMBER_UNICODE_ERROR_START => {
+            let value = unsafe { pyre_object::interp_exceptions::w_exception_get_start(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
+        pyre_object::MEMBER_UNICODE_ERROR_END => {
+            let value = unsafe { pyre_object::interp_exceptions::w_exception_get_end(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
+        pyre_object::MEMBER_UNICODE_ERROR_REASON => {
+            let value = unsafe { pyre_object::interp_exceptions::w_exception_get_reason(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
+        }
         pyre_object::MEMBER_DESCR_OBJCLASS => unsafe { descr_member_objclass(obj) },
         pyre_object::MEMBER_DESCR_NAME => unsafe { descr_member_name(obj) },
         _ => Err(crate::PyError::attribute_error(unsafe {
@@ -12146,6 +12186,26 @@ pub(crate) unsafe fn direct_member_set(
         }
         pyre_object::MEMBER_SYSTEM_EXIT_CODE => {
             unsafe { pyre_object::interp_exceptions::w_exception_set_code(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_UNICODE_ERROR_ENCODING => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_encoding(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_UNICODE_ERROR_OBJECT => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_object(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_UNICODE_ERROR_START => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_start(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_UNICODE_ERROR_END => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_end(obj, value) };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_UNICODE_ERROR_REASON => {
+            unsafe { pyre_object::interp_exceptions::w_exception_set_reason(obj, value) };
             Ok(pyre_object::w_none())
         }
         _ => Err(crate::PyError::attribute_error("readonly attribute")),
@@ -12340,6 +12400,36 @@ pub(crate) unsafe fn direct_member_delete(
         pyre_object::MEMBER_SYSTEM_EXIT_CODE => {
             unsafe {
                 pyre_object::interp_exceptions::w_exception_set_code(obj, pyre_object::w_none())
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_UNICODE_ERROR_ENCODING => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_encoding(obj, pyre_object::w_none())
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_UNICODE_ERROR_OBJECT => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_object(obj, pyre_object::w_none())
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_UNICODE_ERROR_START => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_start(obj, pyre_object::w_none())
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_UNICODE_ERROR_END => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_end(obj, pyre_object::w_none())
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_UNICODE_ERROR_REASON => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_reason(obj, pyre_object::w_none())
             };
             Ok(pyre_object::w_none())
         }

@@ -6673,9 +6673,7 @@ fn exception_typedef_attrs(class_name: &str) -> &'static [&'static str] {
         "NameError" => &[],
         "AttributeError" => &[],
         "SyntaxError" => &[],
-        "UnicodeDecodeError" | "UnicodeEncodeError" | "UnicodeTranslateError" => {
-            &["encoding", "end", "object", "reason", "start"]
-        }
+        "UnicodeDecodeError" | "UnicodeEncodeError" | "UnicodeTranslateError" => &[],
         "BaseExceptionGroup" => &["exceptions", "message"],
         _ => &[],
     }
@@ -7027,6 +7025,51 @@ fn make_exc_type_with_init(
                     );
                 }
             }
+            if matches!(
+                name,
+                "UnicodeDecodeError" | "UnicodeEncodeError" | "UnicodeTranslateError"
+            ) {
+                for (member_name, kind, doc) in [
+                    (
+                        "encoding",
+                        pyre_object::MEMBER_UNICODE_ERROR_ENCODING,
+                        "exception encoding",
+                    ),
+                    (
+                        "object",
+                        pyre_object::MEMBER_UNICODE_ERROR_OBJECT,
+                        "exception object",
+                    ),
+                    (
+                        "start",
+                        pyre_object::MEMBER_UNICODE_ERROR_START,
+                        "exception start",
+                    ),
+                    (
+                        "end",
+                        pyre_object::MEMBER_UNICODE_ERROR_END,
+                        "exception end",
+                    ),
+                    (
+                        "reason",
+                        pyre_object::MEMBER_UNICODE_ERROR_REASON,
+                        "exception reason",
+                    ),
+                ] {
+                    unsafe {
+                        pyre_object::w_dict_setitem_str_no_proxy(
+                            ns,
+                            member_name,
+                            pyre_object::w_member_new_direct_with_doc(
+                                kind,
+                                member_name.to_owned(),
+                                doc.to_owned(),
+                                pyre_object::PY_NULL,
+                            ),
+                        );
+                    }
+                }
+            }
             // `interp_exceptions.py:291-292` registers `__str__` /
             // `__repr__` on `BaseException`'s typedef, and each of the
             // classes below registers a `descr_str` of its own on top.  A
@@ -7329,6 +7372,16 @@ fn make_exc_type_with_init(
     if name == "SystemExit" {
         if let Some(member) = crate::type_dict_lookup(cls, "code") {
             unsafe { pyre_object::w_member_set_cls(member, cls) };
+        }
+    }
+    if matches!(
+        name,
+        "UnicodeDecodeError" | "UnicodeEncodeError" | "UnicodeTranslateError"
+    ) {
+        for member_name in ["encoding", "object", "start", "end", "reason"] {
+            if let Some(member) = crate::type_dict_lookup(cls, member_name) {
+                unsafe { pyre_object::w_member_set_cls(member, cls) };
+            }
         }
     }
     // Record the class so typedef::r#type can map a raised exception
