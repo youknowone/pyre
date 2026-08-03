@@ -554,7 +554,13 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     // with the NONE slot left in place; `stack_sync` (USE) omits any NONE
     // mirror slot, which resume re-materializes.
     if ctx.vstack_valid {
-        let callee_local_shadow = ctx.fbw_mode.inline_subwalk && fbw_callee_vstack_enabled();
+        // Admission, not the env gate, decides the shadow owner: a recursive
+        // closure is admitted with `PYRE_FBW_CALLEE_VSTACK` off, and filling
+        // its hole from the outer portal virtualizable would record a caller
+        // operand as the callee's kept-stack value.  A sub-walk mirror only
+        // exists once `seed_callee_vstack_mirror` / `step_vstack_mirror` have
+        // admitted it, so `inline_subwalk` alone is that predicate here.
+        let callee_local_shadow = ctx.fbw_mode.inline_subwalk;
         let hole = ctx
             .vstack_boxes
             .get(..new_depth)

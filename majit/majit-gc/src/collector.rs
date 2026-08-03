@@ -3332,7 +3332,6 @@ impl MiniMarkGC {
     /// marked value may itself make another owner live, hence the fixed point.
     fn mark_ephemeron_values_to_fixed_point(&mut self) {
         loop {
-            let marked_before = self.incr_state.objects_marked;
             let mut classify_owner = |owner: usize| -> Option<usize> {
                 if owner == 0 || !self.oldgen.contains(owner) {
                     return Some(owner);
@@ -3344,10 +3343,18 @@ impl MiniMarkGC {
             for root in roots {
                 self.seed_major_root(root, "ephemeron_table_root");
             }
+            // Progress is what this drain itself marked: `objects_marked` is
+            // owned by `incremental_mark_step` and never moves here, so reading
+            // it would end the walk after one pass and leave the second owner's
+            // value unmarked while pruning keeps its now-live entry.  Seeding
+            // an already-VISITED root pushes nothing, so an empty drain is
+            // exactly "no owner became live in this pass".
+            let mut drained = 0usize;
             while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
                 self.mark_object(obj_addr);
+                drained += 1;
             }
-            if self.incr_state.objects_marked == marked_before {
+            if drained == 0 {
                 break;
             }
         }

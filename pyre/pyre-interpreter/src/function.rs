@@ -2102,6 +2102,12 @@ pub unsafe fn fset_func_code(obj: PyObjectRef, w_code: PyObjectRef) -> Result<()
         let kind_mask = crate::CodeFlags::GENERATOR
             | crate::CodeFlags::COROUTINE
             | crate::CodeFlags::ASYNC_GENERATOR;
+        // `warn_deprecation` runs the app-level warnings machinery and
+        // `function_get_doc` realizes the docstring; both allocate, so publish
+        // the two operands and read them back from their root slots rather
+        // than storing through a pre-move address.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[obj, w_code]);
         if old_code.flags.intersection(kind_mask).bits()
             != (*raw_code).flags.intersection(kind_mask).bits()
         {
@@ -2113,8 +2119,11 @@ pub unsafe fn fset_func_code(obj: PyObjectRef, w_code: PyObjectRef) -> Result<()
         // Resolves the OLD code's docstring into `w_doc` *before* the
         // pointer flip so the cached value reflects the function's
         // original docstring, not the new code's first const.
-        let _ = function_get_doc(obj);
-        function_set_func_code(obj, w_code as *const ());
+        let _ = function_get_doc(pyre_object::gc_roots::shadow_stack_get(base));
+        function_set_func_code(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(base + 1) as *const (),
+        );
         Ok(())
     }
 }
