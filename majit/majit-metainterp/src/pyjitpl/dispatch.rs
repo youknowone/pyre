@@ -142,7 +142,72 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
         } => {
             if let Some(p) = parent {
                 if !p.all_fielddescrs.is_empty() {
-                    let specs: Vec<_> = p.all_fielddescrs.iter().map(field_spec_from_bh).collect();
+                    let mut specs: Vec<_> =
+                        p.all_fielddescrs.iter().map(field_spec_from_bh).collect();
+                    if p.type_id == 0 {
+                        // Same no-identity sentinel the empty-list branch below
+                        // carves out, and the same one
+                        // `simple_descr_group_from_bh_size`
+                        // (`pyre-jit-trace/src/descr.rs`) carves out for this
+                        // exact input. Here it is the more damaging of the two:
+                        // the keyed publish would put a whole *field table*
+                        // under `LLType::Struct(0)`, and `get_field_descr` keys
+                        // `_cache_field[key]` by field name — so a second
+                        // type-id-less parent that shares a field name would
+                        // resolve to the first parent's descr, and one that does
+                        // not would still mint against the first parent's size
+                        // descr, since `_cache_size` already holds that slot.
+                        // Mint fresh per resolution instead: without an identity
+                        // carrier the orthodox reading is "each of these is a
+                        // distinct STRUCT".
+                        //
+                        // `is_gc_managed`/`headerless` are dropped the way the
+                        // trace-side twin drops them — the non-keyed factory
+                        // defaults to `(true, false)`, and the raw and
+                        // header-less producers all carry a real type id because
+                        // they publish through `register_struct_layout`.
+                        if crate::majit_log_enabled() {
+                            eprintln!(
+                                "[jit] field_descr_ref_from_bh: fresh-minting a \
+                                 type-id-less parent with {} field(s) for field={name:?}",
+                                specs.len()
+                            );
+                        }
+                        // A name miss means the getfield names an inline
+                        // aggregate the flattened list only covers through its
+                        // leaves (see the note in the empty-list branch). Carry
+                        // it as one more field of this fresh parent rather than
+                        // falling through to the parentless placeholder, so
+                        // `protect_speculative_field` still has a parent.
+                        let selected = specs
+                            .iter()
+                            .position(|spec| spec.field_key == *name || spec.name == *name)
+                            .unwrap_or_else(|| {
+                                specs.push(majit_ir::descr::SimpleFieldDescrSpec {
+                                    index: u32::MAX,
+                                    field_key: name.clone(),
+                                    name: name.clone(),
+                                    offset: *offset,
+                                    field_size: *field_size,
+                                    field_type: *field_type,
+                                    is_immutable: *is_immutable,
+                                    is_quasi_immutable: *is_quasi_immutable,
+                                    flag: *field_flag,
+                                    virtualizable: false,
+                                    index_in_parent: *index_in_parent,
+                                });
+                                specs.len() - 1
+                            });
+                        let group = majit_ir::descr::make_simple_descr_group(
+                            u32::MAX,
+                            p.size,
+                            0,
+                            p.vtable as usize,
+                            &specs,
+                        );
+                        let fd = group.field_descrs[selected].clone();
+                        return (*offset, fd as majit_ir::DescrRef);
+                    }
                     // descr.py:218-239 get_field_descr: populate the
                     // gccache (first-write-wins, idempotent across the
                     // matching `new`) then return the *cached*
@@ -9093,6 +9158,130 @@ mod tests {
 
     extern "C" fn scale_f64(x: f64, k: i64) -> f64 {
         x * k as f64
+    }
+
+    /// A `BhDescr::Field` naming `field` of a parent that carries a flattened
+    /// one-entry field list and the `type_id` given.
+    fn field_descr_with_parent(
+        field: &str,
+        type_id: u64,
+        size: usize,
+        vtable: u64,
+    ) -> crate::blackhole::BhDescr {
+        let spec = majit_translate::jitcode::BhFieldSpec {
+            index: 0,
+            field_key: field.to_string(),
+            name: field.to_string(),
+            offset: 0,
+            field_size: 8,
+            field_type: Type::Int,
+            field_flag: majit_ir::descr::ArrayFlag::Signed,
+            is_field_signed: true,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 0,
+        };
+        crate::blackhole::BhDescr::Field {
+            offset: 0,
+            field_size: 8,
+            field_type: Type::Int,
+            field_flag: majit_ir::descr::ArrayFlag::Signed,
+            is_field_signed: true,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 0,
+            parent: Some(majit_translate::jitcode::BhSizeSpec {
+                size,
+                type_id,
+                vtable,
+                is_gc_managed: true,
+                headerless: false,
+                all_fielddescrs: vec![spec],
+            }),
+            name: field.to_string(),
+            owner: String::new(),
+        }
+    }
+
+    fn parent_size_of(descr: &majit_ir::DescrRef) -> usize {
+        descr
+            .as_field_descr()
+            .expect("field descr")
+            .get_parent_descr()
+            .expect("field descr must carry a parent")
+            .as_size_descr()
+            .expect("parent is a size descr")
+            .size()
+    }
+
+    /// `type_id == 0` is the no-STRUCT-identity sentinel, so two parents
+    /// wearing it are two different STRUCTs. Publishing them under
+    /// `LLType::Struct(0)` would put both in one `_cache_size` slot and one
+    /// `_cache_field` name space, and the second resolution would then read
+    /// back the first parent's size descr.
+    ///
+    /// Sharing a field *name* is what makes this observable: it turns the
+    /// collapse into a `_cache_field` hit, so the second field would be the
+    /// first field's Arc outright.
+    #[test]
+    fn type_id_less_parents_do_not_share_one_size_descr() {
+        let first = field_descr_ref_from_bh(&field_descr_with_parent("x", 0, 16, 0xAA)).1;
+        let second = field_descr_ref_from_bh(&field_descr_with_parent("x", 0, 48, 0xBB)).1;
+
+        assert_eq!(parent_size_of(&first), 16);
+        assert_eq!(
+            parent_size_of(&second),
+            48,
+            "the second parent must not resolve to the first one's size descr"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &second),
+            "two type-id-less parents must not share one field descr"
+        );
+    }
+
+    /// The empty-`all_fielddescrs` twin of the above. That branch derives the
+    /// parent from `size`/`vtable` alone (`descr.py:238 parent_descr =
+    /// get_size_descr(gccache, STRUCT, vtable)`), so under `Struct(0)` the
+    /// second resolution reads back the first one's published size slot.
+    #[test]
+    fn type_id_less_parents_without_a_field_list_do_not_share_one_size_descr() {
+        let strip_fields = |mut descr: crate::blackhole::BhDescr| {
+            if let crate::blackhole::BhDescr::Field {
+                parent: Some(p), ..
+            } = &mut descr
+            {
+                p.all_fielddescrs.clear();
+            }
+            descr
+        };
+        let first =
+            field_descr_ref_from_bh(&strip_fields(field_descr_with_parent("z", 0, 24, 0xAA))).1;
+        let second =
+            field_descr_ref_from_bh(&strip_fields(field_descr_with_parent("z", 0, 56, 0xBB))).1;
+
+        assert_eq!(parent_size_of(&first), 24);
+        assert_eq!(
+            parent_size_of(&second),
+            56,
+            "the second parent must not resolve to the first one's size descr"
+        );
+    }
+
+    /// The same two parents with real, distinct type ids stay on the keyed
+    /// path — the carve-out above must not disable caching for everyone.
+    #[test]
+    fn parents_with_real_type_ids_still_resolve_through_the_keyed_cache() {
+        let a = field_descr_ref_from_bh(&field_descr_with_parent("y", 0x51A1, 16, 0xAA)).1;
+        let again = field_descr_ref_from_bh(&field_descr_with_parent("y", 0x51A1, 16, 0xAA)).1;
+        let other = field_descr_ref_from_bh(&field_descr_with_parent("y", 0x51A2, 48, 0xBB)).1;
+
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &again),
+            "one type id must resolve to one cached field descr"
+        );
+        assert!(!std::sync::Arc::ptr_eq(&a, &other));
+        assert_eq!(parent_size_of(&other), 48);
     }
 
     #[test]
