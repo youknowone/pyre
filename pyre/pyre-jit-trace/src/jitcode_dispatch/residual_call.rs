@@ -3480,20 +3480,19 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // emission) sees a non-null `last_exc_value` and routes
             // through the GuardException path.
             //
-            // `execute_residual_call` cleared `BH_LAST_EXC_VALUE` on read;
-            // restore it so the eval-loop walker-skip path
-            // (`eval.rs`) can detect the pending exception and
-            // route into the bytecode-interpreter's exception handler
-            // via `PyError::from_exc_object` — matching RPython's
-            // metainterp framestack scan after a raising residual call
-            // (`handle_possible_exception` + `finishframe_exception`).
+            // `execute_residual_call` consumes `BH_LAST_EXC_VALUE` when it
+            // returns this `Err`.  Do not republish it: RPython transfers the
+            // value into `MetaInterp.last_exc_value` exactly once, and the
+            // walker shadow below is that owner.  Do not republish the
+            // consumed value into TLS as well.  An
+            // uncaught raise is carried by the trace's exception FINISH; an
+            // aborted walk re-executes the live opcode.
             ctx.last_exc_value = Some(ctx.trace_ctx.const_ref(bh_exc));
             ctx.last_exc_value_concrete =
                 ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef);
             // `execute_raised(..., constant=False)`:
             // a residual exception has not had its class proven by a guard yet.
             ctx.fbw_mode.class_of_last_exc_is_const = false;
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(bh_exc));
             // `execute_raised` records the raise into `last_exc_value`
             // (above) only.  The shared `bh_*` residual helper also
             // published into the backend `_store_exception` cells

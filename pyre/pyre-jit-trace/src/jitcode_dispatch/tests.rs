@@ -7426,12 +7426,11 @@ fn non_authoritative_walker_does_not_execute_may_force_call() {
     );
 }
 
-// A may-force call that RAISES (publishes on
-// BH_LAST_EXC_VALUE) is transcribed onto WalkContext.last_exc_value
-// (+ last_exc_value_concrete) and BH_LAST_EXC_VALUE is restored so the
-// eval-loop walker-skip path can detect the pending exception; the
-// result box is NOT stamped (only the normal-return path stamps a
-// result, mirroring `execute_varargs`'s success-only `result_box.value`).
+// A may-force call that RAISES (publishes on BH_LAST_EXC_VALUE) is transcribed
+// onto WalkContext.last_exc_value (+ last_exc_value_concrete), while the
+// blackhole carrier is consumed exactly once. The result box is NOT stamped
+// (only the normal-return path stamps a result, mirroring `execute_varargs`'s
+// success-only `result_box.value`).
 extern "C" fn raises_for_walker_test() -> i64 {
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0xDEAD));
     0
@@ -7508,6 +7507,11 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
         None,
         "the raising path does not stamp `recorded`; the exception routes \
              via last_exc_value (only the normal-return path stamps a result)",
+    );
+    assert_eq!(
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()),
+        0,
+        "the executor must consume the blackhole carrier exactly once",
     );
 }
 

@@ -2642,6 +2642,15 @@ pub fn blackhole_resume_via_rd_numb(
                             );
                         }
                     }
+                    // `guard_exc` is now owned by the typed
+                    // `ExitFrameWithExceptionRef` result. A can-raise
+                    // residual helper published the same value to both the
+                    // backend exception cell and pyre's blackhole adapter;
+                    // the guard supplied the former as `guard_exc`, so the
+                    // latter must be consumed at this terminal handoff.
+                    // RPython has only the deadframe/exception-result
+                    // transfer here, not a second TLS owner.
+                    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
                     return BlackholeResult::ExitFrameWithExceptionRef(err);
                 }
             }
@@ -6936,6 +6945,15 @@ pub extern "C" fn bh_reraise_varargs_zero() -> i64 {
 /// exception becomes current).
 pub extern "C" fn bh_set_current_exception(exc: i64) {
     pyre_interpreter::eval::set_current_exception(exc as pyre_object::PyObjectRef);
+}
+
+/// Complete the `PUSH_EXC_INFO` ownership transfer after the caught exception
+/// has become the execution context's current exception.  The interpreter's
+/// `push_exc_info` clears this propagation carrier at the same point; leaving
+/// it populated roots the handled exception (and its traceback/frame) after
+/// the handler returns.
+pub extern "C" fn bh_clear_in_flight_exception() {
+    pyre_interpreter::eval::set_in_flight_exception(pyre_object::PY_NULL);
 }
 
 /// On-demand resume callback (pyre-jit side).  Registered into cranelift

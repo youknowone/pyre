@@ -3604,6 +3604,7 @@ struct FnPtrIndices {
     call_kw_fn_12: HelperHandle,
     call_kw_fn_13: HelperHandle,
     unbound_local_error_fn: HelperHandle,
+    clear_in_flight_exception_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -4301,6 +4302,14 @@ fn register_helper_fn_pointers(
         cpu.load_build_class_fn as *const (),
         CallFlavor::Plain,
     );
+    // The hand-written PUSH_EXC_INFO lowering must complete the interpreter's
+    // caught-exception ownership transfer.  Bind last so every existing
+    // helper index remains stable.
+    let clear_in_flight_exception_fn = bind(
+        assembler,
+        cpu.clear_in_flight_exception_fn as *const (),
+        CallFlavor::PlainCannotRaiseNoHeap,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4405,6 +4414,7 @@ fn register_helper_fn_pointers(
         make_function_fn,
         set_function_attribute_fn,
         unbound_local_error_fn,
+        clear_in_flight_exception_fn,
     }
 }
 
@@ -6253,6 +6263,11 @@ impl CodeWriter {
                 HelperHandle {
                     idx: unbound_local_error_fn_idx,
                     flavor: _unbound_local_error_fn_flavor,
+                },
+            clear_in_flight_exception_fn:
+                HelperHandle {
+                    idx: clear_in_flight_exception_fn_idx,
+                    flavor: _clear_in_flight_exception_fn_flavor,
                 },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
@@ -9894,6 +9909,23 @@ impl CodeWriter {
                                 vec![exc_value.clone()],
                                 vec![],
                                 vec![Kind::Ref],
+                                ResKind::Void,
+                                py_pc as i64,
+                            );
+                            // `eval.rs::push_exc_info` clears the propagation
+                            // carrier immediately after publishing `exc` as
+                            // current.  Preserve that ownership transfer in
+                            // both tracing and compiled execution; otherwise
+                            // the carrier keeps the handled exception and its
+                            // traceback/frame alive indefinitely.
+                            let _ = residual_call!(
+                                clear_in_flight_exception_fn_idx,
+                                CallFlavor::PlainCannotRaiseNoHeap,
+                                majit_ir::PyreHelperKind::None,
+                                vec![],
+                                vec![],
+                                vec![],
+                                vec![],
                                 ResKind::Void,
                                 py_pc as i64,
                             );

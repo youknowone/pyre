@@ -8723,6 +8723,17 @@ fn execute_assembler(
             is_exit_frame_with_exception,
             ..
         } => {
+            // A residual helper publishes into both the backend exception cell
+            // and `BH_LAST_EXC_VALUE` because the same helper is callable from
+            // compiled code and the blackhole.  At a terminal compiled FINISH
+            // the finish descr (and, for an exceptional finish, `typed_values`)
+            // is now the sole owner of the outcome; no blackhole consumer will
+            // run.  RPython has no parallel TLS carrier here: its backend cell
+            // is consumed by the guard and ExitFrameWithExceptionRef carries
+            // the value onward.  Drop pyre's blackhole-only duplicate before
+            // returning to the interpreter, including the successful-FINISH
+            // case where the trace caught the residual exception internally.
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
             let raw_int_result = raw_int_result || driver.has_raw_int_finish();
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
@@ -9581,6 +9592,11 @@ fn handle_jit_outcome(
             is_exit_frame_with_exception,
             ..
         } => {
+            // The compiled FINISH owns the outcome now; discard the
+            // blackhole-only duplicate left by a residual helper.  See the
+            // equivalent execute-assembler arm above for the RPython ownership
+            // parity rationale.
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
             let (driver, _) = driver_pair();
             let raw_int_result = raw_int_result || driver.has_raw_int_finish();
             if majit_metainterp::majit_log_enabled() {

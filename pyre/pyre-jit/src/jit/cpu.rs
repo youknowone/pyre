@@ -378,6 +378,9 @@ pub struct Cpu {
     /// Write per-thread `CURRENT_EXCEPTION` — used by `PUSH_EXC_INFO`
     /// (set to new exc) and `POP_EXCEPT` (restore saved prev).
     pub set_current_exception_fn: extern "C" fn(i64),
+    /// Clear the exception-propagation carrier after `PUSH_EXC_INFO` has
+    /// transferred ownership to `CURRENT_EXCEPTION`.
+    pub clear_in_flight_exception_fn: extern "C" fn(),
     /// `rpython/jit/backend/llgraph/runner.py:LLGraphCPU.rtyper` —
     /// upstream `flatten_graph` reaches `cpu.rtyper.exceptiondata.
     /// get_standard_ll_exc_instance_by_class(OverflowError)` at
@@ -547,6 +550,7 @@ impl Cpu {
             get_current_exception_fn: crate::call_jit::bh_get_current_exception,
             reraise_varargs_zero_fn: crate::call_jit::bh_reraise_varargs_zero,
             set_current_exception_fn: crate::call_jit::bh_set_current_exception,
+            clear_in_flight_exception_fn: crate::call_jit::bh_clear_in_flight_exception,
             rtyper,
             lowering_ctx: std::sync::RwLock::new(None),
         }

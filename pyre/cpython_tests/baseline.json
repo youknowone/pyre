@@ -365,10 +365,10 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_enum": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_enumerate": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_eof": {
       "dynasm": "IMPORTERROR"

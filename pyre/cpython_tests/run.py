@@ -263,10 +263,10 @@ _RESOURCE_DRIVER = (
     "    runpy.run_path({path!r}, run_name='__main__')\n"
 )
 
-# test_descr asserts fully qualified class names in exception text. Running
-# its file as __main__ changes those names even on CPython, so preserve the
-# dotted identity that libregrtest gives it.
-DOTTED_IDENTITY_MODULES = {"test.test_descr"}
+# These modules assert fully qualified class/enum names. Running their files
+# as __main__ changes those names even on CPython, so preserve the dotted
+# identity that libregrtest gives them.
+DOTTED_IDENTITY_MODULES = {"test.test_descr", "test.test_enum"}
 
 # test_datetime's load_tests appends an exhaustive test class for every
 # installed system timezone when test.support.use_resources is left as None.
