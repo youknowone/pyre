@@ -66,6 +66,7 @@ except OSError:
 # (gateway.py:365 `space.fsencode_w`), so these boundaries do too.
 assert os.system(b"true") == 0
 os.waitpid(os.posix_spawn(TRUE, [TRUE.encode()], {}), 0)
-assert socket.if_nametoindex(socket.if_indextoname(1).encode()) == 1
+index, name = socket.if_nameindex()[0]
+assert socket.if_nametoindex(name.encode()) == index
 
 print("OK")
