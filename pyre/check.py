@@ -536,16 +536,27 @@ def _parse_jit_stats(snapshot):
 # Both directions, because an improvement has to be recorded too. A counter that
 # falls is a real change in what the JIT compiles, and leaving the fall ungated
 # means the committed baseline quietly stops describing the tree — the next
-# regression is then measured against a number that was already stale. The exact
-# comparison is affordable because these counters are deterministic by
-# construction, not by luck: a guard's counter hash comes from
-# `JitCounter.fetch_next_hash` (counter.py), a pure sequence with no address or
-# clock input, so the same program yields the same count. Measured across
-# runners as well as run-to-run — one CI run reported `list_length_hint_validate
-# guard_failures 828 -> 4923` and `exception_args_virtual 401 -> 1002` with
-# identical digits on ubuntu-24.04, macos-latest and windows-latest. That
-# measurement is what retired the +25% band `guard_failures` used to carry for
-# cross-runner drift that had never been measured.
+# regression is then measured against a number that was already stale. Gating a
+# fixture on an exact match is upstream's own instrument, not a stricter one
+# invented here: `OpMatcher.match` (test_pypy_c/model.py) compares a compiled
+# loop operation by operation against a literal expected trace, so an
+# improvement that reorders or removes an operation fails that assertion until
+# the expected trace is updated. These counters are a coarser projection of the
+# same idea.
+#
+# The exact comparison is affordable because nothing on the path takes a
+# per-run input. Each counter is a plain increment at the event
+# (`record_guard_failure_event`, pyjitpl.rs); what varies between runs would
+# have to be the event stream, i.e. which guards got compiled and when, and
+# that is decided by `JitCounter`, which indexes its thresholds by the pure
+# `_nexthash` sequence of `fetch_next_hash` (counter.py) rather than by an
+# object address — the one place in the compile-decision path where a
+# per-process value could have entered. Measured across runners as well as
+# run-to-run — one CI run reported `list_length_hint_validate guard_failures
+# 828 -> 4923` and `exception_args_virtual 401 -> 1002` with identical digits
+# on ubuntu-24.04, macos-latest and windows-latest. That measurement is what
+# retired the +25% band `guard_failures` used to carry for cross-runner drift
+# that had never been measured.
 #
 # `internal_compile_panics` counts an internal compile bug falling back to the
 # interpreter, so 0 is its only healthy value. `loops_aborted` is not absolute:
