@@ -628,10 +628,30 @@ impl OptVirtualize {
                     let b = Operand::from_bound_op(op_rc);
                     ctx.set_ptr_info(&b, PtrInfo::VirtualArrayStruct(vinfo));
                 } else {
-                    let items = vec![Operand::None; size as usize];
+                    // virtualize.py:27-35 `make_varray` passes
+                    // `optimizer.new_const_item(arraydescr)` into
+                    // `ArrayPtrInfo`; info.py:507-514 `_init_items` fills a
+                    // NEW_ARRAY_CLEAR with that typed zero/null constant.
+                    // NEW_ARRAY deliberately keeps `None` for unreadable,
+                    // uninitialized elements.
+                    let clear = matches!(op.opcode, OpCode::NewArrayClear);
+                    let items = if clear {
+                        let item_type = descr
+                            .as_array_descr()
+                            .expect("non-struct NEW_ARRAY descr must be an ArrayDescr")
+                            .item_type();
+                        let default_ref = match item_type {
+                            Type::Int | Type::Void => ctx.make_constant_int(0),
+                            Type::Ref => ctx.make_constant_ref(majit_ir::GcRef::NULL),
+                            Type::Float => ctx.make_constant_float(0.0),
+                        };
+                        vec![ctx.materialize_operand_at(default_ref); size as usize]
+                    } else {
+                        vec![Operand::None; size as usize]
+                    };
                     let vinfo = VirtualArrayInfo {
                         descr,
-                        clear: matches!(op.opcode, OpCode::NewArrayClear),
+                        clear,
                         items,
                         last_guard_pos: -1,
                         avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -3954,6 +3974,54 @@ mod tests {
             "all array ops on virtual should be removed; got {} ops: {:?}",
             result.len(),
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_new_array_clear_unwritten_item_is_typed_zero() {
+        // virtualize.py:27-35 + info.py:507-514: NEW_ARRAY_CLEAR seeds every
+        // virtual slot with optimizer.new_const_item(arraydescr), so reading
+        // an unwritten integer item folds to zero instead of raising
+        // InvalidLoop("reading uninitialized virtual array items").
+        let ad: DescrRef = Arc::new(majit_ir::descr::SimpleArrayDescr::with_flag(
+            21,
+            0,
+            8,
+            21,
+            Type::Int,
+            majit_ir::ArrayFlag::Signed,
+        ));
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::NewArrayClear,
+                &[crate::history::test_support::rooted_resop_operand(
+                    Type::Int,
+                    50,
+                )],
+                ad.clone(),
+            ),
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 51),
+                ],
+                ad,
+            ),
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_pass_with_constants(
+            &ops,
+            &[
+                (OpRef::int_op(50), Value::Int(3)),
+                (OpRef::int_op(51), Value::Int(1)),
+            ],
+        );
+        assert!(
+            result.is_empty(),
+            "clear-array read should fold to its typed zero; got {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
         );
     }
 
