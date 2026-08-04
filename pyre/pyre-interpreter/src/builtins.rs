@@ -10440,6 +10440,20 @@ fn source_as_str(
     crate::compile::decode_source_bytes(&bytes, filename, *flags & PYCF_IGNORE_COOKIE != 0)
 }
 
+fn replace_compile_syntax_error_filename(
+    mut error: crate::PyError,
+    filename: &str,
+    filename_bytes: Option<&[u8]>,
+) -> crate::PyError {
+    if error.kind == crate::PyErrorKind::SyntaxError {
+        let w_filename = crate::gateway::fsdecode_filename_bytes(
+            filename_bytes.unwrap_or_else(|| filename.as_bytes()),
+        );
+        error.replace_syntax_error_filename(w_filename);
+    }
+    error
+}
+
 fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `compile(source, filename, mode, flags=0, dont_inherit=False,
     // optimize=-1, *, _feature_version=-1)`: the three required parameters and
@@ -10471,16 +10485,10 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         ],
         "compile",
     )?;
-    let filename = if unsafe { pyre_object::is_str(filename_obj) } {
-        crate::baseobjspace::str_utf8_w(filename_obj)?.to_string()
-    } else {
-        "<string>".to_string()
-    };
-    let mode = if unsafe { pyre_object::is_str(mode_obj) } {
-        crate::baseobjspace::str_utf8_w(mode_obj)?.to_string()
-    } else {
-        "exec".to_string()
-    };
+    // `compiling.py:12-13 unwrap_spec(filename='fsencode', mode='text')`.
+    let filename_bytes = crate::gateway::fsencode_bytes_w(filename_obj)?;
+    let (filename, filename_bytes) = crate::pycode::split_code_filename_bytes(filename_bytes, None);
+    let mode = crate::baseobjspace::text_w(mode_obj)?;
     // flags / dont_inherit / optimize are positional-or-keyword ints
     // (unwrap_spec flags=int, dont_inherit=int, optimize=int).
     let mut flags = match bind_pos_or_kw(pos, kwargs, 3, "flags", "compile", 4)? {
@@ -10527,7 +10535,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         }
     }
 
-    let mode = match mode.as_str() {
+    let mode = match mode {
         "exec" => crate::compile::Mode::Exec,
         "eval" => crate::compile::Mode::Eval,
         "single" => crate::compile::Mode::Single,
@@ -10563,13 +10571,18 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let source_str = if source_is_ast {
         None
     } else {
-        Some(source_as_str(
-            source,
-            "compile",
-            "string, bytes or AST",
-            &filename,
-            &mut flags,
-        )?)
+        Some(
+            source_as_str(
+                source,
+                "compile",
+                "string, bytes or AST",
+                &filename,
+                &mut flags,
+            )
+            .map_err(|error| {
+                replace_compile_syntax_error_filename(error, &filename, filename_bytes.as_deref())
+            })?,
+        )
     };
 
     // Assemble CompileOpts: the __future__ feature bits, the two PyCF_*
@@ -10586,7 +10599,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // plain ONLY_AST runs syntax-only preprocessing; OPTIMIZED_AST
         // includes ONLY_AST and enables constant folding.
         let syntax_check_only = flags & PYCF_OPTIMIZED_AST == PYCF_ONLY_AST;
-        return if source_is_ast {
+        let result = if source_is_ast {
             // An already materialised AST under plain `PyCF_ONLY_AST` is
             // handed straight back, so `compile(tree, ..., PyCF_ONLY_AST) is
             // tree`.  Re-converting it would hand out a copy instead.
@@ -10611,23 +10624,28 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 syntax_check_only,
             )
         };
+        return result.map_err(|error| {
+            replace_compile_syntax_error_filename(error, &filename, filename_bytes.as_deref())
+        });
     }
-    if source_str.is_none() {
-        let code = crate::module::_ast::convert::compile_object(source, &filename, mode, opts)?;
-        let code_ptr = Box::into_raw(Box::new(code)) as *const ();
-        return Ok(crate::w_code_new(code_ptr));
-    }
-    let source = source_str.as_deref().expect("non-AST source");
-    let code =
+    let code = if let Some(source) = source_str.as_deref() {
         crate::compile::compile_source_with_opts(source, mode, &filename, opts).map_err(|e| {
             compile_err_to_syntax_error_maybe_incomplete(
                 e,
                 source,
                 flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0,
             )
-        })?;
+        })
+    } else {
+        crate::module::_ast::convert::compile_object(source, &filename, mode, opts)
+    }
+    .map_err(|error| {
+        replace_compile_syntax_error_filename(error, &filename, filename_bytes.as_deref())
+    })?;
     let code_ptr = Box::into_raw(Box::new(code)) as *const ();
-    Ok(crate::w_code_new(code_ptr))
+    let result = crate::w_code_new(code_ptr);
+    unsafe { crate::pycode::set_compilation_unit_filename_bytes(result, filename_bytes) };
+    Ok(result)
 }
 
 /// `exec(source_or_code, globals=None, locals=None)` — PyPy:
