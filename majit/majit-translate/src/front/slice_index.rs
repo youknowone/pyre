@@ -7,11 +7,19 @@
 //! `front::mir`: its rewrite plants a Void `ConstNone` stop, which had no
 //! regalloc coloring when the rewritten
 //! `pyre_interpreter::module::_io::buffered_rwpair::<Impl>::readinto` graph
-//! dropped to the legacy walker. Activating RangeTo later emitted bare
-//! `getslice/rii>r` from both `split_builtin_kwargs` and `do_warn_explicit`;
-//! both stops are `args.len() - 1`, statically unsigned but not constant. An
-//! unsigned gate would admit those measured failures, while the same
-//! constant-nonnegative gate used for RangeFrom declines them. Both capture
+//! dropped to the legacy walker.
+//!
+//! RangeTo's primary blocker is semantic: Rust's `&s[..end]` panics when
+//! `end > s.len()`, but `build_ll_listslice_startstop_helper_graph` clamps an
+//! oversized stop to the list length and returns the whole slice
+//! (`translator/rtyper/rlist.rs:3563-3576`). Until lowering can prove
+//! `end <= len`, emitting `getslice(s, 0, end)` would turn an interpreter
+//! failure into success. Its secondary blocker is non-negativity: activating
+//! RangeTo previously emitted bare `getslice/rii>r` from
+//! `split_builtin_kwargs` and `do_warn_explicit`; both stops are
+//! `args.len() - 1`, statically unsigned but not constant. An unsigned gate
+//! would admit those measured failures, while the constant-nonnegative gate
+//! declines them. The upper-bound proof is still missing, so both capture
 //! arms remain dormant and leave the original residual ctor + call chain
 //! untouched.
 #![allow(dead_code)]
@@ -122,7 +130,9 @@ pub(crate) fn rewire_slice_index_rangefrom_sites(
 }
 
 /// Rewrite captured `RangeTo { end }` indexes into
-/// `getslice(slice, 0, end)` (`SliceKind::StartStop`).
+/// `getslice(slice, 0, end)` (`SliceKind::StartStop`). Production capture must
+/// remain dormant until it can prove `end <= slice.len()`; the StartStop
+/// helper clamps instead of preserving Rust's out-of-bounds panic.
 pub(crate) fn rewire_slice_index_rangeto_sites(
     graph: &mut FunctionGraph,
     sites: &[SliceIndexRangeToSite],
@@ -204,11 +214,15 @@ fn rewire_one_slice_index_site(
     //     (the `&s[1..]` / `&s[k..]` literal shape, which
     //     `immutablevalue(ConstInt(k))` annotates `nonneg = k>=0`) keeps every
     //     rewritten graph lift-able; a computed start declines cleanly
-    //     (residual, census Skip). RangeTo uses the same constant gate because
-    //     activating it admitted bare unwired `getslice/rii>r` from
-    //     `split_builtin_kwargs` and `do_warn_explicit`; both measured ends
-    //     were `args.len() - 1`, statically unsigned but not constant, so an
-    //     unsigned-only gate would not decline them.
+    //     (residual, census Skip). RangeTo's constant-nonnegative gate is only
+    //     the secondary blocker: activating it admitted bare unwired
+    //     `getslice/rii>r` from `split_builtin_kwargs` and
+    //     `do_warn_explicit`; both measured ends were `args.len() - 1`,
+    //     statically unsigned but not constant, so an unsigned-only gate would
+    //     not decline them. Even a non-negative constant must not be wired in
+    //     production without the primary `end <= slice.len()` proof: the
+    //     StartStop helper clamps an oversized stop (`rlist.rs:3563-3576`),
+    //     whereas Rust indexing panics.
     match bounds {
         SliceIndexBounds::RangeFrom { start } => {
             if !graph_defines(graph, start) {
