@@ -2272,8 +2272,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     // use the same coordinate.
     let callee_jitcode_pc: i32 = match scope.branch_guard_jitcode_pc {
         Some(g) => g as i32,
-        None if after_residual_call => callee_pjc
-            .after_residual_marker_for_jitcode_pc(callee_op_pc)
+        None if after_residual_call => after_residual_guard_marker(&callee_pjc, callee_op_pc, None)
             .or_else(|| {
                 // Fallback only, for the same reason as the single-frame path:
                 // the sticky cursor names this frame's op only while no other

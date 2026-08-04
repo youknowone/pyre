@@ -2730,8 +2730,70 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // for an elidable or loop-hoisted one.  Feeds [`ESCAPE_OPCODE_WINDOW`].
     let reentrant_residual =
         ei.check_is_elidable() || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant;
-    let provably_side_effect_free =
-        reentrant_residual || helper == majit_ir::PyreHelperKind::ForIterNext;
+    // PyPy traces through `str_descr_new` -> `space.str` and therefore knows
+    // that an exact builtin scalar cannot dispatch to user `__str__` code.
+    // Pyre reaches the same operation through the opaque `CallFn` helper; if
+    // it remains classified as arbitrary here, a loop-bearing inlined caller
+    // (for example `fold`'s `for ch in str(value)`) is denied at the nested
+    // residual and the whole bridge is thrown away once before that caller is
+    // learned as non-inlinable.
+    //
+    // This is deliberately an observed-value fact, not a blanket blessing of
+    // `str(x)`: both the callable and operand must be exact builtins in the
+    // concrete execution this walk may have to replay.  Exact immutable scalar
+    // formatting allocates only its fresh result and cannot mutate live heap or
+    // enter a user frame, so replay has the same safety as an elidable call.
+    // A subclass/callable override misses pointer/type identity and keeps the
+    // ordinary nested-residual decline.
+    let observed_exact_scalar_str =
+        helper == majit_ir::PyreHelperKind::CallFn && args.len() == 3 && {
+            let callable = args[0] as pyre_object::PyObjectRef;
+            let operand = args[2] as pyre_object::PyObjectRef;
+            let str_type =
+                pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::STR_TYPE);
+            !callable.is_null()
+                && !operand.is_null()
+                && std::ptr::eq(callable, str_type)
+                && unsafe {
+                    pyre_object::is_int_or_long(operand)
+                        || pyre_object::is_float(operand)
+                        || pyre_object::is_complex(operand)
+                        || pyre_object::is_str(operand)
+                        || pyre_object::is_none(operand)
+                }
+        };
+    // PyPy traces `space.iter(w_exact_unicode)` through
+    // `W_UnicodeObject.descr_iter` into a fresh sequence iterator.  Pyre's
+    // tagged `GetIter` call has the same no-user-dispatch property for an
+    // exact string; subclasses retain the conservative decline.
+    // The wasm optimizer currently rejects the resulting longer trace as
+    // `InvalidLoop` (three compile aborts versus the conservative path's one
+    // trace-time decline).  Keep its prior admission boundary until that
+    // backend can consume this shape; interpreter semantics are identical.
+    let native_exact_str_replay = !cfg!(target_arch = "wasm32");
+    let observed_exact_str_iter = native_exact_str_replay
+        && helper == majit_ir::PyreHelperKind::GetIter
+        && args.len() == 1
+        && {
+            let operand = args[0] as pyre_object::PyObjectRef;
+            !operand.is_null() && unsafe { pyre_object::is_str(operand) }
+        };
+    // PyPy's `space.ord` reads the immutable unicode payload directly.  Match
+    // both canonical builtin-code identity and the observed exact string so a
+    // rebound `ord` or a user object cannot enter this replay-safe class.
+    let observed_exact_str_ord = native_exact_str_replay
+        && helper == majit_ir::PyreHelperKind::CallFn
+        && args.len() == 3
+        && pyre_interpreter::builtins::is_builtin_ord_function(args[0] as pyre_object::PyObjectRef)
+        && {
+            let operand = args[2] as pyre_object::PyObjectRef;
+            !operand.is_null() && unsafe { pyre_object::is_str(operand) }
+        };
+    let provably_side_effect_free = reentrant_residual
+        || helper == majit_ir::PyreHelperKind::ForIterNext
+        || observed_exact_scalar_str
+        || observed_exact_str_iter
+        || observed_exact_str_ord;
     let writes_live_heap = call_descr.result_type() == majit_ir::Type::Void
         || matches!(
             helper,
