@@ -2652,10 +2652,15 @@ pub fn walk<Sym: WalkSym>(
                 // reset.  `VableEscapedDuringResidualCall` needs no exclusion —
                 // it latches its narrower resume-marker image at force time,
                 // before the error unwinds here, so the guard below defers to it.
-                let coordinate_belongs_to_this_frame = ctx
-                    .session
-                    .borrow_mut()
-                    .claim_abort_coordinate(ctx.fbw_mode.inline_subwalk);
+                // Do not consume the session's one-shot coordinate claim for
+                // a transparent helper: its opcode coordinate is not a Python
+                // resume coordinate, and the enclosing Python walk must still
+                // be able to claim and latch the propagated abort.
+                let coordinate_belongs_to_this_frame = !ctx.fbw_mode.transparent_helper_subwalk
+                    && ctx
+                        .session
+                        .borrow_mut()
+                        .claim_abort_coordinate(ctx.fbw_mode.inline_subwalk);
                 let carrier_owned = matches!(
                     error,
                     DispatchError::AbortPermanentMarkerReached { .. }
@@ -2665,6 +2670,15 @@ pub fn walk<Sym: WalkSym>(
                 // reports a MISSING value cannot be converted, because the
                 // image it would hand the blackhole is the one that just
                 // failed to resolve ([`DispatchError::leaves_complete_image`]).
+                //
+                // A translated builtin gateway is not an MIFrame.  Let its
+                // error unwind to the enclosing Python walk, where the same
+                // latch is built from that frame's own register banks.  If we
+                // latch here, `build_multi_frame_miframe` appends the helper's
+                // r0 args-slice as though it were a Python red frame and the
+                // blackhole resume loses per-frame identity.  This is the
+                // abort counterpart of the transparent-helper guard snapshot
+                // and trace-limit handling below.
                 if coordinate_belongs_to_this_frame
                     && error.leaves_complete_image()
                     && !carrier_owned
@@ -2706,7 +2720,16 @@ pub fn walk<Sym: WalkSym>(
         // fallback because replay would apply an irreversible effect twice.
         // The remaining overshoot is tallied so an unsupported multi-frame
         // shape cannot silently become unbounded.
-        if ctx.trace_ctx.is_too_long() {
+        // A translated builtin gateway is transparent to the Python MIFrame
+        // stack and has no blackhole entry point of its own.  Its bytecode is
+        // one implementation detail of the enclosing Python CALL step, so do
+        // not split the trace in the middle of it: doing so would have to pair
+        // helper registers (r0 is commonly an args slice) with a Python
+        // JitCode's red-frame register.  Finish the helper and let the
+        // enclosing Python `walk()` perform this same post-step limit check at
+        // its real per-frame coordinate, matching RPython's one-red-frame
+        // ownership.
+        if !ctx.fbw_mode.transparent_helper_subwalk && ctx.trace_ctx.is_too_long() {
             // `step` has advanced the register banks for `Continue`. The
             // other outcomes still need the match below to perform their
             // frame transition: in particular, `SubRaise` may enter this
