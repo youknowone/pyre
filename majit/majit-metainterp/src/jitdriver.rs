@@ -2846,12 +2846,20 @@ impl<S: JitState> JitDriver<S> {
                         .and_then(|ctx| ctx.take_close_jump_into_key())
                     {
                         let mut result = crate::pyjitpl::BridgeCompileResult::Declined;
+                        // Whether the close was actually evaluated.  Both conditions below are
+                        // transient — `partial_trace` clears with the retrace it belongs to, and a
+                        // key acquires compiled targets the moment its loop compiles — and
+                        // upstream re-tests them at every later visit of the same header
+                        // (pyjitpl.py:3001-3007 runs once per visit, with no memory of the last).
+                        // Only an attempt that ran and did not compile may be latched below.
+                        let mut attempted = false;
                         let mut continue_running_normally_values = None;
                         // pyjitpl.py:3003 `if not self.partial_trace:` — a retrace must not bridge
                         // into the very loop it exists to respecialize.
                         if self.meta.partial_trace().is_none()
                             && self.meta.has_compiled_targets(target_key)
                         {
+                            attempted = true;
                             continue_running_normally_values = {
                                 let trace_meta = self.meta.trace_meta().cloned();
                                 match (trace_meta, self.sym.as_ref()) {
@@ -2946,8 +2954,15 @@ impl<S: JitState> JitDriver<S> {
                                 // trace is NOT given up — tracing continues.  Latch the decline so the walk
                                 // does not re-run the optimizer over the same key, and re-enter the walk at
                                 // the merge point's own pc (pyjitpl.py:1577 `self.pc = saved_pc`).
+                                //
+                                // Only latch what an attempt actually rejected.  A close the gate
+                                // above never evaluated cost no optimizer pass, which is the whole
+                                // reason the latch exists, and the gate's own conditions can be
+                                // false now and true at the next visit of this header.
                                 if let Some(ctx) = self.meta.trace_ctx() {
-                                    ctx.note_cross_loop_close_declined(target_key);
+                                    if attempted {
+                                        ctx.note_cross_loop_close_declined(target_key);
+                                    }
                                     ctx.close_greens = None;
                                     ctx.close_green_pc = None;
                                     ctx.merge_point_resumed = true;
