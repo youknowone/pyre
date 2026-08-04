@@ -1353,13 +1353,17 @@ impl OptHeap {
         }
     }
 
-    /// Run a guard's `force_lazy_sets_for_guard` at heap's OWN `emit()` point
-    /// (heap.py:417-418: `emitting_operation(op)` precedes `emit_postponed_op()`)
-    /// instead of waiting for the deferred `emitting_operation` callback that
-    /// `Optimizer::emit_operation` fires at final emission. A guard that pairs
-    /// with a postponed op — GUARD_NOT_FORCED with its CALL_MAY_FORCE,
-    /// GUARD_[NO_]OVERFLOW with its INT_*_OVF — must not get a lazy SETFIELD_GC
-    /// scheduled between the two.
+    /// heap.py:432-434 `emitting_operation`'s guard case, run at heap's OWN
+    /// `emit()` point (heap.py:417, which precedes `emit_postponed_op()` on
+    /// heap.py:418) instead of at the deferred `emitting_operation` callback
+    /// that `Optimizer::emit_operation` fires at final emission.
+    ///
+    /// The order matters for every guard that arrives with a postponed op
+    /// pending: GUARD_NOT_FORCED after its CALL_MAY_FORCE, GUARD_[NO_]OVERFLOW
+    /// after its INT_*_OVF, GUARD_TRUE / GUARD_FALSE after the comparison they
+    /// test. A lazy SETFIELD_GC forced late lands between the pair, and the
+    /// backend reads the second of the two out of the first
+    /// (`aarch64/assembler.py:1187-1193`).
     ///
     /// The virtual-valued sets `force_lazy_sets_for_guard` hands back are put
     /// straight back into the caches, so the later `emitting_operation` call
@@ -3060,15 +3064,10 @@ impl OptHeap {
             return OptimizationResult::Emit(op.clone());
         }
 
-        // Note: postponed_op (from CallMayForce) must only be emitted at
-        // GuardNotForced, not at arbitrary guards. RPython's emit() callback
-        // calls emit_postponed_op() before every op, but the postpone→emit
-        // cycle is specifically CallMayForce→GuardNotForced. Don't emit here.
-
         if opcode.is_guard() {
-            // force_lazy_sets_for_guard is now called via emitting_operation
-            // callback (which runs for ALL guards regardless of which pass emits
-            // them). No need to force here — it was already done.
+            // Every guard heap keeps is downstreamed as `Emit`, and
+            // `propagate_forward` then runs heap.py:417-418 for it — the
+            // lazy-set flush, then the postponed op. Neither step belongs here.
             return OptimizationResult::Emit(op.clone());
         }
 
@@ -3240,56 +3239,13 @@ impl OptHeap {
                 return OptimizationResult::Remove;
             }
 
-            // heap.py: GUARD_NOT_FORCED — emit the postponed call_may_force,
-            // then handle as a guard. RPython uses force_lazy_sets_for_guard
-            // (not force_all_lazy) — immutable caches survive.
-            OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
-                // heap.py emit() runs emitting_operation(op) BEFORE
-                // emit_postponed_op(): the guard's lazy-set flush
-                // (force_lazy_sets_for_guard) emits non-virtual lazy
-                // setfields first, THEN the postponed call_may_force is
-                // emitted, THEN the guard itself.  Flushing after the
-                // call would schedule a SETFIELD_GC between the call and
-                // its paired guard, breaking the backend's strict
-                // guard_not_forced-at-+1 invariant
-                // (x86/assembler.py:2225-2244 _store_force_index).
-                self.force_lazy_sets_for_guard_early(ctx);
-                if let Some(postponed) = self.postponed_op.take() {
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[opt-heap] emit postponed {:?} pos={:?} before {:?} pos={:?}",
-                            postponed.opcode,
-                            postponed.pos.get(),
-                            op.opcode,
-                            op.pos.get()
-                        );
-                    }
-                    // RPython emit_postponed_op: route through next_optimization
-                    ctx.emit_extra(ctx.current_pass_idx, postponed);
-                } else if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[opt-heap] no postponed op before {:?} pos={:?}",
-                        op.opcode,
-                        op.pos.get()
-                    );
-                }
-                return OptimizationResult::Emit(op.clone());
-            }
-
-            // heap.py: GUARD_OVERFLOW / GUARD_NO_OVERFLOW — same ordering rule
-            // as GUARD_NOT_FORCED above, for the same reason. The postponed op
-            // here is the INT_*_OVF that OptPure released (pure.py:139-155),
-            // and its overflow answer lives in the condition flags, so a lazy
-            // SETFIELD_GC flushed after it lands BETWEEN the arithmetic and its
-            // guard. `aarch64/assembler.py:1191-1195 _walk_operations` asserts
-            // that pair is `operations[i]` / `operations[i + 1]`.
-            OpCode::GuardOverflow | OpCode::GuardNoOverflow => {
-                self.force_lazy_sets_for_guard_early(ctx);
-                // The generic `emit()` wrapper below flushes `postponed_op`
-                // for every op it downstreams (heap.py:418), which now runs
-                // after the lazy-set flush — the upstream order.
-                OptimizationResult::Emit(op.clone())
-            }
+            // GUARD_NOT_FORCED (with its postponed CALL_MAY_FORCE) and
+            // GUARD_[NO_]OVERFLOW (with its postponed INT_*_OVF) need no arms of
+            // their own: `propagate_forward` runs heap.py:417-418 — the guard's
+            // `force_lazy_sets_for_guard`, then the postponed op — for every
+            // guard, so both pairs stay adjacent. heap.py likewise has no
+            // `optimize_GUARD_NOT_FORCED` and no `optimize_GUARD_NO_OVERFLOW`;
+            // its only guard-named methods are the two below.
 
             // ── heap.py: COND_CALL handling ──
             OpCode::CondCallN => {
@@ -3420,16 +3376,65 @@ impl Optimization for OptHeap {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let result = self.dispatch_propagate(op, op_rc, ctx);
-        // heap.py:417-425 emit() override parity:
-        // Before emitting any new op, flush the postponed op. Then
-        // postpone comparison/ovf ops (call_may_force already handled
-        // in its own match arm).
-        if let OptimizationResult::Emit(ref emit_op) = result {
-            // Step 1: emit_postponed_op — flush previous postponed
+        // heap.py:417-424 `emit()` override parity, in upstream's order:
+        //
+        //     self.emitting_operation(op)     # heap.py:417
+        //     self.emit_postponed_op()        # heap.py:418
+        //     ... postpone comparison / call_may_force / ovf, else pass on
+        //
+        // Both of the first two fire for EVERY op that reaches `heap.emit()` —
+        // any op this pass downstreams, not only the ones it returns as `Emit`.
+        // PassOn / Replace / Restart hand the op to the next pass (eventually
+        // `Optimizer::emit_operation`), so they reach `emit()` too. Gating on
+        // `Emit` alone held a postponed comparison past a following non-`Emit`
+        // consumer (e.g. a COND_CALL whose condition is the comparison),
+        // emitting the comparison after its use. A removed op never reaches
+        // `emit()`, so Remove / InvalidLoop must run neither step.
+        let downstreamed = matches!(
+            result,
+            OptimizationResult::Emit(_)
+                | OptimizationResult::PassOn
+                | OptimizationResult::Replace(_)
+                | OptimizationResult::Restart(_)
+        );
+        if downstreamed {
+            // heap.py:417 `emitting_operation(op)`, whose guard case is
+            // heap.py:432-434: ONE `rop.is_guard(op.opnum)` test covering every
+            // guard opcode, running `force_lazy_sets_for_guard`.
+            //
+            // This is about ORDER, not coverage. The force already ran for every
+            // guard — `Optimizer::emit_operation` fires `emitting_operation` for
+            // all passes at final emission — but it ran too LATE, after the
+            // postponed op had been released. Running it here, at heap's own
+            // emit point, puts the forced SETFIELD_GC in FRONT of the op
+            // released on the next line instead of between that op and its
+            // guard. Both consumers want the adjacency: an `INT_*_OVF`
+            // publishes its answer in the condition flags, and there is nothing
+            // to re-test if it is lost (`aarch64/assembler.py:1191-1193`
+            // asserts it); a comparison is merely fused into its guard by
+            // `next_op_can_accept_cc` (`aarch64/assembler.py:1187-1190`) and
+            // falls back to materialise-and-re-test when it is not, so for that
+            // one the cost is an extra `tst`, not a wrong answer.
+            if op.opcode.is_guard() {
+                self.force_lazy_sets_for_guard_early(ctx);
+            }
+            // heap.py:418 `emit_postponed_op()`.
             if let Some(postponed) = self.postponed_op.take() {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[opt-heap] emit postponed {:?} pos={:?} before {:?} pos={:?}",
+                        postponed.opcode,
+                        postponed.pos.get(),
+                        op.opcode,
+                        op.pos.get()
+                    );
+                }
                 ctx.emit_extra(ctx.current_pass_idx, postponed);
             }
-            // Step 2: postpone comparison/ovf
+        }
+        // heap.py:419-423 — postpone comparison / ovf ops. CALL_MAY_FORCE is
+        // postponed in its own arm, which returns Remove before reaching here.
+        if let OptimizationResult::Emit(ref emit_op) = result {
             if emit_op.opcode.is_comparison() || emit_op.opcode.is_ovf() {
                 self.postponed_op = Some(emit_op.clone());
                 // optimizer.py:84-87 — postponed ops do NOT call
@@ -3439,27 +3444,6 @@ impl Optimization for OptHeap {
                 // before this comparison still observes REMOVED.
                 return OptimizationResult::Remove;
             }
-        }
-        // heap.py:419 `emit_postponed_op()` fires for EVERY op that reaches
-        // `heap.emit()` — i.e. any op the heap pass downstreams, not only the
-        // ones it returns as `Emit`. PassOn / Replace / Restart hand the op to
-        // the next pass (eventually `Optimizer::emit_operation`), so the
-        // previously postponed comparison/ovf must flush BEFORE them. The drain
-        // at `propagate_from_pass` (after this pass returns) emits the flushed
-        // op ahead of the current one. Gating the flush on `Emit` alone held a
-        // postponed comparison past a following non-`Emit` consumer (e.g. a
-        // COND_CALL whose condition is the comparison), emitting the comparison
-        // after its use. A removed op never reaches `emit()`, so Remove /
-        // InvalidLoop must NOT flush.
-        match &result {
-            OptimizationResult::PassOn
-            | OptimizationResult::Replace(_)
-            | OptimizationResult::Restart(_) => {
-                if let Some(postponed) = self.postponed_op.take() {
-                    ctx.emit_extra(ctx.current_pass_idx, postponed);
-                }
-            }
-            _ => {}
         }
         // optimizer.py:84-92 — `Optimization.emit(op)` and
         // `Optimization.emit_result(opt_result)` BOTH set
@@ -4726,6 +4710,65 @@ mod tests {
         assert!(
             last_setfield_at < guard_at,
             "both stores must be emitted before the guard they precede",
+        );
+    }
+
+    /// heap.py:417-419 `emit()` runs `emitting_operation(op)` — for a guard,
+    /// `force_lazy_sets_for_guard` — BEFORE `emit_postponed_op()`. That order is
+    /// what keeps a postponed op adjacent to the guard that reads it:
+    ///
+    ///   setfield_gc(p0, i1, descr=d)   <- lazy
+    ///   i3 = int_gt(i2, 10)            <- heap.py:420-423 postpones comparisons
+    ///   guard_true(i3)
+    ///
+    /// must emit `[setfield_gc][int_gt][guard_true]`. Emitting the forced set
+    /// between the comparison and its guard costs the fusion that
+    /// `aarch64/assembler.py:1187-1190` performs via `next_op_can_accept_cc`.
+    #[test]
+    fn test_lazy_set_flushes_before_a_postponed_comparison_not_between_it_and_its_guard() {
+        let d = descr(0);
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Int, 101),
+                ],
+                d.clone(),
+            ),
+            Op::new(
+                OpCode::IntGt,
+                &[
+                    rooted_inputarg_operand(Type::Int, 102),
+                    Operand::const_from_value(majit_ir::Value::Int(10)),
+                ],
+            ),
+            Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 1)]),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt_typed(&mut ops, &[101, 102]);
+
+        let emitted: Vec<OpCode> = result.iter().map(|o| o.opcode).collect();
+
+        // Pin the whole sequence, not just the relative order. The store has a
+        // non-virtual target (an inputarg pointer, so OptVirtualize never claims
+        // it and it does reach `cached_fields`) and a non-virtual stored value
+        // (an inputarg int, so heap.py:618-620 `is_virtual(op.getarg(1))` is
+        // false and `force_lazy_set` EMITS it rather than parking it in
+        // `pendingfields`). Both are required for this to be a real control:
+        // with a virtual on either side no SETFIELD_GC is emitted at all and the
+        // test would pass under either ordering.
+        assert_eq!(
+            emitted,
+            vec![
+                OpCode::SetfieldGc,
+                OpCode::IntGt,
+                OpCode::GuardTrue,
+                OpCode::Jump,
+            ],
+            "heap.py:417-418: the guard's forced lazy set is emitted BEFORE the \
+             postponed comparison, leaving the comparison adjacent to the guard \
+             that tests it (aarch64/assembler.py:1187-1190 next_op_can_accept_cc)",
         );
     }
 
