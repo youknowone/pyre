@@ -4769,10 +4769,24 @@ fn probe_walk_perfn_jitcode<Sym: WalkSym>(
 /// ops after that merge point and before the loop's final back-edge, so neither
 /// a prologue-only marker (e.g. `COPY_FREE_VARS` ahead of a clean hot loop) nor
 /// a post-loop marker over-declines the loop.  A loop covered by an exception
-/// handler keeps the full-tail scan so a post-loop
-/// `abort_permanent` (e.g. the `DELETE_FAST` cleanup for `except X as e`)
-/// still declines it, because compiled-loop delivery of an uncaught raise to
-/// the handler is not yet supported.
+/// handler keeps the full-tail scan so a post-loop `abort_permanent` still
+/// declines it, because compiled-loop delivery of an uncaught raise to the
+/// handler is not yet supported.
+///
+/// What that widened tail actually declines, measured over the shapes
+/// `bench/synth/loop_in_try_*` cover, is `LOAD_FAST_CHECK`'s null arm — not an
+/// unported opcode.  Putting the loop inside a `try` is itself what makes the
+/// tail read a loop variable through `LOAD_FAST_CHECK` rather than `LOAD_FAST`:
+/// the raise can reach the handler before the loop assigns the slot, so it is
+/// only conditionally bound on the join.  The codewriter splits that opcode,
+/// compiles the bound arm, and sends the null arm to a dead-end block whose
+/// `abort_permanent` no bound-local run can reach — so the widening's own
+/// predicate manufactures the marker it then trips on.  Exempting that marker
+/// class needs a jitcode-offset → emitting-Python-PC map the metadata does not
+/// carry: the null arm's block is emitted after the whole body, and
+/// `py_floor_by_jit_pc` keys each Python PC to its FIRST jitcode offset, so the
+/// floor lookup attributes the late block to whatever opcode last opened a
+/// segment (`RETURN_VALUE`), not to the `LOAD_FAST_CHECK` that owns it.
 fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<usize> {
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
         return None;
