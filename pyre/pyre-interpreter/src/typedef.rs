@@ -18925,42 +18925,54 @@ fn init_object_type(ns: PyObjectRef) {
     // keywords; class-definition keywords reaching it via the builtin
     // kwargs ABI are an error, not silently dropped.
     unsafe {
+        let init_subclass = pyre_object::function::w_classmethod_new(make_builtin_function(
+            "__init_subclass__",
+            |args| {
+                let (_, kwargs) = crate::builtins::split_builtin_kwargs(args);
+                if let Some(kw) = kwargs {
+                    let has_real_kw = unsafe {
+                        pyre_object::w_dict_items(kw).into_iter().any(|(k, _)| {
+                            pyre_object::is_str(k)
+                                && pyre_object::w_str_get_wtf8(k).as_str() != Ok("__pyre_kw__")
+                        })
+                    };
+                    if has_real_kw {
+                        return Err(crate::PyError::type_error(
+                            "__init_subclass__() takes no keyword arguments",
+                        ));
+                    }
+                }
+                Ok(pyre_object::w_none())
+            },
+        ));
+        // Read the wrapped callable back out of the classmethod: allocating it
+        // can move the function, and the qualname lookup compares addresses.
+        crate::function::register_object_class_method(
+            "__init_subclass__",
+            pyre_object::function::w_classmethod_get_func(init_subclass),
+        );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__init_subclass__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__init_subclass__",
-                |args| {
-                    let (_, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                    if let Some(kw) = kwargs {
-                        let has_real_kw = unsafe {
-                            pyre_object::w_dict_items(kw).into_iter().any(|(k, _)| {
-                                pyre_object::is_str(k)
-                                    && pyre_object::w_str_get_wtf8(k).as_str() != Ok("__pyre_kw__")
-                            })
-                        };
-                        if has_real_kw {
-                            return Err(crate::PyError::type_error(
-                                "__init_subclass__() takes no keyword arguments",
-                            ));
-                        }
-                    }
-                    Ok(pyre_object::w_none())
-                },
-            )),
+            init_subclass,
         )
     };
     unsafe {
+        // objectobject.py:413 `interp2app(descr___subclasshook__,
+        // as_classmethod=True)` — the hook receives the class it is
+        // consulted for, so a read off any type binds to that type.
+        let subclasshook = pyre_object::function::w_classmethod_new(make_builtin_function(
+            "__subclasshook__",
+            |_| Ok(pyre_object::w_not_implemented()),
+        ));
+        crate::function::register_object_class_method(
+            "__subclasshook__",
+            pyre_object::function::w_classmethod_get_func(subclasshook),
+        );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__subclasshook__",
-            // objectobject.py:413 `interp2app(descr___subclasshook__,
-            // as_classmethod=True)` — the hook receives the class it is
-            // consulted for, so a read off any type binds to that type.
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__subclasshook__",
-                |_| Ok(pyre_object::w_not_implemented()),
-            )),
+            subclasshook,
         )
     };
     // PyPy: objectobject.py descr___setattr__

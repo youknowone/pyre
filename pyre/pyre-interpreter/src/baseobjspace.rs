@@ -5505,6 +5505,16 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                 // the generic type dispatch below), never forwarded.
                 "__class__" => {}
                 _ => {
+                    // The Python 3.14 METH_CLASS qualname delta, ahead of the
+                    // forwarding test below: the two carriers it applies to are
+                    // published as `builtin_function_or_method`, whose type
+                    // defines `__qualname__`, so `on_method_type` is true for
+                    // them and the forwarding branch never runs.
+                    if name == "__qualname__" {
+                        if let Some(qualname) = crate::function::method_class_bound_qualname(obj)? {
+                            return Ok(qualname);
+                        }
+                    }
                     // `classobject.c method_getattro` — attributes defined on
                     // the method type win (`__call__` / `__repr__` / `__eq__`
                     // / `__hash__`); any other name is forwarded to `__func__`
@@ -5514,17 +5524,6 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResul
                         .map(|t| lookup_in_type_where(t.as_ptr(), name).is_some())
                         .unwrap_or(false);
                     if !on_method_type {
-                        // Keep the CPython-3.14 METH_CLASS qualname delta in
-                        // Method.descr_method_getattribute's single forwarding
-                        // implementation.  The fast path here otherwise
-                        // bypasses that method entirely.
-                        if name == "__qualname__" {
-                            if let Some(qualname) =
-                                crate::function::method_class_bound_qualname(obj)?
-                            {
-                                return Ok(qualname);
-                            }
-                        }
                         let func = pyre_object::function::w_method_get_func(obj);
                         if !func.is_null() {
                             return getattr_str(func, name);

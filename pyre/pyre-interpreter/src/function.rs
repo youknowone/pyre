@@ -2792,6 +2792,41 @@ pub unsafe fn descr_method_getattribute(
     crate::baseobjspace::getattr_str(function, name)
 }
 
+/// The callables `object` publishes as class methods, paired with the name
+/// each is published under.
+///
+/// Only these two take a bound qualname naming the class they were read off,
+/// and `__qualname__` is writable on an ordinary function, so they have to be
+/// recognised by identity.  `Box` so a slot keeps one address for the
+/// collector's whole lifetime; the `Vec` only owns them.
+static OBJECT_CLASS_METHODS: std::sync::Mutex<Vec<(&'static str, Box<usize>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Publish `function` as `object.<name>` for [`method_class_bound_qualname`].
+///
+/// The address is registered as a process-lifetime GC root so the collector
+/// forwards it, the `intern_str` idiom: nothing else keeps this raw copy in
+/// step with a moving collection.
+pub fn register_object_class_method(name: &'static str, function: PyObjectRef) {
+    let mut slot = Box::new(function as usize);
+    let root_slot = (&mut *slot) as *mut usize as *mut *mut u8;
+    unsafe { pyre_object::gc_hook::try_gc_add_root(root_slot) };
+    OBJECT_CLASS_METHODS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((name, slot));
+}
+
+/// The name `object` publishes `function` under, if it publishes it at all.
+fn object_class_method_name(function: PyObjectRef) -> Option<&'static str> {
+    OBJECT_CLASS_METHODS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(_, slot)| **slot == function as usize)
+        .map(|(name, _)| *name)
+}
+
 /// Python 3.14's dynamic qualname for the two METH_CLASS methods inherited
 /// from `object`; `None` for every ordinary bound method.
 pub unsafe fn method_class_bound_qualname(
@@ -2802,12 +2837,12 @@ pub unsafe fn method_class_bound_qualname(
     if !unsafe { pyre_object::is_type(instance) } {
         return Ok(None);
     }
-    let function_qualname = unsafe { function_get_qualname(function) };
-    let inherited_name = if function_qualname == "object.__subclasshook__" {
-        "__subclasshook__"
-    } else if function_qualname == "object.__init_subclass__" {
-        "__init_subclass__"
-    } else {
+    // Identify the two by the callables `object` publishes, not by their
+    // qualname: `__qualname__` is writable on an ordinary function, so a
+    // classmethod over one that spells itself `object.__subclasshook__` would
+    // otherwise be rewritten to name its own owner instead of keeping the
+    // string it was given.
+    let Some(inherited_name) = object_class_method_name(function) else {
         return Ok(None);
     };
     let owner_qualname = crate::baseobjspace::getattr_str(instance, "__qualname__")?;
