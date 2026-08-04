@@ -4818,7 +4818,15 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
     }
     .is_some();
 
-    let scan_end = if loop_in_try || std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_FULL").is_some() {
+    // `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY` drops the `loop_in_try` widening so
+    // the carve-out can be measured rather than argued about: the widening was
+    // justified by "compiled-loop delivery of an uncaught raise into the
+    // handler is not yet supported", which later exception-edge work may have
+    // made obsolete.  Narrowing is the change under test, so it needs a knob
+    // that turns it on without a rebuild.
+    let scan_end = if !std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY").is_some()
+        && (loop_in_try || std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_FULL").is_some())
+    {
         code.len()
     } else {
         back_edge_end.unwrap_or(code.len())
