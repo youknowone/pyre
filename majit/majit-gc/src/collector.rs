@@ -2127,6 +2127,8 @@ impl MiniMarkGC {
         &mut self,
         obj_addr: usize,
         site: &str,
+        // The child site names the slot kind; the root path identifies the producer.
+        parent_site: &'static str,
         holder_addr: usize,
         slot_addr: usize,
     ) -> GcRef {
@@ -2164,6 +2166,7 @@ impl MiniMarkGC {
             panic!(
                 "GC BUG: invalid type_id={} at obj_addr={:#x} \
                  (header_addr={:#x}, nursery_start={:#x}, site={}, \
+                 parent_site={}, \
                  nursery_free={:#x}, nursery_top={:#x}, holder_addr={:#x}, \
                  holder_type_id={:?}, holder_offset={:?}, holder_words={:#x?})",
                 type_id,
@@ -2171,6 +2174,7 @@ impl MiniMarkGC {
                 obj_addr - GcHeader::SIZE,
                 self.nursery.start_ptr() as usize,
                 site,
+                parent_site,
                 self.nursery.free_ptr() as usize,
                 self.nursery.top_ptr() as usize,
                 holder_addr,
@@ -2281,6 +2285,8 @@ impl MiniMarkGC {
         slot_addr: usize,
         holder_addr: usize,
         site: &str,
+        // The child site names the slot kind; the root path identifies the producer.
+        parent_site: &'static str,
     ) {
         const NURSERY_POISON_WORD: usize = (usize::MAX / 0xff) * 0xaa;
         if self.nursery.poison_enabled() && field_ref.0 == NURSERY_POISON_WORD {
@@ -2291,8 +2297,8 @@ impl MiniMarkGC {
             };
             let holder_offset = slot_addr.checked_sub(holder_addr);
             panic!(
-                "GC BUG: traced slot contains nursery poison at slot_addr={:#x} holder_addr={:#x} holder_type_id={:?} holder_offset={:?} site={}",
-                slot_addr, holder_addr, holder_type_id, holder_offset, site,
+                "GC BUG: traced slot contains nursery poison at slot_addr={:#x} holder_addr={:#x} holder_type_id={:?} holder_offset={:?} site={} parent_site={}",
+                slot_addr, holder_addr, holder_type_id, holder_offset, site, parent_site,
             );
         }
     }
@@ -2311,11 +2317,23 @@ impl MiniMarkGC {
     /// white old objects to `more_objects_to_trace`.
     #[inline]
     fn drag_out_root(&mut self, gcref: &mut GcRef) {
-        self.assert_traced_slot_initialized(*gcref, gcref as *mut GcRef as usize, 0, "minor_root");
+        self.assert_traced_slot_initialized(
+            *gcref,
+            gcref as *mut GcRef as usize,
+            0,
+            "minor_root",
+            "minor_root",
+        );
         let pinned = self.pinned_objects.contains(&gcref.0);
         if self.is_nursery_object_start(gcref.0) && !pinned {
             let slot_addr = gcref as *mut GcRef as usize;
-            *gcref = self.copy_nursery_object(gcref.0, "minor_root_target", 0, slot_addr);
+            *gcref = self.copy_nursery_object(
+                gcref.0,
+                "minor_root_target",
+                "minor_root",
+                0,
+                slot_addr,
+            );
         }
         // incminimark.py:2140-2143: append iff (VISITED | PINNED) == 0. pyre's
         // marking convention sets VISITED at push time (see `seed_major_root`
@@ -2332,7 +2350,7 @@ impl MiniMarkGC {
 
     /// Trace an object's GC pointer fields and update any that point
     /// into the nursery by copying the target.
-    fn trace_and_update_object(&mut self, obj_addr: usize, site: &str) {
+    fn trace_and_update_object(&mut self, obj_addr: usize, site: &'static str) {
         let type_id = unsafe { (*header_of(obj_addr)).type_id() };
         self.validate_type_id(type_id, obj_addr, site);
         let custom_trace = self.types.get(type_id).custom_trace;
@@ -2347,11 +2365,13 @@ impl MiniMarkGC {
                         slot_ptr as usize,
                         obj_addr,
                         "minor_custom_trace",
+                        site,
                     );
                     if self.is_nursery_object_start(field_ref.0) {
                         let new_ref = self.copy_nursery_object(
                             field_ref.0,
                             "minor_custom_trace_target",
+                            site,
                             obj_addr,
                             slot_ptr as usize,
                         );
@@ -2378,11 +2398,13 @@ impl MiniMarkGC {
                 slot as usize,
                 obj_addr,
                 "minor_fixed_field",
+                site,
             );
             if self.is_nursery_object_start(field_ref.0) {
                 let new_ref = self.copy_nursery_object(
                     field_ref.0,
                     "minor_fixed_field_target",
+                    site,
                     obj_addr,
                     slot as usize,
                 );
@@ -2404,11 +2426,13 @@ impl MiniMarkGC {
                     slot as usize,
                     obj_addr,
                     "minor_varsize_item",
+                    site,
                 );
                 if self.is_nursery_object_start(field_ref.0) {
                     let new_ref = self.copy_nursery_object(
                         field_ref.0,
                         "minor_varsize_item_target",
+                        site,
                         obj_addr,
                         slot as usize,
                     );
@@ -4257,11 +4281,13 @@ impl MiniMarkGC {
                                     slot as usize,
                                     obj,
                                     "minor_dirty_card_item",
+                                    "minor_dirty_card",
                                 );
                                 if self.is_nursery_object_start(field_ref.0) {
                                     let new_ref = self.copy_nursery_object(
                                         field_ref.0,
                                         "minor_dirty_card_item_target",
+                                        "minor_dirty_card",
                                         obj,
                                         slot as usize,
                                     );
