@@ -2287,11 +2287,11 @@ fn try_adopt_single_frame_blackhole(
     // carries the irrevocable, fully preflighted adoption contract.
     let trace_too_long = commit_leg == WalkEndCommitLeg::TraceTooLong
         && crate::jitcode_dispatch::fbw_executed_effect_count() != 0;
-    // Both full-image legs resume the blackhole at a post-step pc it may leave
-    // by arbitrary control flow, so the root operand stack has to be published
-    // with the locals (`fill_trace_too_long_register_banks`).  The vable-escape
-    // leg instead resumes immediately after one forcing residual and keeps its
-    // narrower resume-marker image.
+    // All three full-image legs resume the blackhole at a pc it may leave by
+    // arbitrary control flow, including back around a loop header where the
+    // jitcode reloads operands from the virtualizable array.  The root operand
+    // stack therefore has to be published with the locals
+    // (`fill_trace_too_long_register_banks`) for each leg.
     //
     // `WalkAbort` deliberately does NOT join `trace_too_long` above: that flag
     // promotes a post-latch decline to a release assert, which the too-long arm
@@ -2299,7 +2299,9 @@ fn try_adopt_single_frame_blackhole(
     // (`trace_too_long_abort_safe`).  A capability-gap abort fires regardless of
     // the latch, so its adopt must still be able to decline into legacy replay.
     let publishes_root_stack =
-        commit_leg == WalkEndCommitLeg::TraceTooLong || commit_leg == WalkEndCommitLeg::WalkAbort;
+        commit_leg == WalkEndCommitLeg::TraceTooLong
+            || commit_leg == WalkEndCommitLeg::WalkAbort
+            || commit_leg == WalkEndCommitLeg::VableEscape;
     let Some(mut latched) = crate::jitcode_dispatch::take_single_frame_blackhole() else {
         assert!(
             !trace_too_long,
@@ -2432,12 +2434,15 @@ fn try_adopt_single_frame_blackhole(
             eprintln!("[wa-stack] snapshot-array={from_array:x?} mirror={from_mirror:x?}");
         }
         // `ABORT_TOO_LONG` stops at an opcode boundary, where the snapshot
-        // array is the image RPython would copy.  `WalkAbort` stops INSIDE an
-        // opcode, and for a root walk that array was never written at all — it
-        // still holds the pre-walk stack (see `capture_frame_stack_from_mirror`).
-        // Take the walker's OpRef mirror, which the latch resolved while the
-        // concrete side tables were still live.
-        let captured = if commit_leg == WalkEndCommitLeg::WalkAbort {
+        // array is the image RPython would copy.  `WalkAbort` and
+        // `VableEscape` stop INSIDE an opcode, and for a root walk that array
+        // was never written at all — it still holds the pre-walk stack (see
+        // `capture_frame_stack_from_mirror`). Take the walker's OpRef mirror,
+        // which the latch resolved while the concrete side tables were still
+        // live.
+        let captured = if commit_leg == WalkEndCommitLeg::WalkAbort
+            || commit_leg == WalkEndCommitLeg::VableEscape
+        {
             latched.mirror_stack.as_ref().and_then(|mirror| {
                 crate::state::capture_frame_stack_from_mirror(
                     vable_frame,

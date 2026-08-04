@@ -142,8 +142,14 @@ pub(crate) struct LatchedSingleFrameBlackhole {
     pub(crate) miframe: majit_metainterp::MIFrame,
     pub(crate) last_exc_value: i64,
     pub(crate) raising_exception: bool,
-    /// `None` for the `ABORT_TOO_LONG` latch, whose post-step coordinate is an
-    /// opcode boundary the snapshot array does describe.
+    /// The walker's resolved operand-stack image, captured by whichever latch
+    /// stops the walk.  The adopter uses it for legs that stop INSIDE an opcode
+    /// (`WalkAbort` and `VableEscape`) and uses the frame's own snapshot array
+    /// for `ABORT_TOO_LONG`, whose post-step coordinate is an opcode boundary
+    /// the array does describe.
+    ///
+    /// `None` means the walk had no resolvable mirror, and the adopt then
+    /// declines rather than publishing a partial stack.
     pub(crate) mirror_stack: Option<MirrorStackImage>,
 }
 
@@ -246,10 +252,10 @@ macro_rules! latchdbg {
 /// (`pyjitpl.py`) — into the concrete operand stack an abort image publishes.
 ///
 /// Same resolution [`flush_escape_state_with_latched_stack`] performs for the
-/// escape flush, and for the same reason: a walk-abort coordinate sits inside
-/// a Python opcode, where no other source describes the operand stack.  The
-/// tracing snapshot's array is not it — a root walk mirrors nothing into that
-/// frame (see [`MirrorStackImage`]).
+/// escape flush, and for the same reason: the walk-abort latch and the
+/// vable-escape latch both stop inside a Python opcode, where no other source
+/// describes the operand stack.  The tracing snapshot's array is not it — a
+/// root walk mirrors nothing into that frame (see [`MirrorStackImage`]).
 ///
 /// A recorded concrete NULL is a REAL operand — it is `PUSH_NULL`'s
 /// `self_or_null` sentinel — so only `GcRef::NO_CONCRETE`, which is what
@@ -3093,14 +3099,19 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     if let Some(miframe) = jitcode.and_then(|jitcode| {
                         build_single_frame_miframe(ctx, jitcode, resume_pc, lastop_result)
                     }) {
+                        // `ctx` is the root walk on this arm
+                        // (`framestack.is_empty() && !inline_subwalk`).  It
+                        // stops inside the residual call, and the resumed
+                        // blackhole can reach a `getarrayitem_vable_r` that
+                        // reloads an operand from the virtualizable array, so
+                        // publish the root stack from the walker's mirror.
+                        let mirror_stack = capture_vstack_mirror_image(ctx);
                         FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| {
                             *slot.borrow_mut() = Some(LatchedSingleFrameBlackhole {
                                 miframe,
                                 last_exc_value,
                                 raising_exception,
-                                // The escape leg resumes at a call resume
-                                // marker and publishes no root stack.
-                                mirror_stack: None,
+                                mirror_stack,
                             });
                         });
                     }
