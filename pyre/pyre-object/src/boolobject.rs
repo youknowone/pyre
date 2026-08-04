@@ -59,6 +59,7 @@ pub unsafe fn w_bool_get_value(obj: PyObjectRef) -> bool {
 static TRUE_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static FALSE_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+#[majit_macros::dont_look_inside]
 fn bool_singleton(slot: &'static std::sync::OnceLock<usize>, intval: i64) -> PyObjectRef {
     *slot.get_or_init(|| {
         crate::lltype::malloc_typed_immortal(W_BoolObject {

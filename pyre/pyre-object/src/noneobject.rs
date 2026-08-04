@@ -26,6 +26,7 @@ impl crate::lltype::GcType for W_NoneObject {
 static NONE_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// Get the None singleton as a PyObjectRef.
+#[majit_macros::dont_look_inside]
 pub fn w_none() -> PyObjectRef {
     *NONE_SINGLETON.get_or_init(|| {
         crate::lltype::malloc_typed_immortal(W_NoneObject {
