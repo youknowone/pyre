@@ -1625,6 +1625,35 @@ pub fn check_exc_match_against(exc_value: PyObjectRef, exc_type: PyObjectRef) ->
 /// (pyopcode.py:144-145 `except OperationError as e: operr = e`); the
 /// caller's `Err(err)` propagation then surfaces the replacement.
 pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut usize) -> bool {
+    handle_exception_with_context(frame, err, next_instr, ContextSource::GeneratorChain)
+}
+
+/// Where the implicit `__context__` of `err` comes from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ContextSource {
+    /// `executioncontext.py:219-233 sys_exc_info` — the logical handled
+    /// exception, walking to the generator that parked one. An exception the
+    /// frame itself produces is raised while the caller's handler is live, so
+    /// it takes that handler's exception.
+    GeneratorChain,
+    /// The flat EC slot alone, for an exception *thrown into* a resumed
+    /// generator. `push_gen_or_coroutine` has already swapped the generator's
+    /// own handled exception into the slot; the caller's belongs to the caller,
+    /// which merely delivered this exception rather than raising it under a
+    /// live handler. A generator holding none of its own therefore keeps a null
+    /// context.
+    ResumedFrameOnly,
+}
+
+/// [`handle_exception`] with an explicit context source
+/// (`pyframe.py:303-306` records the context of a thrown-in
+/// `SApplicationException` before the handler search).
+pub fn handle_exception_with_context(
+    frame: &mut PyFrame,
+    err: &mut PyError,
+    next_instr: &mut usize,
+    context_source: ContextSource,
+) -> bool {
     // Internal control-flow / corruption markers are not real Python
     // exceptions and must never be dispatched via bytecode handlers.
     if err.kind == crate::PyErrorKind::GeneratorReturn
@@ -1672,9 +1701,39 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
     }
     // Implicit __context__ chaining: any exception raised while another is being
     // handled records that active exception as its __context__, not only an
-    // explicit `raise`.  Recorded once (skipped when a __context__ is already
-    // stamped), so it lands at the frame where the exception first surfaces.
-    crate::error::chain_context(err.exc_object, get_sys_exception());
+    // explicit `raise`.
+    //
+    // `error.py:410-420 record_context` records it once and then marks the
+    // OperationError, so the frames the SAME error merely unwinds through never
+    // re-derive it.  That marking is load-bearing whenever the recorded answer
+    // was "no context": a null `__context__` does not distinguish an error that
+    // recorded none from one not yet recorded, and an outer frame handling
+    // something of its own would hand it that instead.  Pyre's witness for the
+    // unmarked state is the application traceback, which
+    // `record_application_traceback` stamps for this frame below and which is
+    // therefore still empty on exactly the frame where the error first
+    // surfaces.
+    //
+    // A thrown-in exception starts a *new* error over an exception object that
+    // already carries a traceback from wherever it was first raised, so it is
+    // unmarked at the delivery frame no matter what that object holds.
+    let record_context = match context_source {
+        ContextSource::GeneratorChain => {
+            !err.exc_object.is_null()
+                && unsafe {
+                    pyre_object::interp_exceptions::w_exception_get_traceback(err.exc_object)
+                }
+                .is_null()
+        }
+        ContextSource::ResumedFrameOnly => true,
+    };
+    if record_context {
+        let active = match context_source {
+            ContextSource::GeneratorChain => get_sys_exception(),
+            ContextSource::ResumedFrameOnly => get_current_exception(),
+        };
+        crate::error::chain_context(err.exc_object, active);
+    }
     if err.attach_tb {
         if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
             // The materialized exception is old-gen managed but lives only in the
@@ -1907,7 +1966,12 @@ pub(crate) fn eval_frame_plain_with_resume(
             FrameResume::Yielded(value) => return Ok(value),
             FrameResume::Dispatch(Some(mut err)) => {
                 let mut next_instr = frame.next_instr();
-                if !handle_exception(frame, &mut err, &mut next_instr) {
+                if !handle_exception_with_context(
+                    frame,
+                    &mut err,
+                    &mut next_instr,
+                    ContextSource::ResumedFrameOnly,
+                ) {
                     return Err(err);
                 }
                 frame.last_instr = next_instr as isize - 1;
@@ -1953,7 +2017,12 @@ pub(crate) fn eval_frame_plain_with_resume(
                 }
                 FrameResume::Dispatch(Some(mut err)) => {
                     let mut next_instr = frame.next_instr();
-                    if !handle_exception(frame, &mut err, &mut next_instr) {
+                    if !handle_exception_with_context(
+                        frame,
+                        &mut err,
+                        &mut next_instr,
+                        ContextSource::ResumedFrameOnly,
+                    ) {
                         return Err(err);
                     }
                     frame.last_instr = next_instr as isize - 1;
