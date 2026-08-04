@@ -6705,7 +6705,7 @@ pub(crate) fn try_walker_specialize_builtin_divmod<Sym: WalkSym>(
 /// aggregate (`SyntheticTransparentCtor "Tuple"`) is elided to `ConstRefNull`
 /// at build time (`jtransform.rs`), so the descent completes and commits a
 /// working trace.  Safety net: if a stale build-time jitcode kept that ctor as
-/// a symbolic (`>>47`) fnaddr, `try_execute_residual_call_via_executor`
+/// a symbolic (tagged) fnaddr, `try_execute_residual_call_via_executor`
 /// declines it (`OrthodoxSubWalkTraceUnsupported`) and the method-call form
 /// records the append as a residual call instead of baking the hash as a code
 /// address and branching to garbage.
@@ -7232,7 +7232,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // (`SyntheticTransparentCtor "Tuple"`) was elided to `ConstRefNull` at
     // build time.  Any residual that does NOT lower —
     // e.g. a stale build-time jitcode whose tuple ctor kept a symbolic
-    // `>>47` funcbox — is declined by `try_execute_residual_call_via_executor`
+    // symbolic-tagged funcbox — is declined by `try_execute_residual_call_via_executor`
     // (`OrthodoxSubWalkTraceUnsupported`) and `walk_result?` propagates that
     // abort before this point (graceful interpreter fallback, never a wrong
     // trace).  The descr-pool wiring above (strategy/header field descrs) is

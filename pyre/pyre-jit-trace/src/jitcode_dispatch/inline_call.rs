@@ -2359,7 +2359,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     let walk_result = match walk_result {
         Ok(outcome) => outcome,
         // `try_execute_residual_call_via_executor` declines an un-lowered
-        // in-body helper (a `>>47` symbolic fnaddr) while inlining a
+        // in-body helper (a tagged symbolic fnaddr) while inlining a
         // sub-jitcode, so the descent aborts instead of baking the hash as a
         // code address.  Propagating that abort from here strands the CALL:
         // this walk is the authoritative executor and the descent declined

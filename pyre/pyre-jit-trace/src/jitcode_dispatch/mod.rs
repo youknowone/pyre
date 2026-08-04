@@ -6465,7 +6465,7 @@ fn direct_call_release_gil<Sym: WalkSym>(
     // un-executed-side-effect SIGBUS class already closed for the
     // may-force branch.
     // `try_execute_residual_call_via_executor` self-gates (authoritative-
-    // executor flag, const-funcbox, fnaddr ≥47-bit sanity) and degrades to
+    // executor flag, const-funcbox, symbolic-fnaddr-tag sanity) and degrades to
     // recording-only on decline; on success it stamps `recorded` with the
     // concrete result and brackets the active virtualizable token for the
     // duration of the call (its may-force arm).
