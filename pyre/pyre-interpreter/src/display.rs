@@ -15,10 +15,17 @@ use crate::{
 ///
 /// PyPy: `ObjSpace.call_function(space.lookup(w_obj, name), w_obj)`
 /// Uses the unified `call_function` instead of a dedicated callback.
+///
+/// An override may answer with a lone surrogate, which this caller's `String`
+/// cannot hold; drop it rather than aborting on it. [`try_call_dunder_wtf8`]
+/// is the accessor that keeps such a result exact.
 fn try_call_dunder(obj: PyObjectRef, name: &str) -> Result<Option<String>, crate::PyError> {
     unsafe {
-        Ok(try_call_dunder_obj(obj, name)?
-            .map(|result| pyre_object::w_str_get_value(result).to_string()))
+        Ok(try_call_dunder_obj(obj, name)?.map(|result| {
+            pyre_object::w_str_get_wtf8(result)
+                .to_string_lossy()
+                .into_owned()
+        }))
     }
 }
 
@@ -490,6 +497,13 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             if std::ptr::eq(tp, &crate::pyframe::FRAME_TYPE as *const PyType) {
                 return Ok((&*(obj as *const crate::PyFrame)).descr_repr());
             }
+            // `pycode.py:570 repr` interpolates the filename the same way, and
+            // reaches for its `utf8_w` rather than a `&str`, so a code object
+            // needs the same exact path as the frame above.
+            if std::ptr::eq(tp, &crate::pycode::CODE_TYPE as *const PyType) {
+                let r = crate::pycode::code_repr(obj)?;
+                return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
+            }
             // A builtin leaf subclass's `__repr__` override may return a
             // lone surrogate; read it as WTF-8 rather than folding to `&str`.
             if let Some(r) = builtin_subclass_dunder_obj(obj, tp, "__repr__")? {
@@ -683,7 +697,13 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
                         // a TypeError like every other `__repr__` override.
                         let r = crate::builtins::call_and_check(method, &[obj])?;
                         if pyre_object::is_str(r) {
-                            return Ok(pyre_object::w_str_get_value(r).to_string());
+                            // An override may answer with a lone surrogate, which
+                            // this caller's `String` cannot hold; drop it here the
+                            // way every other plain-`String` reader does rather
+                            // than aborting. `py_repr_wtf8` keeps it exact.
+                            return Ok(pyre_object::w_str_get_wtf8(r)
+                                .to_string_lossy()
+                                .into_owned());
                         }
                         return Err(dunder_returned_non_string("__repr__", r));
                     }
@@ -1003,7 +1023,11 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> Result<String, crate::PyError> {
                     if !std::ptr::eq(src, crate::typedef::w_object()) && !method.is_null() {
                         let r = crate::builtins::call_and_check(method, &[obj])?;
                         if pyre_object::is_str(r) {
-                            return Ok(pyre_object::w_str_get_value(r).to_string());
+                            // As above: a lone surrogate is dropped for the
+                            // `String` caller instead of aborting on it.
+                            return Ok(pyre_object::w_str_get_wtf8(r)
+                                .to_string_lossy()
+                                .into_owned());
                         }
                         return Err(dunder_returned_non_string("__repr__", r));
                     }

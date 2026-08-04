@@ -1151,10 +1151,14 @@ pub unsafe fn code_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
 pub unsafe fn code_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let code = unsafe { require_code(obj, "__repr__")? };
     let line = (*(obj as *const PyCode)).co_firstlineno_raw as i64;
-    Ok(w_str_new(&format!(
-        "<code object {} at {obj:p}, file \"{}\", line {line}>",
-        code.obj_name, code.source_path,
-    )))
+    let mut repr = rustpython_wtf8::Wtf8Buf::from_string(format!(
+        "<code object {} at {obj:p}, file \"",
+        code.obj_name,
+    ));
+    let filename = crate::gateway::fsdecode_filename_wtf8(&unsafe { code_filename_bytes(obj) });
+    repr.push_wtf8(&filename);
+    repr.push_str(&format!("\", line {line}>"));
+    Ok(pyre_object::w_str_from_wtf8_managed(repr))
 }
 
 pub unsafe fn code_sizeof(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
