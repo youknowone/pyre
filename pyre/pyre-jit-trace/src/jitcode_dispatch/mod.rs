@@ -2131,18 +2131,6 @@ pub enum DispatchError {
     /// region from its start and re-executes every residual the walk already
     /// ran (`pickle_terminal_raise_resume` is the corpus detector).
     ForceQuasiImmutable { pc: usize },
-    /// A callee compiled as its own Finish portal (reached via
-    /// `call_user_function_with_eval`) accessed its frame through a
-    /// `vable_*` op that found it to be a non-standard virtualizable,
-    /// emitting an internal promote `GuardValue` + force store-back. The
-    /// Finish-portal compile path does not yet wire a resume snapshot or a
-    /// `FieldDescr` for those internal ops (only the inline sub-walk path
-    /// does), so compiling the trace trips the optimizer's
-    /// `store_final_boxes_in_guard` / `optimize_setfield_gc` invariants.
-    /// Abort to the interpreter; the method runs interpreted until the
-    /// own-portal callee frame is registered as the standard virtualizable
-    /// (a perf follow-up).
-    NonStandardVableFinishPortalUnsupported { pc: usize },
     /// A residual call to a pure-Python callee that is inline-eligible
     /// (plain, exact-positional, closure-free, not recursion-bound) but
     /// whose body is NOT a straight-line leaf — it carries an internal loop
@@ -2233,9 +2221,6 @@ impl DispatchError {
             Self::SubWalkClosedLoop { .. } => "SubWalkClosedLoop",
             Self::BranchGuardKeptStackUnsupported { .. } => "BranchGuardKeptStackUnsupported",
             Self::ForceQuasiImmutable { .. } => "ForceQuasiImmutable",
-            Self::NonStandardVableFinishPortalUnsupported { .. } => {
-                "NonStandardVableFinishPortalUnsupported"
-            }
             Self::LoopBearingCalleeInlineUnsupported { .. } => "LoopBearingCalleeInlineUnsupported",
             Self::FieldDescrMissingParentDescr { .. } => "FieldDescrMissingParentDescr",
             Self::OrthodoxSubWalkTraceUnsupported { .. } => "OrthodoxSubWalkTraceUnsupported",
@@ -2303,7 +2288,6 @@ impl DispatchError {
             | Self::SubWalkClosedLoop { pc, .. }
             | Self::BranchGuardKeptStackUnsupported { pc, .. }
             | Self::ForceQuasiImmutable { pc, .. }
-            | Self::NonStandardVableFinishPortalUnsupported { pc, .. }
             | Self::LoopBearingCalleeInlineUnsupported { pc, .. }
             | Self::FieldDescrMissingParentDescr { pc, .. }
             | Self::OrthodoxSubWalkTraceUnsupported { pc, .. }
@@ -2343,7 +2327,6 @@ impl DispatchError {
                 | Self::UnfoldableListAppendResidualUnsupported { .. }
                 | Self::MayForceNullRefArgUnsupported { .. }
                 | Self::InplaceContainerMutationUnsupported { .. }
-                | Self::NonStandardVableFinishPortalUnsupported { .. }
                 | Self::InlineCallArityMismatch { .. }
                 | Self::InlineCallIntArityMismatch { .. }
                 | Self::InlineCallFloatArityMismatch { .. }

@@ -134,14 +134,24 @@ pub(crate) fn walker_capture_inline_nonstandard_vable_guard<Sym: WalkSym>(
         return Ok(());
     }
     if !ctx.fbw_mode.inline_subwalk {
-        // A callee compiled as its own Finish portal hit the non-standard
-        // virtualizable path. Its internal promote GuardValue + force
-        // store-back are not yet wired with a resume snapshot / FieldDescr
-        // for the own-portal compile (only the inline sub-walk path below
-        // is), so the optimizer's `store_final_boxes_in_guard` /
-        // `optimize_setfield_gc` would trip. Abort to the interpreter rather
-        // than compile a trace that cannot be finalized.
-        return Err(DispatchError::NonStandardVableFinishPortalUnsupported { pc: op_pc });
+        // The walk's own root frame reached the non-standard path: it is
+        // writing a `vable` field of a frame that is not
+        // `virtualizable_boxes[-1]`.  `_nonstandard_virtualizable`
+        // (pyjitpl.py:1120) has no special case for this — it runs
+        // `implement_guard_value(eqbox, pc)` (:1916) whatever frame the walk
+        // sits in, and that is `generate_guard(GUARD_VALUE, resumepc=orgpc)`
+        // (:2582) -> `capture_resumedata(resumepc)` (:2610).  With no paused
+        // caller frames the capture upstream takes is the ordinary
+        // single-frame one, so take that; the multi-frame publish below is
+        // for the inline sub-walk, whose chain the sentinel collapse cannot
+        // encode.
+        //
+        // The buildability precondition is the sub-walk's, hoisted: an
+        // untyped virtualizable box panics the snapshot encoder either way.
+        if !ctx.trace_ctx.vable_snapshot_buildable() {
+            return Err(DispatchError::GuardSnapshotVableUntyped { pc: op_pc });
+        }
+        return walker_capture_snapshot_for_last_guard(ctx, op_pc);
     }
     // Same buildability precondition as `walker_capture_snapshot_for_last_guard`:
     // every virtualizable box must carry `OpRef::ty()` or the snapshot

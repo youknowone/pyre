@@ -3451,8 +3451,8 @@ fn run_perfn_walk<Sym: WalkSym>(
                 // places frame at r2 / ec at r3, so the positional seed put
                 // `ec_box` in the frame color and every `getfield/getarrayitem
                 // _vable` of a local took the nonstandard-virtualizable leg
-                // (internal promote `GuardValue` + force store-back, no resume
-                // snapshot → `NonStandardVableFinishPortalUnsupported` abort).
+                // (internal promote `GuardValue` + force store-back against a
+                // frame that is not the standard virtualizable).
                 // pycode (the jitdriver's green ref) is read from the frame's
                 // `pycode` field via `getfield_vable`, so it needs no register
                 // seed once `frame` resolves to the standard virtualizable; the
@@ -3543,8 +3543,8 @@ fn run_perfn_walk<Sym: WalkSym>(
         // A kept operand-stack temp never occupies a red-input color, so skip
         // `reserved_red_colors`: seeding a temp over the frame color overwrites
         // the standard virtualizable identity and forces every later `vable_*`
-        // op onto the nonstandard leg (NonStandardVableFinishPortalUnsupported
-        // abort).
+        // op onto the nonstandard leg, promoting and storing back against the
+        // wrong frame.
         if is_bridge_trace {
             if sym.bridge_walk_entry_pc().is_some() {
                 // Kept-stack branch guard resumed at the guard's own jitcode
@@ -3579,8 +3579,8 @@ fn run_perfn_walk<Sym: WalkSym>(
                             // The FRAME color (`reserved_red_colors[0]`) keeps its
                             // skip unconditionally: its `frame_box` is the standard
                             // virtualizable identity and overwriting it forces every
-                            // later `vable_*` op onto the nonstandard leg (#124
-                            // `NonStandardVableFinishPortalUnsupported`).  The EC
+                            // later `vable_*` op onto the nonstandard leg (#124),
+                            // promoting the wrong frame.  The EC
                             // color carries no such identity — the EC stays
                             // recoverable from the frame — so reseeding it is safe.
                             // This applies regardless of tagged-int state: a leaf
@@ -5495,7 +5495,6 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 DE::GuardSnapshotVableUntyped { .. }
                 | DE::MayForceNullRefArgUnsupported { .. }
                 | DE::BranchGuardKeptStackUnsupported { .. }
-                | DE::NonStandardVableFinishPortalUnsupported { .. }
                 | DE::LoopBearingCalleeInlineUnsupported { .. }
                 | DE::UnfoldableListAppendResidualUnsupported { .. }
                 // Plain, retryable: `ABORT_FORCE_QUASIIMMUT` abandons THIS

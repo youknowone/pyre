@@ -841,8 +841,8 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
 /// temps from `setup_reconstructed_callee_frame`) and its locals carried in the
 /// already-emitted frame vable.  Because the walk is a sub-walk, the callee's
 /// `ref_return` surfaces `SubReturn { result }` (`pyjitpl.py finishframe`)
-/// instead of the top-level `Finish` that pyre's own-portal model rejects with
-/// `NonStandardVableFinishPortalUnsupported` — the original #215 item-2 wall.
+/// instead of the top-level `Finish` that pyre's own-portal model cannot close
+/// here — the original #215 item-2 wall.
 ///
 /// The root portal is installed as `fbw_mode.snapshot_sym` and pushed onto the
 /// walk framestack for the sub-walk's lifetime, so an in-callee guard
