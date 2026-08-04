@@ -532,6 +532,61 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
     );
 }
 
+#[test]
+fn vable_store_stamps_executed_null_without_treating_unknown_as_null() {
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let stored = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    assert_eq!(tc.concrete_of_opref(stored), None);
+
+    let stored_result = super::vable_ops::record_stored_null_concrete(
+        &mut tc,
+        stored,
+        Value::Ref(majit_ir::GcRef(0)),
+        true,
+    );
+    assert_eq!(stored_result, stored);
+    assert_eq!(
+        tc.concrete_of_opref(stored),
+        Some(Value::Ref(majit_ir::GcRef(0))),
+        "an actually stored NULL must remain distinguishable from an unwritten slot",
+    );
+
+    let unknown = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+    let unknown_result =
+        super::vable_ops::record_stored_null_concrete(&mut tc, unknown, Value::Void, true);
+    assert_eq!(unknown_result, unknown);
+    assert_eq!(
+        tc.concrete_of_opref(unknown),
+        None,
+        "an unknown store value must not acquire a NULL proof",
+    );
+
+    let const_null = tc.const_null();
+    let stored_const = super::vable_ops::record_stored_null_concrete(
+        &mut tc,
+        const_null,
+        Value::Ref(majit_ir::GcRef(0)),
+        true,
+    );
+    assert!(!stored_const.is_constant());
+    assert_eq!(
+        tc.concrete_of_opref(stored_const),
+        Some(Value::Ref(majit_ir::GcRef(0))),
+        "a constant NULL store must materialize a box carrying store provenance",
+    );
+
+    let cleared_const = super::vable_ops::record_stored_null_concrete(
+        &mut tc,
+        const_null,
+        Value::Ref(majit_ir::GcRef(0)),
+        false,
+    );
+    assert_eq!(
+        cleared_const, const_null,
+        "clearing a popped slot must not acquire live-NULL store provenance",
+    );
+}
+
 /// `getfield_vable_*` must abort to `VableBoxNotSeeded` when the
 /// box register is unseeded (`OpRef::NONE`) rather than feed
 /// `u32::MAX` into the heapcache flag vector (a 16 GiB resize).
