@@ -1654,11 +1654,9 @@ pub fn handle_exception_with_context(
     next_instr: &mut usize,
     context_source: ContextSource,
 ) -> bool {
-    // Internal control-flow / corruption markers are not real Python
-    // exceptions and must never be dispatched via bytecode handlers.
-    if err.kind == crate::PyErrorKind::GeneratorReturn
-        || err.kind == crate::PyErrorKind::BytecodeCorruption
-    {
+    // An internal corruption marker is not a real Python exception and must
+    // never be dispatched via bytecode handlers.
+    if err.kind == crate::PyErrorKind::BytecodeCorruption {
         return false;
     }
     // pyopcode.py:135-148 — exception trace plumbing:
@@ -2148,10 +2146,6 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
             // around the interrupted instruction was bypassed and the
             // exception surfaced one frame up.
             if let Err(mut err) = trace_result {
-                if err.kind == crate::PyErrorKind::GeneratorReturn {
-                    let gen_ptr = err.message.parse::<usize>().unwrap_or(0);
-                    return Ok(gen_ptr as pyre_object::PyObjectRef);
-                }
                 if handle_exception(frame, &mut err, &mut next_instr) {
                     continue;
                 }
@@ -2188,11 +2182,6 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
             Ok(StepResult::Return(result)) => return Ok(result),
             Ok(StepResult::Yield(result)) => return Ok(result),
             Err(mut err) => {
-                // GeneratorReturn: RETURN_GENERATOR unwind → return generator object
-                if err.kind == crate::PyErrorKind::GeneratorReturn {
-                    let gen_ptr = err.message.parse::<usize>().unwrap_or(0);
-                    return Ok(gen_ptr as pyre_object::PyObjectRef);
-                }
                 if handle_exception(frame, &mut err, &mut next_instr) {
                     continue;
                 }
