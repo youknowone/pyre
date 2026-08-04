@@ -33,7 +33,7 @@ pub(crate) enum EscapeResumeKind {
 }
 
 thread_local! {
-    static ACTIVE_FRAME_ESCAPE: std::cell::Cell<Option<(usize, usize)>> =
+    static ACTIVE_FRAME_ESCAPE: std::cell::Cell<Option<(usize, Option<usize>)>> =
         const { std::cell::Cell::new(None) };
     static ACTIVE_FRAME_ESCAPE_STACK: std::cell::RefCell<Option<Vec<OpRef>>> =
         const { std::cell::RefCell::new(None) };
@@ -973,6 +973,10 @@ impl LiveLastInstrGuard {
             (false, None) => (inline, py_pc),
             (true, _) => (live_frame as *mut pyre_interpreter::PyFrame, py_pc),
         };
+        Self::enter_frame(frame, py_pc)
+    }
+
+    fn enter_frame(frame: *mut pyre_interpreter::PyFrame, py_pc: u32) -> Option<Self> {
         if frame.is_null() {
             return None;
         }
@@ -998,8 +1002,9 @@ impl Drop for LiveLastInstrGuard {
         // guard displaced (see [`capture_escape_flush_undo`]), so a later
         // commit withdrawal still restores the resume pc rather than the
         // executing one.
-        let flushed = ESCAPE_FLUSH_UNDO.with(|slot| slot.borrow().as_ref().map(|undo| undo.frame))
-            == Some(self.frame as usize);
+        let flushed = ESCAPE_FLUSH_UNDO.with(|slot| {
+            slot.borrow().as_ref().map(|undo| undo.frame) == Some(self.frame as usize)
+        });
         if !flushed {
             unsafe { (*self.frame).last_instr = self.saved };
         }
@@ -1133,12 +1138,12 @@ impl Drop for ResidualFrameChainGuard {
 }
 
 struct ActiveFrameEscapeGuard {
-    prev: Option<(usize, usize)>,
+    prev: Option<(usize, Option<usize>)>,
     prev_stack: Option<Vec<OpRef>>,
 }
 
 impl ActiveFrameEscapeGuard {
-    fn enter(frame: usize, py_pc: usize, stack: Option<Vec<OpRef>>) -> Self {
+    fn enter(frame: usize, py_pc: Option<usize>, stack: Option<Vec<OpRef>>) -> Self {
         let current = (frame != 0).then_some((frame, py_pc));
         COMMITTED_FRAME_ESCAPE_PC.with(|slot| slot.set(None));
         let latched = if current.is_some() { stack } else { None };
@@ -1199,7 +1204,7 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
         matched
     });
     ACTIVE_FRAME_ESCAPE.with(|slot| {
-        if let Some((expected, py_pc)) = slot.get()
+        if let Some((expected, portal_py_pc)) = slot.get()
             && {
                 let escaped_portal = expected == frame as usize;
                 if escaped_portal || escaped_published {
@@ -1234,13 +1239,21 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                 return true;
             }
             capture_escape_flush_undo(expected);
-            let latched = flush_escape_state_with_latched_stack(ctx, expected, py_pc);
-            let flushed =
-                latched || crate::state::flush_walk_end_state_to_frame(ctx, expected, py_pc);
+            let (latched, flushed) = if let Some(py_pc) = portal_py_pc {
+                let latched = flush_escape_state_with_latched_stack(ctx, expected, py_pc);
+                let flushed =
+                    latched || crate::state::flush_walk_end_state_to_frame(ctx, expected, py_pc);
+                (latched, flushed)
+            } else {
+                (false, false)
+            };
             // Reachability probe: the latched-stack path is gated on
             // `escape_opcode_window_clean`, the plain fallback is not, and this
             // resume pc re-runs the whole escaping opcode.
-            if !latched && flushed {
+            if let Some(py_pc) = portal_py_pc
+                && !latched
+                && flushed
+            {
                 use crate::trace::fbw_diag;
                 fbw_diag::bump(fbw_diag::ESCAPE_PLAIN_FALLBACK);
                 if !escape_opcode_window_clean(py_pc) {
@@ -1253,7 +1266,9 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                 } else {
                     EscapeResumeKind::RerunsOpcode
                 };
-                COMMITTED_FRAME_ESCAPE_PC.with(|committed| committed.set(Some((py_pc, kind))));
+                if let Some(py_pc) = portal_py_pc {
+                    COMMITTED_FRAME_ESCAPE_PC.with(|committed| committed.set(Some((py_pc, kind))));
+                }
             } else if !crate::state::flush_locals_region_to_frame(ctx, expected) {
                 // All-or-nothing decline: nothing was written, nothing to undo.
                 discard_escape_flush_undo();
@@ -2871,19 +2886,29 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // Not latched on a bridge walk: its abort path bypasses the
         // run_perfn_walk epilogue that adopts (or restores) a committed
         // escape flush, so a commit there would strand a moved frame.
-        let escape_stack = (escape_frame != 0
-            && !ctx.fbw_mode.inline_subwalk
-            && !ctx.trace_ctx.is_bridge_trace
-            && ctx.vstack_valid
-            && escape_opcode_window_clean(ctx.vstack_cur_pypc as usize))
-        .then(|| ctx.vstack_boxes.clone());
-        let _frame_escape =
-            ActiveFrameEscapeGuard::enter(escape_frame, ctx.vstack_cur_pypc as usize, escape_stack);
+        let escape_py_pc = (!ctx.fbw_mode.inline_subwalk && ctx.vstack_valid)
+            .then_some(ctx.vstack_cur_pypc as usize);
+        let escape_stack = escape_py_pc
+            .filter(|py_pc| {
+                escape_frame != 0
+                    && !ctx.trace_ctx.is_bridge_trace
+                    && escape_opcode_window_clean(*py_pc)
+            })
+            .map(|_| ctx.vstack_boxes.clone());
+        let _frame_escape = ActiveFrameEscapeGuard::enter(escape_frame, escape_py_pc, escape_stack);
         // `executioncontext.py:85 enter` for the inlined callee this residual
         // runs inside of.
         let _frame_chain = ResidualFrameChainGuard::enter();
-        let _last_instr =
-            LiveLastInstrGuard::enter(live_frame, ctx.vstack_cur_pypc, inline_callee_pc);
+        let live_py_pc = if ctx.fbw_mode.inline_subwalk {
+            ctx.vstack_cur_pypc
+        } else {
+            live_py_pc_from_snapshot(ctx, op_pc).unwrap_or(ctx.vstack_cur_pypc)
+        };
+        let _callee_last_instr =
+            LiveLastInstrGuard::enter(live_frame, live_py_pc, inline_callee_pc);
+        let _caller_last_instr = ctx.fbw_mode.inline_caller_py_pc.map(|py_pc| {
+            LiveLastInstrGuard::enter_frame(live_frame as *mut pyre_interpreter::PyFrame, py_pc)
+        });
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
@@ -3573,6 +3598,25 @@ fn inline_callee_py_pc<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, jit_pc: usi
     let pjc = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
     Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
         &pjc.metadata,
+        jit_pc,
+    ))
+}
+
+fn live_py_pc_from_snapshot<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) -> Option<u32> {
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return None;
+    }
+    let sym = unsafe { &*sym_ptr };
+    if sym.jitcode().is_null() {
+        return None;
+    }
+    let jc = unsafe { &*sym.jitcode() };
+    Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
+        &jc.payload.metadata,
         jit_pc,
     ))
 }

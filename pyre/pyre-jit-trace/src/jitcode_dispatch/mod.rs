@@ -1132,6 +1132,10 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// boundary rather than mapping the callee `op_pc` through the outer
     /// jitcode in `walker_capture_snapshot_for_last_guard`.
     pub inline_subwalk: bool,
+    /// Python pc of the caller CALL instruction an inline sub-walk is
+    /// executing under.  Used only for the temporary live-frame coordinate a
+    /// residual frame reader observes; it is not a walk-end resume claim.
+    pub inline_caller_py_pc: Option<u32>,
     /// The current sub-walk is a translated builtin gateway helper, which has
     /// no Python blackhole frame of its own. Guard snapshots therefore encode
     /// only the precomputed Python caller chain on `framestack`, omitting the
@@ -1203,6 +1207,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
         Self {
             snapshot_sym: std::ptr::null(),
             inline_subwalk: false,
+            inline_caller_py_pc: None,
             transparent_helper_subwalk: false,
             carrier_resume: false,
             current_exception_seed: None,

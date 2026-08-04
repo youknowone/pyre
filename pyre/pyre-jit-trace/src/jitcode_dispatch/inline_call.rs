@@ -2334,6 +2334,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     ctx.raw_descrs = RawDescrPool::Global;
     ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
     ctx.fbw_mode.inline_subwalk = true;
+    ctx.fbw_mode.inline_caller_py_pc = Some(call_site_py_pc);
     ctx.fbw_mode.transparent_helper_subwalk = nested_helper_entry.is_some();
     let _helper_frame =
         nested_helper_entry.map(|frame| InlineFrameGuard::enter(ctx.session, 0, Some(frame)));
@@ -2491,6 +2492,25 @@ fn latch_abort_call_resume<Sym: WalkSym>(
     if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx) {
         fbw_set_abort_call_resume(outer_jitcode_index, call_jitcode_pc, stack);
     }
+}
+
+fn inline_caller_py_pc_from_snapshot<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    call_jitcode_pc: usize,
+) -> Option<u32> {
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return None;
+    }
+    let sym = unsafe { &*sym_ptr };
+    if sym.jitcode().is_null() {
+        return None;
+    }
+    let jc = unsafe { &*sym.jitcode() };
+    Some(
+        crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, call_jitcode_pc)
+            as u32,
+    )
 }
 
 pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
@@ -3831,6 +3851,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         inline_outer_entry_py_pc,
         inline_outer_jc_index,
         inline_outer_resume_marker_jit_pc,
+        inline_caller_py_pc,
     ) = if ctx.outer_active_boxes.is_empty() {
         let sym_ptr = ctx.fbw_mode.snapshot_sym;
         if sym_ptr.is_null() {
@@ -3839,6 +3860,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 ctx.entry_py_pc,
                 ctx.outer_jitcode_index,
                 ctx.outer_resume_marker_jit_pc,
+                inline_caller_py_pc_from_snapshot(ctx, op.pc).or(ctx.fbw_mode.inline_caller_py_pc),
             )
         } else {
             let sym = unsafe { &*sym_ptr };
@@ -3848,6 +3870,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                     ctx.entry_py_pc,
                     ctx.outer_jitcode_index,
                     ctx.outer_resume_marker_jit_pc,
+                    inline_caller_py_pc_from_snapshot(ctx, op.pc)
+                        .or(ctx.fbw_mode.inline_caller_py_pc),
                 )
             } else {
                 // Liveness coordinate is the CALL op's own (jitcode index,
@@ -3859,10 +3883,18 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 // snapshot encodes the wrong frame boxes.  Derive the
                 // coordinate from the snapshot sym's jitcode at the CALL op's
                 // pc, matching `orthodox_list_append_commit`.
-                let (call_site_jc_index, call_site_marker) = unsafe {
+                let (call_site_jc_index, call_site_marker, call_site_py_pc) = unsafe {
                     let jc = &*sym.jitcode();
                     let jc_index = jc.index as u32;
-                    (jc_index, jc.payload.resume_marker_for_jitcode_pc(op.pc))
+                    let py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(
+                        &jc.payload.metadata,
+                        op.pc,
+                    );
+                    (
+                        jc_index,
+                        jc.payload.resume_marker_for_jitcode_pc(op.pc),
+                        py_pc as u32,
+                    )
                 };
                 let call_site_word = match call_site_marker {
                     Some(m) => m as i32,
@@ -3891,6 +3923,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                     EntryPyPc::Jit(op.pc),
                     call_site_jc_index,
                     call_site_marker,
+                    Some(call_site_py_pc),
                 )
             }
         }
@@ -3904,6 +3937,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             ctx.entry_py_pc,
             ctx.outer_jitcode_index,
             ctx.outer_resume_marker_jit_pc,
+            inline_caller_py_pc_from_snapshot(ctx, op.pc).or(ctx.fbw_mode.inline_caller_py_pc),
         )
     };
     // `executioncontext.py:88 enter` — emitted here, past every decline gate,
@@ -3943,6 +3977,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             // tables.
             fbw_mode: FbwWalkMode {
                 inline_subwalk: true,
+                inline_caller_py_pc,
                 ..ctx.fbw_mode
             },
             session: ctx.session,

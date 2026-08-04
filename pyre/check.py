@@ -2408,6 +2408,17 @@ def main():
             f"{B}/frame_inlined_callee_own_image_regression.py",
             20,
         )
+        # The third frame-image shape: an inlined callee reads its CALLER's
+        # real frame via `sys._getframe(1)` while the caller's compiled loop is
+        # still active.  The two sibling guards miss this because one reads
+        # after the loop and the other reads the callee's own frame.  The read
+        # stays on non-forcing coordinates (`f_lasti` / `f_lineno`) so a bad
+        # escape flush cannot be masked by routing back through the interpreter.
+        chk.run_selfcheck(
+            "frame_caller_image_from_inlined_callee",
+            f"{B}/frame_caller_image_from_inlined_callee_regression.py",
+            20,
+        )
         # The branchy-inlined-callee guard (gh#343) lives in the synthetic parity
         # suite as bridge_branchy_callee.py, gated against pypy by
         # `# pyre-check: max-pypy-ratio`; a decline that keeps every crossing
