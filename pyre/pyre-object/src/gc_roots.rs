@@ -368,6 +368,25 @@ impl RootScope {
         // SAFETY: same cell; `slot` bounds-checks `index`.
         unsafe { *(*self.stack_slot).slot(index) }
     }
+
+    /// Scope-local [`shadow_stack_set`] using the cached cell — the write a
+    /// slot whose contents change over the bracket takes on each update.
+    #[majit_macros::dont_look_inside]
+    pub fn set(&self, index: usize, root: PyObjectRef) {
+        #[cfg(debug_assertions)]
+        assert_shadow_stack_not_walking();
+        // Publish the raw value before the query, for the reason [`pin_root`]
+        // gives: the query is itself a GC operation that may park behind
+        // another thread's collection.
+        // SAFETY: same cell; `slot` bounds-checks `index`.
+        unsafe { *(*self.stack_slot).slot(index) = root };
+        let normalized =
+            crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
+        if normalized != root {
+            // SAFETY: same slot, still live.
+            unsafe { *(*self.stack_slot).slot(index) = normalized };
+        }
+    }
 }
 
 impl Drop for RootScope {

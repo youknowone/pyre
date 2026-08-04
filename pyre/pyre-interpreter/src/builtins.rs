@@ -15196,13 +15196,64 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "sum() can't sum bytearray [use b''.join(seq) instead]",
         ));
     }
-    // `_regular_sum`: `last = last + x` over the generic iterator protocol
-    // (so generators, ranges, sets, dict views, ... all work).  Very
-    // intentionally `last + x`, not `+=` — preserving a mutable `start`
-    // (e.g. a list) matches PyPy's app-level definition.
-    let items = crate::builtins::collect_iterable(iterable)?;
-    let mut last = start;
-    let mut i = 0;
+    // `_regular_sum`: `for x in sequence: last = last + x` over the generic
+    // iterator protocol (so generators, ranges, sets, dict views, ... all
+    // work).  Very intentionally `last + x`, not `+=` — preserving a mutable
+    // `start` (e.g. a list) matches PyPy's app-level definition.
+    //
+    // That fold runs over the *live* iterator, so `next` and the addition
+    // interleave.  Materialising the iterable up front reorders those side
+    // effects and turns an unbounded iterable into an unbounded allocation, so
+    // pump the iterator here instead and keep the running total in a
+    // shadow-stack slot: every `next` and every `__add__` can run allocating
+    // Python code and move it.
+    // Every slot here is read and written once per item, so the whole fold
+    // goes through the scope's cached root-stack cell rather than the free
+    // `shadow_stack_*` functions, which re-resolve the thread local on each
+    // call.
+    let roots = pyre_object::gc_roots::push_roots();
+    // `iter(iterable)` runs arbitrary allocating code before the fold begins,
+    // so both operands are already live across a collection point here: root
+    // them first and read every later use back out of the slot, never from the
+    // local a foreign collection has left stale.
+    let last_slot = roots.base();
+    roots.pin_root(start);
+    let iterable_slot = last_slot + 1;
+    roots.pin_root(iterable);
+    let it_slot = iterable_slot + 1;
+    roots.pin_root(crate::baseobjspace::iter(roots.get(iterable_slot))?);
+    // Seeded with `start` purely to own a slot; every read is guarded by
+    // `pending`, which is only set once a real item has been written here.
+    let item_slot = it_slot + 1;
+    roots.pin_root(roots.get(last_slot));
+    // A dict-view iterator is an off-GC carrier whose own walker does not cover
+    // this native loop; retain its source dict for the duration, as
+    // `collect_iterator` does.
+    if unsafe { pyre_object::dictmultiobject::is_dict_view_iterator(roots.get(it_slot)) } {
+        let w_dict = unsafe {
+            pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(roots.get(it_slot))
+        };
+        roots.pin_root(w_dict);
+    }
+    let mut pending = false;
+    let mut exhausted = false;
+    let mut ensure_item =
+        |pending: &mut bool, exhausted: &mut bool| -> Result<(), crate::PyError> {
+            if *pending || *exhausted {
+                return Ok(());
+            }
+            // The iterator may have moved during a prior step; reload it from its
+            // (post-relocation) slot before each call.
+            match crate::baseobjspace::next(roots.get(it_slot)) {
+                Ok(v) => {
+                    roots.set(item_slot, v);
+                    *pending = true;
+                }
+                Err(e) if e.kind == crate::PyErrorKind::StopIteration => *exhausted = true,
+                Err(e) => return Err(e),
+            }
+            Ok(())
+        };
     // `builtin_sum_impl` runs an exact-int accumulator until the running
     // total turns into an exact float, then a float accumulator that carries
     // the improved Kahan-Babuška (Neumaier) compensation term — so
@@ -15210,72 +15261,130 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `functional.py:_sum` produces.  The int phase is the generic `last + x`
     // loop, which already keeps exact ints exact and promotes to a float on
     // the first float item, so only the float phase needs its own arithmetic.
-    while i < items.len()
-        && unsafe { is_exact_int_operand(last) }
-        && !unsafe { is_exact_float_operand(last) }
-    {
-        last = crate::baseobjspace::add(last, items[i])?;
-        i += 1;
+    loop {
+        ensure_item(&mut pending, &mut exhausted)?;
+        if !pending {
+            break;
+        }
+        // Nothing between this read and the `add` can collect, so the running
+        // total is read once per item rather than re-read for the call.
+        let last = roots.get(last_slot);
+        if !unsafe { is_exact_int_operand(last) } || unsafe { is_exact_float_operand(last) } {
+            break;
+        }
+        pending = false;
+        let total = crate::baseobjspace::add(last, roots.get(item_slot))?;
+        roots.set(last_slot, total);
     }
-    if unsafe { is_exact_float_operand(last) } {
-        let mut real_sum =
-            compensated_sum_from_double(unsafe { pyre_object::w_float_get_value(last) });
-        while i < items.len() {
-            let item = items[i];
+    if unsafe { is_exact_float_operand(roots.get(last_slot)) } {
+        let mut real_sum = compensated_sum_from_double(unsafe {
+            pyre_object::w_float_get_value(roots.get(last_slot))
+        });
+        loop {
+            ensure_item(&mut pending, &mut exhausted)?;
+            if !pending {
+                break;
+            }
+            let item = roots.get(item_slot);
             // A float *subclass* leaves the fast path — its `__add__` may be
             // overridden — while `bool` and an `int` subclass stay in it,
             // matching the `PyFloat_CheckExact` / `PyLong_Check` asymmetry of
-            // the C loop.  An int too wide for a machine word leaves it too,
-            // the way `PyLong_AsLongAndOverflow` signals overflow.
+            // the C loop.  An item that leaves it stays `pending` for the
+            // generic fold below.
             let x = unsafe {
                 if pyre_object::is_float(item) && pyre_object::is_exact_builtin_instance(item) {
                     pyre_object::w_float_get_value(item)
-                } else if pyre_object::pyobject::is_int(item) {
-                    pyre_object::w_int_get_value(item) as f64
+                } else if pyre_object::pyobject::is_int_or_long(item) {
+                    let v = sum_int_as_double(item);
+                    if !v.is_finite() {
+                        return Err(crate::PyError::overflow_error(
+                            "int too large to convert to float",
+                        ));
+                    }
+                    v
                 } else {
                     break;
                 }
             };
+            pending = false;
             real_sum = compensated_sum_add(real_sum, x);
-            i += 1;
         }
-        last = pyre_object::w_float_new(compensated_sum_to_double(real_sum));
+        roots.set(
+            last_slot,
+            pyre_object::w_float_new(compensated_sum_to_double(real_sum)),
+        );
     }
     // CPython 3.14's complex fast path carries independent compensated real
     // and imaginary accumulators.  Exact complex items, all ints, and all
     // floats stay on the path; an arbitrary numeric object falls back to the
     // generic left-fold below.
-    if unsafe { is_exact_complex_operand(last) } {
+    if unsafe { is_exact_complex_operand(roots.get(last_slot)) } {
+        let last = roots.get(last_slot);
         let mut real_sum =
             compensated_sum_from_double(unsafe { pyre_object::w_complex_get_real(last) });
         let mut imag_sum =
             compensated_sum_from_double(unsafe { pyre_object::w_complex_get_imag(last) });
-        while i < items.len() {
-            let item = items[i];
+        loop {
+            ensure_item(&mut pending, &mut exhausted)?;
+            if !pending {
+                break;
+            }
+            let item = roots.get(item_slot);
             unsafe {
                 if is_exact_complex_operand(item) {
                     real_sum = compensated_sum_add(real_sum, pyre_object::w_complex_get_real(item));
                     imag_sum = compensated_sum_add(imag_sum, pyre_object::w_complex_get_imag(item));
-                } else if pyre_object::pyobject::is_int(item) {
-                    real_sum =
-                        compensated_sum_add(real_sum, pyre_object::w_int_get_value(item) as f64);
+                } else if pyre_object::pyobject::is_int_or_long(item) {
+                    let v = sum_int_as_double(item);
+                    if !v.is_finite() {
+                        return Err(crate::PyError::overflow_error(
+                            "int too large to convert to float",
+                        ));
+                    }
+                    real_sum = compensated_sum_add(real_sum, v);
                 } else if pyre_object::is_float(item) {
                     real_sum = compensated_sum_add(real_sum, pyre_object::w_float_get_value(item));
                 } else {
                     break;
                 }
             }
-            i += 1;
+            pending = false;
         }
-        last = pyre_object::w_complex_new(
-            compensated_sum_to_double(real_sum),
-            compensated_sum_to_double(imag_sum),
+        roots.set(
+            last_slot,
+            pyre_object::w_complex_new(
+                compensated_sum_to_double(real_sum),
+                compensated_sum_to_double(imag_sum),
+            ),
         );
     }
-    for &item in &items[i..] {
-        last = crate::baseobjspace::add(last, item)?;
+    loop {
+        ensure_item(&mut pending, &mut exhausted)?;
+        if !pending {
+            break;
+        }
+        pending = false;
+        let total = crate::baseobjspace::add(roots.get(last_slot), roots.get(item_slot))?;
+        roots.set(last_slot, total);
     }
-    Ok(last)
+    Ok(roots.get(last_slot))
+}
+
+/// `PyLong_AsDouble` for `builtin_sum`'s compensated fast paths: an `int` of
+/// any width as a double.  A Python `int` is always finite, so a non-finite
+/// result means the magnitude exceeds f64 range and the caller raises.
+///
+/// Signalling over-range through the value rather than a `Result` keeps a
+/// float-payload `Result` out of the JIT codewriter, which cannot flatten a
+/// payload mixing `Float` (`Ok`) and `Ref` (`Err`) into one register kind.
+unsafe fn sum_int_as_double(obj: PyObjectRef) -> f64 {
+    unsafe {
+        if pyre_object::pyobject::is_int(obj) {
+            pyre_object::w_int_get_value(obj) as f64
+        } else {
+            pyre_object::jit_bigint_to_f64_or_nan(pyre_object::w_long_get_value(obj))
+        }
+    }
 }
 
 /// `PyLong_CheckExact` — an exact `int`, excluding `bool` and any subclass.
