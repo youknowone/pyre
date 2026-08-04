@@ -2159,21 +2159,26 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.next_call_results,
             );
         }
-        // NOTE: the `&s[k..]` (`RangeFrom` sub-slice) → orthodox `getslice`
-        // copy recognizer (`front::slice_index`) is DORMANT — it is not wired
-        // into the pipeline here.  Empirically (census build 8c68710) it is a
-        // CAPSTONE, not a standalone slice: `getslice` + its Void `ConstNone`
-        // stop are UNWIRED at the legacy walker (unlike `slice_first`'s
-        // legacy-safe `ArrayRead`/`ConstInt`/discriminant ops), so planting
-        // them into a graph that still drops to legacy — which every real
-        // `&args[1..]` interpreter method does, blocked by a co-wall such as
-        // the scalar `args[1..][0]` slice index or a `compute_at_fixpoint`
-        // failure — crashes regalloc on the Void `ConstNone`
-        // (`assembler.rs:2529 lookup_coloring`) or breaks the unwired-opname
-        // snapshot on the bare `getslice`.  The recognizer, `ConstNone`, and
-        // the `getslice` rtyper lowering stay built + tested so the capstone
-        // can activate once these graphs' co-walls close (mirrors the dormant
-        // vec!/`NewList` recognizer, `design-346-foreign-lib-cluster-epic.md`).
+        // The consumer-gated RangeTo sub-slice capstone remains built but
+        // dormant: aggregate lowering records no sites. If capture is safely
+        // restored, it becomes `getslice(s, 0, k)`; a structural decline
+        // leaves the residual ctor + index chain intact.
+        // `prune_dead_phis` to reclaim the dead threaded RangeTo inputarg /
+        // link args (the getslice never reads them) — run it unconditionally
+        // on any rewrite rather than relying on the gated sweep in
+        // `simplify_lowered_graph`. Fail-safe: a structural mismatch leaves
+        // the residual ctor + index call (rtyper Skip) and touches nothing.
+        let slice_index_rangeto_rewritten = if lo.slice_index_rangeto_sites.is_empty() {
+            0
+        } else {
+            crate::front::slice_index::rewire_slice_index_rangeto_sites(
+                &mut lo.graph,
+                &lo.slice_index_rangeto_sites,
+            )
+        };
+        if slice_index_rangeto_rewritten > 0 {
+            crate::model::prune_dead_phis(&mut lo.graph);
+        }
         let next_rewritten = if lo.next_call_results.is_empty() {
             0
         } else {
@@ -2805,6 +2810,9 @@ struct Lowering<'a> {
     /// after the body lowering completes (see
     /// [`crate::front::slice_first::SliceFirstSite`]).
     slice_first_sites: Vec<crate::front::slice_first::SliceFirstSite>,
+    /// `RangeTo` aggregates recorded for the orthodox sub-slice copy rewrite
+    /// in `front::slice_index`.
+    slice_index_rangeto_sites: Vec<crate::front::slice_index::SliceIndexRangeToSite>,
     /// `{uN}::saturating_sub(a, b)` call sites recorded for the unsigned clamp
     /// diamond (`if a < b { 0 } else { a - b }`) the
     /// `front::saturating_sub` post-pass synthesizes after body lowering (see
@@ -3042,6 +3050,7 @@ impl<'a> Lowering<'a> {
             option_try_sites: Vec::new(),
             bool_then_sites: Vec::new(),
             slice_first_sites: Vec::new(),
+            slice_index_rangeto_sites: Vec::new(),
             saturating_sub_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
@@ -4213,11 +4222,17 @@ impl<'a> Lowering<'a> {
                 // (`SignedLongLongLong` / `UnsignedLongLongLong`), so
                 // collapsing an i128/u128 destination to the word-sized
                 // `Int` carrier here loses the exact RPython low-level type
-                // before the rtyper can see it.  f64 similarly stays Float;
-                // comparisons (bool), ordinary integer math, and
-                // checked-arithmetic `(int, bool)` tuple destinations use
-                // the word-sized Int carrier.
-                let result_ty = match tyref_to_value_type(dest_ty, self.llbc) {
+                // before the rtyper can see it. f64 similarly stays Float.
+                // Charon represents a checked arithmetic result as
+                // `(numeric, bool)`, but this lowering deliberately binds the
+                // destination local to the scalar `.0` value (see
+                // `binop_result_locals`). Project that numeric element's Rust
+                // type before choosing the annotation shell: in particular,
+                // a `usize` subtraction is an unsigned/non-negative value by
+                // type, even though its MIR destination is a tuple.
+                let scalar_ty = tyref_checked_binop_value_type(dest_ty, self.llbc)
+                    .unwrap_or_else(|| tyref_to_value_type(dest_ty, self.llbc));
+                let result_ty = match scalar_ty {
                     ValueType::Float => ValueType::Float,
                     ValueType::Unsigned => ValueType::Unsigned,
                     ValueType::Int128 => ValueType::Int128,
@@ -4742,15 +4757,16 @@ impl<'a> Lowering<'a> {
                             end: arg_vars[1].clone(),
                         });
                 }
-                // NOTE: `RangeFrom { start }` aggregate (`&s[k..]`) capture for
-                // `front::slice_index`'s orthodox `getslice` copy is DORMANT —
-                // the recognizer is a capstone that cannot plant its unwired
-                // `getslice` + Void `ConstNone` into the co-wall-blocked
-                // `&args[1..]` graphs without crashing the legacy walker (see
-                // the companion note in
-                // `lower_unstructured_with_static_addrs_and_attrs`).  Re-enable
-                // the `slice_index_rangefrom_sites` push here + the post-pass
-                // once those graphs' co-walls close.
+                // NOTE: RangeFrom and RangeTo capture are DORMANT. Their
+                // rewrites plant `getslice`, which has no blackhole handler.
+                // RangeFrom first exposed this when a graph dropped to the
+                // legacy walker with an uncolored Void stop. Activating
+                // RangeTo later exposed bare `getslice/rii>r` in both
+                // `split_builtin_kwargs` and `do_warn_explicit`: both stops
+                // are statically unsigned, so the non-negative-stop gate
+                // cannot distinguish the unsafe sites. Leave both captures
+                // disabled until the codewriter is guaranteed to consume the
+                // rtyped graph where `rtype_getslice` has replaced the op.
                 // Surface every operand through a separate FieldWrite so
                 // the field-to-value binding survives into the
                 // codewriter / annotator.  Field names default to
@@ -15872,6 +15888,32 @@ fn tyref_is_tuple(ty: &TyRef, llbc: &Llbc) -> bool {
     is_tuple && non_empty
 }
 
+/// The numeric `.0` type of Charon's checked-arithmetic `(numeric, bool)`
+/// destination. The MIR front-end represents that tuple local as the scalar
+/// arithmetic result, so its [`ValueType`] must come from the tuple's first
+/// Rust type argument rather than from the aggregate tuple itself.
+fn tyref_checked_binop_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    let adt = tyref_node(ty, llbc)?.as_object()?.get("Adt")?.as_object()?;
+    if adt.get("id").and_then(serde_json::Value::as_str) != Some("Tuple") {
+        return None;
+    }
+    let types = adt.get("generics")?.as_object()?.get("types")?.as_array()?;
+    if types.len() != 2 {
+        return None;
+    }
+    let overflow_ty = strip_ty_wrappers(&types[1], llbc)?;
+    if overflow_ty
+        .as_object()?
+        .get("Literal")
+        .and_then(serde_json::Value::as_str)
+        != Some("Bool")
+    {
+        return None;
+    }
+    let value_ty = strip_ty_wrappers(&types[0], llbc)?;
+    Some(tyref_to_value_type(&TyRef::Other(value_ty.clone()), llbc))
+}
+
 /// True when `ty` is Charon's unit type `()`.
 ///
 /// Unit serializes as an `Adt` carrying the synthetic `"Tuple"`
@@ -23130,6 +23172,56 @@ mod tests {
             lt_guards >= 1 && subs >= 1,
             "generic_alias_class_getitem: expected the a<b guard and the a-b subtraction \
              (lt={lt_guards}, sub={subs})"
+        );
+    }
+
+    /// Real-LLBC anchor for the `usize` stop in
+    /// `split_builtin_kwargs`'s `&args[..args.len() - 1]`. Rust's checked
+    /// MIR represents the subtraction destination as `(usize, bool)`, while
+    /// the graph deliberately collapses its `.0` projection to the scalar
+    /// arithmetic result. That scalar must retain the tuple's `usize`
+    /// element type so annotation learns it is unsigned/non-negative.
+    #[test]
+    #[ignore]
+    fn split_builtin_kwargs_getslice_stop_is_unsigned() {
+        use crate::model::{OpKind, ValueType};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "split_builtin_kwargs")
+            .expect("lower split_builtin_kwargs");
+        let stop = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::GetSlice { args } => args.get(2).cloned(),
+                _ => None,
+            })
+            .expect("RangeTo rewrite must emit getslice stop");
+        let producer = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .find(|op| {
+                op.result
+                    .as_ref()
+                    .is_some_and(|result| result.id() == stop.id())
+            })
+            .expect("getslice stop producer");
+        assert!(
+            matches!(
+                &producer.kind,
+                OpKind::BinOp {
+                    op,
+                    result_ty: ValueType::Unsigned,
+                    ..
+                } if op == "sub"
+            ),
+            "usize stop producer must be an unsigned subtraction, got {:?}",
+            producer.kind
         );
     }
 

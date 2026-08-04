@@ -1254,16 +1254,50 @@ pub fn translate_op(
             op: opname,
             lhs,
             rhs,
-            ..
+            result_ty,
         } => {
             let l = lookup_operand(value_map, lhs, op, "lhs")?;
             let r = lookup_operand(value_map, rhs, op, "rhs")?;
             let result = resolve_result_hlvalue(op, value_map)?;
-            Ok(vec![FlowspaceOp::new(
-                normalize_binop_name(opname)?,
-                vec![l, r],
-                result,
-            )])
+            let normalized = normalize_binop_name(opname)?;
+            if result_ty == &crate::model::ValueType::Unsigned && !opname.ends_with("_ovf") {
+                // The model graph retains the Rust result type, while the
+                // RPython annotator derives arithmetic signedness solely from
+                // operand annotations. This matters for checked Rust MIR:
+                // `(usize, bool)` is scalarized to its `.0` value, but `len`
+                // and an integer literal otherwise make `sub` infer a signed
+                // SomeInteger. Re-express the result's Rust `usize` type as
+                // the orthodox RPython `r_uint(value)` conversion. Its
+                // extregistry annotation is
+                // `SomeInteger(unsigned=True, knowntype=Ruint)`, which also
+                // carries non-negativity by type (`unsigned or nonneg`).
+                let module = HOST_ENV
+                    .import_module("rpython.rlib.rarithmetic")
+                    .ok_or_else(|| {
+                        TyperError::message(
+                            "rpython.rlib.rarithmetic missing from HOST_ENV bootstrap".to_string(),
+                        )
+                    })?;
+                let callable_host = module.module_get("r_uint").ok_or_else(|| {
+                    TyperError::message(
+                        "rarithmetic.r_uint missing from HOST_ENV bootstrap".to_string(),
+                    )
+                })?;
+                let scalar = Variable::new();
+                Ok(vec![
+                    FlowspaceOp::new(normalized, vec![l, r], Hlvalue::Variable(scalar.clone())),
+                    FlowspaceOp::new(
+                        "simple_call",
+                        vec![
+                            Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host))),
+                            Hlvalue::Variable(scalar),
+                        ],
+                        result,
+                    ),
+                ])
+            } else {
+                Ok(vec![FlowspaceOp::new(normalized, vec![l, r], result)])
+            }
         }
 
         // ─── Pre-rtyper opname normalization for unary ops ───
@@ -5516,6 +5550,52 @@ mod tests {
             msg.contains("as lhs of BinOp") && msg.contains("result Some(Variable("),
             "verbose diagnostic must include arg role + op variant + result variable, got: {msg}"
         );
+    }
+
+    #[test]
+    fn translate_unsigned_binop_carries_rust_type_through_r_uint() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_unsigned_binop");
+        let vars = mint_vars(&mut graph, 3);
+        let lhs = Variable::new();
+        let rhs = Variable::new();
+        let result = Variable::new();
+        value_map.insert(vars[0].clone(), Hlvalue::Variable(lhs));
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(rhs));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(result.clone()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::BinOp {
+                op: "sub".to_string(),
+                lhs: vars[0].clone(),
+                rhs: vars[1].clone(),
+                result_ty: ValueType::Unsigned,
+            },
+        };
+
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("unsigned BinOp must lower");
+        assert_eq!(translated.len(), 2);
+        assert_eq!(translated[0].opname, "sub");
+        assert_eq!(translated[1].opname, "simple_call");
+        let Hlvalue::Variable(ref scalar_result) = translated[0].result else {
+            panic!("sub result must be a temporary Variable");
+        };
+        let Hlvalue::Variable(ref cast_arg) = translated[1].args[1] else {
+            panic!("r_uint operand must be the sub result Variable");
+        };
+        assert_eq!(scalar_result.id(), cast_arg.id());
+        let Hlvalue::Variable(ref cast_result) = translated[1].result else {
+            panic!("r_uint result must be the model result Variable");
+        };
+        assert_eq!(cast_result.id(), result.id());
+        let Hlvalue::Constant(callable) = &translated[1].args[0] else {
+            panic!("r_uint callable must be a Constant");
+        };
+        let ConstValue::HostObject(host) = &callable.value else {
+            panic!("r_uint callable must be a HostObject");
+        };
+        assert_eq!(host.qualname(), "rarithmetic.r_uint");
     }
 
     // ───── topology assembly ─────
