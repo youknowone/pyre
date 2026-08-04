@@ -15261,6 +15261,13 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `functional.py:_sum` produces.  The int phase is the generic `last + x`
     // loop, which already keeps exact ints exact and promotes to a float on
     // the first float item, so only the float phase needs its own arithmetic.
+    //
+    // The C accumulator is a machine word, and `PyLong_AsLongAndOverflow`
+    // signalling overflow ends the int fast path for good: the value that
+    // leaves it is still an `int`, so neither compensated phase below can
+    // claim it and the rest of the fold is generic.  Leaving on a wide total
+    // reproduces that — `sum([2**63, 0.1, 1, -(2**63)])` is `0.0`, not the
+    // `1.0` a compensated float phase would produce.
     loop {
         ensure_item(&mut pending, &mut exhausted)?;
         if !pending {
@@ -15269,7 +15276,7 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // Nothing between this read and the `add` can collect, so the running
         // total is read once per item rather than re-read for the call.
         let last = roots.get(last_slot);
-        if !unsafe { is_exact_int_operand(last) } || unsafe { is_exact_float_operand(last) } {
+        if !unsafe { is_machine_word_int_operand(last) } {
             break;
         }
         pending = false;
@@ -15385,6 +15392,14 @@ unsafe fn sum_int_as_double(obj: PyObjectRef) -> f64 {
             pyre_object::jit_bigint_to_f64_or_nan(pyre_object::w_long_get_value(obj))
         }
     }
+}
+
+/// An exact `int` the C fast path's `long` accumulator can hold — the
+/// `PyLong_AsLongAndOverflow` precondition guarding `builtin_sum`'s integer
+/// loop.  pyre splits a wide `int` into its own `LONG_TYPE`, so overflow is
+/// the type test rather than a range check.
+unsafe fn is_machine_word_int_operand(obj: PyObjectRef) -> bool {
+    unsafe { is_exact_int_operand(obj) && !pyre_object::is_long(obj) }
 }
 
 /// `PyLong_CheckExact` — an exact `int`, excluding `bool` and any subclass.
