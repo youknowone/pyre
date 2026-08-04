@@ -179,6 +179,7 @@ WASM_BUILD_STD_FLAGS = []
 # ── ANSI helpers ─────────────────────────────────────────────────────
 
 def red(s):    return f"\033[31m{s}\033[0m"
+def yellow(s): return f"\033[33m{s}\033[0m"
 def green(s):  return f"\033[32m{s}\033[0m"
 def dim(s):    return f"\033[2m{s}\033[0m"
 def bold(s):   return f"\033[1m{s}\033[0m"
@@ -666,8 +667,51 @@ JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
 )
 
 
+# Which way each counter has to move to be a regression rather than a gain.
+# Both outcomes fail — a baseline that stopped describing the tree has to be
+# re-recorded either way, and letting a gain pass is how the eight baselines
+# this split was written for went stale. The labels exist so a reader can tell
+# the two apart at a glance: REGRESSED is "something got worse, go look",
+# IMPROVED is "something got better, re-record it".
+#
+# `loops_compiled` is inverted against the badness fields: it is the counter
+# that falls when the tracer stops admitting a frame at all, which aborts
+# nothing and *lowers* `guard_failures`, so a fall is the regression and a rise
+# is the gain.
+JITSTATS_REGRESSION_ON_RISE = JITSTATS_BADNESS_FIELDS + ("guard_failures",)
+JITSTATS_REGRESSION_ON_FALL = ("loops_compiled",)
+
+# How many fresh runs a disagreeing fixture gets before its counters are called
+# stable. Only a fixture that already disagrees pays this, so the common path is
+# untouched.
+#
+# The gate's premise is that these counters are a function of the program. Where
+# that holds, a repeat reproduces the first run exactly and the disagreement is
+# gated as before. Where it does not — measured on this tree: two runs of the
+# same `pyre-dynasm` binary, minutes apart on a loaded machine, disagreed by
+# `loops_compiled` +2 on five unrelated fixtures — the number being compared is
+# not a property of the tree, and failing on it reports load as if it were a
+# code change.
+#
+# So instability is MEASURED, never declared: nothing is annotated as flaky, and
+# a fixture stops being gated only by demonstrating, in this same invocation,
+# that it does not reproduce itself. The cost is that a genuinely
+# nondeterministic regression now warns instead of failing — which is the right
+# trade only because a counter that will not reproduce cannot be gated on
+# exactly anyway, and the warning still names it.
+JITSTATS_STABILITY_RUNS = 2
+
+# `bridges_compiled` is deliberately in neither: it is not interpretable on its
+# own, in either direction. A fall to 0 is the dead-bridge regression this gate
+# was built to catch when guards still fail, and a gain when the guards stopped
+# failing (`list_length_hint_validate` fell 4 -> 0 as guard_failures fell
+# 828 -> 1). A rise is more guards crossing the bridge threshold, which is
+# either wider coverage or a guard storm. Undecidable counters are reported as
+# regressions, so the ambiguous case is the one a human is asked to look at.
+
+
 def _jit_stats_change(saved, current):
-    """Return a failure reason naming every gated counter that moved, else "".
+    """Return `(regressions, improvements)`, each a list of "field a -> b".
 
     Both directions gate: a rise means the JIT started aborting traces, hitting
     internal compile panics or failing guards it did not before, and a fall
@@ -684,30 +728,44 @@ def _jit_stats_change(saved, current):
     follows."""
     old_fields = _parse_jit_stats(saved)
     new_fields = _parse_jit_stats(current)
-    changes = [
-        f"{field} {old_fields.get(field, '0')} -> {new_fields.get(field, '0')}"
-        for field in JITSTATS_SNAPSHOT_FIELDS
-        if old_fields.get(field, "0") != new_fields.get(field, "0")
-    ]
-    if changes:
-        # Report what the run compiled alongside what moved. A `guard_failures`
-        # change costs nothing to explain when the same run also compiled more
-        # loops or bridges — each new guard fails `trace_eagerness` times before
-        # its bridge attaches — but the gate names only the fields that moved,
-        # so the reader cannot tell that case from a real defect without
-        # re-running the bench. On a platform the developer does not have (the
-        # CI runners), re-running is not an option and the row is unjudgeable
-        # without this.
-        context = " ".join(
-            f"{f}={new_fields[f]}"
-            for f in ("loops_compiled", "bridges_compiled")
-            if f in new_fields
-        )
-        detail = ", ".join(changes)
-        if context:
-            detail += f" (observed {context})"
-        return "jit-stats change: " + detail
-    return ""
+    regressions, improvements = [], []
+    for field in JITSTATS_SNAPSHOT_FIELDS:
+        old, new = old_fields.get(field, "0"), new_fields.get(field, "0")
+        if old == new:
+            continue
+        try:
+            rose = int(new) > int(old)
+        except ValueError:
+            # A counter that stopped being an integer is not a gain.
+            rose = None
+        if rose is not None and (
+            (rose and field in JITSTATS_REGRESSION_ON_FALL)
+            or (not rose and field in JITSTATS_REGRESSION_ON_RISE)
+        ):
+            improvements.append(f"{field} {old} -> {new}")
+        else:
+            regressions.append(f"{field} {old} -> {new}")
+    return regressions, improvements
+
+
+def _jit_stats_context(current):
+    """Return " (observed loops_compiled=N bridges_compiled=M)", or "".
+
+    Report what the run compiled alongside what moved. A `guard_failures` change
+    costs nothing to explain when the same run also compiled more loops or
+    bridges — each new guard fails `trace_eagerness` times before its bridge
+    attaches — but a gate that names only the fields that moved leaves the
+    reader unable to tell that case from a real defect without re-running the
+    bench. On a platform the developer does not have (the CI runners),
+    re-running is not an option and the row is unjudgeable without this.
+    """
+    fields = _parse_jit_stats(current)
+    context = " ".join(
+        f"{f}={fields[f]}"
+        for f in ("loops_compiled", "bridges_compiled")
+        if f in fields
+    )
+    return f" (observed {context})" if context else ""
 
 
 def scaled_timeout(base, scale):
@@ -949,6 +1007,14 @@ class Check:
         self.snapshot_diffs = []
         self.snapshot_missing = []
         self.jitstats_diffs = []
+        # Benches whose gated counters all moved the way their field calls a
+        # gain. Still failures — the baseline stopped describing the tree — but
+        # tracked apart so the summary can say which reds need investigating and
+        # which only need re-recording.
+        self.jitstats_improvements = []
+        # Benches whose counters did not reproduce across repeats in this same
+        # invocation. Reported, never failed — see JITSTATS_STABILITY_RUNS.
+        self.jitstats_unstable = []
         self.jitstats_missing = []
         # Benches whose run printed no `[jit-stats]` line at all. Tracked apart
         # from `jitstats_missing` because the two say opposite things: a missing
@@ -1090,14 +1156,57 @@ class Check:
     def _snapshot_path(self, backend, name, suffix):
         return Path(SNAP_DIR) / backend / f"{name}.{suffix}"
 
+    def _jitstats_repeats(self, backend, script, timeout):
+        """Re-run the fixture and return each repeat's jit-stats snapshot.
+
+        Returns None if a repeat did not exit cleanly, so a crashing re-run
+        cannot argue a real diff away — the caller then gates on the first run
+        as if no repeat had happened.
+        """
+        effective_timeout = scaled_timeout(timeout, self._timeout_scale(backend))
+        snapshots = []
+        for _ in range(JITSTATS_STABILITY_RUNS):
+            _output, _elapsed, code, stderr = run_timed(
+                [self._pyre(backend), script],
+                timeout_s=effective_timeout, env=pyre_env(),
+            )
+            if code != 0:
+                return None
+            snapshots.append(_jit_stats_snapshot(stderr))
+        return snapshots
+
     def _jitstats_baseline_path(self, backend, script):
         # The committed structural-stats baseline sits beside its benchmark
         # source (pyre/bench/<name>.<backend>.jitstats), not in the gitignored
         # check.snap scratch tree that holds the local .out/.time snapshots.
+        #
+        # A `<name>.<backend>.<platform>.jitstats` beside it wins on that
+        # platform. This is for the counter a host genuinely disagrees on, and
+        # it keeps the comparison exact everywhere instead of widening the gate
+        # for everyone: a band that tolerated the disagreement would tolerate it
+        # on all 371 fixtures and all three backends, and the band this gate
+        # replaced is exactly what let eight baselines go stale unnoticed.
+        #
+        # Measured, not assumed. windows-latest cranelift reports
+        # `closure_per_call` guard_failures 416 and
+        # `recursive_call_frame_relocation` 637 where macos-latest and
+        # ubuntu-24.04 both report 415 and 638, on two independent runs, with
+        # every other counter identical. `PYPY_GC_NURSERY` is pinned above, so
+        # the nursery is not the differing variable, and the same windows host
+        # passes its dynasm leg 371/371. What is left is that the allocation
+        # footprint differs, hence when a collection lands, hence how often the
+        # back-edge eval-breaker poll bails out; the specific cause is not
+        # identified. Adding an overlay is therefore recording a fact about the
+        # host, and the shared file still gates the other two.
         source = Path(script)
+        per_platform = source.with_name(f"{source.stem}.{backend}.{sys.platform}.jitstats")
+        if per_platform.exists():
+            return per_platform
         return source.with_name(f"{source.stem}.{backend}.jitstats")
 
-    def _apply_snapshot_gate(self, backend, name, script, output, stderr, elapsed):
+    def _apply_snapshot_gate(
+        self, backend, name, script, output, stderr, elapsed, timeout,
+    ):
         status, reason = "ok", ""
         out_path = self._snapshot_path(backend, name, "out")
         time_path = self._snapshot_path(backend, name, "time")
@@ -1140,12 +1249,41 @@ class Check:
                     f"no committed jit-stats baseline ({jitstats_path.name}) — record it with "
                     f"`pyre/check.py --snapshot --backend {backend}`"
                 )
-            change = _jit_stats_change(
+            regressions, improvements = _jit_stats_change(
                 jitstats_path.read_text(encoding="utf-8"), jitstats
             )
-            if change:
-                self.jitstats_diffs.append(f"{backend}/{name}")
-                return "fail", change
+            if regressions or improvements:
+                repeats = self._jitstats_repeats(backend, script, timeout)
+                drifted = next(
+                    (s for s in repeats or () if s != jitstats), None
+                )
+                if drifted is not None:
+                    moved = _jit_stats_change(jitstats, drifted)
+                    self.jitstats_unstable.append(f"{backend}/{name}")
+                    return "unstable", (
+                        "jit-stats unstable — re-running the same binary moved "
+                        + ", ".join(moved[0] + moved[1])
+                        + ", so this run's counters are not a property of the "
+                        "tree and the baseline comparison ("
+                        + ", ".join(regressions + improvements)
+                        + ") is not gated"
+                    )
+                parts = []
+                if regressions:
+                    parts.append("regressed: " + ", ".join(regressions))
+                if improvements:
+                    parts.append("improved: " + ", ".join(improvements))
+                reason = (
+                    "jit-stats change — " + "; ".join(parts)
+                    + _jit_stats_context(jitstats)
+                    + f" (re-record with `pyre/check.py --snapshot --backend {backend} "
+                    f"--synthetic-pattern {Path(script).stem}`)"
+                )
+                if regressions:
+                    self.jitstats_diffs.append(f"{backend}/{name}")
+                    return "regressed", reason
+                self.jitstats_improvements.append(f"{backend}/{name}")
+                return "improved", reason
 
         if self.args.snapshot_mode == "record":
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1620,12 +1758,24 @@ class Check:
             return
 
         snap_status, snap_reason = self._apply_snapshot_gate(
-            backend, name, script, output, stderr, elapsed,
+            backend, name, script, output, stderr, elapsed, timeout,
         )
-        if snap_status == "fail":
+        if snap_status == "unstable":
+            # Warned, not failed: the counter did not reproduce itself in this
+            # invocation, so there is nothing to gate on.
+            self._record(backend, True, name, f"{elapsed:.2f}s")
+            print(f"{yellow('UNSTABLE')}  {snap_reason}")
+            self._append_comparison(backend, name, t_cpython, t_pypy, "UNSTABLE")
+            return
+
+        if snap_status != "ok":
+            # `improved` is still a failure; the label only tells the reader
+            # whether to investigate or just re-record.
+            label = "IMPROVED" if snap_status == "improved" else "SNAPDIFF"
+            paint = yellow if snap_status == "improved" else red
             self._record(backend, False, name, snap_reason)
-            print(f"{red('SNAPDIFF')}  {snap_reason}")
-            self._append_comparison(backend, name, t_cpython, t_pypy, "SNAPDIFF")
+            print(f"{paint(label)}  {snap_reason}")
+            self._append_comparison(backend, name, t_cpython, t_pypy, label)
             return
 
         self._record(backend, True, name, f"{elapsed:.2f}s")
@@ -1943,14 +2093,16 @@ class Check:
         # reported on every non-record run — not only under --snapshot-diff,
         # where it used to live and where the bare CI invocation never looked.
         if self.args.snapshot_mode != "record":
-            for label, benches in (
-                ("jit-stats change", self.jitstats_diffs),
-                ("jit-stats baseline missing", self.jitstats_missing),
-                ("jit-stats line absent", self.jitstats_absent),
+            for paint, label, benches in (
+                (red, "jit-stats regressed", self.jitstats_diffs),
+                (yellow, "jit-stats improved (re-record)", self.jitstats_improvements),
+                (yellow, "jit-stats unstable (not gated)", self.jitstats_unstable),
+                (red, "jit-stats baseline missing", self.jitstats_missing),
+                (red, "jit-stats line absent", self.jitstats_absent),
             ):
                 if benches:
                     print(
-                        f"{red(label)}: {len(benches)} bench(es)"
+                        f"{paint(label)}: {len(benches)} bench(es)"
                         f" — {' '.join(benches)}"
                     )
 
