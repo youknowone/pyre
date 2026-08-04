@@ -1490,6 +1490,21 @@ fn residual_ref_call_dst_before(code: &[u8], entry: usize) -> Option<usize> {
 /// unrelated local whenever regalloc coalesces the call result.
 /// Returns `false` (caller declines the compile) when the register is
 /// unresolved.
+/// `PYRE_INJECT_RCA`: report each engagement of the raw-color result-slot
+/// fallback below, with its coordinate.
+fn inject_rca_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_INJECT_RCA").is_some())
+}
+
+/// `PYRE_INJECT_FALLBACK_DECLINE`: decline the bridge compile instead of
+/// engaging the raw-color fallback — the A/B control for attributing a
+/// wrong-slot injection.
+fn inject_fallback_decline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_INJECT_FALLBACK_DECLINE").is_some())
+}
+
 fn inject_root_call_result<Sym: WalkSym>(
     sym: &mut Sym,
     root_pc: usize,
@@ -1546,7 +1561,18 @@ fn inject_root_call_result<Sym: WalkSym>(
         // at/above the resume's live depth, so resolving it needs a query that
         // does not gate on that depth.  Until that resolves at this
         // coordinate, keep the fallback and its measured cost visible.
-        .or_else(|| (result_reg < valuestackdepth).then_some(result_reg));
+        .or_else(|| {
+            if inject_rca_enabled() {
+                eprintln!(
+                    "[inject-rca] FALLBACK jitcode={:?} pc={root_pc} reg={result_reg} nlocals={nlocals} stack_only={stack_only} vsd={valuestackdepth}",
+                    payload.jitcode.try_index()
+                );
+            }
+            if inject_fallback_decline_enabled() {
+                return None;
+            }
+            (result_reg < valuestackdepth).then_some(result_reg)
+        });
     let Some(semantic_result_slot) = semantic_result_slot else {
         return false;
     };
