@@ -7348,6 +7348,15 @@ fn all_interiorfielddescrs(
 /// that matched `field_name`, so a refusal here means the two disagree about
 /// what a field is — reported rather than papered over with a second opinion.
 fn field_pos_in(cc: &CallControl, owner: &str, field_name: &str) -> usize {
+    // A header word has no place in the positional census the walker numbers,
+    // so asking for its index is not a question `descr.py:228` can answer.
+    // The runtime mints the same descr with `index_in_parent: 0` and documents
+    // that consumers resolve it through `FieldDescr::is_w_class()` rather than
+    // by index (`pyre-jit-trace/src/descr.rs new_w_class_field_descr`); answer
+    // with the same number so both sides agree on the slot nobody reads.
+    if crate::codewriter::heaptracker::is_header_word(owner, field_name) {
+        return 0;
+    }
     let walked = crate::codewriter::heaptracker::get_fielddescr_index_in(cc, owner, field_name, 0);
     usize::try_from(walked).unwrap_or_else(|_| {
         panic!(
@@ -10148,6 +10157,51 @@ mod tests {
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "b", 0), 4);
         // `heaptracker.py:113` `-cur_index - 1` over the 5 leaves above.
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "missing", 0), -6);
+    }
+
+    /// The embedded object header contributes no slot, the way recursing
+    /// into RPython's `OBJECT` contributes none: its one field is `typeptr`
+    /// and `heaptracker.py:64-66` skips it by name.
+    ///
+    /// `w_class` is a header word only inside `PyObject`.  `Method.w_class`
+    /// is an ordinary value field, and numbering it against the header's
+    /// `w_class` is what the early `if r >= 0 { return r }` at
+    /// `heaptracker.py:106-107` does once the header is left countable.
+    #[test]
+    fn object_header_contributes_no_field_slot() {
+        use crate::codewriter::heaptracker::get_fielddescr_index_in;
+        let mut cc = CallControl::new();
+        cc.struct_fields.fields.insert(
+            "PyObject".to_string(),
+            vec![
+                ("ob_type".to_string(), "*const PyType".to_string()),
+                ("w_class".to_string(), "*mut PyObject".to_string()),
+            ],
+        );
+        cc.struct_fields.fields.insert(
+            "Method".to_string(),
+            vec![
+                ("ob".to_string(), "PyObject".to_string()),
+                ("w_function".to_string(), "*mut PyObject".to_string()),
+                ("w_self".to_string(), "*mut PyObject".to_string()),
+                ("w_class".to_string(), "*mut PyObject".to_string()),
+                ("w_module".to_string(), "*mut PyObject".to_string()),
+            ],
+        );
+        cc.set_known_struct_names(["PyObject".to_string()].into_iter().collect());
+
+        // The census is the four value fields, in declaration order — the
+        // same list `W_METHOD_DESCR_GROUP` publishes.
+        assert_eq!(get_fielddescr_index_in(&cc, "Method", "w_function", 0), 0);
+        assert_eq!(get_fielddescr_index_in(&cc, "Method", "w_self", 0), 1);
+        assert_eq!(get_fielddescr_index_in(&cc, "Method", "w_class", 0), 2);
+        assert_eq!(get_fielddescr_index_in(&cc, "Method", "w_module", 0), 3);
+        // Walked on its own the header has no countable field either, so it
+        // reports "not found" over zero leaves.
+        assert_eq!(get_fielddescr_index_in(&cc, "PyObject", "w_class", 0), -1);
+        // …which is why the mint site answers a header word without walking.
+        assert_eq!(field_pos_in(&cc, "PyObject", "w_class"), 0);
+        assert_eq!(field_pos_in(&cc, "Method", "w_class"), 2);
     }
 
     #[test]

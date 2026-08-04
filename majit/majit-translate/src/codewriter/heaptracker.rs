@@ -78,6 +78,27 @@ pub fn set_testing_vtable_for_gcstruct<V>(
         .insert(gcstruct._name.clone(), vtable);
 }
 
+/// `heaptracker.py:64-66` `if name == 'typeptr': continue`, spelled in the
+/// source field-name domain this walker actually sees.
+///
+/// Upstream's positional census never numbers the object header: `typeptr`
+/// lives in `OBJECT`, the substructure every instance embeds first, and the
+/// walk skips it by name, so recursing into that substructure contributes
+/// zero leaves. Pyre embeds `PyObject { ob_type, w_class }` as `ob_header`
+/// instead, and neither word is spelled `typeptr`, so the existing skip never
+/// fires and the header contributes two leaves the runtime publish does not
+/// have.
+///
+/// `w_class` is qualified by its owner because it is a header word only
+/// inside `PyObject`; `Method.w_class` is an ordinary value field that the
+/// census must keep numbering.
+pub(crate) fn is_header_word(struct_name: &str, field_name: &str) -> bool {
+    let owner_leaf = struct_name.rsplit("::").next().unwrap_or(struct_name);
+    field_name == "typeptr"
+        || field_name == "ob_type"
+        || (owner_leaf == "PyObject" && field_name == "w_class")
+}
+
 pub fn all_fielddescrs(
     gccache: &CallControl,
     struct_name: &str,
@@ -181,7 +202,7 @@ pub fn get_fielddescr_index_in(
         if ir_type == majit_ir::value::Type::Void {
             continue;
         }
-        if name == "typeptr" {
+        if is_header_word(struct_name, name) {
             continue;
         }
         if gccache.is_known_struct(field_type) {
@@ -217,7 +238,7 @@ fn all_fielddescrs_into(
         if ir_type == majit_ir::value::Type::Void {
             continue;
         }
-        if name.starts_with("c__pad") || name == "typeptr" {
+        if name.starts_with("c__pad") || is_header_word(struct_name, &name) {
             continue;
         }
         if gccache.is_known_struct(&field_type) {
