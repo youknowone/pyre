@@ -91,6 +91,7 @@ pub mod host_seam {
 }
 pub mod async_operation;
 pub mod jit_fnaddr;
+pub mod launch_env;
 pub mod listobject;
 pub mod listsort;
 pub mod opcode_ops;

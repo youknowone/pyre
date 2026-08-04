@@ -376,13 +376,62 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
         set_force.call(&mut store, selector)?;
     }
 
-    // `-P` / PYTHONSAFEPATH, resolved host-side: the guest's environment is
-    // permanently empty, so the variable has to be handed over explicitly or it
-    // would read as unset there while working natively. A presence flag, matching
-    // `pyrex::resolve_safe_path` — any non-empty value enables it, `"0"`
-    // included, and an empty value counts as unset. Absent on a module predating
-    // the export, leaving the guest on its default of seeding `sys.path[0]`.
-    if std::env::var_os("PYTHONSAFEPATH").is_some_and(|value| !value.is_empty()) {
+    // The environment `-P`, `-O`, PYTHONWARNINGS and the rest resolve against.
+    // The guest's own is permanently empty, so without this every one of them
+    // reads as unset there while working natively; the runner only forwards the
+    // values, the fold stays in `launch_env::finalize` where the launcher's is.
+    // The module names which variables it wants, so the two never drift apart.
+    //
+    // A module predating `pyre_set_launch_env` still understands the `-P` half
+    // through `pyre_set_safe_path`; one predating both keeps its previous
+    // behaviour of always seeding `sys.path[0]`. Both halves are resolved before
+    // either is used, so a module carrying only one degrades to the fallback
+    // instead of failing the run.
+    let launch_env_names = instance
+        .get_typed_func::<(), u64>(&mut store, "pyre_launch_env_names")
+        .ok();
+    let set_launch_env = instance
+        .get_typed_func::<(u32, u32), ()>(&mut store, "pyre_set_launch_env")
+        .ok();
+    if let (Some(names), Some(set_launch_env)) = (launch_env_names, set_launch_env) {
+        let packed = names.call(&mut store, ())?;
+        let (nptr, nlen) = ((packed >> 32) as u32, packed as u32);
+        let mut buf = vec![0u8; nlen as usize];
+        memory.read(&store, nptr as usize, &mut buf)?;
+        dealloc.call(&mut store, (nptr, nlen))?;
+
+        // Only values that are valid UTF-8 are forwarded: the fold reads all
+        // but one of these names through `env::var`, which drops a value that
+        // is not, so dropping it here is what the native launcher already
+        // sees. The exception is the `PYTHONSAFEPATH` presence flag, tested on
+        // raw bytes — a non-UTF-8 value for it reaches the guest as unset,
+        // which leaves `sys.path[0]` seeded rather than suppressed.
+        let mut blob: Vec<u8> = Vec::new();
+        for name in String::from_utf8_lossy(&buf)
+            .split('\0')
+            .filter(|name| !name.is_empty())
+        {
+            let Some(value) = std::env::var_os(name).and_then(|v| v.into_string().ok()) else {
+                continue;
+            };
+            if !blob.is_empty() {
+                blob.push(0);
+            }
+            blob.extend_from_slice(name.as_bytes());
+            blob.push(b'=');
+            blob.extend_from_slice(value.as_bytes());
+        }
+
+        let blen = blob.len() as u32;
+        if blen == 0 {
+            set_launch_env.call(&mut store, (0, 0))?;
+        } else {
+            let p = alloc.call(&mut store, blen)?;
+            memory.write(&mut store, p as usize, &blob)?;
+            set_launch_env.call(&mut store, (p, blen))?;
+            dealloc.call(&mut store, (p, blen))?;
+        }
+    } else if std::env::var_os("PYTHONSAFEPATH").is_some_and(|value| !value.is_empty()) {
         if let Ok(set_safe_path) =
             instance.get_typed_func::<u32, ()>(&mut store, "pyre_set_safe_path")
         {

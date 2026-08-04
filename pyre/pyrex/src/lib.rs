@@ -44,53 +44,10 @@ enum RunMode {
     },
 }
 
-#[derive(Clone)]
-struct LaunchFlags {
-    inspect: bool,
-    quiet: bool,
-    no_site: bool,
-    no_user_site: bool,
-    ignore_environment: bool,
-    isolated: bool,
-    dev_mode: bool,
-    utf8_mode: Option<i64>,
-    safe_path: bool,
-    // `-O` count on the command line; PYTHONOPTIMIZE folds in during finalize.
-    optimize: i64,
-    bytes_warning: i64,
-    dont_write_bytecode: bool,
-    unbuffered: bool,
-    warnoptions: Vec<String>,
-    // app_main.py passes the raw PYTHONIOENCODING value to initstdio after
-    // applying -E/-I. Keep it raw until stdio parses the optional errors part.
-    stdio_encoding: Option<String>,
-    // PyPy app_main.py keeps every raw `-X` value in a list until sys module
-    // initialization turns it into `sys._xoptions`.
-    xoptions: Vec<String>,
-}
-
-impl Default for LaunchFlags {
-    fn default() -> Self {
-        Self {
-            inspect: false,
-            quiet: false,
-            no_site: false,
-            no_user_site: false,
-            ignore_environment: false,
-            isolated: false,
-            dev_mode: false,
-            utf8_mode: None,
-            safe_path: false,
-            optimize: 0,
-            bytes_warning: 0,
-            dont_write_bytecode: false,
-            unbuffered: false,
-            warnoptions: Vec::new(),
-            stdio_encoding: None,
-            xoptions: Vec::new(),
-        }
-    }
-}
+// The option block and the environment fold over it live in the interpreter,
+// beside the `SYS_*` statics they end up in, because the wasm32 embedding
+// resolves the same block without a command line of its own.
+use pyre_interpreter::launch_env::LaunchFlags;
 
 fn usage(binary_name: &str) -> String {
     format!(
@@ -143,132 +100,14 @@ fn fatal_utf8_config_error(detail: &str) -> ! {
     std::process::exit(1);
 }
 
-fn locale_implies_utf8_mode() -> bool {
-    // An empty variable is treated as unset (`setlocale` POSIX semantics) and
-    // falls through to the next, so `LC_ALL= LC_CTYPE=en_US.UTF-8` resolves to
-    // en_US.UTF-8, not C.
-    let read = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-    let locale = read("LC_ALL")
-        .or_else(|| read("LC_CTYPE"))
-        .or_else(|| read("LANG"));
-    // Only the legacy C/POSIX locale — or a fully unset chain, which resolves to
-    // C — coerces utf8_mode to 1; every named locale (en_US, C.UTF-8, …) leaves
-    // it 0.
-    matches!(locale.as_deref(), None | Some("C") | Some("POSIX"))
-}
-
-fn resolve_utf8_mode(flags: &LaunchFlags) -> i64 {
-    if let Some(value) = flags.utf8_mode {
-        return value;
+/// Fold the process environment over the parsed options. The launcher owns a
+/// real environment, so `launch_env` reads `std::env` directly here; an invalid
+/// PYTHONUTF8 is fatal during pre-init config, as it is for `-X utf8`.
+fn finalize_flags(flags: LaunchFlags) -> LaunchFlags {
+    match pyre_interpreter::launch_env::finalize(flags) {
+        Ok(flags) => flags,
+        Err(e) => fatal_utf8_config_error(e.0),
     }
-    if !flags.ignore_environment {
-        if let Ok(value) = std::env::var("PYTHONUTF8") {
-            if !value.is_empty() {
-                return match value.as_str() {
-                    "0" => 0,
-                    "1" => 1,
-                    _ => fatal_utf8_config_error("invalid PYTHONUTF8 environment variable value"),
-                };
-            }
-        }
-    }
-    if locale_implies_utf8_mode() { 1 } else { 0 }
-}
-
-/// `_Py_get_env_flag`: an integer environment flag. An unset or empty value is
-/// absent; a clean non-negative integer is used as-is; anything else (trailing
-/// junk, negative, overflow) counts as 1.
-fn env_int_flag(name: &str) -> Option<u32> {
-    let raw = std::env::var(name).ok()?;
-    if raw.is_empty() {
-        return None;
-    }
-    let value = match raw.parse::<i64>() {
-        Ok(v) if (0..=i64::from(u32::MAX)).contains(&v) => v as u32,
-        _ => 1,
-    };
-    Some(value)
-}
-
-/// `-O` count folded with PYTHONOPTIMIZE (`config_init_optimization_level`):
-/// the effective level is the larger of the two.  The level is kept as a wide
-/// integer so `sys.flags.optimize` mirrors a large `PYTHONOPTIMIZE` verbatim;
-/// the compiler clamps it into a byte at read time.
-fn resolve_optimize(flags: &LaunchFlags) -> i64 {
-    let mut level = flags.optimize;
-    if !flags.ignore_environment {
-        if let Some(v) = env_int_flag("PYTHONOPTIMIZE") {
-            level = level.max(i64::from(v));
-        }
-    }
-    level
-}
-
-/// `-B` folded with PYTHONDONTWRITEBYTECODE: either disables bytecode caches.
-fn resolve_dont_write_bytecode(flags: &LaunchFlags) -> bool {
-    if flags.dont_write_bytecode {
-        return true;
-    }
-    if !flags.ignore_environment {
-        if let Some(v) = env_int_flag("PYTHONDONTWRITEBYTECODE") {
-            return v != 0;
-        }
-    }
-    false
-}
-
-/// `-P` folded with PYTHONSAFEPATH (`config_read_env_vars`). The variable is a
-/// bare presence flag read through `_Py_GetEnv`, not an integer one: any
-/// non-empty value enables safe path — `"0"` included — while an empty value
-/// counts as unset. It only ever sets the flag, so an explicit `-P` survives
-/// `-E`.
-fn resolve_safe_path(flags: &LaunchFlags) -> bool {
-    if flags.safe_path {
-        return true;
-    }
-    if !flags.ignore_environment {
-        // Read as an `OsString`: the value is a presence flag, so bytes that
-        // are not valid Unicode still count as set.
-        if let Some(value) = std::env::var_os("PYTHONSAFEPATH") {
-            return !value.is_empty();
-        }
-    }
-    false
-}
-
-fn finalize_flags(mut flags: LaunchFlags) -> LaunchFlags {
-    flags.utf8_mode = Some(resolve_utf8_mode(&flags));
-    flags.optimize = resolve_optimize(&flags);
-    flags.dont_write_bytecode = resolve_dont_write_bytecode(&flags);
-    flags.safe_path = resolve_safe_path(&flags);
-    flags.stdio_encoding = if flags.ignore_environment {
-        None
-    } else {
-        std::env::var("PYTHONIOENCODING").ok()
-    };
-    // pypy/interpreter/app_main.py:892-906 — lowest-precedence entries first;
-    // the warnings module installs later entries ahead of earlier ones.
-    let mut warnoptions = Vec::new();
-    if flags.dev_mode {
-        warnoptions.push("default".to_string());
-    }
-    if !flags.ignore_environment {
-        if let Ok(value) = std::env::var("PYTHONWARNINGS") {
-            if !value.is_empty() {
-                warnoptions.extend(value.split(',').map(str::to_string));
-            }
-        }
-    }
-    warnoptions.append(&mut flags.warnoptions);
-    if flags.bytes_warning > 0 {
-        warnoptions.push(if flags.bytes_warning > 1 {
-            "error::BytesWarning".to_string()
-        } else {
-            "default::BytesWarning".to_string()
-        });
-    }
-    flags.warnoptions = warnoptions;
-    flags
 }
 
 fn parse_args(binary_name: &str) -> Result<(RunMode, LaunchFlags, Vec<String>), lexopt::Error> {
@@ -665,19 +504,7 @@ fn real_main(binary_name: &str) {
         inspect,
         quiet,
         no_site,
-        no_user_site,
-        ignore_environment,
-        isolated,
-        dev_mode,
-        utf8_mode,
-        safe_path,
-        optimize,
-        bytes_warning,
-        dont_write_bytecode,
-        unbuffered,
-        xoptions,
-        warnoptions,
-        stdio_encoding,
+        ..
     } = flags;
 
     // The `interact` controller does not run the embedded interpreter; it only
@@ -707,23 +534,7 @@ fn real_main(binary_name: &str) {
     // Record `-S` before the first `import sys` so `sys.flags.no_site`
     // reflects whether site initialization was skipped.
     importing::set_no_site(no_site);
-    importing::set_runtime_flags(
-        quiet,
-        inspect,
-        no_user_site,
-        ignore_environment,
-        isolated,
-        dev_mode,
-        utf8_mode.unwrap_or(0),
-        safe_path,
-        optimize,
-        bytes_warning,
-        dont_write_bytecode,
-        unbuffered,
-        xoptions,
-        warnoptions,
-        stdio_encoding,
-    );
+    importing::set_runtime_flags(&flags);
 
     // OS-level hardening (default-on in any Linux `sandbox` build): lock the
     // sandboxed child to a host-neutral syscall allowlist so any un-mediated

@@ -1760,42 +1760,26 @@ pub fn no_site_flag() -> bool {
     SYS_NO_SITE.load(Ordering::Relaxed)
 }
 
-/// Record the command-line flags consumed by `app_main.py` before `sys` is
+/// Record the launcher option block consumed by `app_main.py` before `sys` is
 /// initialized.  The codec paths also read `dev_mode` directly, matching
-/// `space.sys.get_flag('dev_mode')` in `unicodeobject.py`.
-#[allow(clippy::too_many_arguments)]
-pub fn set_runtime_flags(
-    quiet: bool,
-    inspect: bool,
-    no_user_site: bool,
-    ignore_environment: bool,
-    isolated: bool,
-    dev_mode: bool,
-    utf8_mode: i64,
-    safe_path: bool,
-    optimize: i64,
-    bytes_warning: i64,
-    dont_write_bytecode: bool,
-    unbuffered: bool,
-    xoptions: Vec<String>,
-    warnoptions: Vec<String>,
-    stdio_encoding: Option<String>,
-) {
-    SYS_QUIET.store(quiet, Ordering::Relaxed);
-    SYS_INSPECT.store(inspect, Ordering::Relaxed);
-    SYS_NO_USER_SITE.store(no_user_site, Ordering::Relaxed);
-    SYS_IGNORE_ENVIRONMENT.store(ignore_environment, Ordering::Relaxed);
-    SYS_ISOLATED.store(isolated, Ordering::Relaxed);
-    SYS_DEV_MODE.store(dev_mode, Ordering::Relaxed);
-    SYS_UTF8_MODE.store(utf8_mode, Ordering::Relaxed);
-    SYS_SAFE_PATH.store(safe_path, Ordering::Relaxed);
-    SYS_OPTIMIZE.store(optimize, Ordering::Relaxed);
-    SYS_BYTES_WARNING.store(bytes_warning, Ordering::Relaxed);
-    SYS_DONT_WRITE_BYTECODE.store(dont_write_bytecode, Ordering::Relaxed);
-    SYS_UNBUFFERED.store(unbuffered, Ordering::Relaxed);
-    *SYS_XOPTIONS.lock().unwrap() = xoptions;
-    *SYS_WARNOPTIONS.lock().unwrap() = warnoptions;
-    *SYS_STDIO_ENCODING.lock().unwrap() = stdio_encoding;
+/// `space.sys.get_flag('dev_mode')` in `unicodeobject.py`.  The block must have
+/// been through `launch_env::finalize`, which is what fills `utf8_mode`.
+pub fn set_runtime_flags(flags: &crate::launch_env::LaunchFlags) {
+    SYS_QUIET.store(flags.quiet, Ordering::Relaxed);
+    SYS_INSPECT.store(flags.inspect, Ordering::Relaxed);
+    SYS_NO_USER_SITE.store(flags.no_user_site, Ordering::Relaxed);
+    SYS_IGNORE_ENVIRONMENT.store(flags.ignore_environment, Ordering::Relaxed);
+    SYS_ISOLATED.store(flags.isolated, Ordering::Relaxed);
+    SYS_DEV_MODE.store(flags.dev_mode, Ordering::Relaxed);
+    SYS_UTF8_MODE.store(flags.utf8_mode.unwrap_or(0), Ordering::Relaxed);
+    SYS_SAFE_PATH.store(flags.safe_path, Ordering::Relaxed);
+    SYS_OPTIMIZE.store(flags.optimize, Ordering::Relaxed);
+    SYS_BYTES_WARNING.store(flags.bytes_warning, Ordering::Relaxed);
+    SYS_DONT_WRITE_BYTECODE.store(flags.dont_write_bytecode, Ordering::Relaxed);
+    SYS_UNBUFFERED.store(flags.unbuffered, Ordering::Relaxed);
+    *SYS_XOPTIONS.lock().unwrap() = flags.xoptions.clone();
+    *SYS_WARNOPTIONS.lock().unwrap() = flags.warnoptions.clone();
+    *SYS_STDIO_ENCODING.lock().unwrap() = flags.stdio_encoding.clone();
 }
 
 /// Raw `-X` values recorded by the launcher, in command-line order.
