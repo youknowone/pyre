@@ -402,6 +402,35 @@ def pyre_env():
     # compute anyway, so pinning it costs nothing there and makes a macOS
     # recorder agree with them.
     env.setdefault("PYPY_GC_NURSERY", str(4 * 1024 * 1024))
+    # Keep the bench directory off `sys.path` (`-P`), so the jit-stats counters
+    # describe the fixture rather than the directory it happens to sit in.
+    #
+    # `sys.path[0]` is the script's own directory, and `pyre/bench/synth` holds
+    # well over a thousand entries. The import machinery's scan of that entry is
+    # itself a Python loop, and at that size it crosses the 1039 compile
+    # threshold — so a fixture with no loop at all in its body still records
+    # `loops_compiled=1`, produced by a single `import` statement. Measured, one
+    # fixture unchanged and only the directory it runs from varied: 400 files
+    # compile nothing, 800 compile that loop, and the real directory is well past
+    # both. It is invariant to PYPY_GC_NURSERY (1MB..16MB), so it is not the
+    # collection schedule.
+    #
+    # That is what made the counters disagree between platforms: path handling
+    # differs per OS, so the same ambient loop lands either side of the
+    # threshold. Every jit-stats diff CI reported was a uniform +-1 on
+    # `loops_compiled` — and setting this flag reproduces the Linux numbers
+    # exactly on macOS (`arith_int_bool` 8 -> 7 with guard_failures 2213 -> 2211,
+    # `gc_deque_backing_list` 6 -> 5 / 204 -> 203, `struct_pack_unpack`
+    # 2 -> 1 / 2 -> 1).
+    #
+    # `-P` alone, not `-I`: the latter also implies `-E`, which drops
+    # PYTHONIOENCODING and so changes how the child resolves its stdio encoding —
+    # not something to fold into a run whose stdout is diffed against an oracle.
+    #
+    # An explicit PYTHONSAFEPATH in the environment wins, so the old behaviour
+    # stays reachable for an A/B: pyre reads the variable as a presence flag, so
+    # passing it empty is what turns the flag back off.
+    env.setdefault("PYTHONSAFEPATH", "1")
     # Pin the vendored, `_sre.MAGIC`-matched stdlib so pyre never picks up a
     # version-mismatched host `python3` off the PATH. An explicit PYRE_STDLIB
     # in the environment wins.

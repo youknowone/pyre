@@ -516,6 +516,13 @@ thread_local! {
     /// compiles as `<string>` and a traceback can name neither the file nor
     /// the offending line.
     static SCRIPT_PATH: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// `-P` / PYTHONSAFEPATH, which suppresses the `sys.path[0]` entry. The
+    /// guest has no environment, so the embedder passes the resolved flag in
+    /// through `pyre_set_safe_path` rather than the variable being read here.
+    /// Only the native-host binding seeds that entry — the browser build has no
+    /// filesystem to seed it from.
+    #[cfg(feature = "wasm-host")]
+    static SAFE_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(any(feature = "web", feature = "wasm-host"))]
@@ -558,9 +565,11 @@ fn run_python_impl(source: &str) -> String {
     {
         // `pymain_sys_path_add_path0`: the script's directory heads
         // `sys.path`, ahead of the stdlib root `install` appends, so a module
-        // beside the script shadows one of the same name in the stdlib.
+        // beside the script shadows one of the same name in the stdlib. `-P`
+        // (safe_path) suppresses it entirely, as it does natively.
         if let Some(dir) = SCRIPT_PATH
             .with(|p| p.borrow().clone())
+            .filter(|_| !SAFE_PATH.with(|f| f.get()))
             .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
         {
             pyre_interpreter::importing::add_sys_path(&dir);
@@ -799,6 +808,15 @@ mod host_abi {
     pub extern "C" fn pyre_set_script_path(ptr: *const u8, len: usize) {
         let path = guest_str(ptr, len).filter(|s| !s.is_empty());
         super::SCRIPT_PATH.with(|p| *p.borrow_mut() = path);
+    }
+
+    /// Set `-P` / PYTHONSAFEPATH for the next `pyre_run_python`, suppressing the
+    /// `sys.path[0]` entry `pyre_set_script_path` would otherwise seed. Passed in
+    /// rather than read from the environment because the guest's is permanently
+    /// empty, so the flag would silently read as unset there.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_set_safe_path(enabled: u32) {
+        super::SAFE_PATH.with(|f| f.set(enabled != 0));
     }
 
     /// Copy `[ptr, ptr+len)` out of linear memory as UTF-8. The embedder

@@ -376,6 +376,20 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
         set_force.call(&mut store, selector)?;
     }
 
+    // `-P` / PYTHONSAFEPATH, resolved host-side: the guest's environment is
+    // permanently empty, so the variable has to be handed over explicitly or it
+    // would read as unset there while working natively. A presence flag, matching
+    // `pyrex::resolve_safe_path` — any non-empty value enables it, `"0"`
+    // included, and an empty value counts as unset. Absent on a module predating
+    // the export, leaving the guest on its default of seeding `sys.path[0]`.
+    if std::env::var_os("PYTHONSAFEPATH").is_some_and(|value| !value.is_empty()) {
+        if let Ok(set_safe_path) =
+            instance.get_typed_func::<u32, ()>(&mut store, "pyre_set_safe_path")
+        {
+            set_safe_path.call(&mut store, 1)?;
+        }
+    }
+
     // Name the script so the guest compiles it under its real path: that is
     // what a traceback prints, what its source-line lookup reads back through
     // `pyre_host.host_read`, and the directory that heads `sys.path`. Absent
