@@ -3627,11 +3627,9 @@ impl<M: Clone> MetaInterp<M> {
         // MetaInterp `vable_ptr` was cached before `tracing` existed, so
         // `set_vable_ptr` could not plumb it through.
         ctx.set_virtualizable_heap_ptr(self.vable_ptr);
-        // pyjitpl.py:3331: check_synchronized_virtualizable() — debug-only
-        // assertion. pyre's analog is `check_synchronized_virtualizable`
-        // on MetaInterp, but it requires &self which we don't have here.
-        // Callers in setup_tracing / bound_reached perform the check
-        // immediately after `set_force_finish` via the existing path.
+        // pyjitpl.py:3331 `initialize_virtualizable` closes by asserting the
+        // freshly read boxes still match the object it read them from.
+        ctx.check_synchronized_virtualizable();
     }
 
     /// warmstate.py:259: set_param_trace_eagerness — delegates to warmstate.

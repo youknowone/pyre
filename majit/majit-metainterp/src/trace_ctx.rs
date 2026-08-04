@@ -2568,6 +2568,90 @@ impl TraceCtx {
         }
     }
 
+    /// pyjitpl.py:3463-3468 `check_synchronized_virtualizable()`, whose body is
+    /// `virtualizable.py:157-170 check_boxes`.
+    ///
+    /// ```text
+    /// def check_synchronized_virtualizable(self):
+    ///     if not we_are_translated():
+    ///         vinfo = self.jitdriver_sd.virtualizable_info
+    ///         virtualizable_box = self.virtualizable_boxes[-1]
+    ///         virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+    ///         vinfo.check_boxes(virtualizable, self.virtualizable_boxes)
+    /// ```
+    ///
+    /// The shadow is only ever made coherent at the point of a write
+    /// (`_opimpl_setfield_vable` sets `virtualizable_boxes[index]` and then
+    /// calls `synchronize_virtualizable`), so a divergence here is a missing
+    /// write, not something a reader may repair. `not we_are_translated()`
+    /// gates it to the untranslated metainterp; `debug_assertions` is the
+    /// same gate for a Rust port, which keeps it on under `cargo test` and
+    /// out of the released JIT.
+    ///
+    /// The trailing identity slot is excluded, matching `check_boxes`'
+    /// closing `assert len(boxes) == i + 1`.
+    pub fn check_synchronized_virtualizable(&self) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let (Some(heap_ptr), Some(info), Some(values), Some(lengths)) = (
+            self.virtualizable_heap_ptr,
+            self.virtualizable_info.as_ref(),
+            self.virtualizable_values.as_ref(),
+            self.virtualizable_array_lengths.as_ref(),
+        ) else {
+            return;
+        };
+        // `RustVec`-stored arrays are owned and rewritten by the outer
+        // executor on every opcode, so the shadow is deliberately not kept
+        // equal to the heap for them — the same carve-out
+        // `synchronize_virtualizable` makes before writing back.
+        if info.array_fields.iter().any(|a| {
+            matches!(
+                a.storage,
+                crate::virtualizable::VableArrayStorage::RustVec { .. }
+            )
+        }) {
+            return;
+        }
+        let static_count = info.num_static_extra_boxes;
+        let shadow_data_len = values.len().saturating_sub(1);
+        if shadow_data_len < static_count {
+            return;
+        }
+        for i in 0..static_count {
+            let ty = info.static_fields[i].field_type;
+            let bits = unsafe { info.read_field(heap_ptr, i) };
+            let heap = crate::pyjitpl::heap_value_for_pub(ty, bits);
+            debug_assert_eq!(
+                values[i], heap,
+                "virtualizable static field {} ({:?}) diverged from the shadow: \
+                 a vable write did not update virtualizable_boxes",
+                i, info.static_fields[i].name,
+            );
+        }
+        let mut cursor = static_count;
+        for (a_idx, &length) in lengths.iter().enumerate() {
+            if a_idx >= info.array_fields.len() {
+                break;
+            }
+            let ty = info.array_fields[a_idx].item_type;
+            for item_idx in 0..length {
+                if cursor >= shadow_data_len {
+                    return;
+                }
+                let bits = unsafe { info.read_array_item(heap_ptr, a_idx, item_idx) };
+                let heap = crate::pyjitpl::heap_value_for_pub(ty, bits);
+                debug_assert_eq!(
+                    values[cursor], heap,
+                    "virtualizable array {a_idx} item {item_idx} diverged from the \
+                     shadow: a vable write did not update virtualizable_boxes",
+                );
+                cursor += 1;
+            }
+        }
+    }
+
     /// Field-aware variant of [`synchronize_virtualizable`] for the bridge
     /// resume convergence path.  Differs from the generic-bits version in
     /// two ways that match `sync_virtualizable_after_guard_failure`
@@ -3826,7 +3910,9 @@ impl TraceCtx {
             self.heapcache_getfield_now_known(vable_opref, field_index, op);
             return (op, live);
         }
-        // self.metainterp.check_synchronized_virtualizable() — no-op in pyre.
+        // pyjitpl.py:1170,1177,1184,1228 — the reader asserts the shadow is
+        // coherent; it never repairs it.
+        self.check_synchronized_virtualizable();
         // index = self._get_virtualizable_field_index(fielddescr)
         // return self.metainterp.virtualizable_boxes[index]
         let index = self
@@ -4145,6 +4231,9 @@ impl TraceCtx {
             self.heapcache_getfield_now_known(vable_opref, field_index, op);
             return (op, live);
         }
+        // pyjitpl.py:1170,1177,1184,1228 — the reader asserts the shadow is
+        // coherent; it never repairs it.
+        self.check_synchronized_virtualizable();
         let index = self
             .virtualizable_info
             .as_ref()
@@ -4251,6 +4340,9 @@ impl TraceCtx {
             self.heapcache_getfield_now_known(vable_opref, field_index, op);
             return (op, live);
         }
+        // pyjitpl.py:1170,1177,1184,1228 — the reader asserts the shadow is
+        // coherent; it never repairs it.
+        self.check_synchronized_virtualizable();
         let index = self
             .virtualizable_info
             .as_ref()
@@ -4359,6 +4451,9 @@ impl TraceCtx {
                 None,
             );
         }
+        // pyjitpl.py:1170,1177,1184,1228 — the reader asserts the shadow is
+        // coherent; it never repairs it.
+        self.check_synchronized_virtualizable();
         // index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
         // return self.metainterp.virtualizable_boxes[index]
         if let Some(flat_idx) =
