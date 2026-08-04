@@ -9796,6 +9796,7 @@ fn handle<Sym: WalkSym>(
         // vtable word, so nothing is known about its class.
         "new/d>r" => {
             let descr = read_descr(code, op, 0, ctx)?;
+            let concrete = ctx.trace_ctx.execute_new_allocation(&descr, false);
             // pyjitpl.py:624-629 `execute_new`.
             ctx.trace_ctx
                 .profiler()
@@ -9806,7 +9807,16 @@ fn handle<Sym: WalkSym>(
             let resbox = ctx.trace_ctx.record_op_with_descr(OpCode::New, &[], descr);
             ctx.trace_ctx.heap_cache_mut().new_object(resbox);
             let dst = code[op.pc + 3] as usize;
-            write_ref_reg(ctx, op.pc, dst, resbox, ConcreteValue::Null)?;
+            if let Some(value) = concrete {
+                ctx.trace_ctx.set_opref_concrete(resbox, value);
+            }
+            let concrete = match concrete {
+                Some(Value::Ref(majit_ir::GcRef(ptr))) => {
+                    ConcreteValue::Ref(ptr as pyre_object::PyObjectRef)
+                }
+                _ => ConcreteValue::Null,
+            };
+            write_ref_reg(ctx, op.pc, dst, resbox, concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // RPython `pyjitpl.py opimpl_new_with_vtable` delegates straight to
@@ -9821,6 +9831,15 @@ fn handle<Sym: WalkSym>(
         // `new_with_vtable` pushes the descr u16 then the result reg).
         "new_with_vtable/d>r" => {
             let descr = read_descr(code, op, 0, ctx)?;
+            let concrete = ctx.trace_ctx.execute_new_allocation(&descr, true);
+            if let Some(Value::Ref(majit_ir::GcRef(ptr))) = concrete
+                && let Some(w_class) = descr.as_size_descr().and_then(|size| size.w_class_obj())
+            {
+                unsafe {
+                    (*(ptr as *mut pyre_object::PyObject)).w_class =
+                        w_class as pyre_object::PyObjectRef;
+                }
+            }
             // `class_now_known` takes the vtable address: pyre tracks the
             // concrete class pointer where upstream only raises HF_KNOWN_CLASS.
             let known_class = descr.as_size_descr().map(|size| size.vtable() as i64);
@@ -9842,11 +9861,16 @@ fn handle<Sym: WalkSym>(
                     .class_now_known(resbox, class);
             }
             let dst = code[op.pc + 3] as usize;
-            // No recording-time concrete: the walk never allocated a real
-            // object, so readers of the result decline instead of consuming a
-            // stale value — the posture `new_array_clear` keeps whenever it
-            // cannot materialize a backing block.
-            write_ref_reg(ctx, op.pc, dst, resbox, ConcreteValue::Null)?;
+            if let Some(value) = concrete {
+                ctx.trace_ctx.set_opref_concrete(resbox, value);
+            }
+            let concrete = match concrete {
+                Some(Value::Ref(majit_ir::GcRef(ptr))) => {
+                    ConcreteValue::Ref(ptr as pyre_object::PyObjectRef)
+                }
+                _ => ConcreteValue::Null,
+            };
+            write_ref_reg(ctx, op.pc, dst, resbox, concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // RPython `pyjitpl.py opimpl_new_array_clear` —

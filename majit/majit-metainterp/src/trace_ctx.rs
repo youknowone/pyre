@@ -99,6 +99,18 @@ fn descr_to_bh_array_descr(descr: &DescrRef) -> Option<majit_translate::jitcode:
     })
 }
 
+fn descr_to_bh_size_descr(descr: &DescrRef) -> Option<majit_translate::jitcode::BhDescr> {
+    let size = descr.as_size_descr()?;
+    Some(majit_translate::jitcode::BhDescr::Size {
+        size: size.size(),
+        type_id: size.type_id() as u64,
+        vtable: size.vtable() as u64,
+        owner: String::new(),
+        all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(size),
+        is_gc_managed: size.is_gc_managed(),
+    })
+}
+
 /// Inverse of `heap_value_for`: encode a typed `Value` into the raw i64
 /// bit-pattern that `VirtualizableInfo::write_field`/`write_array_item`
 /// interpret per field/item type.
@@ -809,6 +821,24 @@ impl TraceCtx {
             array_ptr,
             &bh_descr,
         )))
+    }
+
+    /// `pyjitpl.py:624-629 execute_new[_with_vtable]` concrete execution.
+    /// RPython executes the allocation before recording the matching trace op,
+    /// so later residual calls and field operations observe a real pointer
+    /// while the optimizer remains free to virtualize the recorded allocation.
+    pub fn execute_new_allocation(&self, descr: &DescrRef, with_vtable: bool) -> Option<Value> {
+        let cpu = unsafe { &*self.cpu? };
+        let bh_descr = descr_to_bh_size_descr(descr)?;
+        let ptr = if with_vtable {
+            cpu.bh_new_with_vtable(&bh_descr)
+        } else {
+            cpu.bh_new(&bh_descr)
+        };
+        if ptr == 0 {
+            return None;
+        }
+        Some(Value::Ref(majit_ir::GcRef(ptr as usize)))
     }
 
     /// `executor.py:200 do_getfield_raw_{i,r,f}` analog — read a raw
