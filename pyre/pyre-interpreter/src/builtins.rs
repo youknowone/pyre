@@ -14922,9 +14922,10 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     {
         let _ = (reading, writing);
         let flags = open_flags_for_mode(&mode);
-        let path_display = String::from_utf8_lossy(&path_bytes);
+        // The failure names the path object the call was given, not a spelling
+        // rebuilt from the bytes: `interp_fileio.py` wraps `w_name`.
         let fd = crate::host_seam::ops::open(&path_bytes, flags, 0o666)
-            .map_err(|e| crate::host_seam::seam_os_err(e, &path_display))?;
+            .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, path_obj))?;
         if let Err(error) = fileio_validate_fd(fd, path_obj) {
             fileio_close_owned_fd(fd);
             return Err(error);
@@ -14951,9 +14952,10 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // close(), which is not the W_FileIO storage shape.
         let _ = (reading, writing);
         let flags = open_flags_for_mode(&mode);
-        let path_display = String::from_utf8_lossy(&path_bytes);
+        // The failure names the path object the call was given, not a spelling
+        // rebuilt from the bytes: `interp_fileio.py` wraps `w_name`.
         let fd = crate::host_seam::ops::open(&path_bytes, flags, 0o666)
-            .map_err(|e| crate::host_seam::seam_os_err(e, &path_display))?;
+            .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, path_obj))?;
         if let Err(error) = fileio_validate_fd(fd, path_obj) {
             fileio_close_owned_fd(fd);
             return Err(error);

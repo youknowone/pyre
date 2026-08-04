@@ -57,13 +57,13 @@ impl Demo {
 /// `PyPath` typed-receiver alias.
 #[crate::pyre_function]
 fn _seed_from_path(path: PyPath) -> i64 {
-    path.bytes().map(|b| b as i64).sum()
+    path.into_iter().map(|b| b as i64).sum()
 }
 
 /// `Vec<i64>` auto return-wrap.
 #[crate::pyre_function]
 fn _path_bytes(path: PyPath) -> Vec<i64> {
-    path.bytes().map(|b| b as i64).collect()
+    path.into_iter().map(|b| b as i64).collect()
 }
 
 /// One parameter per text / int unwrap alias, so the generated unwrap +

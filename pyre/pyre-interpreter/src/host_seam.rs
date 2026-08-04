@@ -149,15 +149,22 @@ pub type SeamResult<T> = Result<T, SeamError>;
 /// the `""` the fd call sites pass). Both real and trampoline-backed opens
 /// use this conversion so they expose the same Python exception shape.
 pub fn seam_os_err(e: SeamError, context: &str) -> crate::PyError {
+    let w_filename = if context.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        pyre_object::w_str_new(context)
+    };
+    seam_os_err_with_filename(e, w_filename)
+}
+
+/// `wrap_oserror2(space, e, w_path)` in `interp_posix.py`: retain the exact
+/// argument object for `OSError.filename` instead of rebuilding its spelling.
+pub fn seam_os_err_with_filename(
+    e: SeamError,
+    w_filename: pyre_object::PyObjectRef,
+) -> crate::PyError {
     match e {
-        SeamError::Os(errno) => {
-            let w_filename = if context.is_empty() {
-                pyre_object::PY_NULL
-            } else {
-                pyre_object::w_str_new(context)
-            };
-            crate::PyError::os_error_syscall(errno, w_filename)
-        }
+        SeamError::Os(errno) => crate::PyError::os_error_syscall(errno, w_filename),
         SeamError::Io => crate::PyError::os_error_with_errno(libc::EIO, "I/O error"),
         SeamError::Value => crate::PyError::value_error("embedded null in path"),
         SeamError::Overflow => crate::PyError::overflow_error("integer overflow"),

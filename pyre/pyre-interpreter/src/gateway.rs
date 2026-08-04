@@ -1513,33 +1513,13 @@ mod tests {
     }
 }
 
-// ── fsencode_w ───────────────────────────────────────────────────────
-// PyPy equivalent: `space.fsencode_w(w_obj)` —
-// `pypy/interpreter/baseobjspace.py:1232 fsencode_w` accepts str,
-// bytes, or any object implementing `__fspath__` and returns the
-// filesystem-encoded path as a Rust string.  Used by the
-// `#[pyre_function]` / `#[pyre_methods]` `PyPath` typed-receiver alias
-// (gateway.py visit_fsencode line 365) and by posix call sites that
-// previously inlined the same extraction.
-pub fn fsencode_w(obj: pyre_object::PyObjectRef) -> Result<String, crate::PyError> {
-    Ok(fsencode_w_with_kind(obj)?.0)
-}
-
-/// [`fsencode_w`] paired with the discriminator `posixmodule.c
-/// path_converter` derives from the same resolution: `true` when the path
-/// resolved to `bytes`, which makes the names the call reports back `bytes`
-/// too.  Callers that need both must use this rather than re-resolving,
-/// because `path_converter` calls `__fspath__` exactly **once** — a second
-/// call would let a stateful implementation observe duplicate side effects, or
-/// answer `str` first and `bytes` second and leave the reported names
-/// describing a different path than the one that was listed.
-pub fn fsencode_w_with_kind(
-    obj: pyre_object::PyObjectRef,
-) -> Result<(String, bool), crate::PyError> {
-    let (data, is_bytes) = fsencode_bytes_w_with_kind(obj)?;
-    Ok((String::from_utf8_lossy(&data).into_owned(), is_bytes))
-}
-
+// ── fsencode_bytes_w ─────────────────────────────────────────────────
+/// `baseobjspace.py:1970 fsencode_w` accepts str, bytes, or an object
+/// implementing `__fspath__`, and answers with the filesystem-encoded bytes.
+///
+/// Bytes, not text: a path byte with no UTF-8 spelling has to reach the syscall
+/// as itself. Folding it into a Rust `String` first replaces it with U+FFFD,
+/// which both loses the name and makes distinct names alias onto one another.
 pub fn fsencode_bytes_w(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
     Ok(fsencode_bytes_w_with_kind(obj)?.0)
 }
@@ -1558,8 +1538,14 @@ pub fn fsdecode_filename_wtf8(data: &[u8]) -> rustpython_wtf8::Wtf8Buf {
     crate::typedef::charp2uni_wtf8(data)
 }
 
-/// [`fsencode_bytes_w`] paired with the `bytes`-ness of the resolved object;
-/// see [`fsencode_w_with_kind`] for why the two are produced together.
+/// [`fsencode_bytes_w`] paired with the discriminator `posixmodule.c
+/// path_converter` derives from the same resolution: `true` when the path
+/// resolved to `bytes`, which makes the names the call reports back `bytes`
+/// too.  Callers that need both must use this rather than re-resolving,
+/// because `path_converter` calls `__fspath__` exactly **once** — a second
+/// call would let a stateful implementation observe duplicate side effects, or
+/// answer `str` first and `bytes` second and leave the reported names
+/// describing a different path than the one that was listed.
 pub fn fsencode_bytes_w_with_kind(
     obj: pyre_object::PyObjectRef,
 ) -> Result<(Vec<u8>, bool), crate::PyError> {

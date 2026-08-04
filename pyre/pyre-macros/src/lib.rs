@@ -412,7 +412,7 @@ fn unwrap_arg(
         }
     };
     // Typed-receiver aliases erase to the binding type declared in
-    // `typed_alias` (PyObjectRef for passthrough, String for PyPath).
+    // `typed_alias` (PyObjectRef for passthrough, Vec<u8> for PyPath).
     // The inner fn signature is rewritten in parallel by
     // `rewrite_alias_args` so user code sees the same type.
     let binding_ty = if let Type::Path(p) = unwrap_type_group(ty) {
@@ -475,7 +475,7 @@ fn arg_default(pt: &PatType) -> syn::Result<Option<proc_macro2::TokenStream>> {
 /// * Convert-to-rust (`PyPath`) — mirrors PyPy
 ///   `@unwrap_spec(path='fsencode')` (`gateway.py:visit_fsencode` line
 ///   365) which lowers to `space.fsencode_w(...)`.  Binding type is the
-///   Rust value the conversion produces (`String` for PyPath); the
+///   Rust value the conversion produces (`Vec<u8>` for PyPath); the
 ///   inner-fn signature is rewritten the same way and the body sees the
 ///   converted Rust value directly.
 ///
@@ -516,8 +516,8 @@ fn typed_alias(
         "PySet" => passthrough(quote! { ::pyre_object::is_set }),
         "PyFrozenSet" => passthrough(quote! { ::pyre_object::is_frozenset }),
         "PyPath" => (
-            quote! { ::std::string::String },
-            quote! { crate::gateway::fsencode_w(args[#idx])? },
+            quote! { ::std::vec::Vec<u8> },
+            quote! { crate::gateway::fsencode_bytes_w(args[#idx])? },
         ),
         "PyIndex" => (
             // Mirrors PyPy `space.getindex_w(w_obj, None)`: consults
@@ -599,13 +599,13 @@ fn typed_alias(
         ),
         "PyPathOrNone" => (
             // space.fsencode_or_none_w — None passes through, otherwise
-            // fsencode_w (same conversion as the `PyPath` alias).
-            quote! { ::std::option::Option<::std::string::String> },
+            // fsencode_bytes_w (same conversion as the `PyPath` alias).
+            quote! { ::std::option::Option<::std::vec::Vec<u8>> },
             quote! {
                 if unsafe { ::pyre_object::is_none(args[#idx]) } {
                     ::std::option::Option::None
                 } else {
-                    ::std::option::Option::Some(crate::gateway::fsencode_w(args[#idx])?)
+                    ::std::option::Option::Some(crate::gateway::fsencode_bytes_w(args[#idx])?)
                 }
             },
         ),
@@ -664,8 +664,8 @@ fn typed_alias_binding_ty(name: &str) -> Option<proc_macro2::TokenStream> {
 fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
     let ty = unwrap_type_group(ty);
     // Typed-receiver aliases — `state: PyTuple` becomes a typecheck +
-    // PyObjectRef binding; `path: PyPath` becomes an fsencode_w call +
-    // `String` binding.  Inner fn signatures get rewritten elsewhere so
+    // PyObjectRef binding; `path: PyPath` becomes an fsencode_bytes_w call +
+    // `Vec<u8>` binding.  Inner fn signatures get rewritten elsewhere so
     // the body's parameter type matches the binding type the alias
     // resolves to.
     if let Type::Path(p) = ty {

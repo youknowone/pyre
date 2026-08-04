@@ -100,4 +100,38 @@ os.waitpid(os.posix_spawn(TRUE, [TRUE.encode()], {}), 0)
 index, name = socket.if_nameindex()[0]
 assert socket.if_nametoindex(name.encode()) == index
 
+# The encoded path has to reach the syscall as bytes.  Were it folded into text
+# first, every byte with no UTF-8 spelling would become U+FFFD and distinct
+# names would alias onto one another: a lookup of `b"\xffvictim"` would answer
+# for the file actually called `"�victim"`.  Plant that file and check the
+# lookup misses it.
+with tempfile.TemporaryDirectory() as d:
+    with open(os.path.join(d, "�victim"), "wb") as fp:
+        fp.write(b"victim")
+    probe = os.path.join(os.fsencode(d), b"\xffvictim")
+    assert not os.path.exists(probe), "a non-UTF-8 path aliased onto U+FFFD"
+    for call in (lambda: os.stat(probe), lambda: open(probe)):
+        try:
+            call()
+        except OSError:
+            pass
+        else:
+            raise AssertionError("a non-UTF-8 path aliased onto U+FFFD")
+
+# `wrap_oserror2(space, e, w_path)` reports the path object the call was given,
+# so a bytes argument reports bytes and a str keeps its surrogate escapes rather
+# than both being re-spelled through a lossy decode.
+with tempfile.TemporaryDirectory() as d:
+    for arg in (
+        os.path.join(d, "absent\udcff"),
+        os.path.join(os.fsencode(d), b"absent\xff"),
+    ):
+        for call in (os.stat, open):
+            try:
+                call(arg)
+            except OSError as exc:
+                assert exc.filename == arg, (ascii(exc.filename), ascii(arg))
+            else:
+                raise AssertionError("an absent path was found")
+
 print("OK")
