@@ -3612,6 +3612,36 @@ mod tests {
     }
 
     #[test]
+    fn jit_emitted_raw_pointer_objects_are_non_moving() {
+        let traceback_descr = pytraceback_size_descr();
+        let traceback_size = traceback_descr
+            .as_size_descr()
+            .expect("PyTraceback SizeDescr");
+        assert!(
+            traceback_size.non_moving(),
+            "raw traceback pointers are not rewritten when a minor collection moves an object"
+        );
+
+        let instance_descr = w_object_object_size_descr();
+        let instance_size = instance_descr
+            .as_size_descr()
+            .expect("W_ObjectObject SizeDescr");
+        assert!(
+            instance_size.non_moving(),
+            "raw instance pointers can survive across allocation without being rooted"
+        );
+
+        let storage_descr = crate::state::mapdict_storage_gcarray_descr();
+        let storage_array = storage_descr
+            .as_array_descr()
+            .expect("mapdict storage ArrayDescr");
+        assert!(
+            storage_array.non_moving(),
+            "the mapdict custom tracer marks raw storage pointers but cannot rewrite them"
+        );
+    }
+
+    #[test]
     fn pyframe_size_descr_clears_the_vable_token_slot() {
         let descr = pyframe_size_descr();
         let size = descr.as_size_descr().expect("PyFrame SizeDescr");
