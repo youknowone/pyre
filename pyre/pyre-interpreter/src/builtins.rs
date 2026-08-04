@@ -4128,6 +4128,25 @@ pub fn is_builtin_hash_function(callable: PyObjectRef) -> bool {
     }
 }
 
+/// True iff `callable` is the canonical builtin `ord` function object.
+/// Keep the wrapped-code identity test beside `len` / `repr`: mutable builtin
+/// globals and user-visible function names are not specialization evidence.
+pub fn is_builtin_ord_function(callable: PyObjectRef) -> bool {
+    unsafe {
+        if callable.is_null() || !crate::is_function(callable) {
+            return false;
+        }
+        let code = crate::function_get_code(callable) as PyObjectRef;
+        if code.is_null() || !crate::gateway::is_builtin_code(code) {
+            return false;
+        }
+        crate::gateway::builtin_code_fn_eq(
+            crate::gateway::builtin_code_get(code),
+            builtin_ord as crate::gateway::BuiltinCodeFn,
+        )
+    }
+}
+
 /// `len(obj)` — return the length of an object.
 /// `len(obj)` — PyPy: operation.py len → space.len_w
 fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -16553,6 +16572,17 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_ord_identity_uses_wrapped_code_not_display_name() {
+        crate::typedef::init_typeobjects();
+        let ord = make_module_builtin_function_with_arity("ord", builtin_ord, 1);
+        let renamed_ord = make_module_builtin_function_with_arity("ord", builtin_repr, 1);
+
+        assert!(is_builtin_ord_function(ord));
+        assert!(!is_builtin_ord_function(renamed_ord));
+        assert!(!is_builtin_ord_function(std::ptr::null_mut()));
+    }
 
     #[test]
     fn long_abs_reuses_nonnegative_rbigint_payload() {
