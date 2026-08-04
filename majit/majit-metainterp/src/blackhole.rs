@@ -3992,6 +3992,13 @@ mod tests {
                 assert!(super::is_callable_fnaddr(real_high));
             }
 
+            // The symbolic tag shares `BhDescr::JitCode.fnaddr` with the
+            // synthetic tag, whose space is every negative `i64`
+            // (`synthetic_cpu::is_synthetic_fnaddr`).  The two must not
+            // overlap.
+            assert!(symbolic > 0, "symbolic fnaddrs must stay out of the synthetic (negative) space");
+            assert!(!majit_backend::synthetic_cpu::is_synthetic_fnaddr(symbolic));
+
             assert!(!super::is_symbolic_fnaddr(0));
             assert!(!super::is_callable_fnaddr(0));
         }

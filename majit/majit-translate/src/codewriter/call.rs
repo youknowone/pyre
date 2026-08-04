@@ -5940,8 +5940,15 @@ impl CallControl {
 /// regions with bit 47 set — 0xaaab…/0xffff… — so every real funcptr there
 /// would read as symbolic.)  Same scheme as
 /// `assembler::STR_CONST_SENTINEL_BASE`.
+///
+/// Bit 63 stays CLEAR: `BhDescr::JitCode.fnaddr` also carries the synthetic
+/// tag, whose whole space is "negative `i64`"
+/// (`majit-backend::synthetic_cpu`: `SYNTHETIC_FNADDR_BASE = i64::MIN`,
+/// `is_synthetic_fnaddr(x) = x < 0`).  A tag setting bit 63 would put every
+/// symbolic hash inside that space, and `decode_synthetic` would answer with
+/// a fabricated jitcode index.
 pub const SYMBOLIC_FNADDR_HIGH_MASK: u64 = 0xFFFF_0000_0000_0000;
-pub const SYMBOLIC_FNADDR_BASE: u64 = 0xFADD_0000_0000_0000;
+pub const SYMBOLIC_FNADDR_BASE: u64 = 0x7ADD_0000_0000_0000;
 
 /// Whether `fnaddr` is a `symbolic_fnaddr_for_path` placeholder rather than a
 /// callable code address.
