@@ -3222,7 +3222,28 @@ pub fn trace_and_compile_from_bridge(
         return BridgeResolution::ResumeBlackhole;
     };
     let is_multiframe_resume = num_resume_frames > 1;
-    frame.set_last_instr_from_next_instr(resume_pc);
+    // `resume_pc` addresses the INNERMOST resumed section, so for a
+    // multi-frame guard it is a pc in an inlined callee's own code object.
+    // It only addresses THIS frame while that section belongs to this
+    // frame's code — the same condition the paired valuestackdepth
+    // correction already applies before handing the coordinate back.
+    // The routing below is meant to keep such a resume off the live frame,
+    // but every arm after this point can still return `ResumeBlackhole`, and
+    // the blackhole itself refuses a jitcode carrying an abort opcode or a pc
+    // whose liveness it cannot decode. On that path the interpreter resumes
+    // this frame, so a foreign pc left in `last_instr` would step a code
+    // object the frame does not run. Keep the vable-derived position instead.
+    let frame_code = jit_state_local.pycode_as_usize();
+    let foreign_innermost =
+        is_multiframe_resume && resume_coords.last().map(|&(code, _)| code) != Some(frame_code);
+    if foreign_innermost {
+        pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
+            frame_code,
+            "Resume::ForeignInnermostLastInstr",
+        );
+    } else {
+        frame.set_last_instr_from_next_instr(resume_pc);
+    }
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     let env = PyreEnv;
     let mut jit_state = build_jit_state(frame, info);
