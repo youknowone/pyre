@@ -12496,12 +12496,6 @@ impl CraneliftBackend {
                         OpCode::GcLoadF => Type::Float,
                         _ => unreachable!(),
                     };
-                    if value_type != Type::Int && item_size < 0 {
-                        return Err(unsupported_semantics(
-                            op.opcode,
-                            "negative GC_LOAD itemsize is only valid for integer loads",
-                        ));
-                    }
                     let addr = emit_dynamic_offset_addr(
                         &mut builder,
                         &constants,
@@ -12559,12 +12553,6 @@ impl CraneliftBackend {
                         OpCode::GcLoadIndexedF => Type::Float,
                         _ => unreachable!(),
                     };
-                    if value_type != Type::Int && item_size < 0 {
-                        return Err(unsupported_semantics(
-                            op.opcode,
-                            "negative GC_LOAD_INDEXED itemsize is only valid for integer loads",
-                        ));
-                    }
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &constants,
@@ -20424,7 +20412,13 @@ mod tests {
         item_type: Type,
         len_offset: Option<usize>,
     ) -> majit_ir::DescrRef {
-        make_array_descr_with_signedness(base_size, item_size, item_type, true, len_offset)
+        // descr.py:311-312 `is_item_signed = flag == FLAG_SIGNED`, over flags
+        // that are one value and not a set (descr.py:132-138), so only an
+        // integer array answers yes. `SimpleArrayDescr::new` derives it the
+        // same way; a signed float array is a descr the rewriter's
+        // itemsize-negating sign encoding cannot express.
+        let signed = item_type == Type::Int;
+        make_array_descr_with_signedness(base_size, item_size, item_type, signed, len_offset)
     }
 
     fn make_array_descr_with_signedness(
@@ -21546,7 +21540,14 @@ mod tests {
         assert!((backend.get_float_value(&frame, 0) - 6.25).abs() < 1e-10);
     }
 
+    /// rewrite.py:319-330 reads `GC_LOAD_INDEXED`'s scale, offset and size
+    /// under `assert isinstance(..., ConstInt)`, and x86/regalloc.py:1178-1182
+    /// asserts the same three again in the backend: a variable scale violates
+    /// the opcode's contract rather than asking the backend for a capability
+    /// it lacks. The rewriter states it the same way and runs ahead of the
+    /// backend, so that is where the trace stops.
     #[test]
+    #[should_panic(expected = "GC_LOAD_INDEXED scale must be ConstInt")]
     fn test_gc_load_indexed_rejects_nonconstant_scale() {
         let mut backend = CraneliftBackend::new();
 
@@ -21585,15 +21586,7 @@ mod tests {
         backend.set_constants(constants);
 
         let mut token = JitCellToken::new(100);
-        let err = backend
-            .compile_loop(&inputargs, &ops, &mut token)
-            .unwrap_err();
-        match err {
-            BackendError::Unsupported(msg) => {
-                assert!(msg.contains("scale must be a compile-time constant"));
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
+        let _ = backend.compile_loop(&inputargs, &ops, &mut token);
     }
 
     #[test]

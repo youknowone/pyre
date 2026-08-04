@@ -3112,22 +3112,24 @@ impl GcRewriter for GcRewriterImpl {
                 counts_toward_high_water(pos).then(|| pos.raw())
             })
             .max();
+        // A trace whose ops all carry void results — `Label` /
+        // `SETARRAYITEM_GC` / `FINISH` is one — leaves `max_result_pos` at
+        // `None`, so the argument scan has to run on its own rather than under
+        // a result-derived floor: the mark it produces is the only thing
+        // separating a minted position from a live input arg.
         let mut max_raw_pos = max_result_pos;
-        if let Some(result_high_water) = max_result_pos {
-            let mut reserve_later_box = |pos: OpRef| {
-                if counts_toward_high_water(pos) && pos.raw() > result_high_water {
-                    max_raw_pos =
-                        Some(max_raw_pos.map_or(pos.raw(), |old: u32| old.max(pos.raw())));
-                }
-            };
-            for op in &ops {
-                for arg in op.getarglist() {
+        let mut reserve_later_box = |pos: OpRef| {
+            if counts_toward_high_water(pos) {
+                max_raw_pos = Some(max_raw_pos.map_or(pos.raw(), |old: u32| old.max(pos.raw())));
+            }
+        };
+        for op in &ops {
+            for arg in op.getarglist() {
+                reserve_later_box(arg.to_opref());
+            }
+            if let Some(fail_args) = op.getfailargs() {
+                for arg in fail_args {
                     reserve_later_box(arg.to_opref());
-                }
-                if let Some(fail_args) = op.getfailargs() {
-                    for arg in fail_args {
-                        reserve_later_box(arg.to_opref());
-                    }
                 }
             }
         }
@@ -4280,8 +4282,13 @@ mod tests {
         let gc_fields = vec![ref_field_descr_at(24), ref_field_descr_at(32)];
         let descr = size_descr_with_gc_fields(48, 42, gc_fields);
         let val = OpRef::const_ptr(majit_ir::GcRef(0x1234));
+        // The SETFIELD_GC names the allocation by position, so the allocation
+        // has to carry that position rather than rely on the rewriter minting
+        // it there.
+        let new_op = Op::with_descr(OpCode::New, &[], descr);
+        new_op.pos.set(OpRef::ref_op(0));
         let ops = vec![
-            Op::with_descr(OpCode::New, &[], descr),
+            new_op,
             Op::with_descr(
                 OpCode::SetfieldGc,
                 &[ro(OpRef::ref_op(0)), ro(val)],
@@ -4488,11 +4495,14 @@ mod tests {
         rw.rewrite_for_gc(&ops);
 
         // Now rewrite a SetfieldGc that stores a ref into the new object.
+        // The allocation carries the position the store names it by.
+        let new_op = Op::with_descr(OpCode::New, &[], size_descr(32, 1));
+        new_op.pos.set(OpRef::ref_op(0));
         let ops2 = vec![
-            Op::with_descr(OpCode::New, &[], size_descr(32, 1)),
+            new_op,
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[ro(OpRef::ref_op(0)), ro(OpRef::ref_op(99))], // arg(0) = pos of the alloc = 0
+                &[ro(OpRef::ref_op(0)), ro(OpRef::ref_op(99))], // arg(0) = pos of the alloc
                 ref_field_descr(),
             ),
         ];
@@ -4707,6 +4717,63 @@ mod tests {
                 .filter(|op| op.opcode == OpCode::GcStore)
                 .all(|op| op.pos.get().is_none())
         );
+    }
+
+    /// A trace whose ops all carry void results has no result position to
+    /// seed the fresh-box high-water mark, and then the argument scan is the
+    /// only thing keeping a minted position off a live input arg.
+    /// `OpRef::raw()` folds `InputArgRef(0)` and `IntOp(0)` onto one payload
+    /// and the backends key their SSA values by it, so a mark left at 0 hands
+    /// the pre-scale `INT_LSHIFT` (rewrite.py:1127-1131) the array base
+    /// pointer's slot and the store loses its base.
+    #[test]
+    fn test_result_less_trace_reserves_input_arg_positions() {
+        let rw = make_rewriter();
+        let none = OpRef::NONE.raw();
+        let ops = vec![
+            mk_op(
+                OpCode::Label,
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
+                none,
+            ),
+            // 4-byte items, and `make_rewriter` takes the llmodel.py:39
+            // `load_supported_factors = (1,)` default, so the factor forces a
+            // pre-scale rather than an addressing-mode scale.
+            mk_op_with_descr(
+                OpCode::SetarrayitemGc,
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
+                none,
+                array_descr_int(),
+            ),
+            mk_op(OpCode::Finish, &[], none),
+        ];
+
+        let result = rw.rewrite_for_gc(&ops);
+
+        assert!(
+            result.iter().any(|op| op.opcode == OpCode::IntLshift),
+            "expected a pre-scale op; without one the test proves nothing"
+        );
+        for pos in result
+            .iter()
+            .map(|op| op.pos.get())
+            .filter(|p| !p.is_none())
+        {
+            assert!(
+                pos.raw() > 2,
+                "minted position {} aliases input arg {}",
+                pos.raw(),
+                pos.raw()
+            );
+        }
     }
 
     #[test]
