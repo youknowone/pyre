@@ -1797,7 +1797,7 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                         &mut storage as *mut _ as *mut u8,
                         copy_len,
                     );
-                    let addr = unpack_inet_addr(&storage);
+                    let addr = unpack_inet_addr(&storage, copy_len as libc::socklen_t);
                     items.push(pyre_object::w_tuple_new(vec![
                         pyre_object::w_int_new(ai.ai_family as i64),
                         pyre_object::w_int_new(ai.ai_socktype as i64),
@@ -2162,6 +2162,12 @@ fn socket_get_so_protocol(_fd: libc::c_int) -> Result<libc::c_int, crate::PyErro
 // (host, port, flowinfo, scopeid).  These helpers convert to/from
 // `sockaddr_storage`.
 
+/// `offsetof(_c.sockaddr_un, 'c_sun_path')` (`rsocket.py:403 minlen`) — where
+/// the name starts inside the address, and therefore the part of an address
+/// length that is not name.
+#[cfg(unix)]
+const SUN_PATH_OFFSET: usize = core::mem::offset_of!(libc::sockaddr_un, sun_path);
+
 #[cfg(unix)]
 fn pack_inet_addr(
     family: libc::c_int,
@@ -2196,17 +2202,21 @@ fn pack_inet_addr(
         };
         let sun = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_un) };
         sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        if path_bytes_vec.len() >= sun.sun_path.len() {
+        let abstract_name = cfg!(target_os = "linux") && path_bytes_vec.first() == Some(&0);
+        // `rsocket.py:412-420 UNIXAddress.__init__`: an abstract name may fill
+        // `sun_path` exactly, a regular one has to leave room for its
+        // terminator.
+        let capacity = sun.sun_path.len() - usize::from(!abstract_name);
+        if path_bytes_vec.len() > capacity {
             return Err(crate::PyError::os_error("AF_UNIX path too long"));
         }
         for (i, &b) in path_bytes_vec.iter().enumerate() {
             sun.sun_path[i] = b as libc::c_char;
         }
-        return Ok((
-            storage,
-            (core::mem::size_of::<libc::sa_family_t>() + path_bytes_vec.len() + 1)
-                as libc::socklen_t,
-        ));
+        // `rsocket.py:409-410 self.setdata(sun, baseofs + len(path))`: the
+        // terminator is counted only for a regular name that has one.
+        let addrlen = SUN_PATH_OFFSET + path_bytes_vec.len() + usize::from(!abstract_name);
+        return Ok((storage, addrlen as libc::socklen_t));
     }
 
     if !unsafe { pyre_object::is_tuple(addr) } {
@@ -2343,7 +2353,10 @@ fn pack_inet_addr(
 }
 
 #[cfg(unix)]
-fn unpack_inet_addr(storage: &libc::sockaddr_storage) -> pyre_object::PyObjectRef {
+fn unpack_inet_addr(
+    storage: &libc::sockaddr_storage,
+    addrlen: libc::socklen_t,
+) -> pyre_object::PyObjectRef {
     let family = storage.ss_family as libc::c_int;
     if family == libc::AF_INET {
         let sin = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
@@ -2391,15 +2404,27 @@ fn unpack_inet_addr(storage: &libc::sockaddr_storage) -> pyre_object::PyObjectRe
         ])
     } else if family == libc::AF_UNIX {
         let sun = unsafe { &*(storage as *const _ as *const libc::sockaddr_un) };
-        let end = sun
-            .sun_path
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(sun.sun_path.len());
+        let maxlength = (addrlen as usize)
+            .saturating_sub(SUN_PATH_OFFSET)
+            .min(sun.sun_path.len());
+        let abstract_name = cfg!(target_os = "linux") && maxlength > 0 && sun.sun_path[0] == 0;
+        let end = if abstract_name {
+            maxlength
+        } else {
+            sun.sun_path[..maxlength]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(maxlength)
+        };
         let bytes: Vec<u8> = sun.sun_path[..end].iter().map(|&b| b as u8).collect();
-        // `interp_socket.py:47 space.newfilename(path)`: read-back uses the filesystem
-        // decoding so a byte with no UTF-8 spelling survives the round trip.
-        crate::gateway::fsdecode_filename_bytes(&bytes)
+        if abstract_name {
+            // `interp_socket.py:45 space.newbytes(path)`: abstract names are bytes.
+            pyre_object::bytesobject::w_bytes_from_bytes(&bytes)
+        } else {
+            // `interp_socket.py:47 space.newfilename(path)`: read-back uses the filesystem
+            // decoding so a byte with no UTF-8 spelling survives the round trip.
+            crate::gateway::fsdecode_filename_bytes(&bytes)
+        }
     } else {
         pyre_object::w_tuple_new(vec![])
     }
@@ -2767,7 +2792,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     libc::fcntl(cfd, libc::F_SETFD, libc::FD_CLOEXEC);
                 }
                 let new_sock = socket_from_fd(cfd, family, ty, proto);
-                let addr = unpack_inet_addr(&storage);
+                let addr = unpack_inet_addr(&storage, slen);
                 Ok(pyre_object::w_tuple_new(vec![new_sock, addr]))
             },
             1,
@@ -2806,7 +2831,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 unsafe {
                     libc::fcntl(cfd, libc::F_SETFD, libc::FD_CLOEXEC);
                 }
-                let addr = unpack_inet_addr(&storage);
+                let addr = unpack_inet_addr(&storage, slen);
                 Ok(pyre_object::w_tuple_new(vec![
                     pyre_object::w_int_new(cfd as i64),
                     addr,
@@ -3142,7 +3167,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 crate::module::signal::interp_signal::checksignals_now()?;
             };
             buf.truncate(got as usize);
-            let addr = unpack_inet_addr(&storage);
+            let addr = unpack_inet_addr(&storage, slen);
             Ok(pyre_object::w_tuple_new(vec![
                 pyre_object::bytesobject::w_bytes_from_bytes(&buf),
                 addr,
@@ -3287,7 +3312,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 // (`converted_error` eintr_retry).
                 crate::module::signal::interp_signal::checksignals_now()?;
             };
-            let addr = unpack_inet_addr(&storage);
+            let addr = unpack_inet_addr(&storage, slen);
             Ok(pyre_object::w_tuple_new(vec![
                 pyre_object::w_int_new(got as i64),
                 addr,
@@ -3350,7 +3375,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let mut data = vec![0u8; bufsize];
             let mut control = vec![0u8; ancbufsize];
             let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-            let (got, msg_flags) = loop {
+            let (got, msg_flags, msg_namelen) = loop {
                 let mut iov = libc::iovec {
                     iov_base: data.as_mut_ptr() as *mut libc::c_void,
                     iov_len: bufsize,
@@ -3368,7 +3393,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     libc::recvmsg(fd, &mut msg, flags)
                 });
                 if r >= 0 {
-                    break (r, msg.msg_flags);
+                    break (r, msg.msg_flags, msg.msg_namelen);
                 }
                 if errno != libc::EINTR {
                     return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
@@ -3413,7 +3438,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     }
                 }
             }
-            let addr = unpack_inet_addr(&storage);
+            let addr = unpack_inet_addr(&storage, msg_namelen);
             Ok(pyre_object::w_tuple_new(vec![
                 pyre_object::bytesobject::w_bytes_from_bytes(&data),
                 pyre_object::w_list_new(anc_items),
@@ -3502,7 +3527,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 .collect();
             let mut control = vec![0u8; ancbufsize];
             let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-            let (got, msg_flags, controllen) = loop {
+            let (got, msg_flags, msg_namelen, controllen) = loop {
                 let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
                 msg.msg_name = &mut storage as *mut _ as *mut libc::c_void;
                 msg.msg_namelen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
@@ -3516,7 +3541,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     libc::recvmsg(fd, &mut msg, flags)
                 });
                 if r >= 0 {
-                    break (r, msg.msg_flags, msg.msg_controllen);
+                    break (r, msg.msg_flags, msg.msg_namelen, msg.msg_controllen);
                 }
                 if errno != libc::EINTR {
                     return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
@@ -3558,7 +3583,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     }
                 }
             }
-            let addr = unpack_inet_addr(&storage);
+            let addr = unpack_inet_addr(&storage, msg_namelen);
             Ok(pyre_object::w_tuple_new(vec![
                 pyre_object::w_int_new(got as i64),
                 pyre_object::w_list_new(anc_items),
@@ -3782,7 +3807,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 if r != 0 {
                     return Err(socket_io_err(std::io::Error::last_os_error()));
                 }
-                Ok(unpack_inet_addr(&storage))
+                Ok(unpack_inet_addr(&storage, slen))
             },
             1,
         ),
@@ -3803,7 +3828,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 if r != 0 {
                     return Err(socket_io_err(std::io::Error::last_os_error()));
                 }
-                Ok(unpack_inet_addr(&storage))
+                Ok(unpack_inet_addr(&storage, slen))
             },
             1,
         ),

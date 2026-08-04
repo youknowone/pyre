@@ -49,14 +49,17 @@ for call in (
 
 # `interp_socket.py:157-159` deliberately uses raw `space.fsencode`: a leading
 # null byte names Linux's abstract namespace and must reach the OS unchanged.
+name = "\x00pyre-os-boundary-%d" % os.getpid()
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 try:
     try:
-        s.bind("\x00pyre-os-boundary-%d" % os.getpid())
+        s.bind(name)
     except ValueError:
         raise AssertionError("AF_UNIX abstract path rejected its null") from None
     except OSError:
         pass
+    else:
+        assert s.getsockname() == name.encode(), s.getsockname()
 finally:
     s.close()
 
