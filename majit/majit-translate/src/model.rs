@@ -2869,6 +2869,7 @@ pub fn fuse_boxing_alloc(
     struct Site {
         block: usize,
         op: usize,
+        aggregate: crate::flowspace::model::Variable,
         result: crate::flowspace::model::Variable,
         owner: String,
         vtable: i64,
@@ -2962,6 +2963,7 @@ pub fn fuse_boxing_alloc(
             sites.push(Site {
                 block: bi,
                 op: oi,
+                aggregate: agg.clone(),
                 result: result.clone(),
                 owner,
                 vtable,
@@ -2971,6 +2973,7 @@ pub fn fuse_boxing_alloc(
     }
 
     let fused = sites.len();
+    let fused_aggregates: Vec<_> = sites.iter().map(|site| site.aggregate.clone()).collect();
     // Rewrite in reverse (block, op) order so the per-site `insert` does not
     // shift the indices of not-yet-processed sites in the same block.
     for site in sites.into_iter().rev() {
@@ -2999,7 +3002,136 @@ pub fn fuse_boxing_alloc(
             );
         }
     }
+    sink_fused_boxing_aggregates_at_raw_writes(graph, &fused_aggregates);
     fused
+}
+
+/// Rematerialize a fused boxing aggregate only at a raw `ptr::write` use.
+///
+/// `gc_interp`'s stable-allocation arm writes the original by-value Rust
+/// aggregate into memory, while the ordinary arm passes that same aggregate
+/// to `lltype::malloc_typed`.  After the latter is lowered to
+/// `NewWithVtable`, leaving the shared aggregate in the dominator would make
+/// its synthetic constructors execute on the ordinary JIT path even though
+/// only the GC-interpreter arm still reads it.  RPython's
+/// `remove_simple_mallocs` performs the equivalent escape-sensitive motion:
+/// keep the materialization at the escaping store, and let the dead-variable
+/// sweep remove it from paths on which it does not escape.
+///
+/// A rename map is the direct equivalent of RPython's per-clone variable
+/// mapping: it preserves the nested header/outer-object shape without a
+/// side-table that survives this local graph rewrite.
+fn sink_fused_boxing_aggregates_at_raw_writes(
+    graph: &mut FunctionGraph,
+    aggregates: &[crate::flowspace::model::Variable],
+) -> usize {
+    use crate::flowspace::model::Variable;
+    use std::collections::{HashMap, HashSet};
+
+    let is_ctor = |op: &SpaceOperation| {
+        matches!(
+            op.kind,
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { .. },
+                ..
+            }
+        )
+    };
+    let is_raw_write = |kind: &OpKind| {
+        matches!(kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, args, .. }
+            if args.len() == 2
+                && segments.iter().map(String::as_str).eq(["core", "ptr", "write"]))
+    };
+
+    let mut sinks = Vec::new();
+    for aggregate in aggregates {
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            for (oi, op) in block.operations.iter().enumerate() {
+                if is_raw_write(&op.kind)
+                    && matches!(&op.kind, OpKind::Call { args, .. } if &args[1] == aggregate)
+                {
+                    sinks.push((bi, oi, aggregate.clone()));
+                }
+            }
+        }
+    }
+    sinks.sort_by_key(|(bi, oi, _)| (*bi, *oi));
+
+    let mut moved = 0;
+    for (bi, oi, aggregate) in sinks.into_iter().rev() {
+        // Include the outer aggregate plus nested aggregate values stored into
+        // it (notably `PyObject ob_header`).  Scalar payloads and type-pointer
+        // casts remain ordinary operands and are threaded to the sink by the
+        // existing SSA-to-SSI repair pass.
+        let mut allocs = HashSet::from([aggregate.clone()]);
+        loop {
+            let mut added = false;
+            for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+                let OpKind::FieldWrite { base, value, .. } = &op.kind else {
+                    continue;
+                };
+                if !allocs.contains(base) {
+                    continue;
+                }
+                let Some(value) = value.as_variable() else {
+                    continue;
+                };
+                let produced_by_ctor =
+                    graph
+                        .blocks
+                        .iter()
+                        .flat_map(|block| &block.operations)
+                        .any(|candidate| {
+                            candidate.result.as_ref() == Some(value) && is_ctor(candidate)
+                        });
+                if produced_by_ctor && allocs.insert(value.clone()) {
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+
+        let template: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                op.result
+                    .as_ref()
+                    .is_some_and(|result| allocs.contains(result) && is_ctor(op))
+                    || matches!(&op.kind, OpKind::FieldWrite { base, .. } if allocs.contains(base))
+            })
+            .cloned()
+            .collect();
+        if template.is_empty() {
+            continue;
+        }
+
+        let mut renaming = HashMap::new();
+        for alloc in &allocs {
+            let mut fresh = Variable::new();
+            fresh.rename_from(alloc);
+            renaming.insert(alloc.clone(), fresh);
+        }
+        let remap = |var: &Variable| renaming.get(var).cloned().unwrap_or_else(|| var.clone());
+        let cloned: Vec<_> = template
+            .iter()
+            .map(|op| SpaceOperation {
+                result: op.result.as_ref().map(&remap),
+                kind: crate::inline::remap_op_kind(&op.kind, &remap),
+            })
+            .collect();
+
+        let block = &mut graph.blocks[bi];
+        if let OpKind::Call { args, .. } = &mut block.operations[oi].kind {
+            args[1] = remap(&aggregate);
+        }
+        moved += cloned.len();
+        block.operations.splice(oi..oi, cloned);
+    }
+    moved
 }
 
 /// Re-thread op operands the boxing lowering left referenced across a block
