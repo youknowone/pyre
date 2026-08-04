@@ -7509,6 +7509,29 @@ fn reject_symbolic_residual_call(bh: &mut BlackholeInterpreter, func: i64) -> Di
 }
 
 // residual_call_irf_*
+
+/// `MAJIT_BH_NULL_ARG`: report a null ref argument about to be handed to a
+/// residual call, with the jitcode coordinate, before the callee can
+/// dereference it.  Some ABIs pass a legitimate null sentinel (e.g. the
+/// CallFn `null_or_self` slot), so this reports rather than aborts.
+fn bh_null_arg_report(bh: &BlackholeInterpreter, ar: &[i64], position: usize) {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ARMED.get_or_init(|| std::env::var_os("MAJIT_BH_NULL_ARG").is_some()) {
+        return;
+    }
+    if ar.iter().any(|&a| a == 0) {
+        eprintln!(
+            "[bh-null-arg] jitcode={} position={} last_opcode_position={} \
+             entry_position={} args_r={:?}",
+            bh.jitcode.name(),
+            position,
+            bh.last_opcode_position,
+            bh.entry_position,
+            ar,
+        );
+    }
+}
+
 fn handler_residual_call_irf_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -7524,6 +7547,7 @@ fn handler_residual_call_irf_i(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1244-1246 → bhimpl_residual_call_irf_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_irf_i(func, &ai, &ar, &af, &calldescr);
@@ -7548,6 +7572,7 @@ fn handler_residual_call_irf_r(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1247-1249 → bhimpl_residual_call_irf_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_irf_r(func, &ai, &ar, &af, &calldescr);
@@ -7572,6 +7597,7 @@ fn handler_residual_call_irf_f(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1250-1252 → bhimpl_residual_call_irf_f.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_irf_f(func, &ai, &ar, &af, &calldescr);
@@ -7595,6 +7621,7 @@ fn handler_residual_call_irf_v(
     let (af, p) = read_list_f(bh, code, p);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1253-1255 routes through bhimpl_residual_call_irf_v
     // which forwards to cpu.bh_call_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
@@ -7619,6 +7646,7 @@ fn handler_residual_call_ir_i(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1234-1236 → bhimpl_residual_call_ir_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_ir_i(func, &ai, &ar, &calldescr);
@@ -7642,6 +7670,7 @@ fn handler_residual_call_ir_r(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1237-1239 → bhimpl_residual_call_ir_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_ir_r(func, &ai, &ar, &calldescr);
@@ -7664,6 +7693,7 @@ fn handler_residual_call_ir_v(
     let (ar, p) = read_list_r(bh, code, p);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1240-1242 → bhimpl_residual_call_ir_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_residual_call_ir_v(func, &ai, &ar, &calldescr);
@@ -7686,6 +7716,7 @@ fn handler_residual_call_r_i(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1225-1226 → bhimpl_residual_call_r_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_r_i(func, &ar, &calldescr);
@@ -7708,6 +7739,7 @@ fn handler_residual_call_r_r(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1227-1229 → bhimpl_residual_call_r_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_r_r(func, &ar, &calldescr);
@@ -7729,6 +7761,7 @@ fn handler_residual_call_r_v(
     let (ar, p) = read_list_r(bh, code, position + 1);
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
+    bh_null_arg_report(bh, &ar, position);
     // blackhole.py:1230-1232 → bhimpl_residual_call_r_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_residual_call_r_v(func, &ar, &calldescr);
