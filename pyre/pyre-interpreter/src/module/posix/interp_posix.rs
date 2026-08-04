@@ -3176,7 +3176,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         argv_ptrs.as_ptr(),
                         Some(env_ptrs.as_ptr()),
                     ) as i32;
-                    Err(errno_err_with_filename(errno, args[0]))
+                    // `interp_posix.py:1812,1817` wraps the failure with
+                    // `wrap_oserror`, which names no file, so the path stays
+                    // out of the error the same way `execv` leaves it out.
+                    Err(errno_err(errno, ""))
                 },
                 3,
             ),

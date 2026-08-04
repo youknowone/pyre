@@ -215,8 +215,10 @@ pub unsafe fn dict_repr(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     let entries = pyre_object::w_dict_items(obj);
     let mut out = Wtf8Buf::new();
     out.push_str("{");
-    for (k, v) in entries {
-        if out.len() > 1 {
+    for (i, (k, v)) in entries.into_iter().enumerate() {
+        // `dictmultiobject.py:388` joins the pairs by position, so a key or
+        // value whose `__repr__` answers `""` still gets its separator.
+        if i != 0 {
             out.push_str(", ");
         }
         out.push_wtf8(&py_repr_wtf8(k)?);
@@ -239,12 +241,17 @@ pub unsafe fn list_repr(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     let mut out = Wtf8Buf::new();
     out.push_str("[");
     for i in 0..n {
-        if let Some(item) = pyre_object::w_list_getitem(obj, i as i64) {
-            if out.len() > 1 {
-                out.push_str(", ");
-            }
-            out.push_wtf8(&py_repr_wtf8(item)?);
+        // `listobject.py:217-221` stops rather than skipping when an item is
+        // gone, since an item's `__repr__` may have shortened the list.
+        let Some(item) = pyre_object::w_list_getitem(obj, i as i64) else {
+            break;
+        };
+        // The separator goes by position, not by how much has been written:
+        // an item whose `__repr__` answers `""` still takes a slot.
+        if i != 0 {
+            out.push_str(", ");
         }
+        out.push_wtf8(&py_repr_wtf8(item)?);
     }
     out.push_str("]");
     Ok(out)
@@ -262,7 +269,9 @@ pub unsafe fn tuple_repr(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     out.push_str("(");
     for i in 0..n {
         if let Some(item) = pyre_object::w_tuple_getitem(obj, i as i64) {
-            if out.len() > 1 {
+            // `tupleobject.py:114` joins by position, so an item whose
+            // `__repr__` answers `""` still gets its separator.
+            if i != 0 {
                 out.push_str(", ");
             }
             out.push_wtf8(&py_repr_wtf8(item)?);
@@ -529,6 +538,13 @@ unsafe fn module_user_dunder_obj(
     }
 }
 
+/// `space.repr` — the whole type dispatch, answering the encoded bytes.
+///
+/// `listobject.py:206-225 _listrepr_inner` assembles a container's repr in a
+/// `rutf8.Utf8StringBuilder` from each item's `space.utf8_len_w(space.repr(...))`,
+/// so a lone surrogate an item wrote survives being nested. A `Wtf8Buf` is the
+/// buffer that can hold the same thing here; a Rust `String` cannot, which is
+/// why [`py_repr`] is a lossy view of this rather than the other way round.
 pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     // A tagged immediate must be formatted before `ob_type` touches it as a
     // pointer; `repr` of a plain `int` is its
@@ -777,7 +793,11 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 } else {
                     for i in 0..n {
                         if let Some(item) = pyre_object::w_tuple_getitem(args_obj, i as i64) {
-                            if !inner.is_empty() {
+                            // `interp_exceptions.py:135-147` spells the args
+                            // with `repr(tuple(args))`, which separates by
+                            // position — an argument whose `__repr__` answers
+                            // `""` still takes a slot.
+                            if i != 0 {
                                 inner.push_str(", ");
                             }
                             inner.push_wtf8(&py_repr_wtf8(item)?);
