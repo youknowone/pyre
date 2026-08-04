@@ -203,6 +203,7 @@ impl Eq for Const {}
 /// collection has finished.
 pub struct SharedConstPool {
     values: std::cell::UnsafeCell<Vec<Const>>,
+    visited_generation: std::sync::atomic::AtomicU64,
 }
 
 unsafe impl Send for SharedConstPool {}
@@ -212,7 +213,14 @@ impl SharedConstPool {
     pub fn new(values: Vec<Const>) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             values: std::cell::UnsafeCell::new(values),
+            visited_generation: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    pub fn mark_visited_generation(&self, generation: u64) -> bool {
+        self.visited_generation
+            .swap(generation, std::sync::atomic::Ordering::Relaxed)
+            != generation
     }
 
     pub fn as_slice(&self) -> &[Const] {

@@ -16,7 +16,10 @@ pub use dispatch::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eva
 pub use frame::{MIFrame, MIFrameStack};
 
 use indexmap::IndexMap;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use crate::optimizeopt::optimizer::{Optimizer, PendingBridgeRd};
 use majit_backend::{Backend, ExitRecoveryLayout, JitCellToken};
@@ -31,6 +34,8 @@ pub(crate) use majit_backend_dynasm::runner::DynasmBackend as BackendImpl;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use majit_backend_wasm::WasmBackend as BackendImpl;
 use majit_ir::operand::Operand;
+
+static RD_CONSTS_WALK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(not(any(feature = "cranelift", feature = "dynasm", target_arch = "wasm32")))]
 compile_error!("majit-metainterp requires a backend: enable feature \"cranelift\" or \"dynasm\"");
@@ -1786,16 +1791,18 @@ impl<M: Clone> MetaInterp<M> {
     pub fn walk_rd_consts_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
         fn visit_pool(
             pool: Option<&Arc<majit_ir::SharedConstPool>>,
-            visited: &mut indexmap::IndexSet<usize>,
+            generation: u64,
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
             let Some(pool) = pool else { return };
-            let identity = Arc::as_ptr(pool) as usize;
-            // A set, not a scanned list: this runs once per exit layout of
-            // every trace of every compiled loop, so the number of pools it
-            // sees grows with the compiled code, and a linear membership scan
-            // would make one walk quadratic in that count.
-            if !visited.insert(identity) {
+            // Each pool records the generation of the walk that last visited
+            // it, so a pool reached twice in one walk is visited once without
+            // a visit set.  The counter is process-global because
+            // `register_thread_root_areas` registers this walker per mutator:
+            // per-`MetaInterp` counters would advance independently and
+            // collide, and a collision skips a pool whose slots then never
+            // reach the visitor.
+            if !pool.mark_visited_generation(generation) {
                 return;
             }
             // SAFETY: pyre is single-threaded and the minor-collection
@@ -1809,13 +1816,13 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        let mut visited = indexmap::IndexSet::new();
+        let generation = RD_CONSTS_WALK_GENERATION.fetch_add(1, Ordering::Relaxed);
         for entry in self.compiled_loops.values_mut() {
             for trace in entry.traces.values_mut() {
                 for layout in trace.exit_layouts.values_mut() {
                     visit_pool(
                         layout.storage.as_ref().map(|storage| &storage.rd_consts),
-                        &mut visited,
+                        generation,
                         &mut visitor,
                     );
                     let descr_pool = layout
@@ -1823,12 +1830,12 @@ impl<M: Clone> MetaInterp<M> {
                         .as_ref()
                         .and_then(|descr| descr.as_fail_descr())
                         .and_then(|fd| fd.rd_consts_arc());
-                    visit_pool(descr_pool.as_ref(), &mut visited, &mut visitor);
+                    visit_pool(descr_pool.as_ref(), generation, &mut visitor);
                 }
                 for layout in trace.terminal_exit_layouts.values_mut() {
                     visit_pool(
                         layout.storage.as_ref().map(|storage| &storage.rd_consts),
-                        &mut visited,
+                        generation,
                         &mut visitor,
                     );
                     let descr_pool = layout
@@ -1836,7 +1843,7 @@ impl<M: Clone> MetaInterp<M> {
                         .as_ref()
                         .and_then(|descr| descr.as_fail_descr())
                         .and_then(|fd| fd.rd_consts_arc());
-                    visit_pool(descr_pool.as_ref(), &mut visited, &mut visitor);
+                    visit_pool(descr_pool.as_ref(), generation, &mut visitor);
                 }
             }
             for tt in entry.front_target_tokens.iter_mut() {
