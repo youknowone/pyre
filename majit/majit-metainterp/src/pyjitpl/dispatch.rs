@@ -4934,9 +4934,25 @@ where
                 if ctx.force_finish_trace() && ctx.num_ops() > ctx.trace_limit() * 4 / 5 {
                     // pyjitpl.py:1639-1640 `if metainterp.current_merge_points
                     // and isinstance(metainterp.resumekey,
-                    // ResumeFromInterpDescr):` — the loop arm.  A bridge takes
-                    // upstream's `compile_trace(resumekey)` else-arm instead,
-                    // which is not ported; it keeps aborting, as before.
+                    // ResumeFromInterpDescr):` — the loop arm.
+                    //
+                    // Upstream's else-arm (pyjitpl.py:1665-1668) segments a
+                    // guard-origin bridge with
+                    // `compile_trace(metainterp, resumekey, [exception_box])`
+                    // and gives up unless the returned token is
+                    // `exit_frame_with_exception_descr_ref`.  That arm is NOT
+                    // ported, and porting it is blocked on the FINISH
+                    // descriptor slot pyre's IR does not have — the same gap
+                    // that makes `create_segmented_trace` record a bare
+                    // `FINISH(ConstInt(0))` — so the `target_token is not
+                    // token` give-up cannot even be expressed yet.
+                    //
+                    // Until it is, a bridge whose key carries JC_FORCE_FINISH
+                    // is not segmented here and runs on to the ordinary
+                    // over-limit abort.  This is a NARROWING: the driver-level
+                    // segmenting fallback this check replaced had no
+                    // loop-vs-bridge test and segmented bridges too, as simple
+                    // loops — which is not upstream's shape for them either.
                     let is_loop_trace = ctx.current_merge_points_first_greenkey().is_some()
                         && ctx.resumekey_original_loop_token().is_none();
                     if is_loop_trace {
