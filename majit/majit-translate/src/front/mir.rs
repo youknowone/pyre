@@ -2159,26 +2159,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.next_call_results,
             );
         }
-        // The consumer-gated RangeTo sub-slice capstone remains built but
-        // dormant: aggregate lowering records no sites. If capture is safely
-        // restored, it becomes `getslice(s, 0, k)`; a structural decline
-        // leaves the residual ctor + index chain intact.
-        // `prune_dead_phis` to reclaim the dead threaded RangeTo inputarg /
-        // link args (the getslice never reads them) — run it unconditionally
-        // on any rewrite rather than relying on the gated sweep in
-        // `simplify_lowered_graph`. Fail-safe: a structural mismatch leaves
-        // the residual ctor + index call (rtyper Skip) and touches nothing.
-        let slice_index_rangeto_rewritten = if lo.slice_index_rangeto_sites.is_empty() {
-            0
-        } else {
-            crate::front::slice_index::rewire_slice_index_rangeto_sites(
-                &mut lo.graph,
-                &lo.slice_index_rangeto_sites,
-            )
-        };
-        if slice_index_rangeto_rewritten > 0 {
-            crate::model::prune_dead_phis(&mut lo.graph);
-        }
         let next_rewritten = if lo.next_call_results.is_empty() {
             0
         } else {
@@ -2810,9 +2790,6 @@ struct Lowering<'a> {
     /// after the body lowering completes (see
     /// [`crate::front::slice_first::SliceFirstSite`]).
     slice_first_sites: Vec<crate::front::slice_first::SliceFirstSite>,
-    /// `RangeTo` aggregates recorded for the orthodox sub-slice copy rewrite
-    /// in `front::slice_index`.
-    slice_index_rangeto_sites: Vec<crate::front::slice_index::SliceIndexRangeToSite>,
     /// `{uN}::saturating_sub(a, b)` call sites recorded for the unsigned clamp
     /// diamond (`if a < b { 0 } else { a - b }`) the
     /// `front::saturating_sub` post-pass synthesizes after body lowering (see
@@ -3050,7 +3027,6 @@ impl<'a> Lowering<'a> {
             option_try_sites: Vec::new(),
             bool_then_sites: Vec::new(),
             slice_first_sites: Vec::new(),
-            slice_index_rangeto_sites: Vec::new(),
             saturating_sub_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
@@ -4763,10 +4739,11 @@ impl<'a> Lowering<'a> {
                 // legacy walker with an uncolored Void stop. Activating
                 // RangeTo later exposed bare `getslice/rii>r` in both
                 // `split_builtin_kwargs` and `do_warn_explicit`: both stops
-                // are statically unsigned, so the non-negative-stop gate
-                // cannot distinguish the unsafe sites. Leave both captures
-                // disabled until the codewriter is guaranteed to consume the
-                // rtyped graph where `rtype_getslice` has replaced the op.
+                // are `args.len() - 1`, statically unsigned but not constant.
+                // The recognizer's const-nonnegative gate declines them; both
+                // captures remain disabled until the codewriter is guaranteed
+                // to consume the rtyped graph where `rtype_getslice` has
+                // replaced the op.
                 // Surface every operand through a separate FieldWrite so
                 // the field-to-value binding survives into the
                 // codewriter / annotator.  Field names default to

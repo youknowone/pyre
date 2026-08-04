@@ -9,9 +9,11 @@
 //! `pyre_interpreter::module::_io::buffered_rwpair::<Impl>::readinto` graph
 //! dropped to the legacy walker. Activating RangeTo later emitted bare
 //! `getslice/rii>r` from both `split_builtin_kwargs` and `do_warn_explicit`;
-//! both stops are statically unsigned, so that gate cannot prove the planted
-//! op will be consumed from the rtyped graph. Both capture arms remain dormant
-//! and leave the original residual ctor + call chain untouched.
+//! both stops are `args.len() - 1`, statically unsigned but not constant. An
+//! unsigned gate would admit those measured failures, while the same
+//! constant-nonnegative gate used for RangeFrom declines them. Both capture
+//! arms remain dormant and leave the original residual ctor + call chain
+//! untouched.
 #![allow(dead_code)]
 //!
 //! ## Positioning
@@ -190,8 +192,8 @@ fn rewire_one_slice_index_site(
         ));
     }
 
-    // 3. Validate the selected bounds before mutating. A RangeFrom `start`
-    // must be a NON-NEGATIVE CONSTANT. `decompose_slice_args`
+    // 3. Validate the selected bounds before mutating. Both bounds must be a
+    // NON-NEGATIVE CONSTANT. `decompose_slice_args`
     //     (rtyper.rs:2809-2816) raises "slice start must be proved
     //     non-negative" for a `nonneg==false` runtime `SomeInteger` start, and
     //     a `usize` literal decodes to a bare `OpKind::ConstInt(k)` with no
@@ -202,7 +204,11 @@ fn rewire_one_slice_index_site(
     //     (the `&s[1..]` / `&s[k..]` literal shape, which
     //     `immutablevalue(ConstInt(k))` annotates `nonneg = k>=0`) keeps every
     //     rewritten graph lift-able; a computed start declines cleanly
-    //     (residual, census Skip).
+    //     (residual, census Skip). RangeTo uses the same constant gate because
+    //     activating it admitted bare unwired `getslice/rii>r` from
+    //     `split_builtin_kwargs` and `do_warn_explicit`; both measured ends
+    //     were `args.len() - 1`, statically unsigned but not constant, so an
+    //     unsigned-only gate would not decline them.
     match bounds {
         SliceIndexBounds::RangeFrom { start } => {
             if !graph_defines(graph, start) {
@@ -210,7 +216,7 @@ fn rewire_one_slice_index_site(
                     "{name}: RangeFrom start is not defined in the graph"
                 ));
             }
-            if !start_is_const_nonneg(graph, start) {
+            if !bound_is_const_nonneg(graph, start) {
                 return Err(format!(
                     "{name}: RangeFrom start is not a non-negative constant — declining"
                 ));
@@ -219,6 +225,11 @@ fn rewire_one_slice_index_site(
         SliceIndexBounds::RangeTo { end } => {
             if !graph_defines(graph, end) {
                 return Err(format!("{name}: RangeTo end is not defined in the graph"));
+            }
+            if !bound_is_const_nonneg(graph, end) {
+                return Err(format!(
+                    "{name}: RangeTo end is not a non-negative constant — declining"
+                ));
             }
         }
     }
@@ -426,7 +437,7 @@ fn graph_defines(graph: &FunctionGraph, var: &Variable) -> bool {
 /// `immutablevalue(ConstInt(k))` annotates as `SomeInteger` with
 /// `nonneg = k>=0`, so a const k ≥ 0 satisfies the getslice nonneg contract
 /// without a computed-stop hazard.
-fn start_is_const_nonneg(graph: &FunctionGraph, var: &Variable) -> bool {
+fn bound_is_const_nonneg(graph: &FunctionGraph, var: &Variable) -> bool {
     graph.blocks.iter().any(|b| {
         b.operations.iter().any(|op| {
             op.result.as_ref() == Some(var) && matches!(&op.kind, OpKind::ConstInt(k) if *k >= 0)
@@ -591,20 +602,7 @@ mod tests {
         let mut g = FunctionGraph::new("test_slice_index_rangeto");
         let a = g.startblock;
         let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
-        let len = g.push_op_var(a, OpKind::ConstInt(8), true).unwrap();
-        let one = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
-        let end = g
-            .push_op_var(
-                a,
-                OpKind::BinOp {
-                    op: "sub".into(),
-                    lhs: len,
-                    rhs: one,
-                    result_ty: ValueType::Int,
-                },
-                true,
-            )
-            .unwrap();
+        let end = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
         let range = g
             .push_op_var(
                 a,
@@ -672,6 +670,83 @@ mod tests {
                 .iter()
                 .flat_map(|blk| &blk.operations)
                 .any(|op| is_slice_range_index_call(&op.kind))
+        );
+    }
+
+    /// A RangeTo whose end is computed at runtime declines even when its Rust
+    /// type is unsigned. The measured `args.len() - 1` sites have this shape
+    /// and produced bare unwired `getslice/rii>r` when admitted.
+    #[test]
+    fn rewrite_declines_runtime_end() {
+        let mut g = FunctionGraph::new("test_slice_index_rangeto_runtime");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let len = g.push_op_var(a, OpKind::ConstInt(8), true).unwrap();
+        let one = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+        let end = g
+            .push_op_var(
+                a,
+                OpKind::BinOp {
+                    op: "sub".into(),
+                    lhs: len,
+                    rhs: one,
+                    result_ty: ValueType::Unsigned,
+                },
+                true,
+            )
+            .unwrap();
+        let range = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: rangeto_ctor_target(),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::ops::range::RangeTo".into())),
+                },
+                true,
+            )
+            .unwrap();
+        g.block_mut(a).operations.push(SpaceOperation {
+            result: None,
+            kind: end_field_write(&range, &end),
+        });
+        let sub = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: slice_index_call_target(),
+                    args: vec![slice, range.clone()],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![sub]);
+
+        let site = SliceIndexRangeToSite {
+            range_result: range,
+            end,
+        };
+        assert_eq!(
+            rewire_slice_index_rangeto_sites(&mut g, &[site]),
+            0,
+            "runtime RangeTo end declines"
+        );
+        assert!(
+            g.blocks
+                .iter()
+                .flat_map(|blk| &blk.operations)
+                .any(|op| is_slice_range_index_call(&op.kind)),
+            "residual slice::index call remains"
+        );
+        assert!(
+            !g.blocks
+                .iter()
+                .flat_map(|blk| &blk.operations)
+                .any(|op| matches!(&op.kind, OpKind::GetSlice { .. })),
+            "no getslice is planted on decline"
         );
     }
 

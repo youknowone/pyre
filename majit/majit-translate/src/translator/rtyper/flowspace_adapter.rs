@@ -5595,7 +5595,15 @@ mod tests {
         let ConstValue::HostObject(host) = &callable.value else {
             panic!("r_uint callable must be a HostObject");
         };
-        assert_eq!(host.qualname(), "rarithmetic.r_uint");
+        let expected = HOST_ENV
+            .import_module("rpython.rlib.rarithmetic")
+            .expect("HOST_ENV bootstrap must register rpython.rlib.rarithmetic")
+            .module_get("r_uint")
+            .expect("rarithmetic module must expose r_uint");
+        assert_eq!(
+            host, &expected,
+            "callable must be the registered r_uint object"
+        );
     }
 
     // ───── topology assembly ─────
