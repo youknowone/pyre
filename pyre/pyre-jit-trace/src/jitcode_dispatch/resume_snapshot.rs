@@ -997,9 +997,18 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     guard_jitcode_pc,
                 );
                 let semantic_limit = sym.nlocals() + maps.stack_depth_at_pc;
+                let nlocals = sym.nlocals();
+                // The residual call's result lands on the operand stack, so
+                // only stack slots need reconciling here.  A local's slot is
+                // maintained in lockstep by the shadow, while the per-PC
+                // color-to-slot map is a per-program-point label rather than a
+                // binding: the register allocator can reuse a local's color
+                // for unrelated SSA temps, so projecting a register into a
+                // local's slot can publish an unrelated value.
                 let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
                 for &(bank, color, slot) in &maps.pcdep_entries {
                     if bank != 1
+                        || (slot as usize) < nlocals
                         || slot as usize >= semantic_limit
                         || !banks.ref_.contains(&(color as u32))
                     {
