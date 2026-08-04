@@ -16949,11 +16949,16 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
             } else {
                 generator_frame_is_finished(gen_obj, &mut *frame_ptr);
             }
+            let ec = crate::call::getexecutioncontext()
+                as *mut crate::executioncontext::ExecutionContext;
+            if !ec.is_null() {
+                (*ec).finalize_explicitly_cleared_frame_references();
+            }
             return Ok(w_none());
         }
     }
     let err = PyError::new(PyErrorKind::GeneratorExit, String::new());
-    match generator_send_ex(gen_obj, w_none(), Some(err), None) {
+    let mut result = match generator_send_ex(gen_obj, w_none(), Some(err), None) {
         Ok(_) => {
             // Generator yielded after GeneratorExit — RuntimeError.
             // generator.py:267-268 `"%s ignored GeneratorExit" % self.KIND`.
@@ -16972,7 +16977,29 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
         }
         Err(e) if e.kind == PyErrorKind::GeneratorExit => Ok(w_none()),
         Err(e) => Err(e),
+    };
+    unsafe {
+        if w_generator_get_frame(gen_obj).is_null() {
+            // The result has left the cleared generator frame but has not yet
+            // reached the caller's value stack. Publish it while the
+            // compatibility collection below determines which former frame
+            // locals became unreachable.
+            let _roots = pyre_object::gc_roots::push_roots();
+            match &mut result {
+                Ok(value) => pyre_object::gc_roots::pin_root(*value),
+                Err(error) => {
+                    let w_exc = error.to_exc_object();
+                    pyre_object::gc_roots::pin_root(w_exc);
+                }
+            }
+            let ec = crate::call::getexecutioncontext()
+                as *mut crate::executioncontext::ExecutionContext;
+            if !ec.is_null() {
+                (*ec).finalize_explicitly_cleared_frame_references();
+            }
+        }
     }
+    result
 }
 
 /// PyPy `Coroutine.descr__await__`: return a distinct iterator wrapper rather

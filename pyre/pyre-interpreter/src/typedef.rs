@@ -7541,6 +7541,11 @@ fn init_frame_type(ns: PyObjectRef) {
                     let f = frame_ptr(args[0]);
                     if !f.is_null() {
                         unsafe { &mut *f }.descr_clear()?;
+                        let ec = crate::call::getexecutioncontext()
+                            as *mut crate::executioncontext::ExecutionContext;
+                        if !ec.is_null() {
+                            unsafe { (*ec).finalize_explicitly_cleared_frame_references() };
+                        }
                     }
                     Ok(pyre_object::w_none())
                 },
