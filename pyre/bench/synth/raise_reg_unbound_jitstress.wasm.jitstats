@@ -4,5 +4,5 @@ descr_set_ambiguous=0
 descr_set_stale_absent=0
 guard_failures=5
 internal_compile_panics=0
-loops_aborted=2
-loops_compiled=5
+loops_aborted=1
+loops_compiled=6
