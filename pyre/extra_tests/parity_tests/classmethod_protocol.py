@@ -9,6 +9,7 @@ PyPy's ``__reduce_ex__`` entry and neither implementation makes the wrapper
 callable.
 """
 
+import gc
 import sys
 
 
@@ -251,11 +252,15 @@ assert Forger.__init_subclass__.__qualname__ == "Forger.__init_subclass__"
 assert int.__subclasshook__.__qualname__ == "int.__subclasshook__"
 assert int.__init_subclass__.__qualname__ == "int.__init_subclass__"
 
-# The same reads after enough allocation to drive a collection: whatever
-# records the two carriers has to survive one.
-churn = [[object() for _ in range(64)] for _ in range(2048)]
-assert len(churn) == 2048
-del churn
+# The same reads across a full collection: whatever records the two carriers
+# has to survive one, and survive it as an address rather than as a value the
+# collection is free to relocate. A small live set is allocated first so the
+# collection has something young to promote; `gc.collect()` then forces the
+# major pass without holding a large heap. Its return value differs between
+# implementations, so nothing here reads it.
+promoted = [object() for _ in range(64)]
+gc.collect()
+assert len(promoted) == 64
 assert Forger.hook.__qualname__ == "object.__subclasshook__"
 assert Forger.__subclasshook__.__qualname__ == "Forger.__subclasshook__"
 assert Forger.__init_subclass__.__qualname__ == "Forger.__init_subclass__"
