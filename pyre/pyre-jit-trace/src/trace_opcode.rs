@@ -2042,16 +2042,19 @@ impl MIFrame {
         // PyFrame's `locals_cells_stack_w` length + `valuestackdepth`
         // — no symbolic mirror in the loop.
         let concrete_nlocals = self.sym().nlocals;
-        // The concrete `PyFrame` is only stepped by the interpreter. A walk
-        // that resumed from a guard keeps the `valuestackdepth` the resume
-        // wrote at the resume PC and never advances it, so a close that lands
-        // on a DIFFERENT bytecode offset — a cross-loop retarget, where
-        // `cut_trace_from` re-heads the trace at the merge point it walked
-        // into — reads a depth belonging to the offset it started from. Every
-        // operand-stack slot at or above that depth is then treated as dead
-        // capacity and force-nulled into the JUMP, while the target LABEL
-        // (built from the merge point's own `virtualizable_boxes`) binds them:
-        // the loop body reads a null where the entry reload put a live value.
+        // interp_jit.py:87-91 reaches `jit_merge_point` from inside the
+        // dispatch loop, so the frame it promotes `valuestackdepth` off is
+        // current at every merge point. Here the concrete `PyFrame` is only
+        // stepped by the interpreter. A walk that resumed from a guard keeps
+        // the `valuestackdepth` the resume wrote at the resume PC and never
+        // advances it, so a close that lands on a DIFFERENT bytecode offset —
+        // a cross-loop retarget, where `cut_trace_from` re-heads the trace at
+        // the merge point it walked into — reads a depth belonging to the
+        // offset it started from. Every operand-stack slot at or above that
+        // depth is then treated as dead capacity and force-nulled into the
+        // JUMP, while the target LABEL (built from the merge point's own
+        // `virtualizable_boxes`) binds them: the loop body reads a null where
+        // the entry reload put a live value.
         //
         // A bytecode offset has exactly one operand-stack depth, so the merge
         // point's depth is available statically from the same liveness table

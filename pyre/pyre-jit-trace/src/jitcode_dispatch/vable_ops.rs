@@ -77,8 +77,8 @@ pub(super) fn vable_effective_value_concrete<Sym: WalkSym>(
 /// Preserve the concrete half of a null Ref box when an executed vable store
 /// writes it into the frame shadow, returning the box the shadow must store.
 ///
-/// RPython's `virtualizable_boxes[index] = valuebox` stores one Box carrying
-/// both its identity and concrete value.  Pyre keeps those halves separately;
+/// pyjitpl.py:1193,1245 `virtualizable_boxes[index] = valuebox` stores one Box
+/// carrying both its identity and concrete value.  Pyre keeps those halves apart;
 /// a value materialized through a Ref register can therefore reach this store
 /// as a non-constant `RefOp` whose register shadow proves `ConstPtr(NULL)` but
 /// whose frontend-op concrete has not yet been stamped.  Record that proof on
