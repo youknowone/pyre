@@ -1636,7 +1636,7 @@ pub type ModuleDictGuard = parking_lot::lock_api::ReentrantMutexGuard<
 pub struct DictOperationGuard {
     // Drop the mutex before rewinding the roots.
     _lock: ModuleDictGuard,
-    _roots: crate::gc_roots::RootScope,
+    roots: crate::gc_roots::RootScope,
     root_base: usize,
 }
 
@@ -1648,21 +1648,26 @@ impl DictOperationGuard {
         // is a safepoint, and `refs` is a caller-owned native slice no
         // collection rewrites — so pinning `obj` first would leave every
         // operand behind it naming a pre-collection address.
-        let root_base = crate::gc_roots::publish_roots(&[obj]);
-        crate::gc_roots::publish_roots(refs);
-        crate::gc_roots::normalize_roots(root_base, 1 + refs.len());
-        let obj = crate::gc_roots::shadow_stack_get(root_base);
+        //
+        // Every slot access goes through the scope's cached root-stack cell:
+        // a dict operation touches each of its operands again on the way out,
+        // and the free `gc_roots` functions re-resolve the thread local on
+        // every call — which on Darwin is an out-of-line `_tlv_get_addr`.
+        let root_base = roots.publish(&[obj]);
+        roots.publish(refs);
+        roots.normalize(root_base, 1 + refs.len());
+        let obj = roots.get(root_base);
         let lock = unsafe { w_dict_lock_raw(obj) };
         Self {
             _lock: lock,
-            _roots: roots,
+            roots,
             root_base,
         }
     }
 
     #[inline]
     pub fn root(&self, index: usize) -> PyObjectRef {
-        crate::gc_roots::shadow_stack_get(self.root_base + index)
+        self.roots.get(self.root_base + index)
     }
 }
 

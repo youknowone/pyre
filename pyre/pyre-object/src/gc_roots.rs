@@ -369,6 +369,43 @@ impl RootScope {
         unsafe { *(*self.stack_slot).slot(index) }
     }
 
+    /// Scope-local [`publish_roots`] using the cached cell.
+    #[majit_macros::dont_look_inside]
+    pub fn publish(&self, roots: &[PyObjectRef]) -> usize {
+        #[cfg(debug_assertions)]
+        assert_shadow_stack_not_walking();
+        // SAFETY: this thread's cell, alive for the bracket; `incr_stack`
+        // returns the slot it just claimed.
+        unsafe {
+            let stack = &*self.stack_slot;
+            let base = stack.len();
+            for &root in roots {
+                *stack.incr_stack() = root;
+            }
+            base
+        }
+    }
+
+    /// Scope-local [`normalize_roots`] using the cached cell.
+    #[majit_macros::dont_look_inside]
+    pub fn normalize(&self, base: usize, len: usize) {
+        #[cfg(debug_assertions)]
+        assert_shadow_stack_not_walking();
+        for index in base..base + len {
+            // Re-read the slot each time, as [`normalize_roots`] does: a
+            // collection triggered by an earlier query may already have
+            // rewritten every published root in place.
+            // SAFETY: `publish` claimed every index in this range.
+            let root = unsafe { *(*self.stack_slot).slot(index) };
+            let current =
+                crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
+            if current != root {
+                // SAFETY: same slot, still live.
+                unsafe { *(*self.stack_slot).slot(index) = current };
+            }
+        }
+    }
+
     /// Scope-local [`shadow_stack_set`] using the cached cell — the write a
     /// slot whose contents change over the bracket takes on each update.
     #[majit_macros::dont_look_inside]
