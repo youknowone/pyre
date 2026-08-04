@@ -7959,9 +7959,38 @@ fn compare_box_provably_dead<Sym: WalkSym>(
     dst_reg: u8,
 ) -> bool {
     matches!(
-        classify_compare_box_use(ctx, compare_pc, dst_reg),
+        classify_compare_box_use(ctx, compare_pc, dst_reg, VablePublish::Disqualifies),
         CompareBoxUse::FeedsBranchOnly { arms_dead: true }
     )
+}
+
+/// How the scan reads the `push_and_bump!` publish — the
+/// `setarrayitem_vable_r` that mirrors the box into the virtualizable's
+/// operand-stack slot.
+pub(crate) enum VablePublish {
+    /// The store needs a box to store, so eliding the box would leave it
+    /// without one.  It counts as a reader like any other op.
+    Disqualifies,
+    /// The caller keeps a box and only changes which one — a prebuilt
+    /// singleton `ConstPtr` in place of a recorded call result.  The store
+    /// publishes that constant just as well, so it does not decide whether the
+    /// box "only ever decides a branch".
+    Tolerated,
+}
+
+/// Is `op` the publish of `dst_reg` into a virtualizable operand-stack slot?
+/// `setarrayitem_vable_r` takes `rir…`: the frame in operand 0, the slot in
+/// operand 1 and the stored register in operand 2.  A `dst_reg` that also
+/// names the frame register is some other shape entirely and stays a reader.
+fn op_publishes_box_to_vable_slot(
+    code: &[u8],
+    op: &crate::jitcode_runtime::DecodedOp,
+    dst_reg: u8,
+) -> bool {
+    op.key.starts_with("setarrayitem_vable_r")
+        && op.argcodes.starts_with("rir")
+        && code.get(op.pc + 3) == Some(&dst_reg)
+        && code.get(op.pc + 1) != Some(&dst_reg)
 }
 
 /// What the forward JitCode lookahead found the compare's boxed Ref dst
@@ -7988,7 +8017,16 @@ fn classify_compare_box_use<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     compare_pc: usize,
     dst_reg: u8,
+    publish: VablePublish,
 ) -> CompareBoxUse {
+    // `compare_pc` indexes the JitCode being walked, while everything below
+    // reads the snapshot root's.  An inlined sub-walk has a distinct callee
+    // JitCode and deliberately shares the root snapshot, so the two disagree
+    // and the scan would decode the callee's offset against the caller's
+    // bytes.  `walker_foriter_green_key` declines the same mismatch.
+    if ctx.fbw_mode.inline_subwalk {
+        return CompareBoxUse::Other;
+    }
     let full_body_sym = ctx.fbw_mode.snapshot_sym;
     if full_body_sym.is_null() {
         return CompareBoxUse::Other;
@@ -8064,7 +8102,9 @@ fn classify_compare_box_use<Sym: WalkSym>(
             // elide is not the one this op produces; stay conservative).
             return CompareBoxUse::Other;
         }
-        if reads {
+        let publishes = matches!(publish, VablePublish::Tolerated)
+            && op_publishes_box_to_vable_slot(code, &op, dst_reg);
+        if reads && !publishes {
             readers += 1;
             // is_true shape: single Ref arg, Int result (`iRd>i`).
             reader_is_is_true = op.key == "residual_call_r_i/iRd>i";

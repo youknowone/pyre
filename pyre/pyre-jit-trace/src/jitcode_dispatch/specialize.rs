@@ -4161,6 +4161,12 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
 /// local) keeps the residual box: guarding it would pin a value the trace
 /// otherwise carries unconstrained, and every later re-entry with the other
 /// truth bails.
+///
+/// The shape survives the `push_and_bump!` publish
+/// ([`VablePublish::Tolerated`]).  That store mirrors the box into the
+/// operand-stack slot the guard's own resume image describes; swapping a
+/// prebuilt singleton in for the recorded call result leaves it storing the
+/// same value, so it is not a second use that makes the bool escape.
 fn walker_newbool_guarded<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -4173,7 +4179,7 @@ fn walker_newbool_guarded<Sym: WalkSym>(
         return Ok(None);
     }
     if !matches!(
-        classify_compare_box_use(ctx, op_pc, dst_reg),
+        classify_compare_box_use(ctx, op_pc, dst_reg, VablePublish::Tolerated),
         CompareBoxUse::FeedsBranchOnly { .. }
     ) {
         return Ok(None);
