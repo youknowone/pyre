@@ -905,9 +905,11 @@ impl GcCache {
         // descr.py:120: cache[STRUCT] = sizedescr
         self._cache_size.insert(key, descr.clone());
         self._cache_size_order.push(descr.clone());
-        // descr.py:123-126: gc_fielddescrs / all_fielddescrs
-        // populated externally via SimpleSizeDescr::with_all_fielddescrs
-        // since we lack the heaptracker to auto-discover fields.
+        // descr.py:123-126: gc_fielddescrs / all_fielddescrs populated
+        // externally via SimpleSizeDescr::with_all_fielddescrs.  The walker
+        // exists (`majit-translate codewriter::heaptracker`) but lives in the
+        // crate that depends on this one, so it cannot be called from here;
+        // its callers thread the resulting list in.
         descr
     }
 
@@ -1241,7 +1243,8 @@ impl GcCache {
     /// `struct_key`: LLType::Struct — the owning type identity.
     /// `index_in_parent`: descr.py:228 heaptracker.get_fielddescr_index_in(STRUCT, fieldname).
     ///   The structural slot number within the parent struct's field list.
-    ///   Caller must provide this — Rust has no heaptracker auto-discovery.
+    ///   Caller must provide it: `heaptracker::get_fielddescr_index_in` runs
+    ///   in `majit-translate`, one crate above this one.
     /// `flag`: descr.py:226 get_type_flag(FIELDTYPE).
     ///
     /// descr.py:234-238: parent_descr = get_size_descr(gccache, STRUCT, vtable).
@@ -3418,8 +3421,9 @@ pub trait SizeDescr: Descr {
 
     /// descr.py:76 `get_all_fielddescrs(self): return self.all_fielddescrs`.
     /// Populated by `heaptracker.all_fielddescrs(gccache, STRUCT)` at
-    /// `get_size_descr` construction time (descr.py:125-126).  pyre has no
-    /// lltype STRUCT walker, so concrete impls thread this in via a
+    /// `get_size_descr` construction time (descr.py:125-126).  That walker
+    /// is `majit-translate codewriter::heaptracker::all_fielddescrs`, one
+    /// crate above this one, so concrete impls thread the list in via a
     /// builder; the default is empty.
     fn all_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
         &[]
@@ -4687,7 +4691,8 @@ impl SimpleSizeDescr {
 
     /// descr.py:123-126 — `get_size_descr` calls
     /// `heaptracker.gc_fielddescrs(...)` / `heaptracker.all_fielddescrs(...)`
-    /// and stores both onto the descriptor.  pyre lacks heaptracker, so
+    /// and stores both onto the descriptor.  That walker lives one crate
+    /// above this one (`majit-translate codewriter::heaptracker`), so
     /// callers thread `all_fielddescrs` in via this builder; the
     /// `gc_fielddescrs` subset is derived by filtering on
     /// `FieldDescr::is_pointer_field()` (heaptracker.py:70).
