@@ -1162,6 +1162,19 @@ pub fn make_builtin_function(name: &'static str, func: BuiltinCodeFn) -> PyObjec
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// `make_builtin_function` carrying the interpreter-level function's
+/// docstring.  PyPy's `interp2app` reads this from `func.__doc__`; Rust
+/// functions have no app-visible function object, so typedef registrations
+/// pass the upstream literal explicitly.
+pub fn make_builtin_function_with_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    docstring: &'static str,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_doc(name, func, Some(docstring));
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
 /// GatewayCache.build parity for an interp2app carrying the text signature
 /// produced by `interp2app._generate_text_signature`.
 pub fn make_builtin_function_with_text_signature(

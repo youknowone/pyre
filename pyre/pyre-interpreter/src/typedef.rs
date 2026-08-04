@@ -25542,27 +25542,53 @@ fn init_generator_type(ns: PyObjectRef) {
 /// PyPy `generator.py Coroutine.typedef`.
 fn init_coroutine_type(ns: PyObjectRef) {
     unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
-    for (name, function, arity) in [
-        ("__repr__", coroutine_descr_repr as DunderFn, 1),
-        ("send", crate::baseobjspace::generator_send_method, 2),
-        ("close", crate::baseobjspace::generator_close_method, 1),
-        ("__await__", crate::baseobjspace::coroutine_await_method, 1),
-        ("__del__", crate::baseobjspace::generator_close_method, 1),
-        ("__sizeof__", generator_descr_sizeof, 1),
+    for (name, function, arity, doc) in [
+        ("__repr__", coroutine_descr_repr as DunderFn, 1, None),
+        (
+            "send",
+            crate::baseobjspace::generator_send_method,
+            2,
+            Some(
+                "send(arg) -> send 'arg' into coroutine,\nreturn next iterated value or raise StopIteration.",
+            ),
+        ),
+        (
+            "close",
+            crate::baseobjspace::generator_close_method,
+            1,
+            Some("close() -> raise GeneratorExit inside coroutine."),
+        ),
+        (
+            "__await__",
+            crate::baseobjspace::coroutine_await_method,
+            1,
+            None,
+        ),
+        (
+            "__del__",
+            crate::baseobjspace::generator_close_method,
+            1,
+            None,
+        ),
+        ("__sizeof__", generator_descr_sizeof, 1, None),
     ] {
-        unsafe {
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
-                name,
-                make_builtin_function_with_arity(name, function, arity),
-            )
+        let function = match doc {
+            Some(doc) => {
+                crate::gateway::make_builtin_function_with_arity_and_doc(name, function, arity, doc)
+            }
+            None => make_builtin_function_with_arity(name, function, arity),
         };
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, function) };
     }
     unsafe {
         pyre_object::w_dict_setitem_str(
             ns,
             "throw",
-            make_builtin_function("throw", crate::baseobjspace::generator_throw_method),
+            crate::gateway::make_builtin_function_with_doc(
+                "throw",
+                crate::baseobjspace::generator_throw_method,
+                "throw(value)\nthrow(type[,value[,traceback]])\n\nRaise exception in coroutine, return next iterated value or raise\nStopIteration.\nthe (type, val, tb) signature is deprecated, \nand may be removed in a future version of Python.",
+            ),
         );
         // CPython 3.14 Objects/genobject.c coro_methods — Py_GenericAlias
         // with METH_CLASS.
@@ -25611,11 +25637,16 @@ fn init_coroutine_type(ns: PyObjectRef) {
         let get = make_builtin_function_with_arity(name, getter, 2);
         let set = make_builtin_function_with_arity(name, setter, 3);
         let delete = make_builtin_function_with_arity(name, deleter, 2);
+        let doc = match name {
+            "__name__" => "name of the coroutine",
+            "__qualname__" => "qualified name of the coroutine",
+            _ => unreachable!(),
+        };
         unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_getset_property_full(get, set, delete, PY_NULL, PY_NULL, Some(name)),
+                make_getset_property_named_doc(get, set, delete, doc, name),
             )
         };
     }
