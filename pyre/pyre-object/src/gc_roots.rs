@@ -454,8 +454,9 @@ impl Drop for RootScope {
 /// Open a `push_roots(hop)` bracket. Drop the returned guard to
 /// execute the matching `pop_roots(hop, livevars)`. See the module
 /// docstring for the multi-phase plan.
+// Do not mark this `dont_look_inside`: `RootScope` is a two-word by-value ADT,
+// but the residual-call classifier would encode it as a one-word `ref` token.
 #[inline]
-#[majit_macros::dont_look_inside]
 pub fn push_roots() -> RootScope {
     RootScope::new()
 }
