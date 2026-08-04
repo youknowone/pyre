@@ -5,4 +5,4 @@ descr_set_stale_absent=0
 guard_failures=450
 internal_compile_panics=0
 loops_aborted=1
-loops_compiled=34
+loops_compiled=36
