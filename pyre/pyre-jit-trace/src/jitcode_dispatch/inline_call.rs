@@ -3028,10 +3028,14 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     };
     let inline_depth = ctx.session.borrow().framestack.len();
     let contains_raise = body_facts.contains_raise;
-    if contains_raise
+    // Evaluated only behind the three cheaper terms, so the short-circuit order
+    // is the same one the single condition had.  Keeping the class lets the
+    // decline census say which admission would widen it.
+    let branchy_handler_safety = if contains_raise
         && !strict_inlinable
         && jitcode_has_exception_handler(body.code)
-        && fbw_callee_body_replay_safety(
+    {
+        Some(fbw_callee_body_replay_safety(
             body.code,
             &exact_numeric_args,
             body.num_regs_i,
@@ -3039,8 +3043,11 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             body.num_regs_r,
             body.constants_r,
             callee_descr_refs,
-        ) != CalleeReplaySafety::Clean
-    {
+        ))
+    } else {
+        None
+    };
+    if matches!(branchy_handler_safety, Some(s) if s != CalleeReplaySafety::Clean) {
         // A branchy callee with its own exception handler can take a structural
         // abort after an earlier effectful Python opcode. The current
         // callee-rebuild payload resumes at the Python opcode owning the abort
@@ -3050,6 +3057,13 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         // ordinary residual path until the generated frame snapshot can
         // represent the precise post-effect coordinate. A terminal raising
         // callee without a handler retains its after-residual live anchor.
+        crate::jitcode_dispatch::census_record(
+            if branchy_handler_safety == Some(CalleeReplaySafety::DeferredCall) {
+                "InlineCallee::BranchyHandlerDeferredCall"
+            } else {
+                "InlineCallee::BranchyHandlerDirty"
+            },
+        );
         return Ok(None);
     }
     // A callee that raises inline needs the cross-frame bridge the carrier
