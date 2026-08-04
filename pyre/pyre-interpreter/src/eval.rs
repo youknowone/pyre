@@ -762,6 +762,29 @@ unsafe fn chain_next_frame(f_backref: *mut PyFrame) -> *mut PyFrame {
     crate::executioncontext::vref_referent(f_backref)
 }
 
+/// Forward the frame named by a `JitVirtualRef` stored in a frame-shaped slot.
+///
+/// Frame backrefs and `executioncontext.rs:88-101` both allow such a slot to
+/// hold a vref in place of a `*mut PyFrame`. Its leading word is the
+/// `JIT_VIRTUAL_REF_VTABLE` magic, not a PyObject `ob_type`, so callers must
+/// skip PyObject-shaped walks when this returns true. The vref is old-gen and
+/// non-moving, but its `forced` frame may be young.
+/// `virtualref.py:94-98 is_virtual_ref(gcref)` supplies the predicate.
+#[inline]
+unsafe fn forward_virtual_ref_forced(
+    value: *mut u8,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) -> bool {
+    unsafe {
+        if !majit_metainterp::virtualref::ptr_is_virtual_ref(value as *const u8) {
+            return false;
+        }
+        let vref = value as *mut majit_metainterp::virtualref::JitVirtualRef;
+        visitor(&mut *(&mut (*vref).forced as *mut *mut u8 as *mut majit_ir::GcRef));
+        true
+    }
+}
+
 /// How much of `locals_cells_stack_w` is reachable state.
 ///
 /// `valuestackdepth` is an absolute index that starts at `stack_base()`
@@ -952,10 +975,7 @@ pub unsafe fn walk_pyframe_roots_area(
                 // `f_backref` needs no such hop — the visitor already left it
                 // naming the live copy.
                 let f_backref = *f_back_slot;
-                if majit_metainterp::virtualref::ptr_is_virtual_ref(f_backref as *const u8) {
-                    let vref = f_backref as *mut majit_metainterp::virtualref::JitVirtualRef;
-                    visitor(&mut *(&mut (*vref).forced as *mut *mut u8 as *mut majit_ir::GcRef));
-                }
+                forward_virtual_ref_forced(f_backref as *mut u8, visitor);
 
                 // pyframe.py:102 `self.pycode` — the running code object.
                 // Visited as a root so a code object reachable only via
@@ -1084,6 +1104,9 @@ pub unsafe fn walk_pyframe_roots_area(
                     // AFTER the visitor so a relocated value is the live one.
                     unsafe {
                         let value = (*slot_ptr).0 as PyObjectRef;
+                        if forward_virtual_ref_forced(value as *mut u8, visitor) {
+                            continue;
+                        }
                         walk_raw_exception_roots(value, visitor);
                         walk_raw_immortal_roots(value, visitor);
                     }
