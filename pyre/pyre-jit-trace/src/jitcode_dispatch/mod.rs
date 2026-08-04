@@ -3107,8 +3107,11 @@ fn finishframe_lookahead_at(code: &[u8], position: usize) -> FinishframeLookahea
         //   assert arg1 == 1
         //   cintf.jit_rvmprof_code(arg1, arg2)
         // Walker surfaces the operand byte indices for the caller to
-        // decide whether to symbolically record (today: drop, mirroring
-        // RPython's non-record direct cintf call).
+        // decide whether to symbolically record. The `cintf` call itself
+        // belongs to the frame-popping loop, which is
+        // `MetaInterp::finishframe_exception` and does perform it; firing
+        // it from here would mark an enter/leave on a lookahead that pops
+        // nothing.
         let arg1_reg = code[next.pc + 1];
         let arg2_reg = code[next.pc + 2];
         return FinishframeLookahead::RvmprofCode { arg1_reg, arg2_reg };
@@ -3120,9 +3123,10 @@ fn finishframe_lookahead_at(code: &[u8], position: usize) -> FinishframeLookahea
 /// `try_catch_exception_at(...) -> Option<target>` shape used by
 /// existing callers. Returns `Some(target)` only on the
 /// `CatchTarget` arm; `RvmprofCode` and `NoMatch` collapse to `None`
-/// (both cases continue unwinding from the caller's POV — the
-/// instrumentation side effect is dropped today, matching RPython's
-/// non-trace-recorded `cintf` call).
+/// (both cases continue unwinding from the caller's POV). This is a
+/// lookahead predicate, not a frame-popping loop, so it carries no
+/// `jit_rvmprof_code` side effect — `MetaInterp::finishframe_exception`
+/// is the loop that decodes `rvmprof_code` and calls it.
 pub(crate) fn try_catch_exception_at(code: &[u8], position: usize) -> Option<usize> {
     match finishframe_lookahead_at(code, position) {
         FinishframeLookahead::CatchTarget(target) => Some(target),
