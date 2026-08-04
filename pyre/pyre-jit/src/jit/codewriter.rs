@@ -8090,11 +8090,44 @@ impl CodeWriter {
                                     py_pc as i64,
                                 );
                             } else {
+                                // The generic (non-explicit-raise) handler entry
+                                // reads the propagated exception from the field to
+                                // give the slot a distinct colour, but that leaves
+                                // the operand in a register only.  A blackhole /
+                                // deopt handoff that resumes the interpreter at this
+                                // handler reads the frame's value-stack array and
+                                // finds an empty top slot, so `PushExcInfo`
+                                // underflows.  Materialize the exception on the
+                                // durable slot as well — the interpreter unwinder
+                                // (`eval.rs` `handle_exception` `frame.push(exc)`)
+                                // and the explicit-raise arm's slot the
+                                // `getarrayitem_vable_r` above reads both keep it
+                                // there.  On the standard virtualizable
+                                // `setarrayitem_vable_r` costs no compiled op; it
+                                // updates the operand image the blackhole hands back
+                                // and the resume snapshots restore.  `depth_at_pc`
+                                // already publishes `vsd = base + current_depth`, so
+                                // no `emit_vsd!` is needed.
                                 record_graph_op(
                                     &current_block.block(),
                                     "last_exc_value",
                                     Vec::new(),
-                                    Some(exc_value),
+                                    Some(exc_value.clone()),
+                                    py_pc as i64,
+                                );
+                                let stack_slot =
+                                    stack_base_absolute + current_depth.saturating_sub(1) as usize;
+                                let stack_idx: super::flow::FlowValue =
+                                    super::flow::Constant::signed(stack_slot as i64).into();
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "setarrayitem_vable_r",
+                                    vable_setarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        stack_idx.into(),
+                                        exc_value.into(),
+                                    ),
+                                    None,
                                     py_pc as i64,
                                 );
                             }
