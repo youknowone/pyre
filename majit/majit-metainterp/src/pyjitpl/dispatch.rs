@@ -5054,17 +5054,29 @@ where
                         // merge point, and — once `retrace_needed` has armed
                         // `partial_trace` — a close storm that leaves no room
                         // for the one extra iteration a retrace has to trace.
-                        let has_targets = ctx
-                            .compiled_key_for_greens_fn
-                            .as_ref()
-                            .and_then(|f| {
-                                f(&(
-                                    mp_green_ints.clone(),
-                                    mp_green_refs.clone(),
-                                    mp_green_floats.clone(),
-                                ))
-                            })
-                            .is_some();
+                        //
+                        // The key must be the one the INTERPRETER enters by:
+                        // `get_procedure_token` is `jit_cell_at_key(greenkey)`,
+                        // and `compile_loop` attaches the token to that same
+                        // cell, so upstream cannot own a compiled loop the
+                        // interpreter cannot reach and this predicate is always
+                        // false for a key being traced for the first time —
+                        // which is what makes :1554-1555 `return` the guard
+                        // against closing a trace on its own first merge point.
+                        // A lookup keyed on anything else (e.g. scanning a side
+                        // table for a loop whose header greens happen to match)
+                        // can answer yes for a loop stored under a key nothing
+                        // enters, auto-stamp here, and close with nothing but
+                        // the green-promotion ops recorded.
+                        let mp_greens = (
+                            mp_green_ints.clone(),
+                            mp_green_refs.clone(),
+                            mp_green_floats.clone(),
+                        );
+                        let has_targets = mp_green_pc
+                            .and_then(|pc| ctx.merge_point_green_key_hash(pc, &mp_greens))
+                            .zip(ctx.has_compiled_targets_fn.as_ref())
+                            .is_some_and(|(key, f)| f(key));
                         depth_zero && has_targets
                     };
                     if should_auto_stamp {
@@ -5288,6 +5300,7 @@ where
                             mp_green_floats.clone(),
                         );
                         ctx.close_greens = Some(close_greens.clone());
+                        ctx.close_green_pc = mp_green_pc;
                         if ctx.is_bridge_trace {
                             // pyjitpl.py:3001-3060: a guard-origin bridge
                             // first consults the procedure token for the
@@ -5297,10 +5310,9 @@ where
                             // scan, appends first visits, and only closes on a
                             // repeated same-greenkey merge point.
                             let already_compiled_here = ctx
-                                .compiled_key_for_greens_fn
-                                .as_ref()
-                                .and_then(|f| f(&close_greens))
-                                .is_some();
+                                .close_green_key_hash()
+                                .zip(ctx.has_compiled_targets_fn.as_ref())
+                                .is_some_and(|(key, f)| f(key));
                             let close_key = ctx.close_green_key_hash().unwrap_or(ctx.green_key);
                             if !already_compiled_here
                                 && !ctx.has_merge_point_at(close_key, ctx.header_pc)
@@ -5366,8 +5378,6 @@ where
                     if inner_close {
                         if let Some(pc) = mp_green_pc {
                             let header_pc = ctx.header_pc;
-                            let inner_key =
-                                crate::green_key_from_code_ptr(ctx.green_key_raw.0, pc as usize);
                             // pyjitpl.py:3001-3007, which runs BEFORE the
                             // `current_merge_points` scan:
                             //
@@ -5447,15 +5457,19 @@ where
                                 mp_green_refs.clone(),
                                 mp_green_floats.clone(),
                             );
+                            let Some(inner_key) = ctx.merge_point_green_key_hash(pc, &mp_greens)
+                            else {
+                                return TraceAction::Continue;
+                            };
                             let already_compiled_here = ctx
-                                .compiled_key_for_greens_fn
+                                .has_compiled_targets_fn
                                 .as_ref()
-                                .and_then(|f| f(&mp_greens));
-                            if let Some(ptoken_key) = already_compiled_here {
+                                .is_some_and(|f| f(inner_key));
+                            if already_compiled_here {
                                 if crate::majit_log_enabled() {
                                     eprintln!(
                                         "[jit] merge point pc={pc} already has compiled loop \
-                                         key={ptoken_key} — declining the cross-loop cut \
+                                         key={inner_key} — declining the cross-loop cut \
                                          (pyjitpl.py:3005)"
                                     );
                                 }
@@ -5491,6 +5505,7 @@ where
                                     mp_green_refs.clone(),
                                     mp_green_floats.clone(),
                                 ));
+                                ctx.close_green_pc = Some(pc);
                                 if capture_walk_reds {
                                     // Single-pass: resume at the inner loop's
                                     // interpreter green pc (the loop variable the

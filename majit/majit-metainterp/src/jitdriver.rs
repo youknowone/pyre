@@ -2822,17 +2822,11 @@ impl<S: JitState> JitDriver<S> {
                             .meta
                             .trace_ctx()
                             .and_then(|ctx| ctx.close_greens.clone());
-                        let resolved_key = match close_greens.as_ref() {
-                            // Closed on a merge point: the token is the one keyed by
-                            // THOSE greens.  When no compiled loop lives there the
-                            // greenkey simply has no procedure token, and upstream
-                            // keeps tracing / compiles a loop (pyjitpl.py:3012-3060)
-                            // — it never falls back to the origin loop's token.
-                            Some(greens) => self.meta.compiled_key_for_greens(greens),
-                            // No merge-point greens recorded (the walk did not close
-                            // on one): the trace's own key stands in.
-                            None => self.current_trace_green_key(),
-                        };
+                        let resolved_key = self
+                            .meta
+                            .trace_ctx()
+                            .and_then(|ctx| ctx.close_green_key_hash())
+                            .or_else(|| self.current_trace_green_key());
                         if crate::closedbg_enabled() {
                             eprintln!(
                                 "@@@CLOSE BRIDGE-TARGET close_greens={close_greens:?} resolved_key={} origin_key={}",

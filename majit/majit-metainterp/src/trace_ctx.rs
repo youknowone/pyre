@@ -315,6 +315,11 @@ pub struct TraceCtx {
     /// from.  Set by both close paths; `None` when the trace did not close on
     /// a merge point.
     pub(crate) close_greens: Option<(Vec<i64>, Vec<i64>, Vec<i64>)>,
+    /// The int pc green that belongs to [`Self::close_greens`].  The structured
+    /// `can_enter_jit` key prepends the back-edge target before the declared
+    /// greens, so reconstructing the interpreter-entered key for a close needs
+    /// this target in addition to the merge-point green tuple.
+    pub(crate) close_green_pc: Option<i64>,
     /// pyjitpl.py:2979 reached_loop_header parity: callback to check
     /// has_compiled_targets(ptoken) for a given green key. Bridge traces
     /// skip loop headers without compiled targets. Live lookup (not snapshot)
@@ -1438,6 +1443,7 @@ impl TraceCtx {
             }],
             header_greens: None,
             close_greens: None,
+            close_green_pc: None,
             heap_cache: HeapCache::new(),
             force_finish: false,
             last_traced_pc: 0,
@@ -1522,6 +1528,7 @@ impl TraceCtx {
             }],
             header_greens: None,
             close_greens: None,
+            close_green_pc: None,
             heap_cache: HeapCache::new(),
             force_finish: false,
             last_traced_pc: 0,
@@ -2012,18 +2019,38 @@ impl TraceCtx {
 
     /// pyjitpl.py:3183-3189: `compile_loop` keys the JitCell by
     /// `original_boxes[:num_green_args]`, i.e. the greens captured at the
-    /// merge point that closed the trace. `close_greens` is grouped by
-    /// JitCode register bank; rebuild the declared green order before hashing
-    /// so this matches warmstate.py:584-593 `JitCell.get_uhash`.
+    /// merge point that closed the trace.
     pub fn close_green_key_hash(&self) -> Option<u64> {
-        let (ints, refs, floats) = self.close_greens.as_ref()?;
-        let spec = self
-            .green_key_values
-            .as_ref()
-            .map(|key| key.types.clone())
-            .or_else(|| self.driver_descriptor.as_ref().map(|d| d.green_args_spec()))?;
+        let greens = self.close_greens.as_ref()?;
+        let pc = self.close_green_pc?;
+        self.merge_point_green_key_hash(pc, greens)
+    }
 
-        let mut values = Vec::with_capacity(spec.len());
+    /// pyjitpl.py:1553 / :3005 `get_procedure_token(greenboxes)` analog: the
+    /// jitcell key the INTERPRETER would enter by for these greens.  The
+    /// grouping is per JitCode register bank; rebuild the declared green order
+    /// before hashing so this matches warmstate.py:584-593 `JitCell.get_uhash`.
+    pub fn merge_point_green_key_hash(
+        &self,
+        pc: i64,
+        greens: &(Vec<i64>, Vec<i64>, Vec<i64>),
+    ) -> Option<u64> {
+        let (ints, refs, floats) = greens;
+        let spec = if let Some(key) = self.green_key_values.as_ref() {
+            debug_assert_eq!(
+                key.types.first().copied(),
+                Some(GreenType::Int),
+                "structured green key must start with the prepended target pc",
+            );
+            key.types.get(1..)?.to_vec()
+        } else {
+            self.driver_descriptor.as_ref().map(|d| d.green_args_spec())?
+        };
+
+        let mut values = Vec::with_capacity(spec.len() + 1);
+        let mut types = Vec::with_capacity(spec.len() + 1);
+        values.push(pc);
+        types.push(GreenType::Int);
         let mut int_i = 0;
         let mut ref_i = 0;
         let mut float_i = 0;
@@ -2047,7 +2074,8 @@ impl TraceCtx {
             };
             values.push(value);
         }
-        Some(crate::green_key_hash_typed(&values, &spec))
+        types.extend(spec);
+        Some(crate::green_key_hash_typed(&values, &types))
     }
 
     /// Set the structured green key values.
