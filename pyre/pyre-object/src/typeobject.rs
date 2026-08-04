@@ -632,8 +632,8 @@ fn cpython314_builtin_abi(name: &str) -> (i64, i64, i64, i64) {
         | "dict_reverseitemiterator" => (56, 0, 0, 0),
         "dict_keys" | "dict_values" | "dict_items" => (24, 0, 0, 0),
         "AttributeError" => (88, 0, 0, 16),
-        "BaseExceptionGroup" => (88, 0, 0, 16),
-        "ExceptionGroup" => (88, 0, -32, 16),
+        "BaseExceptionGroup" => (96, 0, 0, 16),
+        "ExceptionGroup" => (96, 0, -32, 16),
         "ImportError" | "ModuleNotFoundError" => (104, 0, 0, 16),
         "NameError" | "UnboundLocalError" | "StopIteration" | "SystemExit" => (80, 0, 0, 16),
         "SyntaxError" | "IndentationError" | "TabError" | "_IncompleteInputError" => {
