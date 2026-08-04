@@ -2838,6 +2838,27 @@ impl<S: JitState> JitDriver<S> {
                                     ),
                                     crate::pyjitpl::BridgeCompileResult::Compiled
                                 ),
+                                // compile.py:269-270: a cross-loop CUT keeps its cut prefix
+                                // in `front_target_tokens[0]`, where a loop closed at its own
+                                // header keeps its PREAMBLE — the peeled iteration that
+                                // re-derives the specialized label's invariants from the
+                                // loop's entry state, which is what makes `jump_to_preamble`
+                                // (unroll.py:238-242) sound as the no-matching-label
+                                // fallback. The cut prefix's invariants instead hold only
+                                // after the guards preceding the cut point have run.
+                                // `ResumeFromInterpDescr.get_resumestorage()` is None, so an
+                                // entry bridge carries no runtime values, `generate_guards`
+                                // rejects every specialized label, and the JUMP always
+                                // reaches that slot; on cel's
+                                // `batch_chain_eager_fold_traps` the unproven index bound
+                                // became an out-of-bounds store and a SIGSEGV on the reload.
+                                //
+                                // Scoped to this arm alone. A `ResumeGuardDescr` has resume
+                                // storage, so a specialized label can match and the fallback
+                                // need not be reached — and declining the guard origin too
+                                // makes `pi/pi.jinseo` at `MAJIT_THRESHOLD=50` compute wrong
+                                // digits from byte 865, same length, no crash.
+                                None if self.meta.is_cross_loop_cut_key(target_key) => false,
                                 None => match self.compile_trace_entry_data() {
                                     Some((original_green_key, entry_meta)) => matches!(
                                         self.meta.compile_trace_from_interp(
@@ -8126,5 +8147,189 @@ mod tests {
         // return None from index().
         let driver = JitDriver::<TypedRestoreState>::new(1);
         assert_eq!(driver.index(), None);
+    }
+}
+
+/// pyjitpl.py:3001-3007's JUMP arm, over the one target class it must not
+/// take: a loop stored under a cross-loop cut's inner jitcell token
+/// (compile.py:269-270).
+#[cfg(test)]
+mod cross_loop_cut_close_tests {
+    use super::*;
+    use majit_ir::{OpCode, OpRef};
+
+    /// Greens the compiled inner loop is registered under.
+    fn inner_greens() -> (Vec<i64>, Vec<i64>, Vec<i64>) {
+        (vec![4242], vec![], vec![])
+    }
+
+    /// A trace whose closing JUMP carries ONE int, matching the inner loop's
+    /// single inputarg (compile.py:334 `jump.numargs() == label.numargs()`).
+    #[derive(Default)]
+    struct CutCloseState;
+
+    impl JitState for CutCloseState {
+        type Meta = ();
+        type Sym = ();
+        type Env = ();
+
+        fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
+
+        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+            vec![0]
+        }
+
+        fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {}
+
+        fn is_compatible(&self, _meta: &Self::Meta) -> bool {
+            true
+        }
+
+        fn restore(&mut self, _meta: &Self::Meta, _values: &[i64]) {}
+
+        fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
+            vec![OpRef::input_arg_int(0)]
+        }
+
+        fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
+            true
+        }
+    }
+
+    /// Trace and compile a one-inputarg loop at `key`, registering it under
+    /// `inner_greens()`. `cut` routes `compile_loop` through the cross-loop cut
+    /// (compile.py:269-270) so the loop is stored under the inner token.
+    fn compile_inner_loop(driver: &mut JitDriver<CutCloseState>, key: u64, cut: bool) {
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[0]),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[0]),
+            BackEdgeAction::StartedTracing
+        ));
+        {
+            let ctx = driver.meta.trace_ctx().expect("should be tracing");
+            let i0 = OpRef::input_arg_int(0);
+            let c1 = ctx.const_int(1);
+            let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
+            // The optimizer rejects a guardless loop.
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
+            ctx.set_fail_args(g, &[sum]);
+            if cut {
+                ctx.cut_inner_green_key = Some(key);
+            }
+        }
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        assert!(driver.has_compiled_loop(key), "inner loop must compile");
+        driver.meta.record_loop_header_greens(key, inner_greens());
+        assert_eq!(
+            driver.meta.is_cross_loop_cut_key(key),
+            cut,
+            "the cut mark must follow the key compile_loop stored under",
+        );
+    }
+
+    /// Start an interp-origin trace (pyjitpl.py:2905 `ResumeFromInterpDescr`)
+    /// and record one op into it.
+    fn start_outer_trace(driver: &mut JitDriver<CutCloseState>, outer_key: u64) {
+        let mut state = CutCloseState;
+        driver.force_start_tracing(outer_key, outer_key as usize, &mut state, &());
+        assert!(driver.is_tracing(), "outer trace must start");
+        assert!(
+            driver.meta.bridge_info().is_none(),
+            "force_start_tracing is the interp origin",
+        );
+        let ctx = driver.meta.trace_ctx().expect("tracing ⇒ trace ctx");
+        let i0 = OpRef::input_arg_int(0);
+        let c2 = ctx.const_int(2);
+        let sum = ctx.record_op(OpCode::IntAdd, &[i0, c2]);
+        let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+        ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
+        ctx.set_fail_args(g, &[sum]);
+    }
+
+    /// The publish the walker makes at a merge point that already owns a
+    /// procedure token (pyjitpl.py:3005 `get_procedure_token(greenboxes)`).
+    fn close_jumping_into(driver: &mut JitDriver<CutCloseState>, target: u64) {
+        driver.merge_point(|meta, _sym| {
+            let Some(ctx) = meta.trace_ctx() else {
+                return TraceAction::Continue;
+            };
+            if std::mem::take(&mut ctx.merge_point_resumed) {
+                return TraceAction::Continue;
+            }
+            ctx.close_greens = Some(inner_greens());
+            ctx.close_jump_into_key = Some(target);
+            TraceAction::CloseLoop
+        });
+    }
+
+    /// A cross-loop cut leaves no PREAMBLE in `front_target_tokens[0]` — that
+    /// slot holds the cut prefix, whose entry invariants only the cutting trace
+    /// has proven. `jump_to_preamble` (unroll.py:238-242) is the fallback
+    /// whenever no specialized label matches, and an interp-origin entry bridge
+    /// always reaches it, so a cut target would be entered with the specialized
+    /// label's bounds unestablished.
+    #[test]
+    fn interp_origin_close_declines_a_cross_loop_cut_target() {
+        let mut driver = JitDriver::<CutCloseState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let inner_key = 7031u64;
+        compile_inner_loop(&mut driver, inner_key, /* cut */ true);
+
+        start_outer_trace(&mut driver, 7032);
+        close_jumping_into(&mut driver, inner_key);
+
+        // pyjitpl.py:3009-3010: `compile_trace` returned without raising, so
+        // the trace is NOT given up — the walk keeps recording.
+        assert!(
+            driver.is_tracing(),
+            "a cut target must not be entered by an entry bridge",
+        );
+        assert!(
+            driver
+                .meta
+                .trace_ctx()
+                .is_some_and(|ctx| ctx.cross_loop_close_declined(inner_key)),
+            "the decline must be latched so the walk does not re-attempt it",
+        );
+    }
+
+    /// The control the decline is measured against: the same close into a loop
+    /// compiled at its own header does take the JUMP, and a successful
+    /// `compile_trace` ends the trace (pyjitpl.py:3119-3123
+    /// `raise_if_successful`).
+    #[test]
+    fn interp_origin_close_takes_a_non_cut_target() {
+        let mut driver = JitDriver::<CutCloseState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let inner_key = 7051u64;
+        compile_inner_loop(&mut driver, inner_key, /* cut */ false);
+
+        start_outer_trace(&mut driver, 7052);
+        close_jumping_into(&mut driver, inner_key);
+
+        assert!(
+            !driver.is_tracing(),
+            "a non-cut target closes: compile_trace raises and tracing ends",
+        );
+    }
+
+    /// Retiring the loop retires the cut mark with it, so a later loop compiled
+    /// at the same key is not judged by its predecessor.
+    #[test]
+    fn retiring_a_cut_loop_forgets_its_cut_mark() {
+        let mut driver = JitDriver::<CutCloseState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let inner_key = 7041u64;
+        compile_inner_loop(&mut driver, inner_key, /* cut */ true);
+
+        driver.meta.remove_compiled_loop(inner_key);
+        assert!(
+            !driver.meta.is_cross_loop_cut_key(inner_key),
+            "the cut mark must not outlive the loop it describes",
+        );
     }
 }

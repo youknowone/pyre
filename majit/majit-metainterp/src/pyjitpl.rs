@@ -1103,6 +1103,21 @@ pub struct MetaInterp<M: Clone> {
     /// of the loop living AT that merge point (pyjitpl.py:3005), which the
     /// `u64` key alone cannot be inverted to.
     pub(crate) loop_header_greens: indexmap::IndexMap<u64, (Vec<i64>, Vec<i64>, Vec<i64>)>,
+    /// Keys whose compiled loop came from a cross-loop CUT (compile.py:269-270,
+    /// `TraceCtx::cut_inner_green_key`), rather than from a loop closing at its
+    /// own header.
+    ///
+    /// A cut loop's `front_target_tokens[0]` is not a general procedure entry.
+    /// For a loop compiled at its own header that slot is the PREAMBLE — the
+    /// peeled first iteration that re-derives, from the loop's entry state,
+    /// every invariant the specialized label carries — which is what makes
+    /// `jump_to_preamble` (unroll.py:238-242) sound as the fallback when no
+    /// specialized label matches. A cut has no such peeled entry: its first
+    /// target token is the cut prefix, whose entry invariants were established
+    /// by the guards the CUTTING trace had already executed before it reached
+    /// the cut point. Only that trace's own closing JUMP arrives with them
+    /// proven.
+    pub(crate) cut_compiled_keys: indexmap::IndexSet<u64>,
     pub(crate) tracing: Option<TraceCtx>,
     /// Single-pass tracing: the `(walk_final_pc, walk_final_reds)` snapshot
     /// copied off the active `TraceCtx` at the CloseLoop point BEFORE
@@ -2660,6 +2675,7 @@ impl<M: Clone> MetaInterp<M> {
             compiled_loops: indexmap::IndexMap::new(),
             loop_header_pcs: indexmap::IndexMap::new(),
             loop_header_greens: indexmap::IndexMap::new(),
+            cut_compiled_keys: indexmap::IndexSet::new(),
             tracing: None,
             single_pass_outcome: None,
             single_pass_finish: false,
@@ -5790,6 +5806,15 @@ impl<M: Clone> MetaInterp<M> {
             return CompileOutcome::Cancelled;
         }
 
+        // compile.py:269-270 `jitcell_token = cross_loop.jitcell_token`: mark
+        // the key this loop is about to be stored under as cut-owned, before
+        // the ctx that carries `cut_inner_green_key` is drained. Recorded on
+        // the way in rather than on success so a retried compile at the same
+        // key cannot leave the mark behind; `forget_loop_side_tables` retires
+        // it with the loop.
+        if let Some(cut_key) = cut_inner_green_key {
+            self.cut_compiled_keys.insert(cut_key);
+        }
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take().unwrap();
         // Cache driver descriptor before ctx is partially consumed below;
@@ -9225,6 +9250,16 @@ impl<M: Clone> MetaInterp<M> {
             .map(|(key, _)| *key)
     }
 
+    /// compile.py:269-270 parity: whether the loop at `green_key` was stored
+    /// under a cross-loop cut's inner jitcell token.
+    ///
+    /// See [`MetaInterp::cut_compiled_keys`] for why the distinction matters to
+    /// anything that wants to JUMP into the loop from outside the trace that
+    /// cut it.
+    pub fn is_cross_loop_cut_key(&self, green_key: u64) -> bool {
+        self.cut_compiled_keys.contains(&green_key)
+    }
+
     /// Actual key the last compile_loop stored under. Returns inner key
     /// for cross-loop cuts, otherwise the tracing key.
     pub fn last_compiled_key(&self) -> Option<u64> {
@@ -10052,6 +10087,7 @@ impl<M: Clone> MetaInterp<M> {
     fn forget_loop_side_tables(&mut self, green_key: u64) {
         self.loop_header_pcs.swap_remove(&green_key);
         self.loop_header_greens.swap_remove(&green_key);
+        self.cut_compiled_keys.swap_remove(&green_key);
     }
 
     /// rpython/rlib/rstack.py:75-90 `stack_almost_full` — delegates to
@@ -10684,6 +10720,7 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.clear();
         self.loop_header_pcs.clear();
         self.loop_header_greens.clear();
+        self.cut_compiled_keys.clear();
     }
 
     /// warmstate.py:385 — whether this driver's portal returns a raw int.
