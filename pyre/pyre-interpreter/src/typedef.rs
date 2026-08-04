@@ -3985,8 +3985,8 @@ fn init_super_type(ns: PyObjectRef) {
 
 /// `functional.py W_Range.descr_repr`.
 fn range_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_str_new_managed(&unsafe {
-        crate::display::py_repr(args[0])?
+    Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
+        crate::display::py_repr_wtf8(args[0])?
     }))
 }
 
@@ -4723,7 +4723,7 @@ fn init_list_type(ns: PyObjectRef) {
                 "__repr__",
                 |args| {
                     let list = crate::type_methods::require_list_receiver(args, "__repr__", false)?;
-                    Ok(w_str_new_managed(&unsafe {
+                    Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
                         crate::display::list_repr(list)?
                     }))
                 },
@@ -6180,9 +6180,9 @@ fn init_dict_type(ns: PyObjectRef) {
                         )));
                     }
                     unsafe {
-                        Ok(pyre_object::w_str_new_managed(&crate::display::dict_repr(
-                            dict,
-                        )?))
+                        Ok(pyre_object::w_str_from_wtf8_managed(
+                            crate::display::dict_repr(dict)?,
+                        ))
                     }
                 },
                 1,
@@ -6725,8 +6725,8 @@ fn init_dict_view_common_slots(
                     if args.is_empty() {
                         return Ok(pyre_object::w_str_new(""));
                     }
-                    Ok(pyre_object::w_str_new(&unsafe {
-                        crate::display::py_repr(args[0])?
+                    Ok(pyre_object::w_str_from_wtf8(unsafe {
+                        crate::display::py_repr_wtf8(args[0])?
                     }))
                 },
                 1,
@@ -8016,9 +8016,9 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                     return Ok(pyre_object::w_str_new("mappingproxy({})"));
                 }
                 unsafe {
-                    Ok(pyre_object::w_str_new_managed(&crate::display::py_repr(
-                        args[0],
-                    )?))
+                    Ok(pyre_object::w_str_from_wtf8_managed(
+                        crate::display::py_repr_wtf8(args[0])?,
+                    ))
                 }
             }),
         )
@@ -8342,7 +8342,7 @@ fn init_tuple_type(ns: PyObjectRef) {
                 |args| {
                     let tuple =
                         crate::type_methods::require_tuple_receiver(args, "__repr__", false)?;
-                    Ok(w_str_new_managed(&unsafe {
+                    Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
                         crate::display::tuple_repr(tuple)?
                     }))
                 },
@@ -8726,8 +8726,8 @@ fn slice_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// sliceobject.py `descr_repr` — `"slice(%r, %r, %r)"`.
 fn slice_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let self_ = slice_receiver(args, "__repr__")?;
-    Ok(w_str_new_managed(&unsafe {
-        crate::display::py_repr(self_)?
+    Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
+        crate::display::py_repr_wtf8(self_)?
     }))
 }
 
@@ -9111,8 +9111,9 @@ fn union_repr_method(args: &[PyObjectRef]) -> crate::PyResult {
             "descriptor '__repr__' requires a 'types.UnionType' object",
         ));
     }
-    let rendered = unsafe { crate::display::py_repr(self_)? };
-    Ok(pyre_object::w_str_new(&rendered))
+    Ok(pyre_object::w_str_from_wtf8(unsafe {
+        crate::display::py_repr_wtf8(self_)?
+    }))
 }
 
 /// `UnionType.__hash__` (`_pypy_generic_alias.py:275`).
@@ -18783,8 +18784,8 @@ fn init_object_type(ns: PyObjectRef) {
                     crate::type_methods::arity_no_args(args, "__str__")?;
                     // Delegate to __repr__ to avoid infinite recursion
                     // PyPy: objectobject.py descr___str__ → space.repr(w_self)
-                    Ok(pyre_object::w_str_new_managed(&unsafe {
-                        crate::py_repr(args[0])?
+                    Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
+                        crate::py_repr_wtf8(args[0])?
                     }))
                 },
                 1,
@@ -23555,9 +23556,9 @@ fn setlike_descr_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 
 fn setlike_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
-        Ok(pyre_object::w_str_new_managed(&crate::display::py_repr(
-            args[0],
-        )?))
+        Ok(pyre_object::w_str_from_wtf8_managed(
+            crate::display::py_repr_wtf8(args[0])?,
+        ))
     }
 }
 

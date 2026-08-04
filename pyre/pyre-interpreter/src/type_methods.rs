@@ -1673,7 +1673,7 @@ fn format_render(
             None => val,
             Some(cp) => match cp.to_char_lossy() {
                 's' => pyre_object::w_str_from_wtf8(unsafe { crate::py_str_wtf8(val)? }),
-                'r' => pyre_object::w_str_new(&unsafe { crate::py_repr(val)? }),
+                'r' => pyre_object::w_str_from_wtf8(unsafe { crate::py_repr_wtf8(val)? }),
                 'a' => pyre_object::w_str_new(&crate::builtins::py_ascii(val)?),
                 c => {
                     return Err(crate::PyError::value_error(format!(

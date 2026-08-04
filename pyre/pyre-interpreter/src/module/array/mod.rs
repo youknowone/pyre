@@ -926,28 +926,37 @@ fn array_copy_method(args: &[PyObjectRef]) -> PyResult {
 /// `array.__repr__` formatting (`interp_array.py descr_repr`).  Shared with
 /// `display::py_repr` so an array nested in a list / error / tuple formats
 /// the same way.
-pub fn array_repr_string(obj: PyObjectRef) -> Result<String, PyError> {
+pub fn array_repr_wtf8(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, PyError> {
     let tc = unsafe { arr::w_array_typecode(obj) } as char;
     let len = unsafe { arr::w_array_len(obj) };
     if len == 0 {
-        return Ok(format!("array('{tc}')"));
+        return Ok(rustpython_wtf8::Wtf8Buf::from_string(format!(
+            "array('{tc}')"
+        )));
     }
+    let mut out = rustpython_wtf8::Wtf8Buf::new();
+    out.push_str(&format!("array('{tc}', "));
     if matches!(tc, 'u' | 'w') {
         let s = array_tounicode_method(&[obj])?;
-        let inner_s = unsafe { crate::display::py_repr(s)? };
-        return Ok(format!("array('{tc}', {inner_s})"));
+        out.push_wtf8(&unsafe { crate::display::py_repr_wtf8(s)? });
+        out.push_str(")");
+        return Ok(out);
     }
-    let mut parts = Vec::with_capacity(len);
+    out.push_str("[");
     for i in 0..len {
+        if i != 0 {
+            out.push_str(", ");
+        }
         let w_item = unsafe { arr::w_array_unpack_item(obj, i) };
-        parts.push(unsafe { crate::display::py_repr(w_item)? });
+        out.push_wtf8(&unsafe { crate::display::py_repr_wtf8(w_item)? });
     }
-    Ok(format!("array('{tc}', [{}])", parts.join(", ")))
+    out.push_str("])");
+    Ok(out)
 }
 
 fn array_repr_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 1, "array.__repr__")?;
-    Ok(pyre_object::w_str_new(&array_repr_string(args[0])?))
+    Ok(pyre_object::w_str_from_wtf8(array_repr_wtf8(args[0])?))
 }
 
 // `interp_array.py compare_arrays`: compare each element with the requested

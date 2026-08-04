@@ -6920,12 +6920,12 @@ fn base_exception_str_method(args: &[PyObjectRef]) -> crate::PyResult {
 fn exception_str_method(args: &[PyObjectRef]) -> crate::PyResult {
     let obj = args[0];
     let text = unsafe {
-        match crate::display::exception_kind_str(obj)? {
+        match crate::display::exception_kind_str_wtf8(obj)? {
             Some(s) => s,
-            None => crate::display::base_exception_str(obj)?,
+            None => crate::display::base_exception_str_wtf8(obj)?,
         }
     };
-    Ok(pyre_object::w_str_new(&text))
+    Ok(pyre_object::w_str_from_wtf8(text))
 }
 
 /// `interp_exceptions.py:135-151 W_BaseException.descr_repr` — every builtin
@@ -6933,8 +6933,8 @@ fn exception_str_method(args: &[PyObjectRef]) -> crate::PyResult {
 /// alone and reads the receiver's own class name.
 fn exception_repr_method(args: &[PyObjectRef]) -> crate::PyResult {
     let obj = args[0];
-    Ok(pyre_object::w_str_new(&unsafe {
-        crate::display::py_repr(obj)?
+    Ok(pyre_object::w_str_from_wtf8(unsafe {
+        crate::display::py_repr_wtf8(obj)?
     }))
 }
 

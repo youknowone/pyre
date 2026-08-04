@@ -157,18 +157,22 @@ fn structseq_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             .unwrap_or_default()
     };
     let n = unsafe { pyre_object::w_tuple_len(inst) };
-    let mut parts: Vec<String> = Vec::with_capacity(n);
+    let mut out = rustpython_wtf8::Wtf8Buf::new();
+    out.push_str(&name);
+    out.push_str("(");
     for i in 0..n {
+        if i != 0 {
+            out.push_str(", ");
+        }
         let item = unsafe { pyre_object::w_tuple_getitem(inst, i as i64) }
             .unwrap_or(pyre_object::w_none());
         let fname = fields.get(i).cloned().unwrap_or_else(|| format!("?{i}"));
-        let r_str = unsafe { crate::py_repr(item)? };
-        parts.push(format!("{fname}={r_str}"));
+        out.push_str(&fname);
+        out.push_str("=");
+        out.push_wtf8(&unsafe { crate::py_repr_wtf8(item)? });
     }
-    Ok(pyre_object::w_str_new(&format!(
-        "{name}({})",
-        parts.join(", ")
-    )))
+    out.push_str(")");
+    Ok(pyre_object::w_str_from_wtf8(out))
 }
 
 /// `lib_pypy/_structseq.py structseq_reduce` — `return type(self),

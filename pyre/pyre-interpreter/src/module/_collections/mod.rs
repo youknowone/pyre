@@ -1277,27 +1277,32 @@ impl W_Deque {
         store(self_obj, items);
         Ok(self_obj)
     }
-    fn __repr__(&self) -> Result<String, crate::PyError> {
+    fn __repr__(&self) -> Result<PyObjectRef, crate::PyError> {
         let self_obj = self as *const W_Deque as PyObjectRef;
         // `dequerepr` — a deque reachable from its own items renders
         // the inner reference as `[...]` instead of recursing.
         let Some(_guard) = crate::display::ReprGuard::enter(self_obj) else {
-            return Ok("[...]".to_string());
+            return Ok(pyre_object::w_str_new("[...]"));
         };
         // The repr uses the short class name, so strip any dotted
         // module prefix from the builtin tp_name (`collections.deque`
         // → `deque`); a user subclass name has no dot.
         let full = unsafe { w_type_get_name(w_instance_get_type(self_obj)) };
         let name = full.rsplit('.').next().unwrap_or(full);
-        let listrepr = snapshot(self_obj)
-            .into_iter()
-            .map(|it| unsafe { crate::py_repr(it) })
-            .collect::<Result<Vec<_>, _>>()?
-            .join(", ");
-        Ok(match maxlen_bound(self_obj) {
-            Some(m) => format!("{name}([{listrepr}], maxlen={m})"),
-            None => format!("{name}([{listrepr}])"),
-        })
+        let mut out = rustpython_wtf8::Wtf8Buf::new();
+        out.push_str(name);
+        out.push_str("([");
+        for (i, item) in snapshot(self_obj).into_iter().enumerate() {
+            if i != 0 {
+                out.push_str(", ");
+            }
+            out.push_wtf8(&unsafe { crate::py_repr_wtf8(item)? });
+        }
+        match maxlen_bound(self_obj) {
+            Some(m) => out.push_str(&format!("], maxlen={m})")),
+            None => out.push_str("])"),
+        }
+        Ok(pyre_object::w_str_from_wtf8(out))
     }
 
     #[getter]

@@ -642,8 +642,12 @@ pub fn convert_value(value: PyObjectRef, conv: i64) -> Result<PyObjectRef, crate
         let w = unsafe { crate::py_str_wtf8(value)? };
         return Ok(pyre_object::w_str_from_wtf8_managed(w));
     }
+    if conv == 1 {
+        return Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
+            crate::py_repr_wtf8(value)?
+        }));
+    }
     let s = match conv {
-        1 => unsafe { crate::py_repr(value)? },
         2 => crate::builtins::py_ascii(value)?,
         _ => unsafe { crate::py_str(value)? },
     };
