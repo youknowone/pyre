@@ -284,7 +284,12 @@ pub fn is_pyframe_operand_stack_accessor(addr: usize) -> bool {
     addrs.contains(&(addr as i64))
 }
 
-/// True when `addr` is the `list_write_barrier` residual fnaddr.
+/// True when `addr` is the list write barrier's residual fnaddr, in either the
+/// bare [`pyre_object::list_write_barrier`] spelling or the
+/// `prepare_list_ref_store` wrapper the Object-strategy store goes through
+/// (the wrapper only adds the `push_roots` bracket that keeps the stored value
+/// addressable across the barrier's safepoint — the same bookkeeping, so the
+/// same exemption).
 ///
 /// The #171 object-append fold descends `w_list_append`; its Object-strategy
 /// arm stores a GC ref and runs `list_write_barrier(obj)`
@@ -318,6 +323,8 @@ pub fn is_list_write_barrier(addr: usize) -> bool {
             .filter(|(path, _)| {
                 path.ends_with("::listobject::list_write_barrier")
                     || *path == "pyre_object::list_write_barrier"
+                    || path.ends_with("::listobject::prepare_list_ref_store")
+                    || *path == "pyre_object::prepare_list_ref_store"
             })
             .map(|(_, fnaddr)| fnaddr)
             .collect()
@@ -1712,6 +1719,23 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::listobject::list_write_barrier",
         "pyre_object::list_write_barrier",
         pyre_object::list_write_barrier as *const (),
+    );
+    // The Object arm reaches the barrier through `prepare_list_ref_store`,
+    // which brackets it in `push_roots` so the value survives the safepoint
+    // inside the barrier's ownership query. That bracket's zero-arg
+    // root-stack resolve has no registered address, so leaving it inside the
+    // descended body made every object-strategy append decline the fold. The
+    // wrapper is `dont_look_inside`; register it for the same reason as the
+    // barrier itself.
+    let prepare_list_ref_store: fn(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+    ) -> pyre_object::PyObjectRef = pyre_object::listobject::prepare_list_ref_store;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::listobject::prepare_list_ref_store",
+        "pyre_object::prepare_list_ref_store",
+        prepare_list_ref_store as *const (),
     );
     // The #171 fold descends `w_list_append` as a sub-jitcode walk, so a guard
     // exit inside it is numbered against `w_list_append`'s own jitcode and is

@@ -638,7 +638,22 @@ fn list_write_barrier_impl(obj: PyObjectRef, managed: bool) {
 /// shadow-stack slot. A concurrent collector may run while the barrier waits
 /// for the GC operation gate, so the raw Rust argument must be reloaded before
 /// the following pointer store.
-fn prepare_list_ref_store(obj: PyObjectRef, value: PyObjectRef) -> PyObjectRef {
+///
+/// `dont_look_inside`: the `push_roots` bracket around the barrier resolves the
+/// thread-local root stack and installs a `Drop` that truncates it — a
+/// shadow-stack shape with no RPython counterpart (the GC transform emits
+/// `ll_writebarrier` with no bracket at all) and no lowering in the tracer, so
+/// the object-append descent used to hit its unregistered zero-arg callee as a
+/// `symbolic_fnaddr_for_path` hash and decline the whole fold. Collapsing the
+/// bracket and the barrier into one registered residual keeps the Object arm's
+/// `set_len` / `setitem_fast` leaves foldable to native ops, and costs the same
+/// one residual call the barrier alone already did.
+///
+/// Returns `value` at its post-barrier address: the ownership query inside
+/// `list_write_barrier` is a safepoint, so the caller must store the returned
+/// pointer rather than the argument it passed.
+#[majit_macros::dont_look_inside]
+pub fn prepare_list_ref_store(obj: PyObjectRef, value: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let value_slot = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(value);
