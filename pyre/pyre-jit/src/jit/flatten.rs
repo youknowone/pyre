@@ -114,6 +114,18 @@ pub struct SSARepr {
     /// time (call_jit.rs:3939).  Sparse `Vec<(py_pc, first_insn_pos)>`
     /// keyed by py_pc.
     pub pc_first_insn_pos: Vec<(i64, usize)>,
+    /// Pyre-only side-table: `(insns index, py_pc)` for EVERY
+    /// `abort_permanent` serialized, in emission order.
+    ///
+    /// `pc_first_insn_pos` above cannot answer "which opcode owns this
+    /// marker": it keeps only the FIRST position per Python PC, so a block
+    /// emitted out of source order — the `LoadFastCheck` null arm, appended
+    /// after the whole body — is attributed to whichever PC last opened a
+    /// segment.  Markers are the one op class that needs the exact inverse
+    /// (`loop_body_abort_permanent_pc` decides a whole frame on it), and there
+    /// are a handful per jitcode, so recording them exactly costs nothing that
+    /// a dense per-op table would.
+    pub abort_permanent_insn_pos: Vec<(usize, i64)>,
     /// Per-kind fresh-Variable counter. RPython has no analog
     /// because RPython's `Variable()` constructor produces objects with
     /// implicit identity and `regalloc.py` numbers them densely after
@@ -136,8 +148,21 @@ impl SSARepr {
             insns: Vec::new(),
             insns_pos: None,
             pc_first_insn_pos: Vec::new(),
+            abort_permanent_insn_pos: Vec::new(),
             next_var_idx: [0; 3],
         }
+    }
+
+    /// Every `insns` index the side-tables hold, as mutable references.
+    ///
+    /// The marker-splicing passes that insert `-live-` into `insns` must
+    /// rewrite each side-table position by the same shift; iterating them
+    /// together keeps a newly added table from silently missing a pass.
+    pub fn stream_positions_mut(&mut self) -> impl Iterator<Item = &mut usize> {
+        self.pc_first_insn_pos
+            .iter_mut()
+            .map(|(_, pos)| pos)
+            .chain(self.abort_permanent_insn_pos.iter_mut().map(|(pos, _)| pos))
     }
 
     /// Allocate a fresh `(kind, index)` Variable for this SSARepr.
@@ -1342,14 +1367,19 @@ impl<'a> GraphFlattener<'a> {
         // ownership the stream had before per-PC marker emission.
         if op.offset >= 0 && op.opname != OPNAME_LIVE {
             let py_pc = op.offset;
+            let pos = self.ssarepr.insns.len();
             let already_seen = self
                 .ssarepr
                 .pc_first_insn_pos
                 .iter()
                 .any(|(pc, _)| *pc == py_pc);
             if !already_seen {
-                let pos = self.ssarepr.insns.len();
                 self.ssarepr.pc_first_insn_pos.push((py_pc, pos));
+            }
+            // Every marker, not just the first per PC: the exact inverse is
+            // what `loop_body_abort_permanent_pc` resolves a decline against.
+            if op.opname == "abort_permanent" {
+                self.ssarepr.abort_permanent_insn_pos.push((pos, py_pc));
             }
         }
         let insn = self.flatten_space_operation(op);

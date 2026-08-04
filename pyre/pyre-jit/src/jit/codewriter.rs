@@ -4592,6 +4592,14 @@ fn filter_liveness_in_place(
         .iter()
         .map(|entry| entry.map(|old| remap[old]))
         .collect();
+    // `abort_permanent_insn_pos` was captured on the same pre-merge stream, so
+    // it needs the same `remove_repeated_live` rewrite.  Remapped in place
+    // rather than returned alongside `first_insn_post_merge` because the
+    // SSARepr itself reaches `finish_with_positions_from`, which is where the
+    // positions become JitCode byte offsets.
+    for (pos, _) in ssarepr.abort_permanent_insn_pos.iter_mut() {
+        *pos = remap[*pos];
+    }
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let nlocals = code.varnames.len();
     let live_markers_out = live_markers.clone();
@@ -13686,7 +13694,7 @@ impl CodeWriter {
             spliced
                 .insns
                 .insert(first_op_pos, super::flatten::Insn::live(Vec::new()));
-            for (_, pos) in spliced.pc_first_insn_pos.iter_mut() {
+            for pos in spliced.stream_positions_mut() {
                 if *pos >= first_op_pos {
                     *pos += 1;
                 }
@@ -13729,7 +13737,7 @@ impl CodeWriter {
                 }
             }
             shift.push(inserted);
-            for (_, pos) in spliced.pc_first_insn_pos.iter_mut() {
+            for pos in spliced.stream_positions_mut() {
                 *pos += shift[*pos];
             }
             spliced.insns = new_insns;
@@ -13810,7 +13818,7 @@ impl CodeWriter {
                 new_insns.push(insn.clone());
             }
             shift.push(inserted);
-            for (_, pos) in spliced.pc_first_insn_pos.iter_mut() {
+            for pos in spliced.stream_positions_mut() {
                 *pos += shift[*pos];
             }
             spliced.insns = new_insns;
@@ -13835,6 +13843,7 @@ impl CodeWriter {
         }
         ssarepr.insns = spliced.insns;
         ssarepr.pc_first_insn_pos = spliced.pc_first_insn_pos;
+        ssarepr.abort_permanent_insn_pos = spliced.abort_permanent_insn_pos;
         // Per-PC `-live-` marker indices feeding `filter_liveness_in_place`
         // (translated through its `remove_repeated_live` remap), and the
         // sparse after-residual-call resume anchors — both derived from the
@@ -14178,14 +14187,34 @@ impl CodeWriter {
             .enumerate()
             .filter_map(|(py_pc, entry)| entry.map(|idx| (py_pc, idx)))
             .collect();
+        // `abort_permanent` markers ride the same translation as a third
+        // sparse group: `finish_with_positions_from` consumes `ssarepr`, so the
+        // owning Python PCs are read off it here, before the call.
+        let abort_permanent_some: Vec<(usize, i64)> = ssarepr.abort_permanent_insn_pos.clone();
         let mut combined_indices = pc_map.clone();
         combined_indices.extend(after_call_some.iter().map(|(_, idx)| *idx));
         combined_indices.extend(first_insn_some.iter().map(|(_, idx)| *idx));
+        combined_indices.extend(abort_permanent_some.iter().map(|(idx, _)| *idx));
         let (jitcode, combined_bytes) = {
             let mut asm = self.assembler.borrow_mut();
             assembler.finish_with_positions_from(&mut *asm, ssarepr, &combined_indices, num_regs)
         }?;
         let pc_map_bytes = combined_bytes[..pc_map.len()].to_vec();
+        // Exact jitcode-offset → owning-Python-PC inverse for markers only.
+        // `py_floor_by_jit_pc` below cannot serve: it keys each Python PC to
+        // its FIRST jitcode offset, so a marker in a block emitted after the
+        // whole body floors to whichever PC last opened a segment.
+        let abort_permanent_base = pc_map.len() + after_call_some.len() + first_insn_some.len();
+        let mut abort_permanent_py_pc_by_jit_pc: Vec<(u32, u32)> = abort_permanent_some
+            .iter()
+            .enumerate()
+            .filter_map(|(k, (_, py_pc))| {
+                let off = u32::try_from(combined_bytes[abort_permanent_base + k]).ok()?;
+                Some((off, u32::try_from(*py_pc).ok()?))
+            })
+            .collect();
+        abort_permanent_py_pc_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+        abort_permanent_py_pc_by_jit_pc.dedup_by_key(|&mut (off, _)| off);
         // `usize::MAX` = the PC emitted no jitcode of its own (trivia /
         // folded). This local build-time table seeds the floor and marker twins.
         let mut first_jit_pc_by_py_pc: Vec<usize> = vec![usize::MAX; pc_map.len()];
@@ -14724,6 +14753,7 @@ impl CodeWriter {
             n_py_instrs,
             block_head_py_by_jit_pc,
             py_floor_by_jit_pc,
+            abort_permanent_py_pc_by_jit_pc,
             merge_entry_by_green,
             pcdep_by_jit_pc,
             depth_pred_by_jit_pc,
