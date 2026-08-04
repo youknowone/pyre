@@ -2748,9 +2748,6 @@ fn write_traceback_chain_from_tb<W: Write>(
         writer.write_all(b"  File \"")?;
         writer.write_all(&filename)?;
         writeln!(writer, "\", line {lineno}, in {funcname}")?;
-        // A source path with no UTF-8 spelling simply does not resolve, and
-        // `error.py:150 linecache.getline` likewise renders nothing then.
-        let source_filename = String::from_utf8_lossy(&filename);
         // `FrameSummary._set_lines` collects every line the failing
         // instruction spans, so a statement written across several lines (a
         // class body, a multi-line call) shows all of them, dedented by the
@@ -2761,7 +2758,7 @@ fn write_traceback_chain_from_tb<W: Write>(
         {
             let span: Vec<String> = (start_line..=end_line)
                 .map(|n| {
-                    read_source_line(&source_filename, n as i64)
+                    read_source_line(&filename, n as i64)
                         .map_or(String::new(), |l| l.trim_end().to_string())
                 })
                 .collect();
@@ -2770,7 +2767,7 @@ fn write_traceback_chain_from_tb<W: Write>(
                     writeln!(writer, "    {line}")?;
                 }
             }
-        } else if let Some(line) = read_source_line(&source_filename, lineno) {
+        } else if let Some(line) = read_source_line(&filename, lineno) {
             let raw_line = line.trim_end_matches(['\n', '\r']);
             let shown_line = raw_line.trim_start();
             writeln!(writer, "    {shown_line}")?;
@@ -2952,10 +2949,26 @@ fn traceback_anchors(raw_line: &str, start_col: usize, end_col: usize) -> Option
 /// Open `filename` and return its `lineno`-th line (1-indexed).  Returns
 /// `None` for synthetic / unreadable sources — matches PyPy's silent
 /// `linecache.getline` fallback at `error.py:150`.
-fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
-    if lineno <= 0 || filename.is_empty() || filename.starts_with('<') {
+///
+/// The name arrives as the filesystem bytes the code object carries, because
+/// `linecache.getline` is handed `co_filename` itself: a path spelling a byte
+/// with no UTF-8 form still has to open the file it names, which the lossy
+/// spelling no longer does.
+fn read_source_line(filename: &[u8], lineno: i64) -> Option<String> {
+    if lineno <= 0 || filename.is_empty() || filename.first() == Some(&b'<') {
         return None;
     }
+    #[cfg(all(feature = "host_env", unix))]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::Path::new(std::ffi::OsStr::from_bytes(filename))
+    };
+    // Elsewhere the platform has no bytes spelling of a path, so a name that is
+    // not valid UTF-8 simply does not resolve.
+    #[cfg(all(feature = "host_env", not(unix)))]
+    let lossy = String::from_utf8_lossy(filename);
+    #[cfg(all(feature = "host_env", not(unix)))]
+    let path = std::path::Path::new(lossy.as_ref());
     #[cfg(feature = "host_env")]
     {
         // Read through the import machinery's source provider, not std::fs:
@@ -2964,11 +2977,15 @@ fn read_source_line(filename: &str, lineno: i64) -> Option<String> {
         // On wasm32 the provider is the embedder's — the host-FS bridge for the
         // native-host build, `NullSourceProvider` in a browser — so the same
         // call renders the offending line wherever one is actually reachable.
-        let bytes = crate::importing::read_source_bytes(std::path::Path::new(filename)).ok()?;
+        let bytes = crate::importing::read_source_bytes(path).ok()?;
         // `linecache` opens with `tokenize.open`, so the BOM and the PEP 263
         // cookie decide the encoding; a plain UTF-8 read drops the whole line
-        // for a file declaring anything else.
-        let content = crate::compile::decode_source_bytes(&bytes, filename, false).ok()?;
+        // for a file declaring anything else.  The name reaches the decode only
+        // to report a failure this caller discards, so the lossy spelling of a
+        // path with no UTF-8 form is enough there.
+        let content =
+            crate::compile::decode_source_bytes(&bytes, &String::from_utf8_lossy(filename), false)
+                .ok()?;
         content
             .lines()
             .nth((lineno - 1) as usize)
