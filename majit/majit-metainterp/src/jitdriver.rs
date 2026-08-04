@@ -2487,6 +2487,53 @@ impl<S: JitState> JitDriver<S> {
         Some((original_green_key, trace_meta))
     }
 
+    /// pyjitpl.py:1641-1663, the loop arm of
+    /// `_create_segmented_trace_and_blackhole`:
+    ///
+    /// ```python
+    /// target_token = compile.compile_simple_loop(
+    ///     metainterp, greenkey, metainterp.history.trace,
+    ///     fake_runtime_boxes, enable_opts, cut_at, patch_jumpop_at_end=False)
+    /// jd_sd.warmstate.attach_procedure_to_interp(
+    ///     greenkey, target_token.targeting_jitcell_token)
+    /// ```
+    ///
+    /// Split out of the `TraceAction::SegmentedLoop` arm so the arm can host
+    /// the bridge else-arm (pyjitpl.py:1665-1668) beside it without the two
+    /// compiles pushing the shared handoff and blackhole tail apart.
+    fn compile_segmented_loop(&mut self, meta: S::Meta) {
+        let Some(green_key) = self.meta.compile_simple_loop(meta) else {
+            return;
+        };
+        // pyjitpl.py:2760 reads the greenkey from current_merge_points;
+        // without staging the key here, the segmented-loop abort hook
+        // reports key 0.
+        self.meta.pending_abort_green_key = Some(green_key);
+        // pyjitpl.py:1662-1663 line-by-line: pass the compiled
+        // `target_token` returned by `compile_simple_loop` to
+        // `attach_procedure_to_interp`, NOT a fresh synthetic uncompiled
+        // JitCellToken.  pyre's `compile_simple_loop` returns the
+        // green_key; the actual `Arc<JitCellToken>` is the `token` field
+        // of the freshly-installed `CompiledEntry` in `self.compiled_loops`.
+        let install_token = self
+            .meta
+            .compiled_loops
+            .get(&green_key)
+            .expect(
+                "compile_simple_loop returned Some(green_key) ⇒ \
+                 compiled_loops has the new CompiledEntry",
+            )
+            .live_token();
+        // `warmstate.py:339-348` redirect+record_jump_to chain routed
+        // through MetaInterp's caller-side helper.  Skip the redirect when
+        // MemoryManager has already evicted the freshly-installed token
+        // (rare; eviction is independent of this insertion path).
+        if let Some(install_token) = install_token {
+            self.meta
+                .attach_procedure_with_redirect(green_key, install_token);
+        }
+    }
+
     /// RPython rlib.jit.current_trace_length().
     /// Returns the number of ops in the active trace, or -1 if not tracing.
     pub fn current_trace_length(&mut self) -> i64 {
@@ -3491,12 +3538,24 @@ impl<S: JitState> JitDriver<S> {
                     }
                     self.sym = None;
                 }
-                TraceAction::SegmentedLoop => {
-                    // pyjitpl.py:1658-1663 _create_segmented_trace_and_blackhole:
-                    //   target_token = compile.compile_simple_loop(...)
-                    //   warmstate.attach_procedure_to_interp(greenkey, token)
-                    // + pyjitpl.py:1673 SwitchToBlackhole(ABORT_SEGMENTED_TRACE)
-                    //
+                action @ (TraceAction::SegmentedLoop | TraceAction::SegmentedBridge { .. }) => {
+                    // pyjitpl.py:1639-1668 _create_segmented_trace_and_blackhole,
+                    // compile half.  Upstream branches on whether the segmented
+                    // trace owns a merge point and entered from the interpreter:
+                    //   loop:   target_token = compile.compile_simple_loop(...)
+                    //           warmstate.attach_procedure_to_interp(greenkey, token)
+                    //   bridge: target_token = compile.compile_trace(
+                    //               metainterp, metainterp.resumekey, [exception_box])
+                    //           if target_token is not token: compile.giveup()
+                    // then leaves through one shared
+                    // pyjitpl.py:1673 SwitchToBlackhole(ABORT_SEGMENTED_TRACE).
+                    // `create_segmented_trace` made that choice while it still
+                    // held the `TraceCtx`; the box it carries is the FINISH
+                    // operand the bridge arm still has to record.
+                    let bridge_exception_box = match action {
+                        TraceAction::SegmentedBridge { exception_box } => Some(exception_box),
+                        _ => None,
+                    };
                     // pyjitpl.py:1671-1672 blackholes back to the interpreter
                     // rather than jumping to compiled code.  Publish the
                     // single-pass handoff first — the walk executed everything
@@ -3519,40 +3578,56 @@ impl<S: JitState> JitDriver<S> {
                             self.meta.single_pass_virt_array_values = Some(elems);
                         }
                     }
-                    let meta = self.meta.take_trace_meta().unwrap();
-                    if let Some(green_key) = self.meta.compile_simple_loop(meta) {
-                        // pyjitpl.py:2760 reads the greenkey from
-                        // current_merge_points; without staging the key here,
-                        // the segmented-loop abort hook reports key 0.
-                        self.meta.pending_abort_green_key = Some(green_key);
-                        // pyjitpl.py:1662-1663 line-by-line: pass the compiled
-                        // `target_token` returned by `compile_simple_loop` to
-                        // `attach_procedure_to_interp`, NOT a fresh synthetic
-                        // uncompiled JitCellToken.  pyre's `compile_simple_loop`
-                        // returns the green_key; the actual `Arc<JitCellToken>`
-                        // is the `token` field of the freshly-installed
-                        // `CompiledEntry` in `self.compiled_loops`.
-                        let install_token = self
-                            .meta
-                            .compiled_loops
-                            .get(&green_key)
-                            .expect(
-                                "compile_simple_loop returned Some(green_key) ⇒ \
-                             compiled_loops has the new CompiledEntry",
-                            )
-                            .live_token();
-                        // `warmstate.py:339-348` redirect+record_jump_to chain
-                        // routed through MetaInterp's caller-side helper.  Skip
-                        // the redirect when MemoryManager has already evicted
-                        // the freshly-installed token (rare; eviction is
-                        // independent of this insertion path).
-                        if let Some(install_token) = install_token {
-                            self.meta
-                                .attach_procedure_with_redirect(green_key, install_token);
+                    let abort_reason = match bridge_exception_box {
+                        // pyjitpl.py:1665-1668, the else-arm: a guard-origin
+                        // bridge has no merge point to make a loop out of, so
+                        // the segment is closed as an ordinary bridge.
+                        // `compile_finish_from_active_session` IS
+                        // `compile.compile_trace(metainterp, self.resumekey,
+                        // [exception_box])` for a bridge origin: it records the
+                        // FINISH under `sd.exit_frame_with_exception_descr_ref`
+                        // and returns `Err` exactly where upstream's
+                        // `target_token is not token` reaches `compile.giveup()`
+                        // (compile.py:27, `SwitchToBlackhole(ABORT_BRIDGE)`).
+                        //
+                        // The flag this arm answers to was already being armed
+                        // with nothing to act on it: `prepare_trace_segmenting`
+                        // (pyjitpl.py:2849-2857) sets FORCE_BRIDGE_SEGMENTING on
+                        // the source loop token, `start_retrace_from_guard`
+                        // reads it back into `force_finish_trace`
+                        // (compile.py:725-731), and the bridge then ran on to
+                        // the ordinary over-limit abort — the retracing-forever
+                        // outcome the flag is set to prevent.  Upstream's own
+                        // note at pyjitpl.py:2854: "creating a segmented bridge
+                        // is generally quite safe".
+                        Some(exception_box) => {
+                            // Read before the compile drains the tracer: the
+                            // bridge's own key is what its abort hook reports.
+                            let green_key = self.meta.trace_ctx().map(|ctx| ctx.green_key);
+                            let result = self.meta.compile_finish_from_active_session(
+                                &[exception_box],
+                                vec![majit_ir::Type::Int],
+                                /* exit_with_exception */ true,
+                            );
+                            // On the giveup path `abort_trace_live` already
+                            // staged this key; on the success path it was
+                            // cleared again.  Stage it either way so the hook
+                            // below does not report key 0.
+                            self.meta.pending_abort_green_key = green_key;
+                            match result {
+                                Ok(()) => crate::counters::ABORT_SEGMENTED_TRACE,
+                                Err(stb) => stb.reason,
+                            }
                         }
-                    }
+                        None => {
+                            let meta = self.meta.take_trace_meta().unwrap();
+                            self.compile_segmented_loop(meta);
+                            crate::counters::ABORT_SEGMENTED_TRACE
+                        }
+                    };
                     // Blackhole transition: clear all driver tracing state.
-                    // `take_trace_meta` above drained the M-ownership side;
+                    // `take_trace_meta` / `compile_finish_from_active_session`
+                    // above drained the M-ownership side;
                     // `leave_profiler_tracing` fires the matching
                     // `pyjitpl.py:2934 finally: profiler.end_tracing()`.
                     // `clear_trace_session` is then a no-op for both effects
@@ -3565,8 +3640,10 @@ impl<S: JitState> JitDriver<S> {
                     // Counters.ABORT_SEGMENTED_TRACE)` — upstream's handler
                     // (pyjitpl.py:2949) runs `aborted_tracing(stb.reason)`, so a
                     // segmented trace counts as an abort with its own reason.
-                    self.meta
-                        .aborted_tracing(crate::counters::ABORT_SEGMENTED_TRACE);
+                    // A bridge arm that gave up carries `ABORT_BRIDGE` instead,
+                    // for the same reason: `giveup` raises its own
+                    // SwitchToBlackhole and that is the reason the handler sees.
+                    self.meta.aborted_tracing(abort_reason);
                 }
                 // Consumed inside the metainterp dispatch loop
                 // (PyreMetaInterp::step_inline_frame pops the inline frame and

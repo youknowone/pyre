@@ -392,6 +392,23 @@ pub enum TraceAction {
     /// The trace has GUARD_ALWAYS_FAILS + unreachable FINISH appended.
     /// compile_simple_loop inserts a LABEL at entry for bridge attachment.
     SegmentedLoop,
+    /// The else-arm of the same split (pyjitpl.py:1665-1668): the segmented
+    /// trace is a guard-origin bridge, so there is no merge point to make a
+    /// loop out of and it is closed as an ordinary bridge instead.
+    ///
+    /// ```python
+    /// target_token = compile.compile_trace(metainterp, metainterp.resumekey,
+    ///                                      [exception_box])
+    /// if target_token is not token:
+    ///     compile.giveup()
+    /// ```
+    ///
+    /// The trace has GUARD_ALWAYS_FAILS appended but NOT the FINISH — the
+    /// driver's compile records it, so that it carries
+    /// `sd.exit_frame_with_exception_descr_ref` (the `token` upstream
+    /// compares the returned target against).  `exception_box` is the
+    /// operand it finishes with, the same box the loop arm records.
+    SegmentedBridge { exception_box: OpRef },
     /// Abort the current trace (recoverable — may retry later).
     Abort,
     /// Decline the current trace before compilation and return to residual
