@@ -382,6 +382,18 @@ jobs:
       # native backends.
       if: runner.os == 'Linux'
       run: rustup target add wasm32-unknown-unknown
+    - name: Build pyre-wasm web binding (Linux only)
+      # check.py builds and exercises the wasm-host binding below. Build the
+      # browser binding in the same release target first so the two flavours
+      # share their compiled dependencies without spending two additional
+      # runner jobs on checkout, cache restore, and LLBC download. check.py's
+      # later wasm-host build intentionally replaces pyre_wasm.wasm before it
+      # snapshots and runs that module.
+      if: runner.os == 'Linux'
+      run: |
+        cargo build --release -p pyre-wasm \
+          --target wasm32-unknown-unknown \
+          --no-default-features --features web
     - name: Run pyre/check.py
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
@@ -543,77 +555,6 @@ jobs:
       # `--timeout` is per module: `test.test_asyncio` alone takes ~117s of CPU
       # and ~2m47s of wall time, which does not fit the former 120s limit.
       run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --backend dynasm --baseline pyre/cpython_tests/baseline.json --jobs 3 --timeout 300
-
-  wasm-build:
-    name: wasm build (pyre-wasm, ${{ matrix.binding }})
-    runs-on: ubuntu-24.04
-    needs: prepare-charon-llbc-linux
-    if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
-    env:
-      # See prepare-charon-llbc: downstream jobs download the prepared Charon
-      # artifact into this workspace path. pyre-wasm pulls pyre-jit, whose
-      # build needs the extracted LLBC.
-      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.05.29
-    strategy:
-      fail-fast: false
-      matrix:
-        # web = wasm-bindgen / browser host; wasm-host = plain C-ABI for a
-        # native (wasmtime / wasmi) embedder. Both target wasm32.
-        binding: [web, wasm-host]
-
-    steps:
-    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      with:
-        persist-credentials: false
-    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      with:
-        targets: wasm32-unknown-unknown
-    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      with:
-        cache-bin: false
-        shared-key: ${{ runner.arch }}
-        # Restore-only on PRs (they pull main's cache via restore-keys); save
-        # only on main so per-PR target caches don't multiply across refs past
-        # GitHub's 10 GB cache budget and trigger LRU eviction.
-        save-if: ${{ github.ref == 'refs/heads/main' }}
-    - name: Download Charon artifact
-      # Run-scoped handoff from prepare-charon-llbc. Cross-run reuse still
-      # comes from the prepare job's cache; consumers avoid cache eviction
-      # races by downloading the prepared install tree directly.
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-      with:
-        name: charon-${{ runner.os }}-${{ runner.arch }}
-        path: .pyre-build/charon
-    - name: Download LLBC artifact
-      # Run-scoped handoff from prepare-charon-llbc. Unlike actions/cache, an
-      # artifact is exempt from the repo-wide 10 GB cache budget and its LRU
-      # eviction, so the ullbc set cannot vanish between prepare and this
-      # late-scheduled consumer (matches the other consumer jobs).
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-      with:
-        name: llbc-${{ runner.os }}-${{ runner.arch }}
-        path: build/llbc
-    - name: Verify prepared Charon/LLBC
-      shell: bash
-      run: |
-        test -d .pyre-build/charon
-        test -s build/llbc/pyre-object.ullbc
-        test -s build/llbc/pyre-interpreter.ullbc
-        test -s build/llbc/pyre-jit.ullbc
-    - name: Build pyre-wasm (${{ matrix.binding }})
-      shell: bash
-      run: |
-        # wasm-host has no JS host, so getrandom uses its `custom` backend
-        # (see `__getrandom_v03_custom`), which needs this cfg; web uses
-        # `getrandom/wasm_js` via its feature instead. `.cargo/config.toml`
-        # supplies `--export-table` for wasm32, but a RUSTFLAGS env overrides
-        # (does not merge with) it, so re-include it when we set RUSTFLAGS.
-        if [ "${{ matrix.binding }}" = "wasm-host" ]; then
-          export RUSTFLAGS='-C link-arg=--export-table --cfg getrandom_backend="custom"'
-        fi
-        cargo build -p pyre-wasm --target wasm32-unknown-unknown \
-          --no-default-features --features "${{ matrix.binding }}"
 
   sandbox-build:
     name: sandbox build + e2e (ubuntu-24.04)
